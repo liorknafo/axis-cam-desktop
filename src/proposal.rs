@@ -562,6 +562,8 @@ fn operation(
     let suits = match strategy {
         Strategy::Face => ["Flat end mill", "Face mill"].contains(&kind),
         Strategy::Drill if suits_helical(p) => kind == "Flat end mill",
+        Strategy::Drill if suits_cycle(p, crate::model::THREAD_MILLING) => kind == "Thread mill",
+        Strategy::Drill if suits_cycle(p, crate::model::TAPPING) => kind == "Tap",
         Strategy::Drill => ["Drill", "Chamfer mill"].contains(&kind),
         Strategy::Parallel => ["Ball end mill", "Flat end mill"].contains(&kind),
         _ => kind == "Flat end mill",
@@ -569,6 +571,16 @@ fn operation(
     if !suits && kind != "Flat end mill" && suits_helical(p) {
         wrong.push(format!(
             "T{} is a {kind}; Drill with Helical milling takes a flat end mill.",
+            p.tool
+        ));
+    } else if !suits && suits_cycle(p, crate::model::THREAD_MILLING) {
+        wrong.push(format!(
+            "T{} is a {kind}; Drill with Thread milling takes a thread mill.",
+            p.tool
+        ));
+    } else if !suits && suits_cycle(p, crate::model::TAPPING) {
+        wrong.push(format!(
+            "T{} is a {kind}; Drill with Tapping takes a tap.",
             p.tool
         ));
     } else if !suits {
@@ -773,7 +785,11 @@ fn operation(
 /// Whether `p` is a Drill operation with the Helical milling cycle, which
 /// cuts with a flat end mill.
 fn suits_helical(p: &ProposedOp) -> bool {
-    p.strategy == "Drill" && p.drill_cycle.as_deref() == Some(crate::model::HELICAL_MILLING)
+    suits_cycle(p, crate::model::HELICAL_MILLING)
+}
+/// Whether `p` is a Drill operation with the cycle `cycle`.
+fn suits_cycle(p: &ProposedOp, cycle: &str) -> bool {
+    p.strategy == "Drill" && p.drill_cycle.as_deref() == Some(cycle)
 }
 /// An operation of the current plan the planner cannot see or change: its
 /// strategy is not one of the six, its tool has no number, or it machines a

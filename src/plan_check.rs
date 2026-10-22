@@ -357,8 +357,12 @@ pub struct PartGrid {
     deep: Vec<bool>,
 }
 impl PartGrid {
-    /// `geometry` and `stock` must both be in setup 1's frame.
-    pub fn new(stock: &Volume, geometry: &Geometry) -> Self {
+    /// `geometry`, `threads` and `stock` must all be in setup 1's frame.
+    /// The band round each thread, out to its major diameter and a cell on,
+    /// is never deep: a thread's teeth are finer than the cells, and
+    /// threading it (a tap drill past its crests, a thread mill to its
+    /// roots) removes cells there that are the part's.
+    pub fn new(stock: &Volume, geometry: &Geometry, threads: &[crate::thread::Thread]) -> Self {
         let index = Index::new(geometry);
         let mut inside = vec![false; stock.occupied.len()];
         for y in 0..stock.n[1] {
@@ -396,13 +400,37 @@ impl PartGrid {
                 }
             }
         }
+        let margin = stock.cell.into_iter().fold(0., f32::max);
+        if !threads.is_empty() {
+            for z in 0..stock.n[2] {
+                for y in 0..stock.n[1] {
+                    for x in 0..stock.n[0] {
+                        let i = stock.index([x, y, z]);
+                        if !deep[i] {
+                            continue;
+                        }
+                        let p = stock.point([x, y, z], 0.5);
+                        deep[i] = !threads.iter().any(|t| {
+                            let (u, v) = ((t.axis + 1) % 3, (t.axis + 2) % 3);
+                            (p[u] - t.centre[0]).hypot(p[v] - t.centre[1]) <= t.major / 2. + margin
+                                && p[t.axis] >= t.from - t.pitch - margin
+                                && p[t.axis] <= t.to + t.pitch + margin
+                        });
+                    }
+                }
+            }
+        }
         Self { inside, deep }
     }
     /// The part (`mesh`, placed as setup 1 of `doc` places it) on `stock`'s
     /// grid: the stock the simulation keeps is in setup 1's frame
     /// (`simulation::sequence_walk`), whichever setup reads it.
     pub fn in_job(stock: &Volume, doc: &Document, mesh: &Mesh) -> Self {
-        Self::new(stock, &Geometry::new(&doc.setups[0], mesh))
+        Self::new(
+            stock,
+            &Geometry::new(&doc.setups[0], mesh),
+            &crate::thread::in_setup(&doc.setups[0], mesh),
+        )
     }
     /// Whether the cell at `index` (`Volume::index`) has its centre inside
     /// the part.
@@ -433,6 +461,10 @@ impl PartGrid {
 }
 #[cfg(test)]
 impl PartGrid {
+    /// How many cells are deep in the part.
+    pub(crate) fn deep_cells(&self) -> usize {
+        self.deep.iter().filter(|d| **d).count()
+    }
     /// The solid of `triangles` (mm, facing out) on `stock`'s grid, placed
     /// where they are: `mesh::normalize` centres a part on X and Y and lifts
     /// it to 4 display units, which a setup's `tx`, `ty` and `tz` move back.
@@ -455,7 +487,7 @@ impl PartGrid {
         for (key, v) in ["tx", "ty", "tz"].into_iter().zip(at) {
             setup.p.insert(key.into(), v.to_string());
         }
-        Self::new(stock, &Geometry::new(&setup, &mesh))
+        Self::new(stock, &Geometry::new(&setup, &mesh), &[])
     }
     /// The box `b` as a part on `stock`'s grid (`of`).
     pub(crate) fn boxed(stock: &Volume, b: Bounds) -> Self {
@@ -727,6 +759,10 @@ fn cutting_data_problems(built: &Document) -> Vec<Problem> {
             continue;
         }
         for (oi, op) in setup.operations.iter().enumerate() {
+            // Tapping is by hand, one pitch a turn (`material::check`).
+            if op.tapping() {
+                continue;
+            }
             let messages = match built.speed_feed(setup, op) {
                 Some(SpeedFeed::InRange { .. }) => vec![],
                 Some(SpeedFeed::Out(messages)) => messages,
@@ -941,6 +977,10 @@ fn run(
         .map(|s| Geometry::new(s, mesh))
         .collect();
     let indexes: Vec<Index> = geometries.iter().map(Index::new).collect();
+    let threads = built
+        .setups
+        .first()
+        .map_or(vec![], |s| crate::thread::in_setup(s, mesh));
     let mut axis = vec![];
     let mut part: Option<PartGrid> = None;
     let mut gouged = 0;
@@ -1002,7 +1042,7 @@ fn run(
             results[si].push((oi, result));
         },
         |si, oi, stock| {
-            let part = part.get_or_insert_with(|| PartGrid::new(stock, &geometries[0]));
+            let part = part.get_or_insert_with(|| PartGrid::new(stock, &geometries[0], &threads));
             let (count, bounds) = part.gouged(stock);
             if count > gouged {
                 let size = geometries[0].bounds;
@@ -1608,7 +1648,7 @@ mod tests {
             |_, _, v| stock = Some(v.clone()),
         );
         let mut stock = stock.unwrap();
-        let part = PartGrid::new(&stock, &geometry);
+        let part = PartGrid::new(&stock, &geometry, &[]);
         assert_eq!(part.gouged(&stock).0, 0, "a checked plan does not gouge");
         // Plunge a 10 mm cutter 8 mm into solid material beside the pocket.
         let b = geometry.bounds;

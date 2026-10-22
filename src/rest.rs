@@ -538,7 +538,8 @@ impl RestStock {
             min: [centre[0] - radius, centre[1] - radius, bottom],
             max: [centre[0] + radius, centre[1] + radius, top],
         };
-        let overlaps = |b: &Bounds| (0..3).all(|k| b.min[k] <= near.max[k] && b.max[k] >= near.min[k]);
+        let overlaps =
+            |b: &Bounds| (0..3).all(|k| b.min[k] <= near.max[k] && b.max[k] >= near.min[k]);
         let cuts: Vec<&Cut> = self
             .all
             .iter()
@@ -553,7 +554,11 @@ impl RestStock {
                     [centre[0], centre[1], z]
                 } else {
                     let a = k as f32 * std::f32::consts::TAU / rings as f32;
-                    [centre[0] + radius * a.cos(), centre[1] + radius * a.sin(), z]
+                    [
+                        centre[0] + radius * a.cos(),
+                        centre[1] + radius * a.sin(),
+                        z,
+                    ]
                 };
                 !(0..3).all(|i| p[i] > self.whole.min[i] && p[i] < self.whole.max[i])
                     || cuts.iter().any(|c| {

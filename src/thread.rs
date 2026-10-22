@@ -69,7 +69,14 @@ const fn unified(name: &'static str, inches: f32, tpi: f32) -> Spec {
         tap_drill: inches * INCH - 0.974 * pitch,
     }
 }
-const fn pipe(name: &'static str, major: f32, tpi: f32, angle: f32, tapered: bool, drill: f32) -> Spec {
+const fn pipe(
+    name: &'static str,
+    major: f32,
+    tpi: f32,
+    angle: f32,
+    tapered: bool,
+    drill: f32,
+) -> Spec {
     Spec {
         name,
         major,
@@ -364,8 +371,10 @@ pub fn detect(triangles: &[[[f32; 3]; 3]]) -> Vec<Thread> {
                 }
             }
         }
-        let mut cells: Vec<((i32, i32), u32)> =
-            votes.into_iter().filter(|(_, n)| *n as usize >= LEAST).collect();
+        let mut cells: Vec<((i32, i32), u32)> = votes
+            .into_iter()
+            .filter(|(_, n)| *n as usize >= LEAST)
+            .collect();
         cells.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         let mut tried: Vec<[f32; 2]> = vec![];
         for (cell, _) in cells.into_iter().take(600) {
@@ -387,8 +396,8 @@ pub fn detect(triangles: &[[[f32; 3]; 3]]) -> Vec<Thread> {
                         let off = [f.at[0] - at[0], f.at[1] - at[1]];
                         let dist = off[0].hypot(off[1]);
                         let perp = (off[0] * f.toward[1] - off[1] * f.toward[0]).abs();
-                        let radial = (off[0] * f.toward[0] + off[1] * f.toward[1]).abs()
-                            / dist.max(1e-9);
+                        let radial =
+                            (off[0] * f.toward[0] + off[1] * f.toward[1]).abs() / dist.max(1e-9);
                         perp < 1. && dist > 0.3 && dist < REACH && radial > 0.97
                     })
                     .collect();
@@ -421,7 +430,16 @@ pub fn detect(triangles: &[[[f32; 3]; 3]]) -> Vec<Thread> {
             {
                 continue;
             }
-            if let Some(thread) = read(axis, at, &members.iter().map(|f| (f.index, f.up, f.lean)).collect::<Vec<_>>(), triangles, &pitches) {
+            if let Some(thread) = read(
+                axis,
+                at,
+                &members
+                    .iter()
+                    .map(|f| (f.index, f.up, f.lean))
+                    .collect::<Vec<_>>(),
+                triangles,
+                &pitches,
+            ) {
                 found.push(thread);
             }
         }
@@ -451,7 +469,11 @@ fn read(
     // 55° ones cos 27.5° = 0.887.
     let mut leans: Vec<f32> = members.iter().map(|m| m.2).collect();
     leans.sort_by(f32::total_cmp);
-    let angle = if leans[leans.len() / 2] > 0.877 { 55. } else { 60. };
+    let angle = if leans[leans.len() / 2] > 0.877 {
+        55.
+    } else {
+        60.
+    };
     let slope = (angle / 2f32).to_radians().tan();
     // (r, θ, z) of each flank's vertices, by the side the flank faces.
     let polar = |p: [f32; 3]| {
@@ -466,9 +488,11 @@ fn read(
             .collect()
     });
     let all: Vec<(f32, f32, f32)> = sides.iter().flatten().copied().collect();
-    let (from, to) = all.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), p| {
-        (a.min(p.2), b.max(p.2))
-    });
+    let (from, to) = all
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), p| {
+            (a.min(p.2), b.max(p.2))
+        });
     // How well the vertices of one flank side line up on a helix of
     // `pitch` and `hand`: they all sit at one phase of it once their
     // height along the flank is taken off.
@@ -543,7 +567,9 @@ fn read(
     let internal = facing < 0.;
     // A taper shows as a steady change of radius along the axis.
     let n = all.len() as f64;
-    let (mz, mr) = all.iter().fold((0f64, 0f64), |(a, b), p| (a + p.2 as f64, b + p.0 as f64));
+    let (mz, mr) = all
+        .iter()
+        .fold((0f64, 0f64), |(a, b), p| (a + p.2 as f64, b + p.0 as f64));
     let (mz, mr) = (mz / n, mr / n);
     let (sxy, sxx) = all.iter().fold((0f64, 0f64), |(a, b), p| {
         let dz = p.2 as f64 - mz;
@@ -570,9 +596,7 @@ fn read(
     };
     let spec = SPECS
         .iter()
-        .filter(|s| {
-            (s.pitch - pitch).abs() < 1e-3 && s.angle == angle && s.tapered == tapered
-        })
+        .filter(|s| (s.pitch - pitch).abs() < 1e-3 && s.angle == angle && s.tapered == tapered)
         .min_by(|a, b| (a.major - major).abs().total_cmp(&(b.major - major).abs()))
         .filter(|s| {
             let off = (s.major - major).abs();
@@ -656,7 +680,12 @@ pub(crate) mod tests {
         let mut out = vec![];
         for i in 0..steps {
             for j in 0..rows {
-                let (a, b, c, d) = (point(i, j), point(i + 1, j), point(i + 1, j + 1), point(i, j + 1));
+                let (a, b, c, d) = (
+                    point(i, j),
+                    point(i + 1, j),
+                    point(i + 1, j + 1),
+                    point(i, j + 1),
+                );
                 if internal {
                     out.push([a, c, b]);
                     out.push([a, d, c]);
@@ -684,8 +713,16 @@ pub(crate) mod tests {
                 out.push([at(i, r, z0), at(i, r, z1), at(i + 1, r, z1)]);
                 // The cone: 60° from the axis, so its normal leans 30°.
                 let (c0, c1) = (r + 2. + z0 * 3f32.sqrt(), r + 2. + z1 * 3f32.sqrt());
-                out.push([at(i, c0, z0 + 30.), at(i + 1, c1, z1 + 30.), at(i + 1, c0, z0 + 30.)]);
-                out.push([at(i, c0, z0 + 30.), at(i, c1, z1 + 30.), at(i + 1, c1, z1 + 30.)]);
+                out.push([
+                    at(i, c0, z0 + 30.),
+                    at(i + 1, c1, z1 + 30.),
+                    at(i + 1, c0, z0 + 30.),
+                ]);
+                out.push([
+                    at(i, c0, z0 + 30.),
+                    at(i, c1, z1 + 30.),
+                    at(i + 1, c1, z1 + 30.),
+                ]);
             }
         }
         out
@@ -702,35 +739,101 @@ pub(crate) mod tests {
         let t = one(&found);
         assert_eq!(t.spec.map(|s| s.name), Some("M6×1"));
         assert!(t.internal && t.right_hand && !t.tapered && t.axis == 2);
-        assert!((t.centre[0] - 12.).abs() < 0.05 && (t.centre[1] + 4.).abs() < 0.05, "{t:?}");
+        assert!(
+            (t.centre[0] - 12.).abs() < 0.05 && (t.centre[1] + 4.).abs() < 0.05,
+            "{t:?}"
+        );
         assert!((t.length() - 10.).abs() < 0.3, "{t:?}");
-        assert!((t.major - 6.).abs() < 0.1 && (t.minor - 4.917).abs() < 0.15, "{t:?}");
+        assert!(
+            (t.major - 6.).abs() < 0.1 && (t.minor - 4.917).abs() < 0.15,
+            "{t:?}"
+        );
     }
     #[test]
     fn left_hand_fine_and_small_threads_read_true() {
-        let t = one(&detect(&modeled([0., 0.], 8., 1., 60., false, true, 12., 0.))).clone();
+        let t = one(&detect(&modeled(
+            [0., 0.],
+            8.,
+            1.,
+            60.,
+            false,
+            true,
+            12.,
+            0.,
+        )))
+        .clone();
         assert_eq!(t.spec.map(|s| s.name), Some("M8×1"));
         assert!(!t.right_hand);
-        let t = one(&detect(&modeled([3., 3.], 3., 0.5, 60., true, true, 6., 0.))).clone();
+        let t = one(&detect(&modeled(
+            [3., 3.],
+            3.,
+            0.5,
+            60.,
+            true,
+            true,
+            6.,
+            0.,
+        )))
+        .clone();
         assert_eq!(t.spec.map(|s| s.name), Some("M3×0.5"));
     }
     #[test]
     fn a_stud_reads_as_outside() {
-        let t = one(&detect(&modeled([0., 0.], 10., 1.5, 60., true, false, 15., 0.))).clone();
+        let t = one(&detect(&modeled(
+            [0., 0.],
+            10.,
+            1.5,
+            60.,
+            true,
+            false,
+            15.,
+            0.,
+        )))
+        .clone();
         assert_eq!(t.spec.map(|s| s.name), Some("M10×1.5"));
         assert!(!t.internal && t.right_hand);
     }
     #[test]
     fn inch_and_whitworth_sizes_match_their_tables() {
-        let t = one(&detect(&modeled([0., 0.], 6.35, 1.27, 60., true, true, 12., 0.))).clone();
+        let t = one(&detect(&modeled(
+            [0., 0.],
+            6.35,
+            1.27,
+            60.,
+            true,
+            true,
+            12.,
+            0.,
+        )))
+        .clone();
         assert_eq!(t.spec.map(|s| s.name), Some("1/4-20 UNC"));
-        let t = one(&detect(&modeled([0., 0.], 13.157, 25.4 / 19., 55., true, true, 12., 0.))).clone();
+        let t = one(&detect(&modeled(
+            [0., 0.],
+            13.157,
+            25.4 / 19.,
+            55.,
+            true,
+            true,
+            12.,
+            0.,
+        )))
+        .clone();
         assert_eq!((t.angle, t.spec.map(|s| s.name)), (55., Some("G1/4")));
     }
     #[test]
     fn a_tapered_pipe_thread_reads_as_npt() {
         // Narrowing 1:16 into the hole from z = 0.
-        let t = one(&detect(&modeled([0., 0.], 10.272, 25.4 / 27., 60., true, true, 10., 1. / 16.))).clone();
+        let t = one(&detect(&modeled(
+            [0., 0.],
+            10.272,
+            25.4 / 27.,
+            60.,
+            true,
+            true,
+            10.,
+            1. / 16.,
+        )))
+        .clone();
         assert!(t.tapered, "{t:?}");
         assert_eq!(t.spec.map(|s| s.name), Some("1/8-27 NPT"));
     }
@@ -754,6 +857,10 @@ pub(crate) mod tests {
         both.extend(modeled([20., 0.], 5., 0.8, 60., true, true, 8., 0.));
         let found = detect(&both);
         assert_eq!(found.len(), 2, "{found:#?}");
-        assert!(found.iter().all(|t| t.spec.map(|s| s.name) == Some("M5×0.8")));
+        assert!(
+            found
+                .iter()
+                .all(|t| t.spec.map(|s| s.name) == Some("M5×0.8"))
+        );
     }
 }

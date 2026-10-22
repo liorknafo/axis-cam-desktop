@@ -2288,23 +2288,43 @@ pub(crate) struct HoleThread {
 /// none modeled runs through a hole that goes through, and stops a pitch
 /// and a half above a blind hole's bottom.
 pub(crate) fn hole_thread(op: &Operation, h: &Hole) -> Result<HoleThread, String> {
-    let at = format!("Ø{:.2} hole at X{:.2} Y{:.2}", h.diameter, h.center[0], h.center[1]);
+    let at = format!(
+        "Ø{:.2} hole at X{:.2} Y{:.2}",
+        h.diameter, h.center[0], h.center[1]
+    );
     let chosen = get(&op.p, "thread");
-    let (name, major, minor, pitch, angle, tapered, mut right_hand, tap_drill) =
-        if chosen == crate::model::FROM_MODEL {
-            let t = h.thread.as_ref().ok_or_else(|| {
-                format!("The {at} has no thread modeled in it: choose its size in Thread.")
-            })?;
-            let (major, minor, drill) = t.spec.map_or(
-                (t.major, t.minor, t.major - t.pitch),
-                |s| (s.major, s.minor(), s.tap_drill),
-            );
-            (t.name(), major, minor, t.pitch, t.angle, t.tapered, t.right_hand, drill)
-        } else {
-            let s = crate::thread::spec(chosen)
-                .ok_or("Choose the thread size, or From the model.")?;
-            (s.name.to_string(), s.major, s.minor(), s.pitch, s.angle, s.tapered, true, s.tap_drill)
-        };
+    let (name, major, minor, pitch, angle, tapered, mut right_hand, tap_drill) = if chosen
+        == crate::model::FROM_MODEL
+    {
+        let t = h.thread.as_ref().ok_or_else(|| {
+            format!("The {at} has no thread modeled in it: choose its size in Thread.")
+        })?;
+        let (major, minor, drill) = t.spec.map_or((t.major, t.minor, t.major - t.pitch), |s| {
+            (s.major, s.minor(), s.tap_drill)
+        });
+        (
+            t.name(),
+            major,
+            minor,
+            t.pitch,
+            t.angle,
+            t.tapered,
+            t.right_hand,
+            drill,
+        )
+    } else {
+        let s = crate::thread::spec(chosen).ok_or("Choose the thread size, or From the model.")?;
+        (
+            s.name.to_string(),
+            s.major,
+            s.minor(),
+            s.pitch,
+            s.angle,
+            s.tapered,
+            true,
+            s.tap_drill,
+        )
+    };
     match get(&op.p, "thread_hand") {
         "Right hand" => right_hand = true,
         "Left hand" => right_hand = false,
@@ -2380,7 +2400,7 @@ fn thread_mill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resul
     let r = b.plan.radius;
     // Climb inside a hole: counterclockwise with the spindle clockwise.
     let turn = if b.plan.spindle_clockwise { 1. } else { -1. };
-    b.plan.milling_direction = "Climb · thread milling";
+    b.plan.milling_direction = crate::forces::THREAD_MILLING_DIRECTION;
     let count = holes.len();
     crate::progress::expect(count);
     while !holes.is_empty() {
@@ -2442,8 +2462,16 @@ fn thread_mill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resul
         // Half a pitch past an open end: the mouth, and the exit of a hole
         // that goes through.
         let mouth = t.top + t.pitch / 2.;
-        let end = if h.through { t.bottom - t.pitch / 2. } else { t.bottom };
-        let (start, stop) = if rise > 0. { (end, mouth) } else { (mouth, end) };
+        let end = if h.through {
+            t.bottom - t.pitch / 2.
+        } else {
+            t.bottom
+        };
+        let (start, stop) = if rise > 0. {
+            (end, mouth)
+        } else {
+            (mouth, end)
+        };
         let segments = (std::f32::consts::PI / (1. - tolerance.min(full) / full.max(1e-3)).acos())
             .ceil()
             .clamp(12., 360.) as usize;
@@ -2458,9 +2486,8 @@ fn thread_mill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resul
             return Err(too_many("moves"));
         }
         let c = h.center;
-        let around = |a: f32, radius: f32, z: f32| {
-            [c[0] + radius * a.cos(), c[1] + radius * a.sin(), z]
-        };
+        let around =
+            |a: f32, radius: f32, z: f32| [c[0] + radius * a.cos(), c[1] + radius * a.sin(), z];
         b.start_at([c[0], c[1], start], Some(h.top))?;
         for &radius in &radii {
             let radius = radius.max(0.001);
@@ -2471,7 +2498,8 @@ fn thread_mill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resul
             let arc = segments / 2;
             let o = (radius - taper(start)) / 2.;
             for k in 1..=arc {
-                let phi = std::f32::consts::PI + turn * std::f32::consts::PI * k as f32 / arc as f32;
+                let phi =
+                    std::f32::consts::PI + turn * std::f32::consts::PI * k as f32 / arc as f32;
                 b.push(
                     [c[0] + o + o * phi.cos(), c[1] + o * phi.sin(), start],
                     Motion::Feed,
@@ -2514,7 +2542,9 @@ fn thread_mill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resul
 /// thread, so a blind hole must go that far below the thread.
 fn tap(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
     let mut b = Builder::new(setup, op, tool, mesh)?;
-    let spec = tool.tap_spec().ok_or("Choose a tap, with its thread size, for Tapping.")?;
+    let spec = tool
+        .tap_spec()
+        .ok_or("Choose a tap, with its thread size, for Tapping.")?;
     if !crate::manual::is_hand(&setup.machine) {
         return Err(crate::model::TAP_ON_CNC.into());
     }
@@ -2522,7 +2552,7 @@ fn tap(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, 
     let lead = tap_lead(tool) * spec.pitch;
     // The tap cuts to its major diameter.
     b.plan.radius = spec.major / 2.;
-    b.plan.milling_direction = "Tapping · by hand";
+    b.plan.milling_direction = crate::forces::TAPPING_DIRECTION;
     let count = holes.len();
     crate::progress::expect(count);
     while !holes.is_empty() {
@@ -2531,7 +2561,10 @@ fn tap(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, 
         let t = hole_thread(op, &h)?;
         let at = format!("{} hole at X{:.2} Y{:.2}", t.name, h.center[0], h.center[1]);
         if (spec.major - t.major).abs() > 0.3 || (spec.pitch - t.pitch).abs() > 1e-3 {
-            return Err(format!("The {at} takes an {} tap; this tap is {}. Choose an {} tap.", t.name, spec.name, t.name));
+            return Err(format!(
+                "The {at} takes an {} tap; this tap is {}. Choose an {} tap.",
+                t.name, spec.name, t.name
+            ));
         }
         let lowest = t.bottom - lead;
         if !h.through && lowest < h.bottom - 0.001 {
@@ -5856,7 +5889,10 @@ pub(crate) mod tests {
             ]
         );
         // A threaded hole's drill size is its minor diameter.
-        let m8 = found.iter().find(|h| h.thread.as_ref().is_some_and(|t| t.name() == "M8×1.25")).unwrap();
+        let m8 = found
+            .iter()
+            .find(|h| h.thread.as_ref().is_some_and(|t| t.name() == "M8×1.25"))
+            .unwrap();
         assert!((m8.diameter - 6.65).abs() < 0.1, "{m8:?}");
     }
     fn threaded_plate() -> Mesh {
@@ -5868,7 +5904,12 @@ pub(crate) mod tests {
     fn thread_mill_tool(diameter: &str) -> Tool {
         let mut t = Tool::new("Thread mill", "Thread mill", diameter);
         t.set_type("Thread mill");
-        for (k, v) in [("pitches", "0.5-1.25"), ("reach", "16"), ("length", "1"), ("stickout", "40")] {
+        for (k, v) in [
+            ("pitches", "0.5-1.25"),
+            ("reach", "16"),
+            ("length", "1"),
+            ("stickout", "40"),
+        ] {
             t.p.insert(k.into(), v.into());
         }
         t
@@ -5885,6 +5926,22 @@ pub(crate) mod tests {
         cycle: &str,
         edit: impl Fn(&mut Operation),
     ) -> (Result<Simulation, String>, Mesh) {
+        let (result, mesh, _) = threaded_doc(machine, bore, drilled, tool, cycle, edit);
+        (result, mesh)
+    }
+    /// `threaded_job`, with its document and the stock it leaves.
+    fn threaded_doc(
+        machine: Machine,
+        bore: &str,
+        drilled: Option<&str>,
+        tool: Tool,
+        cycle: &str,
+        edit: impl Fn(&mut Operation),
+    ) -> (
+        Result<Simulation, String>,
+        Mesh,
+        (crate::model::Document, Option<crate::volume::Volume>),
+    ) {
         let mesh = threaded_plate();
         let (mut setup, mut drill, _) = fixture(Strategy::Drill);
         setup.machine = machine;
@@ -5921,14 +5978,21 @@ pub(crate) mod tests {
         doc.machines = vec![setup.machine.clone()];
         doc.setups = vec![setup];
         let mut all = vec![];
-        crate::simulation::sequence(&doc, &mesh, None, |_, _, r| all.push(r));
+        let mut stock = None;
+        crate::simulation::sequence_with(
+            &doc,
+            &mesh,
+            None,
+            |_, _, r| all.push(r),
+            |_, _, v| stock = Some(v.clone()),
+        );
         let last = all.pop().unwrap();
         for r in &all {
             if let Err(e) = r {
                 panic!("the drilling before failed: {e}");
             }
         }
-        (last, mesh)
+        (last, mesh, (doc, stock))
     }
     /// The cutting moves of `plan` on the orbit of radius `radius` round
     /// `centre`, as (angle, z) of their ends, in order.
@@ -5946,31 +6010,50 @@ pub(crate) mod tests {
         // The M6×1 holes (bore Ø4.9), drilled Ø4.5, a Ø3.15 thread mill:
         // its full orbit is 3 − 1.575 from the axis.
         for (hand, rises) in [("From the model", true), ("Left hand", false)] {
-            let (result, _) = threaded_job(Machine::new(3), "4.9", Some("4.5"), thread_mill_tool("3.15"), crate::model::THREAD_MILLING, |o| {
-                o.p.insert("thread_hand".into(), hand.into());
-            });
+            let (result, _) = threaded_job(
+                Machine::new(3),
+                "4.9",
+                Some("4.5"),
+                thread_mill_tool("3.15"),
+                crate::model::THREAD_MILLING,
+                |o| {
+                    o.p.insert("thread_hand".into(), hand.into());
+                },
+            );
             let sim = result.unwrap_or_else(|e| panic!("{hand}: {e}"));
             let plan = &sim.plan;
             let centre = [-25., -10.];
             // The hole's centre in the setup frame: find it from the moves.
-            let cut: Vec<[f32; 3]> = plan.moves.iter().filter(|m| m.cutting_pass).map(|m| m.to).collect();
+            let cut: Vec<[f32; 3]> = plan
+                .moves
+                .iter()
+                .filter(|m| m.cutting_pass)
+                .map(|m| m.to)
+                .collect();
             assert!(!cut.is_empty());
             let lowest = cut.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min);
             let _ = centre;
             // Group by hole: the two M6 holes are 20 apart in Y.
             let ys: Vec<f32> = cut.iter().map(|p| p[1]).collect();
-            let split = (ys.iter().copied().fold(f32::INFINITY, f32::min) + ys.iter().copied().fold(f32::NEG_INFINITY, f32::max)) / 2.;
+            let split = (ys.iter().copied().fold(f32::INFINITY, f32::min)
+                + ys.iter().copied().fold(f32::NEG_INFINITY, f32::max))
+                / 2.;
             let one: Vec<[f32; 3]> = cut.iter().copied().filter(|p| p[1] < split).collect();
             let (mx, my) = one.iter().fold((0., 0.), |(a, b), p| (a + p[0], b + p[1]));
             let rough = [mx / one.len() as f32, my / one.len() as f32];
             let full = 3. - 1.575;
             // The orbit's centre: the middle of its extreme points.
-            let far: Vec<&[f32; 3]> = one.iter().filter(|p| ((p[0] - rough[0]).hypot(p[1] - rough[1]) - full).abs() < 0.2).collect();
+            let far: Vec<&[f32; 3]> = one
+                .iter()
+                .filter(|p| ((p[0] - rough[0]).hypot(p[1] - rough[1]) - full).abs() < 0.2)
+                .collect();
             let xs = far.iter().map(|p| p[0]);
             let ys = far.iter().map(|p| p[1]);
             let centre = [
-                (xs.clone().fold(f32::INFINITY, f32::min) + xs.fold(f32::NEG_INFINITY, f32::max)) / 2.,
-                (ys.clone().fold(f32::INFINITY, f32::min) + ys.fold(f32::NEG_INFINITY, f32::max)) / 2.,
+                (xs.clone().fold(f32::INFINITY, f32::min) + xs.fold(f32::NEG_INFINITY, f32::max))
+                    / 2.,
+                (ys.clone().fold(f32::INFINITY, f32::min) + ys.fold(f32::NEG_INFINITY, f32::max))
+                    / 2.,
             ];
             let path = orbit(plan, centre, full);
             assert!(path.len() > 100, "{hand}: {} orbit points", path.len());
@@ -5990,11 +6073,66 @@ pub(crate) mod tests {
                 assert!(da > 0., "{hand}: clockwise step {da}");
                 let dz = pair[1].1 - pair[0].1;
                 let expected = 1. * da / std::f32::consts::TAU * if rises { 1. } else { -1. };
-                assert!((dz - expected).abs() < 2e-4, "{hand}: dz {dz} for {da} rad, expected {expected}");
+                assert!(
+                    (dz - expected).abs() < 2e-4,
+                    "{hand}: dz {dz} for {da} rad, expected {expected}"
+                );
             }
             // Through holes: half a pitch past the exit.
             assert!(lowest < 4. / mesh_scale_free() + 0., "{lowest}");
         }
+    }
+    #[test]
+    fn a_milled_thread_is_no_gouge() {
+        // The M6 holes (bore Ø4.9): drilled Ø5, their tap drill, then milled
+        // to their roots by a Ø4 thread mill. Both cut cells of the part's
+        // thread, which is finer than the cells.
+        let (result, mesh, (doc, stock)) = threaded_doc(
+            Machine::new(3),
+            "4.9",
+            Some("5"),
+            thread_mill_tool("4"),
+            crate::model::THREAD_MILLING,
+            |_| {},
+        );
+        result.unwrap();
+        let stock = stock.unwrap();
+        let masked = crate::plan_check::PartGrid::in_job(&stock, &doc, &mesh)
+            .gouged(&stock)
+            .0;
+        assert_eq!(masked, 0);
+        // The band round each thread is not deep part: on a part small
+        // enough that its cells are finer, a thread's would be.
+        let geometry = Geometry::new(&doc.setups[0], &mesh);
+        let threads = crate::thread::in_setup(&doc.setups[0], &mesh);
+        assert_eq!(threads.len(), 4);
+        let banded = crate::plan_check::PartGrid::new(&stock, &geometry, &threads).deep_cells();
+        let bare = crate::plan_check::PartGrid::new(&stock, &geometry, &[]).deep_cells();
+        assert!(banded < bare, "{banded} {bare}");
+    }
+    #[test]
+    fn a_thread_milling_job_posts_and_replays_exactly() {
+        let (result, mesh, (mut doc, _)) = threaded_doc(Machine::new(3), "4.9", Some("5"), thread_mill_tool("4"), crate::model::THREAD_MILLING, |_| {});
+        result.unwrap();
+        doc.file = Some(crate::model::ModelFile {
+            name: "threaded-plate.3mf".into(),
+            path: "examples/threaded-plate.3mf".into(),
+            format: "3MF".into(),
+            bytes: 1,
+        });
+        for (n, t) in doc.tools.iter_mut().enumerate() {
+            t.p.insert("number".into(), (n + 1).to_string());
+        }
+        let job = crate::post::post_job(&doc, &mesh);
+        let problems: Vec<String> = job
+            .errors
+            .iter()
+            .cloned()
+            .chain(job.setups.iter().filter_map(|s| s.result.as_ref().err()).flatten().cloned())
+            .collect();
+        assert!(job.ready(), "{problems:?}");
+        let program = &job.setups[0].result.as_ref().unwrap()[0];
+        assert!(program.text.contains("T2 M6") && program.text.contains("\nG1 "), "{}", &program.text[..500]);
     }
     /// The plate's bottom in a setup frame: placement puts it a fixed 4
     /// display units up, which `threaded_plate`'s 70 mm makes 2 mm.
@@ -6003,18 +6141,52 @@ pub(crate) mod tests {
     }
     #[test]
     fn thread_milling_refuses_an_undrilled_hole_a_wrong_pitch_and_a_short_reach() {
-        let (result, _) = threaded_job(Machine::new(3), "4.9", None, thread_mill_tool("3.15"), crate::model::THREAD_MILLING, |_| {});
+        let (result, _) = threaded_job(
+            Machine::new(3),
+            "4.9",
+            None,
+            thread_mill_tool("3.15"),
+            crate::model::THREAD_MILLING,
+            |_| {},
+        );
         let e = result.unwrap_err();
         assert!(e.starts_with("Drill the M6×1 hole"), "{e}");
         let mut fine = thread_mill_tool("3.15");
         fine.p.insert("pitches".into(), "0.5-0.8".into());
-        let e = threaded_job(Machine::new(3), "4.9", Some("4.5"), fine, crate::model::THREAD_MILLING, |_| {}).0.unwrap_err();
+        let e = threaded_job(
+            Machine::new(3),
+            "4.9",
+            Some("4.5"),
+            fine,
+            crate::model::THREAD_MILLING,
+            |_| {},
+        )
+        .0
+        .unwrap_err();
         assert!(e.contains("pitch of 1 mm, outside"), "{e}");
         let mut short = thread_mill_tool("3.15");
         short.p.insert("reach".into(), "8".into());
-        let e = threaded_job(Machine::new(3), "4.9", Some("4.5"), short, crate::model::THREAD_MILLING, |_| {}).0.unwrap_err();
+        let e = threaded_job(
+            Machine::new(3),
+            "4.9",
+            Some("4.5"),
+            short,
+            crate::model::THREAD_MILLING,
+            |_| {},
+        )
+        .0
+        .unwrap_err();
         assert!(e.contains("reaches 8 mm"), "{e}");
-        let e = threaded_job(Machine::new(3), "4.9", Some("4.5"), thread_mill_tool("4.95"), crate::model::THREAD_MILLING, |_| {}).0.unwrap_err();
+        let e = threaded_job(
+            Machine::new(3),
+            "4.9",
+            Some("4.5"),
+            thread_mill_tool("4.95"),
+            crate::model::THREAD_MILLING,
+            |_| {},
+        )
+        .0
+        .unwrap_err();
         assert!(e.contains("too wide"), "{e}");
     }
     #[test]
@@ -6025,7 +6197,16 @@ pub(crate) mod tests {
         tap.p.insert("length".into(), "20".into());
         tap.p.insert("stickout".into(), "40".into());
         // The CNC cannot tap.
-        let e = threaded_job(Machine::new(3), "4.9", Some("5"), tap.clone(), crate::model::TAPPING, |_| {}).0.unwrap_err();
+        let e = threaded_job(
+            Machine::new(3),
+            "4.9",
+            Some("5"),
+            tap.clone(),
+            crate::model::TAPPING,
+            |_| {},
+        )
+        .0
+        .unwrap_err();
         assert_eq!(e, crate::model::TAP_ON_CNC);
         let mut manual = Machine::new(3);
         crate::manual::set_kind(&mut manual, "Manual");
@@ -6033,12 +6214,32 @@ pub(crate) mod tests {
             o.p.insert("rpm".into(), "90".into());
             o.p.insert("feed".into(), "90".into());
         };
-        let sim = threaded_job(manual.clone(), "4.9", Some("5"), tap.clone(), crate::model::TAPPING, slow).0.unwrap();
+        let sim = threaded_job(
+            manual.clone(),
+            "4.9",
+            Some("5"),
+            tap.clone(),
+            crate::model::TAPPING,
+            slow,
+        )
+        .0
+        .unwrap();
         assert_eq!(sim.plan.milling_direction, "Tapping · by hand");
-        let e = threaded_job(manual.clone(), "4.9", None, tap.clone(), crate::model::TAPPING, slow).0.unwrap_err();
+        let e = threaded_job(
+            manual.clone(),
+            "4.9",
+            None,
+            tap.clone(),
+            crate::model::TAPPING,
+            slow,
+        )
+        .0
+        .unwrap_err();
         assert!(e.starts_with("Drill the M6×1 hole"), "{e}");
         // An M5 hole takes an M5 tap.
-        let e = threaded_job(manual, "4.1", Some("4.2"), tap, crate::model::TAPPING, slow).0.unwrap_err();
+        let e = threaded_job(manual, "4.1", Some("4.2"), tap, crate::model::TAPPING, slow)
+            .0
+            .unwrap_err();
         assert!(e.contains("takes an M5×0.8 tap"), "{e}");
     }
     #[test]
