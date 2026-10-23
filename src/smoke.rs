@@ -3001,6 +3001,34 @@ flood = { pin = 8 }
         let _ = a.update(Message::Viewport(crate::viewport::Event::SectionSurface(2)));
         assert_eq!(cut(&a), Some(face));
     }
+    /// A section set on one part, with Section still ticked on another (the
+    /// example opened after an imported part), cuts that one across Z
+    /// through its middle, and the controls edit that cut.
+    #[test]
+    fn a_section_left_on_another_part_cuts_this_one_across_z() {
+        use crate::section::{Edit, Through};
+        let mut a = pocket_app(crate::pocket::hole_plate(false));
+        a.page = Page::Work;
+        let _ = a.update(Message::Section(Edit::Toggle));
+        let _ = a.update(Message::Section(Edit::Axis(1)));
+        a.doc = Document::sample();
+        assert!(a.is_sample() && a.section_on);
+        let cut = a.view_section().expect("still cut");
+        assert_eq!((cut.through, cut.positive), (Through::Axis(2), true));
+        let height = a.sample_mesh.dimensions[2];
+        assert!(
+            (cut.at - height / 2.).abs() < 1e-3,
+            "{} of {height}",
+            cut.at
+        );
+        let _ = a.view();
+        let _ = a.update(Message::Section(Edit::At(5.)));
+        let moved = a.view_section().unwrap();
+        assert_eq!(
+            (moved.through, moved.at, moved.positive),
+            (Through::Axis(2), 5., true)
+        );
+    }
     /// Pictures of the 3D view cut on a section, and of picking the face a
     /// section goes through, in `$AXIS_RENDER_DIR` (default /tmp/section-app).
     #[test]

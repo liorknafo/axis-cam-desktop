@@ -1958,12 +1958,19 @@ impl App {
     pub fn is_sample(&self) -> bool {
         self.doc.sample_model && self.doc.file.is_none()
     }
-    /// The section the 3D view's part is cut on, when it is on and was set
-    /// on this part.
+    /// The section the 3D view's part is cut on, when it is on: the one set
+    /// on this part, or across Z when it was set on another.
     pub fn view_section(&self) -> Option<section::Section> {
-        let fingerprint = &self.part_mesh()?.fingerprint;
-        let (cut, part) = self.section.as_ref().filter(|_| self.section_on)?;
-        (part == fingerprint).then_some(*cut)
+        if !self.section_on {
+            return None;
+        }
+        let mesh = self.part_mesh()?;
+        Some(match &self.section {
+            Some((cut, part)) if *part == mesh.fingerprint => *cut,
+            // Set on another part, as after opening the example: across Z
+            // through the middle of this one, its top half cut away.
+            _ => section::Section::across(2, mesh, self.doc.active_setup(), [0., 0., 1.]),
+        })
     }
     /// The 3D view's section changed from its controls.
     fn edit_section(&mut self, edit: section::Edit) {
@@ -1977,7 +1984,9 @@ impl App {
         let mut cut = match (edit, &self.section) {
             (section::Edit::Axis(k), _) => across(k),
             (_, Some((cut, on))) if *on == part => *cut,
-            _ => across(2),
+            // The cut shown on this part (across Z) is the one edited.
+            (section::Edit::Toggle, _) => across(2),
+            _ => self.view_section().unwrap_or_else(|| across(2)),
         };
         match edit {
             section::Edit::Toggle => {

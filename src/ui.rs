@@ -2261,11 +2261,20 @@ fn section_controls(app: &App) -> Option<Element<'_, Message>> {
         controls = controls.push(btn(*name, Message::Section(Edit::Axis(k)), on));
     }
     let on_face = cut.is_some_and(|c| matches!(c.through, Through::Surface(_)));
-    controls = controls.push(btn(
-        "Face…",
-        Message::Section(Edit::PickFace),
-        app.picking_section || on_face,
-    ));
+    // The example's demo geometry has no surfaces to pick: Face… is greyed.
+    let faces = !view.mesh.surfaces.is_empty();
+    let pick = Message::Section(Edit::PickFace);
+    controls = controls.push(if faces {
+        btn("Face…", pick, app.picking_section || on_face)
+    } else {
+        help::HelpButton::new(
+            button(text("Face…").size(12).color(MUTED))
+                .padding([7, 10])
+                .style(|_, status| flat(false, status)),
+            &pick,
+            "Face…",
+        )
+    });
     let Some((cut, (low, high))) =
         cut.and_then(|c| Some((c, c.range(view.mesh, view.setup, view.scene_bounds())?)))
     else {
@@ -2298,7 +2307,10 @@ fn section_controls(app: &App) -> Option<Element<'_, Message>> {
     )
 }
 fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
-    let detail = if app.is_sample() {
+    let detail = if app.is_sample() && app.section_on {
+        "Sample housing · selectable demo geometry · cutting through a face needs an imported part"
+            .to_string()
+    } else if app.is_sample() {
         "Sample housing · selectable demo geometry".to_string()
     } else if let Some(m) = &app.imported_mesh {
         format!(

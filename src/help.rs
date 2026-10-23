@@ -1376,7 +1376,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "",
         ),
         Section(crate::section::Edit::PickFace) => (
-            "Click a flat face of the part to cut through it: the plane is the face's own, and the slider moves it along the face's normal, into the part or out of it. Click again to stop picking.",
+            "Click a face of the part to cut through it: the plane is the face's own (a curved face's is square to its average normal, through its centre), it starts 1 mm into the part, and the slider moves it along the face's normal, into the part or out of it. Click again to stop picking. The example's demo geometry has no faces to pick; import a part.",
             "",
         ),
         Section(crate::section::Edit::Flip) => {
