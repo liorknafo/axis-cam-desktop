@@ -4364,7 +4364,9 @@ impl App {
                             .map(|s| s.major);
                         self.tool_draft.p.insert(k.into(), v);
                         if let Some(major) = major {
-                            self.tool_draft.p.insert("diameter".into(), major.to_string());
+                            self.tool_draft
+                                .p
+                                .insert("diameter".into(), major.to_string());
                         }
                     }
                 }
