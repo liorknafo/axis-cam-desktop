@@ -1637,6 +1637,79 @@ enum Move {
     Feed,
     Dwell,
 }
+/// Where a thread mill's turns start, how far apart they are and how many
+/// there are (the section's heights).
+const THREAD_FOOT: f32 = 8.;
+const THREAD_PITCH: f32 = 3.3;
+const THREAD_TURNS: f32 = 4.;
+/// A tap in section, its tip at `tip`: threaded end, plain shank and the
+/// square the hand turns it by, `d` px across at the thread. The threads'
+/// marks move as it turns.
+fn tapping_tap(f: &mut Frame, tip: Point, time: f32, d: f32) {
+    // The canvas does not clip: stop at its top edge.
+    let at = |s: f32| (tip.y - s).max(0.);
+    let (x0, x1) = (tip.x - d / 2., tip.x + d / 2.);
+    rect(f, x0, at(18.), x1, at(0.), GOLD);
+    for i in 0..4 {
+        let s = ((i as f32 + time * 2.) % 4.) / 4. * 15.;
+        if tip.y - s - 3. > 0. {
+            line(
+                f,
+                Point::new(x0, tip.y - s),
+                Point::new(x1, tip.y - s - 3.),
+                Color::from_rgb(0.56, 0.39, 0.16),
+                1.6,
+            );
+        }
+    }
+    rect(
+        f,
+        tip.x - 4.5,
+        at(32.),
+        tip.x + 4.5,
+        at(18.),
+        Color::from_rgb(0.87, 0.91, 0.93),
+    );
+    rect(
+        f,
+        tip.x - 3.5,
+        at(38.),
+        tip.x + 3.5,
+        at(32.),
+        Color::from_rgb(0.58, 0.67, 0.75),
+    );
+}
+/// A turning arrow round `c`: clockwise (cyan) when `clockwise`, else
+/// counterclockwise (amber).
+fn turn_arrow(f: &mut Frame, c: Point, clockwise: bool) {
+    let (r, sweep) = (9., if clockwise { 1.5 * PI } else { -1.5 * PI });
+    let color = if clockwise { CYAN } else { GOLD };
+    let on = |a: f32| Point::new(c.x + r * a.cos(), c.y + r * a.sin());
+    let start = -0.5 * PI - sweep / 2.;
+    for i in 0..24 {
+        let (a, b) = (
+            start + sweep * i as f32 / 24.,
+            start + sweep * (i + 1) as f32 / 24.,
+        );
+        line(f, on(a), on(b), color, 1.6);
+    }
+    // The arrowhead along the way round at its end.
+    let end = start + sweep;
+    let tip = on(end);
+    let (tx, ty) = (-end.sin() * sweep.signum(), end.cos() * sweep.signum());
+    for side in [-1., 1.] {
+        line(
+            f,
+            tip,
+            Point::new(
+                tip.x - 4.5 * tx - side * 2.8 * ty,
+                tip.y - 4.5 * ty + side * 2.8 * tx,
+            ),
+            color,
+            1.6,
+        );
+    }
+}
 /// A drill cycle: on the left a section of the hole as it is drilled, on
 /// the right the drill's depth against time, where pecks, retracts and a
 /// dwell show as their own shapes.
@@ -1672,6 +1745,31 @@ fn drill_cycle(f: &mut Frame, time: f32, phase: f32, cycle: u8) {
             (8., Dwell),
             (clear, Rapid),
         ],
+        // Down the drilled hole's middle, the arc in (a Dwell: the depth
+        // stands still), the thread's turns up, the arc out.
+        5 => vec![
+            (27., Rapid),
+            (THREAD_FOOT, Feed),
+            (THREAD_FOOT, Dwell),
+            (THREAD_FOOT + THREAD_TURNS * THREAD_PITCH, Feed),
+            (THREAD_FOOT + THREAD_TURNS * THREAD_PITCH, Dwell),
+            (clear, Rapid),
+        ],
+        // A turn or two in, a half turn back, on down; then out.
+        6 => vec![
+            (27., Rapid),
+            (22., Feed),
+            (23., Feed),
+            (18., Feed),
+            (19., Feed),
+            (14., Feed),
+            (15., Feed),
+            (10., Feed),
+            (11., Feed),
+            (7., Feed),
+            (24., Feed),
+            (clear, Rapid),
+        ],
         _ => vec![(27., Rapid), (5., Feed), (clear, Rapid)],
     };
     // Each move's share of the time: feeds slow, rapids quick.
@@ -1698,21 +1796,32 @@ fn drill_cycle(f: &mut Frame, time: f32, phase: f32, cycle: u8) {
         }
         (clear, Rapid, 1.)
     };
-    let (z, _, _) = at(now);
+    let (z, kind, _) = at(now);
     let y = |z: f32| 50. + (24. - z) * 3.3;
     let helix = cycle == 4;
-    // The deepest point so far is the hole's bottom.
-    let mut deepest: f32 = 24.;
+    let thread = cycle == 5;
+    let tap = cycle == 6;
+    // The deepest point so far is the hole's bottom, except where the hole
+    // is drilled already: a thread's, down to the same depth at any time.
+    let mut reached: f32 = 24.;
     for w in timeline.windows(2) {
         if w[0].0 > now {
             break;
         }
         let k = ((now - w[0].0) / (w[1].0 - w[0].0).max(1e-6)).min(1.);
-        deepest = deepest.min(w[0].1 + (w[1].1 - w[0].1) * k);
+        reached = reached.min(w[0].1 + (w[1].1 - w[0].1) * k);
     }
+    let deepest = if thread || tap { 5. } else { reached };
     let cx = 64.;
     stock(f, 14., y(24.), 112., 132.);
-    let (hw, dw) = if helix { (30., 14.) } else { (13., 12.) };
+    // The hole's width and the cutter's: a thread mill goes down a bore
+    // wider than itself, a tap is wider than its hole and cuts the wall.
+    let (hw, dw) = match cycle {
+        4 => (30., 14.),
+        5 => (18., 7.),
+        6 => (12., 16.),
+        _ => (13., 12.),
+    };
     if deepest < 24. {
         rect(
             f,
@@ -1742,26 +1851,106 @@ fn drill_cycle(f: &mut Frame, time: f32, phase: f32, cycle: u8) {
         let (start, bottom) = (timeline[2].0, timeline[4].0);
         ((now - start) / (bottom - start)).clamp(0., 1.) * TAU * 4.
     };
-    let offset = |now: f32| (hw - dw) / 2. * angle(now).sin();
-    if helix {
-        let points: Vec<Point> = (0..=120)
-            .map(|i| now * i as f32 / 120.)
-            .filter(|t| *t >= timeline[2].0 && *t <= timeline[4].0)
+    // The thread mill's turns, as the section sees them: a swing from wall
+    // to wall.
+    let groove = 2.5;
+    let swing = hw / 2. + groove - dw / 2.;
+    let turns = |now: f32| {
+        let (from, to) = (timeline[3].0, timeline[4].0);
+        ((now - from) / (to - from)).clamp(0., 1.) * TAU * THREAD_TURNS
+    };
+    let offset = |now: f32| {
+        if helix {
+            return (hw - dw) / 2. * angle(now).sin();
+        }
+        if !thread {
+            return 0.;
+        }
+        let [arc_in, turning, arc_out, end] = [2, 3, 4, 5].map(|i| timeline[i].0);
+        if now < arc_in {
+            0.
+        } else if now < turning {
+            swing * smooth((now - arc_in) / (turning - arc_in))
+        } else if now < arc_out {
+            swing * turns(now).cos()
+        } else {
+            swing * (1. - smooth((now - arc_out) / (end - arc_out)))
+        }
+    };
+    // The thread's grooves in the wall, the right wall's at each turn, the
+    // left wall's half a pitch between.
+    let notch = |f: &mut Frame, side: f32, z: f32, depth: f32| {
+        let (wall, half) = (cx + side * hw / 2., THREAD_PITCH * 3.3 * 0.3);
+        polygon(
+            f,
+            &[
+                Point::new(wall, y(z) - half),
+                Point::new(wall + side * depth, y(z)),
+                Point::new(wall, y(z) + half),
+            ],
+            BACKGROUND,
+        );
+    };
+    if thread {
+        let done = turns(now);
+        for k in 0..=THREAD_TURNS as usize {
+            for (side, half) in [(1., 0.), (-1., 0.5)] {
+                let around = (k as f32 + half) * TAU;
+                if around <= done && around <= TAU * THREAD_TURNS {
+                    notch(
+                        f,
+                        side,
+                        THREAD_FOOT + (k as f32 + half) * THREAD_PITCH,
+                        groove,
+                    );
+                }
+            }
+        }
+    }
+    if tap {
+        // The thread the tap has cut, behind it.
+        let lead = 1.5;
+        let mut k = 0.;
+        while 24. - 1.5 - k * 3. >= reached + lead {
+            notch(f, 1., 24. - 1.5 - k * 3., (dw - hw) / 2.);
+            notch(f, -1., 24. - 3. - k * 3., (dw - hw) / 2.);
+            k += 1.;
+        }
+    }
+    let traced = if helix {
+        Some((timeline[2].0, timeline[4].0))
+    } else {
+        thread.then(|| (timeline[2].0, timeline[5].0))
+    };
+    if let Some((from, to)) = traced {
+        let points: Vec<Point> = (0..=600)
+            .map(|i| now * i as f32 / 600.)
+            .filter(|t| *t >= from && *t <= to)
             .map(|t| Point::new(cx + offset(t), y(at(t).0)))
             .collect();
         for w in points.windows(2) {
             line(f, w[0], w[1], CYAN, 1.2);
         }
     }
-    cutter_at(
-        f,
-        Point::new(cx + offset(now), y(z)),
-        (0., -1.),
-        time,
-        dw,
-        !helix,
-        0.,
-    );
+    let tip = Point::new(cx + offset(now), y(z));
+    if tap {
+        tapping_tap(f, tip, time, dw);
+        // Which way the hand turns it: in, or back.
+        if kind == Feed {
+            let down = at(now + 0.03).0 < at(now - 0.03).0;
+            turn_arrow(f, Point::new(32., 24.), down);
+            text(
+                f,
+                if down { "TURN IN" } else { "HALF BACK" },
+                14.,
+                36.,
+                if down { CYAN } else { GOLD },
+                8.,
+            );
+        }
+    } else {
+        cutter_at(f, tip, (0., -1.), time, dw, cycle < 4, 0.);
+    }
     // The depth against time, on the same heights as the section.
     let (g0, g1) = (130., 268.);
     line(f, Point::new(g0, y(clear)), Point::new(g0, y(0.)), TEXT, 1.);
@@ -1771,7 +1960,7 @@ fn drill_cycle(f: &mut Frame, time: f32, phase: f32, cycle: u8) {
     dashed(f, Point::new(14., y(24.)), Point::new(g1, y(24.)), DIM, 1.);
     text(f, "STOCK TOP", 16., y(24.) + 3., TEXT, 8.);
     let gx = |t: f32| g0 + (g1 - g0) * t / total;
-    for w in timeline.windows(2) {
+    for (i, w) in timeline.windows(2).enumerate() {
         if w[0].0 > now {
             break;
         }
@@ -1792,7 +1981,12 @@ fn drill_cycle(f: &mut Frame, time: f32, phase: f32, cycle: u8) {
         if w[1].2 == Dwell {
             text(
                 f,
-                if helix { "ONCE ROUND" } else { "DWELL" },
+                match (cycle, i) {
+                    (4, _) => "ONCE ROUND",
+                    (5, 2) => "ARC IN",
+                    (5, _) => "ARC OUT",
+                    _ => "DWELL",
+                },
                 gx(w[0].0) - 4.,
                 y(w[0].1) + 4.,
                 Color::WHITE,
@@ -1816,6 +2010,8 @@ fn drill_cycle(f: &mut Frame, time: f32, phase: f32, cycle: u8) {
             2 => "PECK · FULL RETRACT OUT OF THE HOLE EACH TIME",
             3 => "FEED · DWELL AT THE BOTTOM · RETRACT",
             4 => "HELIX DOWN · ONCE ROUND AT THE BOTTOM · OUT",
+            5 => "DOWN THE MIDDLE · ARC IN · ONE PITCH A TURN · OUT",
+            6 => "A TURN IN · HALF BACK · OUT",
             _ => "ONE FEED TO DEPTH · RETRACT",
         },
     );

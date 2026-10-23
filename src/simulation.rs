@@ -50,21 +50,80 @@ pub enum CutterShape {
     /// the cut's frame whose Z lies between `a[0]` and `b[0]` and whose
     /// distance from its Z axis lies between `a[1]` and `b[1]`.
     Revolve,
+    /// A thread mill: `teeth` V teeth of `angle`° stacked `pitch` µm apart
+    /// along its axis, the lowest one's tip at the programmed point. Each
+    /// tooth is 0.65 of a pitch tall, over a neck that narrow (`teeth`).
+    Thread {
+        pitch: u16,
+        teeth: u8,
+        angle: u8,
+    },
 }
 impl CutterShape {
+    /// A thread mill's teeth (`Thread`): their spacing (mm), their number,
+    /// and how far in a flank comes per mm along the axis (the cotangent of
+    /// half the angle). None for other cutters.
+    pub fn teeth(self) -> Option<(f32, f32, f32)> {
+        match self {
+            CutterShape::Thread {
+                pitch,
+                teeth,
+                angle,
+            } => Some((
+                f32::from(pitch) / 1000.,
+                f32::from(teeth.max(1)),
+                1. / (f32::from(angle) / 2.).to_radians().tan(),
+            )),
+            _ => None,
+        }
+    }
+    /// How far a cutter reaches below its programmed point, and above it
+    /// beyond its flutes: a thread mill's lowest tooth's lower flank, and
+    /// its teeth up the axis.
+    pub fn span(self) -> (f32, f32) {
+        self.teeth().map_or((0., 0.), |(pitch, teeth, cot)| {
+            let half = THREAD_TOOTH * pitch / cot;
+            (half, (teeth - 1.) * pitch + half)
+        })
+    }
+    /// Whether, and how far in mm (negative inside), the point `rho` from
+    /// a thread mill's axis and `h` above its lowest tooth's tip at the
+    /// start of a move rising `rise` (≥ 0) is inside the teeth the move
+    /// sweeps, for a tooth tip radius `r`: the tooth nearest along the axis,
+    /// the neck between teeth, and nothing beyond the end flanks. Positive
+    /// for other cutters.
+    pub fn thread_field(self, rho: f32, h: f32, rise: f32, r: f32) -> f32 {
+        let Some((pitch, teeth, cot)) = self.teeth() else {
+            return f32::INFINITY;
+        };
+        let depth = THREAD_TOOTH * pitch;
+        let mut e = f32::INFINITY;
+        for k in 0..teeth as usize {
+            let at = k as f32 * pitch;
+            e = e.min((at - h).max(h - at - rise).max(0.));
+        }
+        let ends = (-h).max(h - (teeth - 1.) * pitch - rise).max(0.);
+        (rho - (r - e * cot).max(r - depth)).max(ends - depth / cot)
+    }
     /// How far a pointed cutter's cone rises per mm from its axis: a drill's
     /// 118° point or a chamfer mill's angle; None for flat and ball ends.
     pub fn rise(self) -> Option<f32> {
         match self {
             CutterShape::Drill => Some(POINT_RISE),
             CutterShape::Chamfer(tenths) => Some(1. / (f32::from(tenths) / 20.).to_radians().tan()),
-            CutterShape::Flat | CutterShape::Ball | CutterShape::Revolve => None,
+            CutterShape::Flat
+            | CutterShape::Ball
+            | CutterShape::Revolve
+            | CutterShape::Thread { .. } => None,
         }
     }
 }
 /// The rise of a 118° drill point's cone per mm from the drill's axis, tan
 /// 31°: what `cam::holes` takes a blind hole's floor to be.
 pub const POINT_RISE: f32 = 0.600_860_6;
+/// A thread mill's tooth height, in pitches: past an ISO internal thread's
+/// 0.54, so the tooth reaches the root with the neck clear of the crests.
+pub const THREAD_TOOTH: f32 = 0.65;
 #[derive(Debug, Clone)]
 pub struct Plan {
     pub shape: CutterShape,
@@ -77,6 +136,10 @@ pub struct Plan {
     pub flute_length: f32,
     pub tool_length: f32,
     pub holder_radius: f32,
+    /// A thread mill's body over its teeth: its neck's radius, how far the
+    /// neck reaches up from the tip, and the shank's radius above it. None
+    /// for other cutters, one radius up to the stickout.
+    pub neck: Option<[f32; 3]>,
     pub display_scale: f32,
     pub duration: f32,
     pub target: f32,
@@ -428,6 +491,7 @@ pub fn generate(
         flute_length,
         tool_length,
         holder_radius,
+        neck: None,
         display_scale: scale,
         duration: 0.,
         target,

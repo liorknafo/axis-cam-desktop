@@ -168,6 +168,22 @@ pub struct ToolReport {
     /// A chamfer mill's included tip angle, degrees.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tip_angle: Option<f32>,
+    /// A thread mill's thread angle (55 or 60), and a tap's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_angle: Option<f32>,
+    /// A thread mill's finest and coarsest pitch, mm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pitches: Option<[f32; 2]>,
+    /// How deep a thread mill's neck lets it reach, mm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reach: Option<f32>,
+    /// A thread mill's teeth stacked along it, when more than one: it cuts
+    /// only the pitch they are spaced at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub teeth: Option<usize>,
+    /// A tap's thread size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OrientationReport {
@@ -219,6 +235,20 @@ pub struct HoleReport {
     pub through: bool,
     /// The cone the opening narrows down in, when it is countersunk.
     pub countersink: Option<CountersinkReport>,
+    /// The thread modeled in it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread: Option<ThreadReport>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ThreadReport {
+    /// Its standard size ("M6×1", "1/4-20 UNC"), or Ø major × pitch.
+    pub size: String,
+    pub pitch: f32,
+    pub right_hand: bool,
+    /// How far it runs down from the hole's top.
+    pub length: f32,
+    /// The drill its hole takes before it is threaded.
+    pub tap_drill: f32,
 }
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CountersinkReport {
@@ -1045,6 +1075,13 @@ fn orientation(
                         angle: (c.angle * 10.).round() / 10. + 0.,
                         depth: r2(c.depth),
                     }),
+                    thread: h.thread.as_ref().map(|t| ThreadReport {
+                        size: t.name(),
+                        pitch: t.pitch,
+                        right_hand: t.right_hand,
+                        length: r2(h.top - t.from.max(h.bottom)),
+                        tap_drill: r2(t.spec.map_or(t.major - t.pitch, |s| s.tap_drill)),
+                    }),
                 })
                 .collect();
             holes_left = holes_left.saturating_sub(plane.holes.len());
@@ -1309,6 +1346,20 @@ fn describe(
                     tip_angle: (get(&t.p, "type") == "Chamfer mill")
                         .then(|| t.tip_angle())
                         .flatten(),
+                    thread_angle: match get(&t.p, "type") {
+                        "Thread mill" => num(&t.p, "thread_angle"),
+                        "Tap" => t.tap_spec().map(|s| s.angle),
+                        _ => None,
+                    },
+                    pitches: (get(&t.p, "type") == "Thread mill")
+                        .then(|| t.thread_pitches().map(|(a, b)| [a, b]))
+                        .flatten(),
+                    reach: (get(&t.p, "type") == "Thread mill")
+                        .then(|| num(&t.p, "reach"))
+                        .flatten(),
+                    teeth: (get(&t.p, "type") == "Thread mill" && t.thread_teeth() > 1)
+                        .then(|| t.thread_teeth()),
+                    thread: t.tap_spec().map(|s| s.name.to_string()),
                 })
             })
             .collect(),

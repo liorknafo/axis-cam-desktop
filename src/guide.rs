@@ -10,7 +10,7 @@ use crate::{
     lathe::{self, Slide},
     manual,
     mesh::{Bounds, Mesh},
-    model::{Document, Machine, Operation, Strategy, get, num},
+    model::{Document, Machine, Operation, Strategy, Tool, get, num},
     post::At,
     simulation::{self, Motion, Move, POINT_RISE, Plan},
     turn,
@@ -139,8 +139,13 @@ pub enum Step {
         down_to: f32,
     },
     /// The holes of a Drill in the order drilled: X and Y (centres) and the
-    /// Z each is drilled to.
-    Holes { op: usize, holes: Vec<[f32; 3]> },
+    /// Z each is drilled to; and, by hole, the Z its cut starts at: its
+    /// mouth, where a tap's turns are counted from.
+    Holes {
+        op: usize,
+        holes: Vec<[f32; 3]>,
+        mouths: Vec<f32>,
+    },
     /// The stock after the operation.
     Check { op: usize },
     /// The stock leaves for setup `next` (none for the last setup).
@@ -375,6 +380,36 @@ pub enum LatheStep {
         peck: f32,
         quill: Dial,
     },
+    /// Tapping on the centre from the tailstock, by hand with the spindle
+    /// off: the `tap` (a thread size, `pitch` mm) `depth` of full thread
+    /// deep plus its `lead`, from where it touches the hole's mouth, on the
+    /// quill dial (`quill`, zeroed on the touch); `turns` of the tap in all.
+    TailTap {
+        op: usize,
+        tool: String,
+        tap: String,
+        pitch: f32,
+        depth: f32,
+        lead: f32,
+        /// To a tenth, rounded down: a turn more would go past the hole.
+        turns: f32,
+        quill: Dial,
+    },
+    /// A thread cut with a die, by hand with the spindle off: the `die` of
+    /// thread `pitch` and outside diameter `od`, in its holder, pushed
+    /// square on to the bar's `diameter` by the tailstock quill, `length`
+    /// along it: `turns` of the holder.
+    DieThread {
+        op: usize,
+        tool: String,
+        die: String,
+        pitch: f32,
+        diameter: f32,
+        od: f32,
+        length: f32,
+        /// To a tenth, rounded down: a turn more would go past the end.
+        turns: f32,
+    },
     /// A 45° chamfer of leg `size` on `edge` with a tool that has a 45°
     /// edge: the carriage at `carriage` (on a shoulder: the tool's point
     /// `size` short of it; the end edges are touched), locked; the 45° edge
@@ -436,6 +471,8 @@ impl LatheStep {
             LatheStep::Pass { .. } => "Pass",
             LatheStep::Measure { .. } => "Measure",
             LatheStep::TailDrill { .. } => "Drill",
+            LatheStep::TailTap { .. } => "Tap",
+            LatheStep::DieThread { .. } => "Die",
             LatheStep::Chamfer { .. } => "Chamfer",
             LatheStep::Plunge { part_off: true, .. } => "Part off",
             LatheStep::Plunge { .. } => "Groove",
@@ -622,6 +659,24 @@ fn passes(
     Ok(steps)
 }
 /// The holes of a Drill's `plan` in the order drilled: centre and depth.
+/// The Z, from `zero`, each hole's cut starts at, in `holes`' order: the
+/// top of its first cutting move.
+fn mouths(plan: &Plan, zero: [f32; 3]) -> Vec<f32> {
+    let mut out: Vec<([f32; 2], f32)> = vec![];
+    for m in plan.moves.iter().filter(|m| m.cutting_pass) {
+        let at = [m.to[0] - zero[0], m.to[1] - zero[1]];
+        let top = m.from[2].max(m.to[2]) - zero[2];
+        match out.last_mut() {
+            Some((xy, z)) if *xy == at => *z = z.max(top),
+            _ => out.push((at, top)),
+        }
+    }
+    out.into_iter().map(|(_, z)| z).collect()
+}
+/// `turns` to a tenth, rounded down, a hair over a whole tenth kept.
+fn tenths_down(turns: f32) -> f32 {
+    (turns * 10. + 1e-3).floor() / 10.
+}
 fn holes(plan: &Plan, zero: [f32; 3]) -> Vec<[f32; 3]> {
     let mut holes: Vec<[f32; 3]> = vec![];
     for m in plan.moves.iter().filter(|m| m.cutting_pass) {
@@ -877,7 +932,12 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                 sides([0; 2], &mut steps);
                 let holes = holes(&plan, zero);
                 count = holes.len();
-                steps.push(Step::Holes { op: oi, holes });
+                let mouths = mouths(&plan, zero);
+                steps.push(Step::Holes {
+                    op: oi,
+                    holes,
+                    mouths,
+                });
                 steps.push(Step::Check { op: oi });
             }
             other => return Err(format!("{} does not run on a manual mill.", other.name())),
@@ -1047,11 +1107,12 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
     // The Zero is made with the first turning tool, which cuts outside;
     // with none, with the first Turn's tool, touching the bar's outside only
     // when that tool cuts outside.
+    let type_of = |o: &Operation| tool_of(&o.tool).map_or("", |t| get(&t.p, "type"));
+    // A die is turned by hand: it touches nothing.
     let turns: Vec<&Operation> = (done.iter())
         .map(|(oi, _)| &setup.operations[*oi])
-        .filter(|o| o.strategy == Strategy::Turn)
+        .filter(|o| o.strategy == Strategy::Turn && type_of(o) != "Die")
         .collect();
-    let type_of = |o: &Operation| tool_of(&o.tool).map_or("", |t| get(&t.p, "type"));
     let inside = |o: &Operation| {
         type_of(o) == "Boring bar"
             || match get(&o.p, "turn_kind") {
@@ -1217,6 +1278,27 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
                 }
                 n
             }
+            "Drill" if op.tapping() => {
+                let first = feeds.first().ok_or_else(missing)?;
+                let spec = tool_of(tool)
+                    .and_then(Tool::tap_spec)
+                    .ok_or("Choose a tap, with its thread size, for Tapping.")?;
+                // Where the tap touches the hole's mouth: its plan starts
+                // 1 mm in front of it.
+                let quill = first.from[2] - turn::CLEAR - plan.target;
+                let lead = mm(tool_of(tool).map_or(0., crate::cam::tap_lead) * spec.pitch);
+                steps.push(Step::Lathe(LatheStep::TailTap {
+                    op: oi,
+                    tool: tool.into(),
+                    tap: spec.name.into(),
+                    pitch: mm(spec.pitch),
+                    depth: mm(quill - lead),
+                    lead,
+                    turns: tenths_down(quill / spec.pitch),
+                    quill: zeroes.dial(Slide::Quill, quill),
+                }));
+                1
+            }
             "Drill" => {
                 feeds.first().ok_or_else(missing)?;
                 let diameter = tool_of(tool)
@@ -1293,6 +1375,24 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
                     zeroes.end = low;
                 }
                 across.len()
+            }
+            "Thread" if tool_of(tool).and_then(lathe::die_spec).is_some() => {
+                let z0 = along.first().ok_or_else(missing)?.to[2];
+                let spec = tool_of(tool)
+                    .and_then(lathe::die_spec)
+                    .ok_or_else(missing)?;
+                let length = mm(end - z0);
+                steps.push(Step::Lathe(LatheStep::DieThread {
+                    op: oi,
+                    tool: tool.into(),
+                    die: spec.name.into(),
+                    pitch: mm(spec.pitch),
+                    diameter: num(&op.p, "diameter").unwrap_or(spec.major),
+                    od: tool_of(tool).and_then(|t| num(&t.p, "od")).unwrap_or(0.),
+                    length,
+                    turns: tenths_down(length / spec.pitch),
+                }));
+                1
             }
             "Thread" => {
                 let z0 = along.first().ok_or_else(missing)?.to[2];
@@ -1413,7 +1513,7 @@ pub fn place(doc: &Document, guide: &Guide) -> usize {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::model::{BOX_FIELDS, Tool};
+    use crate::model::BOX_FIELDS;
 
     /// A Box named `name` cutting `b` (x_min, x_max, y_min, y_max, z_top,
     /// z_bottom, work frame) with the tool `tool`.
@@ -1924,7 +2024,7 @@ pub(crate) mod tests {
     fn the_holes_are_centres_and_depths_in_work_coordinates() {
         let (doc, mesh) = job("Yes");
         let guide = build(&doc, &mesh, 0).unwrap();
-        let Step::Holes { op, holes } = &guide.steps[10] else {
+        let Step::Holes { op, holes, .. } = &guide.steps[10] else {
             panic!()
         };
         assert_eq!((*op, holes.len()), (2, 4));
@@ -2177,9 +2277,9 @@ pub(crate) mod tests {
         let mut out = vec![];
         for l in lathe_steps(guide) {
             match l {
-                LatheStep::Face { top, .. } | LatheStep::TailDrill { quill: top, .. } => {
-                    out.push(top)
-                }
+                LatheStep::Face { top, .. }
+                | LatheStep::TailDrill { quill: top, .. }
+                | LatheStep::TailTap { quill: top, .. } => out.push(top),
                 LatheStep::Pass {
                     cross,
                     carriage,
@@ -2838,6 +2938,162 @@ pub(crate) mod tests {
             mm(feeds[0].from[2] - crate::turn::CLEAR - plan.target),
         );
     }
+    #[test]
+    fn a_tapping_reads_its_depth_and_lead_on_the_quill_and_its_turns() {
+        use crate::turn::tests::{add_tap, m12_job, m12_lead};
+        let (mut doc, mesh, tap) = m12_job();
+        doc.setups[0]
+            .machine
+            .p
+            .insert("cross_reads".into(), "Diameter".into());
+        add(&mut doc, "Drill", &[("depth", "16")]);
+        add_tap(&mut doc, &tap, "10");
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let of = |i: usize| kinds(&guide, guide.sections[i].steps.clone());
+        // No turning tool, so no Zero; the tap is its own section.
+        assert_eq!(of(0), ["Hold"]);
+        assert_eq!([of(1), of(2), of(3)], [["Drill"], ["Tap"], ["HandOver"]]);
+        assert_eq!(guide.sections[2].count, 1);
+        assert!(guide.sections[2].minutes > 1.);
+        let Some(LatheStep::TailTap {
+            tap: name,
+            pitch,
+            depth,
+            lead,
+            turns,
+            quill,
+            ..
+        }) = lathe_steps(&guide)
+            .into_iter()
+            .find(|l| matches!(l, LatheStep::TailTap { .. }))
+        else {
+            panic!()
+        };
+        // 10 of thread and the tap's lead from the hole's mouth, on the
+        // 2.5-a-turn quill, and that much of the 1.75 pitch in turns of
+        // the tap.
+        let want = 10. + m12_lead(&doc, &tap);
+        assert_eq!(name, "M12×1.75");
+        close(*pitch, 1.75);
+        close(*depth, 10.);
+        close(*lead, want - 10.);
+        // Rounded down: not a turn past the quill's depth.
+        assert_eq!(*turns, (want / 1.75 * 10. + 1e-3).floor() / 10.);
+        assert!(*turns * 1.75 <= want + 1e-3);
+        close(quill.distance, want);
+        let (t, r) = lathe::dial(&doc.setups[0].machine, Slide::Quill, want).unwrap();
+        reads(quill, t, r);
+        assert_eq!(quill.slide, Slide::Quill);
+        let plan = &guide.done[1].plan;
+        let first = plan
+            .moves
+            .iter()
+            .find(|m| m.motion == Motion::Feed)
+            .unwrap();
+        close(
+            quill.distance,
+            mm(first.from[2] - crate::turn::CLEAR - plan.target),
+        );
+        assert!(dials(&guide).contains(&quill));
+    }
+    /// A Ø20 bar with a Ø16 Outside turn to -30 and an M16 × 2 Thread to -20
+    /// cut with the job's die (M16 × 2, outside diameter 20).
+    pub(crate) fn die_sample() -> (Document, Mesh) {
+        let (mut doc, mesh) = lathe_job(20., 100., tube(0., 8., 0., 50.), -60.);
+        doc.setups[0]
+            .machine
+            .p
+            .insert("cross_reads".into(), "Diameter".into());
+        add(
+            &mut doc,
+            "Outside",
+            &[("diameter", "16"), ("z_end", "-30"), ("finish", "0.2")],
+        );
+        add(
+            &mut doc,
+            "Thread",
+            &[("diameter", "16"), ("pitch", "2"), ("z_end", "-20")],
+        );
+        let die = doc.tools.iter_mut().find(|t| get(&t.p, "type") == "Die");
+        let die = die.unwrap();
+        die.p.insert("thread".into(), "M16×2".into());
+        let id = die.id.clone();
+        doc.setups[0].operations[1].tool = id;
+        (doc, mesh)
+    }
+    #[test]
+    fn a_die_is_one_screen_of_turns_not_thread_passes_and_touches_nothing() {
+        let (doc, mesh) = die_sample();
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let of = |i: usize| kinds(&guide, guide.sections[i].steps.clone());
+        // The Zero is the turning tool's; the die has no Touch, no Thread pass.
+        assert_eq!(of(0), ["Hold", "Zero"]);
+        assert_eq!(of(2), ["Die"]);
+        assert!(
+            !lathe_steps(&guide)
+                .iter()
+                .any(|l| matches!(l, LatheStep::ThreadPass { .. }))
+        );
+        let turning = doc.setups[0].operations[0].tool.clone();
+        assert!(matches!(
+            &guide.steps[1],
+            Step::Lathe(LatheStep::Zero { tool, .. }) if *tool == turning
+        ));
+        assert_eq!(guide.sections[2].count, 1);
+        let Some(LatheStep::DieThread {
+            die,
+            pitch,
+            diameter,
+            od,
+            length,
+            turns,
+            ..
+        }) = lathe_steps(&guide)
+            .into_iter()
+            .find(|l| matches!(l, LatheStep::DieThread { .. }))
+        else {
+            panic!()
+        };
+        // From the end to Z -20 at a 2 mm pitch: 10 turns of the holder.
+        assert_eq!(die, "M16×2");
+        close(*pitch, 2.);
+        close(*diameter, 16.);
+        close(*od, 20.);
+        close(*length, 20.);
+        assert_eq!(*turns, 10.);
+        // The same thread with the threading tool has its passes.
+        let mut tool = doc.clone();
+        let threading = tool
+            .tools
+            .iter()
+            .find(|t| get(&t.p, "type") == "Threading tool")
+            .unwrap()
+            .id
+            .clone();
+        tool.setups[0].operations[1].tool = threading;
+        let guide = build(&tool, &mesh, 0).unwrap();
+        assert!(
+            lathe_steps(&guide)
+                .iter()
+                .any(|l| matches!(l, LatheStep::ThreadPass { .. }))
+        );
+        assert!(
+            !lathe_steps(&guide)
+                .iter()
+                .any(|l| matches!(l, LatheStep::DieThread { .. }))
+        );
+    }
+    #[test]
+    fn a_die_alone_has_no_zero() {
+        let (mut doc, mesh) = die_sample();
+        doc.setups[0].operations.remove(0);
+        // The bar is already Ø20, the die's thread Ø16 is not ≥ it: a Ø16 bar.
+        doc.setups[0].p.insert("stock_diameter".into(), "16".into());
+        let guide = build(&doc, &mesh, 0).unwrap();
+        assert_eq!(kinds(&guide, guide.sections[0].steps.clone()), ["Hold"]);
+        assert_eq!(kinds(&guide, guide.sections[1].steps.clone()), ["Die"]);
+    }
+
     #[test]
     fn a_thread_feeds_the_top_slide_at_29_5_degrees_by_the_infeed_over_its_cosine() {
         // Moving the top slide s at 29.5° from the cross slide moves the

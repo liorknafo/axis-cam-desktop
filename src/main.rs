@@ -46,6 +46,8 @@ mod stock;
 mod stock_surface;
 mod storage;
 mod surface;
+mod thread;
+mod threading;
 mod three_mf;
 mod turn;
 mod ui;
@@ -181,6 +183,12 @@ pub enum Message {
     /// "Add the pin holes to …": a Drill of the pin holes in the earlier
     /// setup that has the face the pins stand on facing up.
     AddPinDrilling,
+    /// Add the operations that drill and thread the setup's threaded holes
+    /// (`threading::add`).
+    AddThreading,
+    /// Fill the selected Turn thread's side, diameter, pitch and end from
+    /// the thread on the part's axis (`lathe::thread_from_part`).
+    ThreadFromPart,
     Generate,
     GenerateAll,
     /// A generation off the window's thread is done (`App::generate`): its
@@ -1551,6 +1559,10 @@ impl App {
         // A blank workspace has the starter materials and workholding too.
         doc.adopt_materials();
         doc.adopt_holders();
+        // The owner's threading tools; never in tests.
+        if !isolated {
+            doc.adopt_tools();
+        }
         // The owner's CNC for a library with no machine; never in tests.
         if !isolated && doc.machines.is_empty() {
             match control::owners_machine(state_path.parent().unwrap_or(std::path::Path::new(".")))
@@ -2889,7 +2901,9 @@ impl App {
             .as_ref()
             .map(|s| (&s.mesh_fingerprint, &s.ids))
             .hash(&mut hasher);
-        // Helical milling lists the bores its flat end mill fits.
+        // The cycle says which holes it lists: the bores a flat end mill
+        // fits, the holes to thread.
+        get(&op.p, "cycle").hash(&mut hasher);
         op.helical().hash(&mut hasher);
         let key = hasher.finish();
         let mut kept = self.drill_holes.borrow_mut();
@@ -4008,6 +4022,7 @@ impl App {
                     tools: self.doc.tools.clone(),
                     materials: self.doc.materials.clone(),
                     starter_materials: self.doc.starter_materials,
+                    starter_tools: self.doc.starter_tools,
                     workholding: self.doc.workholding.clone(),
                     ..Document::default()
                 };
@@ -4176,8 +4191,7 @@ impl App {
                             .is_some_and(|o| o.strategy == Strategy::Turn)
                     {
                         let machine = self.doc.setup().machine.clone();
-                        let needed = lathe::tool_for(&v);
-                        let has = |tool: &model::Tool| Some(get(&tool.p, "type")) == needed;
+                        let has = |tool: &model::Tool| lathe::takes(&v, get(&tool.p, "type"));
                         let fitting = (self.doc.tools.iter())
                             .find(|t| t.fits(&machine) && has(t))
                             .map(|t| t.id.clone());
@@ -4279,7 +4293,15 @@ impl App {
                         // A lathe type takes its sizes' defaults, as the editor shows them.
                         self.tool_draft.set_type(&v);
                     } else {
+                        // A tap's size is its diameter.
+                        let major = (k == "thread" && get(&self.tool_draft.p, "type") == "Tap")
+                            .then(|| crate::thread::spec(&v))
+                            .flatten()
+                            .map(|s| s.major);
                         self.tool_draft.p.insert(k.into(), v);
+                        if let Some(major) = major {
+                            self.tool_draft.p.insert("diameter".into(), major.to_string());
+                        }
                     }
                 }
                 Target::Material => {
@@ -4651,6 +4673,40 @@ impl App {
                 self.picking = false;
                 self.picking_pins = false;
                 self.pin_aim = None;
+            }
+            Message::ThreadFromPart => {
+                let Some(mesh) = self.part_mesh() else {
+                    return Task::none();
+                };
+                match lathe::thread_from_part(self.doc.setup(), mesh) {
+                    Some(fields) => {
+                        if let Some(o) = self.operation_mut() {
+                            for (k, v) in fields {
+                                o.p.insert(k.into(), v);
+                            }
+                        }
+                        self.touch();
+                        self.status = "Filled the thread from the part.".into();
+                    }
+                    None => {
+                        self.status =
+                            "The part has no thread on the lathe's axis to fill in.".into()
+                    }
+                }
+            }
+            Message::AddThreading => {
+                let si = self.doc.index();
+                let Some(mesh) = self.part_mesh() else {
+                    return Task::none();
+                };
+                match threading::add(&self.doc, si, mesh) {
+                    Ok(added) => {
+                        self.doc.setups[si].operations.extend(added.ops);
+                        self.touch();
+                        self.status = added.status;
+                    }
+                    Err(why) => self.status = why,
+                }
             }
             Message::AddPinDrilling => {
                 let si = self.doc.index();

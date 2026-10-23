@@ -1250,56 +1250,108 @@ impl Viewport<'_> {
             grid_faces(&sim.stock, &mut face);
         }
         let pos = sim.position;
-        // Cylinders use the saved cutter diameter, flute length and stickout.
-        for (radius, bottom, top, base) in [
-            (
-                sim.plan.radius,
-                pos[2]
-                    + if sim.plan.shape == crate::simulation::CutterShape::Ball {
-                        sim.plan.radius
-                    } else {
-                        0.
-                    },
-                pos[2] + sim.plan.flute_length,
-                [221f32, 158., 50.],
-            ),
-            (
-                sim.plan.radius,
-                pos[2] + sim.plan.flute_length,
-                pos[2] + sim.plan.tool_length,
-                [137., 153., 170.],
-            ),
-            (
-                sim.plan.holder_radius,
-                pos[2] + sim.plan.tool_length,
-                pos[2] + sim.plan.tool_length + 8.,
-                [77., 96., 118.],
-            ),
-        ] {
+        // Frustums, from the tip up, of the saved cutter diameter, flute
+        // length and stickout: (radius below, radius above, from, to, colour).
+        let (cutter, body, holder) = ([221f32, 158., 50.], [137., 153., 170.], [77., 96., 118.]);
+        let r = sim.plan.radius;
+        let length = sim.plan.tool_length;
+        let mut parts: Vec<(f32, f32, f32, f32, [f32; 3])> = vec![];
+        if let (Some((pitch, teeth, cot)), Some([neck, reach, shank])) =
+            (sim.plan.shape.teeth(), sim.plan.neck)
+        {
+            // A thread mill: its V teeth stacked a pitch apart over a thin
+            // neck, which widens to the shank the collet holds.
+            let depth = crate::simulation::THREAD_TOOTH * pitch;
+            let half = depth / cot;
+            for k in 0..teeth as usize {
+                let at = k as f32 * pitch;
+                parts.push((r - depth, r, at - half, at, cutter));
+                parts.push((r, r - depth, at, at + half, cutter));
+                if (k + 1) < teeth as usize && pitch > 2. * half {
+                    parts.push((r - depth, r - depth, at + half, at + pitch - half, cutter));
+                }
+            }
+            let teeth_top = (teeth - 1.) * pitch + half;
+            let neck_top = reach.clamp(teeth_top, length);
+            parts.push((
+                neck.min(r - depth),
+                neck,
+                teeth_top,
+                teeth_top + 0.01,
+                cutter,
+            ));
+            parts.push((neck, neck, teeth_top, neck_top, body));
+            // The shoulder up to the shank, at about 30° to the axis.
+            let shoulder = (neck_top + (shank - neck).abs() * 1.7).min(length);
+            parts.push((neck, shank, neck_top, shoulder, body));
+            parts.push((shank, shank, shoulder, length, body));
+        } else {
+            let bottom = if sim.plan.shape == crate::simulation::CutterShape::Ball {
+                r
+            } else {
+                0.
+            };
+            parts.push((r, r, bottom, sim.plan.flute_length, cutter));
+            parts.push((r, r, sim.plan.flute_length, length, body));
+        }
+        parts.push((
+            sim.plan.holder_radius,
+            sim.plan.holder_radius,
+            length,
+            length + 8.,
+            holder,
+        ));
+        for (below, above, from, to, base) in parts {
+            let (bottom, top) = (pos[2] + from, pos[2] + to);
             let mut cap = Vec::new();
+            let mut floor = Vec::new();
+            // A flank facing down is in shade, one facing up in the light.
+            let tilt = if above < below {
+                1.08
+            } else if above > below {
+                0.82
+            } else {
+                1.
+            };
             for i in 0..24 {
                 let angle = i as f32 * std::f32::consts::TAU / 24.;
                 let next = (i + 1) as f32 * std::f32::consts::TAU / 24.;
-                let a = [pos[0] + radius * angle.cos(), pos[1] + radius * angle.sin()];
-                let b = [pos[0] + radius * next.cos(), pos[1] + radius * next.sin()];
-                let light = 0.75 + 0.25 * (angle + 0.6).cos().abs();
+                let at =
+                    |radius: f32, a: f32| [pos[0] + radius * a.cos(), pos[1] + radius * a.sin()];
+                let (a0, b0, a1, b1) = (
+                    at(below, angle),
+                    at(below, next),
+                    at(above, angle),
+                    at(above, next),
+                );
+                let light = ((0.75 + 0.25 * (angle + 0.6).cos().abs()) * tilt).min(1.15);
                 face(
                     &[
-                        [a[0], a[1], bottom],
-                        [b[0], b[1], bottom],
-                        [b[0], b[1], top],
-                        [a[0], a[1], top],
+                        [a0[0], a0[1], bottom],
+                        [b0[0], b0[1], bottom],
+                        [b1[0], b1[1], top],
+                        [a1[0], a1[1], top],
                     ],
                     [
-                        (base[0] * light) as u8,
-                        (base[1] * light) as u8,
-                        (base[2] * light) as u8,
+                        (base[0] * light).min(255.) as u8,
+                        (base[1] * light).min(255.) as u8,
+                        (base[2] * light).min(255.) as u8,
                         255,
                     ],
                 );
-                cap.push([a[0], a[1], top]);
+                cap.push([a1[0], a1[1], top]);
+                floor.push([a0[0], a0[1], bottom]);
             }
             face(&cap, [base[0] as u8, base[1] as u8, base[2] as u8, 255]);
+            face(
+                &floor,
+                [
+                    (base[0] * 0.7) as u8,
+                    (base[1] * 0.7) as u8,
+                    (base[2] * 0.7) as u8,
+                    255,
+                ],
+            );
         }
         if sim.plan.shape == crate::simulation::CutterShape::Ball {
             let radius = sim.plan.radius;
@@ -2162,6 +2214,16 @@ fn shade(points: &[[f32; 3]], base: [f32; 3]) -> [u8; 4] {
         255,
     ]
 }
+/// `shade` for a cut face of the stock, whose corners run counterclockwise
+/// seen from outside it: lit by whether it faces up or down, so the faces
+/// under an overhang, a thread's lower flanks, are in shade and its teeth
+/// read; a floor and a wall shade as `shade` has them.
+fn shade_cut(points: &[[f32; 3]]) -> [u8; 4] {
+    let n = normal(points);
+    let light = 0.6 + 0.28 * n[2] + 0.12 * n[0].abs();
+    let [r, g, b] = CUT.map(|c| (c * light) as u8);
+    [r, g, b, 255]
+}
 /// The triangles of `surface`, the simulated stock of `volume`, in the frame
 /// `current` (mm), each with the colour the view gives it.
 pub(crate) fn stock_triangles<'a>(
@@ -2192,7 +2254,11 @@ fn stock_color(
                 .iter()
                 .all(|p| (p[k] - volume.bounds.max[k]).abs() < 0.01)
     }) || volume.round && on_bar(volume.bounds, &source, surface.cell_mm);
-    shade(&points, if outer { BLOCK } else { CUT })
+    if outer {
+        shade(&points, BLOCK)
+    } else {
+        shade_cut(&points)
+    }
 }
 /// `f` of each of `items`, in order, worked out on every core.
 fn on_every_core<T: Sync, U: Send>(items: &[T], f: impl Fn(&T) -> U + Sync) -> Vec<U> {
@@ -3019,7 +3085,7 @@ mod tests {
                     && !radii.iter().all(|r| (r - 25.).abs() < 0.05)
             {
                 // The turned diameter and its shoulder.
-                assert_eq!(color, shade(&points, CUT), "{points:?}");
+                assert_eq!(color, shade_cut(&points), "{points:?}");
                 cut += 1;
             }
         }

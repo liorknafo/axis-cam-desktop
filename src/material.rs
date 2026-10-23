@@ -321,6 +321,13 @@ fn chip(mm: f32) -> String {
 /// counts when it is lower), at the chip load the tool takes (`chip_load`).
 /// 1 % slack on every limit absorbs rounding.
 pub fn check(material: &Material, tool: &Tool, op: &Operation, machine: &Machine) -> SpeedFeed {
+    // A tap goes in one pitch a turn, turned by hand: there is no chip
+    // load to choose.
+    if op.tapping() {
+        return SpeedFeed::Unchecked(
+            "A tap is turned by hand, one pitch a turn: no cutting data applies.".into(),
+        );
+    }
     let name = crate::proposal::clip(material.name(), NAME_LIMIT);
     let Some(data) = material.cutting_data() else {
         return SpeedFeed::Unchecked(format!("{name} has no cutting data."));

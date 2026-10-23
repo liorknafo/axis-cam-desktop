@@ -29,6 +29,10 @@ pub const ZERO: &str = "Stock top center";
 /// What feeding by hand is taken as, mm per revolution: Face, Groove, Part
 /// off, Chamfer, and a drill in the tailstock.
 pub const HAND_FEED: f32 = 0.05;
+/// What a turn of a tap or a die takes by hand, seconds: its pitch of travel.
+pub const HAND_TURN: f32 = 4.;
+/// Why a lathe Tapping with no tap is refused.
+const TAP_NEEDED: &str = "Choose a tap, with its thread size, for Tapping.";
 /// The power feed an Outside or Bore pass asks for, mm per revolution: the
 /// machine's nearest is used.
 pub const POWER_FEED: f32 = 0.1;
@@ -445,11 +449,15 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
         let Some(needed) = lathe::tool_for(kind) else {
             return Err(format!("Unknown turn kind \"{kind}\"."));
         };
-        if get(&tool.p, "type") != needed {
+        if !lathe::takes(kind, get(&tool.p, "type")) {
             return Err(format!(
                 "Choose a {} for the {kind} turn.",
                 needed.to_lowercase()
             ));
+        }
+    } else if op.tapping() {
+        if tool.tap_spec().is_none() {
+            return Err(TAP_NEEDED.into());
         }
     } else if get(&tool.p, "type") != "Drill" {
         return Err("A lathe drills on the centre with a drill in the tailstock.".into());
@@ -481,6 +489,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
         "Groove" => lathe.groove(&mut cut)? / 2.,
         "Part off" => lathe.part_off(&mut cut)? / 2.,
         "Thread" => lathe.thread(&mut cut)? / 8.,
+        _ if op.tapping() => lathe.tap(&mut cut)?,
         _ => lathe.drill(&mut cut)?,
     };
     part_check(setup, mesh, stock, &cut.checks)?;
@@ -510,6 +519,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
             .filter(|v| *v >= reach)
             .unwrap_or(reach),
         holder_radius: radius.max(0.05),
+        neck: None,
         display_scale: resolved.display_scale,
         duration: cut.duration,
         target,
@@ -893,7 +903,9 @@ impl Lathe<'_> {
     /// (`thread_infeeds`) to the thread depth; simulated as a ring to the
     /// pitch diameter. The part check asks only that the part keep inside
     /// the major diameter (outside) or outside the minor (inside): the
-    /// model's thread is a plain cylinder. Returns the pitch.
+    /// model's thread is a plain cylinder. A die (`lathe::die_spec`) cuts
+    /// an outside thread of its own size in one pass by hand, `HAND_TURN`
+    /// seconds a turn. Returns the pitch.
     fn thread(&self, cut: &mut Cut) -> Result<f32, String> {
         let op = self.op;
         let outside = match get(&op.p, "thread_side") {
@@ -904,7 +916,21 @@ impl Lathe<'_> {
         let d = above_zero(op, "diameter")?;
         let pitch = above_zero(op, "pitch")?;
         let z_end = below_end(op, "z_end")?;
-        let passes = if get(&op.p, "passes").trim().is_empty() {
+        let die = lathe::die_spec(self.tool);
+        if let Some(spec) = die {
+            if !outside {
+                return Err("A die cuts an outside thread.".into());
+            }
+            if (spec.pitch - pitch).abs() > 1e-3 || (spec.major - d).abs() > 0.3 {
+                return Err(format!(
+                    "This die is {}: the thread is Ø{d:.2} × {pitch}. Choose the die for it.",
+                    spec.name
+                ));
+            }
+        }
+        let passes = if die.is_some() {
+            1
+        } else if get(&op.p, "passes").trim().is_empty() {
             thread_passes(pitch)
         } else {
             let n = field(op, "passes")?;
@@ -953,7 +979,11 @@ impl Lathe<'_> {
         } else {
             ([z0, end, 0., minor / 2.], 0.)
         });
-        let rate = pitch * self.rpm;
+        let rate = if die.is_some() {
+            pitch / HAND_TURN * 60.
+        } else {
+            pitch * self.rpm
+        };
         let back = if outside {
             d / 2. + BACK_OFF
         } else {
@@ -981,6 +1011,68 @@ impl Lathe<'_> {
             cut.rapid(back, end + CLEAR)?;
         }
         Ok(pitch)
+    }
+    /// Tapping on the centre from the tailstock, by hand: the tap goes in
+    /// the drilled hole to its `depth` of full thread and its lead beyond,
+    /// `HAND_TURN` seconds a turn, then back out. Refused unless the hole
+    /// is drilled to the tap's minor diameter (less 15 %) over the whole way.
+    /// Simulated as a ring to the tap's major radius over the full thread,
+    /// so later setups see the thread's bore. Returns the major radius.
+    fn tap(&self, cut: &mut Cut) -> Result<f32, String> {
+        let spec = self.tool.tap_spec().ok_or(TAP_NEEDED)?;
+        let depth = above_zero(self.op, "depth")?;
+        let lead = crate::cam::tap_lead(self.tool) * spec.pitch;
+        let (major, want) = (spec.major / 2., spec.minor() * 0.85 / 2.);
+        let all = self.material.sections(self.material.low, self.end);
+        // The hole's mouth: the highest the material has a hole.
+        let drill = format!(
+            "Drill Ø{:.1} on the centre first, {:.1} deep: the tap cuts its thread in the drilled hole.",
+            spec.tap_drill,
+            depth + lead
+        );
+        let Some(mouth) = all
+            .iter()
+            .filter(|s| s.inner > ON)
+            .map(|s| s.z[1])
+            .reduce(f32::max)
+        else {
+            return Err(drill);
+        };
+        let (full, tip) = (mouth - depth, mouth - depth - lead);
+        if tip < self.material.low - ON {
+            return Err(format!(
+                "The tap reaches Z {:.2}, past the stock's end at Z {:.2}.",
+                self.work(tip),
+                self.work(self.material.low)
+            ));
+        }
+        let span = self.material.sections(tip, mouth);
+        if span.iter().any(|s| s.inner < want - ON) {
+            return Err(drill);
+        }
+        if span.iter().all(|s| s.inner >= major - ON) {
+            return Err(format!(
+                "The hole is already Ø{:.2} or more: nothing to tap.",
+                spec.major
+            ));
+        }
+        if span.iter().any(|s| s.outer <= major + ON) {
+            return Err("The thread breaks through the outside there.".into());
+        }
+        let (rate, end) = (spec.pitch / HAND_TURN * 60., self.end);
+        // The tap is in the tailstock, on the axis.
+        cut.pos = [0., 0., end + CLEAR];
+        cut.rapid(0., mouth + CLEAR)?;
+        cut.pass();
+        cut.go(0., tip, Motion::Feed, rate)?;
+        // The part keeps outside the thread's minor, less what the model's
+        // own thread leaves it.
+        cut.checks
+            .push(([tip, end, 0., spec.minor() / 2. - 0.05], 0.));
+        cut.ring_only([full, mouth, 0., major])?;
+        cut.go(0., mouth + CLEAR, Motion::Feed, rate)?;
+        cut.rapid(0., end + CLEAR)?;
+        Ok(major)
     }
     /// Drill on the centre from the tailstock, by hand, pecking every
     /// diameter: the full diameter `depth` in from where the drill first
@@ -1859,6 +1951,246 @@ pub(crate) mod tests {
         );
         let error = run(&big, &mesh).remove(0).unwrap_err();
         assert!(error.contains("blank to Ø40.00"), "{error}");
+    }
+
+    /// The job's tools with a Tap `thread` (on the lathe) and a Ø`drill`
+    /// drill; the tap's id.
+    pub(crate) fn with_tap(doc: &mut Document, thread: &str, drill: &str) -> String {
+        let lathe_id = doc.setups[0].machine.id.clone();
+        let mut tap = Tool::new("Tap", "Tap", "6");
+        tap.set_type("Tap");
+        tap.p.insert("thread".into(), thread.into());
+        tap.p.insert("machines".into(), lathe_id);
+        let id = tap.id.clone();
+        doc.tools.push(tap);
+        for t in &mut doc.tools {
+            if get(&t.p, "type") == "Drill" {
+                t.p.insert("diameter".into(), drill.into());
+            }
+        }
+        id
+    }
+    /// A lathe Tapping to `depth` with the tool `tap`.
+    pub(crate) fn add_tap(doc: &mut Document, tap: &str, depth: &str) {
+        let m = doc.setups[0].machine.clone();
+        let mut op = Operation::for_machine(Strategy::Drill, tap.into(), &m);
+        op.p.insert("cycle".into(), crate::model::TAPPING.into());
+        op.p.insert("depth".into(), depth.into());
+        doc.setups[0].operations.push(op);
+    }
+    /// An M12 × 1.75 tap job: a Ø40 sleeve with a Ø10.2 bore in a Ø50 bar,
+    /// the Ø10 drill, a spiral flute tap.
+    pub(crate) fn m12_job() -> (Document, Mesh, String) {
+        let (mut doc, mesh) = job(50., 100., tube(5.1, 20., 0., 50.), -60.);
+        let tap = with_tap(&mut doc, "M12×1.75", "10");
+        (doc, mesh, tap)
+    }
+    /// The lead of the job's M12 × 1.75 tap `tap`, mm: its first threads
+    /// cut no full thread (`cam::tap_lead` pitches).
+    pub(crate) fn m12_lead(doc: &Document, tap: &str) -> f32 {
+        let tool = doc.tools.iter().find(|t| t.id == tap).unwrap();
+        crate::cam::tap_lead(tool) * 1.75
+    }
+
+    #[test]
+    fn a_tap_goes_in_its_depth_and_lead_at_four_seconds_a_turn_and_widens_the_bore() {
+        let (mut doc, mesh, tap) = m12_job();
+        // 10 of thread and the lead: drilled 16 deep.
+        let lead = m12_lead(&doc, &tap);
+        assert!(10. + lead < 15.5, "{lead}");
+        add(&mut doc, "Drill", &[("depth", "16")]);
+        add_tap(&mut doc, &tap, "10");
+        let results = run(&doc, &mesh);
+        let plan = plan(&results[1]);
+        let feeds: Vec<&Move> = plan
+            .moves
+            .iter()
+            .filter(|m| m.motion == Motion::Feed)
+            .collect();
+        // In to 10 + the lead below the end at Z 0, then out, on the axis.
+        let tip = 100. - 10. - lead;
+        assert_eq!(feeds.len(), 2);
+        assert!(
+            near(feeds[0].from[2], 101.) && near(feeds[0].to[2], tip),
+            "{feeds:?}"
+        );
+        assert!(near(feeds[1].from[2], tip) && near(feeds[1].to[2], 101.));
+        assert!(plan.moves.iter().all(|m| m.from[0] == 0. && m.to[0] == 0.));
+        assert!(near(plan.target, tip) && plan.levels == 1);
+        assert!(near(plan.radius, 6.));
+        // 4 s a turn of the 1.75 mm pitch: 26.25 mm/min, both ways.
+        assert!(feeds.iter().all(|m| near(m.feed, 26.25)));
+        let turns = (101. - tip) / 1.75;
+        let cutting: f32 = feeds.iter().map(|m| m.end - m.start).sum();
+        assert!((cutting - 2. * turns * 4.).abs() < 0.01, "{cutting}");
+        // The full thread to Ø12, over its 10 mm.
+        assert_eq!(plan.rings.len(), 1);
+        let ring = plan.rings[0];
+        assert!(near(ring.z[0], 90.) && near(ring.z[1], 100.));
+        assert!(ring.r[0] == 0. && near(ring.r[1], 6.));
+        assert_eq!(plan.moves[ring.at].motion, Motion::Feed);
+        // Later setups see the thread's bore: Ø10 before, Ø12 after.
+        let drilled = after(results[0].as_ref().unwrap());
+        let tapped = after(results[1].as_ref().unwrap());
+        assert!(solid(&drilled, [5.5, 0., 95.]) && !solid(&tapped, [5.5, 0., 95.]));
+        assert!(solid(&tapped, [7., 0., 95.]) && !solid(&tapped, [0., 5.5, 95.]));
+    }
+
+    #[test]
+    fn a_tap_is_refused_in_a_hole_that_is_not_drilled_for_it() {
+        let drill_first = |drilled: Option<(&str, &str)>, depth: &str| {
+            let (mut doc, mesh, tap) = m12_job();
+            if let Some((d, deep)) = drilled {
+                for t in &mut doc.tools {
+                    if get(&t.p, "type") == "Drill" {
+                        t.p.insert("diameter".into(), d.into());
+                    }
+                }
+                add(&mut doc, "Drill", &[("depth", deep)]);
+            }
+            add_tap(&mut doc, &tap, depth);
+            let at = doc.setups[0].operations.len() - 1;
+            run(&doc, &mesh).remove(at)
+        };
+        let message = |e: String| {
+            assert!(
+                e.starts_with("Drill Ø10.")
+                    && e.ends_with(" deep: the tap cuts its thread in the drilled hole."),
+                "{e}"
+            );
+            e
+        };
+        // No hole; too shallow (the lead needs more than 12); too narrow
+        // (Ø8 is under 85 % of the minor, Ø10.1).
+        message(drill_first(None, "10").unwrap_err());
+        message(drill_first(Some(("10", "12")), "10").unwrap_err());
+        message(drill_first(Some(("8", "16")), "10").unwrap_err());
+        // It says how deep: thread and lead.
+        let (doc, _, tap) = m12_job();
+        let deep = format!("{:.1} deep", 10. + m12_lead(&doc, &tap));
+        assert!(drill_first(None, "10").unwrap_err().contains(&deep));
+        // A hole drilled as deep as the thread and lead is tapped.
+        assert!(drill_first(Some(("10", "16")), "10").is_ok());
+        assert!(drill_first(Some(("10", "15.5")), "10").is_ok());
+        // A tap deeper than the bar is refused.
+        let past = drill_first(Some(("10", "16")), "98").unwrap_err();
+        assert!(past.contains("past the stock's end"), "{past}");
+    }
+
+    /// What `generate` says of the operation `at` of the job's setup, with
+    /// no check of the operation's own fields before it.
+    fn generated(doc: &Document, mesh: &Mesh, at: usize) -> Result<Plan, String> {
+        let setup = &doc.setups[0];
+        let op = &setup.operations[at];
+        let tool = doc.tools.iter().find(|t| t.id == op.tool).unwrap();
+        generate(setup, op, tool, mesh)
+    }
+
+    #[test]
+    fn a_tapping_needs_a_tap_with_its_thread_size() {
+        let (mut doc, mesh, _) = m12_job();
+        add(&mut doc, "Drill", &[("depth", "16")]);
+        // The drill is no tap.
+        let drill = doc
+            .tools
+            .iter()
+            .find(|t| get(&t.p, "type") == "Drill")
+            .unwrap()
+            .id
+            .clone();
+        add_tap(&mut doc, &drill, "10");
+        let want = "Choose a tap, with its thread size, for Tapping.";
+        assert_eq!(generated(&doc, &mesh, 1).unwrap_err(), want);
+        assert_eq!(
+            run(&doc, &mesh).remove(1).unwrap_err(),
+            "Choose a tap for Tapping."
+        );
+        // A tap whose size is not on the table.
+        let tap = with_tap(&mut doc, "M7×0.9", "10");
+        doc.setups[0].operations[1].tool = tap;
+        assert_eq!(generated(&doc, &mesh, 1).unwrap_err(), want);
+        assert!(run(&doc, &mesh).remove(1).is_err());
+    }
+
+    /// A die job: M16 × 2 on a Ø16 bar, the thread's op (with `fields`
+    /// over its M16 × 2 to Z -20) cut with a die of size `die`.
+    fn die_job(die: &str, fields: &[(&str, &str)]) -> (Document, Mesh) {
+        let (mut doc, mesh) = job(16., 100., tube(0., 8., 0., 50.), -60.);
+        let mut all = vec![("diameter", "16"), ("pitch", "2"), ("z_end", "-20")];
+        all.extend_from_slice(fields);
+        add(&mut doc, "Thread", &all);
+        for t in &mut doc.tools {
+            if get(&t.p, "type") == "Die" {
+                t.p.insert("thread".into(), die.into());
+            }
+        }
+        let tool = doc.tools.iter().find(|t| get(&t.p, "type") == "Die");
+        doc.setups[0].operations[0].tool = tool.unwrap().id.clone();
+        (doc, mesh)
+    }
+
+    #[test]
+    fn a_die_cuts_the_thread_in_one_pass_by_hand_at_four_seconds_a_turn() {
+        let (doc, mesh) = die_job("M16×2", &[]);
+        let sim = run(&doc, &mesh).remove(0).unwrap();
+        let plan = &sim.plan;
+        let feeds: Vec<&Move> = plan
+            .moves
+            .iter()
+            .filter(|m| m.motion == Motion::Feed)
+            .collect();
+        // One pass the thread's length, a turn of the 2 mm pitch in 4 s.
+        assert_eq!(feeds.len(), 1);
+        assert!(near(feeds[0].from[2], 101.) && near(feeds[0].to[2], 80.));
+        assert!(near(feeds[0].feed, 30.), "{}", feeds[0].feed);
+        assert!(near(feeds[0].end - feeds[0].start, 21. / 2. * 4.));
+        assert_eq!((plan.levels, plan.rings.len()), (1, 1));
+        // Down to the pitch diameter, as the threading tool leaves it.
+        let ring = plan.rings[0];
+        assert!(near(ring.z[0], 80.) && near(ring.z[1], 100.));
+        assert!(near(2. * ring.r[0], pitch_diameter(16., 2.)), "{ring:?}");
+        let dwells = plan.moves.iter().filter(|m| m.motion == Motion::Dwell);
+        assert_eq!(dwells.count(), 1);
+        // The threading tool takes its passes at the spindle's pitch a turn.
+        let (mut doc, mesh) = job(16., 100., tube(0., 8., 0., 50.), -60.);
+        add(
+            &mut doc,
+            "Thread",
+            &[("diameter", "16"), ("pitch", "2"), ("z_end", "-20")],
+        );
+        let tool = run(&doc, &mesh).remove(0).unwrap();
+        assert!(tool.plan.levels > 1);
+    }
+
+    #[test]
+    fn a_die_is_refused_for_another_size_or_an_inside_thread() {
+        // The operation's check says so as it is edited; the plan says so
+        // again for a copy that skipped it.
+        let refused = |die: &str, fields: &[(&str, &str)]| {
+            let (doc, mesh) = die_job(die, fields);
+            let plan = generated(&doc, &mesh, 0).map(|_| ());
+            let edited = run(&doc, &mesh).remove(0).map(|_| ());
+            (plan, edited)
+        };
+        let (plan, edited) = refused("M16×2", &[("pitch", "1.5")]);
+        assert!(plan.unwrap_err().starts_with("This die is M16×2"));
+        assert_eq!(
+            edited.unwrap_err(),
+            "pitch must be the die's, 2 mm (M16×2)."
+        );
+        let (plan, edited) = refused("M12×1.75", &[]);
+        assert!(plan.unwrap_err().starts_with("This die is M12×1.75"));
+        assert!(edited.is_err());
+        let (plan, edited) = refused("M16×2", &[("thread_side", "Inside")]);
+        assert_eq!(plan.unwrap_err(), "A die cuts an outside thread.");
+        assert!(edited.is_err());
+        // A diameter 0.5 off the die's.
+        let (plan, edited) = refused("M16×2", &[("diameter", "15.5")]);
+        assert!(plan.unwrap_err().starts_with("This die is M16×2"));
+        assert_eq!(
+            edited.unwrap_err(),
+            "diameter must be the die's, Ø16 (M16×2)."
+        );
     }
 
     #[test]

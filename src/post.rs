@@ -3440,6 +3440,7 @@ pub(crate) mod fixture {
             flute_length: 25.,
             tool_length: 35.,
             holder_radius: 16.,
+            neck: None,
             display_scale: 1.,
             duration: 0.,
             target: 9.,

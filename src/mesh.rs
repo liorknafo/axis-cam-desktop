@@ -2,7 +2,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::Path,
-    sync::{Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -60,6 +60,19 @@ impl Clone for Kept {
         Self(Mutex::new(self.lock().clone()))
     }
 }
+/// The threads `Mesh::threads` found, by angle set, as `Kept` keeps bounds.
+#[derive(Debug, Default)]
+struct KeptThreads(Mutex<Vec<([f32; 3], Arc<Vec<crate::thread::Thread>>)>>);
+impl KeptThreads {
+    fn lock(&self) -> MutexGuard<'_, Vec<([f32; 3], Arc<Vec<crate::thread::Thread>>)>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+impl Clone for KeptThreads {
+    fn clone(&self) -> Self {
+        Self(Mutex::new(self.lock().clone()))
+    }
+}
 #[derive(Debug, Clone)]
 pub struct Mesh {
     pub faces: Vec<Face>,
@@ -75,6 +88,7 @@ pub struct Mesh {
     /// Display-space position of the source file's (0,0,0).
     pub origin: [f32; 3],
     rotated_bounds: Kept,
+    threads: KeptThreads,
 }
 impl Mesh {
     /// The preview normalization is uniform; use the same factor for mm stock.
@@ -119,6 +133,24 @@ impl Mesh {
         }
         kept.push((angles, bounds));
         bounds
+    }
+    /// The threads of the part turned by `angles`, which `find` works out
+    /// the first time an angle set is asked (`thread::in_setup`).
+    pub fn threads(
+        &self,
+        angles: [f32; 3],
+        find: impl FnOnce() -> Vec<crate::thread::Thread>,
+    ) -> Arc<Vec<crate::thread::Thread>> {
+        if let Some((_, found)) = self.threads.lock().iter().find(|(a, _)| *a == angles) {
+            return found.clone();
+        }
+        let found = Arc::new(find());
+        let mut kept = self.threads.lock();
+        if kept.len() == ROTATED_BOUNDS_KEPT {
+            kept.remove(0);
+        }
+        kept.push((angles, found.clone()));
+        found
     }
 }
 pub fn load(path: &Path) -> Result<Mesh, String> {
@@ -335,6 +367,7 @@ pub(crate) fn normalize_faces(
         units: "source units",
         origin,
         rotated_bounds: Kept::default(),
+        threads: KeptThreads::default(),
     })
 }
 pub fn sample() -> Mesh {
@@ -370,6 +403,7 @@ pub fn sample() -> Mesh {
         units: "mm",
         origin: [0., 0., 0.],
         rotated_bounds: Kept::default(),
+        threads: KeptThreads::default(),
     }
 }
 fn box_faces(out: &mut Vec<Face>, a: [f32; 3], b: [f32; 3], feature: Option<usize>, tone: f32) {

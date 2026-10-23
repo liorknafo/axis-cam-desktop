@@ -538,6 +538,21 @@ pub(crate) fn op_checks(app: &App) -> Vec<Check> {
     }
     checks
 }
+/// The drilling cycles a Drill operation offers on `machine`: a drill of the
+/// pin holes only drills; the lathe and the manual mill drill and tap by
+/// hand; a CNC drills and mills (helically, or a thread) but does not tap.
+fn drill_cycles(pin_holes: bool, machine: &Machine) -> Vec<&'static str> {
+    DRILL_CYCLES
+        .into_iter()
+        .enumerate()
+        .filter(|&(i, cycle)| match cycle {
+            _ if i < 4 => true,
+            TAPPING => !pin_holes && manual::is_hand(machine),
+            _ => !pin_holes && !manual::is_hand(machine),
+        })
+        .map(|(_, cycle)| cycle)
+        .collect()
+}
 /// `issue_tab` for an operation of `strategy`: a Drill operation has no
 /// Passes tab, and Helical milling's stepdown, stepover and tolerance are on
 /// its Cycle tab.
@@ -559,8 +574,18 @@ pub(crate) fn issue_tab(issue: &str) -> Option<&'static str> {
                 manual::HELICAL_ON_MANUAL,
                 crate::lathe::HELICAL_ON_LATHE,
                 crate::model::HELICAL_PIN_DRILL,
+                crate::model::THREAD_MILL_ON_HAND,
+                crate::model::TAP_ON_CNC,
             ]
             .contains(&issue)
+                || [
+                    "thread depth ",
+                    "thread passes ",
+                    "Choose the thread",
+                    "Choose Yes or No for the spring",
+                ]
+                .iter()
+                .any(|start| issue.starts_with(start))
             {
                 Some("Cycle")
             } else if issue.starts_with("Choose a tool")
@@ -593,7 +618,10 @@ pub(crate) fn issue_tab(issue: &str) -> Option<&'static str> {
             "angle_a" | "angle_b" | "rotary_start" | "rotary_end" | "tilt_min" | "tilt_max"
             | "lead_angle" | "lean_angle",
         ) => "Orientation",
-        Some("peck" | "dwell") => "Cycle",
+        Some(
+            "peck" | "dwell" | "thread" | "thread_hand" | "thread_depth" | "thread_passes"
+            | "spring_pass",
+        ) => "Cycle",
         Some("ramp_angle" | "lead_in") => "Linking",
         Some(_) => "Passes",
     };
@@ -1664,6 +1692,9 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
             }
         }
     }
+    if let Some(block) = threads_block(app) {
+        tree = tree.push(block);
+    }
     if let Some(block) = uncut_block(app) {
         tree = tree.push(block);
     }
@@ -1784,6 +1815,54 @@ pub(crate) fn uncut_legend(app: &App) -> Option<Element<'_, Message>> {
 /// The browser's list of the regions of the part the whole job leaves under
 /// stock, or why that is not checked. While the job is worked out again,
 /// the last list in grey under a Checking heading (`shown_uncut`).
+/// The threads modeled in the part, as the active setup holds it: each size
+/// once with its count and where it runs, and Add threading for the holes
+/// that open upwards.
+fn threads_block(app: &App) -> Option<Element<'_, Message>> {
+    let mesh = app.part_mesh().filter(|_| app.doc.file.is_some())?;
+    let setup = app.doc.active_setup()?;
+    let found = crate::thread::in_setup(setup, mesh);
+    if found.is_empty() {
+        return None;
+    }
+    let lathe = lathe::is_lathe(&setup.machine);
+    let place = |t: &crate::thread::Thread| match (t.internal, t.axis) {
+        (false, _) if !lathe => "on the lathe, or a die by hand",
+        (_, 2) => "along Z",
+        _ => "on a side: add a setup with it up",
+    };
+    let mut lines: Vec<(String, usize)> = vec![];
+    for t in &found {
+        let line = format!("{} · {:.1} mm · {}", t.label(), t.length(), place(t));
+        match lines.iter_mut().find(|(l, _)| *l == line) {
+            Some((_, n)) => *n += 1,
+            None => lines.push((line, 1)),
+        }
+    }
+    let mut block = column![muted("THREADS").size(12)].spacing(4);
+    for (line, n) in &lines {
+        block = block.push(muted(format!("• {n}× {line}")).size(12));
+    }
+    let addable = if lathe {
+        crate::lathe::thread_from_part(setup, mesh).is_some()
+    } else {
+        found.iter().any(|t| t.internal && t.axis == 2)
+    };
+    if addable {
+        block = block.push(secondary("+ Add threading", Message::AddThreading).width(Fill));
+    }
+    Some(help::wrap(
+        container(block).padding([4, 10]),
+        Help::text(
+            "Threads",
+            "The threads modeled in the part, found from its shape: size, hand, inside (a hole) or outside, and how long. Add threading drills each threaded hole that opens upwards to its tap drill and then threads it: thread milling on the CNC, tapping by hand on the manual mill.",
+        )
+        .more(
+            "Only modeled threads are found: a hole drawn plain at a tap-drill size is a plain hole (choose its thread in a Drill's Thread). Outside threads are cut on the lathe or with a die. The tools come from the library; an operation whose tool is missing is added without one, and the status line says which tool to add.",
+        ),
+        widget::tooltip::Position::Right,
+    ))
+}
 fn uncut_block(app: &App) -> Option<Element<'_, Message>> {
     let shown = shown_uncut(app);
     let current = shown.is_none_or(|(_, current)| current);
@@ -2583,7 +2662,10 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 if o.strategy == Strategy::Drill {
                     c = c.push(choice_value(
                         p,
-                        DRILL_HOLES[usize::from(o.drills_pin_holes())],
+                        DRILL_HOLES
+                            .into_iter()
+                            .find(|h| *h == get(p, "holes"))
+                            .unwrap_or(DRILL_HOLES[0]),
                         "holes",
                         "Holes",
                         &DRILL_HOLES,
@@ -3136,18 +3218,28 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             ));
         }
         "Cycle" => {
-            // A lathe drills on its axis, and a drill drills the pin holes:
-            // neither mills holes.
-            let cycles = if lathe || o.drills_pin_holes() {
-                &DRILL_CYCLES[..4]
-            } else {
-                &DRILL_CYCLES[..]
-            };
-            c = c.push(choice(p, "cycle", "Drilling cycle", cycles, t));
+            let cycles = drill_cycles(o.drills_pin_holes(), machine);
+            c = c.push(choice(p, "cycle", "Drilling cycle", &cycles, t));
             if o.helical() {
                 c = c
                     .push(checks.field(p, "stepdown", "Stepdown per turn · mm"))
                     .push(checks.field(p, "stepover", "Ring stepover · % of tool diameter"))
+                    .push(checks.field(p, "tolerance", "Tolerance · mm"));
+            }
+            if o.threads() {
+                // The model's own thread is read from each hole.
+                let sizes: Vec<&str> = std::iter::once(FROM_MODEL)
+                    .chain(crate::thread::SPECS.iter().map(|s| s.name))
+                    .collect();
+                c = c
+                    .push(choice(p, "thread", "Thread", &sizes, t))
+                    .push(choice(p, "thread_hand", "Hand", &THREAD_HANDS, t))
+                    .push(checks.field(p, "thread_depth", "Thread depth · mm (blank: as modeled)"));
+            }
+            if o.thread_milling() {
+                c = c
+                    .push(checks.field(p, "thread_passes", "Thread passes"))
+                    .push(choice(p, "spring_pass", "Spring pass", &["Yes", "No"], t))
                     .push(checks.field(p, "tolerance", "Tolerance · mm"));
             }
             if ["Chip breaking", "Deep drilling"].contains(&get(p, "cycle")) {
@@ -3175,6 +3267,8 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 "Deep drilling" => "Retract clear of the hole between pecks to evacuate chips.",
                 "Counterboring" => "Feed to depth and dwell before retracting.",
                 HELICAL_MILLING => "Mill each hole with a flat end mill narrower than it: down a helix to a flat bottom, once round there, in rings out to the hole's size when it is over twice the cutter's.",
+                THREAD_MILLING => "Mill each hole's thread with a thread mill: down the drilled hole, arc in to the wall, one pitch a turn, arc back out. Drill the hole first.",
+                TAPPING => "Tap each drilled hole by hand: the spindle (off) or the tailstock holds the tap square. The CNC does not tap.",
                 _ => "Feed to the bottom in one move, then retract.",
             }));
         }
@@ -3396,6 +3490,7 @@ fn turn_fields<'a>(o: &'a Operation, checks: &mut Checks) -> Element<'a, Message
                     .spacing(9),
                 )
                 .push(checks.field(p, "z_end", "Z end · mm"));
+            c = c.push(secondary("From the part", Message::ThreadFromPart).width(Fill));
         }
         _ => {}
     }
@@ -7913,11 +8008,14 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
                 "Face mill",
                 "Drill",
                 "Chamfer mill",
+                "Thread mill",
+                "Tap",
                 "Turning tool",
                 "Boring bar",
                 "Grooving tool",
                 "Parting blade",
-                "Threading tool"
+                "Threading tool",
+                "Die"
             ],
             t
         )
@@ -7968,6 +8066,32 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
                     t,
                 ))
                 .push(field(p, "pitches", "Pitches · mm, min-max", t));
+        }
+        "Thread mill" => {
+            form = form
+                .push(choice(
+                    p,
+                    "thread_angle",
+                    "Thread angle · °",
+                    &["60", "55"],
+                    t,
+                ))
+                .push(field(p, "teeth", "Teeth (stacked along it)", t))
+                .push(field(p, "pitches", "Pitches · mm (e.g. 0.5-1.25)", t))
+                .push(field(p, "reach", "Reach (neck) · mm", t))
+                .push(field(p, "shank", "Shank diameter · mm", t));
+        }
+        "Tap" => {
+            let sizes: Vec<&str> = crate::thread::SPECS.iter().map(|s| s.name).collect();
+            form = form
+                .push(choice(p, "thread", "Thread", &sizes, t))
+                .push(choice(p, "tap_kind", "Tap kind", &TAP_KINDS, t));
+        }
+        "Die" => {
+            let sizes: Vec<&str> = crate::thread::SPECS.iter().map(|s| s.name).collect();
+            form = form
+                .push(choice(p, "thread", "Thread", &sizes, t))
+                .push(field(p, "od", "Die outside diameter · mm", t));
         }
         _ => {}
     }
@@ -8553,6 +8677,16 @@ pub(crate) fn operation_lines(
                 format!("{cycle}, peck {} mm", n(value("peck")))
             } else if cycle == HELICAL_MILLING {
                 format!("{cycle}, {} mm per turn", n(value("stepdown")))
+            } else if [THREAD_MILLING, TAPPING].contains(&cycle) {
+                let thread = get(p, "thread");
+                format!(
+                    "{cycle} · {}",
+                    if thread == FROM_MODEL {
+                        "as modeled"
+                    } else {
+                        thread
+                    }
+                )
             } else {
                 cycle.into()
             });

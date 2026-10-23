@@ -1938,7 +1938,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             )
         }
         step @ Step::Pass { .. } => pass(p, step),
-        Step::Holes { op, holes } => {
+        Step::Holes { op, holes, mouths } => {
             let stock = p.before(*op);
             let i = p.item.min(holes.len().saturating_sub(1));
             let r = p
@@ -1954,9 +1954,17 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     .map(|(n, h)| Shape::Hole([h[0], h[1], stock.max[2]], r, n + 1, lit(n, i))),
             );
             let h = holes.get(i).copied().unwrap_or([0.; 3]);
+            let tapping = p.setup.operations.get(*op).is_some_and(|o| o.tapping());
+            // A tap cuts from the hole's mouth: the stock above it may be
+            // gone already.
+            let mouth = if tapping {
+                mouths.get(i).copied().unwrap_or(stock.max[2])
+            } else {
+                stock.max[2]
+            };
             let drilled = Bounds {
                 min: [h[0] - r, h[1] - r, h[2]],
-                max: [h[0] + r, h[1] + r, stock.max[2]],
+                max: [h[0] + r, h[1] + r, mouth],
             };
             let side = vec![
                 Shape::Hatch(drilled, Hatch::Cut),
@@ -1979,58 +1987,125 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 .and_then(|o| num(&o.p, "rpm"))
                 .unwrap_or(0.);
             let depth = stock.max[2] - h[2];
-            let right = column![
-                chips(vec![
+            // Tapping: by hand, the spindle holding the tap square; the
+            // depth is how many turns the tap goes in.
+            let pitch = p.tool(*op).and_then(|t| t.tap_spec()).map(|s| s.pitch);
+            if let (true, Some(pitch)) = (tapping, pitch) {
+                let depth = mouth - h[2];
+                // Rounded down: a turn more would go past the drilled hole.
+                let turns = (depth / pitch * 10.).floor() / 10.;
+                let mut said = vec![
                     chip(p.tool_name(*op, 2. * r)),
-                    chip(format!("{} rpm", rpm.round())),
-                    warn_chip("centres")
-                ]),
-                label(format!("Hole {} of {}", i + 1, holes.len())),
-                readout(
-                    Readout {
-                        order: Some(1),
-                        lead: None,
-                        axis: "X".into(),
-                        value: dro(h[0]),
-                        lock: Some("X".into()),
-                        tags: vec!["centre".into()],
-                        lit: Lit::Next,
-                        big: false
-                    },
-                    None
-                ),
-                readout(
-                    Readout {
-                        order: Some(2),
-                        lead: None,
-                        axis: "Y".into(),
-                        value: dro(h[1]),
-                        lock: Some("Y".into()),
-                        tags: vec!["centre".into()],
-                        lit: Lit::Next,
-                        big: false
-                    },
-                    None
-                ),
-                readout(
-                    Readout {
-                        order: Some(3),
-                        lead: None,
-                        axis: "Z".into(),
-                        value: dro(h[2]),
-                        lock: None,
-                        tags: vec!["drill to".into(), format!("{} deep", mm(depth))],
-                        lit: Lit::Next,
-                        big: false
-                    },
-                    None
-                ),
-                tiles(
-                    (1..=holes.len()).map(|n| (n.to_string(), None)).collect(),
-                    i
-                ),
-            ];
-            ("Holes".into(), "one hole at a time", left, right)
+                    chip("by hand · spindle off"),
+                    warn_chip("oil"),
+                ];
+                // The tap's tip comes out under the stock: a parallel there
+                // stops it, or it cuts the vise.
+                if h[2] < stock.min[2] {
+                    said.push(warn_chip("nothing under the hole"));
+                }
+                let right = column![
+                    chips(said),
+                    label(format!("Hole {} of {}", i + 1, holes.len())),
+                    readout(
+                        Readout {
+                            order: Some(1),
+                            lead: None,
+                            axis: "X".into(),
+                            value: dro(h[0]),
+                            lock: Some("X".into()),
+                            tags: vec!["centre".into()],
+                            lit: Lit::Next,
+                            big: false
+                        },
+                        None
+                    ),
+                    readout(
+                        Readout {
+                            order: Some(2),
+                            lead: None,
+                            axis: "Y".into(),
+                            value: dro(h[1]),
+                            lock: Some("Y".into()),
+                            tags: vec!["centre".into()],
+                            lit: Lit::Next,
+                            big: false
+                        },
+                        None
+                    ),
+                    readout(
+                        Readout {
+                            order: Some(3),
+                            lead: None,
+                            axis: "turns".into(),
+                            value: format!("{:.1}", turns),
+                            lock: None,
+                            tags: vec![format!("{} deep", mm(depth)), "½ back every turn".into(),],
+                            lit: Lit::Next,
+                            big: true
+                        },
+                        None
+                    ),
+                    tiles(
+                        (1..=holes.len()).map(|n| (n.to_string(), None)).collect(),
+                        i
+                    ),
+                ];
+                ("Tap".into(), "one hole at a time, by hand", left, right)
+            } else {
+                let right = column![
+                    chips(vec![
+                        chip(p.tool_name(*op, 2. * r)),
+                        chip(format!("{} rpm", rpm.round())),
+                        warn_chip("centres")
+                    ]),
+                    label(format!("Hole {} of {}", i + 1, holes.len())),
+                    readout(
+                        Readout {
+                            order: Some(1),
+                            lead: None,
+                            axis: "X".into(),
+                            value: dro(h[0]),
+                            lock: Some("X".into()),
+                            tags: vec!["centre".into()],
+                            lit: Lit::Next,
+                            big: false
+                        },
+                        None
+                    ),
+                    readout(
+                        Readout {
+                            order: Some(2),
+                            lead: None,
+                            axis: "Y".into(),
+                            value: dro(h[1]),
+                            lock: Some("Y".into()),
+                            tags: vec!["centre".into()],
+                            lit: Lit::Next,
+                            big: false
+                        },
+                        None
+                    ),
+                    readout(
+                        Readout {
+                            order: Some(3),
+                            lead: None,
+                            axis: "Z".into(),
+                            value: dro(h[2]),
+                            lock: None,
+                            tags: vec!["drill to".into(), format!("{} deep", mm(depth))],
+                            lit: Lit::Next,
+                            big: false
+                        },
+                        None
+                    ),
+                    tiles(
+                        (1..=holes.len()).map(|n| (n.to_string(), None)).collect(),
+                        i
+                    ),
+                ];
+                ("Holes".into(), "one hole at a time", left, right)
+            }
         }
         Step::Check { op } => {
             let j = p.done(*op);

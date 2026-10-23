@@ -18,14 +18,18 @@ pub enum Detail {
     #[default]
     Standard,
     Fine,
+    /// Fine enough for a thread's teeth: a 1 mm pitch is about 14 cells on
+    /// a 70 mm block.
+    Ultra,
 }
 impl Detail {
-    pub const ALL: [Self; 3] = [Self::Draft, Self::Standard, Self::Fine];
+    pub const ALL: [Self; 4] = [Self::Draft, Self::Standard, Self::Fine, Self::Ultra];
     pub fn depth(self) -> u8 {
         match self {
             Self::Draft => 7,
             Self::Standard => 8,
             Self::Fine => 9,
+            Self::Ultra => 10,
         }
     }
 }
@@ -35,6 +39,7 @@ impl std::fmt::Display for Detail {
             Self::Draft => "Draft",
             Self::Standard => "Standard",
             Self::Fine => "Fine",
+            Self::Ultra => "Ultra",
         })
     }
 }
@@ -118,6 +123,35 @@ impl Cut {
         let d: [f32; 3] = std::array::from_fn(|k| self.b[k] - self.a[k]);
         let l = (d[0] * d[0] + d[1] * d[1]).sqrt();
         let r = self.radius;
+        if let Some((pitch, teeth, cot)) = self.shape.teeth() {
+            // As `volume::swept`: the teeth, as far from the move's track as
+            // the tip radius, anywhere along its rise (`thread_field`).
+            let rho = if l < 1e-6 {
+                (p[0].square() + p[1].square()).sqrt()
+            } else {
+                let u = (p[0].clone() * d[0] + p[1].clone() * d[1]) / l;
+                let v = (p[1].clone() * d[0] - p[0].clone() * d[1]) / l;
+                let nearest = u.clone().max(0.).min(l);
+                ((u - nearest).square() + v.square()).sqrt()
+            };
+            let h = p[2].clone() - d[2].min(0.);
+            let rise = d[2].abs();
+            let depth = crate::simulation::THREAD_TOOTH * pitch;
+            let mut e: Option<Tree> = None;
+            for k in 0..teeth as usize {
+                let at = k as f32 * pitch;
+                let gap = (Tree::from(at) - h.clone())
+                    .max(h.clone() - (at + rise))
+                    .max(0.);
+                e = Some(match e {
+                    Some(e) => e.min(gap),
+                    None => gap,
+                });
+            }
+            let e = e.expect("a thread mill has a tooth");
+            let ends = (-h.clone()).max(h - ((teeth - 1.) * pitch + rise)).max(0.);
+            return (rho - (Tree::from(r) - e * cot).max(r - depth)).max(ends - depth / cot);
+        }
         if l < 1e-6 {
             let radial = (p[0].square() + p[1].square()).sqrt() - r;
             let bottom = match self.shape {
@@ -134,8 +168,8 @@ impl Cut {
                     Tree::from(d[2].min(0.))
                         + (p[0].square() + p[1].square()).sqrt() * self.shape.rise().unwrap()
                 }
-                // Rings return above.
-                CutterShape::Revolve => Tree::from(d[2].min(0.)),
+                // Rings and thread mills return above.
+                CutterShape::Revolve | CutterShape::Thread { .. } => Tree::from(d[2].min(0.)),
             };
             return radial
                 .max(bottom - p[2].clone())
@@ -191,8 +225,8 @@ impl Cut {
                 let t = t.max(lo.clone()).min(hi.clone());
                 t.clone() * d[2] + ((u - t * l).square() + v.square()).sqrt() * rise
             }
-            // Rings return above.
-            CutterShape::Flat | CutterShape::Revolve => {
+            // Rings and thread mills return above.
+            CutterShape::Flat | CutterShape::Revolve | CutterShape::Thread { .. } => {
                 if d[2] < 0. {
                     hi.clone() * d[2]
                 } else {
@@ -365,7 +399,17 @@ mod tests {
     }
     #[test]
     fn continuous_cutter_fields_match_analytic_swept_solids() {
-        for shape in [CutterShape::Flat, CutterShape::Ball, CutterShape::Drill] {
+        let thread = CutterShape::Thread {
+            pitch: 1000,
+            teeth: 3,
+            angle: 60,
+        };
+        for shape in [
+            CutterShape::Flat,
+            CutterShape::Ball,
+            CutterShape::Drill,
+            thread,
+        ] {
             for (a, b) in [
                 ([-4., 0., 2.], [4., 0., 2.]),
                 ([-4., 0., 1.], [4., 0., 6.]),

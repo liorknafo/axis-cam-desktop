@@ -1763,7 +1763,7 @@ impl App {
     }
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::model::*;
     #[test]
@@ -2627,6 +2627,330 @@ flood = { pin = 8 }
         );
     }
 
+    /// The threaded plate (examples/threaded-plate.3mf) with drills and
+    /// thread mills in the library, before and after Add threading.
+    fn threaded_app() -> App {
+        let mut a = app();
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/threaded-plate.3mf");
+        let mesh = crate::mesh::load(&path).unwrap();
+        let file = ModelFile {
+            name: "threaded-plate.3mf".into(),
+            path: path.clone(),
+            format: "3mf".into(),
+            bytes: 1,
+        };
+        let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
+        a.doc.setup_mut().operations.clear();
+        a.selected = None;
+        for (n, (name, kind, d, extra)) in [
+            ("Drill Ø5", "Drill", "5", &[][..]),
+            ("Drill Ø6.8", "Drill", "6.8", &[][..]),
+            (
+                "Thread mill Ø4 DLC",
+                "Thread mill",
+                "4",
+                &[("pitches", "0.5-1"), ("reach", "12")][..],
+            ),
+            (
+                "Thread mill Ø4.8 DLC",
+                "Thread mill",
+                "4.8",
+                &[("pitches", "0.5-1.25"), ("reach", "16")][..],
+            ),
+            (
+                "Thread mill Ø3.15 DLC",
+                "Thread mill",
+                "3.15",
+                &[("pitches", "0.5-0.8"), ("reach", "10")][..],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut t = crate::model::Tool::new(name, kind, d);
+            t.set_type(kind);
+            for (k, v) in [("length", "30"), ("stickout", "45")].iter().chain(extra) {
+                t.p.insert((*k).into(), (*v).into());
+            }
+            t.p.insert("number".into(), (n + 10).to_string());
+            a.doc.tools.push(t);
+        }
+        a
+    }
+    /// Renders threading on the CNC to `$AXIS_RENDER_DIR` (default
+    /// /tmp/threading): the Threads list, Add threading, and an M6 thread
+    /// milled. Not a check: run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_threading_on_the_cnc() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/threading".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let mut a = threaded_app();
+        a.page = Page::Work;
+        let size = iced::Size::new(1600., 1000.);
+        let _ = a.view();
+        render_png(&a, size, &out.join("1-threads-found.png"));
+        let _ = a.update(Message::AddThreading);
+        eprintln!("status: {}", a.status);
+        let names: Vec<String> = a
+            .doc
+            .setup()
+            .operations
+            .iter()
+            .map(|o| o.name().to_string())
+            .collect();
+        eprintln!("ops: {names:?}");
+        let _ = a.view();
+        render_png(&a, size, &out.join("2-threading-added.png"));
+        // Generate the job, then show the M6 thread.
+        let m6 = names.iter().position(|n| n == "M6×1 · thread").unwrap();
+        let _ = a.update(Message::SelectOp(m6));
+        let _ = a.update(Message::Tab("Cycle".into()));
+        let _ = a.update(Message::Generate);
+        eprintln!("after generate: {}", a.status);
+        let _ = a.view();
+        render_png(&a, size, &out.join("3-m6-thread-milling.png"));
+        let _ = a.update(Message::Tab("Tool".into()));
+        let _ = a.view();
+        render_png(&a, size, &out.join("4-thread-mill-tool.png"));
+        // From above, zoomed on the M6 hole's helix.
+        let _ = a.update(Message::Tab("Cycle".into()));
+        let _ = a.update(Message::Camera("TOP"));
+        let _ = a.view();
+        render_png(&a, size, &out.join("5-from-above.png"));
+    }
+    /// Renders the owner's 3-tooth thread mill milling the M6 holes to
+    /// `$AXIS_RENDER_DIR` (default /tmp/threading): the cutter over the part
+    /// between holes, and the threads it leaves at Ultra detail, at the
+    /// zooms in `$AXIS_ZOOMS` ("zoom,x,y[,pitch];..." about a pixel). Not a check:
+    /// run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_a_three_tooth_thread_mill() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/threading".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let mut a = threaded_app();
+        for t in a.doc.tools.iter_mut() {
+            let (pitch, shank) = match t.name() {
+                "Thread mill Ø4.8 DLC" => ("1", "6"),
+                "Thread mill Ø4 DLC" => ("0.8", "4"),
+                "Thread mill Ø3.15 DLC" => ("0.7", "4"),
+                _ => continue,
+            };
+            for (k, v) in [
+                ("pitches", pitch),
+                ("shank", shank),
+                ("teeth", "3"),
+                ("flutes", "4"),
+                ("length", "3"),
+                ("stickout", "35"),
+            ] {
+                t.p.insert(k.into(), v.into());
+            }
+        }
+        // The demo's stock: the part's box, 1 mm over its top.
+        for (k, v) in [
+            ("stock_top", "1"),
+            ("stock_bottom", "0"),
+            ("stock_left", "0"),
+            ("stock_right", "0"),
+            ("stock_front", "0"),
+            ("stock_back", "0"),
+        ] {
+            a.doc.setup_mut().p.insert(k.into(), v.into());
+        }
+        a.page = Page::Work;
+        let _ = a.update(Message::AddThreading);
+        let m6 = (a.doc.setup().operations.iter())
+            .position(|o| o.name() == "M6×1 · thread")
+            .unwrap();
+        let _ = a.update(Message::SelectOp(m6));
+        let _ = a.update(Message::Tab("Cycle".into()));
+        let _ = a.update(Message::StockDetail(crate::stock_surface::Detail::Ultra));
+        let _ = a.update(Message::Generate);
+        eprintln!("after generate: {}", a.status);
+        let mesh = |a: &mut App, at: f32| {
+            let _ = a.update(Message::Scrub(at));
+            let key = a.stock_mesh_key().unwrap();
+            let sim = a.active_simulation().unwrap();
+            let result = crate::stock_surface::Snapshot::of(
+                sim.volume.as_ref().unwrap(),
+                crate::stock_surface::Detail::Ultra,
+            )
+            .build()
+            .map(std::sync::Arc::new);
+            let seconds = sim.seconds;
+            a.stock_mesh_job = None;
+            let _ = a.update(Message::StockMeshed {
+                key,
+                seconds,
+                result,
+            });
+        };
+        // Between the holes: the first move over the part after the first
+        // hole's thread.
+        let plan = &a.active_simulation().unwrap().plan;
+        let top = plan.stock.max[2];
+        let first = plan.moves.iter().position(|m| m.cutting_pass).unwrap();
+        let over = (plan.moves[first..].iter())
+            .find(|m| !m.cutting_pass && m.from[2] > top + 1. && m.to[2] > top + 1.)
+            .unwrap();
+        let between = (over.start + over.end) / 2. / plan.duration;
+        eprintln!("cutter over the part at {between}, tip z {}", over.from[2]);
+        let size = iced::Size::new(1600., 1000.);
+        let zooms = std::env::var("AXIS_ZOOMS").unwrap_or("1,0,0".into());
+        for (name, at) in [("between", between), ("done", 1.)] {
+            mesh(&mut a, at);
+            for (k, z) in zooms.split(';').enumerate() {
+                let v: Vec<f32> = z.split(',').map(|n| n.parse().unwrap()).collect();
+                a.camera = Default::default();
+                if let Some(pitch) = v.get(3) {
+                    a.camera.pitch = *pitch;
+                }
+                let mut zoom = 1.;
+                while zoom < v[0] {
+                    // About the pixel `v[1..]` from the unpanned centre.
+                    let at = [v[1] - a.camera.pan[0], v[2] - a.camera.pan[1]];
+                    let _ = a.update(Message::Viewport(crate::viewport::Event::Zoom(0.25, at)));
+                    zoom *= 1.25;
+                }
+                let _ = a.view();
+                render_png(&a, size, &out.join(format!("3t-{name}-{k}.png")));
+            }
+        }
+    }
+    /// The threaded plate on the manual mill with the owner's kind of taps
+    /// and drills, after Add threading; when `faced`, a Box first faces the
+    /// stock down to the plate's top (8 mm under the stock's), so the holes'
+    /// mouths are below the stock's top. Its guide built.
+    fn manual_threaded_app(faced: bool) -> App {
+        use crate::model::{BOX_FIELDS, Operation, Strategy, Tool};
+        let mut a = threaded_app();
+        let machine = crate::manual::defaults();
+        for (name, kind, d, extra) in [
+            ("M6 tap", "Tap", "6", &[("thread", "M6×1")][..]),
+            ("M8 tap", "Tap", "8", &[("thread", "M8×1.25")][..]),
+            ("M5 tap", "Tap", "5", &[("thread", "M5×0.8")][..]),
+            ("Drill Ø5", "Drill", "5", &[][..]),
+            ("Drill Ø6.8", "Drill", "6.8", &[][..]),
+            ("Drill Ø4.2", "Drill", "4.2", &[][..]),
+            ("End mill 25", "Flat end mill", "25", &[][..]),
+        ] {
+            let mut t = Tool::new(name, kind, d);
+            t.set_type(kind);
+            for (k, v) in [("length", "30"), ("stickout", "45")].iter().chain(extra) {
+                t.p.insert((*k).into(), (*v).into());
+            }
+            t.p.insert("machines".into(), machine.id.clone());
+            a.doc.tools.push(t);
+        }
+        a.doc.machines.push(machine.clone());
+        a.doc.add_manual_setup().expect("a manual setup");
+        a.doc.setups[0].operations.clear();
+        a.doc.active = a.doc.setups[0].id.clone();
+        let _ = a.update(Message::AddThreading);
+        if faced {
+            let mill = a
+                .doc
+                .tools
+                .iter()
+                .find(|t| t.name() == "End mill 25")
+                .unwrap();
+            let mut face = Operation::new(Strategy::Box, mill.id.clone());
+            face.p.insert("name".into(), "Face".into());
+            for (k, v) in BOX_FIELDS
+                .iter()
+                .zip(["-500", "500", "-500", "500", "0", "-8"])
+            {
+                face.p.insert((*k).into(), v.into());
+            }
+            face.p.insert("allowance".into(), "0".into());
+            crate::manual::snap(&machine, &mut face.p);
+            a.doc.setups[0].operations.insert(0, face);
+        }
+        let _ = a.update(Message::Page(Page::Control));
+        crate::steps::tests::build(&mut a);
+        if let Some((_, Err(e))) = &a.guide {
+            panic!("no guide: {e}");
+        }
+        a
+    }
+    /// The guide's step of the M6 tapping.
+    fn m6_tap_step(a: &App) -> usize {
+        use crate::guide::Step;
+        let (shown, _) = a.guide_at().expect("a guide");
+        let ops = &a.doc.setups[0].operations;
+        shown
+            .guide
+            .steps
+            .iter()
+            .position(|s| {
+                matches!(s, Step::Holes { op, .. } if ops[*op].tapping() && ops[*op].name().starts_with("M6"))
+            })
+            .expect("a Tap step")
+    }
+    #[test]
+    fn a_taps_turns_are_counted_from_the_holes_mouth() {
+        use crate::guide::Step;
+        for (faced, mouth, turns) in [(false, 0., "22.4"), (true, -8., "14.4")] {
+            let mut a = manual_threaded_app(faced);
+            let at = m6_tap_step(&a);
+            let (shown, _) = a.guide_at().unwrap();
+            let Step::Holes { holes, mouths, .. } = &shown.guide.steps[at] else {
+                panic!()
+            };
+            // The plate's top is 8 under the stock's, its bottom 20; the
+            // spiral flute tap's tip goes 2.5 pitches past it.
+            assert!((mouths[0] - mouth).abs() < 0.05, "{faced}: {mouths:?}");
+            assert!((holes[0][2] + 22.44).abs() < 0.05, "{faced}: {holes:?}");
+            let _ = a.update(Message::Guide(crate::GuideAction::Go(at)));
+            let texts = crate::ui::probe::texts(a.view(), iced::Size::new(1280., 800.));
+            assert!(
+                texts.iter().any(|t| t == turns),
+                "{faced}: {turns} in {texts:?}"
+            );
+        }
+    }
+    #[test]
+    fn a_tap_coming_out_under_the_stock_says_so() {
+        let mut a = manual_threaded_app(false);
+        let texts = |a: &mut App| {
+            let at = m6_tap_step(a);
+            let _ = a.update(Message::Guide(crate::GuideAction::Go(at)));
+            crate::ui::probe::texts(a.view(), iced::Size::new(1280., 800.))
+        };
+        // 4 mm of stock under the plate: the tap's tip stays in it.
+        assert!(!texts(&mut a).iter().any(|t| t == "nothing under the hole"));
+        // None: the tip comes out under the plate.
+        a.doc.setups[0].p.insert("stock_bottom".into(), "0".into());
+        crate::steps::tests::build(&mut a);
+        assert!(texts(&mut a).iter().any(|t| t == "nothing under the hole"));
+    }
+    /// Renders tapping on the manual mill to `$AXIS_RENDER_DIR` (default
+    /// /tmp/threading): Add threading on a manual setup faced first, and
+    /// the guide's Tap screen. Not a check: run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_tapping_on_the_manual_mill() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/threading".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let mut a = manual_threaded_app(true);
+        let at = m6_tap_step(&a);
+        let _ = a.update(Message::Guide(crate::GuideAction::Go(at)));
+        let _ = a.view();
+        render_png(
+            &a,
+            iced::Size::new(1280., 800.),
+            &out.join("9-manual-tap-step.png"),
+        );
+    }
     /// Pictures of a hole's outline under the pointer seen from above, on
     /// the outline and in the opening, and of the hole picked by a click.
     #[test]
@@ -4319,7 +4643,7 @@ flood = { pin = 8 }
     }
 
     /// Draws `a`'s whole window, `size` px, headless (tiny-skia) to `path`.
-    fn render_png(a: &App, size: iced::Size, path: &std::path::Path) {
+    pub(crate) fn render_png(a: &App, size: iced::Size, path: &std::path::Path) {
         render_png_at(a, size, path, iced::mouse::Cursor::Unavailable);
     }
     /// `render_png` with the pointer at `cursor` (hover marks drawn).

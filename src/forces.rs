@@ -53,6 +53,10 @@ pub const KC: [(&str, f32, f32); 7] = [
     ("Wood and composite", 20., 0.25),
     ("Other", 1700., 0.25),
 ];
+/// The milling direction a Thread milling plan carries (`cam::thread_mill`).
+pub const THREAD_MILLING_DIRECTION: &str = "Climb · thread milling";
+/// The milling direction a Tapping plan carries (`cam::tap`).
+pub const TAPPING_DIRECTION: &str = "Tapping · by hand";
 
 /// What an operation cuts over a stretch of its path (`bites`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -93,6 +97,15 @@ pub fn bites(sim: &Simulation) -> Vec<Bite> {
     };
     if sim.plan.strategy == crate::model::Strategy::Drill
         && sim.plan.shape != crate::simulation::CutterShape::Flat
+    {
+        return vec![];
+    }
+    // Threading takes a thread's depth, a fraction of a millimetre, round
+    // the hole: its sweep is the thread's outline, not what it cuts, and a
+    // tap is turned by hand. Neither is modelled.
+    if sim.plan.strategy == crate::model::Strategy::Drill
+        && (sim.plan.milling_direction == THREAD_MILLING_DIRECTION
+            || sim.plan.milling_direction == TAPPING_DIRECTION)
     {
         return vec![];
     }

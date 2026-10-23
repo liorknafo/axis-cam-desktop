@@ -1907,6 +1907,7 @@ fn finish_plan(setup: &Setup, op: &Operation, job: Job) -> Result<Plan, String> 
         flute_length,
         tool_length,
         holder_radius,
+        neck: None,
         display_scale: scale,
         duration: 0.,
         target: planned.iter().map(|p| p.3).fold(f32::INFINITY, f32::min),

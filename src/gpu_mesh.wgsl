@@ -30,9 +30,11 @@ struct Cut {
     m2: vec4f,
     // xyz: b - a; w: radius.
     d: vec4f,
-    // x: flute; y: the cone's rise; z: the shape (0 flat, 1 ball, 2 cone, 3 ring).
+    // x: flute; y: the cone's rise; z: the shape (0 flat, 1 ball, 2 cone, 3 ring,
+    // 4 thread mill); w: a thread mill's tooth spacing.
     e: vec4f,
-    // A ring's z from, z to, inner and outer radius.
+    // A ring's z from, z to, inner and outer radius; a thread mill's teeth and
+    // the cotangent of half its angle.
     g: vec4f,
 }
 
@@ -93,6 +95,29 @@ fn cut_field(c: Cut, x: vec3f) -> f32 {
     let flute = c.e.x;
     let rise = c.e.y;
     let l = length(d.xy);
+    if shape == 4u {
+        // As `CutterShape::thread_field`.
+        var rho = length(p.xy);
+        if l >= 1e-6 {
+            let u = (p.x * d.x + p.y * d.y) / l;
+            let v = (p.y * d.x - p.x * d.y) / l;
+            let nearest = min(max(u, 0.0), l);
+            rho = sqrt((u - nearest) * (u - nearest) + v * v);
+        }
+        let h = p.z - min(d.z, 0.0);
+        let up = abs(d.z);
+        let pitch = c.e.w;
+        let teeth = c.g.x;
+        let cot = c.g.y;
+        let depth = 0.65 * pitch;
+        var e = 1e9;
+        for (var k = 0.0; k < teeth; k += 1.0) {
+            let at = k * pitch;
+            e = min(e, max(max(at - h, h - at - up), 0.0));
+        }
+        let ends = max(max(-h, h - (teeth - 1.0) * pitch - up), 0.0);
+        return max(rho - max(r - e * cot, r - depth), ends - depth / cot);
+    }
     if l < 1e-6 {
         let radial = length(p.xy) - r;
         var bottom = min(d.z, 0.0);
