@@ -2978,11 +2978,23 @@ flood = { pin = 8 }
         assert!(crate::ui::scene_viewport(&a).unwrap().section.picking);
         let _ = a.update(Message::Viewport(crate::viewport::Event::SectionSurface(1)));
         let face = cut(&a).unwrap();
-        assert_eq!((face.through, face.at), (Through::Surface(1), 0.));
+        // It starts inside the part, behind the face, so the cut shows.
+        assert_eq!(face.through, Through::Surface(1));
+        assert!(face.at < 0., "{}", face.at);
         assert!(!a.picking_section);
+        // The legend names the section's colours while it is on.
+        let legend = |a: &App| {
+            use iced::advanced::widget::Tree;
+            fn nodes(t: &Tree) -> usize {
+                1 + t.children.iter().map(nodes).sum::<usize>()
+            }
+            crate::ui::uncut_legend(a).map(|l| nodes(&Tree::new(l.as_widget())))
+        };
+        let with = legend(&a);
         // Off shows the whole part; on again brings the plane back.
         let _ = a.update(Message::Section(Edit::Toggle));
         assert_eq!(cut(&a), None);
+        assert!(legend(&a) < with);
         let _ = a.update(Message::Section(Edit::Toggle));
         assert_eq!(cut(&a), Some(face));
         // Not while picking: a click on the part picks no face for it.
@@ -3009,6 +3021,38 @@ flood = { pin = 8 }
         let _ = a.update(Message::Section(Edit::PickFace));
         let _ = a.view();
         render_png(&a, size, &out.join("2-picking-a-face.png"));
+        // The side wall that faces the viewer most, as a click picks it.
+        let toward = a.camera.toward();
+        let mesh = a.part_mesh().unwrap();
+        let wall = (0..mesh.surfaces.len())
+            .filter(|&i| mesh.surfaces[i].normal[2].abs() < 0.5)
+            .max_by(|&i, &j| {
+                let facing = |k: usize| {
+                    let n = mesh.surfaces[k].normal;
+                    (n[0] * toward[0] + n[1] * toward[1]) * mesh.surfaces[k].area
+                };
+                facing(i).total_cmp(&facing(j))
+            })
+            .unwrap();
+        let _ = a.update(Message::Viewport(crate::viewport::Event::SectionSurface(
+            wall,
+        )));
+        let _ = a.view();
+        render_png(&a, size, &out.join("3-face-picked.png"));
+        let _ = a.update(Message::Section(Edit::At(-8.)));
+        let _ = a.view();
+        render_png(&a, size, &out.join("4-face-slid-8mm-in.png"));
+        let _ = a.update(Message::Section(Edit::Flip));
+        let _ = a.view();
+        render_png(&a, size, &out.join("5-face-flipped.png"));
+        for (k, name) in [(0, "6-across-x.png"), (2, "7-across-z.png")] {
+            let _ = a.update(Message::Section(Edit::Axis(k)));
+            let _ = a.view();
+            render_png(&a, size, &out.join(name));
+        }
+        let _ = a.update(Message::ToggleStock);
+        let _ = a.view();
+        render_png(&a, size, &out.join("8-across-z-no-stock.png"));
     }
     /// Pictures of a hole's outline under the pointer seen from above, on
     /// the outline and in the opening, and of the hole picked by a click.

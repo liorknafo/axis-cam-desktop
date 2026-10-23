@@ -1791,11 +1791,13 @@ pub(crate) fn uncut_toggle(app: &App) -> Option<Element<'_, Message>> {
     ))
 }
 /// One line on what the colours of the 3D view mean: tan original stock,
-/// green cut faces, and magenta faces still under stock while those are
-/// shown. None with the stock hidden and nothing magenta.
+/// green machined faces, the part's hatched section while it is on,
+/// and magenta faces still under stock while those are shown. None with
+/// the stock hidden, no section and nothing magenta.
 pub(crate) fn uncut_legend(app: &App) -> Option<Element<'_, Message>> {
     let magenta = app.show_uncut && uncut_toggle(app).is_some();
-    if !app.stock && !magenta {
+    let section = app.view_section().is_some();
+    if !app.stock && !magenta && !section {
         return None;
     }
     let key = |colour: Color, name: &'static str| {
@@ -1805,7 +1807,10 @@ pub(crate) fn uncut_legend(app: &App) -> Option<Element<'_, Message>> {
     if app.stock {
         legend = legend
             .push(key(Color::from_rgb8(219, 183, 113), "original stock"))
-            .push(key(Color::from_rgb8(103, 181, 151), "cut faces"));
+            .push(key(Color::from_rgb8(103, 181, 151), "machined faces"));
+    }
+    if section {
+        legend = legend.push(key(Color::from_rgb8(64, 88, 118), "part's section"));
     }
     if magenta {
         legend = legend.push(key(Color::from_rgb8(214, 72, 166), "still under stock"));

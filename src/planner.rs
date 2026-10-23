@@ -302,7 +302,7 @@ pub fn instructions_with(pictures: bool, tool: bool, overview: bool) -> String {
         };
         let (look, limits) = if tool {
             (
-                "- Call `view_model` to see more: another orientation or angle, zoomed on surfaces, surfaces highlighted in blue, layers on or off, and, once a proposal has been checked, one of its operations (`operation`, counted from 1 as in the check report): its toolpaths, and the stock left after it (cut stock green); and cut open on a section (`section`, square to an axis or through a flat surface) to see inside: depths, wall and floor thicknesses, stock left in a pocket or under the part.\n",
+                "- Call `view_model` to see more: another orientation or angle, zoomed on surfaces, surfaces highlighted in blue, layers on or off, and, once a proposal has been checked, one of its operations (`operation`, counted from 1 as in the check report): its toolpaths, and the stock left after it (cut stock green); and cut open on a section (`section`, square to an axis or through a surface) to see inside: depths, wall and floor thicknesses, stock left in a pocket or under the part.\n",
                 format!(
                     "You get at most {MAX_PICTURES_PER_REQUEST} pictures per request (the part report, or a check report the program sends back) and {MAX_PICTURES_PER_RUN} in the run. "
                 ),

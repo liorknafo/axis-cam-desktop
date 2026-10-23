@@ -511,7 +511,7 @@ pub fn tool() -> crate::openai::Tool {
                     "description": "An operation of your latest checked proposal, counted from 1: its toolpaths and the stock left after it."},
                 "section": {"type": ["object", "null"], "properties": {
                         "axis": {"type": ["string", "null"], "enum": ["X", "Y", "Z", null], "description": "Cut square to this axis of the drawn setup's frame; null to cut through `surface`."},
-                        "surface": {"type": ["integer", "null"], "description": "Cut on the plane of this flat surface ID; null to cut square to `axis`."},
+                        "surface": {"type": ["integer", "null"], "description": "Cut on the plane of this surface ID (a curved surface is cut square to its average normal, through its centre); null to cut square to `axis`."},
                         "at": {"type": "number", "description": "With `axis`: mm from the part's -X side, -Y side or bottom. With `surface`: mm along its outward normal, less than 0 into the part."},
                         "cut_away": {"type": "string", "enum": ["positive", "negative"], "description": "positive: what lies toward +axis, or in front of the surface, is left out; negative: the other side. Look from the side cut away to see the cut face."}},
                     "required": ["axis", "surface", "at", "cut_away"], "additionalProperties": false,

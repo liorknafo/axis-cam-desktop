@@ -6102,8 +6102,9 @@ impl App {
                     if self.picking_section
                         && let Some(mesh) = self.part_mesh()
                     {
-                        self.section =
-                            Some((section::Section::through(n), mesh.fingerprint.clone()));
+                        let setup = self.doc.active_setup();
+                        let cut = section::Section::picked(n, mesh, setup);
+                        self.section = Some((cut, mesh.fingerprint.clone()));
                         self.section_on = true;
                         self.picking_section = false;
                     }

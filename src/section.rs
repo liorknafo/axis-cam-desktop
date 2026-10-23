@@ -68,6 +68,18 @@ impl Section {
             positive: true,
         }
     }
+    /// A section through the part's `surface` as a click picks it: 1 mm
+    /// into the part behind the face, or half way through a part thinner
+    /// than 2 mm there, so the cut shows at once.
+    pub fn picked(surface: usize, mesh: &Mesh, setup: Option<&Setup>) -> Self {
+        let cut = Self::through(surface);
+        let bounds = Placement::new(mesh, setup).bounds;
+        let deepest = cut.range(mesh, setup, bounds).map_or(0., |(low, _)| low);
+        Self {
+            at: (deepest / 2.).clamp(-1., 0.),
+            ..cut
+        }
+    }
     /// The plane with `at` 0, its normal along the axis or the surface's
     /// (whatever `positive`), in `setup`'s frame (display units). None for a
     /// surface the part does not have.
@@ -391,6 +403,10 @@ mod tests {
             format!("2.0 mm behind surface {id}")
         );
         assert_eq!(surface.place(), format!("through surface {id}"));
+        // Picked with a click, it starts 1 mm into the part, so the cut shows.
+        let picked = Section::picked(id, &mesh, setup);
+        assert_eq!(picked, Section { at: -1., ..surface });
+        assert_eq!(picked.place(), format!("1.0 mm behind surface {id}"));
         assert!(
             Section::through(mesh.surfaces.len())
                 .plane(&mesh, setup)
