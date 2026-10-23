@@ -4,8 +4,9 @@ use crate::{
     analysis::{self, PartReport},
     mesh::{Bounds, Mesh},
     model::{Document, Setup},
+    section::{AXES, Plane, Section, Through},
     stock::Placement,
-    viewport::{Camera, Projector, Viewport},
+    viewport::{Camera, Projector, Sectioning, Viewport},
 };
 use serde::Deserialize;
 use std::{collections::HashMap, sync::Arc};
@@ -76,6 +77,44 @@ struct OpRef {
     setup: usize,
     operation: usize,
 }
+/// The section a view is cut on (`section::Section`): square to an axis or
+/// through a surface, where, and which side is cut away.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SectionArgs {
+    axis: Option<String>,
+    surface: Option<usize>,
+    at: f32,
+    cut_away: String,
+}
+impl SectionArgs {
+    /// The section these ask for, or one sentence on why there is none.
+    fn section(&self, surfaces: usize) -> Result<Section, String> {
+        let through = match (&self.axis, self.surface) {
+            (Some(axis), None) => Through::Axis(
+                AXES.iter()
+                    .position(|a| a == axis)
+                    .ok_or("A section's axis is X, Y or Z.")?,
+            ),
+            (None, Some(id)) if id < surfaces => Through::Surface(id),
+            (None, Some(id)) => return Err(format!("Surface {id} is not a surface of this part.")),
+            _ => return Err("Give a section either an axis or a surface, not both.".into()),
+        };
+        let positive = match self.cut_away.as_str() {
+            "positive" => true,
+            "negative" => false,
+            _ => return Err("A section's cut_away is \"positive\" or \"negative\".".into()),
+        };
+        if !self.at.is_finite() {
+            return Err("A section's at is a number of mm.".into());
+        }
+        Ok(Section {
+            through,
+            at: self.at,
+            positive,
+        })
+    }
+}
 /// The `view_model` tool's arguments.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -88,6 +127,9 @@ pub(crate) struct Args {
     show_workholding: bool,
     labels: bool,
     operation: Option<OpRef>,
+    /// Missing reads as none, as from callers before sections.
+    #[serde(default)]
+    section: Option<SectionArgs>,
     purpose: String,
 }
 impl Args {
@@ -127,6 +169,9 @@ pub(crate) struct View {
     focus: Vec<usize>,
     /// The operation looked at, counted from 1: setup and operation.
     operation: Option<(usize, usize)>,
+    /// The section the picture is cut on, and its plane in the setup's
+    /// frame (display units).
+    section: Option<(Section, Plane)>,
 }
 impl View {
     /// The view `args` ask for, or one sentence on why it cannot be drawn.
@@ -274,6 +319,16 @@ impl View {
         } else {
             vec![]
         };
+        let section = match &args.section {
+            Some(s) => {
+                let section = s.section(surfaces)?;
+                let plane = section
+                    .plane(mesh, Some(&setup))
+                    .ok_or("That section cannot be drawn.")?;
+                Some((section, plane))
+            }
+            None => None,
+        };
         let viewport = Viewport {
             setup: Some(&setup),
             operation: None,
@@ -296,6 +351,7 @@ impl View {
             start_stock: None,
             uncut: &[],
             show_uncut: true,
+            section: Default::default(),
             frame: None,
         };
         let boxes = focus_bounds(mesh, &setup, &args.focus_surfaces)
@@ -312,6 +368,7 @@ impl View {
             angle_words,
             focus: args.focus_surfaces.clone(),
             operation,
+            section,
         })
     }
     /// Where a point (display units, setup frame) lands in the picture:
@@ -384,6 +441,10 @@ fn paint(scene: &Scene, args: &Args, view: &View) -> Picture {
         start_stock: None,
         uncut: &[],
         show_uncut: true,
+        section: Sectioning {
+            cut: view.section.map(|(s, _)| s),
+            picking: false,
+        },
         frame: None,
     };
     let (w, h) = (SIZE, SIZE - CAPTION);
@@ -423,6 +484,7 @@ pub fn overview(scene: &Scene) -> Result<Picture, String> {
         show_workholding: true,
         labels: true,
         operation: None,
+        section: None,
         purpose: "Overview".into(),
     };
     render(scene, &args)
@@ -447,9 +509,16 @@ pub fn tool() -> crate::openai::Tool {
                 "operation": {"type": ["object", "null"], "properties": {"setup": {"type": "integer"}, "operation": {"type": "integer"}},
                     "required": ["setup", "operation"], "additionalProperties": false,
                     "description": "An operation of your latest checked proposal, counted from 1: its toolpaths and the stock left after it."},
+                "section": {"type": ["object", "null"], "properties": {
+                        "axis": {"type": ["string", "null"], "enum": ["X", "Y", "Z", null], "description": "Cut square to this axis of the drawn setup's frame; null to cut through `surface`."},
+                        "surface": {"type": ["integer", "null"], "description": "Cut on the plane of this surface ID (a curved surface is cut square to its average normal, through its centre); null to cut square to `axis`."},
+                        "at": {"type": "number", "description": "With `axis`: mm from the part's -X side, -Y side or bottom. With `surface`: mm along its outward normal, less than 0 into the part."},
+                        "cut_away": {"type": "string", "enum": ["positive", "negative"], "description": "positive: what lies toward +axis, or in front of the surface, is left out; negative: the other side. Look from the side cut away to see the cut face."}},
+                    "required": ["axis", "surface", "at", "cut_away"], "additionalProperties": false,
+                    "description": "A cut-away view: everything on one side of a plane is left out, and where the plane goes through the part or the stock its cut face is filled and hatched (part: blue-grey with dark hatching; stock: tan with brown hatching, the part's outline drawn on it). Use it to see inside: pocket depths, wall and floor thicknesses, what stock is left in a pocket or under the part. Null for no section."},
                 "purpose": {"type": "string", "description": "A few words on why you look; shown to the user."}
             },
-            "required": ["orientation", "angle", "focus_surfaces", "highlight_surfaces", "show_stock", "show_workholding", "labels", "operation", "purpose"],
+            "required": ["orientation", "angle", "focus_surfaces", "highlight_surfaces", "show_stock", "show_workholding", "labels", "operation", "section", "purpose"],
             "additionalProperties": false
         }),
     }
@@ -472,8 +541,14 @@ fn draw_toolpaths(canvas: &mut Canvas, view: &View, depths: &[f32]) {
     let scale = sim.plan.display_scale;
     let (w, h) = (canvas.w as usize, canvas.h as usize);
     for m in (0..n).map(|i| feeds[i * feeds.len() / n]) {
-        let a = view.screen(m.from.map(|v| v * scale));
-        let b = view.screen(m.to.map(|v| v * scale));
+        let (from, to) = (m.from.map(|v| v * scale), m.to.map(|v| v * scale));
+        let Some((from, to)) = (match view.section {
+            Some((_, plane)) => plane.clip_segment(from, to),
+            None => Some((from, to)),
+        }) else {
+            continue;
+        };
+        let (a, b) = (view.screen(from), view.screen(to));
         let steps = ((b.0 - a.0).hypot(b.1 - a.1).ceil() as usize).clamp(1, 4000);
         for i in 0..=steps {
             let t = i as f32 / steps as f32;
@@ -650,6 +725,9 @@ fn caption(canvas: &mut Canvas, view: &View, scale: f32) {
     if let Some((s, o)) = view.operation {
         words += &format!(" · AFTER S{s} OP{o}");
     }
+    if view.section.is_some() {
+        words += " · SECTION";
+    }
     // Words too long to clear the scale bar are written smaller.
     let room = SIZE - 12 - 160 - 20;
     if Canvas::text_width(&words, 2) <= room {
@@ -741,13 +819,17 @@ fn describe(view: &View, args: &Args, tags: &[String]) -> String {
     } else {
         String::new()
     };
+    let section = view
+        .section
+        .map(|(s, _)| format!("; cut on a section {}, {} cut away", s.place(), s.side()))
+        .unwrap_or_default();
     let tags = if tags.is_empty() {
         "none".to_string()
     } else {
         tags.join(", ")
     };
     format!(
-        "{} up, {}, {scope}{after}; {stock}{holding}{highlights}; tags: {tags}",
+        "{} up, {}, {scope}{after}; {stock}{holding}{highlights}{section}; tags: {tags}",
         up_words(view),
         view.angle_words
     )
@@ -771,7 +853,7 @@ mod tests {
         let mut all = serde_json::json!({
             "orientation": null, "angle": "iso_front_left", "focus_surfaces": [],
             "highlight_surfaces": [], "show_stock": true, "show_workholding": true,
-            "labels": true, "operation": null, "purpose": "look"
+            "labels": true, "operation": null, "section": null, "purpose": "look"
         });
         for (k, v) in json.as_object().unwrap() {
             all[k] = v.clone();
@@ -1236,6 +1318,135 @@ mod tests {
         )
         .unwrap_err();
         assert!(out.contains("Setup 1 has no operation 99"), "{out}");
+    }
+    /// How many pixels of `png` are one of `colors`.
+    fn count(png: &[u8], colors: &[[u8; 3]]) -> usize {
+        (decode(png).2.chunks(3))
+            .filter(|p| colors.iter().any(|c| p == c))
+            .count()
+    }
+    /// The fill and hatching of the part's cut face, and of the stock's.
+    const PART_CUT: [[u8; 3]; 2] = [[198, 212, 228], [64, 88, 118]];
+    const STOCK_CUT: [[u8; 3]; 2] = [[232, 204, 150], [150, 104, 40]];
+    /// A section square to Y through the middle of `setup`'s part.
+    fn across_y(s: &Scene, setup: &Setup, cut_away: &str) -> serde_json::Value {
+        let scale = s.mesh.display_scale();
+        let half = Placement::new(&s.mesh, Some(setup)).bounds.dimensions()[1] / scale / 2.;
+        serde_json::json!({"axis": "Y", "surface": null, "at": half, "cut_away": cut_away})
+    }
+    #[test]
+    fn a_section_cuts_the_part_open_and_hatches_its_cut_face() {
+        let s = scene();
+        let look = |section: serde_json::Value| {
+            draw(
+                &s,
+                &args(serde_json::json!({"angle": "front", "show_stock": false,
+                    "show_workholding": false, "labels": false, "section": section})),
+            )
+        };
+        let whole = look(serde_json::Value::Null).unwrap();
+        assert_eq!(count(&whole.png, &PART_CUT), 0);
+        // The front half cut away: from the front, the cut face.
+        let setup = s.doc.setups[0].clone();
+        let cut = look(across_y(&s, &setup, "negative")).unwrap();
+        let hatched = count(&cut.png, &PART_CUT);
+        assert!(hatched > 5000, "{hatched} pixels of the cut face");
+        assert!(
+            cut.description.contains("cut on a section Y")
+                && cut.description.contains("−Y cut away"),
+            "{}",
+            cut.description
+        );
+        // The back half cut away: the front face hides the cut face.
+        let behind = look(across_y(&s, &setup, "positive")).unwrap();
+        assert_eq!(count(&behind.png, &PART_CUT), 0);
+        // Through a face of the part, 2 mm into it.
+        let face = look(
+            serde_json::json!({"axis": null, "surface": 0, "at": -2., "cut_away": "positive"}),
+        );
+        assert!(
+            face.unwrap()
+                .description
+                .contains("2.0 mm behind surface 0")
+        );
+        for (section, error) in [
+            (
+                serde_json::json!({"axis": "W", "surface": null, "at": 1., "cut_away": "positive"}),
+                "axis is X, Y or Z",
+            ),
+            (
+                serde_json::json!({"axis": "X", "surface": 0, "at": 1., "cut_away": "positive"}),
+                "either an axis or a surface",
+            ),
+            (
+                serde_json::json!({"axis": null, "surface": 99999, "at": 1., "cut_away": "positive"}),
+                "Surface 99999",
+            ),
+            (
+                serde_json::json!({"axis": "X", "surface": null, "at": 1., "cut_away": "up"}),
+                "cut_away",
+            ),
+        ] {
+            let out = look(section).unwrap_err();
+            assert!(out.contains(error), "{out}");
+        }
+    }
+    #[test]
+    fn a_section_of_an_operation_hatches_the_stock_left_and_outlines_the_part_on_it() {
+        let mut s = scene();
+        let (_, job) = crate::plan_check::evaluate(&s.doc, &s.mesh, &s.report, &good(&s.report));
+        let job = Arc::new(job.unwrap());
+        s.job = Some(job.clone());
+        let look = |section: serde_json::Value| {
+            draw(
+                &s,
+                &args(
+                    serde_json::json!({"operation": {"setup": 1, "operation": 2},
+                    "angle": "front", "show_workholding": false, "labels": false,
+                    "section": section}),
+                ),
+            )
+            .unwrap()
+        };
+        let whole = look(serde_json::Value::Null);
+        assert_eq!(count(&whole.png, &STOCK_CUT), 0);
+        let cut = look(across_y(&s, &job.setups[0], "negative"));
+        let stock = count(&cut.png, &STOCK_CUT);
+        assert!(stock > 5000, "{stock} pixels of the stock's cut face");
+        let outline = count(&cut.png, &[[40, 64, 96]]);
+        assert!(outline > 100, "{outline} pixels of the part's outline");
+    }
+    /// Writes /tmp/section-{part,stock}-{front,iso}.png, section views of the
+    /// example block: for looking at.
+    #[test]
+    #[ignore]
+    fn picture_sections() {
+        let mut s = scene();
+        let (_, job) = crate::plan_check::evaluate(&s.doc, &s.mesh, &s.report, &good(&s.report));
+        let job = Arc::new(job.unwrap());
+        s.job = Some(job.clone());
+        for (name, operation, stock) in [
+            ("part", serde_json::Value::Null, false),
+            ("box", serde_json::Value::Null, true),
+            (
+                "stock",
+                serde_json::json!({"setup": 1, "operation": 2}),
+                true,
+            ),
+        ] {
+            for angle in ["front", "iso_front_left"] {
+                let picture = draw(
+                    &s,
+                    &args(serde_json::json!({"operation": operation, "angle": angle,
+                        "show_stock": stock, "show_workholding": true, "labels": false,
+                        "section": across_y(&s, &job.setups[0], "negative")})),
+                )
+                .unwrap();
+                let file = format!("/tmp/section-{name}-{angle}.png");
+                std::fs::write(&file, picture.png.as_slice()).unwrap();
+                println!("{file}: {}", picture.description);
+            }
+        }
     }
     #[test]
     fn highlights_are_reported_as_not_drawn_when_the_stock_after_an_operation_is_shown() {

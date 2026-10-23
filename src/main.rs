@@ -35,6 +35,7 @@ mod progress;
 mod proposal;
 mod rest;
 mod run;
+mod section;
 mod session;
 mod settings;
 mod setup;
@@ -332,6 +333,8 @@ pub enum Message {
     Export(&'static str),
     ToggleStock,
     ToggleUncut,
+    /// A change to the 3D view's section.
+    Section(section::Edit),
     TogglePaths,
     /// A named view of the 3D view, or "FIT": the scene fitted again in the
     /// view it has.
@@ -1075,6 +1078,14 @@ pub struct App {
     /// "Show uncut faces": the part's faces the whole job leaves under stock
     /// are drawn magenta (`uncut::Uncut::faces`), over the simulated stock too.
     pub show_uncut: bool,
+    /// The 3D view's section (`section`), with the fingerprint of the part
+    /// it was set on: a face's number means another face on another part.
+    /// Kept while the section is off, so turning it on again brings it back.
+    pub section: Option<(section::Section, String)>,
+    /// Whether the 3D view is cut on `section`.
+    pub section_on: bool,
+    /// Whether a click on the part picks the face the section goes through.
+    pub picking_section: bool,
     pub paths: bool,
     pub picking: bool,
     /// "Pick holes on the part" in the Work zero step: a click on the part
@@ -1333,6 +1344,7 @@ fn while_locked(m: &Message) -> bool {
             | RunPictures(..)
             | ToggleStock
             | ToggleUncut
+            | Section(_)
             | TogglePaths
             | Camera(_)
             | ToggleSidebar(_)
@@ -1465,6 +1477,7 @@ fn steer(camera: &mut viewport::Camera, event: &viewport::Event) {
         }
         viewport::Event::Pick(_)
         | viewport::Event::PickSurface(_)
+        | viewport::Event::SectionSurface(_)
         | viewport::Event::AimPins(_)
         | viewport::Event::PlacePins(_) => {}
     }
@@ -1699,6 +1712,9 @@ impl App {
             import_error: None,
             stock: true,
             show_uncut: true,
+            section: None,
+            section_on: false,
+            picking_section: false,
             paths: true,
             picking: false,
             picking_pins: false,
@@ -1941,6 +1957,54 @@ impl App {
     }
     pub fn is_sample(&self) -> bool {
         self.doc.sample_model && self.doc.file.is_none()
+    }
+    /// The section the 3D view's part is cut on, when it is on: the one set
+    /// on this part, or across Z when it was set on another.
+    pub fn view_section(&self) -> Option<section::Section> {
+        if !self.section_on {
+            return None;
+        }
+        let mesh = self.part_mesh()?;
+        Some(match &self.section {
+            Some((cut, part)) if *part == mesh.fingerprint => *cut,
+            // Set on another part, as after opening the example: across Z
+            // through the middle of this one, its top half cut away.
+            _ => section::Section::across(2, mesh, self.doc.active_setup(), [0., 0., 1.]),
+        })
+    }
+    /// The 3D view's section changed from its controls.
+    fn edit_section(&mut self, edit: section::Edit) {
+        let Some(mesh) = self.part_mesh() else {
+            return;
+        };
+        let part = mesh.fingerprint.clone();
+        let (setup, toward) = (self.doc.active_setup(), self.camera.toward());
+        let across = |k| section::Section::across(k, mesh, setup, toward);
+        // From the section there is, unless it was set on another part.
+        let mut cut = match (edit, &self.section) {
+            (section::Edit::Axis(k), _) => across(k),
+            (_, Some((cut, on))) if *on == part => *cut,
+            // The cut shown on this part (across Z) is the one edited.
+            (section::Edit::Toggle, _) => across(2),
+            _ => self.view_section().unwrap_or_else(|| across(2)),
+        };
+        match edit {
+            section::Edit::Toggle => {
+                self.section_on = !self.section_on;
+                self.picking_section = false;
+            }
+            section::Edit::Axis(_) => {
+                self.section_on = true;
+                self.picking_section = false;
+            }
+            section::Edit::PickFace => {
+                self.picking_section = !self.picking_section;
+                self.section_on = true;
+            }
+            section::Edit::At(at) => cut.at = at,
+            section::Edit::Flip => cut.positive = !cut.positive,
+        }
+        self.section = Some((cut, part));
     }
     /// Whether a click on the part picks a hole for the fixture pins: "Pick
     /// holes on the part" is on, and the Work zero step of a setup on the
@@ -4300,7 +4364,9 @@ impl App {
                             .map(|s| s.major);
                         self.tool_draft.p.insert(k.into(), v);
                         if let Some(major) = major {
-                            self.tool_draft.p.insert("diameter".into(), major.to_string());
+                            self.tool_draft
+                                .p
+                                .insert("diameter".into(), major.to_string());
                         }
                     }
                 }
@@ -5954,6 +6020,7 @@ impl App {
             }
             Message::ToggleStock => self.stock = !self.stock,
             Message::ToggleUncut => self.show_uncut = !self.show_uncut,
+            Message::Section(edit) => self.edit_section(edit),
             Message::TogglePaths => self.paths = !self.paths,
             Message::Camera(view) => {
                 self.camera = match view {
@@ -6040,6 +6107,17 @@ impl App {
                         }
                         let text = post::leftover_pin_text(setup, mesh, stock, at);
                         return self.update(Message::Edit(Target::Setup, "pin_place", text));
+                    }
+                }
+                viewport::Event::SectionSurface(n) => {
+                    if self.picking_section
+                        && let Some(mesh) = self.part_mesh()
+                    {
+                        let setup = self.doc.active_setup();
+                        let cut = section::Section::picked(n, mesh, setup);
+                        self.section = Some((cut, mesh.fingerprint.clone()));
+                        self.section_on = true;
+                        self.picking_section = false;
                     }
                 }
                 viewport::Event::PickSurface(n) => {

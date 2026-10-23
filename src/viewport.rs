@@ -1,6 +1,7 @@
 use crate::{
     mesh::{Face, Mesh},
     model::{Operation, Setup, Strategy},
+    section::{Plane, Section, Segment},
     stock::{self, Placement},
 };
 use iced::{
@@ -24,6 +25,14 @@ pub struct Camera {
     pub pitch: f32,
     pub zoom: f32,
     pub pan: [f32; 2],
+}
+impl Camera {
+    /// The direction the viewer is in from the target, of length 1.
+    pub fn toward(&self) -> [f32; 3] {
+        let (s, c) = self.yaw.sin_cos();
+        let (se, ce) = self.pitch.sin_cos();
+        [s * ce, -c * ce, se]
+    }
 }
 impl Default for Camera {
     fn default() -> Self {
@@ -52,6 +61,16 @@ pub enum Event {
     /// A click, or a drag of the pins ending, while placing them: pin 1
     /// stands there (plan mm).
     PlacePins([f32; 2]),
+    /// A click on a surface of the part while picking the face a section
+    /// goes through (`Sectioning::picking`).
+    SectionSurface(usize),
+}
+/// The section the view is cut on, and whether a click on the part picks
+/// the face it goes through.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Sectioning {
+    pub cut: Option<Section>,
+    pub picking: bool,
 }
 #[derive(Default)]
 pub struct State {
@@ -256,6 +275,10 @@ pub struct Viewport<'a> {
     /// the bottom of the view and the scene stays where it is on the
     /// screen. None: the view's own height (pictures, tests).
     pub frame: Option<f32>,
+    /// The section the scene is cut on (`section`): what lies on its far
+    /// side is left out and the cut faces of the part and the stock are
+    /// filled and hatched.
+    pub section: Sectioning,
 }
 /// `camera` turned by `yaw` and `pitch` (radians), as a drag turns the
 /// view: the model follows the mouse, as in the machine view, and the pitch
@@ -392,6 +415,34 @@ impl Projector {
         let (se, ce) = self.camera.pitch.sin_cos();
         v[0] * s * ce - v[1] * c * ce + v[2] * se
     }
+    /// The depth (`depth`) of `plane` at each pixel of a frame `ratio`
+    /// times the projector's, (a, b, c): a·x + b·y + c at the point (x, y).
+    /// None when the view looks along the plane, which then shows nothing
+    /// of a cut face.
+    fn plane_depth(&self, plane: &Plane, ratio: f32) -> Option<[f32; 3]> {
+        let (s, c) = self.camera.yaw.sin_cos();
+        let (se, ce) = self.camera.pitch.sin_cos();
+        let right = [c, s, 0.];
+        let up = [-s * se, c * se, ce];
+        let toward = [s * ce, -c * ce, se];
+        let along = |v: [f32; 3]| -> f32 { (0..3).map(|i| plane.normal[i] * v[i]).sum() };
+        let k = along(toward);
+        if k.abs() < 0.05 {
+            return None;
+        }
+        // The point (x, y) shows is target + right·a + up·b + toward·t, a
+        // and b its offsets from the centre, t its depth less the target's
+        // (`at_depth`); on the plane where its distance is 0, linear in x
+        // and y. Worked out whole, not by differences, for f32's sake.
+        let pixel = self.scale * ratio;
+        let at_centre = plane.distance(self.target) - along(right) * self.center.x / self.scale
+            + along(up) * self.center.y / self.scale;
+        Some([
+            -along(right) / (k * pixel),
+            along(up) / (k * pixel),
+            self.depth(self.target) - at_centre / k,
+        ])
+    }
 }
 impl Viewport<'_> {
     /// The frame the camera centres and fits the scene in, for the view's
@@ -411,7 +462,7 @@ impl Viewport<'_> {
         let (width, height) = self.framed_size(b);
         let centre = Point::new(width * 0.5, height * 0.53);
         let nearest = self
-            .transformed()
+            .shown()
             .iter()
             .filter_map(|face| {
                 let v: Vec<_> = face.points.iter().map(|q| (p.p(*q), p.depth(*q))).collect();
@@ -537,6 +588,36 @@ impl Viewport<'_> {
             })
             .collect()
     }
+    /// The section's plane in the setup's frame (display units): None
+    /// without a section or for a surface the part does not have.
+    pub(crate) fn cut(&self) -> Option<Plane> {
+        self.section.cut?.plane(self.mesh, self.setup)
+    }
+    /// The part's faces in the setup's frame (`transformed`), less what the
+    /// section cuts away: a face it cuts away whole has no points left.
+    fn shown(&self) -> Vec<Face> {
+        let mut faces = self.transformed();
+        if let Some(cut) = self.cut() {
+            for face in &mut faces {
+                face.points = cut.clip(&face.points);
+            }
+        }
+        faces
+    }
+    /// Where the section's plane crosses the part's faces, in the setup's
+    /// frame: the outline of the part's cut face. Empty without a section.
+    fn part_crossings(&self) -> Vec<Segment> {
+        let Some(cut) = self.cut() else {
+            return vec![];
+        };
+        let placement = Placement::new(self.mesh, self.setup);
+        (self.mesh.faces.iter())
+            .filter_map(|f| {
+                let points: Vec<_> = f.points.iter().map(|p| placement.transform(*p)).collect();
+                cut.crossing(&points)
+            })
+            .collect()
+    }
     /// The point of the stock's bottom under the screen point `at` while
     /// placing the pins (plan mm).
     fn aimed(&self, b: Rectangle, at: Point) -> Option<[f32; 2]> {
@@ -564,6 +645,12 @@ impl Viewport<'_> {
             .then(|| [q[0] - placed[0], q[1] - placed[1]])
     }
     fn picked(&self, b: Rectangle, point: Point) -> Option<usize> {
+        // The face a section goes through: any surface of the part.
+        if self.section.picking {
+            return self
+                .nearest_surface(b, point)
+                .filter(|f| *f < self.mesh.surfaces.len());
+        }
         if !self.picking
             || (!self.sample
                 && !self.pin_holes.pick
@@ -584,20 +671,7 @@ impl Viewport<'_> {
         {
             return self.hole_outlines[i].walls.first().copied();
         }
-        let p = self.projector(b);
-        let mut nearest = f32::NEG_INFINITY;
-        let mut feature = None;
-        for face in self.transformed() {
-            let vertices: Vec<_> = face.points.iter().map(|v| (p.p(*v), p.depth(*v))).collect();
-            for i in 1..vertices.len() - 1 {
-                if let Some(z) = triangle_depth([vertices[0], vertices[i], vertices[i + 1]], point)
-                    && z > nearest
-                {
-                    nearest = z;
-                    feature = face.feature;
-                }
-            }
-        }
+        let feature = self.nearest_surface(b, point);
         // Nothing of the part under the pointer: the opening of a hole
         // through it, seen from above.
         if feature.is_none()
@@ -613,6 +687,25 @@ impl Viewport<'_> {
                 *f < self.mesh.surfaces.len()
             }
         })
+    }
+    /// The surface of the part's face nearest the viewer at `point`, of the
+    /// faces the section leaves (`shown`).
+    fn nearest_surface(&self, b: Rectangle, point: Point) -> Option<usize> {
+        let p = self.projector(b);
+        let mut nearest = f32::NEG_INFINITY;
+        let mut feature = None;
+        for face in self.shown() {
+            let vertices: Vec<_> = face.points.iter().map(|v| (p.p(*v), p.depth(*v))).collect();
+            for i in 1..vertices.len().saturating_sub(1) {
+                if let Some(z) = triangle_depth([vertices[0], vertices[i], vertices[i + 1]], point)
+                    && z > nearest
+                {
+                    nearest = z;
+                    feature = face.feature;
+                }
+            }
+        }
+        feature
     }
     /// Where this view of `bounds` puts the point `q` (display units),
     /// relative to it: for pictures with the pointer over it.
@@ -811,7 +904,7 @@ impl Viewport<'_> {
             self.simulation.map(|s| (s.id.as_str(), s.revision))
         );
         format!(
-            "{key}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}",
+            "{key}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{:?}",
             self.holding,
             self.framed,
             self.frame,
@@ -822,7 +915,8 @@ impl Viewport<'_> {
                 .map(|(_, surface)| std::ptr::from_ref(surface)),
             self.uncut.first().map(std::ptr::from_ref),
             self.uncut.len(),
-            self.show_uncut
+            self.show_uncut,
+            self.section
         )
     }
     /// The scene as RGBA pixels, `w` by `h`.
@@ -871,11 +965,31 @@ impl Viewport<'_> {
             && self.show_stock
             && (self.live_stock.is_some() || (start.is_some() && !self.picking));
         let behind_stock = (self.simulation.is_some() && self.show_stock) || carved;
-        let faces = if behind_stock && !self.show_uncut {
+        let cut = self.cut();
+        let whole = if behind_stock && !self.show_uncut {
             vec![]
         } else {
             self.transformed()
         };
+        // What the section leaves of each face. Each is shaded as the whole
+        // face is: what is left of one can start with three points nearly in
+        // a line, whose normal says nothing.
+        let clipped: Option<Vec<Face>> = cut.map(|cut| {
+            (whole.iter())
+                .map(|f| Face {
+                    points: cut.clip(&f.points),
+                    feature: f.feature,
+                    tone: f.tone,
+                })
+                .collect()
+        });
+        let faces = clipped.as_ref().unwrap_or(&whole);
+        // A point of the setup's frame (display units) in the frame's pixels.
+        let screen = |v: [f32; 3]| {
+            let q = p.p(v);
+            Point::new(q.x * ratio, q.y * ratio)
+        };
+        let cap_depth = cut.and_then(|cut| p.plane_depth(&cut, ratio));
         let selected_by = |face: &Face| {
             face.feature.is_some_and(|f| {
                 self.operation.is_some_and(|o| {
@@ -901,7 +1015,11 @@ impl Viewport<'_> {
         // Where a click picks a whole smooth face (Parallel and Waterline
         // finishing), the pointer shows all of it.
         let hovered_face: std::collections::HashSet<usize> = match hovered {
-            Some(h) if !self.sample && self.operation.is_some_and(crate::picks_faces) => {
+            Some(h)
+                if !self.sample
+                    && !self.section.picking
+                    && self.operation.is_some_and(crate::picks_faces) =>
+            {
                 self.mesh.region_of(h).into_iter().collect()
             }
             _ => Default::default(),
@@ -913,7 +1031,7 @@ impl Viewport<'_> {
             if behind_stock {
                 break;
             }
-            let light = face_light(face);
+            let light = face_light(&whole[fi]);
             let selected = selected_by(face);
             let hover = face.feature.is_some()
                 && (face.feature == hovered || hovered_face.contains(&face.feature.unwrap()));
@@ -935,7 +1053,7 @@ impl Viewport<'_> {
                 ]
             };
             let v = project(face);
-            for i in 1..v.len() - 1 {
+            for i in 1..v.len().saturating_sub(1) {
                 let tri = [v[0], v[i], v[i + 1]];
                 let minx = tri
                     .iter()
@@ -980,22 +1098,46 @@ impl Viewport<'_> {
                 }
             }
         }
+        // The part's cut face, where the section goes through it.
+        let crossings = self.part_crossings();
+        if !behind_stock && let Some(plane) = cap_depth {
+            let outline: Vec<_> = (crossings.iter())
+                .map(|[a, b]| (screen(*a), screen(*b)))
+                .collect();
+            raster_cap(
+                &mut rgba,
+                &mut depths,
+                (w, h),
+                &outline,
+                plane,
+                section_hatch(PART_CUT, ratio),
+                |index| {
+                    if let Some(plain) = plain.get_mut(index) {
+                        *plain = false;
+                    }
+                },
+            );
+        }
         if self.simulation.is_some() || carved {
-            match (self.simulation, self.live_stock) {
+            let outline = match (self.simulation, self.live_stock) {
                 (Some(simulation), _) => {
                     self.raster_simulation(simulation, p, &mut rgba, &mut depths, w, h, ratio)
                 }
                 (None, Some((grid, _))) => {
                     let scale = self.mesh.display_scale();
+                    let mut outline = vec![];
                     let mut face = |points: &[[f32; 3]], color: [u8; 4]| {
-                        let v: Vec<_> = (points.iter())
-                            .map(|v| {
-                                let v = v.map(|n| n * scale);
-                                let q = p.p(v);
-                                (Point::new(q.x * ratio, q.y * ratio), p.depth(v))
-                            })
-                            .collect();
-                        for i in 1..v.len() - 1 {
+                        let points: Vec<_> = points.iter().map(|v| v.map(|n| n * scale)).collect();
+                        let points = match cut {
+                            Some(cut) => {
+                                outline.extend(cut.crossing(&points));
+                                cut.clip(&points)
+                            }
+                            None => points,
+                        };
+                        let v: Vec<_> =
+                            (points.iter()).map(|v| (screen(*v), p.depth(*v))).collect();
+                        for i in 1..v.len().saturating_sub(1) {
                             raster_triangle(
                                 &mut rgba,
                                 &mut depths,
@@ -1007,15 +1149,49 @@ impl Viewport<'_> {
                         }
                     };
                     grid_faces(grid, &mut face);
+                    outline
                 }
                 (None, None) => {
                     if let (Some((volume, surface)), Some(setup)) = (start, self.setup) {
                         let current = crate::volume::Frame::new(setup, self.mesh);
-                        let (triangles, colors) = self.carved(volume, surface, current, p, ratio);
+                        let (triangles, colors, outline) =
+                            self.carved(volume, surface, current, p, ratio);
                         raster_triangles(&mut rgba, &mut depths, w, h, triangles.len(), |i| {
                             (triangles[i], colors[i])
                         });
+                        outline
+                    } else {
+                        vec![]
                     }
+                }
+            };
+            // The stock's cut face, and on it the outline of the part's.
+            if let Some(plane) = cap_depth
+                && !outline.is_empty()
+            {
+                let outline: Vec<_> = (outline.iter())
+                    .map(|[a, b]| (screen(*a), screen(*b)))
+                    .collect();
+                raster_cap(
+                    &mut rgba,
+                    &mut depths,
+                    (w, h),
+                    &outline,
+                    plane,
+                    section_hatch(STOCK_CUT, ratio),
+                    |_| {},
+                );
+                for [a, b] in &crossings {
+                    raster_depth_line(
+                        &mut rgba,
+                        &depths,
+                        w,
+                        h,
+                        (screen(*a), p.depth(*a)),
+                        (screen(*b), p.depth(*b)),
+                        PART_OUTLINE,
+                        0.9 * ratio,
+                    );
                 }
             }
             for (fi, face) in faces.iter().enumerate() {
@@ -1023,9 +1199,9 @@ impl Viewport<'_> {
                     continue;
                 }
                 let v = project(face);
-                let color = uncut_color(face_light(face));
+                let color = uncut_color(face_light(&whole[fi]));
                 let striped = selected_by(face);
-                for i in 1..v.len() - 1 {
+                for i in 1..v.len().saturating_sub(1) {
                     raster_rows_with(
                         &mut rgba,
                         &mut depths,
@@ -1042,19 +1218,18 @@ impl Viewport<'_> {
             && let (Some((volume, surface)), Some(setup)) = (start, self.setup)
         {
             let current = crate::volume::Frame::new(setup, self.mesh);
-            let (triangles, colors) = self.carved(volume, surface, current, p, ratio);
+            let (triangles, colors, _) = self.carved(volume, surface, current, p, ratio);
             raster_ghost(&mut rgba, &depths, (w, h), &triangles, &colors);
         } else if self.show_stock
             && let Some(setup) = self.setup
             && self.stock_is_known(setup)
             && let Some(stock) = self.resolved_stock()
         {
-            let projected = box_vertices(stock.stock.scaled(stock.display_scale)).map(|v| {
-                let q = p.p(v);
-                (Point::new(q.x * ratio, q.y * ratio), p.depth(v))
+            let solid_box = box_solid(stock.stock.scaled(stock.display_scale), cut.as_ref(), |v| {
+                (screen(v), p.depth(v))
             });
             raster_stock(
-                &mut rgba, &depths, w, h, projected, ratio, p.scale, &mut solid,
+                &mut rgba, &depths, w, h, &solid_box, ratio, p.scale, &mut solid,
             );
             // Only the planner's pictures mark surfaces (the app passes
             // none, so its view is unchanged): the model asked to see them,
@@ -1066,16 +1241,15 @@ impl Viewport<'_> {
         if !self.holding.is_empty() {
             let scale = self.mesh.display_scale();
             for hold in &self.holding {
-                let projected = box_vertices(hold.bounds.scaled(scale)).map(|v| {
-                    let q = p.p(v);
-                    (Point::new(q.x * ratio, q.y * ratio), p.depth(v))
+                let solid_box = box_solid(hold.bounds.scaled(scale), cut.as_ref(), |v| {
+                    (screen(v), p.depth(v))
                 });
                 raster_solid(
                     &HOLDING,
                     &mut rgba,
                     &depths,
                     (w, h),
-                    projected,
+                    &solid_box,
                     ratio,
                     p.scale,
                     &mut solid,
@@ -1137,12 +1311,18 @@ impl Viewport<'_> {
             };
             for (i, path) in paths.iter().enumerate() {
                 for segment in path.windows(2) {
+                    let Some((a, b)) = (match cut {
+                        Some(cut) => cut.clip_segment(segment[0], segment[1]),
+                        None => Some((segment[0], segment[1])),
+                    }) else {
+                        continue;
+                    };
                     raster_line(
                         &mut rgba,
                         w,
                         h,
-                        scaled(segment[0]),
-                        scaled(segment[1]),
+                        scaled(a),
+                        scaled(b),
                         if i % 2 == 0 {
                             [35, 139, 199, 255]
                         } else {
@@ -1183,7 +1363,8 @@ impl Viewport<'_> {
     }
     /// The triangles of `surface`, what is left of the stock `volume`, moved
     /// to the setup's frame `current` and projected (each vertex once), and
-    /// the colour of each (once), as the view draws them.
+    /// the colour of each (once), as the view draws them; less what the
+    /// section cuts away, with where it crosses them (display units).
     fn carved(
         &self,
         volume: &crate::volume::Volume,
@@ -1191,22 +1372,49 @@ impl Viewport<'_> {
         current: crate::volume::Frame,
         p: &Projector,
         ratio: f32,
-    ) -> (Vec<Corners>, Vec<[u8; 4]>) {
+    ) -> (Vec<Corners>, Vec<[u8; 4]>, Vec<Segment>) {
         let scale = self.mesh.display_scale();
+        let project = |v: [f32; 3]| {
+            let pt = p.p(v);
+            (Point::new(pt.x * ratio, pt.y * ratio), p.depth(v))
+        };
         let corners = on_every_core(&surface.vertices, |&v| {
             let q = volume.frame.transfer(v, current);
-            let v = q.map(|n| n * scale);
-            let pt = p.p(v);
-            (q, (Point::new(pt.x * ratio, pt.y * ratio), p.depth(v)))
+            (q, project(q.map(|n| n * scale)))
         });
         let colors = on_every_core(&surface.triangles, |t| {
             stock_color(volume, surface, t, t.map(|i| corners[i].0))
         });
-        let triangles = (surface.triangles.iter())
-            .map(|t| t.map(|v| corners[v].1))
-            .collect();
-        (triangles, colors)
+        let Some(cut) = self.cut() else {
+            let triangles = (surface.triangles.iter())
+                .map(|t| t.map(|v| corners[v].1))
+                .collect();
+            return (triangles, colors, vec![]);
+        };
+        let (mut triangles, mut kept, mut outline) = (vec![], vec![], vec![]);
+        for (t, color) in surface.triangles.iter().zip(colors) {
+            let points = t.map(|i| corners[i].0.map(|n| n * scale));
+            match points.iter().filter(|v| cut.distance(**v) > 0.).count() {
+                0 => {
+                    triangles.push(t.map(|v| corners[v].1));
+                    kept.push(color);
+                }
+                3 => {}
+                _ => {
+                    let left: Vec<_> = cut.clip(&points).into_iter().map(project).collect();
+                    for i in 1..left.len().saturating_sub(1) {
+                        triangles.push([left[0], left[i], left[i + 1]]);
+                        kept.push(color);
+                    }
+                    outline.extend(cut.crossing(&points));
+                }
+            }
+        }
+        (triangles, kept, outline)
     }
+    /// The simulation `sim` drawn: its stock, less what the section cuts
+    /// away, the tool and the paths. Returns where the section crosses the
+    /// stock (display units), the outline of its cut face.
     #[allow(clippy::too_many_arguments)]
     fn raster_simulation(
         &self,
@@ -1217,21 +1425,45 @@ impl Viewport<'_> {
         w: u32,
         h: u32,
         ratio: f32,
-    ) {
+    ) -> Vec<Segment> {
         let scale = sim.plan.display_scale;
-        let project = |v: [f32; 3]| {
-            let v = v.map(|n| n * scale);
+        let shown = |v: [f32; 3]| {
             let q = p.p(v);
             (Point::new(q.x * ratio, q.y * ratio), p.depth(v))
         };
+        let project = |v: [f32; 3]| shown(v.map(|n| n * scale));
+        let cut = self.cut();
+        let mut outline = vec![];
         if self.show_stock
             && let (Some(volume), Some(current)) = (&sim.volume, sim.frame)
             && let Some(surface) = &sim.stock_surface
         {
-            let (triangles, colors) = self.carved(volume, surface, current, p, ratio);
+            let (triangles, colors, crossings) = self.carved(volume, surface, current, p, ratio);
             raster_triangles(rgba, depths, w, h, triangles.len(), |i| {
                 (triangles[i], colors[i])
             });
+            outline = crossings;
+        }
+        if self.show_stock && sim.volume.is_none() {
+            let mut grid = |points: &[[f32; 3]], color: [u8; 4]| {
+                let mut points: Vec<_> = points.iter().map(|v| v.map(|n| n * scale)).collect();
+                if let Some(cut) = cut {
+                    outline.extend(cut.crossing(&points));
+                    points = cut.clip(&points);
+                }
+                let vertices: Vec<_> = points.into_iter().map(shown).collect();
+                for i in 1..vertices.len().saturating_sub(1) {
+                    raster_triangle(
+                        rgba,
+                        depths,
+                        w,
+                        h,
+                        [vertices[0], vertices[i], vertices[i + 1]],
+                        color,
+                    );
+                }
+            };
+            grid_faces(&sim.stock, &mut grid);
         }
         let mut face = |points: &[[f32; 3]], color: [u8; 4]| {
             let vertices: Vec<_> = points.iter().copied().map(project).collect();
@@ -1246,9 +1478,6 @@ impl Viewport<'_> {
                 );
             }
         };
-        if self.show_stock && sim.volume.is_none() {
-            grid_faces(&sim.stock, &mut face);
-        }
         let pos = sim.position;
         // Frustums, from the tip up, of the saved cutter diameter, flute
         // length and stickout: (radius below, radius above, from, to, colour).
@@ -1397,8 +1626,17 @@ impl Viewport<'_> {
                 if movement.start > sim.seconds {
                     break;
                 }
-                let a = project(movement.from);
-                let b = project(movement.at(sim.seconds));
+                let (from, to) = (
+                    movement.from.map(|n| n * scale),
+                    movement.at(sim.seconds).map(|n| n * scale),
+                );
+                let Some((from, to)) = (match cut {
+                    Some(cut) => cut.clip_segment(from, to),
+                    None => Some((from, to)),
+                }) else {
+                    continue;
+                };
+                let (a, b) = (shown(from), shown(to));
                 let feed = movement.motion == crate::simulation::Motion::Feed;
                 let pocket_layer = sim.plan.strategy != Strategy::Face
                     && movement.cutting_pass
@@ -1427,6 +1665,7 @@ impl Viewport<'_> {
                 );
             }
         }
+        outline
     }
 }
 /// The marks drawn over the 3D view: the stock's label, the machine's
@@ -1818,7 +2057,9 @@ impl canvas::Program<Event> for Viewport<'_> {
                         && let Some(f) = self.picked(bounds, p)
                     {
                         return Some(
-                            Action::publish(if self.sample {
+                            Action::publish(if self.section.picking {
+                                Event::SectionSurface(f)
+                            } else if self.sample {
                                 Event::Pick(f)
                             } else {
                                 Event::PickSurface(f)
@@ -1917,7 +2158,7 @@ impl canvas::Program<Event> for Viewport<'_> {
         if state.drag.is_some() {
             mouse::Interaction::Grabbing
         } else if cursor.is_over(bounds) {
-            if self.picking {
+            if self.picking || self.section.picking {
                 mouse::Interaction::Crosshair
             } else {
                 mouse::Interaction::Grab
@@ -2446,7 +2687,7 @@ fn raster_stock(
     part_depth: &[f32],
     w: u32,
     h: u32,
-    vertices: [(Point, f32); 8],
+    solid_box: &SolidBox,
     ratio: f32,
     scale: f32,
     buffers: &mut SolidBuffers,
@@ -2456,11 +2697,85 @@ fn raster_stock(
         pixels,
         part_depth,
         (w, h),
-        vertices,
+        solid_box,
         ratio,
         scale,
         buffers,
     );
+}
+/// The faces of a box by its corners (`box_vertices`): bottom, top, −Y,
+/// +X, +Y and −X, each one's tone (`Look::faces`) its place here.
+const BOX_FACES: [[usize; 4]; 6] = [
+    [0, 1, 2, 3],
+    [4, 5, 6, 7],
+    [0, 1, 5, 4],
+    [1, 2, 6, 5],
+    [2, 3, 7, 6],
+    [3, 0, 4, 7],
+];
+/// The edges of a box by its corners (`box_vertices`).
+const BOX_EDGES: [(usize, usize); 12] = [
+    (0, 1),
+    (1, 2),
+    (2, 3),
+    (3, 0),
+    (4, 5),
+    (5, 6),
+    (6, 7),
+    (7, 4),
+    (0, 4),
+    (1, 5),
+    (2, 6),
+    (3, 7),
+];
+/// The tone of a box's cut face (`Look::faces`, as the X and Y sides').
+const CUT_TONE: u8 = 6;
+/// A box as `raster_solid` draws it, projected: its faces, each a convex
+/// polygon with its tone, and its edges.
+struct SolidBox {
+    faces: Vec<(Vec<(Point, f32)>, u8)>,
+    edges: Vec<((Point, f32), (Point, f32))>,
+}
+/// The box `b` as `raster_solid` draws it, its corners projected by
+/// `project`: what `cut` leaves of it, closed by the box's cut face and that
+/// face's edges.
+fn box_solid(
+    b: crate::mesh::Bounds,
+    cut: Option<&Plane>,
+    project: impl Fn([f32; 3]) -> (Point, f32),
+) -> SolidBox {
+    let v = box_vertices(b);
+    let mut faces = vec![];
+    for (tone, face) in BOX_FACES.iter().enumerate() {
+        let points = face.map(|i| v[i]);
+        let points = match cut {
+            Some(cut) => cut.clip(&points),
+            None => points.to_vec(),
+        };
+        if points.len() >= 3 {
+            faces.push((points.into_iter().map(&project).collect(), tone as u8));
+        }
+    }
+    let mut edges = vec![];
+    for (a, b) in BOX_EDGES {
+        let kept = match cut {
+            Some(cut) => cut.clip_segment(v[a], v[b]),
+            None => Some((v[a], v[b])),
+        };
+        if let Some((a, b)) = kept {
+            edges.push((project(a), project(b)));
+        }
+    }
+    if let Some(cut) = cut {
+        let face = cut.box_face(b);
+        for (i, a) in face.iter().enumerate() {
+            edges.push((project(*a), project(face[(i + 1) % face.len()])));
+        }
+        if face.len() >= 3 {
+            faces.push((face.into_iter().map(&project).collect(), CUT_TONE));
+        }
+    }
+    SolidBox { faces, edges }
 }
 /// Composite only the nearest surface of a box; use both surfaces and part
 /// depth to distinguish visible edges from dashed hidden edges.
@@ -2470,26 +2785,16 @@ fn raster_solid(
     pixels: &mut [u8],
     part_depth: &[f32],
     (w, h): (u32, u32),
-    vertices: [(Point, f32); 8],
+    solid_box: &SolidBox,
     ratio: f32,
     scale: f32,
     buffers: &mut SolidBuffers,
 ) {
     buffers.reset((w * h) as usize);
     let SolidBuffers { near, tones } = buffers;
-    for (tone, face) in [
-        [0, 1, 2, 3],
-        [4, 5, 6, 7],
-        [0, 1, 5, 4],
-        [1, 2, 6, 5],
-        [2, 3, 7, 6],
-        [3, 0, 4, 7],
-    ]
-    .iter()
-    .enumerate()
-    {
-        for tri in [[face[0], face[1], face[2]], [face[0], face[2], face[3]]] {
-            let tri = tri.map(|i| vertices[i]);
+    for (face, tone) in &solid_box.faces {
+        for i in 1..face.len() - 1 {
+            let tri = [face[0], face[i], face[i + 1]];
             let minx = tri
                 .iter()
                 .map(|(p, _)| p.x)
@@ -2521,7 +2826,7 @@ fn raster_solid(
                         && z > near[index]
                     {
                         near[index] = z;
-                        tones[index] = tone as u8;
+                        tones[index] = *tone;
                     }
                 }
             }
@@ -2543,22 +2848,7 @@ fn raster_solid(
             alpha_over(&mut pixels[index * 4..index * 4 + 4], tint, alpha);
         }
     }
-    for (a, b) in [
-        (0, 1),
-        (1, 2),
-        (2, 3),
-        (3, 0),
-        (4, 5),
-        (5, 6),
-        (6, 7),
-        (7, 4),
-        (0, 4),
-        (1, 5),
-        (2, 6),
-        (3, 7),
-    ] {
-        let (a, za) = vertices[a];
-        let (b, zb) = vertices[b];
+    for &((a, za), (b, zb)) in &solid_box.edges {
         let dx = b.x - a.x;
         let dy = b.y - a.y;
         let length_sq = dx * dx + dy * dy;
@@ -2620,6 +2910,77 @@ fn raster_ghost(
             };
             let tint = [near[index * 4], near[index * 4 + 1], near[index * 4 + 2]];
             alpha_over(&mut pixels[index * 4..index * 4 + 4], tint, alpha);
+        }
+    }
+}
+/// The fill and the hatch lines of the part's cut face: a lighter steel
+/// than its faces, hatched dark.
+const PART_CUT: [[u8; 3]; 2] = [[198, 212, 228], [64, 88, 118]];
+/// The fill and the hatch lines of the stock's cut face: the block's tan,
+/// hatched brown.
+const STOCK_CUT: [[u8; 3]; 2] = [[232, 204, 150], [150, 104, 40]];
+/// The outline of the part's cut face drawn on the stock's.
+const PART_OUTLINE: [u8; 4] = [40, 64, 96, 255];
+/// The colour at pixel (x, y) of a cut face, whose fill and hatch lines
+/// are `colors`: thin lines at 45° across the fill, as a drawing hatches a
+/// section, at a frame of `ratio` pixels a logical pixel.
+fn section_hatch(colors: [[u8; 3]; 2], ratio: f32) -> impl Fn(u32, u32) -> [u8; 4] + Copy {
+    let spacing = (7. * ratio).max(4.);
+    let width = ratio.max(1.);
+    move |x, y| {
+        let [r, g, b] = if (x as f32 + y as f32).rem_euclid(spacing) < width {
+            colors[1]
+        } else {
+            colors[0]
+        };
+        [r, g, b, 255]
+    }
+}
+/// The cut face of a solid the section goes through: filled even-odd
+/// between the segments of `outline` (where the plane crosses the solid's
+/// faces, in the frame's pixels), at the plane's depth `plane` (a·x + b·y +
+/// c, `Projector::plane_depth`), wherever nothing drawn is nearer. Each
+/// pixel drawn is `color`'s, and `drawn` is told its index.
+fn raster_cap(
+    pixels: &mut [u8],
+    depths: &mut [f32],
+    (w, h): (u32, u32),
+    outline: &[(Point, Point)],
+    plane: [f32; 3],
+    color: impl Fn(u32, u32) -> [u8; 4],
+    mut drawn: impl FnMut(usize),
+) {
+    // Where each row's centre crosses the outline: a segment takes the rows
+    // whose centres are from its upper end to just short of its lower one,
+    // so two segments meeting at a corner count it once.
+    let mut rows: Vec<Vec<f32>> = vec![vec![]; h as usize];
+    for &(a, b) in outline {
+        if a.y == b.y || !(a.y.is_finite() && b.y.is_finite()) {
+            continue;
+        }
+        let (a, b) = if a.y < b.y { (a, b) } else { (b, a) };
+        let first = (a.y - 0.5).ceil().clamp(0., h as f32) as usize;
+        let last = (b.y - 0.5).ceil().clamp(0., h as f32) as usize;
+        for (y, row) in rows.iter_mut().enumerate().take(last).skip(first) {
+            let t = (y as f32 + 0.5 - a.y) / (b.y - a.y);
+            row.push(a.x + (b.x - a.x) * t);
+        }
+    }
+    for (y, row) in rows.iter_mut().enumerate() {
+        row.sort_by(f32::total_cmp);
+        for &[a, b] in row.as_chunks::<2>().0 {
+            let from = (a - 0.5).ceil().clamp(0., w as f32) as u32;
+            let to = (b - 0.5).ceil().clamp(0., w as f32) as u32;
+            let y = y as u32;
+            for x in from..to {
+                let index = (y * w + x) as usize;
+                let z = plane[0] * (x as f32 + 0.5) + plane[1] * (y as f32 + 0.5) + plane[2];
+                if z >= depths[index] {
+                    depths[index] = z;
+                    pixels[index * 4..index * 4 + 4].copy_from_slice(&color(x, y));
+                    drawn(index);
+                }
+            }
         }
     }
 }
@@ -3117,6 +3478,7 @@ mod tests {
             start_stock: None,
             uncut: &[],
             show_uncut: true,
+            section: Default::default(),
             frame: None,
         };
         let bounds = Rectangle {
@@ -3147,6 +3509,155 @@ mod tests {
         };
         let (_, _, rgba) = uncut.pixels(&p, bounds, None);
         assert!(magenta(&rgba) > 10_000, "{}", magenta(&rgba));
+    }
+    #[test]
+    fn a_planes_depth_on_the_screen_is_the_depth_of_its_points() {
+        let plane = Plane {
+            normal: {
+                let n = [0.3f32, -0.5, 0.8];
+                let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                n.map(|c| c / l)
+            },
+            d: 4.,
+        };
+        let camera = Camera {
+            yaw: 0.4,
+            pitch: 0.7,
+            zoom: 1.3,
+            pan: [12., -7.],
+        };
+        let bounds = crate::mesh::Bounds {
+            min: [-20., -10., 0.],
+            max: [30., 25., 18.],
+        };
+        let p = Projector::fit(camera, (640., 480.), bounds);
+        let ratio = 1.5;
+        let [a, b, c] = p.plane_depth(&plane, ratio).unwrap();
+        // Points of the plane: its point nearest the origin, moved along it.
+        let base = plane.normal.map(|v| v * plane.d);
+        for (u, w) in [(0., 0.), (5., -3.), (-12., 8.), (20., 14.)] {
+            let along = [
+                u,
+                w,
+                -(plane.normal[0] * u + plane.normal[1] * w) / plane.normal[2],
+            ];
+            let v: [f32; 3] = std::array::from_fn(|k| base[k] + along[k]);
+            assert!(plane.distance(v).abs() < 1e-4);
+            let q = p.p(v);
+            let (x, y) = (q.x * ratio, q.y * ratio);
+            let depth = a * x + b * y + c;
+            assert!((depth - p.depth(v)).abs() < 1e-3, "{depth} {}", p.depth(v));
+        }
+    }
+    /// The section of a STEP part across each axis: every face it crosses
+    /// is crossed on two edges, and the segments close on themselves, so the
+    /// cut face is filled without streaks.
+    #[test]
+    fn a_step_parts_cut_outline_closes_on_itself() {
+        use crate::model::{Machine, Setup};
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/half-ball-on-plate.step");
+        let mesh = crate::mesh::load(&path).unwrap();
+        let setup = Setup::new(Machine::new(3), "G54");
+        let placement = Placement::new(&mesh, Some(&setup));
+        for k in 0..3 {
+            let section = Section::across(k, &mesh, Some(&setup), Camera::default().toward());
+            let cut = section.plane(&mesh, Some(&setup)).unwrap();
+            let mut ends = std::collections::HashMap::new();
+            for f in &mesh.faces {
+                let p: Vec<_> = f.points.iter().map(|q| placement.transform(*q)).collect();
+                let crossed = (0..p.len())
+                    .filter(|&i| {
+                        (cut.distance(p[i]) <= 0.) != (cut.distance(p[(i + 1) % p.len()]) <= 0.)
+                    })
+                    .count();
+                assert!(
+                    crossed == 0 || crossed == 2,
+                    "a face crossed {crossed} times"
+                );
+                for end in cut.crossing(&p).into_iter().flatten() {
+                    *ends.entry(end.map(f32::to_bits)).or_insert(0) += 1;
+                }
+            }
+            assert!(ends.len() > 20, "{} ends across axis {k}", ends.len());
+            assert!(
+                ends.values().all(|n| n % 2 == 0),
+                "an open end across axis {k}"
+            );
+        }
+    }
+    /// Writes /tmp/section-step-{x,y,z}.png: the STEP part `$AXIS_SECTION_STEP`
+    /// (default the half ball on its plate) cut across each axis through its
+    /// middle, the side toward the viewer cut away: for looking at.
+    #[test]
+    #[ignore]
+    fn picture_a_step_parts_sections() {
+        use crate::model::{Machine, Setup};
+        let path = std::env::var("AXIS_SECTION_STEP").map_or_else(
+            |_| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("examples/half-ball-on-plate.step")
+            },
+            std::path::PathBuf::from,
+        );
+        let mesh = crate::mesh::load(&path).unwrap();
+        let setup = Setup::new(Machine::new(3), "G54");
+        let zoom: f32 = std::env::var("AXIS_SECTION_ZOOM").map_or(1., |z| z.parse().unwrap());
+        for k in 0..3 {
+            let camera = Camera {
+                yaw: 0.3,
+                pitch: 0.35,
+                zoom,
+                ..Camera::default()
+            };
+            let view = Viewport {
+                setup: Some(&setup),
+                operation: None,
+                mesh: &mesh,
+                simulation: None,
+                sample: false,
+                camera,
+                picking: false,
+                pin_holes: Default::default(),
+                hole_outlines: vec![],
+                pin_aim: Default::default(),
+                show_stock: false,
+                show_paths: false,
+                progress: None,
+                holding: vec![],
+                framed: vec![],
+                leftover: None,
+                live: None,
+                live_stock: None,
+                start_stock: None,
+                uncut: &[],
+                show_uncut: true,
+                section: Sectioning {
+                    cut: Some(Section::across(k, &mesh, Some(&setup), camera.toward())),
+                    picking: false,
+                },
+                frame: None,
+            };
+            let (w, h) = (900, 700);
+            let p = Projector::filling(
+                camera,
+                (w as f32, h as f32),
+                &view.scene_boxes(),
+                0.9 * zoom,
+            );
+            let (rgba, _) = view.render(&p, (w, h), 1., None, &[]);
+            let file = format!("/tmp/section-step-{}.png", ["x", "y", "z"][k]);
+            let mut encoder = png::Encoder::new(
+                std::io::BufWriter::new(std::fs::File::create(&file).unwrap()),
+                w,
+                h,
+            );
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&rgba).unwrap();
+            println!("{file}");
+        }
     }
     /// The pixels of `view` that are magenta, as a face under stock is drawn.
     fn magenta(view: &Viewport, size: (u32, u32)) -> usize {
@@ -3191,6 +3702,7 @@ mod tests {
             start_stock: None,
             uncut: &all,
             show_uncut: true,
+            section: Default::default(),
             frame: None,
         };
         let size = (300, 200);
@@ -3207,6 +3719,7 @@ mod tests {
         let on_key = view.raster_key(bounds, None);
         let off = Viewport {
             show_uncut: false,
+            section: Default::default(),
             ..view
         };
         assert_eq!(magenta(&off, size), 0);
@@ -3216,6 +3729,7 @@ mod tests {
         let none = Viewport {
             uncut: &[],
             show_uncut: true,
+            section: Default::default(),
             ..off
         };
         assert_eq!(magenta(&none, size), 0);
@@ -3256,6 +3770,7 @@ mod tests {
             start_stock: None,
             uncut: &[],
             show_uncut: true,
+            section: Default::default(),
             frame: None,
         };
         let bounds = Rectangle {
@@ -3341,6 +3856,7 @@ mod tests {
             start_stock,
             uncut: &[],
             show_uncut: true,
+            section: Default::default(),
             frame: None,
         };
         let bounds = Rectangle {
@@ -3414,6 +3930,7 @@ mod tests {
             start_stock: None,
             uncut: &[],
             show_uncut: false,
+            section: Default::default(),
             frame: None,
         };
         let bounds = Rectangle {
@@ -3543,6 +4060,7 @@ mod tests {
             start_stock: None,
             uncut: &all,
             show_uncut: true,
+            section: Default::default(),
             frame: None,
         };
         let size = (300, 200);
@@ -3587,6 +4105,7 @@ mod tests {
         // Without the toggle the selection fills the face, as it did.
         let off = Viewport {
             show_uncut: false,
+            section: Default::default(),
             ..view
         };
         let (filled, _) = off.render(&p, size, 1., None, &features);
@@ -3624,6 +4143,7 @@ mod tests {
                 start_stock: None,
                 uncut,
                 show_uncut: true,
+                section: Default::default(),
                 frame: None,
             }
             .raster_key(bounds, None)
@@ -3672,6 +4192,7 @@ mod tests {
             start_stock: None,
             uncut: &[],
             show_uncut: true,
+            section: Default::default(),
             frame: None,
         };
         let bounds = Rectangle {
@@ -3753,6 +4274,7 @@ mod tests {
             start_stock: None,
             uncut: &[],
             show_uncut: true,
+            section: Default::default(),
             frame: None,
         };
         let p = Projector::fit(view.camera, (300., 200.), view.scene_bounds());
@@ -3892,6 +4414,7 @@ mod tests {
             start_stock: None,
             uncut: &[],
             show_uncut: true,
+            section: Default::default(),
             frame: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(860., 540.));
@@ -3919,6 +4442,12 @@ mod tests {
             (Point::new(9., 9.), 2.),
             (Point::new(2., 9.), 2.),
         ];
+        let vertices = SolidBox {
+            faces: (BOX_FACES.iter().enumerate())
+                .map(|(tone, f)| (f.map(|i| vertices[i]).to_vec(), tone as u8))
+                .collect(),
+            edges: BOX_EDGES.map(|(a, b)| (vertices[a], vertices[b])).to_vec(),
+        };
         let index = (5 * 12 + 5) * 4;
         for (depth, expected_unchanged) in [(3., true), (1., false)] {
             let mut pixels = [128u8, 128, 128, 255].repeat(144);
@@ -3927,7 +4456,7 @@ mod tests {
                 &vec![depth; 144],
                 12,
                 12,
-                vertices,
+                &vertices,
                 1.,
                 1.,
                 &mut SolidBuffers::default(),
@@ -3944,7 +4473,7 @@ mod tests {
             &vec![f32::NEG_INFINITY; 144],
             12,
             12,
-            vertices,
+            &vertices,
             1.,
             1.,
             &mut SolidBuffers::default(),
@@ -3991,6 +4520,7 @@ mod tests {
             start_stock: None,
             uncut: &[],
             show_uncut: true,
+            section: Default::default(),
             frame: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(400., 300.));
@@ -4055,6 +4585,7 @@ mod tests {
             start_stock: None,
             uncut: &[],
             show_uncut: true,
+            section: Default::default(),
             frame: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(500., 300.));
@@ -4115,6 +4646,7 @@ mod tests {
             start_stock: None,
             uncut: &[],
             show_uncut: true,
+            section: Default::default(),
             frame: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(500., 240.));
@@ -4167,6 +4699,7 @@ mod tests {
             start_stock: None,
             uncut: &[],
             show_uncut: true,
+            section: Default::default(),
             frame: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(800., 600.));
@@ -4217,6 +4750,7 @@ mod tests {
             start_stock: None,
             uncut: &[],
             show_uncut: true,
+            section: Default::default(),
             frame: None,
         };
         let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800., 600.));
@@ -4281,6 +4815,7 @@ mod tests {
             start_stock: None,
             uncut: &[],
             show_uncut: true,
+            section: Default::default(),
             frame: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(800., 600.));
@@ -4473,6 +5008,7 @@ mod tests {
             start_stock: None,
             uncut: &[],
             show_uncut: true,
+            section: Default::default(),
             frame: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(400., 300.));

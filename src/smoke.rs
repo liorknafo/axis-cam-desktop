@@ -2951,6 +2951,137 @@ flood = { pin = 8 }
             &out.join("9-manual-tap-step.png"),
         );
     }
+    /// The section's controls: on cuts across Z, an axis cuts square to it,
+    /// the slider and Flip move it, a click on a face while picking cuts
+    /// through that face, and off shows the whole part, keeping the plane.
+    #[test]
+    fn the_section_controls_cut_the_3d_view_on_an_axis_or_a_face() {
+        use crate::section::{Edit, Through};
+        let mut a = pocket_app(crate::pocket::hole_plate(false));
+        a.page = Page::Work;
+        let cut = |a: &App| crate::ui::scene_viewport(a).unwrap().section.cut;
+        assert_eq!(cut(&a), None);
+        let _ = a.update(Message::Section(Edit::Toggle));
+        let on = cut(&a).expect("the section is on");
+        assert_eq!(on.through, Through::Axis(2));
+        // The default view looks from above: the top half is cut away.
+        assert!(on.positive);
+        let _ = a.update(Message::Section(Edit::Axis(0)));
+        let across_x = cut(&a).unwrap();
+        assert_eq!(across_x.through, Through::Axis(0));
+        let _ = a.update(Message::Section(Edit::At(3.5)));
+        let _ = a.update(Message::Section(Edit::Flip));
+        let moved = cut(&a).unwrap();
+        assert_eq!((moved.at, moved.positive), (3.5, !across_x.positive));
+        // A click on a face while picking cuts through it.
+        let _ = a.update(Message::Section(Edit::PickFace));
+        assert!(crate::ui::scene_viewport(&a).unwrap().section.picking);
+        let _ = a.update(Message::Viewport(crate::viewport::Event::SectionSurface(1)));
+        let face = cut(&a).unwrap();
+        // It starts inside the part, behind the face, so the cut shows.
+        assert_eq!(face.through, Through::Surface(1));
+        assert!(face.at < 0., "{}", face.at);
+        assert!(!a.picking_section);
+        // The legend names the section's colours while it is on.
+        let legend = |a: &App| {
+            use iced::advanced::widget::Tree;
+            fn nodes(t: &Tree) -> usize {
+                1 + t.children.iter().map(nodes).sum::<usize>()
+            }
+            crate::ui::uncut_legend(a).map(|l| nodes(&Tree::new(l.as_widget())))
+        };
+        let with = legend(&a);
+        // Off shows the whole part; on again brings the plane back.
+        let _ = a.update(Message::Section(Edit::Toggle));
+        assert_eq!(cut(&a), None);
+        assert!(legend(&a) < with);
+        let _ = a.update(Message::Section(Edit::Toggle));
+        assert_eq!(cut(&a), Some(face));
+        // Not while picking: a click on the part picks no face for it.
+        let _ = a.update(Message::Viewport(crate::viewport::Event::SectionSurface(2)));
+        assert_eq!(cut(&a), Some(face));
+    }
+    /// A section set on one part, with Section still ticked on another (the
+    /// example opened after an imported part), cuts that one across Z
+    /// through its middle, and the controls edit that cut.
+    #[test]
+    fn a_section_left_on_another_part_cuts_this_one_across_z() {
+        use crate::section::{Edit, Through};
+        let mut a = pocket_app(crate::pocket::hole_plate(false));
+        a.page = Page::Work;
+        let _ = a.update(Message::Section(Edit::Toggle));
+        let _ = a.update(Message::Section(Edit::Axis(1)));
+        a.doc = Document::sample();
+        assert!(a.is_sample() && a.section_on);
+        let cut = a.view_section().expect("still cut");
+        assert_eq!((cut.through, cut.positive), (Through::Axis(2), true));
+        let height = a.sample_mesh.dimensions[2];
+        assert!(
+            (cut.at - height / 2.).abs() < 1e-3,
+            "{} of {height}",
+            cut.at
+        );
+        let _ = a.view();
+        let _ = a.update(Message::Section(Edit::At(5.)));
+        let moved = a.view_section().unwrap();
+        assert_eq!(
+            (moved.through, moved.at, moved.positive),
+            (Through::Axis(2), 5., true)
+        );
+    }
+    /// Pictures of the 3D view cut on a section, and of picking the face a
+    /// section goes through, in `$AXIS_RENDER_DIR` (default /tmp/section-app).
+    #[test]
+    #[ignore]
+    fn render_the_section_controls() {
+        use crate::section::Edit;
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/section-app".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let mut a = pocket_app(crate::pocket::hole_plate(false));
+        a.page = Page::Work;
+        let size = iced::Size::new(1600., 1100.);
+        let _ = a.update(Message::Section(Edit::Toggle));
+        let _ = a.update(Message::Section(Edit::Axis(1)));
+        let _ = a.view();
+        render_png(&a, size, &out.join("1-across-y.png"));
+        let _ = a.update(Message::Section(Edit::PickFace));
+        let _ = a.view();
+        render_png(&a, size, &out.join("2-picking-a-face.png"));
+        // The side wall that faces the viewer most, as a click picks it.
+        let toward = a.camera.toward();
+        let mesh = a.part_mesh().unwrap();
+        let wall = (0..mesh.surfaces.len())
+            .filter(|&i| mesh.surfaces[i].normal[2].abs() < 0.5)
+            .max_by(|&i, &j| {
+                let facing = |k: usize| {
+                    let n = mesh.surfaces[k].normal;
+                    (n[0] * toward[0] + n[1] * toward[1]) * mesh.surfaces[k].area
+                };
+                facing(i).total_cmp(&facing(j))
+            })
+            .unwrap();
+        let _ = a.update(Message::Viewport(crate::viewport::Event::SectionSurface(
+            wall,
+        )));
+        let _ = a.view();
+        render_png(&a, size, &out.join("3-face-picked.png"));
+        let _ = a.update(Message::Section(Edit::At(-8.)));
+        let _ = a.view();
+        render_png(&a, size, &out.join("4-face-slid-8mm-in.png"));
+        let _ = a.update(Message::Section(Edit::Flip));
+        let _ = a.view();
+        render_png(&a, size, &out.join("5-face-flipped.png"));
+        for (k, name) in [(0, "6-across-x.png"), (2, "7-across-z.png")] {
+            let _ = a.update(Message::Section(Edit::Axis(k)));
+            let _ = a.view();
+            render_png(&a, size, &out.join(name));
+        }
+        let _ = a.update(Message::ToggleStock);
+        let _ = a.view();
+        render_png(&a, size, &out.join("8-across-z-no-stock.png"));
+    }
     /// Pictures of a hole's outline under the pointer seen from above, on
     /// the outline and in the opening, and of the hole picked by a click.
     #[test]
