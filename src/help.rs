@@ -1975,7 +1975,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (Target::Tool, "teeth") => (
             "How many thread-form teeth the thread mill has stacked along its axis: 1 for a single-tooth mill, 3 for a three-tooth one.",
-            "Each turn round the hole, a three-tooth mill cuts three pitches of thread, so it goes round fewer times. Its teeth are spaced at one pitch, so it cuts only that pitch.",
+            "Each turn round the hole, a three-tooth mill cuts three pitches of thread, so it goes round fewer times. Its teeth are spaced at one pitch, so it cuts only that pitch. With three teeth in the cut at once it pushes harder: feed it about a third slower than a single tooth.",
             Some(Tool),
         ),
         (Target::Tool, "thread_angle") => (

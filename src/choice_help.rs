@@ -630,7 +630,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             STOCK_DETAIL_MORE,
         ),
         ("stock_detail", "Ultra") => (
-            "Use an adaptive octree up to depth 10: a 1024-cell span along the padded stock dimension. This shows the teeth of milled and tapped threads, and the smallest fillets, with the most surface triangles and the longest updates. Use it to inspect a thread, then go back to a lighter detail.",
+            "Use an adaptive octree up to depth 10: a 1024-cell span along the padded stock dimension. This shows the teeth of milled threads, and the smallest fillets, with the most surface triangles and the longest updates. Use it to inspect a thread, then go back to a lighter detail.",
             STOCK_DETAIL_MORE,
         ),
         _ => ("", ""),
