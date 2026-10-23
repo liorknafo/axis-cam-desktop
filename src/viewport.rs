@@ -2968,9 +2968,9 @@ fn raster_cap(
     }
     for (y, row) in rows.iter_mut().enumerate() {
         row.sort_by(f32::total_cmp);
-        for span in row.chunks_exact(2) {
-            let from = (span[0] - 0.5).ceil().clamp(0., w as f32) as u32;
-            let to = (span[1] - 0.5).ceil().clamp(0., w as f32) as u32;
+        for &[a, b] in row.as_chunks::<2>().0 {
+            let from = (a - 0.5).ceil().clamp(0., w as f32) as u32;
+            let to = (b - 0.5).ceil().clamp(0., w as f32) as u32;
             let y = y as u32;
             for x in from..to {
                 let index = (y * w + x) as usize;
