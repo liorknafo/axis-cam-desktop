@@ -148,6 +148,9 @@ pub enum Message {
     SelectSetup(usize),
     SelectOp(usize),
     SetupEditor,
+    /// The browser's "Stock after this setup": the 3D view shows the stock
+    /// the active setup's operations leave (`App::setup_end`).
+    SetupEnd,
     /// The workflow footer's 02 step.
     OperationsStep,
     /// The workflow footer's 03 step.
@@ -581,7 +584,8 @@ pub struct LeftStock {
     /// The first operation that could not be generated, by setup and index.
     pub broken: Option<(usize, usize)>,
     /// The `op_fingerprint` of each operation of each setup when this was
-    /// worked out: the stock it starts from stays good while it is the same.
+    /// worked out, and last of the setup's end: the stock it starts from, or
+    /// the setup leaves, stays good while it is the same.
     pub ops: Vec<Vec<u64>>,
     /// The `start_fingerprint` of each setup when this was worked out: a
     /// setup's box and `before` stay good while it is unchanged, whatever
@@ -705,7 +709,8 @@ fn start_fingerprint(doc: &Document, mesh: &mesh::Mesh, si: usize) -> Option<u64
 /// A fingerprint of what the stock operation `oi` of setup `si` of `doc`
 /// starts from depends on: what the setup's does (`start_fingerprint`) and
 /// the operations before it in the setup, but not it or those after it.
-/// None when it cannot be written.
+/// `oi` may be the number of operations: the stock the setup leaves. None
+/// when it cannot be written.
 pub(crate) fn op_fingerprint(
     doc: &Document,
     mesh: &mesh::Mesh,
@@ -838,7 +843,7 @@ fn leftover_stock(doc: &Document, mesh: &mesh::Mesh, key: u64) -> LeftStock {
         broken,
         ops: (doc.setups.iter().enumerate())
             .map(|(si, s)| {
-                (0..s.operations.len())
+                (0..=s.operations.len())
                     .map(|oi| op_fingerprint(doc, mesh, si, oi).unwrap_or_default())
                     .collect()
             })
@@ -937,6 +942,11 @@ pub struct App {
     /// Machine workspace (the Control page).
     pub cam_page: Page,
     pub selected: Option<usize>,
+    /// Whether the browser's "Stock after this setup" is selected: with no
+    /// operation selected, the 3D view shows the stock the active setup
+    /// leaves (`start_source`). Dropped with the selection
+    /// (`stop_selection`) and once an operation is selected.
+    pub setup_end: bool,
     pub tab: String,
     /// The setup editor's step shown (`ui::SETUP_STEPS`).
     pub setup_step: &'static str,
@@ -1647,6 +1657,7 @@ impl App {
             page: Page::Home,
             cam_page: Page::Home,
             selected: None,
+            setup_end: false,
             tab: "Tool".into(),
             setup_step: "Machine",
             status,
@@ -2711,20 +2722,27 @@ impl App {
             },
         )
     }
-    /// What the stock the selected operation starts from is, when the job
-    /// was worked out (`left_stock`) with the setups and operations before it
-    /// as they are now: its key, the job's stock and the setup and operation
-    /// whose cuts and later ones are not made yet. None for the example, on
-    /// another page than MANUFACTURE's, without a selected operation, while
-    /// that is not worked out, after an operation that failed and when
-    /// nothing is cut before it, where the setup's own stock is all there is.
+    /// What the stock the selected operation starts from is, or with "Stock
+    /// after this setup" selected (`setup_end`) the stock the setup leaves,
+    /// when the job was worked out (`left_stock`) with the setups and
+    /// operations before it as they are now: its key, the job's stock and
+    /// the setup and operation whose cuts and later ones are not made yet
+    /// (for the setup's end, one past its last). None for the example, on
+    /// another page than MANUFACTURE's, with neither selected, while that is
+    /// not worked out, after an operation that failed and when nothing is
+    /// cut before it, where the setup's own stock is all there is.
     pub(crate) fn start_source(
         &self,
     ) -> Option<(StartKey, std::sync::Arc<volume::Volume>, (u16, u16))> {
         if self.page != Page::Work || self.is_sample() {
             return None;
         }
-        let (si, oi) = (self.doc.index(), self.selected?);
+        let si = self.doc.index();
+        let oi = match self.selected {
+            Some(oi) => oi,
+            None if self.setup_end => self.doc.active_setup()?.operations.len(),
+            None => return None,
+        };
         let left = &self.left_stock;
         let key = op_fingerprint(&self.doc, self.part_mesh()?, si, oi)?;
         if left.ops.get(si)?.get(oi) != Some(&key) || left.broken.is_some_and(|b| b < (si, oi)) {
@@ -3960,6 +3978,7 @@ impl App {
     }
     fn stop_selection(&mut self) {
         self.selected = None;
+        self.setup_end = false;
         self.picking = false;
         self.playing = false;
         self.progress = 0.;
@@ -4001,6 +4020,10 @@ impl App {
         // Another operation or page closes the delete question.
         if self.selected != selected || self.page != page {
             self.confirm_delete_op = false;
+        }
+        // An operation selected, however, leaves the stock after the setup.
+        if self.selected.is_some() {
+            self.setup_end = false;
         }
         if self
             .pending
@@ -4212,11 +4235,16 @@ impl App {
             }
             Message::SetupEditor => {
                 self.selected = None;
+                self.setup_end = false;
                 self.page = Page::Work;
                 self.picking = false;
                 self.playing = false;
                 self.simulation = None;
                 self.progress = 0.;
+            }
+            Message::SetupEnd => {
+                let _ = self.update(Message::SetupEditor);
+                self.setup_end = true;
             }
             // The footer's 02 and 03 steps are navigation only: the operation
             // selected stays selected (the first when none is), and the
