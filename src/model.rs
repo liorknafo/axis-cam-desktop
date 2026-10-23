@@ -1178,13 +1178,20 @@ impl Operation {
     pub fn tool_types(&self, m: &Machine) -> Vec<&'static str> {
         const FLAT: &str = "Flat end mill";
         match self.strategy {
+            // A tap, on the manual mill or the lathe's centre.
+            Strategy::Drill if self.tapping() => vec!["Tap"],
             Strategy::Drill if self.on_centre(m) => vec!["Drill"],
             Strategy::Drill if self.drills_pin_holes() => vec!["Drill", FLAT],
             Strategy::Drill if self.helical() => vec![FLAT],
+            Strategy::Drill if self.thread_milling() => vec!["Thread mill"],
             Strategy::Drill => vec!["Drill", "Chamfer mill"],
-            Strategy::Turn => crate::lathe::tool_for(get(&self.p, "turn_kind"))
-                .into_iter()
-                .collect(),
+            // A Thread is cut by the threading tool, or by a die.
+            Strategy::Turn => {
+                let kind = get(&self.p, "turn_kind");
+                (crate::lathe::tool_for(kind).into_iter())
+                    .chain((kind == "Thread").then_some("Die"))
+                    .collect()
+            }
             Strategy::Face => vec![FLAT, "Face mill"],
             Strategy::Parallel => vec!["Ball end mill", FLAT],
             Strategy::Scallop | Strategy::Indexed | Strategy::Rotary | Strategy::FiveAxis => {
@@ -3378,6 +3385,10 @@ mod tests {
             Tool::new("Chamfer 6", "Chamfer mill", "6"),
             Tool::lathe("Turn", "Turning tool"),
             Tool::lathe("Bore", "Boring bar"),
+            Tool::new("Thread mill 4", "Thread mill", "4"),
+            Tool::new("Tap M6", "Tap", "6"),
+            Tool::lathe("Thread", "Threading tool"),
+            Tool::lathe("Die M6", "Die"),
         ];
         let m = Machine::new(3);
         let taken = |o: &Operation, m: &Machine| -> Vec<&str> {
@@ -3405,6 +3416,17 @@ mod tests {
         let mut turn = op(Strategy::Turn);
         turn.set_turn_kind("Bore");
         assert_eq!(taken(&turn, &lathe), ["Bore"]);
+        // Threads: a thread mill on the CNC, a tap by hand or from the
+        // tailstock, and a lathe's Thread cut by its tool or a die.
+        let mut milled = op(Strategy::Drill);
+        milled.p.insert("cycle".into(), THREAD_MILLING.into());
+        assert_eq!(taken(&milled, &m), ["Thread mill 4"]);
+        let mut tapped = op(Strategy::Drill);
+        tapped.p.insert("cycle".into(), TAPPING.into());
+        assert_eq!(taken(&tapped, &m), ["Tap M6"]);
+        assert_eq!(taken(&tapped, &lathe), ["Tap M6"]);
+        turn.set_turn_kind("Thread");
+        assert_eq!(taken(&turn, &lathe), ["Thread", "Die M6"]);
         // A Pocket with a drill says which tool to choose.
         let mut pocket = op(Strategy::Pocket);
         pocket.tool = tools[3].id.clone();
