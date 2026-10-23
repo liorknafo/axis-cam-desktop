@@ -1367,6 +1367,22 @@ pub fn command(m: &Message, label: String) -> Help {
             "Choose a folder and write one LinuxCNC .ngc program per setup. Every check and the replay run again first; nothing is written if any setup fails.",
             "",
         ),
+        Section(crate::section::Edit::Toggle) => (
+            "Cut the 3D view on a plane to see inside the part and the stock: what lies on one side of the plane is left out, and where the plane goes through the part or the stock its cut face is filled and hatched. Off again shows the whole scene; the plane is kept for next time. This changes the view only, not the job.",
+            "",
+        ),
+        Section(crate::section::Edit::Axis(_)) => (
+            "Cut square to this axis of the setup's frame, through the middle of the part, cutting away the side toward you. Slide the plane with the slider beside it.",
+            "",
+        ),
+        Section(crate::section::Edit::PickFace) => (
+            "Click a flat face of the part to cut through it: the plane is the face's own, and the slider moves it along the face's normal, into the part or out of it. Click again to stop picking.",
+            "",
+        ),
+        Section(crate::section::Edit::Flip) => {
+            ("Cut away the other side of the plane instead.", "")
+        }
+        Section(crate::section::Edit::At(_)) => ("Slide the plane across the scene.", ""),
         Camera("ISO") => (
             "Reset to an isometric view that shows the top and two sides. Drag to orbit, right-drag to pan, and scroll to zoom.",
             "",
@@ -4410,6 +4426,10 @@ mod tests {
             Scrub(0.),
             ToggleStock,
             ToggleUncut,
+            Section(crate::section::Edit::Toggle),
+            Section(crate::section::Edit::Axis(0)),
+            Section(crate::section::Edit::PickFace),
+            Section(crate::section::Edit::Flip),
             TogglePaths,
             Plan,
             PlanCancel,

@@ -2149,6 +2149,10 @@ pub(crate) fn scene_viewport(app: &App) -> Option<Viewport<'_>> {
             .map(|found| found.faces.as_slice())
             .unwrap_or(&[]),
         show_uncut: app.show_uncut,
+        section: viewport::Sectioning {
+            cut: app.view_section(),
+            picking: app.picking_section,
+        },
         frame: None,
     })
 }
@@ -2234,6 +2238,60 @@ fn no_scene(app: &App) -> Element<'_, Message> {
     container(column![bold(if app.import_busy { "Loading geometry…" } else if !app.doc.has_model() { "Import your part" } else { "Model preview unavailable" },25),muted(app.doc.file.as_ref().map(|f|f.name.clone()).unwrap_or_default()),note(app.import_error.clone().unwrap_or_else(|| "Import STEP, STP, 3MF, STL or OBJ to view your model. Geometry loads in the background; a STEP conversion may take up to two minutes.".into())),primary("Import model",Message::Import),secondary("Start screen",Message::Page(Page::Home))].spacing(20).max_width(380)).center(Fill).into()
 }
 /// The 3D view's toolbar and the simulation strip under it.
+/// The section's controls under the 3D view while it is on: the axis it is
+/// square to or the face it goes through, the slider that moves it across
+/// the scene, where it is, and the side cut away. None while it is off.
+fn section_controls(app: &App) -> Option<Element<'_, Message>> {
+    use crate::section::{AXES, Edit, Through};
+    if !app.section_on {
+        return None;
+    }
+    let view = scene_viewport(app)?;
+    let cut = view.section.cut;
+    let mut controls = row![muted("Cut").size(12)]
+        .spacing(2)
+        .align_y(Alignment::Center);
+    for (k, name) in AXES.iter().enumerate() {
+        let on = !app.picking_section && cut.is_some_and(|c| c.through == Through::Axis(k));
+        controls = controls.push(btn(*name, Message::Section(Edit::Axis(k)), on));
+    }
+    let on_face = cut.is_some_and(|c| matches!(c.through, Through::Surface(_)));
+    controls = controls.push(btn(
+        "Face…",
+        Message::Section(Edit::PickFace),
+        app.picking_section || on_face,
+    ));
+    let Some((cut, (low, high))) =
+        cut.and_then(|c| Some((c, c.range(view.mesh, view.setup, view.scene_bounds())?)))
+    else {
+        return Some(
+            controls
+                .push(space().width(8))
+                .push(muted("Click a face of the part to cut through it.").size(12))
+                .into(),
+        );
+    };
+    let high = high.max(low + 0.1);
+    Some(
+        controls
+            .push(space().width(8))
+            .push(help::wrap(
+                slider(low..=high, cut.at.clamp(low, high), |at| {
+                    Message::Section(Edit::At(at))
+                })
+                .step(0.1_f32)
+                .width(Length::Fixed(170.)),
+                help::command(&Message::Section(Edit::At(cut.at)), "Section plane".into()),
+                widget::tooltip::Position::Top,
+            ))
+            .push(space().width(8))
+            .push(muted(cut.place()).size(12))
+            .push(space().width(Fill))
+            .push(muted(format!("Cut away: {}", cut.side())).size(12))
+            .push(btn("Flip", Message::Section(Edit::Flip), false))
+            .into(),
+    )
+}
 fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
     let detail = if app.is_sample() {
         "Sample housing · selectable demo geometry".to_string()
@@ -2267,6 +2325,17 @@ fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
         ),
         uncut_toggle(app),
         help::wrap(
+            checkbox(app.section_on)
+                .label("Section")
+                .on_toggle(|_| Message::Section(crate::section::Edit::Toggle))
+                .text_size(12),
+            help::command(
+                &Message::Section(crate::section::Edit::Toggle),
+                "Section".into()
+            ),
+            widget::tooltip::Position::Top
+        ),
+        help::wrap(
             checkbox(app.paths)
                 .label(if app.is_sample() {
                     "Sample paths"
@@ -2291,10 +2360,13 @@ fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
     let toolbar = container(
         column![
             toggles,
+            section_controls(app),
             muted(detail).size(12),
             uncut_line(app).map(|line| muted(line).size(12)),
             uncut_legend(app),
-            muted(if app.picking {
+            muted(if app.picking_section && app.section_on {
+                "Click a face of the part to cut through it · drag to orbit"
+            } else if app.picking {
                 "Click a highlighted feature to select it · drag to orbit"
             } else {
                 "Drag to orbit · right-drag to pan · scroll to zoom"
@@ -9323,6 +9395,7 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             start_stock: None,
             uncut: &[],
             show_uncut: true,
+            section: Default::default(),
             frame: None,
         }
         .view(380);
