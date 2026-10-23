@@ -4301,30 +4301,16 @@ impl App {
                     return Task::none();
                 }
                 let machine = &self.doc.setup().machine;
-                let Some(tool) = self
-                    .doc
-                    .tools
-                    .iter()
-                    .find(|t| {
-                        t.fits(machine)
-                            && if strategy == Strategy::Drill {
-                                get(&t.p, "type") == "Drill"
-                            } else if strategy == Strategy::Turn {
-                                // The default kind, Outside, turns with a turning tool.
-                                Some(get(&t.p, "type")) == lathe::tool_for("Outside")
-                            } else if strategy == Strategy::Parallel {
-                                get(&t.p, "type") == "Ball end mill"
-                            } else {
-                                get(&t.p, "type") == "Flat end mill"
-                                    || (strategy == Strategy::Face
-                                        && get(&t.p, "type") == "Face mill")
-                            }
-                    })
-                    .or(self
-                        .doc
-                        .tools
-                        .first()
-                        .filter(|_| strategy != Strategy::Turn))
+                let mut operation = Operation::for_machine(strategy, String::new(), machine);
+                // The first tool of the operation's first type, else of
+                // another type it takes (`Operation::tool_types`).
+                let types = operation.tool_types(machine);
+                let fitting = |t: &&model::Tool| t.fits(machine) && operation.takes(t, machine);
+                let Some(tool) = (self.doc.tools.iter())
+                    .filter(fitting)
+                    .find(|t| types.first() == Some(&get(&t.p, "type")))
+                    .or_else(|| self.doc.tools.iter().find(fitting))
+                    .cloned()
                 else {
                     self.page = Page::Tools;
                     self.pending = Some((Page::Tools, Message::AddOp(strategy)));
@@ -4335,7 +4321,7 @@ impl App {
                     );
                     return Task::none();
                 };
-                let mut operation = Operation::for_machine(strategy, tool.id.clone(), machine);
+                operation.tool = tool.id.clone();
                 operation
                     .p
                     .insert("coolant".into(), control::default_coolant(machine).into());
