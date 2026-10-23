@@ -1968,6 +1968,16 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "",
             Some(LatheTool(5)),
         ),
+        (Target::Tool, "shank") => (
+            "The diameter of the thread mill's shank, the part the collet holds, in mm.",
+            "Often wider than the cutter: a Ø4.8 mill on a Ø6 shank. Choose a collet of this size.",
+            Some(Tool),
+        ),
+        (Target::Tool, "teeth") => (
+            "How many thread-form teeth the thread mill has stacked along its axis: 1 for a single-tooth mill, 3 for a three-tooth one.",
+            "Each turn round the hole, a three-tooth mill cuts three pitches of thread, so it goes round fewer times. Its teeth are spaced at one pitch, so it cuts only that pitch.",
+            Some(Tool),
+        ),
         (Target::Tool, "thread_angle") => (
             "The included angle of the thread form, in degrees: 60 for metric and unified threads, 55 for Whitworth.",
             "",
@@ -1975,7 +1985,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (Target::Tool, "pitches") => (
             "The finest and coarsest pitch the threading tool or thread mill cuts, in mm, written like 0.5-3.",
-            "A thread mill has a single tooth, so one cuts any pitch in its range: the mill follows the pitch, not the tooth.",
+            "A single-tooth thread mill cuts any pitch in its range: the mill follows the pitch, not the tooth. One with teeth stacked along it cuts only the pitch they are spaced at: enter that one pitch.",
             Some(LatheTool(7)),
         ),
         (Target::Tool, "thread") => (
@@ -4329,6 +4339,7 @@ mod tests {
             StockDetail(Detail::Draft),
             StockDetail(Detail::Standard),
             StockDetail(Detail::Fine),
+            StockDetail(Detail::Ultra),
             SetupEditor,
             SetupStep("Machine"),
             SetupStep("Stock"),

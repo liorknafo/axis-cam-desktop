@@ -151,7 +151,9 @@ fn pack(cut: &Cut, reference: Frame) -> GpuCut {
         CutterShape::Ball => 1.,
         CutterShape::Drill | CutterShape::Chamfer(_) => 2.,
         CutterShape::Revolve => 3.,
+        CutterShape::Thread { .. } => 4.,
     };
+    let (pitch, teeth, cot) = cut.shape.teeth().unwrap_or((0., 0., 0.));
     GpuCut {
         m: std::array::from_fn(|k| {
             [
@@ -167,22 +169,27 @@ fn pack(cut: &Cut, reference: Frame) -> GpuCut {
             cut.b[2] - cut.a[2],
             cut.radius,
         ],
-        e: [cut.flute, cut.shape.rise().unwrap_or(0.), code, 0.],
-        g: [cut.a[0], cut.b[0], cut.a[1], cut.b[1]],
+        e: [cut.flute, cut.shape.rise().unwrap_or(0.), code, pitch],
+        g: if teeth > 0. {
+            [teeth, cot, 0., 0.]
+        } else {
+            [cut.a[0], cut.b[0], cut.a[1], cut.b[1]]
+        },
     }
 }
 /// The box of the stock's frame `reference` around what `cut` can remove.
 fn reach(cut: &Cut, reference: Frame) -> Bounds {
+    let (below, above) = cut.shape.span();
     let local = cut.ring().unwrap_or_else(|| Bounds {
         min: [
             cut.a[0].min(cut.b[0]) - cut.radius,
             cut.a[1].min(cut.b[1]) - cut.radius,
-            cut.a[2].min(cut.b[2]),
+            cut.a[2].min(cut.b[2]) - below,
         ],
         max: [
             cut.a[0].max(cut.b[0]) + cut.radius,
             cut.a[1].max(cut.b[1]) + cut.radius,
-            cut.a[2].max(cut.b[2]) + cut.flute,
+            cut.a[2].max(cut.b[2]) + cut.flute.max(above),
         ],
     });
     cut.frame.transfer_bounds(local, reference)
@@ -786,6 +793,11 @@ mod tests {
             CutterShape::Ball,
             CutterShape::Drill,
             CutterShape::Chamfer(900),
+            CutterShape::Thread {
+                pitch: 1250,
+                teeth: 3,
+                angle: 60,
+            },
         ] {
             cases.push((
                 format!("{shape:?} ramps and plunges"),

@@ -2722,6 +2722,108 @@ flood = { pin = 8 }
         let _ = a.view();
         render_png(&a, size, &out.join("5-from-above.png"));
     }
+    /// Renders the owner's 3-tooth thread mill milling the M6 holes to
+    /// `$AXIS_RENDER_DIR` (default /tmp/threading): the cutter over the part
+    /// between holes, and the threads it leaves at Ultra detail, at the
+    /// zooms in `$AXIS_ZOOMS` ("zoom,x,y[,pitch];..." about a pixel). Not a check:
+    /// run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_a_three_tooth_thread_mill() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/threading".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let mut a = threaded_app();
+        for t in a.doc.tools.iter_mut() {
+            let (pitch, shank) = match t.name() {
+                "Thread mill Ø4.8 DLC" => ("1", "6"),
+                "Thread mill Ø4 DLC" => ("0.8", "4"),
+                "Thread mill Ø3.15 DLC" => ("0.7", "4"),
+                _ => continue,
+            };
+            for (k, v) in [
+                ("pitches", pitch),
+                ("shank", shank),
+                ("teeth", "3"),
+                ("flutes", "4"),
+                ("length", "3"),
+                ("stickout", "35"),
+            ] {
+                t.p.insert(k.into(), v.into());
+            }
+        }
+        // The demo's stock: the part's box, 1 mm over its top.
+        for (k, v) in [
+            ("stock_top", "1"),
+            ("stock_bottom", "0"),
+            ("stock_left", "0"),
+            ("stock_right", "0"),
+            ("stock_front", "0"),
+            ("stock_back", "0"),
+        ] {
+            a.doc.setup_mut().p.insert(k.into(), v.into());
+        }
+        a.page = Page::Work;
+        let _ = a.update(Message::AddThreading);
+        let m6 = (a.doc.setup().operations.iter())
+            .position(|o| o.name() == "M6×1 · thread")
+            .unwrap();
+        let _ = a.update(Message::SelectOp(m6));
+        let _ = a.update(Message::Tab("Cycle".into()));
+        let _ = a.update(Message::StockDetail(crate::stock_surface::Detail::Ultra));
+        let _ = a.update(Message::Generate);
+        eprintln!("after generate: {}", a.status);
+        let mesh = |a: &mut App, at: f32| {
+            let _ = a.update(Message::Scrub(at));
+            let key = a.stock_mesh_key().unwrap();
+            let sim = a.active_simulation().unwrap();
+            let result = crate::stock_surface::Snapshot::of(
+                sim.volume.as_ref().unwrap(),
+                crate::stock_surface::Detail::Ultra,
+            )
+            .build()
+            .map(std::sync::Arc::new);
+            let seconds = sim.seconds;
+            a.stock_mesh_job = None;
+            let _ = a.update(Message::StockMeshed {
+                key,
+                seconds,
+                result,
+            });
+        };
+        // Between the holes: the first move over the part after the first
+        // hole's thread.
+        let plan = &a.active_simulation().unwrap().plan;
+        let top = plan.stock.max[2];
+        let first = plan.moves.iter().position(|m| m.cutting_pass).unwrap();
+        let over = (plan.moves[first..].iter())
+            .find(|m| !m.cutting_pass && m.from[2] > top + 1. && m.to[2] > top + 1.)
+            .unwrap();
+        let between = (over.start + over.end) / 2. / plan.duration;
+        eprintln!("cutter over the part at {between}, tip z {}", over.from[2]);
+        let size = iced::Size::new(1600., 1000.);
+        let zooms = std::env::var("AXIS_ZOOMS").unwrap_or("1,0,0".into());
+        for (name, at) in [("between", between), ("done", 1.)] {
+            mesh(&mut a, at);
+            for (k, z) in zooms.split(';').enumerate() {
+                let v: Vec<f32> = z.split(',').map(|n| n.parse().unwrap()).collect();
+                a.camera = Default::default();
+                if let Some(pitch) = v.get(3) {
+                    a.camera.pitch = *pitch;
+                }
+                let mut zoom = 1.;
+                while zoom < v[0] {
+                    // About the pixel `v[1..]` from the unpanned centre.
+                    let at = [v[1] - a.camera.pan[0], v[2] - a.camera.pan[1]];
+                    let _ = a.update(Message::Viewport(crate::viewport::Event::Zoom(0.25, at)));
+                    zoom *= 1.25;
+                }
+                let _ = a.view();
+                render_png(&a, size, &out.join(format!("3t-{name}-{k}.png")));
+            }
+        }
+    }
     /// The threaded plate on the manual mill with the owner's kind of taps
     /// and drills, after Add threading; when `faced`, a Box first faces the
     /// stock down to the plate's top (8 mm under the stock's), so the holes'

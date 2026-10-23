@@ -519,6 +519,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
             .filter(|v| *v >= reach)
             .unwrap_or(reach),
         holder_radius: radius.max(0.05),
+        neck: None,
         display_scale: resolved.display_scale,
         duration: cut.duration,
         target,

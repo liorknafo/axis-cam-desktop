@@ -487,13 +487,15 @@ mod tests {
         let mesh = crate::mesh::load(&path).unwrap();
         let machine = crate::control::owners_machine(&dir).unwrap();
         let mut tools = vec![];
-        // LUOCUT DLC set B0CZNRWQ5V: cutting Ø, pitches, reach (L1).
-        for (n, (d, pitches, reach)) in [
-            ("2.35", "0.3-0.5", "8"),
-            ("3.15", "0.5-0.8", "10"),
-            ("4", "0.5-1", "12"),
-            ("4.8", "0.5-1.25", "15"),
-            ("6", "0.5-1.25", "16"),
+        // The owner's 3-tooth thread mills: cutting Ø, the one pitch their
+        // teeth are spaced at (a guess, M3 to M8, until read off the
+        // shanks), reach (L1), shank Ø.
+        for (n, (d, pitches, reach, shank)) in [
+            ("2.35", "0.5", "8", "4"),
+            ("3.15", "0.7", "10", "4"),
+            ("4", "0.8", "12", "4"),
+            ("4.8", "1", "16", "6"),
+            ("6", "1.25", "16", "6"),
         ]
         .into_iter()
         .enumerate()
@@ -505,7 +507,10 @@ mod tests {
                 &[
                     ("pitches", pitches),
                     ("reach", reach),
-                    ("length", "1"),
+                    ("teeth", "3"),
+                    ("shank", shank),
+                    ("flutes", "4"),
+                    ("length", "3"),
                     ("stickout", "35"),
                     ("number", &(10 + n).to_string()),
                 ],

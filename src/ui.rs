@@ -8001,8 +8001,10 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
                     &["60", "55"],
                     t,
                 ))
+                .push(field(p, "teeth", "Teeth (stacked along it)", t))
                 .push(field(p, "pitches", "Pitches · mm (e.g. 0.5-1.25)", t))
-                .push(field(p, "reach", "Reach (neck) · mm", t));
+                .push(field(p, "reach", "Reach (neck) · mm", t))
+                .push(field(p, "shank", "Shank diameter · mm", t));
         }
         "Tap" => {
             let sizes: Vec<&str> = crate::thread::SPECS.iter().map(|s| s.name).collect();

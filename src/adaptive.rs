@@ -1245,6 +1245,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
             flute_length: job.flute_length,
             tool_length: job.tool_length,
             holder_radius: job.holder_radius,
+            neck: None,
             display_scale: job.scale,
             duration: 0.,
             target: zones

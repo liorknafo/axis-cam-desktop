@@ -541,6 +541,20 @@ impl Tool {
                 if self.thread_pitches().is_none() {
                     e.push("Pitches must be a range of positive pitches, like 0.5-1.25.".into())
                 }
+                if self.p.contains_key("teeth")
+                    && !num(&self.p, "teeth")
+                        .is_some_and(|n| n.fract() == 0. && (1. ..=10.).contains(&n))
+                {
+                    e.push("Teeth must be a whole number from 1 to 10.".into())
+                }
+                if self.thread_teeth() > 1
+                    && self.thread_pitches().is_some_and(|(a, b)| b - a > 1e-4)
+                {
+                    e.push(TEETH_ONE_PITCH.into())
+                }
+                if self.p.contains_key("shank") {
+                    positive(&self.p, "shank", &mut e);
+                }
                 positive(&self.p, "reach", &mut e);
                 if num(&self.p, "reach") > num(&self.p, "stickout") {
                     e.push(
@@ -635,6 +649,13 @@ impl Tool {
         let (lo, hi) = (lo.parse::<f32>().ok()?, hi.parse::<f32>().ok()?);
         (lo.is_finite() && hi.is_finite() && lo > 0. && lo <= hi).then_some((lo, hi))
     }
+    /// A thread mill's teeth stacked along its axis: 1 for a single-profile
+    /// mill (and when not saved or not a whole number from 1 to 10).
+    pub fn thread_teeth(&self) -> usize {
+        num(&self.p, "teeth")
+            .filter(|n| n.fract() == 0. && (1. ..=10.).contains(n))
+            .map_or(1, |n| n as usize)
+    }
     /// A chamfer mill's included tip angle in degrees (90 when not saved),
     /// None when it is outside 20–160°.
     pub fn tip_angle(&self) -> Option<f32> {
@@ -708,6 +729,9 @@ pub const THREAD_HANDS: [&str; 3] = [FROM_MODEL, "Right hand", "Left hand"];
 /// Thread milling is for a CNC: the manual mill moves one axis at a time.
 pub const THREAD_MILL_ON_HAND: &str = "Thread milling needs a CNC: it moves round the hole and up at once. Tap the hole by hand instead (Tapping).";
 /// The CNC does not tap: its spindle and feed are not synchronised.
+/// A thread mill with teeth stacked along it cuts the one pitch they are
+/// spaced at.
+pub const TEETH_ONE_PITCH: &str = "A thread mill with more than one tooth cuts only the pitch its teeth are spaced at: enter that one pitch, like 1 (it is usually marked on the shank).";
 pub const TAP_ON_CNC: &str = "The CNC cannot tap: its spindle and feed are not synchronised. Mill the thread with a thread mill (Thread milling), or tap it by hand on the manual mill.";
 /// The mill tools with keys of their own beyond a mill's sizes, and those
 /// keys' starting values (`Tool::set_type`).
@@ -717,6 +741,8 @@ pub fn mill_tool_defaults(kind: &str) -> &'static [(&'static str, &'static str)]
             ("thread_angle", "60"),
             ("pitches", "0.5-1.25"),
             ("reach", "12"),
+            ("teeth", "1"),
+            ("shank", "6"),
             ("flutes", "4"),
         ],
         "Tap" => &[

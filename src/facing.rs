@@ -299,6 +299,7 @@ pub(crate) fn outline(f: Outline) -> Result<Plan, String> {
         flute_length: f.flute_length,
         tool_length: f.tool_length,
         holder_radius: f.holder_radius,
+        neck: None,
         display_scale: f.scale,
         duration: 0.,
         target: f.target,

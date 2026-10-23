@@ -321,16 +321,17 @@ impl Volume {
             if (0..3).all(|k| (a[k] - b[k]).abs() < 1e-7) {
                 return None;
             }
+            let (below, above) = shape.span();
             (
                 [
                     a[0].min(b[0]) - radius,
                     a[1].min(b[1]) - radius,
-                    a[2].min(b[2]),
+                    a[2].min(b[2]) - below,
                 ],
                 [
                     a[0].max(b[0]) + radius,
                     a[1].max(b[1]) + radius,
-                    a[2].max(b[2]) + flute,
+                    a[2].max(b[2]) + flute.max(above),
                 ],
             )
         };
@@ -479,6 +480,13 @@ pub(crate) fn swept(
     } else {
         ((p[0] - a[0]) * v[0] + (p[1] - a[1]) * v[1]) / l2
     };
+    if shape.teeth().is_some() {
+        // A thread mill's teeth, along a move that rises little: as far
+        // from the move's track as its tip radius, wherever along the rise.
+        let t = projection.clamp(0., 1.);
+        let rho = (p[0] - a[0] - t * v[0]).hypot(p[1] - a[1] - t * v[1]);
+        return shape.thread_field(rho, p[2] - a[2].min(b[2]), v[2].abs(), r) <= 0.00001;
+    }
     let perp =
         (p[0] - a[0] - projection * v[0]).powi(2) + (p[1] - a[1] - projection * v[1]).powi(2);
     if perp > r * r {
@@ -529,8 +537,8 @@ pub(crate) fn swept(
             CutterShape::Ball => r - (r * r - radial).max(0.).sqrt(),
             CutterShape::Flat => 0.,
             CutterShape::Drill | CutterShape::Chamfer(_) => rise * radial.sqrt(),
-            // Rings return above.
-            CutterShape::Revolve => 0.,
+            // Rings and thread mills return above.
+            CutterShape::Revolve | CutterShape::Thread { .. } => 0.,
         };
     p[2] >= bottom - 0.00001
 }

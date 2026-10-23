@@ -255,6 +255,7 @@ impl Builder {
                 flute_length,
                 tool_length,
                 holder_radius: positive("holder")? / 2.,
+                neck: None,
                 display_scale: stock.display_scale,
                 duration: 0.,
                 target: top,
@@ -2415,7 +2416,26 @@ fn thread_mill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resul
         .ok_or("Enter the thread mill's pitches, like 0.5-1.25.")?;
     let angle = num(&tool.p, "thread_angle").ok_or("Enter the thread mill's thread angle.")?;
     let reach = num(&tool.p, "reach").ok_or("Enter the thread mill's reach.")?;
+    let teeth = tool.thread_teeth();
+    if teeth > 1 && coarsest - finest > 1e-4 {
+        return Err(crate::model::TEETH_ONE_PITCH.into());
+    }
+    // The sweep is the teeth: each as tall as the coarsest pitch it cuts.
+    b.plan.shape = CutterShape::Thread {
+        pitch: (coarsest * 1000.).round().clamp(1., f32::from(u16::MAX)) as u16,
+        teeth: teeth as u8,
+        angle: angle.round() as u8,
+    };
     let r = b.plan.radius;
+    // Its body, as drawn: the neck as narrow as the teeth's roots up to its
+    // reach, then the shank (as wide as the teeth when not saved).
+    b.plan.neck = Some([
+        (r - crate::simulation::THREAD_TOOTH * coarsest).max(r * 0.3),
+        reach,
+        num(&tool.p, "shank")
+            .filter(|d| *d > 0.)
+            .map_or(r, |d| d / 2.),
+    ]);
     // Climb inside a hole: counterclockwise with the spindle clockwise.
     let turn = if b.plan.spindle_clockwise { 1. } else { -1. };
     b.plan.milling_direction = crate::forces::THREAD_MILLING_DIRECTION;
@@ -2485,10 +2505,13 @@ fn thread_mill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resul
         } else {
             t.bottom
         };
+        // The teeth above the lowest cut the thread's last pitches: the
+        // lowest stops that much short of the mouth, a turn at the least.
+        let short = (mouth - (teeth - 1) as f32 * t.pitch).max(end + t.pitch);
         let (start, stop) = if rise > 0. {
-            (end, mouth)
+            (end, short)
         } else {
-            (mouth, end)
+            (short, end)
         };
         let segments = (std::f32::consts::PI / (1. - tolerance.min(full) / full.max(1e-3)).acos())
             .ceil()
@@ -6118,6 +6141,86 @@ pub(crate) mod tests {
         }
     }
     #[test]
+    fn a_three_tooth_mill_cuts_the_teeth_of_the_thread_in_fewer_turns() {
+        let mut three = thread_mill_tool("4");
+        three.p.insert("pitches".into(), "1".into());
+        three.p.insert("teeth".into(), "3".into());
+        let mut feeds = vec![];
+        for tool in [thread_mill_tool("4"), three] {
+            let (result, _, (_, stock)) = threaded_doc(
+                Machine::new(3),
+                "4.9",
+                Some("5"),
+                tool,
+                crate::model::THREAD_MILLING,
+                |_| {},
+            );
+            let sim = result.unwrap();
+            feeds.push(sim.plan.moves.iter().filter(|m| m.cutting_pass).count());
+            let cuts: Vec<_> = stock
+                .unwrap()
+                .cuts
+                .iter()
+                .filter(|c| c.shape.teeth().is_some())
+                .cloned()
+                .collect();
+            // One M6×1 hole's orbit: its centre, and how far up it runs.
+            let ys: Vec<f32> = cuts.iter().map(|c| c.b[1]).collect();
+            let split = (ys.iter().copied().fold(f32::INFINITY, f32::min)
+                + ys.iter().copied().fold(f32::NEG_INFINITY, f32::max))
+                / 2.;
+            let one: Vec<_> = cuts.iter().filter(|c| c.b[1] < split).collect();
+            let extent = |k: usize| {
+                let v = one.iter().map(|c| c.b[k]);
+                (
+                    v.clone().fold(f32::INFINITY, f32::min),
+                    v.fold(f32::NEG_INFINITY, f32::max),
+                )
+            };
+            let (x, y, z) = (extent(0), extent(1), extent(2));
+            let centre = [(x.0 + x.1) / 2., (y.0 + y.1) / 2.];
+            let cut = |rho: f32, z: f32| {
+                let p = [centre[0] + rho, centre[1], z];
+                one.iter()
+                    .any(|c| crate::volume::swept(p, c.a, c.b, c.radius, c.flute, c.shape))
+            };
+            // Down the thread, between its major and minor radius, the
+            // teeth's grooves and the crests left between them alternate
+            // a pitch apart; past the major radius nothing is cut.
+            let samples: Vec<bool> = (0..200)
+                .map(|k| cut(2.75, z.0 + 1. + k as f32 * 0.03))
+                .collect();
+            let grooves = samples.iter().filter(|&&c| c).count();
+            let changes = samples.windows(2).filter(|w| w[0] != w[1]).count();
+            assert!((50..150).contains(&grooves), "{grooves} of 200 cut");
+            // 6 mm down the thread: 6 grooves, each in and out.
+            assert!((10..=14).contains(&changes), "{changes} changes");
+            assert!((0..200).all(|k| !cut(3.1, z.0 + 1. + k as f32 * 0.03)));
+            assert!(z.1 - z.0 > 5.);
+        }
+        // The two teeth above the lowest cut the last two turns.
+        assert!(feeds[1] < feeds[0], "{feeds:?}");
+    }
+    #[test]
+    fn a_three_tooth_mill_with_a_range_of_pitches_is_refused() {
+        let mut three = thread_mill_tool("4");
+        three.p.insert("teeth".into(), "3".into());
+        assert!(
+            three
+                .issues()
+                .contains(&crate::model::TEETH_ONE_PITCH.to_string())
+        );
+        let (result, _) = threaded_job(
+            Machine::new(3),
+            "4.9",
+            Some("5"),
+            three,
+            crate::model::THREAD_MILLING,
+            |_| {},
+        );
+        assert_eq!(result.err().as_deref(), Some(crate::model::TEETH_ONE_PITCH));
+    }
+    #[test]
     fn a_milled_thread_is_no_gouge() {
         // The M6 holes (bore Ø4.9): drilled Ø5, their tap drill, then milled
         // to their roots by a Ø4 thread mill. Both cut cells of the part's
@@ -6197,15 +6300,47 @@ pub(crate) mod tests {
             std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/threading".into()),
         );
         std::fs::create_dir_all(&out).unwrap();
-        let (result, mesh, (doc, _)) = threaded_doc(
+        // The owner's 3-tooth Ø4 mill, its teeth a pitch apart.
+        let mut tool = thread_mill_tool("4");
+        tool.p.insert("pitches".into(), "1".into());
+        tool.p.insert("teeth".into(), "3".into());
+        let (result, mesh, (doc, stock)) = threaded_doc(
             Machine::new(3),
             "4.9",
             Some("5"),
-            thread_mill_tool("4"),
+            tool,
             crate::model::THREAD_MILLING,
             |_| {},
         );
         let plan = result.unwrap().plan;
+        // The stock it leaves, at each detail.
+        let stock = stock.unwrap();
+        for detail in [
+            crate::stock_surface::Detail::Standard,
+            crate::stock_surface::Detail::Ultra,
+        ] {
+            let surface = crate::stock_surface::Snapshot::of(&stock, detail)
+                .build()
+                .unwrap();
+            let mut f = std::fs::File::create(out.join(format!("stock_{detail}.stl"))).unwrap();
+            writeln!(f, "solid stock").unwrap();
+            for t in &surface.triangles {
+                writeln!(f, "facet normal 0 0 0\nouter loop").unwrap();
+                for i in t {
+                    // The first setup's frame: the moves'.
+                    let p = surface.vertices[*i];
+                    writeln!(f, "vertex {} {} {}", p[0], p[1], p[2]).unwrap();
+                }
+                writeln!(f, "endloop\nendfacet").unwrap();
+            }
+            writeln!(f, "endsolid stock").unwrap();
+            eprintln!(
+                "{detail}: {} triangles, {:.3} mm cells, {} ms",
+                surface.triangles.len(),
+                surface.cell_mm,
+                surface.milliseconds
+            );
+        }
         let mut f = std::fs::File::create(out.join("m6_path.csv")).unwrap();
         for m in &plan.moves {
             writeln!(

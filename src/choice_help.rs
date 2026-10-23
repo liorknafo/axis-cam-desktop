@@ -629,6 +629,10 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "Use an adaptive octree up to depth 9: a 512-cell span along the padded stock dimension. This resolves smaller curved features with more surface triangles and longer updates. No dense 512³ grid is stored. Features below the finest cell can still be missed.",
             STOCK_DETAIL_MORE,
         ),
+        ("stock_detail", "Ultra") => (
+            "Use an adaptive octree up to depth 10: a 1024-cell span along the padded stock dimension. This shows the teeth of milled and tapped threads, and the smallest fillets, with the most surface triangles and the longest updates. Use it to inspect a thread, then go back to a lighter detail.",
+            STOCK_DETAIL_MORE,
+        ),
         _ => ("", ""),
     };
     let mut body = body.to_string();

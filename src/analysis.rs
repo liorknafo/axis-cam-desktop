@@ -177,6 +177,10 @@ pub struct ToolReport {
     /// How deep a thread mill's neck lets it reach, mm.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reach: Option<f32>,
+    /// A thread mill's teeth stacked along it, when more than one: it cuts
+    /// only the pitch they are spaced at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub teeth: Option<usize>,
     /// A tap's thread size.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,
@@ -1353,6 +1357,8 @@ fn describe(
                     reach: (get(&t.p, "type") == "Thread mill")
                         .then(|| num(&t.p, "reach"))
                         .flatten(),
+                    teeth: (get(&t.p, "type") == "Thread mill" && t.thread_teeth() > 1)
+                        .then(|| t.thread_teeth()),
                     thread: t.tap_spec().map(|s| s.name.to_string()),
                 })
             })
