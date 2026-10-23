@@ -987,6 +987,34 @@ impl Operation {
     pub fn name(&self) -> &str {
         get(&self.p, "name")
     }
+    /// The tool types this operation cuts with on machine `m`, as its
+    /// toolpath checks them: a drilling cycle a drill (or a chamfer mill to
+    /// countersink), Helical milling a flat end mill, the pin holes a drill
+    /// or a flat end mill, a drill on a lathe's centre a drill, a Turn the
+    /// lathe tool of its kind, Facing a flat end mill or face mill, Parallel
+    /// a ball or flat end mill, and the rest a flat end mill.
+    pub fn tool_types(&self, m: &Machine) -> Vec<&'static str> {
+        const FLAT: &str = "Flat end mill";
+        match self.strategy {
+            Strategy::Drill if self.on_centre(m) => vec!["Drill"],
+            Strategy::Drill if self.drills_pin_holes() => vec!["Drill", FLAT],
+            Strategy::Drill if self.helical() => vec![FLAT],
+            Strategy::Drill => vec!["Drill", "Chamfer mill"],
+            Strategy::Turn => crate::lathe::tool_for(get(&self.p, "turn_kind"))
+                .into_iter()
+                .collect(),
+            Strategy::Face => vec![FLAT, "Face mill"],
+            Strategy::Parallel => vec!["Ball end mill", FLAT],
+            Strategy::Scallop | Strategy::Indexed | Strategy::Rotary | Strategy::FiveAxis => {
+                vec![FLAT, "Ball end mill", "Bull nose end mill"]
+            }
+            _ => vec![FLAT],
+        }
+    }
+    /// Whether this operation cuts with `tool` on machine `m` (`tool_types`).
+    pub fn takes(&self, tool: &Tool, m: &Machine) -> bool {
+        self.tool_types(m).contains(&get(&tool.p, "type"))
+    }
     /// A Drill operation that mills its holes (`HELICAL_MILLING`). A Drill
     /// of the pin holes is not: it mills them its own way (`cam::pin_holes`).
     pub fn helical(&self) -> bool {
@@ -1364,6 +1392,16 @@ impl Operation {
                     "Choose a drill, or a chamfer mill to countersink, for a drilling cycle. Helical milling takes a flat end mill."
                         .into(),
                 )
+            } else if milling && !t.is_lathe() && !self.takes(t, m) {
+                // A lathe tool has its own issue below.
+                let types: Vec<String> = (self.tool_types(m).iter())
+                    .map(|k| k.to_lowercase())
+                    .collect();
+                e.push(format!(
+                    "Choose a {} for {}.",
+                    types.join(" or "),
+                    self.strategy.name()
+                ))
             }
             if !t.fits(m) {
                 e.push(format!("{} is not on {}.", t.name(), m.name()))
@@ -3046,6 +3084,52 @@ mod tests {
         let mut d = Document::sample();
         d.setup_mut().operations[0].geometry.clear();
         assert!(d.issues().iter().any(|s| s.contains("Select at least")))
+    }
+    #[test]
+    fn an_operation_takes_only_the_tool_types_it_cuts_with() {
+        let tools = [
+            Tool::new("Flat 6", "Flat end mill", "6"),
+            Tool::new("Ball 6", "Ball end mill", "6"),
+            Tool::new("Face 50", "Face mill", "50"),
+            Tool::new("Drill 4", "Drill", "4"),
+            Tool::new("Chamfer 6", "Chamfer mill", "6"),
+            Tool::lathe("Turn", "Turning tool"),
+            Tool::lathe("Bore", "Boring bar"),
+        ];
+        let m = Machine::new(3);
+        let taken = |o: &Operation, m: &Machine| -> Vec<&str> {
+            (tools.iter())
+                .filter(|t| o.takes(t, m))
+                .map(|t| t.name())
+                .collect()
+        };
+        let op = |s| Operation::new(s, String::new());
+        assert_eq!(taken(&op(Strategy::Drill), &m), ["Drill 4", "Chamfer 6"]);
+        assert_eq!(taken(&op(Strategy::Pocket), &m), ["Flat 6"]);
+        assert_eq!(taken(&op(Strategy::Adaptive), &m), ["Flat 6"]);
+        assert_eq!(taken(&op(Strategy::Contour), &m), ["Flat 6"]);
+        assert_eq!(taken(&op(Strategy::Face), &m), ["Flat 6", "Face 50"]);
+        assert_eq!(taken(&op(Strategy::Parallel), &m), ["Flat 6", "Ball 6"]);
+        // Helical milling mills each hole with an end mill's side.
+        let mut helical = op(Strategy::Drill);
+        helical.p.insert("cycle".into(), HELICAL_MILLING.into());
+        assert_eq!(taken(&helical, &m), ["Flat 6"]);
+        // On a lathe a Drill drills the centre from the tailstock, and a
+        // Turn takes the lathe tool of its kind.
+        let mut lathe = Machine::new(3);
+        lathe.p.insert("kind".into(), "Lathe".into());
+        assert_eq!(taken(&op(Strategy::Drill), &lathe), ["Drill 4"]);
+        let mut turn = op(Strategy::Turn);
+        turn.set_turn_kind("Bore");
+        assert_eq!(taken(&turn, &lathe), ["Bore"]);
+        // A Pocket with a drill says which tool to choose.
+        let mut pocket = op(Strategy::Pocket);
+        pocket.tool = tools[3].id.clone();
+        assert!(
+            pocket
+                .issues(&m, &tools, &[])
+                .contains(&"Choose a flat end mill for Pocket.".to_string())
+        );
     }
     #[test]
     fn helical_milling_takes_a_flat_end_mill_its_pass_settings_and_a_cnc() {

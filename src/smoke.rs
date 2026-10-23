@@ -19552,10 +19552,16 @@ flood = { pin = 8 }
         assert_eq!(tabs.len(), 5);
         // Pinned: Hide, the five tabs, Generate, Duplicate, Suppress, Delete,
         // Move up and Move down; scrolling: the About disclosure, the tools
-        // and the tool library at least.
+        // a Facing takes and the tool library at least.
         let (pinned, scrolled) = split(&a);
         assert_eq!(pinned, 1 + 5 + 1 + 3 + 2);
-        assert!(scrolled >= 2 + a.doc.tools.len(), "{scrolled}");
+        let machine = &a.doc.setup().machine;
+        let op = a.operation().unwrap();
+        let offered = (a.doc.tools.iter())
+            .filter(|t| op.takes(t, machine))
+            .count();
+        assert!(offered > 0);
+        assert!(scrolled >= 2 + offered, "{scrolled}");
         for t in &tabs {
             let _ = a.update(Message::Tab(t.to_string()));
             assert_eq!(split(&a).0, 12, "{t}");
@@ -20681,8 +20687,18 @@ flood = { pin = 8 }
         assert_eq!(op.tool, tool.id);
         assert_eq!((get(&op.p, "rpm"), get(&op.p, "feed")), ("640", "120"));
         assert_eq!(a.op_issues(), Vec::<String>::new());
+        // With no drill on the big mill a Drill asks for one first.
+        let _ = a.update(Message::AddOp(Strategy::Drill));
+        assert_eq!(a.page, Page::Tools);
+        assert_eq!(a.operation().unwrap().strategy, Strategy::Box);
+        let mut drill = crate::model::Tool::new("Big drill", "Drill", "8");
+        drill
+            .p
+            .insert("machines".into(), get(&tool.p, "machines").into());
+        a.doc.tools.push(drill.clone());
         // Drill's own defaults are above the machine: they come down to it.
         let _ = a.update(Message::AddOp(Strategy::Drill));
+        assert_eq!(a.operation().unwrap().tool, drill.id);
         let drill = a.operation().unwrap();
         assert_eq!(
             (get(&drill.p, "rpm"), get(&drill.p, "feed")),

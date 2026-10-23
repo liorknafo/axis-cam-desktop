@@ -2504,13 +2504,27 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
     match app.tab.as_str() {
         "Tool" => {
             c = c.push(section("Cutter"));
-            // A lathe's operation offers the tools that fit the lathe.
-            for tool in app
-                .doc
-                .tools
-                .iter()
-                .filter(|tool| !lathe || tool.fits(machine) || o.tool == tool.id)
-            {
+            // The operation offers the tools of the types it cuts with (a
+            // lathe's, those that fit the lathe), and the one it has.
+            let offered: Vec<_> = (app.doc.tools.iter())
+                .filter(|tool| {
+                    o.tool == tool.id || (o.takes(tool, machine) && (!lathe || tool.fits(machine)))
+                })
+                .collect();
+            if !offered.iter().any(|tool| o.takes(tool, machine)) {
+                let types: Vec<String> = (o.tool_types(machine).iter())
+                    .map(|k| k.to_lowercase())
+                    .collect();
+                c = c.push(
+                    muted(format!(
+                        "{} cuts with a {}: add one in the tool library.",
+                        o.strategy.name(),
+                        types.join(" or ")
+                    ))
+                    .size(12),
+                );
+            }
+            for tool in offered {
                 c = c.push(
                     btn(
                         tool_label(tool),
