@@ -10437,6 +10437,76 @@ flood = { pin = 8 }
         let _ = a.view();
     }
     #[test]
+    fn the_view_shows_the_stock_the_operation_in_focus_starts_from() {
+        let dir = tempfile::tempdir().unwrap();
+        // Setup 1 faces, pockets and contours; setup 2, turned over, faces.
+        let mut a = contoured_app(&dir, "35");
+        // The setups an operation's starting stock was cut by, and the
+        // operations of each, as the 3D view gets it (meshed in line here).
+        let shown = |a: &mut App, si: usize, oi: usize| {
+            let _ = a.update(Message::SelectSetup(si));
+            let _ = a.update(Message::SelectOp(oi));
+            let _ = a.refresh_start_mesh();
+            let view = crate::ui::scene_viewport(a).unwrap();
+            let (_, surface) = view.start_stock?;
+            assert!(!surface.triangles.is_empty());
+            let (_, _, before) = a.start_source().unwrap();
+            let job = a.left_stock.job.clone().unwrap();
+            let mut by: Vec<(u16, u16)> = (job.cuts.iter())
+                .map(|c| c.source)
+                .filter(|s| *s < before)
+                .collect();
+            by.dedup();
+            Some(by)
+        };
+        // Not worked out yet: the setup's box, as before.
+        assert_eq!(shown(&mut a, 0, 2), None);
+        let _ = a.refresh_left_stock();
+        // The first operation starts from the block.
+        assert_eq!(shown(&mut a, 0, 0), None);
+        // The Contour starts from what the Facing and the Pocket leave, not
+        // its own cuts; setup 2's Facing from all three of setup 1's.
+        assert_eq!(shown(&mut a, 0, 2), Some(vec![(0, 0), (0, 1)]));
+        assert_eq!(shown(&mut a, 1, 0), Some(vec![(0, 0), (0, 1), (0, 2)]));
+        // Kept meshed: going back to the Contour draws it at once. Editing
+        // the operation in focus keeps the stock it starts from; setup 2's
+        // Facing, which starts after it, waits for the job to be worked out.
+        let _ = a.update(Message::SelectSetup(0));
+        let _ = a.update(Message::SelectOp(2));
+        assert!(crate::ui::scene_viewport(&a).unwrap().start_stock.is_some());
+        let _ = a.update(Message::Edit(Target::Operation, "bottom", "33".into()));
+        assert!(crate::ui::scene_viewport(&a).unwrap().start_stock.is_some());
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::SelectOp(0));
+        assert!(a.start_source().is_none());
+        let _ = a.update(Message::SelectSetup(0));
+        let _ = a.update(Message::SelectOp(2));
+        let _ = a.view();
+        // Editing one before it does, until the job is worked out again.
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.update(Message::Edit(Target::Operation, "stepdown", "1.5".into()));
+        assert_eq!(shown(&mut a, 0, 2), None);
+        let _ = a.refresh_left_stock();
+        assert_eq!(shown(&mut a, 0, 2), Some(vec![(0, 0), (0, 1)]));
+        let _ = a.view();
+        // The camera fits the same scene in setup 2, in its vise, with the
+        // simulation shown or not and the stock and its jaws shown or not.
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::SelectOp(0));
+        let fit = |a: &App| crate::ui::scene_viewport(a).unwrap().scene_bounds();
+        let regular = fit(&a);
+        assert!(!crate::ui::framed_holding(&a).is_empty());
+        let mesh = a.imported_mesh.clone().unwrap();
+        a.simulation = Some(crate::simulation::prepare(&a.doc, &mesh, 1, 0).unwrap());
+        assert!(a.active_simulation().is_some());
+        assert_eq!(fit(&a), regular);
+        let _ = a.update(Message::ToggleStock);
+        assert!(crate::ui::holding_boxes(&a).is_empty());
+        assert_eq!(fit(&a), regular);
+        a.simulation = None;
+        assert_eq!(fit(&a), regular);
+    }
+    #[test]
     fn the_browser_draws_the_stock_each_setup_starts_from_and_leaves_in_its_jaws() {
         let dir = tempfile::tempdir().unwrap();
         // Both setups are held in a vise. Setup 1 faces, pockets and
@@ -19806,10 +19876,16 @@ flood = { pin = 8 }
         assert_eq!(tabs.len(), 5);
         // Pinned: Hide, the five tabs, Generate, Duplicate, Suppress, Delete,
         // Move up and Move down; scrolling: the About disclosure, the tools
-        // and the tool library at least.
+        // a Facing takes and the tool library at least.
         let (pinned, scrolled) = split(&a);
         assert_eq!(pinned, 1 + 5 + 1 + 3 + 2);
-        assert!(scrolled >= 2 + a.doc.tools.len(), "{scrolled}");
+        let machine = &a.doc.setup().machine;
+        let op = a.operation().unwrap();
+        let offered = (a.doc.tools.iter())
+            .filter(|t| op.takes(t, machine))
+            .count();
+        assert!(offered > 0);
+        assert!(scrolled >= 2 + offered, "{scrolled}");
         for t in &tabs {
             let _ = a.update(Message::Tab(t.to_string()));
             assert_eq!(split(&a).0, 12, "{t}");
@@ -20935,8 +21011,18 @@ flood = { pin = 8 }
         assert_eq!(op.tool, tool.id);
         assert_eq!((get(&op.p, "rpm"), get(&op.p, "feed")), ("640", "120"));
         assert_eq!(a.op_issues(), Vec::<String>::new());
+        // With no drill on the big mill a Drill asks for one first.
+        let _ = a.update(Message::AddOp(Strategy::Drill));
+        assert_eq!(a.page, Page::Tools);
+        assert_eq!(a.operation().unwrap().strategy, Strategy::Box);
+        let mut drill = crate::model::Tool::new("Big drill", "Drill", "8");
+        drill
+            .p
+            .insert("machines".into(), get(&tool.p, "machines").into());
+        a.doc.tools.push(drill.clone());
         // Drill's own defaults are above the machine: they come down to it.
         let _ = a.update(Message::AddOp(Strategy::Drill));
+        assert_eq!(a.operation().unwrap().tool, drill.id);
         let drill = a.operation().unwrap();
         assert_eq!(
             (get(&drill.p, "rpm"), get(&drill.p, "feed")),
