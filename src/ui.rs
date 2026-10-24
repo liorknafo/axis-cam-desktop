@@ -3450,7 +3450,12 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 c = c
                     .push(checks.field(p, "stepdown", "Stepdown per turn · mm"))
                     .push(checks.field(p, "stepover", "Ring stepover · % of tool diameter"))
-                    .push(checks.field(p, "tolerance", "Tolerance · mm"));
+                    .push(checks.field(p, "tolerance", "Tolerance · mm"))
+                    .push(checks.field(
+                        p,
+                        "bore_allowance",
+                        "Leave for a finish · mm on the diameter (blank: none)",
+                    ));
             }
             if o.threads() {
                 // The model's own thread is read from each hole.
@@ -3471,8 +3476,23 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             if ["Chip breaking", "Deep drilling"].contains(&get(p, "cycle")) {
                 c = c.push(checks.field(p, "peck", "Peck depth · mm"));
             }
-            if get(p, "cycle") == "Counterboring" {
+            if get(p, "cycle") == "Counterboring" || o.finishes_holes() {
                 c = c.push(checks.field(p, "dwell", "Dwell at bottom · seconds"));
+            }
+            if o.boring() {
+                c = c
+                    .push(checks.field(p, "bore_cut", "Cut per pass · mm on the radius"))
+                    .push(checks.field(p, "finish_cut", "Last pass · mm on the diameter"));
+            }
+            if o.finishes_holes() {
+                c = c.push(secondary(
+                    if o.boring() {
+                        "+ Add drilling and roughing before it"
+                    } else {
+                        "+ Add the drilling before it"
+                    },
+                    Message::AddHoleStages,
+                ));
             }
             if !lathe {
                 c = c.push(choice(
@@ -3495,6 +3515,8 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 HELICAL_MILLING => "Mill each hole with a flat end mill narrower than it: down a helix to a flat bottom, once round there, in rings out to the hole's size when it is over twice the cutter's.",
                 THREAD_MILLING => "Mill each hole's thread with a thread mill: down the drilled hole, arc in to the wall, one pitch a turn, arc back out. Drill the hole first.",
                 TAPPING => "Tap each drilled hole by hand: the spindle (off) or the tailstock holds the tap square. The CNC does not tap.",
+                REAMING => "Ream each drilled hole to size: feed in, dwell, and feed back out, at a reamer's low speed. Drill the hole a little under size first (Ø9.8 for a Ø10 reamer).",
+                BORING => "Bore each roughed hole of the Hole diameter with a boring head, a pass at each size up to it: feed in, dwell, then out with the spindle stopped or fed out, as the head says. The run pauses before each pass to measure the bore and set the head out.",
                 _ => "Feed to the bottom in one move, then retract.",
             }));
         }
@@ -7923,6 +7945,10 @@ pub(crate) fn run_strip<'a>(
         .spacing(8)
         .align_y(Alignment::Center),
     );
+    // A program's pause (a boring head to set): what it asks, until Resume.
+    if let Some(State::Paused(reason)) = state {
+        body = body.push(note(format!("Paused: {reason}")));
+    }
     body = body.push(muted(
         "Space holds from any page while no text field is being edited, and resumes on this page.",
     ));
@@ -9170,6 +9196,8 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
                 "Thread mill",
                 crate::model::KEYSEAT,
                 "Tap",
+                "Reamer",
+                "Boring head",
                 "Turning tool",
                 "Boring bar",
                 "Grooving tool",
@@ -9185,18 +9213,30 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
     form = form.push(field(p, "number", "Tool number · T", t));
     // A lathe tool has no mill diameter, flutes, flute length, stickout or holder.
     let keyseat = get(p, "type") == crate::model::KEYSEAT;
+    // A boring head's diameter is its body's, its flute length how far its
+    // bar reaches below the body.
+    let head = get(p, "type") == "Boring head";
     if !lathe {
         for (k, l) in [
             (
                 "diameter",
                 if keyseat {
                     "Head diameter · mm"
+                } else if head {
+                    "Head body diameter · mm"
                 } else {
                     "Diameter · mm"
                 },
             ),
-            ("flutes", "Flutes"),
-            ("length", "Flute length · mm"),
+            ("flutes", if head { "Cutting edges" } else { "Flutes" }),
+            (
+                "length",
+                if head {
+                    "Reach (bar below the body) · mm"
+                } else {
+                    "Flute length · mm"
+                },
+            ),
             ("stickout", "Stickout · mm"),
             ("holder", "Holder diameter · mm"),
             (
@@ -9283,6 +9323,28 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
             form = form
                 .push(choice(p, "thread", "Thread", &sizes, t))
                 .push(field(p, "od", "Die outside diameter · mm", t));
+        }
+        "Reamer" => {
+            form = form.push(choice(
+                p,
+                "tolerance",
+                "Tolerance class",
+                &crate::model::REAMER_CLASSES,
+                t,
+            ));
+        }
+        "Boring head" => {
+            form = form
+                .push(field(p, "bore_range", "Bore range · mm, min-max", t))
+                .push(field(p, "bar_diameter", "Bar diameter · mm", t))
+                .push(field(p, "dial", "Dial graduation · mm on the diameter", t))
+                .push(choice(
+                    p,
+                    "bore_retract",
+                    "Out of the bore",
+                    &crate::model::BORE_RETRACTS,
+                    t,
+                ));
         }
         _ => {}
     }
@@ -10050,6 +10112,24 @@ fn tool_label(tool: &Tool) -> String {
 fn tool_details(tool: &Tool) -> String {
     if tool.is_lathe() {
         return get(&tool.p, "type").to_string();
+    }
+    match get(&tool.p, "type") {
+        "Boring head" => {
+            return format!(
+                "Boring head · Ø{} mm · bar Ø{} mm",
+                get(&tool.p, "bore_range"),
+                get(&tool.p, "bar_diameter")
+            );
+        }
+        "Reamer" => {
+            return format!(
+                "Reamer · Ø{} {} · {}",
+                get(&tool.p, "diameter"),
+                get(&tool.p, "tolerance"),
+                plural(get(&tool.p, "flutes").trim().parse().unwrap_or(0), "flute")
+            );
+        }
+        _ => {}
     }
     format!(
         "{} · Ø{} mm · {}",

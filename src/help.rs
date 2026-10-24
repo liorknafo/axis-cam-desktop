@@ -1176,6 +1176,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Place the fixture pins on the stock's leftover in the 3D view: the plate's pins follow the pointer on the stock's bottom, green where they fit and red, with why, where they do not. Click to put pin 1 there; drag the placed pins to move them; drag elsewhere to orbit. Click Finish placing when done.",
             "",
         ),
+        AddHoleStages => (
+            "Add before this Reaming or Boring the operations that open its holes, on the same holes: for a reamer, a drill a little under its size (Ø9.8 for Ø10); for a boring head, a drill, then Helical milling to 0.6 under the size.",
+            "The tools come from the library: the drill nearest a reamer's drill size; for a bore the widest drill and the widest flat end mill that reach through. One that is missing is added without a tool, and the status says which to add.",
+        ),
         AddThreading => (
             "Add, for each thread size of the setup's threaded holes that open upwards, a Drill of its tap drill and then its thread: Thread milling with a thread mill on the CNC, Tapping by hand on the manual mill. Tools come from the library; the status says which are missing.",
             "",
@@ -3734,6 +3738,8 @@ mod tests {
             ("drill-helix", DrillCycle(4)),
             ("drill-thread-mill", DrillCycle(5)),
             ("drill-tap", DrillCycle(6)),
+            ("drill-ream", DrillCycle(7)),
+            ("drill-bore", DrillCycle(8)),
             ("containment-inside", Containment(-1)),
             ("containment-on", Containment(0)),
             ("containment-outside", Containment(1)),
@@ -4729,6 +4735,7 @@ mod tests {
             PlacePins,
             AddPinDrilling,
             AddThreading,
+            AddHoleStages,
             ThreadFromPart,
             Generate,
             GenerateAll,

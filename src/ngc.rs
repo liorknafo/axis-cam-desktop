@@ -483,6 +483,39 @@ fn tool_ok(st: &State, op: &OpState, settings: &PostSettings) -> bool {
         st.tool.is_none() && st.length == Length::Off
     }
 }
+/// `active`, but for a move after a plan's stop (`simulation::Stop`): the
+/// spindle and coolant are off.
+fn active_stopped(
+    s: &Step,
+    op: &OpState,
+    settings: &PostSettings,
+    offset: &str,
+) -> Result<(), String> {
+    let st = &s.state;
+    if st.spindle != Spindle::Off || st.mist || st.flood {
+        return Err(format!(
+            "line {}: the spindle or coolant runs after the stop for {}",
+            s.line, op.name
+        ));
+    }
+    let mut running = st.clone();
+    running.spindle = if op.clockwise {
+        Spindle::Cw
+    } else {
+        Spindle::Ccw
+    };
+    running.rpm = f64::from(op.rpm.round());
+    (running.mist, running.flood) = op.coolant;
+    active(
+        &Step {
+            state: running,
+            ..s.clone()
+        },
+        op,
+        settings,
+        offset,
+    )
+}
 fn active(s: &Step, op: &OpState, settings: &PostSettings, offset: &str) -> Result<(), String> {
     let st = &s.state;
     let blend = match st.blend {
@@ -540,9 +573,22 @@ pub fn verify(
     let mut want_a: Option<f32> = None;
     // The operation of the most recent Start: its tool is the one loaded.
     let mut current: Option<usize> = None;
+    // A Stop has stopped the spindle and coolant, until the next Run.
+    let mut stopped = false;
     for block in blocks {
         match block {
-            Block::Stop | Block::Run { .. } | Block::End => {}
+            Block::Stop => stopped = true,
+            Block::Run { .. } => stopped = false,
+            Block::End => {}
+            Block::Pause { message, .. } => {
+                if !r
+                    .messages
+                    .iter()
+                    .any(|m| *m == crate::post::comment(message))
+                {
+                    return Err(format!("the pause \"{message}\" says nothing"));
+                }
+            }
             Block::Start { op, .. } => current = Some(*op),
             Block::Retract => {
                 let s = take(steps, &mut i, "a safe retract")?;
@@ -711,7 +757,11 @@ pub fn verify(
                             s.line, s.state.feed
                         ));
                     }
-                    active(s, &ops[*op], settings, offset)?;
+                    if stopped && expected == StepKind::Rapid {
+                        active_stopped(s, &ops[*op], settings, offset)?;
+                    } else {
+                        active(s, &ops[*op], settings, offset)?;
+                    }
                     a_ok(s, want_a)?;
                     at = s.to;
                     at_a = s.a;

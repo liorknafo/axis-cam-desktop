@@ -2227,6 +2227,7 @@ fn finish_plan(setup: &Setup, op: &Operation, job: Job) -> Result<Plan, String> 
         tool_length,
         holder_radius,
         neck: None,
+        stops: vec![],
         display_scale: scale,
         duration: 0.,
         target: planned.iter().map(|p| p.3).fold(f32::INFINITY, f32::min),
