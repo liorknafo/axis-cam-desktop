@@ -1157,6 +1157,7 @@ impl Motions {
                 feed: rate,
                 start: self.plan.duration,
                 end,
+                a: None,
             });
             self.plan.duration = end;
         }

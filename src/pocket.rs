@@ -341,6 +341,7 @@ fn push(
             feed: rate,
             start: plan.duration,
             end,
+            a: None,
         });
         plan.duration = end;
     }

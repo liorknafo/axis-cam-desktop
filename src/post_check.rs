@@ -57,6 +57,23 @@ impl Problems {
 fn key(x: f32, y: f32) -> (i64, i64) {
     ((x * 1000.).round() as i64, (y * 1000.).round() as i64)
 }
+/// Each operation and A angle `blocks` move at: the A the last
+/// `Block::Index` turned to, or a move's own when it differs.
+fn angles(blocks: &[Block]) -> Vec<(usize, f32)> {
+    let mut a_now = None;
+    let mut out = vec![];
+    for block in blocks {
+        let (op, a) = match block {
+            Block::Index { op, a } => (*op, Some(*a)),
+            Block::Move { op, a, .. } => (*op, a.or(a_now)),
+            Block::Descend { op, .. } | Block::Approach { op, .. } => (*op, a_now),
+            _ => continue,
+        };
+        a_now = a;
+        out.extend(a.map(|a| (op, a)));
+    }
+    out
+}
 pub fn check_setup(
     setup: &Setup,
     ops: &[OpState],
@@ -152,11 +169,45 @@ pub fn check_setup(
             p[2] - datum[2]
         )
     };
-    // Lowest tip Z reached at each XY by the loaded tool since its tool change.
+    // An indexed operation's moves at each A angle: the stock as its
+    // simulation starts, seen in that angle's frame (`Simulation::frame_at`),
+    // and the top of the box round it, which no layer earlier cuts removed
+    // whole lies above (`RestStock::left`, the part not kept). A 3-axis
+    // move (no A) keeps the setup's.
+    let mut turned: HashMap<(usize, u32), (Option<RestStock>, f32)> = HashMap::new();
+    let unbounded = Bounds {
+        min: [f32::INFINITY; 3],
+        max: [f32::NEG_INFINITY; 3],
+    };
+    for (op, a) in angles(blocks) {
+        turned.entry((op, a.to_bits())).or_insert_with(|| {
+            let sim = sims[op];
+            let rest = (sim.initial_volume.as_ref())
+                .zip(sim.frame_at(Some(a)))
+                .map(|(v, f)| RestStock::new(v, f));
+            let high = rest.as_ref().map_or(top, |r| r.left(unbounded).max[2]);
+            (rest, high)
+        });
+    }
+    let at_angle = |op: usize, a: Option<f32>| -> (Option<&RestStock>, f32) {
+        match a.and_then(|a| turned.get(&(op, a.to_bits()))) {
+            Some((rest, high)) => (rest.as_ref(), *high),
+            None => (rests[op].as_ref(), top),
+        }
+    };
+    // The A the program has turned to (`Block::Index`); None until it turns.
+    let mut a_now: Option<f32> = None;
+    // Lowest tip Z reached at each XY by the loaded tool since its tool
+    // change, at the A it is at: a turn of A moves the stock under it.
     let mut visited: HashMap<(i64, i64), f32> = HashMap::new();
     for block in blocks {
         let (op, from, to, rapid) = match block {
             Block::Start { change: true, .. } => {
+                visited.clear();
+                continue;
+            }
+            Block::Index { a, .. } => {
+                a_now = Some(*a);
                 visited.clear();
                 continue;
             }
@@ -169,15 +220,43 @@ pub fn check_setup(
                 from,
                 to,
                 feed,
+                a,
                 ..
             } => {
                 if *kind == Kind::Feed && !(*feed > 0. && *feed <= max_feed + 0.001) {
                     problems.add(Some(*op), "feed", format!("{}: F{feed:.1} is outside the machine's 0-{max_feed:.1} mm/min feed range.", ops[*op].name));
                 }
+                // Only indexed A is posted: A turns alone (G0 A), never
+                // during a move. Continuous A is not posted yet.
+                let same = match (*a, a_now) {
+                    (Some(a), Some(b)) => (a - b).abs() < 1e-4,
+                    (a, b) => a.is_none() && b.is_none(),
+                };
+                if !same {
+                    let said = |a: Option<f32>| {
+                        a.map_or("no A".to_string(), |a| {
+                            format!("A {}°", crate::indexed::degrees(a))
+                        })
+                    };
+                    problems.add(
+                        Some(*op),
+                        "continuous A",
+                        format!(
+                            "{}: A turns from {} to {} during a {} move to {}. Only indexed A is posted, A turning alone with X, Y and Z still; continuous A moves are not posted yet.",
+                            ops[*op].name,
+                            said(a_now),
+                            said(*a),
+                            if *kind == Kind::Feed { "feed" } else { "rapid" },
+                            at(*to)
+                        ),
+                    );
+                    a_now = *a;
+                }
                 (*op, *from, *to, *kind == Kind::Rapid)
             }
             _ => continue,
         };
+        let (rest, top) = at_angle(op, a_now);
         let o = &ops[op];
         let low = from[2].min(to[2]);
         if low + o.stickout < top - EPS {
@@ -209,7 +288,7 @@ pub fn check_setup(
                 .get(&key(to[0], to[1]))
                 .is_some_and(|z| *z <= low + EPS);
             let proven = || {
-                rests[op].as_ref().is_some_and(|r| {
+                rest.is_some_and(|r| {
                     // The controller may leave the path by the blend
                     // tolerance at the corners: the column is that much wider.
                     let radius = o.diameter / 2. + settings.blend;
@@ -259,7 +338,9 @@ const HOME_CLEARANCE: f32 = 10_000.;
 /// program's first rapid starts wherever the tool was, so the plane itself
 /// has to be above the highest box and its gap: one more problem, for the
 /// program. Messages are in work coordinates (`datum`), each with the index in
-/// `ops` of the operation it is about (None for the plane's).
+/// `ops` of the operation it is about (None for the plane's). The tests'
+/// way in; the walk of a setup takes its tools' parts (`holding_problems_of`).
+#[cfg(test)]
 pub fn holding_problems(
     ops: &[OpState],
     plans: &[&Plan],
@@ -269,6 +350,29 @@ pub fn holding_problems(
     gap: f32,
     datum: [f32; 3],
 ) -> Vec<(Option<usize>, String)> {
+    let tools: Vec<_> = plans
+        .iter()
+        .map(|p| {
+            let parts = crate::holding::parts(p.radius, p.tool_length, p.holder_radius);
+            (parts.to_vec(), String::new())
+        })
+        .collect();
+    holding_problems_of(ops, plans, blocks, settings, boxes, (gap, datum), &tools)
+}
+/// `holding_problems` with each operation's tool made of its own parts and
+/// a sentence ending the message of a hit by any part but the cutter (what
+/// of it is assumed): a chuck's setup takes the spindle nose over the holder
+/// (`rotary_check::in_spindle`, LIO-204). `place` is the gap and the datum.
+pub fn holding_problems_of(
+    ops: &[OpState],
+    plans: &[&Plan],
+    blocks: &[Block],
+    settings: &PostSettings,
+    boxes: &[HoldBox],
+    place: (f32, [f32; 3]),
+    tools: &[(Vec<crate::holding::Part>, String)],
+) -> Vec<(Option<usize>, String)> {
+    let (gap, datum) = place;
     // The highest box, the first of equals.
     let Some(highest) = boxes.iter().fold(None::<&HoldBox>, |best, b| {
         best.filter(|x| x.bounds.max[2] >= b.bounds.max[2])
@@ -339,17 +443,13 @@ pub fn holding_problems(
         }
     }
     for (k, path) in segments.iter().enumerate() {
-        let plan = plans[k];
-        let hits = crate::holding::hits_segments(
-            path,
-            plan.radius,
-            plan.tool_length,
-            plan.holder_radius,
-            boxes,
-            reach,
-        );
+        let (parts, assumed) = &tools[k];
+        let hits = crate::holding::hits_parts(path, parts, boxes, reach);
         for hit in hits {
-            let message = crate::holding::message(&ops[k].name, &hit, gap, datum);
+            let mut message = crate::holding::message(&ops[k].name, &hit, gap, datum);
+            if hit.part != "tool" {
+                message.push_str(assumed);
+            }
             problems.add_about(Some(k), hit.part, &hit.label, message);
         }
     }
@@ -616,6 +716,7 @@ mod tests {
                 feed: 0.,
                 start: 0.,
                 end: 0.,
+                a: None,
             };
             plan.moves.splice(
                 1..1,
@@ -701,6 +802,7 @@ mod tests {
     }
     fn clamp_box(label: &str, min: [f32; 3], max: [f32; 3]) -> HoldBox {
         HoldBox {
+            shape: Default::default(),
             label: label.into(),
             bounds: Bounds { min, max },
         }
@@ -1200,6 +1302,7 @@ mod tests {
                 feed: 0.,
                 start: 0.,
                 end: 0.,
+                a: None,
             };
             plan.moves.splice(
                 1..1,

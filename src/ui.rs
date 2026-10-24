@@ -615,8 +615,7 @@ pub(crate) fn issue_tab(issue: &str) -> Option<&'static str> {
             | "tab_width" | "tab_height",
         ) => "Heights",
         Some(
-            "angle_a" | "angle_b" | "rotary_start" | "rotary_end" | "tilt_min" | "tilt_max"
-            | "lead_angle" | "lean_angle",
+            "rotary_start" | "rotary_end" | "tilt_min" | "tilt_max" | "lead_angle" | "lean_angle",
         ) => "Orientation",
         Some(
             "peck" | "dwell" | "thread" | "thread_hand" | "thread_depth" | "thread_passes"
@@ -1026,7 +1025,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
             text(if app.page == Page::Control {
                 "mm  |  UC100 machine control"
             } else {
-                "mm  |  Bounded mesh previews · LinuxCNC 3-axis post"
+                "mm  |  Bounded mesh previews · LinuxCNC 3-axis and indexed A post"
             })
             .size(12)
             .color(MUTED)
@@ -1226,6 +1225,9 @@ fn ribbon(app: &App) -> Element<'_, Message> {
                 Some(lathe::TURN_ON_MILL)
             } else if s == Strategy::Box {
                 (!manual_setup).then_some(manual::BOX_ON_CNC)
+            } else if s == Strategy::Indexed {
+                // A pointer to indexed setups, not an operation to add.
+                Some(crate::indexed::POINTER)
             } else {
                 (manual_setup && s != Strategy::Drill).then_some(manual::ONE_AXIS)
             };
@@ -1588,6 +1590,9 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
                     .size(12)
                     .wrapping(Wrapping::None)
                 ]
+                // The setup's A angle, on a line of its own: a list of them
+                // is long.
+                .push(crate::indexed::label(s).map(|a| muted(a).size(12).wrapping(Wrapping::Word)))
                 .spacing(2)
             )
             .width(Fill)
@@ -2005,7 +2010,13 @@ pub(crate) fn pictured_holding(
     let Some(setup) = app.doc.setups.get(si) else {
         return vec![];
     };
-    let mut jaws = if matches!(get(&setup.p, "holding"), "Vise" | "Clamps") {
+    // A lathe's chuck is drawn by the lathe view, not as boxes.
+    let modelled = match get(&setup.p, "holding") {
+        "Vise" | "Clamps" => true,
+        "Chuck" => crate::chuck::holds(setup),
+        _ => false,
+    };
+    let mut jaws = if modelled {
         let held = app
             .known_held(si)
             .filter(|held| held.stock == stock)
@@ -2147,8 +2158,10 @@ pub(crate) fn scene_viewport(app: &App) -> Option<Viewport<'_>> {
         framed: framed_holding(app),
         leftover: leftover_view(app),
         live: app.live_tool(),
+        a: app.live_a(),
         live_stock: app.live_stock(),
         start_stock: app.start_stock(),
+        live_volume: app.live_volume(),
         uncut: shown_uncut(app)
             .and_then(|(found, _)| found.as_ref().ok())
             .map(|found| found.faces.as_slice())
@@ -2172,9 +2185,12 @@ fn workspace(app: &App) -> Element<'_, Message> {
                     Some(s) => Element::from(
                         row![
                             muted(format!(
-                                "{} / {} / Work zero:",
+                                "{} / {} / {}Work zero:",
                                 get(&s.p, "offset"),
                                 app.doc.holding_label(s),
+                                crate::indexed::label(s)
+                                    .map(|a| format!("{a} / "))
+                                    .unwrap_or_default(),
                             )),
                             button(text(format!("{} · Change", get(&s.p, "origin"))).size(12))
                                 .padding([2, 6])
@@ -3256,12 +3272,6 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             }
         }
         "Orientation" => match o.strategy {
-            Strategy::Indexed => {
-                c=c.push(note("Position the rotary axis before cutting. Angles are checked against the setup’s saved machine limits.")).push(checks.field(p, "angle_a", "Primary rotary angle · degrees"));
-                if app.doc.setup().machine.axes() == 5 {
-                    c = c.push(checks.field(p, "angle_b", "Secondary rotary angle · degrees"));
-                }
-            }
             Strategy::Rotary => {
                 c = c
                     .push(choice(
@@ -3834,7 +3844,8 @@ pub(crate) fn setup_step_done(app: &App, step: &str) -> bool {
         "Machine" => s.machine.issues().is_empty(),
         "Work zero" => {
             !get(&s.p, "offset").is_empty()
-                && crate::post::references(get(&s.p, "origin")).is_some()
+                && (crate::post::references(get(&s.p, "origin")).is_some()
+                    || crate::indexed::ORIGINS.contains(&get(&s.p, "origin")))
                 && crate::post::pins_issue(s).is_none()
                 && !app
                     .current_ready()
@@ -3913,6 +3924,7 @@ fn setup_editor(app: &App) -> Panel<'_> {
     // Pinned under the body: the checks and the setup's actions.
     let mut issues = s.issues();
     issues.extend(app.doc.skew_issue(app.doc.index()));
+    issues.extend(app.doc.index_issues(app.doc.index()));
     let mut foot = column![warnings(issues)].spacing(12);
     if app.confirm_delete_setup {
         foot=foot.push(note("Delete this setup and its operations? Later stock will be rebuilt from the revised setup order.")).push(row![secondary("Cancel",Message::ConfirmDeleteSetup(false)),danger("Delete setup",Message::ConfirmDeleteSetup(true))].spacing(5));
@@ -3970,6 +3982,14 @@ fn setup_zero<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
     let p = &s.p;
     let t = Target::Setup;
     let origin = get(p, "origin");
+    if let Some(base) = app.doc.index_base(app.doc.index()) {
+        return c.push(section("Work zero")).push(note(format!(
+            "{origin} in {}, as setup {} ({}) has it: A turns the stock about the A centreline and leaves the work zero where it is, so nothing is probed again.",
+            get(p, "offset"),
+            base + 1,
+            app.doc.setups[base].name()
+        )));
+    }
     let zero = crate::post::stock_zero(origin);
     let model = origin == "Model origin";
     // A spot keeps the face picked, the top for Model origin.
@@ -4042,6 +4062,7 @@ fn setup_zero<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
             "On the stock, seen from above (back at the top, front toward you):"
         }))
         .push(grid)
+        .push(rotary_zeros(s, origin))
         .push(choice(
             p,
             "offset",
@@ -4051,6 +4072,37 @@ fn setup_zero<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
         ))
         .push(pins_block(app, s))
         .push(zero_note(app))
+}
+/// The Work zero step's zeros on the A axis (`indexed::ORIGINS`), on a
+/// machine with one, and how the chosen one is found.
+fn rotary_zeros<'a>(s: &Setup, origin: &str) -> Element<'a, Message> {
+    if !s.machine.has_a() {
+        return column![].into();
+    }
+    let set = |v: &str| Some(Message::Edit(Target::Setup, "origin", v.into()));
+    let mut c = column![
+        muted("On the A axis: Y0 Z0 on the A centreline, X0 at"),
+        row![
+            act_sized(
+                "Stock end",
+                set(crate::indexed::ORIGINS[0]),
+                origin == crate::indexed::ORIGINS[0],
+                Some(Length::FillPortion(1))
+            ),
+            act_sized(
+                "Chuck face",
+                set(crate::indexed::ORIGINS[1]),
+                origin == crate::indexed::ORIGINS[1],
+                Some(Length::FillPortion(1))
+            ),
+        ]
+        .spacing(4)
+    ]
+    .spacing(4);
+    if let Some(words) = crate::indexed::zero_words(origin) {
+        c = c.push(muted(words));
+    }
+    c.into()
 }
 /// The Work zero step's fixture pins: whether the setup sits on its
 /// machine's pins, the part's holes chosen to drop over them (one button
@@ -4390,7 +4442,10 @@ fn zero_note(app: &App) -> Element<'_, Message> {
             "Model origin is the part file's own 0,0,0. A probe finds it from the stock this setup starts from ({from}): {}. By hand, the program header locates it from the part.",
             crate::post::probe_spots(refs, stock)
         ),
-        _ => "Choose a work zero.".into(),
+        _ => match crate::indexed::zero_words(origin) {
+            Some(words) => format!("On the stock this setup starts from ({from}): {words}"),
+            None => "Choose a work zero.".into(),
+        },
     }];
     if let Some(refs) = refs {
         lines.push(format!(
@@ -4427,16 +4482,24 @@ fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> 
             p,
             "stock_type",
             "Initial stock mode",
-            &[
-                "Relative size box",
-                "Fixed size box",
-                "Round bar",
-                "Relative round bar",
-            ],
+            crate::stock::modes(s),
             t,
         ));
         let round = crate::stock::is_round(s);
-        if get(p, "stock_type") == "Relative round bar" {
+        if crate::stock::round_bar(s) {
+            c = c.push(
+                row![
+                    container(field(p, "stock_diameter", "Bar diameter · mm", t))
+                        .width(Length::FillPortion(1)),
+                    container(field(p, "stock_length", "Bar length · mm", t))
+                        .width(Length::FillPortion(1))
+                ]
+                .spacing(10),
+            );
+            c = c.push(muted(
+                "A bar along X, centred on the part's X and Y, standing on Z0. Hold it in the chuck (Workholding).",
+            ));
+        } else if get(p, "stock_type") == "Relative round bar" {
             c = c.push(muted("Extra material round the part · mm"));
             c = c.push(field(p, "stock_radial", "Radial · mm", t));
             c = c.push(
@@ -4494,7 +4557,13 @@ fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> 
         }
         match crate::stock::resolve(s, app.part_mesh()) {
             Ok(resolved) => {
-                let (title, size) = if round {
+                let (title, size) = if crate::stock::round_bar(s) {
+                    let d = resolved.stock.dimensions();
+                    (
+                        "Resulting stock · round bar",
+                        format!("Ø{:.3} × {:.3} mm", d[1], d[0]),
+                    )
+                } else if round {
                     (
                         "Resulting stock · Ø × length",
                         crate::stock::bar_text(resolved.stock),
@@ -4524,7 +4593,9 @@ fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> 
                         .style(panel_style),
                 );
                 if outside_fixed_stock(s, &resolved) {
-                    c = c.push(note(if round {
+                    c = c.push(note(if crate::stock::round_bar(s) {
+                        "The part extends outside the box round this bar. Increase its diameter or length, adjust placement, or choose a box."
+                    } else if round {
                         "The part extends outside this bar. Increase its size, adjust placement, or choose Relative round bar."
                     } else {
                         "The part extends outside this fixed stock box. Increase its dimensions, adjust placement, or choose Relative size box."
@@ -4560,6 +4631,14 @@ fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> 
 fn setup_position<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
     let p = &app.doc.setup().p;
     let t = Target::Setup;
+    if let Some(base) = app.doc.index_base(app.doc.index()) {
+        return c.push(section("Part position")).push(note(format!(
+            "Placed as setup {} ({}) places it, turned about the A centreline to {}: A turns the stock in that clamping, with no re-clamp. To place this setup yourself, choose Reclamp and probe origin under Holding.",
+            base + 1,
+            app.doc.setups[base].name(),
+            crate::indexed::label(app.doc.setup()).unwrap_or_default()
+        )));
+    }
     let mut c = c.push(section("Part position"));
     let i = app.doc.index();
     c = if i == 0 {
@@ -4647,9 +4726,22 @@ fn stock_turn<'a>(app: &'a App, i: usize, mut c: Column<'a, Message>) -> Column<
 fn setup_holding<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
     let p = &app.doc.setup().p;
     let t = Target::Setup;
+    let si = app.doc.index();
     let mut c = c.push(section("Workholding"));
-    for control in holding_controls(app) {
-        c = c.push(control);
+    match app.doc.index_base(si) {
+        Some(base) => {
+            c = c.push(note(format!(
+                "Held as setup {} ({}) holds it: {}. A turns the stock in that clamping, so it is not re-clamped or probed again.",
+                base + 1,
+                app.doc.setups[base].name(),
+                app.doc.holding_label(&app.doc.setups[base])
+            )))
+        }
+        None => {
+            for control in holding_controls(app) {
+                c = c.push(control);
+            }
+        }
     }
     // What follows is recorded for the operator and checked by nothing, so
     // it sits under its own heading, apart from the checked workholding.
@@ -4667,9 +4759,31 @@ fn setup_holding<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message
                 "Change fixture",
             ],
             t,
-        ))
-        .push(field(p, "notes", "Setup instructions", t));
-    c
+        ));
+    let s = app.doc.setup();
+    if crate::indexed::is_indexed(s) {
+        c = c
+            .push(field(p, crate::indexed::ANGLES, "A angles · degrees", t))
+            .push(muted(
+                "One angle, or several for the same operations (0, 90, 180, -90). Positive A turns the part clockwise seen from the chuck along +X (the right-hand rule about +X): +Y up to +Z at A90.",
+            ));
+        let wrong = crate::indexed::issues(s);
+        if !wrong.is_empty() {
+            c = c.push(caution("A angles", wrong));
+        }
+        let warned = app.doc.index_warnings(si);
+        if !warned.is_empty() {
+            c = c.push(caution("Not ready to index", warned));
+        }
+        c = c.push(muted(
+            "Its programs turn A to each angle, A alone with the tool above all that A swings: LinuxCNC exports them, and a run on the UC100 turns its A once the A centreline is measured.",
+        ));
+    } else if crate::indexed::is_label_only(s) {
+        c = c.push(note(
+            "Saved before indexing turned the stock: this setup keeps its own placement and work zero. Choose Index rotary axis again to turn the stock about A in the clamping before it.",
+        ));
+    }
+    c.push(field(p, "notes", "Setup instructions", t))
 }
 /// An item of a pick list: what is sent when it is chosen, and what it says.
 #[derive(Clone, PartialEq)]
@@ -4761,9 +4875,12 @@ pub(crate) fn speed_feed_heading(lines: &[(bool, String)]) -> &'static str {
 }
 /// The workholding a setup can model: a lathe setup a chuck, any other a
 /// vise or clamps.
-pub(crate) fn holding_choices(lathe: bool) -> &'static [&'static str] {
-    if lathe {
+pub(crate) fn holding_choices(machine: &crate::model::Machine) -> &'static [&'static str] {
+    if crate::lathe::is_lathe(machine) {
         &["None", "Chuck"]
+    } else if machine.has_a() {
+        // The chuck on the rotary A axis (`chuck`).
+        &crate::holding::CHOICES
     } else {
         &["None", "Vise", "Clamps"]
     }
@@ -4781,6 +4898,8 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
     let mut c: Vec<Element<_>> = vec![
         muted(if lathe {
             "The chuck that holds the bar, from the workholding library."
+        } else if app.doc.setup().machine.has_a() {
+            "The vise or clamps that hold the stock, from the workholding library, or the chuck on the machine's rotary A axis."
         } else {
             "The vise or clamps that hold the stock, from the workholding library."
         })
@@ -4790,12 +4909,13 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
             holding,
             "holding",
             "Modelled workholding",
-            holding_choices(lathe),
+            holding_choices(&app.doc.setup().machine),
             t,
         ),
     ];
+    let rotary_chuck = crate::chuck::holds(app.doc.setup());
     match holding {
-        "Chuck" => {
+        "Chuck" if !rotary_chuck => {
             c.push(holder_picker(app, "Chuck"));
             // Changing the chuck is slow: say so wherever the 4-jaw is on.
             if app
@@ -4817,6 +4937,37 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
                         .width(Length::FillPortion(1))
                 ]
                 .spacing(10)
+                .into(),
+            );
+        }
+        "Chuck" => {
+            c.push(choice(p, "chuck_jaws", "Chuck", &crate::chuck::JAWS, t));
+            c.push(
+                row![
+                    container(field(
+                        p,
+                        "chuck_stickout",
+                        "Stick-out from the jaws · mm",
+                        t
+                    ))
+                    .width(Length::FillPortion(1)),
+                    container(field(p, "chuck_jaw_angle", "Jaw 1 at A0 · ° from up", t))
+                        .width(Length::FillPortion(1))
+                ]
+                .spacing(10)
+                .into(),
+            );
+            c.push(choice(
+                p,
+                "chuck_tailstock",
+                "Tailstock",
+                &crate::chuck::TAILSTOCK,
+                t,
+            ));
+            c.push(
+                muted(
+                    "The chuck, its jaws, the rotary head and the tailstock are sized from the machine's rotary unit, the jaws' width and height and the bodies' lengths assumed from it, and checked as the boxes round them with the gap, at A0 for today's operations. The stock in the jaws is kept clear too.",
+                )
                 .into(),
             );
         }
@@ -4890,22 +5041,27 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
         }
     }
     if holding != "None" {
-        // A chuck has no clearance gap to set; Suggest picks its library entry.
-        if holding != "Chuck" {
+        // A lathe's chuck has no clearance gap to set; Suggest picks its
+        // library entry. The chuck on A has a gap, and its layout is the
+        // rotary unit's, not suggested.
+        let library_chuck = holding == "Chuck" && !rotary_chuck;
+        if !library_chuck {
             c.push(field(p, "holding_gap", HOLDING_GAP_LABEL, t));
         }
-        c.push(
-            secondary(
-                if holding == "Chuck" {
-                    "Suggest chuck"
-                } else {
-                    "Suggest layout"
-                },
-                Message::SuggestLayout,
-            )
-            .width(Fill)
-            .into(),
-        );
+        if holding != "Chuck" || library_chuck {
+            c.push(
+                secondary(
+                    if library_chuck {
+                        "Suggest chuck"
+                    } else {
+                        "Suggest layout"
+                    },
+                    Message::SuggestLayout,
+                )
+                .width(Fill)
+                .into(),
+            );
+        }
         let lines = holding_lines(app);
         if !lines.is_empty() {
             let heading = format!(
@@ -5105,8 +5261,20 @@ fn holding_on(
     stock: crate::mesh::Bounds,
     held: crate::holding::Gripped,
 ) -> Vec<crate::holding::HoldBox> {
-    let mut boxes = if matches!(get(&setup.p, "holding"), "Vise" | "Clamps") {
-        let jaws = app.doc.holding_boxes(setup, held);
+    // An indexed setup's chuck and jaws turn to the A shown.
+    let mut posed = setup.clone();
+    if let (Some(t), Some(a)) = (setup.turn, app.shown_a()) {
+        let turn = crate::indexed::sign(&setup.machine) * a;
+        posed.turn = Some(crate::indexed::Turn { a, turn, ..t });
+    }
+    // A lathe's chuck is drawn by the lathe view, not as boxes.
+    let modelled = match get(&setup.p, "holding") {
+        "Vise" | "Clamps" => true,
+        "Chuck" => crate::chuck::holds(setup),
+        _ => false,
+    };
+    let mut boxes = if modelled {
+        let jaws = app.doc.holding_boxes(&posed, held);
         crate::holding::shown(&jaws.unwrap_or_default(), stock)
     } else {
         vec![]
@@ -5536,7 +5704,11 @@ fn machines(app: &App) -> Element<'_, Message> {
             "Machine library",
             "Saved locally. Each setup keeps a snapshot of its assigned profile."
         ),
-        primary("+ New machine profile", Message::NewMachine),
+        row![
+            primary("+ New machine profile", Message::NewMachine),
+            secondary("+ Jingyan CNC4030 + rotary", Message::AddRotaryMachine)
+        ]
+        .spacing(8),
         space().height(5)
     ]
     .spacing(18);
@@ -5872,6 +6044,15 @@ fn wizard(app: &App) -> Element<'_, Message> {
                         form = form.push(field(p, k, l, t));
                     }
                 }
+                if m.has_a() {
+                    form = form
+                        .push(bold("Rotary unit", 15))
+                        .push(note("Where the A axis sits and how big its chuck and tailstock are, all in mm in machine coordinates (Z is zero at the top and negative down). New values are ASSUMED for a 100 mm 3-jaw chuck on a NEMA23 rotary unit and the 800 W spindle's Ø65 mm body, and still to be measured: calibration will replace them."));
+                    for (k, l, _) in crate::model::ROTARY_GEOMETRY {
+                        form = form.push(field(p, k, l, t));
+                    }
+                    form = form.push(warnings(m.rotary_issues()));
+                }
             } else {
                 form = form.push(note(
                     "Fixed spindle, linear X/Y/Z motion. No rotary kinematics are needed.",
@@ -5936,6 +6117,7 @@ fn wizard(app: &App) -> Element<'_, Message> {
                     .push(row![
                         field(p, "probe_distance", "Maximum probe distance · mm", t),
                         field(p, "probe_retract", "Retract after the probe · mm", t),
+                        field(p, "probe_length", "Probe length, spindle nose to tip · mm", t),
                     ].spacing(8))
                     .push(warnings(crate::control::probe_settings(p).err().unwrap_or_default()))
                     .push(bold("Fixture pins", 15))
@@ -6105,7 +6287,17 @@ pub(crate) fn machine_panel<'a>(title: &str, body: Column<'a, Message>) -> Eleme
         .into()
 }
 
-const AXES: [&str; 6] = ["X", "Y", "Z", "A", "B", "C"];
+const AXES: [&str; 6] = crate::control::AXIS_NAMES;
+
+/// A position on axis `a` as the Control page shows it: mm bare, as ever,
+/// and a rotary axis's degrees with their sign.
+fn reading(a: usize, v: f64) -> String {
+    if crate::control::rotary(a) {
+        format!("{v:.3}°")
+    } else {
+        format!("{v:.3}")
+    }
+}
 
 /// "X", "X and Y", "X, Y and Z".
 fn axis_names(axes: &[usize]) -> String {
@@ -6363,13 +6555,17 @@ fn control(app: &App) -> Element<'_, Message> {
         if let Some((heading, lines)) = limits_off_warning(&unlimited, &unset, c.home_switches()) {
             caution(heading, lines)
         } else {
-            let ranges: Vec<String> = (0..6)
-                .filter_map(|a| {
-                    let x = c.config.axes.get(a)?;
-                    Some(format!("{} {}…{}", AXES[a], x.soft_min?, x.soft_max?))
-                })
+            let range = |a: usize| {
+                let x = c.config.axes.get(a)?;
+                Some(format!("{} {}…{}", AXES[a], x.soft_min?, x.soft_max?))
+            };
+            let ranges: Vec<String> = (0..3).filter_map(range).collect();
+            // A rotary axis's range is in degrees, after the mm.
+            let angles: String = (3..6)
+                .filter_map(range)
+                .map(|r| format!(", {r}°"))
                 .collect();
-            muted(format!("Soft limits on: {} mm.", ranges.join(", ")))
+            muted(format!("Soft limits on: {} mm{angles}.", ranges.join(", ")))
                 .color(Color::from_rgb8(39, 130, 93))
                 .into()
         };
@@ -6391,6 +6587,8 @@ fn control(app: &App) -> Element<'_, Message> {
                 "Job",
                 column![
                     container(view).height(360),
+                    (app.doc.active_setup().and_then(crate::indexed::label))
+                        .map(|a| muted(format!("{} at {a}", app.doc.setup().name()))),
                     muted("Drag to orbit · right-drag to pan · scroll to zoom. The machine's tool is red while a tool run cuts, and the stock is cut away where it goes."),
                     uncut_line(app).map(muted),
                     uncut_legend(app)
@@ -6415,8 +6613,8 @@ fn control(app: &App) -> Element<'_, Message> {
     for &i in &enabled {
         table = table.push(row![
             text(AXES[i]).size(14).width(50),
-            mono(format!("{:.3}", s.machine_pos[i])),
-            mono(format!("{:.3}", s.work_pos[i])),
+            mono(reading(i, s.machine_pos[i])),
+            mono(reading(i, s.work_pos[i])),
             text(if s.referenced[i] { "Yes" } else { "No" }).size(14),
         ]);
     }
@@ -6425,7 +6623,7 @@ fn control(app: &App) -> Element<'_, Message> {
     let declared: Vec<usize> = enabled
         .iter()
         .copied()
-        .filter(|&a| a < 3 && c.switchless(a))
+        .filter(|&a| c.switchless(a))
         .collect();
     let mut zero = column![bold("Machine zero", 13)].spacing(10);
     if !declared.is_empty() {
@@ -6466,6 +6664,13 @@ fn control(app: &App) -> Element<'_, Message> {
             .block
             .map(|(lo, hi)| [lo.map(|v| v as f32), hi.map(|v| v as f32)]),
         zero: std::array::from_fn(|k| s.work_offset[k] as f32),
+        rotary: c.rotary.as_ref().filter(|_| c.axis(3)).map(|r| {
+            let sign = (app.doc.machines.iter())
+                .find(|m| m.id == c.machine_id)
+                .map_or(1., crate::indexed::sign);
+            crate::chuck::Rig::on_machine(r.unit, sign)
+        }),
+        a: s.machine_pos[3] as f32,
     };
     let position = machine_panel(
         "Position",
@@ -6497,12 +6702,34 @@ fn control(app: &App) -> Element<'_, Message> {
             c.jog_step == Some(step),
         ));
     }
+    // A steps in degrees, on its own row: a step in mm means nothing to it.
+    let angles = c.axis(3).then(|| {
+        let mut angles = row![
+            text("A").size(13).width(24),
+            act(
+                "Continuous",
+                Some(Message::Machine(Action::JogAngle(None))),
+                c.jog_angle.is_none()
+            )
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        for step in [0.1, 1., 15., 90.] {
+            angles = angles.push(act(
+                format!("{step}°"),
+                Some(Message::Machine(Action::JogAngle(Some(step)))),
+                c.jog_angle == Some(step),
+            ));
+        }
+        angles
+    });
     // Hold to jog: a press starts it; a release, anywhere, or leaving the
     // button stops it.
     let jog = |axis: usize, negative: bool| -> Element<'_, Message> {
         if !c.axis(axis) {
             return space().width(64).height(44).into();
         }
+        let can_jog = can_jog && c.jog_blocked(axis).is_none();
         let held = c.held() == Some((axis, negative));
         let label = format!("{}{}", AXES[axis], if negative { "−" } else { "+" });
         let face = container(bold(label, 15).color(if held {
@@ -6548,6 +6775,12 @@ fn control(app: &App) -> Element<'_, Message> {
         column![jog(2, false), gap(), jog(2, true)].spacing(6),
     ]
     .spacing(6);
+    let pad = if c.axis(3) {
+        pad.push(space().width(18))
+            .push(column![jog(3, false), gap(), jog(3, true)].spacing(6))
+    } else {
+        pad
+    };
     let speed = row![
         text(format!(
             "Speed {:.0} % · X {:.0} mm/min",
@@ -6567,17 +6800,20 @@ fn control(app: &App) -> Element<'_, Message> {
     ]
     .spacing(10)
     .align_y(Alignment::Center);
-    let jog_panel = machine_panel(
-        "Jog",
-        column![
-            modes,
-            pad,
-            speed,
-            muted(
-                "Hold a button, an arrow key (X, Y) or Page Up/Down (Z) to jog, and let go to stop. The arrow and Page keys jog while these controls are on screen and no text field is being edited."
-            )
-        ],
-    );
+    let keys = if c.axis(3) {
+        "Hold a button, an arrow key (X, Y), Page Up/Down (Z) or Home/End (A) to jog, and let go to stop. These keys jog while these controls are on screen and no text field is being edited."
+    } else {
+        "Hold a button, an arrow key (X, Y) or Page Up/Down (Z) to jog, and let go to stop. The arrow and Page keys jog while these controls are on screen and no text field is being edited."
+    };
+    let mut jog_column = column![modes];
+    if let Some(angles) = angles {
+        jog_column = jog_column.push(angles);
+    }
+    let mut jog_column = jog_column.push(pad).push(speed);
+    if let Some(why) = c.jog_blocked(3) {
+        jog_column = jog_column.push(text(why).size(12).color(Color::from_rgb8(166, 101, 32)));
+    }
+    let jog_panel = machine_panel("Jog", jog_column.push(muted(keys)));
     let manual = |a: Action| c.manual().then_some(Message::Machine(a));
     // A milling machine's DRO: each axis's work position with Zero, ½ and
     // a value to set it to.
@@ -6587,7 +6823,7 @@ fn control(app: &App) -> Element<'_, Message> {
             row![
                 bold(AXES[a], 18).width(24),
                 // Right-aligned so the decimal points line up, as on a DRO.
-                text(format!("{:.3}", s.work_pos[a]))
+                text(reading(a, s.work_pos[a]))
                     .size(22)
                     .font(Font {
                         weight: iced::font::Weight::Bold,
@@ -6613,7 +6849,15 @@ fn control(app: &App) -> Element<'_, Message> {
                         .padding([7, 9])
                         .size(13),
                     "work_set",
-                    &format!("Set {} · mm", AXES[a]),
+                    &format!(
+                        "Set {} · {}",
+                        AXES[a],
+                        if crate::control::rotary(a) {
+                            "°"
+                        } else {
+                            "mm"
+                        }
+                    ),
                     Target::Machine
                 ),
                 act(
@@ -6796,7 +7040,8 @@ fn control(app: &App) -> Element<'_, Message> {
     if let Some(note) = probe_note(c) {
         probe = probe.push(note);
     }
-    if let Some((lo, hi)) = c.block {
+    // The test bar on A stands where the block would (Rotary A).
+    if let Some((lo, hi)) = c.block.filter(|_| c.sim_bar().is_none()) {
         probe = probe.push(muted(format!(
             "Simulated: a block at machine X {:.0}…{:.0}, Y {:.0}…{:.0}, its top at Z {:.3}, stands for the stock{}.",
             lo[0],
@@ -6922,18 +7167,21 @@ fn control(app: &App) -> Element<'_, Message> {
     // the spindle.
     main = main
         .push(row![position, jog_panel].spacing(12))
-        .push(work_panel)
-        .push(
-            row![
-                model,
-                column![
-                    machine_panel("Spindle and coolant", spindle),
-                    machine_panel("Overrides", overrides)
-                ]
-                .spacing(12)
+        .push(work_panel);
+    if let Some(rotary) = rotary_panel(c) {
+        main = main.push(rotary);
+    }
+    main = main.push(
+        row![
+            model,
+            column![
+                machine_panel("Spindle and coolant", spindle),
+                machine_panel("Overrides", overrides)
             ]
-            .spacing(12),
-        );
+            .spacing(12)
+        ]
+        .spacing(12),
+    );
     let send =
         (c.manual() && !c.mdi.trim().is_empty()).then_some(Message::Machine(Action::MdiSend));
     main = main.push(machine_panel(
@@ -7039,7 +7287,14 @@ pub(crate) fn run_strip<'a>(
         for (si, x) in setups {
             let picked = c.run.as_ref().is_some_and(|r| r.setup == si);
             pick = pick.push(act(
-                format!("{}. {}", si + 1, x.name()),
+                format!(
+                    "{}. {}{}",
+                    si + 1,
+                    x.name(),
+                    crate::indexed::label(x)
+                        .map(|a| format!(" · {a}"))
+                        .unwrap_or_default()
+                ),
                 msg(!c.setup_locked(), R::Setup(si)),
                 picked,
             ));
@@ -7240,6 +7495,39 @@ pub(crate) fn run_panel<'a>(
     body = body.push(muted(
         "Each operation in the order it is cut, with the stock as it leaves it: cut faces are green. Start here makes Cycle Start begin with that operation, those before it taken as cut.",
     ));
+    // Where A is, on a machine with A, and while an index move turns it.
+    let with_a = app
+        .doc
+        .setups
+        .get(run.setup)
+        .is_some_and(|x| x.machine.has_a())
+        && c.axis(3);
+    if with_a {
+        let turning = run
+            .progress(s.current_line)
+            .and_then(|(_, _, b)| match run.running_blocks()?.get(b)? {
+                crate::post::Block::Index { a, .. } => Some(*a),
+                _ => None,
+            })
+            .filter(|_| running);
+        let mut line = if s.referenced[3] {
+            format!(
+                "A now: {:.3}° in G{} (machine A {:.3}°)",
+                s.work_pos[3],
+                54 + s.active_wcs,
+                s.machine_pos[3]
+            )
+        } else {
+            "A now: no machine position".to_string()
+        };
+        if let Some(a) = turning {
+            line += &format!(
+                " · index move: turning A alone to {}°, X Y Z still",
+                crate::indexed::degrees(a)
+            );
+        }
+        body = body.push(bold(line, 13));
+    }
     // Operations are numbered through the setup, across its tool runs.
     let mut number = 0;
     for (i, p) in programs.iter().enumerate() {
@@ -7303,7 +7591,17 @@ pub(crate) fn run_panel<'a>(
                 (_, Some(t)) => t.get(k).map(|&t| format!("Time {}", crate::run::clock(t))),
                 _ => None,
             };
-            cards = cards.push(op_card(number, o, run.picture(oi), stage, time, start));
+            // The setup and the A angles the operation is cut at.
+            let angles = crate::run::op_angles(&p.blocks, k);
+            let at = with_a.then(|| {
+                let a = if angles.is_empty() {
+                    "A 0°".to_string()
+                } else {
+                    crate::indexed::angles_text(&angles)
+                };
+                format!("Setup {} · {a}", run.setup + 1)
+            });
+            cards = cards.push(op_card(number, o, run.picture(oi), stage, time, start, at));
         }
         body = body.push(cards.wrap().vertical_spacing(8));
     }
@@ -7324,25 +7622,95 @@ pub(crate) fn run_panel<'a>(
             o.stickout,
             o.tool
         )));
+        if with_a {
+            // A turns the stock and the chuck: a reference on them is
+            // touched off at the angle it was recorded at.
+            let first = crate::run::a_angles(&p.blocks);
+            let back = match first.first() {
+                Some(a) => format!(
+                    "Cycle Start's first moves retract Z, then turn A alone back to {}° for this tool run. It turns A, so touch the new tool off with Touch off on the A reference: Set Z from reference does not relate it to the probed centreline.",
+                    crate::indexed::degrees(*a)
+                ),
+                None => {
+                    "This tool run does not turn A: turn A back to A0 before Cycle Start.".into()
+                }
+            };
+            body = body.push(note(match run.reference_a {
+                Some(ra) => format!(
+                    "A axis: the reference was recorded with A at {ra:.3}°. Touch the new tool off with A there (Set Z from reference waits for it), then {}",
+                    back[..1].to_lowercase() + &back[1..]
+                ),
+                None => format!(
+                    "A axis: record the reference and touch both tools off at the same A angle; A where it is now ({:.3}°) will do. {back}",
+                    s.work_pos[3]
+                ),
+            }));
+        }
+    }
+    // A tool run that turns A runs only with its tool touched off on the
+    // Z reference the probe touched with the centreline (LIO-207).
+    if let Some(p) =
+        (programs.get(run.next)).filter(|p| !crate::run::a_angles(&p.blocks).is_empty())
+    {
+        let o = &p.ops[0];
+        let ready = c.a_reference(&app.doc);
+        let said = match run.length.as_ref().filter(|(id, ..)| *id == o.tool_id) {
+            Some((_, d, _)) => format!(
+                "T{} is touched off on the A centreline's Z reference: its tip is {:.3} mm {} the probe's, and its work Z is on the centreline.",
+                o.tool,
+                d.abs(),
+                if *d >= 0. { "under" } else { "over" }
+            ),
+            None => format!(
+                "T{} {}: with it in the spindle, jog over the Z reference the probe touched with the A centreline, put the touch plate on it and press Touch off on the A reference. That sets its work Z on the centreline, whatever its length.",
+                o.tool, o.tool_name
+            ),
+        };
+        body = body.push(
+            row![
+                act(
+                    "Touch off on the A reference",
+                    msg(ready.is_ok() && !running, R::ProbeCentreReference),
+                    false
+                ),
+                muted(said),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+        if let (Err(why), false) = (&ready, running) {
+            body = body.push(muted(why.clone()));
+        }
     }
     if count > 1 {
         let manual = c.manual() && !running;
         body = body.push(
             row![
-                muted(match run.reference {
-                    Some(z) => format!("Reference surface: Z {z:.3} (G{})", 54 + s.active_wcs),
-                    None => "Reference surface: not recorded".into(),
+                muted(match (run.reference, run.reference_a) {
+                    (Some(z), Some(a)) => format!(
+                        "Reference surface: Z {z:.3} (G{}) at A {a:.3}°",
+                        54 + s.active_wcs
+                    ),
+                    (Some(z), None) =>
+                        format!("Reference surface: Z {z:.3} (G{})", 54 + s.active_wcs),
+                    (None, _) => "Reference surface: not recorded".into(),
                 }),
                 act("Record reference", msg(manual, R::RecordReference), false),
                 act(
                     "Set Z from reference",
-                    msg(manual && run.reference.is_some(), R::ZFromReference),
+                    msg(
+                        manual && run.reference.is_some() && run.reference_a_problem(c).is_none(),
+                        R::ZFromReference
+                    ),
                     false
                 ),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
         );
+        if let Some(why) = run.reference_a_problem(c).filter(|_| !running) {
+            body = body.push(muted(why));
+        }
         if c.config.inputs.probe.is_some() {
             let probe = c.probe_blocked().is_none() && !running;
             body = body.push(
@@ -7350,7 +7718,12 @@ pub(crate) fn run_panel<'a>(
                     act("Probe reference", msg(probe, R::ProbeReference), false),
                     act(
                         "Probe Z from reference",
-                        msg(probe && run.reference.is_some(), R::ProbeFromReference),
+                        msg(
+                            probe
+                                && run.reference.is_some()
+                                && run.reference_a_problem(c).is_none(),
+                            R::ProbeFromReference
+                        ),
                         false
                     ),
                     muted(if c.direct() {
@@ -7443,6 +7816,7 @@ fn op_card<'a>(
     stage: crate::run::Stage,
     time: Option<String>,
     start: Option<Option<Message>>,
+    angles: Option<String>,
 ) -> Element<'a, Message> {
     use crate::run::Stage;
     let (w, h) = OP_CARD_PICTURE;
@@ -7485,6 +7859,9 @@ fn op_card<'a>(
     .width(w);
     if let Some(time) = time {
         card = card.push(muted(time).size(11));
+    }
+    if let Some(angles) = angles {
+        card = card.push(muted(angles).size(11).wrapping(Wrapping::Word));
     }
     if let Some(start) = start {
         card = card.push(act("Start here", start, false));
@@ -7951,6 +8328,134 @@ fn pin_block<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>>
     }
     Some(col.into())
 }
+/// The Rotary A panel on a machine with the rotary unit (LIO-186): how the
+/// A centreline was found, the calibration probes, Save the centreline and
+/// Rotary unit remounted, why a probe cannot start and how the last ended.
+fn rotary_panel<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>> {
+    use crate::control::{Action, Calibrate};
+    let rot = c.rotary.as_ref().filter(|_| c.axis(3))?;
+    let (green, amber) = (
+        Color::from_rgb8(39, 130, 93),
+        Color::from_rgb8(166, 101, 32),
+    );
+    let (y, z) = (rot.unit.centre_y, rot.unit.centre_z);
+    let state = if rot.measured() {
+        text(format!(
+            "Centreline measured: machine Y {y:.3}, Z {z:.3}. Probe it again after the rotary unit is moved."
+        ))
+        .size(12)
+        .color(green)
+    } else if rot.mark.starts_with("stale") {
+        text(format!(
+            "The measured centreline (machine Y {y:.3}, Z {z:.3}) is {}: probe it again before cutting on A.",
+            rot.mark
+        ))
+        .size(12)
+        .color(amber)
+    } else {
+        text(format!(
+            "The centreline is ASSUMED, machine Y {y:.3}, Z {z:.3}: probe it before cutting on A. An error of e mm puts a feature cut at A 180° off by 2e."
+        ))
+        .size(12)
+        .color(amber)
+    };
+    let field = |value: &str, hint: &'a str, key: &str, label: &str, on: fn(String) -> Action| {
+        help::field(
+            text_input(hint, value)
+                .on_input(move |v| Message::Machine(on(v)))
+                .width(90)
+                .padding([7, 9])
+                .size(13),
+            key,
+            label,
+            Target::Machine,
+        )
+    };
+    let fields = row![
+        muted("Bar or stock Ø"),
+        field(
+            &c.bar_text,
+            "mm",
+            "rotary_bar",
+            "Bar or stock diameter · mm",
+            Action::BarText
+        ),
+        muted("Touch spacing"),
+        field(
+            &c.spacing_text,
+            "mm",
+            "rotary_spacing",
+            "Touch spacing · mm",
+            Action::SpacingText
+        ),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    let probe = |what: Calibrate| {
+        act(
+            what.label(),
+            c.calibrate_blocked(what)
+                .is_none()
+                .then_some(Message::Machine(Action::Calibrate(what))),
+            c.calibrating() == Some(what),
+        )
+    };
+    let idle = c.calibrating().is_none();
+    let buttons = row![
+        probe(Calibrate::Centreline),
+        probe(Calibrate::Alignment),
+        probe(Calibrate::AZero),
+        act(
+            "Touch the Z reference",
+            c.centre_reference_blocked()
+                .is_none()
+                .then_some(Message::Machine(Action::TouchCentreReference)),
+            false
+        ),
+        act(
+            "Save the centreline",
+            (idle && c.centre.is_some_and(|x| x.reference.is_some()) && !c.centre_saved)
+                .then_some(Message::Machine(Action::SaveCentreline)),
+            false
+        ),
+        act(
+            "Rotary unit remounted",
+            (idle && rot.measured()).then_some(Message::Machine(Action::Remounted)),
+            false
+        ),
+    ]
+    .spacing(6);
+    let how = match c.calibrating() {
+        Some(what) => format!("{} E-stop stops it.", what.how()),
+        None => match c.calibrate_blocked(Calibrate::Centreline) {
+            Some(why) => format!("{} {why}", Calibrate::Centreline.how()),
+            None => Calibrate::Centreline.how(),
+        },
+    };
+    let mut col = column![state, fields, buttons, muted(how)].spacing(8);
+    if c.centre.is_some_and(|x| x.reference.is_none()) && idle {
+        col = col.push(muted(crate::control::NO_CENTRE_REFERENCE));
+    }
+    if let Some((ok, said)) = &c.rotary_said {
+        col = col.push(
+            text(said.clone())
+                .size(12)
+                .color(if *ok { green } else { amber }),
+        );
+    }
+    if let Some(bar) = c.sim_bar() {
+        let r = c.bar_diameter().unwrap_or_default() / 2.;
+        let x = bar.x[0] + crate::control::CHUCK_GAP + 5.;
+        let top = z as f64 + r + 3.;
+        col = col.push(muted(format!(
+            "Simulated: a Ø{} mm test bar is in the chuck, from X {:.0} to {:.0}, on an A axis a little off the assumed one, with a 1 mm deep flat on top at about A −45°; the simulator's block is off the table meanwhile. The MDI line G53 G0 X{x:.1} Y{y:.1} Z{top:.1} puts the tip about 3 mm over it near the chuck.",
+            2. * r,
+            bar.x[0],
+            bar.x[1],
+        )));
+    }
+    Some(machine_panel("Rotary A", col))
+}
 const HOME_NOTE: &str = "Home references every axis on its switch. Every E-stop clears the machine position: home again after one.";
 const MACHINE_ZERO_NOTE: &str = "Every E-stop clears the machine position: set it again after one. Without home switches, jog X to its left end, Y to its front end (gantry toward you) and Z to the top, then Set machine zero here. Keep the last position takes the position AXIS CAM saved at the last disconnect: only if nothing moved the machine since.";
 /// The note under a library editor's fields when its draft is not what the
@@ -8120,6 +8625,10 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
             ("length", "Flute length · mm"),
             ("stickout", "Stickout · mm"),
             ("holder", "Holder diameter · mm"),
+            (
+                "holder_length",
+                "Holder length to the spindle nose · mm (empty: 10, assumed)",
+            ),
         ] {
             form = form.push(field(p, k, l, t));
         }
@@ -8941,6 +9450,11 @@ pub(crate) fn plan_holding_line(job: &crate::model::Document, index: usize) -> O
     } else {
         ", laid out by the app from this setup's toolpaths"
     };
+    if crate::chuck::holds(job.setups.get(index)?) {
+        return Some(format!(
+            "Modelled workholding{by}: {text} The chuck, its jaws, the rotary head, the tailstock and the stock in the jaws are checked as the boxes round them with the gap, at A0; the table and the machine body are not."
+        ));
+    }
     Some(format!(
         "Modelled workholding{by}: {text} Jaws and clamps are checked as boxes with the gap; parallels, bolts, the table and the machine body are not."
     ))
@@ -9057,13 +9571,13 @@ pub(crate) fn plan_work_zero_line(outcome: &crate::planner::Outcome, si: usize) 
 pub(crate) fn program_note(held: Held) -> &'static str {
     match held {
         Held::No => {
-            "LinuxCNC 3-axis output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Fixtures, clamps and the machine body are not checked: preview each program in LinuxCNC and air-cut first."
+            "LinuxCNC 3-axis or indexed A output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Fixtures, clamps and the machine body are not checked: preview each program in LinuxCNC and air-cut first."
         }
         Held::Every => {
-            "LinuxCNC 3-axis output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Every program move, the links between operations, approaches and retracts included, is checked against each setup's vise jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked, and retracts to machine home are assumed to clear everything: preview each program in LinuxCNC and air-cut first."
+            "LinuxCNC 3-axis or indexed A output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Every program move, the links between operations, approaches and retracts included, is checked against each setup's vise jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked, and retracts to machine home are assumed to clear everything: preview each program in LinuxCNC and air-cut first."
         }
         Held::Mixed => {
-            "LinuxCNC 3-axis output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Every program move of a setup that models a vise or clamps, the links between operations, approaches and retracts included, is checked against its jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked, and neither are fixtures and clamps in the setups whose workholding is not modelled or cannot be checked; retracts to machine home are assumed to clear everything: preview each program in LinuxCNC and air-cut first."
+            "LinuxCNC 3-axis or indexed A output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Every program move of a setup that models a vise or clamps, the links between operations, approaches and retracts included, is checked against its jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked, and neither are fixtures and clamps in the setups whose workholding is not modelled or cannot be checked; retracts to machine home are assumed to clear everything: preview each program in LinuxCNC and air-cut first."
         }
     }
 }
@@ -9408,8 +9922,10 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             framed: vec![],
             leftover: None,
             live: None,
+            a: None,
             live_stock: None,
             start_stock: None,
+            live_volume: None,
             uncut: &[],
             show_uncut: true,
             section: Default::default(),

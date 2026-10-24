@@ -73,9 +73,7 @@ impl Strategy {
                 "Available · planar pocket with islands, cleared at a controlled radial engagement"
             }
             Self::Scallop => "Unavailable · constant surface-spacing kernel is not implemented",
-            Self::Indexed => {
-                "Unavailable · indexed tool frames and rotary kinematics are not implemented"
-            }
+            Self::Indexed => crate::indexed::AVAILABILITY,
             Self::Rotary => {
                 "Unavailable · continuous rotary paths and stock simulation are not implemented"
             }
@@ -152,7 +150,7 @@ impl Strategy {
             "Finish shallow surfaces using parallel passes. Set direction, surface spacing and the slope range.",
             "Finish steep walls at constant Z levels. Choose surfaces and a vertical stepdown.",
             "Finish surfaces at approximately constant spacing. Use rest machining to target a previous operation’s remaining stock.",
-            "Position a rotary axis, lock it, then machine a face. Set the indexed angles within the machine travel limits.",
+            "Indexed work is a setup, not an operation: add a setup, choose Reposition → Index rotary axis and list its A angles. Every operation in it runs at each angle.",
             "Finish around a rotary axis. Choose an axis, angular range and line, circular or spiral motion.",
             "Orient the cutter along a surface. Set axis control, tilt limits and lead/lean before checking machine motion.",
             "Remove a rectangular block of material, one axis at a time, on a manual mill.",
@@ -177,7 +175,7 @@ impl Strategy {
             return vec!["Tool", "Turn", "Passes"];
         }
         let mut v = vec!["Tool", "Geometry"];
-        if matches!(self, Self::Indexed | Self::Rotary | Self::FiveAxis) {
+        if matches!(self, Self::Rotary | Self::FiveAxis) {
             v.push("Orientation")
         }
         v.push("Heights");
@@ -207,8 +205,8 @@ pub const FEATURES: [&str; 9] = [
     "Hole 4 · Ø8",
 ];
 
-/// The keys of a setup's vise or clamps.
-const HOLDING: [&str; 7] = [
+/// The keys of a setup's vise, clamps or chuck.
+const HOLDING: [&str; 11] = [
     "holding",
     "holder",
     "holding_gap",
@@ -216,6 +214,10 @@ const HOLDING: [&str; 7] = [
     "vise_offset",
     "vise_grip",
     "clamps",
+    "chuck_jaws",
+    "chuck_stickout",
+    "chuck_tailstock",
+    "chuck_jaw_angle",
 ];
 /// The setup keys a manual setup put first takes from the old first setup,
 /// besides its stock: orientation, zero, offset and holding.
@@ -254,6 +256,89 @@ pub fn tool_label(number: impl std::fmt::Display, name: &str) -> String {
 pub fn names_number(number: impl std::fmt::Display, name: &str) -> bool {
     let t = format!("T{number}");
     name == t || name.starts_with(&format!("{t} "))
+}
+
+/// A rotary unit's geometry on a machine with an A axis (LIO-184): the
+/// `p` key, the form's label and the default, all in mm. EVERY DEFAULT IS
+/// ASSUMED, for a 100 mm 3-jaw chuck on a NEMA23 rotary unit at the left end
+/// of a Jingyan CNC4030's table, and still to be measured (calibration,
+/// LIO-186). Machine files saved before these fields existed lack the keys
+/// and still load: the geometry is then not recorded (`Machine::rotary_unit`
+/// is None) and is not checked, until the machine is edited (which fills
+/// these defaults in, `Machine::fill_rotary_defaults`). The spindle nose's
+/// two (LIO-204), last, are ASSUMED for the CNC4030's 800 W spindle, a Ø65
+/// mm body; a file without them takes these defaults (`NOSE_DEFAULT`) and
+/// the rotary checks say so.
+pub const ROTARY_GEOMETRY: [(&str, &str, &str); 17] = [
+    ("a_centre_y", "A centreline in machine Y · mm", "140"),
+    ("a_centre_z", "A centreline in machine Z · mm", "-40"),
+    ("a_chuck_x", "Chuck face in machine X · mm", "20"),
+    (
+        "a_centre_height",
+        "Centre height above the table · mm",
+        "70",
+    ),
+    ("a_chuck_diameter", "Chuck diameter · mm", "100"),
+    ("a_jaw_length", "Jaw length · mm", "25"),
+    ("a_grip_min", "Smallest part the jaws grip · mm", "5"),
+    ("a_grip_max", "Largest part the jaws grip · mm", "80"),
+    ("a_tail_width", "Tailstock body width (Y) · mm", "60"),
+    ("a_tail_height", "Tailstock body height (Z) · mm", "80"),
+    ("a_tail_length", "Tailstock body length (X) · mm", "90"),
+    ("a_tail_travel", "Tailstock travel · mm", "30"),
+    ("a_tail_x", "Tailstock centre in machine X · mm", "330"),
+    (
+        "a_fit_diameter",
+        "Largest part diameter under the gantry · mm",
+        "80",
+    ),
+    (
+        "a_fit_length",
+        "Longest part between chuck and tailstock · mm",
+        "250",
+    ),
+    ("a_nose_diameter", "Spindle nose diameter · mm", "65"),
+    (
+        "a_nose_length",
+        "Spindle body length above its nose · mm",
+        "185",
+    ),
+];
+/// The spindle nose's diameter and its body's length (mm) a machine file
+/// without them is taken to have: the assumed 800 W spindle's (LIO-204).
+pub const NOSE_DEFAULT: [f32; 2] = [65., 185.];
+
+/// The rotary unit's geometry, mm, as `Machine::rotary_unit` reads it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RotaryUnit {
+    pub centre_y: f32,
+    pub centre_z: f32,
+    pub chuck_x: f32,
+    pub centre_height: f32,
+    pub chuck_diameter: f32,
+    pub jaw_length: f32,
+    pub grip_min: f32,
+    pub grip_max: f32,
+    pub tail_width: f32,
+    pub tail_height: f32,
+    pub tail_length: f32,
+    pub tail_travel: f32,
+    pub tail_x: f32,
+    pub fit_diameter: f32,
+    pub fit_length: f32,
+    /// The spindle nose: its diameter and how far its body reaches up
+    /// from it (LIO-204).
+    pub nose_diameter: f32,
+    pub nose_length: f32,
+    /// Whether the machine file gives no spindle nose, so `NOSE_DEFAULT`'s
+    /// is taken.
+    pub nose_assumed: bool,
+    /// The Z reference the probe touched with the centreline (LIO-207):
+    /// machine X, Y and the machine Z of the probe's tip on the surface
+    /// (`CENTRE_REF`). `centre_z` is where the probe's tip is on the
+    /// centreline; a tool touched off on this surface is related to it.
+    /// None until the Control page saves one.
+    pub reference: Option<[f32; 3]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,17 +416,139 @@ impl Machine {
             );
             p.insert("pivot_z".into(), "120".into());
         }
-        Self {
+        let mut m = Self {
             id: id(),
             version: 1,
             p,
-        }
+        };
+        m.fill_rotary_defaults();
+        m
     }
     pub fn name(&self) -> &str {
         get(&self.p, "name")
     }
     pub fn axes(&self) -> u8 {
         get(&self.p, "axes").parse().unwrap_or(3)
+    }
+    /// Whether the machine has an A axis on its table, turning about X: the
+    /// 4-axis "A table around X". The rotary unit's geometry applies to it.
+    pub fn has_a(&self) -> bool {
+        self.axes() == 4 && get(&self.p, "arrangement").starts_with('A')
+    }
+    /// The rotary unit's geometry; None without an A axis, or when a field
+    /// is missing (a file saved before they existed) or not a number.
+    pub fn rotary_unit(&self) -> Option<RotaryUnit> {
+        if !self.has_a() {
+            return None;
+        }
+        let v = |i: usize| num(&self.p, ROTARY_GEOMETRY[i].0);
+        // A file saved before the spindle nose existed takes the default.
+        let given = |i: usize| !get(&self.p, ROTARY_GEOMETRY[i].0).trim().is_empty();
+        let nose = |i: usize| match given(i) {
+            true => v(i).filter(|n| *n > 0.),
+            false => Some(NOSE_DEFAULT[i - 15]),
+        };
+        Some(RotaryUnit {
+            centre_y: v(0)?,
+            centre_z: v(1)?,
+            chuck_x: v(2)?,
+            centre_height: v(3)?,
+            chuck_diameter: v(4)?,
+            jaw_length: v(5)?,
+            grip_min: v(6)?,
+            grip_max: v(7)?,
+            tail_width: v(8)?,
+            tail_height: v(9)?,
+            tail_length: v(10)?,
+            tail_travel: v(11)?,
+            tail_x: v(12)?,
+            fit_diameter: v(13)?,
+            fit_length: v(14)?,
+            nose_diameter: nose(15)?,
+            nose_length: nose(16)?,
+            nose_assumed: !given(15) || !given(16),
+            reference: centre_reference(&self.p),
+        })
+    }
+    /// What is wrong with the rotary unit's geometry. Nothing is checked
+    /// while no field has been given (an older file): the geometry is not
+    /// recorded then.
+    pub fn rotary_issues(&self) -> Vec<String> {
+        let mut e = vec![];
+        let p = &self.p;
+        if ROTARY_GEOMETRY
+            .iter()
+            .all(|(k, _, _)| get(p, k).trim().is_empty())
+        {
+            return e;
+        }
+        // The form's label without its unit.
+        let name = |k: &str| {
+            let label = ROTARY_GEOMETRY.iter().find(|g| g.0 == k).map_or(k, |g| g.1);
+            label.split(" · ").next().unwrap_or(label).to_string()
+        };
+        for (k, _, _) in ROTARY_GEOMETRY {
+            let ok = match k {
+                "a_centre_y" | "a_centre_z" | "a_chuck_x" | "a_tail_x" => num(p, k).is_some(),
+                // Empty takes the assumed spindle's (`NOSE_DEFAULT`).
+                "a_nose_diameter" | "a_nose_length" if get(p, k).trim().is_empty() => true,
+                "a_grip_min" => num(p, k).is_some_and(|n| n >= 0.),
+                _ => num(p, k).is_some_and(|n| n > 0.),
+            };
+            if !ok {
+                e.push(format!(
+                    "{} must be {}.",
+                    name(k),
+                    match k {
+                        "a_grip_min" => "zero or more",
+                        "a_centre_y" | "a_centre_z" | "a_chuck_x" | "a_tail_x" => "a number",
+                        _ => "greater than zero",
+                    }
+                ))
+            }
+        }
+        // Machine Z is zero at the top and negative down, as in the UC100
+        // profile: the centreline is somewhere in the Z travel below it.
+        let [x, y, z] = ["x", "y", "z"].map(|k| crate::post_check::machine_mm(self, k));
+        for (k, lo, hi) in [
+            ("a_centre_y", 0., y),
+            ("a_centre_z", -z, 0.),
+            ("a_chuck_x", 0., x),
+            ("a_tail_x", 0., x),
+        ] {
+            if num(p, k).is_some_and(|n| !(lo..=hi).contains(&n)) {
+                e.push(format!(
+                    "{} must be inside the machine's travel, from {lo} to {hi} mm.",
+                    name(k)
+                ))
+            }
+        }
+        let Some(u) = self.rotary_unit() else {
+            return e;
+        };
+        if u.grip_max <= u.grip_min {
+            e.push(format!(
+                "{} must be greater than {}.",
+                name("a_grip_max"),
+                name("a_grip_min")
+            ))
+        }
+        if u.grip_max > u.chuck_diameter {
+            e.push(format!(
+                "{} cannot be wider than the chuck.",
+                name("a_grip_max")
+            ))
+        }
+        if u.tail_x <= u.chuck_x {
+            e.push("The tailstock must be at a larger machine X than the chuck face.".into())
+        } else if u.fit_length > u.tail_x - u.chuck_x {
+            e.push(format!(
+                "{} cannot be longer than the {} mm between the chuck face and the tailstock.",
+                name("a_fit_length"),
+                u.tail_x - u.chuck_x
+            ))
+        }
+        e
     }
     pub fn issues(&self) -> Vec<String> {
         let mut e = vec![];
@@ -421,6 +628,9 @@ impl Machine {
                 finite(&self.p, k, &mut e)
             }
         }
+        if self.has_a() {
+            e.extend(self.rotary_issues());
+        }
         if self.axes() == 5 {
             range(&self.p, "rotary2_min", "rotary2_max", &mut e);
             for k in ["pivot2_x", "pivot2_y", "pivot2_z"] {
@@ -440,6 +650,16 @@ impl Machine {
         );
         e
     }
+    /// Gives a machine with an A axis the assumed rotary geometry it lacks
+    /// (`ROTARY_GEOMETRY`), when it is edited or turned into one; the values
+    /// it has are kept.
+    pub fn fill_rotary_defaults(&mut self) {
+        if self.has_a() {
+            for (key, _, value) in ROTARY_GEOMETRY {
+                self.p.entry(key.into()).or_insert_with(|| value.into());
+            }
+        }
+    }
     pub fn fill_post_defaults(&mut self) {
         // The plate's thickness and the tip's diameter have no default to fill in.
         for key in POST_KEYS.into_iter().chain(PROBE_KEYS) {
@@ -450,6 +670,20 @@ impl Machine {
         }
     }
 }
+/// The machine key the Control page keeps the A centreline's Z reference
+/// in (LIO-207): "X Y Z", machine mm, as `RotaryUnit::reference`.
+pub const CENTRE_REF: &str = "a_centre_ref";
+/// The A centreline's Z reference in `p` (`CENTRE_REF`), if one is kept.
+pub fn centre_reference(p: &Fields) -> Option<[f32; 3]> {
+    let v: Vec<f32> = (get(p, CENTRE_REF).split_whitespace())
+        .map(|w| w.parse::<f32>().ok().filter(|v| v.is_finite()))
+        .collect::<Option<_>>()?;
+    v.try_into().ok()
+}
+/// The holder length taken for a tool that gives none, mm (LIO-204):
+/// short, so the spindle nose is taken as low as it can plausibly be (an
+/// ER11 collet nut on the 800 W spindle stands about this far below it).
+pub const HOLDER_LENGTH: f32 = 10.;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
     pub id: String,
@@ -529,6 +763,12 @@ impl Tool {
                 get(&self.p, "stickout"),
                 get(&self.p, "length")
             ))
+        }
+        // Optional: empty takes `HOLDER_LENGTH`, assumed.
+        if !get(&self.p, "holder_length").trim().is_empty()
+            && !num(&self.p, "holder_length").is_some_and(|v| v >= 0.)
+        {
+            e.push("Holder length must be zero or more.".into())
         }
         if get(&self.p, "type") == "Chamfer mill" && self.tip_angle().is_none() {
             e.push("Enter a chamfer mill tip angle from 20° to 160°.".into())
@@ -655,6 +895,15 @@ impl Tool {
         num(&self.p, "teeth")
             .filter(|n| n.fract() == 0. && (1. ..=10.).contains(n))
             .map_or(1, |n| n as usize)
+    }
+    /// How far the holder reaches up from where the tool comes out of it to
+    /// the spindle nose, mm, and whether it is assumed (`HOLDER_LENGTH`):
+    /// a tool saved before the field existed, or left empty (LIO-204).
+    pub fn holder_length(&self) -> (f32, bool) {
+        match num(&self.p, "holder_length").filter(|v| *v >= 0.) {
+            Some(v) => (v, false),
+            None => (HOLDER_LENGTH, true),
+        }
     }
     /// A chamfer mill's included tip angle in degrees (90 when not saved),
     /// None when it is outside 20–160°.
@@ -929,9 +1178,10 @@ pub const POST_KEYS: [&str; 5] = [
 /// A UC100 machine's probe settings (`control::probe_settings`). The plate's
 /// thickness and the probe tip's diameter have no default: they must be
 /// measured.
-pub const PROBE_KEYS: [&str; 5] = [
+pub const PROBE_KEYS: [&str; 6] = [
     "probe_plate",
     "probe_tip",
+    "probe_length",
     "probe_feed",
     "probe_distance",
     "probe_retract",
@@ -1028,8 +1278,6 @@ impl Operation {
             ("ramp_angle", "2"),
             ("lead_in", "2"),
             ("keep_down", "Yes"),
-            ("angle_a", "0"),
-            ("angle_b", "0"),
             ("rotary_axis", "A around X"),
             ("rotary_start", "0"),
             ("rotary_end", "360"),
@@ -1558,6 +1806,11 @@ impl Operation {
         preceding: &[Operation],
     ) -> Vec<String> {
         let mut e = vec![];
+        // An older project's Indexed operation that could not be moved into
+        // an indexed setup (`Document::migrate_indexed_operations`).
+        if self.strategy == Strategy::Indexed {
+            e.push(crate::indexed::LEGACY.into())
+        }
         if self.strategy == Strategy::Face {
             e.extend(facing_setting_issues(&self.p));
         }
@@ -1698,7 +1951,7 @@ impl Operation {
         if crate::lathe::is_lathe(m) && !matches!(s, Strategy::Turn | Strategy::Drill) {
             e.push(crate::lathe::ONLY_TURN.into())
         }
-        if matches!(s, Strategy::Indexed | Strategy::Rotary) && m.axes() < 4 {
+        if s == Strategy::Rotary && m.axes() < 4 {
             e.push("This strategy needs at least 4 machine axes.".into())
         }
         if s == Strategy::FiveAxis && (m.axes() != 5 || get(&m.p, "mode") != "Simultaneous 5-axis")
@@ -1850,24 +2103,6 @@ impl Operation {
         {
             e.push("Rest machining needs an enabled preceding operation.".into())
         }
-        if s == Strategy::Indexed {
-            bounded(
-                &self.p,
-                "angle_a",
-                num(&m.p, "rotary_min").unwrap_or(0.),
-                num(&m.p, "rotary_max").unwrap_or(0.),
-                &mut e,
-            );
-            if m.axes() == 5 {
-                bounded(
-                    &self.p,
-                    "angle_b",
-                    num(&m.p, "rotary2_min").unwrap_or(0.),
-                    num(&m.p, "rotary2_max").unwrap_or(0.),
-                    &mut e,
-                )
-            }
-        }
         if s == Strategy::Rotary {
             range(&self.p, "rotary_start", "rotary_end", &mut e);
             if get(&self.p, "rotary_style") != "Line"
@@ -1892,6 +2127,10 @@ pub struct Setup {
     pub preview_stock: Option<crate::mesh::Bounds>,
     #[serde(skip)]
     pub preview_remaining: Option<std::sync::Arc<crate::rest::RestStock>>,
+    /// How A turns the part of an indexed setup from its base's placement
+    /// (`indexed`), worked out by `Document::sync_turns`; None otherwise.
+    #[serde(skip)]
+    pub turn: Option<crate::indexed::Turn>,
     pub id: String,
     pub machine: Machine,
     pub p: Fields,
@@ -1902,6 +2141,7 @@ impl Setup {
         Self {
             preview_stock: None,
             preview_remaining: None,
+            turn: None,
             id: id(),
             machine,
             p: fields(&[
@@ -1955,9 +2195,15 @@ impl Setup {
         s
     }
     pub fn is_repositioned(&self) -> bool {
-        ["rx", "ry", "rz", "tx", "ty", "tz"]
-            .iter()
-            .any(|k| num(&self.p, k).unwrap_or(0.).abs() > 0.001)
+        // An indexed setup turned by A, other than a whole turn.
+        let turned = self.turn.is_some_and(|t| {
+            let r = t.turn.rem_euclid(360.);
+            r > 0.001 && r < 359.999
+        });
+        turned
+            || ["rx", "ry", "rz", "tx", "ty", "tz"]
+                .iter()
+                .any(|k| num(&self.p, k).unwrap_or(0.).abs() > 0.001)
     }
     /// What is wrong with operation `i`: its own checks (`Operation::issues`)
     /// and those the setup's stock adds (`Operation::stock_issues`).
@@ -1987,6 +2233,7 @@ impl Setup {
             finite(&self.p, k, &mut e)
         }
         nonnegative(&self.p, "clearance", &mut e);
+        e.extend(crate::indexed::issues(self));
         // The machine's own issues say what is wrong with the pins.
         if crate::control::pins_settings(&self.machine.p).is_ok() {
             e.extend(crate::post::pins_issue(self));
@@ -2370,6 +2617,29 @@ impl Document {
     pub fn holder(&self, id: &str) -> Option<&crate::holding::Holder> {
         self.workholding.iter().find(|h| h.id == id)
     }
+    /// The chuck of `setup` round `stock`, the box it starts from (mm, its
+    /// frame): a round bar when setup 1's stock is one and `setup` faces as
+    /// setup 1 does, else the box (`chuck::rig`).
+    pub fn chuck_rig(
+        &self,
+        setup: &Setup,
+        stock: crate::mesh::Bounds,
+    ) -> Result<crate::chuck::Rig, String> {
+        // An indexed setup's chuck is its base's, round the stock it starts
+        // from, turned to the setup's A angle where it is drawn and checked.
+        if let Some(t) = setup.turn
+            && let Some(base) = self.setups.get(t.base)
+        {
+            return self.chuck_rig(base, t.stock);
+        }
+        let round = self.setups.first().is_some_and(|first| {
+            crate::stock::round_bar(first)
+                && ["rx", "ry", "rz"]
+                    .iter()
+                    .all(|k| num(&first.p, k).unwrap_or(0.) == num(&setup.p, k).unwrap_or(0.))
+        });
+        crate::chuck::rig(setup, stock, round)
+    }
     /// Why `holder` cannot be saved to the library: another entry has its
     /// name (ignoring case).
     pub fn holder_name_issues(&self, holder: &crate::holding::Holder) -> Vec<String> {
@@ -2489,6 +2759,29 @@ impl Document {
             "Chuck" => "Chuck",
             _ => "",
         };
+        // A vise or clamps close on flat sides, which a round bar has not.
+        let round = self.setups.first().is_some_and(crate::stock::round_bar);
+        if round && matches!(kind, "Vise" | "Clamp") {
+            return vec![format!(
+                "A round bar is held in the chuck: a {} is modelled on flat sides. Choose Chuck, or a box stock.",
+                kind.to_lowercase()
+            )];
+        }
+        if crate::chuck::holds(s) {
+            let mut issues = vec![];
+            if let Err(error) = crate::holding::gap(s) {
+                issues.push(error);
+            }
+            if let Some(held) = held() {
+                match self.chuck_rig(s, held.stock) {
+                    Ok(rig) => issues.extend(rig.issues()),
+                    Err(error) => issues.push(error),
+                }
+            } else if s.machine.rotary_unit().is_none() {
+                issues.push(crate::chuck::NO_UNIT.into());
+            }
+            return issues;
+        }
         let id = get(&s.p, "holder");
         let entry = self.holder(id);
         let mut issues = vec![];
@@ -2622,6 +2915,13 @@ impl Document {
         {
             return Err(issue);
         }
+        if crate::chuck::holds(setup) {
+            // Operations run at A0 (`chuck::Rig::hits_at` at any other
+            // angle), an indexed setup's at its first A angle, as its 3D
+            // view shows it.
+            let a = setup.turn.map_or(0., |t| t.a);
+            return Ok(self.chuck_rig(setup, held.stock)?.boxes(a));
+        }
         let layout = crate::holding::layout(setup)?;
         match self.holder(get(&setup.p, "holder")) {
             Some(entry) => crate::holding::boxes(&layout, entry, held),
@@ -2634,6 +2934,16 @@ impl Document {
     /// `holding_issues` says.
     pub fn holding_text(&self, setup: &Setup) -> Option<String> {
         use crate::holding::{Layout, refusal, sentence};
+        if crate::chuck::holds(setup) {
+            // Without the part a later setup's stock is not known: then the
+            // chuck is named without what it grips.
+            let gap = crate::holding::gap(setup).ok()?;
+            let i = self.setups.iter().position(|s| s.id == setup.id)?;
+            return Some(match self.setup_stock(i, None) {
+                Some(stock) => self.chuck_rig(setup, stock).ok()?.sentence(gap),
+                None => format!("{}, gap {gap} mm.", self.holding_label(setup)),
+            });
+        }
         let layout = crate::holding::layout(setup).ok()?;
         let entry = self.holder(get(&setup.p, "holder"))?;
         (layout != Layout::None && refusal(&layout, entry).is_none())
@@ -2648,6 +2958,16 @@ impl Document {
             self.holder(get(&setup.p, "holder"))
                 .map_or(kind.to_string(), |h| h.name().to_string())
         };
+        if crate::chuck::holds(setup) {
+            return format!(
+                "{} chuck on A",
+                if get(&setup.p, "chuck_jaws") == "4-jaw" {
+                    "4-jaw"
+                } else {
+                    "3-jaw"
+                }
+            );
+        }
         match layout(setup) {
             Ok(Layout::None) => fixture_note(setup).map_or("No workholding modelled".into(), |n| {
                 format!("{n}, not modelled")
@@ -2667,7 +2987,20 @@ impl Document {
         let kind = match get(&s.p, "holding") {
             "Vise" => "Vise",
             "Clamps" => "Clamp",
-            "Chuck" => "Chuck",
+            "Chuck" if !crate::chuck::holds(s) => "Chuck",
+            // The chuck on the machine's rotary A axis (`chuck`).
+            "Chuck" => {
+                let p = &mut self.setups[setup].p;
+                for (k, v) in crate::chuck::DEFAULTS {
+                    if get(p, k).trim().is_empty() {
+                        p.insert(k.into(), v.into());
+                    }
+                }
+                if get(p, "holding_gap").trim().is_empty() {
+                    p.insert("holding_gap".into(), "2".into());
+                }
+                return;
+            }
             _ => return,
         };
         let mine = self
@@ -2843,6 +3176,7 @@ impl Document {
             setup.p.insert("stock_source".into(), source);
             source = setup.id.clone();
         }
+        self.sync_indexed();
     }
     pub fn validate_order(&self, setups: &[Setup]) -> Result<(), String> {
         let mut seen = HashSet::new();
@@ -3154,7 +3488,7 @@ impl Document {
                 get(&setup.p, "tx"),
                 get(&setup.p, "ty"),
                 get(&setup.p, "tz"),
-                get(&setup.p, "reposition"),
+                self.reposition_text(i),
                 requested,
                 get(&setup.p, "notes")
             );
@@ -3177,7 +3511,7 @@ fn label(k: &str) -> String {
 pub const BOX_FIELDS: [&str; 6] = ["x_min", "x_max", "y_min", "y_max", "z_top", "z_bottom"];
 /// The operation editor's text fields, by key: the ones a check's message
 /// names by its `label`.
-const OPERATION_FIELDS: [&str; 58] = [
+const OPERATION_FIELDS: [&str; 56] = [
     "name",
     "x_min",
     "x_max",
@@ -3193,8 +3527,6 @@ const OPERATION_FIELDS: [&str; 58] = [
     "top",
     "bottom",
     "breakthrough",
-    "angle_a",
-    "angle_b",
     "rotary_start",
     "rotary_end",
     "tilt_min",
@@ -6852,5 +7184,201 @@ mod manual_setups {
         assert!(issues(Strategy::Scallop, false));
         assert!(issues(Strategy::Adaptive, true));
         assert!(!issues(Strategy::Adaptive, false));
+    }
+}
+#[cfg(test)]
+mod rotary_unit {
+    use super::*;
+
+    #[test]
+    fn a_4_axis_machine_starts_with_the_assumed_geometry_and_no_issues() {
+        let m = Machine::new(4);
+        assert!(m.has_a());
+        assert_eq!(m.issues(), Vec::<String>::new());
+        let u = m.rotary_unit().unwrap();
+        assert_eq!(
+            (u.chuck_diameter, u.centre_height, u.fit_diameter, u.tail_x),
+            (100., 70., 80., 330.)
+        );
+        for (key, _, value) in ROTARY_GEOMETRY {
+            assert_eq!(get(&m.p, key), value);
+        }
+    }
+
+    #[test]
+    fn the_geometry_is_saved_in_mm_and_comes_back_from_a_file() {
+        let mut m = Machine::new(4);
+        m.p.insert("a_chuck_diameter".into(), "125".into());
+        m.p.insert("a_grip_max".into(), "110".into());
+        let back: Machine = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.p, m.p);
+        assert_eq!(back.rotary_unit(), m.rotary_unit());
+        assert_eq!(back.rotary_unit().unwrap().chuck_diameter, 125.);
+        // Inches change the travel's unit, not the geometry's.
+        let mut inch = back;
+        inch.p.insert("units".into(), "inch".into());
+        assert_eq!(inch.rotary_unit().unwrap().chuck_diameter, 125.);
+    }
+
+    #[test]
+    fn a_machine_file_saved_before_the_geometry_existed_still_loads() {
+        let old = r#"{"id":"m1","version":3,"p":{"name":"Rotary Mill","axes":"4",
+            "mode":"Indexed (3+1)","arrangement":"A table around X","x":"390","y":"280","z":"55",
+            "units":"mm","controller":"LinuxCNC","rpm":"12000","feed":"5000",
+            "rotary_min":"-180","rotary_max":"180","pivot_x":"0","pivot_y":"0","pivot_z":"120"}}"#;
+        let mut m: Machine = serde_json::from_str(old).unwrap();
+        assert!(m.has_a());
+        // Not recorded and not complained about; editing fills in the assumed values.
+        assert_eq!(m.rotary_unit(), None);
+        assert_eq!(m.issues(), Vec::<String>::new());
+        m.fill_rotary_defaults();
+        assert_eq!(m.rotary_unit(), Machine::new(4).rotary_unit());
+        // A value it had is kept.
+        let mut kept = m.clone();
+        kept.p.insert("a_chuck_diameter".into(), "125".into());
+        kept.fill_rotary_defaults();
+        assert_eq!(get(&kept.p, "a_chuck_diameter"), "125");
+        // A library file with such a machine loads whole.
+        let doc: Document =
+            serde_json::from_str(&serde_json::to_string(&Document::default()).unwrap()).unwrap();
+        assert!(doc.machines.is_empty());
+    }
+
+    #[test]
+    fn a_machine_file_saved_before_the_spindle_nose_existed_takes_the_assumed_one() {
+        // A file with the rotary unit of LIO-184 and no spindle nose.
+        let mut m = Machine::new(4);
+        m.p.remove("a_nose_diameter");
+        m.p.remove("a_nose_length");
+        let back: Machine = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        let u = back.rotary_unit().unwrap();
+        assert_eq!(
+            (u.nose_diameter, u.nose_length, u.nose_assumed),
+            (65., 185., true)
+        );
+        assert_eq!(back.issues(), Vec::<String>::new());
+        // The rest of its geometry is as it was.
+        assert_eq!((u.chuck_diameter, u.centre_z), (100., -40.));
+        // Given, it is the machine's; editing fills in the assumed values.
+        let new = Machine::new(4).rotary_unit().unwrap();
+        assert_eq!(
+            (new.nose_diameter, new.nose_length, new.nose_assumed),
+            (65., 185., false)
+        );
+        let mut edited = back;
+        edited.p.insert("a_nose_diameter".into(), "52".into());
+        edited.fill_rotary_defaults();
+        let u = edited.rotary_unit().unwrap();
+        assert_eq!(
+            (u.nose_diameter, u.nose_length, u.nose_assumed),
+            (52., 185., false)
+        );
+        // One that is not a size is refused, and the geometry not taken.
+        edited.p.insert("a_nose_diameter".into(), "0".into());
+        assert_eq!(edited.rotary_unit(), None);
+        assert_eq!(
+            edited.issues(),
+            vec!["Spindle nose diameter must be greater than zero.".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_tool_without_a_holder_length_takes_a_short_assumed_one() {
+        let mut t = Tool::new("Flat", "Flat end mill", "6");
+        assert_eq!(t.holder_length(), (HOLDER_LENGTH, true));
+        assert_eq!(HOLDER_LENGTH, 10.);
+        assert!(t.issues().is_empty());
+        t.p.insert("holder_length".into(), "25".into());
+        assert_eq!(t.holder_length(), (25., false));
+        t.p.insert("holder_length".into(), "0".into());
+        assert_eq!(t.holder_length(), (0., false));
+        t.p.insert("holder_length".into(), "-1".into());
+        assert_eq!(
+            t.issues(),
+            vec!["Holder length must be zero or more.".to_string()]
+        );
+        assert_eq!(t.holder_length(), (HOLDER_LENGTH, true));
+    }
+
+    #[test]
+    fn only_a_4_axis_table_around_x_has_the_geometry() {
+        let mut three = Machine::new(3);
+        three.fill_rotary_defaults();
+        assert!(!three.has_a() && three.rotary_unit().is_none());
+        assert!(!three.p.contains_key("a_chuck_diameter"));
+        let mut b = Machine::new(4);
+        b.p.insert("arrangement".into(), "B table around Y".into());
+        assert!(!b.has_a() && b.rotary_unit().is_none());
+        // Bad geometry is not asked about on a machine without an A axis.
+        b.p.insert("a_chuck_diameter".into(), "-1".into());
+        assert!(b.issues().is_empty());
+    }
+
+    #[test]
+    fn the_geometry_is_validated() {
+        let issues = |edits: &[(&str, &str)]| {
+            // The Jingyan's travel.
+            let mut m = Machine::new(4);
+            for (k, v) in [("x", "390"), ("y", "280"), ("z", "55")] {
+                m.p.insert(k.into(), v.into());
+            }
+            for (k, v) in edits {
+                m.p.insert((*k).into(), (*v).into());
+            }
+            m.issues()
+        };
+        for (edits, expected) in [
+            (
+                &[("a_chuck_diameter", "0")][..],
+                "Chuck diameter must be greater than zero.",
+            ),
+            (
+                &[("a_jaw_length", "abc")],
+                "Jaw length must be greater than zero.",
+            ),
+            (
+                &[("a_tail_travel", "-5")],
+                "Tailstock travel must be greater than zero.",
+            ),
+            (
+                &[("a_grip_min", "-1")],
+                "Smallest part the jaws grip must be zero or more.",
+            ),
+            (
+                &[("a_centre_y", "300")],
+                "A centreline in machine Y must be inside the machine's travel, from 0 to 280 mm.",
+            ),
+            (
+                &[("a_centre_z", "10")],
+                "A centreline in machine Z must be inside the machine's travel, from -55 to 0 mm.",
+            ),
+            (
+                &[("a_centre_z", "-60")],
+                "A centreline in machine Z must be inside the machine's travel, from -55 to 0 mm.",
+            ),
+            (
+                &[("a_grip_max", "4")],
+                "Largest part the jaws grip must be greater than Smallest part the jaws grip.",
+            ),
+            (
+                &[("a_grip_max", "120")],
+                "Largest part the jaws grip cannot be wider than the chuck.",
+            ),
+            (
+                &[("a_tail_x", "10")],
+                "The tailstock must be at a larger machine X than the chuck face.",
+            ),
+            (
+                &[("a_fit_length", "400")],
+                "Longest part between chuck and tailstock cannot be longer than the 310 mm between the chuck face and the tailstock.",
+            ),
+        ] {
+            let found = issues(edits);
+            // A chuck of no size also leaves the jaws wider than it.
+            assert_eq!(found.first(), Some(&expected.to_string()), "{edits:?}");
+            assert!(found.len() <= 2, "{found:?}");
+        }
+        // The centreline may sit on the edges of the travel.
+        assert!(issues(&[("a_centre_y", "280"), ("a_centre_z", "-55")]).is_empty());
     }
 }

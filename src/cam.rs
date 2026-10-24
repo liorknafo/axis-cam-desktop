@@ -320,6 +320,7 @@ impl Builder {
                 feed: rate,
                 start: self.plan.duration,
                 end,
+                a: None,
             });
             self.plan.duration = end;
         }
@@ -338,6 +339,7 @@ impl Builder {
                 feed: 0.,
                 start: self.plan.duration,
                 end,
+                a: None,
             });
             self.plan.duration = end;
         }

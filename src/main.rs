@@ -3,6 +3,7 @@ mod analysis;
 mod cam;
 mod choice_diagram;
 mod choice_help;
+mod chuck;
 mod control;
 mod facing;
 #[cfg(test)]
@@ -14,6 +15,7 @@ mod guide;
 mod help;
 mod holding;
 mod illustration;
+mod indexed;
 mod lathe;
 mod look;
 mod machine_view;
@@ -34,6 +36,7 @@ mod post_check;
 mod progress;
 mod proposal;
 mod rest;
+mod rotary_check;
 mod run;
 mod section;
 mod session;
@@ -223,6 +226,8 @@ pub enum Message {
     SquareToStock,
     AssignMachine(String),
     NewMachine,
+    /// Adds the Jingyan CNC4030 with its rotary unit to the Machine library.
+    AddRotaryMachine,
     EditMachine(String),
     WizardStep(usize),
     SaveMachine,
@@ -621,7 +626,7 @@ pub struct SetupHolding {
 }
 /// Setup settings that decide how the setup is held and nothing the earlier
 /// setups' cuts leave behind: an edit of one keeps the stock worked out.
-const HOLDING_KEYS: [&str; 7] = [
+const HOLDING_KEYS: [&str; 11] = [
     "holding",
     "holder",
     "vise_axis",
@@ -629,6 +634,10 @@ const HOLDING_KEYS: [&str; 7] = [
     "vise_grip",
     "clamps",
     "holding_gap",
+    "chuck_jaws",
+    "chuck_stickout",
+    "chuck_tailstock",
+    "chuck_jaw_angle",
 ];
 /// What `cam::holes` answers for the Drill editor's list.
 pub(crate) type DrillHoles = Result<Vec<cam::Hole>, String>;
@@ -881,6 +890,24 @@ fn holding_checks(doc: &Document, mesh: &mesh::Mesh, left: &LeftStock, key: u64)
                 .map(|v| holding::Bands::new(v, frame, part));
             let held = holding::held_by(doc, setup, stock, bands.as_ref());
             let (mut problems, mut margins) = (vec![], vec![]);
+            if chuck::holds(setup)
+                && doc.holding_issues_with(si, Some(held)).is_empty()
+                && let Ok(rig) = doc.chuck_rig(setup, held.stock)
+            {
+                let removed = before.as_deref().map(|v| rest::Removed::new(v, frame));
+                problems.extend(rig.grip_issue(removed.as_ref()));
+                let bites = left.bites.get(si).into_iter().flatten();
+                let bites = bites.map(|(oi, b)| (*oi, b.as_slice()));
+                if problems.is_empty() {
+                    for (oi, margin) in forces::chuck_margins(doc, si, bites, &rig) {
+                        let name = setup.operations[oi].name();
+                        margins.push(forces::chuck_line(name, margin.as_ref()));
+                        if let Some(m) = margin {
+                            problems.extend(forces::chuck_issues(name, &m));
+                        }
+                    }
+                }
+            }
             if let (Some(layout), Some(holder)) = (layout, doc.holder(get(&setup.p, "holder")))
                 && doc.holding_issues_with(si, Some(held)).is_empty()
             {
@@ -1591,6 +1618,7 @@ impl App {
         if !doc.sample_model {
             doc.sync_stock_sources();
         }
+        doc.sync_turns(None);
         let imported_mesh = None;
         let icons: Vec<_> = [
             include_bytes!("../assets/op-0.svg").as_slice(),
@@ -1848,6 +1876,7 @@ impl App {
         self.left_stock = LeftStock::default();
         self.holding_checks = HoldingChecks::default();
         self.imported_mesh = None;
+        self.sync_turns();
         self.import_error = None;
         self.project_dirty = path.is_none();
         self.set_project_file(path);
@@ -2287,6 +2316,48 @@ impl App {
     fn finished(&mut self, epoch: u64) -> Option<Generating> {
         self.generating.take_if(|g| g.epoch == epoch)
     }
+    /// Keeps what the Control page found for the rotary unit of machine
+    /// `id` (LIO-186): its centreline probed, marked measured, or the mark
+    /// gone stale; in its draft too if it is being edited. Like the pins'
+    /// place it is a measurement: no setup's check is made out of date.
+    fn keep_rotary(&mut self, id: &str, keep: control::RotaryKeep) {
+        let keep = |m: &mut Machine| {
+            if m.id != id {
+                return;
+            }
+            match keep {
+                control::RotaryKeep::Centreline([y, z], [rx, ry, rz]) => {
+                    m.p.insert("a_centre_y".into(), format!("{y:.3}"));
+                    m.p.insert("a_centre_z".into(), format!("{z:.3}"));
+                    m.p.insert(model::CENTRE_REF.into(), format!("{rx:.3} {ry:.3} {rz:.3}"));
+                    m.p.insert(control::CENTRE_MARK.into(), control::MEASURED.into());
+                }
+                control::RotaryKeep::Stale(why)
+                    if get(&m.p, control::CENTRE_MARK) == control::MEASURED =>
+                {
+                    m.p.insert(control::CENTRE_MARK.into(), format!("stale after {why}"));
+                }
+                control::RotaryKeep::Stale(_) => {}
+            }
+        };
+        self.doc.machines.iter_mut().for_each(keep);
+        keep(&mut self.machine_draft);
+        self.dirty = true;
+        self.project_dirty = true;
+        self.last_edit = Instant::now();
+    }
+    /// Works out how A turns each indexed setup (`Document::sync_turns`),
+    /// with the part when it is there.
+    fn sync_turns(&mut self) {
+        let mesh = if self.doc.file.is_some() {
+            self.imported_mesh.as_ref()
+        } else if self.doc.sample_model {
+            Some(&self.sample_mesh)
+        } else {
+            None
+        };
+        self.doc.sync_turns(mesh);
+    }
     fn touch(&mut self) {
         // A generation under way makes the job as it was.
         let placing = self
@@ -2305,6 +2376,7 @@ impl App {
                 post::sync_pin_drilling(&mut self.doc, mesh);
             }
         }
+        self.sync_turns();
         self.audit_report.clear();
         self.invalidate_post();
         // A running plan and a preview describe the job as it was.
@@ -2400,6 +2472,21 @@ impl App {
         let setup = self.doc.setups.get(live.setup)?;
         (setup.id == self.doc.active).then_some((live.tip, live.radius, live.stickout))
     }
+    /// The machine's A (degrees, in work coordinates, as programs command
+    /// it) while a tool run of the active setup cuts, on a machine with A.
+    pub fn live_a(&self) -> Option<f32> {
+        let c = self.control.as_ref()?;
+        let live = c.run.as_ref()?.live(&c.snapshot)?;
+        let setup = self.doc.setups.get(live.setup)?;
+        (setup.id == self.doc.active && c.axis(3)).then_some(c.snapshot.work_pos[3] as f32)
+    }
+    /// The A the Job view draws the active indexed setup's part, stock and
+    /// chuck at: the machine's while a run of it cuts (`live_a`), else the
+    /// simulation's (`Simulation::a_now`). None for a setup not indexed.
+    pub fn shown_a(&self) -> Option<f32> {
+        self.doc.active_setup()?.turn?;
+        self.live_a().or_else(|| self.active_simulation()?.a_now())
+    }
     /// The stock the run of the active setup has carved (`run::Run::stock`),
     /// for the Control page's 3D view: MANUFACTURE keeps the part and the
     /// planned stock.
@@ -2413,6 +2500,19 @@ impl App {
             return None;
         }
         r.stock()
+    }
+    /// The stock a run of the active setup that turns A has carved, as a
+    /// volume (`run::Run::carved_volume`), for the Control page's 3D view.
+    pub fn live_volume(&self) -> Option<(&volume::Volume, u64)> {
+        if self.page != Page::Control {
+            return None;
+        }
+        let r = self.control.as_ref()?.run.as_ref()?;
+        let setup = self.doc.setups.get(r.setup)?;
+        if setup.id != self.doc.active {
+            return None;
+        }
+        r.carved_volume()
     }
     /// The machine moves, or a tool run of the Run panel or a probe is under way:
     /// planning is locked (`while_locked`) and no preview or check is worked
@@ -2592,9 +2692,10 @@ impl App {
                             .setup()
                             .operation_issues_in(i, &self.doc.tools, self.is_sample());
                     if self.doc.file.is_some() {
-                        issues.extend(surface::issues(
+                        issues.extend(indexed::surface_issues(
+                            &self.doc,
+                            self.doc.index(),
                             o,
-                            self.doc.setup(),
                             self.imported_mesh.as_ref(),
                         ));
                     }
@@ -2606,11 +2707,12 @@ impl App {
     pub fn job_issues(&self) -> Vec<String> {
         let mut issues = self.doc.issues();
         if self.doc.file.is_some() {
-            for setup in &self.doc.setups {
+            for (si, setup) in self.doc.setups.iter().enumerate() {
                 for operation in setup.operations.iter().filter(|o| o.enabled) {
-                    issues.extend(surface::issues(
+                    issues.extend(indexed::surface_issues(
+                        &self.doc,
+                        si,
                         operation,
-                        setup,
                         self.imported_mesh.as_ref(),
                     ));
                 }
@@ -4304,7 +4406,13 @@ impl App {
                         return Task::none();
                     }
                     let holder = get(&self.doc.setup().p, "holder").to_string();
-                    self.doc.setup_mut().p.insert(k.into(), v);
+                    // Index rotary axis turns the stock about A at the angles
+                    // the setup lists; another action takes them away.
+                    if k == "reposition" {
+                        indexed::set_reposition(&mut self.doc.setup_mut().p, &v);
+                    } else {
+                        self.doc.setup_mut().p.insert(k.into(), v);
+                    }
                     if matches!(k, "holding" | "holder") {
                         self.doc.settle_holding(self.doc.index());
                     }
@@ -4350,6 +4458,9 @@ impl App {
                             }
                             .into(),
                         );
+                    }
+                    if matches!(k, "axes" | "arrangement") {
+                        self.machine_draft.fill_rotary_defaults();
                     }
                 }
                 Target::Tool => {
@@ -5135,10 +5246,7 @@ impl App {
                         .expect("every face is a turn");
                     self.doc.turn_setup(i, turn);
                 }
-                self.doc
-                    .setup_mut()
-                    .p
-                    .insert("reposition".into(), "Reclamp and probe origin".into());
+                indexed::set_reposition(&mut self.doc.setup_mut().p, "Reclamp and probe origin");
                 self.touch();
             }
             Message::TurnStock(face, table) => {
@@ -5185,10 +5293,30 @@ impl App {
                 self.wizard_step = 0;
                 self.page = Page::Wizard;
             }
+            Message::AddRotaryMachine => {
+                let dir = self
+                    .state_path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."));
+                match control::rotary_machine(dir) {
+                    Ok(m) => {
+                        self.status = format!(
+                            "{} is in the Machine library, with an assumed rotary unit still to be measured.",
+                            m.name()
+                        );
+                        self.doc.machines.push(m);
+                        self.touch();
+                    }
+                    Err(e) => {
+                        self.status = format!("Could not write the rotary UC100 profile: {e}.")
+                    }
+                }
+            }
             Message::EditMachine(id) => {
                 if let Some(m) = self.doc.machines.iter().find(|m| m.id == id) {
                     self.machine_draft = m.clone();
                     self.machine_draft.fill_post_defaults();
+                    self.machine_draft.fill_rotary_defaults();
                     self.wizard_step = 0;
                     self.page = Page::Wizard;
                 }
@@ -5552,9 +5680,21 @@ impl App {
                 let errors = self.machine_draft.issues();
                 if errors.is_empty() {
                     let mut m = self.machine_draft.clone();
+                    // A centreline typed over the probed one is no longer
+                    // the measurement.
+                    let saved = self.doc.machines.iter().find(|x| x.id == m.id);
+                    if saved.is_some_and(|x| {
+                        ["a_centre_y", "a_centre_z"]
+                            .iter()
+                            .any(|k| get(&x.p, k) != get(&m.p, k))
+                    }) {
+                        m.p.remove(control::CENTRE_MARK);
+                        m.p.remove(model::CENTRE_REF);
+                    }
                     if let Some(c) = self.control.as_mut().filter(|c| c.machine_id == m.id) {
                         c.probe = control::probe_settings(&m.p);
                         c.pins = control::pins_settings(&m.p);
+                        c.rotary = control::Rotary::of(&m);
                     }
                     if let Some(i) = self.doc.machines.iter().position(|x| x.id == m.id) {
                         m.version += 1;
@@ -5930,6 +6070,7 @@ impl App {
                 match result {
                     Ok(mesh) => {
                         self.imported_mesh = Some(mesh);
+                        self.sync_turns();
                         self.undo = None;
                         self.invalidate_post();
                         self.status = "Saved model geometry restored.".into();
@@ -6340,6 +6481,11 @@ impl App {
                     .and_then(|c| Some((c.machine_id.clone(), c.recorded.take()?)))
                 {
                     self.record_pins(&id, at);
+                }
+                if let Some((id, keep)) = (self.control.as_mut())
+                    .and_then(|c| Some((c.machine_id.clone(), c.rotary_keep.take()?)))
+                {
+                    self.keep_rotary(&id, keep);
                 }
                 if self.status == LOCKED && !self.locked() {
                     self.status.clear();
@@ -7172,7 +7318,8 @@ pub(crate) fn tab_move(typing: bool, back: bool, jogging: bool) -> TabMove {
     }
 }
 /// The axis and direction a jog key moves: the arrows jog X and Y (up is
-/// +Y, away from the operator), Page Up and Page Down jog Z.
+/// +Y, away from the operator), Page Up and Page Down jog Z, Home and End
+/// jog A (on a machine without A they move nothing).
 fn jog_key(key: iced::keyboard::key::Named) -> Option<(usize, bool)> {
     use iced::keyboard::key::Named;
     match key {
@@ -7182,6 +7329,8 @@ fn jog_key(key: iced::keyboard::key::Named) -> Option<(usize, bool)> {
         Named::ArrowDown => Some((1, true)),
         Named::PageUp => Some((2, false)),
         Named::PageDown => Some((2, true)),
+        Named::Home => Some((3, false)),
+        Named::End => Some((3, true)),
         _ => None,
     }
 }

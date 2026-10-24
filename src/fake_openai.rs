@@ -300,3 +300,185 @@ pub fn tokens(access: &str, refresh: &str, id_token: &str, scope: &str) -> Value
         "scope": scope,
     })
 }
+
+/// A 4-axis planner scenario for tests (LIO-194): a square bar on a machine
+/// with a rotary A axis, the model answering first with a stock too big for
+/// the Z travel and then with the bar held in the chuck and indexed to A 0,
+/// 90, 180 and 270.
+pub mod rotary {
+    use super::{Req, Resp};
+    use crate::{
+        analysis::{self, PartReport},
+        mesh::Mesh,
+        model::{Document, Setup},
+        proposal::{Proposal, ProposedChuck, ProposedOp, ProposedSetup, Unmachined, tests::op},
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The part, a 20 × 20 mm square bar 30 mm long.
+    pub fn mesh() -> Mesh {
+        crate::indexed::tests::prism(30.)
+    }
+    /// The project: the bar on a rotary machine whose A centreline is 45 mm
+    /// under the top of a 100 mm Z travel, with a Ø10 end mill as tool 1 and
+    /// aluminium. Setup 1 is held by nothing yet; the
+    /// stock is a box round the part.
+    pub fn job() -> (Document, Mesh) {
+        let mesh = mesh();
+        let mut doc = Document::sample();
+        doc.sample_model = false;
+        doc.file = Some(crate::model::ModelFile {
+            name: "square-bar.stl".into(),
+            path: "square-bar.stl".into(),
+            format: "stl".into(),
+            bytes: 0,
+        });
+        let mut machine = crate::indexed::tests::rotary();
+        for (key, value) in [
+            ("z", "100"),
+            ("a_centre_z", "-45"),
+            ("rotary_min", "-360"),
+            ("rotary_max", "360"),
+        ] {
+            machine.p.insert(key.into(), value.into());
+        }
+        let mut tool = crate::indexed::tests::cutter("10");
+        tool.p.insert("number".into(), "1".into());
+        doc.tools = vec![tool];
+        let mut setup = Setup::new(machine.clone(), "G54");
+        setup.p.insert("name".into(), "Bar".into());
+        for key in ["stock_left", "stock_right", "stock_front", "stock_back"] {
+            setup.p.insert(key.into(), "2".into());
+        }
+        doc.machines = vec![machine];
+        doc.setups = vec![setup];
+        doc.active = doc.setups[0].id.clone();
+        crate::proposal::tests::aluminium(&mut doc);
+        doc.sync_stock_sources();
+        doc.sync_turns(Some(&mesh));
+        (doc, mesh)
+    }
+    /// `job` with its part report.
+    pub fn report() -> (Document, Mesh, PartReport) {
+        let (doc, mesh) = job();
+        let report = analysis::report(&doc, &mesh).unwrap();
+        (doc, mesh, report)
+    }
+    /// A box `across` mm square, 130 mm long, in a 4-jaw chuck, 90 mm out of
+    /// the jaws, the tailstock off the table.
+    fn chuck(across: f32) -> ProposedChuck {
+        ProposedChuck {
+            stock: "Box".into(),
+            length: 130.,
+            diameter: None,
+            width: Some(across),
+            height: Some(across),
+            jaws: "4-jaw".into(),
+            stickout: 90.,
+            tailstock: "Off the table".into(),
+            free_end: None,
+        }
+    }
+    /// One setup of the bar's plan: `operation` at `angles`.
+    fn setup(
+        name: &str,
+        up: &str,
+        origin: &str,
+        angles: Option<Vec<f32>>,
+        operation: ProposedOp,
+    ) -> ProposedSetup {
+        ProposedSetup {
+            orientation: up.into(),
+            name: name.into(),
+            origin: origin.into(),
+            workholding: "The bar in the chuck.".into(),
+            holder: None,
+            a_angles: angles,
+            operations: vec![operation],
+            from: None,
+        }
+    }
+    /// An outside contour down to 7 mm over the A axis (17 mm over the
+    /// part's bottom), so that its passes across the bar's ends leave a web
+    /// on the axis that holds the part on the bar (LIO-208, LIO-211).
+    fn contour() -> ProposedOp {
+        let mut contour = op("Contour", 1, vec![]);
+        contour.contour_mode = Some("outside".into());
+        contour.stepdown = Some(6.);
+        contour.bottom_offset = Some(17.);
+        contour
+    }
+    /// A Facing of the square's four sides: the surface IDs of the top plane
+    /// of each orientation A 0, 90, 180 and 270 brings up (+Z, +Y, -Z, -Y),
+    /// each faced at the angle where it is up, out to its edges, which
+    /// leaves a square joined to the bar at a shoulder (LIO-214).
+    fn four_sides() -> ProposedOp {
+        let (_, _, report) = report();
+        let ids = ["+Z", "+Y", "-Z", "-Y"]
+            .iter()
+            .flat_map(|up| {
+                let orientation = report.orientations.iter().find(|o| o.up == *up).unwrap();
+                orientation
+                    .planes
+                    .iter()
+                    .find(|p| p.kind == "top")
+                    .unwrap()
+                    .surfaces
+                    .clone()
+            })
+            .collect();
+        op("Face", 1, ids)
+    }
+    /// The plan the scenario ends with: the bar in a 4-jaw chuck as a
+    /// 24 mm box, its top contoured, then its four sides faced at A 0, 90,
+    /// 180 and 270.
+    pub fn good() -> Proposal {
+        Proposal {
+            summary: "Square bar in the chuck, all four sides by indexing A.".into(),
+            chuck: Some(chuck(24.)),
+            setups: vec![
+                setup(
+                    "Bar in the chuck",
+                    "+Z",
+                    crate::indexed::ORIGINS[0],
+                    None,
+                    contour(),
+                ),
+                setup(
+                    "Four sides",
+                    "+Z",
+                    "Model origin",
+                    Some(vec![0., 90., 180., 270.]),
+                    four_sides(),
+                ),
+            ],
+            unmachined: vec![Unmachined {
+                feature: "The end face in the jaws".into(),
+                reason: "It is gripped.".into(),
+            }],
+            warnings: vec![],
+        }
+    }
+    /// A plan whose stock is too big for the Z travel: a 44 mm box, whose
+    /// corners swing 31.1 mm from the centreline under the tool, so that a
+    /// retract 15 mm above them is out of the Z travel (LIO-209).
+    pub fn too_big() -> Proposal {
+        let mut plan = good();
+        plan.summary = "The same, in a larger box.".into();
+        plan.chuck = Some(chuck(44.));
+        plan
+    }
+    /// The fake's answers: `first` to the first request, then `then` to
+    /// every later one.
+    pub fn replies(first: Proposal, then: Proposal) -> impl Fn(&Req) -> Resp + Send + Sync {
+        let seen = AtomicUsize::new(0);
+        move |_| {
+            let plan = if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                &first
+            } else {
+                &then
+            };
+            Resp::answer(&serde_json::to_string(plan).unwrap())
+        }
+    }
+}
