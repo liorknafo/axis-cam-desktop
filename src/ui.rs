@@ -511,12 +511,12 @@ pub(crate) fn op_checks(app: &App) -> Vec<Check> {
     if let Some(o) = app.operation()
         && matches!(o.strategy, Strategy::Pocket | Strategy::Contour)
         && let Some(mesh) = &app.imported_mesh
-        && let Some((diameter, fits)) = app.pocket_fits(o, mesh).as_ref()
+        && let Some((diameter, fits, cleared)) = app.pocket_fits(o, mesh).as_ref()
         && let Ok(holes) = app.pocket_holes(o, mesh).as_ref()
     {
-        for (h, fits) in holes.iter().zip(fits) {
+        for ((h, fits), cleared) in holes.iter().zip(fits).zip(cleared) {
             checks.extend(
-                h.uncut(*diameter, fits)
+                h.uncut(*diameter, fits, *cleared)
                     .into_iter()
                     .map(|text| Check::new(text, false)),
             );
@@ -535,6 +535,24 @@ pub(crate) fn op_checks(app: &App) -> Vec<Check> {
             "Bottom offset takes the contour through the stock's bottom all the way round: the part comes loose and the cutter can throw it. Turn on Holding tabs, or raise Bottom offset to leave a skin.".into(),
             false,
         ));
+    }
+    // A face below the part's top would cut through its higher features.
+    if let Some(o) = app.operation()
+        && o.strategy == Strategy::Face
+        && let Some(mesh) = &app.imported_mesh
+    {
+        let setup = app.doc.setup();
+        if crate::simulation::facing_faces_down(setup, o, mesh) {
+            checks.push(Check::new(
+                "The selected surface faces down, away from the spindle: Facing faces the part's top instead. Select the top surface, or the surface to face in a setup that turns it up.".into(),
+                false,
+            ));
+        } else if let Some(raise) = crate::simulation::facing_raise(setup, o, mesh) {
+            checks.push(Check::new(
+                format!("Facing stops at the part's top, {raise:.2} mm above the selected surface plus bottom offset: going lower would cut the part's higher features. Below that, mill the selected surface with a Pocket or Adaptive clearing."),
+                false,
+            ));
+        }
     }
     checks
 }
@@ -2888,14 +2906,20 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                                         .collect::<Vec<_>>()
                                         .join(", ");
                                     // What the cutter cannot get into.
-                                    if let Some((diameter, fits)) =
+                                    if let Some((diameter, fits, cleared)) =
                                         app.pocket_fits(o, mesh).as_ref()
                                     {
                                         let fits = &fits[i];
                                         if fits.iter().all(|f| !f) {
-                                            depth += &format!(
-                                                " · too narrow for Ø{diameter}: left uncut"
-                                            );
+                                            depth += &match cleared[i] {
+                                                Some(c) => format!(
+                                                    " · too narrow for Ø{diameter}: cleared to {} only",
+                                                    c.short()
+                                                ),
+                                                None => format!(
+                                                    " · too narrow for Ø{diameter}: left uncut"
+                                                ),
+                                            };
                                         } else if fits.iter().any(|f| !f) {
                                             depth += &format!(" · part too narrow for Ø{diameter}");
                                         }
@@ -3033,7 +3057,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     }
                     c = c.push(note(match o.strategy {
                         Strategy::Adaptive => "Adaptive clearing works on the same geometry as Pocket: the selected recessed flat floors, with the walls and islands of the part. Vertical access only; overhanging geometry is rejected. The path keeps the cutter's side load near the optimal load, so it can take a deep stepdown. It inherits the stock left by all earlier enabled operations and setups.".to_string(),
-                        Strategy::Pocket => "Pocket uses offset contours of the selected floor triangles, including islands, and of each picked hole's outline. Supports open, vertical-wall pockets with a flat floor; overhanging geometry is rejected. A picked hole is cut down to the highest of the part under it, or through the part with the breakthrough. Simulation inherits the stock left by all earlier enabled operations and setups.".to_string(),
+                        Strategy::Pocket => "Pocket uses offset contours of the selected floor triangles, including islands, and of each picked hole's outline. Supports open, vertical-wall pockets with a flat floor; overhanging geometry is rejected. A picked hole is cut down to the highest of the part under it, or through the part with the breakthrough; one too narrow for the cutter has only the stock over it cleared, down to its rim. Simulation inherits the stock left by all earlier enabled operations and setups.".to_string(),
                         Strategy::Contour => "Inside contour offsets only the walls and islands of this floor, or the wall of each picked hole. It does not clear the interior. The floor must be flat and accessible along setup Z; overhangs are rejected.".to_string(),
                         Strategy::Drill => "Hole detection uses tessellated circular openings and vertical rays. Noncircular openings and obstructions are excluded. Confirm the detected centers and depths before previewing.".to_string(),
                         Strategy::Parallel => "Parallel finishing cuts only where the cutter touches a picked face. The rest of the part still holds the cutter up, so it never cuts into a face it was not given; where a picked face meets one that is not, the cutter stops at the corner between them, which keeps its radius.".to_string(),
@@ -3671,15 +3695,18 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
                     &FACING_MILLING,
                     t,
                 ))
-                .push(checks.field(p, "stepdown", "Maximum stepdown · mm"))
-                .push(checks.field(p, "allowance", "Radial stock to leave · mm"));
+                .push(checks.field(p, "stepdown", "Maximum stepdown · mm"));
+            if s == Strategy::Waterline {
+                c = c.push(checks.field(p, "surface_stepover", "Maximum stepover · mm"));
+            }
+            c = c.push(checks.field(p, "allowance", "Radial stock to leave · mm"));
             if s == Strategy::Contour {
                 c=c.push(choice(p,"side","Contour side",&["Outside","Inside"],t))
                     .push(choice(p,"compensation","Cutter compensation",&["In computer"],t))
                     .push(checks.field(p, "finish_passes", "Repeat finishing passes"))
                     .push(note("Outside follows the outer model silhouette at successive depths. Inside follows only the walls and islands of a selected recessed floor; select that floor in Geometry. Computer compensation includes the cutter radius and allowance. Repeat passes revisit the contour."));
             } else {
-                c=c.push(note("Constant-Z loops follow the projected geometry above each level, with cutter-radius compensation. This conservative vertical-access preview supports flat cutters. Overhung detail remains unmachined."));
+                c=c.push(note("Constant-Z loops follow the projected geometry above each level, with cutter-radius compensation. Levels are the stepdown apart, closer on sloping faces so neighbouring loops stay within the stepover of each other across them; faces flatter than 1° are left for Facing or Parallel. This conservative vertical-access preview supports flat cutters. Overhung detail remains unmachined."));
             }
         }
         return c.into();
@@ -5534,7 +5561,8 @@ pub(crate) fn mark_help(
 }
 /// What the checks before a run refuse of operation `i`'s setup, in the Run
 /// panel's words: the operation's own workholding lines first, then the
-/// setup's, then the other problems, none twice.
+/// setup's, then the other problems, none twice. Holding not checked for a
+/// problem listed too names its operation, last, instead of repeating it.
 fn refusal_lines(r: &crate::run::Ready, i: usize) -> Vec<String> {
     let own = r.held.iter().filter(|h| h.operation == Some(i));
     let setup_wide = r.held.iter().filter(|h| h.operation.is_none());
@@ -5544,7 +5572,52 @@ fn refusal_lines(r: &crate::run::Ready, i: usize) -> Vec<String> {
             lines.push(problem.clone());
         }
     }
+    let listed = lines.clone();
+    let repeated = |line: &String| {
+        listed
+            .iter()
+            .find(|other| *line == crate::post::not_checked(std::slice::from_ref(*other)))
+    };
+    if let Some(at) = lines.iter().position(|line| repeated(line).is_some()) {
+        let problem = repeated(&lines[at]).unwrap();
+        let what = match problem.split_once(": ") {
+            Some((op, _)) => format!("the {op} problem"),
+            None => "that problem".into(),
+        };
+        lines.remove(at);
+        lines.push(format!("Holding not checked until {what} is fixed."));
+    }
     lines
+}
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+    #[test]
+    fn holding_not_checked_does_not_repeat_the_problem_it_is_for() {
+        let problem = "Facing: Enter a positive tool diameter.";
+        let ready = |held: &str| crate::run::Ready {
+            key: 0,
+            setup: 0,
+            generated: vec![],
+            held: vec![crate::post::Held {
+                operation: None,
+                message: held.into(),
+            }],
+            problems: vec![problem.into()],
+            zero: None,
+        };
+        let r = ready(&crate::post::not_checked(&[problem.into()]));
+        assert_eq!(
+            refusal_lines(&r, 0),
+            [
+                problem,
+                "Holding not checked until the Facing problem is fixed."
+            ]
+        );
+        // Holding not checked for another reason is kept as it is.
+        let other = "Holding not checked: Drill: Select holes first.";
+        assert_eq!(refusal_lines(&ready(other), 0), [other, problem]);
+    }
 }
 /// What the simulation panel says of the selected operation's setup above
 /// its controls: a heading, the lines of the checks before a run (the Run

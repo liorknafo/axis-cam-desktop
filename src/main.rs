@@ -648,8 +648,9 @@ pub(crate) type DrillHoles = Result<Vec<cam::Hole>, String>;
 pub(crate) type BottomHoles = Result<Vec<cam::BottomHole>, String>;
 pub(crate) type PocketHoles = Result<Vec<pocket::Hole>, String>;
 /// The cutter's diameter and, for each picked hole, which of its levels it
-/// fits; None without holes or a flat end mill.
-pub(crate) type PocketFits = Option<(f32, Vec<Vec<bool>>)>;
+/// fits and, in a Pocket, how low it clears the stock over one it fits none
+/// of (`pocket::Hole::cleared_to`); None without holes or a flat end mill.
+pub(crate) type PocketFits = Option<(f32, Vec<Vec<bool>>, Vec<Option<pocket::Cleared>>)>;
 #[cfg(test)]
 thread_local! {
     /// How many times this thread has run `cam::holes` for the Drill editor.
@@ -3288,8 +3289,10 @@ impl App {
         hasher.finish()
     }
     /// Which levels of the holes a Pocket's or Contour's walls pick its flat
-    /// end mill fits with its radial allowance (`pocket::Hole::fits`): kept
-    /// as `pocket_holes` is, and until the tool or the allowance changes.
+    /// end mill fits with its radial allowance (`pocket::Hole::fits`), and
+    /// how low a Pocket clears over each it fits none of: kept as
+    /// `pocket_holes` is, and until the tool, the allowances, the offsets or
+    /// the setup change.
     pub(crate) fn pocket_fits(
         &self,
         op: &Operation,
@@ -3307,6 +3310,10 @@ impl App {
         self.holes_key(op, mesh).hash(&mut hasher);
         diameter.map(f32::to_bits).hash(&mut hasher);
         radial.map(f32::to_bits).hash(&mut hasher);
+        let pocket = op.strategy == Strategy::Pocket;
+        pocket.hash(&mut hasher);
+        (get(&op.p, "bottom"), get(&op.p, "axial_allowance")).hash(&mut hasher);
+        self.doc.setup().p.hash(&mut hasher);
         let key = hasher.finish();
         let mut kept = self.pocket_fits.borrow_mut();
         if let Some((k, found)) = kept.as_ref()
@@ -3315,10 +3322,17 @@ impl App {
             return found.clone();
         }
         let found = std::sync::Arc::new(match (&*holes, diameter, radial) {
-            (Ok(holes), Some(diameter), Some(radial)) if !holes.is_empty() => Some((
-                diameter,
-                holes.iter().map(|h| h.fits(diameter, radial)).collect(),
-            )),
+            (Ok(holes), Some(diameter), Some(radial)) if !holes.is_empty() => {
+                let fits: Vec<Vec<bool>> = holes.iter().map(|h| h.fits(diameter, radial)).collect();
+                let cleared = (holes.iter().zip(&fits))
+                    .map(|(h, fits)| {
+                        (pocket && fits.iter().all(|f| !f))
+                            .then(|| h.cleared_to(self.doc.setup(), op, mesh, diameter, radial))
+                            .flatten()
+                    })
+                    .collect();
+                Some((diameter, fits, cleared))
+            }
             _ => None,
         });
         *kept = Some((key, found.clone()));

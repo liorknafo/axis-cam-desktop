@@ -1130,16 +1130,19 @@ fn same_centre(a: &Hole, b: &Hole) -> bool {
     (a.center[0] - b.center[0]).hypot(a.center[1] - b.center[1]) <= 0.05
 }
 /// The hole a Pocket's wall click picks (`pocket::Hole`) read as a drill
-/// reads a rim's opening. Its walls' middle is found from their top edge in
-/// the part (the corners of its wall triangles at their highest). Then, of
-/// the part's flat faces facing up from that height (`rims`: each height,
-/// lowest first, with its loops, by `rim_loops`), the first with a loop
-/// round that middle is its rim, as a selected rim face is (over a
-/// countersink, the face round its top): that loop at that height, when it
-/// is round. Else that top edge, at its height. None unless the loop read
-/// is round. (The pocket's own outline is cut from a section and offset, a
-/// few hundredths inside the part's edge, and not round where a lip is over
-/// it.)
+/// reads a rim's opening. Its walls' middle is their outline's centre of
+/// area, seen from above, and their top edge the corners of its wall
+/// triangles at their highest. Then, of the part's flat faces facing up
+/// from that height (`rims`: each height, lowest first, with its loops, by
+/// `rim_loops`), the first with a loop round that middle is its rim, as a
+/// selected rim face is (over a countersink, the face round its top): that
+/// loop at that height, when it is round. Else that top edge, at its
+/// height. None unless the loop read is round. (The pocket's own outline is
+/// cut from a section and offset, a few hundredths inside the part's edge,
+/// and not round where a lip is over it: it finds the middle, not the
+/// opening. The top edge's corners are no middle either where that edge is
+/// a few hundredths of a millimetre off level, a recess's under a screw
+/// hole with only a corner or two at its highest.)
 fn drill_hole(
     g: &Geometry,
     hole: &crate::pocket::Hole,
@@ -1161,14 +1164,7 @@ fn drill_hole(
             ring.push(q);
         }
     }
-    if ring.len() < 8 {
-        return None;
-    }
-    let n = ring.len() as f64;
-    let middle = (
-        ring.iter().map(|q| q.0).sum::<f64>() / n,
-        ring.iter().map(|q| q.1).sum::<f64>() / n,
-    );
+    let middle = centre_of_area(&hole.outline)?;
     ring.sort_by(|a, b| {
         let angle = |q: &(f64, f64)| (q.1 - middle.1).atan2(q.0 - middle.0);
         angle(a).total_cmp(&angle(b))
@@ -1191,7 +1187,10 @@ fn drill_hole(
             _ => break,
         }
     }
-    let mut found = found.or_else(|| round_hole(g, &ring, top))?;
+    if found.is_none() && ring.len() >= 8 {
+        found = round_hole(g, &ring, top);
+    }
+    let mut found = found?;
     // With `stop`, at an A angle of an indexed setup of several, a hole over
     // a cavity is drilled just through its own wall, its breakthrough on
     // from there (`indexed::holes_by_angle` says which). Everywhere else it
@@ -1204,6 +1203,21 @@ fn drill_hole(
         (found.bottom, found.through) = (ring.bottom, true);
     }
     Some(found)
+}
+/// The centre of area of `region` seen from above, its holes taken out;
+/// None when it has no area.
+fn centre_of_area(region: &Region) -> Option<(f64, f64)> {
+    let (mut twice, mut x, mut y) = (0., 0., 0.);
+    let loops: Vec<Polygon> = region.clone().into();
+    for p in &loops {
+        for (a, b) in p.iter().zip(p.iter().cycle().skip(1)) {
+            let cross = a.0 * b.1 - b.0 * a.1;
+            twice += cross;
+            x += (a.0 + b.0) * cross;
+            y += (a.1 + b.1) * cross;
+        }
+    }
+    (twice.abs() > 1e-9).then(|| (x / (3. * twice), y / (3. * twice)))
 }
 /// Whether anything of the part lies under a drill of radius `r` at
 /// `centre` below the height `z` (at its centre and 16 points `r` from it):
@@ -3266,14 +3280,16 @@ fn waterline(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
     let target = g.bounds.min[2] + number(op, "bottom")?;
     let top = g.bounds.max[2] + number(op, "top")?.max(0.);
     let down = number(op, "stepdown")?;
+    let across = number(op, "surface_stepover")?;
     if allowance < 0.
         || down <= 0.
+        || across <= 0.
         || down > b.plan.flute_length
         || target < g.bounds.min[2]
         || target >= top
         || top - target >= b.plan.tool_length
     {
-        return Err("Use nonnegative allowances, a target above model bottom, positive stepdown within flute length, and adequate tool reach.".into());
+        return Err("Use nonnegative allowances, a target above model bottom, positive stepdown and stepover, a stepdown within flute length, and adequate tool reach.".into());
     }
     // Every level's loops go round what of the model stands above it, so
     // the cutter stays within its diameter and the allowance of the model's
@@ -3310,11 +3326,84 @@ fn waterline(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
         }
         None => target,
     };
-    let levels = ((cutting_top - target) / down).ceil().max(1.) as usize;
-    if levels > CEILING {
-        return Err(too_many("moves"));
+    // Neighbouring loops round a face of slope θ lie dz ÷ tan θ apart across
+    // it, so a stepdown that suits a wall leaves a gentle slope as separate
+    // trenches with ridges between them. Each level is the stepdown below
+    // the last, or closer where the faces it passes slope gently enough
+    // that the loops would lie more than the stepover apart. Faces flatter
+    // than 1° are floors, which waterline loops do not finish.
+    let flat = 1f32.to_radians().tan();
+    let slopes: Vec<(f32, f32, f32)> = (g.triangles.iter())
+        .filter(|t| picked.is_none() || group_of(t).is_some())
+        .filter_map(|t| {
+            let [a, b, c] = t.p;
+            let (u, v) = (
+                [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+                [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
+            );
+            let n = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
+            let (side, up) = (n[0].hypot(n[1]), n[2].abs());
+            (side >= up * flat && up > 0.).then(|| {
+                let z = t.p.map(|p| p[2]);
+                (
+                    z[0].min(z[1]).min(z[2]),
+                    z[0].max(z[1]).max(z[2]),
+                    side / up,
+                )
+            })
+        })
+        .collect();
+    let fits = |lo: f32, hi: f32| {
+        (slopes.iter())
+            .filter(|s| s.1 > lo && s.0 < hi)
+            .map(|s| across * s.2)
+            .fold(down, f32::min)
+            .max(0.01)
+    };
+    // A level just under the top of each run of sloping faces: the one
+    // below it stays clear of the slope's top edge, so without it a fin of
+    // stock is left there, as wide as the steps across the slope and as tall
+    // as the stock above it. Not at the top itself, where the slope is only
+    // its edge, which a wall standing on it hides from the picked faces.
+    let mut tops = vec![];
+    let mut by_top: Vec<_> = slopes.iter().collect();
+    by_top.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut low = f32::INFINITY;
+    for s in by_top {
+        if s.1 < low - 0.0001 {
+            tops.push(s.1 - 0.01);
+        }
+        low = low.min(s.0);
     }
-    b.plan.levels = levels;
+    let mut heights = vec![];
+    let mut z = cutting_top;
+    while z > target + 0.0001 {
+        let mut step = down;
+        loop {
+            let most = fits((z - step).max(target), z);
+            if most >= step.min(z - target) - 0.0001 {
+                break;
+            }
+            step = most;
+        }
+        if let Some(top) = (tops.iter()).find(|t| **t < z - 0.0001 && **t > z - step + 0.0001) {
+            step = z - top;
+        }
+        z = if z - step < target + 0.0001 {
+            target
+        } else {
+            z - step
+        };
+        heights.push(z);
+        if heights.len() > CEILING {
+            return Err(too_many("moves"));
+        }
+    }
+    let levels = heights.len();
     b.plan.target = target;
     let climb = pocket_setting(&op.p, "pocket_milling") == "Climb";
     if !crate::model::FACING_MILLING.contains(&pocket_setting(&op.p, "pocket_milling")) {
@@ -3324,10 +3413,12 @@ fn waterline(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
     // The cuts of each group of picked faces, level by level, made once
     // every level is worked out.
     let mut later: Vec<Vec<Vec<[f32; 3]>>> = vec![vec![]; picked.as_ref().map_or(0, Vec::len)];
+    // The levels that cut: picked faces' levels above them cut nothing.
+    let mut cutting = 0;
     crate::progress::expect(levels);
-    for level in 1..=levels {
-        crate::progress::report(level)?;
-        let z = (cutting_top - level as f32 * down).max(target);
+    for (level, &z) in heights.iter().enumerate() {
+        crate::progress::report(level + 1)?;
+        let mut cuts_here = false;
         let mut polys = vec![];
         // Projection of all geometry above the level accounts for the vertical cutter/shank corridor.
         for triangle in &g.triangles {
@@ -3381,6 +3472,7 @@ fn waterline(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
             let Some(near) = &near_faces else {
                 points.push(points[0]);
                 b.stroke(&points)?;
+                cuts_here = true;
                 continue;
             };
             // The loop in short steps, each point kept where the cutter
@@ -3402,6 +3494,7 @@ fn waterline(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
                 if !kept.iter().any(|k| *k) {
                     continue;
                 }
+                cuts_here = true;
                 if kept.iter().all(|k| *k) {
                     let mut closed = dense.clone();
                     closed.push(closed[0]);
@@ -3424,7 +3517,9 @@ fn waterline(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
                 }
             }
         }
+        cutting += cuts_here as usize;
     }
+    b.plan.levels = cutting.max(1);
     for cut in later.iter().flatten() {
         b.stroke(cut)?;
     }
@@ -3909,7 +4004,7 @@ pub(crate) mod tests {
                 }
             }
         }
-        op.p.insert("stepdown".into(), "1".into());
+        op.p.insert("stepdown".into(), "0.5".into());
         let c = generate(&setup, &op, &tool, &mesh).unwrap();
         assert!(c.levels > a.levels);
         assert_plan(a);
@@ -4224,6 +4319,111 @@ pub(crate) mod tests {
             assert_plan(plan);
         }
     }
+    /// A 30 × 16 mm wedge whose top slopes 21° down from 13.5 mm at X 0 to
+    /// 2 mm at X 30, like the ramps under the TOTEM case.
+    fn ramp() -> (Mesh, impl Fn(f32) -> f32) {
+        let rise = 21f32.to_radians().tan();
+        let high = 2. + 30. * rise;
+        let mut t = vec![];
+        quad(
+            &mut t,
+            [
+                [0., 0., high],
+                [30., 0., 2.],
+                [30., 16., 2.],
+                [0., 16., high],
+            ],
+        );
+        quad(
+            &mut t,
+            [[0., 0., 0.], [0., 16., 0.], [30., 16., 0.], [30., 0., 0.]],
+        );
+        quad(
+            &mut t,
+            [[0., 0., 0.], [30., 0., 0.], [30., 0., 2.], [0., 0., high]],
+        );
+        quad(
+            &mut t,
+            [
+                [30., 16., 0.],
+                [0., 16., 0.],
+                [0., 16., high],
+                [30., 16., 2.],
+            ],
+        );
+        quad(
+            &mut t,
+            [[0., 16., 0.], [0., 0., 0.], [0., 0., high], [0., 16., high]],
+        );
+        quad(
+            &mut t,
+            [[30., 0., 0.], [30., 16., 0.], [30., 16., 2.], [30., 0., 2.]],
+        );
+        (mesh::normalize(t).unwrap(), move |x: f32| high - x * rise)
+    }
+    #[test]
+    fn waterline_levels_close_up_over_a_gentle_slope() {
+        let (mesh, surface) = ramp();
+        let (setup, mut op, tool) = fixture(Strategy::Waterline);
+        op.p.insert("stepdown".into(), "2".into());
+        op.p.insert("surface_stepover".into(), "0.5".into());
+        let g = Geometry::new(&setup, &mesh);
+        // The stock left over the ramp, at most, and the cutting levels.
+        let finish = |op: &Operation| {
+            let plan = generate(&setup, op, &tool, &mesh).unwrap();
+            let levels: Vec<f32> = (plan.moves.iter())
+                .filter(|m| m.cutting_pass)
+                .map(|m| m.to[2])
+                .fold(vec![], |mut l, z| {
+                    if !l.iter().any(|w: &f32| (w - z).abs() < 0.0001) {
+                        l.push(z);
+                    }
+                    l
+                });
+            let mut sim = Simulation::new(plan.clone());
+            sim.seek(1.);
+            let mut most = 0f32;
+            for y in 0..sim.stock.ny {
+                for x in 0..sim.stock.nx {
+                    let px = sim.stock.bounds.min[0] + (x as f32 + 0.5) * sim.stock.dx;
+                    let py = sim.stock.bounds.min[1] + (y as f32 + 0.5) * sim.stock.dy;
+                    if px > g.bounds.min[0] + 1.
+                        && px < g.bounds.max[0] - 1.
+                        && py > g.bounds.min[1] + 1.
+                        && py < g.bounds.max[1] - 1.
+                    {
+                        let over = px - g.bounds.min[0];
+                        let left = sim.stock.heights[y * sim.stock.nx + x]
+                            - (g.bounds.min[2] + surface(over));
+                        most = most.max(left);
+                    }
+                }
+            }
+            (plan, levels, most)
+        };
+        // Over the ramp the levels are 0.5 × tan 21° = 0.19 mm apart, not
+        // the stepdown's 2 mm, so the loops 0.5 mm apart across it clear it
+        // to steps that high.
+        let (plan, mut levels, most) = finish(&op);
+        levels.sort_by(f32::total_cmp);
+        let over_ramp: Vec<f32> = (levels.iter())
+            .map(|z| z - g.bounds.min[2])
+            .filter(|z| *z > 2.001)
+            .collect();
+        for pair in over_ramp.windows(2) {
+            assert!(pair[1] - pair[0] < 0.193, "{pair:?}");
+        }
+        assert!(over_ramp.len() > 55, "{}", over_ramp.len());
+        assert!(most < 0.4, "{most} mm left over the ramp");
+        assert_eq!(plan.levels, levels.len());
+        assert_plan(plan);
+        // With a stepover wider than the cutter, levels go the stepdown
+        // apart: 5.2 mm across the ramp, trenches with ridges between.
+        op.p.insert("surface_stepover".into(), "100".into());
+        let (_, wide, ridges) = finish(&op);
+        assert!(wide.len() < 10, "{}", wide.len());
+        assert!(ridges > 1.5, "{ridges} mm left over the ramp");
+    }
     #[test]
     fn waterline_finishes_only_the_picked_curved_face() {
         let mesh = half_ball_on_plate();
@@ -4264,11 +4464,21 @@ pub(crate) mod tests {
         let points = feeds(&plan);
         let r = plan.radius;
         // Every loop goes round the dome at its own height, the cutter's side
-        // on the dome, and none goes round the plate or below its top.
+        // on the dome, and none goes round the plate or below its top. Within
+        // half a mm of the top, where the level under the top goes round the
+        // facets of the dome's cap, those lie up to a few tenths inside the
+        // sphere.
         for p in &points {
             let h = p[2] - centre[2];
             assert!(h > -0.001, "{p:?}");
             let ring = (100. - h.min(10.).powi(2)).max(0.).sqrt();
+            if h > 9.5 {
+                assert!(
+                    off_axis(p) - r > 0. && off_axis(p) - ring - r < 0.1,
+                    "{p:?}"
+                );
+                continue;
+            }
             assert!(
                 (off_axis(p) - ring - r).abs() < 0.1,
                 "{p:?}: {} from the axis, the dome {ring} there, centre {centre:?}",
@@ -5243,6 +5453,70 @@ pub(crate) mod tests {
             g.bounds
         );
         assert!(h.top - h.bottom > 39.5, "{h:?}");
+    }
+    #[test]
+    fn a_screw_hole_over_a_recess_whose_edge_is_off_level_reads_as_a_level_one() {
+        // A Ø24 x 10 disc with a Ø2 screw hole from its top through to a
+        // Ø4.3 recess 8 mm up from its bottom, as the TOTEM case's bottom
+        // has. Picked by any of its walls, the recess's included (the walls
+        // the view outlines it by there), a Drill drills it as its top face
+        // reads it, as it does where one corner of the recess's top edge is
+        // two hundredths of a millimetre high: that STEP's edge goes up and
+        // down by three.
+        let section = [
+            (1., 10.),
+            (1., 8.),
+            (2.15, 8.),
+            (2.15, 0.),
+            (12., 0.),
+            (12., 10.),
+            (1., 10.),
+        ];
+        let level = mesh::normalize(revolved(&section)).unwrap();
+        let (setup, mut op, _) = fixture(Strategy::Drill);
+        select_top(&mut op, &level);
+        let by_rim = holes(&setup, &op, &level).unwrap();
+        assert_eq!(by_rim.len(), 1, "{by_rim:?}");
+        let rim = &by_rim[0];
+        assert!(rim.through && (rim.opening - 2.).abs() < 0.01, "{rim:?}");
+        let off_level: Vec<[[f32; 3]; 3]> = (revolved(&section).iter())
+            .map(|t| {
+                t.map(|p| {
+                    if p == [2.15, 0., 8.] {
+                        [2.15, 0., 8.02]
+                    } else {
+                        p
+                    }
+                })
+            })
+            .collect();
+        for mesh in [level, mesh::normalize(off_level).unwrap()] {
+            let mut picked: Vec<Vec<usize>> = (0..mesh.surfaces.len())
+                .filter(|&id| crate::pocket::is_wall(&setup, &mesh, id))
+                .filter_map(|id| crate::pocket::hole_walls(&setup, &mesh, id).ok())
+                .collect();
+            picked.sort();
+            picked.dedup();
+            // The bore's walls and the recess's.
+            assert!(picked.len() >= 2, "{picked:?}");
+            for walls in picked {
+                let mut by_walls = op.clone();
+                by_walls.surfaces.as_mut().unwrap().ids = walls.clone();
+                let drilled =
+                    holes(&setup, &by_walls, &mesh).unwrap_or_else(|e| panic!("{walls:?}: {e}"));
+                assert_eq!(drilled.len(), 1, "{drilled:?}");
+                let h = &drilled[0];
+                assert!(same_centre(h, rim), "{h:?} {rim:?}");
+                for (a, b) in [
+                    (h.diameter, rim.diameter),
+                    (h.opening, rim.opening),
+                    (h.top, rim.top),
+                    (h.bottom, rim.bottom),
+                ] {
+                    assert!((a - b).abs() < 0.01, "{h:?} {rim:?}");
+                }
+            }
+        }
     }
     #[test]
     fn a_hole_picked_by_its_wall_reads_as_its_rim_face_reads_it_counterbored_or_not() {

@@ -2417,7 +2417,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Stepover),
         ),
         (_, "surface_stepover") => (
-            "Spacing between adjacent finishing passes, in mm. Smaller spacing usually reduces scallop height but increases machining time.",
+            "Spacing between adjacent finishing passes, in mm; smaller leaves smaller scallops but takes longer. Waterline adds levels where a face slopes gently so its loops stay this close across it: 0.5 mm on a 20° slope puts levels 0.18 mm apart.",
             "",
             Some(Stepover),
         ),

@@ -2727,6 +2727,105 @@ flood = { pin = 8 }
         let _ = a.view();
         render_png(&a, size, &out.join("5-from-above.png"));
     }
+    /// `imported_app` with its Facing selected and set to the highest
+    /// upward floor below the part's top, a counterbore's: the app, the
+    /// Facing's index, and the part's top in mm.
+    fn facing_a_floor() -> (App, usize, f32) {
+        let mut a = imported_app();
+        a.page = Page::Work;
+        let mesh = a.imported_mesh.clone().unwrap();
+        let setup = a.doc.setup().clone();
+        let placement = crate::stock::Placement::new(&mesh, Some(&setup));
+        let top = placement.bounds.max[2];
+        let floor = (0..mesh.surfaces.len())
+            .filter(|&id| mesh.surfaces[id].normal[2] > 0.99)
+            .map(|id| (id, placement.transform(mesh.surfaces[id].center)[2]))
+            .filter(|&(_, z)| z < top - 0.01)
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap()
+            .0;
+        let face = (a.doc.setup().operations.iter())
+            .position(|o| o.strategy == Strategy::Face)
+            .unwrap();
+        a.doc.setup_mut().operations[face].surfaces = Some(crate::surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: vec![floor],
+        });
+        let _ = a.update(Message::SelectOp(face));
+        (a, face, top / mesh.display_scale())
+    }
+    #[test]
+    fn a_facing_of_a_floor_below_the_top_faces_the_whole_top() {
+        let (mut a, face, top) = facing_a_floor();
+        assert_eq!(
+            get(&a.doc.setup().operations[face].p, "boundary"),
+            "Selected geometry"
+        );
+        let warning = crate::ui::op_checks(&a)
+            .into_iter()
+            .find(|c| c.text.starts_with("Facing stops at the part's top"))
+            .unwrap();
+        assert!(
+            !warning.error && warning.text.contains("6.00 mm"),
+            "{}",
+            warning.text
+        );
+        let _ = a.update(Message::Generate);
+        let plan = &a.active_simulation().unwrap().plan;
+        assert!((plan.target - top).abs() < 0.001, "{} {top}", plan.target);
+        // The counterbore floor is a spot; the cuts sweep the part's 120 × 80
+        // mm top, not just the spot.
+        let cuts = plan.moves.iter().filter(|m| m.cutting_pass);
+        let (lo, hi) = cuts.fold(([f32::MAX; 2], [f32::MIN; 2]), |(lo, hi), m| {
+            (
+                std::array::from_fn(|k| lo[k].min(m.from[k]).min(m.to[k])),
+                std::array::from_fn(|k| hi[k].max(m.from[k]).max(m.to[k])),
+            )
+        });
+        assert!(hi[0] - lo[0] > 100. && hi[1] - lo[1] > 60., "{lo:?} {hi:?}");
+        assert!(plan.moves.iter().all(|m| m.to[2] >= plan.target - 0.001));
+    }
+    /// Renders a Facing of a floor below the part's top to `$AXIS_RENDER_DIR`
+    /// (default /tmp/facing-raise): its warning, and the stock it leaves,
+    /// faced to the part's top over the top. Not a check: run it with
+    /// --ignored.
+    #[test]
+    #[ignore]
+    fn render_a_facing_below_the_parts_top() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/facing-raise".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let (mut a, _, top) = facing_a_floor();
+        let size = iced::Size::new(1600., 1100.);
+        let _ = a.view();
+        render_png(&a, size, &out.join("1-facing-a-floor.png"));
+        let _ = a.update(Message::Generate);
+        eprintln!("after generate: {}", a.status);
+        let _ = a.update(Message::Scrub(1.));
+        let key = a.stock_mesh_key().unwrap();
+        let sim = a.active_simulation().unwrap();
+        let result = crate::stock_surface::Snapshot::of(
+            sim.volume.as_ref().unwrap(),
+            crate::stock_surface::Detail::Standard,
+        )
+        .build()
+        .map(std::sync::Arc::new);
+        let seconds = sim.seconds;
+        a.stock_mesh_job = None;
+        let _ = a.update(Message::StockMeshed {
+            key,
+            seconds,
+            result,
+        });
+        let _ = a.view();
+        render_png(&a, size, &out.join("2-faced-to-the-top.png"));
+        let _ = a.update(Message::Camera("FRONT"));
+        let _ = a.view();
+        render_png(&a, size, &out.join("3-from-the-front.png"));
+        let plan = &a.active_simulation().unwrap().plan;
+        eprintln!("target {} part top {top}", plan.target);
+    }
     /// Renders the owner's 3-tooth thread mill milling the M6 holes to
     /// `$AXIS_RENDER_DIR` (default /tmp/threading): the cutter over the part
     /// between holes, and the threads it leaves at Ultra detail, at the

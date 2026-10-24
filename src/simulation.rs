@@ -197,6 +197,43 @@ pub fn exceeds_coordinate_limit(bounds: &Bounds) -> bool {
         .chain(&bounds.max)
         .any(|v| v.abs() > 1_000_000.)
 }
+/// A Face operation's selected plane and the placed part's top, in mm along
+/// setup +Z.
+fn facing_levels(setup: &Setup, operation: &Operation, mesh: &Mesh) -> Result<(f32, f32), String> {
+    let id = operation
+        .surfaces
+        .as_ref()
+        .and_then(|s| s.ids.first())
+        .ok_or("Select a top planar surface in Geometry first.")?;
+    let scale = stock::resolve(setup, Some(mesh))?.display_scale;
+    let placement = Placement::new(mesh, Some(setup));
+    let reference = mesh
+        .faces
+        .iter()
+        .find(|f| f.feature == Some(*id))
+        .and_then(|f| f.points.first())
+        .ok_or("The selected surface has no triangles.")?;
+    Ok((
+        placement.transform(*reference)[2] / scale,
+        placement.bounds.max[2] / scale,
+    ))
+}
+/// How far above its selected plane and bottom offset a Face operation
+/// stops, at the part's top, in mm; None when it reaches them.
+pub fn facing_raise(setup: &Setup, operation: &Operation, mesh: &Mesh) -> Option<f32> {
+    let (plane, part_top) = facing_levels(setup, operation, mesh).ok()?;
+    let raise = part_top - (plane + num(&operation.p, "bottom")?);
+    (raise > 0.001).then_some(raise)
+}
+/// Whether a Face operation's selected surface faces down in its setup,
+/// away from the spindle.
+pub fn facing_faces_down(setup: &Setup, operation: &Operation, mesh: &Mesh) -> bool {
+    let angles = ["rx", "ry", "rz"].map(|k| num(&setup.p, k).unwrap_or(0.));
+    (operation.surfaces.as_ref())
+        .and_then(|s| s.ids.first())
+        .and_then(|&id| mesh.surfaces.get(id))
+        .is_some_and(|s| crate::mesh::rotation(s.normal, angles)[2] < 0.)
+}
 pub fn generate(
     setup: &Setup,
     operation: &Operation,
@@ -265,17 +302,11 @@ pub fn generate(
     let stock = stock::resolve(setup, Some(mesh))?;
     let scale = stock.display_scale;
     let placement = Placement::new(mesh, Some(setup));
-    let reference = mesh
-        .faces
-        .iter()
-        .find(|f| f.feature == Some(selection.ids[0]))
-        .and_then(|f| f.points.first())
-        .ok_or("The selected surface has no triangles.")?;
-    let plane = placement.transform(*reference)[2] / scale;
-    let target = plane + number(operation, "bottom")?;
-    if target < placement.bounds.max[2] / scale - 0.001 {
-        return Err("Facing preview supports the highest plane of the placed part. This selection or bottom offset would cut below other model features; reposition the part or choose its top surface.".into());
-    }
+    let (plane, part_top) = facing_levels(setup, operation, mesh)?;
+    // A face sweeps its whole area: below the part's top it would cut
+    // through the higher features, so it stops there (`facing_raise`).
+    let requested = plane + number(operation, "bottom")?;
+    let target = requested.max(part_top);
     if target < stock.stock.min[2] || target >= stock.stock.max[2] - 0.0001 {
         return Err("No stock exists above the facing target. Increase the setup's top stock offset or review the selected plane and bottom offset.".into());
     }
@@ -366,6 +397,10 @@ pub fn generate(
     let mut area = match get(&operation.p, "boundary") {
         "Stock silhouette" => stock.stock,
         "Model silhouette" => placement.bounds.scaled(1. / scale),
+        // Raised to the part's top, it faces all of the part's top,
+        // whether that is a face, a ridge or a point: the selection lies
+        // inside it.
+        "Selected geometry" if target > requested => placement.bounds.scaled(1. / scale),
         "Selected geometry" => {
             let mut b = Bounds {
                 min: [f32::INFINITY; 3],
@@ -1420,15 +1455,83 @@ mod tests {
         assert_eq!(sim.stock.removed_volume(), 0.);
     }
     #[test]
-    fn reject_gouging_unsupported_tools_stale_mesh_and_unbounded_paths() {
-        let (setup, mut op, mut tool, mesh) = fixture();
+    fn a_facing_below_the_parts_top_stops_at_the_top() {
+        let (setup, mut op, tool, mesh) = fixture();
+        assert_eq!(facing_raise(&setup, &op, &mesh), None);
+        let top = generate(&setup, &op, &tool, &mesh).unwrap();
+        // A negative bottom offset would gouge the part: it faces the top.
         op.p.insert("bottom".into(), "-1".into());
-        assert!(
-            generate(&setup, &op, &tool, &mesh)
-                .unwrap_err()
-                .contains("below")
-        );
+        assert_eq!(facing_raise(&setup, &op, &mesh), Some(1.));
+        let lowered = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert_eq!(lowered.target, top.target);
+        assert_eq!(lowered.moves.len(), top.moves.len());
+        // So does a face selected below the top: the fixture's floor, 10 mm down.
         op.p.insert("bottom".into(), "0".into());
+        let floor = (0..mesh.surfaces.len())
+            .min_by(|&a, &b| mesh.surfaces[a].center[2].total_cmp(&mesh.surfaces[b].center[2]))
+            .unwrap();
+        op.surfaces.as_mut().unwrap().ids = vec![floor];
+        let raise = facing_raise(&setup, &op, &mesh).unwrap();
+        assert!((raise - 10.).abs() < 0.001, "{raise}");
+        assert_eq!(
+            generate(&setup, &op, &tool, &mesh).unwrap().target,
+            top.target
+        );
+        // Turned over, the selected surface faces away from the spindle.
+        assert!(!facing_faces_down(&setup, &op, &mesh));
+        let mut over = setup.clone();
+        over.p.insert("rx".into(), "180".into());
+        assert!(facing_faces_down(&over, &op, &mesh));
+    }
+    #[test]
+    fn a_facing_raised_over_a_ridge_clears_the_stock_over_the_ridge() {
+        // A low plateau beside a roof ridge 10 mm higher, 20 mm deep in Y.
+        let cross = [
+            [0., 0.],
+            [40., 0.],
+            [40., 10.],
+            [30., 20.],
+            [20., 10.],
+            [0., 10.],
+        ];
+        let at = |i: usize, y: f32| [cross[i][0], y, cross[i][1]];
+        let mut triangles = vec![];
+        for i in 0..6 {
+            let j = (i + 1) % 6;
+            triangles.push([at(i, 0.), at(i, 20.), at(j, 20.)]);
+            triangles.push([at(i, 0.), at(j, 20.), at(j, 0.)]);
+        }
+        for [i, j, k] in [[0, 1, 2], [0, 2, 4], [2, 3, 4], [0, 4, 5]] {
+            triangles.push([at(i, 0.), at(j, 0.), at(k, 0.)]);
+            triangles.push([at(i, 20.), at(k, 20.), at(j, 20.)]);
+        }
+        let mesh = crate::mesh::normalize(triangles).unwrap();
+        let (setup, mut op, tool, _) = fixture();
+        let plateau = mesh.surfaces.iter().position(|s| s.normal[2] > 0.999);
+        op.surfaces = Some(surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: vec![plateau.unwrap()],
+        });
+        op.p.insert("boundary".into(), "Selected geometry".into());
+        op.p.insert("containment".into(), "Tool inside boundary".into());
+        assert!((facing_raise(&setup, &op, &mesh).unwrap() - 10.).abs() < 0.001);
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        let mut sim = Simulation::new(plan.clone());
+        sim.seek(1.);
+        // The ridge runs along Y at X 10, the middle of the part's 40 mm.
+        let g = &sim.stock;
+        let column = ((10. - g.bounds.min[0]) / g.dx) as usize;
+        for row in 0..g.ny {
+            let z = g.heights[row * g.nx + column];
+            let y = g.bounds.min[1] + (row as f32 + 0.5) * g.dy;
+            if y.abs() < 8. {
+                assert!((z - plan.target).abs() < 0.001, "{y}: {z} {}", plan.target);
+            }
+        }
+    }
+    #[test]
+    fn reject_unsupported_tools_stale_mesh_and_unbounded_paths() {
+        let (setup, mut op, mut tool, mesh) = fixture();
         tool.p.insert("type".into(), "Ball end mill".into());
         assert!(
             generate(&setup, &op, &tool, &mesh)

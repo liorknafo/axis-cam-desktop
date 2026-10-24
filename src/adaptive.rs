@@ -2491,6 +2491,44 @@ mod tests {
         assert!(program.text.contains("Adaptive clearing"));
         assert!(program.lines > 500, "{} lines", program.lines);
     }
+    /// Floors side by side at Z 3, 1 and −1 (`pocket::stepped_pocket`) are
+    /// cleared as one down to Z 3, then on down to each, clear of those
+    /// higher: four levels at a 2 mm stepdown, not each floor's own nine.
+    #[test]
+    fn floors_side_by_side_clear_together_down_to_each_height() {
+        let (setup, mut op, tool, mesh) = part(crate::pocket::stepped_pocket(), &[3., 1., -1.], 4.);
+        op.p.insert("stepdown".into(), "2".into());
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert_eq!(plan.levels, 4);
+        let scale = mesh.display_scale();
+        let dz = stock::Placement::new(&mesh, Some(&setup)).bounds.min[2] / scale + 4.;
+        let r = plan.radius;
+        let floor = |x: f32| {
+            if x < -5. {
+                3.
+            } else if x < 5. {
+                1.
+            } else {
+                -1.
+            }
+        };
+        for m in plan.moves.iter().filter(|m| m.motion == Motion::Feed) {
+            for i in 0..=10 {
+                let p = m.at(m.start + (m.end - m.start) * i as f32 / 10.);
+                let z = p[2] - dz;
+                if z < 6. {
+                    assert!(p[0].abs() + r <= 15.001 && p[1].abs() + r <= 6.001, "{p:?}");
+                }
+                assert!(z >= floor(p[0] - r + 0.001) - 0.001, "{p:?}");
+            }
+        }
+        for (x0, x1, z) in [(-15., -5., 3.), (-5., 5., 1.), (5., 15., -1.)] {
+            assert!(plan.moves.iter().any(|m| m.cutting_pass
+                && m.to[0] > x0
+                && m.to[0] < x1
+                && (m.to[2] - dz - z).abs() < 0.001));
+        }
+    }
     #[test]
     fn a_notch_in_a_wall_of_any_width_clears_and_its_corners_are_slowed() {
         // The 20 × 16 mm pocket with a notch 3 mm deep into its right wall.
