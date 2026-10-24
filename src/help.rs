@@ -3048,6 +3048,81 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "Drilling with a chamfer mill plunges its point into each detected opening until the cone is as wide as the opening at its rim, so a countersink comes out at the CAD's size. Bottom offset raises the plunge (a narrower chamfer); a negative one lowers it (a wider one).",
             Some(Tool),
         ),
+        (_, "tip_flat") => (
+            "How wide a chamfer mill's flat tip is across, in mm. Empty or 0 is a pointed tip. A flat tip is wider at every height by half its width on each side, so Chamfer milling holds the axis that much further from the edge.",
+            "The flat must be narrower than the tool. The simulation cuts with the flat, and Chamfer milling puts the axis by it.",
+            Some(Tool),
+        ),
+        (_, "chamfer_source") => (
+            "What a Chamfer milling puts the side of the cone on: the edges of the faces you pick on the part, or a straight line given by its two ends and its height.",
+            "A line needs no part, so it can cut V flanks at a depth, as the teeth of a clutch. Selected edges follow the part, so a change in the model moves them.",
+            None,
+        ),
+        (_, "chamfer_edges") => (
+            "Which edges of the picked level faces are chamfered: all of their outline and hole mouths, only the outer contour, or only the hole mouths.",
+            "A wall picked beside the level face narrows it to the one straight edge they share, whatever this says.",
+            None,
+        ),
+        (_, "extend") => (
+            "How far, in mm, a chain of edges that does not close is run on past both its ends, so the cone's side leaves the edge cleanly. Closed outlines and holes ignore it.",
+            "",
+            None,
+        ),
+        (_, "from_x" | "from_y" | "to_x" | "to_y") => (
+            "One end of the line the cone's side is put on, in mm in work coordinates, from the setup's work zero. The tool runs from the start to the end.",
+            "The two ends must be at least 0.01 mm apart. The line is level, at the line height.",
+            None,
+        ),
+        (_, "line_z") => (
+            "The height of the line the cone's side is put on, in mm in work coordinates, from the setup's work zero. Passes sets how far under it the tip goes.",
+            "",
+            None,
+        ),
+        (_, "chamfer_side") => (
+            "Which side of the line the tool is on, looking from its start to its end: the side it cuts away. Alternate takes Left for the first copy, Right for the second, and so on.",
+            "",
+            None,
+        ),
+        (_, "copies") => (
+            "How many copies of the cut are made, turned round a vertical axis: a whole number from 1 to 720. One copy is the cut as set.",
+            "Copy k is turned the first copy's angle plus k times the angle between copies, anticlockwise seen from above.",
+            None,
+        ),
+        (_, "copy_pitch") => (
+            "The angle in degrees between one copy and the next, anticlockwise seen from above. The copies must not go round more than once, or they would cut over each other.",
+            "",
+            None,
+        ),
+        (_, "first_angle") => (
+            "The angle in degrees the first copy is turned about the axis, anticlockwise seen from above. 0 leaves it where it is set.",
+            "",
+            None,
+        ),
+        (_, "axis_x" | "axis_y") => (
+            "Where the vertical axis the copies turn about is, in mm in work coordinates, from the setup's work zero.",
+            "",
+            None,
+        ),
+        (_, "chamfer_size") => (
+            "How a cut along a line is sized: by the chamfer's width on the face, or by the Z the tool's tip goes down to. Selected edges are always sized by the width.",
+            "Either way the cone's side, not its tip, does the cutting, and the axis is put off the edge or line so the side lies on it.",
+            None,
+        ),
+        (_, "chamfer_width") => (
+            "How wide the chamfer is on the level face, in mm. It must be above zero. The cone's side cuts the whole chamfer, down the wall to its lower end.",
+            "",
+            None,
+        ),
+        (_, "tip_offset") => (
+            "How far the tip goes below the lower end of the chamfer, in mm: 0 or more. It keeps the tip out of the cut, so the cone's side cuts the whole chamfer; a deeper tip moves the axis further from the edge.",
+            "",
+            None,
+        ),
+        (_, "tip_z") => (
+            "The Z the tool's tip goes to, in mm in work coordinates, from the setup's work zero. The axis is off the line by the cone's radius at the line's height.",
+            "The tip must be below the line, and the cone must not be wider there than the tool.",
+            None,
+        ),
         _ => (
             "Saved parameter for the current setup or operation. See the field label for its units.",
             "",

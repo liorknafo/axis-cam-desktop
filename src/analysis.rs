@@ -314,6 +314,9 @@ pub struct ToolReport {
     /// A chamfer mill's included tip angle, degrees.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tip_angle: Option<f32>,
+    /// A chamfer mill's flat tip, across, mm, when it is not pointed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tip_flat: Option<f32>,
     /// A thread mill's thread angle (55 or 60), and a tap's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_angle: Option<f32>,
@@ -1570,6 +1573,8 @@ fn describe(
                     tip_angle: (get(&t.p, "type") == "Chamfer mill")
                         .then(|| t.tip_angle())
                         .flatten(),
+                    tip_flat: (get(&t.p, "type") == "Chamfer mill" && t.tip_flat() > 0.)
+                        .then(|| t.tip_flat()),
                     thread_angle: match get(&t.p, "type") {
                         "Thread mill" => num(&t.p, "thread_angle"),
                         "Tap" => t.tap_spec().map(|s| s.angle),

@@ -31,7 +31,7 @@ struct Cut {
     // xyz: b - a; w: radius.
     d: vec4f,
     // x: flute; y: the cone's rise; z: the shape (0 flat, 1 ball, 2 cone, 3 ring,
-    // 4 thread mill); w: a thread mill's tooth spacing.
+    // 4 thread mill); w: a thread mill's tooth spacing, a cone's flat tip radius.
     e: vec4f,
     // A ring's z from, z to, inner and outer radius; a thread mill's teeth and
     // the cotangent of half its angle.
@@ -124,7 +124,7 @@ fn cut_field(c: Cut, x: vec3f) -> f32 {
         if shape == 1u {
             bottom = min(d.z, 0.0) + r - sqrt(max(r * r - dot(p.xy, p.xy), 0.0));
         } else if shape == 2u {
-            bottom = min(d.z, 0.0) + length(p.xy) * rise;
+            bottom = min(d.z, 0.0) + max(length(p.xy) - c.e.w, 0.0) * rise;
         }
         return max(max(radial, bottom - p.z), p.z - (max(d.z, 0.0) + flute));
     }
@@ -159,7 +159,7 @@ fn cut_field(c: Cut, x: vec3f) -> f32 {
         }
         t = min(max(t, lo), hi);
         let w = u - t * l;
-        lower = t * d.z + sqrt(w * w + v * v) * rise;
+        lower = t * d.z + max(sqrt(w * w + v * v) - c.e.w, 0.0) * rise;
     } else if d.z < 0.0 {
         lower = hi * d.z;
     } else {

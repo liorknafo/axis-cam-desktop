@@ -164,9 +164,10 @@ impl Cut {
                             .sqrt()
                 }
                 // The point's cone, rising from the tip, under the wall.
-                CutterShape::Drill | CutterShape::Chamfer(_) => {
+                CutterShape::Drill | CutterShape::Chamfer(..) => {
                     Tree::from(d[2].min(0.))
-                        + (p[0].square() + p[1].square()).sqrt() * self.shape.rise().unwrap()
+                        + ((p[0].square() + p[1].square()).sqrt() - self.shape.flat()).max(0.)
+                            * self.shape.rise().unwrap()
                 }
                 // Rings and thread mills return above.
                 CutterShape::Revolve | CutterShape::Thread { .. } => Tree::from(d[2].min(0.)),
@@ -203,7 +204,7 @@ impl Cut {
                         .max(0.)
                         .sqrt()
             }
-            CutterShape::Drill | CutterShape::Chamfer(_) => {
+            CutterShape::Drill | CutterShape::Chamfer(..) => {
                 let rise = self.shape.rise().unwrap();
                 // As the ball, with the point's cone as the lower envelope:
                 // lowest where the tip's descent balances the cone's rise,
@@ -223,7 +224,9 @@ impl Cut {
                     lo.clone()
                 };
                 let t = t.max(lo.clone()).min(hi.clone());
-                t.clone() * d[2] + ((u - t * l).square() + v.square()).sqrt() * rise
+                t.clone() * d[2]
+                    + (((u - t * l).square() + v.square()).sqrt() - self.shape.flat()).max(0.)
+                        * rise
             }
             // Rings and thread mills return above.
             CutterShape::Flat | CutterShape::Revolve | CutterShape::Thread { .. } => {

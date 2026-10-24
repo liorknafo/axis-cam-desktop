@@ -51,9 +51,11 @@ pub enum CutterShape {
     /// A drill: flat flutes over a 118° point, the cone `POINT_RISE` gives,
     /// with the programmed tip at its apex.
     Drill,
-    /// A chamfer mill: a cone of this included angle, in tenths of a degree,
-    /// from its pointed tip up to its diameter.
-    Chamfer(u16),
+    /// A chamfer mill: a cone of the first included angle, in tenths of a
+    /// degree, from its tip up to its diameter, over a flat tip the second
+    /// across, in µm (0 for a pointed one): the programmed point is the
+    /// flat's centre.
+    Chamfer(u16, u16),
     /// A lathe cut: the ring `volume::Volume::revolve` makes, every point of
     /// the cut's frame whose Z lies between `a[0]` and `b[0]` and whose
     /// distance from its Z axis lies between `a[1]` and `b[1]`.
@@ -118,11 +120,21 @@ impl CutterShape {
     pub fn rise(self) -> Option<f32> {
         match self {
             CutterShape::Drill => Some(POINT_RISE),
-            CutterShape::Chamfer(tenths) => Some(1. / (f32::from(tenths) / 20.).to_radians().tan()),
+            CutterShape::Chamfer(tenths, _) => {
+                Some(1. / (f32::from(tenths) / 20.).to_radians().tan())
+            }
             CutterShape::Flat
             | CutterShape::Ball
             | CutterShape::Revolve
             | CutterShape::Thread { .. } => None,
+        }
+    }
+    /// The radius of a chamfer mill's flat tip, mm (`Chamfer`): its cone
+    /// rises from this far from the axis. 0 for every other cutter.
+    pub fn flat(self) -> f32 {
+        match self {
+            CutterShape::Chamfer(_, um) => f32::from(um) / 2000.,
+            _ => 0.,
         }
     }
 }
@@ -645,7 +657,7 @@ pub struct StockGrid {
     pub heights: Vec<f32>,
 }
 impl StockGrid {
-    fn new(bounds: Bounds) -> Self {
+    pub(crate) fn new(bounds: Bounds) -> Self {
         let size = bounds.dimensions();
         let cell = size[0].max(size[1]) / 96.;
         let nx = (size[0] / cell).ceil().clamp(1., 96.) as usize;
@@ -749,7 +761,9 @@ impl StockGrid {
                         // The cone's lowest point over the covered interval:
                         // where the tip's descent balances the cone's rise,
                         // or an end of the interval when the move is steeper
-                        // than the cone, as a flat end is lowest there.
+                        // than the cone, as a flat end is lowest there. A
+                        // flat tip lowers the cone by its radius: exact for
+                        // level moves and plunges.
                         let perp = if length < 1e-10 {
                             (point[0] - a[0]).powi(2) + (point[1] - a[1]).powi(2)
                         } else {
@@ -774,7 +788,7 @@ impl StockGrid {
                         };
                         let d = (point[0] - a[0] - contact * (b[0] - a[0])).powi(2)
                             + (point[1] - a[1] - contact * (b[1] - a[1])).powi(2);
-                        a[2] + contact * dz + rise * d.sqrt()
+                        a[2] + contact * dz + rise * (d.sqrt() - shape.flat()).max(0.)
                     } else if length < 1e-10 {
                         a[2].min(b[2])
                     } else {

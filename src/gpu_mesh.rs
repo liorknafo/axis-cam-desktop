@@ -149,7 +149,7 @@ fn pack(cut: &Cut, reference: Frame) -> GpuCut {
     let code = match cut.shape {
         CutterShape::Flat => 0.,
         CutterShape::Ball => 1.,
-        CutterShape::Drill | CutterShape::Chamfer(_) => 2.,
+        CutterShape::Drill | CutterShape::Chamfer(..) => 2.,
         CutterShape::Revolve => 3.,
         CutterShape::Thread { .. } => 4.,
     };
@@ -169,7 +169,13 @@ fn pack(cut: &Cut, reference: Frame) -> GpuCut {
             cut.b[2] - cut.a[2],
             cut.radius,
         ],
-        e: [cut.flute, cut.shape.rise().unwrap_or(0.), code, pitch],
+        // A thread mill's tooth spacing, or a chamfer mill's flat tip.
+        e: [
+            cut.flute,
+            cut.shape.rise().unwrap_or(0.),
+            code,
+            if teeth > 0. { pitch } else { cut.shape.flat() },
+        ],
         g: if teeth > 0. {
             [teeth, cot, 0., 0.]
         } else {
@@ -793,7 +799,7 @@ mod tests {
             CutterShape::Flat,
             CutterShape::Ball,
             CutterShape::Drill,
-            CutterShape::Chamfer(900),
+            CutterShape::Chamfer(900, 0),
             CutterShape::Thread {
                 pitch: 1250,
                 teeth: 3,

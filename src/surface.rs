@@ -302,6 +302,11 @@ pub fn issues(operation: &Operation, setup: &Setup, mesh: Option<&Mesh>) -> Vec<
         ) {
             continue;
         }
+        // Chamfer milling takes a level face's edges, and a wall beside it
+        // to keep only the edge they share (`chamfer::chains`).
+        if operation.strategy == crate::model::Strategy::Chamfer {
+            continue;
+        }
         // A Pocket, an inside Contour or a Drill picks a hole by its walls.
         if picks_holes && up < crate::pocket::WALL {
             continue;

@@ -600,6 +600,53 @@ pub(crate) fn angle_problems(
     }
     out
 }
+/// The cone of the Chamfer milling `op` of setup `si` (from 0) against the
+/// part, past the chamfers it is meant to cut (`chamfer::gouge_problem`): an
+/// indexed setup's at each of its A angles, as `angle_problems`.
+fn chamfer_problems(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    op: &crate::model::Operation,
+    sim: &Simulation,
+    geometry: &Geometry,
+    index: &Index,
+) -> Vec<String> {
+    let Some(tool) = doc.tools.iter().find(|t| t.id == op.tool) else {
+        return vec![];
+    };
+    let check = |setup: &crate::model::Setup, plan: &Plan, geometry: &Geometry, index: &Index| {
+        match crate::chamfer::allowances(setup, op, tool, mesh) {
+            Ok(allowed) => crate::chamfer::gouge_problem(plan, geometry, index, &allowed),
+            Err(e) => Some(e),
+        }
+    };
+    if sim.turns.is_empty() {
+        return check(&doc.setups[si], &sim.plan, geometry, index)
+            .into_iter()
+            .collect();
+    }
+    let mut out = vec![];
+    for &(a, _) in &sim.turns {
+        let posed = match doc.setup_at(&doc.setups[si], si, a, mesh) {
+            Ok(posed) => posed,
+            Err(e) => {
+                out.push(e);
+                continue;
+            }
+        };
+        let geometry = Geometry::new(&posed, mesh);
+        let mut plan = sim.plan.clone();
+        plan.moves
+            .retain(|m| m.motion != Motion::Index && m.a.is_some_and(|b| (a - b).abs() < 1e-4));
+        let at = crate::indexed::degrees(a);
+        out.extend(
+            check(&posed, &plan, &geometry, &Index::new(&geometry))
+                .map(|p| format!("At A {at}°: {p}")),
+        );
+    }
+    out
+}
 /// The tool axis problems of one generated operation in setup `si` (from 0):
 /// more than 0.1 mm of part above the tool tip, whatever the strategy, and
 /// moves below the floor. The floor is the stock's bottom in setup 1; later
@@ -1097,6 +1144,24 @@ fn run(
                             message,
                         });
                     }
+                    if op.strategy == crate::model::Strategy::Chamfer {
+                        for message in chamfer_problems(
+                            built,
+                            mesh,
+                            si,
+                            op,
+                            sim,
+                            &geometries[si],
+                            &indexes[si],
+                        ) {
+                            axis.push(Problem {
+                                setup: si + 1,
+                                operation: Some(oi + 1),
+                                stage: "gouge",
+                                message,
+                            });
+                        }
+                    }
                 }
                 Err(message) => problems.push(Problem {
                     setup: si + 1,
@@ -1110,7 +1175,11 @@ fn run(
         |si, oi, stock| {
             let part = part.get_or_insert_with(|| PartGrid::new(stock, &geometries[0], &threads));
             let (count, bounds) = part.gouged(stock);
-            if count > gouged {
+            // A Chamfer milling's cone is checked against the part itself
+            // (`chamfer_problems`), the chamfers it is meant to cut let be.
+            let chamfer =
+                built.setups[si].operations[oi].strategy == crate::model::Strategy::Chamfer;
+            if count > gouged && !chamfer {
                 let size = geometries[0].bounds;
                 removed.push(count - gouged);
                 candidates.push(Problem {
