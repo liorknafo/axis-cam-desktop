@@ -609,7 +609,9 @@ pub(crate) fn swept(
         + match shape {
             CutterShape::Ball => r - (r * r - radial).max(0.).sqrt(),
             CutterShape::Flat => 0.,
-            CutterShape::Drill | CutterShape::Chamfer(_) => rise * radial.sqrt(),
+            CutterShape::Drill | CutterShape::Chamfer(..) => {
+                rise * (radial.sqrt() - shape.flat()).max(0.)
+            }
             // Rings and thread mills return above.
             CutterShape::Revolve | CutterShape::Thread { .. } => 0.,
         };

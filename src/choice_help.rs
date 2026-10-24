@@ -489,7 +489,47 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("type", "Chamfer mill") => (
-            "A pointed cone of its tip angle. Drilling with it countersinks each detected opening: it plunges until the cone is as wide as the opening at its rim. A hole countersunk in the model takes only a chamfer mill of its countersink's angle. Chamfers along edges are not generated.",
+            "A pointed cone of its tip angle. Drilling with it countersinks each detected opening: it plunges until the cone is as wide as the opening at its rim. A hole countersunk in the model takes only a chamfer mill of its countersink's angle. Chamfer milling runs its side along edges or a line.",
+            "",
+        ),
+        ("chamfer_source", "Selected edges") => (
+            "The cone's side runs along the edges of the faces you pick: a level face's outline and hole mouths, or one edge when you also pick the wall beside it.",
+            "Pick on the part with Select surfaces on part. Edges narrows which edges of the level faces are broken. Edges are sized by the chamfer's width.",
+        ),
+        ("chamfer_source", "Line") => (
+            "The cone's side runs along a straight line given by its ends and its height in work coordinates. It needs no part, for flanks at a depth.",
+            "Which side of the line the tool is on is Tool side. Copies repeat it round an axis.",
+        ),
+        ("chamfer_edges", "All edges") => (
+            "Every edge of the picked level faces is chamfered: their outer outlines and the mouths of their holes.",
+            "",
+        ),
+        ("chamfer_edges", "Outer contour") => (
+            "Only the outer outline of the picked level faces is chamfered; the holes in them are left alone.",
+            "",
+        ),
+        ("chamfer_edges", "Hole mouths") => (
+            "Only the mouths of the holes in the picked level faces are chamfered; the outer outline is left alone.",
+            "",
+        ),
+        ("chamfer_side", "Left") => (
+            "The tool is on the left of the line, looking from its start to its end, and cuts that side away.",
+            "",
+        ),
+        ("chamfer_side", "Right") => (
+            "The tool is on the right of the line, looking from its start to its end, and cuts that side away.",
+            "",
+        ),
+        ("chamfer_side", "Alternate") => (
+            "The tool is on the left for the first copy, on the right for the second, and so on. It cuts the flanks of a row of teeth that face alternately.",
+            "",
+        ),
+        ("chamfer_size", "Chamfer width") => (
+            "The chamfer is this wide on the face. The tip goes a tip offset under its lower end, and the axis is set off the edge so the cone's side cuts all of it.",
+            "",
+        ),
+        ("chamfer_size", "Tip depth") => (
+            "The tip goes to a given Z. The axis is set off the line by the cone's radius at the line's height, so the cone's side lies on the line.",
             "",
         ),
         ("type", "Thread mill") => (

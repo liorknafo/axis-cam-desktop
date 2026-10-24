@@ -1,6 +1,7 @@
 mod adaptive;
 mod analysis;
 mod cam;
+mod chamfer;
 mod choice_diagram;
 mod choice_help;
 mod chuck;
@@ -1644,6 +1645,7 @@ impl App {
             include_bytes!("../assets/op-10.svg"),
             include_bytes!("../assets/op-11.svg"),
             include_bytes!("../assets/op-12.svg"),
+            include_bytes!("../assets/op-13.svg"),
         ]
         .iter()
         .map(|b| iced::widget::svg::Handle::from_memory(b.to_vec()))

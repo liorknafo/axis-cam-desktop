@@ -1,5 +1,5 @@
 use crate::{
-    App, Message, Page, Target,
+    App, Message, Page, Target, chamfer,
     help::{self, Help, HelpButton},
     holding::Held,
     lathe, manual,
@@ -1208,15 +1208,19 @@ fn ribbon(app: &App) -> Element<'_, Message> {
         .doc
         .active_setup()
         .is_some_and(|s| lathe::is_lathe(&s.machine));
-    for (label, range) in [
-        ("2D MILLING", 0..5),
-        ("3D FINISHING", 5..8),
-        ("MULTI-AXIS", 8..11),
-        ("MANUAL", 11..12),
-        ("LATHE", 12..13),
+    let all = &Strategy::ALL;
+    for (label, group) in [
+        (
+            "2D MILLING",
+            &[&all[0..5], &[Strategy::Chamfer][..]].concat()[..],
+        ),
+        ("3D FINISHING", &all[5..8]),
+        ("MULTI-AXIS", &all[8..11]),
+        ("MANUAL", &all[11..12]),
+        ("LATHE", &all[12..13]),
     ] {
         let mut buttons = Row::new().spacing(1);
-        for s in &Strategy::ALL[range] {
+        for s in group {
             let s = *s;
             // Why the strategy is dimmed on the active setup's machine.
             let reason = if lathe_setup {
@@ -2785,6 +2789,16 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             }
         }
         "Geometry" => {
+            if o.strategy == Strategy::Chamfer {
+                c = c.push(choice_value(
+                    p,
+                    chamfer::setting(p, "chamfer_source"),
+                    "chamfer_source",
+                    "Put the cone's side on",
+                    &chamfer::SOURCES,
+                    t,
+                ));
+            }
             if let Some(file) = &app.doc.file {
                 c = c.push(muted(format!("Part · {}", file.name)));
                 if o.strategy == Strategy::Drill {
@@ -2804,10 +2818,12 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     c = c.push(pin_hole_drilling(app, o));
                 } else if !o.needs_surfaces() && crate::picks_faces(o) {
                     c = c.push(note("Finishes the whole imported part in this setup. To finish only some of its faces, flat or curved, set Machining boundary to Selected geometry and pick them."));
+                } else if o.strategy == Strategy::Chamfer && !o.needs_surfaces() {
+                    // A line needs no pick: its fields are below.
                 } else if !o.needs_surfaces() && o.strategy.imported_preview() {
                     c = c.push(note("Uses the current imported model in this setup. No demonstration geometry or saved sample features are used."));
                 } else if o.strategy.imported_preview() {
-                    c = c.push(note(if o.strategy == Strategy::Drill { "While picking, every round hole of the part is outlined in teal with the diameter it drills. Click a hole (its outline, its wall or inside it) to drill it: its outline turns blue. Click it again to drop it. Or click a horizontal rim face: every round opening in it is drilled. The diameter filter can restrict the holes. Amber = hover." } else if matches!(o.strategy, Strategy::Pocket | Strategy::Contour) { "Click the recessed pocket floor on your part: its outline defines the walls, and holes in the floor preserve islands. Or pick a whole hole: hold the pointer over it until its outline shows, then click the outline or the hole's wall. Its outline is cut down to its floor, or through the part if nothing is under it. Picked holes' outlines are blue; click one again to drop the hole. Amber = hover; blue = selected. Click Finish picking when done." } else if o.strategy == Strategy::Adaptive { "Click the recessed pocket floor on your part. Its outline defines the walls; holes in the floor preserve islands. Amber = hover; blue = selected. Click Finish picking when done." } else if crate::picks_faces(o) { "Click any face of your part, flat or curved: the whole face, up to its sharp edges, is picked. Click it again to drop it. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." } else { "Click a planar surface on your part. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." }));
+                    c = c.push(note(if o.strategy == Strategy::Chamfer { "Click a level face of your part, one facing up: its outline and the mouths of its holes are the edges to chamfer. Click it again to drop it. To break only one edge, also click the wall beside it: only the edge the level face shares with that wall is chamfered. Amber = hover; blue = selected. Click Finish picking when done." } else if o.strategy == Strategy::Drill { "While picking, every round hole of the part is outlined in teal with the diameter it drills. Click a hole (its outline, its wall or inside it) to drill it: its outline turns blue. Click it again to drop it. Or click a horizontal rim face: every round opening in it is drilled. The diameter filter can restrict the holes. Amber = hover." } else if matches!(o.strategy, Strategy::Pocket | Strategy::Contour) { "Click the recessed pocket floor on your part: its outline defines the walls, and holes in the floor preserve islands. Or pick a whole hole: hold the pointer over it until its outline shows, then click the outline or the hole's wall. Its outline is cut down to its floor, or through the part if nothing is under it. Picked holes' outlines are blue; click one again to drop the hole. Amber = hover; blue = selected. Click Finish picking when done." } else if o.strategy == Strategy::Adaptive { "Click the recessed pocket floor on your part. Its outline defines the walls; holes in the floor preserve islands. Amber = hover; blue = selected. Click Finish picking when done." } else if crate::picks_faces(o) { "Click any face of your part, flat or curved: the whole face, up to its sharp edges, is picked. Click it again to drop it. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." } else { "Click a planar surface on your part. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." }));
                     if app.imported_mesh.is_some() {
                         c = c.push(
                             btn(
@@ -3036,6 +3052,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         Strategy::Pocket => "Pocket uses offset contours of the selected floor triangles, including islands, and of each picked hole's outline. Supports open, vertical-wall pockets with a flat floor; overhanging geometry is rejected. A picked hole is cut down to the highest of the part under it, or through the part with the breakthrough. Simulation inherits the stock left by all earlier enabled operations and setups.".to_string(),
                         Strategy::Contour => "Inside contour offsets only the walls and islands of this floor, or the wall of each picked hole. It does not clear the interior. The floor must be flat and accessible along setup Z; overhangs are rejected.".to_string(),
                         Strategy::Drill => "Hole detection uses tessellated circular openings and vertical rays. Noncircular openings and obstructions are excluded. Confirm the detected centers and depths before previewing.".to_string(),
+                        Strategy::Chamfer => "Chamfer milling runs the side of the cone along the edges of the picked level faces, level, with the tool in the air beside each edge. The path is checked against the part for gouging.".to_string(),
                         Strategy::Parallel => "Parallel finishing cuts only where the cutter touches a picked face. The rest of the part still holds the cutter up, so it never cuts into a face it was not given; where a picked face meets one that is not, the cutter stops at the corner between them, which keeps its radius.".to_string(),
                         Strategy::Waterline => "Waterline finishing cuts each level's loop only where the face nearest the cutter is a picked one, and goes no lower than the lowest picked face. Where a picked face meets one that is not, the cutter finishes up to the corner between them. The rest of the part still keeps the cutter out, so it never cuts into a face it was not given.".to_string(),
                         _ => fixture_note(app, Note::Facing),
@@ -3073,8 +3090,11 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         "{} selected",
                         plural(o.geometry.len(), "feature")
                     )));
-            } else {
+            } else if o.strategy != Strategy::Chamfer || o.needs_surfaces() {
                 c = c.push(note("Import a part before selecting geometry."));
+            }
+            if o.strategy == Strategy::Chamfer {
+                c = c.push(chamfer_geometry(o, checks));
             }
             if !app.is_sample() && o.faces_outline() {
                 c = c.push(note("Model silhouette faces the part's outline seen from above, holes through it included, grown by Clear past outline: how far the cutter's edge reaches beyond it. The stock outside stays at its height for a later operation. On the part's outer corners a round cutter needs some room past the outline, about a third of its radius for a square corner and more for a sharper one; Generate refuses less and says the least that clears them."));
@@ -3127,7 +3147,9 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         t,
                     ));
                 }
-            } else if o.strategy.imported_preview() && o.strategy != Strategy::Drill {
+            } else if o.strategy.imported_preview()
+                && !matches!(o.strategy, Strategy::Drill | Strategy::Chamfer)
+            {
                 c = c.push(choice(
                     p,
                     "boundary",
@@ -3197,6 +3219,8 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 "Bottom offset is relative to model bottom. Contour normally starts at stock top; Waterline at model top. Earlier cuts lower the start only when the whole machining area is cleared. Positive top offset adds an approach margin. Clearance/retract retain the original stock reference."
             } else if !app.is_sample() && o.strategy == Strategy::Parallel {
                 "Bottom offset is added to the cutter-compensated surface height; stock to leave is a vertical offset. Top offset raises approach heights. Finishing starts with the stock left by the earlier roughing operations."
+            } else if o.strategy == Strategy::Chamfer {
+                "The cut's own height is set in Passes: by the chamfer's width or by the tip's Z. Clearance and retract are measured above the stock top: the heights the tool travels at between cuts."
             } else if o.drills_pin_holes() {
                 "Each pin hole goes down from the face the pins stand on, as earlier cuts leave it, 1 mm deeper than the pins stand at its full width: a drill goes on by its point under that. Top offset raises the approach. Clearance/retract retain their original reference."
             } else if !app.is_sample() && o.strategy == Strategy::Drill {
@@ -3214,7 +3238,10 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 // A Box's depths are its own, a pin hole's the pins'.
                 let own = match k {
                     "top" => o.strategy != Strategy::Box,
-                    "bottom" => o.strategy != Strategy::Box && !o.drills_pin_holes(),
+                    "bottom" => {
+                        !matches!(o.strategy, Strategy::Box | Strategy::Chamfer)
+                            && !o.drills_pin_holes()
+                    }
                     _ => true,
                 };
                 if own {
@@ -3546,6 +3573,69 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
         foot: Some(foot.into()),
     }
 }
+/// A Chamfer milling's Geometry fields after its source and the picking:
+/// the edges or the line, and the copies round an axis.
+fn chamfer_geometry<'a>(o: &'a Operation, checks: &mut Checks) -> Element<'a, Message> {
+    let p = &o.p;
+    let t = Target::Operation;
+    let mut c = Column::new().spacing(12);
+    if chamfer::on_edges(p) {
+        c = c
+            .push(choice_value(
+                p,
+                chamfer::setting(p, "chamfer_edges"),
+                "chamfer_edges",
+                "Edges",
+                &chamfer::EDGES,
+                t,
+            ))
+            .push(checks.field(p, "extend", "Run past open ends · mm"));
+    } else {
+        c = c
+            .push(note("The line is in work coordinates, from the setup's work zero. The cone's side is put on it, level, at the line's height; Passes sets how deep the tip goes."))
+            .push(
+                row![
+                    checks.field(p, "from_x", "Line from X · mm"),
+                    checks.field(p, "from_y", "Line from Y · mm")
+                ]
+                .spacing(9),
+            )
+            .push(
+                row![
+                    checks.field(p, "to_x", "Line to X · mm"),
+                    checks.field(p, "to_y", "Line to Y · mm")
+                ]
+                .spacing(9),
+            )
+            .push(checks.field(p, "line_z", "Line height Z · mm"))
+            .push(choice_value(
+                p,
+                chamfer::setting(p, "chamfer_side"),
+                "chamfer_side",
+                "Tool side, looking along the line",
+                &chamfer::SIDES,
+                t,
+            ));
+    }
+    c.push(section("Copies round an axis"))
+        .push(checks.field(p, "copies", "Copies"))
+        .push(
+            row![
+                checks.field(p, "copy_pitch", "Angle between copies · °"),
+                checks.field(p, "first_angle", "First copy's angle · °")
+            ]
+            .spacing(9),
+        )
+        .push(
+            row![
+                checks.field(p, "axis_x", "Axis X · mm"),
+                checks.field(p, "axis_y", "Axis Y · mm")
+            ]
+            .spacing(9),
+        )
+        .push(note("Each copy is the cut turned that many degrees anticlockwise, seen from above, about the vertical axis through Axis X, Axis Y, from the work zero: copy k is turned First copy's angle plus k times the angle between copies."))
+        .into()
+}
 /// A Turn's kind and the sizes of that kind, in lathe work coordinates.
 fn turn_fields<'a>(o: &'a Operation, checks: &mut Checks) -> Element<'a, Message> {
     let p = &o.p;
@@ -3645,6 +3735,46 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
             .push(checks.field(p, "stepover", "Stepover · % tool diameter"))
             .push(checks.hinted(p, "stepdown", "Maximum stepdown · mm", "Auto"))
             .push(note("Stock to leave stays on every side that touches the part, for the CNC to finish; 0 makes the cut final. Leave the stepdown empty for Auto."))
+            .into();
+    }
+    if s == Strategy::Chamfer {
+        // Edges are always sized by the chamfer's width; a line also by
+        // the tip's depth.
+        if !chamfer::on_edges(p) {
+            c = c.push(choice_value(
+                p,
+                chamfer::setting(p, "chamfer_size"),
+                "chamfer_size",
+                "Size by",
+                &chamfer::SIZES,
+                t,
+            ));
+        }
+        let by_width =
+            chamfer::on_edges(p) || chamfer::setting(p, "chamfer_size") == chamfer::SIZES[0];
+        if by_width {
+            c = c
+                .push(checks.field(p, "chamfer_width", "Chamfer width · mm"))
+                .push(checks.field(p, "tip_offset", "Tip below the chamfer · mm"));
+        } else {
+            c = c.push(checks.field(p, "tip_z", "Tip Z · mm"));
+        }
+        if chamfer::on_edges(p) {
+            c = c.push(choice_value(
+                p,
+                pocket_setting(p, "pocket_milling"),
+                "pocket_milling",
+                "Milling direction",
+                &FACING_MILLING,
+                t,
+            ));
+        }
+        return c
+            .push(note(if by_width {
+                "The chamfer is this wide on the face. The tip goes the tip offset below the chamfer's lower end, so the cone's side cuts all of it, and the axis is half the flat tip plus the offset times the tangent of half the tip angle away from the edge, towards the air."
+            } else {
+                "The tip is at this Z, from the work zero. The axis is off the line, towards the air, by the cone's radius at the line's height: half the flat tip plus the height above the tip times the tangent of half the tip angle."
+            }))
             .into();
     }
     if !app.is_sample()
@@ -8664,7 +8794,16 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
         }
     }
     if get(p, "type") == "Chamfer mill" {
-        form = form.push(field(p, "tip_angle", "Tip angle · °", t));
+        form = form
+            .push(field(p, "tip_angle", "Tip angle · °", t))
+            .push(hinted_field(
+                p,
+                "tip_flat",
+                "Flat tip · mm across",
+                "0 (pointed)",
+                t,
+                &[],
+            ));
     }
     match get(p, "type") {
         "Turning tool" => {
@@ -9339,6 +9478,27 @@ pub(crate) fn operation_lines(
         Strategy::Waterline => {
             push(stepdown);
             [radial, bottom].into_iter().flatten().for_each(&mut push);
+        }
+        Strategy::Chamfer => {
+            let setting = |key: &str| chamfer::setting(p, key).trim().parse::<f32>().unwrap_or(0.);
+            push(
+                if chamfer::setting(p, "chamfer_size") == chamfer::SIZES[1] {
+                    format!("tip Z {} mm", n(setting("tip_z")))
+                } else {
+                    format!("{} mm wide", n(setting("chamfer_width")))
+                },
+            );
+            push(if chamfer::on_edges(p) {
+                chamfer::setting(p, "chamfer_edges").to_lowercase()
+            } else {
+                format!(
+                    "line, side {}",
+                    chamfer::setting(p, "chamfer_side").to_lowercase()
+                )
+            });
+            if setting("copies") > 1. {
+                push(format!("{} copies", n(setting("copies"))));
+            }
         }
         _ => {}
     }
