@@ -202,7 +202,7 @@ pub struct Push {
     pub z: f32,
 }
 /// kc1.1 and mc of `material`'s group (`KC`), "Other"'s without one.
-fn kc(material: Option<&Material>) -> (f32, f32) {
+pub(crate) fn kc(material: Option<&Material>) -> (f32, f32) {
     let group = material.map_or("Other", |m| get(&m.p, "group"));
     let (_, kc, mc) = KC
         .iter()

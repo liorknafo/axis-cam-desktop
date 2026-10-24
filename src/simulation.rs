@@ -813,6 +813,11 @@ pub struct Simulation {
     /// What the operation cuts, stretch by stretch (`forces::bites`), once
     /// asked: the export and a run's checks both ask.
     pub bites: std::sync::OnceLock<Vec<crate::forces::Bite>>,
+    /// The load on one tooth along the moves (`tooth_load::of`), worked out
+    /// off the window's thread once the preview is shown
+    /// (`App::measure_tooth_load`); None until then and for an operation
+    /// that is not milled.
+    pub tooth_load: Option<std::sync::Arc<crate::tooth_load::ToothLoad>>,
 }
 impl Simulation {
     pub fn new(plan: Plan) -> Self {
@@ -838,6 +843,7 @@ impl Simulation {
             current: 0,
             revision: 0,
             bites: Default::default(),
+            tooth_load: None,
         }
     }
     /// `forces::bites` of this simulation, worked out once.

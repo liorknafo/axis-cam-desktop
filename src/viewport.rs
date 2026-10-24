@@ -1622,47 +1622,75 @@ impl Viewport<'_> {
                 .iter()
                 .take(sim.current + 1)
                 .rposition(|m| m.cutting_pass && m.start <= sim.seconds);
+            // The pieces to draw, drawn from the farthest to the nearest:
+            // the lines do not hide each other by depth.
+            let mut lines = vec![];
             for (index, movement) in sim.plan.moves.iter().enumerate().take(sim.current + 1) {
                 if movement.start > sim.seconds {
                     break;
                 }
-                let (from, to) = (
-                    movement.from.map(|n| n * scale),
-                    movement.at(sim.seconds).map(|n| n * scale),
-                );
-                let Some((from, to)) = (match cut {
-                    Some(cut) => cut.clip_segment(from, to),
-                    None => Some((from, to)),
-                }) else {
-                    continue;
-                };
-                let (a, b) = (shown(from), shown(to));
                 let feed = movement.motion == crate::simulation::Motion::Feed;
                 let pocket_layer = sim.plan.strategy != Strategy::Face
                     && movement.cutting_pass
                     && (sim.plan.strategy == Strategy::Parallel
                         || ((movement.to[2] - pos[2]).abs() < 0.001
                             && (movement.from[2] - pos[2]).abs() < 0.001));
-                if feed && !pocket_layer && Some(index) != last_cut && index != sim.current {
+                // With the load on each tooth, every cut so far stays drawn
+                // in its colour, to be looked over when the run ends; without
+                // it, this level's alone.
+                if feed
+                    && sim.tooth_load.is_none()
+                    && !pocket_layer
+                    && Some(index) != last_cut
+                    && index != sim.current
+                {
                     continue;
                 }
                 if !feed && sim.seconds >= movement.end {
                     continue;
                 }
-                raster_depth_line(
-                    rgba,
-                    depths,
-                    w,
-                    h,
-                    a,
-                    b,
-                    if feed {
-                        [34, 114, 176, 255]
-                    } else {
-                        [226, 149, 38, 255]
-                    },
-                    ratio * 0.5,
-                );
+                // A feed move in the colour of the load on each tooth along
+                // it (`tooth_load::colour`), piece by piece as it was
+                // measured, up to where the cutter is.
+                let load = sim.tooth_load.as_ref().filter(|_| feed);
+                let pieces = load.map_or(1, |l| l.moves[index].len().max(1));
+                let span = movement.end - movement.start;
+                let now = if span > 0. {
+                    ((sim.seconds - movement.start) / span).clamp(0., 1.)
+                } else {
+                    1.
+                };
+                let at = |t: f32| -> [f32; 3] {
+                    std::array::from_fn(|k| {
+                        (movement.from[k] + (movement.to[k] - movement.from[k]) * t) * scale
+                    })
+                };
+                for piece in 0..pieces {
+                    let t0 = piece as f32 / pieces as f32;
+                    if t0 >= now && piece > 0 {
+                        break;
+                    }
+                    let t1 = ((piece + 1) as f32 / pieces as f32).min(now);
+                    let Some((from, to)) = (match cut {
+                        Some(cut) => cut.clip_segment(at(t0), at(t1)),
+                        None => Some((at(t0), at(t1))),
+                    }) else {
+                        continue;
+                    };
+                    let colour = match load {
+                        Some(l) => crate::tooth_load::colour(
+                            l.moves[index].get(piece).copied().unwrap_or(0.),
+                            l.peak,
+                        ),
+                        None if feed => [34, 114, 176, 255],
+                        None => [226, 149, 38, 255],
+                    };
+                    lines.push((shown(from), shown(to), colour));
+                }
+            }
+            lines.sort_by(|p, q| (p.0.1 + p.1.1).total_cmp(&(q.0.1 + q.1.1)));
+            for (a, b, colour) in lines {
+                raster_depth_line(rgba, depths, w, h, a, b, colour, ratio * 0.5);
             }
         }
         outline

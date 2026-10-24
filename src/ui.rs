@@ -2529,6 +2529,28 @@ fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
                 ))
                 .size(12),
             );
+            // The scale the path's colours are in (`tooth_load::colour`).
+            if sim.tooth_load.is_none()
+                && app
+                    .tooth_load_job
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == sim.id)
+            {
+                playback = playback.push(muted("Working out the load on each tooth…").size(12));
+            }
+            if let Some(load) = &sim.tooth_load {
+                playback = playback.push(
+                    muted(if load.peak > 0. {
+                        format!(
+                            "Path coloured by the force on one tooth: blue light, red {:.0} N, this operation's most · grey cuts nothing",
+                            load.peak
+                        )
+                    } else {
+                        "Path grey: no tooth of this operation meets material".into()
+                    })
+                    .size(12),
+                );
+            }
             // A slow update is said in place of the details, on their one
             // line: the strip keeps its height while Play meshes each frame.
             let surface_status = match stock_surface_notice(app) {

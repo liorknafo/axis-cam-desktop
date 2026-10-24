@@ -5228,6 +5228,148 @@ flood = { pin = 8 }
         }
         eprintln!("{}", a.status);
     }
+    /// Renders the fixture job's Pocket, its path coloured by the force on
+    /// one tooth (`tooth_load`), from above and from the front, partway and
+    /// done, to $AXIS_RENDER_DIR (/tmp/tooth-load-renders), and says how long
+    /// the load took: for looking at, with --ignored.
+    #[test]
+    #[ignore]
+    fn render_the_tooth_load() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/tooth-load-renders".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), FAST, &[0, 1]);
+        let strategy = std::env::var("AXIS_STRATEGY").unwrap_or_default();
+        {
+            let op = &mut a.doc.setups[0].operations[1];
+            if strategy == "adaptive" {
+                op.strategy = Strategy::Adaptive;
+                op.p.insert("name".into(), Strategy::Adaptive.name().into());
+                op.p.insert("optimal_load".into(), "1.5".into());
+                op.p.insert("stepdown".into(), "12".into());
+            }
+            op.p.insert("feed".into(), "1200".into());
+        }
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(1));
+        let started = std::time::Instant::now();
+        let _ = a.update(Message::Generate);
+        let sim = a.active_simulation().expect("a simulation");
+        let load = sim.tooth_load.as_ref().expect("a tooth load");
+        let samples: usize = load.moves.iter().map(Vec::len).sum();
+        let mut sorted: Vec<f32> = load.moves.iter().flatten().copied().collect();
+        sorted.sort_by(f32::total_cmp);
+        let quantile = |q: f32| sorted[((sorted.len() - 1) as f32 * q) as usize];
+        let timed = std::time::Instant::now();
+        let again = crate::tooth_load::of(sim, &a.doc).unwrap();
+        eprintln!(
+            "generate + load {:.1} s, load alone {:.1} s: {} moves, {samples} samples, peak {:.1} N, median {:.1} N, 90% {:.1} N, in the air {}",
+            started.elapsed().as_secs_f32() - timed.elapsed().as_secs_f32(),
+            timed.elapsed().as_secs_f32(),
+            sim.plan.moves.len(),
+            again.peak,
+            quantile(0.5),
+            quantile(0.9),
+            sorted.iter().filter(|f| **f == 0.).count()
+        );
+        // The cutting moves of each level from above, close up, each piece
+        // in its load's colour.
+        let plan = &sim.plan;
+        let feeds = || {
+            plan.moves.iter().enumerate().filter(|(i, m)| {
+                m.motion == crate::simulation::Motion::Feed && !load.moves[*i].is_empty()
+            })
+        };
+        let (lo, hi) = feeds().fold(([f32::MAX; 2], [f32::MIN; 2]), |(lo, hi), (_, m)| {
+            (
+                std::array::from_fn(|k| lo[k].min(m.from[k]).min(m.to[k])),
+                std::array::from_fn(|k| hi[k].max(m.from[k]).max(m.to[k])),
+            )
+        });
+        let (lo, hi) = (lo.map(|v| v - 6.), hi.map(|v| v + 6.));
+        let scale = 900. / (hi[0] - lo[0]).max(hi[1] - lo[1]);
+        let (w, h) = (
+            ((hi[0] - lo[0]) * scale) as usize + 1,
+            ((hi[1] - lo[1]) * scale) as usize + 1,
+        );
+        let mut levels: Vec<f32> = vec![];
+        for (_, m) in feeds().filter(|(_, m)| m.from[2] == m.to[2]) {
+            if !levels.iter().any(|z| (z - m.to[2]).abs() < 0.01) {
+                levels.push(m.to[2]);
+            }
+        }
+        levels.sort_by(|a, b| b.total_cmp(a));
+        for (n, z) in levels.iter().enumerate() {
+            let at_level: Vec<f32> = feeds()
+                .filter(|(_, m)| (m.to[2] - z).abs() < 0.01)
+                .flat_map(|(i, _)| load.moves[i].iter().copied())
+                .collect();
+            let most = at_level.iter().copied().fold(0., f32::max);
+            eprintln!(
+                "level {n} at Z {z:.2}: {} samples, most {most:.0} N",
+                at_level.len()
+            );
+            let mut rgb = vec![255_u8; w * h * 3];
+            // Moves down to the level that end on it, ramps and plunges too.
+            for (i, m) in feeds().filter(|(_, m)| (m.to[2] - z).abs() < 0.01) {
+                let pieces = &load.moves[i];
+                for (k, force) in pieces.iter().enumerate() {
+                    let colour = crate::tooth_load::colour(*force, load.peak);
+                    for s in 0..=20 {
+                        let t = (k as f32 + s as f32 / 20.) / pieces.len() as f32;
+                        let x = ((m.from[0] + (m.to[0] - m.from[0]) * t - lo[0]) * scale) as usize;
+                        let y = ((hi[1] - m.from[1] - (m.to[1] - m.from[1]) * t) * scale) as usize;
+                        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                            let (x, y) = ((x + dx).min(w - 1), (y + dy).min(h - 1));
+                            rgb[(y * w + x) * 3..][..3].copy_from_slice(&colour[..3]);
+                        }
+                    }
+                }
+            }
+            let file = std::fs::File::create(out.join(format!("level-{n}.png"))).unwrap();
+            let mut png = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
+            png.set_color(png::ColorType::Rgb);
+            png.set_depth(png::BitDepth::Eight);
+            png.write_header().unwrap().write_image_data(&rgb).unwrap();
+        }
+        let size = iced::Size::new(1600., 1100.);
+        // The stock surface, built in line rather than in the background.
+        let mesh = |a: &mut App| {
+            a.stock_mesh_job = None;
+            let key = a.stock_mesh_key().expect("a simulation with stock");
+            let sim = a.active_simulation().unwrap();
+            let snapshot =
+                crate::stock_surface::Snapshot::of(sim.volume.as_ref().unwrap(), a.stock_detail);
+            let seconds = sim.seconds;
+            let result = snapshot.build().map(std::sync::Arc::new);
+            a.stock_mesh_job = Some(key.clone());
+            let _ = a.update(Message::StockMeshed {
+                key,
+                seconds,
+                result,
+            });
+        };
+        for camera in ["TOP", "ISO"] {
+            let _ = a.update(Message::Camera(camera));
+            a.camera.zoom = 2.;
+            for at in [0.3, 0.6, 1.] {
+                let _ = a.update(Message::Scrub(at));
+                mesh(&mut a);
+                let _ = a.view();
+                render_png(
+                    &a,
+                    size,
+                    &out.join(format!(
+                        "{}-{:03}.png",
+                        camera.to_lowercase(),
+                        (at * 100.) as u32
+                    )),
+                );
+            }
+        }
+    }
 
     /// Renders the fixture pins to PNGs in `$AXIS_RENDER_DIR` (default
     /// /tmp/fp-renders) for a look: the Machine library's pins, the flipped

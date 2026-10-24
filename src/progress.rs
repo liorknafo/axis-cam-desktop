@@ -152,6 +152,12 @@ pub fn stopped() -> bool {
     })
 }
 
+/// The progress this thread reports into, for the threads it starts to
+/// look at its Cancel (`Progress::cancelled`); None off a progress.
+pub fn current() -> Option<Arc<Progress>> {
+    CURRENT.with(|c| c.borrow().as_ref().map(|c| c.progress.clone()))
+}
+
 fn look(done: usize, every: usize) -> Result<(), String> {
     CURRENT.with(|c| {
         let mut current = c.borrow_mut();
