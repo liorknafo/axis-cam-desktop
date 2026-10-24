@@ -1489,8 +1489,8 @@ type Member = (Zone, Region, f32);
 /// their areas and `keepout` from the part above the highest floor among
 /// them (`above`), so floors side by side at different heights are cleared
 /// together down to the higher, and the lower on from there. A zone alone,
-/// or holding the others of its pocket, keeps its own centres; one cut the
-/// same in the band below goes on down through it.
+/// or holding the others of its pocket, keeps its own centres; the same
+/// zones together in the band below go on down through it.
 fn banded(
     members: Vec<Member>,
     above: &mut impl FnMut(f32) -> Result<Region, String>,
@@ -1516,17 +1516,19 @@ fn banded(
         if spanning.is_empty() {
             continue;
         }
-        let plane = (spanning.iter())
-            .map(|&i| members[i].2)
-            .fold(f32::NEG_INFINITY, f32::max);
-        let over = above(plane)?;
-        let pocket = |of: &[usize]| -> Result<Centres, String> {
+        // The pocket round `of`, clear of the part above the highest floor
+        // among them: so the same zones make the same pocket in every
+        // band they go on through, whatever else is cut beside them.
+        let mut pocket = |of: &[usize]| -> Result<Centres, String> {
+            let plane = (of.iter())
+                .map(|&i| members[i].2)
+                .fold(f32::NEG_INFINITY, f32::max);
             let loops: Vec<Polygon> = (of.iter())
                 .flat_map(|&i| Vec::<Polygon>::from(members[i].1.clone()))
                 .collect();
             Ok(Centres::Floor {
                 area: outline(&region(loops)?),
-                above: over.clone(),
+                above: above(plane)?,
                 reach,
                 keepout,
             })
@@ -3360,6 +3362,62 @@ mod tests {
             "{} vs {expected}",
             sim.stock.removed_volume()
         );
+    }
+    /// A floor of a separate pocket higher up does not open the island of
+    /// the pocket beside it: a 60 × 20 mm block (Z −4 to 6) with a pocket
+    /// to Z 3 (X −25 to −15) apart from one stepping from Z 1 (X −5 to 5)
+    /// to Z −1 (X 5 to 15), in whose upper step an island stands to Z 2
+    /// (X 0 to 2, Y −2 to 2). Down to Z 3 the island is under the band;
+    /// below it, it is not.
+    #[test]
+    fn a_separate_higher_floor_leaves_the_island_beside_it_standing() {
+        let mut tris = vec![];
+        for (x, y, xx, yy, z) in [
+            (-30., -10., 30., -6., 6.),
+            (-30., 6., 30., 10., 6.),
+            (-30., -6., -25., 6., 6.),
+            (-15., -6., -5., 6., 6.),
+            (15., -6., 30., 6., 6.),
+            (-25., -6., -15., 6., 3.),
+            (-5., -6., 0., 6., 1.),
+            (2., -6., 5., 6., 1.),
+            (0., -6., 2., -2., 1.),
+            (0., 2., 2., 6., 1.),
+            (0., -2., 2., 2., 2.),
+            (5., -6., 15., 6., -1.),
+            (-30., -10., 30., 10., -4.),
+        ] {
+            quad(&mut tris, x, y, xx, yy, z);
+        }
+        for strategy in [Strategy::Pocket, Strategy::Adaptive] {
+            let (setup, mut op, tool, mesh, dz) = part(tris.clone(), &[3., 1., -1.], 2.);
+            op.strategy = strategy;
+            let plan = if strategy == Strategy::Pocket {
+                generate(&setup, &op, &tool, &mesh)
+            } else {
+                crate::adaptive::generate(&setup, &op, &tool, &mesh)
+            }
+            .unwrap();
+            for m in plan.moves.iter().filter(|m| m.motion == Motion::Feed) {
+                let n = ((m.to[0] - m.from[0]).hypot(m.to[1] - m.from[1]) / 0.05)
+                    .ceil()
+                    .max(1.);
+                for i in 0..=n as usize {
+                    let p = m.at(m.start + (m.end - m.start) * i as f32 / n);
+                    assert!(
+                        p[2] - dz >= 2. - 0.002
+                            || clear(&p, (0., -2., 2., 2.), plan.radius - 0.002),
+                        "{strategy:?} {p:?}"
+                    );
+                }
+            }
+            for (x0, x1, z) in [(-25., -15., 3.), (-5., 0., 1.), (5., 15., -1.)] {
+                assert!(plan.moves.iter().any(|m| m.cutting_pass
+                    && m.to[0] > x0
+                    && m.to[0] < x1
+                    && (m.to[2] - dz - z).abs() < 0.001));
+            }
+        }
     }
     #[test]
     fn a_wall_leaning_over_its_floor_by_its_tessellation_is_not_an_overhang() {
