@@ -122,6 +122,28 @@ pub fn holddown(setup: &Setup) -> &str {
 pub fn screwed(setup: &Setup) -> bool {
     is_sheet(setup) && holddown(setup) == "Screws"
 }
+/// What holds `setup`'s sheet, in a few words for its header ("Sheet held
+/// down by 4 screws", "Sheet held down by tape"); None for a stock that is
+/// no sheet, or one held by nothing chosen or by a vise or clamps.
+pub fn holddown_label(setup: &Setup) -> Option<String> {
+    if !is_sheet(setup) || !matches!(get(&setup.p, "holding"), "" | "None") {
+        return None;
+    }
+    match holddown(setup) {
+        "Tape" => Some("Sheet held down by tape".into()),
+        "Screws" => {
+            let count = match get(&setup.p, "holddown_screws").trim() {
+                "" => 4,
+                text => text.split(';').filter(|s| !s.trim().is_empty()).count(),
+            };
+            Some(format!(
+                "Sheet held down by {count} screw{}",
+                if count == 1 { "" } else { "s" }
+            ))
+        }
+        _ => None,
+    }
+}
 /// The screws' head diameter and height above the sheet, mm.
 pub fn screw_size(setup: &Setup) -> Result<(f32, f32), String> {
     let head = optional(setup, "screw_head", SCREW_HEAD)
@@ -647,6 +669,19 @@ mod tests {
             [260., 360., 1.5]
         );
         assert!(doc.holding_issues(0, Some(&mesh)).is_empty());
+        // The setup's header names the hold-down, and the screw heads are
+        // its holding boxes, which the 3D view draws.
+        assert_eq!(
+            doc.holding_label(&doc.setups[0]),
+            "Sheet held down by 4 screws"
+        );
+        let boxes = doc.holding_boxes(
+            &doc.setups[0],
+            crate::stock::resolve(&doc.setups[0], Some(&mesh))
+                .unwrap()
+                .stock,
+        );
+        assert_eq!(boxes.unwrap().len(), 4);
         let lowest = |p: &Plan| {
             (p.moves.iter())
                 .flat_map(|m| [m.from[2], m.to[2]])
@@ -793,6 +828,7 @@ mod tests {
         );
         doc.setups[0].p.insert("holddown".into(), "Tape".into());
         assert!(plan(&doc, &mesh, 2).is_ok());
+        assert_eq!(doc.holding_label(&doc.setups[0]), "Sheet held down by tape");
         // Tape puts nothing in the way: the export has no boxes to check.
         assert!(crate::post::post_job(&doc, &mesh).setups[0].result.is_ok());
         // A sheet held by nothing is refused.

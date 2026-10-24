@@ -2038,7 +2038,8 @@ pub(crate) fn pictured_holding(
     let modelled = match get(&setup.p, "holding") {
         "Vise" | "Clamps" => true,
         "Chuck" => crate::chuck::holds(setup),
-        _ => false,
+        // A sheet's hold-down screw heads.
+        _ => crate::sheet::screwed(setup),
     };
     let mut jaws = if modelled {
         let held = app
@@ -5409,7 +5410,8 @@ fn holding_on(
     let modelled = match get(&setup.p, "holding") {
         "Vise" | "Clamps" => true,
         "Chuck" => crate::chuck::holds(setup),
-        _ => false,
+        // A sheet's hold-down screw heads.
+        _ => crate::sheet::screwed(setup),
     };
     let mut boxes = if modelled {
         let jaws = app.doc.holding_boxes(&posed, held);

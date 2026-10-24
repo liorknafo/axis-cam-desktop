@@ -3001,6 +3001,10 @@ impl Document {
                 }
             );
         }
+        // A sheet held down by its own screws or tape.
+        if let Some(held) = crate::sheet::holddown_label(setup) {
+            return held;
+        }
         match layout(setup) {
             Ok(Layout::None) => fixture_note(setup).map_or("No workholding modelled".into(), |n| {
                 format!("{n}, not modelled")
