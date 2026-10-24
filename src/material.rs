@@ -32,9 +32,9 @@ pub const NAME_LIMIT: usize = 60;
 pub const STARTER_NOTE: &str =
     "Starting point for carbide tools: adjust to your machine and your tool maker's data.";
 /// The starter set a library has been given: 1 is the first nine, 2 adds
-/// six common aluminium alloys, 3 adds seven woods. A library is brought up
-/// to it once.
-pub const STARTER_SET: u32 = 3;
+/// six common aluminium alloys, 3 adds seven woods, 4 adds a bronze and two
+/// steels. A library is brought up to it once.
+pub const STARTER_SET: u32 = 4;
 /// The starters set 2 added, by name.
 pub const ADDED_IN_SET_2: [&str; 6] = [
     "Aluminium 6082-T6",
@@ -54,14 +54,32 @@ pub const ADDED_IN_SET_3: [&str; 7] = [
     "Cherry",
     "Birch plywood",
 ];
+/// The starters set 4 added, by name: the metals of the power feed's parts.
+pub const ADDED_IN_SET_4: [&str; 3] = [
+    "Bronze CuSn12",
+    "Steel 1045 (C45) normalised",
+    "Silver steel 1.2210 annealed",
+];
+/// The starters whose finishing passes are milled conventionally, not
+/// climbing (`FINISH_MILLING`): a hard, abrasive tin bronze, whose cast bar
+/// lets a climbing cutter grab, is finished against the feed.
+const CONVENTIONAL_FINISH: [&str; 1] = ["Bronze CuSn12"];
+/// The material field that asks for conventional finishing passes.
+pub const FINISH_MILLING: &str = "finish_milling";
+/// What `FINISH_MILLING` holds for such a material.
+pub const CONVENTIONAL: &str = "Conventional";
 /// The starters added after set `set`, by name: what a library given that
 /// set is still missing.
 pub fn added_since(set: u32) -> Vec<&'static str> {
-    [(2, &ADDED_IN_SET_2[..]), (3, &ADDED_IN_SET_3[..])]
-        .into_iter()
-        .filter(|(added, _)| set < *added)
-        .flat_map(|(_, names)| names.iter().copied())
-        .collect()
+    [
+        (2, &ADDED_IN_SET_2[..]),
+        (3, &ADDED_IN_SET_3[..]),
+        (4, &ADDED_IN_SET_4[..]),
+    ]
+    .into_iter()
+    .filter(|(added, _)| set < *added)
+    .flat_map(|(_, names)| names.iter().copied())
+    .collect()
 }
 /// Every cutting-data key prefix: the surface speed, then each chip-load band.
 fn bases() -> impl Iterator<Item = &'static str> {
@@ -131,6 +149,20 @@ impl Material {
     }
     fn pair(&self, key: &str) -> Option<(f32, f32)> {
         self.bounds(key).filter(|(min, max)| min <= max)
+    }
+    /// The milling direction its finishing passes must use, when it asks for
+    /// one (`FINISH_MILLING`).
+    pub fn finish_milling(&self) -> Option<&str> {
+        Some(get(&self.p, FINISH_MILLING)).filter(|d| !d.is_empty())
+    }
+    /// Its hardness in Brinell, when `hardness` gives a number of HB or HBW,
+    /// such as "95 HB" (other scales are not converted).
+    pub fn brinell(&self) -> Option<f32> {
+        let text = get(&self.p, "hardness").trim();
+        let number = text
+            .strip_suffix("HBW")
+            .or_else(|| text.strip_suffix("HB"))?;
+        number.trim().parse().ok().filter(|hb: &f32| *hb > 0.)
     }
     pub fn cutting_data(&self) -> Option<CuttingData> {
         let vc = self.pair("vc")?;
@@ -384,7 +416,7 @@ pub fn starters() -> Vec<Material> {
         [(f32, f32); 5],
         &'static str,
     );
-    let rows: [Row; 22] = [
+    let rows: [Row; 25] = [
         (
             "Aluminium 6061-T6",
             "Aluminium",
@@ -693,10 +725,71 @@ pub fn starters() -> Vec<Material> {
             ],
             "Dust extraction; no coolant. The glue lines dull tools; compression or down-cut tools keep the faces from splintering.",
         ),
+        // Set 4, the metals of the power feed's parts. Sources of the cutting
+        // data (starting points for solid carbide, kept under the tool makers'
+        // rigid-setup figures for a hobby-class machine):
+        // - Harvey Tool, "General Machining Guidelines" (harveytool.com),
+        //   carbide end mill tables: 10XX steels 100–300 SFM, chip load
+        //   0.0005 in at 1/8", 0.0015 at 1/4", 0.003 at 1/2"; O1 and A2 tool
+        //   steels 100–250 SFM, 0.0005 / 0.001 / 0.001 in; bronzes 800–1000
+        //   SFM, 0.001 / 0.002 / 0.003 in.
+        // - Machining Doctor (machiningdoctor.com): steel 1045 milling
+        //   150–205 m/min and 160–200 HB; steel O1 95–130 m/min; tin bronzes
+        //   C90500 120–165 m/min and the harder C91100 40–55 m/min.
+        // - EN 1982: CuSn12-C (CC483K) at least 80 HBW cast in sand or a
+        //   chill, 90 HBW centrifugal or continuous; MakeItFrom lists 97 HB.
+        // - UTEC, "Machining AISI 1045": normalised 1045 163–202 HB.
+        // - Datasheets of 1.2210 / 115CrV3 (Abrams Industries, Meusburger):
+        //   annealed at most 220 HB.
+        (
+            "Bronze CuSn12",
+            "Brass and copper",
+            "95 HB",
+            (100., 200.),
+            [
+                (0.008, 0.020),
+                (0.015, 0.035),
+                (0.020, 0.050),
+                (0.030, 0.065),
+                (0.035, 0.080),
+            ],
+            "Dry or air, sharp tools. Cast tin bronze (CC483K) runs near brass speeds on lighter chips, and is abrasive. Finish in conventional milling, not climb: the app checks this.",
+        ),
+        (
+            "Steel 1045 (C45) normalised",
+            "Steel",
+            "190 HB",
+            (70., 130.),
+            [
+                (0.005, 0.013),
+                (0.009, 0.027),
+                (0.018, 0.045),
+                (0.027, 0.062),
+                (0.036, 0.080),
+            ],
+            "Flood; avoid rubbing at low feed. Harder than 1018, so a little slower and lighter.",
+        ),
+        (
+            "Silver steel 1.2210 annealed",
+            "Steel",
+            "220 HB",
+            (50., 90.),
+            [
+                (0.004, 0.012),
+                (0.008, 0.025),
+                (0.012, 0.030),
+                (0.018, 0.040),
+                (0.025, 0.060),
+            ],
+            "Flood; unhardened ground rod (DIN 1.2210, 115CrV3, 220 HB at most when annealed). Tough: keep the tool cutting, short stick-out for flats.",
+        ),
     ];
     rows.into_iter()
         .map(|(name, group, hardness, vc, fz, note)| {
             let mut m = Material::new(name);
+            if CONVENTIONAL_FINISH.contains(&name) {
+                m.p.insert(FINISH_MILLING.into(), CONVENTIONAL.into());
+            }
             m.p.insert("group".into(), group.into());
             m.p.insert("hardness".into(), hardness.into());
             m.p.insert("notes".into(), format!("{STARTER_NOTE} {note}"));
@@ -729,7 +822,7 @@ mod tests {
     #[test]
     fn starters_are_valid_and_complete() {
         let all = starters();
-        assert_eq!(all.len(), 22);
+        assert_eq!(all.len(), 25);
         for m in &all {
             assert!(m.issues().is_empty(), "{}: {:?}", m.name(), m.issues());
             assert!(m.cutting_data().is_some(), "{}", m.name());
@@ -739,7 +832,7 @@ mod tests {
         let mut names: Vec<_> = all.iter().map(|m| m.name().to_lowercase()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 22);
+        assert_eq!(names.len(), 25);
         let data = alu().cutting_data().unwrap();
         assert_eq!(data.vc, (150., 300.));
         assert_eq!(data.fz[1], (0.02, 0.05));
@@ -786,9 +879,96 @@ mod tests {
         assert_eq!(all[14].name(), "Cast aluminium plate (MIC-6)");
         assert_eq!(all[15].name(), "Pine");
         // What a library given each set is still missing.
-        assert_eq!(added_since(1).len(), 13);
-        assert_eq!(added_since(2), ADDED_IN_SET_3);
+        assert_eq!(added_since(1).len(), 16);
+        assert_eq!(
+            added_since(2),
+            [&ADDED_IN_SET_3[..], &ADDED_IN_SET_4[..]].concat()
+        );
+        assert_eq!(added_since(3), ADDED_IN_SET_4);
         assert!(added_since(STARTER_SET).is_empty());
+    }
+    /// A starter by name.
+    fn starter(name: &str) -> Material {
+        starters()
+            .into_iter()
+            .find(|m| m.name() == name)
+            .expect(name)
+    }
+    #[test]
+    fn the_fourth_starter_set_is_a_bronze_and_two_steels_with_hardness() {
+        let all = starters();
+        // After the woods, in the order added.
+        assert_eq!(all[22].name(), "Bronze CuSn12");
+        for (name, group, hb) in [
+            ("Bronze CuSn12", "Brass and copper", 95.),
+            ("Steel 1045 (C45) normalised", "Steel", 190.),
+            ("Silver steel 1.2210 annealed", "Steel", 220.),
+        ] {
+            let m = starter(name);
+            assert!(ADDED_IN_SET_4.contains(&name));
+            assert_eq!(get(&m.p, "group"), group, "{name}");
+            assert_eq!(m.brinell(), Some(hb), "{name}");
+            assert!(
+                m.cutting_data().is_some() && m.issues().is_empty(),
+                "{name}"
+            );
+            assert!(m.conducts(), "{name}");
+        }
+        // The cited bands: 1045 a little under 1018's speed and chip load,
+        // between Machining Doctor's 150–205 m/min for a rigid setup and
+        // the 76–107 m/min of hobby-class sources.
+        let (mild, c45) = (
+            starter("Mild steel 1018"),
+            starter("Steel 1045 (C45) normalised"),
+        );
+        let (mild, c45) = (mild.cutting_data().unwrap(), c45.cutting_data().unwrap());
+        assert_eq!(c45.vc, (70., 130.));
+        assert!(c45.vc.1 < mild.vc.1 && c45.vc.0 < mild.vc.0);
+        for (c, m) in c45.fz.iter().zip(mild.fz) {
+            assert!(c.1 < m.1, "{c:?} {m:?}");
+        }
+        // Harvey Tool's 10XX row, 0.0015 in at Ø6.35 and 0.003 in at Ø12.7,
+        // is the ceiling of the Ø3–6 and Ø10–16 bands.
+        assert!(c45.fz[1].1 <= 0.0015 * 25.4 && c45.fz[3].1 <= 0.003 * 25.4);
+        // Silver steel is tougher: slower than 1045 and under Machining
+        // Doctor's 95–130 m/min for O1.
+        let silver = starter("Silver steel 1.2210 annealed")
+            .cutting_data()
+            .unwrap();
+        assert_eq!(silver.vc, (50., 90.));
+        assert!(silver.vc.1 < c45.vc.1 && silver.vc.1 < 95.);
+        // Bronze runs near brass speeds (150–300) on lighter chips.
+        let brass = starter("Brass C360").cutting_data().unwrap();
+        let bronze = starter("Bronze CuSn12").cutting_data().unwrap();
+        assert_eq!(bronze.vc, (100., 200.));
+        assert!(bronze.vc.1 < brass.vc.1 && bronze.vc.0 >= 100.);
+        for (b, r) in bronze.fz.iter().zip(brass.fz) {
+            assert!(b.1 < r.1 && b.0 <= r.0, "{b:?} {r:?}");
+        }
+    }
+    #[test]
+    fn only_the_bronze_asks_for_conventional_finishing() {
+        assert_eq!(
+            starter("Bronze CuSn12").finish_milling(),
+            Some("Conventional")
+        );
+        for m in starters().iter().filter(|m| m.name() != "Bronze CuSn12") {
+            assert_eq!(m.finish_milling(), None, "{}", m.name());
+        }
+    }
+    #[test]
+    fn hardness_is_read_in_brinell_only() {
+        let hb = |text: &str| {
+            let mut m = Material::new("x");
+            m.p.insert("hardness".into(), text.into());
+            m.brinell()
+        };
+        assert_eq!(hb("95 HB"), Some(95.));
+        assert_eq!(hb(" 220HBW "), Some(220.));
+        assert_eq!(hb("78 HRB"), None);
+        assert_eq!(hb("Janka 6.4 kN"), None);
+        assert_eq!(hb(""), None);
+        assert_eq!(hb("0 HB"), None);
     }
     #[test]
     fn cutting_data_must_be_complete_positive_and_ordered() {
@@ -1051,7 +1231,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(checked, 22 * 3 * 5 * 4);
+        assert_eq!(checked, 25 * 3 * 5 * 4);
         // Aluminium, Ø6 three-flute, 12000 rpm and 5000 mm/min: the middle of
         // 7958–12000 rpm, and of the 0.02–0.05 mm band's 599–1497 mm/min there.
         assert_eq!(

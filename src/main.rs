@@ -9,6 +9,7 @@ mod facing;
 #[cfg(test)]
 mod fake_openai;
 mod field_art;
+mod finishing;
 mod forces;
 mod gpu_mesh;
 mod guide;
