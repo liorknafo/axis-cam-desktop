@@ -11295,6 +11295,61 @@ soft_max = 180.0
         );
         let _ = a.view();
     }
+    /// "Stock after this setup" on an indexed setup with the bar in the
+    /// chuck: the view shows the round bar as its four angles leave it, every
+    /// angle's cuts (#288 with LIO-246).
+    #[test]
+    fn stock_after_an_indexed_setup_is_the_bar_its_angles_leave() {
+        use crate::indexed::tests::{bar_job, cutter, faced_square, prism};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        let mesh = prism(30.);
+        let mut doc = bar_job(
+            &mesh,
+            30.,
+            "100",
+            "-150",
+            "90, 180, 270, 0",
+            faced_square(&cutter("12"), &mesh),
+        );
+        doc.file = Some(crate::model::ModelFile {
+            name: "square-bar.stl".into(),
+            path: dir.path().join("square-bar.stl"),
+            format: "stl".into(),
+            bytes: 0,
+        });
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.smoke_dir = Some(dir.path().to_path_buf());
+        a.page = Page::Work;
+        a.selected = None;
+        let _ = a.refresh_left_stock();
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::SetupEnd);
+        let _ = a.refresh_start_mesh();
+        let view = crate::ui::scene_viewport(&a).unwrap();
+        let (volume, surface) = view.start_stock.expect("the stock setup 2 leaves");
+        assert!(!surface.triangles.is_empty());
+        // The bar along X, cut.
+        assert!(volume.bar_x.is_some() && volume.remaining < volume.material);
+        let (_, _, before) = a.start_source().unwrap();
+        assert_eq!(before, (1, 1));
+        let job = a.left_stock.job.clone().unwrap();
+        let cuts: Vec<_> = job.cuts.iter().filter(|c| c.source < before).collect();
+        assert_eq!(
+            cuts.len(),
+            a.left_stock.after[1].clone().unwrap().cuts.len()
+        );
+        // The Facing's cuts at each of its four angles: each angle's frame.
+        let mut frames: Vec<_> = vec![];
+        for c in cuts.iter().filter(|c| c.source == (1, 0)) {
+            if !frames.contains(&c.frame) {
+                frames.push(c.frame);
+            }
+        }
+        assert_eq!(frames.len(), 4);
+        let _ = a.view();
+    }
     #[test]
     fn the_view_shows_the_stock_a_setup_leaves_when_its_end_is_selected() {
         let dir = tempfile::tempdir().unwrap();

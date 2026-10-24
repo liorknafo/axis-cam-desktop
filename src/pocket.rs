@@ -694,7 +694,8 @@ fn same_region(a: &Region, b: &Region) -> bool {
 /// Whether mesh surface `id` is a wall, as `setup` turns the part: what a
 /// click on it picks in a Pocket or a Contour is the hole it is a wall of.
 pub fn is_wall(setup: &Setup, mesh: &Mesh, id: usize) -> bool {
-    let angles = ["rx", "ry", "rz"].map(|k| num(&setup.p, k).unwrap_or(0.));
+    // By A too for an indexed setup posed at an angle (`indexed`).
+    let angles = crate::stock::Placement::new(mesh, Some(setup)).rotation();
     mesh.surfaces
         .get(id)
         .is_some_and(|s| crate::mesh::rotation(s.normal, angles)[2].abs() < WALL)
@@ -925,7 +926,7 @@ pub const LEANING: &str = "At that wall's height the hole's outline runs over a 
 /// border no wall.
 pub fn hole_near(setup: &Setup, mesh: &Mesh, id: usize) -> Option<Result<Vec<usize>, String>> {
     let g = crate::cam::Geometry::new(setup, mesh);
-    let angles = ["rx", "ry", "rz"].map(|k| num(&setup.p, k).unwrap_or(0.));
+    let angles = crate::stock::Placement::new(mesh, Some(setup)).rotation();
     let floor = |f: usize| {
         mesh.surfaces.get(f).is_some_and(|s| {
             crate::mesh::rotation(s.normal, angles)[2].abs() >= 0.5f32.to_radians().cos()

@@ -4661,6 +4661,9 @@ impl App {
                     return Task::none();
                 }
                 let fingerprint = mesh.fingerprint.clone();
+                // An indexed setup reads the click at the A angle that turns
+                // its hole up, which may not be the one shown.
+                let setup = self.doc.picking_pose(self.doc.index(), mesh, n);
                 // A Pocket, an inside Contour or a Drill takes a wall as its
                 // hole: every wall of it, added or removed together. A face
                 // that is neither a floor nor a wall (a cone, a chamfer, a
@@ -4669,20 +4672,21 @@ impl App {
                 let drill = self
                     .operation()
                     .is_some_and(|o| o.strategy == Strategy::Drill);
-                let angles = ["rx", "ry", "rz"].map(|k| num(&self.doc.setup().p, k).unwrap_or(0.));
+                // As the setup turns the part, by A too for an indexed one.
+                let angles = crate::stock::Placement::new(mesh, Some(&setup)).rotation();
                 let up = mesh::rotation(mesh.surfaces[n].normal, angles)[2].abs();
-                let wall = pocket::is_wall(self.doc.setup(), mesh, n);
+                let wall = pocket::is_wall(&setup, mesh, n);
                 let sloped = !wall && up < 0.5f32.to_radians().cos();
                 if picks_holes && (wall || sloped) {
                     // What a click here picks: the wall's hole, or the hole
                     // past a sloping face (a cone, a chamfer, a fillet) or past
                     // the one a wall's outline crosses (a screw hole's lip).
-                    let found = match wall.then(|| pocket::hole_walls(self.doc.setup(), mesh, n)) {
+                    let found = match wall.then(|| pocket::hole_walls(&setup, mesh, n)) {
                         Some(Err(e)) if e == pocket::LEANING => {
-                            pocket::hole_near(self.doc.setup(), mesh, n).unwrap_or(Err(e))
+                            pocket::hole_near(&setup, mesh, n).unwrap_or(Err(e))
                         }
                         Some(found) => found,
-                        None => match pocket::hole_near(self.doc.setup(), mesh, n) {
+                        None => match pocket::hole_near(&setup, mesh, n) {
                             Some(Ok(walls)) => Ok(walls),
                             _ => Err(format!(
                                 "That face slopes {:.0}°: it is no floor, and no hole past it can be picked from it. Click a flat floor, or a wall of a hole.",
@@ -4704,13 +4708,13 @@ impl App {
                     let clicked: Option<std::collections::HashSet<usize>> =
                         found.as_ref().ok().map(|w| w.iter().copied().collect());
                     let this = (clicked.as_ref())
-                        .and_then(|c| pocket::holes(self.doc.setup(), c, mesh).ok())
+                        .and_then(|c| pocket::holes(&setup, c, mesh).ok())
                         .unwrap_or_default();
                     let drop = pocket::dropped(now, &picked, n, clicked.as_ref(), &this);
                     // A Drill drills round holes: it reads the hole as it
                     // drills it, and names it by the diameter it drills.
                     let round = if drill {
-                        cam::drill_holes_of(self.doc.setup(), mesh, &this)
+                        cam::drill_holes_of(&setup, mesh, &this)
                     } else {
                         vec![]
                     };

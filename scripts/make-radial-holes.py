@@ -1,0 +1,36 @@
+"""A test part for indexed drilling on the rotary A axis: a Ø40 x 40 mm round part along X
+with six blind radial Ø4 holes, 8 deep, one every 60° round X from +Y towards +Z (0°, 60°, …,
+300°), each at its own X (-12.5, -7.5, …, 12.5) so that a test can tell them apart. Positive A
+turns +Y towards +Z, so hole k (at 60k°) faces up at A 90 - 60k: A 90, 30, -30, -90, -150 and
+-210, which are A 90, 30, 330, 270, 210 and 150.
+Written as STEP and 3MF to the folder given (needs cadquery)."""
+import math
+import os
+import sys
+import zipfile
+
+import cadquery as cq
+
+out = sys.argv[1]
+R, LENGTH, HOLE, DEPTH = 20.0, 40.0, 4.0, 8.0
+part = cq.Workplane("YZ").circle(R).extrude(LENGTH).translate((-LENGTH / 2, 0, 0))
+for k in range(6):
+    t = math.radians(60 * k)
+    d = cq.Vector(0, math.cos(t), math.sin(t))
+    x = -12.5 + 5 * k
+    start = cq.Vector(x, 0, 0) + d * (R - DEPTH)
+    part = part.cut(cq.Workplane().add(cq.Solid.makeCylinder(HOLE / 2, DEPTH + 1, start, d)))
+solid = part.val()
+print(solid.BoundingBox().xlen, solid.BoundingBox().ylen, solid.BoundingBox().zlen, round(solid.Volume(), 1))
+cq.exporters.export(part, os.path.join(out, "radial-holes.step"))
+path = os.path.join(out, "radial-holes.3mf")
+cq.exporters.export(part, path, tolerance=0.02, angularTolerance=0.3)
+# CadQuery numbers the mesh object 0; a 3MF resource id must be 1 or more.
+with zipfile.ZipFile(path) as z:
+    files = {n: z.read(n) for n in z.namelist()}
+model = "3D/3dmodel.model"
+files[model] = files[model].replace(b'object id="0"', b'object id="2"').replace(b'objectid="0"', b'objectid="2"')
+with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+    for n, data in files.items():
+        z.writestr(n, data)
+print("ok")

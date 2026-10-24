@@ -112,8 +112,14 @@ impl Round {
         (p[1] - self.axis[0]).hypot(p[2] - self.axis[1]) <= self.radius
     }
 }
+/// Why a "Relative round bar" is refused on a machine with a rotary A axis,
+/// which does not offer it (`modes`): it stands along the setup's Z, which
+/// the chuck on A (along X) would hold as its box.
+pub const NO_RELATIVE_BAR_ON_A: &str = "A Relative round bar stands along the setup's Z, which the chuck on this machine's rotary A axis does not hold: choose Round bar (along X), or a box.";
 pub fn parameter_issues(setup: &Setup) -> Vec<String> {
-    if relative_round(setup) {
+    if relative_round(setup) && setup.machine.has_a() {
+        vec![NO_RELATIVE_BAR_ON_A.into()]
+    } else if relative_round(setup) {
         ROUND_OFFSETS
             .iter()
             .filter(|&(key, _label)| !num(&setup.p, key).is_some_and(|v| v >= 0.))
@@ -519,6 +525,13 @@ mod tests {
             assert!(resolve(&t, None).is_err());
         }
         assert!(!is_round(&s) && modes(&s) == ROTARY_MODES);
+        // A Relative round bar saved on another machine is refused here.
+        let mut relative = s.clone();
+        relative
+            .p
+            .insert("stock_type".into(), "Relative round bar".into());
+        assert_eq!(parameter_issues(&relative), [NO_RELATIVE_BAR_ON_A]);
+        assert!(resolve(&relative, None).is_err());
         // On a 3-axis mill the same bar stands along Z.
         let mut upright = s.clone();
         upright.machine = Machine::new(3);
