@@ -21743,11 +21743,20 @@ soft_max = 180.0
     }
     #[test]
     fn a_lathe_setup_offers_a_chuck_and_a_mill_setup_a_vise_or_clamps() {
+        // A 3-axis mill also holds a round bar in a V-block, soft jaws or a
+        // collet block (LIO-249).
         let lathe = crate::lathe::defaults();
         assert_eq!(crate::ui::holding_choices(&lathe), ["None", "Chuck"]);
         assert_eq!(
             crate::ui::holding_choices(&Machine::new(3)),
-            ["None", "Vise", "Clamps"]
+            [
+                "None",
+                "Vise",
+                "Clamps",
+                "V-block",
+                "Soft jaws",
+                "Collet block"
+            ]
         );
         // A mill with a rotary A axis also holds the stock in the chuck on A.
         assert_eq!(
@@ -21761,7 +21770,9 @@ soft_max = 180.0
         let _ = a.update(Message::SetupStep("Holding"));
         shows(
             &a,
-            &["The vise or clamps that hold the stock, from the workholding library."],
+            &[
+                "The vise or clamps that hold the stock, or the V-block, soft jaws or collet block that hold a round bar, from the workholding library.",
+            ],
         );
         edit_setup(&mut a, &[("holding", "Vise")]);
         shows(&a, &["Vise", "Suggest layout", "Jaw offset · mm"]);

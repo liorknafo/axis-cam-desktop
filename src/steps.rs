@@ -122,7 +122,7 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
             .map(|d| work(leftover_box(&d.after, setup, mesh))),
     );
     let jaws: Vec<Bounds> = match &guide.steps[0] {
-        Step::Hold { holding, .. } if matches!(get(&setup.p, "holding"), "Vise" | "Clamps") => {
+        Step::Hold { holding, .. } if crate::holding::modelled(setup) => {
             let held = Gripped {
                 stock: holding.stock.translated(zero),
                 band: holding.band.translated(zero),

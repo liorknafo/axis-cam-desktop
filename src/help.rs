@@ -46,6 +46,8 @@ pub enum Diagram {
     Manual(u8),
     Machine(u8),
     Cutting(u8),
+    /// A round bar's V-block (0), soft jaws (1) or collet block (2).
+    Round(u8),
 }
 #[derive(Clone, Debug)]
 pub struct Help {
@@ -1971,6 +1973,41 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "",
             Some(Clamp(3)),
         ),
+        (Target::Holder, "angle") => (
+            "The V's included angle, in degrees: 90 for most V-blocks. A bar sits on its two flanks, each a line along the bar.",
+            "",
+            Some(Round(0)),
+        ),
+        (Target::Holder, "v_width") => (
+            "How wide the V is at the block's top, in mm. It decides the bars it seats: one too wide sits on the V's edges, one too narrow sinks below the block's top, where the clamp cannot reach it.",
+            "",
+            Some(Round(0)),
+        ),
+        (Target::Holder, "clamp_width") => (
+            "How wide the V-block clamp's strap is along the bar, in mm. It crosses the bar at the V-block's middle.",
+            "",
+            Some(Round(0)),
+        ),
+        (Target::Holder, "clamp_height") => (
+            "How thick the V-block clamp's strap is above the bar, in mm; its legs, as thick, run down the block's sides.",
+            "",
+            Some(Round(0)),
+        ),
+        (Target::Holder, "bore") => (
+            "The diameter the soft jaws are bored to, in mm. A bar more than 0.5 mm off it is not held round its arc.",
+            "",
+            Some(Round(1)),
+        ),
+        (Target::Holder, "er") => (
+            "The ER collet size of the block: 11, 16, 20, 25, 32 or 40. It sets the diameters its collets close on, the collet's length and the nut's size.",
+            "",
+            Some(Round(2)),
+        ),
+        (Target::Holder, "block") => (
+            "The collet block's width across, in mm: square or hex, measured across its flats.",
+            "",
+            Some(Round(2)),
+        ),
         (Target::Holder, "jaws") => (
             "How many jaws the chuck has: 3 (self-centring, for round bar) or 4 (independent, for square or off-centre work).",
             "",
@@ -1995,6 +2032,31 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "The chuck's outside diameter, in mm. The 160 mm starters are typical: measure yours.",
             "",
             Some(Chuck(4)),
+        ),
+        (Target::Setup, "round_offset") => (
+            "Where the V-block or the soft jaws sit along the bar, in mm from its middle: + toward +X. 0 centres them. They must stay on the bar.",
+            "",
+            Some(Round(0)),
+        ),
+        (Target::Setup, "round_grip") => (
+            "Soft jaws: how high their top is above the bar's bottom, in mm; on a lying bar more than half its diameter, so that they close over its axis. A collet: how deep the bar stands in it, in mm, at most the collet's length; under two thirds of its length it grips less.",
+            "",
+            Some(Round(2)),
+        ),
+        (Target::Setup, "jaw_bore") => (
+            "Which way the soft jaws are bored: X for a bar lying along X, Z for one standing up. Empty follows the stock.",
+            "",
+            Some(Round(1)),
+        ),
+        (Target::Setup, "collet_diameter") => (
+            "The diameter the collet closes on, in mm, when it is not the bar's own: a hub turned on the part. Empty: the bar's.",
+            "",
+            Some(Round(2)),
+        ),
+        (_, "stock_axis") => (
+            "Which way a round bar lies on a machine without a rotary A axis: standing along Z (a lathe, a collet block or soft jaws bored upright hold it) or lying along X (a V-block or soft jaws bored along X hold it).",
+            "",
+            Some(Stock(1)),
         ),
         (Target::Setup, "grip") => (
             "How much of the bar is held in the jaws, in mm. It starts at the chuck's jaw length. Hold at least a third of the diameter.",
@@ -2137,12 +2199,12 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(TurnOp(13)),
         ),
         (Target::Setup, "holding") => (
-            "The workholding to model for this setup: a Vise from the library, jaws on two opposite sides of the stock, Clamps round it, or a Chuck (a lathe's from the library, or the rotary A axis's). Each is kept as boxes with a clearance gap that moves are checked against, as is its hold against each cut. None models nothing.",
-            "Each is kept as boxes with a clearance gap, and every move is checked against them: the cutter from its tip up to its stickout at its cutting diameter, the tool holder above that at the holder diameter (a wider shank or a reduced neck is not modelled). A move that comes within the gap is warned of in the operation preview, which covers that operation's own toolpath, and refused at export, which checks every program move, the links between operations, approaches and retracts included. Parallels, bolts, the table and the machine body are not modelled. Each operation's cutting force is also set against what the vise's or clamps' clamping force holds (sliding, lifting and tipping), over the contact the earlier setups left the jaws; an operation held with a margin under ×2 is refused at export. In a later setup the jaws or clamps sit at the stock box carried over from setup 1, not at the walls earlier operations cut, and a setup turned from setup 1 by other than a multiple of 90° cannot model them. None models nothing; the Fixture note below is only a description. Chuck on a machine with a rotary A axis models the chuck on A from its rotary unit's sizes: the chuck body, its jaws (turning with A), the rotary head, the tailstock and the stock gripped in the jaws, each as the box round it with the gap, at each A angle; the grip left after earlier cuts, the stock turning or sliding in the jaws and its stick-out bending under each cut are checked too. A lathe setup has a Chuck instead of a Vise or Clamps, and its checks are the chuck's: the bar's diameter in the jaws must be one the chuck closes on (a 3-jaw holds round work only), the grip at least a third of that diameter and no longer than the jaws, the stickout at least the furthest cut from the free end plus 5 mm, no cut inside the grip, the bar within the lathe's swing and the grip plus the stickout within the bar's length. A stickout over 4 diameters is warned of, not refused. The chuck's body is a box 40 mm deep behind the jaws' end, and a move within the clearance gap of it is warned of in the operation preview. Nothing is exported: a lathe has no G-code.",
+            "The workholding to model: a Vise, jaws on two opposite sides, Clamps round the stock, a Chuck (a lathe's, or the rotary A axis's), or a round bar's V-block, Soft jaws or Collet block. Each is kept as boxes with a clearance gap that moves are checked against, as is its hold against each cut. None models nothing.",
+            "Each is kept as boxes with a clearance gap, and every move is checked against them: the cutter from its tip up to its stickout at its cutting diameter, the tool holder above that at the holder diameter (a wider shank or a reduced neck is not modelled). A move that comes within the gap is warned of in the operation preview, which covers that operation's own toolpath, and refused at export, which checks every program move, the links between operations, approaches and retracts included. Parallels, bolts, the table and the machine body are not modelled. Each operation's cutting force is also set against what the vise's or clamps' clamping force holds (sliding, lifting and tipping), over the contact the earlier setups left the jaws; an operation held with a margin under ×2 is refused at export. In a later setup the jaws or clamps sit at the stock box carried over from setup 1, not at the walls earlier operations cut, and a setup turned from setup 1 by other than a multiple of 90° cannot model them. None models nothing; the Fixture note below is only a description. Chuck on a machine with a rotary A axis models the chuck on A from its rotary unit's sizes: the chuck body, its jaws (turning with A), the rotary head, the tailstock and the stock gripped in the jaws, each as the box round it with the gap, at each A angle; the grip left after earlier cuts, the stock turning or sliding in the jaws and its stick-out bending under each cut are checked too. A lathe setup has a Chuck instead of a Vise or Clamps, and its checks are the chuck's: the bar's diameter in the jaws must be one the chuck closes on (a 3-jaw holds round work only), the grip at least a third of that diameter and no longer than the jaws, the stickout at least the furthest cut from the free end plus 5 mm, no cut inside the grip, the bar within the lathe's swing and the grip plus the stickout within the bar's length. A stickout over 4 diameters is warned of, not refused. The chuck's body is a box 40 mm deep behind the jaws' end, and a move within the clearance gap of it is warned of in the operation preview. Nothing is exported: a lathe has no G-code. A V-block holds a bar lying along X in its V under a strap clamp: the block, its flanks (as steps that hold them) and the clamp are kept clear, the bar must seat on the flanks inside the V's edges and stand above the block, and its two line contacts and the clamp hold it against each cut. Soft jaws bored to the bar's diameter (within 0.5 mm) close round it along X or upright: on a lying bar their top must be above its axis; their arc contact holds it. A collet block stands in the vise with the bar in an ER collet: the collet must close on the diameter it grips, the nut and block are kept clear, and its grip, less when the bar stands under two thirds of the collet's length in it, holds it.",
             Some(Vise(8)),
         ),
         (Target::Setup, "holder") => (
-            "The library entry used: a vise for Vise, a clamp for Clamps. Entries are made on the Workholding page; changing one changes every setup that uses it.",
+            "The library entry used: a vise for Vise, a clamp for Clamps, a V-block, soft jaws or a collet block for those. Entries are made on the Workholding page; changing one changes every setup that uses it.",
             "",
             None,
         ),
@@ -2663,7 +2725,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (_, "stock_type") => (
             "Relative size box adds offsets to the six sides of the part's box after setup rotation. Fixed size box uses X, Y and Z sizes. A round bar lies along setup Z on X 0 Y 0, for the lathe; on a machine with a rotary A axis it lies along X, for the chuck on A. Values are kept when switching.",
-            "",
+            "On a machine without a rotary A axis The bar says whether a Round bar stands along Z (a collet block or soft jaws bored upright hold it) or lies along X (a V-block or soft jaws bored along X).",
             Some(Stock(0)),
         ),
         (_, "stock_diameter") => (
@@ -3523,6 +3585,9 @@ mod tests {
             ("clamp-2-height", Clamp(2)),
             ("clamp-3-bite", Clamp(3)),
             ("clamp-4-clamps", Clamp(4)),
+            ("round-0-v-block", Round(0)),
+            ("round-1-soft-jaws", Round(1)),
+            ("round-2-collet-block", Round(2)),
             ("cutting-0-vc_min", Cutting(0)),
             ("cutting-1-fz", Cutting(1)),
             ("lathetool-0-hand", LatheTool(0)),
