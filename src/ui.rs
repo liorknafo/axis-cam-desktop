@@ -2991,7 +2991,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                                     )));
                                     for h in holes.iter().take(64) {
                                         let said = format!(
-                                            "Ø{:.2} (opening Ø{:.2}) · X{:.2} Y{:.2} · depth {:.2} mm · {}{}",
+                                            "Ø{:.2} (opening Ø{:.2}) · X{:.2} Y{:.2}{} · depth {:.2} mm · {}{}",
                                             h.diameter,
                                             h.opening,
                                             // No "-0.00" for a centre on an axis.
@@ -3005,6 +3005,8 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                                             } else {
                                                 h.center[1]
                                             },
+                                            // At several A angles, read at its own.
+                                            crate::indexed::at_angle(h.a),
                                             h.top - h.bottom,
                                             if h.through { "through" } else { "blind" },
                                             h.countersink.map_or(String::new(), |c| format!(
@@ -4890,8 +4892,6 @@ pub(crate) fn speed_feed_heading(lines: &[(bool, String)]) -> &'static str {
         "Speeds and feeds not checked (export still allowed)"
     }
 }
-/// The workholding a setup can model: a lathe setup a chuck, any other a
-/// vise or clamps.
 /// Which of the holes `picked` by their walls (`App::pocket_holes`) the
 /// drill's hole `h` (`App::drill_holes`) is, for its remove button: the one
 /// at its centre, and at several A angles at its angle too, as each angle
@@ -4902,6 +4902,9 @@ pub(crate) fn picked_row(picked: &[crate::pocket::Hole], h: &crate::cam::Hole) -
         w.a == h.a && (x as f32 - h.center[0]).hypot(y as f32 - h.center[1]) <= 0.1
     })
 }
+/// The workholding a setup can model: a lathe setup a chuck, a machine with
+/// a rotary A axis a vise, clamps or the chuck on A, any other a vise or
+/// clamps.
 pub(crate) fn holding_choices(machine: &crate::model::Machine) -> &'static [&'static str] {
     if crate::lathe::is_lathe(machine) {
         &["None", "Chuck"]

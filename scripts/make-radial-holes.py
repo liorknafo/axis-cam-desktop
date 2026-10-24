@@ -5,6 +5,8 @@ turns +Y towards +Z, so hole k (at 60k°) faces up at A 90 - 60k: A 90, 30, -30,
 -210, which are A 90, 30, 330, 270, 210 and 150.
 Also radial-tube: a Ø40 x 40 mm tube along X with a Ø28 bore and six Ø4 radial holes through its
 wall at X 0, 60° apart as above, so that each faces the one opposite across the bore.
+And radial-tube-half: the same tube with only the holes at 0°, 60° and 120°, each facing solid wall
+across the bore.
 Written as STEP and 3MF to the folder given (needs cadquery)."""
 import math
 import os
@@ -43,11 +45,18 @@ def write(part, name):
 
 write(part, "radial-holes")
 BORE = 28.0
-tube = cq.Workplane("YZ").circle(R).circle(BORE / 2).extrude(LENGTH).translate((-LENGTH / 2, 0, 0))
-for k in range(6):
-    t = math.radians(60 * k)
-    d = cq.Vector(0, math.cos(t), math.sin(t))
-    start = d * (BORE / 2 - 1)
-    tube = tube.cut(cq.Workplane().add(cq.Solid.makeCylinder(HOLE / 2, R - BORE / 2 + 2, start, d)))
-write(tube, "radial-tube")
+
+
+def tube_with(holes):
+    tube = cq.Workplane("YZ").circle(R).circle(BORE / 2).extrude(LENGTH).translate((-LENGTH / 2, 0, 0))
+    for k in holes:
+        t = math.radians(60 * k)
+        d = cq.Vector(0, math.cos(t), math.sin(t))
+        start = d * (BORE / 2 - 1)
+        tube = tube.cut(cq.Workplane().add(cq.Solid.makeCylinder(HOLE / 2, R - BORE / 2 + 2, start, d)))
+    return tube
+
+
+write(tube_with(range(6)), "radial-tube")
+write(tube_with(range(3)), "radial-tube-half")
 print("ok")

@@ -11334,15 +11334,15 @@ soft_max = 180.0
         assert_eq!(walls(&a), Some(2));
     }
     /// On a Drill at several A angles each row's remove drops its own hole:
-    /// the tube's six holes, read each in its angle's frame, all at the
-    /// same centre there (LIO-246, review 3).
+    /// the tube's three pairs of holes at A 30, 90 and 150, read each in its
+    /// angle's frame, all at the same centre there (LIO-246, review 3).
     #[test]
     fn each_remove_of_a_drill_at_several_angles_drops_its_own_hole() {
         let dir = tempfile::tempdir().unwrap();
         let (mut doc, mesh) = crate::indexed::tests::radial_doc(
             "radial-tube",
-            "30, 90, 150, 210, 270, 330",
-            ("3.3", "20"),
+            "30, 90, 150",
+            ("3.3", "45"),
             14.3,
             |x, _| (x - 20.).abs() < 2.2,
         );
@@ -11366,14 +11366,22 @@ soft_max = 180.0
         let drilled = a.drill_holes(&op, &mesh).as_ref().clone().unwrap();
         let picked = a.pocket_holes(&op, &mesh);
         let picked = picked.as_ref().as_ref().unwrap();
-        assert_eq!((drilled.len(), picked.len()), (6, 6));
+        assert_eq!((drilled.len(), picked.len()), (3, 3));
         let rows: Vec<usize> = (drilled.iter())
             .map(|h| crate::ui::picked_row(picked, h).unwrap())
             .collect();
         let mut distinct = rows.clone();
         distinct.sort();
         distinct.dedup();
-        assert_eq!(distinct.len(), 6, "{rows:?}");
+        assert_eq!(distinct.len(), 3, "{rows:?}");
+        // Each says its angle, its X and Y the same in each angle's frame.
+        assert_eq!(
+            drilled
+                .iter()
+                .map(|h| crate::indexed::at_angle(h.a))
+                .collect::<Vec<_>>(),
+            [" at A30°", " at A90°", " at A150°"]
+        );
         for (h, &i) in drilled.iter().zip(&rows) {
             let mut a = fresh();
             let _ = a.update(Message::DropHole(i));
@@ -11382,7 +11390,8 @@ soft_max = 180.0
                 .iter()
                 .map(|h| h.a)
                 .collect();
-            assert_eq!(left.len(), 5, "{left:?}");
+            // The hole opposite stays picked, but no angle turns it up now.
+            assert_eq!(left.len(), 2, "{left:?}");
             assert!(
                 !left.contains(&h.a),
                 "dropped row {i} at {:?}: {left:?}",

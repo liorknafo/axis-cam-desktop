@@ -83,6 +83,12 @@ fn with_surfaces(op: &crate::model::Operation, ids: Vec<usize>) -> crate::model:
     }
     op
 }
+/// " at A30°" for a hole read at A 30° (`cam::Hole::a`), to tell holes
+/// apart that are listed at one centre in their own angles' frames; empty
+/// for None.
+pub fn at_angle(a: Option<f32>) -> String {
+    a.map_or(String::new(), |a| format!(" at A{}°", degrees(a)))
+}
 /// Whether `op`, of `setup`, picks holes (a Drill, a Pocket, a Contour,
 /// `crate::picks_holes`) in an indexed setup of several A angles: then each
 /// angle cuts the holes it turns up (`holes_by_angle`).
@@ -106,7 +112,10 @@ pub struct AngleCut {
 /// several angles (`holes_at_angles`), cuts, in the setup's order: each
 /// picked hole at the first angle that turns its axis along Z and opens it
 /// upward (`hole_along_z`, `opens_up`), and each picked face at the first
-/// angle that turns it up. And how many picked holes (or faces) no angle
+/// angle that turns it up. A picked hole that a plunge at an angle goes out
+/// through (a tube's opposite hole, under it on its axis, where nothing of
+/// the part is under its disc: `cam::part_under_disc`) is drilled there
+/// with it, not again. And how many picked holes (or faces) no angle
 /// cuts.
 pub fn holes_by_angle(
     doc: &Document,
@@ -127,20 +136,44 @@ pub fn holes_by_angle(
         let g = crate::cam::Geometry::new(&posed, mesh);
         let turned = crate::stock::Placement::new(mesh, Some(&posed)).rotation();
         let (mut cut, mut tried) = (vec![], HashSet::new());
+        // The holes cut here whose plunge goes on through the cavity under
+        // them and out of the part (middle, radius, bottom), and the picked
+        // holes along Z here that open downward, under one of them perhaps.
+        let (mut through, mut down) = (vec![], vec![]);
         for &id in &ids {
             if done.contains(&id) || tried.contains(&id) {
                 continue;
             }
             if let Some(walls) = hole_along_z(&posed, mesh, id) {
                 tried.extend(walls.iter().copied());
-                let whole = walls.iter().all(|w| picked.contains(w));
-                if whole && opens_up(&g, &walls) {
+                if !walls.iter().all(|w| picked.contains(w)) {
+                    continue;
+                }
+                if opens_up(&g, &walls) {
                     done.extend(walls.iter().copied());
                     cut.extend(walls.iter().copied());
+                    if let Some((c, r, _, bottom)) = crate::cam::wall_ring(&g, &walls)
+                        && !crate::cam::part_under_disc(&g, c, r, bottom)
+                    {
+                        through.push((c, r, bottom));
+                    }
+                } else {
+                    down.push(walls);
                 }
             } else if faces_up(mesh, turned, id) {
                 done.insert(id);
                 cut.push(id);
+            }
+        }
+        // A picked hole that a plunge here goes out through (under it, on
+        // its axis) is drilled here with it: a tube's opposite hole.
+        for walls in down {
+            if let Some((c, _, top, _)) = crate::cam::wall_ring(&g, &walls)
+                && (through.iter()).any(|(t, r, bottom)| {
+                    (c[0] - t[0]).hypot(c[1] - t[1]) < r / 2. && top < *bottom
+                })
+            {
+                done.extend(walls);
             }
         }
         out.push(AngleCut {
@@ -196,25 +229,8 @@ pub fn holes_by_angle(
 /// the part over it past a gap (`cam::part_past_gap`), as there is over a
 /// through-hole facing down, across a tube's bore.
 fn opens_up(g: &crate::cam::Geometry, walls: &[usize]) -> bool {
-    let corners: Vec<[f32; 3]> = (g.triangles.iter())
-        .filter(|t| t.feature.is_some_and(|id| walls.contains(&id)))
-        .flat_map(|t| t.p)
-        .collect();
-    if corners.is_empty() {
-        return false;
-    }
-    let n = corners.len() as f32;
-    let centre = [0, 1].map(|k| corners.iter().map(|p| p[k]).sum::<f32>() / n);
-    let r = corners
-        .iter()
-        .map(|p| (p[0] - centre[0]).hypot(p[1] - centre[1]))
-        .sum::<f32>()
-        / n;
-    let top = corners
-        .iter()
-        .map(|p| p[2])
-        .fold(f32::NEG_INFINITY, f32::max);
-    !crate::cam::part_past_gap(g, centre, r, top, true)
+    crate::cam::wall_ring(g, walls)
+        .is_some_and(|(centre, r, top, _)| !crate::cam::part_past_gap(g, centre, r, top, true))
 }
 /// The mean lean of a hole's walls from Z under which its axis is along Z:
 /// their triangles' normals' Z, area-weighted, is (2/π)·sin t for a hole
@@ -2862,8 +2878,13 @@ pub(crate) mod tests {
             (22. - mesh.dimensions[2] / 2. - 4. / s).to_string(),
         );
         let mut tool = Tool::new(&format!("Drill {}", drill.0), "Drill", drill.0);
-        for (k, v) in [("length", drill.1), ("stickout", "30")] {
-            tool.p.insert(k.into(), v.into());
+        // Out of the holder by 10 more than its flutes, 30 at least.
+        let stickout = drill.1.parse::<f32>().map_or(30., |f| (f + 10.).max(30.));
+        for (k, v) in [
+            ("length", drill.1.to_string()),
+            ("stickout", stickout.to_string()),
+        ] {
+            tool.p.insert(k.into(), v);
         }
         // The holes' walls, as setup 1 places the part, and not a blind
         // hole's bottom, whose normal is radial.
@@ -2978,61 +2999,100 @@ pub(crate) mod tests {
             "{issues:?}"
         );
     }
-    /// Six Ø4 holes through a tube's wall, 60° apart at one X, each facing
-    /// the one opposite across the bore: one Drill of a Ø3.3 drill with 20
-    /// mm flutes drills each once, at the angle that turns it up and opens
-    /// it upward (not the one under it, open from above through the bore
-    /// and the hole over it), through its own wall and not on across the
-    /// bore (LIO-246, review 2).
-    #[test]
-    fn one_drill_drills_a_tubes_opposite_holes_each_once_through_its_wall() {
-        let (doc, mesh) = radial_doc(
-            "radial-tube",
-            "30, 90, 150, 210, 270, 330",
-            ("3.3", "20"),
-            14.3,
-            |x, _| (x - 20.).abs() < 2.2,
-        );
+    /// What `tube_drill` finds: each angle and how many picked surfaces it
+    /// cuts, how many picked holes none drills, and each drilling angle and
+    /// its drill tip over the A centreline.
+    type TubeDrill = (Vec<(f32, usize)>, usize, Vec<(f32, f32)>);
+    /// The Drill of a Ø3.3 drill with `flutes` mm of flutes on the holes
+    /// `pick` takes (by their angle round X at A 0) of the tube `file` at
+    /// `angles`: what
+    /// each angle cuts, how many picked holes none does, and each angle's
+    /// drill tip under the A centreline (mm, over it when positive). Its
+    /// surface issues must be none.
+    fn tube_drill(file: &str, angles: &str, flutes: &str, pick: impl Fn(f32) -> bool) -> TubeDrill {
+        let (doc, mesh) = radial_doc(file, angles, ("3.3", flutes), 14.3, |x, t| {
+            (x - 20.).abs() < 2.2 && pick(t)
+        });
         let op = &doc.setups[1].operations[0];
-        let (cuts, left) = holes_by_angle(&doc, 1, op, &mesh).unwrap();
-        assert_eq!(left, 0);
-        // One hole an angle, each of the six walls once.
-        let mut seen = std::collections::HashSet::new();
-        for c in &cuts {
-            assert!(!c.ids.is_empty(), "A {}", c.a);
-            assert!(c.ids.iter().all(|id| seen.insert(*id)), "A {}", c.a);
-        }
-        assert_eq!(seen.len(), op.surfaces.as_ref().unwrap().ids.len());
         assert_eq!(
             surface_issues(&doc, 1, op, Some(&mesh)),
             Vec::<String>::new()
         );
+        let (cuts, left) = holes_by_angle(&doc, 1, op, &mesh).unwrap();
         let sim = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap();
-        for c in &cuts {
-            // The drill's lowest point at that angle: through the wall
-            // (its inner face 14 mm from the axis) by its breakthrough, not
-            // across the bore towards the far wall.
-            let axis = c.posed.turn.unwrap().axis;
-            let low = (sim.plan.moves.iter())
-                .filter(|m| m.cutting_pass && m.a == Some(c.a))
-                .map(|m| m.to[2])
-                .fold(f32::INFINITY, f32::min);
-            let depth = low - axis[1];
-            assert!(
-                depth > 9. && depth < 13.9,
-                "A {}: tip {depth} over the axis",
-                c.a
-            );
+        let axis = doc.setups[1].turn.unwrap().axis;
+        let tips = (drilled_at(&sim.plan).into_iter())
+            .map(|(a, lo, hi)| {
+                assert!((lo - 20.).abs() < 0.01 && (hi - 20.).abs() < 0.01, "A {a}");
+                let low = (sim.plan.moves.iter())
+                    .filter(|m| m.cutting_pass && m.a == Some(a))
+                    .map(|m| m.to[2])
+                    .fold(f32::INFINITY, f32::min);
+                (a, low - axis[1])
+            })
+            .collect();
+        (
+            cuts.iter().map(|c| (c.a, c.ids.len())).collect(),
+            left,
+            tips,
+        )
+    }
+    /// Whether picked angle round X `t` (degrees, at A 0) is within 15° of
+    /// one of `holes`'.
+    fn near(t: f32, holes: &[f32]) -> bool {
+        holes
+            .iter()
+            .any(|h| ((t - h + 540.).rem_euclid(360.) - 180.).abs() < 15.)
+    }
+    /// (a) At A 30 and 90, the A 30 hole alone picked of a tube whose holes
+    /// face each other across its bore (a long drill, 60 mm of flutes, for
+    /// the stock's top to under both walls): drilled through both walls, out of
+    /// the hole opposite, as at A 30 alone and as main drills it; A 90 cuts
+    /// nothing for it (LIO-246, review 4).
+    #[test]
+    fn a_tube_hole_over_a_hole_opposite_is_drilled_through_both_walls() {
+        let (cuts, left, tips) = tube_drill("radial-tube", "30, 90", "60", |t| near(t, &[60.]));
+        assert_eq!(left, 0);
+        assert!(cuts[0].1 > 0 && cuts[1].1 == 0, "{cuts:?}");
+        let (_, _, alone) = tube_drill("radial-tube", "30", "60", |t| near(t, &[60.]));
+        assert_eq!(tips.len(), 1);
+        assert!((tips[0].1 - alone[0].1).abs() < 0.01, "{tips:?} {alone:?}");
+        // Out of the far wall, 20 under the axis.
+        assert!(tips[0].1 < -19.99, "{tips:?}");
+    }
+    /// (b) At A 30, 90 and 150, all six of the tube's holes picked: three
+    /// plunges, each through a hole and the one opposite, nothing refused.
+    /// (c) At all six angles the same three: no hole drilled twice, and A
+    /// 210, 270 and 330, which turn up holes already drilled from the other
+    /// side, cut nothing (LIO-246, review 4).
+    #[test]
+    fn a_tubes_opposite_holes_are_drilled_in_pairs_each_once() {
+        for angles in ["30, 90, 150", "30, 90, 150, 210, 270, 330"] {
+            let (cuts, left, tips) = tube_drill("radial-tube", angles, "60", |_| true);
+            assert_eq!(left, 0, "{angles}");
+            let cutting: Vec<f32> = (cuts.iter())
+                .filter(|(_, n)| *n > 0)
+                .map(|(a, _)| *a)
+                .collect();
+            assert_eq!(cutting, [30., 90., 150.], "{angles}: {cuts:?}");
+            assert_eq!(tips.len(), 3, "{angles}: {tips:?}");
+            assert!(tips.iter().all(|(_, t)| *t < -19.99), "{angles}: {tips:?}");
         }
-        // Each hole once: one plunge at each angle, at the holes' X.
-        let drilled = drilled_at(&sim.plan);
-        assert_eq!(drilled.len(), 6, "{drilled:?}");
-        assert!(
-            drilled
-                .iter()
-                .all(|(_, lo, hi)| (lo - 20.).abs() < 0.01 && (hi - 20.).abs() < 0.01),
-            "{drilled:?}"
-        );
+    }
+    /// (d) A tube whose holes face solid wall across its bore: each drilled
+    /// through its own wall only, by its breakthrough, not into the far wall
+    /// (LIO-246, review 4).
+    #[test]
+    fn a_tube_hole_over_solid_wall_is_drilled_through_its_own_wall_only() {
+        let (cuts, left, tips) = tube_drill("radial-tube-half", "30, 90, 330", "20", |t| {
+            near(t, &[0., 60., 120.])
+        });
+        assert_eq!(left, 0);
+        assert!(cuts.iter().all(|(_, n)| *n > 0), "{cuts:?}");
+        assert_eq!(tips.len(), 3, "{tips:?}");
+        // Through the wall's inner face (14 over the axis), well over the
+        // far wall's (14 under it).
+        assert!(tips.iter().all(|(_, t)| *t > 9. && *t < 13.9), "{tips:?}");
     }
     /// An indexed setup's angles serve its other operations too: a Drill
     /// whose holes one angle turns up skips the angles that turn none up,

@@ -1070,8 +1070,8 @@ pub fn holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, St
     };
     if !walls.is_empty() {
         let rims = rims(&g);
-        // At several A angles the hole opposite across a cavity is turned
-        // up and drilled at its own angle (`indexed::holes_by_angle`).
+        // At several A angles a hole over a cavity may stop through its own
+        // wall (`stops_at_own_wall`).
         let own_wall = crate::indexed::holes_at_angles(op, setup);
         for picked in crate::pocket::holes(setup, &walls, mesh)? {
             if let Some(h) = drill_hole(&g, &picked, &rims, own_wall)
@@ -1190,20 +1190,68 @@ fn drill_hole(
     let mut found = found.or_else(|| round_hole(g, &ring, top))?;
     // With `own_wall`, in an indexed setup of several A angles, a hole that
     // opens into a cavity under its walls (a radial hole in a tube, into its
-    // bore) is drilled through its own wall, not on across the cavity: the
-    // hole past it is turned up at an angle of its own. Elsewhere it goes on
-    // through what lies under it, as a cross-hole through both walls of a
-    // tube in a vise does.
+    // bore) and whose plunge would go on into the part past it is drilled
+    // through its own wall only (`stops_at_own_wall`). Else, and everywhere
+    // else, it goes on as main drills it: through both walls of a tube
+    // whose far wall has a hole opposite, as a cross-hole in a vise is.
     let bottom = corners.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min);
     let r = corners
         .iter()
         .map(|p| (p[0] - found.center[0]).hypot(p[1] - found.center[1]))
         .sum::<f32>()
         / corners.len() as f32;
-    if own_wall && found.bottom < bottom - 0.05 && into_cavity(g, found.center, r, bottom) {
+    if own_wall && found.bottom < bottom - 0.05 && stops_at_own_wall(g, found.center, r, bottom) {
         (found.bottom, found.through) = (bottom, true);
     }
     Some(found)
+}
+/// Whether a hole of radius `r` at `centre` whose walls end at the height
+/// `z` stops just through its own wall in an indexed setup of several A
+/// angles: it opens into a cavity under them (`into_cavity`), and a plunge
+/// on across it would cut the part past it (`part_under_disc`), where no
+/// hole opposite at least as wide lets the drill out.
+pub(crate) fn stops_at_own_wall(g: &Geometry, centre: [f32; 2], r: f32, z: f32) -> bool {
+    into_cavity(g, centre, r, z) && part_under_disc(g, centre, r, z)
+}
+/// Whether anything of the part lies under the disc of a hole of radius `r`
+/// at `centre` below the height `z` (at its centre and 16 points 0.9 `r`
+/// from it): what a plunge on through it would cut. Nothing there under a
+/// hole whose far side has a hole opposite at least as wide.
+pub(crate) fn part_under_disc(g: &Geometry, centre: [f32; 2], r: f32, z: f32) -> bool {
+    std::iter::once(centre)
+        .chain((0..16).map(|k| {
+            let t = k as f32 * std::f32::consts::PI / 8.;
+            [centre[0] + 0.9 * r * t.cos(), centre[1] + 0.9 * r * t.sin()]
+        }))
+        .any(|p| {
+            (g.triangles.iter())
+                .filter_map(|tri| plane_height(&tri.p, p))
+                .any(|h| h < z - 0.05)
+        })
+}
+/// The ring of a hole's walls `walls` in `g`: the middle and the mean
+/// radius of their triangles' corners, and their top and bottom. None
+/// without a triangle of them.
+pub(crate) fn wall_ring(g: &Geometry, walls: &[usize]) -> Option<([f32; 2], f32, f32, f32)> {
+    let corners: Vec<[f32; 3]> = (g.triangles.iter())
+        .filter(|t| t.feature.is_some_and(|id| walls.contains(&id)))
+        .flat_map(|t| t.p)
+        .collect();
+    if corners.is_empty() {
+        return None;
+    }
+    let n = corners.len() as f32;
+    let centre = [0, 1].map(|k| corners.iter().map(|p| p[k]).sum::<f32>() / n);
+    let r = (corners.iter())
+        .map(|p| (p[0] - centre[0]).hypot(p[1] - centre[1]))
+        .sum::<f32>()
+        / n;
+    let top = corners
+        .iter()
+        .map(|p| p[2])
+        .fold(f32::NEG_INFINITY, f32::max);
+    let bottom = corners.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min);
+    Some((centre, r, top, bottom))
 }
 /// Whether a hole of radius `r` at `centre` whose walls end at the height
 /// `z` opens there into a cavity: nothing solid under it (at 16 points 0.8

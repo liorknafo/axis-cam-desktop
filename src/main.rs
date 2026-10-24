@@ -3255,8 +3255,6 @@ impl App {
         }
         out
     }
-    /// What the holes a Pocket's or Contour's walls pick are worked out from:
-    /// the part, the setup's placement and the selected surfaces.
     /// What the active setup's holes are read in, for the kept hole lists:
     /// its placement; for an indexed setup all its fields and its machine's
     /// (its A angles, its Reposition action, the A centreline and limits),
@@ -3276,6 +3274,8 @@ impl App {
             }
         }
     }
+    /// What the holes a Pocket's or Contour's walls pick are worked out from:
+    /// the part, the setup's placement and the selected surfaces.
     fn holes_key(&self, op: &Operation, mesh: &mesh::Mesh) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::hash::DefaultHasher::new();
@@ -4889,7 +4889,10 @@ impl App {
                     return Task::none();
                 };
                 let ((x, y), (w, d)) = (hole.centre(), hole.size());
-                let said = format!("Dropped the hole at X{x:.2} Y{y:.2} ({w:.2} × {d:.2} mm).");
+                let said = format!(
+                    "Dropped the hole at X{x:.2} Y{y:.2}{} ({w:.2} × {d:.2} mm).",
+                    indexed::at_angle(hole.a)
+                );
                 let drop: std::collections::HashSet<usize> = hole.walls.iter().copied().collect();
                 let keep: std::collections::HashSet<usize> =
                     (holes.as_ref().as_ref().unwrap().iter())
