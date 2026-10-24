@@ -575,7 +575,8 @@ pub(crate) fn angle_problems(
     index: &Index,
 ) -> Vec<String> {
     if sim.turns.is_empty() {
-        return axis_problems(&sim.plan, geometry, index, si);
+        let board = crate::stock::below(&doc.setups[si]);
+        return axis_problems_over(&sim.plan, geometry, index, si, board);
     }
     let mut out = vec![];
     for &(a, _) in &sim.turns {
@@ -609,6 +610,17 @@ pub(crate) fn axis_problems(
     index: &Index,
     si: usize,
 ) -> Vec<String> {
+    axis_problems_over(plan, geometry, index, si, 0.)
+}
+/// `axis_problems` of setup 1 on a sheet, whose floor is `board` mm under
+/// the stock's bottom: the spoilboard's allowance (`stock::below`).
+pub(crate) fn axis_problems_over(
+    plan: &Plan,
+    geometry: &Geometry,
+    index: &Index,
+    si: usize,
+    board: f32,
+) -> Vec<String> {
     let b = geometry.bounds;
     let (worst, at, lowest) = tool_axis(plan, index, b.max[2]);
     let mut problems = vec![];
@@ -622,13 +634,19 @@ pub(crate) fn axis_problems(
         ));
     }
     let floor = if si == 0 {
-        plan.stock.min[2]
+        plan.stock.min[2] - board
     } else {
         plan.stock.min[2].max(b.min[2])
     };
     let below = floor - lowest;
     if below > 0.001 {
-        problems.push(if si == 0 {
+        problems.push(if si == 0 && board > 0. {
+            format!(
+                "The tool goes {} mm into the spoilboard under the sheet, past its {} mm allowance. Reduce the depth or the breakthrough.",
+                mm(below + board),
+                mm(board)
+            )
+        } else if si == 0 {
             format!(
                 "The tool goes {} mm below the bottom of the stock, where the vise or table is. Reduce the depth or the breakthrough.",
                 mm(below)
@@ -1854,6 +1872,19 @@ mod tests {
         let (json, summary, passed) =
             crate::check_plan(&[project.clone(), good_file.clone()]).unwrap();
         assert!(passed && summary.starts_with("The plan passes every check: 6 operations"));
+        // With a third path the passing job is saved as a project.
+        let saved = dir.path().join("saved.axis.json");
+        let with_job = [
+            project.clone(),
+            good_file.clone(),
+            saved.display().to_string(),
+        ];
+        assert!(crate::check_plan(&with_job).unwrap().2);
+        let job = crate::storage::load(&saved).unwrap();
+        assert_eq!(
+            job.setups.iter().map(|s| s.operations.len()).sum::<usize>(),
+            6
+        );
         let printed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(printed["passed"], true);
         assert_eq!(crate::exit_code(&Ok(passed)), 0);
@@ -1873,7 +1904,12 @@ mod tests {
             .into_owned();
         for args in [
             vec![project.clone()],
-            vec![project.clone(), good_file.clone(), "extra".into()],
+            vec![
+                project.clone(),
+                good_file.clone(),
+                "job.json".into(),
+                "extra".into(),
+            ],
             vec![project.clone(), not_json],
             vec![missing.clone(), good_file.clone()],
         ] {
@@ -3157,6 +3193,7 @@ mod totem {
             path,
             format: "step".into(),
             bytes: 0,
+            thickness: None,
         });
         doc.sync_stock_sources();
         aluminium(&mut doc);

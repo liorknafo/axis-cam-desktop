@@ -2459,6 +2459,7 @@ pub(crate) mod tests {
                 .join("examples/four-setup-block.3mf"),
             format: "3mf".into(),
             bytes: 1,
+            thickness: None,
         });
         doc.active = doc.setups[0].id.clone();
         edit(&mut doc);
@@ -3005,6 +3006,7 @@ pub(crate) mod tests {
             path: std::path::PathBuf::from("sleeve.stl"),
             format: "stl".into(),
             bytes: 1,
+            thickness: None,
         });
         doc.active = doc.setups[0].id.clone();
         edit(&mut doc);

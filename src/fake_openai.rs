@@ -332,6 +332,7 @@ pub mod rotary {
             path: "square-bar.stl".into(),
             format: "stl".into(),
             bytes: 0,
+            thickness: None,
         });
         let mut machine = crate::indexed::tests::rotary();
         for (key, value) in [

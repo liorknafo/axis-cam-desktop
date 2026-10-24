@@ -527,6 +527,7 @@ pub(crate) fn op_checks(app: &App) -> Vec<Check> {
     if let Some(o) = app.operation()
         && o.strategy == Strategy::Contour
         && get(&o.p, "boundary") == "Model silhouette"
+        && get(&o.p, "side") != crate::model::CONTOUR_HOLES
         && pocket_setting(&o.p, "tabs") == CONTOUR_TABS[0]
         && let Some(plan) = app.active_simulation().map(|s| &s.plan)
         && plan.target <= plan.stock.min[2] + 0.001
@@ -2297,7 +2298,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
 }
 /// What the workspace shows in place of the 3D view without a part.
 fn no_scene(app: &App) -> Element<'_, Message> {
-    container(column![bold(if app.import_busy { "Loading geometry…" } else if !app.doc.has_model() { "Import your part" } else { "Model preview unavailable" },25),muted(app.doc.file.as_ref().map(|f|f.name.clone()).unwrap_or_default()),note(app.import_error.clone().unwrap_or_else(|| "Import STEP, STP, 3MF, STL or OBJ to view your model. Geometry loads in the background; a STEP conversion may take up to two minutes.".into())),primary("Import model",Message::Import),secondary("Start screen",Message::Page(Page::Home))].spacing(20).max_width(380)).center(Fill).into()
+    container(column![bold(if app.import_busy { "Loading geometry…" } else if !app.doc.has_model() { "Import your part" } else { "Model preview unavailable" },25),muted(app.doc.file.as_ref().map(|f|f.name.clone()).unwrap_or_default()),note(app.import_error.clone().unwrap_or_else(|| "Import STEP, STP, 3MF, STL, OBJ or DXF to view your model. Geometry loads in the background; a STEP conversion may take up to two minutes.".into())),primary("Import model",Message::Import),secondary("Start screen",Message::Page(Page::Home))].spacing(20).max_width(380)).center(Fill).into()
 }
 /// The 3D view's toolbar and the simulation strip under it.
 /// The section's controls under the 3D view while it is on: the axis it is
@@ -3270,6 +3271,14 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             if !app.is_sample()
                 && o.strategy == Strategy::Contour
                 && get(p, "boundary") == "Model silhouette"
+                && get(p, "side") == crate::model::CONTOUR_HOLES
+            {
+                c = c
+                    .push(checks.field(p, "hole_min", "Smallest hole to cut · mm"))
+                    .push(muted("Holes narrower than this are left for a Drill; empty cuts every hole the tool fits in. The slugs come free: Holes leave no tabs."));
+            } else if !app.is_sample()
+                && o.strategy == Strategy::Contour
+                && get(p, "boundary") == "Model silhouette"
             {
                 c = c.push(choice_value(
                     p,
@@ -3723,10 +3732,10 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
             }
             c = c.push(checks.field(p, "allowance", "Radial stock to leave · mm"));
             if s == Strategy::Contour {
-                c=c.push(choice(p,"side","Contour side",&["Outside","Inside"],t))
+                c=c.push(choice(p,"side","Contour side",&crate::model::CONTOUR_SIDES,t))
                     .push(choice(p,"compensation","Cutter compensation",&["In computer"],t))
                     .push(checks.field(p, "finish_passes", "Repeat finishing passes"))
-                    .push(note("Outside follows the outer model silhouette at successive depths. Inside follows only the walls and islands of a selected recessed floor; select that floor in Geometry. Computer compensation includes the cutter radius and allowance. Repeat passes revisit the contour."));
+                    .push(note("Outside follows the outer model silhouette at successive depths. Inside follows only the walls and islands of a selected recessed floor; select that floor in Geometry. Holes follows the inside of every hole through the part's outline, a flat part's cut-outs. Computer compensation includes the cutter radius and allowance. Repeat passes revisit the contour."));
             } else {
                 c=c.push(note("Constant-Z loops follow the projected geometry above each level, with cutter-radius compensation. Levels are the stepdown apart, closer on sloping faces so neighbouring loops stay within the stepover of each other across them; faces flatter than 1° are left for Facing or Parallel. This conservative vertical-access preview supports flat cutters. Overhung detail remains unmachined."));
             }
@@ -4584,6 +4593,24 @@ fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> 
     let p = &s.p;
     let t = Target::Setup;
     let mut c = c.push(material_picker(app)).push(section("Stock"));
+    // A DXF part is a flat profile, extruded to the thickness set here.
+    if app.doc.index() == 0
+        && let Some(file) = app.doc.file.as_ref().filter(|f| f.format == "dxf")
+    {
+        c = c
+            .push(hinted_field(
+                p,
+                crate::sheet::DXF_THICKNESS_KEY,
+                "DXF part thickness · mm",
+                "Part thickness · mm",
+                t,
+                &[],
+            ))
+            .push(muted(format!(
+                "The flat profile is extruded {} mm thick: its outer loop is the part, its inner loops holes through it.",
+                file.thickness.unwrap_or(crate::mesh::DXF_THICKNESS)
+            )));
+    }
     if app.doc.index() == 0 || app.is_sample() {
         c = c.push(choice(
             p,
@@ -4656,6 +4683,34 @@ fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> 
             ] {
                 c = c.push(field(p, k, l, t));
             }
+        } else if crate::sheet::is_sheet(s) {
+            c = c.push(
+                row![
+                    container(field(p, "stock_x", "Sheet X · mm", t)).width(Length::FillPortion(1)),
+                    container(field(p, "stock_y", "Sheet Y · mm", t)).width(Length::FillPortion(1))
+                ]
+                .spacing(10),
+            );
+            c = c
+                .push(hinted_field(
+                    p,
+                    "sheet_thickness",
+                    "Sheet thickness · mm",
+                    "The part's thickness",
+                    t,
+                    &[],
+                ))
+                .push(hinted_field(
+                    p,
+                    "spoilboard",
+                    "Spoilboard allowance · mm",
+                    "0.5",
+                    t,
+                    &[],
+                ))
+                .push(muted(
+                    "The sheet lies on a spoilboard at the part's bottom, centred on X0 Y0. A cut through it may go on into the board by the allowance, never deeper. Hold it down under Workholding.",
+                ));
         } else if crate::stock::relative(s) {
             c = c.push(muted("Extra material from each side of the part · mm"));
             for pair in [
@@ -4880,6 +4935,9 @@ fn setup_holding<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message
             }
         }
     }
+    if si == 0 && crate::sheet::is_sheet(app.doc.setup()) {
+        c = holddown_controls(app, c);
+    }
     // What follows is recorded for the operator and checked by nothing, so
     // it sits under its own heading, apart from the checked workholding.
     c = c
@@ -5040,6 +5098,56 @@ pub(crate) fn holding_choices(machine: &crate::model::Machine) -> &'static [&'st
             crate::round_hold::COLLET_BLOCK,
         ]
     }
+}
+/// A sheet's hold-down: screws through its waste into the spoilboard, whose
+/// heads every move is kept clear of, or tape; and what is wrong with it.
+fn holddown_controls<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
+    let s = app.doc.setup();
+    let (p, t) = (&s.p, Target::Setup);
+    let mut c = c.push(section("Hold-down")).push(choice_value(
+        p,
+        crate::sheet::holddown(s),
+        "holddown",
+        "Sheet hold-down",
+        &crate::sheet::HOLDDOWNS,
+        t,
+    ));
+    if crate::sheet::screwed(s) {
+        c = c
+            .push(hinted_field(
+                p,
+                "holddown_screws",
+                "Screws · X,Y from the sheet's front-left corner · mm",
+                "Empty: one in from each corner",
+                t,
+                &[],
+            ))
+            .push(
+                row![
+                    container(hinted_field(p, "screw_head", "Head Ø · mm", "12", t, &[]))
+                        .width(Length::FillPortion(1)),
+                    container(hinted_field(p, "screw_height", "Head height · mm", "5", t, &[]))
+                        .width(Length::FillPortion(1))
+                ]
+                .spacing(10),
+            )
+            .push(muted(
+                "Put the screws in the waste outside the part's outline. Every move keeps clear of their heads by the gap; the screws hold only the waste, so an outside contour that cuts through leaves tabs.",
+            ));
+    } else if crate::sheet::holddown(s) == "Tape" {
+        c = c.push(muted(
+            "Double-sided tape under the sheet holds the part and the waste: nothing stands in the cutter's way and tabs are optional.",
+        ));
+    }
+    let stock = app.known_stock(0).0;
+    let mut lines = crate::sheet::holddown_issues(s, stock);
+    if let (Some(stock), Some(mesh)) = (stock, app.part_mesh()) {
+        lines.extend(crate::sheet::screws_on_part(s, stock, mesh));
+    }
+    if !lines.is_empty() {
+        c = c.push(caution("Hold-down", lines));
+    }
+    c
 }
 /// The setup editor's controls for the modelled workholding, above the
 /// fixture description.
@@ -9497,6 +9605,7 @@ pub(crate) fn operation_lines(
     let n = |v: f32| format!("{}", (v * 1000.).round() / 1000.);
     let strategy = match op.strategy {
         Strategy::Contour if get(p, "side") == "Inside" => "Contour, inside floor",
+        Strategy::Contour if get(p, "side") == crate::model::CONTOUR_HOLES => "Contour, holes",
         Strategy::Contour => "Contour, outside",
         s => s.name(),
     };

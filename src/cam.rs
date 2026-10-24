@@ -455,8 +455,11 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
     if get(&op.p, "compensation") != "In computer" {
         return Err("Only In computer compensation is supported. Controller compensation needs a postprocessor.".into());
     }
-    if get(&op.p, "boundary") != "Model silhouette" || get(&op.p, "side") != "Outside" {
-        return Err("Choose Model silhouette / Outside, or Selected geometry / Inside and select a recessed planar floor.".into());
+    // Holes: inside every hole through the part's outline, the cut-outs of
+    // a flat part, which a Drill does not make.
+    let holes = get(&op.p, "side") == crate::model::CONTOUR_HOLES;
+    if get(&op.p, "boundary") != "Model silhouette" || !(holes || get(&op.p, "side") == "Outside") {
+        return Err("Choose Model silhouette / Outside or Holes, or Selected geometry / Inside and select a recessed planar floor.".into());
     }
     let g = Geometry::new(setup, mesh);
     let radial = number(op, "allowance")?;
@@ -475,7 +478,20 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
         .into();
     let target = g.bounds.min[2] + number(op, "bottom")?;
     let top = b.plan.stock.max[2] + number(op, "top")?.max(0.);
-    if target < b.plan.stock.min[2] || target >= top || top - target >= b.plan.tool_length {
+    // A sheet's cut goes on into the spoilboard, by its allowance at most.
+    let board = stock::below(setup);
+    if target < b.plan.stock.min[2] - board - 0.0001 {
+        return Err(if board > 0. {
+            format!(
+                "The contour would go {:.2} mm into the spoilboard, deeper than its {board} mm allowance: raise Bottom offset.",
+                b.plan.stock.min[2] - target
+            )
+        } else {
+            "Contour depth must be within stock and tool reach; bottom is relative to model bottom."
+                .into()
+        });
+    }
+    if target >= top || top - target >= b.plan.tool_length {
         return Err("Contour depth must be within stock and tool reach; bottom is relative to model bottom.".into());
     }
     let down = number(op, "stepdown")?;
@@ -489,10 +505,52 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
             "Use a positive stepdown within flute length and 0–20 whole finishing passes.".into(),
         );
     }
+    // The outer outlines, or for Holes the holes the tool fits in that are
+    // at least `hole_min` wide (narrower ones are left for a Drill), each
+    // turned to run anticlockwise.
+    let offset = f64::from(b.plan.radius + radial + (b.plan.radius * 0.01).max(0.02));
+    let hole_min = if holes {
+        num(&op.p, "hole_min").unwrap_or(0.).max(0.)
+    } else {
+        0.
+    };
+    let paths: Vec<Polygon> = (paths.into_iter())
+        .filter(|p| if holes { area(p) < 0. } else { area(p) > 0. })
+        .filter(|p| {
+            let (lo, hi) = p.iter().fold(
+                ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]),
+                |(lo, hi), q| {
+                    (
+                        [lo[0].min(q.0), lo[1].min(q.1)],
+                        [hi[0].max(q.0), hi[1].max(q.1)],
+                    )
+                },
+            );
+            // A round hole's chords read it up to `HOLE_MIN_SLACK` narrower.
+            ((hi[0] - lo[0]).min(hi[1] - lo[1]) + 2. * offset) as f32 >= hole_min - HOLE_MIN_SLACK
+        })
+        .map(|mut p| {
+            if holes {
+                p.reverse();
+            }
+            p
+        })
+        .collect();
+    if holes && paths.is_empty() {
+        return Err(format!(
+            "The part has no hole through its outline that a Ø{:.2} tool fits in{}.",
+            2. * b.plan.radius,
+            if hole_min > 0. {
+                format!(" and that is at least {hole_min} mm wide")
+            } else {
+                String::new()
+            }
+        ));
+    }
     // From the highest material in the ring the cutter sweeps round each
     // outline, not in the outlines' box: the part inside the ring stands
     // above where earlier cuts may have cleared round it.
-    let outer: Vec<Polygon> = paths.iter().filter(|p| area(p) > 0.).cloned().collect();
+    let outer: Vec<Polygon> = paths.clone();
     let ring: Vec<Polygon> = Region::from(outer)
         .inflate(b.plan.radius as f64, JoinType::Round, EndType::Joined, 2.)
         .into();
@@ -515,7 +573,8 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
     b.plan.milling_direction = if climb { "Climb" } else { "Conventional" };
     b.plan.target = target;
     b.plan.levels = levels;
-    let tabs = if pocket_setting(&op.p, "tabs") == CONTOUR_TABS[1] {
+    // Tabs hold the part in the sheet or stock round it: an outside contour's.
+    let tabs = if pocket_setting(&op.p, "tabs") == CONTOUR_TABS[1] && !holes {
         let count = number(op, "tab_count")?;
         let width = number(op, "tab_width")?;
         let height = number(op, "tab_height")?;
@@ -533,6 +592,7 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
         }
         Some(Tabs {
             count: count as usize,
+            width,
             // The tool's centre rises over the tab and its own diameter.
             lift: width + 2. * b.plan.radius,
             top: tab_top,
@@ -540,13 +600,20 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
     } else {
         None
     };
+    if tabs.is_none()
+        && !holes
+        && target <= b.plan.stock.min[2] + 0.001
+        && let Some(loose) = crate::sheet::loose_part(setup)
+    {
+        return Err(loose.into());
+    }
     let loops: Vec<Vec<[f32; 2]>> = paths
         .iter()
-        .filter(|p| area(p) > 0.)
         .map(|path| {
             let mut points: Vec<_> = path.iter().map(|p| [p.0 as f32, p.1 as f32]).collect();
             // Solid is inside the outer profile: CW spindle climb travels CW.
-            if climb == b.plan.spindle_clockwise {
+            // Round a hole the solid is outside: climb travels anticlockwise.
+            if (climb == b.plan.spindle_clockwise) != holes {
                 points.reverse();
             }
             if let Some(&first) = points.first() {
@@ -555,6 +622,7 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
             points
         })
         .collect();
+    let mut spans: Vec<Vec<(f32, f32)>> = vec![];
     if let Some(tabs) = &tabs {
         let stock = b.plan.stock;
         let through = target <= stock.min[2] + 0.001;
@@ -581,7 +649,8 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
                 .map(|w| w[0][0] * w[1][1] - w[1][0] * w[0][1])
                 .sum::<f32>()
                 > 0.;
-            for (start, end) in outline.spans(tabs) {
+            let placed = outline.spans(tabs)?;
+            for &(start, end) in &placed {
                 let (c, d) = outline.at((start + end) / 2.);
                 let out = if anticlockwise {
                     [d[1], -d[0]]
@@ -597,6 +666,7 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
                         && q[1] < stock.max[1]),
                 );
             }
+            spans.push(placed);
         }
         if through && loose > 0 {
             return Err(format!(
@@ -610,9 +680,9 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
     for level in 1..=levels {
         crate::progress::report(level)?;
         let z = (cutting_top - level as f32 * down).max(target);
-        for points in &loops {
+        for (i, points) in loops.iter().enumerate() {
             let points = match &tabs {
-                Some(tabs) if z < tabs.top => tabbed(points, z, tabs),
+                Some(tabs) if z < tabs.top => tabbed(points, z, tabs, &spans[i]),
                 _ => points.iter().map(|p| [p[0], p[1], z]).collect(),
             };
             for _ in 0..=if level == levels { finish as usize } else { 0 } {
@@ -892,14 +962,29 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
 }
 /// The stock, mm, a tab must reach past the cut's outer edge.
 const WALL: f32 = 2.;
+/// How much narrower than a Holes contour's smallest hole a hole may read
+/// and still be cut, mm: a round hole's chords lie inside its circle.
+const HOLE_MIN_SLACK: f32 = 0.05;
 /// An outside Contour's holding tabs: `count` on each outline, evenly
 /// spaced, over each of which the tool's centre rises to `top` along
 /// `lift` mm of its path.
 struct Tabs {
     count: usize,
+    /// Each tab's own width, at its narrowest.
+    width: f32,
     lift: f32,
     top: f32,
 }
+/// How far a tab's stretch of the path may turn, over the tab and its
+/// margins: a straight side does not, an arc of radius R does by its length
+/// over R, a corner by its angle.
+const TAB_TURN: f32 = 0.5;
+/// The path either side of a tab that must not turn either, mm.
+const TAB_MARGIN: f32 = 1.;
+/// The least path between two tabs, mm.
+const TAB_GAP: f32 = 1.;
+/// The step along the path at which tab centres are tried, mm.
+const TAB_STEP: f32 = 0.25;
 /// A closed tool path (its last point its first) and how far along it
 /// each of its points is, mm.
 struct Outline<'a> {
@@ -918,17 +1003,78 @@ impl<'a> Outline<'a> {
     fn length(&self) -> f32 {
         *self.along.last().unwrap()
     }
-    /// Where each of `tabs` starts and ends along the path. Their centres
-    /// are spaced evenly, half a spacing from the start, so that none spans
-    /// the start while they fit (`lift` × `count` under the path's length).
-    fn spans(&self, tabs: &Tabs) -> Vec<(f32, f32)> {
-        let spacing = self.length() / tabs.count as f32;
-        (0..tabs.count)
-            .map(|i| {
-                let centre = (i as f32 + 0.5) * spacing;
-                (centre - tabs.lift / 2., centre + tabs.lift / 2.)
-            })
-            .collect()
+    /// How much the path turns at each of its points, radians, as a running
+    /// sum along it: `turned[i]` is the turning at points 1..=i.
+    fn turned(&self) -> Vec<f32> {
+        let p = self.points;
+        let mut sum = vec![0f32; p.len()];
+        for i in 1..p.len().saturating_sub(1) {
+            let (a, b) = (
+                [p[i][0] - p[i - 1][0], p[i][1] - p[i - 1][1]],
+                [p[i + 1][0] - p[i][0], p[i + 1][1] - p[i][1]],
+            );
+            let turn = (a[0] * b[1] - a[1] * b[0]).atan2(a[0] * b[0] + a[1] * b[1]);
+            sum[i] = sum[i - 1] + turn.abs();
+        }
+        if let Some(last) = sum.len().checked_sub(1).filter(|&l| l > 0) {
+            sum[last] = sum[last - 1];
+        }
+        sum
+    }
+    /// Where each of `tabs` starts and ends along the path, placed
+    /// automatically: each on a stretch of the path that turns by at most
+    /// `TAB_TURN` over the tab and `TAB_MARGIN` either side of it (a
+    /// straight side, or an arc of a large enough radius; never a corner, a
+    /// short segment between corners or a tight arc), as near as such
+    /// stretches allow to centres spaced evenly half a spacing from the
+    /// start, `TAB_GAP` apart at least, none spanning the start. Refused
+    /// when fewer fit than asked.
+    fn spans(&self, tabs: &Tabs) -> Result<Vec<(f32, f32)>, String> {
+        let length = self.length();
+        let half = tabs.lift / 2. + TAB_MARGIN;
+        let turned = self.turned();
+        // The turning strictly inside the stretch `from`..`to`.
+        let turning = |from: f32, to: f32| {
+            let i = self.along.partition_point(|&a| a <= from);
+            let j = self.along.partition_point(|&a| a < to);
+            if j <= i {
+                0.
+            } else {
+                turned[j - 1] - if i == 0 { 0. } else { turned[i - 1] }
+            }
+        };
+        let steps = ((length - 2. * half) / TAB_STEP).floor().max(-1.) as i64;
+        let fits: Vec<f32> = (0..=steps)
+            .map(|k| half + k as f32 * TAB_STEP)
+            .filter(|&c| turning(c - half, c + half) <= TAB_TURN)
+            .collect();
+        let spacing = length / tabs.count as f32;
+        let mut centres: Vec<f32> = vec![];
+        for i in 0..tabs.count {
+            let ideal = (i as f32 + 0.5) * spacing;
+            let best = (fits.iter().copied())
+                .filter(|c| centres.iter().all(|o| (c - o).abs() >= tabs.lift + TAB_GAP))
+                .min_by(|a, b| (a - ideal).abs().total_cmp(&(b - ideal).abs()));
+            match best {
+                Some(c) => centres.push(c),
+                None => {
+                    return Err(format!(
+                        "Only {} of {} tabs {:.2} mm wide fit on the straight sides and gentle curves of a {:.2} mm outline: a tab needs {:.2} mm of it turning by {:.0}° at most, away from corners and short segments. Use fewer or narrower tabs.",
+                        centres.len(),
+                        tabs.count,
+                        tabs.width,
+                        length,
+                        2. * half,
+                        TAB_TURN.to_degrees()
+                    ));
+                }
+            }
+        }
+        centres.sort_by(f32::total_cmp);
+        Ok(centres
+            .into_iter()
+            .map(|c| (c - tabs.lift / 2., c + tabs.lift / 2.))
+            .collect())
     }
     /// The point `s` mm along the path, and the way the path runs there
     /// (a unit vector).
@@ -949,7 +1095,7 @@ impl<'a> Outline<'a> {
 /// The closed path `points` (its last point its first) at height `z`,
 /// rising straight up to the tabs' top at the start of each tab
 /// (`Outline::spans`) and dropping straight back down at its end.
-fn tabbed(points: &[[f32; 2]], z: f32, tabs: &Tabs) -> Vec<[f32; 3]> {
+fn tabbed(points: &[[f32; 2]], z: f32, tabs: &Tabs, spans: &[(f32, f32)]) -> Vec<[f32; 3]> {
     let outline = Outline::new(points);
     let along = &outline.along;
     // Along the path: each vertex (None), each tab's start (Some(true))
@@ -959,7 +1105,7 @@ fn tabbed(points: &[[f32; 2]], z: f32, tabs: &Tabs) -> Vec<[f32; 3]> {
         .enumerate()
         .map(|(i, &s)| (s, None, i))
         .collect();
-    for (start, end) in outline.spans(tabs) {
+    for &(start, end) in spans {
         events.extend([(start, Some(true), 0), (end, Some(false), 0)]);
     }
     events.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -3868,6 +4014,102 @@ pub(crate) mod tests {
         assert_eq!(narrow.rest_top, None);
         assert_eq!(narrow.levels, plan.levels);
     }
+    /// A closed path through `corners` (its last point its first), with
+    /// points every `step` mm along its sides.
+    fn path(corners: &[[f32; 2]], step: f32) -> Vec<[f32; 2]> {
+        let mut out = vec![];
+        for (i, a) in corners.iter().enumerate() {
+            let b = corners[(i + 1) % corners.len()];
+            let n = (((b[0] - a[0]).hypot(b[1] - a[1])) / step).ceil().max(1.) as usize;
+            out.extend((0..n).map(|k| {
+                let t = k as f32 / n as f32;
+                [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+            }));
+        }
+        out.push(out[0]);
+        out
+    }
+    fn circle(r: f32, n: usize) -> Vec<[f32; 2]> {
+        let mut out: Vec<[f32; 2]> = (0..n)
+            .map(|i| {
+                let a = i as f32 * std::f32::consts::TAU / n as f32;
+                [r * a.cos(), r * a.sin()]
+            })
+            .collect();
+        out.push(out[0]);
+        out
+    }
+    #[test]
+    fn tabs_go_on_straight_sides_evenly_spaced_never_on_corners_short_segments_or_tight_arcs() {
+        let tabs = |count, width: f32| Tabs {
+            count,
+            width,
+            lift: width + 4.,
+            top: 1.,
+        };
+        // A 100 × 40 rectangle, its sides split into 1 mm segments: 4 tabs
+        // 6 mm wide, each wholly on one side, clear of the corners by the
+        // margin, 1 mm apart at least, near the even spacing of 70 mm.
+        let points = path(&[[0., 0.], [100., 0.], [100., 40.], [0., 40.]], 1.);
+        let outline = Outline::new(&points);
+        let spans = outline.spans(&tabs(4, 6.)).unwrap();
+        assert_eq!(spans.len(), 4);
+        let corners = [0., 100., 140., 240., 280.];
+        for (i, &(a, b)) in spans.iter().enumerate() {
+            assert!((b - a - 10.).abs() < 1e-4);
+            assert!(
+                corners
+                    .iter()
+                    .all(|&c| a - TAB_MARGIN >= c - 1e-3 || b + TAB_MARGIN <= c + 1e-3),
+                "{a}..{b} spans a corner"
+            );
+            let even = (i as f32 + 0.5) * 70.;
+            assert!(((a + b) / 2. - even).abs() <= 6., "{i}: {a}..{b}");
+            if i > 0 {
+                assert!(a - spans[i - 1].1 >= TAB_GAP - 1e-3);
+            }
+        }
+        // A notch of 2 mm steps in the bottom side: none lands on it, though
+        // the even spacing puts the first there.
+        let notched = path(
+            &[
+                [0., 0.],
+                [30., 0.],
+                [30., 2.],
+                [32., 2.],
+                [32., 0.],
+                [34., 0.],
+                [34., 2.],
+                [36., 2.],
+                [36., 0.],
+                [100., 0.],
+                [100., 40.],
+                [0., 40.],
+            ],
+            1.,
+        );
+        let outline = Outline::new(&notched);
+        let at = |q: [f32; 2]| outline.along[notched.iter().position(|p| *p == q).unwrap()];
+        let notch = (at([30., 0.]), at([36., 0.]));
+        for (a, b) in outline.spans(&tabs(4, 6.)).unwrap() {
+            assert!(
+                b + TAB_MARGIN <= notch.0 + 1e-3 || a - TAB_MARGIN >= notch.1 - 1e-3,
+                "{a}..{b}"
+            );
+        }
+        // A Ø10 circle turns too much under any tab; a Ø400 one barely.
+        let small = circle(5., 72);
+        let error = Outline::new(&small).spans(&tabs(2, 3.)).unwrap_err();
+        assert!(
+            error.starts_with("Only 0 of 2 tabs 3.00 mm wide fit"),
+            "{error}"
+        );
+        let large = circle(200., 720);
+        assert_eq!(Outline::new(&large).spans(&tabs(6, 6.)).unwrap().len(), 6);
+        // More tabs than the sides hold are refused with how many fit.
+        let error = Outline::new(&points).spans(&tabs(30, 6.)).unwrap_err();
+        assert!(error.starts_with("Only "), "{error}");
+    }
     #[test]
     fn contour_tabs_keep_the_part_joined_to_the_stock_around_it() {
         let mesh = block();
@@ -6742,6 +6984,7 @@ pub(crate) mod tests {
             path: "examples/threaded-plate.3mf".into(),
             format: "3MF".into(),
             bytes: 1,
+            thickness: None,
         });
         for (n, t) in doc.tools.iter_mut().enumerate() {
             t.p.insert("number".into(), (n + 1).to_string());
