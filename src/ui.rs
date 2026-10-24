@@ -2037,7 +2037,7 @@ pub(crate) fn pictured_holding(
     let modelled = match get(&setup.p, "holding") {
         "Vise" | "Clamps" => true,
         "Chuck" => crate::chuck::holds(setup),
-        _ => false,
+        holding => crate::round_hold::Kind::of(holding).is_some(),
     };
     let mut jaws = if modelled {
         let held = app
@@ -3880,7 +3880,7 @@ pub(crate) fn setup_step_done(app: &App, step: &str) -> bool {
             .iter()
             .all(|k| num(&s.p, k).is_some()),
         "Holding" => {
-            matches!(get(&s.p, "holding"), "Vise" | "Clamps" | "Chuck")
+            crate::holding::library_kind(get(&s.p, "holding")).is_some()
                 && holding_lines(app).is_empty()
         }
         _ => false,
@@ -4082,6 +4082,7 @@ fn setup_zero<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
         }))
         .push(grid)
         .push(rotary_zeros(s, origin))
+        .push(bar_zeros(s, origin))
         .push(choice(
             p,
             "offset",
@@ -4119,6 +4120,39 @@ fn rotary_zeros<'a>(s: &Setup, origin: &str) -> Element<'a, Message> {
     ]
     .spacing(4);
     if let Some(words) = crate::indexed::zero_words(origin) {
+        c = c.push(muted(words));
+    }
+    c.into()
+}
+/// The Work zero step's zeros on a lying round bar's axis
+/// (`round_hold::ORIGINS`), on a machine without a rotary A axis whose
+/// setup 1 stock is such a bar, and how the chosen one is found.
+fn bar_zeros<'a>(s: &Setup, origin: &str) -> Element<'a, Message> {
+    if s.machine.has_a() || !crate::stock::round_bar(s) {
+        return column![].into();
+    }
+    let set = |v: &str| Some(Message::Edit(Target::Setup, "origin", v.into()));
+    let zeros = crate::round_hold::ORIGINS;
+    let mut c = column![
+        muted("On the bar's axis: Y0 Z0 on it, X0 at"),
+        row![
+            act_sized(
+                "Left end",
+                set(zeros[0]),
+                origin == zeros[0],
+                Some(Length::FillPortion(1))
+            ),
+            act_sized(
+                "Middle",
+                set(zeros[1]),
+                origin == zeros[1],
+                Some(Length::FillPortion(1))
+            ),
+        ]
+        .spacing(4)
+    ]
+    .spacing(4);
+    if let Some(words) = crate::round_hold::zero_words(origin) {
         c = c.push(muted(words));
     }
     c.into()
@@ -4454,14 +4488,19 @@ fn zero_note(app: &App) -> Element<'_, Message> {
     );
     let refs = crate::post::references(origin);
     let mut lines = vec![match (crate::post::touch_off_spots(origin, stock), refs) {
-        (Some(spots), _) => {
-            format!("On the stock this setup starts from ({from}): touch off {spots}.")
-        }
+        (Some(spots), _) => format!(
+            "On the stock this setup starts from ({from}): touch off {spots}.{}",
+            crate::round_hold::side_note(setup, stock)
+                .map(|note| format!(" {note}"))
+                .unwrap_or_default()
+        ),
         (None, Some(refs)) => format!(
             "Model origin is the part file's own 0,0,0. A probe finds it from the stock this setup starts from ({from}): {}. By hand, the program header locates it from the part.",
             crate::post::probe_spots(refs, stock)
         ),
-        _ => match crate::indexed::zero_words(origin) {
+        _ => match crate::indexed::zero_words(origin)
+            .or_else(|| crate::round_hold::zero_words(origin))
+        {
             Some(words) => format!("On the stock this setup starts from ({from}): {words}"),
             None => "Choose a work zero.".into(),
         },
@@ -4505,6 +4544,34 @@ fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> 
             t,
         ));
         let round = crate::stock::is_round(s);
+        // A 3-axis "Round bar" stands along Z or lies along X (LIO-249).
+        if get(p, "stock_type") == "Round bar" && !s.machine.has_a() {
+            let axes: Vec<Named> = (crate::stock::AXES.iter())
+                .map(|(id, name)| Named {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                })
+                .collect();
+            let chosen = axes[usize::from(crate::stock::lying(s))].clone();
+            c = c.push(help::field(
+                column![
+                    muted("The bar"),
+                    pick_list(axes, Some(chosen), |a| Message::Edit(
+                        Target::Setup,
+                        "stock_axis",
+                        a.id
+                    ))
+                    .width(Fill)
+                    .padding([7, 9])
+                    .text_size(13)
+                    .style(choice_style)
+                ]
+                .spacing(5),
+                "stock_axis",
+                "The bar",
+                t,
+            ));
+        }
         if crate::stock::round_bar(s) {
             c = c.push(
                 row![
@@ -4515,9 +4582,11 @@ fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> 
                 ]
                 .spacing(10),
             );
-            c = c.push(muted(
-                "A bar along X, centred on the part's X and Y, standing on Z0. Hold it in the chuck (Workholding).",
-            ));
+            c = c.push(muted(if s.machine.has_a() {
+                "A bar along X, centred on the part's X and Y, standing on Z0. Hold it in the chuck (Workholding)."
+            } else {
+                "A bar lying along X, centred on the part's X and Y, standing on Z0. Hold it in a V-block or soft jaws bored along X (Workholding)."
+            }));
         } else if get(p, "stock_type") == "Relative round bar" {
             c = c.push(muted("Extra material round the part · mm"));
             c = c.push(field(p, "stock_radial", "Radial · mm", t));
@@ -4903,16 +4972,24 @@ pub(crate) fn picked_row(picked: &[crate::pocket::Hole], h: &crate::cam::Hole) -
     })
 }
 /// The workholding a setup can model: a lathe setup a chuck, a machine with
-/// a rotary A axis a vise, clamps or the chuck on A, any other a vise or
-/// clamps.
+/// a rotary A axis a vise, clamps or the chuck on A, any other a vise,
+/// clamps, or a round bar's V-block, soft jaws or collet block.
 pub(crate) fn holding_choices(machine: &crate::model::Machine) -> &'static [&'static str] {
     if crate::lathe::is_lathe(machine) {
         &["None", "Chuck"]
     } else if machine.has_a() {
-        // The chuck on the rotary A axis (`chuck`).
-        &crate::holding::CHOICES
+        // The chuck on the rotary A axis (`chuck`), which holds its round bar.
+        &crate::holding::CHOICES[..4]
     } else {
-        &["None", "Vise", "Clamps"]
+        // A round part's V-block, soft jaws or collet block (`round_hold`).
+        &[
+            "None",
+            "Vise",
+            "Clamps",
+            crate::round_hold::V_BLOCK,
+            crate::round_hold::SOFT_JAWS,
+            crate::round_hold::COLLET_BLOCK,
+        ]
     }
 }
 /// The setup editor's controls for the modelled workholding, above the
@@ -4931,7 +5008,7 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
         } else if app.doc.setup().machine.has_a() {
             "The vise or clamps that hold the stock, from the workholding library, or the chuck on the machine's rotary A axis."
         } else {
-            "The vise or clamps that hold the stock, from the workholding library."
+            "The vise or clamps that hold the stock, or the V-block, soft jaws or collet block that hold a round bar, from the workholding library."
         })
         .into(),
         choice_value(
@@ -5039,6 +5116,9 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
                 .into(),
             );
         }
+        holding if crate::round_hold::Kind::of(holding).is_some() => {
+            round_controls(app, &mut c, holding)
+        }
         "Clamps" => {
             c.push(holder_picker(app, "Clamp"));
             let (typed, error) = app.clamps_field();
@@ -5078,7 +5158,8 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
         if !library_chuck {
             c.push(field(p, "holding_gap", HOLDING_GAP_LABEL, t));
         }
-        if holding != "Chuck" || library_chuck {
+        let round = crate::round_hold::Kind::of(holding).is_some();
+        if (holding != "Chuck" || library_chuck) && !round {
             c.push(
                 secondary(
                     if library_chuck {
@@ -5220,6 +5301,67 @@ pub(crate) fn fitting_holders<'a>(app: &'a App, kind: &str) -> Vec<&'a crate::ho
         .collect()
 }
 /// The picker of the library's vises or clamps (`kind`) for the active setup.
+/// The setup editor's controls for a round bar's V-block, soft jaws or
+/// collet block (`round_hold`): the library entry, where it sits along the
+/// bar, how deep it grips, which way soft jaws are bored and what a collet
+/// closes on.
+fn round_controls<'a>(app: &'a App, c: &mut Vec<Element<'a, Message>>, holding: &str) {
+    use crate::round_hold::{COLLET_BLOCK, Kind, SOFT_JAWS, V_BLOCK};
+    let (p, t) = (&app.doc.setup().p, Target::Setup);
+    let kind = Kind::of(holding).unwrap_or(Kind::VBlock);
+    c.push(holder_picker(
+        app,
+        match kind {
+            Kind::VBlock => V_BLOCK,
+            Kind::SoftJaws => SOFT_JAWS,
+            Kind::Collet => COLLET_BLOCK,
+        },
+    ));
+    let mut fields = row![].spacing(10);
+    if kind != Kind::Collet {
+        fields = fields.push(
+            container(field(p, "round_offset", "Offset along the bar · mm", t))
+                .width(Length::FillPortion(1)),
+        );
+    }
+    match kind {
+        Kind::VBlock => {}
+        Kind::SoftJaws => {
+            fields = fields.push(
+                container(field(p, "round_grip", "Jaw top above bar bottom · mm", t))
+                    .width(Length::FillPortion(1)),
+            )
+        }
+        Kind::Collet => {
+            fields = fields
+                .push(
+                    container(field(p, "round_grip", "Depth in the collet · mm", t))
+                        .width(Length::FillPortion(1)),
+                )
+                .push(
+                    container(field(
+                        p,
+                        "collet_diameter",
+                        "Grips Ø · mm (empty: the bar)",
+                        t,
+                    ))
+                    .width(Length::FillPortion(1)),
+                )
+        }
+    }
+    c.push(fields.into());
+    if kind == Kind::SoftJaws {
+        c.push(choice(p, "jaw_bore", "Bored along", &["X", "Z"], t));
+    }
+    c.push(
+        muted(match kind {
+            Kind::VBlock => "The bar lies along X in the V, the clamp's strap over it at the V-block's middle. The block, its flanks and the clamp are kept clear with the gap; the V's two line contacts and the clamp hold it against the cut.",
+            Kind::SoftJaws => "Jaws bored to the bar's diameter close round it: along X round a lying bar, up Z round a standing one. The jaws are kept clear with the gap; their arc contact holds it against the cut.",
+            Kind::Collet => "The bar stands in an ER collet in a block stood in the vise. The nut and the block are kept clear with the gap; the collet's grip holds it against the cut.",
+        })
+        .into(),
+    );
+}
 fn holder_picker<'a>(app: &'a App, kind: &'static str) -> Element<'a, Message> {
     let choices: Vec<Named> = fitting_holders(app, kind)
         .into_iter()
@@ -5301,7 +5443,7 @@ fn holding_on(
     let modelled = match get(&setup.p, "holding") {
         "Vise" | "Clamps" => true,
         "Chuck" => crate::chuck::holds(setup),
-        _ => false,
+        holding => crate::round_hold::Kind::of(holding).is_some(),
     };
     let mut boxes = if modelled {
         let jaws = app.doc.holding_boxes(&posed, held);
@@ -8522,6 +8664,9 @@ fn holder_word(h: &crate::holding::Holder) -> &'static str {
         "Vise" => "vise",
         "Clamp" => "clamp",
         "Chuck" => "chuck",
+        "V-block" => "V-block",
+        "Soft jaws" => "soft jaws",
+        "Collet block" => "collet block",
         _ => "entry",
     }
 }
@@ -8855,6 +9000,30 @@ const CLAMP_FIELDS: [(&str, &str); 5] = [
     ("bite", "Bite onto the stock · mm"),
     ("force", "Clamping force · N"),
 ];
+const V_BLOCK_FIELDS: [(&str, &str); 8] = [
+    ("angle", "V angle · °"),
+    ("v_width", "V width at the top · mm"),
+    ("width", "Block width · mm"),
+    ("height", "Block height · mm"),
+    ("length", "Block length along the bar · mm"),
+    ("clamp_width", "Clamp strap width · mm"),
+    ("clamp_height", "Clamp strap thickness · mm"),
+    ("force", "Clamping force · N"),
+];
+const SOFT_JAW_FIELDS: [(&str, &str); 6] = [
+    ("bore", "Bored to · Ø mm"),
+    ("jaw_width", "Jaw width · mm"),
+    ("jaw_height", "Jaw height · mm"),
+    ("jaw_thickness", "Jaw thickness · mm"),
+    ("max_opening", "Maximum opening · mm"),
+    ("force", "Clamping force · N"),
+];
+const COLLET_BLOCK_FIELDS: [(&str, &str); 4] = [
+    ("er", "ER size (11, 16, 20, 25, 32, 40)"),
+    ("block", "Block width · mm"),
+    ("height", "Block height · mm"),
+    ("force", "Grip force · N (empty: the size's)"),
+];
 /// A library entry's key sizes, for the list.
 fn holder_summary(h: &crate::holding::Holder) -> String {
     let n = |key| get(&h.p, key);
@@ -8877,6 +9046,14 @@ fn holder_summary(h: &crate::holding::Holder) -> String {
             n("min_grip"),
             n("max_grip")
         ),
+        "V-block" => format!(
+            "V-block · {}° V {} wide · {} long",
+            n("angle"),
+            n("v_width"),
+            n("length")
+        ),
+        "Soft jaws" => format!("Soft jaws · bored Ø{} · {} wide", n("bore"), n("jaw_width")),
+        "Collet block" => format!("Collet block · ER{} · {} mm block", n("er"), n("block")),
         other => other.to_string(),
     }
 }
@@ -8888,6 +9065,13 @@ pub(crate) fn workholding(app: &App) -> Element<'_, Message> {
             secondary("+ New vise", Message::NewHolder("Vise")),
             secondary("+ New clamp", Message::NewHolder("Clamp")),
             secondary("+ New chuck", Message::NewHolder("Chuck"))
+        ]
+        .spacing(8),
+        // A round part's holdings (`round_hold`).
+        row![
+            secondary("+ New V-block", Message::NewHolder("V-block")),
+            secondary("+ New soft jaws", Message::NewHolder("Soft jaws")),
+            secondary("+ New collet block", Message::NewHolder("Collet block"))
         ]
         .spacing(8)
     ]
@@ -8909,6 +9093,9 @@ pub(crate) fn workholding(app: &App) -> Element<'_, Message> {
         "Vise" => ("Vise definition", &VISE_FIELDS),
         "Clamp" => ("Clamp definition", &CLAMP_FIELDS),
         "Chuck" => ("Chuck definition", &CHUCK_FIELDS),
+        "V-block" => ("V-block definition", &V_BLOCK_FIELDS),
+        "Soft jaws" => ("Soft jaws definition", &SOFT_JAW_FIELDS),
+        "Collet block" => ("Collet block definition", &COLLET_BLOCK_FIELDS),
         _ => ("Workholding definition", &[]),
     };
     let mut form = column![bold(title, 21), field(p, "name", "Name", t)].spacing(14);
@@ -8941,7 +9128,7 @@ pub(crate) fn workholding(app: &App) -> Element<'_, Message> {
         column![
             page_header(
                 "Workholding",
-                "Vises, toe clamps and lathe chucks your setups can model. The starter entries have typical sizes: measure yours."
+                "Vises, toe clamps, lathe chucks, and the V-blocks, soft jaws and collet blocks that hold round parts, your setups can model. The starter entries have typical sizes: measure yours."
             ),
             row![
                 container(scrollable(list))

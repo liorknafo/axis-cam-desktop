@@ -1377,7 +1377,7 @@ impl Viewport<'_> {
                         );
                         prism_solid([&a, &b], prism.smooth, cut.as_ref(), project)
                     }
-                    crate::holding::Shape::Box => {
+                    crate::holding::Shape::Box | crate::holding::Shape::Whole => {
                         box_solid(hold.bounds.scaled(scale), cut.as_ref(), project)
                     }
                 };

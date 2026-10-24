@@ -117,7 +117,8 @@ pub fn orientation_at(base: &Setup, turn: f32) -> Option<&'static str> {
 pub struct LibraryEntry {
     /// Counts from 1 over `library`.
     pub number: usize,
-    /// "Vise" or "Clamp", as the library names its kinds.
+    /// "Vise", "Clamp", or for a round bar "V-block", "Soft jaws" or
+    /// "Collet block", as the library names its kinds.
     pub kind: &'static str,
     /// A vise: `jaw_width`, `jaw_height`, `jaw_thickness`, `max_opening`,
     /// `grip`. A clamp: `length`, `width`, `height`, `bite`. In mm, sorted by
@@ -131,7 +132,9 @@ pub struct LibraryEntry {
 pub fn library(doc: &Document) -> Vec<&crate::holding::Holder> {
     doc.workholding
         .iter()
-        .filter(|h| matches!(h.kind(), "Vise" | "Clamp"))
+        .filter(|h| {
+            matches!(h.kind(), "Vise" | "Clamp") || crate::round_hold::KINDS.contains(&h.kind())
+        })
         .collect()
 }
 /// The number, counted as `library` is, of the entry that holds `setup1`: None
@@ -154,11 +157,7 @@ fn library_report(doc: &Document) -> Vec<LibraryEntry> {
         .enumerate()
         .map(|(n, holder)| LibraryEntry {
             number: n + 1,
-            kind: if holder.kind() == "Vise" {
-                "Vise"
-            } else {
-                "Clamp"
-            },
+            kind: crate::holding::library_kind(holder.kind()).unwrap_or("Clamp"),
             sizes: holder
                 .keys()
                 .iter()
@@ -171,7 +170,8 @@ fn library_report(doc: &Document) -> Vec<LibraryEntry> {
 /// and clearance gap are told: never the library entry's name or notes.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WorkholdingReport {
-    /// "Vise", "Clamps" or "Chuck".
+    /// "Vise", "Clamps" or "Chuck", or a round bar's "V-block", "Soft jaws"
+    /// or "Collet block".
     pub kind: &'static str,
     /// The `workholding_library` number of setup 1's entry, which a later
     /// setup's `holder` of null shares; absent when setup 1 has no entry.
@@ -190,6 +190,18 @@ pub struct WorkholdingReport {
     /// The chuck on the rotary A axis, for "Chuck".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chuck: Option<ChuckReport>,
+    /// The round bar a V-block, soft jaws or a collet block holds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round_bar: Option<RoundBarReport>,
+}
+/// Setup 1's round bar on a 3-axis mill (`round_hold`), mm.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RoundBarReport {
+    pub diameter: f32,
+    pub length: f32,
+    /// "X" for a bar lying along X (a V-block, soft jaws bored along X),
+    /// "Z" for one standing (soft jaws bored upright, a collet block).
+    pub along: &'static str,
 }
 /// Setup 1's chuck (`chuck::Rig`), mm.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1373,7 +1385,10 @@ fn workholding_report(
         "Clamps" => "Clamps",
         // The chuck on A; a lathe's chuck is not reported.
         "Chuck" if crate::chuck::holds(setup1) => "Chuck",
-        _ => return Ok(None),
+        holding => match crate::round_hold::Kind::of(holding) {
+            Some(kind) => kind.name(),
+            None => return Ok(None),
+        },
     };
     let resolved = crate::stock::resolve(setup1, Some(mesh))?;
     let (stock, corner) = (resolved.stock, resolved.part.map_or([0.; 3], |p| p.min));
@@ -1425,6 +1440,15 @@ fn workholding_report(
         gap: r2(gap),
         clearance_above_stock_top: (needed > 0.).then(|| up2(needed)),
         chuck,
+        round_bar: crate::round_hold::Kind::of(kind).map(|_| {
+            let lying = crate::stock::round_bar(setup1);
+            let bar = crate::round_hold::Bar::of(lying, stock);
+            RoundBarReport {
+                diameter: r2(bar.diameter()),
+                length: r2(bar.ends[1] - bar.ends[0]),
+                along: if lying { "X" } else { "Z" },
+            }
+        }),
     }))
 }
 fn describe(
@@ -1595,6 +1619,7 @@ pub(crate) mod tests {
             gap: 2.,
             clearance_above_stock_top: None,
             chuck: None,
+            round_bar: None,
         };
         let json = serde_json::to_string(&none).unwrap();
         assert!(!json.contains("number"), "{json}");

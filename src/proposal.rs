@@ -24,6 +24,21 @@ const CYCLES: [&str; 7] = crate::model::DRILL_CYCLES;
 const ENTRIES: [&str; 2] = ["Profile ramp", "Plunge"];
 /// The stock of a chuck proposal: a round bar, or the user's own box.
 const STOCKS: [&str; 2] = ["Round bar", "Box"];
+/// The work zeros a proposal may name: the stock box's and the part's
+/// (`ORIGINS`), and those on a round bar lying along X
+/// (`round_hold::ORIGINS`), which only such a bar takes.
+/// The setup's `holding` choice that takes a library entry of `kind`:
+/// "Clamps" for a "Clamp", the kind's own name otherwise.
+fn holding_of(kind: &str) -> &str {
+    if kind == "Clamp" { "Clamps" } else { kind }
+}
+fn work_zeros() -> Vec<&'static str> {
+    ORIGINS
+        .iter()
+        .chain(&crate::round_hold::ORIGINS)
+        .copied()
+        .collect()
+}
 /// The stock left beyond the part at the free end of a chuck proposal's
 /// stock when it names none, mm.
 pub const FREE_END: f32 = 2.;
@@ -240,7 +255,7 @@ pub fn schema_with(edit: bool, rotary: bool) -> Value {
     let mut setup = json!({
         "orientation": choice(&ups, false),
         "name": text(),
-        "origin": choice(&ORIGINS, false),
+        "origin": choice(&work_zeros(), false),
         "workholding": text(),
         "holder": {"type": ["integer", "null"]},
         "operations": {"type": "array", "items": operation},
@@ -1089,7 +1104,7 @@ fn setup_fields(doc: &Document, si: usize) -> (String, String, String, Option<us
     let setup = &doc.setups[si];
     let setup1 = &doc.setups[0];
     let origin = get(&setup.p, "origin");
-    let origin = if ORIGINS.contains(&origin) {
+    let origin = if work_zeros().contains(&origin) {
         origin
     } else {
         "Model origin"
@@ -1621,7 +1636,7 @@ pub fn build(
                     _ => proposed.holder != *holder,
                 })
         };
-        if si > 0 && !angled && changed(1) && !ORIGINS.contains(&proposed.origin.as_str()) {
+        if si > 0 && !angled && changed(1) && !work_zeros().contains(&proposed.origin.as_str()) {
             wrong(
                 None,
                 format!("\"{}\" is not a work zero choice.", proposed.origin),
@@ -1671,11 +1686,7 @@ pub fn build(
                     };
                 }
                 if let Some(holder) = holder {
-                    let holding = if holder.kind() == "Vise" {
-                        "Vise"
-                    } else {
-                        "Clamps"
-                    };
+                    let holding = holding_of(holder.kind());
                     setup.p.insert("holding".into(), holding.into());
                     setup.p.insert("holder".into(), holder.id.clone());
                 }
@@ -1705,11 +1716,7 @@ pub fn build(
                 }
             }
             if let Some(holder) = holder {
-                let holding = if holder.kind() == "Vise" {
-                    "Vise"
-                } else {
-                    "Clamps"
-                };
+                let holding = holding_of(holder.kind());
                 setup.p.insert("holding".into(), holding.into());
                 setup.p.insert("holder".into(), holder.id.clone());
             }
@@ -1877,6 +1884,13 @@ pub fn build(
     built.setups = setups;
     if proposal.chuck.is_some() {
         built.settle_holding(0);
+    }
+    // A later setup in a V-block, soft jaws or a collet block takes the
+    // entry's grip as the setup page fills it in.
+    for si in 1..built.setups.len() {
+        if crate::round_hold::Kind::of(get(&built.setups[si].p, "holding")).is_some() {
+            built.settle_holding(si);
+        }
     }
     built.sync_stock_sources();
     if !rotary {

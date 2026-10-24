@@ -2750,21 +2750,41 @@ impl Document {
         held: impl FnOnce() -> Option<crate::holding::Gripped>,
     ) -> Vec<String> {
         use crate::holding::{
-            DELETED, NOT_SQUARE, height_issue, layout, machine_refusal, opening_issue,
+            DELETED, Layout, NOT_SQUARE, height_issue, layout, machine_refusal, opening_issue,
             position_issue, refusal,
         };
-        let kind = match get(&s.p, "holding") {
-            "Vise" => "Vise",
-            "Clamps" => "Clamp",
-            "Chuck" => "Chuck",
-            _ => "",
-        };
+        let kind = crate::holding::library_kind(get(&s.p, "holding")).unwrap_or("");
         // A vise or clamps close on flat sides, which a round bar has not.
         let round = self.setups.first().is_some_and(crate::stock::round_bar);
         if round && matches!(kind, "Vise" | "Clamp") {
+            return vec![if s.machine.has_a() {
+                format!(
+                    "A round bar is held in the chuck: a {} is modelled on flat sides. Choose Chuck, or a box stock.",
+                    kind.to_lowercase()
+                )
+            } else {
+                format!(
+                    "A round bar lying along X is held in a V-block or in soft jaws bored along X: a {} is modelled on flat sides. Choose V-block or Soft jaws, or a box stock.",
+                    kind.to_lowercase()
+                )
+            }];
+        }
+        // A V-block, soft jaws and a collet block hold a round bar.
+        if let Some(holds) = crate::round_hold::Kind::of(kind)
+            && !self
+                .setups
+                .first()
+                .is_some_and(|first| crate::stock::is_round(first) || round)
+        {
+            use crate::round_hold::Kind;
             return vec![format!(
-                "A round bar is held in the chuck: a {} is modelled on flat sides. Choose Chuck, or a box stock.",
-                kind.to_lowercase()
+                "A {} holds a round bar: make setup 1's stock a Round bar{}.",
+                holds.words(),
+                match holds {
+                    Kind::VBlock => ", lying along X",
+                    Kind::Collet => ", standing along Z",
+                    Kind::SoftJaws => "",
+                }
             )];
         }
         if crate::chuck::holds(s) {
@@ -2830,6 +2850,9 @@ impl Document {
                     issues.extend(opening_issue(&layout, entry, held));
                     issues.extend(position_issue(&layout, entry, held));
                     issues.extend(height_issue(&layout, held.stock));
+                    if let Layout::Round(round) = &layout {
+                        issues.extend(crate::round_hold::issues(round, entry, held.stock));
+                    }
                 }
             }
             _ => {}
@@ -2988,6 +3011,10 @@ impl Document {
             "Vise" => "Vise",
             "Clamps" => "Clamp",
             "Chuck" if !crate::chuck::holds(s) => "Chuck",
+            holding if crate::round_hold::Kind::of(holding).is_some() => {
+                self.settle_round(setup);
+                return;
+            }
             // The chuck on the machine's rotary A axis (`chuck`).
             "Chuck" => {
                 let p = &mut self.setups[setup].p;
@@ -3027,6 +3054,73 @@ impl Document {
             && get(p, key).trim().is_empty()
         {
             p.insert(key.into(), grip);
+        }
+        if get(p, "holding_gap").trim().is_empty() {
+            p.insert("holding_gap".into(), "2".into());
+        }
+    }
+    /// `settle_holding` of a setup held in a V-block, soft jaws or a
+    /// collet block: it points at a library entry of its kind (its own, else
+    /// the first), and without a grip one is filled in from setup 1's bar
+    /// (`stock_diameter`, `stock_length`): soft jaws bored along X up to
+    /// three quarters of the bar's diameter, upright ones a third of its
+    /// length or their height, and a collet two thirds of its length or half
+    /// the bar. Soft jaws are bored as setup 1's bar lies. The clearance gap
+    /// starts at 2 mm.
+    fn settle_round(&mut self, setup: usize) {
+        use crate::round_hold::Kind;
+        let s = &self.setups[setup];
+        let holding = get(&s.p, "holding").to_string();
+        let Some(kind) = Kind::of(&holding) else {
+            return;
+        };
+        let mine = self
+            .holder(get(&s.p, "holder"))
+            .filter(|h| h.kind() == holding);
+        let chosen = mine
+            .or_else(|| self.workholding.iter().find(|h| h.kind() == holding))
+            .cloned();
+        let first = self.setups.first().map(|f| {
+            (
+                num(&f.p, "stock_diameter").filter(|v| *v > 0.),
+                num(&f.p, "stock_length").filter(|v| *v > 0.),
+            )
+        });
+        let lying = match get(&s.p, "jaw_bore") {
+            "X" => true,
+            "Z" => false,
+            _ => self.setups.first().is_some_and(crate::stock::round_bar),
+        };
+        let grip = match (kind, first, &chosen) {
+            (Kind::SoftJaws, Some((Some(d), _)), _) if lying => Some(0.75 * d),
+            (Kind::SoftJaws, Some((_, Some(l))), Some(h)) => {
+                Some((l / 3.).min(num(&h.p, "jaw_height").unwrap_or(l / 3.)))
+            }
+            (Kind::Collet, Some((_, Some(l))), Some(h)) => {
+                let collet = crate::round_hold::ER
+                    .iter()
+                    .find(|row| Some(row.0 as f32) == num(&h.p, "er"))
+                    .map_or(l / 2., |row| row.3 * crate::round_hold::FULL_GRIP);
+                Some(collet.min(l / 2.))
+            }
+            _ => None,
+        };
+        let p = &mut self.setups[setup].p;
+        p.insert(
+            "holder".into(),
+            chosen.map(|h| h.id.clone()).unwrap_or_default(),
+        );
+        // Soft jaws are bored as setup 1's bar lies, unless told.
+        if kind == Kind::SoftJaws && get(p, "jaw_bore").trim().is_empty() {
+            p.insert("jaw_bore".into(), if lying { "X" } else { "Z" }.into());
+        }
+        if let Some(grip) = grip.filter(|_| kind != Kind::VBlock)
+            && get(p, "round_grip").trim().is_empty()
+        {
+            p.insert(
+                "round_grip".into(),
+                format!("{}", (grip * 100.).round() / 100.),
+            );
         }
         if get(p, "holding_gap").trim().is_empty() {
             p.insert("holding_gap".into(), "2".into());

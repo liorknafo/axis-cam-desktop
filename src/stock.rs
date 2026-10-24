@@ -45,13 +45,23 @@ pub fn relative(setup: &Setup) -> bool {
 /// "Round bar" (`stock_diameter` × `stock_length`) or "Relative round bar"
 /// (`stock_radial` round the part, `stock_top` and `stock_bottom` along
 /// the axis). Its bounds are the bar's box (`bar`). A "Round bar" on a
-/// machine with a rotary A axis lies along X instead (`round_bar`).
+/// machine with a rotary A axis, or one laid along X (`lying`), lies along
+/// X instead (`round_bar`).
 pub fn is_round(setup: &Setup) -> bool {
     match get(&setup.p, "stock_type") {
-        "Round bar" => !setup.machine.has_a(),
+        "Round bar" => !round_bar(setup),
         "Relative round bar" => true,
         _ => false,
     }
+}
+/// The ways a "Round bar" can lie on a machine without a rotary A axis
+/// (`stock_axis`): standing along Z, as a lathe or a collet block holds it,
+/// or lying along X, as a V-block or soft jaws bored along X hold it.
+pub const AXES: [(&str, &str); 2] = [("Z", "Standing (along Z)"), ("X", "Lying (along X)")];
+/// Whether a 3-axis setup's "Round bar" lies along X (`stock_axis` "X"),
+/// as a V-block holds it (LIO-249).
+pub fn lying(setup: &Setup) -> bool {
+    get(&setup.p, "stock_axis") == "X"
 }
 fn relative_round(setup: &Setup) -> bool {
     get(&setup.p, "stock_type") == "Relative round bar"
@@ -81,13 +91,14 @@ pub fn part_radius(setup: &Setup, mesh: &Mesh) -> f32 {
         })
         .fold(0., f32::max)
 }
-/// Whether the setup's stock is a round bar along X, on a machine with a
-/// rotary A axis about X (`Machine::has_a`), to hold in the chuck on A: a
+/// Whether the setup's stock is a round bar along X: on a machine with a
+/// rotary A axis about X (`Machine::has_a`), to hold in the chuck on A, or
+/// on any other laid along X (`lying`), to hold in a V-block or soft jaws: a
 /// cylinder of `stock_diameter` and `stock_length`, centred on X and Y and
 /// standing on Z0 like a fixed box, the box round it being the stock's box
 /// everywhere. Elsewhere a "Round bar" stands along Z (`is_round`).
 pub fn round_bar(setup: &Setup) -> bool {
-    get(&setup.p, "stock_type") == "Round bar" && setup.machine.has_a()
+    get(&setup.p, "stock_type") == "Round bar" && (setup.machine.has_a() || lying(setup))
 }
 /// The round bar a first setup's `stock` box holds, in its frame: its axis
 /// (Y, Z) and radius. None for a box.

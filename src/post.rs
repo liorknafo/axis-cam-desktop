@@ -225,6 +225,9 @@ pub fn datum(setup: &Setup, stock: Bounds, mesh: &Mesh) -> Result<[f32; 3], Stri
     if let Some(zero) = crate::indexed::rotary_datum(setup, origin, stock, axis) {
         return zero;
     }
+    if let Some(zero) = crate::round_hold::datum(setup, origin, stock) {
+        return zero;
+    }
     if let Some((xy, top)) = stock_zero(origin) {
         let z = if top { stock.max[2] } else { stock.min[2] };
         return Ok([along(stock, 0, xy[0]), along(stock, 1, xy[1]), z]);
@@ -798,7 +801,9 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
     let model = origin == "Model origin";
     // An indexed setup's work zero is its clamping's, touched off there: the
     // stock A has turned no longer has the faces it was found on.
-    let kept = indexed && crate::indexed::zero_words(origin).is_none();
+    let words =
+        crate::indexed::zero_words(origin).or_else(|| crate::round_hold::zero_words(origin));
+    let kept = indexed && words.is_none();
     if later {
         w.note(&format!(
             "Work zero: {origin} in {offset}. X0 Y0 are unchanged from program 1."
@@ -808,7 +813,7 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
             "Work zero: ",
             &format!("{origin} in {offset}, as the setup this one indexes from set it. Do not touch it off again: A has turned the stock."),
         );
-    } else if let Some(words) = crate::indexed::zero_words(origin) {
+    } else if let Some(words) = words {
         w.wrapped("Work zero: ", &format!("{origin} in {offset}. {words}"));
     } else if let Some(spots) = touch_off_spots(origin, h.stock) {
         // Front-left's sentence runs on over a second line.
@@ -816,6 +821,9 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
             "Work zero: ",
             &format!("{origin} in {offset}. Touch off {spots}."),
         );
+        if let Some(sides) = crate::round_hold::side_note(h.setup, h.stock) {
+            w.wrapped("Round bar: ", &sides);
+        }
     } else {
         w.note(&format!("Work zero: {origin} in {offset}."));
     }
@@ -948,7 +956,14 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         w.note(MACHINE_HOME);
         w.note(SOFT_LIMITS);
     } else if h.holding.is_some() {
-        w.note("Not checked: parallels, bolts, the table, the machine body and tool-change motion. Vise jaws and clamps were checked as boxes with a clearance gap.");
+        use crate::round_hold::Kind;
+        let checked = match Kind::of(get(&h.setup.p, "holding")) {
+            Some(Kind::VBlock) => "The V-block, its flanks and its clamp were",
+            Some(Kind::SoftJaws) => "The soft jaws round their bore were",
+            Some(Kind::Collet) => "The collet nut and block were",
+            None => "Vise jaws and clamps were",
+        };
+        w.note(&format!("Not checked: parallels, bolts, the table, the machine body and tool-change motion. {checked} checked as boxes with a clearance gap."));
         w.note(MACHINE_HOME);
         w.note(SOFT_LIMITS);
     } else {
