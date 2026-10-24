@@ -1117,16 +1117,19 @@ fn same_centre(a: &Hole, b: &Hole) -> bool {
     (a.center[0] - b.center[0]).hypot(a.center[1] - b.center[1]) <= 0.05
 }
 /// The hole a Pocket's wall click picks (`pocket::Hole`) read as a drill
-/// reads a rim's opening. Its walls' middle is found from their top edge in
-/// the part (the corners of its wall triangles at their highest). Then, of
-/// the part's flat faces facing up from that height (`rims`: each height,
-/// lowest first, with its loops, by `rim_loops`), the first with a loop
-/// round that middle is its rim, as a selected rim face is (over a
-/// countersink, the face round its top): that loop at that height, when it
-/// is round. Else that top edge, at its height. None unless the loop read
-/// is round. (The pocket's own outline is cut from a section and offset, a
-/// few hundredths inside the part's edge, and not round where a lip is over
-/// it.)
+/// reads a rim's opening. Its walls' middle is their outline's centre of
+/// area, seen from above, and their top edge the corners of its wall
+/// triangles at their highest. Then, of the part's flat faces facing up
+/// from that height (`rims`: each height, lowest first, with its loops, by
+/// `rim_loops`), the first with a loop round that middle is its rim, as a
+/// selected rim face is (over a countersink, the face round its top): that
+/// loop at that height, when it is round. Else that top edge, at its
+/// height. None unless the loop read is round. (The pocket's own outline is
+/// cut from a section and offset, a few hundredths inside the part's edge,
+/// and not round where a lip is over it: it finds the middle, not the
+/// opening. The top edge's corners are no middle either where that edge is
+/// a few hundredths of a millimetre off level, a recess's under a screw
+/// hole with only a corner or two at its highest.)
 fn drill_hole(
     g: &Geometry,
     hole: &crate::pocket::Hole,
@@ -1147,14 +1150,7 @@ fn drill_hole(
             ring.push(q);
         }
     }
-    if ring.len() < 8 {
-        return None;
-    }
-    let n = ring.len() as f64;
-    let middle = (
-        ring.iter().map(|q| q.0).sum::<f64>() / n,
-        ring.iter().map(|q| q.1).sum::<f64>() / n,
-    );
+    let middle = centre_of_area(&hole.outline)?;
     ring.sort_by(|a, b| {
         let angle = |q: &(f64, f64)| (q.1 - middle.1).atan2(q.0 - middle.0);
         angle(a).total_cmp(&angle(b))
@@ -1177,7 +1173,25 @@ fn drill_hole(
             _ => break,
         }
     }
-    found.or_else(|| round_hole(g, &ring, top))
+    if found.is_none() && ring.len() >= 8 {
+        found = round_hole(g, &ring, top);
+    }
+    found
+}
+/// The centre of area of `region` seen from above, its holes taken out;
+/// None when it has no area.
+fn centre_of_area(region: &Region) -> Option<(f64, f64)> {
+    let (mut twice, mut x, mut y) = (0., 0., 0.);
+    let loops: Vec<Polygon> = region.clone().into();
+    for p in &loops {
+        for (a, b) in p.iter().zip(p.iter().cycle().skip(1)) {
+            let cross = a.0 * b.1 - b.0 * a.1;
+            twice += cross;
+            x += (a.0 + b.0) * cross;
+            y += (a.1 + b.1) * cross;
+        }
+    }
+    (twice.abs() > 1e-9).then(|| (x / (3. * twice), y / (3. * twice)))
 }
 /// The heights of the part's flat faces facing up, lowest first, each with
 /// its loops (`rim_loops`): where a hole's rim is looked for.
@@ -5235,6 +5249,70 @@ pub(crate) mod tests {
         let plan = generate(&setup, &op, &tool, &mesh).unwrap();
         assert_eq!(plan.levels, 4);
         assert_plan(plan);
+    }
+    #[test]
+    fn a_screw_hole_over_a_recess_whose_edge_is_off_level_reads_as_a_level_one() {
+        // A Ø24 x 10 disc with a Ø2 screw hole from its top through to a
+        // Ø4.3 recess 8 mm up from its bottom, as the TOTEM case's bottom
+        // has. Picked by any of its walls, the recess's included (the walls
+        // the view outlines it by there), a Drill drills it as its top face
+        // reads it, as it does where one corner of the recess's top edge is
+        // two hundredths of a millimetre high: that STEP's edge goes up and
+        // down by three.
+        let section = [
+            (1., 10.),
+            (1., 8.),
+            (2.15, 8.),
+            (2.15, 0.),
+            (12., 0.),
+            (12., 10.),
+            (1., 10.),
+        ];
+        let level = mesh::normalize(revolved(&section)).unwrap();
+        let (setup, mut op, _) = fixture(Strategy::Drill);
+        select_top(&mut op, &level);
+        let by_rim = holes(&setup, &op, &level).unwrap();
+        assert_eq!(by_rim.len(), 1, "{by_rim:?}");
+        let rim = &by_rim[0];
+        assert!(rim.through && (rim.opening - 2.).abs() < 0.01, "{rim:?}");
+        let off_level: Vec<[[f32; 3]; 3]> = (revolved(&section).iter())
+            .map(|t| {
+                t.map(|p| {
+                    if p == [2.15, 0., 8.] {
+                        [2.15, 0., 8.02]
+                    } else {
+                        p
+                    }
+                })
+            })
+            .collect();
+        for mesh in [level, mesh::normalize(off_level).unwrap()] {
+            let mut picked: Vec<Vec<usize>> = (0..mesh.surfaces.len())
+                .filter(|&id| crate::pocket::is_wall(&setup, &mesh, id))
+                .filter_map(|id| crate::pocket::hole_walls(&setup, &mesh, id).ok())
+                .collect();
+            picked.sort();
+            picked.dedup();
+            // The bore's walls and the recess's.
+            assert!(picked.len() >= 2, "{picked:?}");
+            for walls in picked {
+                let mut by_walls = op.clone();
+                by_walls.surfaces.as_mut().unwrap().ids = walls.clone();
+                let drilled =
+                    holes(&setup, &by_walls, &mesh).unwrap_or_else(|e| panic!("{walls:?}: {e}"));
+                assert_eq!(drilled.len(), 1, "{drilled:?}");
+                let h = &drilled[0];
+                assert!(same_centre(h, rim), "{h:?} {rim:?}");
+                for (a, b) in [
+                    (h.diameter, rim.diameter),
+                    (h.opening, rim.opening),
+                    (h.top, rim.top),
+                    (h.bottom, rim.bottom),
+                ] {
+                    assert!((a - b).abs() < 0.01, "{h:?} {rim:?}");
+                }
+            }
+        }
     }
     #[test]
     fn a_hole_picked_by_its_wall_reads_as_its_rim_face_reads_it_counterbored_or_not() {
