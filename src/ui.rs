@@ -511,12 +511,12 @@ pub(crate) fn op_checks(app: &App) -> Vec<Check> {
     if let Some(o) = app.operation()
         && matches!(o.strategy, Strategy::Pocket | Strategy::Contour)
         && let Some(mesh) = &app.imported_mesh
-        && let Some((diameter, fits)) = app.pocket_fits(o, mesh).as_ref()
+        && let Some((diameter, fits, cleared)) = app.pocket_fits(o, mesh).as_ref()
         && let Ok(holes) = app.pocket_holes(o, mesh).as_ref()
     {
-        for (h, fits) in holes.iter().zip(fits) {
+        for ((h, fits), cleared) in holes.iter().zip(fits).zip(cleared) {
             checks.extend(
-                h.uncut(*diameter, fits)
+                h.uncut(*diameter, fits, *cleared)
                     .into_iter()
                     .map(|text| Check::new(text, false)),
             );
@@ -2872,14 +2872,20 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                                         .collect::<Vec<_>>()
                                         .join(", ");
                                     // What the cutter cannot get into.
-                                    if let Some((diameter, fits)) =
+                                    if let Some((diameter, fits, cleared)) =
                                         app.pocket_fits(o, mesh).as_ref()
                                     {
                                         let fits = &fits[i];
                                         if fits.iter().all(|f| !f) {
-                                            depth += &format!(
-                                                " · too narrow for Ø{diameter}: left uncut"
-                                            );
+                                            depth += &match cleared[i] {
+                                                Some(c) => format!(
+                                                    " · too narrow for Ø{diameter}: cleared to {} only",
+                                                    c.short()
+                                                ),
+                                                None => format!(
+                                                    " · too narrow for Ø{diameter}: left uncut"
+                                                ),
+                                            };
                                         } else if fits.iter().any(|f| !f) {
                                             depth += &format!(" · part too narrow for Ø{diameter}");
                                         }
@@ -3021,7 +3027,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     }
                     c = c.push(note(match o.strategy {
                         Strategy::Adaptive => "Adaptive clearing works on the same geometry as Pocket: the selected recessed flat floors, with the walls and islands of the part. Vertical access only; overhanging geometry is rejected. The path keeps the cutter's side load near the optimal load, so it can take a deep stepdown. It inherits the stock left by all earlier enabled operations and setups.".to_string(),
-                        Strategy::Pocket => "Pocket uses offset contours of the selected floor triangles, including islands, and of each picked hole's outline. Supports open, vertical-wall pockets with a flat floor; overhanging geometry is rejected. A picked hole is cut down to the highest of the part under it, or through the part with the breakthrough. Simulation inherits the stock left by all earlier enabled operations and setups.".to_string(),
+                        Strategy::Pocket => "Pocket uses offset contours of the selected floor triangles, including islands, and of each picked hole's outline. Supports open, vertical-wall pockets with a flat floor; overhanging geometry is rejected. A picked hole is cut down to the highest of the part under it, or through the part with the breakthrough; one too narrow for the cutter has only the stock over it cleared, down to its rim. Simulation inherits the stock left by all earlier enabled operations and setups.".to_string(),
                         Strategy::Contour => "Inside contour offsets only the walls and islands of this floor, or the wall of each picked hole. It does not clear the interior. The floor must be flat and accessible along setup Z; overhangs are rejected.".to_string(),
                         Strategy::Drill => "Hole detection uses tessellated circular openings and vertical rays. Noncircular openings and obstructions are excluded. Confirm the detected centers and depths before previewing.".to_string(),
                         Strategy::Parallel => "Parallel finishing cuts only where the cutter touches a picked face. The rest of the part still holds the cutter up, so it never cuts into a face it was not given; where a picked face meets one that is not, the cutter stops at the corner between them, which keeps its radius.".to_string(),
