@@ -203,6 +203,16 @@ pub fn generate(
     tool: &Tool,
     mesh: &Mesh,
 ) -> Result<Plan, String> {
+    let plan = generate_plan(setup, operation, tool, mesh)?;
+    // On a sheet every cut stops within the spoilboard's allowance.
+    crate::sheet::floor_issue(setup, &plan).map_or(Ok(plan), Err)
+}
+fn generate_plan(
+    setup: &Setup,
+    operation: &Operation,
+    tool: &Tool,
+    mesh: &Mesh,
+) -> Result<Plan, String> {
     // Turning and a lathe's centre drilling are planned in their own frame.
     if operation.strategy == Strategy::Turn || operation.on_centre(&setup.machine) {
         return crate::turn::generate(setup, operation, tool, mesh);

@@ -20,16 +20,23 @@ pub const ROUND_OFFSETS: [(&str, &str); 3] = [
     ("stock_top", "Top (+Z)"),
 ];
 /// The stock modes of the first setup: a round bar along Z, or round the
-/// part, on most machines (`is_round`)…
-pub const MODES: [&str; 4] = [
+/// part, on most machines (`is_round`), or a sheet on a spoilboard
+/// (`sheet`)…
+pub const MODES: [&str; 5] = [
     "Relative size box",
     "Fixed size box",
     "Round bar",
     "Relative round bar",
+    crate::sheet::SHEET,
 ];
 /// …and a round bar along X on a machine with a rotary A axis about X
 /// (`round_bar`), to hold in the chuck on A.
-pub const ROTARY_MODES: [&str; 3] = ["Relative size box", "Fixed size box", "Round bar"];
+pub const ROTARY_MODES: [&str; 4] = [
+    "Relative size box",
+    "Fixed size box",
+    "Round bar",
+    crate::sheet::SHEET,
+];
 /// The stock modes `setup`'s machine offers.
 pub fn modes(setup: &Setup) -> &'static [&'static str] {
     if setup.machine.has_a() {
@@ -52,6 +59,11 @@ pub fn is_round(setup: &Setup) -> bool {
         "Relative round bar" => true,
         _ => false,
     }
+}
+/// How far below the stock's bottom a cut may go in `setup`: into a
+/// sheet's spoilboard (`sheet::below`), else nowhere.
+pub fn below(setup: &Setup) -> f32 {
+    crate::sheet::below(setup)
 }
 fn relative_round(setup: &Setup) -> bool {
     get(&setup.p, "stock_type") == "Relative round bar"
@@ -144,6 +156,8 @@ pub fn parameter_issues(setup: &Setup) -> Vec<String> {
                 format!("{label} stock offset must be a finite number of 0 mm or more.")
             })
             .collect()
+    } else if crate::sheet::is_sheet(setup) {
+        crate::sheet::parameter_issues(setup)
     } else if get(&setup.p, "stock_type") == "Fixed size box" {
         ["stock_x", "stock_y", "stock_z"]
             .iter()
@@ -256,6 +270,9 @@ pub fn resolve(setup: &Setup, mesh: Option<&Mesh>) -> Result<ResolvedStock, Stri
             min: [-d / 2., -d / 2., 0.],
             max: [d / 2., d / 2., l],
         }
+    } else if crate::sheet::is_sheet(setup) {
+        let part = part.ok_or("Load the part to place it on the sheet.")?;
+        crate::sheet::bounds(setup, part)?
     } else if relative(setup) {
         let part = part.ok_or("Load the part to calculate relative stock dimensions.")?;
         let mut stock = part;
@@ -311,6 +328,13 @@ pub fn sheet_description(setup: &Setup, mesh: Option<&Mesh>) -> String {
             text += &format!("- {label}: {} mm\n", get(&setup.p, key));
         }
         text += "\n";
+    }
+    if crate::sheet::is_sheet(setup) {
+        text += &format!(
+            "Sheet on a spoilboard: cuts go at most {} mm into the board. Hold-down: {}.\n\n",
+            crate::sheet::below(setup),
+            crate::sheet::holddown(setup)
+        );
     }
     if round_bar(setup) {
         text += &format!(

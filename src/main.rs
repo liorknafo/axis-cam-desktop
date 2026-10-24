@@ -5,6 +5,7 @@ mod choice_diagram;
 mod choice_help;
 mod chuck;
 mod control;
+mod dxf;
 mod facing;
 #[cfg(test)]
 mod fake_openai;
@@ -42,6 +43,7 @@ mod section;
 mod session;
 mod settings;
 mod setup;
+mod sheet;
 mod simulation;
 mod smoke;
 mod step;
@@ -1946,18 +1948,38 @@ impl App {
         self.touch();
         self.status = "Setup created without operations. Set stock, origin and workholding, then add an operation.".into();
     }
+    /// Setup 1's DXF thickness field: the text is kept as typed, and a
+    /// positive number becomes the part's thickness (`ModelFile::thickness`),
+    /// which reloads the part extruded to it.
+    fn set_dxf_thickness(&mut self, text: String) -> Task<Message> {
+        let value = text.trim().parse::<f32>().ok();
+        if let Some(first) = self.doc.setups.first_mut() {
+            first.p.insert(sheet::DXF_THICKNESS_KEY.into(), text);
+        }
+        self.touch();
+        let Some(file) = self.doc.file.as_mut().filter(|f| f.format == "dxf") else {
+            return Task::none();
+        };
+        match value.filter(|v| v.is_finite() && *v > 0. && *v <= sheet::MAX_DXF_THICKNESS) {
+            Some(t) if file.thickness != Some(t) => {
+                file.thickness = Some(t);
+                self.restore_model()
+            }
+            _ => Task::none(),
+        }
+    }
     fn restore_model(&mut self) -> Task<Message> {
         self.imported_mesh = None;
         self.import_error = None;
         let Some(file) = &self.doc.file else {
             return Task::none();
         };
-        let path = file.path.clone();
+        let file = file.clone();
         self.import_busy = true;
         self.status = format!("Loading {}…", file.name);
         Task::perform(
             async move {
-                tokio::task::spawn_blocking(move || mesh::load(&path))
+                tokio::task::spawn_blocking(move || mesh::load_file(&file))
                     .await
                     .unwrap_or_else(|e| Err(format!("Import worker failed: {e}")))
             },
@@ -4450,6 +4472,9 @@ impl App {
                     }
                     self.touch()
                 }
+                Target::Setup if k == sheet::DXF_THICKNESS_KEY => {
+                    return self.set_dxf_thickness(v);
+                }
                 Target::Setup => {
                     // A pick_list repeats the chosen item, which may be the
                     // default it shows for an empty value: not a change.
@@ -6066,7 +6091,10 @@ impl App {
                     async {
                         let file = rfd::AsyncFileDialog::new()
                             .set_title("Import CAD or mesh")
-                            .add_filter("CAD and mesh", &["step", "stp", "3mf", "stl", "obj"])
+                            .add_filter(
+                                "CAD and mesh",
+                                &["step", "stp", "3mf", "stl", "obj", "dxf"],
+                            )
                             .pick_file()
                             .await?;
                         let p = file.path();
@@ -6084,6 +6112,9 @@ impl App {
                             path: p.to_path_buf(),
                             format: ext.clone(),
                             bytes: meta.len(),
+                            // A DXF is a flat profile, extruded to this until
+                            // its thickness is set.
+                            thickness: (ext == "dxf").then_some(mesh::DXF_THICKNESS),
                         };
                         let path = p.to_path_buf();
                         let mesh =
@@ -6117,6 +6148,22 @@ impl App {
                     "{} geometry loaded. Facing and Pocket can select planar surfaces, Parallel finishing any face, curved ones included, and generate bounded previews.",
                     f.format.to_uppercase()
                 );
+                // A flat profile: its thickness is set on setup 1's Stock
+                // step, and a sheet is what it is cut from.
+                if let Some(t) = f.thickness {
+                    let profile = std::fs::read_to_string(&f.path)
+                        .ok()
+                        .and_then(|text| dxf::parse(&text).ok())
+                        .map_or(String::new(), |p| format!(" {}", p.describe()));
+                    self.status = format!(
+                        "DXF flat profile loaded, {t} mm thick.{profile} Set its thickness and the sheet under Stock in setup 1."
+                    );
+                    if let Some(first) = self.doc.setups.first_mut() {
+                        first
+                            .p
+                            .insert(sheet::DXF_THICKNESS_KEY.into(), t.to_string());
+                    }
+                }
                 self.doc.sample_model = false;
                 self.doc.file = Some(f);
                 for setup in &mut self.doc.setups {
@@ -7430,7 +7477,7 @@ fn planning_project(project: &str) -> Result<(Document, mesh::Mesh), String> {
         .file
         .clone()
         .ok_or("The project has no imported part.")?;
-    let mesh = mesh::load(std::path::Path::new(&file.path))?;
+    let mesh = mesh::load_file(&file)?;
     if let Some(unmet) = analysis::preconditions(&doc, Some(&mesh))
         .into_iter()
         .find(|p| !p.ok)
@@ -7457,15 +7504,26 @@ fn proposal_schema(args: &[String]) -> Result<String, String> {
 /// Checks a proposal file against a saved project with every planner check.
 /// Returns the JSON report, a one-line summary and whether the plan passed;
 /// `Err` when the check could not run.
+/// With a third path, a passing plan's job is saved there as a project, which
+/// `--export-gcode` takes.
 fn check_plan(args: &[String]) -> Result<(String, String, bool), String> {
-    let [project, proposal] = args else {
-        return Err("Usage: axis-cam --check-plan <project.json> <proposal.json>".into());
+    let (project, proposal, job_path) = match args {
+        [project, proposal] => (project, proposal, None),
+        [project, proposal, job] => (project, proposal, Some(job)),
+        _ => {
+            return Err(
+                "Usage: axis-cam --check-plan <project.json> <proposal.json> [<job.json>]".into(),
+            );
+        }
     };
     let (doc, mesh) = planning_project(project)?;
     let report = analysis::report(&doc, &mesh)?;
     let text = std::fs::read_to_string(proposal).map_err(|e| format!("{proposal}: {e}"))?;
     let proposal = proposal::parse(&text)?;
-    let (check, _) = plan_check::check(&doc, &mesh, &report, &proposal);
+    let (check, job) = plan_check::check(&doc, &mesh, &report, &proposal);
+    if let (Some(path), Some(job)) = (job_path, job) {
+        storage::save(std::path::Path::new(path), &job)?;
+    }
     let json = serde_json::to_string_pretty(&check).map_err(|e| e.to_string())?;
     let summary = if check.passed {
         let split = check
@@ -7514,7 +7572,7 @@ fn export_document(mut doc: Document, folder: &str) -> Result<String, String> {
         .file
         .clone()
         .ok_or("The project has no imported part.")?;
-    let mesh = mesh::load(std::path::Path::new(&file.path))?;
+    let mesh = mesh::load_file(&file)?;
     let job = post::post_job(&doc, &mesh);
     for e in &job.errors {
         eprintln!("! {e}");

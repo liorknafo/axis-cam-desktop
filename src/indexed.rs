@@ -2437,6 +2437,7 @@ pub(crate) mod tests {
             path: "bar.stl".into(),
             format: "STL".into(),
             bytes: 1,
+            thickness: None,
         });
         let posted = crate::post::post_job(&doc, &mesh);
         // `post_job` writes a program only once its replay matches the
@@ -2524,6 +2525,7 @@ pub(crate) mod tests {
             path: "bar.stl".into(),
             format: "STL".into(),
             bytes: 1,
+            thickness: None,
         });
         (doc, mesh)
     }

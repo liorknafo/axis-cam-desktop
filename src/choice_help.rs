@@ -244,6 +244,10 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "Follow the model's outer projected silhouette. Offset the center outward by cutter radius and radial allowance, then cut in depth layers. Full-depth reach must fit the saved tool.",
             "",
         ),
+        ("side", "Holes") => (
+            "Follow the inside of every hole through the part's outline seen from above: a flat part's cut-outs and round holes, offset into each by the cutter radius and radial allowance, cut in depth layers down to the bottom offset. The holes narrower than Smallest hole, and those the tool does not fit, are left; the slugs come free.",
+            "",
+        ),
         ("side", "On center") => (
             "Record a path centered on the selected chain. This option belongs to the illustrative sample workflow; imported contour generation supports Inside and Outside only.",
             "",
@@ -286,6 +290,22 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
         ),
         ("stock_type", "Round bar") => (
             "A round bar of the entered diameter and length along the setup Z axis, centred on X 0 Y 0, from Z 0 up; lathe cuts turn it. On a machine with a rotary A axis it lies along X, centred in X/Y on Z=0, for the chuck on A. The simulation cuts the bar; checks use its box.",
+            "",
+        ),
+        ("stock_type", "Sheet") => (
+            "A flat sheet of Sheet X × Sheet Y, centred on X 0 Y 0, lying on a spoilboard at the part's bottom and as thick as the part unless Sheet thickness says more. A cut through it may go on into the spoilboard by the allowance, never deeper.",
+            "Hold it down under Workholding with screws through its waste, whose heads every move keeps clear of, or with tape.",
+        ),
+        ("holddown", "None") => (
+            "Nothing chosen: a sheet must be held down, so its setup reports it until Screws or Tape is chosen.",
+            "",
+        ),
+        ("holddown", "Screws") => (
+            "Screws through the sheet's waste into the spoilboard, outside the part's outline. Their heads are checked like clamps: every move keeps clear of them by the gap. They hold only the waste, so an outside contour that cuts through must leave tabs.",
+            "",
+        ),
+        ("holddown", "Tape") => (
+            "Double-sided tape under the sheet holds the part and the waste: nothing stands in the cutter's way, and the part stays put when it is cut free, so tabs are optional.",
             "",
         ),
         ("stock_type", "Relative round bar") => (

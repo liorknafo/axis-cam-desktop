@@ -1019,7 +1019,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "",
         ),
         Import => (
-            "Open STEP/STP, 3MF, STL or OBJ geometry for viewing. STEP and 3MF units are converted to mm. Import runs in the background; machining feature recognition is a future step.",
+            "Open STEP/STP, 3MF, STL or OBJ geometry, or a DXF flat profile, for viewing. STEP, 3MF and DXF units are converted to mm. Import runs in the background; machining feature recognition is a future step.",
             "",
         ),
         OpenHistory => (
@@ -2247,7 +2247,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Offsets),
         ),
         (_, "tab_count") => (
-            "How many tabs an outside Contour leaves on each outline it goes around, spaced evenly along it, the first half a spacing from where the cut starts. Two or three hold a small part; use more on a long or thin one, so it cannot bend into the cutter.",
+            "How many tabs an outside Contour leaves on each outline it goes around, placed automatically: as near to evenly spaced as the outline allows, each on a straight side or a gentle curve, never on a corner, a short segment or a tight arc. Two or three hold a small part; use more on a long or thin one, so it cannot bend into the cutter.",
             "",
             Some(Operation(Strategy::Contour)),
         ),
@@ -2260,6 +2260,41 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "How thick each tab is, in mm: over the tabs the cut stops this far above the stock's bottom, or above the contour's bottom where that is higher. It must be less than the depth the contour cuts.",
             "A tab holds only where stock is left beyond the cut, so leave more stock beside the part than the stock to leave, the tool's diameter and a 2 mm wall. Levels above the tabs' top go round in full. Below it the tool rises straight up at each tab's start and plunges back down at its end at a quarter of the cutting feed, as it does entering the cut. Cut or file the tabs off after the part is unclamped.",
             Some(Operation(Strategy::Contour)),
+        ),
+        (_, "hole_min") => (
+            "The narrowest hole a Holes contour cuts, in mm across its narrower side: the holes through the part's outline narrower than this are left for a Drill. Empty cuts every hole the tool fits in.",
+            "The tool follows the inside of each hole, from the stock top down to the bottom offset; the slug inside comes free, so on a sheet held by screws cut the holes before the outline.",
+            Some(Operation(Strategy::Contour)),
+        ),
+        (_, "dxf_thickness") => (
+            "The thickness of the flat part a DXF describes, in mm: its profile is extruded this thick, the outer loop the part and the inner loops holes through it. Changing it reloads the part.",
+            "",
+            None,
+        ),
+        (_, "sheet_thickness") => (
+            "The sheet's thickness, in mm. Empty takes the part's thickness. A sheet thicker than the part leaves material over it; a thinner one is refused.",
+            "",
+            None,
+        ),
+        (_, "spoilboard") => (
+            "How far a cut through the sheet may go on into the spoilboard under it, in mm (0 to 3; empty is 0.5). A Contour's bottom offset or a Drill's breakthrough may take the cut that far below the sheet, never deeper: a deeper cut is refused.",
+            "",
+            None,
+        ),
+        (_, "holddown_screws") => (
+            "Where the hold-down screws go, as X,Y in mm from the sheet's front-left (−X −Y) corner, separated by semicolons: 10,10; 240,10. Empty puts one in from each corner by the head's diameter. Each must be in the waste outside the part's outline, its head wholly on the sheet.",
+            "Every move, rapids included, is kept clear of each head by the setup's gap; one in the cutter's way is refused.",
+            None,
+        ),
+        (_, "screw_head") => (
+            "The diameter of each hold-down screw's head or washer, in mm. Empty is 12.",
+            "",
+            None,
+        ),
+        (_, "screw_height") => (
+            "How far each hold-down screw's head stands above the sheet, in mm. Empty is 5.",
+            "",
+            None,
         ),
         (_, "through") => (
             "Add Breakthrough below the bottom of each hole that goes through the part. A blind hole is refused with Yes, since the part goes on under its bottom. Check the extra depth and the material or fixture underneath.",
@@ -2663,7 +2698,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (_, "stock_type") => (
             "Relative size box adds offsets to the six sides of the part's box after setup rotation. Fixed size box uses X, Y and Z sizes. A round bar lies along setup Z on X 0 Y 0, for the lathe; on a machine with a rotary A axis it lies along X, for the chuck on A. Values are kept when switching.",
-            "",
+            "Sheet is a flat sheet of X × Y on a spoilboard, the part lying on it, held down by screws or tape.",
             Some(Stock(0)),
         ),
         (_, "stock_diameter") => (

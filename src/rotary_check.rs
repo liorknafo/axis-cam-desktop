@@ -2237,6 +2237,7 @@ mod tests {
             path: "bar.stl".into(),
             format: "STL".into(),
             bytes: 0,
+            thickness: None,
         });
         doc.sync_stock_sources();
         doc.sync_turns(Some(&mesh));
@@ -2629,6 +2630,7 @@ mod tests {
             path: "bar.stl".into(),
             format: "STL".into(),
             bytes: 0,
+            thickness: None,
         });
         let posted = crate::post::post_job(&doc, &mesh);
         let refused = posted.setups[0].result.as_ref().unwrap_err();

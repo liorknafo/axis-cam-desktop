@@ -1083,6 +1083,12 @@ pub const POCKET_OPENINGS: [&str; 2] = ["Leave", "Cut through"];
 /// across its cut, near its bottom, that keep the part joined to the stock
 /// around it when the cut goes through.
 pub const CONTOUR_TABS: [&str; 2] = ["No", "Yes"];
+/// The Contour side that cuts inside every hole through the part's outline
+/// (a flat part's cut-outs), whole model, no floor picked.
+pub const CONTOUR_HOLES: &str = "Holes";
+/// The sides a Contour cuts: round the outline, a selected floor's walls,
+/// or the holes through the outline.
+pub const CONTOUR_SIDES: [&str; 3] = ["Outside", "Inside", CONTOUR_HOLES];
 /// What a Drill makes (`holes`): the round holes of the part's surfaces it
 /// selects, or the holes a later setup drops over the fixture pins by in
 /// the stock's leftover (`pin_points`), as its Work zero step placed them.
@@ -2068,6 +2074,12 @@ impl Operation {
                 positive(&self.p, "tab_width", &mut e);
                 positive(&self.p, "tab_height", &mut e)
             }
+            if s == Strategy::Contour && get(&self.p, "side") == CONTOUR_HOLES {
+                // Empty cuts every hole the tool fits in.
+                if !get(&self.p, "hole_min").trim().is_empty() {
+                    bounded(&self.p, "hole_min", 0., 10_000., &mut e);
+                }
+            }
             if self.faces_outline()
                 && !sample
                 && !self
@@ -2300,6 +2312,11 @@ pub struct ModelFile {
     pub path: PathBuf,
     pub format: String,
     pub bytes: u64,
+    /// A DXF flat profile's thickness, mm, which the part is extruded to
+    /// (`mesh::load_file`); None for any other format, and for a DXF until
+    /// one is set (`mesh::DXF_THICKNESS`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thickness: Option<f32>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
@@ -2724,6 +2741,17 @@ impl Document {
         let Some(s) = self.setups.get(setup) else {
             return vec![];
         };
+        if crate::sheet::is_sheet(s) {
+            // A sheet's hold-down screws are checked on the stock and, with
+            // the part known, against its outline.
+            let stock = self.setup_stock(setup, mesh);
+            let mut issues = self.holding_problems(s, || stock.map(crate::holding::Gripped::whole));
+            issues.extend(crate::sheet::holddown_issues(s, stock));
+            if let (Some(stock), Some(mesh)) = (stock, mesh) {
+                issues.extend(crate::sheet::screws_on_part(s, stock, mesh));
+            }
+            return issues;
+        }
         self.holding_problems(s, || {
             self.setup_stock(setup, mesh)
                 .map(crate::holding::Gripped::whole)
@@ -2741,7 +2769,9 @@ impl Document {
         let Some(s) = self.setups.get(setup) else {
             return vec![];
         };
-        self.holding_problems(s, || held)
+        let mut issues = self.holding_problems(s, || held);
+        issues.extend(crate::sheet::holddown_issues(s, held.map(|h| h.stock)));
+        issues
     }
     /// `holding_issues` of `s`, the stock being told by `held` when needed.
     fn holding_problems(
@@ -2923,10 +2953,13 @@ impl Document {
             return Ok(self.chuck_rig(setup, held.stock)?.boxes(a));
         }
         let layout = crate::holding::layout(setup)?;
-        match self.holder(get(&setup.p, "holder")) {
-            Some(entry) => crate::holding::boxes(&layout, entry, held),
-            None => Ok(vec![]),
-        }
+        let mut boxes = match self.holder(get(&setup.p, "holder")) {
+            Some(entry) => crate::holding::boxes(&layout, entry, held)?,
+            None => vec![],
+        };
+        // A sheet's hold-down screws, which refuse as the jaws do.
+        boxes.extend(crate::sheet::holddown_boxes(setup, held.stock)?);
+        Ok(boxes)
     }
     /// `setup`'s modelled workholding in a sentence, for the setup sheet and
     /// the program header (`holding::sentence`). None without workholding and
@@ -3450,6 +3483,13 @@ impl Document {
                 )
                 .first()
                 .map(|note| format!("Workholding note: {note}\n\n")),
+                // A sheet on its spoilboard, and what holds it down.
+                (self.setup_stock(i, mesh).zip(mesh))
+                    .and_then(|(stock, mesh)| {
+                        let zero = crate::post::datum(setup, stock, mesh).ok()?;
+                        crate::sheet::sentence(setup, stock, zero)
+                    })
+                    .map(|text| format!("Sheet: {text}\n\n")),
             ]
             .into_iter()
             .flatten()
@@ -3511,8 +3551,9 @@ fn label(k: &str) -> String {
 pub const BOX_FIELDS: [&str; 6] = ["x_min", "x_max", "y_min", "y_max", "z_top", "z_bottom"];
 /// The operation editor's text fields, by key: the ones a check's message
 /// names by its `label`.
-const OPERATION_FIELDS: [&str; 56] = [
+const OPERATION_FIELDS: [&str; 57] = [
     "name",
+    "hole_min",
     "x_min",
     "x_max",
     "y_min",
@@ -3667,6 +3708,14 @@ fn the_model_path_is_read_from_a_string_and_written_as_one_when_it_is_text() {
     assert_eq!(file.path, PathBuf::from("/parts/a.stl"));
     let text = serde_json::to_value(&file).unwrap();
     assert_eq!(text["path"], "/parts/a.stl");
+    // A file saved before DXF import has no thickness, and writes none.
+    assert_eq!(file.thickness, None);
+    assert!(text.get("thickness").is_none());
+    let dxf: ModelFile = serde_json::from_str(
+        r#"{"name":"t.dxf","path":"/parts/t.dxf","format":"dxf","bytes":3,"thickness":1.5}"#,
+    )
+    .unwrap();
+    assert_eq!(dxf.thickness, Some(1.5));
 }
 #[cfg(unix)]
 #[test]
@@ -3680,6 +3729,7 @@ fn a_model_path_that_is_not_utf8_survives_a_save_and_load() {
         path: path.clone(),
         format: "stl".into(),
         bytes: 3,
+        thickness: None,
     };
     let json = serde_json::to_string(&file).unwrap();
     let back: ModelFile = serde_json::from_str(&json).unwrap();

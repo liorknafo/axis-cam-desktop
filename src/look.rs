@@ -937,6 +937,7 @@ mod tests {
                 name: "half-ball-on-plate.step".into(),
                 format: "STEP".into(),
                 bytes: 0,
+                thickness: None,
             });
             let report = crate::analysis::report(&doc, &mesh).unwrap();
             let doc = Arc::new(doc);

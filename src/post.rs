@@ -862,6 +862,9 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
     if let Some(holding) = &h.holding {
         w.wrapped("Workholding: ", holding);
     }
+    if let Some(sheet) = crate::sheet::sentence(setup, h.stock, h.datum) {
+        w.wrapped("Sheet: ", &sheet);
+    }
     if let Some(note) = &h.a_axis {
         w.wrapped("A axis: ", note);
     }
@@ -949,6 +952,10 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         w.note(SOFT_LIMITS);
     } else if h.holding.is_some() {
         w.note("Not checked: parallels, bolts, the table, the machine body and tool-change motion. Vise jaws and clamps were checked as boxes with a clearance gap.");
+        w.note(MACHINE_HOME);
+        w.note(SOFT_LIMITS);
+    } else if crate::sheet::screwed(h.setup) {
+        w.note("Not checked: the spoilboard's flatness, the table, the machine body and tool-change motion. The hold-down screw heads were checked as boxes with a clearance gap.");
         w.note(MACHINE_HOME);
         w.note(SOFT_LIMITS);
     } else {
@@ -2781,6 +2788,12 @@ fn holding_boxes(
     let mut boxes = doc
         .holding_boxes(setup, held)
         .map_err(|e| format!("{}: {e}", setup.name()))?;
+    if let Some(on_part) = crate::sheet::screws_on_part(setup, held.stock, mesh)
+        .into_iter()
+        .next()
+    {
+        return Err(format!("{}: {on_part}", setup.name()));
+    }
     boxes.extend(crate::holding::pin_boxes(
         on_pins(setup, mesh, held.stock, datum).as_ref(),
         held.stock,
@@ -3961,6 +3974,7 @@ pub(crate) mod fixture {
             path: path.clone(),
             format: "3mf".into(),
             bytes: 0,
+            thickness: None,
         });
         doc.sync_stock_sources();
         (doc, mesh)
@@ -4136,6 +4150,7 @@ pub(crate) mod fixture {
                 path,
                 format: "3mf".into(),
                 bytes: 0,
+                thickness: None,
             }),
             ..Default::default()
         };
@@ -4233,6 +4248,7 @@ pub(crate) mod fixture {
                 path,
                 format: "obj".into(),
                 bytes: 0,
+                thickness: None,
             }),
             ..Default::default()
         };
@@ -5656,6 +5672,7 @@ M2
             path: path.clone(),
             format: "obj".into(),
             bytes: 0,
+            thickness: None,
         });
         doc.sync_stock_sources();
         (doc, mesh)

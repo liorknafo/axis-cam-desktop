@@ -536,6 +536,7 @@ mod tests {
             path: path.clone(),
             format: "3mf".into(),
             bytes: std::fs::metadata(&path).unwrap().len(),
+            thickness: None,
         });
         doc.adopt_materials();
         if let Some(al) = doc
