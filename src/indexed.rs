@@ -340,21 +340,22 @@ impl Document {
     /// What the Geometry tab lists of operation `op` of setup `si` that picks
     /// holes at several angles (`holes_at_angles`): `read` of what each angle
     /// cuts (`holes_by_angle`), read in the setup posed there, one after the
-    /// other. None for another operation.
+    /// other, each with its angle. None for another operation.
     pub fn holes_listed<T>(
         &self,
         si: usize,
         op: &crate::model::Operation,
         mesh: &Mesh,
         read: impl Fn(&Setup, &crate::model::Operation) -> Result<Vec<T>, String>,
-    ) -> Option<Result<Vec<T>, String>> {
+    ) -> Option<Result<Vec<(f32, T)>, String>> {
         if !holes_at_angles(op, self.setups.get(si)?) {
             return None;
         }
         let listed = holes_by_angle(self, si, op, mesh).and_then(|(cuts, _)| {
             let mut all = vec![];
             for c in cuts.iter().filter(|c| !c.ids.is_empty()) {
-                all.extend(read(&c.posed, &with_surfaces(op, c.ids.clone()))?);
+                let read = read(&c.posed, &with_surfaces(op, c.ids.clone()))?;
+                all.extend(read.into_iter().map(|h| (c.a, h)));
             }
             Ok(all)
         });
@@ -2840,7 +2841,7 @@ pub(crate) mod tests {
     /// walls of the holes `pick` takes by their X and their angle round X
     /// (degrees from +Y towards +Z at A 0), between `inner` from the bar's
     /// axis (the holes' bottom, or the tube's bore) and the skin (20).
-    fn radial_doc(
+    pub(crate) fn radial_doc(
         file: &str,
         angles: &str,
         drill: (&str, &str),
@@ -3076,7 +3077,7 @@ pub(crate) mod tests {
             })
             .unwrap()
             .unwrap();
-        let mut xs: Vec<f32> = listed.iter().map(|h| h.center[0]).collect();
+        let mut xs: Vec<f32> = listed.iter().map(|(_, h)| h.center[0]).collect();
         xs.sort_by(f32::total_cmp);
         assert_eq!(xs.len(), 6, "{xs:?}");
         for (k, x) in xs.iter().enumerate() {

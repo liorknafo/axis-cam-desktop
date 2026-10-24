@@ -11333,6 +11333,63 @@ soft_max = 180.0
         assert_eq!(holes(&a), Ok(2));
         assert_eq!(walls(&a), Some(2));
     }
+    /// On a Drill at several A angles each row's remove drops its own hole:
+    /// the tube's six holes, read each in its angle's frame, all at the
+    /// same centre there (LIO-246, review 3).
+    #[test]
+    fn each_remove_of_a_drill_at_several_angles_drops_its_own_hole() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut doc, mesh) = crate::indexed::tests::radial_doc(
+            "radial-tube",
+            "30, 90, 150, 210, 270, 330",
+            ("3.3", "20"),
+            14.3,
+            |x, _| (x - 20.).abs() < 2.2,
+        );
+        doc.file = Some(crate::model::ModelFile {
+            name: "radial-tube.3mf".into(),
+            path: dir.path().join("radial-tube.3mf"),
+            format: "3mf".into(),
+            bytes: 0,
+        });
+        let fresh = || {
+            let mut a = fresh_app(&dir);
+            a.replace_document(doc.clone(), None);
+            a.imported_mesh = Some(mesh.clone());
+            a.page = Page::Work;
+            let _ = a.update(Message::SelectSetup(1));
+            let _ = a.update(Message::SelectOp(0));
+            a
+        };
+        let a = fresh();
+        let op = a.doc.setups[1].operations[0].clone();
+        let drilled = a.drill_holes(&op, &mesh).as_ref().clone().unwrap();
+        let picked = a.pocket_holes(&op, &mesh);
+        let picked = picked.as_ref().as_ref().unwrap();
+        assert_eq!((drilled.len(), picked.len()), (6, 6));
+        let rows: Vec<usize> = (drilled.iter())
+            .map(|h| crate::ui::picked_row(picked, h).unwrap())
+            .collect();
+        let mut distinct = rows.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 6, "{rows:?}");
+        for (h, &i) in drilled.iter().zip(&rows) {
+            let mut a = fresh();
+            let _ = a.update(Message::DropHole(i));
+            let op = a.doc.setups[1].operations[0].clone();
+            let left: Vec<Option<f32>> = (a.drill_holes(&op, &mesh).as_ref().clone().unwrap())
+                .iter()
+                .map(|h| h.a)
+                .collect();
+            assert_eq!(left.len(), 5, "{left:?}");
+            assert!(
+                !left.contains(&h.a),
+                "dropped row {i} at {:?}: {left:?}",
+                h.a
+            );
+        }
+    }
     /// "Stock after this setup" on an indexed setup with the bar in the
     /// chuck: the view shows the round bar as its four angles leave it, every
     /// angle's cuts (#288 with LIO-246).

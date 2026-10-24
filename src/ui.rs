@@ -2982,14 +2982,8 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                                     // button; a rim face's go with the face.
                                     let picked = app.pocket_holes(o, mesh);
                                     let by_walls = |h: &crate::cam::Hole| {
-                                        picked.as_ref().as_ref().ok().and_then(|p| {
-                                            p.iter().position(|w| {
-                                                let (x, y) = w.centre();
-                                                (x as f32 - h.center[0])
-                                                    .hypot(y as f32 - h.center[1])
-                                                    <= 0.1
-                                            })
-                                        })
+                                        (picked.as_ref().as_ref().ok())
+                                            .and_then(|p| picked_row(p, h))
                                     };
                                     c = c.push(muted(format!(
                                         "{} to drill",
@@ -4898,6 +4892,16 @@ pub(crate) fn speed_feed_heading(lines: &[(bool, String)]) -> &'static str {
 }
 /// The workholding a setup can model: a lathe setup a chuck, any other a
 /// vise or clamps.
+/// Which of the holes `picked` by their walls (`App::pocket_holes`) the
+/// drill's hole `h` (`App::drill_holes`) is, for its remove button: the one
+/// at its centre, and at several A angles at its angle too, as each angle
+/// reads its holes in its own frame (`Hole::a`).
+pub(crate) fn picked_row(picked: &[crate::pocket::Hole], h: &crate::cam::Hole) -> Option<usize> {
+    picked.iter().position(|w| {
+        let (x, y) = w.centre();
+        w.a == h.a && (x as f32 - h.center[0]).hypot(y as f32 - h.center[1]) <= 0.1
+    })
+}
 pub(crate) fn holding_choices(machine: &crate::model::Machine) -> &'static [&'static str] {
     if crate::lathe::is_lathe(machine) {
         &["None", "Chuck"]

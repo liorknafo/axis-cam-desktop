@@ -3078,11 +3078,7 @@ impl App {
         let setup = self.doc.setup();
         let mut hasher = std::hash::DefaultHasher::new();
         mesh.fingerprint.hash(&mut hasher);
-        for key in ["rx", "ry", "rz", "tx", "ty", "tz", indexed::ANGLES] {
-            get(&setup.p, key).hash(&mut hasher);
-        }
-        // An indexed setup's A turn, which its A angles and its base give.
-        format!("{:?}", setup.turn).hash(&mut hasher);
+        self.hash_placement(&mut hasher);
         op.surfaces
             .as_ref()
             .map(|s| (&s.mesh_fingerprint, &s.ids))
@@ -3106,6 +3102,9 @@ impl App {
             .holes_listed(self.doc.index(), op, mesh, |posed, op| {
                 cam::holes(posed, op, mesh)
             }))
+        .map(|listed| {
+            listed.map(|l| (l.into_iter().map(|(a, h)| cam::Hole { a: Some(a), ..h })).collect())
+        })
         .unwrap_or_else(|| cam::holes(setup, op, mesh));
         let found = std::sync::Arc::new(found);
         *kept = Some((key, found.clone()));
@@ -3137,6 +3136,9 @@ impl App {
                 let ids = (op.surfaces.iter()).flat_map(|s| s.ids.iter().copied());
                 pocket::holes(posed, &ids.collect(), mesh)
             }))
+        .map(|listed| {
+            listed.map(|l| (l.into_iter().map(|(a, h)| pocket::Hole { a: Some(a), ..h })).collect())
+        })
         .unwrap_or_else(|| pocket::holes(self.doc.setup(), &ids, mesh));
         let found = std::sync::Arc::new(found);
         *kept = Some((key, found.clone()));
@@ -3255,16 +3257,30 @@ impl App {
     }
     /// What the holes a Pocket's or Contour's walls pick are worked out from:
     /// the part, the setup's placement and the selected surfaces.
+    /// What the active setup's holes are read in, for the kept hole lists:
+    /// its placement; for an indexed setup all its fields and its machine's
+    /// (its A angles, its Reposition action, the A centreline and limits),
+    /// its A turn, and its base setup's fields and machine's.
+    fn hash_placement(&self, hasher: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        let si = self.doc.index();
+        let setup = self.doc.setup();
+        for key in ["rx", "ry", "rz", "tx", "ty", "tz"] {
+            get(&setup.p, key).hash(hasher);
+        }
+        if indexed::is_indexed(setup) || indexed::is_label_only(setup) {
+            (&setup.p, &setup.machine.p).hash(hasher);
+            format!("{:?}", setup.turn).hash(hasher);
+            if let Some(base) = self.doc.index_base(si).and_then(|b| self.doc.setups.get(b)) {
+                (&base.p, &base.machine.p).hash(hasher);
+            }
+        }
+    }
     fn holes_key(&self, op: &Operation, mesh: &mesh::Mesh) -> u64 {
         use std::hash::{Hash, Hasher};
-        let setup = self.doc.setup();
         let mut hasher = std::hash::DefaultHasher::new();
         mesh.fingerprint.hash(&mut hasher);
-        for key in ["rx", "ry", "rz", "tx", "ty", "tz", indexed::ANGLES] {
-            get(&setup.p, key).hash(&mut hasher);
-        }
-        // An indexed setup's A turn, which its A angles and its base give.
-        format!("{:?}", setup.turn).hash(&mut hasher);
+        self.hash_placement(&mut hasher);
         op.surfaces
             .as_ref()
             .map(|s| (&s.mesh_fingerprint, &s.ids))
@@ -4809,12 +4825,19 @@ impl App {
                         && let Some(r) = round.first().and_then(|r| r.as_ref())
                         && let Some(mesh) = self.imported_mesh.take()
                     {
+                        // At several A angles, the same hole at the angle
+                        // it was read at (`picking_pose`).
+                        let at = (self.operation())
+                            .filter(|op| indexed::holes_at_angles(op, self.doc.setup()))
+                            .and(setup.turn.map(|t| t.a));
                         let held = (self.operation())
                             .and_then(|op| self.drill_holes(op, &mesh).as_ref().clone().ok())
                             .is_some_and(|holes| {
                                 holes.iter().any(|h| {
-                                    (h.center[0] - r.center[0]).hypot(h.center[1] - r.center[1])
-                                        <= 0.05
+                                    h.a == at
+                                        && (h.center[0] - r.center[0])
+                                            .hypot(h.center[1] - r.center[1])
+                                            <= 0.05
                                 })
                             });
                         self.imported_mesh = Some(mesh);

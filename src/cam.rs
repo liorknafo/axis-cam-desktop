@@ -1000,6 +1000,10 @@ pub struct Hole {
     pub countersink: Option<Countersink>,
     /// The thread modeled in it.
     pub thread: Option<crate::thread::Thread>,
+    /// The A angle (degrees) it is read at when an operation of an indexed
+    /// setup of several angles lists it (`Document::holes_listed`): its
+    /// centre is in the setup's frame at that angle. None otherwise.
+    pub a: Option<f32>,
 }
 impl Hole {
     /// The widest drill the hole takes: its bore, which a drill may fill
@@ -1066,8 +1070,11 @@ pub fn holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, St
     };
     if !walls.is_empty() {
         let rims = rims(&g);
+        // At several A angles the hole opposite across a cavity is turned
+        // up and drilled at its own angle (`indexed::holes_by_angle`).
+        let own_wall = crate::indexed::holes_at_angles(op, setup);
         for picked in crate::pocket::holes(setup, &walls, mesh)? {
-            if let Some(h) = drill_hole(&g, &picked, &rims)
+            if let Some(h) = drill_hole(&g, &picked, &rims, own_wall)
                 && !holes.iter().any(|o| same_centre(o, &h))
             {
                 holes.push(h);
@@ -1133,6 +1140,7 @@ fn drill_hole(
     g: &Geometry,
     hole: &crate::pocket::Hole,
     rims: &[(f32, Vec<Polygon>)],
+    own_wall: bool,
 ) -> Option<Hole> {
     let corners: Vec<[f32; 3]> = (g.triangles.iter())
         .filter(|t| t.feature.is_some_and(|id| hole.walls.contains(&id)))
@@ -1180,16 +1188,19 @@ fn drill_hole(
         }
     }
     let mut found = found.or_else(|| round_hole(g, &ring, top))?;
-    // A hole that opens into a cavity under its walls (a radial hole in a
-    // tube, into its bore) is drilled through its own wall, not on across
-    // the cavity into what lies past it.
+    // With `own_wall`, in an indexed setup of several A angles, a hole that
+    // opens into a cavity under its walls (a radial hole in a tube, into its
+    // bore) is drilled through its own wall, not on across the cavity: the
+    // hole past it is turned up at an angle of its own. Elsewhere it goes on
+    // through what lies under it, as a cross-hole through both walls of a
+    // tube in a vise does.
     let bottom = corners.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min);
     let r = corners
         .iter()
         .map(|p| (p[0] - found.center[0]).hypot(p[1] - found.center[1]))
         .sum::<f32>()
         / corners.len() as f32;
-    if found.bottom < bottom - 0.05 && into_cavity(g, found.center, r, bottom) {
+    if own_wall && found.bottom < bottom - 0.05 && into_cavity(g, found.center, r, bottom) {
         (found.bottom, found.through) = (bottom, true);
     }
     Some(found)
@@ -1300,7 +1311,8 @@ pub fn largest_drill(hole: &Hole) -> f32 {
     ((hole.diameter + 2. * hole.sagitta + 0.01) * 10. + 1e-3).floor() / 10.
 }
 /// Each of `holes` (the part's holes a wall click picks) read as a drill
-/// reads it (`drill_hole`): None for one that is not round.
+/// reads it (`drill_hole`, to main's depth): None for one that is not
+/// round.
 pub fn drill_holes_of(
     setup: &Setup,
     mesh: &Mesh,
@@ -1308,7 +1320,10 @@ pub fn drill_holes_of(
 ) -> Vec<Option<Hole>> {
     let g = Geometry::with_threads(setup, mesh);
     let rims = rims(&g);
-    holes.iter().map(|h| drill_hole(&g, h, &rims)).collect()
+    holes
+        .iter()
+        .map(|h| drill_hole(&g, h, &rims, false))
+        .collect()
 }
 /// The round hole whose opening is the loop `path` at the height `top`,
 /// going down from it along Z; None when the loop is not round or nothing
@@ -1413,6 +1428,7 @@ fn round_hole(g: &Geometry, path: &Polygon, top: f32) -> Option<Hole> {
         through,
         countersink: countersink(g, center, top, radius, path.len()),
         thread,
+        a: None,
     })
 }
 /// The countersink of the opening of radius `radius` round `center` in the
@@ -5107,6 +5123,40 @@ pub(crate) mod tests {
         let plan = generate(&setup, &op, &tool, &mesh).unwrap();
         assert_eq!(plan.levels, 4);
         assert_plan(plan);
+    }
+    /// A cross-hole through both walls of a tube in a plain 3-axis setup, +Y
+    /// up: the top hole picked by its walls is drilled on through the bore
+    /// and the hole opposite, to the part's bottom, as main drills it (the
+    /// own-wall depth is for indexed setups of several angles only, where
+    /// the opposite hole gets its own angle; LIO-246, review 3).
+    #[test]
+    fn a_tubes_cross_hole_picked_by_its_walls_goes_through_both_walls_in_3_axis() {
+        let mesh = mesh::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/radial-tube.3mf"),
+        )
+        .unwrap();
+        let (setup, mut op, _) = fixture(Strategy::Drill);
+        let setup = crate::analysis::oriented(&setup, "+Y").unwrap();
+        let top = crate::pocket::part_holes(&setup, &mesh)
+            .into_iter()
+            .max_by(|a, b| a.top.total_cmp(&b.top))
+            .unwrap();
+        op.geometry.clear();
+        op.surfaces = Some(crate::surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: top.walls.clone(),
+        });
+        let g = Geometry::new(&setup, &mesh);
+        let found = holes(&setup, &op, &mesh).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        let h = &found[0];
+        assert!(h.through, "{h:?}");
+        assert!(
+            (h.bottom - g.bounds.min[2]).abs() < 0.01,
+            "{h:?} {:?}",
+            g.bounds
+        );
+        assert!(h.top - h.bottom > 39.5, "{h:?}");
     }
     #[test]
     fn a_hole_picked_by_its_wall_reads_as_its_rim_face_reads_it_counterbored_or_not() {

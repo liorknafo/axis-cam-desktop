@@ -581,6 +581,10 @@ pub struct Hole {
     pub bottom: f32,
     /// The mesh surfaces of its walls.
     pub walls: Vec<usize>,
+    /// The A angle (degrees) it is read at when an operation of an indexed
+    /// setup of several angles lists it (`Document::holes_listed`). None
+    /// otherwise.
+    pub a: Option<f32>,
 }
 /// A region of a hole (`Hole::levels`) and how deep it is cut.
 #[derive(Clone)]
@@ -1268,6 +1272,7 @@ fn hole(
         top,
         bottom,
         walls: walls.into_iter().collect(),
+        a: None,
     })
 }
 fn area_of(p: &Polygon) -> f64 {
