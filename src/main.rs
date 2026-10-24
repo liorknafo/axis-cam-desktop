@@ -11,6 +11,7 @@ mod fake_openai;
 mod field_art;
 mod forces;
 mod gpu_mesh;
+mod groove;
 mod guide;
 mod help;
 mod holding;
@@ -1284,10 +1285,13 @@ pub struct FoundHoles {
     pub round: Vec<Option<cam::Hole>>,
 }
 /// Whether a click on a wall of the part picks its whole hole in `op`: a
-/// Pocket, a Contour, and a Drill of the part's holes (not of the pins').
+/// Pocket, a Contour, a Drill of the part's holes (not of the pins'), and
+/// an Internal groove's bore (a boss's wall it picks as a face).
 pub(crate) fn picks_holes(op: &Operation) -> bool {
-    matches!(op.strategy, Strategy::Pocket | Strategy::Contour)
-        || (op.strategy == Strategy::Drill && !op.drills_pin_holes())
+    matches!(
+        op.strategy,
+        Strategy::Pocket | Strategy::Contour | Strategy::Groove
+    ) || (op.strategy == Strategy::Drill && !op.drills_pin_holes())
 }
 /// Whether a click on the part picks the whole smooth face it lands on in
 /// `op` (`mesh::Mesh::region_of`), a curved one included: Parallel and
@@ -1644,6 +1648,7 @@ impl App {
             include_bytes!("../assets/op-10.svg"),
             include_bytes!("../assets/op-11.svg"),
             include_bytes!("../assets/op-12.svg"),
+            include_bytes!("../assets/op-13.svg"),
         ]
         .iter()
         .map(|b| iced::widget::svg::Handle::from_memory(b.to_vec()))
@@ -4711,6 +4716,13 @@ impl App {
                 let up = mesh::rotation(mesh.surfaces[n].normal, angles)[2].abs();
                 let wall = pocket::is_wall(&setup, mesh, n);
                 let sloped = !wall && up < 0.5f32.to_radians().cos();
+                // An Internal groove takes a boss's wall, no hole's, as a face.
+                let picks_holes = picks_holes
+                    && !(self
+                        .operation()
+                        .is_some_and(|o| o.strategy == Strategy::Groove)
+                        && wall
+                        && pocket::hole_walls(&setup, mesh, n).is_err());
                 if picks_holes && (wall || sloped) {
                     // What a click here picks: the wall's hole, or the hole
                     // past a sloping face (a cone, a chamfer, a fillet) or past

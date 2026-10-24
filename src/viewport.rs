@@ -1656,6 +1656,14 @@ impl Viewport<'_> {
             let shoulder = (neck_top + (shank - neck).abs() * 1.7).min(length);
             parts.push((neck, shank, neck_top, shoulder, body));
             parts.push((shank, shank, shoulder, length, body));
+        } else if let Some([neck, reach, shank]) = sim.plan.neck {
+            // A keyseat cutter (`groove`): its head, as tall as its flutes,
+            // under a thin neck up to its reach, then the shank.
+            let head = sim.plan.flute_length;
+            let neck_top = reach.clamp(head, length);
+            parts.push((r, r, 0., head, cutter));
+            parts.push((neck, neck, head, neck_top, body));
+            parts.push((shank, shank, neck_top, length, body));
         } else {
             let bottom = if sim.plan.shape == crate::simulation::CutterShape::Ball {
                 r

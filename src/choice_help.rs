@@ -496,6 +496,22 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "A single-tooth cutter on a neck that mills a thread inside a drilled hole, on a CNC. It cuts any pitch in its range, so one covers many sizes. The hole must be drilled first, and the mill must fit down it.",
             "Its thread angle must match the thread's, and its Reach (neck) is how deep it can thread.",
         ),
+        ("type", "Keyseat cutter") => (
+            "A thin disc head on a narrower neck that cuts sideways: an internal groove below the mouth of a bore, like a circlip groove, by circular interpolation on a CNC. Its flutes are its head, as tall as its width.",
+            "The head must fit down the bore with 0.2 mm clear a side, its neck must clear the bore while it cuts, and its reach is how far down the bore it can cut.",
+        ),
+        ("groove_from", "Land from the top of the bore") => (
+            "The groove's near edge is the land below the top of the bore: the face this setup has up.",
+            "",
+        ),
+        ("groove_from", "Land from the bottom of the bore") => (
+            "The groove's near edge is the land above the bottom of the bore: the far face, cut from this one when the cutter reaches that deep.",
+            "",
+        ),
+        ("groove_from", "Depth below the stock top") => (
+            "The groove's top edge is this deep below the stock top.",
+            "",
+        ),
         ("type", "Tap") => (
             "A tool that cuts an internal thread of one size, turned by hand into a drilled hole on the manual mill or the lathe. The CNC cannot tap: use a thread mill. The hole must be drilled first.",
             "",

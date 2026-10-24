@@ -2027,18 +2027,23 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(LatheTool(3)),
         ),
         (Target::Tool, "reach") => (
-            "How far the tool can reach into the work, in mm: a boring bar's depth into the bore, a grooving tool's or parting blade's deepest plunge, a thread mill's neck.",
+            "How far the tool can reach into the work, in mm: a boring bar's depth into the bore, a grooving tool's or parting blade's deepest plunge, a thread mill's neck, a keyseat cutter's neck from the head's bottom to the shank.",
             "A thread mill's neck is thinner than its cutter so it can go down a drilled hole. The thread cannot be deeper than the neck reaches.",
             Some(LatheTool(4)),
         ),
         (Target::Tool, "width") => (
-            "The width of the grooving tool's or parting blade's cutting edge, in mm. A groove is at least this wide.",
+            "The width of the grooving tool's or parting blade's cutting edge, or of a keyseat cutter's head, in mm. A groove is at least this wide; a wider one takes more passes.",
             "",
             Some(LatheTool(5)),
         ),
         (Target::Tool, "shank") => (
-            "The diameter of the thread mill's shank, the part the collet holds, in mm.",
+            "The diameter of the thread mill's or keyseat cutter's shank, the part the collet holds, in mm.",
             "Often wider than the cutter: a Ø4.8 mill on a Ø6 shank. Choose a collet of this size.",
+            Some(Tool),
+        ),
+        (Target::Tool, "neck") => (
+            "The diameter of the keyseat cutter's neck, between its head and its shank, in mm.",
+            "The head cuts as deep past the bore's wall as it is wider than the neck: the neck must stay 0.2 mm clear of the wall while the head circles the groove.",
             Some(Tool),
         ),
         (Target::Tool, "teeth") => (
@@ -2331,6 +2336,21 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "",
             Some(Operation(Strategy::Drill)),
         ),
+        (_, "groove_diameter") => (
+            "The groove's diameter, in mm: wider than the bore for an internal groove (Ø33.7 for a DIN 472-32 circlip in a Ø32 bore), smaller than the boss for one round it.",
+            "The keyseat head's edge reaches it: the head's centre circles this radius less (or, round a boss, plus) the head's.",
+            None,
+        ),
+        (_, "groove_width") => (
+            "The groove's width along the bore, in mm. A groove wider than the head takes the fewest passes that cover it, evenly spread; a head wider than the groove is refused.",
+            "",
+            None,
+        ),
+        (_, "groove_land") => (
+            "How far the groove is from where it is measured, in mm: the land between the bore's end and the groove's near edge, or the depth of the groove's top edge below the stock top.",
+            "A circlip's land takes its load: keep the bore's entry chamfer smaller than it.",
+            None,
+        ),
         (_, "thread_depth") => (
             "How deep the full thread runs from the hole's rim, in mm. Blank takes the depth the model has.",
             "",
@@ -2342,7 +2362,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Operation(Strategy::Drill)),
         ),
         (_, "spring_pass") => (
-            "Yes goes round the thread once more at full depth. The mill springs back from the wall as it cuts, so the last pass takes the spring out and trues the size.",
+            "Yes goes round the thread (or the groove) once more at full depth. The cutter springs back from the wall as it cuts, so the last pass takes the spring out and trues the size.",
             "",
             Some(Operation(Strategy::Drill)),
         ),
