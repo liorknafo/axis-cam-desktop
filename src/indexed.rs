@@ -1940,13 +1940,22 @@ pub(crate) mod tests {
         let filled = |q: [f32; 3]| volume.filled(base.map(q), base);
         assert!(!filled([0., 11.5, c]), "over the +Y face");
         assert!(filled([0., -11.5, c]), "over the -Y face");
-        // At A-90 the +Y face is underneath: facing it is refused.
-        let doc = bar_job(&mesh, 0., "80", "-150", "-90", op);
-        let refused = prepare(&doc, &mesh, 1, 0).unwrap_err();
-        assert!(
-            refused.starts_with("At A -90°: Facing preview supports the highest plane"),
-            "{refused}"
-        );
+        // At A-90 the +Y face is underneath: as main faces a selected
+        // surface that faces down, the Facing faces the part's top there
+        // (#290), and the editor warns that it does (`facing_faces_down`, A's
+        // turn included).
+        assert!(!crate::simulation::facing_faces_down(
+            &doc.setups[1],
+            &op,
+            &mesh
+        ));
+        let doc = bar_job(&mesh, 0., "80", "-150", "-90", op.clone());
+        assert!(crate::simulation::facing_faces_down(
+            &doc.setups[1],
+            &op,
+            &mesh
+        ));
+        assert!(prepare(&doc, &mesh, 1, 0).is_ok());
     }
 
     #[test]

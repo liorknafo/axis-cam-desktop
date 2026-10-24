@@ -228,7 +228,8 @@ pub fn facing_raise(setup: &Setup, operation: &Operation, mesh: &Mesh) -> Option
 /// Whether a Face operation's selected surface faces down in its setup,
 /// away from the spindle.
 pub fn facing_faces_down(setup: &Setup, operation: &Operation, mesh: &Mesh) -> bool {
-    let angles = ["rx", "ry", "rz"].map(|k| num(&setup.p, k).unwrap_or(0.));
+    // By A too for an indexed setup posed at an angle (`indexed`).
+    let angles = stock::Placement::new(mesh, Some(setup)).rotation();
     (operation.surfaces.as_ref())
         .and_then(|s| s.ids.first())
         .and_then(|&id| mesh.surfaces.get(id))
