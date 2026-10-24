@@ -50,6 +50,7 @@ mod surface;
 mod thread;
 mod threading;
 mod three_mf;
+mod tooth_load;
 mod turn;
 mod ui;
 mod uncut;
@@ -362,6 +363,9 @@ pub enum Message {
     /// The simulation replayed to where the slider was let go: the epoch
     /// of that catch-up and the simulation.
     Replayed(u64, Replayed),
+    /// The load on each tooth along the path of the simulation of this id
+    /// (`App::measure_tooth_load`).
+    ToothLoaded(String, Option<std::sync::Arc<tooth_load::ToothLoad>>),
     /// The part's holes worked out off the window's thread for picking by
     /// their outline (`App::refresh_part_holes`), with their key.
     PartHoles(u64, PartHoles),
@@ -1030,6 +1034,9 @@ pub struct App {
     /// Generate where it is asked, not on a thread of its own: in the
     /// headless smoke run and the unit tests, as their other work is.
     pub(crate) generate_inline: bool,
+    /// The load on each tooth being worked out off the window's thread for
+    /// the simulation of this id, and its Cancel (`App::measure_tooth_load`).
+    pub(crate) tooth_load_job: Option<(String, std::sync::Arc<progress::Progress>)>,
     /// The browser's pictures of stock, each drawn once for what it shows
     /// (`ui::stock_picture`).
     pub(crate) stock_pictures: std::cell::RefCell<Vec<(u64, iced::widget::image::Handle)>>,
@@ -1693,6 +1700,7 @@ impl App {
             generating: None,
             generation_epoch: 0,
             generate_inline,
+            tooth_load_job: None,
             stock_pictures: Default::default(),
             post_epoch: 0,
             picture_job: None,
@@ -2223,6 +2231,9 @@ impl App {
         if let Some(g) = self.generating.take() {
             g.progress.cancel();
         }
+        if let Some((_, job)) = self.tooth_load_job.take() {
+            job.cancel();
+        }
         self.generation_epoch += 1;
         let epoch = self.generation_epoch;
         let progress = std::sync::Arc::new(progress::Progress::default());
@@ -2283,6 +2294,36 @@ impl App {
                 }
                 Err(_) => Message::ReplayFailed(epoch),
             },
+        )
+    }
+    /// Works out the load on each tooth along the simulation's path
+    /// (`tooth_load::of`) off the window's thread, on a copy, after its
+    /// preview is shown: the path takes its colours when it is done
+    /// (`Message::ToothLoaded`). One for an earlier simulation is cancelled.
+    /// Inline in the smoke run and tests.
+    fn measure_tooth_load(&mut self) -> Task<Message> {
+        if let Some((_, job)) = self.tooth_load_job.take() {
+            job.cancel();
+        }
+        let Some(simulation) = &mut self.simulation else {
+            return Task::none();
+        };
+        if self.generate_inline {
+            simulation.tooth_load = tooth_load::of(simulation, &self.doc).map(std::sync::Arc::new);
+            return Task::none();
+        }
+        let progress = std::sync::Arc::new(progress::Progress::default());
+        let id = simulation.id.clone();
+        self.tooth_load_job = Some((id.clone(), progress.clone()));
+        let (copy, doc) = (simulation.clone(), self.doc.clone());
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    progress.run(|| tooth_load::of(&copy, &doc).map(std::sync::Arc::new))
+                })
+                .await
+            },
+            move |load| Message::ToothLoaded(id.clone(), load.ok().flatten()),
         )
     }
     /// Stops the generation under way, if any: what it makes is dropped.
@@ -5003,6 +5044,7 @@ impl App {
                             self.playing = true;
                             self.last_tick = Instant::now();
                         }
+                        return self.measure_tooth_load();
                     }
                     Err(error) => self.status = error,
                 }
@@ -6251,6 +6293,19 @@ impl App {
                 }
                 self.part_holes = Some((key, found.0));
             }
+            Message::ToothLoaded(id, load) => {
+                // Only into the simulation it was worked out for, still there.
+                if self
+                    .tooth_load_job
+                    .as_ref()
+                    .is_some_and(|(job, _)| *job == id)
+                {
+                    self.tooth_load_job = None;
+                }
+                if let Some(simulation) = self.simulation.as_mut().filter(|s| s.id == id) {
+                    simulation.tooth_load = load;
+                }
+            }
             Message::Replayed(epoch, replayed) => {
                 let Some((_, at, play)) = self.catching_up.take_if(|c| c.0 == epoch) else {
                     return Task::none();
@@ -6262,9 +6317,15 @@ impl App {
                     .is_some_and(|s| s.id == replayed.0.id)
                     && self.progress == at
                 {
-                    self.simulation = Some(
-                        std::sync::Arc::try_unwrap(replayed.0).unwrap_or_else(|s| (*s).clone()),
-                    );
+                    let mut replayed =
+                        std::sync::Arc::try_unwrap(replayed.0).unwrap_or_else(|s| (*s).clone());
+                    // The load on each tooth may have come while it replayed.
+                    if let Some(current) = &self.simulation
+                        && replayed.tooth_load.is_none()
+                    {
+                        replayed.tooth_load = current.tooth_load.clone();
+                    }
+                    self.simulation = Some(replayed);
                     if play {
                         self.playing = true;
                         self.last_tick = Instant::now();
