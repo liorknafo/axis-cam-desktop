@@ -536,6 +536,24 @@ pub(crate) fn op_checks(app: &App) -> Vec<Check> {
             false,
         ));
     }
+    // A face below the part's top would cut through its higher features.
+    if let Some(o) = app.operation()
+        && o.strategy == Strategy::Face
+        && let Some(mesh) = &app.imported_mesh
+    {
+        let setup = app.doc.setup();
+        if crate::simulation::facing_faces_down(setup, o, mesh) {
+            checks.push(Check::new(
+                "The selected surface faces down, away from the spindle: Facing faces the part's top instead. Select the top surface, or the surface to face in a setup that turns it up.".into(),
+                false,
+            ));
+        } else if let Some(raise) = crate::simulation::facing_raise(setup, o, mesh) {
+            checks.push(Check::new(
+                format!("Facing stops at the part's top, {raise:.2} mm above the selected surface plus bottom offset: going lower would cut the part's higher features. Below that, mill the selected surface with a Pocket or Adaptive clearing."),
+                false,
+            ));
+        }
+    }
     checks
 }
 /// The drilling cycles a Drill operation offers on `machine`: a drill of the
@@ -5365,7 +5383,8 @@ pub(crate) fn mark_help(
 }
 /// What the checks before a run refuse of operation `i`'s setup, in the Run
 /// panel's words: the operation's own workholding lines first, then the
-/// setup's, then the other problems, none twice.
+/// setup's, then the other problems, none twice. Holding not checked for a
+/// problem listed too names its operation, last, instead of repeating it.
 fn refusal_lines(r: &crate::run::Ready, i: usize) -> Vec<String> {
     let own = r.held.iter().filter(|h| h.operation == Some(i));
     let setup_wide = r.held.iter().filter(|h| h.operation.is_none());
@@ -5375,7 +5394,52 @@ fn refusal_lines(r: &crate::run::Ready, i: usize) -> Vec<String> {
             lines.push(problem.clone());
         }
     }
+    let listed = lines.clone();
+    let repeated = |line: &String| {
+        listed
+            .iter()
+            .find(|other| *line == crate::post::not_checked(std::slice::from_ref(*other)))
+    };
+    if let Some(at) = lines.iter().position(|line| repeated(line).is_some()) {
+        let problem = repeated(&lines[at]).unwrap();
+        let what = match problem.split_once(": ") {
+            Some((op, _)) => format!("the {op} problem"),
+            None => "that problem".into(),
+        };
+        lines.remove(at);
+        lines.push(format!("Holding not checked until {what} is fixed."));
+    }
     lines
+}
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+    #[test]
+    fn holding_not_checked_does_not_repeat_the_problem_it_is_for() {
+        let problem = "Facing: Enter a positive tool diameter.";
+        let ready = |held: &str| crate::run::Ready {
+            key: 0,
+            setup: 0,
+            generated: vec![],
+            held: vec![crate::post::Held {
+                operation: None,
+                message: held.into(),
+            }],
+            problems: vec![problem.into()],
+            zero: None,
+        };
+        let r = ready(&crate::post::not_checked(&[problem.into()]));
+        assert_eq!(
+            refusal_lines(&r, 0),
+            [
+                problem,
+                "Holding not checked until the Facing problem is fixed."
+            ]
+        );
+        // Holding not checked for another reason is kept as it is.
+        let other = "Holding not checked: Drill: Select holes first.";
+        assert_eq!(refusal_lines(&ready(other), 0), [other, problem]);
+    }
 }
 /// What the simulation panel says of the selected operation's setup above
 /// its controls: a heading, the lines of the checks before a run (the Run
