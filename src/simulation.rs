@@ -178,11 +178,14 @@ pub struct Plan {
 /// A stop of the spindle partway through a plan: before move `at` the
 /// spindle and coolant stop and, with a `pause`, the program waits there,
 /// saying it, for the operator to resume (`post::Block::Pause`). They start
-/// again before the next feed move.
+/// again before the next feed move. A boring head's pause before a pass
+/// carries the `size` the head is set to for it (the manual mill's guide
+/// shows it).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stop {
     pub at: usize,
     pub pause: Option<String>,
+    pub size: Option<f32>,
 }
 impl Plan {
     /// Whether this is a lathe plan: its moves are a side view (X the

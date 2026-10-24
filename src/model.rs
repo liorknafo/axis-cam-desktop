@@ -1046,7 +1046,8 @@ pub const POCKET_ENTRIES: [&str; 2] = ["Profile ramp", "Plunge"];
 /// mills each hole with a flat end mill, `THREAD_MILLING` mills its thread
 /// with a thread mill (on a CNC), `TAPPING` taps it by hand (on the
 /// manual mill or the lathe), and `REAMING` and `BORING` finish a drilled
-/// or roughed hole to size with a reamer or a boring head (on a CNC).
+/// or roughed hole to size with a reamer or a boring head (on a CNC or the
+/// manual mill).
 pub const DRILL_CYCLES: [&str; 9] = [
     "Drilling",
     "Chip breaking",
@@ -1078,9 +1079,8 @@ pub const BORE_ONE_SIZE: &str =
 /// A Boring's pauses are not carried through a chuck-held or indexed
 /// setup's entry moves.
 pub const BORE_IN_CHUCK: &str = "Boring pauses between passes for the head to be set, which a setup held in the chuck or indexed does not carry: bore the hole in a 3-axis setup.";
-/// Reaming and Boring are CNC cycles here: the big mill's guide does not
-/// show them.
-pub const FINISH_ON_HAND: &str = "Reaming and Boring are CNC cycles here: on the manual mill, drill and ream or bore by hand, or use the CNC.";
+/// Reaming and Boring are mill cycles: the lathe drills on its centre.
+pub const FINISH_ON_LATHE: &str = "Reaming and Boring are for a mill: on the lathe, drill on the centre and bore with a boring bar (Turn · Bore).";
 /// The Drill cycle that mills each hole's thread with a thread mill: down
 /// the drilled hole, in to the wall on an arc, one pitch up a turn.
 pub const THREAD_MILLING: &str = "Thread milling";
@@ -2199,8 +2199,8 @@ impl Operation {
             if ["Chip breaking", "Deep drilling"].contains(&get(&self.p, "cycle")) {
                 positive(&self.p, "peck", &mut e)
             }
-            if self.finishes_holes() && manual::is_hand(m) {
-                e.push(FINISH_ON_HAND.into())
+            if self.finishes_holes() && crate::lathe::is_lathe(m) {
+                e.push(FINISH_ON_LATHE.into())
             }
             if get(&self.p, "cycle") == "Counterboring" || self.finishes_holes() {
                 nonnegative(&self.p, "dwell", &mut e)

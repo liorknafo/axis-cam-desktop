@@ -4,9 +4,12 @@
 //! boring head's are drilled as wide as the library's drills go, then
 //! milled out to the size the head finishes from (`cam::boring::bore_rough`)
 //! by Helical milling with the widest flat end mill that reaches, which
-//! leaves the rest on the diameter (its `bore_allowance`). Tools come from
-//! the library, as Add threading's do; one that is missing is added
-//! without it, and the status says which tool to add.
+//! leaves the rest on the diameter (its `bore_allowance`). The manual mill
+//! cannot mill a hole round: there the drills step up to the widest that
+//! fits (`steps_up`) and the head roughs the rest, a bigger cut a pass
+//! (`rough_cut`). Tools come from the library, as Add threading's do; one
+//! that is missing is added without it, and the status says which tool to
+//! add.
 use crate::{
     cam::{
         self,
@@ -21,6 +24,46 @@ use crate::{
 pub struct Added {
     pub ops: Vec<Operation>,
     pub status: String,
+    /// The Boring's Cut per pass (mm on the radius) when its head roughs
+    /// the hole from a drilled size, on the manual mill (`rough_cut`).
+    pub bore_cut: Option<f32>,
+}
+/// Drills up to this size go in without a pilot; a wider one is piloted
+/// with one at least half its size (`steps_up`).
+const NO_PILOT: f32 = 10.;
+/// The drills that open a hole to `widest` (the widest drill), smallest
+/// first: each one after a pilot at least half its size, from those of
+/// `drills`, until one needs no pilot (`NO_PILOT`).
+fn steps_up(drills: &[(&Tool, f32)], widest: (&Tool, f32)) -> Vec<(String, f32)> {
+    let mut chain = vec![(widest.0.id.clone(), widest.1)];
+    let mut d = widest.1;
+    while d > NO_PILOT {
+        let Some(pilot) = (drills.iter())
+            .filter(|(_, p)| *p >= d / 2. && *p < d - 0.05)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+        else {
+            break;
+        };
+        chain.push((pilot.0.id.clone(), pilot.1));
+        d = pilot.1;
+    }
+    chain.reverse();
+    chain
+}
+/// What a boring head takes off the radius a pass roughing a hole from a
+/// drilled size: 1 mm in a soft material (aluminium, brass and copper,
+/// plastic, wood), 0.5 mm otherwise or without a material.
+pub fn rough_cut(doc: &Document) -> f32 {
+    let soft = [
+        "Aluminium",
+        "Brass and copper",
+        "Plastic",
+        "Wood and composite",
+    ];
+    match doc.selected_material() {
+        Some(m) if soft.contains(&get(&m.p, "group")) => 1.,
+        _ => 0.5,
+    }
 }
 
 /// The keys of a finishing operation its stages share: the holes they cut
@@ -114,6 +157,7 @@ pub fn add(doc: &Document, si: usize, oi: usize, mesh: &Mesh) -> Result<Added, S
     let label = format!("Ø{}", trim(size));
     let mut ops = vec![];
     let mut missing = vec![];
+    let mut bore_cut = None;
     if op.reaming() {
         let want = ream_drill(size);
         let drill = drills(&doc.tools, machine, depth)
@@ -125,6 +169,29 @@ pub fn add(doc: &Document, si: usize, oi: usize, mesh: &Mesh) -> Result<Added, S
             missing.push(format!("a Ø{} drill", trim(want)));
         }
         ops.push(hole);
+    } else if crate::manual::is_manual(machine) {
+        // Stepped up through the drills; the head roughs the rest.
+        let rough = bore_rough(size);
+        let all: Vec<(&Tool, f32)> = drills(&doc.tools, machine, depth)
+            .filter(|(_, d)| *d <= rough)
+            .collect();
+        match all.iter().copied().max_by(|a, b| a.1.total_cmp(&b.1)) {
+            Some(widest) => {
+                for (id, d) in steps_up(&all, widest) {
+                    let t = doc.tools.iter().find(|t| t.id == id);
+                    let mut hole = stage(t, format!("{label} · drill Ø{}", trim(d)));
+                    drilled(&mut hole, d);
+                    ops.push(hole);
+                }
+            }
+            None => {
+                let mut hole = stage(None, format!("{label} · drill"));
+                drilled(&mut hole, rough);
+                ops.push(hole);
+                missing.push(format!("a drill under Ø{}", trim(rough)));
+            }
+        }
+        bore_cut = Some(rough_cut(doc));
     } else {
         let rough = bore_rough(size);
         let drill = drills(&doc.tools, machine, depth)
@@ -164,13 +231,23 @@ pub fn add(doc: &Document, si: usize, oi: usize, mesh: &Mesh) -> Result<Added, S
         op.name(),
         setup.name()
     );
+    if let Some(cut) = bore_cut {
+        status.push_str(&format!(
+            " The boring head roughs the rest, {} mm off the radius a pass.",
+            trim(cut)
+        ));
+    }
     if !missing.is_empty() {
         status.push_str(&format!(
             " Add to the library, then choose in the operation: {}.",
             missing.join("; ")
         ));
     }
-    Ok(Added { ops, status })
+    Ok(Added {
+        ops,
+        status,
+        bore_cut,
+    })
 }
 /// The library's tools on `machine` (`threading` takes them the same way).
 fn tools<'a>(tools: &'a [Tool], machine: &'a Machine) -> impl Iterator<Item = &'a Tool> {
@@ -302,7 +379,7 @@ mod tests {
         assert_eq!(plan.stops.iter().filter(|s| s.pause.is_some()).count(), 2);
     }
     #[test]
-    fn a_reamer_and_a_boring_head_need_their_sizes_and_the_cnc() {
+    fn a_reamer_and_a_boring_head_need_their_sizes_and_a_mill() {
         let mut r = reamer("10");
         assert!(r.issues().is_empty(), "{:?}", r.issues());
         r.p.insert("tolerance".into(), "".into());
@@ -336,14 +413,167 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("size") || e.contains("CNC"))
         );
+        // The manual mill bores too; the lathe does not.
         let manual = crate::manual::defaults();
-        assert!(
-            bore.issues(&manual, &tools, &[])
-                .iter()
-                .any(|e| e == crate::model::FINISH_ON_HAND)
-        );
+        let finish = |m: &Machine| {
+            (bore.issues(m, &tools, &[]).iter()).any(|e| e == crate::model::FINISH_ON_LATHE)
+        };
+        assert!(!finish(&manual) && finish(&crate::lathe::defaults()));
         assert_eq!(bore.tool_types(&cnc), vec!["Boring head"]);
         let ream = drilling(&mesh, &r, REAMING);
         assert_eq!(ream.tool_types(&cnc), vec!["Reamer"]);
+    }
+    /// A tool for the manual mill `m` too: its list names it.
+    fn on(mut t: Tool, m: &Machine) -> Tool {
+        t.p.insert("machines".into(), m.id.clone());
+        t
+    }
+    #[test]
+    fn on_the_manual_mill_a_bore_steps_up_through_the_drills_and_the_head_roughs_the_rest() {
+        let mesh = ring(32., 60., 28.);
+        let manual = crate::manual::defaults();
+        let drills: Vec<Tool> = ["3.2", "6.2", "8", "12"]
+            .map(|d| on(drill(d), &manual))
+            .into();
+        let h = on(head(BORE_RETRACTS[0]), &manual);
+        let mut bore = drilling(&mesh, &h, BORING);
+        bore.p.insert("hole_diameter".into(), "32".into());
+        bore.p.insert("rpm".into(), "640".into());
+        bore.p.insert("feed".into(), "60".into());
+        let (mut doc, _) = job(&mesh, manual.clone(), vec![(h.clone(), bore.clone())]);
+        doc.tools.extend(drills.iter().cloned());
+        let added = add(&doc, 0, 0, &mesh).unwrap();
+        // Ø12, piloted with the smallest drill at least half its size; no
+        // helical milling on the manual mill.
+        let used: Vec<&str> = added.ops.iter().map(|o| o.tool.as_str()).collect();
+        assert_eq!(
+            used,
+            [drills[1].id.as_str(), drills[3].id.as_str()],
+            "{}",
+            added.status
+        );
+        assert!(
+            added
+                .ops
+                .iter()
+                .all(|o| get(&o.p, "cycle") != HELICAL_MILLING)
+        );
+        assert!(
+            added.ops[1].name().ends_with("drill Ø12"),
+            "{}",
+            added.ops[1].name()
+        );
+        // Without a material: half a millimetre a pass.
+        assert_eq!(added.bore_cut, Some(0.5));
+        assert!(
+            added.status.contains("roughs the rest, 0.5 mm"),
+            "{}",
+            added.status
+        );
+        // In aluminium: a millimetre. The head roughs Ø12 to Ø31.9 in ten
+        // passes, then the last one to size.
+        crate::proposal::tests::aluminium(&mut doc);
+        assert_eq!(add(&doc, 0, 0, &mesh).unwrap().bore_cut, Some(1.));
+        let mut ops: Vec<(Tool, Operation)> = (added.ops.iter())
+            .map(|o| {
+                let mut o = o.clone();
+                o.p.insert("rpm".into(), "640".into());
+                o.p.insert("feed".into(), "60".into());
+                (drills.iter().find(|t| t.id == o.tool).unwrap().clone(), o)
+            })
+            .collect();
+        bore.p.insert("bore_cut".into(), "1".into());
+        ops.push((h, bore));
+        let (doc, all) = job(&mesh, manual, ops);
+        assert!(
+            all.iter().all(|r| r.is_ok()),
+            "{:?}",
+            all.iter().find_map(|r| r.as_ref().err())
+        );
+        let plan = &all.last().unwrap().as_ref().unwrap().plan;
+        let sizes: Vec<f32> = plan.stops.iter().filter_map(|s| s.size).collect();
+        assert_eq!(sizes.len(), 11, "{sizes:?}");
+        assert!(
+            (sizes[9] - 31.9).abs() < 1e-3 && sizes[10] == 32.,
+            "{sizes:?}"
+        );
+        // One axis at a time, as the manual mill moves.
+        for m in &plan.moves {
+            let moved = (0..3)
+                .filter(|&k| (m.to[k] - m.from[k]).abs() > 1e-4)
+                .count();
+            assert!(moved <= 1, "{m:?}");
+        }
+        // The guide: a Bore step a pass, each with the size to set and,
+        // after the first, the size to measure; the one hole each time.
+        let guide = crate::guide::build(&doc, &mesh, 0).unwrap();
+        let passes: Vec<&crate::guide::Step> = (guide.steps.iter())
+            .filter(|s| matches!(s, crate::guide::Step::Bore { .. }))
+            .collect();
+        assert_eq!(passes.len(), 11);
+        for (k, s) in passes.iter().enumerate() {
+            let crate::guide::Step::Bore {
+                index,
+                of,
+                size,
+                before,
+                dial,
+                feed_out,
+                holes,
+                mouths,
+                ..
+            } = s
+            else {
+                unreachable!()
+            };
+            assert_eq!((*index, *of), (k + 1, 11));
+            assert_eq!(*size, sizes[k]);
+            assert_eq!(*before, k.checked_sub(1).map(|j| sizes[j]));
+            assert_eq!((*dial, *feed_out), (0.01, false));
+            assert_eq!((holes.len(), mouths.len()), (1, 1), "{holes:?}");
+        }
+    }
+    #[test]
+    fn the_manual_mill_reams_and_its_guide_shows_each_hole() {
+        let mesh = ring(10., 40., 8.7);
+        let manual = crate::manual::defaults();
+        let (d, r) = (on(drill("9.8"), &manual), on(reamer("10"), &manual));
+        let mut hole = drilling(&mesh, &d, "Drilling");
+        hole.p.insert("breakthrough".into(), "3.5".into());
+        let mut ream = drilling(&mesh, &r, REAMING);
+        for op in [&mut hole, &mut ream] {
+            op.p.insert("rpm".into(), "640".into());
+            op.p.insert("feed".into(), "60".into());
+        }
+        let (doc, all) = job(&mesh, manual.clone(), vec![(d, hole), (r, ream.clone())]);
+        assert!(
+            all.iter().all(|r| r.is_ok()),
+            "{:?}",
+            all.iter().find_map(|r| r.as_ref().err())
+        );
+        assert!(
+            ream.issues(&manual, &doc.tools, &[]).is_empty(),
+            "{:?}",
+            ream.issues(&manual, &doc.tools, &[])
+        );
+        // Fed back out, one axis at a time.
+        let plan = &all[1].as_ref().unwrap().plan;
+        let dwell = plan
+            .moves
+            .iter()
+            .position(|m| m.motion == crate::simulation::Motion::Dwell)
+            .unwrap();
+        assert_eq!(
+            plan.moves[dwell + 1].motion,
+            crate::simulation::Motion::Feed
+        );
+        let guide = crate::guide::build(&doc, &mesh, 0).unwrap();
+        let holes = (guide.steps.iter())
+            .filter_map(|s| match s {
+                crate::guide::Step::Holes { op: 1, holes, .. } => Some(holes.len()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(holes, [1]);
     }
 }

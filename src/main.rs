@@ -3749,7 +3749,7 @@ impl App {
             return Task::none();
         };
         let holes = match &shown.guide.steps[at] {
-            guide::Step::Holes { holes, .. } => holes.len(),
+            guide::Step::Holes { holes, .. } | guide::Step::Bore { holes, .. } => holes.len(),
             _ => 0,
         };
         match action {
@@ -5072,7 +5072,11 @@ impl App {
                 match hole_stages::add(&self.doc, si, oi, mesh) {
                     Ok(added) => {
                         let n = added.ops.len();
-                        self.doc.setups[si].operations.splice(oi..oi, added.ops);
+                        let ops = &mut self.doc.setups[si].operations;
+                        ops.splice(oi..oi, added.ops);
+                        if let Some(cut) = added.bore_cut {
+                            ops[oi + n].p.insert("bore_cut".into(), cut.to_string());
+                        }
                         // The finishing operation stays the one open.
                         self.selected = Some(oi + n);
                         self.touch();

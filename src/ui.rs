@@ -565,7 +565,8 @@ pub(crate) fn op_checks(app: &App) -> Vec<Check> {
 }
 /// The drilling cycles a Drill operation offers on `machine`: a drill of the
 /// pin holes only drills; the lathe and the manual mill drill and tap by
-/// hand; a CNC drills and mills (helically, or a thread) but does not tap.
+/// hand; a CNC drills and mills (helically, or a thread) but does not tap;
+/// a CNC and the manual mill ream and bore.
 fn drill_cycles(pin_holes: bool, machine: &Machine) -> Vec<&'static str> {
     DRILL_CYCLES
         .into_iter()
@@ -573,6 +574,7 @@ fn drill_cycles(pin_holes: bool, machine: &Machine) -> Vec<&'static str> {
         .filter(|&(i, cycle)| match cycle {
             _ if i < 4 => true,
             TAPPING => !pin_holes && manual::is_hand(machine),
+            REAMING | BORING => !pin_holes && !lathe::is_lathe(machine),
             _ => !pin_holes && !manual::is_hand(machine),
         })
         .map(|(_, cycle)| cycle)

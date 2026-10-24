@@ -1,5 +1,6 @@
 //! Reaming and Boring (`model::REAMING`, `model::BORING`): a hole an earlier
-//! operation drilled or roughed, finished to size on a CNC. A reamer is fed
+//! operation drilled or roughed, finished to size on a CNC or the manual
+//! mill (whose guide shows each pass, `guide::Step::Bore`). A reamer is fed
 //! in and fed back out. A boring head is set to a size and fed down each
 //! hole, then leaves it with the spindle stopped or fed out, as the head
 //! says: a pass at each size up to the hole's, the program pausing before
@@ -138,9 +139,11 @@ fn depths(
     );
     Ok((cutting_top, target))
 }
-fn on_cnc(setup: &Setup, b: &Builder) -> Result<(), String> {
-    if b.single_axis || crate::manual::is_hand(&setup.machine) {
-        return Err(crate::model::FINISH_ON_HAND.into());
+/// A mill's: a CNC's, or the manual mill's, whose moves go one axis at a
+/// time (`Builder::push`).
+fn on_mill(setup: &Setup) -> Result<(), String> {
+    if crate::lathe::is_lathe(&setup.machine) {
+        return Err(crate::model::FINISH_ON_LATHE.into());
     }
     Ok(())
 }
@@ -159,7 +162,7 @@ pub(super) fn ream(
     if get(&tool.p, "type") != "Reamer" {
         return Err("Choose a reamer for Reaming.".into());
     }
-    on_cnc(setup, &b)?;
+    on_mill(setup)?;
     let mut holes = drill_holes(setup, op, mesh)?;
     let ends = breakthrough(op)?;
     let dwell = dwell(op)?;
@@ -267,7 +270,7 @@ pub(super) fn bore(
     if get(&tool.p, "type") != "Boring head" {
         return Err("Choose a boring head for Boring.".into());
     }
-    on_cnc(setup, &b)?;
+    on_mill(setup)?;
     let (low, high) = tool
         .bore_range()
         .ok_or("Enter the boring head's bore range, like 12-50.")?;
@@ -343,6 +346,7 @@ pub(super) fn bore(
         b.plan.stops.push(Stop {
             at: b.plan.moves.len(),
             pause: Some(adjust_message(&sizes, k, dial)),
+            size: Some(sizes[k]),
         });
         for (i, (h, cutting_top, target, _)) in ordered.iter().enumerate() {
             crate::progress::report(k * ordered.len() + i)?;
@@ -362,6 +366,7 @@ pub(super) fn bore(
                 b.plan.stops.push(Stop {
                     at: b.plan.moves.len(),
                     pause: None,
+                    size: None,
                 });
             }
             b.plan.target = b.plan.target.min(bottom);

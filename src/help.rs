@@ -1177,7 +1177,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "",
         ),
         AddHoleStages => (
-            "Add before this Reaming or Boring the operations that open its holes, on the same holes: for a reamer, a drill a little under its size (Ø9.8 for Ø10); for a boring head, a drill, then Helical milling to 0.6 under the size.",
+            "Add before this Reaming or Boring the operations that open its holes, on the same holes: for a reamer, a drill a little under its size (Ø9.8 for Ø10); for a boring head, a drill, then on a CNC Helical milling to 0.6 under the size; on the manual mill the drills step up and the head roughs the rest.",
             "The tools come from the library: the drill nearest a reamer's drill size; for a bore the widest drill and the widest flat end mill that reach through. One that is missing is added without a tool, and the status says which to add.",
         ),
         AddThreading => (
