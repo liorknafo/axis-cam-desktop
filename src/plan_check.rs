@@ -790,8 +790,9 @@ pub fn coverage(
 /// One problem per operation (of a setup that is not a lathe's) whose speed
 /// or feed lies outside the project material's cutting data, per value, or
 /// that cannot be checked (no material, no cutting data, a tool or operation
-/// without the numbers), naming its setup and operation. Each message is one
-/// line of at most 300 characters: it names the material.
+/// without the numbers), naming its setup and operation, and per finishing
+/// operation not milled the way the material asks (`finishing::issue`). Each
+/// message is one line of at most 300 characters: it names the material.
 fn cutting_data_problems(built: &Document) -> Vec<Problem> {
     let mut problems = vec![];
     for (si, setup) in built.setups.iter().enumerate() {
@@ -814,7 +815,11 @@ fn cutting_data_problems(built: &Document) -> Vec<Problem> {
                 Some(SpeedFeed::Unchecked(why)) => vec![unchecked(&why)],
                 None => vec![unchecked("Choose a material with cutting data.")],
             };
-            problems.extend(messages.into_iter().map(|message| Problem {
+            let messages = messages.into_iter().chain(
+                (built.selected_material())
+                    .and_then(|material| crate::finishing::issue(material, op)),
+            );
+            problems.extend(messages.map(|message| Problem {
                 setup: si + 1,
                 operation: Some(oi + 1),
                 stage: "cutting data",
@@ -1950,6 +1955,69 @@ mod tests {
         ] {
             op.p.insert(k.into(), v.into());
         }
+    }
+    #[test]
+    fn a_climbing_finish_in_bronze_is_a_cutting_data_problem_naming_the_operation() {
+        let (mut job, mesh, report) = good_job();
+        let bronze = job
+            .materials
+            .iter()
+            .find(|m| m.name() == "Bronze CuSn12")
+            .unwrap()
+            .id
+            .clone();
+        assert!(job.select_material(&bronze));
+        let finishing = |job: &Document| -> Vec<String> {
+            cutting_data_problems(job)
+                .into_iter()
+                .filter(|p| p.message.contains("finishing passes"))
+                .map(|p| format!("{}/{:?}: {}", p.setup, p.operation, p.message))
+                .collect()
+        };
+        // Only one Pocket (setup 1, operation 2) has a finishing pass.
+        for op in job.setups.iter_mut().flat_map(|s| &mut s.operations) {
+            op.p.insert("finish_passes".into(), "0".into());
+        }
+        let pocket = &mut job.setups[0].operations[1];
+        pocket.p.insert("finish_passes".into(), "1".into());
+        pocket.p.insert("pocket_milling".into(), "Climb".into());
+        let found = finishing(&job);
+        assert_eq!(
+            found,
+            [
+                "1/Some(2): Bronze CuSn12's finishing passes are milled conventional, not climb: set the milling direction to Conventional, or the finishing passes to 0."
+            ]
+        );
+        // The check as a whole refuses the plan for it.
+        let check = check_built(&job, &mesh, &report);
+        assert!(!check.passed);
+        assert!(
+            stages(&check)
+                .iter()
+                .any(|m| m.starts_with("cutting data 1/Some(2): Bronze CuSn12's finishing"))
+        );
+        // Conventional, or no finishing passes, is not a problem; nor is
+        // climbing in aluminium.
+        let set = |job: &mut Document, key: &str, value: &str| {
+            job.setups[0].operations[1]
+                .p
+                .insert(key.into(), value.into());
+        };
+        set(&mut job, "pocket_milling", "Conventional");
+        assert_eq!(finishing(&job), Vec::<String>::new());
+        set(&mut job, "pocket_milling", "Climb");
+        set(&mut job, "finish_passes", "0");
+        assert_eq!(finishing(&job), Vec::<String>::new());
+        set(&mut job, "finish_passes", "1");
+        let alu = job
+            .materials
+            .iter()
+            .find(|m| m.name() == "Aluminium 6061-T6")
+            .unwrap()
+            .id
+            .clone();
+        assert!(job.select_material(&alu));
+        assert_eq!(finishing(&job), Vec::<String>::new());
     }
     #[test]
     fn a_job_the_app_cannot_save_stops_at_structure() {
