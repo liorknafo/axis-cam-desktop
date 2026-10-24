@@ -435,15 +435,34 @@ pub(crate) fn outline(f: Outline) -> Result<Plan, String> {
                     false,
                 );
             } else {
-                let height = if inner { hop } else { f.clearance };
+                // No rapid moves sideways under the stock top, as the export
+                // check has it (its blend could dip into what is left):
+                // there it feeds across just over the level before, or goes
+                // over the stock where plunging back down from there takes
+                // less time than that feed.
+                let over = if approach >= f.top {
+                    approach
+                } else {
+                    f.clearance
+                };
+                let across = (a.0 - here.0).hypot(a.1 - here.1) as f32 / feed;
+                let (height, motion, rate) = if !inner {
+                    (f.clearance, Motion::Rapid, 6000.)
+                } else if hop >= f.top {
+                    (hop, Motion::Rapid, 6000.)
+                } else if across <= (over - z) / (feed * 0.25) {
+                    (hop, Motion::Feed, feed)
+                } else {
+                    (over, Motion::Rapid, 6000.)
+                };
                 let up = [position[0], position[1], height];
                 push(&mut plan, &mut position, up, Motion::Rapid, 6000., false);
                 push(
                     &mut plan,
                     &mut position,
                     point(a, height),
-                    Motion::Rapid,
-                    6000.,
+                    motion,
+                    rate,
                     false,
                 );
                 push(
@@ -680,6 +699,40 @@ mod tests {
             .collect();
         assert!(ways.len() > 20);
         assert!(ways.iter().all(|w| *w == ways[0]), "{ways:?}");
+    }
+    #[test]
+    fn under_the_stock_top_rows_link_at_feed_or_over_the_stock_never_by_a_rapid() {
+        // The L under 3 mm of stock, faced in two levels: on the second the
+        // rows link just over the first, under the stock top, where the
+        // export check refuses a rapid that moves sideways. They feed across
+        // there, or go over the stock where plunging back down from 1 mm
+        // over it is quicker: one way, the long way back to each row.
+        for (pattern, retract, fed_links, over_links) in [
+            ("Both ways (zigzag)", "5", true, false),
+            ("One way", "5", true, false),
+            ("One way", "1", true, true),
+        ] {
+            let (setup, mut op, tool, mesh) = l_part(6.);
+            op.p.insert("facing_pattern".into(), pattern.into());
+            op.p.insert("retract".into(), retract.into());
+            let plan = crate::simulation::generate(&setup, &op, &tool, &mesh).unwrap();
+            assert_eq!(plan.levels, 2);
+            let top = plan.stock.max[2];
+            let (mut fed, mut over) = (0, 0);
+            for m in &plan.moves {
+                if m.from[..2] == m.to[..2] {
+                    continue;
+                }
+                if m.from[2].min(m.to[2]) < top - 1e-4 {
+                    assert_eq!(m.motion, Motion::Feed, "{pattern}: {m:?}");
+                    fed += usize::from(!m.cutting_pass && m.to[2] > plan.target + 0.1);
+                } else if m.motion == Motion::Rapid && (m.to[2] - top - 1.).abs() < 1e-4 {
+                    over += 1;
+                }
+            }
+            assert!(fed > 0 || !fed_links, "{pattern} {retract}: {fed}");
+            assert!(over > 0 || !over_links, "{pattern} {retract}: {over}");
+        }
     }
     #[test]
     fn ramps_into_stock_round_the_edge_but_comes_down_beside_a_part_flush_with_it() {
