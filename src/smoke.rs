@@ -11296,6 +11296,57 @@ soft_max = 180.0
         let _ = a.view();
     }
     #[test]
+    fn the_view_shows_the_stock_a_setup_leaves_when_its_end_is_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        // Setup 1 faces, pockets and contours; setup 2, turned over, faces.
+        let mut a = contoured_app(&dir, "35");
+        // The cuts of the stock the 3D view shows with "Stock after this
+        // setup" selected, by setup and operation (meshed in line here).
+        let shown = |a: &mut App, si: usize| {
+            let _ = a.update(Message::SelectSetup(si));
+            let _ = a.update(Message::SetupEnd);
+            let _ = a.refresh_start_mesh();
+            let view = crate::ui::scene_viewport(a).unwrap();
+            let (_, surface) = view.start_stock?;
+            assert!(!surface.triangles.is_empty());
+            let (_, _, before) = a.start_source().unwrap();
+            let job = a.left_stock.job.clone().unwrap();
+            let cuts: Vec<_> = job.cuts.iter().filter(|c| c.source < before).collect();
+            // The very cuts the browser's picture of that stock is made of.
+            let after = a.left_stock.after[si].clone().unwrap();
+            assert_eq!(cuts.len(), after.cuts.len());
+            let mut by: Vec<(u16, u16)> = cuts.iter().map(|c| c.source).collect();
+            by.dedup();
+            Some(by)
+        };
+        // Not worked out yet: the setup's box.
+        assert_eq!(shown(&mut a, 0), None);
+        let _ = a.refresh_left_stock();
+        // Setup 1 leaves all three of its operations' cuts; setup 2 those
+        // and its Facing's.
+        assert_eq!(shown(&mut a, 0), Some(vec![(0, 0), (0, 1), (0, 2)]));
+        assert_eq!(shown(&mut a, 1), Some(vec![(0, 0), (0, 1), (0, 2), (1, 0)]));
+        let _ = a.view();
+        // Selecting an operation, the setup editor or another setup leaves it.
+        // Setup 2's Facing shows the stock it starts from, not its own cuts.
+        let _ = a.update(Message::SelectOp(0));
+        assert!(!a.setup_end);
+        assert_eq!(a.start_source().unwrap().2, (1, 0));
+        let _ = a.update(Message::SetupEnd);
+        let _ = a.update(Message::SetupEditor);
+        assert!(crate::ui::scene_viewport(&a).unwrap().start_stock.is_none());
+        let _ = a.update(Message::SetupEnd);
+        let _ = a.update(Message::SelectSetup(0));
+        assert!(crate::ui::scene_viewport(&a).unwrap().start_stock.is_none());
+        // Editing an operation of the setup drops it until the job is worked
+        // out again, so a stale stock is never shown.
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.update(Message::Edit(Target::Operation, "stepdown", "1.5".into()));
+        assert_eq!(shown(&mut a, 0), None);
+        let _ = a.refresh_left_stock();
+        assert_eq!(shown(&mut a, 0), Some(vec![(0, 0), (0, 1), (0, 2)]));
+    }
+    #[test]
     fn the_view_shows_the_stock_the_operation_in_focus_starts_from() {
         let dir = tempfile::tempdir().unwrap();
         // Setup 1 faces, pockets and contours; setup 2, turned over, faces.

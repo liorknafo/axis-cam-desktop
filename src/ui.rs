@@ -1680,17 +1680,40 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
                 ));
             }
             if let Some(picture) = stock_picture(app, si, true) {
+                let selected = app.setup_end && app.selected.is_none() && app.page == Page::Work;
                 tree = tree.push(help::wrap(
-                    row![
-                        muted("Stock after this setup").size(12).width(Fill),
-                        widget::image(picture).width(64).height(48)
-                    ]
-                    .spacing(6)
-                    .padding([0, 10])
-                    .align_y(Alignment::Center),
+                    button(
+                        row![
+                            muted("Stock after this setup").size(12).width(Fill),
+                            widget::image(picture).width(64).height(48)
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                    )
+                    .width(Fill)
+                    .padding([2, 10])
+                    .on_press(Message::SetupEnd)
+                    .style(move |_, st| button::Style {
+                        background: Some(
+                            if selected {
+                                SELECTED_ROW
+                            } else if matches!(st, button::Status::Hovered) {
+                                HOVER_ROW
+                            } else {
+                                Color::TRANSPARENT
+                            }
+                            .into(),
+                        ),
+                        text_color: INK,
+                        border: Border {
+                            radius: 4.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
                     Help::text(
                         "Stock after this setup",
-                        "The stock as this setup's operations leave it, in its jaws or clamps, seen as its 3D view first shows it. Cut faces are green.",
+                        "The stock as this setup's operations leave it, in its jaws or clamps, seen as its 3D view first shows it. Cut faces are green. Click it to see that stock in the 3D view.",
                     ),
                     widget::tooltip::Position::Right,
                 ));
