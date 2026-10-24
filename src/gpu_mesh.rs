@@ -772,6 +772,7 @@ mod tests {
             cuts: Arc::new(cuts),
             detail,
             round: false,
+            bar_x: None,
         }
     }
     fn gpu() -> Option<&'static Gpu> {

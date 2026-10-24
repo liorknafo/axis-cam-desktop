@@ -345,6 +345,7 @@ impl Cut {
                 feed: rate,
                 start: self.duration,
                 end,
+                a: None,
             });
             self.duration = end;
         }
@@ -367,6 +368,7 @@ impl Cut {
                 feed: 0.,
                 start: self.duration,
                 end,
+                a: None,
             });
             self.duration = end;
         }

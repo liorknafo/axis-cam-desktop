@@ -19,18 +19,39 @@ pub const ROUND_OFFSETS: [(&str, &str); 3] = [
     ("stock_bottom", "Bottom (−Z)"),
     ("stock_top", "Top (+Z)"),
 ];
+/// The stock modes of the first setup: a round bar along Z, or round the
+/// part, on most machines (`is_round`)…
+pub const MODES: [&str; 4] = [
+    "Relative size box",
+    "Fixed size box",
+    "Round bar",
+    "Relative round bar",
+];
+/// …and a round bar along X on a machine with a rotary A axis about X
+/// (`round_bar`), to hold in the chuck on A.
+pub const ROTARY_MODES: [&str; 3] = ["Relative size box", "Fixed size box", "Round bar"];
+/// The stock modes `setup`'s machine offers.
+pub fn modes(setup: &Setup) -> &'static [&'static str] {
+    if setup.machine.has_a() {
+        &ROTARY_MODES
+    } else {
+        &MODES
+    }
+}
 pub fn relative(setup: &Setup) -> bool {
     get(&setup.p, "stock_type") == "Relative size box"
 }
 /// Whether the setup's stock is a round bar along its Z axis, X = Y = 0:
 /// "Round bar" (`stock_diameter` × `stock_length`) or "Relative round bar"
 /// (`stock_radial` round the part, `stock_top` and `stock_bottom` along
-/// the axis). Its bounds are the bar's box (`bar`).
+/// the axis). Its bounds are the bar's box (`bar`). A "Round bar" on a
+/// machine with a rotary A axis lies along X instead (`round_bar`).
 pub fn is_round(setup: &Setup) -> bool {
-    matches!(
-        get(&setup.p, "stock_type"),
-        "Round bar" | "Relative round bar"
-    )
+    match get(&setup.p, "stock_type") {
+        "Round bar" => !setup.machine.has_a(),
+        "Relative round bar" => true,
+        _ => false,
+    }
 }
 fn relative_round(setup: &Setup) -> bool {
     get(&setup.p, "stock_type") == "Relative round bar"
@@ -60,8 +81,45 @@ pub fn part_radius(setup: &Setup, mesh: &Mesh) -> f32 {
         })
         .fold(0., f32::max)
 }
+/// Whether the setup's stock is a round bar along X, on a machine with a
+/// rotary A axis about X (`Machine::has_a`), to hold in the chuck on A: a
+/// cylinder of `stock_diameter` and `stock_length`, centred on X and Y and
+/// standing on Z0 like a fixed box, the box round it being the stock's box
+/// everywhere. Elsewhere a "Round bar" stands along Z (`is_round`).
+pub fn round_bar(setup: &Setup) -> bool {
+    get(&setup.p, "stock_type") == "Round bar" && setup.machine.has_a()
+}
+/// The round bar a first setup's `stock` box holds, in its frame: its axis
+/// (Y, Z) and radius. None for a box.
+pub fn round(setup: &Setup, stock: Bounds) -> Option<Round> {
+    round_bar(setup).then(|| Round {
+        axis: [
+            (stock.min[1] + stock.max[1]) / 2.,
+            (stock.min[2] + stock.max[2]) / 2.,
+        ],
+        radius: (stock.max[1] - stock.min[1]).min(stock.max[2] - stock.min[2]) / 2.,
+    })
+}
+/// A round bar along X: its axis's Y and Z and its radius, mm.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Round {
+    pub axis: [f32; 2],
+    pub radius: f32,
+}
+impl Round {
+    /// Whether `p` (the bar's frame) lies inside it, ignoring its ends.
+    pub fn contains(self, p: [f32; 3]) -> bool {
+        (p[1] - self.axis[0]).hypot(p[2] - self.axis[1]) <= self.radius
+    }
+}
+/// Why a "Relative round bar" is refused on a machine with a rotary A axis,
+/// which does not offer it (`modes`): it stands along the setup's Z, which
+/// the chuck on A (along X) would hold as its box.
+pub const NO_RELATIVE_BAR_ON_A: &str = "A Relative round bar stands along the setup's Z, which the chuck on this machine's rotary A axis does not hold: choose Round bar (along X), or a box.";
 pub fn parameter_issues(setup: &Setup) -> Vec<String> {
-    if relative_round(setup) {
+    if relative_round(setup) && setup.machine.has_a() {
+        vec![NO_RELATIVE_BAR_ON_A.into()]
+    } else if relative_round(setup) {
         ROUND_OFFSETS
             .iter()
             .filter(|&(key, _label)| !num(&setup.p, key).is_some_and(|v| v >= 0.))
@@ -109,7 +167,26 @@ pub struct Placement {
     pub bounds: Bounds,
 }
 impl Placement {
+    /// The part placed as `setup` places it, turned by A when the setup is
+    /// indexed (`Setup::turn`): its base's placement turned about the A
+    /// centreline.
     pub fn new(mesh: &Mesh, setup: Option<&Setup>) -> Self {
+        let placed = Self::unturned(mesh, setup);
+        let Some(t) = setup.and_then(|s| s.turn) else {
+            return placed;
+        };
+        let axis = t.axis.map(|v| v * mesh.display_scale());
+        let angles = crate::indexed::turned_angles(placed.angles, t.turn);
+        let shift = crate::indexed::turn_point(placed.shift, axis, t.turn);
+        Self {
+            angles,
+            shift,
+            bounds: mesh.rotated_bounds(angles).translated(shift),
+        }
+    }
+    /// The part placed by `setup`'s own rotation and translation: an
+    /// indexed setup's base's placement, before A turns it.
+    pub fn unturned(mesh: &Mesh, setup: Option<&Setup>) -> Self {
         let angles = ["rx", "ry", "rz"].map(|k| setup.and_then(|s| num(&s.p, k)).unwrap_or(0.));
         let t = ["tx", "ty", "tz"]
             .map(|k| setup.and_then(|s| num(&s.p, k)).unwrap_or(0.) * mesh.display_scale());
@@ -124,6 +201,10 @@ impl Placement {
     /// The rotation angles and then the shift `transform` applies.
     pub fn parts(&self) -> ([f32; 3], [f32; 3]) {
         (self.angles, self.shift)
+    }
+    /// The part's rotation (`mesh::rotation`'s angles), A's turn included.
+    pub fn rotation(&self) -> [f32; 3] {
+        self.angles
     }
     pub fn transform(&self, point: [f32; 3]) -> [f32; 3] {
         let r = rotation(point, self.angles);
@@ -162,6 +243,12 @@ pub fn resolve(setup: &Setup, mesh: Option<&Mesh>) -> Result<ResolvedStock, Stri
         Bounds {
             min: [-r, -r, part.min[2] - num(&setup.p, "stock_bottom").unwrap()],
             max: [r, r, part.max[2] + num(&setup.p, "stock_top").unwrap()],
+        }
+    } else if round_bar(setup) {
+        let [d, l] = ["stock_diameter", "stock_length"].map(|k| num(&setup.p, k).unwrap());
+        Bounds {
+            min: [-l / 2., -d / 2., 0.],
+            max: [l / 2., d / 2., d],
         }
     } else if get(&setup.p, "stock_type") == "Round bar" {
         let [d, l] = ["stock_diameter", "stock_length"].map(|k| num(&setup.p, k).unwrap());
@@ -224,6 +311,13 @@ pub fn sheet_description(setup: &Setup, mesh: Option<&Mesh>) -> String {
             text += &format!("- {label}: {} mm\n", get(&setup.p, key));
         }
         text += "\n";
+    }
+    if round_bar(setup) {
+        text += &format!(
+            "Round bar along X: Ø{} × {} mm\n\n",
+            get(&setup.p, "stock_diameter"),
+            get(&setup.p, "stock_length")
+        );
     }
     match resolve(setup, mesh) {
         Ok(result) if is_round(setup) && setup.preview_stock.is_none() => {
@@ -400,6 +494,54 @@ mod tests {
         s.p.insert("stock_radial".into(), "2".into());
         let text = sheet_description(&s, Some(&mesh));
         assert!(text.contains("Radial: 2 mm") && text.contains("Round bar Ø × length: Ø"));
+    }
+    #[test]
+    fn a_round_bar_is_its_box_along_x_and_its_sizes_must_be_positive() {
+        // Along X on a machine with a rotary A axis.
+        let mut s = Setup::new(Machine::new(4), "G54");
+        for (k, v) in [
+            ("stock_type", "Round bar"),
+            ("stock_diameter", "30"),
+            ("stock_length", "120"),
+        ] {
+            s.p.insert(k.into(), v.into());
+        }
+        assert!(round_bar(&s) && parameter_issues(&s).is_empty());
+        let stock = resolve(&s, None).unwrap().stock;
+        close(stock.min, [-60., -15., 0.]);
+        close(stock.max, [60., 15., 30.]);
+        let bar = round(&s, stock).unwrap();
+        assert_eq!((bar.axis, bar.radius), ([0., 15.], 15.));
+        assert!(bar.contains([0., 10., 25.]) && !bar.contains([0., 14., 29.]));
+        assert!(sheet_description(&s, None).contains("Round bar along X: Ø30 × 120 mm"));
+        for (key, bad) in [
+            ("stock_diameter", "0"),
+            ("stock_length", "-3"),
+            ("stock_diameter", "x"),
+        ] {
+            let mut t = s.clone();
+            t.p.insert(key.into(), bad.into());
+            assert_eq!(parameter_issues(&t).len(), 1, "{key} {bad}");
+            assert!(resolve(&t, None).is_err());
+        }
+        assert!(!is_round(&s) && modes(&s) == ROTARY_MODES);
+        // A Relative round bar saved on another machine is refused here.
+        let mut relative = s.clone();
+        relative
+            .p
+            .insert("stock_type".into(), "Relative round bar".into());
+        assert_eq!(parameter_issues(&relative), [NO_RELATIVE_BAR_ON_A]);
+        assert!(resolve(&relative, None).is_err());
+        // On a 3-axis mill the same bar stands along Z.
+        let mut upright = s.clone();
+        upright.machine = Machine::new(3);
+        assert!(!round_bar(&upright) && is_round(&upright) && modes(&upright) == MODES);
+        let along_z = resolve(&upright, None).unwrap().stock;
+        close(along_z.min, [-15., -15., 0.]);
+        close(along_z.max, [15., 15., 120.]);
+        // A box is no bar.
+        s.p.insert("stock_type".into(), "Fixed size box".into());
+        assert_eq!(round(&s, stock), None);
     }
     #[test]
     fn sheet_uses_relative_dimensions_and_all_six_offsets() {

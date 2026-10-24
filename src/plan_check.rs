@@ -362,7 +362,11 @@ impl PartGrid {
     /// is never deep: a thread's teeth are finer than the cells, and
     /// threading it (a tap drill past its crests, a thread mill to its
     /// roots) removes cells there that are the part's.
-    pub fn new(stock: &Volume, geometry: &Geometry, threads: &[crate::thread::Thread]) -> Self {
+    pub(crate) fn new(
+        stock: &Volume,
+        geometry: &Geometry,
+        threads: &[crate::thread::Thread],
+    ) -> Self {
         let index = Index::new(geometry);
         let mut inside = vec![false; stock.occupied.len()];
         for y in 0..stock.n[1] {
@@ -559,11 +563,52 @@ fn tool_axis(plan: &Plan, index: &Index, top: f32) -> (f32, [f32; 3], f32) {
     }
     (worst, at, lowest)
 }
+/// `axis_problems` of `sim`, setup `si`'s: an indexed setup's at each of
+/// its A angles, against the part posed there (`indexed`), each said with
+/// its angle; another's against the part as `geometry` places it.
+pub(crate) fn angle_problems(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    sim: &Simulation,
+    geometry: &Geometry,
+    index: &Index,
+) -> Vec<String> {
+    if sim.turns.is_empty() {
+        return axis_problems(&sim.plan, geometry, index, si);
+    }
+    let mut out = vec![];
+    for &(a, _) in &sim.turns {
+        let posed = match doc.setup_at(&doc.setups[si], si, a, mesh) {
+            Ok(posed) => posed,
+            Err(e) => {
+                out.push(e);
+                continue;
+            }
+        };
+        let geometry = Geometry::new(&posed, mesh);
+        let mut plan = sim.plan.clone();
+        plan.moves
+            .retain(|m| m.motion != Motion::Index && m.a.is_some_and(|b| (a - b).abs() < 1e-4));
+        let at = crate::indexed::degrees(a);
+        out.extend(
+            axis_problems(&plan, &geometry, &Index::new(&geometry), si)
+                .into_iter()
+                .map(|p| format!("At A {at}°: {p}")),
+        );
+    }
+    out
+}
 /// The tool axis problems of one generated operation in setup `si` (from 0):
 /// more than 0.1 mm of part above the tool tip, whatever the strategy, and
 /// moves below the floor. The floor is the stock's bottom in setup 1; later
 /// setups rest on the part, whose underside may be all that is left there.
-fn axis_problems(plan: &Plan, geometry: &Geometry, index: &Index, si: usize) -> Vec<String> {
+pub(crate) fn axis_problems(
+    plan: &Plan,
+    geometry: &Geometry,
+    index: &Index,
+    si: usize,
+) -> Vec<String> {
     let b = geometry.bounds;
     let (worst, at, lowest) = tool_axis(plan, index, b.max[2]);
     let mut problems = vec![];
@@ -1018,9 +1063,12 @@ fn run(
                     // were checked against the part when it was generated
                     // (`turn::generate`), and the stock check below sees
                     // them in the volume.
+                    // An indexed setup's at each of its A angles.
                     let lathe = sim.plan.is_lathe();
                     for message in (!lathe)
-                        .then(|| axis_problems(&sim.plan, &geometries[si], &indexes[si], si))
+                        .then(|| {
+                            angle_problems(built, mesh, si, sim, &geometries[si], &indexes[si])
+                        })
                         .into_iter()
                         .flatten()
                     {
@@ -1139,6 +1187,23 @@ fn run(
                     stage: "export",
                     message: message.clone(),
                 });
+            }
+        }
+        // An indexed setup's moves on the machine: its travel, Z reach and A;
+        // and a cut parting the bar in the chuck. Each said once, with its
+        // operation: the export's refusal above says them too.
+        for (si, sims) in results.iter().enumerate() {
+            for (oi, message) in crate::rotary_check::problems(job_doc, mesh, si, sims) {
+                let operation = oi.map(|oi| oi + 1);
+                match (export.iter_mut()).find(|p| p.setup == si + 1 && p.message == message) {
+                    Some(said) => said.operation = said.operation.or(operation),
+                    None => export.push(Problem {
+                        setup: si + 1,
+                        operation,
+                        stage: "export",
+                        message,
+                    }),
+                }
             }
         }
         if export.is_empty() && held.is_empty() {
@@ -2199,6 +2264,7 @@ mod tests {
     fn plan_of(setups: Vec<(&str, Vec<proposal::ProposedOp>)>) -> Proposal {
         Proposal {
             summary: String::new(),
+            chuck: None,
             setups: setups
                 .into_iter()
                 .enumerate()
@@ -2213,6 +2279,7 @@ mod tests {
                     .into(),
                     workholding: String::new(),
                     holder: None,
+                    a_angles: None,
                     operations,
                     from: None,
                 })
@@ -3147,6 +3214,7 @@ mod totem {
         };
         let proposal = Proposal {
             summary: "Top, then the underside".into(),
+            chuck: None,
             setups: vec![
                 ProposedSetup {
                     orientation: "+Z".into(),
@@ -3154,6 +3222,7 @@ mod totem {
                     origin: "Stock top center".into(),
                     workholding: "Vise on the stock's frame".into(),
                     holder: None,
+                    a_angles: None,
                     operations: vec![
                         cut("Face", 1, &top, 1200., &|_| {}),
                         cut("Pocket", 1, &well, 1200., &|o| {
@@ -3197,6 +3266,7 @@ mod totem {
                     origin: "Stock top front-left".into(),
                     workholding: "Vise on the frame".into(),
                     holder: None,
+                    a_angles: None,
                     operations: vec![
                         cut("Face", 1, &at("-Z", 0.), 1200., &|_| {}),
                         cut("Pocket", 1, &underside, 1200., &|o| o.stepdown = Some(2.)),

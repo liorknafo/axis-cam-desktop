@@ -21,9 +21,24 @@ impl Frame {
             ..Self::axes(setup)
         }
     }
-    /// The axes of `setup`'s frame, which its rotation alone gives, at no shift.
+    /// This frame with the part turned about the line along X through Y, Z
+    /// `axis` (mm) by `turn` degrees, by the right-hand rule about +X: an
+    /// indexed setup's frame at an A angle (`indexed`).
+    pub fn turned(self, axis: [f32; 2], turn: f32) -> Self {
+        let turn_axis = |v| crate::indexed::turn_point(v, [0., 0.], turn);
+        Self {
+            basis: self.basis.map(turn_axis),
+            shift: crate::indexed::turn_point(self.shift, axis, turn),
+        }
+    }
+    /// The axes of `setup`'s frame, which its rotation alone gives (turned
+    /// by A for an indexed setup), at no shift.
     fn axes(setup: &Setup) -> Self {
         let angles = ["rx", "ry", "rz"].map(|k| num(&setup.p, k).unwrap_or(0.));
+        let angles = match setup.turn {
+            Some(t) => crate::indexed::turned_angles(angles, t.turn),
+            None => angles,
+        };
         Self {
             basis: [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]].map(|p| rotation(p, angles)),
             shift: [0.; 3],
@@ -222,6 +237,9 @@ pub struct Volume {
     /// Whether the stock started as a round bar (`bar`): the cylinder in
     /// `bounds` (`crate::stock::bar`), not the whole box.
     pub round: bool,
+    /// The round bar along X the stock is on a rotary setup (`chuck`), in
+    /// its frame; None otherwise.
+    pub bar_x: Option<crate::stock::Round>,
 }
 impl Volume {
     /// A round bar's stock: `new`, with the voxels whose centres lie outside
@@ -258,6 +276,19 @@ impl Volume {
         let size = bounds.dimensions();
         let step = size.into_iter().fold(0., f32::max) / 96.;
         let n = size.map(|v| (v / step).ceil().clamp(1., 96.) as usize);
+        Self::of(bounds, frame, n)
+    }
+    /// The stock `bounds` in cells at most `most` mm on a side, and no
+    /// larger than `new`'s: a finer grid for a check that must tell a few
+    /// millimetres apart (`rotary_check`'s part-off), cut with `carve`.
+    pub fn finer(bounds: Bounds, frame: Frame, most: f32) -> Self {
+        let size = bounds.dimensions();
+        let coarse = Self::new(bounds, frame);
+        let n = std::array::from_fn(|k| coarse.n[k].max((size[k] / most).ceil().max(1.) as usize));
+        Self::of(bounds, frame, n)
+    }
+    fn of(bounds: Bounds, frame: Frame, n: [usize; 3]) -> Self {
+        let size = bounds.dimensions();
         let cell = std::array::from_fn(|k| size[k] / n[k] as f32);
         let count = n.iter().product();
         Self {
@@ -271,7 +302,28 @@ impl Volume {
             cuts: std::sync::Arc::new(vec![]),
             version: 0,
             round: false,
+            bar_x: None,
         }
+    }
+    /// The stock as the round bar `round` inside its box: the voxels whose
+    /// centres lie outside the bar hold no material. Unchanged for None.
+    pub fn rounded(mut self, round: Option<crate::stock::Round>) -> Self {
+        let Some(bar) = round else {
+            return self;
+        };
+        for z in 0..self.n[2] {
+            for y in 0..self.n[1] {
+                for x in 0..self.n[0] {
+                    let i = self.index([x, y, z]);
+                    if self.occupied[i] != 0 && !bar.contains(self.point([x, y, z], 0.5)) {
+                        self.occupied[i] = 0;
+                        self.remaining -= 1;
+                    }
+                }
+            }
+        }
+        self.bar_x = round;
+        self
     }
     pub fn index(&self, p: [usize; 3]) -> usize {
         (p[2] * self.n[1] + p[1]) * self.n[0] + p[0]
@@ -417,6 +469,27 @@ impl Volume {
             cuts.push(cut);
         }
         self.version = self.version.wrapping_add(1);
+        self.clear(ranges, a, b, radius, flute, shape, current);
+    }
+    /// Takes away what `cut`, made on another grid of the same stock (its
+    /// `cuts`), sweeps, without keeping it among this grid's cuts.
+    pub fn carve(&mut self, cut: &crate::stock_surface::Cut) {
+        let (a, b, r, flute) = (cut.a, cut.b, cut.radius, cut.flute);
+        if let Some(ranges) = self.ranges(a, b, r, flute, cut.shape, cut.frame) {
+            self.clear(ranges, a, b, r, flute, cut.shape, cut.frame);
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn clear(
+        &mut self,
+        ranges: [(usize, usize); 3],
+        a: [f32; 3],
+        b: [f32; 3],
+        radius: f32,
+        flute: f32,
+        shape: CutterShape,
+        current: Frame,
+    ) {
         for z in ranges[2].0..ranges[2].1 {
             for y in ranges[1].0..ranges[1].1 {
                 for x in ranges[0].0..ranges[0].1 {

@@ -92,7 +92,7 @@ pub struct Bite {
 /// ponytail: a replay more than the simulation makes; keep what
 /// `Simulation::seek` removes per move if that time ever shows.
 pub fn bites(sim: &Simulation) -> Vec<Bite> {
-    let (Some(mut volume), Some(frame)) = (sim.initial_volume.clone(), sim.frame) else {
+    let (Some(mut volume), Some(_)) = (sim.initial_volume.clone(), sim.frame) else {
         return vec![];
     };
     if sim.plan.strategy == crate::model::Strategy::Drill
@@ -119,7 +119,8 @@ pub fn bites(sim: &Simulation) -> Vec<Bite> {
     // some. Half a voxel reaches the original stock faces, which lie half a
     // voxel above the centres, but not a floor or a wall an earlier cut
     // left, which can lie a whole voxel past the last centre it kept.
-    let touches = |from: [f32; 3], to: [f32; 3], volume: &Volume| {
+    // Each move cuts in its A angle's frame (`Simulation::frame_of`).
+    let touches = |from: [f32; 3], to: [f32; 3], volume: &Volume, frame| {
         let lower = |p: [f32; 3]| [p[0], p[1], p[2] - thick];
         volume.touches(
             lower(from),
@@ -143,6 +144,9 @@ pub fn bites(sim: &Simulation) -> Vec<Bite> {
             .map(|k| (m.to[k] - m.from[k]).powi(2))
             .sum::<f32>()
             .sqrt();
+        let Some(frame) = sim.frame_of(m) else {
+            continue;
+        };
         let pieces = (length / reach).ceil().max(1.);
         let at = |t: f32| std::array::from_fn(|k| m.from[k] + (m.to[k] - m.from[k]) * t);
         for i in 0..pieces as usize {
@@ -163,7 +167,7 @@ pub fn bites(sim: &Simulation) -> Vec<Bite> {
             run.2 += length / pieces / m.feed;
             run.3 = run.3.min(from[2]).min(to[2]);
             if run.0 == 0 && !run.4 {
-                run.4 = touches(from, to, &volume);
+                run.4 = touches(from, to, &volume, frame);
             }
             if run.1 >= 0.999 * reach {
                 runs.push(std::mem::replace(&mut run, fresh));
@@ -544,11 +548,12 @@ pub fn margins<'a>(
         })
         .collect()
 }
-/// A margin as said: ×1.4, ×2, ×12. Rounded down, so that one under
+/// A margin as said: ×0.05, ×1.4, ×2, ×12. Rounded down, so that one under
 /// `SAFETY` never reads as it.
-fn times(factor: f32) -> String {
+pub(crate) fn times(factor: f32) -> String {
     let tenths = match factor {
         f if f >= 10. => f.floor(),
+        f if f < 0.1 => (f * 100.).floor() / 100.,
         f => (f * 10.).floor() / 10.,
     };
     format!("×{tenths}")
@@ -612,6 +617,247 @@ pub fn issue(name: &str, m: &Margin) -> Option<String> {
             )
         }
     })
+}
+/// A chuck's clamping force when nothing gives it, N: all its jaws together,
+/// a 100 mm 3-jaw chuck tightened by hand with its key, on the low side.
+pub const CHUCK_FORCE: f32 = 6000.;
+/// The most the stock may bend at its end under a cut, mm, before it chatters
+/// or the cut comes out of size.
+pub const DEFLECTION: f32 = 0.05;
+/// Young's modulus by material group, N/mm². "Other", and a job without a
+/// material, take aluminium's, the least of the metals: the bar bends no
+/// less than this says.
+pub const STIFFNESS: [(&str, f32); 7] = [
+    ("Aluminium", 69_000.),
+    ("Steel", 200_000.),
+    ("Stainless steel", 193_000.),
+    ("Brass and copper", 100_000.),
+    ("Plastic", 2_000.),
+    ("Wood and composite", 8_000.),
+    ("Other", 69_000.),
+];
+/// Yield strength by material group, N/mm², on the low side of the grades
+/// these machines cut (6060 aluminium, S235 steel, annealed 304 stainless,
+/// copper, nylon, softwood across the grain): what a web left between the
+/// chuck and the part takes before it bends for good (`rotary_check`'s
+/// part-off check). "Other", and a job without a material, take copper's,
+/// the least of the metals.
+pub const STRENGTH: [(&str, f32); 7] = [
+    ("Aluminium", 110.),
+    ("Steel", 235.),
+    ("Stainless steel", 205.),
+    ("Brass and copper", 70.),
+    ("Plastic", 40.),
+    ("Wood and composite", 20.),
+    ("Other", 70.),
+];
+/// The material group of `material` (None when the project has none) and
+/// its `STRENGTH`.
+pub fn strength(material: Option<&Material>) -> (&str, f32) {
+    let group = material.map_or("Other", |m| get(&m.p, "group"));
+    let row = STRENGTH
+        .iter()
+        .find(|row| row.0 == group)
+        .unwrap_or(&STRENGTH[STRENGTH.len() - 1]);
+    (row.0, row.1)
+}
+/// How a chuck could give way.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Give {
+    /// Turn in the jaws, about A.
+    Turn,
+    /// Slide out of the jaws along A.
+    Slide,
+}
+/// An operation's least margin in a chuck (`chuck_check`): what the jaws'
+/// friction resists over what the cut applies, the way the stock would give,
+/// the push, and how far its free end bends.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChuckMargin {
+    pub factor: f32,
+    pub give: Give,
+    pub push: Push,
+    /// What resists: N·mm against a turn, N against a slide.
+    pub resisted: f32,
+    /// What the cut applies, the same way.
+    pub applied: f32,
+    /// How far the stock's end bends under the largest push, mm.
+    pub bend: f32,
+    /// The length that bends, mm: from the jaws' front to the stock's end.
+    pub free: f32,
+    /// Whether the tailstock supports the end.
+    pub supported: bool,
+}
+/// What the chuck of `rig` resists of `pushes` in `material` (None when the
+/// project has none). The jaws grip with `CHUCK_FORCE`: their friction on
+/// the stock where they close on it resists a turn about A, at the radius
+/// they close at, and a slide along it. A push acts at its height above the
+/// axis sideways and, upward, as far out as the stock reaches (the most it
+/// can turn it). The free length out of the jaws bends as a cantilever under
+/// the largest push at its end (P L³ / 3 E I), or, with the tailstock in
+/// its end, as a beam held in the jaws and resting on the centre (at most
+/// P L³ / 102 E I), the whole uncut stock's section taken: what earlier cuts
+/// thin it bends more. None without pushes.
+pub fn chuck_check(
+    rig: &crate::chuck::Rig,
+    material: Option<&Material>,
+    pushes: &[Push],
+) -> Option<ChuckMargin> {
+    let force = CHUCK_FORCE;
+    let turn = FRICTION * force * rig.inner;
+    let slide = FRICTION * force;
+    let group = material.map_or("Other", |m| get(&m.p, "group"));
+    let e = STIFFNESS
+        .iter()
+        .find(|row| row.0 == group)
+        .unwrap_or(&STIFFNESS[STIFFNESS.len() - 1])
+        .1;
+    let [_, dy, dz] = rig.stock.dimensions();
+    let i = if rig.round {
+        PI * (2. * rig.inner).powi(4) / 64.
+    } else {
+        dy.max(dz) * dy.min(dz).powi(3) / 12.
+    };
+    let free = (rig.stock.max[0] - rig.front).max(0.);
+    let supported = matches!(rig.tail, crate::chuck::Tail::Supports(_));
+    let beam = if supported { 102. } else { 3. };
+    let mut least: Option<ChuckMargin> = None;
+    let mut bend: f32 = 0.;
+    for &push in pushes {
+        bend = bend.max(push.side.hypot(push.up) * free.powi(3) / (beam * e * i));
+        let lever = (push.z - rig.axis[1]).abs();
+        for (resisted, applied, give) in [
+            (turn, push.side * lever + push.up * rig.outer, Give::Turn),
+            (slide, push.side, Give::Slide),
+        ] {
+            let factor = if applied > 0. {
+                resisted / applied
+            } else {
+                f32::INFINITY
+            };
+            if least.is_none_or(|m| factor < m.factor) {
+                least = Some(ChuckMargin {
+                    factor,
+                    give,
+                    push,
+                    resisted,
+                    applied,
+                    bend: 0.,
+                    free,
+                    supported,
+                });
+            }
+        }
+    }
+    least.map(|m| ChuckMargin { bend, ..m })
+}
+/// The chuck margin of each operation of setup `si` of `doc` whose `bites`
+/// are given (`chuck_check`), as `margins` gives a vise's.
+pub fn chuck_margins<'a>(
+    doc: &Document,
+    si: usize,
+    bites: impl IntoIterator<Item = (usize, &'a [Bite])>,
+    rig: &crate::chuck::Rig,
+) -> Vec<(usize, Option<ChuckMargin>)> {
+    let Some(setup) = doc.setups.get(si) else {
+        return vec![];
+    };
+    bites
+        .into_iter()
+        .map(|(oi, bites)| {
+            let margin = setup.operations.get(oi).and_then(|op| {
+                let pushes = op_pushes(doc, setup, op, bites)?;
+                chuck_check(rig, doc.selected_material(), &pushes)
+            });
+            (oi, margin)
+        })
+        .collect()
+}
+/// The `pushes` of operation `op` of `setup` over its `bites`, with its
+/// tool's diameter and flutes, its rpm and the project's material: None when
+/// one of those is not given.
+pub fn op_pushes(
+    doc: &Document,
+    setup: &crate::model::Setup,
+    op: &crate::model::Operation,
+    bites: &[Bite],
+) -> Option<Vec<Push>> {
+    let positive = |p, key| num(p, key).filter(|v| *v > 0.);
+    let tool = doc.tools.iter().find(|t| t.id == op.tool)?;
+    Some(pushes(
+        bites,
+        positive(&tool.p, "diameter")?,
+        positive(&tool.p, "flutes")?,
+        positive(&op.p, "rpm")?,
+        doc.selected_material(),
+        &setup.machine,
+    ))
+}
+/// What the setup's holding section says of operation `name`'s chuck
+/// `margin`.
+pub fn chuck_line(name: &str, margin: Option<&ChuckMargin>) -> String {
+    let Some(m) = margin else {
+        return format!("{name}: no cutting force sideways or up to hold against.");
+    };
+    let way = match m.give {
+        Give::Turn => "turning in the jaws",
+        Give::Slide => "sliding out of the jaws",
+    };
+    let bend = format!(
+        "its end bends {:.3} mm{}",
+        m.bend,
+        if m.supported { " on the tailstock" } else { "" }
+    );
+    if m.factor >= SAFETY {
+        format!("{name}: holds {} against {way}; {bend}.", times(m.factor))
+    } else {
+        format!(
+            "{name}: only {} against {way}; {} is wanted; {bend}.",
+            times(m.factor),
+            times(SAFETY)
+        )
+    }
+}
+/// The issues of operation `name`'s chuck `margin`: a margin under `SAFETY`,
+/// and an end that bends more than `DEFLECTION`.
+pub fn chuck_issues(name: &str, m: &ChuckMargin) -> Vec<String> {
+    let mut e = vec![];
+    let lighter = "take a smaller stepdown or stepover or a lower feed";
+    if m.factor < SAFETY {
+        let short = format!("{}, under the {} wanted", times(m.factor), times(SAFETY));
+        e.push(match m.give {
+            Give::Turn => format!(
+                "{name}: the cut could turn the stock in the chuck: about {} N·mm about A against the jaws' {} N·mm of friction ({short}). Grip a wider part of the stock, {lighter}.",
+                m.applied.round(),
+                m.resisted.round()
+            ),
+            Give::Slide => format!(
+                "{name}: the cut could pull the stock out of the chuck: about {} N along A against the jaws' {} N of friction ({short}). {}, or {lighter}.",
+                m.applied.round(),
+                m.resisted.round(),
+                if m.supported {
+                    "Grip more of the stock"
+                } else {
+                    "Support its end with the tailstock"
+                }
+            ),
+        });
+    }
+    if m.bend > DEFLECTION {
+        e.push(format!(
+            "{name}: the stock's end, {:.0} mm out of the jaws, could bend {:.2} mm under the cut's {} N; at most {} mm is wanted. {}, or {lighter}.",
+            m.free,
+            m.bend,
+            m.push.side.hypot(m.push.up).round(),
+            DEFLECTION,
+            if m.supported {
+                "Shorten the stick-out"
+            } else {
+                "Support the end with the tailstock, shorten the stick-out"
+            }
+        ));
+    }
+    e
 }
 #[cfg(test)]
 mod tests {
