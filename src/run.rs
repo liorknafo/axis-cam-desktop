@@ -1174,7 +1174,8 @@ fn op_of(b: &Block) -> Option<usize> {
         | Block::Run { op, .. }
         | Block::Approach { op, .. }
         | Block::Descend { op, .. }
-        | Block::Move { op, .. } => Some(*op),
+        | Block::Move { op, .. }
+        | Block::Pause { op, .. } => Some(*op),
         _ => None,
     }
 }
@@ -1612,6 +1613,10 @@ fn lower_blocks(
             }
             Block::Wait { seconds } | Block::Standstill { seconds } => actions.push(Do::Dwell {
                 seconds: *seconds as f64,
+            }),
+            // The run waits, saying it, until Resume: the spindle stopped.
+            Block::Pause { message, .. } => actions.push(Do::Pause {
+                reason: message.clone(),
             }),
             // X and Y alone, at the retract's height; the first after A
             // and X alone when the way out says so.

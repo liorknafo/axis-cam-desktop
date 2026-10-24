@@ -290,20 +290,104 @@ pub fn recommend(
     ) else {
         return Err("The tool has no diameter or flutes.".into());
     };
+    recommend_at(data.vc, chip_load(&data, d), d, z, machine)
+}
+/// `recommend` for a cutter of diameter `d` with `z` edges, in the
+/// surface speed range `vc` at the chip load range `fz` per edge.
+fn recommend_at(
+    vc: (f32, f32),
+    fz: (f32, f32),
+    d: f32,
+    z: f32,
+    machine: &Machine,
+) -> Result<(f32, f32), String> {
     let (max_rpm, max_feed) = limits(machine);
     if !(max_rpm.is_finite() && max_rpm > 0. && max_feed.is_finite() && max_feed > 0.) {
         return Err("The machine has no maximum spindle speed or feed.".into());
     }
     let rpm_at = |vc: f32| vc * 1000. / (std::f32::consts::PI * d);
-    let top = rpm_at(data.vc.1).min(max_rpm);
-    let bottom = rpm_at(data.vc.0).min(top);
-    Ok(pick(
-        (bottom, top),
-        chip_load(&data, d),
-        z,
-        max_rpm,
-        max_feed,
-    ))
+    let top = rpm_at(vc.1).min(max_rpm);
+    let bottom = rpm_at(vc.0).min(top);
+    Ok(pick((bottom, top), fz, z, max_rpm, max_feed))
+}
+/// A reamer's share of the material's surface speed: a third. Faster
+/// burns its margins and cuts the hole oversize.
+pub const REAMING_SPEED: f32 = 1. / 3.;
+/// A boring head's share of the material's surface speed: half, its one
+/// edge out on a slide unbalancing the spindle.
+pub const BORING_SPEED: f32 = 0.5;
+/// What a Reaming's or a Boring's speed and feed are reckoned for (they
+/// finish a hole a few tenths at a time, slower than the material's
+/// end-mill data): the diameter cut, the cutting edges, the share of the
+/// material's surface speed, and the cutter whose chip load per tooth each
+/// edge takes. A reamer is its own size with its flutes, at
+/// `REAMING_SPEED`; a boring head cuts the bore (its operation's Hole
+/// diameter) with one edge, at `BORING_SPEED`, the chip of a cutter as
+/// wide as its bar. None for other operations.
+struct Rates {
+    diameter: f32,
+    edges: f32,
+    speed: f32,
+    chip: f32,
+    what: &'static str,
+}
+fn rates(tool: &Tool, op: &Operation) -> Option<Result<Rates, String>> {
+    let size = |k: &str| num(&tool.p, k).filter(|d| *d > 0.);
+    if op.reaming() {
+        return Some(match (size("diameter"), size("flutes")) {
+            (Some(d), Some(z)) => Ok(Rates {
+                diameter: d,
+                edges: z,
+                speed: REAMING_SPEED,
+                chip: d,
+                what: "reaming",
+            }),
+            _ => Err("The tool has no diameter or flutes.".into()),
+        });
+    }
+    if op.boring() {
+        let Some(d) = num(&op.p, "hole_diameter").filter(|d| *d > 0.) else {
+            return Some(Err(
+                "Enter the Hole diameter the boring head bores: its speed is reckoned at it."
+                    .into(),
+            ));
+        };
+        let Some(bar) = size("bar_diameter") else {
+            return Some(Err("The boring head has no bar diameter.".into()));
+        };
+        return Some(Ok(Rates {
+            diameter: d,
+            edges: 1.,
+            speed: BORING_SPEED,
+            chip: bar,
+            what: "boring",
+        }));
+    }
+    None
+}
+/// `recommend` for operation `op`: a Reaming's and a Boring's at their own
+/// rates (`Rates`), every other's as `recommend` gives for its tool.
+pub fn recommend_for(
+    material: &Material,
+    tool: &Tool,
+    op: &Operation,
+    machine: &Machine,
+) -> Result<(f32, f32), String> {
+    let Some(rates) = rates(tool, op) else {
+        return recommend(material, tool, machine);
+    };
+    let rates = rates?;
+    let name = crate::proposal::clip(material.name(), NAME_LIMIT);
+    let Some(data) = material.cutting_data() else {
+        return Err(format!("{name} has no cutting data."));
+    };
+    recommend_at(
+        (data.vc.0 * rates.speed, data.vc.1 * rates.speed),
+        chip_load(&data, rates.chip),
+        rates.diameter,
+        rates.edges,
+        machine,
+    )
 }
 /// A chip load in mm as a check says it: 3 decimals, and a fourth under
 /// 0.01 mm, where a small cutter's lie, unless it is 0.
@@ -332,7 +416,20 @@ pub fn check(material: &Material, tool: &Tool, op: &Operation, machine: &Machine
     let Some(data) = material.cutting_data() else {
         return SpeedFeed::Unchecked(format!("{name} has no cutting data."));
     };
-    let (Some(d), Some(z)) = (num(&tool.p, "diameter"), num(&tool.p, "flutes")) else {
+    // A reamer and a boring head at their own rates (`Rates`).
+    let rates = match rates(tool, op) {
+        Some(Err(why)) => return SpeedFeed::Unchecked(why),
+        Some(Ok(r)) => Some(r),
+        None => None,
+    };
+    let (Some(d), Some(z)) = (
+        rates
+            .as_ref()
+            .map_or(num(&tool.p, "diameter"), |r| Some(r.diameter)),
+        rates
+            .as_ref()
+            .map_or(num(&tool.p, "flutes"), |r| Some(r.edges)),
+    ) else {
         return SpeedFeed::Unchecked("The tool has no diameter or flutes.".into());
     };
     let (Some(n), Some(f)) = (num(&op.p, "rpm"), num(&op.p, "feed")) else {
@@ -346,26 +443,37 @@ pub fn check(material: &Material, tool: &Tool, op: &Operation, machine: &Machine
     let (max_rpm, max_feed) = limits(machine);
     let vc = std::f32::consts::PI * d * n / 1000.;
     let fz = f / (n * z);
-    let (vc_min, vc_max) = data.vc;
-    let (fz_min, fz_max) = chip_load(&data, d);
+    let speed = rates.as_ref().map_or(1., |r| r.speed);
+    let (vc_min, vc_max) = (data.vc.0 * speed, data.vc.1 * speed);
+    let (fz_min, fz_max) = chip_load(&data, rates.as_ref().map_or(d, |r| r.chip));
+    // "Aluminium's 150–300 m/min", or "Aluminium's reaming 50–100 m/min".
+    let whose = match &rates {
+        Some(r) => format!("{name}'s {}", r.what),
+        None => format!("{name}'s"),
+    };
     let mut out = vec![];
     if vc > vc_max * 1.01 {
         out.push(format!(
-            "Surface speed {vc:.0} m/min is above {name}'s {vc_min:.0}–{vc_max:.0} m/min."
+            "Surface speed {vc:.0} m/min is above {whose} {vc_min:.0}–{vc_max:.0} m/min."
         ));
     } else if vc < vc_min * 0.99 && n < max_rpm - 0.5 {
         out.push(format!(
-            "Surface speed {vc:.0} m/min is below {name}'s {vc_min:.0}–{vc_max:.0} m/min."
+            "Surface speed {vc:.0} m/min is below {whose} {vc_min:.0}–{vc_max:.0} m/min."
         ));
     }
     let (shown, low, high) = (chip(fz), chip(fz_min), chip(fz_max));
+    let per = if rates.as_ref().is_some_and(|r| r.edges == 1.) {
+        "per turn"
+    } else {
+        "per tooth"
+    };
     if fz > fz_max * 1.01 {
         out.push(format!(
-            "Chip load {shown} mm per tooth is above {name}'s {low}–{high} mm for a Ø{d} mm tool."
+            "Chip load {shown} mm {per} is above {whose} {low}–{high} mm for a Ø{d} mm tool."
         ));
     } else if fz < fz_min * 0.99 && f < max_feed - 0.5 {
         out.push(format!(
-            "Chip load {shown} mm per tooth is below {name}'s {low}–{high} mm for a Ø{d} mm tool."
+            "Chip load {shown} mm {per} is below {whose} {low}–{high} mm for a Ø{d} mm tool."
         ));
     }
     if out.is_empty() {
@@ -725,6 +833,65 @@ mod tests {
             .into_iter()
             .find(|m| m.name() == "Aluminium 6061-T6")
             .unwrap()
+    }
+    /// A Reaming's speed is a third of the material's surface speed at the
+    /// reamer's size and flutes; a Boring's half of it at the bore, one edge
+    /// taking the chip of a cutter as wide as the bar (LIO-248).
+    #[test]
+    fn a_reamer_and_a_boring_head_run_at_their_own_rates() {
+        let (m, machine) = (alu(), Machine::new(3));
+        let mut reamer = Tool::new("Reamer 10", "Reamer", "10");
+        reamer.set_type("Reamer");
+        reamer.p.insert("flutes".into(), "6".into());
+        let mut ream = op("", "");
+        ream.strategy = Strategy::Drill;
+        ream.p.insert("cycle".into(), crate::model::REAMING.into());
+        let (rpm, feed) = recommend_for(&m, &reamer, &ream, &machine).unwrap();
+        // 6061 is 150–300 m/min: a reamer 50–100, 1592–3183 rpm at Ø10.
+        assert!((1590. ..=3190.).contains(&rpm), "{rpm}");
+        let per_tooth = feed / rpm / 6.;
+        assert!((0.03..=0.08).contains(&per_tooth), "{feed} at {rpm}");
+        ream.p.insert("rpm".into(), rpm.to_string());
+        ream.p.insert("feed".into(), feed.to_string());
+        assert!(matches!(
+            check(&m, &reamer, &ream, &machine),
+            SpeedFeed::InRange { .. }
+        ));
+        // An end mill's speed burns a reamer.
+        ream.p.insert("rpm".into(), "8000".into());
+        let SpeedFeed::Out(why) = check(&m, &reamer, &ream, &machine) else {
+            panic!("8000 rpm is too fast for a Ø10 reamer")
+        };
+        assert!(
+            why[0].contains("above Aluminium 6061-T6's reaming 50–100 m/min"),
+            "{why:?}"
+        );
+        let mut head = Tool::new("Boring head", "Boring head", "50");
+        head.set_type("Boring head");
+        let mut bore = op("", "");
+        bore.strategy = Strategy::Drill;
+        bore.p.insert("cycle".into(), crate::model::BORING.into());
+        bore.p.insert("hole_diameter".into(), "32".into());
+        let (rpm, feed) = recommend_for(&m, &head, &bore, &machine).unwrap();
+        // 75–150 m/min at Ø32: 746–1492 rpm; 0.03–0.08 mm a turn (Ø10 bar).
+        assert!((746. ..=1493.).contains(&rpm), "{rpm}");
+        assert!((0.03..=0.08).contains(&(feed / rpm)), "{feed} at {rpm}");
+        bore.p.insert("rpm".into(), rpm.to_string());
+        bore.p.insert("feed".into(), feed.to_string());
+        assert!(matches!(
+            check(&m, &head, &bore, &machine),
+            SpeedFeed::InRange { .. }
+        ));
+        bore.p.insert("hole_diameter".into(), "0".into());
+        assert!(
+            matches!(check(&m, &head, &bore, &machine), SpeedFeed::Unchecked(w) if w.contains("Hole diameter"))
+        );
+        // Other operations are as `recommend` gives.
+        let mill = Tool::new("Flat 10", "Flat end mill", "10");
+        assert_eq!(
+            recommend_for(&m, &mill, &op("", ""), &machine),
+            recommend(&m, &mill, &machine)
+        );
     }
     #[test]
     fn starters_are_valid_and_complete() {

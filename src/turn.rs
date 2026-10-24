@@ -522,6 +522,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
             .unwrap_or(reach),
         holder_radius: radius.max(0.05),
         neck: None,
+        stops: vec![],
         display_scale: resolved.display_scale,
         duration: cut.duration,
         target,

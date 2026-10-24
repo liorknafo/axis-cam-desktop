@@ -159,6 +159,18 @@ pub struct Plan {
     /// the simulation turns each ring away when its move ends, instead of
     /// sweeping the cutter along the moves. Empty for every other plan.
     pub rings: Vec<Ring>,
+    /// Where the spindle stops partway through (`cam::boring`), in order.
+    /// Empty for most plans.
+    pub stops: Vec<Stop>,
+}
+/// A stop of the spindle partway through a plan: before move `at` the
+/// spindle and coolant stop and, with a `pause`, the program waits there,
+/// saying it, for the operator to resume (`post::Block::Pause`). They start
+/// again before the next feed move.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stop {
+    pub at: usize,
+    pub pause: Option<String>,
 }
 impl Plan {
     /// Whether this is a lathe plan: its moves are a side view (X the
@@ -500,6 +512,7 @@ pub fn generate(
         tool_length,
         holder_radius,
         neck: None,
+        stops: vec![],
         display_scale: scale,
         duration: 0.,
         target,

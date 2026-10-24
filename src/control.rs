@@ -4890,6 +4890,79 @@ soft_max = 0.0
         assert!((at[0] - 30.).abs() < 1e-3 && at[2].abs() < 1e-3, "{at:?}");
     }
 
+    /// A Boring's run on the simulated UC100 (LIO-248): lowered from its
+    /// checked program, it stops the spindle and pauses before each pass,
+    /// saying the size to set the boring head to, and goes on to its end
+    /// after each Resume. Its feeds and dwells are sped up, the order kept.
+    #[test]
+    fn a_boring_run_pauses_to_set_the_head_and_goes_on_after_resume_on_the_simulator() {
+        use crate::cam::boring::tests::{bored, head, on_uc100};
+        let (doc, mesh, _) = bored(true, head(crate::model::BORE_RETRACTS[0]), |_| {});
+        let dir = tempfile::tempdir().unwrap();
+        let programs = crate::run::programs(&on_uc100(doc, dir.path()), &mesh, 0).unwrap();
+        let p = (programs.iter())
+            .find(|p| {
+                p.blocks
+                    .iter()
+                    .any(|b| matches!(b, crate::post::Block::Pause { .. }))
+            })
+            .unwrap();
+        // Placed by its own extents: inside X and Y, its highest point 1 mm
+        // under the top of Z's travel (the retracts go to Z 0).
+        let e = crate::post::extents(&p.blocks);
+        let d = p.datum;
+        let offset = [
+            f64::from(50. - (e.min[0] - d[0])),
+            f64::from(50. - (e.min[1] - d[1])),
+            f64::from(-1. - (e.max[2] - d[2])),
+            0.,
+            0.,
+            0.,
+        ];
+        assert!(e.max[2] - e.min[2] < 50., "{e:?}");
+        let lowered = crate::run::lower(p, 0, offset, [0.; 6]).unwrap();
+        let actions: Vec<Do> = (lowered.into_iter())
+            .map(|l| match l.action {
+                Do::Move {
+                    target,
+                    feed: Some(_),
+                } => Do::Move {
+                    target,
+                    feed: Some(40.),
+                },
+                Do::Dwell { .. } => Do::Dwell { seconds: 0.05 },
+                a => a,
+            })
+            .collect();
+        let mut c = zeroed_sim(dir.path(), LIMITED, None, 3);
+        let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
+        c.send(job("bore", actions));
+        for (pass, said) in [(1, "set it to Ø31.90"), (2, "Set the head out 0.10")] {
+            until(
+                &mut c,
+                120.0,
+                "the pause before a pass",
+                |s| matches!(&s.state, Some(State::Paused(r)) if r.contains(&format!("pass {pass} of 2"))),
+            );
+            let Some(State::Paused(reason)) = c.snapshot.state.clone() else {
+                unreachable!()
+            };
+            assert!(reason.contains(said), "{reason}");
+            c.send(Command::Resume);
+            until(
+                &mut c,
+                3.0,
+                "running again",
+                |s| !matches!(&s.state, Some(State::Paused(r)) if r.contains(&format!("pass {pass} of 2"))),
+            );
+        }
+        until(&mut c, 120.0, "the job's end", |s| {
+            s.program_outcome.as_ref().is_some_and(|o| o.seq > seq)
+        });
+        let o = c.snapshot.program_outcome.clone().unwrap();
+        assert!(o.ok, "{}", o.message);
+    }
+
     /// A connection to the simulated UC100 with `profile`, Idle with Set
     /// machine zero here made on its first `axes` axes.
     fn zeroed_sim(dir: &Path, profile: &str, m: Option<&Machine>, axes: usize) -> Connection {

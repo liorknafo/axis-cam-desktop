@@ -548,6 +548,13 @@ pub enum Block {
         /// during a move (`post_check::check_setup`).
         a: Option<f32>,
     },
+    /// The program waits for the operator, saying `message` (a boring
+    /// head's size to set, `simulation::Stop`): (MSG, ...) then M0, with
+    /// the spindle and coolant stopped before it.
+    Pause {
+        op: usize,
+        message: String,
+    },
     /// G0 A alone: A turns to `a` (degrees, as commanded) with X, Y and Z
     /// still, where the tool is: over the first point of an indexed
     /// operation's tool run, or at an index move's height above all that A
@@ -570,6 +577,9 @@ pub fn blocks(ops: &[OpState], plans: &[&Plan], settings: &PostSettings) -> Vec<
     let mut out = vec![];
     // The A the program has turned to; None until it commands one.
     let mut a_now: Option<f32> = None;
+    // A plan's stop (`simulation::Stop`) has stopped the spindle and coolant:
+    // they start again before the next feed, or the next operation.
+    let mut stopped = false;
     for (k, (op, plan)) in ops.iter().zip(plans).enumerate() {
         let first = plan.moves[0].from;
         let previous = k.checked_sub(1);
@@ -577,8 +587,16 @@ pub fn blocks(ops: &[OpState], plans: &[&Plan], settings: &PostSettings) -> Vec<
         // A spindle turning the other way is stopped first (with the coolant,
         // as at a tool change), then started again with the coolant.
         let reverse = previous.is_some_and(|p| ops[p].clockwise != op.clockwise);
-        let spindle = change || reverse || previous.is_some_and(|p| ops[p].rpm != op.rpm);
-        let coolant = change || reverse || previous.is_some_and(|p| ops[p].coolant != op.coolant);
+        // A pause before the plan's first move (a boring head set to its
+        // first size) comes with the spindle stopped, before it starts.
+        let paused = (plan.stops.first())
+            .filter(|s| s.at == 0)
+            .and_then(|s| s.pause.clone());
+        let restart = stopped || paused.is_some();
+        let spindle =
+            change || reverse || restart || previous.is_some_and(|p| ops[p].rpm != op.rpm);
+        let coolant =
+            change || reverse || restart || previous.is_some_and(|p| ops[p].coolant != op.coolant);
         // With a tool table and clearance-plane retracts, the first G0 Z needs the new tool's G43 H.
         if change && !(k == 0 && settings.tool_table && !settings.machine_home) {
             out.extend([Block::Stop, Block::Retract]);
@@ -598,6 +616,13 @@ pub fn blocks(ops: &[OpState], plans: &[&Plan], settings: &PostSettings) -> Vec<
             // The new tool's tip (after G43 or a manual touch-off) goes to a safe height first.
             out.push(Block::Retract);
         }
+        if let Some(message) = paused {
+            if !change && !stopped {
+                out.push(Block::Stop);
+            }
+            out.push(Block::Pause { op: k, message });
+        }
+        stopped = false;
         out.push(Block::Run {
             op: k,
             spindle,
@@ -653,7 +678,30 @@ pub fn blocks(ops: &[OpState], plans: &[&Plan], settings: &PostSettings) -> Vec<
                 }
             }
         }
-        for m in &plan.moves {
+        for (i, m) in plan.moves.iter().enumerate() {
+            for stop in plan.stops.iter().filter(|s| s.at == i && i > 0) {
+                out.push(Block::Stop);
+                if let Some(message) = &stop.pause {
+                    out.push(Block::Pause {
+                        op: k,
+                        message: message.clone(),
+                    });
+                }
+                stopped = true;
+            }
+            if stopped && m.motion == Motion::Feed {
+                out.push(Block::Run {
+                    op: k,
+                    spindle: true,
+                    coolant: true,
+                });
+                if settings.dwell > 0. {
+                    out.push(Block::Wait {
+                        seconds: settings.dwell,
+                    });
+                }
+                stopped = false;
+            }
             let kind = match m.motion {
                 Motion::Rapid => Kind::Rapid,
                 Motion::Feed => Kind::Feed,
@@ -1078,6 +1126,10 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
             }
             Block::Wait { seconds } | Block::Standstill { seconds } => {
                 w.line(format!("G4 P{seconds:.3}"))
+            }
+            Block::Pause { message, .. } => {
+                w.line(format!("(MSG, {})", comment(message)));
+                w.line("M0");
             }
             Block::Approach { xy, .. } => {
                 let (x, y) = (work(xy[0], d[0]), work(xy[1], d[1]));
@@ -3450,6 +3502,7 @@ fn checked_with(
                     | Block::Approach { op, .. }
                     | Block::Descend { op, .. }
                     | Block::Move { op, .. }
+                    | Block::Pause { op, .. }
                     | Block::Index { op, .. } = b
                     {
                         *op += k;
@@ -3819,6 +3872,7 @@ pub(crate) mod fixture {
             tool_length: 35.,
             holder_radius: 16.,
             neck: None,
+            stops: vec![],
             display_scale: 1.,
             duration: 0.,
             target: 9.,

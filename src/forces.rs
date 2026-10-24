@@ -57,6 +57,10 @@ pub const KC: [(&str, f32, f32); 7] = [
 pub const THREAD_MILLING_DIRECTION: &str = "Climb · thread milling";
 /// The milling direction a Tapping plan carries (`cam::tap`).
 pub const TAPPING_DIRECTION: &str = "Tapping · by hand";
+/// The milling direction a Reaming plan carries (`cam::boring::ream`).
+pub const REAMING_DIRECTION: &str = "Reaming · axial feed";
+/// The milling direction a Boring plan carries (`cam::boring::bore`).
+pub const BORING_DIRECTION: &str = "Boring · axial feed";
 
 /// What an operation cuts over a stretch of its path (`bites`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -102,10 +106,16 @@ pub fn bites(sim: &Simulation) -> Vec<Bite> {
     }
     // Threading takes a thread's depth, a fraction of a millimetre, round
     // the hole: its sweep is the thread's outline, not what it cuts, and a
-    // tap is turned by hand. Neither is modelled.
+    // tap is turned by hand. Neither is modelled. Nor are a reamer's and a
+    // boring head's few tenths round a hole: their push is along it.
     if sim.plan.strategy == crate::model::Strategy::Drill
-        && (sim.plan.milling_direction == THREAD_MILLING_DIRECTION
-            || sim.plan.milling_direction == TAPPING_DIRECTION)
+        && [
+            THREAD_MILLING_DIRECTION,
+            TAPPING_DIRECTION,
+            REAMING_DIRECTION,
+            BORING_DIRECTION,
+        ]
+        .contains(&sim.plan.milling_direction)
     {
         return vec![];
     }
