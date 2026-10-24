@@ -2056,7 +2056,8 @@ pub(crate) fn pictured_holding(
     let modelled = match get(&setup.p, "holding") {
         "Vise" | "Clamps" => true,
         "Chuck" => crate::chuck::holds(setup),
-        holding => crate::round_hold::Kind::of(holding).is_some(),
+        // A round bar's holder, or a sheet's hold-down screw heads.
+        holding => crate::round_hold::Kind::of(holding).is_some() || crate::sheet::screwed(setup),
     };
     let mut jaws = if modelled {
         let held = app
@@ -5600,7 +5601,8 @@ fn holding_on(
     let modelled = match get(&setup.p, "holding") {
         "Vise" | "Clamps" => true,
         "Chuck" => crate::chuck::holds(setup),
-        holding => crate::round_hold::Kind::of(holding).is_some(),
+        // A round bar's holder, or a sheet's hold-down screw heads.
+        holding => crate::round_hold::Kind::of(holding).is_some() || crate::sheet::screwed(setup),
     };
     let mut boxes = if modelled {
         let jaws = app.doc.holding_boxes(&posed, held);
