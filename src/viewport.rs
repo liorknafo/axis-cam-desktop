@@ -452,6 +452,73 @@ impl Projector {
         ])
     }
 }
+/// The cutter as the simulation view draws it: frustums from the tip up of
+/// the saved cutter diameter, flute length and stickout, (radius below,
+/// radius above, from, to, colour), mm above the tip: a thread mill's teeth
+/// and neck, a drill's or chamfer mill's cone, the flutes, the body and the
+/// holder.
+fn cutter_parts(plan: &crate::simulation::Plan) -> Vec<(f32, f32, f32, f32, [f32; 3])> {
+    let (cutter, body, holder) = ([221f32, 158., 50.], [137., 153., 170.], [77., 96., 118.]);
+    let r = plan.radius;
+    let length = plan.tool_length;
+    let mut parts: Vec<(f32, f32, f32, f32, [f32; 3])> = vec![];
+    if let (Some((pitch, teeth, cot)), Some([neck, reach, shank])) = (plan.shape.teeth(), plan.neck)
+    {
+        // A thread mill: its V teeth stacked a pitch apart over a thin
+        // neck, which widens to the shank the collet holds.
+        let depth = crate::simulation::THREAD_TOOTH * pitch;
+        let half = depth / cot;
+        for k in 0..teeth as usize {
+            let at = k as f32 * pitch;
+            parts.push((r - depth, r, at - half, at, cutter));
+            parts.push((r, r - depth, at, at + half, cutter));
+            if (k + 1) < teeth as usize && pitch > 2. * half {
+                parts.push((r - depth, r - depth, at + half, at + pitch - half, cutter));
+            }
+        }
+        let teeth_top = (teeth - 1.) * pitch + half;
+        let neck_top = reach.clamp(teeth_top, length);
+        parts.push((
+            neck.min(r - depth),
+            neck,
+            teeth_top,
+            teeth_top + 0.01,
+            cutter,
+        ));
+        parts.push((neck, neck, teeth_top, neck_top, body));
+        // The shoulder up to the shank, at about 30° to the axis.
+        let shoulder = (neck_top + (shank - neck).abs() * 1.7).min(length);
+        parts.push((neck, shank, neck_top, shoulder, body));
+        parts.push((shank, shank, shoulder, length, body));
+    } else if let Some(rise) = plan.shape.rise() {
+        // A drill's 118° point or a chamfer mill's cone, from its tip (a
+        // chamfer mill's flat) up to its diameter, then its flutes.
+        let flat = plan.shape.flat().min(r);
+        let flute = plan.flute_length;
+        let point = ((r - flat) * rise).min(flute);
+        parts.push((flat, (flat + point / rise).min(r), 0., point, cutter));
+        if point < flute {
+            parts.push((r, r, point, flute, cutter));
+        }
+        parts.push((r, r, flute, length, body));
+    } else {
+        let bottom = if plan.shape == crate::simulation::CutterShape::Ball {
+            r
+        } else {
+            0.
+        };
+        parts.push((r, r, bottom, plan.flute_length, cutter));
+        parts.push((r, r, plan.flute_length, length, body));
+    }
+    parts.push((
+        plan.holder_radius,
+        plan.holder_radius,
+        length,
+        length + 8.,
+        holder,
+    ));
+    parts
+}
 impl Viewport<'_> {
     /// The frame the camera centres and fits the scene in, for the view's
     /// bounds `b`: as wide as the view, `frame` high from its top (its own
@@ -1621,57 +1688,7 @@ impl Viewport<'_> {
             }
         };
         let pos = sim.position;
-        // Frustums, from the tip up, of the saved cutter diameter, flute
-        // length and stickout: (radius below, radius above, from, to, colour).
-        let (cutter, body, holder) = ([221f32, 158., 50.], [137., 153., 170.], [77., 96., 118.]);
-        let r = sim.plan.radius;
-        let length = sim.plan.tool_length;
-        let mut parts: Vec<(f32, f32, f32, f32, [f32; 3])> = vec![];
-        if let (Some((pitch, teeth, cot)), Some([neck, reach, shank])) =
-            (sim.plan.shape.teeth(), sim.plan.neck)
-        {
-            // A thread mill: its V teeth stacked a pitch apart over a thin
-            // neck, which widens to the shank the collet holds.
-            let depth = crate::simulation::THREAD_TOOTH * pitch;
-            let half = depth / cot;
-            for k in 0..teeth as usize {
-                let at = k as f32 * pitch;
-                parts.push((r - depth, r, at - half, at, cutter));
-                parts.push((r, r - depth, at, at + half, cutter));
-                if (k + 1) < teeth as usize && pitch > 2. * half {
-                    parts.push((r - depth, r - depth, at + half, at + pitch - half, cutter));
-                }
-            }
-            let teeth_top = (teeth - 1.) * pitch + half;
-            let neck_top = reach.clamp(teeth_top, length);
-            parts.push((
-                neck.min(r - depth),
-                neck,
-                teeth_top,
-                teeth_top + 0.01,
-                cutter,
-            ));
-            parts.push((neck, neck, teeth_top, neck_top, body));
-            // The shoulder up to the shank, at about 30° to the axis.
-            let shoulder = (neck_top + (shank - neck).abs() * 1.7).min(length);
-            parts.push((neck, shank, neck_top, shoulder, body));
-            parts.push((shank, shank, shoulder, length, body));
-        } else {
-            let bottom = if sim.plan.shape == crate::simulation::CutterShape::Ball {
-                r
-            } else {
-                0.
-            };
-            parts.push((r, r, bottom, sim.plan.flute_length, cutter));
-            parts.push((r, r, sim.plan.flute_length, length, body));
-        }
-        parts.push((
-            sim.plan.holder_radius,
-            sim.plan.holder_radius,
-            length,
-            length + 8.,
-            holder,
-        ));
+        let parts = cutter_parts(&sim.plan);
         for (below, above, from, to, base) in parts {
             let (bottom, top) = (pos[2] + from, pos[2] + to);
             let mut cap = Vec::new();
@@ -3624,6 +3641,37 @@ fn grid_faces(g: &crate::simulation::StockGrid, face: &mut impl FnMut(&[[f32; 3]
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_chamfer_mill_and_a_drill_are_drawn_with_their_cone() {
+        use crate::simulation::{CutterShape, Motion, POINT_RISE};
+        let mut plan =
+            crate::post::fixture::plan([0., 0., 5.], &[(Motion::Feed, [9., 0., 5.], 600.)]);
+        plan.radius = 3.;
+        plan.flute_length = 10.;
+        // A 60° chamfer mill with a 0.2 flat: from the flat up to Ø6, 2.9 ×
+        // cot 30° tall, then its flutes, its body and its holder.
+        plan.shape = CutterShape::Chamfer(600, 200);
+        let parts = cutter_parts(&plan);
+        let (below, above, from, to, _) = parts[0];
+        let tall = 2.9 / 30f32.to_radians().tan();
+        assert!(
+            (below - 0.1).abs() < 1e-5 && (above - 3.).abs() < 1e-4,
+            "{parts:?}"
+        );
+        assert!(from == 0. && (to - tall).abs() < 1e-4, "{parts:?}");
+        assert_eq!((parts[1].0, parts[1].1, parts[1].3), (3., 3., 10.));
+        // A drill: its 118° point under its flutes.
+        plan.shape = CutterShape::Drill;
+        let parts = cutter_parts(&plan);
+        assert!(parts[0].0 == 0. && (parts[0].3 - 3. * POINT_RISE).abs() < 1e-5);
+        // A cone longer than the flutes is drawn to the flutes' end.
+        plan.shape = CutterShape::Chamfer(200, 0);
+        let parts = cutter_parts(&plan);
+        assert!(parts[0].3 == 10. && parts[0].1 < 3., "{parts:?}");
+        // A flat end mill is still a cylinder from its tip.
+        plan.shape = CutterShape::Flat;
+        assert_eq!(cutter_parts(&plan)[0].0, 3.);
+    }
     /// FNV-1a over the pixels, to pin the drawing across the refactor.
     fn digest(bytes: &[u8]) -> u64 {
         bytes.iter().fold(0xcbf29ce484222325, |h, b| {
