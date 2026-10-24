@@ -3078,9 +3078,11 @@ impl App {
         let setup = self.doc.setup();
         let mut hasher = std::hash::DefaultHasher::new();
         mesh.fingerprint.hash(&mut hasher);
-        for key in ["rx", "ry", "rz", "tx", "ty", "tz"] {
+        for key in ["rx", "ry", "rz", "tx", "ty", "tz", indexed::ANGLES] {
             get(&setup.p, key).hash(&mut hasher);
         }
+        // An indexed setup's A turn, which its A angles and its base give.
+        format!("{:?}", setup.turn).hash(&mut hasher);
         op.surfaces
             .as_ref()
             .map(|s| (&s.mesh_fingerprint, &s.ids))
@@ -3098,7 +3100,14 @@ impl App {
         }
         #[cfg(test)]
         DRILL_HOLE_RUNS.with(|n| n.set(n.get() + 1));
-        let found = std::sync::Arc::new(cam::holes(setup, op, mesh));
+        // At several A angles, each hole read at the angle that cuts it.
+        let found = (self
+            .doc
+            .holes_listed(self.doc.index(), op, mesh, |posed, op| {
+                cam::holes(posed, op, mesh)
+            }))
+        .unwrap_or_else(|| cam::holes(setup, op, mesh));
+        let found = std::sync::Arc::new(found);
         *kept = Some((key, found.clone()));
         found
     }
@@ -3122,7 +3131,14 @@ impl App {
             .iter()
             .flat_map(|s| s.ids.iter().copied())
             .collect();
-        let found = std::sync::Arc::new(pocket::holes(self.doc.setup(), &ids, mesh));
+        let found = (self
+            .doc
+            .holes_listed(self.doc.index(), op, mesh, |posed, op| {
+                let ids = (op.surfaces.iter()).flat_map(|s| s.ids.iter().copied());
+                pocket::holes(posed, &ids.collect(), mesh)
+            }))
+        .unwrap_or_else(|| pocket::holes(self.doc.setup(), &ids, mesh));
+        let found = std::sync::Arc::new(found);
         *kept = Some((key, found.clone()));
         found
     }
@@ -3244,9 +3260,11 @@ impl App {
         let setup = self.doc.setup();
         let mut hasher = std::hash::DefaultHasher::new();
         mesh.fingerprint.hash(&mut hasher);
-        for key in ["rx", "ry", "rz", "tx", "ty", "tz"] {
+        for key in ["rx", "ry", "rz", "tx", "ty", "tz", indexed::ANGLES] {
             get(&setup.p, key).hash(&mut hasher);
         }
+        // An indexed setup's A turn, which its A angles and its base give.
+        format!("{:?}", setup.turn).hash(&mut hasher);
         op.surfaces
             .as_ref()
             .map(|s| (&s.mesh_fingerprint, &s.ids))

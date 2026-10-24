@@ -25,6 +25,8 @@ use crate::model::{Document, Machine, Setup, get, num};
 
 /// The Reposition action of an indexed setup.
 pub const ACTION: &str = "Index rotary axis";
+/// Why an operation that picks holes at several A angles makes nothing.
+pub const NO_HOLE_UP: &str = "None of the picked holes is turned up and open from above at any of this setup's A angles: pick holes that one of the angles turns up, or add the angle that does.";
 /// The setup field that lists its A angles, degrees. A setup whose action
 /// is `ACTION` without it is from a project saved before indexing turned
 /// the stock: the action is a label there, and the setup keeps its own
@@ -43,12 +45,9 @@ const OWN: [&str; 5] = ["name", "notes", "reposition", ANGLES, "stock_source"];
 /// `op` as it runs on the part `posed` at one of its setup's angles: a
 /// Facing operation whose selected faces are not all on top there faces
 /// those that are, so that one operation faces a square's four sides at A
-/// 0, 90, 180 and 270° (LIO-211). An operation that picks holes (a Drill, a
-/// Pocket, a Contour, `crate::picks_holes`) in a setup of several angles
-/// cuts there the picked holes whose axis is along Z there (`hole_along_z`)
-/// and the picked faces on top, so that one Drill drills radial holes each
-/// at the angle that turns it up. Unchanged otherwise, and when none of its
-/// faces is on top, which the operation then refuses.
+/// 0, 90, 180 and 270° (LIO-211). Unchanged otherwise, and when none of its
+/// faces is on top, which the facing then refuses. An operation that picks
+/// holes at several angles cuts its own at each (`holes_by_angle`).
 pub fn on_top<'a>(
     op: &'a crate::model::Operation,
     posed: &Setup,
@@ -58,50 +57,168 @@ pub fn on_top<'a>(
     let Some(selection) = op.surfaces.as_ref() else {
         return Cow::Borrowed(op);
     };
-    let holes = crate::picks_holes(op) && angles(posed).is_ok_and(|a| a.len() > 1);
-    let face = op.strategy == crate::model::Strategy::Face && selection.ids.len() >= 2;
-    if !holes && !face {
+    if op.strategy != crate::model::Strategy::Face || selection.ids.len() < 2 {
         return Cow::Borrowed(op);
     }
-    let up = kept_on_top(&selection.ids, holes, posed, mesh);
+    let angles = crate::stock::Placement::new(mesh, Some(posed)).rotation();
+    let up = (selection.ids.iter().copied())
+        .filter(|&id| faces_up(mesh, angles, id))
+        .collect::<Vec<_>>();
     if up.is_empty() || up.len() == selection.ids.len() {
         return Cow::Borrowed(op);
     }
+    Cow::Owned(with_surfaces(op, up))
+}
+/// Whether surface `id` of `mesh` faces up, the part turned by `angles`.
+fn faces_up(mesh: &Mesh, angles: [f32; 3], id: usize) -> bool {
+    mesh.surfaces
+        .get(id)
+        .is_some_and(|f| rotation(f.normal, angles)[2] >= 0.5f32.to_radians().cos())
+}
+/// `op` cutting only the surfaces `ids` of its selection.
+fn with_surfaces(op: &crate::model::Operation, ids: Vec<usize>) -> crate::model::Operation {
     let mut op = op.clone();
     if let Some(s) = op.surfaces.as_mut() {
-        s.ids = up;
+        s.ids = ids;
     }
-    Cow::Owned(op)
+    op
 }
-/// Of the picked surfaces `ids`, those cut on the part `posed`: the faces
-/// on top there, and with `holes` the walls of each picked hole whose axis
-/// is along Z there, all its walls picked.
-fn kept_on_top(ids: &[usize], holes: bool, posed: &Setup, mesh: &Mesh) -> Vec<usize> {
-    let angles = crate::stock::Placement::new(mesh, Some(posed)).rotation();
-    let on_top = |id: usize| {
-        mesh.surfaces
-            .get(id)
-            .is_some_and(|f| rotation(f.normal, angles)[2] >= 0.5f32.to_radians().cos())
-    };
-    let picked: std::collections::HashSet<usize> = ids.iter().copied().collect();
-    let mut along = std::collections::HashSet::new();
-    for &id in ids.iter().filter(|_| holes) {
-        if along.contains(&id) {
-            continue;
+/// Whether `op`, of `setup`, picks holes (a Drill, a Pocket, a Contour,
+/// `crate::picks_holes`) in an indexed setup of several A angles: then each
+/// angle cuts the holes it turns up (`holes_by_angle`).
+pub fn holes_at_angles(op: &crate::model::Operation, setup: &Setup) -> bool {
+    crate::picks_holes(op)
+        && op.surfaces.is_some()
+        && is_indexed(setup)
+        && angles(setup).is_ok_and(|a| a.len() > 1)
+}
+/// What one A angle of an operation that picks holes cuts.
+pub struct AngleCut {
+    pub a: f32,
+    /// The setup posed at `a` (`Document::setup_at`).
+    pub posed: Setup,
+    /// The picked surfaces cut there: those of the holes it turns up, and
+    /// the picked faces on top there. Empty when it cuts none: the angle
+    /// is skipped.
+    pub ids: Vec<usize>,
+}
+/// What each A angle of operation `op` of setup `si`, which picks holes at
+/// several angles (`holes_at_angles`), cuts, in the setup's order: each
+/// picked hole at the first angle that turns its axis along Z and opens it
+/// upward (`hole_along_z`, `opens_up`), and each picked face at the first
+/// angle that turns it up. And how many picked holes (or faces) no angle
+/// cuts.
+pub fn holes_by_angle(
+    doc: &Document,
+    si: usize,
+    op: &crate::model::Operation,
+    mesh: &Mesh,
+) -> Result<(Vec<AngleCut>, usize), String> {
+    use std::collections::HashSet;
+    let setup = &doc.setups[si];
+    let ids: Vec<usize> = (op.surfaces.iter())
+        .flat_map(|s| s.ids.iter().copied())
+        .collect();
+    let picked: HashSet<usize> = ids.iter().copied().collect();
+    let mut done = HashSet::new();
+    let mut out = vec![];
+    for a in angles(setup)? {
+        let posed = doc.setup_at(setup, si, a, mesh)?;
+        let g = crate::cam::Geometry::new(&posed, mesh);
+        let turned = crate::stock::Placement::new(mesh, Some(&posed)).rotation();
+        let (mut cut, mut tried) = (vec![], HashSet::new());
+        for &id in &ids {
+            if done.contains(&id) || tried.contains(&id) {
+                continue;
+            }
+            if let Some(walls) = hole_along_z(&posed, mesh, id) {
+                tried.extend(walls.iter().copied());
+                let whole = walls.iter().all(|w| picked.contains(w));
+                if whole && opens_up(&g, &walls) {
+                    done.extend(walls.iter().copied());
+                    cut.extend(walls.iter().copied());
+                }
+            } else if faces_up(mesh, turned, id) {
+                done.insert(id);
+                cut.push(id);
+            }
         }
-        if let Some(walls) = hole_along_z(posed, mesh, id)
-            && walls.iter().all(|w| picked.contains(w))
-        {
-            along.extend(walls);
+        out.push(AngleCut {
+            a,
+            posed,
+            ids: (ids.iter().copied())
+                .filter(|id| cut.contains(id))
+                .collect(),
+        });
+    }
+    // The picked surfaces no angle cuts, counted by hole: those joined by a
+    // corner of their triangles are one.
+    let left: Vec<usize> = ids
+        .iter()
+        .copied()
+        .filter(|id| !done.contains(id))
+        .collect();
+    let mut root: std::collections::HashMap<usize, usize> =
+        left.iter().map(|&id| (id, id)).collect();
+    fn find(root: &mut std::collections::HashMap<usize, usize>, id: usize) -> usize {
+        let up = root[&id];
+        if up == id {
+            return id;
+        }
+        let top = find(root, up);
+        root.insert(id, top);
+        top
+    }
+    let mut corner: std::collections::HashMap<[i64; 3], usize> = Default::default();
+    for f in &mesh.faces {
+        let Some(id) = f.feature.filter(|id| root.contains_key(id)) else {
+            continue;
+        };
+        for p in &f.points {
+            let key = p.map(|v| (v as f64 * 1e5).round() as i64);
+            match corner.get(&key) {
+                Some(&other) => {
+                    let (a, b) = (find(&mut root, id), find(&mut root, other));
+                    root.insert(a, b);
+                }
+                None => {
+                    corner.insert(key, id);
+                }
+            }
         }
     }
-    (ids.iter().copied())
-        .filter(|&id| on_top(id) || along.contains(&id))
-        .collect()
+    let count = (left.iter())
+        .filter(|&&id| find(&mut root, id) == id)
+        .count();
+    Ok((out, count))
+}
+/// Whether the hole whose walls are `walls` opens upward in `g`: nothing of
+/// the part over it past a gap (`cam::part_past_gap`), as there is over a
+/// through-hole facing down, across a tube's bore.
+fn opens_up(g: &crate::cam::Geometry, walls: &[usize]) -> bool {
+    let corners: Vec<[f32; 3]> = (g.triangles.iter())
+        .filter(|t| t.feature.is_some_and(|id| walls.contains(&id)))
+        .flat_map(|t| t.p)
+        .collect();
+    if corners.is_empty() {
+        return false;
+    }
+    let n = corners.len() as f32;
+    let centre = [0, 1].map(|k| corners.iter().map(|p| p[k]).sum::<f32>() / n);
+    let r = corners
+        .iter()
+        .map(|p| (p[0] - centre[0]).hypot(p[1] - centre[1]))
+        .sum::<f32>()
+        / n;
+    let top = corners
+        .iter()
+        .map(|p| p[2])
+        .fold(f32::NEG_INFINITY, f32::max);
+    !crate::cam::part_past_gap(g, centre, r, top, true)
 }
 /// The mean lean of a hole's walls from Z under which its axis is along Z:
-/// their triangles' normals' Z, area-weighted, is (2/π)·sin t for a hole tilted by t,
-/// so this is about 4.5°.
+/// their triangles' normals' Z, area-weighted, is (2/π)·sin t for a hole
+/// tilted by t, so this is about 4.5°.
 const ALONG_Z: f32 = 0.05;
 /// The walls of the hole surface `id` is a wall of (`pocket::hole_walls`),
 /// when `posed` turns that hole's axis along Z; None when it does not, or
@@ -142,7 +259,10 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 }
 /// The selected surfaces' problems (`surface::issues`) of operation `op` of
 /// setup `si`: an indexed setup's at each of its angles, with the part
-/// posed there and its faces on top there (`on_top`), each said once.
+/// posed there and its faces on top there (`on_top`), each said once. An
+/// operation that picks holes at several angles is checked at each angle
+/// on what it cuts there (`holes_by_angle`), and refused when a picked hole
+/// is cut at none.
 pub fn surface_issues(
     doc: &Document,
     si: usize,
@@ -157,33 +277,43 @@ pub fn surface_issues(
         return crate::surface::issues(op, setup, Some(mesh));
     }
     let mut out: Vec<String> = vec![];
-    // The picked surfaces some angle cuts, for an operation that picks holes.
-    let holes = crate::picks_holes(op) && list.len() > 1;
-    let mut cut = std::collections::HashSet::new();
-    for &a in &list {
-        let Ok(posed) = doc.setup_at(setup, si, a, mesh) else {
-            return crate::surface::issues(op, setup, Some(mesh));
-        };
-        let at = on_top(op, &posed, mesh);
-        if let Some(s) = at.surfaces.as_ref().filter(|_| holes) {
-            cut.extend(kept_on_top(&s.ids, true, &posed, mesh));
-        }
-        for issue in crate::surface::issues(&at, &posed, Some(mesh)) {
+    let mut add = |issues: Vec<String>| {
+        for issue in issues {
             if !out.contains(&issue) {
                 out.push(issue);
             }
         }
+    };
+    if holes_at_angles(op, setup) {
+        let (cuts, left) = match holes_by_angle(doc, si, op, mesh) {
+            Ok(found) => found,
+            Err(e) => return vec![e],
+        };
+        for c in cuts.iter().filter(|c| !c.ids.is_empty()) {
+            add(crate::surface::issues(
+                &with_surfaces(op, c.ids.clone()),
+                &c.posed,
+                Some(mesh),
+            ));
+        }
+        if left > 0 {
+            add(vec![format!(
+                "{left} of the picked holes {} turned up and open from above at none of this setup's A angles ({}), so nothing would cut {}. Pick holes that one of the angles turns up, or add the angle that does.",
+                if left == 1 { "is" } else { "are" },
+                angles_text(&list),
+                if left == 1 { "it" } else { "them" }
+            )]);
+        }
+        return out;
     }
-    let left = (op.surfaces.iter())
-        .flat_map(|s| s.ids.iter())
-        .filter(|id| !cut.contains(id))
-        .count();
-    if holes && left > 0 {
-        out.push(format!(
-            "{left} of the picked faces {} no hole along Z and no face on top at any of this setup's A angles ({}), so nothing would cut {}. Pick holes that one of the angles turns up, or add the angle that does.",
-            if left == 1 { "is" } else { "are" },
-            angles_text(&list),
-            if left == 1 { "it" } else { "them" }
+    for &a in &list {
+        let Ok(posed) = doc.setup_at(setup, si, a, mesh) else {
+            return crate::surface::issues(op, setup, Some(mesh));
+        };
+        add(crate::surface::issues(
+            &on_top(op, &posed, mesh),
+            &posed,
+            Some(mesh),
         ));
     }
     out
@@ -191,17 +321,44 @@ pub fn surface_issues(
 impl Document {
     /// The setup a click on surface `id` of setup `si` picks a hole in: the
     /// setup as the view shows it, or for an indexed setup the setup posed at
-    /// the first of its A angles that turns the hole of `id` along Z
-    /// (`hole_along_z`), so that one operation picks holes at each angle.
+    /// the first of its A angles that turns the hole of `id` along Z and
+    /// opens it upward, so that one operation picks holes at each angle.
     pub fn picking_pose(&self, si: usize, mesh: &Mesh, id: usize) -> Setup {
         let setup = &self.setups[si];
-        if !is_indexed(setup) || hole_along_z(setup, mesh, id).is_some() {
+        let up = |posed: &Setup| {
+            hole_along_z(posed, mesh, id)
+                .is_some_and(|walls| opens_up(&crate::cam::Geometry::new(posed, mesh), &walls))
+        };
+        if !is_indexed(setup) || up(setup) {
             return setup.clone();
         }
         (angles(setup).unwrap_or_default().into_iter())
             .filter_map(|a| self.setup_at(setup, si, a, mesh).ok())
-            .find(|posed| hole_along_z(posed, mesh, id).is_some())
+            .find(|posed| up(posed))
             .unwrap_or_else(|| setup.clone())
+    }
+    /// What the Geometry tab lists of operation `op` of setup `si` that picks
+    /// holes at several angles (`holes_at_angles`): `read` of what each angle
+    /// cuts (`holes_by_angle`), read in the setup posed there, one after the
+    /// other. None for another operation.
+    pub fn holes_listed<T>(
+        &self,
+        si: usize,
+        op: &crate::model::Operation,
+        mesh: &Mesh,
+        read: impl Fn(&Setup, &crate::model::Operation) -> Result<Vec<T>, String>,
+    ) -> Option<Result<Vec<T>, String>> {
+        if !holes_at_angles(op, self.setups.get(si)?) {
+            return None;
+        }
+        let listed = holes_by_angle(self, si, op, mesh).and_then(|(cuts, _)| {
+            let mut all = vec![];
+            for c in cuts.iter().filter(|c| !c.ids.is_empty()) {
+                all.extend(read(&c.posed, &with_surfaces(op, c.ids.clone()))?);
+            }
+            Ok(all)
+        });
+        Some(listed)
     }
 }
 /// Whether `setup` is indexed: its Reposition action is `ACTION` and it
@@ -966,7 +1123,22 @@ pub fn generate(
     start: Start,
 ) -> Result<Posed, String> {
     use crate::simulation::Simulation;
-    let list = angles(setup)?;
+    // An operation that picks holes at several angles cuts at each only the
+    // holes it turns up, and skips an angle that turns none up.
+    let by_angle = holes_at_angles(op, setup)
+        .then(|| holes_by_angle(doc, si, op, mesh))
+        .transpose()?
+        .map(|(cuts, _)| cuts);
+    let list: Vec<f32> = match &by_angle {
+        Some(cuts) => (cuts.iter())
+            .filter(|c| !c.ids.is_empty())
+            .map(|c| c.a)
+            .collect(),
+        None => angles(setup)?,
+    };
+    if list.is_empty() {
+        return Err(NO_HOLE_UP.into());
+    }
     let begin = start.begin.ok_or(STOCK_UNKNOWN)?;
     let mut now = start.now.cloned();
     let mut parts = vec![];
@@ -979,7 +1151,11 @@ pub fn generate(
             .as_ref()
             .filter(|v| !v.cuts.is_empty())
             .map(|v| std::sync::Arc::new(crate::rest::RestStock::new(v, at.frame)));
-        let mut plan = crate::simulation::generate(&posed, &on_top(op, &posed, mesh), tool, mesh)
+        let here = match by_angle.as_ref().and_then(|c| c.iter().find(|c| c.a == a)) {
+            Some(c) => std::borrow::Cow::Owned(with_surfaces(op, c.ids.clone())),
+            None => on_top(op, &posed, mesh),
+        };
+        let mut plan = crate::simulation::generate(&posed, &here, tool, mesh)
             .map_err(|e| format!("At A {}°: {e}", degrees(a)))?;
         for m in &mut plan.moves {
             m.a = Some(a);
@@ -2653,10 +2829,27 @@ pub(crate) mod tests {
     /// A Ø40 × 40 part with six blind radial Ø4 holes (`radial_hole`) in a
     /// Ø44 bar in the chuck, its -X end at X 0, and setup 2 indexed to
     /// `angles` with one Drill of a Ø4 drill on the walls of holes `holes`.
-    fn radial_job(angles: &str, holes: &[usize]) -> (Document, Mesh) {
+    pub(crate) fn radial_job(angles: &str, holes: &[usize]) -> (Document, Mesh) {
+        radial_doc("radial-holes", angles, ("4", "20"), 12.3, |x, _| {
+            holes.iter().any(|&k| (x - radial_hole(k).0).abs() < 2.2)
+        })
+    }
+    /// The radial-hole part `file` (`scripts/make-radial-holes.py`) in a
+    /// Ø44 bar in the chuck, its -X end at X 0, setup 2 indexed to `angles`
+    /// with one Drill of a drill of (diameter, flute length) `drill` on the
+    /// walls of the holes `pick` takes by their X and their angle round X
+    /// (degrees from +Y towards +Z at A 0), between `inner` from the bar's
+    /// axis (the holes' bottom, or the tube's bore) and the skin (20).
+    fn radial_doc(
+        file: &str,
+        angles: &str,
+        drill: (&str, &str),
+        inner: f32,
+        pick: impl Fn(f32, f32) -> bool,
+    ) -> (Document, Mesh) {
         use crate::model::{Operation, Strategy, Tool};
         let mesh = crate::mesh::load(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/radial-holes.3mf"),
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("examples/{file}.3mf")),
         )
         .unwrap();
         let mut doc = bar_job(&mesh, 0., "80", "-150", angles, contour(&cutter("12")));
@@ -2667,13 +2860,12 @@ pub(crate) mod tests {
             "tz".into(),
             (22. - mesh.dimensions[2] / 2. - 4. / s).to_string(),
         );
-        let mut drill = Tool::new("Drill 4", "Drill", "4");
-        for (k, v) in [("length", "20"), ("stickout", "30")] {
-            drill.p.insert(k.into(), v.into());
+        let mut tool = Tool::new(&format!("Drill {}", drill.0), "Drill", drill.0);
+        for (k, v) in [("length", drill.1), ("stickout", "30")] {
+            tool.p.insert(k.into(), v.into());
         }
-        // The holes' walls, as setup 1 places the part: between the hole's
-        // bottom (12 from the bar's axis) and the part's skin (20), round
-        // the hole's X, and not its bottom, whose normal is radial.
+        // The holes' walls, as setup 1 places the part, and not a blind
+        // hole's bottom, whose normal is radial.
         let placed = crate::stock::Placement::new(&mesh, Some(&doc.setups[0]));
         let stock = crate::stock::resolve(&doc.setups[0], Some(&mesh))
             .unwrap()
@@ -2686,19 +2878,19 @@ pub(crate) mod tests {
                 let (y, z) = (c[1] - bar.axis[0], c[2] - bar.axis[1]);
                 let r = y.hypot(z);
                 let radial = (f.normal[1] * y + f.normal[2] * z).abs() / r.max(1e-6);
-                (12.3..19.7).contains(&r)
+                (inner..19.7).contains(&r)
                     && radial < 0.5
-                    && holes.iter().any(|&k| (c[0] - radial_hole(k).0).abs() < 2.2)
+                    && pick(c[0], z.atan2(y).to_degrees().rem_euclid(360.))
             })
             .collect::<Vec<_>>();
-        assert!(ids.len() >= 4 * holes.len(), "{} walls", ids.len());
-        let mut op = Operation::new(Strategy::Drill, drill.id.clone());
+        assert!(ids.len() >= 4, "{} walls", ids.len());
+        let mut op = Operation::new(Strategy::Drill, tool.id.clone());
         op.geometry.clear();
         op.surfaces = Some(crate::surface::Selection {
             mesh_fingerprint: mesh.fingerprint.clone(),
             ids,
         });
-        doc.tools = vec![drill];
+        doc.tools = vec![tool];
         doc.setups[1].operations = vec![op];
         doc.sync_stock_sources();
         doc.sync_turns(Some(&mesh));
@@ -2781,8 +2973,129 @@ pub(crate) mod tests {
         assert!(
             issues
                 .iter()
-                .any(|i| i.contains("no hole along Z and no face on top")),
+                .any(|i| i.starts_with("1 of the picked holes is turned up and open from above at none of this setup's A angles (A 30°, 90°, 150°, 210°, 270°)")),
             "{issues:?}"
+        );
+    }
+    /// Six Ø4 holes through a tube's wall, 60° apart at one X, each facing
+    /// the one opposite across the bore: one Drill of a Ø3.3 drill with 20
+    /// mm flutes drills each once, at the angle that turns it up and opens
+    /// it upward (not the one under it, open from above through the bore
+    /// and the hole over it), through its own wall and not on across the
+    /// bore (LIO-246, review 2).
+    #[test]
+    fn one_drill_drills_a_tubes_opposite_holes_each_once_through_its_wall() {
+        let (doc, mesh) = radial_doc(
+            "radial-tube",
+            "30, 90, 150, 210, 270, 330",
+            ("3.3", "20"),
+            14.3,
+            |x, _| (x - 20.).abs() < 2.2,
+        );
+        let op = &doc.setups[1].operations[0];
+        let (cuts, left) = holes_by_angle(&doc, 1, op, &mesh).unwrap();
+        assert_eq!(left, 0);
+        // One hole an angle, each of the six walls once.
+        let mut seen = std::collections::HashSet::new();
+        for c in &cuts {
+            assert!(!c.ids.is_empty(), "A {}", c.a);
+            assert!(c.ids.iter().all(|id| seen.insert(*id)), "A {}", c.a);
+        }
+        assert_eq!(seen.len(), op.surfaces.as_ref().unwrap().ids.len());
+        assert_eq!(
+            surface_issues(&doc, 1, op, Some(&mesh)),
+            Vec::<String>::new()
+        );
+        let sim = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap();
+        for c in &cuts {
+            // The drill's lowest point at that angle: through the wall
+            // (its inner face 14 mm from the axis) by its breakthrough, not
+            // across the bore towards the far wall.
+            let axis = c.posed.turn.unwrap().axis;
+            let low = (sim.plan.moves.iter())
+                .filter(|m| m.cutting_pass && m.a == Some(c.a))
+                .map(|m| m.to[2])
+                .fold(f32::INFINITY, f32::min);
+            let depth = low - axis[1];
+            assert!(
+                depth > 9. && depth < 13.9,
+                "A {}: tip {depth} over the axis",
+                c.a
+            );
+        }
+        // Each hole once: one plunge at each angle, at the holes' X.
+        let drilled = drilled_at(&sim.plan);
+        assert_eq!(drilled.len(), 6, "{drilled:?}");
+        assert!(
+            drilled
+                .iter()
+                .all(|(_, lo, hi)| (lo - 20.).abs() < 0.01 && (hi - 20.).abs() < 0.01),
+            "{drilled:?}"
+        );
+    }
+    /// An indexed setup's angles serve its other operations too: a Drill
+    /// whose holes one angle turns up skips the angles that turn none up,
+    /// instead of being refused (LIO-246, review 2).
+    #[test]
+    fn a_drill_skips_the_angles_that_turn_none_of_its_holes_up() {
+        let (doc, mesh) = radial_job("0, 90", &[0]);
+        let op = &doc.setups[1].operations[0];
+        assert_eq!(
+            surface_issues(&doc, 1, op, Some(&mesh)),
+            Vec::<String>::new()
+        );
+        let sim = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap();
+        let drilled = drilled_at(&sim.plan);
+        assert_eq!(drilled.len(), 1, "{drilled:?}");
+        assert_eq!(drilled[0].0, 90.);
+        assert!(sim.plan.moves.iter().all(|m| m.a != Some(0.)));
+        // With no angle that turns its hole up it is refused.
+        let (none, _) = radial_job("0, 180", &[0]);
+        let op = &none.setups[1].operations[0];
+        let issues = surface_issues(&none, 1, op, Some(&mesh));
+        assert!(
+            issues[0].starts_with("1 of the picked holes is"),
+            "{issues:?}"
+        );
+        let e = crate::simulation::prepare(&none, &mesh, 1, 0)
+            .err()
+            .unwrap();
+        assert!(e.contains(NO_HOLE_UP), "{e}");
+    }
+    /// The Geometry tab lists a Drill at several angles as each angle reads
+    /// its holes: all six of the six-hole job, which the setup as shown
+    /// (its first angle) cannot read (LIO-246, review 2).
+    #[test]
+    fn a_drill_at_several_angles_lists_each_hole_as_its_angle_reads_it() {
+        let (doc, mesh) = radial_job("30, 90, 150, 210, 270, 330", &[0, 1, 2, 3, 4, 5]);
+        let op = &doc.setups[1].operations[0];
+        assert!(crate::cam::holes(&doc.setups[1], op, &mesh).is_err());
+        let listed = doc
+            .holes_listed(1, op, &mesh, |posed, op| {
+                crate::cam::holes(posed, op, &mesh)
+            })
+            .unwrap()
+            .unwrap();
+        let mut xs: Vec<f32> = listed.iter().map(|h| h.center[0]).collect();
+        xs.sort_by(f32::total_cmp);
+        assert_eq!(xs.len(), 6, "{xs:?}");
+        for (k, x) in xs.iter().enumerate() {
+            assert!((x - radial_hole(k).0).abs() < 0.01, "{xs:?}");
+        }
+        let walls = doc
+            .holes_listed(1, op, &mesh, |posed, op| {
+                let ids = (op.surfaces.iter()).flat_map(|s| s.ids.iter().copied());
+                crate::pocket::holes(posed, &ids.collect(), &mesh)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(walls.len(), 6);
+        // Not for a setup of one angle: the setup as it is reads it.
+        let (one, _) = radial_job("90", &[0]);
+        let op = &one.setups[1].operations[0];
+        assert!(
+            one.holes_listed(1, op, &mesh, |_, _| Ok(vec![()]))
+                .is_none()
         );
     }
     /// The threaded plate, a box in a 4-jaw chuck on the rotary unit: drilled

@@ -11295,6 +11295,44 @@ soft_max = 180.0
         );
         let _ = a.view();
     }
+    /// The Geometry tab's holes of a Drill at several A angles: each read at
+    /// the angle that cuts it, and read again when the angles change (the
+    /// kept answer is keyed on them and on A's turn) (LIO-246, review 2).
+    #[test]
+    fn a_drill_at_several_angles_lists_its_holes_and_follows_the_angles() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        let (mut doc, mesh) =
+            crate::indexed::tests::radial_job("30, 90, 150, 210, 270, 330", &[0, 1, 2, 3, 4, 5]);
+        doc.file = Some(crate::model::ModelFile {
+            name: "radial-holes.3mf".into(),
+            path: dir.path().join("radial-holes.3mf"),
+            format: "3mf".into(),
+            bytes: 0,
+        });
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh.clone());
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectSetup(1));
+        let op = a.doc.setups[1].operations[0].clone();
+        let holes = |a: &App| a.drill_holes(&op, &mesh).as_ref().clone().map(|h| h.len());
+        assert_eq!(holes(&a), Ok(6));
+        let walls = |a: &App| {
+            a.pocket_holes(&op, &mesh)
+                .as_ref()
+                .as_ref()
+                .map(|h| h.len())
+                .ok()
+        };
+        assert_eq!(walls(&a), Some(6));
+        // Two of the angles: two of the holes.
+        a.doc.setups[1]
+            .p
+            .insert(crate::indexed::ANGLES.into(), "30, 90".into());
+        a.doc.sync_turns(Some(&mesh));
+        assert_eq!(holes(&a), Ok(2));
+        assert_eq!(walls(&a), Some(2));
+    }
     /// "Stock after this setup" on an indexed setup with the bar in the
     /// chuck: the view shows the round bar as its four angles leave it, every
     /// angle's cuts (#288 with LIO-246).

@@ -1179,7 +1179,73 @@ fn drill_hole(
             _ => break,
         }
     }
-    found.or_else(|| round_hole(g, &ring, top))
+    let mut found = found.or_else(|| round_hole(g, &ring, top))?;
+    // A hole that opens into a cavity under its walls (a radial hole in a
+    // tube, into its bore) is drilled through its own wall, not on across
+    // the cavity into what lies past it.
+    let bottom = corners.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min);
+    let r = corners
+        .iter()
+        .map(|p| (p[0] - found.center[0]).hypot(p[1] - found.center[1]))
+        .sum::<f32>()
+        / corners.len() as f32;
+    if found.bottom < bottom - 0.05 && into_cavity(g, found.center, r, bottom) {
+        (found.bottom, found.through) = (bottom, true);
+    }
+    Some(found)
+}
+/// Whether a hole of radius `r` at `centre` whose walls end at the height
+/// `z` opens there into a cavity: nothing solid under it (at 16 points 0.8
+/// `r` from its centre, the first face under `z` is no underside of the
+/// part), and the part past the cavity round it (`part_past_gap`), as a
+/// tube's bore is under a hole through its wall. Not a counterbore over its
+/// bore, whose shoulder is solid under it.
+fn into_cavity(g: &Geometry, centre: [f32; 2], r: f32, z: f32) -> bool {
+    let solid_under = (0..16).any(|k| {
+        let t = k as f32 * std::f32::consts::PI / 8.;
+        let p = [centre[0] + 0.8 * r * t.cos(), centre[1] + 0.8 * r * t.sin()];
+        (g.triangles.iter())
+            .filter_map(|tri| plane_height(&tri.p, p).map(|h| (h, tri)))
+            .filter(|(h, _)| *h < z - 0.05)
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .is_some_and(|(_, tri)| up_of(tri) < -0.1)
+    });
+    !solid_under && part_past_gap(g, centre, r, z, false)
+}
+/// The Z of triangle `t`'s unit normal: up for a face of the part facing up.
+fn up_of(t: &Triangle) -> f32 {
+    let [a, b, c] = t.p;
+    let (u, v) = (
+        [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+        [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
+    );
+    let n = [
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    ];
+    n[2] / (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-12)
+}
+/// Whether the part has a face past a gap from the height `z` round a hole
+/// of radius `r` at `centre` (at 16 points 1.2 `r` from it): with `above`,
+/// one facing down over `z`, the underside of something of the part over
+/// the hole; else one facing up under `z`, the top of something under it.
+pub(crate) fn part_past_gap(g: &Geometry, centre: [f32; 2], r: f32, z: f32, above: bool) -> bool {
+    (0..16).any(|k| {
+        let t = k as f32 * std::f32::consts::PI / 8.;
+        let p = [centre[0] + 1.2 * r * t.cos(), centre[1] + 1.2 * r * t.sin()];
+        g.triangles.iter().any(|tri| {
+            let Some(h) = plane_height(&tri.p, p) else {
+                return false;
+            };
+            let up = up_of(tri);
+            if above {
+                h > z + 0.05 && up < -0.1
+            } else {
+                h < z - 0.05 && up > 0.1
+            }
+        })
+    })
 }
 /// The heights of the part's flat faces facing up, lowest first, each with
 /// its loops (`rim_loops`): where a hole's rim is looked for.
