@@ -3689,15 +3689,18 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
                     &FACING_MILLING,
                     t,
                 ))
-                .push(checks.field(p, "stepdown", "Maximum stepdown · mm"))
-                .push(checks.field(p, "allowance", "Radial stock to leave · mm"));
+                .push(checks.field(p, "stepdown", "Maximum stepdown · mm"));
+            if s == Strategy::Waterline {
+                c = c.push(checks.field(p, "surface_stepover", "Maximum stepover · mm"));
+            }
+            c = c.push(checks.field(p, "allowance", "Radial stock to leave · mm"));
             if s == Strategy::Contour {
                 c=c.push(choice(p,"side","Contour side",&["Outside","Inside"],t))
                     .push(choice(p,"compensation","Cutter compensation",&["In computer"],t))
                     .push(checks.field(p, "finish_passes", "Repeat finishing passes"))
                     .push(note("Outside follows the outer model silhouette at successive depths. Inside follows only the walls and islands of a selected recessed floor; select that floor in Geometry. Computer compensation includes the cutter radius and allowance. Repeat passes revisit the contour."));
             } else {
-                c=c.push(note("Constant-Z loops follow the projected geometry above each level, with cutter-radius compensation. This conservative vertical-access preview supports flat cutters. Overhung detail remains unmachined."));
+                c=c.push(note("Constant-Z loops follow the projected geometry above each level, with cutter-radius compensation. Levels are the stepdown apart, closer on sloping faces so neighbouring loops stay within the stepover of each other across them; faces flatter than 1° are left for Facing or Parallel. This conservative vertical-access preview supports flat cutters. Overhung detail remains unmachined."));
             }
         }
         return c.into();
