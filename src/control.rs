@@ -145,6 +145,7 @@ pub fn owners_machine(dir: &Path) -> std::io::Result<Machine> {
         m.p.insert(key.into(), value.into());
     }
     m.p.insert("uc100_profile".into(), path.display().to_string());
+    crate::envelope::jingyan(&mut m);
     Ok(m)
 }
 
@@ -223,6 +224,7 @@ pub fn rotary_machine(dir: &Path) -> std::io::Result<Machine> {
         m.p.insert(key.into(), value);
     }
     m.p.insert("uc100_profile".into(), path.display().to_string());
+    crate::envelope::jingyan(&mut m);
     Ok(m)
 }
 

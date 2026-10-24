@@ -614,6 +614,7 @@ impl Machine {
             for k in ["rpm", "feed"] {
                 positive(&self.p, k, &mut e)
             }
+            e.extend(crate::envelope::issues(self));
         }
         // Optional: empty takes `forces::SPINDLE_POWER`.
         if !get(&self.p, "power").trim().is_empty() {

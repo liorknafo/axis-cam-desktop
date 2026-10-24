@@ -215,8 +215,27 @@ pub struct MachineReport {
     pub max_rpm: f32,
     pub max_feed: f32,
     pub travel: [f32; 3],
+    /// What fits in the machine, when it gives the figures (LIO-252): the
+    /// program refuses a part and tool that do not fit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clearance: Option<ClearanceReport>,
     /// The coolant choices the machine has outputs for.
     pub coolants: Vec<&'static str>,
+}
+/// A machine's clearances in mm, as the model is told them; a missing figure
+/// is not checked.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ClearanceReport {
+    /// From the spindle nose, with Z at its top, to the table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nose_to_table: Option<f32>,
+    /// Under the gantry beam, and between its uprights.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gantry_height: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gantry_width: Option<f32>,
+    /// The machine's figures that are only ASSUMED, not measured.
+    pub assumed: Vec<&'static str>,
 }
 /// The project material and its cutting data, as the model sees them.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1259,8 +1278,23 @@ fn machine_report(machine: &crate::model::Machine) -> Result<MachineReport, Stri
         max_rpm,
         max_feed: r2(num(&machine.p, "feed").unwrap_or(0.) * inch),
         travel: ["x", "y", "z"].map(|k| r2(num(&machine.p, k).unwrap_or(0.) * inch)),
+        clearance: clearance_report(machine, inch),
         coolants: crate::control::coolants(machine)?,
     })
+}
+/// The machine's clearances for the report, None when it gives none.
+fn clearance_report(machine: &crate::model::Machine, inch: f32) -> Option<ClearanceReport> {
+    let given = |k: &str| num(&machine.p, k).filter(|v| *v > 0.).map(|v| r2(v * inch));
+    let report = ClearanceReport {
+        nose_to_table: given("nose_to_table"),
+        gantry_height: given("gantry_height"),
+        gantry_width: given("gantry_width"),
+        assumed: crate::envelope::assumed(machine),
+    };
+    (report.nose_to_table.is_some()
+        || report.gantry_height.is_some()
+        || report.gantry_width.is_some())
+    .then_some(report)
 }
 /// The project's material and its cutting data, or why planning cannot use
 /// the project's material. The user's text is cleaned and bounded.

@@ -5917,6 +5917,36 @@ fn wizard(app: &App) -> Element<'_, Message> {
             {
                 form = form.push(field(p, k, l, t));
             }
+            if !manual::is_manual(m) {
+                form = form
+                    .push(bold("Clearances", 15))
+                    .push(note("How tall and wide a part fits: the setup check refuses a part and tool that do not, naming these numbers. Measure them with the spindle jogged to Z top (nose to table: from the spindle nose's face to the table's top) and under the gantry beam (from the table's top to the beam's underside, and between its uprights). Empty: not checked."));
+                for (k, l, _) in crate::envelope::CLEARANCES {
+                    form = form.push(field(p, k, l, t));
+                }
+                form = form.push(bold("Measured or ASSUMED", 15));
+                for (_, source, name) in crate::envelope::FIGURES {
+                    let shown = match get(p, source) {
+                        crate::envelope::MEASURED => crate::envelope::MEASURED,
+                        _ => crate::envelope::ASSUMED,
+                    };
+                    form = form.push(choice_value(
+                        p,
+                        shown,
+                        source,
+                        name,
+                        &[crate::envelope::ASSUMED, crate::envelope::MEASURED],
+                        t,
+                    ));
+                }
+                let assumed = crate::envelope::assumed(m);
+                if !assumed.is_empty() {
+                    form = form.push(caution(
+                        "ASSUMED, not measured",
+                        assumed.iter().map(|s| s.to_string()).collect(),
+                    ));
+                }
+            }
         }
         "Spindle & travel" => {
             for (k, l) in [
@@ -8834,12 +8864,13 @@ pub(crate) fn materials(app: &App) -> Element<'_, Message> {
     .height(Fill)
     .into()
 }
-const VISE_FIELDS: [(&str, &str); 6] = [
+const VISE_FIELDS: [(&str, &str); 7] = [
     ("jaw_width", "Jaw width · mm"),
     ("jaw_height", "Jaw height · mm"),
     ("jaw_thickness", "Jaw thickness · mm"),
     ("max_opening", "Maximum opening · mm"),
     ("grip", "Grip height · mm"),
+    ("base_height", "Stock rests above the table · mm"),
     ("force", "Clamping force · N"),
 ];
 const CHUCK_FIELDS: [(&str, &str); 4] = [

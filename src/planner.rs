@@ -403,6 +403,7 @@ WORKHOLDING
 - `bottom_offset`, `radial_allowance` and `axial_allowance` cannot be negative. Only a through drill's breakthrough in setup 1 goes below the model, into the stock beneath it.
 - Order operations in a setup: Face, then Pocket (larger cutters before the rest passes of smaller ones), then Contour, then Drill (drills before chamfer mills), then finishing.
 - No tool tip may go deeper below the stock top than the tool's stickout.
+- When `machine.clearance` is present, the program also refuses a stock that stands taller than `gantry_height` (the vise's height under it plus the stock's height) or wider than `gantry_width`, and a tool whose stick-out and holder, from the highest the tip travels, reach past `nose_to_table` (the spindle nose at Z top, over the table). Stand a tall part on its shorter side or use a shorter tool; a figure named in `assumed` was not measured, so say so when a plan is close to it.
 - Choose each operation's spindle speed and feed from the material's cutting data (see SPEEDS AND FEEDS), within the machine's limits.
 - Set each operation's `coolant` to one of `machine.coolants`: coolant the machine has no output for is refused.
 - Set the fields a strategy does not use to null. A null field takes the program's default: `stepdown` 2, `stepover_percent` 40, `surface_stepover` 1, `tolerance` 0.01, `peck` 3, `finish_passes` 1, `ramp_angle` 2, `breakthrough` 1, `clearance` 15, allowances and `bottom_offset` 0.

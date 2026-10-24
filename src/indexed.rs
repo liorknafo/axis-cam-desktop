@@ -2508,7 +2508,7 @@ pub(crate) mod tests {
 
     /// `bar_job` with a numbered tool and a part file, so it posts, its
     /// contour leaving a web on the A axis (`on_the_bar`).
-    fn posting_bar_job(x0: f32, stickout: &str, angles: &str) -> (Document, Mesh) {
+    pub(crate) fn posting_bar_job(x0: f32, stickout: &str, angles: &str) -> (Document, Mesh) {
         let mesh = prism(30.);
         let mut doc = bar_job(
             &mesh,

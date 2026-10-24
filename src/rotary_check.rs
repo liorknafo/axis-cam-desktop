@@ -236,7 +236,16 @@ pub fn problems(
 ) -> Vec<(Option<usize>, String)> {
     let mut out = placed(doc, mesh, si, sims);
     out.extend(parted(doc, mesh, si, sims));
+    // What the machine's clearances refuse in any setup, with this module's
+    // Z reach left to it (LIO-252, `envelope`).
+    out.extend(crate::envelope::problems(doc, mesh, si, sims));
     out
+}
+
+/// How far the stock of setup `base` reaches from its axis in the chuck and
+/// along X (`Bar`), for `envelope`.
+pub(crate) fn bar_reach(doc: &Document, base: usize, mesh: &Mesh) -> Option<(f32, [f32; 2])> {
+    Bar::of(doc, base, mesh).map(|b| (b.radius, b.x))
 }
 
 /// `problems` of an indexed setup's moves on the machine.

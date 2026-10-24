@@ -85,6 +85,15 @@ impl Holder {
                 ));
             }
         }
+        // Optional: empty takes `envelope::VISE_BASE` for a vise and the table for clamps.
+        if !get(&self.p, "base_height").trim().is_empty()
+            && !num(&self.p, "base_height").is_some_and(|v| v >= 0.)
+        {
+            e.push(
+                "The height above the table must be zero or more, or empty for a typical one."
+                    .into(),
+            );
+        }
         // Optional: empty takes the typical force (`forces::VISE_FORCE`, `forces::CLAMP_FORCE`).
         if !get(&self.p, "force").trim().is_empty()
             && !num(&self.p, "force").is_some_and(|v| v > 0.)
@@ -128,6 +137,7 @@ pub fn starters() -> Vec<Holder> {
         ("jaw_thickness", "20"),
         ("max_opening", "120"),
         ("grip", "8"),
+        ("base_height", &crate::envelope::VISE_BASE.to_string()),
         ("force", &vise_force),
     ] {
         v.p.insert(k.into(), x.into());

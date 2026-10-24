@@ -1388,3 +1388,17 @@ The LIO-208 check counted a loose piece only when one of its voxels had all six 
 - **Threading.** Thread milling runs in an indexed setup (`indexed::tests::thread_milling_runs_in_an_indexed_setup`, the threaded plate in a 4-jaw chuck at A 0°).
 - **Stock after this setup (#288).** On an indexed setup with the bar in the chuck it shows the round bar its four angles leave, with every angle's cuts (`smoke::tests::stock_after_an_indexed_setup_is_the_bar_its_angles_leave`).
 - Not validated: a lathe setup and a rotary setup in one job, editing a rotary plan through the planner chat (refused), and anything on the machine.
+
+## What fits under the gantry and the spindle: clearances in the machine profile (LIO-252, 24 October 2026)
+
+The profile gave travel and a top speed only, all of it ASSUMED, and no clearance from the spindle nose at Z top to the table or under the gantry: a part standing 110 mm tall in the vise was planned and posted, and the spindle or the beam would have met it.
+
+- `envelope::tests::a_machine_without_the_figures_is_not_checked_and_a_bad_one_is_said`: a machine with no clearance gives no problem for any job; zero, text, a gantry narrower than the X travel and a source that is neither ASSUMED nor Measured are each said once in the machine's issues; a rotary unit whose chuck (centre height and half its diameter) is taller than the gantry is said too.
+- `the_stack_up_is_the_vise_the_stock_and_the_tool_up_to_the_nose`: the vise's `base_height` plus the stock's height is the stock top and the frame's Z maps onto it; a vise entry with no height takes 40 mm and the message says it was taken; clamps and none stand on the table.
+- `a_part_taller_than_the_gantry_is_refused_naming_the_numbers` and `a_part_wider_than_the_gantry_is_refused`: needs X mm, has Y mm, one more millimetre of room passes; an ASSUMED figure says so in the refusal, a Measured one does not; the width counts the stock with its jaws.
+- `a_tool_that_reaches_the_nose_is_refused_with_its_stick_out_and_holder`: 0.1 mm of room passes, 0.1 mm short is refused with the sum, the stick-out and the holder's 20 mm; a tool with no holder length is taken as 10 mm and says so.
+- `a_tool_too_short_to_reach_down_is_refused_only_for_a_measured_nose_height`: the same job passes with the nose height unmarked or ASSUMED and is refused when it is Measured; 2 mm lower it reaches.
+- `the_shipped_jingyan_is_marked_assumed_and_an_edited_figure_is_not`: a saved Jingyan machine (library and the setup's copy) takes the three placeholders and ASSUMED on the shipped travel and speed, a figure the operator typed or measured is left as it is, a second pass changes nothing, and another machine is untouched.
+- `storage::tests`: an old workspace file without the figures loads, adopts them, and says so in its load notes; the library's two Jingyan entries start with them.
+- Headless (`--part-report`, `--check-plan`, `--export-gcode` on the JY5800 profile, the placeholders): the 110 × 197 × 28 plate standing on either edge is refused "doesn't fit under the gantry", lying flat it passes, the Ø88 cover on its side shows its margin (see the pull request).
+- Not validated: anything on the machine. The placeholders are chosen, not measured: the real nose height, gantry height and width, travel and top speed are to be measured with the spindle at Z top and replace them.

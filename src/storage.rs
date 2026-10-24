@@ -75,6 +75,7 @@ pub fn load_reporting(path: &Path) -> Result<(Document, Vec<String>), String> {
     notes.extend(d.migrate_indexed_operations());
     notes.extend(d.adopt_materials());
     d.adopt_holders();
+    notes.extend(crate::envelope::adopt(&mut d));
     d.validate_structure()?;
     Ok((d, notes))
 }
