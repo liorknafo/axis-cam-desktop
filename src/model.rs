@@ -1071,6 +1071,12 @@ impl Operation {
         if s == Strategy::Parallel {
             p.insert("surface_stepover".into(), "1".into());
         }
+        // Waterline finishes: no stock left on the walls, and layers close
+        // enough that the steps they leave on a sloping face stay small.
+        if s == Strategy::Waterline {
+            p.insert("stepdown".into(), "1".into());
+            p.insert("allowance".into(), "0".into());
+        }
         if s == Strategy::Box {
             for (k, v) in [
                 ("x_min", "0"),
@@ -1785,6 +1791,9 @@ impl Operation {
                     "Pocket stepover must be between 0.01 and 50% for overlapping offset contours."
                         .into(),
                 )
+            }
+            if s == Strategy::Waterline {
+                positive(&self.p, "surface_stepover", &mut e);
             }
             if matches!(
                 s,
