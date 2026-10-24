@@ -1815,6 +1815,35 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "",
             Some(Machine(0)),
         ),
+        (Target::Machine, "nose_to_table") => (
+            "From the spindle nose's face, Z at its top, down to the table's top, in mm. The workholding, stock and the tool's stick-out and holder must fit in it, or the setup is refused. Empty: not checked.",
+            "",
+            None,
+        ),
+        (Target::Machine, "gantry_height") => (
+            "From the table's top to the gantry beam's underside, in mm. The stock and its workholding pass under it as Y moves, so a taller part is refused. Empty: not checked.",
+            "",
+            None,
+        ),
+        (Target::Machine, "gantry_width") => (
+            "The gantry's inside width between its uprights, along X, in mm. The stock with its jaws or clamps must pass through it; not narrower than the X travel. Empty: not checked.",
+            "",
+            None,
+        ),
+        (
+            Target::Machine,
+            "x_source"
+            | "y_source"
+            | "z_source"
+            | "rpm_source"
+            | "nose_to_table_source"
+            | "gantry_height_source"
+            | "gantry_width_source",
+        ) => (
+            "Whether this figure was measured on the machine or is an ASSUMED placeholder. A refusal that rests on an ASSUMED figure says so. Choose Measured once you have measured it.",
+            "",
+            None,
+        ),
         (Target::Machine, "power") => (
             "The spindle's rated power, in watts. The check of whether a setup's vise or clamps hold the stock against each operation's cut takes no more force than this power drives at the spindle's top speed (the spindle keeps its torque below that speed). Empty: 800 W, a Jingyan CNC4030's spindle.",
             "",
@@ -1947,6 +1976,11 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "How much of the stock the jaws hold, as a height above the stock's bottom, in mm. A setup starts from it and can change its own grip.",
             "",
             Some(Vise(4)),
+        ),
+        (Target::Holder, "base_height") => (
+            "How far above the table the stock rests in this vise, in mm (bed and parallels). The check adds the stock's height to see if it fits under the gantry and spindle. Empty: 40 mm.",
+            "",
+            None,
         ),
         (Target::Holder, "length") => (
             "Length of the clamp from its tip outward, in mm; the bite is part of it. The rest of it reaches beyond the stock's edge.",
