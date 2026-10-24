@@ -303,6 +303,9 @@ pub struct Margin {
     /// A vise's contact with the stock: its height and its length along the
     /// jaws, mm (the least of the two jaws').
     pub contact: Option<[f32; 2]>,
+    /// The round holding that holds the bar (`round_hold::grip`), None for a
+    /// vise or clamps.
+    pub round: Option<crate::round_hold::Kind>,
 }
 /// What a vise or clamps resist.
 enum Hold {
@@ -322,6 +325,8 @@ enum Hold {
         at: Vec<[f32; 2]>,
         stock: Bounds,
     },
+    /// A V-block, soft jaws or a collet block on a round bar.
+    Round(crate::round_hold::Kind, crate::round_hold::Grip),
 }
 /// What `layout`, with `holder`, resists on `held` given what earlier
 /// setups `removed` (None for setup 1). A vise's jaws touch the stock where
@@ -350,6 +355,10 @@ fn hold(
     match layout {
         // A chuck's hold against the cutting forces is not modelled.
         Layout::None | Layout::Chuck { .. } => None,
+        Layout::Round(round) => Some(Hold::Round(
+            round.kind,
+            crate::round_hold::grip(round, holder, held.stock),
+        )),
         Layout::Vise { axis_y, grip, .. } => {
             let (across, along) = if *axis_y { (1, 0) } else { (0, 1) };
             let (band, stock) = (held.band, held.stock);
@@ -435,7 +444,11 @@ pub fn check(
     let hold = hold(layout, holder, held, removed)?;
     let contact = match &hold {
         Hold::Vise { contact, .. } => Some(*contact),
-        Hold::Clamps { .. } => None,
+        _ => None,
+    };
+    let round = match &hold {
+        Hold::Round(kind, _) => Some(*kind),
+        _ => None,
     };
     let mut least: Option<Margin> = None;
     for &push in pushes {
@@ -452,6 +465,26 @@ pub fn check(
                     (*friction, push.side.hypot(push.up), Way::Slip, 0.),
                     (*couple, push.side * lever, Way::Tip(None), lever),
                 ]
+            }
+            // The round-contact model (`round_hold::grip`): the contacts'
+            // friction against the push, less what a push up lifts off a
+            // V-block's clamp; the clamp against the push up; a standing
+            // bar's grip against a turn out of it.
+            Hold::Round(_, grip) => {
+                let mut tries = vec![];
+                match grip.down {
+                    Some(down) => {
+                        let left = (down - push.up).max(0.) / down;
+                        tries.push((grip.friction * left, push.side, Way::Slip, 0.));
+                        tries.push((down, push.up, Way::Lift, 0.));
+                    }
+                    None => tries.push((grip.friction, push.side.hypot(push.up), Way::Slip, 0.)),
+                }
+                if let Some((couple, top)) = grip.couple {
+                    let lever = (push.z - top).max(0.);
+                    tries.push((couple, push.side * lever, Way::Tip(None), lever));
+                }
+                tries
             }
             Hold::Clamps { force, at, stock } => {
                 let down = force * at.len() as f32;
@@ -498,6 +531,7 @@ pub fn check(
                     lever,
                     resisted,
                     contact,
+                    round,
                 });
             }
         }
@@ -564,6 +598,8 @@ pub fn line(name: &str, margin: Option<&Margin>) -> String {
         return format!("{name}: no cutting force sideways or up to hold against.");
     };
     let way = match m.way {
+        Way::Slip if m.round == Some(crate::round_hold::Kind::VBlock) => "sliding in the V-block",
+        Way::Slip if m.round.is_some() => "sliding, turning or lifting in its grip",
         Way::Slip if m.contact.is_some() => "sliding or lifting in the jaws",
         Way::Slip => "sliding",
         Way::Lift => "lifting",
@@ -589,6 +625,9 @@ pub fn issue(name: &str, m: &Margin) -> Option<String> {
     let lighter = "take a smaller stepdown or stepover or a lower feed";
     let (side, up) = (m.push.side.round(), m.push.up.round());
     let lever = m.lever.round();
+    if let Some(kind) = m.round {
+        return Some(round_issue(name, m, kind, &short, lighter));
+    }
     Some(match (m.way, m.contact) {
         (Way::Slip, Some(_)) => format!(
             "{name}: the cut could move the stock in the vise: about {side} N against the jaws' {} N of friction ({short}). Set the vise's clamping force in the library if it clamps harder, {lighter}, or choose another holder.",
@@ -617,6 +656,51 @@ pub fn issue(name: &str, m: &Margin) -> Option<String> {
             )
         }
     })
+}
+/// `issue` of a bar held in a V-block, soft jaws or a collet (`kind`).
+fn round_issue(
+    name: &str,
+    m: &Margin,
+    kind: crate::round_hold::Kind,
+    short: &str,
+    lighter: &str,
+) -> String {
+    use crate::round_hold::Kind;
+    let (side, up) = (m.push.side.round(), m.push.up.round());
+    let resisted = m.resisted.round();
+    let (contact, harder) = match kind {
+        Kind::VBlock => (
+            "the V's two line contacts and the clamp",
+            "Set the V-block clamp's force in the library if it clamps harder",
+        ),
+        Kind::SoftJaws => (
+            "the jaws' arc contact round the bar",
+            "Set the soft jaws' clamping force in the library if the vise clamps harder",
+        ),
+        Kind::Collet => (
+            "the collet's grip all round the bar",
+            "Stand the bar deeper in the collet, set the collet's grip force in the library if it grips harder",
+        ),
+    };
+    match m.way {
+        Way::Lift => format!(
+            "{name}: the cut could lift the bar out of the V-block: about {up} N up against its clamp's {resisted} N ({short}). {harder}, {lighter}, or choose another holder."
+        ),
+        Way::Tip(_) => format!(
+            "{name}: the cut could tip the bar out of the {}: about {side} N, {} mm above the top of its grip ({short}). Grip deeper, {lighter}, or choose another holder.",
+            kind.words(),
+            m.lever.round()
+        ),
+        _ => format!(
+            "{name}: the cut could move the bar in the {}: about {} N against {resisted} N of friction from {contact} ({short}). {harder}, {lighter}, or choose another holder.",
+            kind.words(),
+            if m.round == Some(Kind::VBlock) {
+                side
+            } else {
+                m.push.side.hypot(m.push.up).round()
+            }
+        ),
+    }
 }
 /// A chuck's clamping force when nothing gives it, N: all its jaws together,
 /// a 100 mm 3-jaw chuck tightened by hand with its key, on the low side.

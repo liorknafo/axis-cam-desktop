@@ -37,6 +37,7 @@ mod progress;
 mod proposal;
 mod rest;
 mod rotary_check;
+mod round_hold;
 mod run;
 mod section;
 mod session;
@@ -5979,6 +5980,14 @@ impl App {
             Message::NewHolder(kind) => {
                 let name = format!("New {}", kind.to_lowercase());
                 self.holder_draft = holding::Holder::new(kind, &name);
+                // A round part's holding starts at typical sizes to measure.
+                if let Some(typical) = round_hold::starters()
+                    .into_iter()
+                    .find(|h| h.kind() == kind)
+                {
+                    self.holder_draft.p = typical.p;
+                    self.holder_draft.p.insert("name".into(), name);
+                }
                 self.page = Page::Workholding
             }
             Message::SaveHolder => {
@@ -6001,7 +6010,7 @@ impl App {
             }
             Message::DeleteHolder(id) => {
                 let using = self.doc.setups.iter().find(|s| {
-                    matches!(get(&s.p, "holding"), "Vise" | "Clamps" | "Chuck")
+                    holding::library_kind(get(&s.p, "holding")).is_some()
                         && get(&s.p, "holder") == id
                 });
                 if let Some(setup) = using {
