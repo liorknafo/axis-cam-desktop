@@ -35,6 +35,9 @@ pub enum Strategy {
     FiveAxis,
     Box,
     Turn,
+    /// A groove below the mouth of a bore (or round a boss) milled by
+    /// circular interpolation with a keyseat cutter (`groove`).
+    Groove,
 }
 impl Strategy {
     pub fn imported_preview(self) -> bool {
@@ -49,12 +52,13 @@ impl Strategy {
                 | Self::Waterline
                 | Self::Box
                 | Self::Turn
+                | Self::Groove
         )
     }
     pub fn needs_surfaces(self) -> bool {
         matches!(
             self,
-            Self::Face | Self::Adaptive | Self::Pocket | Self::Drill
+            Self::Face | Self::Adaptive | Self::Pocket | Self::Drill | Self::Groove
         )
     }
     pub fn availability(self) -> &'static str {
@@ -86,9 +90,10 @@ impl Strategy {
             Self::Turn => {
                 "Available · face, turn, bore, chamfer, groove, thread or part off on a manual lathe"
             }
+            Self::Groove => crate::groove::AVAILABILITY,
         }
     }
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Face,
         Self::Adaptive,
         Self::Pocket,
@@ -102,6 +107,7 @@ impl Strategy {
         Self::FiveAxis,
         Self::Box,
         Self::Turn,
+        Self::Groove,
     ];
     pub fn index(self) -> usize {
         Self::ALL.iter().position(|s| *s == self).unwrap()
@@ -121,6 +127,7 @@ impl Strategy {
             "5-axis surface",
             "Box",
             "Turning",
+            "Internal groove",
         ][self.index()]
     }
     pub fn short(self) -> &'static str {
@@ -138,6 +145,7 @@ impl Strategy {
             "5-axis",
             "Box",
             "Turn",
+            "Groove",
         ][self.index()]
     }
     pub fn help(self) -> &'static str {
@@ -155,6 +163,7 @@ impl Strategy {
             "Orient the cutter along a surface. Set axis control, tilt limits and lead/lean before checking machine motion.",
             "Remove a rectangular block of material, one axis at a time, on a manual mill.",
             "Turn the bar on a manual lathe: face the end, turn or bore a diameter, chamfer, groove, thread or part off. Choose the kind and its sizes in lathe coordinates.",
+            "Mill a groove below the mouth of a bore, like a circlip groove, with a keyseat cutter: pick the bore's wall, then set the groove's diameter, width and where it lies. Pick a boss's outside wall for a groove round it.",
         ][self.index()]
     }
     pub fn features(self) -> &'static [usize] {
@@ -163,7 +172,7 @@ impl Strategy {
             Self::Face | Self::Indexed => &[0, 1],
             Self::Adaptive | Self::Pocket => &[1],
             Self::Contour => &[2, 3],
-            Self::Box | Self::Turn => &[],
+            Self::Box | Self::Turn | Self::Groove => &[],
             _ => &[0, 1, 2, 4],
         }
     }
@@ -173,6 +182,9 @@ impl Strategy {
         }
         if self == Self::Turn {
             return vec!["Tool", "Turn", "Passes"];
+        }
+        if self == Self::Groove {
+            return vec!["Tool", "Geometry", "Heights", "Groove"];
         }
         let mut v = vec!["Tool", "Geometry"];
         if matches!(self, Self::Rotary | Self::FiveAxis) {
@@ -752,13 +764,19 @@ impl Tool {
             self.lathe_issues(&mut e);
             return e;
         }
+        // A keyseat cutter's flutes are its head, as wide as its `width`.
+        let keyseat = get(&self.p, "type") == KEYSEAT;
         for k in ["diameter", "flutes", "length", "stickout", "holder"] {
-            positive(&self.p, k, &mut e)
+            if !(keyseat && k == "length") {
+                positive(&self.p, k, &mut e)
+            }
         }
         if num(&self.p, "flutes").is_some_and(|n| n.fract() != 0.) {
             e.push("Flutes must be a whole number.".into())
         }
-        if num(&self.p, "stickout") < num(&self.p, "length") {
+        if keyseat {
+            e.extend(crate::groove::keyseat_issues(&self.p));
+        } else if num(&self.p, "stickout") < num(&self.p, "length") {
             e.push(format!(
                 "Stickout ({} mm) must be at least the flute length ({} mm): how far the tool reaches out of its holder.",
                 get(&self.p, "stickout"),
@@ -995,6 +1013,7 @@ pub fn mill_tool_defaults(kind: &str) -> &'static [(&'static str, &'static str)]
             ("shank", "6"),
             ("flutes", "4"),
         ],
+        KEYSEAT => crate::groove::KEYSEAT_DEFAULTS,
         "Tap" => &[
             ("thread", "M6×1"),
             ("tap_kind", TAP_KINDS[0]),
@@ -1169,6 +1188,9 @@ pub fn facing_setting_issues(p: &Fields) -> Vec<String> {
     .collect()
 }
 pub const TOOL_NUMBER_MAX: u32 = 9999;
+/// The tool type of a keyseat (slot) cutter: a thin disc head on a neck,
+/// which cuts a groove sideways below the mouth of a bore (`groove`).
+pub const KEYSEAT: &str = "Keyseat cutter";
 pub const POST_TOOL_LENGTH: [&str; 2] = [
     "Tool table (G43 H#)",
     "Touch off each tool (one program per tool)",
@@ -1349,6 +1371,11 @@ impl Operation {
                 p.insert(k.into(), v.into());
             }
         }
+        if s == Strategy::Groove {
+            for (k, v) in crate::groove::DEFAULTS {
+                p.insert((*k).into(), (*v).into());
+            }
+        }
         if s == Strategy::Turn {
             p.insert("turn_kind".into(), "Outside".into());
             p.insert("name".into(), "Turn · Outside".into());
@@ -1357,7 +1384,7 @@ impl Operation {
             }
         }
         let geometry = match s {
-            Strategy::Box | Strategy::Turn => vec![],
+            Strategy::Box | Strategy::Turn | Strategy::Groove => vec![],
             Strategy::Drill => vec![5, 6, 7, 8],
             Strategy::Face | Strategy::Indexed => vec![0],
             Strategy::Contour => vec![2],
@@ -1454,6 +1481,7 @@ impl Operation {
                     .collect()
             }
             Strategy::Face => vec![FLAT, "Face mill"],
+            Strategy::Groove => vec![KEYSEAT],
             Strategy::Parallel => vec!["Ball end mill", FLAT],
             Strategy::Scallop | Strategy::Indexed | Strategy::Rotary | Strategy::FiveAxis => {
                 vec![FLAT, "Ball end mill", "Bull nose end mill"]
@@ -1857,6 +1885,7 @@ impl Operation {
         }
         let tool = tools.iter().find(|t| t.id == self.tool);
         let milling = self.strategy != Strategy::Turn;
+        let s0 = self.strategy;
         if let Some(t) = tool {
             e.extend(t.issues());
             if centre
@@ -1888,6 +1917,8 @@ impl Operation {
                 e.push("Choose a thread mill for Thread milling.".into())
             } else if self.tapping() && get(&t.p, "type") != "Tap" {
                 e.push("Choose a tap for Tapping.".into())
+            } else if s0 == Strategy::Groove && get(&t.p, "type") != KEYSEAT {
+                e.push(crate::groove::NEEDS_KEYSEAT.into())
             } else if self.strategy == Strategy::Drill
                 && !self.helical()
                 && !self.threads()
@@ -1957,6 +1988,10 @@ impl Operation {
         }
         if s == Strategy::Box && !manual::is_manual(m) {
             e.push(manual::BOX_ON_CNC.into())
+        }
+        // A hand machine says so above (one axis at a time, or turning only).
+        if s == Strategy::Groove {
+            e.extend(crate::groove::setting_issues(&self.p));
         }
         if s == Strategy::Turn && !crate::lathe::is_lathe(m) {
             e.push(crate::lathe::TURN_ON_MILL.into())
@@ -6041,7 +6076,7 @@ mod manual_setups {
     }
     #[test]
     fn box_is_the_twelfth_strategy_with_its_name_and_help() {
-        assert_eq!(Strategy::ALL.len(), 13);
+        assert_eq!(Strategy::ALL.len(), 14);
         assert_eq!(Strategy::Box.index(), 11);
         for s in Strategy::ALL {
             assert!(!s.name().is_empty() && !s.short().is_empty() && !s.help().is_empty());

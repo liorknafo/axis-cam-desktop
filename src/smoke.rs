@@ -21967,7 +21967,7 @@ soft_max = 180.0
         assert!(!adds(&a, Strategy::Face));
         assert!(!adds(&a, Strategy::FiveAxis));
         assert!(adds(&a, Strategy::Drill) && adds(&a, Strategy::Box));
-        // The nine dimmed tiles each say why; Box and Drill are not dimmed,
+        // The ten dimmed tiles each say why; Box and Drill are not dimmed,
         // and Indexed points to indexed setups.
         assert_eq!(reasons(&a, one_axis), Strategy::ALL.len() - 4);
         assert_eq!(reasons(&a, crate::indexed::POINTER), 1);
@@ -22048,7 +22048,7 @@ soft_max = 180.0
                 "{s:?}"
             );
         }
-        // The eleven others each say why.
+        // The twelve others each say why.
         assert_eq!(reasons(&a, only_turn), Strategy::ALL.len() - 2);
         assert_eq!(reasons(&a, turn_on_mill), 0);
         // Back on the CNC setup.

@@ -320,9 +320,14 @@ pub struct ToolReport {
     /// A thread mill's finest and coarsest pitch, mm.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pitches: Option<[f32; 2]>,
-    /// How deep a thread mill's neck lets it reach, mm.
+    /// How deep a thread mill's neck lets it reach, mm; a keyseat cutter's
+    /// reach from its head's bottom to its shank.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reach: Option<f32>,
+    /// A keyseat cutter's neck diameter, mm (its `diameter` is the head's
+    /// and its `flute_length` the head's width).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub neck_diameter: Option<f32>,
     /// A thread mill's teeth stacked along it, when more than one: it cuts
     /// only the pitch they are spaced at.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1540,6 +1545,7 @@ fn describe(
             .map(|(up, _)| *up)
             .filter(|up| *up != first),
     );
+    let keyseat = |t: &crate::model::Tool| get(&t.p, "type") == crate::model::KEYSEAT;
     Ok(PartReport {
         units: "mm",
         part_size: mesh.dimensions.map(r2),
@@ -1555,7 +1561,11 @@ fn describe(
                     kind: get(&t.p, "type").to_string(),
                     diameter: num(&t.p, "diameter")?,
                     flutes: num(&t.p, "flutes").filter(|f| *f >= 1. && f.fract() == 0.)? as u32,
-                    flute_length: num(&t.p, "length")?,
+                    flute_length: if keyseat(t) {
+                        num(&t.p, "width")?
+                    } else {
+                        num(&t.p, "length")?
+                    },
                     stickout: num(&t.p, "stickout")?,
                     tip_angle: (get(&t.p, "type") == "Chamfer mill")
                         .then(|| t.tip_angle())
@@ -1568,9 +1578,10 @@ fn describe(
                     pitches: (get(&t.p, "type") == "Thread mill")
                         .then(|| t.thread_pitches().map(|(a, b)| [a, b]))
                         .flatten(),
-                    reach: (get(&t.p, "type") == "Thread mill")
+                    reach: (get(&t.p, "type") == "Thread mill" || keyseat(t))
                         .then(|| num(&t.p, "reach"))
                         .flatten(),
+                    neck_diameter: keyseat(t).then(|| num(&t.p, "neck")).flatten(),
                     teeth: (get(&t.p, "type") == "Thread mill" && t.thread_teeth() > 1)
                         .then(|| t.thread_teeth()),
                     thread: t.tap_spec().map(|s| s.name.to_string()),
