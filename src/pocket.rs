@@ -1405,6 +1405,7 @@ pub(crate) fn envelope(centres: &Region, radius: f32) -> crate::mesh::Bounds {
     b
 }
 /// Where a pocket's tool centre may go.
+#[derive(Clone)]
 pub(crate) enum Centres {
     /// Within `reach` of `area` and `keepout` from `above`: offset by `d`,
     /// `area` grown by `reach - d` less `above` grown by `keepout + d`, each
@@ -1456,6 +1457,141 @@ fn components(region: &Region) -> Vec<Region> {
         }
     }
     pieces.into_iter().map(Paths::from).collect()
+}
+/// Everything of the part above `z` as `setup` places it, seen from above
+/// (mm): a floor's `above` at that height.
+fn part_above(setup: &Setup, mesh: &Mesh, z: f32) -> Result<Region, String> {
+    let placement = Placement::new(mesh, Some(setup));
+    let scale = mesh.display_scale();
+    let mut obstacles = vec![];
+    for face in &mesh.faces {
+        let points: Vec<_> = (face.points.iter())
+            .map(|p| placement.transform(*p).map(|v| v / scale))
+            .collect();
+        let mut p = above(&points, z + 0.01);
+        let a = area(&p);
+        if a < 0. {
+            p.reverse();
+        }
+        if a.abs() >= 0.000001 {
+            obstacles.push(p);
+        }
+    }
+    region(obstacles)
+}
+/// A zone as `banded` takes it, with the area its tool clears round (a
+/// floor's outline, a hole's open region, an opening) and the height of
+/// the floor under it.
+type Member = (Zone, Region, f32);
+/// `members` cut a depth band at a time, highest first. Between each two
+/// heights where one of them starts or stops, those that go on through the
+/// band and touch there are one pocket: within the cutter's `reach` of
+/// their areas and `keepout` from the part above the highest floor among
+/// them (`above`), so floors side by side at different heights are cleared
+/// together down to the higher, and the lower on from there. A zone alone,
+/// or holding the others of its pocket, keeps its own centres; the same
+/// zones together in the band below go on down through it.
+fn banded(
+    members: Vec<Member>,
+    above: &mut impl FnMut(f32) -> Result<Region, String>,
+    reach: f64,
+    keepout: f64,
+) -> Result<Vec<Zone>, String> {
+    let shapes = (members.iter())
+        .map(|m| m.0.centres.at(0.))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut heights: Vec<f32> = members.iter().flat_map(|m| [m.0.top, m.0.target]).collect();
+    heights.sort_by(|a, b| b.total_cmp(a));
+    heights.dedup_by(|low, high| *high - *low < 0.001);
+    let mut cut: Vec<(Vec<usize>, Zone)> = vec![];
+    for band in heights.windows(2) {
+        let (high, low) = (band[0], band[1]);
+        let spanning: Vec<usize> = (0..members.len())
+            .filter(|&i| {
+                let zone = &members[i].0;
+                zone.top >= high - 0.001 && zone.target <= low + 0.001
+            })
+            .filter(|&i| shapes[i].contains_points())
+            .collect();
+        if spanning.is_empty() {
+            continue;
+        }
+        // The pocket round `of`, clear of the part above the highest floor
+        // among them: so the same zones make the same pocket in every
+        // band they go on through, whatever else is cut beside them.
+        let mut pocket = |of: &[usize]| -> Result<Centres, String> {
+            let plane = (of.iter())
+                .map(|&i| members[i].2)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let loops: Vec<Polygon> = (of.iter())
+                .flat_map(|&i| Vec::<Polygon>::from(members[i].1.clone()))
+                .collect();
+            Ok(Centres::Floor {
+                area: outline(&region(loops)?),
+                above: above(plane)?,
+                reach,
+                keepout,
+            })
+        };
+        // Those that share a piece of the band's pocket are one.
+        let mut group: Vec<usize> = (0..spanning.len()).collect();
+        for piece in components(&pocket(&spanning)?.at(0.)?) {
+            let mut shared = None;
+            for k in 0..spanning.len() {
+                let meets = intersect::<Milli>(
+                    piece.clone(),
+                    shapes[spanning[k]].clone(),
+                    FillRule::NonZero,
+                )
+                .map_err(|e| e.to_string())?
+                .contains_points();
+                if !meets {
+                    continue;
+                }
+                let old = group[k];
+                let new = *shared.get_or_insert(old);
+                group
+                    .iter_mut()
+                    .filter(|g| **g == old)
+                    .for_each(|g| *g = new);
+            }
+        }
+        let mut groups: Vec<Vec<usize>> = vec![];
+        for k in 0..spanning.len() {
+            if !(0..k).any(|j| group[j] == group[k]) {
+                groups.push(
+                    (k..spanning.len())
+                        .filter(|&j| group[j] == group[k])
+                        .map(|j| spanning[j])
+                        .collect(),
+                );
+            }
+        }
+        for of in groups {
+            let centres = if of.len() == 1 {
+                members[of[0]].0.centres.clone()
+            } else {
+                let merged = pocket(&of)?;
+                let ring = merged.at(0.)?;
+                match of.iter().find(|&&i| same_region(&ring, &shapes[i])) {
+                    Some(&i) => members[i].0.centres.clone(),
+                    None => merged,
+                }
+            };
+            match (cut.iter_mut()).find(|(m, z)| *m == of && (z.target - high).abs() < 0.001) {
+                Some((_, zone)) => zone.target = low,
+                None => cut.push((
+                    of,
+                    Zone {
+                        centres,
+                        top: high,
+                        target: low,
+                    },
+                )),
+            }
+        }
+    }
+    Ok(cut.into_iter().map(|(_, zone)| zone).collect())
 }
 /// One region a pocket clears: where the tool centre may go, from the
 /// height its material starts at down to its target.
@@ -1578,7 +1714,8 @@ fn over_rim(
 /// offset loops, an inside Contour's profile and Adaptive clearing's walk
 /// all go through the same zones within the same limits.
 pub(crate) struct Job {
-    /// Each floor, highest first, then each opening cut through.
+    /// Each depth band's pockets, highest first (`banded`): floors, the
+    /// levels of picked holes and openings cut through.
     pub(crate) zones: Vec<Zone>,
     pub(crate) stock: crate::mesh::Bounds,
     pub(crate) scale: f32,
@@ -1803,19 +1940,22 @@ fn floor_job(
         return Err("The selected floor has no openings that go through the part. Set Openings to Leave, or select the floor around the openings.".into());
     }
     let several = floors.len() + picked.len() > 1;
-    let mut zones = vec![];
+    // Every zone with the area it clears round and the height of the floor
+    // under it, for `banded`; the part above each floor, which it seeks
+    // again at that height.
+    let mut members: Vec<Member> = vec![];
     let mut openings = vec![];
-    // Where each floor zone's tool reaches, with its target: a deeper floor
-    // inside a shallower one starts where that one stops.
-    let mut cleared: Vec<(Region, f32)> = vec![];
+    let mut aboves: Vec<(f32, Region)> =
+        floors.iter().map(|f| (f.plane, f.above.clone())).collect();
     for floor in floors {
         let target = floor.plane + bottom + axial;
         // The tool centre keeps its radius, the radial allowance and the
         // margin from everything above the floor, and may stand anywhere
         // within its radius of the floor: over a hole in the floor, and past
         // an edge where the part falls away below it, as over a ledge.
+        let area = outline(&floor.area);
         let centres = Centres::Floor {
-            area: outline(&floor.area),
+            area: area.clone(),
             above: floor.above,
             reach: radius as f64,
             keepout: inset,
@@ -1829,30 +1969,28 @@ fn floor_job(
             }
             return Err("The selected pocket is too narrow for this tool and radial allowance. Choose a smaller cutter.".into());
         }
-        let reach = ring.inflate(radius as f64, JoinType::Round, EndType::Polygon, 2.);
-        let mut start = top;
-        for (above, height) in &cleared {
-            let outside = difference::<Milli>(reach.clone(), above.clone(), FillRule::NonZero)
-                .map_err(|e| e.to_string())?;
-            if outside.signed_area().abs() < 0.01 {
-                start = start.min(*height);
-            }
-        }
-        cleared.push((reach, target));
-        zones.push(Zone {
-            centres,
-            top: start,
-            target,
-        });
+        members.push((
+            Zone {
+                centres,
+                top,
+                target,
+            },
+            area,
+            floor.plane,
+        ));
         if through {
             for (hole, bottom) in &floor.openings {
                 let centres = Centres::Region(hole.clone());
                 if centres.at(inset)?.contains_points() {
-                    openings.push(Zone {
-                        centres: Centres::Region(centres.at(inset)?),
-                        top: target,
-                        target: (bottom - breakthrough).max(stock.stock.min[2] - breakthrough),
-                    });
+                    openings.push((
+                        Zone {
+                            centres: Centres::Region(centres.at(inset)?),
+                            top: target,
+                            target: (bottom - breakthrough).max(stock.stock.min[2] - breakthrough),
+                        },
+                        hole.clone(),
+                        *bottom,
+                    ));
                 }
             }
         }
@@ -1866,23 +2004,15 @@ fn floor_job(
                 continue;
             }
             fitted += 1;
-            // A level under a floor this pocket clears, or under the hole's
-            // level above it, starts where that cut stops.
-            let reach = centres.inflate(radius as f64, JoinType::Round, EndType::Polygon, 2.);
-            let mut start = top;
-            for (above, height) in &cleared {
-                let outside = difference::<Milli>(reach.clone(), above.clone(), FillRule::NonZero)
-                    .map_err(|e| e.to_string())?;
-                if outside.signed_area().abs() < 0.01 {
-                    start = start.min(*height);
-                }
-            }
-            cleared.push((reach, target));
-            zones.push(Zone {
-                centres: Centres::Region(centres),
-                top: start,
-                target,
-            });
+            members.push((
+                Zone {
+                    centres: Centres::Region(centres),
+                    top,
+                    target,
+                },
+                outline(&level.open),
+                level.floor.unwrap_or(h.bottom),
+            ));
         }
         // A hole too narrow for this tool still has the stock over it
         // cleared, down to its rim, where a smaller cutter or a drill
@@ -1903,21 +2033,15 @@ fn floor_job(
         if let Some((centres, rim)) = over {
             let target = rim + bottom + axial;
             fitted += 1;
-            let reach = centres.inflate(radius as f64, JoinType::Round, EndType::Polygon, 2.);
-            let mut start = top;
-            for (above, height) in &cleared {
-                let outside = difference::<Milli>(reach.clone(), above.clone(), FillRule::NonZero)
-                    .map_err(|e| e.to_string())?;
-                if outside.signed_area().abs() < 0.01 {
-                    start = start.min(*height);
-                }
-            }
-            cleared.push((reach, target));
-            zones.push(Zone {
-                centres: Centres::Region(centres),
-                top: start,
-                target,
-            });
+            members.push((
+                Zone {
+                    centres: Centres::Region(centres),
+                    top,
+                    target,
+                },
+                outline(&h.levels[0].open),
+                rim,
+            ));
         }
         // As a floor too narrow for this tool, left to a smaller one.
         if fitted == 0 && !several {
@@ -1927,13 +2051,22 @@ fn floor_job(
             ));
         }
     }
-    if zones.is_empty() {
+    if members.is_empty() {
         return Err("Every selected floor and hole is too narrow for this tool and radial allowance. Choose a smaller cutter.".into());
     }
     if through && openings.is_empty() {
         return Err("Every opening in the selected floor is too narrow for this tool and radial allowance. Choose a smaller cutter.".into());
     }
-    zones.extend(openings);
+    members.extend(openings);
+    let mut above = |z: f32| -> Result<Region, String> {
+        if let Some((_, r)) = aboves.iter().find(|(p, _)| (p - z).abs() < 0.0001) {
+            return Ok(r.clone());
+        }
+        let r = part_above(setup, mesh, z)?;
+        aboves.push((z, r.clone()));
+        Ok(r)
+    };
+    let zones = banded(members, &mut above, radius as f64, inset)?;
     let deepest = zones.iter().map(|z| z.target).fold(f32::INFINITY, f32::min);
     if tool_length < flute_length || top - deepest >= tool_length {
         return Err("Pocket depth must be less than tool stickout, with stickout at least the flute length. Choose a tool with adequate reach.".into());
@@ -2320,6 +2453,30 @@ pub(crate) fn hole_plate(shelf: bool) -> Vec<[[f32; 3]; 3]> {
         tris.push([[-11., -1., 4.], [-9., -1., 4.], [-9., 1., 4.]]);
         tris.push([[-11., -1., 4.], [-9., 1., 4.], [-11., 1., 4.]]);
     }
+    tris
+}
+/// A 40 × 20 × 10 mm block (Z −4 to 6) with a 30 × 12 mm pocket that
+/// steps down from west to east: a floor at Z 3 (X −15 to −5), one at Z 1
+/// (X −5 to 5) and one at Z −1 (X 5 to 15).
+#[cfg(test)]
+pub(crate) fn stepped_pocket() -> Vec<[[f32; 3]; 3]> {
+    let mut tris = vec![];
+    let mut quad = |x: f32, y: f32, xx: f32, yy: f32, z: f32| {
+        tris.push([[x, y, z], [xx, y, z], [xx, yy, z]]);
+        tris.push([[x, y, z], [xx, yy, z], [x, yy, z]]);
+    };
+    for (x, y, xx, yy) in [
+        (-20., -10., 20., -6.),
+        (-20., 6., 20., 10.),
+        (-20., -6., -15., 6.),
+        (15., -6., 20., 6.),
+    ] {
+        quad(x, y, xx, yy, 6.);
+    }
+    quad(-15., -6., -5., 6., 3.);
+    quad(-5., -6., 5., 6., 1.);
+    quad(5., -6., 15., 6., -1.);
+    quad(-20., -10., 20., 10., -4.);
     tris
 }
 /// A 20 mm square block (Z −4 to 6) with a 10 mm square pocket down to
@@ -3133,6 +3290,134 @@ mod tests {
         // Clear of the wall, and of the ledge below its height.
         assert!(points.iter().all(|p| clear(p, (-15., -10., -5., 10.), 1.)
             && (p[2] >= 3. - 0.001 || clear(p, (-15., -10., -3., 10.), 1.))));
+    }
+    #[test]
+    fn floors_side_by_side_are_cleared_together_down_to_each_height() {
+        let (setup, op, tool, mesh, dz) = part(stepped_pocket(), &[3., 1., -1.], 4.);
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert!((plan.target - dz + 1.).abs() < 0.001);
+        let r = plan.radius;
+        // The floor under X; the cutter is clear of the highest under it.
+        let floor = |x: f32| {
+            if x < -5. {
+                3.
+            } else if x < 5. {
+                1.
+            } else {
+                -1.
+            }
+        };
+        for m in plan.moves.iter().filter(|m| m.motion == Motion::Feed) {
+            for i in 0..=10 {
+                let p = m.at(m.start + (m.end - m.start) * i as f32 / 10.);
+                let z = p[2] - dz;
+                if z < 6. {
+                    assert!(p[0].abs() + r <= 15.001 && p[1].abs() + r <= 6.001, "{p:?}");
+                }
+                assert!(z >= floor(p[0] - r + 0.001) - 0.001, "{p:?}");
+            }
+        }
+        let points: Vec<_> = (cutting(&plan).into_iter())
+            .map(|p| [p[0], p[1], p[2] - dz])
+            .collect();
+        for (x0, x1, z) in [(-15., -5., 3.), (-5., 5., 1.), (5., 15., -1.)] {
+            assert!(
+                points
+                    .iter()
+                    .any(|p| p[0] > x0 && p[0] < x1 && (p[2] - z).abs() < 0.001)
+            );
+        }
+        // Down to Z 3 the three are one pocket: its outermost loop goes
+        // round all of them.
+        let mut runs: Vec<Vec<[f32; 3]>> = vec![vec![]];
+        for m in &plan.moves {
+            if m.cutting_pass && m.from[2] == m.to[2] {
+                runs.last_mut().unwrap().push(m.to);
+            } else {
+                runs.push(vec![]);
+            }
+        }
+        assert!(runs.iter().any(|run| {
+            run.iter().any(|p| p[0] < -10.)
+                && run.iter().any(|p| p[0] > 10.)
+                && run.iter().all(|p| p[2] - dz > 3. - 0.001)
+        }));
+        // Faster than each floor in an operation of its own, which clears
+        // the depth they share three times.
+        let alone: f32 = [3., 1., -1.]
+            .iter()
+            .map(|&z| {
+                let (setup, op, tool, mesh, _) = part(stepped_pocket(), &[z], 4.);
+                generate(&setup, &op, &tool, &mesh).unwrap().duration
+            })
+            .sum();
+        assert!(plan.duration < alone * 0.85, "{} vs {alone}", plan.duration);
+        // And it leaves the same: the three floors' volume, less the round
+        // cutter's corners.
+        let mut sim = Simulation::new(plan);
+        sim.seek(1.);
+        let expected = 10. * 12. * (3. + 5. + 7.);
+        assert!(
+            (sim.stock.removed_volume() - expected).abs() / expected < 0.04,
+            "{} vs {expected}",
+            sim.stock.removed_volume()
+        );
+    }
+    /// A floor of a separate pocket higher up does not open the island of
+    /// the pocket beside it: a 60 × 20 mm block (Z −4 to 6) with a pocket
+    /// to Z 3 (X −25 to −15) apart from one stepping from Z 1 (X −5 to 5)
+    /// to Z −1 (X 5 to 15), in whose upper step an island stands to Z 2
+    /// (X 0 to 2, Y −2 to 2). Down to Z 3 the island is under the band;
+    /// below it, it is not.
+    #[test]
+    fn a_separate_higher_floor_leaves_the_island_beside_it_standing() {
+        let mut tris = vec![];
+        for (x, y, xx, yy, z) in [
+            (-30., -10., 30., -6., 6.),
+            (-30., 6., 30., 10., 6.),
+            (-30., -6., -25., 6., 6.),
+            (-15., -6., -5., 6., 6.),
+            (15., -6., 30., 6., 6.),
+            (-25., -6., -15., 6., 3.),
+            (-5., -6., 0., 6., 1.),
+            (2., -6., 5., 6., 1.),
+            (0., -6., 2., -2., 1.),
+            (0., 2., 2., 6., 1.),
+            (0., -2., 2., 2., 2.),
+            (5., -6., 15., 6., -1.),
+            (-30., -10., 30., 10., -4.),
+        ] {
+            quad(&mut tris, x, y, xx, yy, z);
+        }
+        for strategy in [Strategy::Pocket, Strategy::Adaptive] {
+            let (setup, mut op, tool, mesh, dz) = part(tris.clone(), &[3., 1., -1.], 2.);
+            op.strategy = strategy;
+            let plan = if strategy == Strategy::Pocket {
+                generate(&setup, &op, &tool, &mesh)
+            } else {
+                crate::adaptive::generate(&setup, &op, &tool, &mesh)
+            }
+            .unwrap();
+            for m in plan.moves.iter().filter(|m| m.motion == Motion::Feed) {
+                let n = ((m.to[0] - m.from[0]).hypot(m.to[1] - m.from[1]) / 0.05)
+                    .ceil()
+                    .max(1.);
+                for i in 0..=n as usize {
+                    let p = m.at(m.start + (m.end - m.start) * i as f32 / n);
+                    assert!(
+                        p[2] - dz >= 2. - 0.002
+                            || clear(&p, (0., -2., 2., 2.), plan.radius - 0.002),
+                        "{strategy:?} {p:?}"
+                    );
+                }
+            }
+            for (x0, x1, z) in [(-25., -15., 3.), (-5., 0., 1.), (5., 15., -1.)] {
+                assert!(plan.moves.iter().any(|m| m.cutting_pass
+                    && m.to[0] > x0
+                    && m.to[0] < x1
+                    && (m.to[2] - dz - z).abs() < 0.001));
+            }
+        }
     }
     #[test]
     fn a_wall_leaning_over_its_floor_by_its_tessellation_is_not_an_overhang() {
