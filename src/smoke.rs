@@ -5397,6 +5397,146 @@ flood = { pin = 8 }
         }
     }
 
+    /// Headless source frames for the LIO-253 narrated video. Each scene is
+    /// recorded at 12 fps; static frames are held when the narration is laid
+    /// over them. This is deliberately ignored and leaves no project data.
+    #[test]
+    #[ignore]
+    fn record_tooth_load_video() {
+        use crate::model::Strategy;
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").expect("AXIS_RENDER_DIR for the video"),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let adaptive = std::env::var("AXIS_STRATEGY").as_deref() == Ok("adaptive");
+        let sample = std::env::var("AXIS_RECORDER_SAMPLE").is_ok();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), FAST, &[0, 1]);
+        {
+            let op = &mut a.doc.setups[0].operations[1];
+            op.p.insert("feed".into(), "1200".into());
+            if adaptive {
+                op.strategy = Strategy::Adaptive;
+                op.p.insert("name".into(), Strategy::Adaptive.name().into());
+                op.p.insert("optimal_load".into(), "1.5".into());
+                op.p.insert("stepdown".into(), "12".into());
+            }
+        }
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.update(Message::Generate);
+        a.scrub_live = usize::MAX;
+        a.stock_detail = crate::stock_surface::Detail::Draft;
+        let sim = a.active_simulation().expect("simulation");
+        let load = sim.tooth_load.as_ref().expect("measured tooth load");
+        eprintln!(
+            "video {}: peak {:.1} N, {} moves, {:.1} s",
+            if adaptive { "adaptive" } else { "pocket" },
+            load.peak,
+            sim.plan.moves.len(),
+            sim.plan.duration
+        );
+        let mut levels: Vec<f32> = Vec::new();
+        for m in &sim.plan.moves {
+            if m.motion == crate::simulation::Motion::Feed
+                && (m.from[2] - m.to[2]).abs() < 0.01
+                && !levels.iter().any(|z| (z - m.to[2]).abs() < 0.01)
+            {
+                levels.push(m.to[2]);
+            }
+        }
+        levels.sort_by(|x, y| y.total_cmp(x));
+        let mut windows = Vec::new();
+        for &z in &levels {
+            let moves: Vec<_> = sim
+                .plan
+                .moves
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| {
+                    m.motion == crate::simulation::Motion::Feed
+                        && (m.from[2] - z).abs() < 0.01
+                        && (m.to[2] - z).abs() < 0.01
+                })
+                .collect();
+            if moves.is_empty() {
+                continue;
+            }
+            let start = moves
+                .iter()
+                .map(|(_, m)| m.start)
+                .fold(f32::INFINITY, f32::min);
+            let end = moves.iter().map(|(_, m)| m.end).fold(0., f32::max);
+            let peak = moves
+                .iter()
+                .flat_map(|(i, _)| load.moves[*i].iter().copied())
+                .fold(0., f32::max);
+            eprintln!(
+                "level Z {z:.2}: {:.3}..{:.3}, peak {peak:.1} N",
+                start / sim.plan.duration,
+                end / sim.plan.duration
+            );
+            windows.push((z, start / sim.plan.duration, end / sim.plan.duration, peak));
+        }
+        // The finished map is kept on screen long enough for its scale to be
+        // read. The other scenes scrub through cuts at a steady screen rate.
+        let scenes: Vec<(&str, &str, f32, f32, usize)> = if adaptive {
+            vec![
+                ("adaptive-intro", "TOP", 0.02, 0.02, 1),
+                ("adaptive-rings", "TOP", 0.04, 0.98, 84),
+                ("adaptive-map", "ISO", 1., 1., 1),
+            ]
+        } else {
+            let deep = windows
+                .iter()
+                .max_by(|a, b| a.3.total_cmp(&b.3))
+                .expect("deep level");
+            let shallow = windows
+                .iter()
+                .filter(|w| w.3 < deep.3 * 0.5)
+                .max_by(|a, b| a.3.total_cmp(&b.3))
+                .expect("shallow level");
+            vec![
+                ("pocket-intro", "TOP", 0.02, 0.02, 1),
+                ("deep", "TOP", deep.1.max(0.), deep.2.min(1.), 120),
+                ("shallow", "TOP", shallow.1.max(0.), shallow.2.min(1.), 60),
+                ("pocket-map", "ISO", 1., 1., 1),
+            ]
+        };
+        let size = iced::Size::new(1600., 1100.);
+        let mut frame = 0;
+        let mut manifest = String::from("scene\tfirst\tcount\tstart\tend\n");
+        for (scene, camera, start, end, count) in scenes {
+            let _ = a.update(Message::Camera(camera));
+            a.camera.zoom = if camera == "TOP" { 4.0 } else { 3.6 };
+            let first = frame;
+            let indices: Vec<usize> = if sample && count > 1 {
+                vec![0, count / 2, count - 1]
+            } else {
+                (0..count).collect()
+            };
+            for i in indices {
+                let at = if count == 1 {
+                    start
+                } else {
+                    start + (end - start) * i as f32 / (count - 1) as f32
+                };
+                let _ = a.update(Message::Scrub(at));
+                if a.stock_mesh_key().is_some() {
+                    mesh_the_stock(&mut a);
+                }
+                render_png(&a, size, &out.join(format!("frame-{frame:05}.png")));
+                frame += 1;
+            }
+            manifest.push_str(&format!(
+                "{scene}\t{first}\t{}\t{start:.4}\t{end:.4}\n",
+                frame - first
+            ));
+            eprintln!("recorded {scene}: {} frames", frame - first);
+        }
+        std::fs::write(out.join("manifest.tsv"), manifest).unwrap();
+    }
+
     /// Renders the fixture pins to PNGs in `$AXIS_RENDER_DIR` (default
     /// /tmp/fp-renders) for a look: the Machine library's pins, the flipped
     /// setup's Work zero step before and after its holes are chosen for the
