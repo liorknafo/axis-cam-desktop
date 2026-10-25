@@ -153,7 +153,20 @@ impl Mesh {
         found
     }
 }
+/// The thickness a DXF flat profile is extruded to when its project does
+/// not say (`ModelFile::thickness`), mm.
+pub const DXF_THICKNESS: f32 = 3.;
 pub fn load(path: &Path) -> Result<Mesh, String> {
+    load_with(path, None)
+}
+/// The part of a project's imported file: a DXF extruded to its thickness.
+pub fn load_file(file: &crate::model::ModelFile) -> Result<Mesh, String> {
+    load_with(&file.path, file.thickness)
+}
+/// `load`, a DXF flat profile (`dxf`) extruded `thickness` mm, or
+/// `DXF_THICKNESS` when None: the outer loop the part, the inner loops holes
+/// through it, each wall a CAD face.
+pub fn load_with(path: &Path, thickness: Option<f32>) -> Result<Mesh, String> {
     if fs::metadata(path).map_err(|e| e.to_string())?.len() > 50_000_000 {
         return Err("Mesh preview accepts files up to 50 MB.".into());
     }
@@ -167,6 +180,11 @@ pub fn load(path: &Path) -> Result<Mesh, String> {
     } else {
         let b = fs::read(path).map_err(|e| e.to_string())?;
         match ext.as_str() {
+            "dxf" => {
+                let thickness = thickness.unwrap_or(DXF_THICKNESS);
+                let flat = crate::dxf::load(&b, f64::from(thickness))?;
+                ((flat.triangles, Some(flat.faces)), "mm")
+            }
             "stl" => ((stl(&b)?, None), "source units"),
             "obj" => (
                 (
@@ -176,7 +194,7 @@ pub fn load(path: &Path) -> Result<Mesh, String> {
                 "source units",
             ),
             "3mf" => ((crate::three_mf::load(&b)?, None), "mm"),
-            _ => return Err("Choose STEP, STP, 3MF, STL or OBJ.".into()),
+            _ => return Err("Choose STEP, STP, 3MF, STL, OBJ or DXF.".into()),
         }
     };
     let mut mesh = normalize_faces(triangles, cad.as_deref())?;

@@ -5092,6 +5092,7 @@ spindle_max_rpm = 24000
             path: "bar.stl".into(),
             format: "STL".into(),
             bytes: 1,
+            thickness: None,
         });
         let path = dir.path().join("profile.toml");
         let m = &mut doc.setups[0].machine;
@@ -5266,6 +5267,7 @@ spindle_max_rpm = 24000
                 path: "bar.stl".into(),
                 format: "STL".into(),
                 bytes: 1,
+                thickness: None,
             });
             let path = dir.path().join("profile.toml");
             let m = &mut doc.setups[0].machine;
@@ -5527,6 +5529,7 @@ spindle_max_rpm = 24000
             path: "bar.stl".into(),
             format: "STL".into(),
             bytes: 1,
+            thickness: None,
         });
         doc.machines = vec![doc.setups[0].machine.clone()];
         doc.sync_indexed();
@@ -6069,6 +6072,7 @@ spindle_max_rpm = 24000
             path: "bar.stl".into(),
             format: "STL".into(),
             bytes: 1,
+            thickness: None,
         });
         let path = dir.path().join("profile.toml");
         let m = &mut doc.setups[0].machine;

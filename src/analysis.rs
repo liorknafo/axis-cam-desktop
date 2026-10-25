@@ -55,6 +55,39 @@ pub struct PartReport {
     /// recorded; absent on a 3-axis machine.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rotary: Option<RotaryReport>,
+    /// Setup 1's sheet on its spoilboard; absent for any other stock.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sheet: Option<SheetReport>,
+}
+/// Setup 1's stock when it is a sheet lying on a spoilboard (`sheet`), mm.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SheetReport {
+    /// X, Y and thickness.
+    pub size: [f32; 3],
+    /// How far a cut through the sheet may go on into the spoilboard: a
+    /// through cut's bottom offset (or breakthrough) of up to this much below
+    /// the model's bottom, no more.
+    pub spoilboard_allowance: f32,
+    /// What holds the sheet down: "Screws" (their heads are setup 1's
+    /// `workholding` boxes, which every move keeps clear of), "Tape" (holds
+    /// the part too) or "None".
+    pub holddown: String,
+    /// With screws only the waste is held: an outside contour that cuts
+    /// through must leave tabs.
+    pub needs_tabs: bool,
+}
+/// Setup 1's sheet for the report, or None for any other stock.
+fn sheet_report(setup1: &Setup, mesh: &Mesh) -> Option<SheetReport> {
+    if !crate::sheet::is_sheet(setup1) {
+        return None;
+    }
+    let stock = crate::stock::resolve(setup1, Some(mesh)).ok()?.stock;
+    Some(SheetReport {
+        size: stock.dimensions().map(r2),
+        spoilboard_allowance: r2(crate::sheet::below(setup1)),
+        holddown: crate::sheet::holddown(setup1).to_string(),
+        needs_tabs: crate::sheet::loose_part(setup1).is_some(),
+    })
 }
 /// The machine's rotary A axis for the planner (`model::RotaryUnit`), mm and
 /// degrees: what holds in the chuck, what fits, and how far to trust it.
@@ -170,8 +203,9 @@ fn library_report(doc: &Document) -> Vec<LibraryEntry> {
 /// and clearance gap are told: never the library entry's name or notes.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WorkholdingReport {
-    /// "Vise", "Clamps" or "Chuck", or a round bar's "V-block", "Soft jaws"
-    /// or "Collet block".
+    /// "Vise", "Clamps" or "Chuck", a round bar's "V-block", "Soft jaws"
+    /// or "Collet block", or "Hold-down screws" (a sheet's, through its
+    /// waste into the spoilboard: each box is a screw's head).
     pub kind: &'static str,
     /// The `workholding_library` number of setup 1's entry, which a later
     /// setup's `holder` of null shares; absent when setup 1 has no entry.
@@ -1113,12 +1147,17 @@ fn orientation(
     planes.truncate(MAX_PLANES);
     let mut holes_left = max_holes;
     for plane in &mut planes {
-        if plane.depth_below_top < 0.01 {
+        let top = plane.depth_below_top < 0.01;
+        if top {
             plane.kind = "top";
-        } else {
+        }
+        // A flat part on a sheet: its cut-outs are openings through the top.
+        if !top || crate::sheet::is_sheet(&setup) {
             let ids = plane.surfaces.iter().copied().collect();
             if let Ok(floor) = crate::pocket::floor(&setup, &ids, mesh) {
-                plane.max_cutter_diameter = Some(r2(floor.largest(MAX_CUTTER)));
+                if !top {
+                    plane.max_cutter_diameter = Some(r2(floor.largest(MAX_CUTTER)));
+                }
                 let sizes = floor.opening_sizes();
                 if sizes.len() > MAX_OPENINGS {
                     truncated = true;
@@ -1385,6 +1424,8 @@ fn workholding_report(
         "Clamps" => "Clamps",
         // The chuck on A; a lathe's chuck is not reported.
         "Chuck" if crate::chuck::holds(setup1) => "Chuck",
+        // A sheet's hold-down screws, whose heads are boxes like clamps.
+        _ if crate::sheet::screwed(setup1) => "Hold-down screws",
         holding => match crate::round_hold::Kind::of(holding) {
             Some(kind) => kind.name(),
             None => return Ok(None),
@@ -1509,6 +1550,7 @@ fn describe(
             .filter_map(|up| orientation(setup1, stock, mesh, up, MAX_HOLES))
             .collect(),
         rotary: rotary_report(doc, setup1),
+        sheet: sheet_report(setup1, mesh),
     })
 }
 

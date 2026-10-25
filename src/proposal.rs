@@ -4,7 +4,7 @@
 use crate::{
     analysis::{self, OrientationReport, PartReport, PlaneReport},
     mesh::Mesh,
-    model::{CLEARANCE, Document, Operation, Setup, Strategy, Tool, get, num},
+    model::{CLEARANCE, Document, Operation, Setup, Strategy, Tool, get, num, pocket_setting},
     surface::Selection,
 };
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,9 @@ const STRATEGIES: [(&str, Strategy); 6] = [
 const COOLANTS: [&str; 4] = ["Flood", "Mist", "Air", "Off"];
 const CYCLES: [&str; 7] = crate::model::DRILL_CYCLES;
 const ENTRIES: [&str; 2] = ["Profile ramp", "Plunge"];
+/// A Contour's modes: round the outline, a floor's walls, or inside every
+/// hole through the outline (a flat part's cut-outs).
+const CONTOUR_MODES: [&str; 3] = ["outside", "inside_floor", "inside_holes"];
 /// The stock of a chuck proposal: a round bar, or the user's own box.
 const STOCKS: [&str; 2] = ["Round bar", "Box"];
 /// The work zeros a proposal may name: the stock box's and the part's
@@ -142,12 +145,26 @@ pub struct ProposedOp {
     pub breakthrough: Option<f32>,
     pub hole_diameter: Option<f32>,
     pub through: Option<bool>,
+    /// An outside Contour's holding tabs; None for none. A proposal written
+    /// before tabs has none.
+    #[serde(default)]
+    pub tabs: Option<ProposedTabs>,
     pub coolant: String,
     pub reason: String,
     /// When the planner changes a plan: the number of the current operation
     /// this one keeps (see [`describe`]), None for a new operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<usize>,
+}
+/// An outside Contour's holding tabs (`cam`'s, placed on the outline's
+/// straight sides and gentle curves): how many on each outline, each one's
+/// width and its height above where the cut leaves the stock, mm.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposedTabs {
+    pub count: u32,
+    pub width: f32,
+    pub height: f32,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -230,7 +247,7 @@ pub fn schema_with(edit: bool, rotary: bool) -> Value {
         "clearance": optional(),
         "finish_passes": {"type": ["integer", "null"]},
         "facing_area": choice(&["stock", "model"], true),
-        "contour_mode": choice(&["outside", "inside_floor"], true),
+        "contour_mode": choice(&CONTOUR_MODES, true),
         "pocket_entry": choice(&ENTRIES, true),
         "ramp_angle": optional(),
         "surface_stepover": optional(),
@@ -240,6 +257,11 @@ pub fn schema_with(edit: bool, rotary: bool) -> Value {
         "breakthrough": optional(),
         "hole_diameter": optional(),
         "through": {"type": ["boolean", "null"]},
+        "tabs": {"anyOf": [object(json!({
+            "count": {"type": "integer"},
+            "width": number(),
+            "height": number(),
+        })), {"type": "null"}]},
         "coolant": choice(&COOLANTS, false),
         "reason": text(),
     }));
@@ -575,14 +597,39 @@ fn operation(
             wrong.push(format!("{field} is not a finite number."));
         }
     }
-    // Negative stock to leave or bottom offset would cut below the model.
-    for (field, value) in [
-        ("radial_allowance", p.radial_allowance),
-        ("axial_allowance", p.axial_allowance),
-        ("bottom_offset", p.bottom_offset),
+    // Negative stock to leave or bottom offset would cut below the model;
+    // in setup 1 on a sheet a bottom offset may go into the spoilboard, by
+    // its allowance at most.
+    let board = report
+        .sheet
+        .as_ref()
+        .filter(|_| si == 0)
+        .map_or(0., |sheet| sheet.spoilboard_allowance);
+    for (field, value, least) in [
+        ("radial_allowance", p.radial_allowance, 0.),
+        ("axial_allowance", p.axial_allowance, 0.),
+        ("bottom_offset", p.bottom_offset, -board),
     ] {
-        if value.is_some_and(|v| v < 0. && v.is_finite()) {
-            wrong.push(format!("{field} cannot be negative."));
+        if value.is_some_and(|v| v < least - 0.0001 && v.is_finite()) {
+            wrong.push(if least < 0. {
+                format!(
+                    "{field} cannot be below -{board}: a cut through the sheet goes at most {board} mm into the spoilboard."
+                )
+            } else {
+                format!("{field} cannot be negative.")
+            });
+        }
+    }
+    if let Some(tabs) = &p.tabs {
+        if p.strategy != "Contour" || p.contour_mode.as_deref().is_some_and(|m| m != "outside") {
+            wrong
+                .push("tabs are for a Contour with contour_mode outside; set tabs to null.".into());
+        }
+        if !(1..=50).contains(&tabs.count)
+            || !(tabs.width.is_finite() && tabs.width > 0.)
+            || !(tabs.height.is_finite() && tabs.height > 0.)
+        {
+            wrong.push("tabs need a count of 1-50 and a positive width and height.".into());
         }
     }
     // Every planned operation travels at the default height or above it: a
@@ -620,11 +667,7 @@ fn operation(
     let inside = p.contour_mode.as_deref() == Some("inside_floor");
     for (value, allowed, what) in [
         (&p.facing_area, &["stock", "model"][..], "facing area"),
-        (
-            &p.contour_mode,
-            &["outside", "inside_floor"][..],
-            "contour mode",
-        ),
+        (&p.contour_mode, &CONTOUR_MODES[..], "contour mode"),
         (&p.pocket_entry, &ENTRIES[..], "pocket entry"),
         (&p.drill_cycle, &CYCLES[..], "drill cycle"),
     ] {
@@ -846,10 +889,34 @@ fn operation(
             set("side", "Inside".into());
             set("containment", "Tool inside boundary".into());
         }
+        // Inside every hole through the outline at least `hole_diameter`
+        // wide: a flat part's cut-outs.
+        Strategy::Contour if p.contour_mode.as_deref() == Some("inside_holes") => {
+            set("boundary", "Model silhouette".into());
+            set("side", crate::model::CONTOUR_HOLES.into());
+            set("containment", "Tool inside boundary".into());
+            if let Some(d) = p.hole_diameter.filter(|d| *d > 0.) {
+                set("hole_min", d.to_string());
+            }
+        }
         Strategy::Contour => {
             set("boundary", "Model silhouette".into());
             set("side", "Outside".into());
             set("containment", "Tool outside boundary".into());
+            let tabs = p.tabs.as_ref();
+            set(
+                "tabs",
+                crate::model::CONTOUR_TABS[usize::from(tabs.is_some())].into(),
+            );
+            if let Some(tabs) = tabs {
+                for (key, value) in [
+                    ("tab_count", tabs.count as f32),
+                    ("tab_width", tabs.width),
+                    ("tab_height", tabs.height),
+                ] {
+                    set(key, value.to_string());
+                }
+            }
         }
         Strategy::Drill => {
             set(
@@ -959,7 +1026,26 @@ fn described(op: &Operation, tools: &[Tool]) -> Option<ProposedOp> {
         }
         Strategy::Contour => {
             let inside = get(&op.p, "side") == "Inside";
-            p.contour_mode = Some(if inside { "inside_floor" } else { "outside" }.into());
+            let holes = get(&op.p, "side") == crate::model::CONTOUR_HOLES;
+            p.contour_mode = Some(
+                if inside {
+                    "inside_floor"
+                } else if holes {
+                    "inside_holes"
+                } else {
+                    "outside"
+                }
+                .into(),
+            );
+            if holes {
+                p.hole_diameter = value("hole_min").filter(|d| *d > 0.);
+            } else if !inside && pocket_setting(&op.p, "tabs") == crate::model::CONTOUR_TABS[1] {
+                p.tabs = Some(ProposedTabs {
+                    count: value("tab_count").unwrap_or(4.).max(0.).round() as u32,
+                    width: value("tab_width").unwrap_or(6.),
+                    height: value("tab_height").unwrap_or(1.5),
+                });
+            }
             p.stepdown = value("stepdown");
             p.radial_allowance = value("allowance");
             p.axial_allowance = value("axial_allowance");
@@ -1078,8 +1164,15 @@ fn merged(base: &Operation, fresh: &Operation, p: &ProposedOp, d: &ProposedOp) -
         (p.drill_cycle != d.drill_cycle, &["cycle"]),
         (p.peck != d.peck, &["peck"]),
         (p.breakthrough != d.breakthrough, &["breakthrough"]),
-        (p.hole_diameter != d.hole_diameter, &["hole_diameter"]),
+        (
+            p.hole_diameter != d.hole_diameter,
+            &["hole_diameter", "hole_min"],
+        ),
         (p.through != d.through, &["through", "openings"]),
+        (
+            p.tabs != d.tabs,
+            &["tabs", "tab_count", "tab_width", "tab_height"],
+        ),
     ] {
         if changed {
             copy(keys);
@@ -1958,6 +2051,7 @@ pub(crate) mod tests {
             breakthrough: None,
             hole_diameter: None,
             through: None,
+            tabs: None,
             coolant: "Flood".into(),
             reason: "test".into(),
             from: None,
@@ -2104,7 +2198,8 @@ pub(crate) mod tests {
             let schema = schema_for(edit);
             let mut objects = 0;
             walk(&schema, &mut objects);
-            assert_eq!(objects, 4);
+            // The proposal, its setups, operations, tabs and unmachined items.
+            assert_eq!(objects, 5);
             // Every field of the Rust types is in the schema, and nothing else.
             let (_, _, report) = block();
             let mut plan = good(&report);
@@ -4139,8 +4234,9 @@ pub(crate) mod tests {
         let schema = schema_on(&report);
         let mut objects = 0;
         walk(&schema, &mut objects);
-        // The proposal, its chuck, a setup, an operation and an unmachined entry.
-        assert_eq!(objects, 5);
+        // The proposal, its chuck, a setup, an operation, its tabs and an
+        // unmachined entry.
+        assert_eq!(objects, 6);
         let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
         let props = |v: &Value| keys(&v["properties"]);
         let value = serde_json::to_value(&plan).unwrap();

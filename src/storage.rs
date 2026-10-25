@@ -283,6 +283,7 @@ mod tests {
             path: PathBuf::from("/models/part.stl"),
             format: "stl".into(),
             bytes: 10,
+            thickness: None,
         });
         let value = serde_json::to_value(&doc).unwrap();
         for units in [

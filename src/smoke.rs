@@ -461,6 +461,7 @@ impl App {
                     path: path.clone(),
                     format: format.into(),
                     bytes: std::fs::metadata(path).unwrap().len(),
+                    thickness: None,
                 };
                 let _ = self.update(Message::FileImported(Some(Ok((info, Some(mesh))))));
                 self.stock = false;
@@ -486,6 +487,7 @@ impl App {
                         path: path.clone(),
                         format: "3mf".into(),
                         bytes: std::fs::metadata(path).unwrap().len(),
+                        thickness: None,
                     },
                     Some(mesh),
                 ))))]
@@ -2644,6 +2646,7 @@ flood = { pin = 8 }
             path: path.clone(),
             format: "3mf".into(),
             bytes: 1,
+            thickness: None,
         };
         let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
         a.doc.setup_mut().operations.clear();
@@ -3263,6 +3266,7 @@ flood = { pin = 8 }
             path: "plate.stl".into(),
             format: "stl".into(),
             bytes: 1,
+            thickness: None,
         };
         let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
         let mut mill = crate::model::Tool::new("T7 Flat end mill 2", "Flat end mill", "2");
@@ -5574,6 +5578,7 @@ flood = { pin = 8 }
             path: dir.path().join("square-bar.stl"),
             format: "stl".into(),
             bytes: 0,
+            thickness: None,
         });
         a.replace_document(doc, None);
         a.imported_mesh = Some(mesh);
@@ -5693,6 +5698,7 @@ flood = { pin = 8 }
             path: dir.path().join("square-bar.stl"),
             format: "stl".into(),
             bytes: 0,
+            thickness: None,
         });
         let at = doc.at_angle(1, 0., &mesh).unwrap();
         let machine_zero = at.machine_zero.unwrap();
@@ -11550,6 +11556,7 @@ soft_max = 180.0
             path: dir.path().join("radial-holes.3mf"),
             format: "3mf".into(),
             bytes: 0,
+            thickness: None,
         });
         a.replace_document(doc, None);
         a.imported_mesh = Some(mesh.clone());
@@ -11592,6 +11599,7 @@ soft_max = 180.0
             path: dir.path().join("radial-tube.3mf"),
             format: "3mf".into(),
             bytes: 0,
+            thickness: None,
         });
         let fresh = || {
             let mut a = fresh_app(&dir);
@@ -11662,6 +11670,7 @@ soft_max = 180.0
             path: dir.path().join("square-bar.stl"),
             format: "stl".into(),
             bytes: 0,
+            thickness: None,
         });
         a.replace_document(doc, None);
         a.imported_mesh = Some(mesh);
@@ -13479,6 +13488,7 @@ soft_max = 180.0
             path: path.clone(),
             format: "obj".into(),
             bytes: std::fs::metadata(&path).unwrap().len(),
+            thickness: None,
         };
         let _ = a.update(Message::FileImported(Some(Ok((info, Some(mesh))))));
         assert!(!a.import_busy);
@@ -13688,6 +13698,7 @@ soft_max = 180.0
             path: "part.obj".into(),
             format: "obj".into(),
             bytes: 10,
+            thickness: None,
         };
         let _ = a.update(Message::FileImported(Some(Ok((
             file,
@@ -13828,6 +13839,7 @@ soft_max = 180.0
             path: path.clone(),
             format: "3mf".into(),
             bytes: 1,
+            thickness: None,
         };
         let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
         a
@@ -13842,6 +13854,7 @@ soft_max = 180.0
             path: "part.stl".into(),
             format: "stl".into(),
             bytes: 1,
+            thickness: None,
         };
         let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
         let tool = a.doc.setup().operations[0].tool.clone();
@@ -14117,6 +14130,7 @@ soft_max = 180.0
             path: "part.stl".into(),
             format: "stl".into(),
             bytes: 1,
+            thickness: None,
         };
         let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
         let tool = a.doc.setup().operations[0].tool.clone();
@@ -14133,6 +14147,7 @@ soft_max = 180.0
             path: "half-ball.stl".into(),
             format: "stl".into(),
             bytes: 1,
+            thickness: None,
         };
         let mesh = crate::cam::tests::half_ball_on_plate();
         let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
@@ -14263,6 +14278,7 @@ soft_max = 180.0
                 path: "two-half-balls.stl".into(),
                 format: "stl".into(),
                 bytes: 1,
+                thickness: None,
             };
             let mesh = crate::cam::tests::two_half_balls();
             let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
@@ -14484,6 +14500,7 @@ soft_max = 180.0
             path: "part.stl".into(),
             format: "stl".into(),
             bytes: 1,
+            thickness: None,
         };
         let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
         let tool = a.doc.setup().operations[0].tool.clone();
@@ -17814,6 +17831,7 @@ soft_max = 180.0
             path: dir.path().join("other.stl"),
             format: "stl".into(),
             bytes: 1,
+            thickness: None,
         };
         let other = box_mesh([30., 20., 10.]);
         let _ = a.update(Message::FileImported(Some(Ok((file, Some(other))))));

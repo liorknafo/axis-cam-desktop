@@ -1471,6 +1471,7 @@ pub(crate) mod tests {
             path: std::path::PathBuf::from("shaft.stl"),
             format: "stl".into(),
             bytes: 0,
+            thickness: None,
         });
     }
     /// Adds a Turn of `kind` (or a Drill on the centre, "Drill") to the
