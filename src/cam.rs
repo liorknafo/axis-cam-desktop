@@ -380,7 +380,7 @@ impl Builder {
         self.push([p[0], p[1], approach], Motion::Rapid, false, self.rapid)?;
         self.push(p, Motion::Feed, false, self.feed * 0.25)
     }
-    fn stroke(&mut self, points: &[[f32; 3]]) -> Result<(), String> {
+    pub(crate) fn stroke(&mut self, points: &[[f32; 3]]) -> Result<(), String> {
         if points.len() < 2 {
             return Ok(());
         }
@@ -441,6 +441,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
         Strategy::Waterline => waterline(setup, op, tool, mesh),
         Strategy::Box => boxed(setup, op, tool, mesh),
         Strategy::Groove => crate::groove::generate(setup, op, tool, mesh),
+        Strategy::Chamfer => crate::chamfer::generate(setup, op, tool, mesh),
         _ => Err(op.strategy.availability().into()),
     }
 }
@@ -1528,7 +1529,7 @@ fn rims(g: &Geometry) -> Vec<(f32, Vec<Polygon>)> {
     heights.into_iter().map(|z| (z, rim_loops(g, z))).collect()
 }
 /// Whether the loop `l` goes round the point `p` (even-odd).
-fn encloses(l: &Polygon, p: (f64, f64)) -> bool {
+pub(crate) fn encloses(l: &Polygon, p: (f64, f64)) -> bool {
     let mut odd = false;
     for (a, b) in l.iter().zip(l.iter().cycle().skip(1)) {
         if (a.1 > p.1) != (b.1 > p.1) && p.0 < a.0 + (p.1 - a.1) / (b.1 - a.1) * (b.0 - a.0) {
@@ -2297,7 +2298,7 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
             .tip_angle()
             .ok_or("Enter a chamfer mill tip angle from 20° to 160°.")?;
         b.plan.milling_direction = "Countersinking · axial feed";
-        CutterShape::Chamfer((angle * 10.).round() as u16)
+        tool.chamfer_shape(angle)
     } else {
         CutterShape::Drill
     };
@@ -2313,7 +2314,7 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         // A countersink is cut by a cone of its own angle: a sharper one
         // would cut into its wall and the bore under it, a blunter one would
         // leave the cone but for its rim.
-        if let (CutterShape::Chamfer(tenths), Some(c)) = (b.plan.shape, h.countersink)
+        if let (CutterShape::Chamfer(tenths, _), Some(c)) = (b.plan.shape, h.countersink)
             && (f32::from(tenths) / 10. - c.angle).abs() > 0.5
         {
             let angle = (c.angle * 10.).round() / 10.;
@@ -2331,6 +2332,14 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
                 h.opening
             ));
         }
+        // A flat tip wider than the bore would flatten the countersink.
+        if chamfer && b.plan.shape.flat() * 2. >= h.diameter {
+            return Err(format!(
+                "The chamfer mill's {:.2} mm flat tip is as wide as the Ø{:.2} hole it would countersink. Choose a pointed one.",
+                b.plan.shape.flat() * 2.,
+                h.diameter
+            ));
+        }
         if !chamfer && b.plan.radius * 2. > h.widest_drill() {
             return Err(format!(
                 "The Ø{:.2} drill exceeds an opening Ø{:.2}. Choose a smaller drill or a diameter filter.",
@@ -2345,9 +2354,10 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
             ));
         }
         let top = b.plan.stock.max[2] + number(op, "top")?.max(0.);
-        // A chamfer mill's cone is as wide as the opening at its rim.
+        // A chamfer mill's cone is as wide as the opening at its rim; it
+        // rises from the edge of its flat tip.
         let target = if chamfer {
-            h.top - h.opening / 2. * rise + number(op, "bottom")?
+            h.top - (h.opening / 2. - b.plan.shape.flat()) * rise + number(op, "bottom")?
         } else {
             h.bottom + number(op, "bottom")? - breakthrough
         };
@@ -5012,7 +5022,7 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 plan.shape,
-                CutterShape::Chamfer(angle.parse::<u16>().unwrap() * 10)
+                CutterShape::Chamfer(angle.parse::<u16>().unwrap() * 10, 0)
             );
             assert_plan(plan);
         }
@@ -5939,7 +5949,7 @@ pub(crate) mod tests {
         assert_ne!(generate(&setup, &plain, &tool, &mesh).unwrap_err(), refusal);
     }
     #[test]
-    fn all_fourteen_strategies_have_an_explicit_executable_or_unavailable_contract() {
+    fn all_fifteen_strategies_have_an_explicit_executable_or_unavailable_contract() {
         let mesh = block();
         for strategy in Strategy::ALL {
             assert!(!strategy.availability().is_empty());
@@ -5956,7 +5966,7 @@ pub(crate) mod tests {
                 .iter()
                 .filter(|s| s.imported_preview())
                 .count(),
-            10
+            11
         );
     }
     /// FNV-1a over every bit of every move, and the move count and duration.

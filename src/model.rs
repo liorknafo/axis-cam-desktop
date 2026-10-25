@@ -38,6 +38,9 @@ pub enum Strategy {
     /// A groove below the mouth of a bore (or round a boss) milled by
     /// circular interpolation with a keyseat cutter (`groove`).
     Groove,
+    /// Chamfer milling (`chamfer`): a chamfer mill's side along a line or
+    /// picked edges.
+    Chamfer,
 }
 impl Strategy {
     pub fn imported_preview(self) -> bool {
@@ -53,6 +56,7 @@ impl Strategy {
                 | Self::Box
                 | Self::Turn
                 | Self::Groove
+                | Self::Chamfer
         )
     }
     pub fn needs_surfaces(self) -> bool {
@@ -91,9 +95,12 @@ impl Strategy {
                 "Available · face, turn, bore, chamfer, groove, thread or part off on a manual lathe"
             }
             Self::Groove => crate::groove::AVAILABILITY,
+            Self::Chamfer => {
+                "Available · a chamfer mill's side along a line or picked edges: V flanks at depth, edge chamfers, deburring, copied round an axis"
+            }
         }
     }
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Face,
         Self::Adaptive,
         Self::Pocket,
@@ -108,6 +115,7 @@ impl Strategy {
         Self::Box,
         Self::Turn,
         Self::Groove,
+        Self::Chamfer,
     ];
     pub fn index(self) -> usize {
         Self::ALL.iter().position(|s| *s == self).unwrap()
@@ -128,6 +136,7 @@ impl Strategy {
             "Box",
             "Turning",
             "Internal groove",
+            "Chamfer milling",
         ][self.index()]
     }
     pub fn short(self) -> &'static str {
@@ -146,6 +155,7 @@ impl Strategy {
             "Box",
             "Turn",
             "Groove",
+            "Chamfer",
         ][self.index()]
     }
     pub fn help(self) -> &'static str {
@@ -164,6 +174,7 @@ impl Strategy {
             "Remove a rectangular block of material, one axis at a time, on a manual mill.",
             "Turn the bar on a manual lathe: face the end, turn or bore a diameter, chamfer, groove, thread or part off. Choose the kind and its sizes in lathe coordinates.",
             "Mill a groove below the mouth of a bore, like a circlip groove, with a keyseat cutter: pick the bore's wall, then set the groove's diameter, width and where it lies. Pick a boss's outside wall for a groove round it.",
+            "Run a chamfer mill's side along picked edges or a line: edge chamfers, deburring, or V flanks at a depth. Size it by the chamfer's width or the tip's depth, and copy it round an axis.",
         ][self.index()]
     }
     pub fn features(self) -> &'static [usize] {
@@ -172,7 +183,7 @@ impl Strategy {
             Self::Face | Self::Indexed => &[0, 1],
             Self::Adaptive | Self::Pocket => &[1],
             Self::Contour => &[2, 3],
-            Self::Box | Self::Turn | Self::Groove => &[],
+            Self::Box | Self::Turn | Self::Groove | Self::Chamfer => &[],
             _ => &[0, 1, 2, 4],
         }
     }
@@ -792,6 +803,15 @@ impl Tool {
         if get(&self.p, "type") == "Chamfer mill" && self.tip_angle().is_none() {
             e.push("Enter a chamfer mill tip angle from 20° to 160°.".into())
         }
+        // Optional: empty is a pointed tip.
+        if get(&self.p, "type") == "Chamfer mill"
+            && !get(&self.p, "tip_flat").trim().is_empty()
+            && !num(&self.p, "tip_flat")
+                .zip(num(&self.p, "diameter"))
+                .is_some_and(|(f, d)| f >= 0. && f < d)
+        {
+            e.push("The flat tip must be zero or more, and narrower than the tool.".into())
+        }
         match get(&self.p, "type") {
             "Thread mill" => {
                 if !num(&self.p, "thread_angle").is_some_and(|a| a == 55. || a == 60.) {
@@ -933,6 +953,19 @@ impl Tool {
             90.
         };
         (20. ..=160.).contains(&angle).then_some(angle)
+    }
+    /// A chamfer mill's flat tip, across, mm (`tip_flat`): 0 for a pointed
+    /// one and for a tool saved before the field existed.
+    pub fn tip_flat(&self) -> f32 {
+        num(&self.p, "tip_flat").filter(|v| *v > 0.).unwrap_or(0.)
+    }
+    /// The cone the stock simulation sweeps for this chamfer mill at tip
+    /// angle `angle`: the angle in tenths of a degree, the flat in µm.
+    pub fn chamfer_shape(&self, angle: f32) -> crate::simulation::CutterShape {
+        crate::simulation::CutterShape::Chamfer(
+            (angle * 10.).round() as u16,
+            (self.tip_flat() * 1000.).round().min(f32::from(u16::MAX)) as u16,
+        )
     }
     /// Controller tool number (T#), when it is a whole number 1–9999.
     pub fn number(&self) -> Option<u32> {
@@ -1376,6 +1409,13 @@ impl Operation {
                 p.insert((*k).into(), (*v).into());
             }
         }
+        if s == Strategy::Chamfer {
+            for (k, v) in crate::chamfer::DEFAULTS {
+                p.insert(k.into(), v.into());
+            }
+            p.insert("rpm".into(), "6000".into());
+            p.insert("feed".into(), "300".into());
+        }
         if s == Strategy::Turn {
             p.insert("turn_kind".into(), "Outside".into());
             p.insert("name".into(), "Turn · Outside".into());
@@ -1384,7 +1424,7 @@ impl Operation {
             }
         }
         let geometry = match s {
-            Strategy::Box | Strategy::Turn | Strategy::Groove => vec![],
+            Strategy::Box | Strategy::Turn | Strategy::Groove | Strategy::Chamfer => vec![],
             Strategy::Drill => vec![5, 6, 7, 8],
             Strategy::Face | Strategy::Indexed => vec![0],
             Strategy::Contour => vec![2],
@@ -1482,6 +1522,7 @@ impl Operation {
             }
             Strategy::Face => vec![FLAT, "Face mill"],
             Strategy::Groove => vec![KEYSEAT],
+            Strategy::Chamfer => vec!["Chamfer mill"],
             Strategy::Parallel => vec!["Ball end mill", FLAT],
             Strategy::Scallop | Strategy::Indexed | Strategy::Rotary | Strategy::FiveAxis => {
                 vec![FLAT, "Ball end mill", "Bull nose end mill"]
@@ -1546,6 +1587,7 @@ impl Operation {
                 self.strategy,
                 Strategy::Contour | Strategy::Parallel | Strategy::Waterline
             ) && get(&self.p, "boundary") == "Selected geometry")
+            || (self.strategy == Strategy::Chamfer && crate::chamfer::on_edges(&self.p))
     }
     pub fn toggle_feature(&mut self, n: usize) {
         if !self.strategy.features().contains(&n) {
@@ -1854,6 +1896,9 @@ impl Operation {
         }
         if self.strategy == Strategy::Face {
             e.extend(facing_setting_issues(&self.p));
+        }
+        if self.strategy == Strategy::Chamfer {
+            e.extend(crate::chamfer::issues(&self.p));
         }
         if matches!(self.strategy, Strategy::Pocket | Strategy::Adaptive) {
             e.extend(pocket_setting_issues(&self.p));
@@ -3694,7 +3739,7 @@ fn label(k: &str) -> String {
 pub const BOX_FIELDS: [&str; 6] = ["x_min", "x_max", "y_min", "y_max", "z_top", "z_bottom"];
 /// The operation editor's text fields, by key: the ones a check's message
 /// names by its `label`.
-const OPERATION_FIELDS: [&str; 57] = [
+const OPERATION_FIELDS: [&str; 71] = [
     "name",
     "hole_min",
     "x_min",
@@ -3753,6 +3798,21 @@ const OPERATION_FIELDS: [&str; 57] = [
     "thread_side",
     "pitch",
     "passes",
+    // A Chamfer milling's.
+    "from_x",
+    "from_y",
+    "to_x",
+    "to_y",
+    "line_z",
+    "tip_z",
+    "chamfer_width",
+    "tip_offset",
+    "extend",
+    "copies",
+    "copy_pitch",
+    "first_angle",
+    "axis_x",
+    "axis_y",
 ];
 /// The operation editor's text field a check's message is about, by its key,
 /// so the editor can show the message at the field. The messages of
@@ -6076,7 +6136,7 @@ mod manual_setups {
     }
     #[test]
     fn box_is_the_twelfth_strategy_with_its_name_and_help() {
-        assert_eq!(Strategy::ALL.len(), 14);
+        assert_eq!(Strategy::ALL.len(), 15);
         assert_eq!(Strategy::Box.index(), 11);
         for s in Strategy::ALL {
             assert!(!s.name().is_empty() && !s.short().is_empty() && !s.help().is_empty());

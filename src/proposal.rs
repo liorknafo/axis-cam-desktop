@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub use crate::post::ORIGINS;
-const STRATEGIES: [(&str, Strategy); 7] = [
+const STRATEGIES: [(&str, Strategy); 8] = [
     ("Face", Strategy::Face),
     ("Pocket", Strategy::Pocket),
     ("Contour", Strategy::Contour),
@@ -19,7 +19,13 @@ const STRATEGIES: [(&str, Strategy); 7] = [
     ("Parallel", Strategy::Parallel),
     ("Waterline", Strategy::Waterline),
     ("Groove", Strategy::Groove),
+    ("Chamfer", Strategy::Chamfer),
 ];
+/// A Chamfer's `chamfer.source`, `edges`, `side` and `size` choices, as
+/// `chamfer::SOURCES`, `EDGES`, `SIDES` and `SIZES` name them.
+const CHAMFER_SOURCES: [&str; 2] = ["edges", "line"];
+const CHAMFER_EDGES: [&str; 3] = ["all", "outer", "holes"];
+const CHAMFER_SIDES: [&str; 3] = ["left", "right", "alternate"];
 const COOLANTS: [&str; 4] = ["Flood", "Mist", "Air", "Off"];
 const CYCLES: [&str; 7] = crate::model::DRILL_CYCLES;
 const ENTRIES: [&str; 2] = ["Profile ramp", "Plunge"];
@@ -163,6 +169,10 @@ pub struct ProposedOp {
     pub groove_land: Option<f32>,
     #[serde(default)]
     pub spring_pass: Option<bool>,
+    /// A Chamfer's settings (`chamfer`); null for every other strategy. A
+    /// proposal saved before Chamfer had none.
+    #[serde(default)]
+    pub chamfer: Option<ProposedChamfer>,
     pub coolant: String,
     pub reason: String,
     /// When the planner changes a plan: the number of the current operation
@@ -179,6 +189,40 @@ pub struct ProposedTabs {
     pub count: u32,
     pub width: f32,
     pub height: f32,
+}
+/// A Chamfer operation's settings (`chamfer`, its module doc): what the
+/// cone's side goes on, how the cut is sized, and the copies round an axis.
+/// Work coordinates (mm from the setup's work zero) and degrees.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposedChamfer {
+    /// `edges`: the edges of the listed surfaces (a level face's outline and
+    /// hole mouths; with walls listed too, only the edges it shares with
+    /// them, though the part report names no walls); `line`: the line `line`
+    /// at `line_z`.
+    pub source: String,
+    /// For `edges`: `all`, `outer` (the outer contour) or `holes` (the hole
+    /// mouths); null is `all`.
+    pub edges: Option<String>,
+    /// For `line`: its start and end, [x1, y1, x2, y2].
+    pub line: Option<[f32; 4]>,
+    pub line_z: Option<f32>,
+    /// For `line`: the side of it the tool is on (and cuts away), looking
+    /// from its start to its end: `left`, `right` or `alternate` (left for
+    /// the first copy, right for the second, ...); null is `left`.
+    pub side: Option<String>,
+    /// The chamfer's width on the face, mm, with the tip `tip_offset` (null:
+    /// 0.5) under its lower end; or null with `tip_z`, the tip's Z.
+    pub width: Option<f32>,
+    pub tip_offset: Option<f32>,
+    pub tip_z: Option<f32>,
+    /// Copies turned `first_angle + k × copy_pitch` degrees anticlockwise
+    /// about the vertical axis through `axis` [x, y]; null is one copy, not
+    /// turned, about the work zero.
+    pub copies: Option<u32>,
+    pub copy_pitch: Option<f32>,
+    pub first_angle: Option<f32>,
+    pub axis: Option<[f32; 2]>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -246,6 +290,20 @@ pub fn schema_with(edit: bool, rotary: bool) -> Value {
     let optional = || json!({"type": ["number", "null"]});
     let ups: Vec<&str> = analysis::ORIENTATIONS.iter().map(|(up, _)| *up).collect();
     let strategies: Vec<&str> = STRATEGIES.iter().map(|(name, _)| *name).collect();
+    let chamfer = json!({"anyOf": [object(json!({
+        "source": choice(&CHAMFER_SOURCES, false),
+        "edges": choice(&CHAMFER_EDGES, true),
+        "line": {"type": ["array", "null"], "items": number(), "minItems": 4, "maxItems": 4},
+        "line_z": optional(),
+        "side": choice(&CHAMFER_SIDES, true),
+        "width": optional(),
+        "tip_offset": optional(),
+        "tip_z": optional(),
+        "copies": {"type": ["integer", "null"]},
+        "copy_pitch": optional(),
+        "first_angle": optional(),
+        "axis": {"type": ["array", "null"], "items": number(), "minItems": 2, "maxItems": 2},
+    })), {"type": "null"}]});
     let operation = object(json!({
         "strategy": choice(&strategies, false),
         "name": text(),
@@ -281,6 +339,7 @@ pub fn schema_with(edit: bool, rotary: bool) -> Value {
         "groove_from": choice(&crate::groove::GROOVE_FROM, true),
         "groove_land": optional(),
         "spring_pass": {"type": ["boolean", "null"]},
+        "chamfer": chamfer,
         "coolant": choice(&COOLANTS, false),
         "reason": text(),
     }));
@@ -588,7 +647,7 @@ fn operation(
         .map(|(_, s)| *s);
     if strategy.is_none() {
         wrong.push(format!(
-            "\"{}\" is not one of the seven available strategies.",
+            "\"{}\" is not one of the eight available strategies.",
             p.strategy
         ));
     }
@@ -717,8 +776,10 @@ fn operation(
         Strategy::Drill => ["Drill", "Chamfer mill"].contains(&kind),
         Strategy::Parallel => ["Ball end mill", "Flat end mill"].contains(&kind),
         Strategy::Groove => kind == crate::model::KEYSEAT,
+        Strategy::Chamfer => kind == "Chamfer mill",
         _ => kind == "Flat end mill",
     };
+    let chamfer = chamfer_problems(p, strategy, &ids, &mut wrong);
     if !suits && kind != "Flat end mill" && suits_helical(p) {
         wrong.push(format!(
             "T{} is a {kind}; Drill with Helical milling takes a flat end mill.",
@@ -793,7 +854,7 @@ fn operation(
                 }
             }
         },
-        Strategy::Face | Strategy::Drill => {}
+        Strategy::Face | Strategy::Drill | Strategy::Chamfer => {}
         _ if !ids.is_empty() => wrong.push(format!(
             "{} works on the whole model; its surfaces list must be empty.",
             p.strategy
@@ -981,6 +1042,11 @@ fn operation(
                 .into(),
             );
         }
+        Strategy::Chamfer => {
+            for (key, value) in chamfer.into_iter().flatten() {
+                set(key, value);
+            }
+        }
         _ => set("boundary", "Model silhouette".into()),
     }
     if let Some(entry) = &p.pocket_entry {
@@ -1026,6 +1092,155 @@ fn groove_wrong(
     }
     wrong
 }
+/// What is wrong with `p`'s `chamfer` for `strategy`, added to `wrong`; for
+/// a Chamfer that has none wrong, its operation's settings (`chamfer`).
+/// Every other strategy must give it null.
+fn chamfer_problems(
+    p: &ProposedOp,
+    strategy: Strategy,
+    ids: &[usize],
+    wrong: &mut Vec<String>,
+) -> Option<Vec<(&'static str, String)>> {
+    use crate::chamfer::{EDGES, SIDES, SIZES, SOURCES};
+    if strategy != Strategy::Chamfer {
+        if p.chamfer.is_some() {
+            wrong.push("chamfer is only for the Chamfer strategy: give it null.".into());
+        }
+        return None;
+    }
+    let Some(c) = &p.chamfer else {
+        wrong.push("Chamfer needs its `chamfer` settings.".into());
+        return None;
+    };
+    let before = wrong.len();
+    let pick = |value: Option<&str>,
+                names: &[&str],
+                keys: &[&'static str],
+                what: &str,
+                wrong: &mut Vec<String>| {
+        let at = value.map_or(Some(0), |v| names.iter().position(|n| *n == v));
+        if at.is_none() {
+            wrong.push(format!(
+                "\"{}\" is not a chamfer {what} choice.",
+                value.unwrap_or("")
+            ));
+        }
+        keys[at.unwrap_or(0)]
+    };
+    let source = pick(Some(&c.source), &CHAMFER_SOURCES, &SOURCES, "source", wrong);
+    let line = source == SOURCES[1];
+    let mut out = vec![("chamfer_source", source.to_string())];
+    let finite = |v: &[f32]| v.iter().all(|x| x.is_finite());
+    if line {
+        match (c.line, c.line_z) {
+            (Some(l), Some(z)) if finite(&l) && z.is_finite() => {
+                for (key, v) in ["from_x", "from_y", "to_x", "to_y"].into_iter().zip(l) {
+                    out.push((key, v.to_string()));
+                }
+                out.push(("line_z", z.to_string()));
+            }
+            _ => wrong.push(
+                "A chamfer on a line needs `line` [x1, y1, x2, y2] and `line_z`, finite.".into(),
+            ),
+        }
+        if !ids.is_empty() {
+            wrong.push("A chamfer on a line uses no surfaces: give an empty surfaces list.".into());
+        }
+        let side = pick(c.side.as_deref(), &CHAMFER_SIDES, &SIDES, "side", wrong);
+        out.push(("chamfer_side", side.into()));
+    } else {
+        if ids.is_empty() {
+            wrong.push("A chamfer on edges needs the surfaces of the level face whose edges it breaks (and of the walls, to break only the edges they share).".into());
+        }
+        let edges = pick(c.edges.as_deref(), &CHAMFER_EDGES, &EDGES, "edges", wrong);
+        out.push(("chamfer_edges", edges.into()));
+    }
+    match (c.width, c.tip_z) {
+        (Some(w), None) if w.is_finite() && w > 0. => {
+            let t = c.tip_offset.unwrap_or(0.5);
+            if !(t.is_finite() && t >= 0.) {
+                wrong.push("chamfer tip_offset cannot be negative.".into());
+            }
+            out.extend([
+                ("chamfer_size", SIZES[0].to_string()),
+                ("chamfer_width", w.to_string()),
+                ("tip_offset", t.to_string()),
+            ]);
+        }
+        (None, Some(z)) if z.is_finite() => {
+            out.extend([
+                ("chamfer_size", SIZES[1].to_string()),
+                ("tip_z", z.to_string()),
+            ]);
+        }
+        _ => wrong.push(
+            "Give a chamfer either a positive `width` or a finite `tip_z`, and the other null."
+                .into(),
+        ),
+    }
+    let copies = c.copies.unwrap_or(1);
+    let pitch = c.copy_pitch.unwrap_or(0.);
+    let first = c.first_angle.unwrap_or(0.);
+    let axis = c.axis.unwrap_or([0., 0.]);
+    if !(1..=720).contains(&copies) || !finite(&[pitch, first, axis[0], axis[1]]) {
+        wrong.push(
+            "chamfer copies must be 1-720, with a finite copy_pitch, first_angle and axis.".into(),
+        );
+    } else if copies > 1 && (copies - 1) as f32 * pitch.abs() >= 360. - 0.001 {
+        wrong.push(format!(
+            "chamfer copy_pitch {pitch}° takes {copies} copies round more than once."
+        ));
+    }
+    out.extend([
+        ("copies", copies.to_string()),
+        ("copy_pitch", pitch.to_string()),
+        ("first_angle", first.to_string()),
+        ("axis_x", axis[0].to_string()),
+        ("axis_y", axis[1].to_string()),
+    ]);
+    (wrong.len() == before).then_some(out)
+}
+/// `op`'s Chamfer settings as a proposal writes them (`ProposedChamfer`).
+fn described_chamfer(op: &Operation) -> ProposedChamfer {
+    use crate::chamfer::{EDGES, SIDES, SIZES, SOURCES, setting};
+    let value = |key: &str| {
+        setting(&op.p, key)
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite())
+    };
+    let name = |key: &str, names: &[&str], ours: &[&str]| {
+        let at = ours
+            .iter()
+            .position(|v| *v == setting(&op.p, key))
+            .unwrap_or(0);
+        names[at].to_string()
+    };
+    let line = setting(&op.p, "chamfer_source") == SOURCES[1];
+    let depth = setting(&op.p, "chamfer_size") == SIZES[1];
+    let ends = ["from_x", "from_y", "to_x", "to_y"].map(value);
+    ProposedChamfer {
+        source: name("chamfer_source", &CHAMFER_SOURCES, &SOURCES),
+        edges: (!line).then(|| name("chamfer_edges", &CHAMFER_EDGES, &EDGES)),
+        line: line
+            .then(|| {
+                ends.iter()
+                    .all(Option::is_some)
+                    .then(|| ends.map(Option::unwrap_or_default))
+            })
+            .flatten(),
+        line_z: value("line_z").filter(|_| line),
+        side: line.then(|| name("chamfer_side", &CHAMFER_SIDES, &SIDES)),
+        width: value("chamfer_width").filter(|_| !depth),
+        tip_offset: value("tip_offset").filter(|_| !depth),
+        tip_z: value("tip_z").filter(|_| depth),
+        copies: value("copies").map(|n| n.max(1.).round() as u32),
+        copy_pitch: value("copy_pitch"),
+        first_angle: value("first_angle"),
+        axis: value("axis_x").zip(value("axis_y")).map(|(x, y)| [x, y]),
+    }
+}
 /// Whether `p` is a Drill operation with the Helical milling cycle, which
 /// cuts with a flat end mill.
 fn suits_helical(p: &ProposedOp) -> bool {
@@ -1036,7 +1251,7 @@ fn suits_cycle(p: &ProposedOp, cycle: &str) -> bool {
     p.strategy == "Drill" && p.drill_cycle.as_deref() == Some(cycle)
 }
 /// An operation of the current plan the planner cannot see or change: its
-/// strategy is not one of the seven, its tool has no number, or it machines a
+/// strategy is not one of the eight, its tool has no number, or it machines a
 /// selection that is not surfaces. It stays in its setup, at its place.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct KeptOp {
@@ -1186,6 +1401,7 @@ fn described(op: &Operation, tools: &[Tool]) -> Option<ProposedOp> {
             p.tolerance = value("tolerance");
             p.hole_diameter = value("hole_diameter").filter(|d| *d > 0.);
         }
+        Strategy::Chamfer => p.chamfer = Some(described_chamfer(op)),
         _ => {
             p.stepdown = value("stepdown");
             p.bottom_offset = value("bottom");
@@ -1280,6 +1496,7 @@ fn merged(base: &Operation, fresh: &Operation, p: &ProposedOp, d: &ProposedOp) -
         (p.groove_from != d.groove_from, &["groove_from"]),
         (p.groove_land != d.groove_land, &["groove_land"]),
         (p.spring_pass != d.spring_pass, &["spring_pass"]),
+        (p.chamfer != d.chamfer, &crate::chamfer::KEYS[..]),
     ] {
         if changed {
             copy(keys);
@@ -2164,6 +2381,7 @@ pub(crate) mod tests {
             groove_from: None,
             groove_land: None,
             spring_pass: None,
+            chamfer: None,
             coolant: "Flood".into(),
             reason: "test".into(),
             from: None,
@@ -2310,8 +2528,9 @@ pub(crate) mod tests {
             let schema = schema_for(edit);
             let mut objects = 0;
             walk(&schema, &mut objects);
-            // The proposal, its setups, operations, tabs and unmachined items.
-            assert_eq!(objects, 5);
+            // The proposal, its setups, operations, their tabs and chamfer and
+            // the unmachined items.
+            assert_eq!(objects, 6);
             // Every field of the Rust types is in the schema, and nothing else.
             let (_, _, report) = block();
             let mut plan = good(&report);
@@ -2881,7 +3100,7 @@ pub(crate) mod tests {
         );
         refused(
             &|p| p.setups[0].operations[1].strategy = "Adaptive".into(),
-            "1/Some(2): \"Adaptive\" is not one of the seven",
+            "1/Some(2): \"Adaptive\" is not one of the eight",
         );
         refused(
             &|p| p.setups[0].operations[0].tool = 9,
@@ -3660,7 +3879,7 @@ pub(crate) mod tests {
     #[test]
     fn an_operation_the_format_cannot_carry_is_listed_and_still_counted() {
         let (doc, _, report) = planned();
-        // A strategy that is not one of the six.
+        // A strategy that is not one of the eight.
         let adaptive = with_adaptive(doc.clone(), 0, 1);
         let current = describe(&adaptive, &report).unwrap();
         assert_eq!(
@@ -4479,9 +4698,9 @@ pub(crate) mod tests {
         let schema = schema_on(&report);
         let mut objects = 0;
         walk(&schema, &mut objects);
-        // The proposal, its chuck, a setup, an operation, its tabs and an
-        // unmachined entry.
-        assert_eq!(objects, 6);
+        // The proposal, its chuck, a setup, an operation, its tabs and
+        // chamfer, and an unmachined entry.
+        assert_eq!(objects, 7);
         let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
         let props = |v: &Value| keys(&v["properties"]);
         let value = serde_json::to_value(&plan).unwrap();
