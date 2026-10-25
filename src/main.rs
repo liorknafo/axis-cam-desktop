@@ -6,6 +6,7 @@ mod choice_help;
 mod chuck;
 mod control;
 mod dxf;
+mod envelope;
 mod facing;
 #[cfg(test)]
 mod fake_openai;
