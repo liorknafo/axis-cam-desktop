@@ -87,6 +87,9 @@ fn opened(setup: &Setup, b: &Builder, centre: [f32; 2], top: f32, bottom: f32, m
     }
     2. * lo
 }
+/// How far under its size `opened` may read a hole, mm on the diameter,
+/// with room to spare: it reads to a thousandth on the radius, from below.
+const OPEN_READ: f32 = 0.005;
 /// An operation's value of `key`, or `default` when it is blank (saved
 /// before the field was).
 fn value_or(op: &Operation, key: &str, default: f32) -> Result<f32, String> {
@@ -328,7 +331,9 @@ pub(super) fn bore(
             ));
         }
         let open = opened(setup, &b, h.center, h.top, target.max(h.bottom), size);
-        if open < low - 1e-3 {
+        // `opened` reads up to 0.002 under on the diameter: a hole drilled
+        // at the head's smallest bore is open to it.
+        if open < low - OPEN_READ {
             return Err(format!(
                 "Rough the {at} first: it is open to Ø{open:.2}, and the boring head's smallest bore is Ø{low}. Drill it, or mill it to Ø{:.1} (Helical milling), before boring.",
                 bore_rough(size)
@@ -661,6 +666,15 @@ pub(crate) mod tests {
         let plan = &all.last().unwrap().as_ref().unwrap().plan;
         let pauses = plan.stops.iter().filter(|s| s.pause.is_some()).count();
         assert_eq!(pauses, 1 + ((31.9f32 - 12.) / 0.6).ceil() as usize);
+        // The Ø12 drilling reads a hair under Ø12, and a head whose
+        // smallest bore is a hair over still bores it: the real plate's Ø12
+        // drilling read Ø11.998 and was refused.
+        let mut fine = head(BORE_RETRACTS[0]);
+        fine.p.insert("bore_range".into(), "12.002-50".into());
+        let (_, _, all) = bored(false, fine, |_| {});
+        let plan = &all.last().unwrap().as_ref().unwrap().plan;
+        let first = plan.stops[0].size.unwrap();
+        assert!(first > 12.002, "{first}");
     }
     #[test]
     fn boring_refuses_a_head_out_of_range_or_short_a_hole_not_roughed_and_two_sizes() {
