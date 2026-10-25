@@ -2244,7 +2244,14 @@ pub fn build(
                 _ => fresh(),
             };
             match built {
-                Ok(op) => setup.operations.push(op),
+                Ok(mut op) => {
+                    // The direction a material asks for its finishing passes
+                    // is fixed here, not left to the model (`finishing`).
+                    if let Some(material) = doc.selected_material() {
+                        crate::finishing::apply(material, &mut op);
+                    }
+                    setup.operations.push(op)
+                }
                 Err(messages) => messages.into_iter().for_each(|m| wrong(Some(oi + 1), m)),
             }
         }
@@ -2600,6 +2607,55 @@ pub(crate) mod tests {
             .remove("tool");
         assert!(parse(&missing.to_string()).is_err());
         assert!(parse("Here is the plan: {}").is_err());
+    }
+    /// `doc` with the starter `name` selected.
+    fn choose(doc: &mut Document, name: &str) {
+        let id = (doc.materials.iter())
+            .find(|m| m.name() == name)
+            .unwrap()
+            .id
+            .clone();
+        assert!(doc.select_material(&id));
+    }
+    #[test]
+    fn a_plan_in_bronze_finishes_conventionally_and_in_aluminium_it_does_not() {
+        let (mut doc, mesh, report) = block();
+        let mut plan = good(&report);
+        for o in plan.setups.iter_mut().flat_map(|s| &mut s.operations) {
+            if matches!(o.strategy.as_str(), "Pocket" | "Contour") {
+                o.finish_passes = Some(1);
+            }
+        }
+        let milling = |job: &Document| -> Vec<(Strategy, String)> {
+            (job.setups.iter())
+                .flat_map(|s| &s.operations)
+                .filter(|o| matches!(o.strategy, Strategy::Pocket | Strategy::Contour))
+                .map(|o| {
+                    (
+                        o.strategy,
+                        crate::model::pocket_setting(&o.p, "pocket_milling").to_string(),
+                    )
+                })
+                .collect()
+        };
+        let alu = milling(&build(&doc, &mesh, &report, &plan).unwrap());
+        assert!(
+            alu.len() >= 2 && alu.iter().all(|(_, m)| m == "Climb"),
+            "{alu:?}"
+        );
+        choose(&mut doc, "Bronze CuSn12");
+        let bronze = milling(&build(&doc, &mesh, &report, &plan).unwrap());
+        assert_eq!(bronze.len(), alu.len());
+        assert!(
+            bronze.iter().all(|(_, m)| m == "Conventional"),
+            "{bronze:?}"
+        );
+        // Without finishing passes the direction is left alone.
+        for o in plan.setups.iter_mut().flat_map(|s| &mut s.operations) {
+            o.finish_passes = Some(0);
+        }
+        let rough = milling(&build(&doc, &mesh, &report, &plan).unwrap());
+        assert!(rough.iter().all(|(_, m)| m == "Climb"), "{rough:?}");
     }
     #[test]
     fn building_keeps_setup_one_and_creates_later_setups() {

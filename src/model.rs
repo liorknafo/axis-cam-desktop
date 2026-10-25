@@ -4373,7 +4373,7 @@ mod tests {
             ..Default::default()
         };
         let note = doc.adopt_materials().unwrap();
-        assert_eq!(doc.materials.len(), 22);
+        assert_eq!(doc.materials.len(), 25);
         assert!(note.contains("linked to the library"), "{note}");
         assert_eq!(doc.selected_material().unwrap().name(), "Aluminium 6061-T6");
         assert_eq!(doc.material, "Aluminium 6061-T6");
@@ -4381,7 +4381,7 @@ mod tests {
             doc.adopt_materials().is_none(),
             "a second call changes nothing"
         );
-        assert_eq!(doc.materials.len(), 22);
+        assert_eq!(doc.materials.len(), 25);
 
         let mut odd = Document {
             material: "Inconel 718".into(),
@@ -4389,12 +4389,12 @@ mod tests {
         };
         let note = odd.adopt_materials().unwrap();
         assert!(note.contains("without cutting data"), "{note}");
-        assert_eq!(odd.materials.len(), 23);
+        assert_eq!(odd.materials.len(), 26);
         assert!(odd.selected_material().unwrap().cutting_data().is_none());
 
         let mut none = Document::default();
         assert!(none.adopt_materials().is_none());
-        assert_eq!(none.materials.len(), 22);
+        assert_eq!(none.materials.len(), 25);
         assert!(none.material_id.is_empty());
 
         let mut stale = none.clone();
@@ -4532,7 +4532,7 @@ mod tests {
         };
         assert!(doc.adopt_materials().is_none());
         let names: Vec<_> = doc.materials.iter().map(|m| m.name().to_string()).collect();
-        assert_eq!(names.len(), 14, "{names:?}");
+        assert_eq!(names.len(), 17, "{names:?}");
         assert!(names.contains(&"Aluminium 6082-T6".to_string()));
         assert!(names.contains(&"Walnut".to_string()));
         assert!(!names.contains(&"Aluminium 6061-T6".to_string()));
@@ -4558,10 +4558,10 @@ mod tests {
                 .count(),
             1
         );
-        // An empty library gets all twenty-two and the current set.
+        // An empty library gets all twenty-five and the current set.
         let mut empty = Document::default();
         empty.adopt_materials();
-        assert_eq!((empty.materials.len(), empty.starter_materials), (22, 3));
+        assert_eq!((empty.materials.len(), empty.starter_materials), (25, 4));
     }
     #[test]
     fn choosing_a_material_sets_every_operations_speed_and_feed() {
@@ -4689,7 +4689,7 @@ mod tests {
         assert_eq!(speeds(&doc), before);
     }
     #[test]
-    fn a_library_given_the_alloys_gets_only_the_woods_once() {
+    fn a_library_given_the_alloys_gets_only_the_woods_and_metals_once() {
         let mut doc = Document {
             materials: vec![crate::material::Material::new("My alloy")],
             starter_materials: 2,
@@ -4698,12 +4698,19 @@ mod tests {
         assert!(doc.adopt_materials().is_none());
         let names: Vec<_> = doc.materials.iter().map(|m| m.name()).collect();
         assert_eq!(names[0], "My alloy");
-        assert_eq!(names[1..], crate::material::ADDED_IN_SET_3);
-        assert_eq!(doc.starter_materials, 3);
+        assert_eq!(
+            names[1..],
+            [
+                &crate::material::ADDED_IN_SET_3[..],
+                &crate::material::ADDED_IN_SET_4[..]
+            ]
+            .concat()
+        );
+        assert_eq!(doc.starter_materials, crate::material::STARTER_SET);
         // Deleted after the addition: it does not come back.
         doc.materials.retain(|m| m.name() != "Cherry");
         doc.adopt_materials();
-        assert_eq!(doc.materials.len(), 7);
+        assert_eq!(doc.materials.len(), 10);
         // The user's own spelling of a wood is kept, not doubled.
         let mut mine = Document {
             materials: vec![crate::material::Material::new("oak")],
@@ -4711,8 +4718,63 @@ mod tests {
             ..Document::default()
         };
         mine.adopt_materials();
-        assert_eq!(mine.materials.len(), 7);
+        assert_eq!(mine.materials.len(), 10);
         assert_eq!(mine.materials[0].name(), "oak");
+    }
+    #[test]
+    fn a_library_given_the_woods_gains_bronze_and_two_steels_without_losing_edits() {
+        // A library as the app saved it with set 3: the starters of the
+        // first three sets, one of them edited, one deleted, and the
+        // owner's own.
+        let mut doc = Document::default();
+        doc.adopt_materials();
+        doc.materials = crate::material::starters()
+            .into_iter()
+            .filter(|m| !crate::material::ADDED_IN_SET_4.contains(&m.name()))
+            .collect();
+        doc.starter_materials = 3;
+        doc.materials.retain(|m| m.name() != "Brass C360");
+        let mine = crate::material::Material::new("My alloy");
+        doc.materials.push(mine.clone());
+        let steel = doc
+            .materials
+            .iter_mut()
+            .find(|m| m.name() == "Mild steel 1018")
+            .unwrap();
+        steel.p.insert("vc_max".into(), "170".into());
+        steel.p.insert("hardness".into(), "130 HB".into());
+        let edited = steel.clone();
+        let before = doc.materials.len();
+        assert!(doc.adopt_materials().is_none());
+        assert_eq!(doc.starter_materials, crate::material::STARTER_SET);
+        let names: Vec<_> = doc.materials.iter().map(|m| m.name()).collect();
+        assert_eq!(names.len(), before + 3, "{names:?}");
+        // The new ones come after everything there, in order.
+        assert_eq!(names[before..], crate::material::ADDED_IN_SET_4);
+        // Nothing there is touched or brought back.
+        assert!(doc.materials.contains(&edited));
+        assert!(doc.materials.contains(&mine));
+        assert!(!names.contains(&"Brass C360"));
+        // The new ones carry cutting data, hardness and the bronze's rule.
+        for m in &doc.materials[before..] {
+            assert!(
+                m.cutting_data().is_some() && m.brinell().is_some(),
+                "{}",
+                m.name()
+            );
+        }
+        assert_eq!(doc.materials[before].finish_milling(), Some("Conventional"));
+        // Once: a deleted one stays deleted.
+        doc.materials.retain(|m| m.name() != "Bronze CuSn12");
+        doc.adopt_materials();
+        assert_eq!(doc.materials.len(), before + 2);
+        // A library of the current set gains nothing.
+        let mut current = Document::default();
+        current.adopt_materials();
+        let all = current.materials.len();
+        current.adopt_materials();
+        assert_eq!(current.materials.len(), all);
+        assert_eq!(all, 25);
     }
     fn doc_with_holding(pairs: &[(&str, &str)]) -> Document {
         let mut doc = Document::sample();

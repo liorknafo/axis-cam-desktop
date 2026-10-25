@@ -507,6 +507,12 @@ pub(crate) fn op_checks(app: &App) -> Vec<Check> {
     {
         checks.extend(problems.into_iter().map(|text| Check::new(text, false)));
     }
+    if let Some(o) = app.operation()
+        && let Some(m) = app.doc.selected_material()
+        && let Some(text) = crate::finishing::issue(m, o)
+    {
+        checks.push(Check::new(text, false));
+    }
     // Holes a Pocket picked by their walls that its cutter cannot get into.
     if let Some(o) = app.operation()
         && matches!(o.strategy, Strategy::Pocket | Strategy::Contour)

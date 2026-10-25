@@ -205,14 +205,44 @@ pub struct Push {
     pub up: f32,
     pub z: f32,
 }
-/// kc1.1 and mc of `material`'s group (`KC`), "Other"'s without one.
+/// The Brinell hardness each group's `KC` is rounded for: the starters
+/// 6061-T6, 1018, 304, and the soft end of the copper alloys (CuSn12's
+/// 80 HBW minimum). Groups not listed (plastic, wood, "Other") are not
+/// scaled by hardness.
+pub const KC_HARDNESS: [(&str, f32); 4] = [
+    ("Aluminium", 95.),
+    ("Steel", 126.),
+    ("Stainless steel", 201.),
+    ("Brass and copper", 80.),
+];
+/// How kc rises with hardness: kc ∝ HB^0.4, an assumed, rounded rule: the
+/// force to shear a chip follows the material's strength, which follows its
+/// hardness, but less than in proportion (1045 at 190 HB gets 1.18 times
+/// 1018's kc). Not from a table; a library entry's hardness is a number to
+/// type in.
+pub const KC_HARDNESS_EXPONENT: f32 = 0.4;
+/// The most a hardness raises kc: a hardness typed far past the group's
+/// (a hardened steel's 600 HB) does not run the force away.
+pub const KC_HARDNESS_MOST: f32 = 1.5;
+/// kc1.1 and mc of `material`'s group (`KC`), "Other"'s without one. When the
+/// material's hardness is in HB and above its group's (`KC_HARDNESS`), kc1.1
+/// is raised with it (`KC_HARDNESS_EXPONENT`, at most `KC_HARDNESS_MOST`
+/// times): a softer alloy keeps the group's, which errs towards holding.
 pub(crate) fn kc(material: Option<&Material>) -> (f32, f32) {
     let group = material.map_or("Other", |m| get(&m.p, "group"));
     let (_, kc, mc) = KC
         .iter()
         .find(|row| row.0 == group)
         .unwrap_or(&KC[KC.len() - 1]);
-    (*kc, *mc)
+    let harder = material
+        .and_then(Material::brinell)
+        .zip(KC_HARDNESS.iter().find(|row| row.0 == group))
+        .map_or(1., |(hb, (_, reference))| {
+            (hb / reference)
+                .powf(KC_HARDNESS_EXPONENT)
+                .clamp(1., KC_HARDNESS_MOST)
+        });
+    (*kc * harder, *mc)
 }
 /// The pushes of `bites` taken by a Ø`diameter` tool with `flutes` at `rpm`
 /// in `material` (None when the project has none) on `machine`. Each bite's
@@ -1056,6 +1086,80 @@ mod tests {
             let push = pushes(&full, 10., 3., 8000., material, &machine)[0];
             assert!((push.side - 191.).abs() < 1., "{push:?}");
         }
+    }
+    #[test]
+    fn a_harder_material_pushes_harder_and_a_softer_one_keeps_its_groups_force() {
+        let named = |name: &str| {
+            crate::material::starters()
+                .into_iter()
+                .find(|m| m.name() == name)
+                .unwrap()
+        };
+        let mild = named("Mild steel 1018");
+        let c45 = named("Steel 1045 (C45) normalised");
+        let silver = named("Silver steel 1.2210 annealed");
+        let bronze = named("Bronze CuSn12");
+        let brass = named("Brass C360");
+        let bite = [Bite {
+            rate: 400.,
+            feed: 600.,
+            z: 38.,
+        }];
+        let mut machine = Machine::new(3);
+        machine.p.insert("power".into(), "5000".into());
+        let side = |m: &Material| pushes(&bite, 10., 3., 8000., Some(m), &machine)[0].side;
+        let kc1 = |m: &Material| kc(Some(m)).0;
+        // 1018 (126 HB) is the group's own; 1045 (190 HB) and silver steel
+        // (220 HB) are raised by (HB / 126)^0.4: ×1.18 and ×1.25.
+        assert_eq!(kc1(&mild), 1700.);
+        assert!((kc1(&c45) / 1700. - 1.18).abs() < 0.005, "{}", kc1(&c45));
+        assert!(
+            (kc1(&silver) / 1700. - 1.25).abs() < 0.005,
+            "{}",
+            kc1(&silver)
+        );
+        assert!(side(&silver) > side(&c45) && side(&c45) > side(&mild));
+        // The push follows kc: the same bite pushes 1045 18 % harder.
+        assert!((side(&c45) / side(&mild) - 1.18).abs() < 0.01);
+        // Bronze at 95 HB against copper alloys' 80 HB: ×1.07, where brass,
+        // whose hardness is not in HB, keeps the group's.
+        assert_eq!(kc1(&brass), 700.);
+        assert!(
+            (kc1(&bronze) / 700. - 1.07).abs() < 0.005,
+            "{}",
+            kc1(&bronze)
+        );
+        // A softer material keeps its group's kc, a hardness typed in far
+        // past it stops at ×1.5, and one that is no number of HB counts as
+        // the group's.
+        let mut soft = mild.clone();
+        soft.p.insert("hardness".into(), "60 HB".into());
+        assert_eq!(kc1(&soft), 1700.);
+        soft.p.insert("hardness".into(), "900 HB".into());
+        assert_eq!(kc1(&soft), 1700. * 1.5);
+        soft.p.insert("hardness".into(), "60 HRC".into());
+        assert_eq!(kc1(&soft), 1700.);
+        // Plastic has no reference hardness: never scaled.
+        let mut plastic = crate::material::Material::new("Nylon");
+        plastic.p.insert("group".into(), "Plastic".into());
+        plastic.p.insert("hardness".into(), "400 HB".into());
+        assert_eq!(kc1(&plastic), 60.);
+    }
+    #[test]
+    fn a_stepdown_in_a_harder_material_is_shallower_for_the_same_power() {
+        let mut machine = Machine::new(3);
+        machine.p.insert("power".into(), "800".into());
+        let named = |name: &str| {
+            crate::material::starters()
+                .into_iter()
+                .find(|m| m.name() == name)
+                .unwrap()
+        };
+        let at = |m: &Material| power_stepdown(&machine, Some(m), 25., 17.5, 120., 640., 3.);
+        assert!(
+            at(&named("Silver steel 1.2210 annealed")) < at(&named("Steel 1045 (C45) normalised"))
+                && at(&named("Steel 1045 (C45) normalised")) < at(&named("Mild steel 1018"))
+        );
     }
     #[test]
     fn a_skim_thinner_than_a_voxel_still_pushes_and_a_shallow_grip_refuses_it() {
