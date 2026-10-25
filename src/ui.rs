@@ -1229,6 +1229,7 @@ fn ribbon(app: &App) -> Element<'_, Message> {
         .is_some_and(|s| lathe::is_lathe(&s.machine));
     for (label, range) in [
         ("2D MILLING", 0..5),
+        ("UNDERCUT", 13..14),
         ("3D FINISHING", 5..8),
         ("MULTI-AXIS", 8..11),
         ("MANUAL", 11..12),
@@ -2849,7 +2850,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 } else if !o.needs_surfaces() && o.strategy.imported_preview() {
                     c = c.push(note("Uses the current imported model in this setup. No demonstration geometry or saved sample features are used."));
                 } else if o.strategy.imported_preview() {
-                    c = c.push(note(if o.strategy == Strategy::Drill { "While picking, every round hole of the part is outlined in teal with the diameter it drills. Click a hole (its outline, its wall or inside it) to drill it: its outline turns blue. Click it again to drop it. Or click a horizontal rim face: every round opening in it is drilled. The diameter filter can restrict the holes. Amber = hover." } else if matches!(o.strategy, Strategy::Pocket | Strategy::Contour) { "Click the recessed pocket floor on your part: its outline defines the walls, and holes in the floor preserve islands. Or pick a whole hole: hold the pointer over it until its outline shows, then click the outline or the hole's wall. Its outline is cut down to its floor, or through the part if nothing is under it. Picked holes' outlines are blue; click one again to drop the hole. Amber = hover; blue = selected. Click Finish picking when done." } else if o.strategy == Strategy::Adaptive { "Click the recessed pocket floor on your part. Its outline defines the walls; holes in the floor preserve islands. Amber = hover; blue = selected. Click Finish picking when done." } else if crate::picks_faces(o) { "Click any face of your part, flat or curved: the whole face, up to its sharp edges, is picked. Click it again to drop it. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." } else { "Click a planar surface on your part. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." }));
+                    c = c.push(note(if o.strategy == Strategy::Groove { "Click the wall of the bore the groove goes in: the whole hole is picked, its walls blue. For a groove round a boss, click every face of the boss's outside wall instead. Amber = hover. Click Finish picking when done." } else if o.strategy == Strategy::Drill { "While picking, every round hole of the part is outlined in teal with the diameter it drills. Click a hole (its outline, its wall or inside it) to drill it: its outline turns blue. Click it again to drop it. Or click a horizontal rim face: every round opening in it is drilled. The diameter filter can restrict the holes. Amber = hover." } else if matches!(o.strategy, Strategy::Pocket | Strategy::Contour) { "Click the recessed pocket floor on your part: its outline defines the walls, and holes in the floor preserve islands. Or pick a whole hole: hold the pointer over it until its outline shows, then click the outline or the hole's wall. Its outline is cut down to its floor, or through the part if nothing is under it. Picked holes' outlines are blue; click one again to drop the hole. Amber = hover; blue = selected. Click Finish picking when done." } else if o.strategy == Strategy::Adaptive { "Click the recessed pocket floor on your part. Its outline defines the walls; holes in the floor preserve islands. Amber = hover; blue = selected. Click Finish picking when done." } else if crate::picks_faces(o) { "Click any face of your part, flat or curved: the whole face, up to its sharp edges, is picked. Click it again to drop it. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." } else { "Click a planar surface on your part. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." }));
                     if app.imported_mesh.is_some() {
                         c = c.push(
                             btn(
@@ -3224,6 +3225,24 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
         }
         "Turn" => {
             c = c.push(turn_fields(o, checks));
+        }
+        "Groove" => {
+            c = c
+                .push(row![checks.field(p, "groove_diameter", "Groove diameter · mm"), checks.field(p, "groove_width", "Groove width · mm")].spacing(9))
+                .push(choice(p, "groove_from", "Where it is", &crate::groove::GROOVE_FROM, t))
+                .push(checks.field(
+                    p,
+                    "groove_land",
+                    if get(p, "groove_from") == crate::groove::GROOVE_FROM[2] {
+                        "Depth of its top edge below the stock top · mm"
+                    } else {
+                        "Land: from the bore's end to the groove · mm"
+                    },
+                ))
+                .push(choice(p, "spring_pass", "Spring pass", &["Yes", "No"], t))
+                .push(checks.field(p, "tolerance", "Tolerance · mm"))
+                .push(checks.field(p, "hole_diameter", "Bore diameter · mm (0: the bore picked)"))
+                .push(note("The keyseat head goes down the bore's axis to the groove, arcs out to its diameter, circles once (twice with a spring pass), arcs back to the axis and comes up it. A groove wider than the head takes as many passes along the axis as cover it. The head must fit down the bore, its neck must clear the bore while it cuts, and it must reach the groove's far edge below its shank. Round a boss it goes down outside it."));
         }
         "Centre" => {
             c = c
@@ -3716,7 +3735,7 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
                 .push(checks.field(p, "slope_max", "Maximum surface slope · degrees"))
                 .push(checks.field(p, "tolerance", "Sampling tolerance · mm"))
                 .push(checks.field(p, "allowance", "Vertical stock to leave · mm"))
-                .push(note("Flat and ball cutter envelopes are evaluated against mesh triangles on a bounded grid. Zigzag passes follow the upper surface. Undercuts are unreachable; spacing/tolerance controls sampling, not certified machining accuracy."));
+                .push(note("Flat and ball cutter envelopes are evaluated against mesh triangles on a bounded grid. Zigzag passes follow the upper surface, so they cannot reach an undercut (cut a groove below a bore's mouth with Internal groove and a keyseat cutter); spacing/tolerance controls sampling, not certified machining accuracy."));
         } else {
             c = c
                 .push(choice_value(
@@ -9013,6 +9032,7 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
                 "Drill",
                 "Chamfer mill",
                 "Thread mill",
+                crate::model::KEYSEAT,
                 "Tap",
                 "Turning tool",
                 "Boring bar",
@@ -9028,9 +9048,17 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
     let lathe = crate::lathe::is_tool(get(p, "type"));
     form = form.push(field(p, "number", "Tool number · T", t));
     // A lathe tool has no mill diameter, flutes, flute length, stickout or holder.
+    let keyseat = get(p, "type") == crate::model::KEYSEAT;
     if !lathe {
         for (k, l) in [
-            ("diameter", "Diameter · mm"),
+            (
+                "diameter",
+                if keyseat {
+                    "Head diameter · mm"
+                } else {
+                    "Diameter · mm"
+                },
+            ),
             ("flutes", "Flutes"),
             ("length", "Flute length · mm"),
             ("stickout", "Stickout · mm"),
@@ -9040,7 +9068,10 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
                 "Holder length to the spindle nose · mm (empty: 10, assumed)",
             ),
         ] {
-            form = form.push(field(p, k, l, t));
+            // A keyseat cutter's flutes are its head, its width long.
+            if !(keyseat && k == "length") {
+                form = form.push(field(p, k, l, t));
+            }
         }
     }
     if get(p, "type") == "Chamfer mill" {
@@ -9094,6 +9125,13 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
             form = form
                 .push(choice(p, "thread", "Thread", &sizes, t))
                 .push(choice(p, "tap_kind", "Tap kind", &TAP_KINDS, t));
+        }
+        crate::model::KEYSEAT => {
+            form = form
+                .push(field(p, "width", "Head width · mm", t))
+                .push(field(p, "neck", "Neck diameter · mm", t))
+                .push(field(p, "reach", "Reach (head bottom to shank) · mm", t))
+                .push(field(p, "shank", "Shank diameter · mm", t));
         }
         "Die" => {
             let sizes: Vec<&str> = crate::thread::SPECS.iter().map(|s| s.name).collect();

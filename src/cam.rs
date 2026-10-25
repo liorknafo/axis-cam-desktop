@@ -187,12 +187,12 @@ fn plane_slope(p: &[[f32; 3]; 3]) -> Option<f32> {
     let gy = (a[0] * b[2] - b[0] * a[2]) / det;
     Some((gx * gx + gy * gy).sqrt())
 }
-struct Builder {
-    plan: Plan,
-    pos: [f32; 3],
-    feed: f32,
-    clearance: f32,
-    retract: f32,
+pub(crate) struct Builder {
+    pub(crate) plan: Plan,
+    pub(crate) pos: [f32; 3],
+    pub(crate) feed: f32,
+    pub(crate) clearance: f32,
+    pub(crate) retract: f32,
     retract_margin: f32,
     /// Rapid rate, mm/min: the hand rapid on a manual mill.
     rapid: f32,
@@ -200,7 +200,12 @@ struct Builder {
     single_axis: bool,
 }
 impl Builder {
-    fn new(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Self, String> {
+    pub(crate) fn new(
+        setup: &Setup,
+        op: &Operation,
+        tool: &Tool,
+        mesh: &Mesh,
+    ) -> Result<Self, String> {
         if !op.enabled {
             return Err("Enable the operation before generating it.".into());
         }
@@ -281,7 +286,13 @@ impl Builder {
     }
     /// A move to `to`. With `single_axis`, legs of one axis each: Z first
     /// when it rises, then X, then Y, then Z when it falls.
-    fn push(&mut self, to: [f32; 3], motion: Motion, cut: bool, rate: f32) -> Result<(), String> {
+    pub(crate) fn push(
+        &mut self,
+        to: [f32; 3],
+        motion: Motion,
+        cut: bool,
+        rate: f32,
+    ) -> Result<(), String> {
         if !self.single_axis {
             return self.leg(to, motion, cut, rate);
         }
@@ -344,7 +355,7 @@ impl Builder {
             self.plan.duration = end;
         }
     }
-    fn retract(&mut self) -> Result<(), String> {
+    pub(crate) fn retract(&mut self) -> Result<(), String> {
         self.push(
             [self.pos[0], self.pos[1], self.clearance],
             Motion::Rapid,
@@ -355,7 +366,7 @@ impl Builder {
     fn start(&mut self, p: [f32; 3]) -> Result<(), String> {
         self.start_at(p, self.plan.rest_top)
     }
-    fn start_at(&mut self, p: [f32; 3], top: Option<f32>) -> Result<(), String> {
+    pub(crate) fn start_at(&mut self, p: [f32; 3], top: Option<f32>) -> Result<(), String> {
         self.retract()?;
         self.push(
             [p[0], p[1], self.clearance],
@@ -395,7 +406,7 @@ impl Builder {
         }
         self.retract()
     }
-    fn finish(mut self) -> Result<Plan, String> {
+    pub(crate) fn finish(mut self) -> Result<Plan, String> {
         self.retract()?;
         if self
             .plan
@@ -429,6 +440,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
         Strategy::Parallel => parallel(setup, op, tool, mesh),
         Strategy::Waterline => waterline(setup, op, tool, mesh),
         Strategy::Box => boxed(setup, op, tool, mesh),
+        Strategy::Groove => crate::groove::generate(setup, op, tool, mesh),
         _ => Err(op.strategy.availability().into()),
     }
 }
@@ -2985,7 +2997,14 @@ fn tap(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, 
 /// Whether the stock is gone from the upright cylinder of `radius` round
 /// `centre` between `bottom` and `top` before this operation: earlier cuts
 /// emptied it (`RestStock::bored`), or, with none, it is clear of the stock.
-fn bored(setup: &Setup, b: &Builder, centre: [f32; 2], radius: f32, top: f32, bottom: f32) -> bool {
+pub(crate) fn bored(
+    setup: &Setup,
+    b: &Builder,
+    centre: [f32; 2],
+    radius: f32,
+    top: f32,
+    bottom: f32,
+) -> bool {
     match &setup.preview_remaining {
         Some(rest) => rest.bored(centre, radius, top, bottom),
         None => {
@@ -5920,7 +5939,7 @@ pub(crate) mod tests {
         assert_ne!(generate(&setup, &plain, &tool, &mesh).unwrap_err(), refusal);
     }
     #[test]
-    fn all_thirteen_strategies_have_an_explicit_executable_or_unavailable_contract() {
+    fn all_fourteen_strategies_have_an_explicit_executable_or_unavailable_contract() {
         let mesh = block();
         for strategy in Strategy::ALL {
             assert!(!strategy.availability().is_empty());
@@ -5937,7 +5956,7 @@ pub(crate) mod tests {
                 .iter()
                 .filter(|s| s.imported_preview())
                 .count(),
-            9
+            10
         );
     }
     /// FNV-1a over every bit of every move, and the move count and duration.

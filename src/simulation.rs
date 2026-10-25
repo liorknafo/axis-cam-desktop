@@ -965,7 +965,10 @@ impl Simulation {
                     .a
                     .zip(self.turns.first())
                     .is_none_or(|(a, t)| (a - t.0).abs() < 1e-4);
-                if own {
+                // A height per column cannot hold the undercut a keyseat
+                // head cuts below a bore's wall (`groove`): it is in the
+                // volume and its cutter history only.
+                if own && self.plan.strategy != Strategy::Groove {
                     self.stock
                         .cut_shape(from, to, self.plan.radius, self.plan.shape);
                 }

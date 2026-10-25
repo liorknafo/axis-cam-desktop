@@ -11,13 +11,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub use crate::post::ORIGINS;
-const STRATEGIES: [(&str, Strategy); 6] = [
+const STRATEGIES: [(&str, Strategy); 7] = [
     ("Face", Strategy::Face),
     ("Pocket", Strategy::Pocket),
     ("Contour", Strategy::Contour),
     ("Drill", Strategy::Drill),
     ("Parallel", Strategy::Parallel),
     ("Waterline", Strategy::Waterline),
+    ("Groove", Strategy::Groove),
 ];
 const COOLANTS: [&str; 4] = ["Flood", "Mist", "Air", "Off"];
 const CYCLES: [&str; 7] = crate::model::DRILL_CYCLES;
@@ -149,6 +150,19 @@ pub struct ProposedOp {
     /// before tabs has none.
     #[serde(default)]
     pub tabs: Option<ProposedTabs>,
+    /// A Groove's diameter and width, mm, where it lies (`groove::GROOVE_FROM`)
+    /// and its land (or depth) from there, mm, and whether it takes a
+    /// spring pass. Null for other strategies.
+    #[serde(default)]
+    pub groove_diameter: Option<f32>,
+    #[serde(default)]
+    pub groove_width: Option<f32>,
+    #[serde(default)]
+    pub groove_from: Option<String>,
+    #[serde(default)]
+    pub groove_land: Option<f32>,
+    #[serde(default)]
+    pub spring_pass: Option<bool>,
     pub coolant: String,
     pub reason: String,
     /// When the planner changes a plan: the number of the current operation
@@ -262,6 +276,11 @@ pub fn schema_with(edit: bool, rotary: bool) -> Value {
             "width": number(),
             "height": number(),
         })), {"type": "null"}]},
+        "groove_diameter": optional(),
+        "groove_width": optional(),
+        "groove_from": choice(&crate::groove::GROOVE_FROM, true),
+        "groove_land": optional(),
+        "spring_pass": {"type": ["boolean", "null"]},
         "coolant": choice(&COOLANTS, false),
         "reason": text(),
     }));
@@ -569,7 +588,7 @@ fn operation(
         .map(|(_, s)| *s);
     if strategy.is_none() {
         wrong.push(format!(
-            "\"{}\" is not one of the six available strategies.",
+            "\"{}\" is not one of the seven available strategies.",
             p.strategy
         ));
     }
@@ -592,6 +611,9 @@ fn operation(
         ("peck", p.peck),
         ("breakthrough", p.breakthrough),
         ("hole_diameter", p.hole_diameter),
+        ("groove_diameter", p.groove_diameter),
+        ("groove_width", p.groove_width),
+        ("groove_land", p.groove_land),
     ] {
         if value.is_some_and(|v| !v.is_finite()) {
             wrong.push(format!("{field} is not a finite number."));
@@ -670,6 +692,11 @@ fn operation(
         (&p.contour_mode, &CONTOUR_MODES[..], "contour mode"),
         (&p.pocket_entry, &ENTRIES[..], "pocket entry"),
         (&p.drill_cycle, &CYCLES[..], "drill cycle"),
+        (
+            &p.groove_from,
+            &crate::groove::GROOVE_FROM[..],
+            "groove from",
+        ),
     ] {
         if value.as_deref().is_some_and(|v| !allowed.contains(&v)) {
             wrong.push(format!(
@@ -689,6 +716,7 @@ fn operation(
         Strategy::Drill if suits_cycle(p, crate::model::TAPPING) => kind == "Tap",
         Strategy::Drill => ["Drill", "Chamfer mill"].contains(&kind),
         Strategy::Parallel => ["Ball end mill", "Flat end mill"].contains(&kind),
+        Strategy::Groove => kind == crate::model::KEYSEAT,
         _ => kind == "Flat end mill",
     };
     if !suits && kind != "Flat end mill" && suits_helical(p) {
@@ -724,6 +752,7 @@ fn operation(
             "Drilling needs the surfaces of one plane with holes in orientation {}.",
             orientation.up
         )),
+        Strategy::Groove => wrong.extend(groove_wrong(p, plane, orientation)),
         // A Pocket clears each of the floor planes it names to its own depth.
         Strategy::Pocket => match floors_of(orientation, &ids) {
             None => wrong.push(format!(
@@ -928,12 +957,74 @@ fn operation(
                 if p.through == Some(true) { "Yes" } else { "No" }.into(),
             );
         }
+        Strategy::Groove => {
+            for (key, value) in [
+                ("groove_diameter", p.groove_diameter),
+                ("groove_width", p.groove_width),
+                ("groove_land", p.groove_land),
+            ] {
+                set(key, value.unwrap_or(0.).to_string());
+            }
+            set(
+                "groove_from",
+                (p.groove_from.as_deref())
+                    .unwrap_or(crate::groove::GROOVE_FROM[0])
+                    .into(),
+            );
+            set(
+                "spring_pass",
+                if p.spring_pass == Some(true) {
+                    "Yes"
+                } else {
+                    "No"
+                }
+                .into(),
+            );
+        }
         _ => set("boundary", "Model silhouette".into()),
     }
     if let Some(entry) = &p.pocket_entry {
         set("pocket_entry", entry.clone());
     }
     Ok(op)
+}
+/// What is wrong with a Groove `p` on `plane` of `orientation`: its bore
+/// is one hole of the plane, by `hole_diameter` when the plane has several,
+/// and it gives the groove's diameter, width and land.
+fn groove_wrong(
+    p: &ProposedOp,
+    plane: Option<&PlaneReport>,
+    orientation: &OrientationReport,
+) -> Vec<String> {
+    let mut wrong = vec![];
+    let holes: Vec<_> = plane
+        .iter()
+        .flat_map(|pl| &pl.holes)
+        .filter(|h| {
+            p.hole_diameter
+                .filter(|d| *d > 0.)
+                .is_none_or(|d| (h.diameter - d).abs() <= 0.11)
+        })
+        .collect();
+    if holes.len() != 1 {
+        wrong.push(format!(
+            "Groove needs the surfaces of one plane with holes in orientation {}, and hole_diameter naming one bore of it (it has {}).",
+            orientation.up,
+            holes.len()
+        ));
+    }
+    for (field, value) in [
+        ("groove_diameter", p.groove_diameter),
+        ("groove_width", p.groove_width),
+    ] {
+        if !value.is_some_and(|v| v > 0.) {
+            wrong.push(format!("Groove needs a positive {field}."));
+        }
+    }
+    if !p.groove_land.is_some_and(|v| v >= 0.) {
+        wrong.push("Groove needs a groove_land of zero or more.".into());
+    }
+    wrong
 }
 /// Whether `p` is a Drill operation with the Helical milling cycle, which
 /// cuts with a flat end mill.
@@ -945,7 +1036,7 @@ fn suits_cycle(p: &ProposedOp, cycle: &str) -> bool {
     p.strategy == "Drill" && p.drill_cycle.as_deref() == Some(cycle)
 }
 /// An operation of the current plan the planner cannot see or change: its
-/// strategy is not one of the six, its tool has no number, or it machines a
+/// strategy is not one of the seven, its tool has no number, or it machines a
 /// selection that is not surfaces. It stays in its setup, at its place.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct KeptOp {
@@ -1084,6 +1175,17 @@ fn described(op: &Operation, tools: &[Tool]) -> Option<ProposedOp> {
             p.radial_allowance = value("allowance");
             p.axial_allowance = value("axial_allowance");
         }
+        Strategy::Groove => {
+            p.groove_diameter = value("groove_diameter");
+            p.groove_width = value("groove_width");
+            p.groove_land = value("groove_land");
+            p.groove_from = Some(get(&op.p, "groove_from"))
+                .filter(|f| crate::groove::GROOVE_FROM.contains(f))
+                .map(String::from);
+            p.spring_pass = Some(get(&op.p, "spring_pass") == "Yes");
+            p.tolerance = value("tolerance");
+            p.hole_diameter = value("hole_diameter").filter(|d| *d > 0.);
+        }
         _ => {
             p.stepdown = value("stepdown");
             p.bottom_offset = value("bottom");
@@ -1173,6 +1275,11 @@ fn merged(base: &Operation, fresh: &Operation, p: &ProposedOp, d: &ProposedOp) -
             p.tabs != d.tabs,
             &["tabs", "tab_count", "tab_width", "tab_height"],
         ),
+        (p.groove_diameter != d.groove_diameter, &["groove_diameter"]),
+        (p.groove_width != d.groove_width, &["groove_width"]),
+        (p.groove_from != d.groove_from, &["groove_from"]),
+        (p.groove_land != d.groove_land, &["groove_land"]),
+        (p.spring_pass != d.spring_pass, &["spring_pass"]),
     ] {
         if changed {
             copy(keys);
@@ -2052,6 +2159,11 @@ pub(crate) mod tests {
             hole_diameter: None,
             through: None,
             tabs: None,
+            groove_diameter: None,
+            groove_width: None,
+            groove_from: None,
+            groove_land: None,
+            spring_pass: None,
             coolant: "Flood".into(),
             reason: "test".into(),
             from: None,
@@ -2769,7 +2881,7 @@ pub(crate) mod tests {
         );
         refused(
             &|p| p.setups[0].operations[1].strategy = "Adaptive".into(),
-            "1/Some(2): \"Adaptive\" is not one of the six",
+            "1/Some(2): \"Adaptive\" is not one of the seven",
         );
         refused(
             &|p| p.setups[0].operations[0].tool = 9,
@@ -2986,6 +3098,139 @@ pub(crate) mod tests {
         assert_eq!(
             (get(&op.p, "stepdown"), get(&op.p, "stepover")),
             ("1.5", "30")
+        );
+    }
+    #[test]
+    fn a_groove_proposal_becomes_an_internal_groove() {
+        let (mut doc, mesh, _) = block();
+        let mut keyseat = crate::groove::tests::keyseat(3., 1., 1.5, 10.);
+        keyseat.p.insert("number".into(), "9".into());
+        doc.tools.push(keyseat);
+        let report = analysis::report(&doc, &mesh).unwrap();
+        // The report gives its head's width as its flutes, and its neck.
+        let tool = report.tools.iter().find(|t| t.number == 9).unwrap();
+        assert_eq!(
+            (
+                tool.kind.as_str(),
+                tool.flute_length,
+                tool.neck_diameter,
+                tool.reach
+            ),
+            (crate::model::KEYSEAT, 1., Some(1.5), Some(10.))
+        );
+        let top = ids(&report, "+Z", 0.);
+        let plane = (report.orientations[0].planes.iter())
+            .find(|p| p.depth_below_top.abs() < 0.01)
+            .unwrap();
+        let alone = |d: f32| {
+            plane
+                .holes
+                .iter()
+                .filter(|h| (h.diameter - d).abs() <= 0.11)
+                .count()
+                == 1
+        };
+        let bore = (plane.holes.iter().map(|h| h.diameter))
+            .find(|d| alone(*d))
+            .unwrap_or_else(|| panic!("no hole of its own size: {:?}", plane.holes));
+        let mut groove = op("Groove", 9, top.clone());
+        (groove.rpm, groove.feed) = (12000., 800.);
+        groove.hole_diameter = Some(bore);
+        groove.groove_diameter = Some(bore + 1.);
+        groove.groove_width = Some(1.3);
+        groove.groove_from = Some(crate::groove::GROOVE_FROM[1].into());
+        groove.groove_land = Some(2.);
+        groove.spring_pass = Some(true);
+        let mut proposal = good(&report);
+        proposal.setups[0].operations.push(groove.clone());
+        let job = build(&doc, &mesh, &report, &proposal).unwrap_or_else(|e| panic!("{e:?}"));
+        let made = job.setups[0].operations.last().unwrap();
+        assert_eq!(made.strategy, Strategy::Groove);
+        for (k, v) in [
+            ("groove_diameter", (bore + 1.).to_string()),
+            ("groove_width", "1.3".into()),
+            ("groove_from", crate::groove::GROOVE_FROM[1].into()),
+            ("groove_land", "2".into()),
+            ("spring_pass", "Yes".into()),
+            ("hole_diameter", bore.to_string()),
+        ] {
+            assert_eq!(get(&made.p, k), v, "{k}");
+        }
+        // The current plan gives it back as it was proposed.
+        let back = described(made, &job.tools).unwrap();
+        assert_eq!(
+            (
+                back.groove_diameter,
+                back.groove_width,
+                back.groove_land,
+                back.spring_pass
+            ),
+            (
+                groove.groove_diameter,
+                groove.groove_width,
+                groove.groove_land,
+                Some(true)
+            )
+        );
+        assert_eq!(back.groove_from, groove.groove_from);
+        // A flat end mill, or no groove size, is refused.
+        let refused = |edit: &dyn Fn(&mut ProposedOp)| {
+            let mut p = good(&report);
+            let mut g = groove.clone();
+            edit(&mut g);
+            p.setups[0].operations.push(g);
+            messages(build(&doc, &mesh, &report, &p))
+        };
+        assert!(
+            refused(&|g| g.tool = 1)
+                .iter()
+                .any(|m| m.contains("which Groove cannot use")),
+            "{:?}",
+            refused(&|g| g.tool = 1)
+        );
+        assert!(
+            refused(&|g| g.groove_diameter = None)
+                .iter()
+                .any(|m| m.contains("Groove needs a positive groove_diameter."))
+        );
+        // The schema offers it, with its fields.
+        let schema = schema();
+        let fields = &schema["properties"]["setups"]["items"]["properties"]["operations"]["items"]
+            ["properties"];
+        assert!(
+            fields["strategy"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("Groove"))
+        );
+        for k in [
+            "groove_diameter",
+            "groove_width",
+            "groove_from",
+            "groove_land",
+            "spring_pass",
+        ] {
+            assert!(fields.get(k).is_some(), "{k}");
+        }
+        // A proposal saved before the groove fields reads them as null.
+        let mut value = serde_json::to_value(good(&report)).unwrap();
+        for op in value["setups"][0]["operations"].as_array_mut().unwrap() {
+            for k in [
+                "groove_diameter",
+                "groove_width",
+                "groove_from",
+                "groove_land",
+                "spring_pass",
+            ] {
+                op.as_object_mut().unwrap().remove(k);
+            }
+        }
+        let old = parse(&value.to_string()).unwrap();
+        assert!(
+            old.setups[0]
+                .operations
+                .iter()
+                .all(|o| o.groove_diameter.is_none())
         );
     }
     #[test]
