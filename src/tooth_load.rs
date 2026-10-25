@@ -146,114 +146,6 @@ fn elements(shape: CutterShape, radius: f32, flute: f32, helix: f32) -> Vec<Elem
     out
 }
 
-/// The cuts made so far, kept in buckets over the stock's plan in `frame`
-/// so a point is tested against the cuts near it only: a long cut in
-/// stretches a bucket or its radius long, whichever is more (a wide cut in
-/// small buckets would fill many), each with the box it sweeps in the
-/// frame, which a point outside of is not tested against. Each bucket
-/// holds its cuts in the order they were kept.
-struct History {
-    frame: Frame,
-    min: [f32; 2],
-    cell: f32,
-    n: [usize; 2],
-    buckets: Vec<Vec<(u32, Bounds)>>,
-    cuts: Vec<Cut>,
-}
-impl History {
-    fn new(frame: Frame, over: Bounds, cell: f32) -> Self {
-        let n = [0, 1].map(|k| ((over.max[k] - over.min[k]) / cell).ceil().max(1.) as usize);
-        Self {
-            frame,
-            min: [over.min[0], over.min[1]],
-            cell,
-            n,
-            buckets: vec![vec![]; n[0] * n[1]],
-            cuts: vec![],
-        }
-    }
-    fn bucket(&self, x: f32, k: usize) -> usize {
-        (((x - self.min[k]) / self.cell).floor().max(0.) as usize).min(self.n[k] - 1)
-    }
-    /// Keep `cut`, the latest so far: its number.
-    fn add(&mut self, cut: Cut) -> u32 {
-        let id = self.cuts.len() as u32;
-        // The cut's stretches, each the box it sweeps in its own frame.
-        let boxes: Vec<Bounds> = match cut.ring() {
-            Some(ring) => vec![ring],
-            None => {
-                let (below, above) = cut.shape.span();
-                let r = cut.radius;
-                let length = (0..3).map(|k| (cut.b[k] - cut.a[k]).powi(2)).sum::<f32>();
-                let pieces = (length.sqrt() / self.cell.max(r)).ceil().max(1.) as usize;
-                let at = |t: f32| -> [f32; 3] {
-                    std::array::from_fn(|k| cut.a[k] + (cut.b[k] - cut.a[k]) * t)
-                };
-                (0..pieces)
-                    .map(|i| {
-                        let (p, q) = (
-                            at(i as f32 / pieces as f32),
-                            at((i + 1) as f32 / pieces as f32),
-                        );
-                        Bounds {
-                            min: [
-                                p[0].min(q[0]) - r,
-                                p[1].min(q[1]) - r,
-                                p[2].min(q[2]) - below,
-                            ],
-                            max: [
-                                p[0].max(q[0]) + r,
-                                p[1].max(q[1]) + r,
-                                p[2].max(q[2]) + cut.flute + above,
-                            ],
-                        }
-                    })
-                    .collect()
-            }
-        };
-        for own in boxes {
-            let at = cut.frame.transfer_bounds(own, self.frame);
-            let [x0, y0] = [0, 1].map(|k| self.bucket(at.min[k], k));
-            let [x1, y1] = [0, 1].map(|k| self.bucket(at.max[k], k));
-            for y in y0..=y1 {
-                for x in x0..=x1 {
-                    let bucket = &mut self.buckets[y * self.n[0] + x];
-                    match bucket.last_mut() {
-                        // The cut's last stretch here too: one box round both.
-                        Some((last, b)) if *last == id => {
-                            for k in 0..3 {
-                                b.min[k] = b.min[k].min(at.min[k]);
-                                b.max[k] = b.max[k].max(at.max[k]);
-                            }
-                        }
-                        _ => bucket.push((id, at)),
-                    }
-                }
-            }
-        }
-        self.cuts.push(cut);
-        id
-    }
-    /// Whether a cut kept before cut `before` swept the point `p` of the
-    /// frame: the latest cuts first, the likeliest to have.
-    fn swept(&self, p: [f32; 3], before: u32) -> bool {
-        let bucket = &self.buckets[self.bucket(p[1], 1) * self.n[0] + self.bucket(p[0], 0)];
-        let earlier = &bucket[..bucket.partition_point(|(id, _)| *id < before)];
-        earlier.iter().rev().any(|(id, b)| {
-            if (0..3).any(|k| p[k] < b.min[k] || p[k] > b.max[k]) {
-                return false;
-            }
-            let c = &self.cuts[*id as usize];
-            let q = if c.frame == self.frame {
-                p
-            } else {
-                self.frame.transfer(p, c.frame)
-            };
-            swept(q, c.a, c.b, c.radius, c.flute, c.shape)
-        })
-    }
-}
-
 /// The load on one tooth along `sim`'s moves (`ToothLoad`), cut by a tool
 /// with `flutes` wound at `helix` degrees at `rpm` in `material` (None
 /// counts as steel, `forces::kc`). None for a plan that is not milled
@@ -281,7 +173,7 @@ pub fn measure(
     let stock = volume.frame.transfer_bounds(volume.bounds, frame);
     let bar = volume.round.then(|| crate::stock::bar(volume.bounds));
     let extent = (stock.max[0] - stock.min[0]).max(stock.max[1] - stock.min[1]);
-    let mut history = History::new(frame, stock, plan.radius.max(extent / 400.));
+    let mut history = crate::volume::History::new(frame, stock, plan.radius.max(extent / 400.));
     for cut in volume.cuts.iter() {
         history.add(cut.clone());
     }

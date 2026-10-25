@@ -650,7 +650,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("rest", "Yes") => (
-            "Record the intention to machine material remaining from an earlier operation. Fully cleared top layers are skipped automatically. This saved preference does not yet isolate leftover islands or corners; other air cuts can remain. Imported Pocket and Adaptive clearing need no setting: they cut only where earlier operations left material.",
+            "Record the intention to machine material left by an earlier operation. Fully cleared top layers are skipped automatically, and feed through air becomes a retract and a rapid where quicker. This does not yet isolate leftover islands or corners. Pocket and Adaptive clearing need no setting: they cut only where earlier operations left material.",
             "",
         ),
         ("rest", "No") => (

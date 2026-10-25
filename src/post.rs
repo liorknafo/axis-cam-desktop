@@ -8149,7 +8149,7 @@ M2
         assert!(!text.contains(CUT), "{text}");
     }
     #[test]
-    fn a_manual_setup_makes_no_program_and_leaves_the_cnc_programs_as_they_were() {
+    fn a_manual_setup_makes_no_program_and_leaves_the_cnc_programs_but_their_air() {
         let (plain, mesh) = fixture::job();
         let mut doc = plain.clone();
         // A notch in the stock's corner that the CNC setup's cuts do not reach.
@@ -8164,14 +8164,29 @@ M2
         let manual = &after.setups[0];
         assert!(manual.result.as_ref().unwrap().is_empty());
         assert!(manual.run.is_none() && manual.passes());
-        // The CNC setup is setup 2 now: its number is the only difference.
+        // The CNC setup is setup 2 now, with the same programs. Its Facing
+        // may feed through less air where the notch took the top
+        // (`air::trim`); every operation after it is as it was.
         let (was, now) = (&before.setups[0], &after.setups[1]);
         let (was, now) = (was.result.as_ref().unwrap(), now.result.as_ref().unwrap());
         assert_eq!(was.len(), now.len());
         for (a, b) in was.iter().zip(now) {
-            assert_eq!(a.text, b.text.replacen("Setup 2:", "Setup 1:", 1));
             assert_eq!(a.file_name, b.file_name.replacen(" - 2 ", " - 1 ", 1));
             assert_eq!((&a.tools, &a.operations), (&b.tools, &b.operations));
+        }
+        for ((oi, a), (_, b)) in simulated(&plain, &mesh)[0].iter().zip(&cut[1]) {
+            let (a, b) = (&a.as_ref().unwrap().plan, &b.as_ref().unwrap().plan);
+            if *oi == 0 {
+                assert!(
+                    b.duration <= a.duration + 1e-3,
+                    "{} > {}",
+                    b.duration,
+                    a.duration
+                );
+            } else {
+                assert_eq!(a.moves.len(), b.moves.len(), "{oi}");
+                assert!((a.duration - b.duration).abs() < 1e-3, "{oi}");
+            }
         }
         let dir = tempfile::tempdir().unwrap();
         let (_, count) = write_job(&after, dir.path()).unwrap();

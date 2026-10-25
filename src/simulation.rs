@@ -856,6 +856,9 @@ pub struct Simulation {
     /// (`App::measure_tooth_load`); None until then and for an operation
     /// that is not milled.
     pub tooth_load: Option<std::sync::Arc<crate::tooth_load::ToothLoad>>,
+    /// The stretches of air taken out of the plan (`air::trim`); None where
+    /// none were.
+    pub air: Option<crate::air::Trimmed>,
 }
 impl Simulation {
     pub fn new(plan: Plan) -> Self {
@@ -883,6 +886,7 @@ impl Simulation {
             revision: 0,
             bites: Default::default(),
             tooth_load: None,
+            air: None,
         }
     }
     /// The frame move `m` cuts in: the one `turns` lists for its A angle,
@@ -1122,6 +1126,12 @@ pub fn sequence_walk(
             }
         }
         begin(si, starts.filter(|_| blocked.is_none()));
+        // The vise jaws or clamps, which no link `air::trim` makes comes near.
+        let holding = if indexed {
+            vec![]
+        } else {
+            crate::air::workholding(doc, &setup, mesh, volume.as_ref(), frame)
+        };
         // The stock an indexed setup starts from, which each angle's own box
         // is taken from.
         let began = if indexed { volume.clone() } else { None };
@@ -1161,7 +1171,14 @@ pub fn sequence_walk(
                                 .and_then(|plan| {
                                     crate::indexed::enter_held(doc, si, op, mesh, plan)
                                 })
-                                .map(|plan| (plan, vec![]));
+                                .and_then(|plan| match &volume {
+                                    // Its stretches through air, replaced.
+                                    Some(v) => crate::air::trim(
+                                        plan, &setup, op, v, frame, source, &holding,
+                                    ),
+                                    None => Ok((plan, None)),
+                                })
+                                .map(|(plan, air)| (plan, vec![], air));
                         }
                         let start = crate::indexed::Start {
                             begin: began.as_ref(),
@@ -1170,13 +1187,13 @@ pub fn sequence_walk(
                             source,
                         };
                         crate::indexed::generate(doc, si, &setup, op, t, mesh, start)
-                            .map(|posed| (posed.plan, posed.turns))
+                            .map(|posed| (posed.plan, posed.turns, None))
                     })
             };
-            let result=plan.and_then(|(plan, turns)| {
+            let result=plan.and_then(|(plan, turns, air)| {
                 if let Some(reason)=&blocked {return Err(format!("Cannot inherit remaining stock because an earlier operation/setup failed: {reason}"));}
                 let mut sim=Simulation::new(plan);
-                sim.volume=volume.clone();sim.initial_volume=volume.clone();sim.frame=Some(frame);sim.turns=turns;sim.preceding=preceding;sim.source=source;
+                sim.volume=volume.clone();sim.initial_volume=volume.clone();sim.frame=Some(frame);sim.turns=turns;sim.preceding=preceding;sim.source=source;sim.air=air;
                 if let Some((previous,stock))=&grid&& *previous==frame && stock.bounds==sim.plan.stock {sim.stock=stock.clone();sim.initial_stock=stock.clone();}
                 Ok(sim)
             });
