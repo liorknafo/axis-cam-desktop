@@ -2311,6 +2311,11 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "",
             Some(Tool),
         ),
+        (_, "tooth_force") => (
+            "The force on one tooth, in N, that the feed is changed along the path to hold. Empty: the force at the cutting feed on the operation's nominal cut, its stepover (a Contour: a full slot) as deep as its levels cut, at most the stepdown; the one at the full stepdown is shown under the field. A larger force feeds faster everywhere.",
+            "Worked out from the project material's kc1.1 and mc (steel without one) and the tool's flutes, for a 30° helix. The SIMULATION panel says the feeds it took.",
+            Some(Tool),
+        ),
         (_, "coolant") => (
             "Coolant for this operation. LinuxCNC export writes M8 for Flood, M7 for Mist, the machine's Air output for Air (refused when it has none) and nothing for Off, then M9 when the coolant changes, at a tool change and at the end of the program. The preview does not simulate coolant.",
             "",

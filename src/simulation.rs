@@ -872,6 +872,10 @@ pub struct Simulation {
     /// (`App::measure_tooth_load`); None until then and for an operation
     /// that is not milled.
     pub tooth_load: Option<std::sync::Arc<crate::tooth_load::ToothLoad>>,
+    /// The force on a tooth the feed was changed along the moves to hold,
+    /// and the feeds it took (`tooth_load::hold`); None for an operation
+    /// whose feed is the programmed one.
+    pub held: Option<crate::tooth_load::Held>,
 }
 impl Simulation {
     pub fn new(plan: Plan) -> Self {
@@ -899,6 +903,7 @@ impl Simulation {
             revision: 0,
             bites: Default::default(),
             tooth_load: None,
+            held: None,
         }
     }
     /// The frame move `m` cuts in: the one `turns` lists for its A angle,
@@ -1193,6 +1198,8 @@ pub fn sequence_walk(
                 if let Some(reason)=&blocked {return Err(format!("Cannot inherit remaining stock because an earlier operation/setup failed: {reason}"));}
                 let mut sim=Simulation::new(plan);
                 sim.volume=volume.clone();sim.initial_volume=volume.clone();sim.frame=Some(frame);sim.turns=turns;sim.preceding=preceding;sim.source=source;
+                // The feed changed along the path to hold the force on a tooth.
+                crate::tooth_load::hold(&mut sim, doc, &setup.machine, op)?;
                 if let Some((previous,stock))=&grid&& *previous==frame && stock.bounds==sim.plan.stock {sim.stock=stock.clone();sim.initial_stock=stock.clone();}
                 Ok(sim)
             });

@@ -630,7 +630,7 @@ pub(crate) fn issue_tab(issue: &str) -> Option<&'static str> {
                 None
             };
         }
-        Some("rpm" | "feed") => "Tool",
+        Some("rpm" | "feed" | "tooth_force") => "Tool",
         Some("hole_diameter" | "silhouette_extend") => "Geometry",
         Some("x_min" | "x_max" | "y_min" | "y_max" | "z_top" | "z_bottom") => "Box",
         Some(
@@ -2569,6 +2569,22 @@ fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
             {
                 playback = playback.push(muted("Working out the load on each tooth…").size(12));
             }
+            if let Some(held) = &sim.held {
+                playback = playback.push(
+                    muted(if held.slowest < held.fastest {
+                        format!(
+                            "Feed {:.0}–{:.0} mm/min to hold {:.0} N per tooth",
+                            held.slowest, held.fastest, held.target
+                        )
+                    } else {
+                        format!(
+                            "Feed {:.0} mm/min holds {:.0} N per tooth or less",
+                            held.fastest, held.target
+                        )
+                    })
+                    .size(12),
+                );
+            }
             if let Some(load) = &sim.tooth_load {
                 playback = playback.push(
                     muted(if load.peak > 0. {
@@ -2825,6 +2841,49 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 c = c.push(muted("Feed: the carriage power feed, or by hand.").size(12));
             } else {
                 c = c.push(checks.field(p, "feed", "Cutting feed · mm/min"));
+            }
+            if crate::tooth_load::offered(o.strategy, machine) {
+                let follows = crate::tooth_load::follows(o, machine);
+                c = c.push(choice_value(
+                    p,
+                    crate::tooth_load::FEED_FOLLOWS[follows as usize],
+                    "feed_follows",
+                    "Feed along the path",
+                    &crate::tooth_load::FEED_FOLLOWS,
+                    t,
+                ));
+                if follows {
+                    c = c.push(checks.hinted(
+                        p,
+                        "tooth_force",
+                        "Force per tooth to hold · N",
+                        "Automatic",
+                    ));
+                    let tool = app.doc.tools.iter().find(|tool| tool.id == o.tool);
+                    let automatic = tool.and_then(|tool| {
+                        let cut = crate::tooth_load::nominal_cut(o, tool, None)?;
+                        let force = crate::tooth_load::nominal(
+                            &cut,
+                            num(&tool.p, "flutes")?,
+                            num(&o.p, "rpm")?,
+                            num(&o.p, "feed")?,
+                            app.doc.selected_material(),
+                        )?;
+                        Some(format!(
+                            "Automatic: one tooth's force at the cutting feed on the nominal cut, {} as deep as a level: {force:.0} N at the full {:.1} mm stepdown. The simulation says the force held.",
+                            cut.width
+                                .map_or("a full slot".into(), |w| format!("{w:.1} mm wide")),
+                            cut.depth
+                        ))
+                    });
+                    c = c.push(
+                        muted(automatic.unwrap_or_else(|| {
+                            "Automatic: needs the tool's flutes, the spindle speed and the feed"
+                                .into()
+                        }))
+                        .size(12),
+                    );
+                }
             }
             c = c.push(choice(
                 p,
