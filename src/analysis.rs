@@ -338,6 +338,13 @@ pub struct ToolReport {
     /// A tap's thread size.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,
+    /// A reamer's tolerance class, like H7.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tolerance: Option<String>,
+    /// A boring head's smallest and largest bore, mm; its `diameter` is
+    /// its body's and its `flute_length` how far its bar reaches below it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bore_range: Option<[f32; 2]>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OrientationReport {
@@ -1590,6 +1597,11 @@ fn describe(
                     teeth: (get(&t.p, "type") == "Thread mill" && t.thread_teeth() > 1)
                         .then(|| t.thread_teeth()),
                     thread: t.tap_spec().map(|s| s.name.to_string()),
+                    tolerance: (get(&t.p, "type") == "Reamer")
+                        .then(|| get(&t.p, "tolerance").to_string()),
+                    bore_range: (get(&t.p, "type") == "Boring head")
+                        .then(|| t.bore_range().map(|(a, b)| [a, b]))
+                        .flatten(),
                 })
             })
             .collect(),

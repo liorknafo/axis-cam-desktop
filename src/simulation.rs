@@ -171,6 +171,21 @@ pub struct Plan {
     /// the simulation turns each ring away when its move ends, instead of
     /// sweeping the cutter along the moves. Empty for every other plan.
     pub rings: Vec<Ring>,
+    /// Where the spindle stops partway through (`cam::boring`), in order.
+    /// Empty for most plans.
+    pub stops: Vec<Stop>,
+}
+/// A stop of the spindle partway through a plan: before move `at` the
+/// spindle and coolant stop and, with a `pause`, the program waits there,
+/// saying it, for the operator to resume (`post::Block::Pause`). They start
+/// again before the next feed move. A boring head's pause before a pass
+/// carries the `size` the head is set to for it (the manual mill's guide
+/// shows it).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stop {
+    pub at: usize,
+    pub pause: Option<String>,
+    pub size: Option<f32>,
 }
 impl Plan {
     /// Whether this is a lathe plan: its moves are a side view (X the
@@ -558,6 +573,7 @@ fn generate_plan(
         tool_length,
         holder_radius,
         neck: None,
+        stops: vec![],
         display_scale: scale,
         duration: 0.,
         target,

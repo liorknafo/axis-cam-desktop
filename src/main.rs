@@ -19,6 +19,7 @@ mod groove;
 mod guide;
 mod help;
 mod holding;
+mod hole_stages;
 mod illustration;
 mod indexed;
 mod lathe;
@@ -201,6 +202,9 @@ pub enum Message {
     /// Add the operations that drill and thread the setup's threaded holes
     /// (`threading::add`).
     AddThreading,
+    /// Add the drilling (and roughing) before the selected Reaming or
+    /// Boring, on its holes (`hole_stages::add`).
+    AddHoleStages,
     /// Fill the selected Turn thread's side, diameter, pitch and end from
     /// the thread on the part's axis (`lathe::thread_from_part`).
     ThreadFromPart,
@@ -3745,7 +3749,7 @@ impl App {
             return Task::none();
         };
         let holes = match &shown.guide.steps[at] {
-            guide::Step::Holes { holes, .. } => holes.len(),
+            guide::Step::Holes { holes, .. } | guide::Step::Bore { holes, .. } => holes.len(),
             _ => 0,
         };
         match action {
@@ -5052,6 +5056,29 @@ impl App {
                 match threading::add(&self.doc, si, mesh) {
                     Ok(added) => {
                         self.doc.setups[si].operations.extend(added.ops);
+                        self.touch();
+                        self.status = added.status;
+                    }
+                    Err(why) => self.status = why,
+                }
+            }
+            Message::AddHoleStages => {
+                let (si, Some(oi)) = (self.doc.index(), self.selected) else {
+                    return Task::none();
+                };
+                let Some(mesh) = self.part_mesh() else {
+                    return Task::none();
+                };
+                match hole_stages::add(&self.doc, si, oi, mesh) {
+                    Ok(added) => {
+                        let n = added.ops.len();
+                        let ops = &mut self.doc.setups[si].operations;
+                        ops.splice(oi..oi, added.ops);
+                        if let Some(cut) = added.bore_cut {
+                            ops[oi + n].p.insert("bore_cut".into(), cut.to_string());
+                        }
+                        // The finishing operation stays the one open.
+                        self.selected = Some(oi + n);
                         self.touch();
                         self.status = added.status;
                     }

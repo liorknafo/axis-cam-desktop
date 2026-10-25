@@ -27,7 +27,7 @@ const CHAMFER_SOURCES: [&str; 2] = ["edges", "line"];
 const CHAMFER_EDGES: [&str; 3] = ["all", "outer", "holes"];
 const CHAMFER_SIDES: [&str; 3] = ["left", "right", "alternate"];
 const COOLANTS: [&str; 4] = ["Flood", "Mist", "Air", "Off"];
-const CYCLES: [&str; 7] = crate::model::DRILL_CYCLES;
+const CYCLES: [&str; 9] = crate::model::DRILL_CYCLES;
 const ENTRIES: [&str; 2] = ["Profile ramp", "Plunge"];
 /// A Contour's modes: round the outline, a floor's walls, or inside every
 /// hole through the outline (a flat part's cut-outs).
@@ -773,6 +773,8 @@ fn operation(
         Strategy::Drill if suits_helical(p) => kind == "Flat end mill",
         Strategy::Drill if suits_cycle(p, crate::model::THREAD_MILLING) => kind == "Thread mill",
         Strategy::Drill if suits_cycle(p, crate::model::TAPPING) => kind == "Tap",
+        Strategy::Drill if suits_cycle(p, crate::model::REAMING) => kind == "Reamer",
+        Strategy::Drill if suits_cycle(p, crate::model::BORING) => kind == "Boring head",
         Strategy::Drill => ["Drill", "Chamfer mill"].contains(&kind),
         Strategy::Parallel => ["Ball end mill", "Flat end mill"].contains(&kind),
         Strategy::Groove => kind == crate::model::KEYSEAT,
@@ -795,11 +797,26 @@ fn operation(
             "T{} is a {kind}; Drill with Tapping takes a tap.",
             p.tool
         ));
+    } else if !suits && suits_cycle(p, crate::model::REAMING) {
+        wrong.push(format!(
+            "T{} is a {kind}; Drill with Reaming takes a reamer.",
+            p.tool
+        ));
+    } else if !suits && suits_cycle(p, crate::model::BORING) {
+        wrong.push(format!(
+            "T{} is a {kind}; Drill with Boring takes a boring head.",
+            p.tool
+        ));
     } else if !suits {
         wrong.push(format!(
             "T{} is a {kind}, which {} cannot use.",
             p.tool, p.strategy
         ));
+    }
+    if suits_cycle(p, crate::model::BORING) && !p.hole_diameter.is_some_and(|d| d > 0.) {
+        wrong.push(
+            "Drill with Boring needs hole_diameter: the boring head is set to one size.".into(),
+        );
     }
     let plane = plane_of(orientation, &ids);
     let floor = strategy == Strategy::Pocket || (strategy == Strategy::Contour && inside);
@@ -1013,6 +1030,14 @@ fn operation(
                 "cycle",
                 p.drill_cycle.clone().unwrap_or_else(|| "Drilling".into()),
             );
+            // Helical milling leaves `radial_allowance` round the hole for a
+            // Boring after it, on the diameter.
+            if suits_helical(p) && p.radial_allowance.is_some_and(|r| r > 0.) {
+                set(
+                    "bore_allowance",
+                    format!("{:.2}", 2. * p.radial_allowance.unwrap_or(0.)),
+                );
+            }
             set(
                 "through",
                 if p.through == Some(true) { "Yes" } else { "No" }.into(),
@@ -1374,10 +1399,11 @@ fn described(op: &Operation, tools: &[Tool]) -> Option<ProposedOp> {
                 .into(),
             );
             p.peck = value("peck");
-            // Helical milling's pitch and rings.
+            // Helical milling's pitch and rings, and what it leaves.
             if op.helical() {
                 p.stepdown = value("stepdown");
                 p.stepover_percent = value("stepover");
+                p.radial_allowance = value("bore_allowance").map(|d| d / 2.).filter(|r| *r > 0.);
             }
             let through = get(&op.p, "through") == "Yes";
             p.through = Some(through);
@@ -1462,7 +1488,10 @@ fn merged(base: &Operation, fresh: &Operation, p: &ProposedOp, d: &ProposedOp) -
     for (changed, keys) in [
         (p.stepdown != d.stepdown, &["stepdown"][..]),
         (p.stepover_percent != d.stepover_percent, &["stepover"]),
-        (p.radial_allowance != d.radial_allowance, &["allowance"]),
+        (
+            p.radial_allowance != d.radial_allowance,
+            &["allowance", "bore_allowance"],
+        ),
         (p.axial_allowance != d.axial_allowance, &["axial_allowance"]),
         (p.bottom_offset != d.bottom_offset, &["bottom"]),
         (p.clearance != d.clearance, &["clearance"]),
