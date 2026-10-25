@@ -141,8 +141,11 @@ fn elements(shape: CutterShape, radius: f32, flute: f32, helix: f32) -> Vec<Elem
             0.
         }
     };
+    // A quarter of a millimetre each, however long the flutes: a cut 1 mm
+    // deep is four of them, not a part of one (those above the stock's top
+    // cost nothing, `measure`).
     let height = (flute - side_from).max(0.);
-    let slices = (height / 0.25).ceil().clamp(1., 40.);
+    let slices = (height / 0.25).ceil().clamp(1., 400.);
     let dz = height / slices;
     for i in 0..slices as usize {
         add(radius, side_from + (i as f32 + 0.5) * dz, [1., 0.], dz);
@@ -671,8 +674,8 @@ struct Refed {
 /// `op`'s target (`target`), when its feed follows it (`follows`): splits
 /// the cutting moves where the feed wanted changes (`refeed`), re-times the
 /// plan, and keeps the load along the new moves (`Simulation::tooth_load`)
-/// and what was held (`Simulation::held`). Worked out once for the same
-/// plan from the same stock. Nothing changes for an operation whose feed
+/// and what was held (`Simulation::held`). The load is measured once for
+/// the same plan from the same stock. Nothing changes for an operation whose feed
 /// does not follow the load, an indexed one, or one whose load cannot be
 /// measured; an error only for a cancelled generation.
 pub fn hold(
@@ -682,7 +685,7 @@ pub fn hold(
     op: &Operation,
 ) -> Result<(), String> {
     use std::hash::{Hash, Hasher};
-    static KNOWN: std::sync::Mutex<Vec<(u64, std::sync::Arc<Refed>)>> =
+    static KNOWN: std::sync::Mutex<Vec<(u64, std::sync::Arc<ToothLoad>)>> =
         std::sync::Mutex::new(vec![]);
     if !follows(op, machine) || sim.plan.moves.iter().any(|m| m.a.is_some()) {
         return Ok(());
@@ -692,11 +695,11 @@ pub fn hold(
         return Ok(());
     };
     let material = doc.selected_material();
-    let (Some(flutes), Some(rpm), Some(feed), Some((target, _))) = (
+    let (Some(flutes), Some(rpm), Some(feed), Some(_)) = (
         positive(&tool.p, "flutes"),
         positive(&op.p, "rpm"),
         positive(&op.p, "feed"),
-        target(op, tool, material, level_depth(&sim.plan)),
+        target(op, tool, material, None),
     ) else {
         return Ok(());
     };
@@ -707,8 +710,8 @@ pub fn hold(
     };
     let fastest = positive(&machine.p, "feed").map_or(f32::INFINITY, |f| f * inch);
     let (kc, mc) = crate::forces::kc(material);
-    // What the feeds depend on: the plan, the stock it starts from, the
-    // cutter, the material and the target.
+    // What the load depends on: the plan, the stock it starts from, the
+    // cutter and the material.
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let plan = &sim.plan;
     for m in &plan.moves {
@@ -727,9 +730,7 @@ pub fn hold(
         sim.frame
     )
     .hash(&mut h);
-    [flutes, rpm, feed, kc, mc, target, fastest, HELIX]
-        .map(f32::to_bits)
-        .hash(&mut h);
+    [flutes, rpm, kc, mc, HELIX].map(f32::to_bits).hash(&mut h);
     if let Some(v) = &sim.initial_volume {
         format!("{:?} {:?} {} {:?}", v.bounds, v.frame, v.round, v.bar_x).hash(&mut h);
         for c in v.cuts.iter() {
@@ -745,8 +746,8 @@ pub fn hold(
         .lock()
         .ok()
         .and_then(|k| k.iter().find(|k| k.0 == key).map(|k| k.1.clone()));
-    let refed = match known {
-        Some(refed) => refed,
+    let load = match known {
+        Some(load) => load,
         None => {
             let Some(load) = measure(sim, flutes, rpm, material, HELIX) else {
                 if crate::progress::current().is_some_and(|p| p.cancelled()) {
@@ -754,42 +755,55 @@ pub fn hold(
                 }
                 return Ok(());
             };
-            let refed = std::sync::Arc::new(refeed(
-                &sim.plan,
-                &load,
-                Feeding {
-                    target,
-                    mc,
-                    programmed: feed,
-                    fastest,
-                    most: crate::cam::CEILING,
-                },
-            ));
+            let load = std::sync::Arc::new(load);
             if let Ok(mut known) = KNOWN.lock() {
                 if known.len() >= 6 {
                     known.remove(0);
                 }
-                known.push((key, refed.clone()));
+                known.push((key, load.clone()));
             }
-            refed
+            load
         }
     };
-    sim.plan.moves = refed.moves.clone();
+    // The nominal cut as deep as the levels that cut are.
+    let Some((target, _)) = target(op, tool, material, level_depth(&sim.plan, &load)) else {
+        return Ok(());
+    };
+    let refed = refeed(
+        &sim.plan,
+        &load,
+        Feeding {
+            target,
+            mc,
+            programmed: feed,
+            fastest,
+            most: crate::cam::CEILING,
+        },
+    );
+    sim.plan.moves = refed.moves;
     sim.plan.duration = refed.duration;
-    sim.tooth_load = Some(refed.load.clone());
+    sim.tooth_load = Some(refed.load);
     sim.held = Some(refed.held);
     Ok(())
 }
-/// How deep a plan's levels cut, mm: the most its cuts along a level (feed
-/// moves at one Z) step down from the level above, the first from where
-/// it starts cutting (`Plan::rest_top`, else the stock's top). None
+/// How deep a plan's levels cut, mm: the most its cuts along a level step
+/// down from the level above, the first from where it starts cutting
+/// (`Plan::rest_top`, else the stock's top). A level is the Z of feed moves
+/// along which a tooth takes a tenth of the operation's most force or
+/// more (`load`): not one the cutter only travels along, over what it has
+/// cleared (an Adaptive's, half a millimetre over the level before). None
 /// without a level below that.
-fn level_depth(plan: &Plan) -> Option<f32> {
+fn level_depth(plan: &Plan, load: &ToothLoad) -> Option<f32> {
     let top = plan.rest_top.unwrap_or(plan.stock.max[2]);
-    let mut levels: Vec<f32> = (plan.moves.iter())
-        .filter(|m| m.motion == Motion::Feed && m.from != m.to)
-        .filter(|m| (m.to[2] - m.from[2]).abs() < 1e-4 && m.to[2] < top - 1e-3)
-        .map(|m| m.to[2])
+    let cuts = |i: usize| {
+        load.moves[i]
+            .iter()
+            .any(|f| *f >= 0.1 * load.peak && *f > 0.)
+    };
+    let mut levels: Vec<f32> = (plan.moves.iter().enumerate())
+        .filter(|(i, m)| m.motion == Motion::Feed && m.from != m.to && cuts(*i))
+        .filter(|(_, m)| (m.to[2] - m.from[2]).abs() < 1e-4 && m.to[2] < top - 1e-3)
+        .map(|(_, m)| m.to[2])
         .collect();
     levels.sort_by(|a, b| b.total_cmp(a));
     levels.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
@@ -1137,6 +1151,33 @@ mod tests {
         );
     }
     #[test]
+    fn a_shallow_cut_with_long_flutes_is_measured_at_its_depth() {
+        // 60 mm flutes, slots 1 and 0.75 mm deep, straight flutes: the force
+        // goes with the depth, to a quarter of a millimetre, not with how
+        // long a piece of the flute is.
+        let slot = |depth: f32| {
+            let mut s = sim(
+                &[[-60., 0., 40. - depth], [60., 0., 40. - depth]],
+                CutterShape::Flat,
+                &[],
+            );
+            s.plan.flute_length = 60.;
+            middle(&s, 0.)
+        };
+        let full = KC.0 * 0.05_f32.powf(1. - KC.1) * 1.;
+        assert!(
+            (slot(1.) / full - 1.).abs() < 0.03,
+            "{} vs {full}",
+            slot(1.)
+        );
+        assert!(
+            (slot(0.75) / slot(1.) - 0.75).abs() < 0.01,
+            "{} vs {}",
+            slot(0.75),
+            slot(1.)
+        );
+    }
+    #[test]
     fn a_light_side_cut_takes_a_thinner_chip() {
         // An earlier slot along Y = 0 leaves a wall at Y 5; 1.25 mm (a
         // quarter of the radius) into it, the edge cuts from 90° to where
@@ -1391,6 +1432,33 @@ mod tests {
                 .fold(f32::INFINITY, f32::min);
             assert_eq!(m.feed, slowest);
         }
+    }
+    #[test]
+    fn the_levels_depth_counts_the_levels_that_cut_not_the_travel_over_them() {
+        // Slots 1 mm deep from the stock's top at 40, each followed, as an
+        // Adaptive does, by travel at the feed half a millimetre over the
+        // level it cleared; the last level only 0.5 mm deeper.
+        let points = [
+            [-60., 0., 39.],
+            [60., 0., 39.],
+            [60., 0., 39.5],
+            [-60., 0., 39.5],
+            [-60., 0., 38.],
+            [60., 0., 38.],
+            [60., 0., 38.5],
+            [-60., 0., 38.5],
+            [-60., 0., 37.5],
+            [60., 0., 37.5],
+        ];
+        let s = sim(&points, CutterShape::Flat, &[]);
+        let load = load(&s, HELIX);
+        // Nothing is cut along the travel.
+        assert!(
+            load.moves[2].iter().all(|f| *f == 0.),
+            "{:?}",
+            load.moves[2]
+        );
+        assert_eq!(level_depth(&s.plan, &load), Some(1.));
     }
     #[test]
     fn the_nominal_force_is_the_one_measured_along_that_cut() {
