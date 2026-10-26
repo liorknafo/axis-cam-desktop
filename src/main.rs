@@ -5310,7 +5310,7 @@ impl App {
                                             sim.plan.duration / 60.,
                                             sim.preceding,
                                             match sim.air {
-                                                Some(air) if air.nothing => " · cuts nothing: the earlier operations already took its material".to_string(),
+                                                Some(air) if air.nothing => " · cuts nothing on the stock it starts from".to_string(),
                                                 Some(air) => format!(" · air taken out, {:.1} min saved", air.saved / 60.),
                                                 None => String::new(),
                                             }

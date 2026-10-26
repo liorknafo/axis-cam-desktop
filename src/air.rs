@@ -579,8 +579,14 @@ fn relink(
     let keep = |p: &Piece, out: &mut Vec<_>, visited: &mut _| {
         let m = &moves[p.index];
         let (a, b) = (from(p), to(p));
-        visit(a, visited);
-        visit(b, visited);
+        // A move's own ends only: where it is cut in pieces that are kept
+        // whole again, the export never sees the point.
+        if p.t[0] <= 0. {
+            visit(a, visited);
+        }
+        if p.t[1] >= 1. {
+            visit(b, visited);
+        }
         out.push((Some(*p), a, b, m.motion, m.feed));
     };
     let mut trimmed = Trimmed::default();

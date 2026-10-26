@@ -2312,7 +2312,20 @@ pub(crate) mod tests {
         assert!(sim.turns.is_empty());
         let mut fresh = doc.setups[0].clone();
         fresh.p.insert("stock_source".into(), "fresh".into());
-        let direct = crate::simulation::generate(&fresh, &op, &doc.tools[0], &mesh).unwrap();
+        let kernel = crate::simulation::generate(&fresh, &op, &doc.tools[0], &mesh).unwrap();
+        // The kernel's plan with its air taken out as the sequence takes
+        // it (`air::trim`), held as `held` holds it.
+        let trimmed = |held: &crate::model::Document, sim: &crate::simulation::Simulation| {
+            let mut setup = held.setups[0].clone();
+            setup.p.insert("stock_source".into(), "fresh".into());
+            let (volume, frame) = (sim.initial_volume.as_ref().unwrap(), sim.frame.unwrap());
+            let holding = crate::air::workholding(held, &setup, &mesh, Some(volume), frame);
+            let plan = kernel.clone();
+            crate::air::trim(plan, &setup, &op, volume, frame, sim.source, &holding)
+                .unwrap()
+                .0
+        };
+        let direct = trimmed(&doc, &sim);
         // Held in the chuck it enters from above the jaws (LIO-206); from
         // its first feed on it is the kernel's, move for move.
         let feed = |p: &crate::simulation::Plan| {
@@ -2336,6 +2349,7 @@ pub(crate) mod tests {
             let mut held = doc.clone();
             held.setups[0].p.insert("holding".into(), holding.into());
             let sim = prepare(&held, &mesh, 0, 0).unwrap();
+            let direct = trimmed(&held, &sim);
             assert_eq!(direct.moves.len(), sim.plan.moves.len(), "{holding}");
             for (a, b) in direct.moves.iter().zip(&sim.plan.moves) {
                 assert_eq!(

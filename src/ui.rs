@@ -2562,7 +2562,7 @@ fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
             if let Some(air) = sim.air {
                 playback = playback.push(if air.nothing {
                     bold(
-                        "Cuts nothing: the earlier operations already took its material. Disable it, or keep it as a spring pass.",
+                        "Cuts nothing on the stock it starts from. Disable it, or keep it as a spring pass.",
                         12,
                     )
                     .color(WARN)
