@@ -1352,7 +1352,7 @@ mod tests {
         assert!((held.bottom - (left.min[2] + 2.)).abs() < 0.001, "{held:?}");
         let removed = Removed::new(&v, flipped);
         let nameless = |_, _| String::new();
-        assert!(holdable(1, &layout, &vise, held, Some(&removed), &nameless).is_empty());
+        assert!(holdable(1, &layout, &vise, held, Some(&removed), None, &nameless).is_empty());
         // 500 N sideways 1 mm under the top: the contact is the 8 mm the
         // jaws reach above the faced surface (less the sampling's insets),
         // its top 10 mm above the box's bottom, 29 mm under the push.
@@ -1417,7 +1417,7 @@ mod tests {
         let held = crate::holding::gripped(&layout, &vise, STOCK, Some(&Bands::new(&v, f, part)));
         let removed = Removed::new(&v, f);
         let nameless = |_, _| String::new();
-        assert!(holdable(1, &layout, &vise, held, Some(&removed), &nameless).is_empty());
+        assert!(holdable(1, &layout, &vise, held, Some(&removed), None, &nameless).is_empty());
         let cut = check(&layout, &vise, held, Some(&removed), &push).unwrap();
         assert!((cut.factor - 1.3).abs() < 0.01, "{cut:?}");
         assert_eq!(

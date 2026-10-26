@@ -282,9 +282,9 @@ fn holding_rules(tools: bool) -> String {
 - `workholding_library` lists the vises and clamps you may choose from, by `number` from 1, with their sizes in mm and no names. A `Vise` has `jaw_width`, `jaw_height`, `jaw_thickness`, `max_opening` (the widest stock it opens to across its jaws) and `grip` (how far up from the stock's bottom the jaws hold it). A `Clamp` has `length`, `width`, `height` and `bite` (how far it reaches onto the stock top). A round bar's holders: a `V-block` (`angle`, `v_width`, `width`, `height`, `length`, `clamp_width`, `clamp_height`) holds a bar lying along X, `Soft jaws` (`bore`, the diameter they are bored to, and a vise's sizes) one lying or standing, a `Collet block` (`er`, `block`, `height`) one standing; choose them only for a round bar.
 - Each setup's `holder` is a `number` from `workholding_library`, or null. Setup 1 is held by the user's own entry, whose `number` is given in the report's `workholding` (which is absent when setup 1 models no vise or clamps): its `holder` is null or that `number` and cannot be changed. For a later setup null means the same holder as setup 1 when setup 1 has an entry, and no modelled holding when it has none; choose a `number` when the stock it starts from suits another holder better, for example clamps when the earlier setups took the material a vise would grip, or a vise that opens wider. The program lays the chosen holder out (a vise's axis and grip, the clamps' sides and positions) for the setup's toolpaths: you choose only the entry.
 - A vise closes on the material in its grip band, from the stock's bottom up to the grip: across the jaws, the stock is as wide as that band. Walls an earlier setup cut through the whole band, such as walls an outside Contour finished, can be gripped, even under stock left wider above them; sides cut through only part of the band cannot, as the jaws then close on the wider stock with part of their face on air.
-- A vise needs, in the stock the setup starts from: material at both jaws from the bottom up to the grip (at least 60 % of each jaw's contact face), material under the band to rest on (at least half of it), stock at least 1 mm above the grip, and a band no wider across the jaws than `max_opening`. Clamps need material under each clamp's bite (at least 60 % of it). A part cut free of the material the holder grips cannot be held either.
+- A vise needs, in the stock the setup starts from: material at both jaws from the bottom up to the grip (at least 60 % of each jaw's contact face), material under the band to rest on (at least half of it), stock at least 1 mm above the grip, and a band no wider across the jaws than `max_opening`. Clamps need material under each clamp's bite (at least 60 % of it), and it must stay there for the whole setup: clamps press on the stock's top at its edges, so a setup held by clamps must not cut under its own clamps (face only the model's outline, or keep pockets and contours off the bites) and finishes those areas in another setup, or is held in the vise instead. A bite over the part's outline cannot keep its stock once the part's top is cut: clamps need stock beside the part, on two opposite sides. That stock must also stay joined to the part until the setup ends: an outside Contour cut through to the bottom, or a Face that takes the last skin under the part, cuts the part free from the stock the clamps hold; leave a skin or tabs (for example with `bottom_offset`) until the last setup. A part cut free of the material the holder grips cannot be held either.
 - Plan the earlier setups for that. A later setup turned over grips what was their top: cut the sides there through the whole band (an outside Contour down past it) or leave them whole, never part of the way. A later setup facing the same way grips what was their bottom: stop an outside Contour above its grip with `bottom_offset` and finish the rest in a later setup. Order the setups so that each starts from stock its holder can hold.
-- A setup its holder cannot hold comes back as a problem with the stage `workholding` on that setup; it names the earlier operation that removed the material. Change that operation, the order of the setups or the `holder`.{tools}
+- A setup its holder cannot hold comes back as a problem with the stage `workholding` on that setup; it names the operation that removed the material, an earlier one or one of the setup's own under a clamp. Change that operation, the order of the setups or the `holder`.{tools}
 
 ")
 }
@@ -324,13 +324,13 @@ pub fn instructions_for(pictures: bool, tool: bool, overview: bool, rotary: bool
         // Without its overview (it could not be drawn) the section does not
         // promise one.
         let first = if overview {
-            "After the part report you get an overview picture drawn by the program: setup 1's orientation from the front-left, with the stock (amber, see-through) and setup 1's vise or clamps (grey)."
+            "After the part report you get an overview picture drawn by the program: setup 1's orientation from the front-left, with the stock (amber, see-through) and setup 1's vise or clamps (solid grey blocks), the stock under each clamp's bite solid amber."
         } else {
-            "The pictures are drawn by the program, with the stock (amber, see-through) and setup 1's vise or clamps (grey)."
+            "The pictures are drawn by the program, with the stock (amber, see-through) and setup 1's vise or clamps (solid grey blocks), the stock under each clamp's bite solid amber."
         };
         let (look, limits) = if tool {
             (
-                "- Call `view_model` to see more: another orientation or angle, zoomed on surfaces, surfaces highlighted in blue, layers on or off, and, once a proposal has been checked, one of its operations (`operation`, counted from 1 as in the check report): its toolpaths, and the stock left after it (cut stock green); and cut open on a section (`section`, square to an axis or through a surface) to see inside: depths, wall and floor thicknesses, stock left in a pocket or under the part.\n",
+                "- Call `view_model` to see more: another orientation or angle, zoomed on surfaces, surfaces highlighted in blue, layers on or off, and, once a proposal has been checked, one of its operations (`operation`, counted from 1 as in the check report): its toolpaths, and the stock left after it (cut stock green; a clamp whose bite has lost its stock red, which the description says); and cut open on a section (`section`, square to an axis or through a surface) to see inside: depths, wall and floor thicknesses, stock left in a pocket or under the part.\n",
                 format!(
                     "You get at most {MAX_PICTURES_PER_REQUEST} pictures per request (the part report, or a check report the program sends back) and {MAX_PICTURES_PER_RUN} in the run. "
                 ),
@@ -388,7 +388,7 @@ WORKHOLDING
 - `workholding` in the part report, when present, describes what holds the stock in setup 1. `kind` is `Vise` (two jaws on opposite sides of the stock), `Clamps`, `Chuck`, or for a round bar `V-block`, `Soft jaws` or `Collet block`, with `round_bar` giving its `diameter`, `length` and `along` (`X` lying, `Z` standing); a lying bar's work zero may be on its axis (`Bar axis at left end`, `Bar axis center`). `boxes` lists each jaw or clamp as [x0, y0, z0, x1, y1, z1] in setup 1's axes, in mm from the model's -X/-Y/bottom corner. A clamp lies over the stock top; a jaw reaches from the stock's bottom up to its top, which is its z1.
 - A `Chuck` holds the stock on the machine's rotary A axis, along X, by its -X end: `chuck` gives its `jaws` (3 or 4), its `chuck_diameter`, the `jaw_length`, the `gripped_length` of stock in the jaws, the `stickout` beyond them towards +X, the `bar_diameter` of a round bar, where the `tailstock` is and the `a_angle` every operation runs at (0: indexed angles are not planned). Its `boxes` are the chuck body, each jaw, the rotary head, the tailstock's centre, quill and body when it is on the table, and the stock gripped in the jaws: no tool may come within `gap` of the gripped stock either, so cut only the stick-out, from its +X end to `gap` plus the tool's radius short of the jaws.
 - The boxes are keep-out zones. The program grows each box by `gap` mm on every side and refuses any move, rapids and retracts included, that brings the cutter or the tool holder within `gap` of a box. A refused move comes back as a problem with the stage `workholding`, by setup and operation. Parallels, bolts, the table and the machine body are not checked.
-- The later setups (every setup after the first) are held by the library entry their `holder` names, or by setup 1's own entry when it is null (see PLANNING THE HOLDING). That entry is laid out by the program once it has generated the setup's toolpaths: it picks the sides and positions that keep them clearest of those toolpaths, and the preview shows the result. What still comes within `gap` of it is reported with the stage `workholding` too.
+- The later setups (every setup after the first) are held by the library entry their `holder` names, or by setup 1's own entry when it is null (see PLANNING THE HOLDING). That entry is laid out by the program once it has generated the setup's toolpaths: it picks the sides and positions that keep them clearest of those toolpaths, clamps only where the stock under each bite stays for the whole setup, and the preview shows the result. When no two opposite sides can be clamped it places none, and a problem with the stage `workholding` on the setup says why and about how much stock to leave beside the part. What still comes within `gap` of it is reported with the stage `workholding` too.
 - Keep the plan clear of the boxes. Do not face or contour where a clamp sits over the stock edge, and do not let a tool work beside a jaw below the jaws' top. Keep outside contours above the jaws' top by giving them a `bottom_offset` greater than the jaw's z1 plus `gap`, and finish the walls below from the setup turned over, whose vise can grip the walls finished above (see PLANNING THE HOLDING); or move them to a setup where the sides are free.
 - `clearance_above_stock_top` is present when a box and its gap reach above the stock top, and says how far. The default `clearance` of 15 already covers a height below 15, so leave `clearance` null then. When the height is 15 or more, give every operation a `clearance` greater than it: a machine that retracts to a clearance plane refuses a plan whose plane (the highest `clearance` in a setup) is not above the boxes and their gap, and rapids then pass over the boxes. Otherwise leave `clearance` null.
 - A `workholding` problem names its place in the setup's work coordinates (X, Y and Z measured from the setup's work zero, Z up), not from the model's corner as the report's boxes are: convert before comparing.
@@ -1841,7 +1841,12 @@ pub(crate) mod tests {
             "`bottom_offset`",
             "in a later setup",
             "stage `workholding`",
-            "names the earlier operation",
+            "names the operation that removed the material",
+            // Clamps press on the top at its edges for the whole setup: the
+            // setup must not cut under its own clamps.
+            "it must stay there for the whole setup",
+            "must not cut under its own clamps",
+            "or is held in the vise instead",
             // The vise closes on its grip band: walls finished through it
             // can be gripped, sides cut through part of it cannot.
             "A vise closes on the material in its grip band",
@@ -1905,6 +1910,9 @@ pub(crate) mod tests {
         for setup in &mut clear.setups {
             setup.operations[0].facing_area = Some("model".into());
         }
+        // The Contour stops 5 mm above the part's underside, so the part
+        // stays joined to the stock round it for setup 2's clamps.
+        clear.setups[0].operations[2].bottom_offset = Some(5.);
         let script = Script::new(vec![json(&through), json(&clear), json(&clear)]);
         let outcome = plan(&script, doc.clone(), mesh.clone(), &Busy::default(), |_| {}).await;
         assert!(outcome.is_ok(), "{:?}", outcome.err());
@@ -4307,7 +4315,7 @@ pub(crate) mod tests {
             // The overview is promised only when the conversation has it.
             assert_eq!(with.contains("overview"), overview, "{tool} {overview}");
             assert!(with.contains("stock (amber, see-through)"));
-            assert!(with.contains("vise or clamps (grey)"));
+            assert!(with.contains("vise or clamps (solid grey blocks)"));
             assert!(with.contains("the triad shows +X (red)"));
             assert!(with.contains("the report's numbers are right"));
             // Without the section the text is the same as a run without
@@ -4949,7 +4957,8 @@ pub(crate) mod tests {
             )
         );
         // Setup 2's Face runs over the whole stock top, where clamps would
-        // sit: the plan check would refuse them, and so does check_holding.
+        // sit: the plan check would place none and say why, and so does
+        // check_holding.
         let held: serde_json::Value = serde_json::from_str(outputs[1].1).unwrap();
         assert_eq!(held["holds"], false, "{held}");
         assert!(
@@ -4960,7 +4969,7 @@ pub(crate) mod tests {
                 .any(|p| p["message"]
                     .as_str()
                     .unwrap()
-                    .contains("the tool hits the clamp on")),
+                    .contains("Toe clamps cannot hold this setup")),
             "{held}"
         );
         let checked: serde_json::Value = serde_json::from_str(outputs[2].1).unwrap();
@@ -4979,12 +4988,9 @@ pub(crate) mod tests {
             lines[0],
             "Stock before setup 2: 124 × 84 × 43 mm; bottom cut 4 mm by setup 1"
         );
-        assert!(
-            lines[1].starts_with("Clamp 2 for setup 2: ")
-                && lines[1].contains(" problem")
-                && lines[1].contains(" (clamps on "),
-            "{}",
-            lines[1]
+        assert_eq!(
+            lines[1],
+            "Clamp 2 for setup 2: 1 problem (no place for clamps)"
         );
         assert_eq!(lines[2..], ["Checked a draft: 1 problem", no_draft]);
         // No title, setup name, entry name or note in what the tools said.

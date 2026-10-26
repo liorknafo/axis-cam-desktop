@@ -234,6 +234,10 @@ pub struct Viewport<'a> {
     /// The jaws or clamps of the setup, in its frame in mm; drawn with the
     /// stock and part of the camera's fit.
     pub holding: Vec<crate::holding::HoldBox>,
+    /// Setup 1 of the job shown, which places the part on the grid of the
+    /// simulated stock (`PartGrid::in_job`): what tells a clamp's stock cut
+    /// free from the part (`bare_clamps`). None leaves that untold.
+    pub first_setup: Option<&'a Setup>,
     /// The jaws or clamps the camera fits (`scene_bounds`), in the same frame
     /// and units: the setup's round its own stock, drawn or not, so that
     /// hiding them or a change of the box they hold does not move the view.
@@ -641,6 +645,77 @@ impl Viewport<'_> {
         self.sample
             || self.leftover.is_some()
             || crate::model::get(&setup.p, "stock_source") == "fresh"
+    }
+    /// The stock box drawn without a simulation (`render`), in mm: the
+    /// setup's stock when it is shown and is the real one.
+    fn drawn_stock(&self) -> Option<crate::mesh::Bounds> {
+        let setup = self.setup?;
+        (self.simulation.is_none() && self.show_stock && self.stock_is_known(setup))
+            .then(|| self.resolved_stock())
+            .flatten()
+            .map(|stock| stock.stock)
+    }
+    /// Under each clamp's bite (`holding::bite`) on the stock drawn before
+    /// machining (`drawn_stock`), the stock it rests on as a solid block:
+    /// the bite, from the stock's top down by `PAD_DEPTH` (no deeper than
+    /// the stock), in mm. None for a jaw or while simulating.
+    pub(crate) fn pads(&self) -> Vec<crate::mesh::Bounds> {
+        let Some(stock) = self.drawn_stock() else {
+            return vec![];
+        };
+        let depth = PAD_DEPTH.min(stock.dimensions()[2]);
+        self.holding
+            .iter()
+            .filter_map(|hold| crate::holding::bite(&hold.bounds, stock))
+            .map(|mut bite| {
+                bite.min[2] = bite.max[2] - depth;
+                bite
+            })
+            .collect()
+    }
+    /// For each of `holding`, how its bite fares in the simulation shown, as
+    /// far as it has run (`holding::bare`: the simulated stock's cuts so
+    /// far, knowing the part, on the stock the operation starts from): a
+    /// clamp whose bite has lost its stock or whose stock is cut free from
+    /// the part. All `Bite::Holds` without a simulated stock. Worked out once
+    /// for a simulation's playback point and the boxes (`BARE`): orbiting
+    /// the view does not work it out again.
+    pub(crate) fn bare_clamps(&self) -> Vec<crate::holding::Bite> {
+        use crate::holding::Bite;
+        let Some(sim) = self.simulation else {
+            return vec![Bite::Holds; self.holding.len()];
+        };
+        let (Some(volume), Some(frame)) = (sim.volume.as_ref(), sim.frame) else {
+            return vec![Bite::Holds; self.holding.len()];
+        };
+        if self.holding.is_empty() {
+            return vec![];
+        }
+        let key = format!(
+            "{}|{}|{:?}|{:p}",
+            sim.id,
+            sim.revision,
+            self.holding,
+            self.mesh.faces.as_ptr()
+        );
+        let mut cached = BARE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((previous, found)) = cached.as_ref()
+            && *previous == key
+        {
+            return found.clone();
+        }
+        let removed = crate::rest::Removed::new(volume, frame);
+        let removed = match self.first_setup {
+            Some(first) => {
+                let geometry = crate::cam::Geometry::new(first, self.mesh);
+                let threads = crate::thread::in_setup(first, self.mesh);
+                removed.with_part(&crate::plan_check::PartGrid::new(volume, &geometry, &threads))
+            }
+            None => removed,
+        };
+        let found = crate::holding::bare(&self.holding, sim.plan.stock, &removed);
+        *cached = Some((key, found.clone()));
+        found
     }
     /// What a still picture fits to, box by box: the part's first, then the
     /// stock's when shown, each jaw's or clamp's and, when simulating, the
@@ -1439,8 +1514,26 @@ impl Viewport<'_> {
         }
         if !self.holding.is_empty() {
             let scale = self.mesh.display_scale();
-            for hold in &self.holding {
-                let project = |v: [f32; 3]| (screen(v), p.depth(v));
+            let project = |v: [f32; 3]| (screen(v), p.depth(v));
+            // Before machining the stock is a translucent box: under each
+            // clamp's bite the stock it rests on is drawn solid (`pads`), so
+            // the clamp is seen on it.
+            for pad in self.pads() {
+                let solid_box = box_solid(pad.scaled(scale), cut.as_ref(), project);
+                raster_solid(
+                    &PAD,
+                    &mut rgba,
+                    &depths,
+                    (w, h),
+                    &solid_box,
+                    ratio,
+                    p.scale,
+                    &mut solid,
+                );
+            }
+            // While simulating, a clamp whose stock is cut away is red.
+            let bare = self.bare_clamps();
+            for (hold, bite) in self.holding.iter().zip(&bare) {
                 let solid_box = match &hold.shape {
                     crate::holding::Shape::Hidden => continue,
                     // A chuck's turned solids.
@@ -1457,7 +1550,11 @@ impl Viewport<'_> {
                     }
                 };
                 raster_solid(
-                    &HOLDING,
+                    if *bite == crate::holding::Bite::Holds {
+                        &HOLDING
+                    } else {
+                        &LOST
+                    },
                     &mut rgba,
                     &depths,
                     (w, h),
@@ -2922,13 +3019,13 @@ const STOCK: Look = Look {
     open: 0.30,
     behind: 0.12,
 };
-/// Jaws and clamps: a neutral grey, more opaque than the stock.
+/// Jaws and clamps: solid neutral grey blocks.
 const HOLDING: Look = Look {
     faces: [[176, 176, 176], [138, 138, 138], [158, 158, 158]],
     edge: [84, 84, 84],
     hidden_edge: [118, 118, 118],
-    open: 0.5,
-    behind: 0.3,
+    open: 1.,
+    behind: 1.,
 };
 /// What `raster_solid` finds nearest at each pixel: the depth and the face's
 /// tone. One is kept for all the boxes of a frame and reset for each.
@@ -2945,6 +3042,29 @@ impl SolidBuffers {
         self.tones.resize(cells, 0);
     }
 }
+/// A clamp whose bite has lost its stock in the simulation shown, or whose
+/// stock is cut free from the part: red.
+const LOST: Look = Look {
+    faces: [[205, 60, 60], [166, 46, 46], [186, 52, 52]],
+    edge: [112, 30, 30],
+    hidden_edge: [150, 80, 80],
+    open: 1.,
+    behind: 1.,
+};
+/// The stock under a clamp's bite before machining: the stock's colours,
+/// solid.
+const PAD: Look = Look {
+    open: 1.,
+    behind: 1.,
+    ..STOCK
+};
+/// The clamps' bites as last worked out (`Viewport::bare_clamps`), by what
+/// they were worked out from.
+static BARE: std::sync::Mutex<Option<(String, Vec<crate::holding::Bite>)>> =
+    std::sync::Mutex::new(None);
+/// How far down from the stock's top the stock under a clamp's bite is
+/// drawn solid, mm.
+const PAD_DEPTH: f32 = 3.;
 /// The stock's box: `raster_solid` in the stock's colors.
 #[allow(clippy::too_many_arguments)]
 fn raster_stock(
@@ -3880,6 +4000,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            first_setup: None,
             framed: vec![],
             leftover: None,
             live: None,
@@ -4036,6 +4157,7 @@ mod tests {
                 show_paths: false,
                 progress: None,
                 holding: vec![],
+                first_setup: None,
                 framed: vec![],
                 leftover: None,
                 live: None,
@@ -4114,6 +4236,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            first_setup: None,
             framed: vec![],
             leftover: None,
             live: None,
@@ -4202,6 +4325,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            first_setup: None,
             framed: vec![],
             leftover: None,
             live: None,
@@ -4272,6 +4396,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            first_setup: None,
             framed: vec![],
             leftover: None,
             live: None,
@@ -4361,6 +4486,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            first_setup: None,
             framed: vec![],
             leftover: None,
             live: None,
@@ -4437,6 +4563,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            first_setup: None,
             framed: vec![],
             leftover: None,
             live: None,
@@ -4569,6 +4696,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            first_setup: None,
             framed: vec![],
             leftover: None,
             live: None,
@@ -4654,6 +4782,7 @@ mod tests {
                 show_paths: false,
                 progress: None,
                 holding: vec![],
+                first_setup: None,
                 framed: vec![],
                 leftover: None,
                 live: None,
@@ -4705,6 +4834,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            first_setup: None,
             framed: vec![],
             leftover,
             live: None,
@@ -4789,6 +4919,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            first_setup: None,
             framed: vec![],
             leftover: None,
             live: None,
@@ -4931,6 +5062,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            first_setup: None,
             framed: vec![],
             leftover: None,
             live: None,
@@ -5007,7 +5139,7 @@ mod tests {
         assert!(transparent[index + 3] > 0 && transparent[index + 3] < 128);
     }
     #[test]
-    fn workholding_is_drawn_as_grey_translucent_boxes() {
+    fn workholding_is_drawn_as_solid_grey_blocks() {
         use crate::holding::HoldBox;
         let d = crate::model::Document::sample();
         let mesh = crate::mesh::sample();
@@ -5040,6 +5172,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            first_setup: None,
             framed: vec![],
             leftover: None,
             live: None,
@@ -5061,10 +5194,10 @@ mod tests {
         let at = |x: f32, y: f32| ((y * 1.5) as u32 * w + (x * 1.5) as u32) as usize * 4;
         let top = p.p([0., 70. * scale, 30. * scale]);
         let i = at(top.x, top.y);
-        // Nothing was there; now there is neutral grey, not opaque.
+        // Nothing was there; now there is solid neutral grey.
         assert_eq!(plain[i + 3], 0);
         let [r, g, bl, a] = [drawn[i], drawn[i + 1], drawn[i + 2], drawn[i + 3]];
-        assert!(a > 0 && a < 255, "{a}");
+        assert_eq!(a, 255);
         assert!(r == g && g == bl, "{r} {g} {bl}");
         // Only the jaw's own pixels changed.
         let changed = (0..plain.len() / 4)
@@ -5077,6 +5210,193 @@ mod tests {
         let (_, _, listed) = v.pixels(&p, b, None);
         v.holding.clear();
         assert_ne!(v.pixels(&p, b, None).2, listed);
+    }
+    #[test]
+    fn a_clamp_rests_on_solid_stock_before_machining_and_the_rest_stays_translucent() {
+        // The example block on 2 mm of stock beside the part and 4 mm above
+        // it, a clamp on -X at offset 0, seen from the front.
+        let (doc, mesh) = crate::post::fixture::job();
+        let setup = &doc.setups[0];
+        let stock = stock::resolve(setup, Some(&mesh)).unwrap().stock;
+        let mut holder = crate::holding::starters().remove(1);
+        holder.id = "c".into();
+        let layout = crate::holding::Layout::Clamps {
+            holder: "c".into(),
+            clamps: vec![(crate::holding::Side::MinusX, 0.)],
+            gap: 2.,
+        };
+        let clamp = crate::holding::boxes(&layout, &holder, stock).unwrap();
+        let view = |holding: Vec<crate::holding::HoldBox>| Viewport {
+            setup: Some(setup),
+            operation: None,
+            mesh: &mesh,
+            simulation: None,
+            sample: false,
+            camera: Camera {
+                yaw: std::f32::consts::PI,
+                pitch: 0.,
+                ..Default::default()
+            },
+            picking: false,
+            pin_holes: Default::default(),
+            hole_outlines: vec![],
+            pin_aim: Default::default(),
+            show_stock: true,
+            show_paths: false,
+            progress: None,
+            holding,
+            first_setup: None,
+            framed: vec![],
+            leftover: None,
+            live: None,
+            a: None,
+            live_stock: None,
+            start_stock: None,
+            live_volume: None,
+            uncut: &[],
+            show_uncut: true,
+            section: Default::default(),
+            frame: None,
+        };
+        let (with, without) = (view(clamp.clone()), view(vec![]));
+        // The pad: the bite (X -62..-50, Y -10..10), 3 mm down from the top.
+        let pads = with.pads();
+        assert_eq!(pads.len(), 1);
+        let pad = pads[0];
+        assert_eq!(
+            (pad.min[0], pad.max[0], pad.min[1], pad.max[1]),
+            (stock.min[0], stock.min[0] + 12., -10., 10.)
+        );
+        assert!((pad.max[2] - stock.max[2]).abs() < 1e-4);
+        assert!((pad.max[2] - pad.min[2] - 3.).abs() < 1e-4);
+        assert!(without.pads().is_empty());
+        let p = Projector::fit(with.camera, (400., 300.), with.scene_bounds());
+        let (w, h) = (400, 300);
+        let (drawn, _) = with.render(&p, (w, h), 1., None, &[]);
+        let (bare, _) = without.render(&p, (w, h), 1., None, &[]);
+        let scale = mesh.display_scale();
+        let at = |rgba: &[u8], v: [f32; 3]| {
+            let q = p.p(v.map(|c| c * scale));
+            let i = (q.y as u32 * w + q.x as u32) as usize * 4;
+            [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
+        };
+        // Under the clamp, above the part's top: solid stock (opaque, the
+        // stock's brown), where without the clamp the box is see-through.
+        let under = [stock.min[0] + 6., -10., stock.max[2] - 1.5];
+        let [r, g, b, a] = at(&drawn, under);
+        assert_eq!(a, 255);
+        assert!(r > g && g > b && r as i32 - b as i32 > 80, "{r} {g} {b}");
+        assert!(at(&bare, under)[3] < 255, "{:?}", at(&bare, under));
+        // Away from the bite the drawing is what it was: the stock box stays
+        // translucent over the part.
+        let middle = [0., -10., stock.max[2] - 1.5];
+        assert_eq!(at(&drawn, middle), at(&bare, middle));
+        // The contact line along the clamp's bottom edge over the stock is
+        // dark.
+        let edge = [stock.min[0] + 6., -10., stock.max[2]];
+        let [r, g, b, _] = at(&drawn, edge);
+        assert!(r < 90 && g < 90 && b < 90, "{r} {g} {b}");
+        // While simulating the stock is drawn as it is cut: no pads.
+        let (doc2, mesh2, report) = crate::proposal::tests::block();
+        let job = crate::proposal::build(
+            &doc2,
+            &mesh2,
+            &report,
+            &crate::proposal::tests::good(&report),
+        )
+        .unwrap();
+        let sim =
+            crate::planner::view_after(&job, &mesh2, 0, 0, crate::stock_surface::Detail::Draft)
+                .unwrap();
+        let simulating = Viewport {
+            setup: job.setups.first(),
+            simulation: Some(&sim),
+            mesh: &mesh2,
+            ..view(clamp.clone())
+        };
+        assert!(simulating.pads().is_empty());
+        // The Face took the top from under that clamp's bite: it is bare.
+        assert_eq!(simulating.bare_clamps(), [crate::holding::Bite::Gone]);
+    }
+    #[test]
+    fn a_block_in_front_of_the_part_hides_it_and_one_behind_is_hidden() {
+        use crate::holding::HoldBox;
+        let d = crate::model::Document::sample();
+        let mesh = crate::mesh::sample();
+        // Seen from above: a clamp-like block over the middle of the part,
+        // and one under it.
+        let over = HoldBox {
+            shape: Default::default(),
+            label: "clamp on top".into(),
+            bounds: crate::mesh::Bounds {
+                min: [-10., -10., 200.],
+                max: [10., 10., 220.],
+            },
+        };
+        let under = HoldBox {
+            shape: Default::default(),
+            label: "block below".into(),
+            bounds: crate::mesh::Bounds {
+                min: [-10., -10., -220.],
+                max: [10., 10., -200.],
+            },
+        };
+        let mut v = Viewport {
+            setup: Some(d.setup()),
+            operation: None,
+            mesh: &mesh,
+            simulation: None,
+            sample: true,
+            camera: Camera {
+                yaw: 0.,
+                pitch: std::f32::consts::FRAC_PI_2,
+                ..Default::default()
+            },
+            picking: false,
+            pin_holes: Default::default(),
+            hole_outlines: vec![],
+            pin_aim: Default::default(),
+            show_stock: false,
+            show_paths: false,
+            progress: None,
+            holding: vec![],
+            first_setup: None,
+            framed: vec![],
+            leftover: None,
+            live: None,
+            a: None,
+            live_stock: None,
+            start_stock: None,
+            live_volume: None,
+            uncut: &[],
+            show_uncut: true,
+            section: Default::default(),
+            frame: None,
+        };
+        let b = Rectangle::new(Point::ORIGIN, iced::Size::new(400., 300.));
+        let p = v.projector(b);
+        let ratio = 1.5;
+        let (w, h) = (600, 450);
+        let centre = p.p([0., 0., 0.]);
+        let i = ((centre.y * ratio) as u32 * w + (centre.x * ratio) as u32) as usize;
+        let (part, _) = v.render(&p, (w, h), ratio, None, &[]);
+        assert_eq!(part[i * 4 + 3], 255, "the part is under the centre");
+        // Above: solid grey covers the part.
+        v.holding = vec![over.clone()];
+        let (rgba, _) = v.render(&p, (w, h), ratio, None, &[]);
+        let [r, g, bl, a] = [
+            rgba[i * 4],
+            rgba[i * 4 + 1],
+            rgba[i * 4 + 2],
+            rgba[i * 4 + 3],
+        ];
+        assert_eq!(a, 255);
+        assert!(r == g && g == bl, "{r} {g} {bl}");
+        assert_ne!(rgba[i * 4..i * 4 + 4], part[i * 4..i * 4 + 4]);
+        // Below: hidden by the part, which is drawn as before.
+        v.holding = vec![under];
+        let (rgba, _) = v.render(&p, (w, h), ratio, None, &[]);
+        assert_eq!(rgba[i * 4..i * 4 + 4], part[i * 4..i * 4 + 4]);
     }
     #[test]
     fn the_camera_fit_contains_the_workholding_drawn_or_not() {
@@ -5108,6 +5428,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            first_setup: None,
             framed: vec![],
             leftover: None,
             live: None,
@@ -5171,6 +5492,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            first_setup: None,
             framed: vec![],
             leftover: None,
             live: None,
@@ -5226,6 +5548,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            first_setup: None,
             framed: vec![],
             leftover: None,
             live: None,
@@ -5279,6 +5602,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            first_setup: None,
             framed: vec![],
             leftover: None,
             live: None,
@@ -5346,6 +5670,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            first_setup: None,
             framed: vec![],
             leftover: None,
             live: None,
@@ -5540,6 +5865,7 @@ mod tests {
             show_stock: false,
             show_paths: false,
             progress: None,
+            first_setup: None,
             framed: holding.clone(),
             holding,
             leftover: None,

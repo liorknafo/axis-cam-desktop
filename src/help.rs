@@ -1350,8 +1350,8 @@ pub fn command(m: &Message, label: String) -> Help {
             "",
         ),
         SuggestLayout => (
-            "Place this setup's vise jaws or clamps. A vise goes on the X or the Y sides, whichever its generated toolpaths leave clearer, at its grip or less. Clamps are chosen among the middle and quarter points of each side: four, or two on a small stock.",
-            "The status says how many operations still come within the clearance gap. The setup's operations are generated for this and never changed. Jaws and clamps are checked as boxes with the gap; parallels, bolts, the table and the machine body are not. Choosing Vise or Clamps, or another library entry, does this too; other edits are kept until you press this again. On a lathe setup it chooses the chuck instead: the 3-jaw when the bar in the jaws is round and within its range, else the 4-jaw (change the chuck), never a vise; the grip and the stickout stay yours.",
+            "Place this setup's vise jaws or clamps. A vise goes on the X or the Y sides, whichever its generated toolpaths leave clearer, at its grip or less. Clamps go only where they hold: along each side, every 5 mm, the spot clearest of the toolpaths whose bite keeps its stock for the whole setup, one per side on at least two opposite sides, or two on a small stock.",
+            "Where no two opposite sides can be clamped, none are placed and the status says why and how much stock to leave beside the part. The status says how many operations still come within the clearance gap. The setup's operations are generated for this and never changed. Jaws and clamps are checked as boxes with the gap; parallels, bolts, the table and the machine body are not. Choosing Vise or Clamps, or another library entry, does this too; other edits are kept until you press this again. On a lathe setup it chooses the chuck instead: the 3-jaw when the bar in the jaws is round and within its range, else the 4-jaw (change the chuck), never a vise; the grip and the stickout stay yours.",
         ),
         SetClamps(_) if label == crate::ui::ADD_CLAMP => (
             "Add a clamp at the middle of a side of the stock, the sides taken in turn. Change its side and offset in its row.",
@@ -4096,7 +4096,7 @@ mod tests {
         }
         let suggest = command(&Message::SuggestLayout, "x".into());
         assert!(
-            suggest.body.contains("middle and quarter points"),
+            suggest.body.contains("only where they hold"),
             "{}",
             suggest.body
         );

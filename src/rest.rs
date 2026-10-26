@@ -255,6 +255,129 @@ pub fn removal_box(c: &Cut, current: Frame) -> Bounds {
     });
     transformed(b, c.frame, current)
 }
+/// What can tell which operation removed material at a point: the cuts of
+/// earlier setups (`Removed`) or a setup's own (`Cuts`).
+pub trait Removes {
+    /// The operation whose cut removed material at `p` (current frame, mm),
+    /// as its `Cut::source`, or None.
+    fn by(&self, p: [f32; 3]) -> Option<(u16, u16)>;
+    fn at(&self, p: [f32; 3]) -> bool {
+        self.by(p).is_some()
+    }
+}
+impl Removes for Removed<'_> {
+    fn by(&self, p: [f32; 3]) -> Option<(u16, u16)> {
+        Removed::by(self, p)
+    }
+}
+/// The cuts a setup's own operations make, from their toolpaths, as
+/// `Volume::cut` records them when the setup is simulated: each feed move a
+/// sweep of the plan's cutter, made in the setup's frame. Which of them
+/// removes material at a point, exactly as `Removed` tells it of earlier
+/// setups' cuts.
+pub struct Cuts {
+    cuts: Vec<Cut>,
+    boxes: Vec<Bounds>,
+    current: Frame,
+}
+impl Cuts {
+    /// The feed moves of `plans` (each with its operation's index) of setup
+    /// `setup`, whose frame is `frame`.
+    pub fn of_plans<'p>(
+        plans: impl IntoIterator<Item = (usize, &'p crate::simulation::Plan)>,
+        setup: usize,
+        frame: Frame,
+    ) -> Self {
+        let index = |i: usize| u16::try_from(i).unwrap_or(u16::MAX);
+        let cuts: Vec<Cut> = plans
+            .into_iter()
+            .flat_map(|(oi, plan)| {
+                plan.moves
+                    .iter()
+                    .filter(|m| m.motion == crate::simulation::Motion::Feed)
+                    .map(move |m| Cut {
+                        a: m.from,
+                        b: m.to,
+                        radius: plan.radius,
+                        flute: plan.flute_length,
+                        shape: plan.shape,
+                        frame,
+                        source: (index(setup), index(oi)),
+                    })
+            })
+            .collect();
+        let boxes = cuts.iter().map(|c| removal_box(c, frame)).collect();
+        Self {
+            cuts,
+            boxes,
+            current: frame,
+        }
+    }
+}
+/// The stock a setup leaves once its operations are done: `before`, the
+/// stock it starts from (the earlier setups' leftover, or a fresh `Volume`
+/// of its stock box for setup 1), with the feed moves of `plans` (each with
+/// its operation's index, in order) of setup `setup`, whose frame is
+/// `frame`, cut from it as the simulation cuts them when each is played to
+/// its end.
+pub fn after_setup<'p>(
+    mut before: Volume,
+    plans: impl IntoIterator<Item = (usize, &'p crate::simulation::Plan)>,
+    setup: usize,
+    frame: Frame,
+) -> Volume {
+    let index = |i: usize| u16::try_from(i).unwrap_or(u16::MAX);
+    for (oi, plan) in plans {
+        for m in plan
+            .moves
+            .iter()
+            .filter(|m| m.motion == crate::simulation::Motion::Feed)
+        {
+            before.cut(
+                m.from,
+                m.to,
+                plan.radius,
+                plan.flute_length,
+                plan.shape,
+                frame,
+                (index(setup), index(oi)),
+            );
+        }
+    }
+    before
+}
+/// `after_setup` from the stock the setup starts from as the caller has it:
+/// `before` (the earlier setups' leftover), else a fresh `Volume` of its
+/// stock box `stock` in its frame, as the simulation starts setup 1.
+pub fn after_setup_from<'p>(
+    before: Option<&Volume>,
+    stock: Bounds,
+    plans: impl IntoIterator<Item = (usize, &'p crate::simulation::Plan)>,
+    setup: usize,
+    frame: Frame,
+) -> Volume {
+    let before = before.cloned().unwrap_or_else(|| Volume::new(stock, frame));
+    after_setup(before, plans, setup, frame)
+}
+impl Cuts {
+    /// The cutter radius of the cuts operation `source` makes (its first
+    /// cut's), or None when it makes none.
+    pub fn radius(&self, source: (u16, u16)) -> Option<f32> {
+        self.cuts
+            .iter()
+            .find(|c| c.source == source)
+            .map(|c| c.radius)
+    }
+}
+impl Removes for Cuts {
+    fn by(&self, p: [f32; 3]) -> Option<(u16, u16)> {
+        self.cuts
+            .iter()
+            .zip(&self.boxes)
+            .find(|(cut, b)| removes(cut, b, self.current, p))
+            .map(|(cut, _)| cut.source)
+    }
+}
 /// Where earlier cuts can have removed material, for single points: within
 /// the tool radius of each cut's path, from its tip up to its flute top,
 /// tested with `Volume::cut`'s own `swept`. Tighter than `removal_boxes`

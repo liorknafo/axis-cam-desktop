@@ -2211,6 +2211,7 @@ pub(crate) fn scene_viewport(app: &App) -> Option<Viewport<'_>> {
             None
         },
         holding: holding_boxes(app),
+        first_setup: app.doc.setups.first(),
         framed: framed_holding(app),
         leftover: leftover_view(app),
         live: app.live_tool(),
@@ -5588,7 +5589,7 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
                 .into(),
             );
         }
-        let lines = holding_lines(app);
+        let lines = editor_holding_lines(app);
         if !lines.is_empty() {
             let heading = format!(
                 "{} workholding issue{}",
@@ -6235,7 +6236,7 @@ fn holding_note(
     let chuck = crate::holding::layout(setup)
         .ok()
         .filter(|l| on_lathe && matches!(l, crate::holding::Layout::Chuck { .. }));
-    let lines: Vec<String> = match chuck {
+    let mut lines: Vec<String> = match chuck {
         Some(layout) => {
             crate::holding::chuck_problems(&layout, plan.stock, reach, &boxes, &[(0, name, plan)])
                 .into_iter()
@@ -6247,26 +6248,74 @@ fn holding_note(
             .map(|hit| crate::holding::message(name, hit, gap, datum.unwrap_or_default()))
             .collect(),
     };
+    let hit = !lines.is_empty();
+    lines.extend(bites_lost(app, plan, setup));
     (!lines.is_empty()).then(|| {
         let frame = if datum.is_none() {
             "; coordinates in the setup frame"
         } else {
             ""
         };
-        (
-            if on_lathe {
-                "This cut conflicts with the chuck".to_string()
-            } else {
-                format!("Too close to the workholding (export will refuse this{frame})")
-            },
-            lines,
-        )
+        let what = if on_lathe {
+            "This cut conflicts with the chuck".to_string()
+        } else if hit {
+            format!("Too close to the workholding (export will refuse this{frame})")
+        } else {
+            format!("A clamp would lose the stock under it (export will refuse this{frame})")
+        };
+        (what, lines)
     })
 }
-/// What is wrong with the active setup's workholding, as the setup editor
-/// lists it under the controls (`holding_lines_in`).
+/// Where the operation whose toolpath is `plan` cuts away the stock under a
+/// clamp of `setup`, as the export says it (`holding::holdable` with the
+/// setup's own cuts); the vise and a setup without clamps have none.
+fn bites_lost(app: &App, plan: &crate::simulation::Plan, setup: &Setup) -> Vec<String> {
+    let (Some(mesh), Ok(layout), Some(holder)) = (
+        app.part_mesh(),
+        crate::holding::layout(setup),
+        app.doc.holder(get(&setup.p, "holder")),
+    ) else {
+        return vec![];
+    };
+    if !matches!(layout, crate::holding::Layout::Clamps { .. }) {
+        return vec![];
+    }
+    let si = app.doc.index();
+    let oi = app.selected.unwrap_or_default();
+    let frame = crate::volume::Frame::new(setup, mesh);
+    let cuts = crate::rest::Cuts::of_plans([(oi, plan)], si, frame);
+    // One operation's own cuts; whether the setup's operations together cut
+    // the part free is the export's and the preview's red to tell.
+    let own = crate::holding::Own {
+        cuts: &cuts,
+        part: crate::simulation::part_box(setup, mesh),
+        after: None,
+    };
+    let held = held_of(app, plan.stock);
+    let height = crate::holding::height_issue(&layout, plan.stock);
+    let names = |s, o| crate::holding::operation_name(&app.doc, s, o);
+    crate::holding::holdable(si, &layout, holder, held, None, Some(&own), &names)
+        .into_iter()
+        .filter(|line| Some(line) != height.as_ref())
+        .collect()
+}
+/// What is wrong with the active setup's workholding (`holding_lines_in`).
 pub(crate) fn holding_lines(app: &App) -> Vec<String> {
     holding_lines_in(app, app.left_boxes(), app.current_checks(), app.doc.index())
+}
+/// What the setup editor lists under the workholding controls: first, while
+/// the setup is as it was then, why Suggest layout placed no clamps on it
+/// (`App::clamp_refusal_of`), then what is wrong with its workholding
+/// (`holding_lines`). The reason is advice: clamps typed by hand are still
+/// checked, so it does not count against them.
+pub(crate) fn editor_holding_lines(app: &App) -> Vec<String> {
+    let mut lines: Vec<String> = app
+        .clamp_refusal_of(app.doc.index())
+        .map(String::from)
+        .into_iter()
+        .collect();
+    lines.extend(holding_lines(app));
+    lines
 }
 /// What is wrong with setup `si`'s workholding as the editor knows it, in
 /// the export's order: `Document::holding_issues_with` on the box the setup
@@ -10737,6 +10786,7 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             show_paths: false,
             progress: None,
             holding: vec![],
+            first_setup: None,
             framed: vec![],
             leftover: None,
             live: None,
