@@ -136,6 +136,20 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
                 "Drill the hole first. Thread passes go round the thread more than once, each further out, the last to the full depth; a Spring pass goes round once more to true the size. From the model reads each hole's size from its modeled thread. A manual mill or a lathe cannot mill a thread: tap it.",
             )
         }
+        ("cycle", crate::model::REAMING) => {
+            diagram = Some(Diagram::DrillCycle(7));
+            (
+                "Ream each drilled hole to size with a reamer: feed in to the bottom, an optional dwell, and feed back out the same way (pulled out at a rapid, it scores the wall). Its speed and feed come from the material at a reamer's rate: a third of the surface speed.",
+                "Drill the hole a little under the reamer first: 0.1 under up to Ø5, 0.2 up to Ø20 (Ø9.8 for a Ø10 H7), 0.3 over; Add the drilling before it adds that drill. A hole not drilled, or drilled more than 0.5 under, is refused, and so is a reamer whose flutes are shorter than the hole is deep. On a CNC or the manual mill.",
+            )
+        }
+        ("cycle", crate::model::BORING) => {
+            diagram = Some(Diagram::DrillCycle(8));
+            (
+                "Bore the holes of one Hole diameter with a boring head, a pass at each size up to it: feed in, dwell, then out with the spindle stopped (a rapid) or fed out, as the head says. Before each pass the run stops the spindle and pauses: measure the bore, set the head out as it says, and resume.",
+                "Rough the hole first, to at least the head's smallest bore: Add drilling and roughing before it drills it and, on a CNC, mills it out to 0.6 under; on the manual mill the drills step up and the head roughs the rest. The passes start from how far it is open, take at most Cut per pass off the radius, and end with the Last pass. A hole outside the head's range, or deeper than its bar reaches below the body, is refused. On the manual mill the Steps page shows each pass: the size to measure, the head setting and each hole on the DRO.",
+            )
+        }
         ("cycle", crate::model::TAPPING) => {
             diagram = Some(Diagram::DrillCycle(6));
             (
@@ -267,6 +281,14 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
         ("compensation", "Inverse wear") => (
             "Record the opposite wear-compensation sign convention. This sample preference is not implemented for imported machining or controller output.",
             "",
+        ),
+        ("feed_follows", "Programmed feed") => (
+            "Every cutting move runs at the cutting feed, as programmed: where the cutter wraps into a corner or takes a full slot each tooth takes more force, and where it only skims a wall less.",
+            "Ramps and plunges keep their own slower feeds.",
+        ),
+        ("feed_follows", "Hold the force per tooth") => (
+            "The feed changes along the path so each tooth takes about the same force: slower where more of the cutter is in the material (a corner, a slot), faster where little is (a light side cut). The force is the nominal cut's at the cutting feed, or the one typed in below.",
+            "Moves are split where the feed changes by more than a tenth, each with its own F word; the minutes, the preview and the export all use the new feeds. Measuring the force along the path takes seconds for a long path. A feed is never faster than the machine's most feed or three times the programmed, than gives one and a half times the programmed chip at the thickest chip (feeding up a light cut's thin chip), or, down a ramp or plunge, than its programmed feed, and never slower than a quarter of the move's own feed (a ramp's of its quarter feed). In the air the programmed feed is kept. A faster stretch shorter than two thirds of the cutter's radius is not taken. The force model is simple (kc1.1, a 30° helix): check the first part.",
         ),
         ("coolant", "Flood") => (
             "Flood coolant: LinuxCNC export writes M8 when the operation starts, and M9 when the coolant changes, at a tool change and at the end of the program. The preview does not simulate coolant.",
@@ -571,6 +593,14 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
         ("groove_from", "Depth below the stock top") => (
             "The groove's top edge is this deep below the stock top.",
             "",
+        ),
+        ("type", "Reamer") => (
+            "A tool of one size that finishes a drilled hole to it, to its tolerance class (H7 for a bearing's or a bush's fit), with the Reaming cycle on a CNC or the manual mill. Its flutes must be as long as the hole is deep.",
+            "Drill the hole a little under it first: Ø9.8 for a Ø10.",
+        ),
+        ("type", "Boring head") => (
+            "An adjustable head with a single-point bar that bores a roughed hole to size on a CNC or the manual mill, set out by its dial between passes. Bore range is the smallest and largest bore it sets to; the bar goes down the hole, so it is narrower than the smallest; Reach is how deep the bar goes below the head's body.",
+            "Out of the bore says how it leaves each pass: with the spindle stopped and a rapid (its edge leaves a fine line up the wall), or fed out turning (it can rub the wall). The dial graduation is how much one division sets it out on the diameter.",
         ),
         ("type", "Tap") => (
             "A tool that cuts an internal thread of one size, turned by hand into a drilled hole on the manual mill or the lathe. The CNC cannot tap: use a thread mill. The hole must be drilled first.",

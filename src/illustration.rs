@@ -1770,6 +1770,27 @@ fn drill_cycle(f: &mut Frame, time: f32, phase: f32, cycle: u8) {
             (24., Feed),
             (clear, Rapid),
         ],
+        // A reamer: in, a dwell, and fed back out.
+        7 => vec![
+            (27., Rapid),
+            (5., Feed),
+            (5., Dwell),
+            (27., Feed),
+            (clear, Rapid),
+        ],
+        // A boring head: a pass, out with the spindle stopped, the head set
+        // out (a Dwell at the clearance), a second pass.
+        8 => vec![
+            (27., Rapid),
+            (5., Feed),
+            (5., Dwell),
+            (clear, Rapid),
+            (clear, Dwell),
+            (27., Rapid),
+            (5., Feed),
+            (5., Dwell),
+            (clear, Rapid),
+        ],
         _ => vec![(27., Rapid), (5., Feed), (clear, Rapid)],
     };
     // Each move's share of the time: feeds slow, rapids quick.
@@ -1801,6 +1822,7 @@ fn drill_cycle(f: &mut Frame, time: f32, phase: f32, cycle: u8) {
     let helix = cycle == 4;
     let thread = cycle == 5;
     let tap = cycle == 6;
+    let (ream, bore) = (cycle == 7, cycle == 8);
     // The deepest point so far is the hole's bottom, except where the hole
     // is drilled already: a thread's, down to the same depth at any time.
     let mut reached: f32 = 24.;
@@ -1811,7 +1833,11 @@ fn drill_cycle(f: &mut Frame, time: f32, phase: f32, cycle: u8) {
         let k = ((now - w[0].0) / (w[1].0 - w[0].0).max(1e-6)).min(1.);
         reached = reached.min(w[0].1 + (w[1].1 - w[0].1) * k);
     }
-    let deepest = if thread || tap { 5. } else { reached };
+    let deepest = if thread || tap || ream || bore {
+        5.
+    } else {
+        reached
+    };
     let cx = 64.;
     stock(f, 14., y(24.), 112., 132.);
     // The hole's width and the cutter's: a thread mill goes down a bore
@@ -1820,6 +1846,8 @@ fn drill_cycle(f: &mut Frame, time: f32, phase: f32, cycle: u8) {
         4 => (30., 14.),
         5 => (18., 7.),
         6 => (12., 16.),
+        7 => (10., 16.),
+        8 => (16., 5.),
         _ => (13., 12.),
     };
     if deepest < 24. {
@@ -1839,6 +1867,58 @@ fn drill_cycle(f: &mut Frame, time: f32, phase: f32, cycle: u8) {
                     Point::new(cx + hw / 2., y(deepest)),
                     Point::new(cx, y(deepest) + 5.),
                 ],
+                BACKGROUND,
+            );
+        }
+    }
+    // The deepest the timeline has gone since `from`.
+    let lowest = |from: f32| {
+        (timeline.iter())
+            .filter(|w| w.0 > from && w.0 <= now)
+            .map(|w| w.1)
+            .chain((now > from).then_some(at(now).0))
+            .fold(24f32, f32::min)
+            .max(5.)
+    };
+    // The reamer's full size behind it.
+    if ream && lowest(0.) < 24. {
+        rect(
+            f,
+            cx - dw / 2.,
+            y(24.),
+            cx + dw / 2.,
+            y(lowest(0.)),
+            BACKGROUND,
+        );
+    }
+    // The boring head's two sizes: each pass bores down as wide as it is
+    // set, and the head is set out between them.
+    let (set, setting) = (
+        timeline.get(4).map_or(0., |w| w.0),
+        timeline.get(5).map_or(0., |w| w.0),
+    );
+    let (first, second) = (24., 28.);
+    let bore_width =
+        first + (second - first) * smooth(((now - set) / (setting - set)).clamp(0., 1.));
+    if bore {
+        let done = if now > setting { 5. } else { lowest(0.) };
+        if done < 24. {
+            rect(
+                f,
+                cx - first / 2.,
+                y(24.),
+                cx + first / 2.,
+                y(done),
+                BACKGROUND,
+            );
+        }
+        if now > setting && lowest(setting) < 24. {
+            rect(
+                f,
+                cx - second / 2.,
+                y(24.),
+                cx + second / 2.,
+                y(lowest(setting)),
                 BACKGROUND,
             );
         }
@@ -1948,6 +2028,42 @@ fn drill_cycle(f: &mut Frame, time: f32, phase: f32, cycle: u8) {
                 8.,
             );
         }
+    } else if bore {
+        // The bar, its edge out at the size the head is set to, under the
+        // head's body; it stands still on the way out.
+        let edge = cx + bore_width / 2.;
+        let (right, left) = (edge - 3.5, edge - 3.5 - dw);
+        let top = |v: f32| v.max(0.);
+        let (bar_top, body_top) = (tip.y - 70., tip.y - 84.);
+        rect(
+            f,
+            left,
+            top(bar_top),
+            right,
+            tip.y,
+            Color::from_rgb(0.87, 0.91, 0.93),
+        );
+        rect(
+            f,
+            cx - 15.,
+            top(body_top),
+            cx + 15.,
+            top(bar_top),
+            Color::from_rgb(0.58, 0.67, 0.75),
+        );
+        polygon(
+            f,
+            &[
+                Point::new(right, tip.y - 5.),
+                Point::new(edge, tip.y - 1.),
+                Point::new(right, tip.y),
+            ],
+            GOLD,
+        );
+        let out = kind == Rapid && at(now + 0.03).0 > z;
+        if out && z > 6. {
+            text(f, "SPINDLE OFF", 16., 36., GOLD, 8.);
+        }
     } else {
         cutter_at(f, tip, (0., -1.), time, dw, cycle < 4, 0.);
     }
@@ -1985,6 +2101,7 @@ fn drill_cycle(f: &mut Frame, time: f32, phase: f32, cycle: u8) {
                     (4, _) => "ONCE ROUND",
                     (5, 2) => "ARC IN",
                     (5, _) => "ARC OUT",
+                    (8, 4) => "SET HEAD OUT",
                     _ => "DWELL",
                 },
                 gx(w[0].0) - 4.,
@@ -2012,6 +2129,8 @@ fn drill_cycle(f: &mut Frame, time: f32, phase: f32, cycle: u8) {
             4 => "HELIX DOWN · ONCE ROUND AT THE BOTTOM · OUT",
             5 => "DOWN THE MIDDLE · ARC IN · ONE PITCH A TURN · OUT",
             6 => "A TURN IN · HALF BACK · OUT",
+            7 => "FEED IN SLOWLY · DWELL · FEED BACK OUT",
+            8 => "BORE · SPINDLE OFF, OUT · SET THE HEAD OUT · BORE AGAIN",
             _ => "ONE FEED TO DEPTH · RETRACT",
         },
     );

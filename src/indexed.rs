@@ -1214,6 +1214,9 @@ pub fn generate(
     start: Start,
 ) -> Result<Posed, String> {
     use crate::simulation::Simulation;
+    if op.boring() {
+        return Err(crate::model::BORE_IN_CHUCK.into());
+    }
     // An operation that picks holes at several angles cuts at each only the
     // holes it turns up, and skips an angle that turns none up.
     let by_angle = holes_at_angles(op, setup)
@@ -1372,6 +1375,9 @@ pub fn enter_held(
     let setup = &doc.setups[si];
     if !crate::chuck::holds(setup) || plan.moves.is_empty() {
         return Ok(plan);
+    }
+    if !plan.stops.is_empty() {
+        return Err(crate::model::BORE_IN_CHUCK.into());
     }
     let Ok(swing) = doc.swing_unchecked(si, mesh, crate::cam::number(op, "clearance")?) else {
         return Ok(plan);

@@ -852,9 +852,47 @@ impl Tool {
                     )
                 }
             }
+            "Reamer" => {
+                if !REAMER_CLASSES.contains(&get(&self.p, "tolerance")) {
+                    e.push("Choose the reamer's tolerance class, like H7.".into())
+                }
+            }
+            "Boring head" => {
+                if self.bore_range().is_none() {
+                    e.push(
+                        "Bore range must be the smallest and largest bore it sets to, like 12-50."
+                            .into(),
+                    )
+                }
+                positive(&self.p, "bar_diameter", &mut e);
+                positive(&self.p, "dial", &mut e);
+                if let (Some((low, _)), Some(bar)) =
+                    (self.bore_range(), num(&self.p, "bar_diameter"))
+                    && bar >= low
+                {
+                    e.push(
+                        "Bar diameter must be under the smallest bore: the bar goes down the hole it cuts."
+                            .into(),
+                    )
+                }
+                if !BORE_RETRACTS.contains(&get(&self.p, "bore_retract")) {
+                    e.push("Choose how the head leaves the bore.".into())
+                }
+            }
             _ => {}
         }
         e
+    }
+    /// A boring head's smallest and largest bore in mm, from its
+    /// `bore_range` ("12-50"); None unless both are positive and the first
+    /// is under the second.
+    pub fn bore_range(&self) -> Option<(f32, f32)> {
+        let (lo, hi) = get(&self.p, "bore_range").trim().split_once(['-', '–'])?;
+        let (lo, hi) = (
+            lo.trim().parse::<f32>().ok()?,
+            hi.trim().parse::<f32>().ok()?,
+        );
+        (lo.is_finite() && hi.is_finite() && lo > 0. && lo < hi).then_some((lo, hi))
     }
     /// A tap's thread size.
     pub fn tap_spec(&self) -> Option<&'static crate::thread::Spec> {
@@ -1006,9 +1044,11 @@ pub const FACING_MILLING: [&str; 2] = ["Climb", "Conventional"];
 pub const POCKET_ENTRIES: [&str; 2] = ["Profile ramp", "Plunge"];
 /// A Drill operation's cycles. The first four drill; `HELICAL_MILLING`
 /// mills each hole with a flat end mill, `THREAD_MILLING` mills its thread
-/// with a thread mill (on a CNC), and `TAPPING` taps it by hand (on the
-/// manual mill or the lathe).
-pub const DRILL_CYCLES: [&str; 7] = [
+/// with a thread mill (on a CNC), `TAPPING` taps it by hand (on the
+/// manual mill or the lathe), and `REAMING` and `BORING` finish a drilled
+/// or roughed hole to size with a reamer or a boring head (on a CNC or the
+/// manual mill).
+pub const DRILL_CYCLES: [&str; 9] = [
     "Drilling",
     "Chip breaking",
     "Deep drilling",
@@ -1016,7 +1056,31 @@ pub const DRILL_CYCLES: [&str; 7] = [
     HELICAL_MILLING,
     THREAD_MILLING,
     TAPPING,
+    REAMING,
+    BORING,
 ];
+/// The Drill cycle that reams each drilled hole to size with a reamer: fed
+/// in and fed back out at a reamer's low speed (`cam::boring`).
+pub const REAMING: &str = "Reaming";
+/// The Drill cycle that bores each roughed hole to size with a boring head:
+/// a pass at each size the head is set out to, the run pausing between
+/// passes for the head to be measured and set (`cam::boring`).
+pub const BORING: &str = "Boring";
+/// How a boring head leaves the bore after each pass (its `bore_retract`):
+/// with the spindle stopped, its edge dragging a fine line up the wall, or
+/// fed out turning, which can rub the wall it has just cut.
+pub const BORE_RETRACTS: [&str; 2] = ["Stop the spindle, rapid out", "Feed out"];
+/// A reamer's tolerance classes (its `tolerance`): the hole fits it makes.
+pub const REAMER_CLASSES: [&str; 4] = ["H6", "H7", "H8", "H9"];
+/// A boring head is set to one size: a Boring bores the holes of one
+/// Hole diameter.
+pub const BORE_ONE_SIZE: &str =
+    "Hole diameter must be the one size a Boring bores: the head is set to it.";
+/// A Boring's pauses are not carried through a chuck-held or indexed
+/// setup's entry moves.
+pub const BORE_IN_CHUCK: &str = "Boring pauses between passes for the head to be set, which a setup held in the chuck or indexed does not carry: bore the hole in a 3-axis setup.";
+/// Reaming and Boring are mill cycles: the lathe drills on its centre.
+pub const FINISH_ON_LATHE: &str = "Reaming and Boring are for a mill: on the lathe, drill on the centre and bore with a boring bar (Turn · Bore).";
 /// The Drill cycle that mills each hole's thread with a thread mill: down
 /// the drilled hole, in to the wall on an arc, one pitch up a turn.
 pub const THREAD_MILLING: &str = "Thread milling";
@@ -1052,6 +1116,19 @@ pub fn mill_tool_defaults(kind: &str) -> &'static [(&'static str, &'static str)]
             ("tap_kind", TAP_KINDS[0]),
             ("diameter", "6"),
             ("flutes", "3"),
+        ],
+        "Reamer" => &[("tolerance", "H7"), ("diameter", "10"), ("flutes", "6")],
+        // Its diameter is the head's body, its flute length how far the
+        // bar reaches below it.
+        "Boring head" => &[
+            ("bore_range", "12-50"),
+            ("bar_diameter", "10"),
+            ("dial", "0.01"),
+            ("bore_retract", BORE_RETRACTS[0]),
+            ("diameter", "50"),
+            ("flutes", "1"),
+            ("length", "40"),
+            ("stickout", "90"),
         ],
         _ => &[],
     }
@@ -1289,6 +1366,10 @@ pub fn post_setting_issues(p: &Fields) -> Vec<String> {
     }
     e
 }
+/// The message for a force per tooth to hold that is not a force
+/// (`tooth_load::target`).
+pub const TOOTH_FORCE_ISSUE: &str =
+    "Force per tooth to hold must be a number above zero, or empty for the nominal cut's.";
 /// The height above the stock top at which a new operation's tool travels
 /// between cuts, mm (the "clearance" `Operation::new` starts with).
 pub const CLEARANCE: f32 = 15.;
@@ -1298,6 +1379,11 @@ impl Operation {
             ("name", s.name()),
             ("rpm", "8000"),
             ("feed", "1000"),
+            // A new operation keeps its programmed feed: holding the force
+            // on a tooth measures the path, which takes time, and changes
+            // the feeds typed in.
+            ("feed_follows", crate::tooth_load::FEED_FOLLOWS[0]),
+            ("tooth_force", ""),
             ("coolant", "Flood"),
             ("boundary", "Selected geometry"),
             ("containment", "Tool inside boundary"),
@@ -1332,6 +1418,8 @@ impl Operation {
             ("cycle", "Drilling"),
             ("peck", "3"),
             ("dwell", "0.5"),
+            ("bore_cut", "0.3"),
+            ("finish_cut", "0.1"),
             ("through", "Yes"),
             ("breakthrough", "1"),
             ("hole_order", "Optimize travel"),
@@ -1512,6 +1600,8 @@ impl Operation {
             Strategy::Drill if self.drills_pin_holes() => vec!["Drill", FLAT],
             Strategy::Drill if self.helical() => vec![FLAT],
             Strategy::Drill if self.thread_milling() => vec!["Thread mill"],
+            Strategy::Drill if self.reaming() => vec!["Reamer"],
+            Strategy::Drill if self.boring() => vec!["Boring head"],
             Strategy::Drill => vec!["Drill", "Chamfer mill"],
             // A Thread is cut by the threading tool, or by a die.
             Strategy::Turn => {
@@ -1556,6 +1646,22 @@ impl Operation {
     /// A Drill operation that threads its holes, by either cycle.
     pub fn threads(&self) -> bool {
         self.thread_milling() || self.tapping()
+    }
+    /// A Drill operation that reams its holes (`REAMING`).
+    pub fn reaming(&self) -> bool {
+        self.strategy == Strategy::Drill
+            && get(&self.p, "cycle") == REAMING
+            && !self.drills_pin_holes()
+    }
+    /// A Drill operation that bores its holes with a boring head (`BORING`).
+    pub fn boring(&self) -> bool {
+        self.strategy == Strategy::Drill
+            && get(&self.p, "cycle") == BORING
+            && !self.drills_pin_holes()
+    }
+    /// A Drill operation that finishes its holes to size, by either cycle.
+    pub fn finishes_holes(&self) -> bool {
+        self.reaming() || self.boring()
     }
     /// A Facing of the part's outline seen from above rather than a
     /// rectangle: its Model silhouette boundary, grown by `silhouette_extend`.
@@ -1964,13 +2070,18 @@ impl Operation {
                 e.push("Choose a tap for Tapping.".into())
             } else if s0 == Strategy::Groove && get(&t.p, "type") != KEYSEAT {
                 e.push(crate::groove::NEEDS_KEYSEAT.into())
+            } else if self.reaming() && get(&t.p, "type") != "Reamer" {
+                e.push("Choose a reamer for Reaming.".into())
+            } else if self.boring() && get(&t.p, "type") != "Boring head" {
+                e.push("Choose a boring head for Boring.".into())
             } else if self.strategy == Strategy::Drill
                 && !self.helical()
                 && !self.threads()
+                && !self.finishes_holes()
                 && !["Drill", "Chamfer mill"].contains(&get(&t.p, "type"))
             {
                 e.push(
-                    "Choose a drill, or a chamfer mill to countersink, for a drilling cycle. Helical milling takes a flat end mill, Thread milling a thread mill, Tapping a tap."
+                    "Choose a drill, or a chamfer mill to countersink, for a drilling cycle. Helical milling takes a flat end mill, Thread milling a thread mill, Tapping a tap, Reaming a reamer, Boring a boring head."
                         .into(),
                 )
             } else if milling && !t.is_lathe() && !self.takes(t, m) {
@@ -2009,6 +2120,13 @@ impl Operation {
             if num(&self.p, k).zip(cap).is_some_and(|(v, c)| v > c) {
                 e.push(format!("{} exceeds the saved machine limit.", label(k)));
             }
+        }
+        // Empty: the force at the cutting feed on the nominal cut.
+        if crate::tooth_load::follows(self, m)
+            && !get(&self.p, "tooth_force").trim().is_empty()
+            && !num(&self.p, "tooth_force").is_some_and(|f| f > 0.)
+        {
+            e.push(TOOTH_FORCE_ISSUE.into())
         }
         if manual::is_hand(m)
             && num(&self.p, "rpm").is_some_and(|rpm| rpm > 0. && !manual::on_gear(m, rpm))
@@ -2061,7 +2179,10 @@ impl Operation {
             if self.helical() {
                 positive(&self.p, "stepdown", &mut e);
                 bounded(&self.p, "stepover", 1., 100., &mut e);
-                bounded(&self.p, "tolerance", 0.001, 0.1, &mut e)
+                bounded(&self.p, "tolerance", 0.001, 0.1, &mut e);
+                if !get(&self.p, "bore_allowance").trim().is_empty() {
+                    bounded(&self.p, "bore_allowance", 0., 5., &mut e)
+                }
             }
             if self.thread_milling() && manual::is_hand(m) {
                 e.push(THREAD_MILL_ON_HAND.into())
@@ -2094,8 +2215,23 @@ impl Operation {
             if ["Chip breaking", "Deep drilling"].contains(&get(&self.p, "cycle")) {
                 positive(&self.p, "peck", &mut e)
             }
-            if get(&self.p, "cycle") == "Counterboring" {
+            if self.finishes_holes() && crate::lathe::is_lathe(m) {
+                e.push(FINISH_ON_LATHE.into())
+            }
+            if get(&self.p, "cycle") == "Counterboring" || self.finishes_holes() {
                 nonnegative(&self.p, "dwell", &mut e)
+            }
+            if self.boring() {
+                // Blank in an operation saved before they were: the defaults.
+                if !get(&self.p, "bore_cut").trim().is_empty() {
+                    positive(&self.p, "bore_cut", &mut e);
+                }
+                if !get(&self.p, "finish_cut").trim().is_empty() {
+                    nonnegative(&self.p, "finish_cut", &mut e);
+                }
+                if !num(&self.p, "hole_diameter").is_some_and(|d| d > 0.) {
+                    e.push(BORE_ONE_SIZE.into())
+                }
             }
             if get(&self.p, "through") == "Yes" {
                 nonnegative(&self.p, "breakthrough", &mut e)
@@ -2556,11 +2692,12 @@ impl Document {
         self.material = name;
         true
     }
-    /// Gives every operation the speed and feed `material::recommend` gives
-    /// for the selected material, its tool and its setup's machine, whatever
-    /// it had: the same material always gives the same speeds. Drilling
-    /// operations keep theirs (it would give them an end mill's chip load;
-    /// Helical milling, which cuts with an end mill, is given one), and so
+    /// Gives every operation the speed and feed `material::recommend_for`
+    /// gives for the selected material, its tool and its setup's machine,
+    /// whatever it had: the same material always gives the same speeds.
+    /// Drilling operations keep theirs (it would give them an end mill's
+    /// chip load; Helical milling, which cuts with an end mill, is given one,
+    /// and Reaming and Boring theirs at a reamer's and a boring head's rates), and so
     /// do those it cannot give one: without a tool, whose tool has no
     /// diameter or flutes, or whose machine has no maximum spindle speed or
     /// feed. Returns what changed, old to new, and why any was not set, for
@@ -2583,14 +2720,16 @@ impl Document {
                 let (setup, op) = (&self.setups[si], &self.setups[si].operations[oi]);
                 // The chip loads are an end mill's per tooth; a drill's feed
                 // is per revolution, which the library has no data for.
-                if op.strategy == Strategy::Drill && !op.helical() {
+                if op.strategy == Strategy::Drill && !op.helical() && !op.finishes_holes() {
                     if !matches!(self.speed_feed(setup, op), Some(SpeedFeed::InRange { .. })) {
                         drills += 1;
                     }
                     continue;
                 }
                 let recommended = match self.tools.iter().find(|t| t.id == op.tool) {
-                    Some(tool) => crate::material::recommend(&material, tool, &setup.machine),
+                    Some(tool) => {
+                        crate::material::recommend_for(&material, tool, op, &setup.machine)
+                    }
                     None => Err("The operation has no tool.".into()),
                 };
                 let (rpm, feed) = match recommended {
@@ -3739,7 +3878,7 @@ fn label(k: &str) -> String {
 pub const BOX_FIELDS: [&str; 6] = ["x_min", "x_max", "y_min", "y_max", "z_top", "z_bottom"];
 /// The operation editor's text fields, by key: the ones a check's message
 /// names by its `label`.
-const OPERATION_FIELDS: [&str; 71] = [
+const OPERATION_FIELDS: [&str; 74] = [
     "name",
     "hole_min",
     "x_min",
@@ -3764,6 +3903,9 @@ const OPERATION_FIELDS: [&str; 71] = [
     "lean_angle",
     "peck",
     "dwell",
+    "bore_cut",
+    "finish_cut",
+    "bore_allowance",
     "thread_depth",
     "thread_passes",
     "direction",
@@ -3829,6 +3971,9 @@ pub fn issue_field(issue: &str) -> Option<&'static str> {
     }
     if m.starts_with("chip load ") {
         return Some("feed");
+    }
+    if m.starts_with("force per tooth ") {
+        return Some("tooth_force");
     }
     if m.starts_with("finishing passes ") {
         return Some("finish_passes");

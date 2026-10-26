@@ -11,6 +11,7 @@ use crate::{
 };
 use clipper2::{EndType, FillRule, JoinType, Milli, Paths, union};
 use std::collections::{HashMap, HashSet};
+pub(crate) mod boring;
 pub(crate) type Polygon = Vec<(f64, f64)>;
 pub(crate) type Region = Paths<Milli>;
 /// The most moves (or samples) a toolpath may have: what memory takes, not
@@ -261,6 +262,7 @@ impl Builder {
                 tool_length,
                 holder_radius: positive("holder")? / 2.,
                 neck: None,
+                stops: vec![],
                 display_scale: stock.display_scale,
                 duration: 0.,
                 target: top,
@@ -2251,6 +2253,12 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     if op.tapping() {
         return tap(setup, op, tool, mesh);
     }
+    if op.reaming() {
+        return boring::ream(setup, op, tool, mesh);
+    }
+    if op.boring() {
+        return boring::bore(setup, op, tool, mesh);
+    }
     let mut b = Builder::new(setup, op, tool, mesh)?;
     // A chamfer mill countersinks each opening rather than drilling it.
     let chamfer = get(&tool.p, "type") == "Chamfer mill";
@@ -2487,6 +2495,16 @@ fn helical(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
     if !(0.001..=0.1).contains(&tolerance) {
         return Err("Helical milling needs a tolerance of 0.001–0.1 mm.".into());
     }
+    // What a Boring or a Reaming after it takes off, on the diameter
+    // (`finishing`): blank leaves nothing.
+    let leave = if get(&op.p, "bore_allowance").trim().is_empty() {
+        0.
+    } else {
+        number(op, "bore_allowance")?
+    };
+    if !(0. ..=5.).contains(&leave) {
+        return Err("Bore allowance must be 0–5 mm on the diameter.".into());
+    }
     let r = b.plan.radius;
     // Climb inside a hole: counterclockwise with the spindle clockwise.
     let turn = if b.plan.spindle_clockwise { 1. } else { -1. };
@@ -2498,7 +2516,7 @@ fn helical(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
     while !holes.is_empty() {
         crate::progress::report(count - holes.len())?;
         let h = next_hole(&mut holes, b.pos, op);
-        let (floor, diameter) = (h.bottom, h.diameter);
+        let (floor, diameter) = (h.bottom, h.diameter - leave);
         // As for a drill, a cutter of the bore's size fits: it may be as
         // wide as the bore at its tessellation's vertices.
         if 2. * r > diameter + 2. * h.sagitta + 0.01 {

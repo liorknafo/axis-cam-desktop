@@ -1176,6 +1176,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Place the fixture pins on the stock's leftover in the 3D view: the plate's pins follow the pointer on the stock's bottom, green where they fit and red, with why, where they do not. Click to put pin 1 there; drag the placed pins to move them; drag elsewhere to orbit. Click Finish placing when done.",
             "",
         ),
+        AddHoleStages => (
+            "Add before this Reaming or Boring the operations that open its holes, on the same holes: for a reamer, a drill a little under its size (Ø9.8 for Ø10); for a boring head, a drill, then on a CNC Helical milling to 0.6 under the size; on the manual mill the drills step up and the head roughs the rest.",
+            "The tools come from the library: the drill nearest a reamer's drill size; for a bore the widest drill and the widest flat end mill that reach through. One that is missing is added without a tool, and the status says which to add.",
+        ),
         AddThreading => (
             "Add, for each thread size of the setup's threaded holes that open upwards, a Drill of its tap drill and then its thread: Thread milling with a thread mill on the CNC, Tapping by hand on the manual mill. Tools come from the library; the status says which are missing.",
             "",
@@ -2305,6 +2309,11 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         (_, "feed") => (
             "Cutter travel speed during cutting, in mm/min. Feed per tooth = feed ÷ (rpm × flute count). When the project material has cutting data, a feed per tooth outside the range for the tool's diameter is flagged on this tab and on the NC review page; export still goes ahead. Plunge and ramp feeds are not checked.",
             "",
+            Some(Tool),
+        ),
+        (_, "tooth_force") => (
+            "The force on one tooth, in N, that the feed is changed along the path to hold. Empty: the force at the cutting feed on the operation's nominal cut, its stepover (a Contour: a full slot) as deep as its levels cut, at most the stepdown; the one at the full stepdown is shown under the field. A larger force feeds faster everywhere.",
+            "Worked out from the project material's kc1.1 and mc (steel without one) and the tool's flutes, for a 30° helix. The SIMULATION panel says the feeds it took.",
             Some(Tool),
         ),
         (_, "coolant") => (
@@ -3734,6 +3743,8 @@ mod tests {
             ("drill-helix", DrillCycle(4)),
             ("drill-thread-mill", DrillCycle(5)),
             ("drill-tap", DrillCycle(6)),
+            ("drill-ream", DrillCycle(7)),
+            ("drill-bore", DrillCycle(8)),
             ("containment-inside", Containment(-1)),
             ("containment-on", Containment(0)),
             ("containment-outside", Containment(1)),
@@ -4729,6 +4740,7 @@ mod tests {
             PlacePins,
             AddPinDrilling,
             AddThreading,
+            AddHoleStages,
             ThreadFromPart,
             Generate,
             GenerateAll,

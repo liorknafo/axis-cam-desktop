@@ -21,6 +21,23 @@ impl Frame {
             ..Self::axes(setup)
         }
     }
+    /// The setup's frame of a part placed as it is, unturned: a frame for a
+    /// cut that is no part's (`tooth_load::nominal`).
+    pub fn identity() -> Self {
+        Self {
+            basis: [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+            shift: [0.; 3],
+        }
+    }
+    /// Its numbers, bit for bit: a key to what was worked out in it.
+    pub fn key(&self) -> [u32; 12] {
+        let [a, b, c] = self.basis;
+        let s = self.shift;
+        [
+            a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2], s[0], s[1], s[2],
+        ]
+        .map(f32::to_bits)
+    }
     /// This frame with the part turned about the line along X through Y, Z
     /// `axis` (mm) by `turn` degrees, by the right-hand rule about +X: an
     /// indexed setup's frame at an A angle (`indexed`).

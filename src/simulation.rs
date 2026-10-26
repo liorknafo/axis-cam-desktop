@@ -171,6 +171,21 @@ pub struct Plan {
     /// the simulation turns each ring away when its move ends, instead of
     /// sweeping the cutter along the moves. Empty for every other plan.
     pub rings: Vec<Ring>,
+    /// Where the spindle stops partway through (`cam::boring`), in order.
+    /// Empty for most plans.
+    pub stops: Vec<Stop>,
+}
+/// A stop of the spindle partway through a plan: before move `at` the
+/// spindle and coolant stop and, with a `pause`, the program waits there,
+/// saying it, for the operator to resume (`post::Block::Pause`). They start
+/// again before the next feed move. A boring head's pause before a pass
+/// carries the `size` the head is set to for it (the manual mill's guide
+/// shows it).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stop {
+    pub at: usize,
+    pub pause: Option<String>,
+    pub size: Option<f32>,
 }
 impl Plan {
     /// Whether this is a lathe plan: its moves are a side view (X the
@@ -558,6 +573,7 @@ fn generate_plan(
         tool_length,
         holder_radius,
         neck: None,
+        stops: vec![],
         display_scale: scale,
         duration: 0.,
         target,
@@ -859,6 +875,10 @@ pub struct Simulation {
     /// The stretches of air taken out of the plan (`air::trim`); None where
     /// none were.
     pub air: Option<crate::air::Trimmed>,
+    /// The force on a tooth the feed was changed along the moves to hold,
+    /// and the feeds it took (`tooth_load::hold`); None for an operation
+    /// whose feed is the programmed one.
+    pub held: Option<crate::tooth_load::Held>,
 }
 impl Simulation {
     pub fn new(plan: Plan) -> Self {
@@ -887,6 +907,7 @@ impl Simulation {
             bites: Default::default(),
             tooth_load: None,
             air: None,
+            held: None,
         }
     }
     /// The frame move `m` cuts in: the one `turns` lists for its A angle,
@@ -1194,6 +1215,8 @@ pub fn sequence_walk(
                 if let Some(reason)=&blocked {return Err(format!("Cannot inherit remaining stock because an earlier operation/setup failed: {reason}"));}
                 let mut sim=Simulation::new(plan);
                 sim.volume=volume.clone();sim.initial_volume=volume.clone();sim.frame=Some(frame);sim.turns=turns;sim.preceding=preceding;sim.source=source;sim.air=air;
+                // The feed changed along the path to hold the force on a tooth.
+                crate::tooth_load::hold(&mut sim, doc, &setup.machine, op)?;
                 if let Some((previous,stock))=&grid&& *previous==frame && stock.bounds==sim.plan.stock {sim.stock=stock.clone();sim.initial_stock=stock.clone();}
                 Ok(sim)
             });
