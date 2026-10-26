@@ -611,6 +611,7 @@ pub fn nominal(
         spindle_clockwise: cut.clockwise,
         milling_direction: if cut.climb { "Climb" } else { "Conventional" },
         rings: vec![],
+        stops: vec![],
     };
     let mut sim = Simulation::new(plan);
     (sim.initial_volume, sim.frame) = (Some(volume), Some(frame));
@@ -665,6 +666,8 @@ pub struct Held {
 #[derive(Debug, Clone)]
 struct Refed {
     moves: Vec<Move>,
+    /// Of each of the plan's moves, the index of its first piece.
+    starts: Vec<usize>,
     duration: f32,
     load: std::sync::Arc<ToothLoad>,
     held: Held,
@@ -780,6 +783,14 @@ pub fn hold(
             most: crate::cam::CEILING,
         },
     );
+    // A stop before a move is before its first piece.
+    for stop in &mut sim.plan.stops {
+        stop.at = refed
+            .starts
+            .get(stop.at)
+            .copied()
+            .unwrap_or(refed.moves.len());
+    }
     sim.plan.moves = refed.moves;
     sim.plan.duration = refed.duration;
     sim.tooth_load = Some(refed.load);
@@ -944,6 +955,7 @@ fn refeed(plan: &Plan, load: &ToothLoad, f: Feeding) -> Refed {
         }
     }
     let mut moves = Vec::with_capacity(count.min(f.most));
+    let mut starts = Vec::with_capacity(plan.moves.len());
     let mut forces = vec![];
     let mut facing = vec![];
     let mut time = 0.;
@@ -953,6 +965,7 @@ fn refeed(plan: &Plan, load: &ToothLoad, f: Feeding) -> Refed {
         fastest: 0.,
     };
     for (i, m) in plan.moves.iter().enumerate() {
+        starts.push(moves.len());
         if pieces[i].is_empty() {
             let seconds = m.end - m.start;
             moves.push(Move {
@@ -998,6 +1011,7 @@ fn refeed(plan: &Plan, load: &ToothLoad, f: Feeding) -> Refed {
     let peak = forces.iter().flatten().copied().fold(0., f32::max);
     Refed {
         moves,
+        starts,
         duration: time,
         load: std::sync::Arc::new(ToothLoad {
             moves: forces,
@@ -1406,6 +1420,10 @@ mod tests {
             time += m.end - m.start;
         }
         assert!((refed.duration - time).abs() < 1e-3);
+        // Each move's first piece starts where it did.
+        for (m, &start) in s.plan.moves.iter().zip(&refed.starts) {
+            assert_eq!(refed.moves[start].from, m.from);
+        }
         assert_eq!(refed.moves.last().unwrap().end, refed.duration);
         // As many pieces as the load has: one per move, at its slowest.
         let most = refeed(
