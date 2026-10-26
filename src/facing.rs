@@ -104,6 +104,55 @@ fn spans(loops: &[Vec<(f64, f64)>], v: f64) -> Vec<(f64, f64)> {
         .collect()
 }
 
+/// The shorter way along the closed `path` from `a` to `b`, both on it: the
+/// points after `a` up to `b`, and its length. None where either is off it.
+fn along(path: &Polygon, a: (f64, f64), b: (f64, f64)) -> Option<(Vec<(f64, f64)>, f64)> {
+    let n = path.len();
+    let mut sum = vec![0.; n + 1];
+    for k in 0..n {
+        let (p, q) = (path[k], path[(k + 1) % n]);
+        sum[k + 1] = sum[k] + (q.0 - p.0).hypot(q.1 - p.1);
+    }
+    let total = sum[n];
+    // How far round from the path's start `p` is, if on it.
+    let at = |p: (f64, f64)| {
+        (0..n)
+            .filter_map(|k| {
+                let (s, e) = (path[k], path[(k + 1) % n]);
+                let (dx, dy) = (e.0 - s.0, e.1 - s.1);
+                let squared = dx * dx + dy * dy;
+                let t = if squared > 0. {
+                    (((p.0 - s.0) * dx + (p.1 - s.1) * dy) / squared).clamp(0., 1.)
+                } else {
+                    0.
+                };
+                let off = (s.0 + t * dx - p.0).hypot(s.1 + t * dy - p.1);
+                (off < 1e-3).then_some((off, sum[k] + t * (sum[k + 1] - sum[k])))
+            })
+            .min_by(|x, y| x.0.total_cmp(&y.0))
+            .map(|x| x.1)
+    };
+    let (from, to) = (at(a)?, at(b)?);
+    let ahead = (to - from).rem_euclid(total);
+    let forward = ahead <= total / 2.;
+    let length = if forward { ahead } else { total - ahead };
+    let mut points: Vec<(f64, (f64, f64))> = (0..n)
+        .map(|k| {
+            let d = if forward {
+                sum[k] - from
+            } else {
+                from - sum[k]
+            };
+            (d.rem_euclid(total), path[k])
+        })
+        .filter(|(d, _)| *d > 1e-9 && *d < length - 1e-9)
+        .collect();
+    points.sort_by(|x, y| x.0.total_cmp(&y.0));
+    let mut way: Vec<(f64, f64)> = points.into_iter().map(|x| x.1).collect();
+    way.push(b);
+    Some((way, length))
+}
+
 pub(crate) fn outline(f: Outline) -> Result<Plan, String> {
     let r = f.radius as f64;
     let stock = rectangle(&f.stock);
@@ -319,6 +368,8 @@ pub(crate) fn outline(f: Outline) -> Result<Plan, String> {
     let first = edges[0].1.unwrap_or(edges[0].0[0]);
     let mut position = [first.0 as f32, first.1 as f32, f.clearance];
     let feed = f.feed;
+    // Through air, over what is cut: as fast as the machine feeds.
+    let air = crate::post_check::machine_mm(&f.setup.machine, "feed").max(feed);
     let point = |p: (f64, f64), z: f32| [p.0 as f32, p.1 as f32, z];
     crate::progress::expect(levels * (segments + edges.len()));
     let mut done = 0;
@@ -339,7 +390,37 @@ pub(crate) fn outline(f: Outline) -> Result<Plan, String> {
         for (path, entry) in &edges {
             done += 1;
             crate::progress::step(done)?;
-            let start = path[0];
+            // Into the stock round the loop at the ramp angle, unless that
+            // would wind round it more than `RAMP_LAPS` times; plunged then.
+            // The ramp starts back round the loop at the corner its run
+            // reaches, so it reaches depth at the loop's start and one lap
+            // at depth follows; the level before went round through that
+            // corner, so the export's check sees it clear to come down to.
+            let n = path.len();
+            let length: f64 = path
+                .iter()
+                .zip(path.iter().cycle().skip(1))
+                .map(|(a, b)| (b.0 - a.0).hypot(b.1 - a.1))
+                .sum();
+            let laps = (previous_z - z) / (length as f32 * slope).max(1e-6);
+            let ramp = entry.is_none() && laps <= RAMP_LAPS;
+            let mut start = path[0];
+            let mut ramped = vec![(path[0], z)];
+            if ramp {
+                let run = (previous_z - z) as f64 / slope as f64;
+                let (mut back, mut k) = (0., 0);
+                let mut way = vec![(path[0], 0.)];
+                while back < run {
+                    let (p, q) = (path[k], path[(k + n - 1) % n]);
+                    back += (q.0 - p.0).hypot(q.1 - p.1);
+                    way.push((q, back));
+                    k = (k + n - 1) % n;
+                }
+                start = way[way.len() - 1].0;
+                ramped = (way.into_iter().rev())
+                    .map(|(p, s)| (p, z + ((previous_z - z) as f64 * s / back) as f32))
+                    .collect();
+            }
             let up = [position[0], position[1], f.clearance];
             push(&mut plan, &mut position, up, Motion::Rapid, 6000., false);
             // Down beside the stock and in to the loop at depth.
@@ -347,7 +428,7 @@ pub(crate) fn outline(f: Outline) -> Result<Plan, String> {
                 for (to, motion, rate) in [
                     (point(outside, f.clearance), Motion::Rapid, 6000.),
                     (point(outside, hop), Motion::Rapid, 6000.),
-                    (point(outside, z), Motion::Feed, feed * 0.25),
+                    (point(outside, z), Motion::Feed, feed),
                     (point(start, z), Motion::Feed, feed),
                 ] {
                     push(&mut plan, &mut position, to, motion, rate, false);
@@ -370,38 +451,26 @@ pub(crate) fn outline(f: Outline) -> Result<Plan, String> {
                     false,
                 );
             }
-            // Into the stock round the loop at the ramp angle, unless that
-            // would wind round it more than `RAMP_LAPS` times; plunged then.
-            let length: f64 = path
-                .iter()
-                .zip(path.iter().cycle().skip(1))
-                .map(|(a, b)| (b.0 - a.0).hypot(b.1 - a.1))
-                .sum();
-            let laps = (previous_z - z) / (length as f32 * slope).max(1e-6);
-            let ramp = entry.is_none() && laps <= RAMP_LAPS;
-            push(
-                &mut plan,
-                &mut position,
-                point(start, if ramp { previous_z } else { z }),
-                Motion::Feed,
-                feed * 0.25,
-                false,
-            );
-            if ramp {
-                while position[2] > z + 0.00001 {
-                    for &p in path.iter().skip(1).chain(std::iter::once(&path[0])) {
-                        let distance = (p.0 as f32 - position[0]).hypot(p.1 as f32 - position[1]);
-                        let next = (position[2] - distance * slope).max(z);
-                        push(
-                            &mut plan,
-                            &mut position,
-                            point(p, next),
-                            Motion::Feed,
-                            feed * 0.25,
-                            true,
-                        );
-                    }
-                }
+            // Fed down through air to the level before, then into the stock.
+            if entry.is_none() {
+                push(
+                    &mut plan,
+                    &mut position,
+                    point(start, previous_z),
+                    Motion::Feed,
+                    feed,
+                    false,
+                );
+            }
+            for &(p, height) in &ramped {
+                push(
+                    &mut plan,
+                    &mut position,
+                    point(p, height),
+                    Motion::Feed,
+                    feed * 0.25,
+                    ramp,
+                );
             }
             for &p in path.iter().skip(1).chain(std::iter::once(&path[0])) {
                 push(
@@ -415,9 +484,11 @@ pub(crate) fn outline(f: Outline) -> Result<Plan, String> {
             }
         }
         // The rows, each from the edge pass to the edge pass. Down along a
-        // short line inside the region; otherwise up just over the level
-        // before, or to clearance where the line leaves the region, and down
-        // where the edge pass has already cut.
+        // short line inside the region; otherwise round the edge pass at
+        // depth (kept down), or up just over the level before, or to
+        // clearance where the line leaves the region, and down where the
+        // edge pass has already cut: whichever is quickest. Through air at
+        // the machine's fastest feed.
         for &(a, b) in &order {
             done += 1;
             if done % 64 == 0 {
@@ -451,34 +522,54 @@ pub(crate) fn outline(f: Outline) -> Result<Plan, String> {
                 } else {
                     f.clearance
                 };
-                let across = (a.0 - here.0).hypot(a.1 - here.1) as f32 / feed;
-                let (height, motion, rate) = if !inner {
-                    (f.clearance, Motion::Rapid, 6000.)
-                } else if hop >= f.top - 0.0005 {
-                    (hop.max(clear), Motion::Rapid, 6000.)
-                } else if across <= (over - z) / (feed * 0.25) {
-                    (hop, Motion::Feed, feed)
-                } else {
-                    (over, Motion::Rapid, 6000.)
+                // Up, across, at rapid down to over the top (or the level
+                // before), fed down the rest; its time in minutes.
+                let across = (a.0 - here.0).hypot(a.1 - here.1) as f32;
+                let lift = |height: f32, motion: Motion, rate: f32| {
+                    let low = hop.max(clear).min(height);
+                    let time = (2. * height - low - z) / 6000. + across / rate + (low - z) / air;
+                    (time, height, motion, rate, low)
                 };
-                let up = [position[0], position[1], height];
-                push(&mut plan, &mut position, up, Motion::Rapid, 6000., false);
-                push(
-                    &mut plan,
-                    &mut position,
-                    point(a, height),
-                    motion,
-                    rate,
-                    false,
-                );
-                push(
-                    &mut plan,
-                    &mut position,
-                    point(a, z),
-                    Motion::Feed,
-                    feed * 0.25,
-                    false,
-                );
+                let lifts = if !inner {
+                    vec![lift(f.clearance, Motion::Rapid, 6000.)]
+                } else if hop >= f.top - 0.0005 {
+                    vec![lift(hop.max(clear), Motion::Rapid, 6000.)]
+                } else {
+                    vec![
+                        lift(hop, Motion::Feed, air),
+                        lift(over, Motion::Rapid, 6000.),
+                    ]
+                };
+                let (time, height, motion, rate, low) = lifts
+                    .into_iter()
+                    .min_by(|x, y| x.0.total_cmp(&y.0))
+                    .unwrap();
+                let round = if f.keep_down {
+                    loops.iter().find_map(|l| along(l, here, a))
+                } else {
+                    None
+                };
+                if let Some((way, _)) = round.filter(|(_, l)| (*l as f32) / air < time) {
+                    for p in way {
+                        push(
+                            &mut plan,
+                            &mut position,
+                            point(p, z),
+                            Motion::Feed,
+                            air,
+                            false,
+                        );
+                    }
+                } else {
+                    for (to, motion, rate) in [
+                        ([position[0], position[1], height], Motion::Rapid, 6000.),
+                        (point(a, height), motion, rate),
+                        (point(a, low), Motion::Rapid, 6000.),
+                        (point(a, z), Motion::Feed, air),
+                    ] {
+                        push(&mut plan, &mut position, to, motion, rate, false);
+                    }
+                }
             }
             push(
                 &mut plan,
@@ -491,6 +582,10 @@ pub(crate) fn outline(f: Outline) -> Result<Plan, String> {
         }
         let up = [position[0], position[1], f.clearance];
         push(&mut plan, &mut position, up, Motion::Rapid, 6000., false);
+        // Links round the edge add moves the estimate above does not count.
+        if plan.moves.len() > crate::cam::CEILING {
+            return Err(crate::cam::too_many("moves"));
+        }
     }
     if plan.moves.is_empty() || !plan.duration.is_finite() {
         return Err("No finite facing motion could be generated from these settings.".into());
@@ -533,7 +628,7 @@ mod tests {
     use crate::{
         mesh::{self, Mesh},
         model::{Machine, Operation, Setup, Strategy, Tool},
-        simulation::{Motion, Plan, Simulation},
+        simulation::{Motion, Move, Plan, Simulation},
         stock, surface,
     };
     fn quad(tris: &mut Vec<[[f32; 3]; 3]>, x: f32, y: f32, xx: f32, yy: f32, z: f32) {
@@ -680,10 +775,10 @@ mod tests {
                 .count();
             (plan, lifts)
         };
-        let (_, both) = lifts(&op);
-        // Up after each level and between loops; the rows themselves stay
-        // down but where the L's corner breaks them.
-        assert!(both <= 8, "{both} lifts");
+        let (plan, both) = lifts(&op);
+        // Up after each level only: where the L's corner breaks the rows
+        // they go round the edge pass at depth.
+        assert_eq!(both, plan.levels, "{both} lifts");
         op.p.insert("facing_pattern".into(), "One way".into());
         let (plan, one) = lifts(&op);
         assert!(one > 20, "{one} lifts");
@@ -713,9 +808,10 @@ mod tests {
         // rows link just over the first, under the stock top, where the
         // export check refuses a rapid that moves sideways. They feed across
         // there, or go over the stock where plunging back down from 1 mm
-        // over it is quicker: one way, the long way back to each row.
+        // over it is quicker: one way, the long way back to each row. Both
+        // ways they go round the edge pass at depth instead.
         for (pattern, retract, fed_links, over_links) in [
-            ("Both ways (zigzag)", "5", true, false),
+            ("Both ways (zigzag)", "5", false, false),
             ("One way", "5", true, false),
             ("One way", "1", true, true),
         ] {
@@ -804,6 +900,54 @@ mod tests {
             } else if x > 17. + cell && y > 17. + cell {
                 assert_eq!(height, top, "{x} {y}");
             }
+        }
+    }
+    #[test]
+    fn a_ramp_reaches_depth_where_one_lap_round_the_edge_starts_and_air_feeds_fast() {
+        // The edge pass, ramped in 6 mm of stock all round or come to from
+        // beside it flush: the ramp's run, and the lap at depth after it.
+        let edge = |sides: f32| {
+            let (setup, op, tool, mesh) = l_part(sides);
+            let plan = crate::simulation::generate(&setup, &op, &tool, &mesh).unwrap();
+            let xy = |m: &&Move| (m.to[0] - m.from[0]).hypot(m.to[1] - m.from[1]);
+            let moves: Vec<&Move> = (plan.moves.iter())
+                .skip_while(|m| !m.cutting_pass)
+                .take_while(|m| m.cutting_pass)
+                .collect();
+            let ramp: f32 = (moves.iter())
+                .filter(|m| m.to[2] < m.from[2] - 1e-5)
+                .map(xy)
+                .sum();
+            let flat: f32 = (moves.iter())
+                .filter(|m| (m.to[2] - m.from[2]).abs() <= 1e-5)
+                .map(xy)
+                .sum();
+            (ramp, flat)
+        };
+        let (ramp, lap) = edge(6.);
+        let (none, once) = edge(0.);
+        // 2 mm down at 2° or less from a corner, then once round, as beside
+        // the stock.
+        assert!(ramp >= 2. / 2_f32.to_radians().tan() - 0.01, "{ramp}");
+        assert!(ramp < lap, "{ramp} {lap}");
+        assert_eq!(none, 0.);
+        assert!((lap - once).abs() < 0.01, "{lap} {once}");
+        // Through air, both ways and one way, at the cutting feed or the
+        // machine's fastest (5000 mm/min), never at the plunge rate.
+        for pattern in ["Both ways (zigzag)", "One way"] {
+            let (setup, mut op, tool, mesh) = l_part(6.);
+            op.p.insert("facing_pattern".into(), pattern.into());
+            let plan = crate::simulation::generate(&setup, &op, &tool, &mesh).unwrap();
+            let air: Vec<f32> = (plan.moves.iter())
+                .filter(|m| m.motion == Motion::Feed && !m.cutting_pass)
+                .map(|m| m.feed)
+                .collect();
+            let cutting = (plan.moves.iter())
+                .filter(|m| m.cutting_pass)
+                .map(|m| m.feed)
+                .fold(0., f32::max);
+            assert!(air.iter().all(|f| *f >= cutting), "{pattern}: {air:?}");
+            assert!(air.contains(&5000.), "{pattern}: {air:?}");
         }
     }
     #[test]
