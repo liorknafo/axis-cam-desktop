@@ -1366,6 +1366,10 @@ pub fn post_setting_issues(p: &Fields) -> Vec<String> {
     }
     e
 }
+/// The message for a force per tooth to hold that is not a force
+/// (`tooth_load::target`).
+pub const TOOTH_FORCE_ISSUE: &str =
+    "Force per tooth to hold must be a number above zero, or empty for the nominal cut's.";
 /// The height above the stock top at which a new operation's tool travels
 /// between cuts, mm (the "clearance" `Operation::new` starts with).
 pub const CLEARANCE: f32 = 15.;
@@ -1375,6 +1379,11 @@ impl Operation {
             ("name", s.name()),
             ("rpm", "8000"),
             ("feed", "1000"),
+            // A new operation keeps its programmed feed: holding the force
+            // on a tooth measures the path, which takes time, and changes
+            // the feeds typed in.
+            ("feed_follows", crate::tooth_load::FEED_FOLLOWS[0]),
+            ("tooth_force", ""),
             ("coolant", "Flood"),
             ("boundary", "Selected geometry"),
             ("containment", "Tool inside boundary"),
@@ -2111,6 +2120,13 @@ impl Operation {
             if num(&self.p, k).zip(cap).is_some_and(|(v, c)| v > c) {
                 e.push(format!("{} exceeds the saved machine limit.", label(k)));
             }
+        }
+        // Empty: the force at the cutting feed on the nominal cut.
+        if crate::tooth_load::follows(self, m)
+            && !get(&self.p, "tooth_force").trim().is_empty()
+            && !num(&self.p, "tooth_force").is_some_and(|f| f > 0.)
+        {
+            e.push(TOOTH_FORCE_ISSUE.into())
         }
         if manual::is_hand(m)
             && num(&self.p, "rpm").is_some_and(|rpm| rpm > 0. && !manual::on_gear(m, rpm))
@@ -3955,6 +3971,9 @@ pub fn issue_field(issue: &str) -> Option<&'static str> {
     }
     if m.starts_with("chip load ") {
         return Some("feed");
+    }
+    if m.starts_with("force per tooth ") {
+        return Some("tooth_force");
     }
     if m.starts_with("finishing passes ") {
         return Some("finish_passes");

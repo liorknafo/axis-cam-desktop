@@ -2370,7 +2370,8 @@ impl App {
         if let Some((_, job)) = self.tooth_load_job.take() {
             job.cancel();
         }
-        let Some(simulation) = &mut self.simulation else {
+        // A feed held to the load came with it (`tooth_load::hold`).
+        let Some(simulation) = self.simulation.as_mut().filter(|s| s.tooth_load.is_none()) else {
             return Task::none();
         };
         if self.generate_inline {

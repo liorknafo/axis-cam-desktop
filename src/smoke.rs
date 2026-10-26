@@ -5254,10 +5254,74 @@ flood = { pin = 8 }
         }
         eprintln!("{}", a.status);
     }
+    #[test]
+    fn holding_the_force_per_tooth_is_chosen_with_the_feed_and_the_simulation_says_its_feeds() {
+        use crate::tooth_load::FEED_FOLLOWS;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), FAST, &[0, 1]);
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.update(Message::Tab("Tool".into()));
+        let texts = page_texts(&a);
+        let feed = (texts.iter())
+            .position(|t| t == "Cutting feed · mm/min")
+            .unwrap_or_else(|| panic!("{texts:?}"));
+        let choice = (texts.iter())
+            .position(|t| t == "Feed along the path")
+            .unwrap_or_else(|| panic!("{texts:?}"));
+        assert!(choice > feed);
+        lacks(&a, &["Force per tooth to hold · N"]);
+        let _ = a.update(Message::Edit(
+            Target::Operation,
+            "feed_follows",
+            FEED_FOLLOWS[1].into(),
+        ));
+        let texts = page_texts(&a);
+        let field = (texts.iter())
+            .position(|t| t == "Force per tooth to hold · N")
+            .unwrap_or_else(|| panic!("{texts:?}"));
+        // Empty: the nominal cut's, said under it.
+        assert!(
+            texts[field + 1..].iter().any(|t| t
+                .starts_with("Automatic: one tooth's force at the cutting feed")
+                && t.contains("5.0 mm wide")),
+            "{texts:?}"
+        );
+        // A force that is not one is an error at its field.
+        let _ = a.update(Message::Edit(Target::Operation, "tooth_force", "-3".into()));
+        let texts = page_texts(&a);
+        let field = texts
+            .iter()
+            .position(|t| t == "Force per tooth to hold · N")
+            .unwrap();
+        assert_eq!(
+            (texts[field + 1].as_str(), texts[field + 2].as_str()),
+            ("Error", crate::model::TOOTH_FORCE_ISSUE)
+        );
+        let _ = a.update(Message::Edit(Target::Operation, "tooth_force", "".into()));
+        let _ = a.update(Message::Generate);
+        let sim = a.active_simulation().expect("a simulation");
+        let held = sim.held.expect("held");
+        assert!(held.slowest < held.fastest, "{held:?}");
+        // The load along the moves came with the feeds: the path is
+        // coloured at once.
+        assert!(sim.tooth_load.is_some() && a.tooth_load_job.is_none());
+        let said = format!(
+            "Feed {:.0}–{:.0} mm/min to hold {:.0} N per tooth",
+            held.slowest, held.fastest, held.target
+        );
+        shows(&a, &[said.as_str()]);
+    }
     /// Renders the fixture job's Pocket, its path coloured by the force on
     /// one tooth (`tooth_load`), from above and from the front, partway and
     /// done, to $AXIS_RENDER_DIR (/tmp/tooth-load-renders), and says how long
-    /// the load took: for looking at, with --ignored.
+    /// the load took: for looking at, with --ignored. $AXIS_STRATEGY=adaptive
+    /// makes it an Adaptive ($AXIS_STEPDOWN mm deep levels, 12 without; the
+    /// Pocket's 10 without);
+    /// $AXIS_HOLD=1 holds the force on a tooth (`tooth_load::hold`), its
+    /// feeds said. The level pictures are coloured by the load measured
+    /// again along the moves as they are, on the scale of $AXIS_PEAK N (the
+    /// peak without), so a run with and one without compare.
     #[test]
     #[ignore]
     fn render_the_tooth_load() {
@@ -5274,9 +5338,28 @@ flood = { pin = 8 }
                 op.strategy = Strategy::Adaptive;
                 op.p.insert("name".into(), Strategy::Adaptive.name().into());
                 op.p.insert("optimal_load".into(), "1.5".into());
-                op.p.insert("stepdown".into(), "12".into());
+                op.p.insert(
+                    "stepdown".into(),
+                    std::env::var("AXIS_STEPDOWN")
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or("12".into()),
+                );
             }
             op.p.insert("feed".into(), "1200".into());
+            if strategy != "adaptive"
+                && let Some(stepdown) = std::env::var("AXIS_STEPDOWN")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+            {
+                op.p.insert("stepdown".into(), stepdown);
+            }
+            if std::env::var("AXIS_HOLD").is_ok_and(|v| v == "1") {
+                op.p.insert(
+                    "feed_follows".into(),
+                    crate::tooth_load::FEED_FOLLOWS[1].into(),
+                );
+            }
         }
         a.page = Page::Work;
         let _ = a.update(Message::SelectOp(1));
@@ -5290,10 +5373,143 @@ flood = { pin = 8 }
         let quantile = |q: f32| sorted[((sorted.len() - 1) as f32 * q) as usize];
         let timed = std::time::Instant::now();
         let again = crate::tooth_load::of(sim, &a.doc).unwrap();
+        let measured = timed.elapsed().as_secs_f32();
+        // How flat the load measured again is about what was held.
+        let mut engaged: Vec<f32> = again
+            .moves
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|f| *f > 0.)
+            .collect();
+        engaged.sort_by(f32::total_cmp);
+        let at = |q: f32| engaged[((engaged.len() - 1) as f32 * q) as usize];
+        let target = sim.held.map_or(at(0.5), |h| h.target);
+        let near = engaged
+            .iter()
+            .filter(|f| (**f / target - 1.).abs() <= 0.15)
+            .count();
+        let feeds: Vec<f32> = (sim.plan.moves.iter())
+            .filter(|m| m.motion == crate::simulation::Motion::Feed)
+            .map(|m| m.feed)
+            .collect();
+        eprintln!(
+            "held {:?}: {:.1} min, {} feed moves at {:.0}–{:.0} mm/min; measured again: 5% {:.0} N, 25% {:.0}, median {:.0}, 75% {:.0}, 95% {:.0}, peak {:.0}; {:.0}% of {} cutting samples within 15% of {target:.0} N",
+            sim.held,
+            sim.plan.duration / 60.,
+            feeds.len(),
+            feeds.iter().copied().fold(f32::MAX, f32::min),
+            feeds.iter().copied().fold(0., f32::max),
+            at(0.05),
+            at(0.25),
+            at(0.5),
+            at(0.75),
+            at(0.95),
+            again.peak,
+            near as f32 * 100. / engaged.len() as f32,
+            engaged.len()
+        );
+        // Where the load is not near it: on moves down (ramps), at the
+        // least or the most feed, or elsewhere.
+        let mut kinds = std::collections::BTreeMap::<&str, (usize, f32)>::new();
+        let programmed: f32 = 1200.;
+        for ((m, forces), facing) in sim.plan.moves.iter().zip(&again.moves).zip(&again.facing) {
+            for (&f, &facing) in forces.iter().zip(facing) {
+                if f <= 0. || (f / target - 1.).abs() <= 0.15 {
+                    continue;
+                }
+                let kind = if m.to[2] < m.from[2] - 1e-4 {
+                    "down"
+                } else if sim.held.is_some_and(|h| m.feed <= h.slowest) {
+                    "slowest"
+                } else if sim.held.is_some_and(|h| m.feed >= h.fastest) {
+                    "fastest"
+                } else if f < target && m.feed * facing * 1.1 >= 1.5 * programmed {
+                    "under, at the thickest chip"
+                } else if f < target {
+                    "under"
+                } else {
+                    "over"
+                };
+                let e = kinds.entry(kind).or_default();
+                (e.0, e.1) = (e.0 + 1, e.1 + f);
+            }
+        }
+        for (kind, (n, sum)) in &kinds {
+            eprintln!(
+                "  off target, {kind}: {n} samples, mean {:.0} N",
+                sum / *n as f32
+            );
+        }
+        // The most force over each stretch of level cutting a cutter's
+        // radius long: what a feed, which cannot change every sample, holds.
+        let mut stretches: Vec<f32> = vec![];
+        let (mut most, mut length) = (0_f32, 0_f32);
+        for (m, forces) in sim.plan.moves.iter().zip(&again.moves) {
+            let level =
+                m.motion == crate::simulation::Motion::Feed && (m.to[2] - m.from[2]).abs() < 1e-4;
+            if !level {
+                (most, length) = (0., 0.);
+                continue;
+            }
+            let piece = ((0..3).map(|k| (m.to[k] - m.from[k]).powi(2)).sum::<f32>()).sqrt()
+                / forces.len().max(1) as f32;
+            for &f in forces {
+                most = most.max(f);
+                length += piece;
+                if length >= sim.plan.radius {
+                    if most > 0. {
+                        stretches.push(most);
+                    }
+                    (most, length) = (0., 0.);
+                }
+            }
+        }
+        stretches.sort_by(f32::total_cmp);
+        let q = |p: f32| stretches[((stretches.len() - 1) as f32 * p) as usize];
+        eprintln!(
+            "  stretches of level cutting: {} at most 10% 25% 50% 75% 90% {:.0} {:.0} {:.0} {:.0} {:.0} N; {:.0}% within 15% of {target:.0} N",
+            stretches.len(),
+            q(0.1),
+            q(0.25),
+            q(0.5),
+            q(0.75),
+            q(0.9),
+            stretches
+                .iter()
+                .filter(|f| (**f / target - 1.).abs() <= 0.15)
+                .count() as f32
+                * 100.
+                / stretches.len() as f32
+        );
+        // The load the hold worked out along the moves, beside the one
+        // measured again.
+        let derived: Vec<f32> = load
+            .moves
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|f| *f > 0.)
+            .collect();
+        eprintln!(
+            "  as held: {:.0}% of {} cutting samples within 15% of {target:.0} N",
+            derived
+                .iter()
+                .filter(|f| (**f / target - 1.).abs() <= 0.15)
+                .count() as f32
+                * 100.
+                / derived.len() as f32,
+            derived.len()
+        );
+        let peak = std::env::var("AXIS_PEAK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(again.peak);
+        let load = &again;
         eprintln!(
             "generate + load {:.1} s, load alone {:.1} s: {} moves, {samples} samples, peak {:.1} N, median {:.1} N, 90% {:.1} N, in the air {}",
             started.elapsed().as_secs_f32() - timed.elapsed().as_secs_f32(),
-            timed.elapsed().as_secs_f32(),
+            measured,
             sim.plan.moves.len(),
             again.peak,
             quantile(0.5),
@@ -5342,7 +5558,7 @@ flood = { pin = 8 }
             for (i, m) in feeds().filter(|(_, m)| (m.to[2] - z).abs() < 0.01) {
                 let pieces = &load.moves[i];
                 for (k, force) in pieces.iter().enumerate() {
-                    let colour = crate::tooth_load::colour(*force, load.peak);
+                    let colour = crate::tooth_load::colour(*force, peak);
                     for s in 0..=20 {
                         let t = (k as f32 + s as f32 / 20.) / pieces.len() as f32;
                         let x = ((m.from[0] + (m.to[0] - m.from[0]) * t - lo[0]) * scale) as usize;
