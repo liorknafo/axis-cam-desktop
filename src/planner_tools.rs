@@ -106,11 +106,17 @@ pub fn crashed(name: &str) -> Answer {
 /// pictures.
 #[cfg(test)]
 pub fn offered(pictures: bool) -> Vec<Tool> {
-    offered_with(pictures, false)
+    offered_for(pictures, proposal::schema())
 }
 /// `offered`, with `edit` (the planner changes the current plan) drafts for
 /// `check_plan` in `proposal::schema_for(true)`, with their `from`.
+#[cfg(test)]
 pub fn offered_with(pictures: bool, edit: bool) -> Vec<Tool> {
+    offered_for(pictures, proposal::schema_for(edit))
+}
+/// `offered`, with `check_plan` taking a draft in `schema` (the proposal
+/// schema of the machine and the run, `proposal::schema_with`).
+pub fn offered_for(pictures: bool, schema: serde_json::Value) -> Vec<Tool> {
     let mut tools = vec![];
     if pictures {
         tools.push(look::tool());
@@ -120,7 +126,7 @@ pub fn offered_with(pictures: bool, edit: bool) -> Vec<Tool> {
         description: format!("Checks a draft proposal as an answer is checked, which takes some seconds, and answers with the same check report: `passed`, the `problems` by setup and operation, `operations` with their minutes, `coverage`, `total_minutes`, and `stocks`, the stock before each setup. The draft becomes the latest for `stock_after`, `check_holding` and the operation views. At most {MAX_CHECKS_PER_REQUEST} per request and {MAX_CHECKS_PER_RUN} in the run."),
         parameters: json!({
             "type": "object",
-            "properties": {"proposal": proposal::schema_for(edit)},
+            "properties": {"proposal": schema},
             "required": ["proposal"],
             "additionalProperties": false
         }),
@@ -1993,5 +1999,81 @@ mod tests {
         assert!(all.contains("Vise 1 for setup 1: "), "{all}");
         assert!(all.contains("\"holds\":true") && all.contains("\"holds\":false"));
         assert!(!all.contains("ZZ-SECRET"), "{all}");
+    }
+    /// The square-bar scenario's scene (a rotary machine) for `check_plan`.
+    fn rotary_state() -> ToolState {
+        let (doc, mesh, report) = crate::fake_openai::rotary::report();
+        ToolState::new(look::Scene {
+            doc: Arc::new(doc),
+            mesh: Arc::new(mesh),
+            report: Arc::new(report),
+            job: None,
+        })
+    }
+    /// What `check_plan` says of `draft`: its problems, one line each, and
+    /// whether it passed.
+    fn drafted(draft: &crate::proposal::Proposal, state: &mut ToolState) -> (bool, Vec<String>) {
+        let a = call("check_plan", json!({"proposal": as_json(draft)}), state);
+        let report = json_of(&a);
+        let lines = report["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                format!(
+                    "{}/{}: {}",
+                    p["stage"].as_str().unwrap(),
+                    p["setup"],
+                    p["message"].as_str().unwrap()
+                )
+            })
+            .collect();
+        (report["passed"].as_bool().unwrap(), lines)
+    }
+    #[test]
+    fn check_plan_refuses_a_stock_too_big_for_z_and_a_tailstock_that_cannot_reach_with_the_checks_messages()
+     {
+        use crate::fake_openai::rotary;
+        let mut s = rotary_state();
+        // The chuck and the four angles pass, and the draft is the latest.
+        // Its four sides are faced whole (LIO-214), joined to the bar at a
+        // shoulder, so that the part-off and web checks pass: the stock still
+        // covers only the part's end face in the jaws.
+        let a = call(
+            "check_plan",
+            json!({"proposal": as_json(&rotary::good())}),
+            &mut s,
+        );
+        let report = json_of(&a);
+        assert_eq!(report["passed"], true, "{report}");
+        assert!(s.checked.is_some());
+        let covered: Vec<&str> = (report["coverage"]["covered_planes"].as_array().unwrap())
+            .iter()
+            .map(|p| p["orientation"].as_str().unwrap())
+            .collect();
+        assert_eq!(covered, ["-X"], "{report}");
+        // The Z reach of the rotary check: the retract over what A swings is
+        // above the Z travel.
+        let (passed, problems) = drafted(&rotary::too_big(), &mut s);
+        assert!(!passed);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].starts_with("generation/2: Index moves turn A with the tool above all that A swings under it: at machine Z 1.11 with the tool over X")
+                && problems[0].contains("(the A centreline at Z -45 + 31.11 mm, as far as the stock reaches from it at any angle, + 15 mm clearance)")
+                && problems[0].contains("above the top of the machine's 100 mm Z travel (Z 0)"),
+            "{problems:?}"
+        );
+        // The tailstock a chuck's stock cannot reach: the chuck's own message.
+        let mut far = rotary::good();
+        far.chuck.as_mut().unwrap().tailstock = "Supports the stock".into();
+        let (passed, problems) = drafted(&far, &mut s);
+        assert!(!passed);
+        assert!(
+            problems.iter().any(|p| p
+                .starts_with("workholding/1: The chuck: The tailstock centre reaches 30 mm out")),
+            "{problems:?}"
+        );
+        // A draft the plan cannot be built from has no latest draft.
+        assert!(s.checked.is_none());
     }
 }

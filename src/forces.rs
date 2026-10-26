@@ -57,6 +57,10 @@ pub const KC: [(&str, f32, f32); 7] = [
 pub const THREAD_MILLING_DIRECTION: &str = "Climb · thread milling";
 /// The milling direction a Tapping plan carries (`cam::tap`).
 pub const TAPPING_DIRECTION: &str = "Tapping · by hand";
+/// The milling direction a Reaming plan carries (`cam::boring::ream`).
+pub const REAMING_DIRECTION: &str = "Reaming · axial feed";
+/// The milling direction a Boring plan carries (`cam::boring::bore`).
+pub const BORING_DIRECTION: &str = "Boring · axial feed";
 
 /// What an operation cuts over a stretch of its path (`bites`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -92,7 +96,7 @@ pub struct Bite {
 /// ponytail: a replay more than the simulation makes; keep what
 /// `Simulation::seek` removes per move if that time ever shows.
 pub fn bites(sim: &Simulation) -> Vec<Bite> {
-    let (Some(mut volume), Some(frame)) = (sim.initial_volume.clone(), sim.frame) else {
+    let (Some(mut volume), Some(_)) = (sim.initial_volume.clone(), sim.frame) else {
         return vec![];
     };
     if sim.plan.strategy == crate::model::Strategy::Drill
@@ -102,10 +106,16 @@ pub fn bites(sim: &Simulation) -> Vec<Bite> {
     }
     // Threading takes a thread's depth, a fraction of a millimetre, round
     // the hole: its sweep is the thread's outline, not what it cuts, and a
-    // tap is turned by hand. Neither is modelled.
+    // tap is turned by hand. Neither is modelled. Nor are a reamer's and a
+    // boring head's few tenths round a hole: their push is along it.
     if sim.plan.strategy == crate::model::Strategy::Drill
-        && (sim.plan.milling_direction == THREAD_MILLING_DIRECTION
-            || sim.plan.milling_direction == TAPPING_DIRECTION)
+        && [
+            THREAD_MILLING_DIRECTION,
+            TAPPING_DIRECTION,
+            REAMING_DIRECTION,
+            BORING_DIRECTION,
+        ]
+        .contains(&sim.plan.milling_direction)
     {
         return vec![];
     }
@@ -119,7 +129,8 @@ pub fn bites(sim: &Simulation) -> Vec<Bite> {
     // some. Half a voxel reaches the original stock faces, which lie half a
     // voxel above the centres, but not a floor or a wall an earlier cut
     // left, which can lie a whole voxel past the last centre it kept.
-    let touches = |from: [f32; 3], to: [f32; 3], volume: &Volume| {
+    // Each move cuts in its A angle's frame (`Simulation::frame_of`).
+    let touches = |from: [f32; 3], to: [f32; 3], volume: &Volume, frame| {
         let lower = |p: [f32; 3]| [p[0], p[1], p[2] - thick];
         volume.touches(
             lower(from),
@@ -143,6 +154,9 @@ pub fn bites(sim: &Simulation) -> Vec<Bite> {
             .map(|k| (m.to[k] - m.from[k]).powi(2))
             .sum::<f32>()
             .sqrt();
+        let Some(frame) = sim.frame_of(m) else {
+            continue;
+        };
         let pieces = (length / reach).ceil().max(1.);
         let at = |t: f32| std::array::from_fn(|k| m.from[k] + (m.to[k] - m.from[k]) * t);
         for i in 0..pieces as usize {
@@ -163,7 +177,7 @@ pub fn bites(sim: &Simulation) -> Vec<Bite> {
             run.2 += length / pieces / m.feed;
             run.3 = run.3.min(from[2]).min(to[2]);
             if run.0 == 0 && !run.4 {
-                run.4 = touches(from, to, &volume);
+                run.4 = touches(from, to, &volume, frame);
             }
             if run.1 >= 0.999 * reach {
                 runs.push(std::mem::replace(&mut run, fresh));
@@ -201,14 +215,44 @@ pub struct Push {
     pub up: f32,
     pub z: f32,
 }
-/// kc1.1 and mc of `material`'s group (`KC`), "Other"'s without one.
-fn kc(material: Option<&Material>) -> (f32, f32) {
+/// The Brinell hardness each group's `KC` is rounded for: the starters
+/// 6061-T6, 1018, 304, and the soft end of the copper alloys (CuSn12's
+/// 80 HBW minimum). Groups not listed (plastic, wood, "Other") are not
+/// scaled by hardness.
+pub const KC_HARDNESS: [(&str, f32); 4] = [
+    ("Aluminium", 95.),
+    ("Steel", 126.),
+    ("Stainless steel", 201.),
+    ("Brass and copper", 80.),
+];
+/// How kc rises with hardness: kc ∝ HB^0.4, an assumed, rounded rule: the
+/// force to shear a chip follows the material's strength, which follows its
+/// hardness, but less than in proportion (1045 at 190 HB gets 1.18 times
+/// 1018's kc). Not from a table; a library entry's hardness is a number to
+/// type in.
+pub const KC_HARDNESS_EXPONENT: f32 = 0.4;
+/// The most a hardness raises kc: a hardness typed far past the group's
+/// (a hardened steel's 600 HB) does not run the force away.
+pub const KC_HARDNESS_MOST: f32 = 1.5;
+/// kc1.1 and mc of `material`'s group (`KC`), "Other"'s without one. When the
+/// material's hardness is in HB and above its group's (`KC_HARDNESS`), kc1.1
+/// is raised with it (`KC_HARDNESS_EXPONENT`, at most `KC_HARDNESS_MOST`
+/// times): a softer alloy keeps the group's, which errs towards holding.
+pub(crate) fn kc(material: Option<&Material>) -> (f32, f32) {
     let group = material.map_or("Other", |m| get(&m.p, "group"));
     let (_, kc, mc) = KC
         .iter()
         .find(|row| row.0 == group)
         .unwrap_or(&KC[KC.len() - 1]);
-    (*kc, *mc)
+    let harder = material
+        .and_then(Material::brinell)
+        .zip(KC_HARDNESS.iter().find(|row| row.0 == group))
+        .map_or(1., |(hb, (_, reference))| {
+            (hb / reference)
+                .powf(KC_HARDNESS_EXPONENT)
+                .clamp(1., KC_HARDNESS_MOST)
+        });
+    (*kc * harder, *mc)
 }
 /// The pushes of `bites` taken by a Ø`diameter` tool with `flutes` at `rpm`
 /// in `material` (None when the project has none) on `machine`. Each bite's
@@ -299,6 +343,9 @@ pub struct Margin {
     /// A vise's contact with the stock: its height and its length along the
     /// jaws, mm (the least of the two jaws').
     pub contact: Option<[f32; 2]>,
+    /// The round holding that holds the bar (`round_hold::grip`), None for a
+    /// vise or clamps.
+    pub round: Option<crate::round_hold::Kind>,
 }
 /// What a vise or clamps resist.
 enum Hold {
@@ -318,6 +365,8 @@ enum Hold {
         at: Vec<[f32; 2]>,
         stock: Bounds,
     },
+    /// A V-block, soft jaws or a collet block on a round bar.
+    Round(crate::round_hold::Kind, crate::round_hold::Grip),
 }
 /// What `layout`, with `holder`, resists on `held` given what earlier
 /// setups `removed` (None for setup 1). A vise's jaws touch the stock where
@@ -346,6 +395,10 @@ fn hold(
     match layout {
         // A chuck's hold against the cutting forces is not modelled.
         Layout::None | Layout::Chuck { .. } => None,
+        Layout::Round(round) => Some(Hold::Round(
+            round.kind,
+            crate::round_hold::grip(round, holder, held.stock),
+        )),
         Layout::Vise { axis_y, grip, .. } => {
             let (across, along) = if *axis_y { (1, 0) } else { (0, 1) };
             let (band, stock) = (held.band, held.stock);
@@ -431,7 +484,11 @@ pub fn check(
     let hold = hold(layout, holder, held, removed)?;
     let contact = match &hold {
         Hold::Vise { contact, .. } => Some(*contact),
-        Hold::Clamps { .. } => None,
+        _ => None,
+    };
+    let round = match &hold {
+        Hold::Round(kind, _) => Some(*kind),
+        _ => None,
     };
     let mut least: Option<Margin> = None;
     for &push in pushes {
@@ -448,6 +505,26 @@ pub fn check(
                     (*friction, push.side.hypot(push.up), Way::Slip, 0.),
                     (*couple, push.side * lever, Way::Tip(None), lever),
                 ]
+            }
+            // The round-contact model (`round_hold::grip`): the contacts'
+            // friction against the push, less what a push up lifts off a
+            // V-block's clamp; the clamp against the push up; a standing
+            // bar's grip against a turn out of it.
+            Hold::Round(_, grip) => {
+                let mut tries = vec![];
+                match grip.down {
+                    Some(down) => {
+                        let left = (down - push.up).max(0.) / down;
+                        tries.push((grip.friction * left, push.side, Way::Slip, 0.));
+                        tries.push((down, push.up, Way::Lift, 0.));
+                    }
+                    None => tries.push((grip.friction, push.side.hypot(push.up), Way::Slip, 0.)),
+                }
+                if let Some((couple, top)) = grip.couple {
+                    let lever = (push.z - top).max(0.);
+                    tries.push((couple, push.side * lever, Way::Tip(None), lever));
+                }
+                tries
             }
             Hold::Clamps { force, at, stock } => {
                 let down = force * at.len() as f32;
@@ -494,6 +571,7 @@ pub fn check(
                     lever,
                     resisted,
                     contact,
+                    round,
                 });
             }
         }
@@ -544,11 +622,12 @@ pub fn margins<'a>(
         })
         .collect()
 }
-/// A margin as said: ×1.4, ×2, ×12. Rounded down, so that one under
+/// A margin as said: ×0.05, ×1.4, ×2, ×12. Rounded down, so that one under
 /// `SAFETY` never reads as it.
-fn times(factor: f32) -> String {
+pub(crate) fn times(factor: f32) -> String {
     let tenths = match factor {
         f if f >= 10. => f.floor(),
+        f if f < 0.1 => (f * 100.).floor() / 100.,
         f => (f * 10.).floor() / 10.,
     };
     format!("×{tenths}")
@@ -559,6 +638,8 @@ pub fn line(name: &str, margin: Option<&Margin>) -> String {
         return format!("{name}: no cutting force sideways or up to hold against.");
     };
     let way = match m.way {
+        Way::Slip if m.round == Some(crate::round_hold::Kind::VBlock) => "sliding in the V-block",
+        Way::Slip if m.round.is_some() => "sliding, turning or lifting in its grip",
         Way::Slip if m.contact.is_some() => "sliding or lifting in the jaws",
         Way::Slip => "sliding",
         Way::Lift => "lifting",
@@ -584,6 +665,9 @@ pub fn issue(name: &str, m: &Margin) -> Option<String> {
     let lighter = "take a smaller stepdown or stepover or a lower feed";
     let (side, up) = (m.push.side.round(), m.push.up.round());
     let lever = m.lever.round();
+    if let Some(kind) = m.round {
+        return Some(round_issue(name, m, kind, &short, lighter));
+    }
     Some(match (m.way, m.contact) {
         (Way::Slip, Some(_)) => format!(
             "{name}: the cut could move the stock in the vise: about {side} N against the jaws' {} N of friction ({short}). Set the vise's clamping force in the library if it clamps harder, {lighter}, or choose another holder.",
@@ -612,6 +696,292 @@ pub fn issue(name: &str, m: &Margin) -> Option<String> {
             )
         }
     })
+}
+/// `issue` of a bar held in a V-block, soft jaws or a collet (`kind`).
+fn round_issue(
+    name: &str,
+    m: &Margin,
+    kind: crate::round_hold::Kind,
+    short: &str,
+    lighter: &str,
+) -> String {
+    use crate::round_hold::Kind;
+    let (side, up) = (m.push.side.round(), m.push.up.round());
+    let resisted = m.resisted.round();
+    let (contact, harder) = match kind {
+        Kind::VBlock => (
+            "the V's two line contacts and the clamp",
+            "Set the V-block clamp's force in the library if it clamps harder",
+        ),
+        Kind::SoftJaws => (
+            "the jaws' arc contact round the bar",
+            "Set the soft jaws' clamping force in the library if the vise clamps harder",
+        ),
+        Kind::Collet => (
+            "the collet's grip all round the bar",
+            "Stand the bar deeper in the collet, set the collet's grip force in the library if it grips harder",
+        ),
+    };
+    match m.way {
+        Way::Lift => format!(
+            "{name}: the cut could lift the bar out of the V-block: about {up} N up against its clamp's {resisted} N ({short}). {harder}, {lighter}, or choose another holder."
+        ),
+        Way::Tip(_) => format!(
+            "{name}: the cut could tip the bar out of the {}: about {side} N, {} mm above the top of its grip ({short}). Grip deeper, {lighter}, or choose another holder.",
+            kind.words(),
+            m.lever.round()
+        ),
+        _ => format!(
+            "{name}: the cut could move the bar in the {}: about {} N against {resisted} N of friction from {contact} ({short}). {harder}, {lighter}, or choose another holder.",
+            kind.words(),
+            if m.round == Some(Kind::VBlock) {
+                side
+            } else {
+                m.push.side.hypot(m.push.up).round()
+            }
+        ),
+    }
+}
+/// A chuck's clamping force when nothing gives it, N: all its jaws together,
+/// a 100 mm 3-jaw chuck tightened by hand with its key, on the low side.
+pub const CHUCK_FORCE: f32 = 6000.;
+/// The most the stock may bend at its end under a cut, mm, before it chatters
+/// or the cut comes out of size.
+pub const DEFLECTION: f32 = 0.05;
+/// Young's modulus by material group, N/mm². "Other", and a job without a
+/// material, take aluminium's, the least of the metals: the bar bends no
+/// less than this says.
+pub const STIFFNESS: [(&str, f32); 7] = [
+    ("Aluminium", 69_000.),
+    ("Steel", 200_000.),
+    ("Stainless steel", 193_000.),
+    ("Brass and copper", 100_000.),
+    ("Plastic", 2_000.),
+    ("Wood and composite", 8_000.),
+    ("Other", 69_000.),
+];
+/// Yield strength by material group, N/mm², on the low side of the grades
+/// these machines cut (6060 aluminium, S235 steel, annealed 304 stainless,
+/// copper, nylon, softwood across the grain): what a web left between the
+/// chuck and the part takes before it bends for good (`rotary_check`'s
+/// part-off check). "Other", and a job without a material, take copper's,
+/// the least of the metals.
+pub const STRENGTH: [(&str, f32); 7] = [
+    ("Aluminium", 110.),
+    ("Steel", 235.),
+    ("Stainless steel", 205.),
+    ("Brass and copper", 70.),
+    ("Plastic", 40.),
+    ("Wood and composite", 20.),
+    ("Other", 70.),
+];
+/// The material group of `material` (None when the project has none) and
+/// its `STRENGTH`.
+pub fn strength(material: Option<&Material>) -> (&str, f32) {
+    let group = material.map_or("Other", |m| get(&m.p, "group"));
+    let row = STRENGTH
+        .iter()
+        .find(|row| row.0 == group)
+        .unwrap_or(&STRENGTH[STRENGTH.len() - 1]);
+    (row.0, row.1)
+}
+/// How a chuck could give way.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Give {
+    /// Turn in the jaws, about A.
+    Turn,
+    /// Slide out of the jaws along A.
+    Slide,
+}
+/// An operation's least margin in a chuck (`chuck_check`): what the jaws'
+/// friction resists over what the cut applies, the way the stock would give,
+/// the push, and how far its free end bends.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChuckMargin {
+    pub factor: f32,
+    pub give: Give,
+    pub push: Push,
+    /// What resists: N·mm against a turn, N against a slide.
+    pub resisted: f32,
+    /// What the cut applies, the same way.
+    pub applied: f32,
+    /// How far the stock's end bends under the largest push, mm.
+    pub bend: f32,
+    /// The length that bends, mm: from the jaws' front to the stock's end.
+    pub free: f32,
+    /// Whether the tailstock supports the end.
+    pub supported: bool,
+}
+/// What the chuck of `rig` resists of `pushes` in `material` (None when the
+/// project has none). The jaws grip with `CHUCK_FORCE`: their friction on
+/// the stock where they close on it resists a turn about A, at the radius
+/// they close at, and a slide along it. A push acts at its height above the
+/// axis sideways and, upward, as far out as the stock reaches (the most it
+/// can turn it). The free length out of the jaws bends as a cantilever under
+/// the largest push at its end (P L³ / 3 E I), or, with the tailstock in
+/// its end, as a beam held in the jaws and resting on the centre (at most
+/// P L³ / 102 E I), the whole uncut stock's section taken: what earlier cuts
+/// thin it bends more. None without pushes.
+pub fn chuck_check(
+    rig: &crate::chuck::Rig,
+    material: Option<&Material>,
+    pushes: &[Push],
+) -> Option<ChuckMargin> {
+    let force = CHUCK_FORCE;
+    let turn = FRICTION * force * rig.inner;
+    let slide = FRICTION * force;
+    let group = material.map_or("Other", |m| get(&m.p, "group"));
+    let e = STIFFNESS
+        .iter()
+        .find(|row| row.0 == group)
+        .unwrap_or(&STIFFNESS[STIFFNESS.len() - 1])
+        .1;
+    let [_, dy, dz] = rig.stock.dimensions();
+    let i = if rig.round {
+        PI * (2. * rig.inner).powi(4) / 64.
+    } else {
+        dy.max(dz) * dy.min(dz).powi(3) / 12.
+    };
+    let free = (rig.stock.max[0] - rig.front).max(0.);
+    let supported = matches!(rig.tail, crate::chuck::Tail::Supports(_));
+    let beam = if supported { 102. } else { 3. };
+    let mut least: Option<ChuckMargin> = None;
+    let mut bend: f32 = 0.;
+    for &push in pushes {
+        bend = bend.max(push.side.hypot(push.up) * free.powi(3) / (beam * e * i));
+        let lever = (push.z - rig.axis[1]).abs();
+        for (resisted, applied, give) in [
+            (turn, push.side * lever + push.up * rig.outer, Give::Turn),
+            (slide, push.side, Give::Slide),
+        ] {
+            let factor = if applied > 0. {
+                resisted / applied
+            } else {
+                f32::INFINITY
+            };
+            if least.is_none_or(|m| factor < m.factor) {
+                least = Some(ChuckMargin {
+                    factor,
+                    give,
+                    push,
+                    resisted,
+                    applied,
+                    bend: 0.,
+                    free,
+                    supported,
+                });
+            }
+        }
+    }
+    least.map(|m| ChuckMargin { bend, ..m })
+}
+/// The chuck margin of each operation of setup `si` of `doc` whose `bites`
+/// are given (`chuck_check`), as `margins` gives a vise's.
+pub fn chuck_margins<'a>(
+    doc: &Document,
+    si: usize,
+    bites: impl IntoIterator<Item = (usize, &'a [Bite])>,
+    rig: &crate::chuck::Rig,
+) -> Vec<(usize, Option<ChuckMargin>)> {
+    let Some(setup) = doc.setups.get(si) else {
+        return vec![];
+    };
+    bites
+        .into_iter()
+        .map(|(oi, bites)| {
+            let margin = setup.operations.get(oi).and_then(|op| {
+                let pushes = op_pushes(doc, setup, op, bites)?;
+                chuck_check(rig, doc.selected_material(), &pushes)
+            });
+            (oi, margin)
+        })
+        .collect()
+}
+/// The `pushes` of operation `op` of `setup` over its `bites`, with its
+/// tool's diameter and flutes, its rpm and the project's material: None when
+/// one of those is not given.
+pub fn op_pushes(
+    doc: &Document,
+    setup: &crate::model::Setup,
+    op: &crate::model::Operation,
+    bites: &[Bite],
+) -> Option<Vec<Push>> {
+    let positive = |p, key| num(p, key).filter(|v| *v > 0.);
+    let tool = doc.tools.iter().find(|t| t.id == op.tool)?;
+    Some(pushes(
+        bites,
+        positive(&tool.p, "diameter")?,
+        positive(&tool.p, "flutes")?,
+        positive(&op.p, "rpm")?,
+        doc.selected_material(),
+        &setup.machine,
+    ))
+}
+/// What the setup's holding section says of operation `name`'s chuck
+/// `margin`.
+pub fn chuck_line(name: &str, margin: Option<&ChuckMargin>) -> String {
+    let Some(m) = margin else {
+        return format!("{name}: no cutting force sideways or up to hold against.");
+    };
+    let way = match m.give {
+        Give::Turn => "turning in the jaws",
+        Give::Slide => "sliding out of the jaws",
+    };
+    let bend = format!(
+        "its end bends {:.3} mm{}",
+        m.bend,
+        if m.supported { " on the tailstock" } else { "" }
+    );
+    if m.factor >= SAFETY {
+        format!("{name}: holds {} against {way}; {bend}.", times(m.factor))
+    } else {
+        format!(
+            "{name}: only {} against {way}; {} is wanted; {bend}.",
+            times(m.factor),
+            times(SAFETY)
+        )
+    }
+}
+/// The issues of operation `name`'s chuck `margin`: a margin under `SAFETY`,
+/// and an end that bends more than `DEFLECTION`.
+pub fn chuck_issues(name: &str, m: &ChuckMargin) -> Vec<String> {
+    let mut e = vec![];
+    let lighter = "take a smaller stepdown or stepover or a lower feed";
+    if m.factor < SAFETY {
+        let short = format!("{}, under the {} wanted", times(m.factor), times(SAFETY));
+        e.push(match m.give {
+            Give::Turn => format!(
+                "{name}: the cut could turn the stock in the chuck: about {} N·mm about A against the jaws' {} N·mm of friction ({short}). Grip a wider part of the stock, {lighter}.",
+                m.applied.round(),
+                m.resisted.round()
+            ),
+            Give::Slide => format!(
+                "{name}: the cut could pull the stock out of the chuck: about {} N along A against the jaws' {} N of friction ({short}). {}, or {lighter}.",
+                m.applied.round(),
+                m.resisted.round(),
+                if m.supported {
+                    "Grip more of the stock"
+                } else {
+                    "Support its end with the tailstock"
+                }
+            ),
+        });
+    }
+    if m.bend > DEFLECTION {
+        e.push(format!(
+            "{name}: the stock's end, {:.0} mm out of the jaws, could bend {:.2} mm under the cut's {} N; at most {} mm is wanted. {}, or {lighter}.",
+            m.free,
+            m.bend,
+            m.push.side.hypot(m.push.up).round(),
+            DEFLECTION,
+            if m.supported {
+                "Shorten the stick-out"
+            } else {
+                "Support the end with the tailstock, shorten the stick-out"
+            }
+        ));
+    }
+    e
 }
 #[cfg(test)]
 mod tests {
@@ -726,6 +1096,80 @@ mod tests {
             let push = pushes(&full, 10., 3., 8000., material, &machine)[0];
             assert!((push.side - 191.).abs() < 1., "{push:?}");
         }
+    }
+    #[test]
+    fn a_harder_material_pushes_harder_and_a_softer_one_keeps_its_groups_force() {
+        let named = |name: &str| {
+            crate::material::starters()
+                .into_iter()
+                .find(|m| m.name() == name)
+                .unwrap()
+        };
+        let mild = named("Mild steel 1018");
+        let c45 = named("Steel 1045 (C45) normalised");
+        let silver = named("Silver steel 1.2210 annealed");
+        let bronze = named("Bronze CuSn12");
+        let brass = named("Brass C360");
+        let bite = [Bite {
+            rate: 400.,
+            feed: 600.,
+            z: 38.,
+        }];
+        let mut machine = Machine::new(3);
+        machine.p.insert("power".into(), "5000".into());
+        let side = |m: &Material| pushes(&bite, 10., 3., 8000., Some(m), &machine)[0].side;
+        let kc1 = |m: &Material| kc(Some(m)).0;
+        // 1018 (126 HB) is the group's own; 1045 (190 HB) and silver steel
+        // (220 HB) are raised by (HB / 126)^0.4: ×1.18 and ×1.25.
+        assert_eq!(kc1(&mild), 1700.);
+        assert!((kc1(&c45) / 1700. - 1.18).abs() < 0.005, "{}", kc1(&c45));
+        assert!(
+            (kc1(&silver) / 1700. - 1.25).abs() < 0.005,
+            "{}",
+            kc1(&silver)
+        );
+        assert!(side(&silver) > side(&c45) && side(&c45) > side(&mild));
+        // The push follows kc: the same bite pushes 1045 18 % harder.
+        assert!((side(&c45) / side(&mild) - 1.18).abs() < 0.01);
+        // Bronze at 95 HB against copper alloys' 80 HB: ×1.07, where brass,
+        // whose hardness is not in HB, keeps the group's.
+        assert_eq!(kc1(&brass), 700.);
+        assert!(
+            (kc1(&bronze) / 700. - 1.07).abs() < 0.005,
+            "{}",
+            kc1(&bronze)
+        );
+        // A softer material keeps its group's kc, a hardness typed in far
+        // past it stops at ×1.5, and one that is no number of HB counts as
+        // the group's.
+        let mut soft = mild.clone();
+        soft.p.insert("hardness".into(), "60 HB".into());
+        assert_eq!(kc1(&soft), 1700.);
+        soft.p.insert("hardness".into(), "900 HB".into());
+        assert_eq!(kc1(&soft), 1700. * 1.5);
+        soft.p.insert("hardness".into(), "60 HRC".into());
+        assert_eq!(kc1(&soft), 1700.);
+        // Plastic has no reference hardness: never scaled.
+        let mut plastic = crate::material::Material::new("Nylon");
+        plastic.p.insert("group".into(), "Plastic".into());
+        plastic.p.insert("hardness".into(), "400 HB".into());
+        assert_eq!(kc1(&plastic), 60.);
+    }
+    #[test]
+    fn a_stepdown_in_a_harder_material_is_shallower_for_the_same_power() {
+        let mut machine = Machine::new(3);
+        machine.p.insert("power".into(), "800".into());
+        let named = |name: &str| {
+            crate::material::starters()
+                .into_iter()
+                .find(|m| m.name() == name)
+                .unwrap()
+        };
+        let at = |m: &Material| power_stepdown(&machine, Some(m), 25., 17.5, 120., 640., 3.);
+        assert!(
+            at(&named("Silver steel 1.2210 annealed")) < at(&named("Steel 1045 (C45) normalised"))
+                && at(&named("Steel 1045 (C45) normalised")) < at(&named("Mild steel 1018"))
+        );
     }
     #[test]
     fn a_skim_thinner_than_a_voxel_still_pushes_and_a_shallow_grip_refuses_it() {

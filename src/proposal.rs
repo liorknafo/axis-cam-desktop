@@ -4,24 +4,54 @@
 use crate::{
     analysis::{self, OrientationReport, PartReport, PlaneReport},
     mesh::Mesh,
-    model::{CLEARANCE, Document, Operation, Setup, Strategy, Tool, get, num},
+    model::{CLEARANCE, Document, Operation, Setup, Strategy, Tool, get, num, pocket_setting},
     surface::Selection,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub use crate::post::ORIGINS;
-const STRATEGIES: [(&str, Strategy); 6] = [
+const STRATEGIES: [(&str, Strategy); 8] = [
     ("Face", Strategy::Face),
     ("Pocket", Strategy::Pocket),
     ("Contour", Strategy::Contour),
     ("Drill", Strategy::Drill),
     ("Parallel", Strategy::Parallel),
     ("Waterline", Strategy::Waterline),
+    ("Groove", Strategy::Groove),
+    ("Chamfer", Strategy::Chamfer),
 ];
+/// A Chamfer's `chamfer.source`, `edges`, `side` and `size` choices, as
+/// `chamfer::SOURCES`, `EDGES`, `SIDES` and `SIZES` name them.
+const CHAMFER_SOURCES: [&str; 2] = ["edges", "line"];
+const CHAMFER_EDGES: [&str; 3] = ["all", "outer", "holes"];
+const CHAMFER_SIDES: [&str; 3] = ["left", "right", "alternate"];
 const COOLANTS: [&str; 4] = ["Flood", "Mist", "Air", "Off"];
-const CYCLES: [&str; 7] = crate::model::DRILL_CYCLES;
+const CYCLES: [&str; 9] = crate::model::DRILL_CYCLES;
 const ENTRIES: [&str; 2] = ["Profile ramp", "Plunge"];
+/// A Contour's modes: round the outline, a floor's walls, or inside every
+/// hole through the outline (a flat part's cut-outs).
+const CONTOUR_MODES: [&str; 3] = ["outside", "inside_floor", "inside_holes"];
+/// The stock of a chuck proposal: a round bar, or the user's own box.
+const STOCKS: [&str; 2] = ["Round bar", "Box"];
+/// The work zeros a proposal may name: the stock box's and the part's
+/// (`ORIGINS`), and those on a round bar lying along X
+/// (`round_hold::ORIGINS`), which only such a bar takes.
+/// The setup's `holding` choice that takes a library entry of `kind`:
+/// "Clamps" for a "Clamp", the kind's own name otherwise.
+fn holding_of(kind: &str) -> &str {
+    if kind == "Clamp" { "Clamps" } else { kind }
+}
+fn work_zeros() -> Vec<&'static str> {
+    ORIGINS
+        .iter()
+        .chain(&crate::round_hold::ORIGINS)
+        .copied()
+        .collect()
+}
+/// The stock left beyond the part at the free end of a chuck proposal's
+/// stock when it names none, mm.
+pub const FREE_END: f32 = 2.;
 const MAX_SETUPS: usize = 6;
 pub const MAX_SETUP_OPERATIONS: usize = 12;
 pub const MAX_OPERATIONS: usize = 40;
@@ -42,10 +72,38 @@ pub fn clearance_cap(report: &PartReport) -> f32 {
 #[serde(deny_unknown_fields)]
 pub struct Proposal {
     pub summary: String,
+    /// How setup 1's stock is held in the chuck on the rotary A axis; None
+    /// keeps the user's own workholding. Only on a machine with the axis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chuck: Option<ProposedChuck>,
     pub setups: Vec<ProposedSetup>,
     pub unmachined: Vec<Unmachined>,
     pub warnings: Vec<String>,
 }
+/// Setup 1's stock in a chuck, as the setup's Stock and Modelled workholding
+/// fields have it: a bar along X centred on the A axis, the part placed on
+/// that axis in the stick-out.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposedChuck {
+    /// "Round bar" (`diameter`) or "Box" (`width` across Y and `height` in Z
+    /// in setup 1's axes), `length` long along X in both.
+    pub stock: String,
+    pub length: f32,
+    pub diameter: Option<f32>,
+    pub width: Option<f32>,
+    pub height: Option<f32>,
+    /// `chuck::JAWS`.
+    pub jaws: String,
+    /// How far the stock reaches out of the jaws, mm.
+    pub stickout: f32,
+    /// `chuck::TAILSTOCK`.
+    pub tailstock: String,
+    /// The stock left beyond the part at the free (+X) end, mm; null is
+    /// `FREE_END`.
+    pub free_end: Option<f32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProposedSetup {
@@ -56,6 +114,11 @@ pub struct ProposedSetup {
     /// The `number` of the `workholding_library` entry that holds this setup,
     /// or None: setup 1's own, which for a later setup is setup 1's.
     pub holder: Option<usize>,
+    /// The A angles, degrees, this setup indexes to in setup 1's chuck
+    /// instead of re-clamping the stock (every operation runs at each); None
+    /// for a setup that is clamped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a_angles: Option<Vec<f32>>,
     pub operations: Vec<ProposedOp>,
     /// When the planner changes a plan: the number of the current setup this
     /// one keeps (see [`describe`]), None for a new setup.
@@ -89,12 +152,77 @@ pub struct ProposedOp {
     pub breakthrough: Option<f32>,
     pub hole_diameter: Option<f32>,
     pub through: Option<bool>,
+    /// An outside Contour's holding tabs; None for none. A proposal written
+    /// before tabs has none.
+    #[serde(default)]
+    pub tabs: Option<ProposedTabs>,
+    /// A Groove's diameter and width, mm, where it lies (`groove::GROOVE_FROM`)
+    /// and its land (or depth) from there, mm, and whether it takes a
+    /// spring pass. Null for other strategies.
+    #[serde(default)]
+    pub groove_diameter: Option<f32>,
+    #[serde(default)]
+    pub groove_width: Option<f32>,
+    #[serde(default)]
+    pub groove_from: Option<String>,
+    #[serde(default)]
+    pub groove_land: Option<f32>,
+    #[serde(default)]
+    pub spring_pass: Option<bool>,
+    /// A Chamfer's settings (`chamfer`); null for every other strategy. A
+    /// proposal saved before Chamfer had none.
+    #[serde(default)]
+    pub chamfer: Option<ProposedChamfer>,
     pub coolant: String,
     pub reason: String,
     /// When the planner changes a plan: the number of the current operation
     /// this one keeps (see [`describe`]), None for a new operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<usize>,
+}
+/// An outside Contour's holding tabs (`cam`'s, placed on the outline's
+/// straight sides and gentle curves): how many on each outline, each one's
+/// width and its height above where the cut leaves the stock, mm.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposedTabs {
+    pub count: u32,
+    pub width: f32,
+    pub height: f32,
+}
+/// A Chamfer operation's settings (`chamfer`, its module doc): what the
+/// cone's side goes on, how the cut is sized, and the copies round an axis.
+/// Work coordinates (mm from the setup's work zero) and degrees.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposedChamfer {
+    /// `edges`: the edges of the listed surfaces (a level face's outline and
+    /// hole mouths; with walls listed too, only the edges it shares with
+    /// them, though the part report names no walls); `line`: the line `line`
+    /// at `line_z`.
+    pub source: String,
+    /// For `edges`: `all`, `outer` (the outer contour) or `holes` (the hole
+    /// mouths); null is `all`.
+    pub edges: Option<String>,
+    /// For `line`: its start and end, [x1, y1, x2, y2].
+    pub line: Option<[f32; 4]>,
+    pub line_z: Option<f32>,
+    /// For `line`: the side of it the tool is on (and cuts away), looking
+    /// from its start to its end: `left`, `right` or `alternate` (left for
+    /// the first copy, right for the second, ...); null is `left`.
+    pub side: Option<String>,
+    /// The chamfer's width on the face, mm, with the tip `tip_offset` (null:
+    /// 0.5) under its lower end; or null with `tip_z`, the tip's Z.
+    pub width: Option<f32>,
+    pub tip_offset: Option<f32>,
+    pub tip_z: Option<f32>,
+    /// Copies turned `first_angle + k × copy_pitch` degrees anticlockwise
+    /// about the vertical axis through `axis` [x, y]; null is one copy, not
+    /// turned, about the work zero.
+    pub copies: Option<u32>,
+    pub copy_pitch: Option<f32>,
+    pub first_angle: Option<f32>,
+    pub axis: Option<[f32; 2]>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -136,19 +264,46 @@ fn choice(options: &[&str], nullable: bool) -> Value {
         json!({"type": "string", "enum": options})
     }
 }
-/// Strict JSON Schema for a proposal: every field required, nothing extra.
+/// Strict JSON Schema for a proposal on a machine without a rotary axis:
+/// every field required, nothing extra.
 pub fn schema() -> Value {
-    schema_for(false)
+    schema_with(false, false)
 }
 /// [`schema`], with `edit` (the planner changes the current plan) a `from`
 /// on every setup and operation: the number of the current one it keeps, or
 /// null.
+#[cfg(test)]
 pub fn schema_for(edit: bool) -> Value {
+    schema_with(edit, false)
+}
+/// `schema` for the machine of `report`: with a rotary A axis it also asks
+/// for the chuck and the A angles of the setups.
+#[cfg(test)]
+pub fn schema_on(report: &PartReport) -> Value {
+    schema_with(false, report.rotary.is_some())
+}
+/// The schema with `from` when `edit` (`schema_for`), and with the chuck
+/// and the A angles when `rotary` (`schema_on`).
+pub fn schema_with(edit: bool, rotary: bool) -> Value {
     let text = || json!({"type": "string"});
     let number = || json!({"type": "number"});
     let optional = || json!({"type": ["number", "null"]});
     let ups: Vec<&str> = analysis::ORIENTATIONS.iter().map(|(up, _)| *up).collect();
     let strategies: Vec<&str> = STRATEGIES.iter().map(|(name, _)| *name).collect();
+    let chamfer = json!({"anyOf": [object(json!({
+        "source": choice(&CHAMFER_SOURCES, false),
+        "edges": choice(&CHAMFER_EDGES, true),
+        "line": {"type": ["array", "null"], "items": number(), "minItems": 4, "maxItems": 4},
+        "line_z": optional(),
+        "side": choice(&CHAMFER_SIDES, true),
+        "width": optional(),
+        "tip_offset": optional(),
+        "tip_z": optional(),
+        "copies": {"type": ["integer", "null"]},
+        "copy_pitch": optional(),
+        "first_angle": optional(),
+        "axis": {"type": ["array", "null"], "items": number(), "minItems": 2, "maxItems": 2},
+    })), {"type": "null"}]});
     let operation = object(json!({
         "strategy": choice(&strategies, false),
         "name": text(),
@@ -164,7 +319,7 @@ pub fn schema_for(edit: bool) -> Value {
         "clearance": optional(),
         "finish_passes": {"type": ["integer", "null"]},
         "facing_area": choice(&["stock", "model"], true),
-        "contour_mode": choice(&["outside", "inside_floor"], true),
+        "contour_mode": choice(&CONTOUR_MODES, true),
         "pocket_entry": choice(&ENTRIES, true),
         "ramp_angle": optional(),
         "surface_stepover": optional(),
@@ -174,6 +329,17 @@ pub fn schema_for(edit: bool) -> Value {
         "breakthrough": optional(),
         "hole_diameter": optional(),
         "through": {"type": ["boolean", "null"]},
+        "tabs": {"anyOf": [object(json!({
+            "count": {"type": "integer"},
+            "width": number(),
+            "height": number(),
+        })), {"type": "null"}]},
+        "groove_diameter": optional(),
+        "groove_width": optional(),
+        "groove_from": choice(&crate::groove::GROOVE_FROM, true),
+        "groove_land": optional(),
+        "spring_pass": {"type": ["boolean", "null"]},
+        "chamfer": chamfer,
         "coolant": choice(&COOLANTS, false),
         "reason": text(),
     }));
@@ -186,28 +352,38 @@ pub fn schema_for(edit: bool) -> Value {
             .unwrap()
             .push(json!("from"));
     }
-    let setup = object(json!({
+    let mut setup = json!({
         "orientation": choice(&ups, false),
         "name": text(),
-        "origin": choice(&ORIGINS, false),
+        "origin": choice(&work_zeros(), false),
         "workholding": text(),
         "holder": {"type": ["integer", "null"]},
         "operations": {"type": "array", "items": operation},
-    }));
-    let mut setup = setup;
-    if edit {
-        setup["properties"]["from"] = from();
-        setup["required"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!("from"));
-    }
-    object(json!({
+    });
+    let mut plan = json!({
         "summary": text(),
-        "setups": {"type": "array", "items": setup},
         "unmachined": {"type": "array", "items": object(json!({"feature": text(), "reason": text()}))},
         "warnings": {"type": "array", "items": text()},
-    }))
+    });
+    if edit {
+        setup["from"] = from();
+    }
+    if rotary {
+        setup["a_angles"] = json!({"type": ["array", "null"], "items": number()});
+        plan["chuck"] = json!({"anyOf": [object(json!({
+            "stock": choice(&STOCKS, false),
+            "length": number(),
+            "diameter": optional(),
+            "width": optional(),
+            "height": optional(),
+            "jaws": choice(&crate::chuck::JAWS, false),
+            "stickout": number(),
+            "tailstock": choice(&crate::chuck::TAILSTOCK, false),
+            "free_end": optional(),
+        })), {"type": "null"}]});
+    }
+    plan["setups"] = json!({"type": "array", "items": object(setup)});
+    object(plan)
 }
 pub fn parse(text: &str) -> Result<Proposal, String> {
     serde_json::from_str(text.trim())
@@ -443,10 +619,14 @@ fn floors_of<'a>(
 }
 /// Checks an operation of setup `si` (from 0) and builds it. Returns what is
 /// wrong instead when the tool, surfaces or choices do not fit the strategy.
+/// `sides` is set for a Face of an indexed setup's several angles, whose
+/// surfaces `faces_each_angle` has checked: the tool's centre goes out to
+/// each face's edges, as the UI's facing of a square's sides does.
 fn operation(
     p: &ProposedOp,
     si: usize,
     orientation: &OrientationReport,
+    sides: bool,
     report: &PartReport,
     tools: &[Tool],
     fingerprint: &str,
@@ -467,7 +647,7 @@ fn operation(
         .map(|(_, s)| *s);
     if strategy.is_none() {
         wrong.push(format!(
-            "\"{}\" is not one of the six available strategies.",
+            "\"{}\" is not one of the eight available strategies.",
             p.strategy
         ));
     }
@@ -490,19 +670,47 @@ fn operation(
         ("peck", p.peck),
         ("breakthrough", p.breakthrough),
         ("hole_diameter", p.hole_diameter),
+        ("groove_diameter", p.groove_diameter),
+        ("groove_width", p.groove_width),
+        ("groove_land", p.groove_land),
     ] {
         if value.is_some_and(|v| !v.is_finite()) {
             wrong.push(format!("{field} is not a finite number."));
         }
     }
-    // Negative stock to leave or bottom offset would cut below the model.
-    for (field, value) in [
-        ("radial_allowance", p.radial_allowance),
-        ("axial_allowance", p.axial_allowance),
-        ("bottom_offset", p.bottom_offset),
+    // Negative stock to leave or bottom offset would cut below the model;
+    // in setup 1 on a sheet a bottom offset may go into the spoilboard, by
+    // its allowance at most.
+    let board = report
+        .sheet
+        .as_ref()
+        .filter(|_| si == 0)
+        .map_or(0., |sheet| sheet.spoilboard_allowance);
+    for (field, value, least) in [
+        ("radial_allowance", p.radial_allowance, 0.),
+        ("axial_allowance", p.axial_allowance, 0.),
+        ("bottom_offset", p.bottom_offset, -board),
     ] {
-        if value.is_some_and(|v| v < 0. && v.is_finite()) {
-            wrong.push(format!("{field} cannot be negative."));
+        if value.is_some_and(|v| v < least - 0.0001 && v.is_finite()) {
+            wrong.push(if least < 0. {
+                format!(
+                    "{field} cannot be below -{board}: a cut through the sheet goes at most {board} mm into the spoilboard."
+                )
+            } else {
+                format!("{field} cannot be negative.")
+            });
+        }
+    }
+    if let Some(tabs) = &p.tabs {
+        if p.strategy != "Contour" || p.contour_mode.as_deref().is_some_and(|m| m != "outside") {
+            wrong
+                .push("tabs are for a Contour with contour_mode outside; set tabs to null.".into());
+        }
+        if !(1..=50).contains(&tabs.count)
+            || !(tabs.width.is_finite() && tabs.width > 0.)
+            || !(tabs.height.is_finite() && tabs.height > 0.)
+        {
+            wrong.push("tabs need a count of 1-50 and a positive width and height.".into());
         }
     }
     // Every planned operation travels at the default height or above it: a
@@ -540,13 +748,14 @@ fn operation(
     let inside = p.contour_mode.as_deref() == Some("inside_floor");
     for (value, allowed, what) in [
         (&p.facing_area, &["stock", "model"][..], "facing area"),
-        (
-            &p.contour_mode,
-            &["outside", "inside_floor"][..],
-            "contour mode",
-        ),
+        (&p.contour_mode, &CONTOUR_MODES[..], "contour mode"),
         (&p.pocket_entry, &ENTRIES[..], "pocket entry"),
         (&p.drill_cycle, &CYCLES[..], "drill cycle"),
+        (
+            &p.groove_from,
+            &crate::groove::GROOVE_FROM[..],
+            "groove from",
+        ),
     ] {
         if value.as_deref().is_some_and(|v| !allowed.contains(&v)) {
             wrong.push(format!(
@@ -564,10 +773,15 @@ fn operation(
         Strategy::Drill if suits_helical(p) => kind == "Flat end mill",
         Strategy::Drill if suits_cycle(p, crate::model::THREAD_MILLING) => kind == "Thread mill",
         Strategy::Drill if suits_cycle(p, crate::model::TAPPING) => kind == "Tap",
+        Strategy::Drill if suits_cycle(p, crate::model::REAMING) => kind == "Reamer",
+        Strategy::Drill if suits_cycle(p, crate::model::BORING) => kind == "Boring head",
         Strategy::Drill => ["Drill", "Chamfer mill"].contains(&kind),
         Strategy::Parallel => ["Ball end mill", "Flat end mill"].contains(&kind),
+        Strategy::Groove => kind == crate::model::KEYSEAT,
+        Strategy::Chamfer => kind == "Chamfer mill",
         _ => kind == "Flat end mill",
     };
+    let chamfer = chamfer_problems(p, strategy, &ids, &mut wrong);
     if !suits && kind != "Flat end mill" && suits_helical(p) {
         wrong.push(format!(
             "T{} is a {kind}; Drill with Helical milling takes a flat end mill.",
@@ -583,15 +797,31 @@ fn operation(
             "T{} is a {kind}; Drill with Tapping takes a tap.",
             p.tool
         ));
+    } else if !suits && suits_cycle(p, crate::model::REAMING) {
+        wrong.push(format!(
+            "T{} is a {kind}; Drill with Reaming takes a reamer.",
+            p.tool
+        ));
+    } else if !suits && suits_cycle(p, crate::model::BORING) {
+        wrong.push(format!(
+            "T{} is a {kind}; Drill with Boring takes a boring head.",
+            p.tool
+        ));
     } else if !suits {
         wrong.push(format!(
             "T{} is a {kind}, which {} cannot use.",
             p.tool, p.strategy
         ));
     }
+    if suits_cycle(p, crate::model::BORING) && !p.hole_diameter.is_some_and(|d| d > 0.) {
+        wrong.push(
+            "Drill with Boring needs hole_diameter: the boring head is set to one size.".into(),
+        );
+    }
     let plane = plane_of(orientation, &ids);
     let floor = strategy == Strategy::Pocket || (strategy == Strategy::Contour && inside);
     match strategy {
+        Strategy::Face if sides => {}
         Strategy::Face if !plane.is_some_and(|pl| pl.kind == "top") => wrong.push(format!(
             "Facing needs surfaces of the top plane in orientation {}.",
             orientation.up
@@ -600,6 +830,7 @@ fn operation(
             "Drilling needs the surfaces of one plane with holes in orientation {}.",
             orientation.up
         )),
+        Strategy::Groove => wrong.extend(groove_wrong(p, plane, orientation)),
         // A Pocket clears each of the floor planes it names to its own depth.
         Strategy::Pocket => match floors_of(orientation, &ids) {
             None => wrong.push(format!(
@@ -640,7 +871,7 @@ fn operation(
                 }
             }
         },
-        Strategy::Face | Strategy::Drill => {}
+        Strategy::Face | Strategy::Drill | Strategy::Chamfer => {}
         _ if !ids.is_empty() => wrong.push(format!(
             "{} works on the whole model; its surfaces list must be empty.",
             p.strategy
@@ -729,6 +960,11 @@ fn operation(
     }
     // Combinations the generators require are fixed here, not by the model.
     match strategy {
+        Strategy::Face if sides => {
+            set("boundary", "Selected geometry".into());
+            set("containment", "Tool center on boundary".into());
+            set("allowance", "0".into());
+        }
         Strategy::Face => {
             let model = p.facing_area.as_deref() == Some("model");
             set(
@@ -760,20 +996,81 @@ fn operation(
             set("side", "Inside".into());
             set("containment", "Tool inside boundary".into());
         }
+        // Inside every hole through the outline at least `hole_diameter`
+        // wide: a flat part's cut-outs.
+        Strategy::Contour if p.contour_mode.as_deref() == Some("inside_holes") => {
+            set("boundary", "Model silhouette".into());
+            set("side", crate::model::CONTOUR_HOLES.into());
+            set("containment", "Tool inside boundary".into());
+            if let Some(d) = p.hole_diameter.filter(|d| *d > 0.) {
+                set("hole_min", d.to_string());
+            }
+        }
         Strategy::Contour => {
             set("boundary", "Model silhouette".into());
             set("side", "Outside".into());
             set("containment", "Tool outside boundary".into());
+            let tabs = p.tabs.as_ref();
+            set(
+                "tabs",
+                crate::model::CONTOUR_TABS[usize::from(tabs.is_some())].into(),
+            );
+            if let Some(tabs) = tabs {
+                for (key, value) in [
+                    ("tab_count", tabs.count as f32),
+                    ("tab_width", tabs.width),
+                    ("tab_height", tabs.height),
+                ] {
+                    set(key, value.to_string());
+                }
+            }
         }
         Strategy::Drill => {
             set(
                 "cycle",
                 p.drill_cycle.clone().unwrap_or_else(|| "Drilling".into()),
             );
+            // Helical milling leaves `radial_allowance` round the hole for a
+            // Boring after it, on the diameter.
+            if suits_helical(p) && p.radial_allowance.is_some_and(|r| r > 0.) {
+                set(
+                    "bore_allowance",
+                    format!("{:.2}", 2. * p.radial_allowance.unwrap_or(0.)),
+                );
+            }
             set(
                 "through",
                 if p.through == Some(true) { "Yes" } else { "No" }.into(),
             );
+        }
+        Strategy::Groove => {
+            for (key, value) in [
+                ("groove_diameter", p.groove_diameter),
+                ("groove_width", p.groove_width),
+                ("groove_land", p.groove_land),
+            ] {
+                set(key, value.unwrap_or(0.).to_string());
+            }
+            set(
+                "groove_from",
+                (p.groove_from.as_deref())
+                    .unwrap_or(crate::groove::GROOVE_FROM[0])
+                    .into(),
+            );
+            set(
+                "spring_pass",
+                if p.spring_pass == Some(true) {
+                    "Yes"
+                } else {
+                    "No"
+                }
+                .into(),
+            );
+        }
+        Strategy::Chamfer => {
+            for (key, value) in chamfer.into_iter().flatten() {
+                set(key, value);
+            }
         }
         _ => set("boundary", "Model silhouette".into()),
     }
@@ -781,6 +1078,193 @@ fn operation(
         set("pocket_entry", entry.clone());
     }
     Ok(op)
+}
+/// What is wrong with a Groove `p` on `plane` of `orientation`: its bore
+/// is one hole of the plane, by `hole_diameter` when the plane has several,
+/// and it gives the groove's diameter, width and land.
+fn groove_wrong(
+    p: &ProposedOp,
+    plane: Option<&PlaneReport>,
+    orientation: &OrientationReport,
+) -> Vec<String> {
+    let mut wrong = vec![];
+    let holes: Vec<_> = plane
+        .iter()
+        .flat_map(|pl| &pl.holes)
+        .filter(|h| {
+            p.hole_diameter
+                .filter(|d| *d > 0.)
+                .is_none_or(|d| (h.diameter - d).abs() <= 0.11)
+        })
+        .collect();
+    if holes.len() != 1 {
+        wrong.push(format!(
+            "Groove needs the surfaces of one plane with holes in orientation {}, and hole_diameter naming one bore of it (it has {}).",
+            orientation.up,
+            holes.len()
+        ));
+    }
+    for (field, value) in [
+        ("groove_diameter", p.groove_diameter),
+        ("groove_width", p.groove_width),
+    ] {
+        if !value.is_some_and(|v| v > 0.) {
+            wrong.push(format!("Groove needs a positive {field}."));
+        }
+    }
+    if !p.groove_land.is_some_and(|v| v >= 0.) {
+        wrong.push("Groove needs a groove_land of zero or more.".into());
+    }
+    wrong
+}
+/// What is wrong with `p`'s `chamfer` for `strategy`, added to `wrong`; for
+/// a Chamfer that has none wrong, its operation's settings (`chamfer`).
+/// Every other strategy must give it null.
+fn chamfer_problems(
+    p: &ProposedOp,
+    strategy: Strategy,
+    ids: &[usize],
+    wrong: &mut Vec<String>,
+) -> Option<Vec<(&'static str, String)>> {
+    use crate::chamfer::{EDGES, SIDES, SIZES, SOURCES};
+    if strategy != Strategy::Chamfer {
+        if p.chamfer.is_some() {
+            wrong.push("chamfer is only for the Chamfer strategy: give it null.".into());
+        }
+        return None;
+    }
+    let Some(c) = &p.chamfer else {
+        wrong.push("Chamfer needs its `chamfer` settings.".into());
+        return None;
+    };
+    let before = wrong.len();
+    let pick = |value: Option<&str>,
+                names: &[&str],
+                keys: &[&'static str],
+                what: &str,
+                wrong: &mut Vec<String>| {
+        let at = value.map_or(Some(0), |v| names.iter().position(|n| *n == v));
+        if at.is_none() {
+            wrong.push(format!(
+                "\"{}\" is not a chamfer {what} choice.",
+                value.unwrap_or("")
+            ));
+        }
+        keys[at.unwrap_or(0)]
+    };
+    let source = pick(Some(&c.source), &CHAMFER_SOURCES, &SOURCES, "source", wrong);
+    let line = source == SOURCES[1];
+    let mut out = vec![("chamfer_source", source.to_string())];
+    let finite = |v: &[f32]| v.iter().all(|x| x.is_finite());
+    if line {
+        match (c.line, c.line_z) {
+            (Some(l), Some(z)) if finite(&l) && z.is_finite() => {
+                for (key, v) in ["from_x", "from_y", "to_x", "to_y"].into_iter().zip(l) {
+                    out.push((key, v.to_string()));
+                }
+                out.push(("line_z", z.to_string()));
+            }
+            _ => wrong.push(
+                "A chamfer on a line needs `line` [x1, y1, x2, y2] and `line_z`, finite.".into(),
+            ),
+        }
+        if !ids.is_empty() {
+            wrong.push("A chamfer on a line uses no surfaces: give an empty surfaces list.".into());
+        }
+        let side = pick(c.side.as_deref(), &CHAMFER_SIDES, &SIDES, "side", wrong);
+        out.push(("chamfer_side", side.into()));
+    } else {
+        if ids.is_empty() {
+            wrong.push("A chamfer on edges needs the surfaces of the level face whose edges it breaks (and of the walls, to break only the edges they share).".into());
+        }
+        let edges = pick(c.edges.as_deref(), &CHAMFER_EDGES, &EDGES, "edges", wrong);
+        out.push(("chamfer_edges", edges.into()));
+    }
+    match (c.width, c.tip_z) {
+        (Some(w), None) if w.is_finite() && w > 0. => {
+            let t = c.tip_offset.unwrap_or(0.5);
+            if !(t.is_finite() && t >= 0.) {
+                wrong.push("chamfer tip_offset cannot be negative.".into());
+            }
+            out.extend([
+                ("chamfer_size", SIZES[0].to_string()),
+                ("chamfer_width", w.to_string()),
+                ("tip_offset", t.to_string()),
+            ]);
+        }
+        (None, Some(z)) if z.is_finite() => {
+            out.extend([
+                ("chamfer_size", SIZES[1].to_string()),
+                ("tip_z", z.to_string()),
+            ]);
+        }
+        _ => wrong.push(
+            "Give a chamfer either a positive `width` or a finite `tip_z`, and the other null."
+                .into(),
+        ),
+    }
+    let copies = c.copies.unwrap_or(1);
+    let pitch = c.copy_pitch.unwrap_or(0.);
+    let first = c.first_angle.unwrap_or(0.);
+    let axis = c.axis.unwrap_or([0., 0.]);
+    if !(1..=720).contains(&copies) || !finite(&[pitch, first, axis[0], axis[1]]) {
+        wrong.push(
+            "chamfer copies must be 1-720, with a finite copy_pitch, first_angle and axis.".into(),
+        );
+    } else if copies > 1 && (copies - 1) as f32 * pitch.abs() >= 360. - 0.001 {
+        wrong.push(format!(
+            "chamfer copy_pitch {pitch}° takes {copies} copies round more than once."
+        ));
+    }
+    out.extend([
+        ("copies", copies.to_string()),
+        ("copy_pitch", pitch.to_string()),
+        ("first_angle", first.to_string()),
+        ("axis_x", axis[0].to_string()),
+        ("axis_y", axis[1].to_string()),
+    ]);
+    (wrong.len() == before).then_some(out)
+}
+/// `op`'s Chamfer settings as a proposal writes them (`ProposedChamfer`).
+fn described_chamfer(op: &Operation) -> ProposedChamfer {
+    use crate::chamfer::{EDGES, SIDES, SIZES, SOURCES, setting};
+    let value = |key: &str| {
+        setting(&op.p, key)
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite())
+    };
+    let name = |key: &str, names: &[&str], ours: &[&str]| {
+        let at = ours
+            .iter()
+            .position(|v| *v == setting(&op.p, key))
+            .unwrap_or(0);
+        names[at].to_string()
+    };
+    let line = setting(&op.p, "chamfer_source") == SOURCES[1];
+    let depth = setting(&op.p, "chamfer_size") == SIZES[1];
+    let ends = ["from_x", "from_y", "to_x", "to_y"].map(value);
+    ProposedChamfer {
+        source: name("chamfer_source", &CHAMFER_SOURCES, &SOURCES),
+        edges: (!line).then(|| name("chamfer_edges", &CHAMFER_EDGES, &EDGES)),
+        line: line
+            .then(|| {
+                ends.iter()
+                    .all(Option::is_some)
+                    .then(|| ends.map(Option::unwrap_or_default))
+            })
+            .flatten(),
+        line_z: value("line_z").filter(|_| line),
+        side: line.then(|| name("chamfer_side", &CHAMFER_SIDES, &SIDES)),
+        width: value("chamfer_width").filter(|_| !depth),
+        tip_offset: value("tip_offset").filter(|_| !depth),
+        tip_z: value("tip_z").filter(|_| depth),
+        copies: value("copies").map(|n| n.max(1.).round() as u32),
+        copy_pitch: value("copy_pitch"),
+        first_angle: value("first_angle"),
+        axis: value("axis_x").zip(value("axis_y")).map(|(x, y)| [x, y]),
+    }
 }
 /// Whether `p` is a Drill operation with the Helical milling cycle, which
 /// cuts with a flat end mill.
@@ -792,7 +1276,7 @@ fn suits_cycle(p: &ProposedOp, cycle: &str) -> bool {
     p.strategy == "Drill" && p.drill_cycle.as_deref() == Some(cycle)
 }
 /// An operation of the current plan the planner cannot see or change: its
-/// strategy is not one of the six, its tool has no number, or it machines a
+/// strategy is not one of the eight, its tool has no number, or it machines a
 /// selection that is not surfaces. It stays in its setup, at its place.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct KeptOp {
@@ -873,7 +1357,26 @@ fn described(op: &Operation, tools: &[Tool]) -> Option<ProposedOp> {
         }
         Strategy::Contour => {
             let inside = get(&op.p, "side") == "Inside";
-            p.contour_mode = Some(if inside { "inside_floor" } else { "outside" }.into());
+            let holes = get(&op.p, "side") == crate::model::CONTOUR_HOLES;
+            p.contour_mode = Some(
+                if inside {
+                    "inside_floor"
+                } else if holes {
+                    "inside_holes"
+                } else {
+                    "outside"
+                }
+                .into(),
+            );
+            if holes {
+                p.hole_diameter = value("hole_min").filter(|d| *d > 0.);
+            } else if !inside && pocket_setting(&op.p, "tabs") == crate::model::CONTOUR_TABS[1] {
+                p.tabs = Some(ProposedTabs {
+                    count: value("tab_count").unwrap_or(4.).max(0.).round() as u32,
+                    width: value("tab_width").unwrap_or(6.),
+                    height: value("tab_height").unwrap_or(1.5),
+                });
+            }
             p.stepdown = value("stepdown");
             p.radial_allowance = value("allowance");
             p.axial_allowance = value("axial_allowance");
@@ -896,10 +1399,11 @@ fn described(op: &Operation, tools: &[Tool]) -> Option<ProposedOp> {
                 .into(),
             );
             p.peck = value("peck");
-            // Helical milling's pitch and rings.
+            // Helical milling's pitch and rings, and what it leaves.
             if op.helical() {
                 p.stepdown = value("stepdown");
                 p.stepover_percent = value("stepover");
+                p.radial_allowance = value("bore_allowance").map(|d| d / 2.).filter(|r| *r > 0.);
             }
             let through = get(&op.p, "through") == "Yes";
             p.through = Some(through);
@@ -912,6 +1416,18 @@ fn described(op: &Operation, tools: &[Tool]) -> Option<ProposedOp> {
             p.radial_allowance = value("allowance");
             p.axial_allowance = value("axial_allowance");
         }
+        Strategy::Groove => {
+            p.groove_diameter = value("groove_diameter");
+            p.groove_width = value("groove_width");
+            p.groove_land = value("groove_land");
+            p.groove_from = Some(get(&op.p, "groove_from"))
+                .filter(|f| crate::groove::GROOVE_FROM.contains(f))
+                .map(String::from);
+            p.spring_pass = Some(get(&op.p, "spring_pass") == "Yes");
+            p.tolerance = value("tolerance");
+            p.hole_diameter = value("hole_diameter").filter(|d| *d > 0.);
+        }
+        Strategy::Chamfer => p.chamfer = Some(described_chamfer(op)),
         _ => {
             p.stepdown = value("stepdown");
             p.bottom_offset = value("bottom");
@@ -972,7 +1488,10 @@ fn merged(base: &Operation, fresh: &Operation, p: &ProposedOp, d: &ProposedOp) -
     for (changed, keys) in [
         (p.stepdown != d.stepdown, &["stepdown"][..]),
         (p.stepover_percent != d.stepover_percent, &["stepover"]),
-        (p.radial_allowance != d.radial_allowance, &["allowance"]),
+        (
+            p.radial_allowance != d.radial_allowance,
+            &["allowance", "bore_allowance"],
+        ),
         (p.axial_allowance != d.axial_allowance, &["axial_allowance"]),
         (p.bottom_offset != d.bottom_offset, &["bottom"]),
         (p.clearance != d.clearance, &["clearance"]),
@@ -992,8 +1511,21 @@ fn merged(base: &Operation, fresh: &Operation, p: &ProposedOp, d: &ProposedOp) -
         (p.drill_cycle != d.drill_cycle, &["cycle"]),
         (p.peck != d.peck, &["peck"]),
         (p.breakthrough != d.breakthrough, &["breakthrough"]),
-        (p.hole_diameter != d.hole_diameter, &["hole_diameter"]),
+        (
+            p.hole_diameter != d.hole_diameter,
+            &["hole_diameter", "hole_min"],
+        ),
         (p.through != d.through, &["through", "openings"]),
+        (
+            p.tabs != d.tabs,
+            &["tabs", "tab_count", "tab_width", "tab_height"],
+        ),
+        (p.groove_diameter != d.groove_diameter, &["groove_diameter"]),
+        (p.groove_width != d.groove_width, &["groove_width"]),
+        (p.groove_from != d.groove_from, &["groove_from"]),
+        (p.groove_land != d.groove_land, &["groove_land"]),
+        (p.spring_pass != d.spring_pass, &["spring_pass"]),
+        (p.chamfer != d.chamfer, &crate::chamfer::KEYS[..]),
     ] {
         if changed {
             copy(keys);
@@ -1018,7 +1550,7 @@ fn setup_fields(doc: &Document, si: usize) -> (String, String, String, Option<us
     let setup = &doc.setups[si];
     let setup1 = &doc.setups[0];
     let origin = get(&setup.p, "origin");
-    let origin = if ORIGINS.contains(&origin) {
+    let origin = if work_zeros().contains(&origin) {
         origin
     } else {
         "Model origin"
@@ -1056,6 +1588,18 @@ pub fn describe(doc: &Document, report: &PartReport) -> Result<Current, String> 
     }
     let (mut setups, mut kept, mut number) = (vec![], vec![], 0);
     for (si, setup) in doc.setups.iter().enumerate() {
+        // A plan's chuck and A angles are made afresh (`build`), not kept.
+        if crate::chuck::holds(setup) || crate::indexed::is_indexed(setup) {
+            return Err(format!(
+                "Setup {} {}, so the planner cannot change this plan. Ask it to plan the job again with an empty request, or change the setups by hand.",
+                si + 1,
+                if crate::indexed::is_indexed(setup) {
+                    "indexes A"
+                } else {
+                    "holds the stock in the chuck on A"
+                }
+            ));
+        }
         let up = if si == 0 {
             report.orientations.first().map(|o| o.up)
         } else {
@@ -1091,6 +1635,7 @@ pub fn describe(doc: &Document, report: &PartReport) -> Result<Current, String> 
             origin,
             workholding,
             holder,
+            a_angles: None,
             operations,
             from: Some(si + 1),
         });
@@ -1099,11 +1644,161 @@ pub fn describe(doc: &Document, report: &PartReport) -> Result<Current, String> 
         current_plan: Proposal {
             summary: String::new(),
             setups,
+            chuck: None,
             unmachined: vec![],
             warnings: vec![],
         },
         kept_operations: kept,
     })
+}
+/// Why a setup cannot index A without the stock in the chuck.
+const INDEX_NEEDS_CHUCK: &str = "a_angles index the stock in the chuck: give `chuck` (or have setup 1 held in the chuck) and put this setup after it, or give a_angles null.";
+/// Why the first setup cannot index A.
+const FIRST_INDEXED: &str = "The first setup cannot index A: it is the clamping later setups turn. Give its a_angles null and index the setups after it.";
+/// Why an operation with surfaces cannot run at several A angles.
+const SURFACES_AT_ANGLES: &str = "This setup runs every operation at each of its A angles, but its surfaces face up in one orientation only. At several angles use Contour outside, Parallel or Waterline (surfaces empty), a Face whose surfaces are the top plane's IDs of the orientation each angle brings up (all the sides to face), or give each angle its own setup.";
+/// Whether `p` is a Facing of the sides an indexed setup brings up, one top
+/// plane of the orientations `at` (one per angle) after the other: every
+/// surface lies in the top plane of one of them and every angle has a face
+/// of its own to face (LIO-214). The Facing then faces, at each angle, the
+/// faces that are on top there (`indexed::on_top`).
+fn faces_each_angle(p: &ProposedOp, at: &[Option<&OrientationReport>]) -> Result<(), String> {
+    fn top(o: &OrientationReport) -> Option<&PlaneReport> {
+        o.planes.iter().find(|pl| pl.kind == "top")
+    }
+    if p.strategy != "Face" {
+        return Err(SURFACES_AT_ANGLES.into());
+    }
+    let Some(at) = at.iter().copied().collect::<Option<Vec<_>>>() else {
+        return Err(format!(
+            "An A angle of this setup brings no face of the part up, so a Face has none to face there. {SURFACES_AT_ANGLES}"
+        ));
+    };
+    if let Some(id) = p.surfaces.iter().find(|id| {
+        !at.iter()
+            .any(|o| top(o).is_some_and(|pl| pl.surfaces.contains(id)))
+    }) {
+        return Err(format!(
+            "Surface {id} is not the top plane of any orientation this setup's A angles bring up. {SURFACES_AT_ANGLES}"
+        ));
+    }
+    if let Some(o) = at
+        .iter()
+        .find(|o| !top(o).is_some_and(|pl| pl.surfaces.iter().any(|id| p.surfaces.contains(id))))
+    {
+        return Err(format!(
+            "None of the surfaces is the top plane of {}, which an A angle of this setup brings up. {SURFACES_AT_ANGLES}",
+            o.up
+        ));
+    }
+    Ok(())
+}
+/// Seats setup 1's stock in the chuck the way the setup page does: the
+/// stock fields, `Chuck` as its workholding with the proposal's jaws,
+/// stick-out and tailstock, the A axis as its work zero, and the part turned
+/// to `up` and placed on the bar's axis in the stick-out, `free_end` mm short
+/// of the free end. The chuck's defaults and the clearance gap are filled in
+/// afterwards by `Document::settle_holding`.
+fn in_chuck(setup: &mut Setup, chuck: &ProposedChuck, up: &str, mesh: &Mesh) -> Result<(), String> {
+    let positive = |v: f32| v.is_finite() && v > 0.;
+    let round = match chuck.stock.as_str() {
+        "Round bar" => true,
+        "Box" => false,
+        other => return Err(format!("\"{other}\" is not a chuck stock.")),
+    };
+    let need = |name: &str, v: Option<f32>| {
+        v.filter(|v| positive(*v)).ok_or_else(|| {
+            format!(
+                "chuck.{name} must be a positive number for {}.",
+                chuck.stock
+            )
+        })
+    };
+    let length = need("length", Some(chuck.length))?;
+    let stickout = need("stickout", Some(chuck.stickout))?;
+    let (diameter, width, height) = if round {
+        let d = need("diameter", chuck.diameter)?;
+        (d, d, d)
+    } else {
+        (
+            0.,
+            need("width", chuck.width)?,
+            need("height", chuck.height)?,
+        )
+    };
+    let free_end = chuck.free_end.unwrap_or(FREE_END);
+    if !(free_end.is_finite() && free_end >= 0.) {
+        return Err("chuck.free_end cannot be negative.".into());
+    }
+    for (value, choices, what) in [
+        (&chuck.jaws, &crate::chuck::JAWS[..], "jaws"),
+        (&chuck.tailstock, &crate::chuck::TAILSTOCK[..], "tailstock"),
+    ] {
+        if !choices.contains(&value.as_str()) {
+            return Err(format!("\"{value}\" is not a chuck {what} choice."));
+        }
+    }
+    let rotation = analysis::rotation_for(setup, up).ok_or("Setup 1 has no such orientation.")?;
+    for (key, value) in ["rx", "ry", "rz", "tx", "ty", "tz"]
+        .iter()
+        .zip(rotation.into_iter().chain([0.; 3]))
+    {
+        setup.p.insert((*key).into(), value.to_string());
+    }
+    // The part in the bar's frame: X along it, the stock centred on Y and
+    // standing on Z0 (`stock::resolve`).
+    let scale = mesh.display_scale();
+    let placed = crate::stock::Placement::unturned(mesh, Some(setup)).bounds;
+    let size = placed.dimensions().map(|v| v / scale);
+    let across = if round { size[1].hypot(size[2]) } else { 0. };
+    if round && across > diameter {
+        return Err(format!(
+            "In orientation {up} the part is {:.2} × {:.2} mm across the bar, which needs a bar of at least Ø{:.2} mm, not Ø{diameter} mm.",
+            size[1],
+            size[2],
+            (across * 100.).ceil() / 100.
+        ));
+    }
+    if !round && (size[1] > width || size[2] > height) {
+        return Err(format!(
+            "In orientation {up} the part is {:.2} × {:.2} mm across the bar, which does not fit a box of {width} × {height} mm.",
+            size[1], size[2]
+        ));
+    }
+    if size[0] + free_end > stickout {
+        return Err(format!(
+            "In orientation {up} the part is {:.2} mm along X: with {free_end} mm of stock beyond it, it needs a stick-out of at least {:.2} mm, not {stickout} mm.",
+            size[0],
+            ((size[0] + free_end) * 100.).ceil() / 100.
+        ));
+    }
+    let [tx, ty, tz] = [
+        length / 2. - free_end - placed.max[0] / scale,
+        -(placed.min[1] + placed.max[1]) / 2. / scale,
+        height / 2. - 4. / scale - size[2] / 2.,
+    ];
+    for (key, value) in [("tx", tx), ("ty", ty), ("tz", tz)] {
+        setup.p.insert(key.into(), value.to_string());
+    }
+    let p = &mut setup.p;
+    if round {
+        p.insert("stock_type".into(), "Round bar".into());
+        p.insert("stock_diameter".into(), diameter.to_string());
+        p.insert("stock_length".into(), length.to_string());
+    } else {
+        p.insert("stock_type".into(), "Fixed size box".into());
+        for (key, value) in [("stock_x", length), ("stock_y", width), ("stock_z", height)] {
+            p.insert(key.into(), value.to_string());
+        }
+    }
+    p.insert("holding".into(), "Chuck".into());
+    p.insert("chuck_jaws".into(), chuck.jaws.clone());
+    p.insert("chuck_stickout".into(), stickout.to_string());
+    p.insert("chuck_tailstock".into(), chuck.tailstock.clone());
+    if !crate::indexed::ORIGINS.contains(&get(p, "origin")) {
+        p.insert("origin".into(), crate::indexed::ORIGINS[0].into());
+    }
+    Ok(())
 }
 /// Builds the job a proposal describes. Setup 1 keeps the user's machine,
 /// stock, work zero and fixture; its operations and all later setups are
@@ -1155,10 +1850,20 @@ pub fn build(
         ));
     }
     let first = report.orientations.first().map(|o| o.up);
-    if proposal
-        .setups
-        .first()
-        .is_some_and(|s| Some(s.orientation.as_str()) != first)
+    let rotary = report.rotary.is_some();
+    if !rotary && proposal.chuck.is_some() {
+        whole("`chuck` must be null: this machine has no rotary A axis.".into());
+    }
+    if !rotary && proposal.setups.iter().any(|s| s.a_angles.is_some()) {
+        whole("`a_angles` must be null: this machine has no rotary A axis.".into());
+    }
+    // A stock in the chuck is turned to the orientation the proposal gives
+    // setup 1; otherwise setup 1 keeps the user's.
+    if proposal.chuck.is_none()
+        && proposal
+            .setups
+            .first()
+            .is_some_and(|s| Some(s.orientation.as_str()) != first)
     {
         whole(format!(
             "The first setup must use orientation {}, where the stock is defined.",
@@ -1223,11 +1928,78 @@ pub fn build(
             }
             (si > 0).then_some(*holder)
         });
-        let Some(orientation) = report
-            .orientations
-            .iter()
-            .find(|o| o.up == proposed.orientation)
-        else {
+        let angled = proposed.a_angles.is_some();
+        let offset = (54..=59)
+            .map(|n| format!("G{n}"))
+            .find(|o| {
+                !setups.iter().any(|s| get(&s.p, "offset") == o) && !reserved.contains(&o.as_str())
+            })
+            .unwrap_or_default();
+        // An indexed setup is made as the Reposition choice makes it, and
+        // shows the part as the setup it indexes does, turned by its first
+        // A angle.
+        let mut indexed = None;
+        let mut at_angles: Option<Vec<Option<&OrientationReport>>> = None;
+        let mut up = proposed.orientation.as_str();
+        if let Some(list) = &proposed.a_angles {
+            if si == 0 {
+                wrong(None, FIRST_INDEXED.into());
+                continue;
+            }
+            if proposed.holder.is_some() {
+                wrong(
+                    None,
+                    "holder must be null: an indexed setup is held by the chuck of the setup it indexes.".into(),
+                );
+            }
+            let base = setups.iter().rev().find(|s| !crate::indexed::is_indexed(s));
+            let mut made = Setup::new(setup1.machine.clone(), &offset);
+            crate::indexed::set_reposition(&mut made.p, crate::indexed::ACTION);
+            made.p.insert(
+                crate::indexed::ANGLES.into(),
+                crate::indexed::angles_list(list),
+            );
+            let mut issues = crate::indexed::issues(&made);
+            // A chuck the proposal gave but could not seat is said once, by
+            // its own problem.
+            if proposal.chuck.is_none() && !base.is_some_and(crate::chuck::holds) {
+                issues.push(INDEX_NEEDS_CHUCK.into());
+            } else if let (Some(base), Ok(listed)) = (
+                base.filter(|b| crate::chuck::holds(b)),
+                crate::indexed::angles(&made),
+            ) {
+                let turn = crate::indexed::sign(&made.machine) * listed[0];
+                // The orientation each angle brings up, for a Face of the
+                // sides.
+                at_angles = Some(
+                    (listed.iter())
+                        .map(|a| {
+                            let turn = crate::indexed::sign(&made.machine) * a;
+                            let up = analysis::orientation_at(base, turn)?;
+                            report.orientations.iter().find(|o| o.up == up)
+                        })
+                        .collect(),
+                );
+                match analysis::orientation_at(base, turn) {
+                    Some(shown) if shown == proposed.orientation => up = shown,
+                    Some(shown) => issues.push(format!(
+                        "At A {}° the part shows {shown} up, not {}: an indexed setup's orientation is the one its first A angle brings up (positive A turns +Y towards +Z).",
+                        crate::indexed::degrees(listed[0]),
+                        proposed.orientation
+                    )),
+                    None => issues.push(format!(
+                        "At A {}° no face of the part is up: index to angles that turn a face of setup 1's orientation up, such as multiples of 90°.",
+                        crate::indexed::degrees(listed[0])
+                    )),
+                }
+            }
+            if !issues.is_empty() {
+                issues.into_iter().for_each(|m| wrong(None, m));
+                continue;
+            }
+            indexed = Some(made);
+        }
+        let Some(orientation) = report.orientations.iter().find(|o| o.up == up) else {
             wrong(
                 None,
                 format!("\"{}\" is not an orientation.", proposed.orientation),
@@ -1235,9 +2007,17 @@ pub fn build(
             continue;
         };
         // The current setup this one keeps: the one its `from` names, when
-        // that is still turned the same way (else this is a new setup).
+        // that is still turned the same way (else this is a new setup). An
+        // indexed setup is made afresh.
         let base = match proposed.from {
             None => None,
+            Some(_) if angled => {
+                wrong(
+                    None,
+                    "An indexed setup (a_angles) is made afresh: give it from null.".into(),
+                );
+                None
+            }
             Some(n) if n == 0 || n > doc.setups.len() => {
                 wrong(
                     None,
@@ -1276,9 +2056,10 @@ pub fn build(
             kept_setups.push(b);
         }
         if base.is_none()
+            && !angled
             && proposal.setups[..si]
                 .iter()
-                .any(|s| s.orientation == proposed.orientation)
+                .any(|s| s.a_angles.is_none() && s.orientation == proposed.orientation)
         {
             wrong(
                 None,
@@ -1301,7 +2082,7 @@ pub fn build(
                     _ => proposed.holder != *holder,
                 })
         };
-        if si > 0 && changed(1) && !ORIGINS.contains(&proposed.origin.as_str()) {
+        if si > 0 && !angled && changed(1) && !work_zeros().contains(&proposed.origin.as_str()) {
             wrong(
                 None,
                 format!("\"{}\" is not a work zero choice.", proposed.origin),
@@ -1320,7 +2101,18 @@ pub fn build(
             );
         }
         let mut setup = if si == 0 {
-            setup1.clone()
+            let mut setup = setup1.clone();
+            if let Some(chuck) = &proposal.chuck
+                && let Err(message) = in_chuck(&mut setup, chuck, orientation.up, mesh)
+            {
+                wrong(None, message);
+            }
+            setup
+        } else if let Some(mut setup) = indexed {
+            setup
+                .p
+                .insert("notes".into(), clip(&proposed.workholding, 500));
+            setup
         } else if let Some(b) = base {
             let mut setup = doc.setups[b].clone();
             if changed(1) {
@@ -1340,11 +2132,7 @@ pub fn build(
                     };
                 }
                 if let Some(holder) = holder {
-                    let holding = if holder.kind() == "Vise" {
-                        "Vise"
-                    } else {
-                        "Clamps"
-                    };
+                    let holding = holding_of(holder.kind());
                     setup.p.insert("holding".into(), holding.into());
                     setup.p.insert("holder".into(), holder.id.clone());
                 }
@@ -1354,13 +2142,6 @@ pub fn build(
             }
             setup
         } else {
-            let offset = (54..=59)
-                .map(|n| format!("G{n}"))
-                .find(|o| {
-                    !setups.iter().any(|s| get(&s.p, "offset") == o)
-                        && !reserved.contains(&o.as_str())
-                })
-                .unwrap_or_default();
             let mut setup = Setup::new(setup1.machine.clone(), &offset);
             let rotation = analysis::rotation_for(setup1, orientation.up).unwrap_or_default();
             for (key, value) in ["rx", "ry", "rz"].iter().zip(rotation) {
@@ -1381,11 +2162,7 @@ pub fn build(
                 }
             }
             if let Some(holder) = holder {
-                let holding = if holder.kind() == "Vise" {
-                    "Vise"
-                } else {
-                    "Clamps"
-                };
+                let holding = holding_of(holder.kind());
                 setup.p.insert("holding".into(), holding.into());
                 setup.p.insert("holder".into(), holder.id.clone());
             }
@@ -1415,6 +2192,20 @@ pub fn build(
             .take(MAX_SETUP_OPERATIONS)
             .enumerate()
         {
+            // Every operation of an indexed setup runs at each A angle, but a
+            // surface faces up in one orientation only: a Face may name the
+            // sides that come up at the angles, each faced where it is up.
+            let sides =
+                proposed.a_angles.as_ref().is_some_and(|a| a.len() > 1) && !op.surfaces.is_empty();
+            // (Without the chuck's orientations the setup has said why.)
+            if sides && let Some(at) = &at_angles {
+                if let Err(message) = faces_each_angle(op, at) {
+                    wrong(Some(oi + 1), message);
+                    continue;
+                }
+            } else if sides {
+                continue;
+            }
             // The current operation this one keeps, and what it was.
             let kept = match op.from {
                 None => None,
@@ -1459,6 +2250,17 @@ pub fn build(
                     }
                 },
             };
+            let fresh = || {
+                operation(
+                    op,
+                    si,
+                    orientation,
+                    sides,
+                    report,
+                    &doc.tools,
+                    &mesh.fingerprint,
+                )
+            };
             let built = match kept {
                 Some((current, d)) if unchanged(op, &d, get(&current.p, "name")) => {
                     Ok(current.clone())
@@ -1466,13 +2268,19 @@ pub fn build(
                 Some((current, d))
                     if op.strategy == d.strategy && op.contour_mode == d.contour_mode =>
                 {
-                    operation(op, si, orientation, report, &doc.tools, &mesh.fingerprint)
-                        .map(|fresh| merged(current, &fresh, op, &d))
+                    fresh().map(|fresh| merged(current, &fresh, op, &d))
                 }
-                _ => operation(op, si, orientation, report, &doc.tools, &mesh.fingerprint),
+                _ => fresh(),
             };
             match built {
-                Ok(op) => setup.operations.push(op),
+                Ok(mut op) => {
+                    // The direction a material asks for its finishing passes
+                    // is fixed here, not left to the model (`finishing`).
+                    if let Some(material) = doc.selected_material() {
+                        crate::finishing::apply(material, &mut op);
+                    }
+                    setup.operations.push(op)
+                }
                 Err(messages) => messages.into_iter().for_each(|m| wrong(Some(oi + 1), m)),
             }
         }
@@ -1527,8 +2335,46 @@ pub fn build(
         setups[0].id.clone()
     };
     built.setups = setups;
+    if proposal.chuck.is_some() {
+        built.settle_holding(0);
+    }
+    // A later setup in a V-block, soft jaws or a collet block takes the
+    // entry's grip as the setup page fills it in.
+    for si in 1..built.setups.len() {
+        if crate::round_hold::Kind::of(get(&built.setups[si].p, "holding")).is_some() {
+            built.settle_holding(si);
+        }
+    }
     built.sync_stock_sources();
-    Ok(built)
+    if !rotary {
+        return Ok(built);
+    }
+    // The checks the chuck and the A angles have of their own, as the setups
+    // page shows them, before any operation is generated.
+    built.sync_turns(Some(mesh));
+    let mut refused = vec![];
+    if proposal.chuck.is_some() {
+        for message in built.holding_issues(0, Some(mesh)) {
+            refused.push((1, "workholding", format!("The chuck: {message}")));
+        }
+    }
+    for si in 1..built.setups.len() {
+        for message in built.index_issues(si) {
+            refused.push((si + 1, "structure", message));
+        }
+    }
+    if refused.is_empty() {
+        return Ok(built);
+    }
+    Err(refused
+        .into_iter()
+        .map(|(setup, stage, message)| Problem {
+            setup,
+            operation: None,
+            stage,
+            message,
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -1565,6 +2411,13 @@ pub(crate) mod tests {
             breakthrough: None,
             hole_diameter: None,
             through: None,
+            tabs: None,
+            groove_diameter: None,
+            groove_width: None,
+            groove_from: None,
+            groove_land: None,
+            spring_pass: None,
+            chamfer: None,
             coolant: "Flood".into(),
             reason: "test".into(),
             from: None,
@@ -1631,6 +2484,7 @@ pub(crate) mod tests {
         drill.peck = Some(3.);
         Proposal {
             summary: "Top side, then the underside.".into(),
+            chuck: None,
             setups: vec![
                 ProposedSetup {
                     orientation: "+Z".into(),
@@ -1638,6 +2492,7 @@ pub(crate) mod tests {
                     origin: "Stock top center".into(),
                     workholding: "Vise on the long sides.".into(),
                     holder: None,
+                    a_angles: None,
                     operations: vec![
                         op("Face", 1, ids(report, "+Z", 0.)),
                         op("Pocket", 1, ids(report, "+Z", 12.)),
@@ -1652,6 +2507,7 @@ pub(crate) mod tests {
                     origin: "Model origin".into(),
                     workholding: "Flip about X; clamp on the machined walls.".into(),
                     holder: None,
+                    a_angles: None,
                     operations: vec![
                         op("Face", 1, ids(report, "-Z", 0.)),
                         op("Pocket", 1, ids(report, "-Z", 6.)),
@@ -1708,7 +2564,9 @@ pub(crate) mod tests {
             let schema = schema_for(edit);
             let mut objects = 0;
             walk(&schema, &mut objects);
-            assert_eq!(objects, 4);
+            // The proposal, its setups, operations, their tabs and chamfer and
+            // the unmachined items.
+            assert_eq!(objects, 6);
             // Every field of the Rust types is in the schema, and nothing else.
             let (_, _, report) = block();
             let mut plan = good(&report);
@@ -1778,6 +2636,55 @@ pub(crate) mod tests {
             .remove("tool");
         assert!(parse(&missing.to_string()).is_err());
         assert!(parse("Here is the plan: {}").is_err());
+    }
+    /// `doc` with the starter `name` selected.
+    fn choose(doc: &mut Document, name: &str) {
+        let id = (doc.materials.iter())
+            .find(|m| m.name() == name)
+            .unwrap()
+            .id
+            .clone();
+        assert!(doc.select_material(&id));
+    }
+    #[test]
+    fn a_plan_in_bronze_finishes_conventionally_and_in_aluminium_it_does_not() {
+        let (mut doc, mesh, report) = block();
+        let mut plan = good(&report);
+        for o in plan.setups.iter_mut().flat_map(|s| &mut s.operations) {
+            if matches!(o.strategy.as_str(), "Pocket" | "Contour") {
+                o.finish_passes = Some(1);
+            }
+        }
+        let milling = |job: &Document| -> Vec<(Strategy, String)> {
+            (job.setups.iter())
+                .flat_map(|s| &s.operations)
+                .filter(|o| matches!(o.strategy, Strategy::Pocket | Strategy::Contour))
+                .map(|o| {
+                    (
+                        o.strategy,
+                        crate::model::pocket_setting(&o.p, "pocket_milling").to_string(),
+                    )
+                })
+                .collect()
+        };
+        let alu = milling(&build(&doc, &mesh, &report, &plan).unwrap());
+        assert!(
+            alu.len() >= 2 && alu.iter().all(|(_, m)| m == "Climb"),
+            "{alu:?}"
+        );
+        choose(&mut doc, "Bronze CuSn12");
+        let bronze = milling(&build(&doc, &mesh, &report, &plan).unwrap());
+        assert_eq!(bronze.len(), alu.len());
+        assert!(
+            bronze.iter().all(|(_, m)| m == "Conventional"),
+            "{bronze:?}"
+        );
+        // Without finishing passes the direction is left alone.
+        for o in plan.setups.iter_mut().flat_map(|s| &mut s.operations) {
+            o.finish_passes = Some(0);
+        }
+        let rough = milling(&build(&doc, &mesh, &report, &plan).unwrap());
+        assert!(rough.iter().all(|(_, m)| m == "Climb"), "{rough:?}");
     }
     #[test]
     fn building_keeps_setup_one_and_creates_later_setups() {
@@ -2278,7 +3185,7 @@ pub(crate) mod tests {
         );
         refused(
             &|p| p.setups[0].operations[1].strategy = "Adaptive".into(),
-            "1/Some(2): \"Adaptive\" is not one of the six",
+            "1/Some(2): \"Adaptive\" is not one of the eight",
         );
         refused(
             &|p| p.setups[0].operations[0].tool = 9,
@@ -2495,6 +3402,139 @@ pub(crate) mod tests {
         assert_eq!(
             (get(&op.p, "stepdown"), get(&op.p, "stepover")),
             ("1.5", "30")
+        );
+    }
+    #[test]
+    fn a_groove_proposal_becomes_an_internal_groove() {
+        let (mut doc, mesh, _) = block();
+        let mut keyseat = crate::groove::tests::keyseat(3., 1., 1.5, 10.);
+        keyseat.p.insert("number".into(), "9".into());
+        doc.tools.push(keyseat);
+        let report = analysis::report(&doc, &mesh).unwrap();
+        // The report gives its head's width as its flutes, and its neck.
+        let tool = report.tools.iter().find(|t| t.number == 9).unwrap();
+        assert_eq!(
+            (
+                tool.kind.as_str(),
+                tool.flute_length,
+                tool.neck_diameter,
+                tool.reach
+            ),
+            (crate::model::KEYSEAT, 1., Some(1.5), Some(10.))
+        );
+        let top = ids(&report, "+Z", 0.);
+        let plane = (report.orientations[0].planes.iter())
+            .find(|p| p.depth_below_top.abs() < 0.01)
+            .unwrap();
+        let alone = |d: f32| {
+            plane
+                .holes
+                .iter()
+                .filter(|h| (h.diameter - d).abs() <= 0.11)
+                .count()
+                == 1
+        };
+        let bore = (plane.holes.iter().map(|h| h.diameter))
+            .find(|d| alone(*d))
+            .unwrap_or_else(|| panic!("no hole of its own size: {:?}", plane.holes));
+        let mut groove = op("Groove", 9, top.clone());
+        (groove.rpm, groove.feed) = (12000., 800.);
+        groove.hole_diameter = Some(bore);
+        groove.groove_diameter = Some(bore + 1.);
+        groove.groove_width = Some(1.3);
+        groove.groove_from = Some(crate::groove::GROOVE_FROM[1].into());
+        groove.groove_land = Some(2.);
+        groove.spring_pass = Some(true);
+        let mut proposal = good(&report);
+        proposal.setups[0].operations.push(groove.clone());
+        let job = build(&doc, &mesh, &report, &proposal).unwrap_or_else(|e| panic!("{e:?}"));
+        let made = job.setups[0].operations.last().unwrap();
+        assert_eq!(made.strategy, Strategy::Groove);
+        for (k, v) in [
+            ("groove_diameter", (bore + 1.).to_string()),
+            ("groove_width", "1.3".into()),
+            ("groove_from", crate::groove::GROOVE_FROM[1].into()),
+            ("groove_land", "2".into()),
+            ("spring_pass", "Yes".into()),
+            ("hole_diameter", bore.to_string()),
+        ] {
+            assert_eq!(get(&made.p, k), v, "{k}");
+        }
+        // The current plan gives it back as it was proposed.
+        let back = described(made, &job.tools).unwrap();
+        assert_eq!(
+            (
+                back.groove_diameter,
+                back.groove_width,
+                back.groove_land,
+                back.spring_pass
+            ),
+            (
+                groove.groove_diameter,
+                groove.groove_width,
+                groove.groove_land,
+                Some(true)
+            )
+        );
+        assert_eq!(back.groove_from, groove.groove_from);
+        // A flat end mill, or no groove size, is refused.
+        let refused = |edit: &dyn Fn(&mut ProposedOp)| {
+            let mut p = good(&report);
+            let mut g = groove.clone();
+            edit(&mut g);
+            p.setups[0].operations.push(g);
+            messages(build(&doc, &mesh, &report, &p))
+        };
+        assert!(
+            refused(&|g| g.tool = 1)
+                .iter()
+                .any(|m| m.contains("which Groove cannot use")),
+            "{:?}",
+            refused(&|g| g.tool = 1)
+        );
+        assert!(
+            refused(&|g| g.groove_diameter = None)
+                .iter()
+                .any(|m| m.contains("Groove needs a positive groove_diameter."))
+        );
+        // The schema offers it, with its fields.
+        let schema = schema();
+        let fields = &schema["properties"]["setups"]["items"]["properties"]["operations"]["items"]
+            ["properties"];
+        assert!(
+            fields["strategy"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("Groove"))
+        );
+        for k in [
+            "groove_diameter",
+            "groove_width",
+            "groove_from",
+            "groove_land",
+            "spring_pass",
+        ] {
+            assert!(fields.get(k).is_some(), "{k}");
+        }
+        // A proposal saved before the groove fields reads them as null.
+        let mut value = serde_json::to_value(good(&report)).unwrap();
+        for op in value["setups"][0]["operations"].as_array_mut().unwrap() {
+            for k in [
+                "groove_diameter",
+                "groove_width",
+                "groove_from",
+                "groove_land",
+                "spring_pass",
+            ] {
+                op.as_object_mut().unwrap().remove(k);
+            }
+        }
+        let old = parse(&value.to_string()).unwrap();
+        assert!(
+            old.setups[0]
+                .operations
+                .iter()
+                .all(|o| o.groove_diameter.is_none())
         );
     }
     #[test]
@@ -2924,7 +3964,7 @@ pub(crate) mod tests {
     #[test]
     fn an_operation_the_format_cannot_carry_is_listed_and_still_counted() {
         let (doc, _, report) = planned();
-        // A strategy that is not one of the six.
+        // A strategy that is not one of the eight.
         let adaptive = with_adaptive(doc.clone(), 0, 1);
         let current = describe(&adaptive, &report).unwrap();
         assert_eq!(
@@ -3667,5 +4707,400 @@ pub(crate) mod tests {
             value["setups"][0]["from"] = bad;
             assert!(parse(&value.to_string()).is_err());
         }
+    }
+    /// The rotary scenario's project, report and the plan that ends it,
+    /// with `edit` applied to the plan.
+    fn rotary(edit: impl FnOnce(&mut Proposal)) -> (Document, Mesh, PartReport, Proposal) {
+        let (doc, mesh, report) = crate::fake_openai::rotary::report();
+        let mut plan = crate::fake_openai::rotary::good();
+        edit(&mut plan);
+        (doc, mesh, report, plan)
+    }
+    /// A change of a plan on a rotary machine asks for `from` as well as
+    /// the chuck and the angles, and the schema stays strict.
+    #[test]
+    fn the_schema_of_a_change_on_a_rotary_machine_has_from_and_the_chuck() {
+        let both = schema_with(true, true);
+        let setup = &both["properties"]["setups"]["items"];
+        let op = &setup["properties"]["operations"]["items"];
+        for (object, key) in [
+            (setup, "from"),
+            (setup, "a_angles"),
+            (op, "from"),
+            (&both, "chuck"),
+        ] {
+            assert!(object["properties"].get(key).is_some(), "{key}");
+            let required = object["required"].as_array().unwrap();
+            assert!(required.contains(&json!(key)), "{key}");
+            assert_eq!(
+                required.len(),
+                object["properties"].as_object().unwrap().len()
+            );
+            assert_eq!(object["additionalProperties"], false);
+        }
+        let (_, _, report, _) = rotary(|_| {});
+        assert_eq!(schema_with(true, false), schema_for(true));
+        assert_eq!(schema_with(false, true), schema_on(&report));
+        assert_eq!(schema_with(false, false), schema());
+    }
+    /// The planner cannot change a plan that holds the stock in the chuck
+    /// on A or indexes A (it makes those afresh): it says so before
+    /// anything is sent.
+    #[test]
+    fn a_plan_on_the_chuck_or_indexing_a_is_not_described_for_a_change() {
+        let (doc, mesh, report, plan) = rotary(|_| {});
+        let job = build(&doc, &mesh, &report, &plan).unwrap();
+        assert!(crate::chuck::holds(&job.setups[0]));
+        let e = describe(&job, &report).unwrap_err();
+        assert!(
+            e.starts_with(
+                "Setup 1 holds the stock in the chuck on A, so the planner cannot change this plan."
+            ),
+            "{e}"
+        );
+        let mut loose = job.clone();
+        loose.setups[0].p.insert("holding".into(), "None".into());
+        assert!(crate::indexed::is_indexed(&loose.setups[1]));
+        let e = describe(&loose, &report).unwrap_err();
+        assert!(e.starts_with("Setup 2 indexes A"), "{e}");
+    }
+    #[test]
+    fn the_rotary_schema_asks_for_the_chuck_and_the_angles_and_stays_strict() {
+        fn walk(value: &Value, objects: &mut usize) {
+            if value["type"] == "object" {
+                *objects += 1;
+                let keys: Vec<&String> = value["properties"].as_object().unwrap().keys().collect();
+                assert_eq!(value["required"].as_array().unwrap().len(), keys.len());
+                assert_eq!(value["additionalProperties"], false);
+            }
+            match value {
+                Value::Object(map) => map.values().for_each(|v| walk(v, objects)),
+                Value::Array(items) => items.iter().for_each(|v| walk(v, objects)),
+                _ => {}
+            }
+        }
+        let (_, _, report, plan) = rotary(|_| {});
+        let schema = schema_on(&report);
+        let mut objects = 0;
+        walk(&schema, &mut objects);
+        // The proposal, its chuck, a setup, an operation, its tabs and
+        // chamfer, and an unmachined entry.
+        assert_eq!(objects, 7);
+        let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        let props = |v: &Value| keys(&v["properties"]);
+        let value = serde_json::to_value(&plan).unwrap();
+        assert_eq!(keys(&value), props(&schema));
+        assert_eq!(
+            keys(&value["chuck"]),
+            props(&schema["properties"]["chuck"]["anyOf"][0])
+        );
+        let setup = &schema["properties"]["setups"]["items"];
+        assert_eq!(keys(&value["setups"][1]), props(setup));
+        // The angles are numbers or null; the chuck an object or null.
+        assert_eq!(
+            setup["properties"]["a_angles"],
+            json!({"type": ["array", "null"], "items": {"type": "number"}})
+        );
+        assert_eq!(
+            schema["properties"]["chuck"]["anyOf"][1],
+            json!({"type": "null"})
+        );
+        // What the model answers reads back, null or not.
+        assert_eq!(parse(&value.to_string()).unwrap(), plan);
+        let mut nulls = value;
+        nulls["chuck"] = Value::Null;
+        nulls["setups"][1]["a_angles"] = Value::Null;
+        let parsed = parse(&nulls.to_string()).unwrap();
+        assert!(parsed.chuck.is_none() && parsed.setups[1].a_angles.is_none());
+    }
+    #[test]
+    fn a_machine_without_a_rotary_axis_refuses_a_chuck_and_angles() {
+        let (doc, mesh, report) = block();
+        assert!(report.rotary.is_none());
+        let mut plan = good(&report);
+        plan.chuck = rotary(|_| {}).3.chuck;
+        plan.setups[1].a_angles = Some(vec![90.]);
+        let said = messages(build(&doc, &mesh, &report, &plan));
+        assert!(
+            said.iter()
+                .any(|m| m.contains("`chuck` must be null: this machine has no rotary A axis"))
+                && said.iter().any(|m| m.contains("`a_angles` must be null")),
+            "{said:?}"
+        );
+    }
+    #[test]
+    fn a_chuck_seats_setup_1s_stock_and_an_indexed_setup_is_made_as_the_setups_page_makes_it() {
+        let (doc, mesh, report, plan) = rotary(|_| {});
+        let built = build(&doc, &mesh, &report, &plan).unwrap();
+        let (first, second) = (&built.setups[0], &built.setups[1]);
+        // Setup 1: a 24 mm box of the proposal's length, in a 4-jaw chuck with
+        // the chuck's defaults and the A axis as its work zero.
+        assert_eq!(
+            [
+                get(&first.p, "stock_type"),
+                get(&first.p, "stock_x"),
+                get(&first.p, "stock_y")
+            ],
+            ["Fixed size box", "130", "24"]
+        );
+        assert_eq!(
+            [
+                get(&first.p, "holding"),
+                get(&first.p, "chuck_jaws"),
+                get(&first.p, "chuck_stickout")
+            ],
+            ["Chuck", "4-jaw", "90"]
+        );
+        assert_eq!(get(&first.p, "chuck_tailstock"), "Off the table");
+        assert_eq!(get(&first.p, "chuck_jaw_angle"), "0");
+        assert_eq!(get(&first.p, "holding_gap"), "2");
+        assert_eq!(get(&first.p, "origin"), crate::indexed::ORIGINS[0]);
+        assert_eq!(first.id, doc.setups[0].id);
+        // The part sits in the stick-out, 2 mm short of the free end, on the axis.
+        let stock = built.setup_stock(0, Some(&mesh)).unwrap();
+        let placed = crate::stock::Placement::new(&mesh, Some(first)).bounds;
+        let scale = mesh.display_scale();
+        assert!((placed.max[0] / scale - (stock.max[0] - crate::proposal::FREE_END)).abs() < 0.01);
+        let mid = |b: crate::mesh::Bounds, k: usize| (b.min[k] + b.max[k]) / 2.;
+        assert!((mid(placed, 1) / scale - mid(stock, 1)).abs() < 0.01);
+        assert!((mid(placed, 2) / scale - mid(stock, 2)).abs() < 0.01);
+        // Setup 2 is the Reposition choice with its angles, and the rest is setup 1's.
+        assert_eq!(get(&second.p, "reposition"), crate::indexed::ACTION);
+        assert_eq!(get(&second.p, crate::indexed::ANGLES), "0, 90, 180, 270");
+        assert!(crate::indexed::is_indexed(second));
+        assert_eq!(built.index_base(1), Some(0));
+        for key in [
+            "offset",
+            "holding",
+            "chuck_jaws",
+            "origin",
+            "stock_type",
+            "tx",
+            "tz",
+        ] {
+            assert_eq!(get(&second.p, key), get(&first.p, key), "{key}");
+        }
+        assert_eq!(second.machine.id, first.machine.id);
+        assert_eq!(get(&second.p, "notes"), "The bar in the chuck.");
+        assert_eq!(second.turn.map(|t| (t.base, t.a)), Some((0, 0.)));
+        assert!(built.validate_structure().is_ok());
+    }
+    #[test]
+    fn a_round_bar_is_seated_on_its_axis_and_a_part_that_does_not_fit_is_refused() {
+        let round = |diameter, stickout| {
+            move |plan: &mut Proposal| {
+                let chuck = plan.chuck.as_mut().unwrap();
+                chuck.stock = "Round bar".into();
+                (chuck.diameter, chuck.width, chuck.height) = (Some(diameter), None, None);
+                chuck.jaws = "3-jaw".into();
+                chuck.stickout = stickout;
+            }
+        };
+        let (doc, mesh, report, plan) = rotary(round(30., 60.));
+        let built = build(&doc, &mesh, &report, &plan).unwrap();
+        let first = &built.setups[0];
+        assert_eq!(
+            [
+                get(&first.p, "stock_type"),
+                get(&first.p, "stock_diameter"),
+                get(&first.p, "stock_length")
+            ],
+            ["Round bar", "30", "130"]
+        );
+        // The 20 × 20 mm part is 28.28 mm across its corners.
+        let (doc, mesh, report, plan) = rotary(round(28., 60.));
+        let said = messages(build(&doc, &mesh, &report, &plan));
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("needs a bar of at least Ø28.29 mm, not Ø28 mm"),
+            "{said:?}"
+        );
+        // 30 mm of part and 2 mm of stock beyond it do not fit a 31 mm stick-out.
+        let (doc, mesh, report, plan) = rotary(round(30., 31.));
+        let said = messages(build(&doc, &mesh, &report, &plan));
+        assert!(
+            said[0].contains("needs a stick-out of at least 32.00 mm, not 31 mm"),
+            "{said:?}"
+        );
+    }
+    #[test]
+    fn a_stock_the_chuck_cannot_hold_is_refused_with_the_chucks_own_message() {
+        // A 3-jaw chuck cannot hold a box.
+        let (doc, mesh, report, plan) = rotary(|p| p.chuck.as_mut().unwrap().jaws = "3-jaw".into());
+        let said = build(&doc, &mesh, &report, &plan).unwrap_err();
+        assert_eq!((said[0].setup, said[0].stage), (1, "workholding"));
+        assert!(
+            said[0]
+                .message
+                .contains("A 3-jaw chuck centres round stock"),
+            "{said:?}"
+        );
+        // Wider across its corners than the rotary unit takes.
+        let (doc, mesh, report, plan) = rotary(|p| {
+            let chuck = p.chuck.as_mut().unwrap();
+            (chuck.width, chuck.height) = (Some(60.), Some(60.));
+        });
+        let said = build(&doc, &mesh, &report, &plan).unwrap_err();
+        assert!(
+            said.iter()
+                .any(|p| p.message.contains("the jaws grip from Ø5 to Ø80 mm")),
+            "{said:?}"
+        );
+        // Nothing but the two choices of the schema is a jaw or a tailstock choice.
+        let (doc, mesh, report, plan) = rotary(|p| p.chuck.as_mut().unwrap().jaws = "5-jaw".into());
+        assert!(
+            messages(build(&doc, &mesh, &report, &plan))[0]
+                .contains("\"5-jaw\" is not a chuck jaws choice")
+        );
+    }
+    #[test]
+    fn the_orientation_of_an_indexed_setup_is_the_one_its_first_angle_brings_up() {
+        // With +Z up in setup 1, positive A brings +Y up at 90, -Z at 180, -Y at 270.
+        for (angle, up) in [(0., "+Z"), (90., "+Y"), (180., "-Z"), (270., "-Y")] {
+            let (doc, mesh, report, plan) = rotary(|p| {
+                p.setups[1].a_angles = Some(vec![angle]);
+                p.setups[1].orientation = up.into();
+                p.setups[1].operations = vec![op("Contour", 1, vec![])];
+            });
+            assert!(build(&doc, &mesh, &report, &plan).is_ok(), "A {angle} {up}");
+        }
+        let (doc, mesh, report, plan) = rotary(|p| {
+            p.setups[1].a_angles = Some(vec![90., 180.]);
+            p.setups[1].orientation = "+Z".into();
+        });
+        let said = messages(build(&doc, &mesh, &report, &plan));
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("At A 90° the part shows +Y up, not +Z"),
+            "{said:?}"
+        );
+        // An angle that turns no face up has none to name.
+        let (doc, mesh, report, plan) = rotary(|p| p.setups[1].a_angles = Some(vec![45.]));
+        let said = messages(build(&doc, &mesh, &report, &plan));
+        assert!(
+            said[0].contains("At A 45° no face of the part is up"),
+            "{said:?}"
+        );
+    }
+    #[test]
+    fn an_indexed_setup_is_refused_for_what_the_setups_page_refuses() {
+        // An angle outside the machine's A range (-360° to 360°), a repeat, none.
+        for (angles, words) in [
+            (
+                vec![400.],
+                "A 400° is outside the machine's A range, -360° to 360°.",
+            ),
+            (vec![90., 90.], "A 90° is listed twice."),
+            (vec![], "List the A angles to index to"),
+        ] {
+            let (doc, mesh, report, plan) = rotary(|p| p.setups[1].a_angles = Some(angles));
+            let said = messages(build(&doc, &mesh, &report, &plan));
+            assert!(said.iter().any(|m| m.contains(words)), "{words}: {said:?}");
+        }
+        // Several angles run each operation at every one of them, so no surfaces ...
+        let (doc, mesh, report, plan) = rotary(|p| {
+            let top = report_top(&crate::fake_openai::rotary::report().2);
+            p.setups[1].operations = vec![op("Contour", 1, top)];
+        });
+        let said = messages(build(&doc, &mesh, &report, &plan));
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0]
+                .starts_with("2/Some(1): This setup runs every operation at each of its A angles")
+                && said[0].contains("Contour outside, Parallel or Waterline"),
+            "{said:?}"
+        );
+        // ... but a Face of the sides each angle brings up (LIO-214): one top
+        // plane alone leaves the angles after it nothing to face, a surface
+        // that is on top at none of them is refused.
+        let (doc, mesh, report, plan) = rotary(|p| {
+            let top = report_top(&crate::fake_openai::rotary::report().2);
+            p.setups[1].operations = vec![op("Face", 1, top)];
+        });
+        let said = messages(build(&doc, &mesh, &report, &plan));
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].starts_with("2/Some(1): None of the surfaces is the top plane of +Y"),
+            "{said:?}"
+        );
+        let (doc, mesh, report, plan) = rotary(|p| {
+            let mut ids = p.setups[1].operations[0].surfaces.clone();
+            ids.push(usize::MAX);
+            p.setups[1].operations[0].surfaces = ids;
+        });
+        let said = messages(build(&doc, &mesh, &report, &plan));
+        assert!(
+            said.len() == 1
+                && said[0].contains(&format!("Surface {} is not the top plane", usize::MAX)),
+            "{said:?}"
+        );
+        // The four sides build as one Face, its tool centre out to the edges.
+        let (doc, mesh, report, plan) = rotary(|_| {});
+        let built = build(&doc, &mesh, &report, &plan).unwrap();
+        let face = &built.setups[1].operations[0];
+        assert_eq!(face.strategy, Strategy::Face);
+        assert_eq!(face.surfaces.as_ref().unwrap().ids.len(), 4);
+        assert_eq!(
+            (get(&face.p, "boundary"), get(&face.p, "containment")),
+            ("Selected geometry", "Tool center on boundary")
+        );
+        // One angle may use them: its orientation is told.
+        let (doc, mesh, report, plan) = rotary(|p| {
+            let top = report_top(&crate::fake_openai::rotary::report().2);
+            p.setups[1].a_angles = Some(vec![0.]);
+            p.setups[1].operations = vec![op("Face", 1, top)];
+        });
+        assert!(build(&doc, &mesh, &report, &plan).is_ok());
+        // The holder is the chuck's.
+        let (mut doc, mesh, report, plan) = rotary(|p| p.setups[1].holder = Some(1));
+        doc.adopt_holders();
+        let said = messages(build(&doc, &mesh, &report, &plan));
+        assert!(
+            said.iter()
+                .any(|m| m.contains("holder must be null: an indexed setup is held by the chuck")),
+            "{said:?}"
+        );
+        // The stock must be in the chuck: without `chuck` setup 1 keeps the user's.
+        let (doc, mesh, report, plan) = rotary(|p| p.chuck = None);
+        let said = messages(build(&doc, &mesh, &report, &plan));
+        assert!(
+            said.iter()
+                .any(|m| m.contains("a_angles index the stock in the chuck")),
+            "{said:?}"
+        );
+        // ... and an indexed setup cannot come first.
+        let (doc, mesh, report, plan) = rotary(|p| {
+            p.setups.remove(0);
+            p.setups[0].a_angles = Some(vec![90.]);
+            p.setups[0].orientation = "+Y".into();
+        });
+        let said = messages(build(&doc, &mesh, &report, &plan));
+        assert!(
+            said.iter()
+                .any(|m| m.contains("The first setup cannot index A")),
+            "{said:?}"
+        );
+    }
+    /// The top plane's surface IDs of the first orientation.
+    fn report_top(report: &PartReport) -> Vec<usize> {
+        report.orientations[0]
+            .planes
+            .iter()
+            .find(|p| p.kind == "top")
+            .unwrap()
+            .surfaces
+            .clone()
+    }
+    #[test]
+    fn a_user_chuck_in_setup_1_takes_indexed_setups_without_a_chuck_proposal() {
+        let (doc, mesh, report, plan) = rotary(|p| p.chuck = None);
+        // Build the chuck into the project as the user would, then plan on it.
+        let seated = build(&doc, &mesh, &report, &crate::fake_openai::rotary::good()).unwrap();
+        let report = analysis::report(&seated, &mesh).unwrap();
+        assert_eq!(report.workholding.as_ref().unwrap().kind, "Chuck");
+        let built = build(&seated, &mesh, &report, &plan).unwrap();
+        assert_eq!(get(&built.setups[0].p, "holding"), "Chuck");
+        assert_eq!(built.index_base(1), Some(0));
+        assert_eq!(get(&built.setups[0].p, "stock_x"), "130");
     }
 }

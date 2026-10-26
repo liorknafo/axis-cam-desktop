@@ -46,6 +46,8 @@ pub enum Diagram {
     Manual(u8),
     Machine(u8),
     Cutting(u8),
+    /// A round bar's V-block (0), soft jaws (1) or collet block (2).
+    Round(u8),
 }
 #[derive(Clone, Debug)]
 pub struct Help {
@@ -1019,7 +1021,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "",
         ),
         Import => (
-            "Open STEP/STP, 3MF, STL or OBJ geometry for viewing. STEP and 3MF units are converted to mm. Import runs in the background; machining feature recognition is a future step.",
+            "Open STEP/STP, 3MF, STL or OBJ geometry, or a DXF flat profile, for viewing. STEP, 3MF and DXF units are converted to mm. Import runs in the background; machining feature recognition is a future step.",
             "",
         ),
         OpenHistory => (
@@ -1072,6 +1074,10 @@ pub fn command(m: &Message, label: String) -> Help {
         ),
         Page(crate::Page::Wizard) | NewMachine => (
             "Create a reusable machine profile in five steps: identity, travel, kinematics, controller and review.",
+            "",
+        ),
+        AddRotaryMachine => (
+            "Add the Jingyan CNC4030 with a rotary unit on its table to the Machine library: 4 axes with A about X, on a copy of the JY5800 UC100 profile with an A axis. Its rotary unit's place, chuck and tailstock sizes are assumed for a 100 mm 3-jaw chuck on a NEMA23 rotary unit and still to be measured. The 3-axis Jingyan CNC4030 stays as it is.",
             "",
         ),
         AddSetup => (
@@ -1169,6 +1175,10 @@ pub fn command(m: &Message, label: String) -> Help {
         PlacePins => (
             "Place the fixture pins on the stock's leftover in the 3D view: the plate's pins follow the pointer on the stock's bottom, green where they fit and red, with why, where they do not. Click to put pin 1 there; drag the placed pins to move them; drag elsewhere to orbit. Click Finish placing when done.",
             "",
+        ),
+        AddHoleStages => (
+            "Add before this Reaming or Boring the operations that open its holes, on the same holes: for a reamer, a drill a little under its size (Ø9.8 for Ø10); for a boring head, a drill, then on a CNC Helical milling to 0.6 under the size; on the manual mill the drills step up and the head roughs the rest.",
+            "The tools come from the library: the drill nearest a reamer's drill size; for a bore the widest drill and the widest flat end mill that reach through. One that is missing is added without a tool, and the status says which to add.",
         ),
         AddThreading => (
             "Add, for each thread size of the setup's threaded holes that open upwards, a Drill of its tap drill and then its thread: Thread milling with a thread mill on the CNC, Tapping by hand on the manual mill. Tools come from the library; the status says which are missing.",
@@ -1509,7 +1519,7 @@ pub fn command(m: &Message, label: String) -> Help {
         Guide(a) => guide_help(a),
         ControlSetup(false) => ("Jog, zero and run the machine.", ""),
         ControlSetup(true) => (
-            "Edit the machine's UC100 profile, watch its inputs, test its outputs and calibrate steps per mm.",
+            "Edit the machine's UC100 profile, watch its inputs, test its outputs and calibrate steps per mm (per degree for A).",
             "",
         ),
         Setup(crate::setup::Msg::Save) => (
@@ -1517,7 +1527,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "",
         ),
         Setup(crate::setup::Msg::UseCalibration) => (
-            "Put this steps per mm in the profile below. Save to use it.",
+            "Put this steps per mm (per degree for the A axis) in the profile below. Save to use it.",
             "",
         ),
         Setup(crate::setup::Msg::Revert) => (
@@ -1549,7 +1559,7 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
             "",
         ),
         MachineZero(None) => (
-            "Declare the current position machine zero for X, Y and Z. First jog X to its left end, Y to its front end and Z to the top. The soft limits apply once every limited axis has a machine position.",
+            "Declare the current position machine zero for X, Y and Z, and A on a machine with one. First jog X to its left end, Y to its front end and Z to the top. The soft limits apply once every limited axis has a machine position, and A jogs and runs only once it has one.",
             "",
         ),
         MachineZero(Some(_)) => (
@@ -1561,11 +1571,13 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
             "",
         ),
         JogPress(..) | JogRelease => (
-            "Hold to jog this axis; release to stop. In step mode each press moves one step. The arrow keys and Page Up/Down do the same on this page.",
+            "Hold to jog this axis; release to stop. In step mode each press moves one step. The arrow keys, Page Up/Down and Home/End (A) do the same on this page. A jogs only once it has a machine position.",
             "",
         ),
         JogStep(None) => ("Jog for as long as the button or key is held.", ""),
         JogStep(Some(_)) => ("Move exactly this far for each press.", ""),
+        JogAngle(None) => ("Jog A for as long as the button or key is held.", ""),
+        JogAngle(Some(_)) => ("Turn A exactly this many degrees for each press.", ""),
         JogSpeed(_) => (
             "Jog speed, as a share of each axis's maximum speed in the profile.",
             "",
@@ -1576,7 +1588,9 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
         ),
         TestOutput(_, None) => ("Release the pin: the machine drives it again.", ""),
         CalAxis(_) => ("Calibrate this axis.", ""),
-        CalDistance(_) | CalMeasured(_) => ("Travel in mm.", ""),
+        CalDistance(_) | CalMeasured(_) => {
+            ("Travel in mm; for the A axis, the angle in degrees.", "")
+        }
         CalMove => (
             "Move the axis by the commanded travel at the jog speed, counting its step pulses. Soft limits apply.",
             "",
@@ -1663,6 +1677,38 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
         ),
         PinZero => (
             "Set the X and Y work offset of the active work system to the one the pins give this setup: pin 1's recorded machine place less where pin 1 stands in the setup's work coordinates. Exact, with no probing. Z is touched off as for any setup.",
+            "",
+        ),
+        BarText(_) => (
+            "The diameter of the bar or stock in the chuck, in mm, measured with a micrometer. The centreline is the top's height less half of it, and A zero lifts the tip this much over the centreline, plus 5 mm, before A turns.",
+            "",
+        ),
+        SpacingText(_) => (
+            "How far apart along Y Find A zero touches the flat, in mm, half either side of the tip. Wider is more exact; both touches must land on the flat, not past its edges.",
+            "",
+        ),
+        Calibrate(crate::control::Calibrate::Centreline) => (
+            "Find A's centreline in machine Y and Z from a test bar in the chuck: both sides and the top at A and at A + 180°, whose means cancel the bar's runout. The tip lifts 5 mm over the bar before A turns. Save it to keep it in the machine.",
+            "An error of e mm in the centreline puts a feature cut at A 180° off by 2e. Every move down beside the bar is a probe move that stops on contact; A turns only in a move of its own, with the tip up clear and the probe touching nothing. Z is the probe tip's, with this probe in the spindle.",
+        ),
+        Calibrate(crate::control::Calibrate::Alignment) => (
+            "Probe the bar again near the tailstock, as near the chuck, and say how far the centreline runs off machine X between the two. Over 0.05 mm, square the rotary unit or line up the tailstock.",
+            "",
+        ),
+        Calibrate(crate::control::Calibrate::AZero) => (
+            "Level a flat on the stock or a jaw face: touch it at two points along Y, lift clear, turn A by the slope found and again until they are level, then zero A there in the active work system.",
+            "It needs the centreline (probed or measured) and the stock's diameter, to lift the tip clear of the stock before A turns. The flat must start within 20° of level.",
+        ),
+        TouchCentreReference => (
+            "With the probe the centreline was just probed with still in the spindle, over a surface that stays put (the table, a block on it, not on A), probe straight down onto it, no plate. It is saved with the centreline; each tool is touched off on the same spot.",
+            "The centreline's Z is where the probe's tip was. A tool 15 mm longer puts its tip 15 mm lower for the same Z, so every indexed cut would be 15 mm deeper and a feature cut at A 180° 30 mm off. The touch-off on this spot tells how much longer or shorter than the probe each tool is.",
+        ),
+        SaveCentreline => (
+            "Keep the centreline just probed near the chuck, with the Z reference the probe touched, in the machine's rotary unit geometry, marked measured. It says when the largest part on that centreline leaves no room to retract over it.",
+            "",
+        ),
+        Remounted => (
+            "The rotary unit was taken off the table and put back: its measured centreline is marked stale until it is probed again. Every E-stop does the same, as the machine position it is in is lost.",
             "",
         ),
     }
@@ -1754,6 +1800,10 @@ fn run_help(a: &crate::run::Action) -> (&'static str, &'static str) {
             "With the touch plate on the recorded reference surface and the new tool above it, probe down onto the plate and set work Z so that the surface is at the reference's Z. X and Y zero stay as they are.",
             "",
         ),
+        ProbeCentreReference => (
+            "For a tool run that turns A: with its tool in the spindle and the touch plate on the Z reference the probe touched with the A centreline, probe down onto the plate. Work Z is set on the centreline for this tool, whatever its length.",
+            "The contact's height against the probe's tells how much longer or shorter than the probe the tool is. Each tool that cuts on A is touched off this way: Set Z from reference and Zero Z do not count for a tool run that turns A, as they do not relate the tool's tip to the probed centreline.",
+        ),
         CoolantOff => (
             "Set the coolant of the operations listed to Off, in every tool run of this setup: they ask for flood or mist coolant the UC100 profile has no output for. Then check the setup again.",
             "",
@@ -1768,6 +1818,35 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "Maximum spindle speed allowed by this machine, in revolutions per minute. Operations above this limit are flagged.",
             "",
             Some(Machine(0)),
+        ),
+        (Target::Machine, "nose_to_table") => (
+            "From the spindle nose's face, Z at its top, down to the table's top, in mm. The workholding, stock and the tool's stick-out and holder must fit in it, or the setup is refused. Empty: not checked.",
+            "",
+            None,
+        ),
+        (Target::Machine, "gantry_height") => (
+            "From the table's top to the gantry beam's underside, in mm. The stock and its workholding pass under it as Y moves, so a taller part is refused. Empty: not checked.",
+            "",
+            None,
+        ),
+        (Target::Machine, "gantry_width") => (
+            "The gantry's inside width between its uprights, along X, in mm. The stock with its jaws or clamps must pass through it; not narrower than the X travel. Empty: not checked.",
+            "",
+            None,
+        ),
+        (
+            Target::Machine,
+            "x_source"
+            | "y_source"
+            | "z_source"
+            | "rpm_source"
+            | "nose_to_table_source"
+            | "gantry_height_source"
+            | "gantry_width_source",
+        ) => (
+            "Whether this figure was measured on the machine or is an ASSUMED placeholder. A refusal that rests on an ASSUMED figure says so. Choose Measured once you have measured it.",
+            "",
+            None,
         ),
         (Target::Machine, "power") => (
             "The spindle's rated power, in watts. The check of whether a setup's vise or clamps hold the stock against each operation's cut takes no more force than this power drives at the spindle's top speed (the spindle keeps its torque below that speed). Empty: 800 W, a Jingyan CNC4030's spindle.",
@@ -1795,6 +1874,14 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         }
         (Target::Machine, "measured") => {
             let (body, more) = guide_help(&crate::GuideAction::Measured(String::new(), 0.));
+            (body, more, None)
+        }
+        (Target::Machine, "rotary_bar") => {
+            let (body, more) = machine_help(&crate::control::Action::BarText(String::new()));
+            (body, more, None)
+        }
+        (Target::Machine, "rotary_spacing") => {
+            let (body, more) = machine_help(&crate::control::Action::SpacingText(String::new()));
             (body, more, None)
         }
         (Target::Machine, "work_set") => {
@@ -1894,6 +1981,11 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "",
             Some(Vise(4)),
         ),
+        (Target::Holder, "base_height") => (
+            "How far above the table the stock rests in this vise, in mm (bed and parallels). The check adds the stock's height to see if it fits under the gantry and spindle. Empty: 40 mm.",
+            "",
+            None,
+        ),
         (Target::Holder, "length") => (
             "Length of the clamp from its tip outward, in mm; the bite is part of it. The rest of it reaches beyond the stock's edge.",
             "",
@@ -1919,6 +2011,41 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "",
             Some(Clamp(3)),
         ),
+        (Target::Holder, "angle") => (
+            "The V's included angle, in degrees: 90 for most V-blocks. A bar sits on its two flanks, each a line along the bar.",
+            "",
+            Some(Round(0)),
+        ),
+        (Target::Holder, "v_width") => (
+            "How wide the V is at the block's top, in mm. It decides the bars it seats: one too wide sits on the V's edges, one too narrow sinks below the block's top, where the clamp cannot reach it.",
+            "",
+            Some(Round(0)),
+        ),
+        (Target::Holder, "clamp_width") => (
+            "How wide the V-block clamp's strap is along the bar, in mm. It crosses the bar at the V-block's middle.",
+            "",
+            Some(Round(0)),
+        ),
+        (Target::Holder, "clamp_height") => (
+            "How thick the V-block clamp's strap is above the bar, in mm; its legs, as thick, run down the block's sides.",
+            "",
+            Some(Round(0)),
+        ),
+        (Target::Holder, "bore") => (
+            "The diameter the soft jaws are bored to, in mm. A bar more than 0.5 mm off it is not held round its arc.",
+            "",
+            Some(Round(1)),
+        ),
+        (Target::Holder, "er") => (
+            "The ER collet size of the block: 11, 16, 20, 25, 32 or 40. It sets the diameters its collets close on, the collet's length and the nut's size.",
+            "",
+            Some(Round(2)),
+        ),
+        (Target::Holder, "block") => (
+            "The collet block's width across, in mm: square or hex, measured across its flats.",
+            "",
+            Some(Round(2)),
+        ),
         (Target::Holder, "jaws") => (
             "How many jaws the chuck has: 3 (self-centring, for round bar) or 4 (independent, for square or off-centre work).",
             "",
@@ -1943,6 +2070,31 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "The chuck's outside diameter, in mm. The 160 mm starters are typical: measure yours.",
             "",
             Some(Chuck(4)),
+        ),
+        (Target::Setup, "round_offset") => (
+            "Where the V-block or the soft jaws sit along the bar, in mm from its middle: + toward +X. 0 centres them. They must stay on the bar.",
+            "",
+            Some(Round(0)),
+        ),
+        (Target::Setup, "round_grip") => (
+            "Soft jaws: how high their top is above the bar's bottom, in mm; on a lying bar more than half its diameter, so that they close over its axis. A collet: how deep the bar stands in it, in mm, at most the collet's length; under two thirds of its length it grips less.",
+            "",
+            Some(Round(2)),
+        ),
+        (Target::Setup, "jaw_bore") => (
+            "Which way the soft jaws are bored: X for a bar lying along X, Z for one standing up. Empty follows the stock.",
+            "",
+            Some(Round(1)),
+        ),
+        (Target::Setup, "collet_diameter") => (
+            "The diameter the collet closes on, in mm, when it is not the bar's own: a hub turned on the part. Empty: the bar's.",
+            "",
+            Some(Round(2)),
+        ),
+        (_, "stock_axis") => (
+            "Which way a round bar lies on a machine without a rotary A axis: standing along Z (a lathe, a collet block or soft jaws bored upright hold it) or lying along X (a V-block or soft jaws bored along X hold it).",
+            "",
+            Some(Stock(1)),
         ),
         (Target::Setup, "grip") => (
             "How much of the bar is held in the jaws, in mm. It starts at the chuck's jaw length. Hold at least a third of the diameter.",
@@ -1975,18 +2127,23 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(LatheTool(3)),
         ),
         (Target::Tool, "reach") => (
-            "How far the tool can reach into the work, in mm: a boring bar's depth into the bore, a grooving tool's or parting blade's deepest plunge, a thread mill's neck.",
+            "How far the tool can reach into the work, in mm: a boring bar's depth into the bore, a grooving tool's or parting blade's deepest plunge, a thread mill's neck, a keyseat cutter's neck from the head's bottom to the shank.",
             "A thread mill's neck is thinner than its cutter so it can go down a drilled hole. The thread cannot be deeper than the neck reaches.",
             Some(LatheTool(4)),
         ),
         (Target::Tool, "width") => (
-            "The width of the grooving tool's or parting blade's cutting edge, in mm. A groove is at least this wide.",
+            "The width of the grooving tool's or parting blade's cutting edge, or of a keyseat cutter's head, in mm. A groove is at least this wide; a wider one takes more passes.",
             "",
             Some(LatheTool(5)),
         ),
         (Target::Tool, "shank") => (
-            "The diameter of the thread mill's shank, the part the collet holds, in mm.",
+            "The diameter of the thread mill's or keyseat cutter's shank, the part the collet holds, in mm.",
             "Often wider than the cutter: a Ø4.8 mill on a Ø6 shank. Choose a collet of this size.",
+            Some(Tool),
+        ),
+        (Target::Tool, "neck") => (
+            "The diameter of the keyseat cutter's neck, between its head and its shank, in mm.",
+            "The head cuts as deep past the bore's wall as it is wider than the neck: the neck must stay 0.2 mm clear of the wall while the head circles the groove.",
             Some(Tool),
         ),
         (Target::Tool, "teeth") => (
@@ -2085,12 +2242,12 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(TurnOp(13)),
         ),
         (Target::Setup, "holding") => (
-            "The workholding to model for this setup: a Vise from the library, with its jaws on two opposite sides of the stock, or Clamps placed around it. Each is kept as boxes with a clearance gap that every move is checked against, and its hold is checked against each operation's cutting force. None models nothing.",
-            "Each is kept as boxes with a clearance gap, and every move is checked against them: the cutter from its tip up to its stickout at its cutting diameter, the tool holder above that at the holder diameter (a wider shank or a reduced neck is not modelled). A move that comes within the gap is warned of in the operation preview, which covers that operation's own toolpath, and refused at export, which checks every program move, the links between operations, approaches and retracts included. Parallels, bolts, the table and the machine body are not modelled. Each operation's cutting force is also set against what the vise's or clamps' clamping force holds (sliding, lifting and tipping), over the contact the earlier setups left the jaws; an operation held with a margin under ×2 is refused at export. In a later setup the jaws or clamps sit at the stock box carried over from setup 1, not at the walls earlier operations cut, and a setup turned from setup 1 by other than a multiple of 90° cannot model them. None models nothing; the Fixture note below is only a description. A lathe setup has a Chuck instead of a Vise or Clamps, and its checks are the chuck's: the bar's diameter in the jaws must be one the chuck closes on (a 3-jaw holds round work only), the grip at least a third of that diameter and no longer than the jaws, the stickout at least the furthest cut from the free end plus 5 mm, no cut inside the grip, the bar within the lathe's swing and the grip plus the stickout within the bar's length. A stickout over 4 diameters is warned of, not refused. The chuck's body is a box 40 mm deep behind the jaws' end, and a move within the clearance gap of it is warned of in the operation preview. Nothing is exported: a lathe has no G-code.",
+            "The workholding to model: a Vise, jaws on two opposite sides, Clamps round the stock, a Chuck (a lathe's, or the rotary A axis's), or a round bar's V-block, Soft jaws or Collet block. Each is kept as boxes with a clearance gap that moves are checked against, as is its hold against each cut. None models nothing.",
+            "Each is kept as boxes with a clearance gap, and every move is checked against them: the cutter from its tip up to its stickout at its cutting diameter, the tool holder above that at the holder diameter (a wider shank or a reduced neck is not modelled). A move that comes within the gap is warned of in the operation preview, which covers that operation's own toolpath, and refused at export, which checks every program move, the links between operations, approaches and retracts included. Parallels, bolts, the table and the machine body are not modelled. Each operation's cutting force is also set against what the vise's or clamps' clamping force holds (sliding, lifting and tipping), over the contact the earlier setups left the jaws; an operation held with a margin under ×2 is refused at export. In a later setup the jaws or clamps sit at the stock box carried over from setup 1, not at the walls earlier operations cut, and a setup turned from setup 1 by other than a multiple of 90° cannot model them. None models nothing; the Fixture note below is only a description. Chuck on a machine with a rotary A axis models the chuck on A from its rotary unit's sizes: the chuck body, its jaws (turning with A), the rotary head, the tailstock and the stock gripped in the jaws, each as the box round it with the gap, at each A angle; the grip left after earlier cuts, the stock turning or sliding in the jaws and its stick-out bending under each cut are checked too. A lathe setup has a Chuck instead of a Vise or Clamps, and its checks are the chuck's: the bar's diameter in the jaws must be one the chuck closes on (a 3-jaw holds round work only), the grip at least a third of that diameter and no longer than the jaws, the stickout at least the furthest cut from the free end plus 5 mm, no cut inside the grip, the bar within the lathe's swing and the grip plus the stickout within the bar's length. A stickout over 4 diameters is warned of, not refused. The chuck's body is a box 40 mm deep behind the jaws' end, and a move within the clearance gap of it is warned of in the operation preview. Nothing is exported: a lathe has no G-code. A V-block holds a bar lying along X in its V under a strap clamp: the block, its flanks (as steps that hold them) and the clamp are kept clear, the bar must seat on the flanks inside the V's edges and stand above the block, and its two line contacts and the clamp hold it against each cut. Soft jaws bored to the bar's diameter (within 0.5 mm) close round it along X or upright: on a lying bar their top must be above its axis; their arc contact holds it. A collet block stands in the vise with the bar in an ER collet: the collet must close on the diameter it grips, the nut and block are kept clear, and its grip, less when the bar stands under two thirds of the collet's length in it, holds it.",
             Some(Vise(8)),
         ),
         (Target::Setup, "holder") => (
-            "The library entry used: a vise for Vise, a clamp for Clamps. Entries are made on the Workholding page; changing one changes every setup that uses it.",
+            "The library entry used: a vise for Vise, a clamp for Clamps, a V-block, soft jaws or a collet block for those. Entries are made on the Workholding page; changing one changes every setup that uses it.",
             "",
             None,
         ),
@@ -2154,6 +2311,11 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "",
             Some(Tool),
         ),
+        (_, "tooth_force") => (
+            "The force on one tooth, in N, that the feed is changed along the path to hold. Empty: the force at the cutting feed on the operation's nominal cut, its stepover (a Contour: a full slot) as deep as its levels cut, at most the stepdown; the one at the full stepdown is shown under the field. A larger force feeds faster everywhere.",
+            "Worked out from the project material's kc1.1 and mc (steel without one) and the tool's flutes, for a 30° helix. The SIMULATION panel says the feeds it took.",
+            Some(Tool),
+        ),
         (_, "coolant") => (
             "Coolant for this operation. LinuxCNC export writes M8 for Flood, M7 for Mist, the machine's Air output for Air (refused when it has none) and nothing for Off, then M9 when the coolant changes, at a tool change and at the end of the program. The preview does not simulate coolant.",
             "",
@@ -2195,7 +2357,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Offsets),
         ),
         (_, "tab_count") => (
-            "How many tabs an outside Contour leaves on each outline it goes around, spaced evenly along it, the first half a spacing from where the cut starts. Two or three hold a small part; use more on a long or thin one, so it cannot bend into the cutter.",
+            "How many tabs an outside Contour leaves on each outline it goes around, placed automatically: as near to evenly spaced as the outline allows, each on a straight side or a gentle curve, never on a corner, a short segment or a tight arc. Two or three hold a small part; use more on a long or thin one, so it cannot bend into the cutter.",
             "",
             Some(Operation(Strategy::Contour)),
         ),
@@ -2208,6 +2370,41 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "How thick each tab is, in mm: over the tabs the cut stops this far above the stock's bottom, or above the contour's bottom where that is higher. It must be less than the depth the contour cuts.",
             "A tab holds only where stock is left beyond the cut, so leave more stock beside the part than the stock to leave, the tool's diameter and a 2 mm wall. Levels above the tabs' top go round in full. Below it the tool rises straight up at each tab's start and plunges back down at its end at a quarter of the cutting feed, as it does entering the cut. Cut or file the tabs off after the part is unclamped.",
             Some(Operation(Strategy::Contour)),
+        ),
+        (_, "hole_min") => (
+            "The narrowest hole a Holes contour cuts, in mm across its narrower side: the holes through the part's outline narrower than this are left for a Drill. Empty cuts every hole the tool fits in.",
+            "The tool follows the inside of each hole, from the stock top down to the bottom offset; the slug inside comes free, so on a sheet held by screws cut the holes before the outline.",
+            Some(Operation(Strategy::Contour)),
+        ),
+        (_, "dxf_thickness") => (
+            "The thickness of the flat part a DXF describes, in mm: its profile is extruded this thick, the outer loop the part and the inner loops holes through it. Changing it reloads the part.",
+            "",
+            None,
+        ),
+        (_, "sheet_thickness") => (
+            "The sheet's thickness, in mm. Empty takes the part's thickness. A sheet thicker than the part leaves material over it; a thinner one is refused.",
+            "",
+            None,
+        ),
+        (_, "spoilboard") => (
+            "How far a cut through the sheet may go on into the spoilboard under it, in mm (0 to 3; empty is 0.5). A Contour's bottom offset or a Drill's breakthrough may take the cut that far below the sheet, never deeper: a deeper cut is refused.",
+            "",
+            None,
+        ),
+        (_, "holddown_screws") => (
+            "Where the hold-down screws go, as X,Y in mm from the sheet's front-left (−X −Y) corner, separated by semicolons: 10,10; 240,10. Empty puts one in from each corner by the head's diameter. Each must be in the waste outside the part's outline, its head wholly on the sheet.",
+            "Every move, rapids included, is kept clear of each head by the setup's gap; one in the cutter's way is refused.",
+            None,
+        ),
+        (_, "screw_head") => (
+            "The diameter of each hold-down screw's head or washer, in mm. Empty is 12.",
+            "",
+            None,
+        ),
+        (_, "screw_height") => (
+            "How far each hold-down screw's head stands above the sheet, in mm. Empty is 5.",
+            "",
+            None,
         ),
         (_, "through") => (
             "Add Breakthrough below the bottom of each hole that goes through the part. A blind hole is refused with Yes, since the part goes on under its bottom. Check the extra depth and the material or fixture underneath.",
@@ -2223,11 +2420,6 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "Holes in the selected floors with nothing of the part over or under them, such as switch cut-outs in a plate: Leave clears over them at the floor's height, Cut through also cuts each down to where its walls end, plus Breakthrough. Pocket and Adaptive clearing share this setting.",
             "An opening is a hole in a selected floor whose column holds no part at all. Its walls are followed at the cutter's radius, as a pocket's are, so corners keep that radius; run a smaller cutter after it to sharpen them. Openings narrower than the cutter are left, for a smaller one. Round holes are openings too, but Drilling makes them faster.",
             Some(Operation(Strategy::Pocket)),
-        ),
-        (_, "angle_a" | "angle_b") => (
-            "Indexed position of the primary or secondary rotary axis, in degrees. The axis is positioned before cutting and held fixed during the cut.",
-            "",
-            Some(Operation(Strategy::Indexed)),
         ),
         (_, "rotary_axis") => (
             "A rotates about X, B about Y, and C about Z. Choose the axis that matches the setup's saved machine arrangement.",
@@ -2284,6 +2476,21 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "",
             Some(Operation(Strategy::Drill)),
         ),
+        (_, "groove_diameter") => (
+            "The groove's diameter, in mm: wider than the bore for an internal groove (Ø33.7 for a DIN 472-32 circlip in a Ø32 bore), smaller than the boss for one round it.",
+            "The keyseat head's edge reaches it: the head's centre circles this radius less (or, round a boss, plus) the head's.",
+            None,
+        ),
+        (_, "groove_width") => (
+            "The groove's width along the bore, in mm. A groove wider than the head takes the fewest passes that cover it, evenly spread; a head wider than the groove is refused.",
+            "",
+            None,
+        ),
+        (_, "groove_land") => (
+            "How far the groove is from where it is measured, in mm: the land between the bore's end and the groove's near edge, or the depth of the groove's top edge below the stock top.",
+            "A circlip's land takes its load: keep the bore's entry chamfer smaller than it.",
+            None,
+        ),
         (_, "thread_depth") => (
             "How deep the full thread runs from the hole's rim, in mm. Blank takes the depth the model has.",
             "",
@@ -2295,7 +2502,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Operation(Strategy::Drill)),
         ),
         (_, "spring_pass") => (
-            "Yes goes round the thread once more at full depth. The mill springs back from the wall as it cuts, so the last pass takes the spring out and trues the size.",
+            "Yes goes round the thread (or the groove) once more at full depth. The cutter springs back from the wall as it cuts, so the last pass takes the spring out and trues the size.",
             "",
             Some(Operation(Strategy::Drill)),
         ),
@@ -2370,7 +2577,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Stepover),
         ),
         (_, "surface_stepover") => (
-            "Spacing between adjacent finishing passes, in mm. Smaller spacing usually reduces scallop height but increases machining time.",
+            "Spacing between adjacent finishing passes, in mm; smaller leaves smaller scallops but takes longer. Waterline adds levels where a face slopes gently so its loops stay this close across it: 0.5 mm on a 20° slope puts levels 0.18 mm apart.",
             "",
             Some(Stepover),
         ),
@@ -2494,6 +2701,11 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "",
             Some(Probe(3)),
         ),
+        (_, "probe_length") => (
+            "How far the probe the A centreline is probed with reaches from the spindle nose to its tip, in mm. The Z travel checks at each A angle hold a tool's spindle its stick-out plus holder length less this higher. Left empty, each tool is taken as long as the probe, and the checks say so.",
+            "Only for the travel checks: the depth of every cut on A comes from each tool's touch-off on the Z reference, never from these lengths.",
+            None,
+        ),
         (_, "probe_tip") => (
             "Diameter of the probe's ball or pin, in mm: measure it, or the tool's diameter for a tool with the plate's lead on conductive stock. Probe corner and Probe centre move each side they touch by half of it. Leave it empty without a probe.",
             "",
@@ -2605,22 +2817,22 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (_, "origin") => (
-            "Work zero for this setup's G-code and runs: a spot on the top or bottom of the stock this setup starts from, or the part file's own origin. The probe on the Control page finds exactly this point; the editor says where it is touched off and whether it is still on the stock.",
+            "Work zero for this setup's G-code and runs: a spot on the top or bottom of the stock this setup starts from, or the part file's own origin; with A, the A centreline at the stock's end or the chuck's face. The probe on the Control page finds exactly this point; the editor says where it is touched off and whether it is still on the stock.",
             "Work zero for this setup's G-code and runs: a corner, the middle of an edge or the centre of the stock's top or bottom, on the stock this setup starts from (what earlier setups leave, turned with it), or the part file's own origin.",
             Some(Orientation),
         ),
         (_, "stock_type") => (
-            "Relative size box adds offsets to the six sides of the part's box after setup rotation. Fixed size box uses X, Y and Z sizes. A round bar lies along setup Z on X 0 Y 0, for the lathe. Values are kept when switching.",
-            "",
+            "Relative size box adds offsets to the six sides of the part's box after setup rotation. Fixed size box uses X, Y and Z sizes. A round bar lies along setup Z on X 0 Y 0, for the lathe; on a machine with a rotary A axis it lies along X, for the chuck on A. Values are kept when switching.",
+            "On a machine without a rotary A axis The bar says whether a Round bar stands along Z (a collet block or soft jaws bored upright hold it) or lies along X (a V-block or soft jaws bored along X). Sheet is a flat sheet of X × Y on a spoilboard, the part lying on it, held down by screws or tape.",
             Some(Stock(0)),
         ),
         (_, "stock_diameter") => (
-            "Round bar diameter, mm. The bar lies along the setup Z axis, centred on X 0 Y 0.",
+            "Round bar diameter, mm. The bar lies along the setup Z axis, centred on X 0 Y 0; on a machine with a rotary A axis, along setup X, centred on X and Y and standing on Z=0, the chuck's jaws gripping its -X end.",
             "",
             Some(Stock(1)),
         ),
         (_, "stock_length") => (
-            "Round bar length along the setup Z axis, mm, from Z 0 up.",
+            "Round bar length along the setup Z axis, mm, from Z 0 up; on a machine with a rotary A axis, along setup X.",
             "",
             Some(Stock(2)),
         ),
@@ -2628,6 +2840,26 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "Extra material round the part, mm: the bar's radius is the part's largest distance from the setup Z axis plus this. 0 touches the part.",
             "",
             Some(Stock(3)),
+        ),
+        (Target::Setup, "chuck_jaws") => (
+            "The chuck on the A axis: 3-jaw for round stock, 4-jaw for a box or round stock. Its diameter, jaw length and grip range are the machine's rotary unit's.",
+            "",
+            None,
+        ),
+        (Target::Setup, "chuck_stickout") => (
+            "How far the stock reaches out of the jaws towards the tailstock, in mm. The jaws grip the rest up to their length: at least half of it must be gripped.",
+            "The stick-out places the stock in the chuck: the jaws' front is the stick-out from the stock's +X end, the chuck's face a jaw length behind it. A longer stick-out bends more under the cut.",
+            None,
+        ),
+        (Target::Setup, "chuck_jaw_angle") => (
+            "Where jaw 1 points at A0, in degrees from straight up, turning as +A does. 0 puts it on top. A 4-jaw chuck on a box needs 0, 90, 180 or 270.",
+            "",
+            None,
+        ),
+        (Target::Setup, "chuck_tailstock") => (
+            "Where the machine's tailstock is: drawn back, its centre in the stock's end, or off the table.",
+            "",
+            None,
         ),
         (_, "stock_x" | "stock_y" | "stock_z") => (
             "Overall stock box extent along this setup axis, in mm. Fixed stock is centered on X and Y with its bottom on Z=0 in the preview. Use relative stock for extra material measured from each part side.",
@@ -2685,8 +2917,13 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (_, "reposition") => (
-            "Action needed before this setup: initial loading, reclamping and probing, rotary indexing, or changing the fixture. Included in the setup sheet.",
-            "",
+            "Action needed before this setup: initial loading, reclamping and probing, indexing the rotary A axis, or changing the fixture. Included in the setup sheet.",
+            "Index rotary axis turns the stock about A in the setup before's clamping: the setup keeps that setup's work zero and lists its A angles. The other actions only describe the setup.",
+            Some(Orientation),
+        ),
+        (_, "a_angles") => (
+            "The A angles this indexed setup turns the stock to, in degrees: one (90), or several for the same operations at each (0, 90, 180, −90), within the machine's A range. Positive A turns the part by the right-hand rule about +X: clockwise seen from the chuck looking along +X, +Y up to +Z at A90.",
+            "Each angle must be inside the machine's A range. The stock turns about the A centreline in the clamping of the setup before, so the work zero stays where that setup has it. Every operation of the setup runs at each angle, in the order listed, with A held still while it cuts; between angles the tool retracts above the swing radius of the stock, part and jaws plus the operation's clearance before A turns.",
             Some(Orientation),
         ),
         (_, "notes") => (
@@ -2712,7 +2949,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             )),
         ),
         (_, "mode") => (
-            "Indexed motion positions the rotary axes before cutting; simultaneous motion changes rotary and linear positions together. This prototype saves the capability but does not solve it.",
+            "Indexed motion positions the rotary axes before cutting; simultaneous motion changes rotary and linear positions together. On a 4-axis machine with A around X, an indexed setup runs its operations at each A angle it lists; simultaneous motion is saved but not solved.",
             "",
             Some(Operation(Strategy::Indexed)),
         ),
@@ -2731,8 +2968,47 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "",
             Some(Orientation),
         ),
+        (Target::Machine, k) if k.starts_with("a_") => (
+            match k {
+                "a_centre_y" => {
+                    "Where the A axis' centreline runs in machine Y, in mm from the machine's Y zero. It must be inside the Y travel. Assumed until measured: the Control page's Rotary A panel probes it and saves it as measured."
+                }
+                "a_centre_z" => {
+                    "Where the A axis' centreline runs in machine Z, in mm (zero is the top of the Z travel, so this is negative). It must be inside the Z travel. Assumed until measured."
+                }
+                "a_chuck_x" => {
+                    "Machine X of the chuck's face, where a part starts, in mm. Assumed until measured."
+                }
+                "a_centre_height" => {
+                    "Height of the A centreline above the table, in mm. Assumed until measured."
+                }
+                "a_chuck_diameter" => "The chuck's outside diameter, in mm.",
+                "a_jaw_length" => {
+                    "How far the jaws reach out from the chuck face, in mm: a part is gripped over this length."
+                }
+                "a_grip_min" => "The smallest part diameter the jaws grip, in mm.",
+                "a_grip_max" => {
+                    "The largest part diameter the jaws grip, in mm. It cannot be more than the chuck diameter."
+                }
+                "a_tail_width" => "Width of the tailstock body across Y, in mm.",
+                "a_tail_height" => "Height of the tailstock body in Z, in mm.",
+                "a_tail_length" => "Length of the tailstock body along X, in mm.",
+                "a_tail_travel" => "How far the tailstock's centre moves in or out, in mm.",
+                "a_tail_x" => {
+                    "Machine X of the tailstock's centre point, in mm. It must be farther along X than the chuck face."
+                }
+                "a_fit_diameter" => {
+                    "The largest part diameter that fits under the gantry with the machine's Z travel (55 mm, assumed), in mm."
+                }
+                _ => {
+                    "The longest part that fits between the chuck face and the tailstock, in mm. It cannot be more than the distance between them."
+                }
+            },
+            "Every default is assumed, for a 100 mm 3-jaw chuck on a NEMA23 rotary unit, and still to be measured; calibration will fill in measured numbers.",
+            None,
+        ),
         (_, "controller") => (
-            "Controller family. LinuxCNC has a 3-axis postprocessor; other controllers are saved for planning and cannot export G-code yet.",
+            "Controller family. LinuxCNC has a 3-axis postprocessor that also indexes A; other controllers are saved for planning and cannot export G-code yet.",
             "",
             None,
         ),
@@ -2780,6 +3056,81 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "A chamfer mill's included point angle in degrees, 90 when left empty. Match a countersink's angle: an 82° countersink needs an 82° cutter. A Drill finds each countersink the model has with its angle and refuses a chamfer mill of another angle, which would cut into its wall (sharper) or leave its cone (blunter).",
             "Drilling with a chamfer mill plunges its point into each detected opening until the cone is as wide as the opening at its rim, so a countersink comes out at the CAD's size. Bottom offset raises the plunge (a narrower chamfer); a negative one lowers it (a wider one).",
             Some(Tool),
+        ),
+        (_, "tip_flat") => (
+            "How wide a chamfer mill's flat tip is across, in mm. Empty or 0 is a pointed tip. A flat tip is wider at every height by half its width on each side, so Chamfer milling holds the axis that much further from the edge.",
+            "The flat must be narrower than the tool. The simulation cuts with the flat, and Chamfer milling puts the axis by it.",
+            Some(Tool),
+        ),
+        (_, "chamfer_source") => (
+            "What a Chamfer milling puts the side of the cone on: the edges of the faces you pick on the part, or a straight line given by its two ends and its height.",
+            "A line needs no part, so it can cut V flanks at a depth, as the teeth of a clutch. Selected edges follow the part, so a change in the model moves them.",
+            None,
+        ),
+        (_, "chamfer_edges") => (
+            "Which edges of the picked level faces are chamfered: all of their outline and hole mouths, only the outer contour, or only the hole mouths.",
+            "A wall picked beside the level face narrows it to the one straight edge they share, whatever this says.",
+            None,
+        ),
+        (_, "extend") => (
+            "How far, in mm, a chain of edges that does not close is run on past both its ends, so the cone's side leaves the edge cleanly. Closed outlines and holes ignore it.",
+            "",
+            None,
+        ),
+        (_, "from_x" | "from_y" | "to_x" | "to_y") => (
+            "One end of the line the cone's side is put on, in mm in work coordinates, from the setup's work zero. The tool runs from the start to the end.",
+            "The two ends must be at least 0.01 mm apart. The line is level, at the line height.",
+            None,
+        ),
+        (_, "line_z") => (
+            "The height of the line the cone's side is put on, in mm in work coordinates, from the setup's work zero. Passes sets how far under it the tip goes.",
+            "",
+            None,
+        ),
+        (_, "chamfer_side") => (
+            "Which side of the line the tool is on, looking from its start to its end: the side it cuts away. Alternate takes Left for the first copy, Right for the second, and so on.",
+            "",
+            None,
+        ),
+        (_, "copies") => (
+            "How many copies of the cut are made, turned round a vertical axis: a whole number from 1 to 720. One copy is the cut as set.",
+            "Copy k is turned the first copy's angle plus k times the angle between copies, anticlockwise seen from above.",
+            None,
+        ),
+        (_, "copy_pitch") => (
+            "The angle in degrees between one copy and the next, anticlockwise seen from above. The copies must not go round more than once, or they would cut over each other.",
+            "",
+            None,
+        ),
+        (_, "first_angle") => (
+            "The angle in degrees the first copy is turned about the axis, anticlockwise seen from above. 0 leaves it where it is set.",
+            "",
+            None,
+        ),
+        (_, "axis_x" | "axis_y") => (
+            "Where the vertical axis the copies turn about is, in mm in work coordinates, from the setup's work zero.",
+            "",
+            None,
+        ),
+        (_, "chamfer_size") => (
+            "How a cut along a line is sized: by the chamfer's width on the face, or by the Z the tool's tip goes down to. Selected edges are always sized by the width.",
+            "Either way the cone's side, not its tip, does the cutting, and the axis is put off the edge or line so the side lies on it.",
+            None,
+        ),
+        (_, "chamfer_width") => (
+            "How wide the chamfer is on the level face, in mm. It must be above zero. The cone's side cuts the whole chamfer, down the wall to its lower end.",
+            "",
+            None,
+        ),
+        (_, "tip_offset") => (
+            "How far the tip goes below the lower end of the chamfer, in mm: 0 or more. It keeps the tip out of the cut, so the cone's side cuts the whole chamfer; a deeper tip moves the axis further from the edge.",
+            "",
+            None,
+        ),
+        (_, "tip_z") => (
+            "The Z the tool's tip goes to, in mm in work coordinates, from the setup's work zero. The axis is off the line by the cone's radius at the line's height.",
+            "The tip must be below the line, and the cone must not be wider there than the tool.",
+            None,
         ),
         _ => (
             "Saved parameter for the current setup or operation. See the field label for its units.",
@@ -3392,6 +3743,8 @@ mod tests {
             ("drill-helix", DrillCycle(4)),
             ("drill-thread-mill", DrillCycle(5)),
             ("drill-tap", DrillCycle(6)),
+            ("drill-ream", DrillCycle(7)),
+            ("drill-bore", DrillCycle(8)),
             ("containment-inside", Containment(-1)),
             ("containment-on", Containment(0)),
             ("containment-outside", Containment(1)),
@@ -3407,6 +3760,9 @@ mod tests {
             ("clamp-2-height", Clamp(2)),
             ("clamp-3-bite", Clamp(3)),
             ("clamp-4-clamps", Clamp(4)),
+            ("round-0-v-block", Round(0)),
+            ("round-1-soft-jaws", Round(1)),
+            ("round-2-collet-block", Round(2)),
             ("cutting-0-vc_min", Cutting(0)),
             ("cutting-1-fz", Cutting(1)),
             ("lathetool-0-hand", LatheTool(0)),
@@ -4230,7 +4586,13 @@ mod tests {
         }
         let fallbacks: Vec<(&str, Vec<&str>)> = vec![
             ("offset", vec!["G54", "G55", "G56", "G57", "G58", "G59"]),
-            ("origin", crate::post::ORIGINS.to_vec()),
+            (
+                "origin",
+                (crate::post::ORIGINS.iter())
+                    .chain(&crate::indexed::ORIGINS)
+                    .copied()
+                    .collect(),
+            ),
             (
                 "controller",
                 vec![
@@ -4256,7 +4618,7 @@ mod tests {
                 ],
             ),
             ("speed", vec!["0.5", "1", "120"]),
-            ("holding", vec!["None", "Vise", "Clamps", "Chuck"]),
+            ("holding", crate::holding::CHOICES.to_vec()),
             ("group", crate::material::GROUPS.to_vec()),
         ];
         for (key, values) in fallbacks {
@@ -4347,6 +4709,7 @@ mod tests {
             SaveProjectAs,
             RunOnMachine(0),
             NewMachine,
+            AddRotaryMachine,
             AddSetup,
             AddManualSetup,
             AddLatheSetup,
@@ -4377,6 +4740,7 @@ mod tests {
             PlacePins,
             AddPinDrilling,
             AddThreading,
+            AddHoleStages,
             ThreadFromPart,
             Generate,
             GenerateAll,
@@ -4466,6 +4830,8 @@ mod tests {
             Ctl::JogRelease,
             Ctl::JogStep(None),
             Ctl::JogStep(Some(1.)),
+            Ctl::JogAngle(None),
+            Ctl::JogAngle(Some(15.)),
             Ctl::JogSpeed(50.),
             Ctl::WorkZero(None),
             Ctl::WorkZero(Some(0)),
@@ -4495,6 +4861,14 @@ mod tests {
             Ctl::ProbeFeature(crate::control::Feature::Bore),
             Ctl::TouchOff,
             Ctl::ToSimZero,
+            Ctl::BarText(String::new()),
+            Ctl::SpacingText(String::new()),
+            Ctl::Calibrate(crate::control::Calibrate::Centreline),
+            Ctl::Calibrate(crate::control::Calibrate::Alignment),
+            Ctl::Calibrate(crate::control::Calibrate::AZero),
+            Ctl::TouchCentreReference,
+            Ctl::SaveCentreline,
+            Ctl::Remounted,
         ] {
             messages.push(Machine(a));
         }
@@ -4510,6 +4884,7 @@ mod tests {
             Run::ZFromReference,
             Run::ProbeReference,
             Run::ProbeFromReference,
+            Run::ProbeCentreReference,
             Run::CoolantOff,
         ] {
             messages.push(Message::Run(a));

@@ -300,6 +300,7 @@ pub(crate) fn outline(f: Outline) -> Result<Plan, String> {
         tool_length: f.tool_length,
         holder_radius: f.holder_radius,
         neck: None,
+        stops: vec![],
         display_scale: f.scale,
         duration: 0.,
         target: f.target,
@@ -515,6 +516,7 @@ fn push(
             feed: rate,
             start: plan.duration,
             end,
+            a: None,
         });
         plan.duration = end;
     }

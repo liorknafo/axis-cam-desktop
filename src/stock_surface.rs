@@ -164,9 +164,10 @@ impl Cut {
                             .sqrt()
                 }
                 // The point's cone, rising from the tip, under the wall.
-                CutterShape::Drill | CutterShape::Chamfer(_) => {
+                CutterShape::Drill | CutterShape::Chamfer(..) => {
                     Tree::from(d[2].min(0.))
-                        + (p[0].square() + p[1].square()).sqrt() * self.shape.rise().unwrap()
+                        + ((p[0].square() + p[1].square()).sqrt() - self.shape.flat()).max(0.)
+                            * self.shape.rise().unwrap()
                 }
                 // Rings and thread mills return above.
                 CutterShape::Revolve | CutterShape::Thread { .. } => Tree::from(d[2].min(0.)),
@@ -203,7 +204,7 @@ impl Cut {
                         .max(0.)
                         .sqrt()
             }
-            CutterShape::Drill | CutterShape::Chamfer(_) => {
+            CutterShape::Drill | CutterShape::Chamfer(..) => {
                 let rise = self.shape.rise().unwrap();
                 // As the ball, with the point's cone as the lower envelope:
                 // lowest where the tip's descent balances the cone's rise,
@@ -223,7 +224,9 @@ impl Cut {
                     lo.clone()
                 };
                 let t = t.max(lo.clone()).min(hi.clone());
-                t.clone() * d[2] + ((u - t * l).square() + v.square()).sqrt() * rise
+                t.clone() * d[2]
+                    + (((u - t * l).square() + v.square()).sqrt() - self.shape.flat()).max(0.)
+                        * rise
             }
             // Rings and thread mills return above.
             CutterShape::Flat | CutterShape::Revolve | CutterShape::Thread { .. } => {
@@ -250,6 +253,8 @@ pub struct Snapshot {
     pub detail: Detail,
     /// Whether the stock is the round bar in `bounds` (`Volume::round`).
     pub round: bool,
+    /// The round bar along X inside its box (`Volume::bar_x`).
+    pub bar_x: Option<crate::stock::Round>,
 }
 #[derive(Debug)]
 pub struct SurfaceMesh {
@@ -274,6 +279,7 @@ impl Snapshot {
             cuts: volume.cuts.clone(),
             detail,
             round: volume.round,
+            bar_x: volume.bar_x,
         }
     }
     pub(crate) fn field(&self) -> Tree {
@@ -292,6 +298,14 @@ impl Snapshot {
                 t.max(self.bounds.min[k] - p[k].clone())
                     .max(p[k].clone() - self.bounds.max[k])
             });
+        // A rotary setup's bar along X (`Volume::bar_x`).
+        let box_field = match self.bar_x {
+            Some(bar) => {
+                let (y, z) = (p[1].clone() - bar.axis[0], p[2].clone() - bar.axis[1]);
+                box_field.max((y.square() + z.square()).sqrt() - bar.radius)
+            }
+            None => box_field,
+        };
         if self.cuts.is_empty() {
             return box_field;
         }
@@ -301,7 +315,11 @@ impl Snapshot {
     /// The surface, meshed on the GPU when there is one (`gpu_mesh`), else
     /// by fidget's octree on the CPU (`build_cpu`).
     pub fn build(&self) -> Result<SurfaceMesh, String> {
-        if let Some(gpu) = crate::gpu_mesh::shared() {
+        // The GPU's field has the bar along Z (`round`), not a rotary
+        // setup's bar along X (`bar_x`): that one is meshed on the CPU.
+        if self.bar_x.is_none()
+            && let Some(gpu) = crate::gpu_mesh::shared()
+        {
             match gpu.mesh(self) {
                 Ok(mesh) => return Ok(mesh),
                 Err(e) => eprintln!("GPU stock mesher: {e}; meshing on the CPU."),
@@ -360,6 +378,33 @@ mod tests {
             &mesh,
         )
     }
+    /// A round bar's stock has no material outside the bar: its voxels
+    /// there are empty and its surface keeps inside it, touching it.
+    #[test]
+    fn a_round_bar_stock_is_meshed_and_counted_inside_the_bar() {
+        let bounds = Bounds {
+            min: [-30., -10., 0.],
+            max: [30., 10., 20.],
+        };
+        let bar = crate::stock::Round {
+            axis: [0., 10.],
+            radius: 10.,
+        };
+        let v = crate::volume::Volume::new(bounds, frame()).rounded(Some(bar));
+        let share = v.remaining as f32 / v.occupied.len() as f32;
+        // π/4 of the box, within the voxels' rounding.
+        assert!(
+            (share - std::f32::consts::FRAC_PI_4).abs() < 0.03,
+            "{share}"
+        );
+        let mesh = Snapshot::of(&v, Detail::Draft).build().unwrap();
+        let r = mesh
+            .vertices
+            .iter()
+            .map(|p| (p[1] - 0.).hypot(p[2] - 10.))
+            .fold(0f32, f32::max);
+        assert!((r - 10.).abs() <= mesh.cell_mm, "{r}");
+    }
     fn snapshot(cuts: Vec<Cut>, detail: Detail) -> Snapshot {
         Snapshot {
             bounds: Bounds {
@@ -370,6 +415,7 @@ mod tests {
             cuts: Arc::new(cuts),
             detail,
             round: false,
+            bar_x: None,
         }
     }
     fn cut(a: [f32; 3], b: [f32; 3], shape: CutterShape) -> Cut {

@@ -51,6 +51,98 @@ pub struct PartReport {
     pub workholding: Option<WorkholdingReport>,
     /// The first entry is setup 1's orientation.
     pub orientations: Vec<OrientationReport>,
+    /// The rotary A axis, on a machine that has one with its geometry
+    /// recorded; absent on a 3-axis machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotary: Option<RotaryReport>,
+    /// Setup 1's sheet on its spoilboard; absent for any other stock.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sheet: Option<SheetReport>,
+}
+/// Setup 1's stock when it is a sheet lying on a spoilboard (`sheet`), mm.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SheetReport {
+    /// X, Y and thickness.
+    pub size: [f32; 3],
+    /// How far a cut through the sheet may go on into the spoilboard: a
+    /// through cut's bottom offset (or breakthrough) of up to this much below
+    /// the model's bottom, no more.
+    pub spoilboard_allowance: f32,
+    /// What holds the sheet down: "Screws" (their heads are setup 1's
+    /// `workholding` boxes, which every move keeps clear of), "Tape" (holds
+    /// the part too) or "None".
+    pub holddown: String,
+    /// With screws only the waste is held: an outside contour that cuts
+    /// through must leave tabs.
+    pub needs_tabs: bool,
+}
+/// Setup 1's sheet for the report, or None for any other stock.
+fn sheet_report(setup1: &Setup, mesh: &Mesh) -> Option<SheetReport> {
+    if !crate::sheet::is_sheet(setup1) {
+        return None;
+    }
+    let stock = crate::stock::resolve(setup1, Some(mesh)).ok()?.stock;
+    Some(SheetReport {
+        size: stock.dimensions().map(r2),
+        spoilboard_allowance: r2(crate::sheet::below(setup1)),
+        holddown: crate::sheet::holddown(setup1).to_string(),
+        needs_tabs: crate::sheet::loose_part(setup1).is_some(),
+    })
+}
+/// The machine's rotary A axis for the planner (`model::RotaryUnit`), mm and
+/// degrees: what holds in the chuck, what fits, and how far to trust it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RotaryReport {
+    /// The A centreline above the table.
+    pub centre_height: f32,
+    /// The largest stock diameter, and the longest stock from the chuck's
+    /// face, that fit on the rotary unit.
+    pub max_diameter: f32,
+    pub max_length: f32,
+    /// The machine's A range.
+    pub a_min: f32,
+    pub a_max: f32,
+    /// The smallest and largest stock the jaws grip: a round bar's diameter,
+    /// or a box's thinner side and its diagonal.
+    pub grip_min: f32,
+    pub grip_max: f32,
+    /// "measured" while the A centreline was probed and has not gone stale,
+    /// else "assumed".
+    pub centreline: &'static str,
+}
+/// The rotary axis for the report of a job whose setup 1 is `setup1`, or
+/// None without an A axis around X and its rotary unit's sizes.
+fn rotary_report(doc: &Document, setup1: &Setup) -> Option<RotaryReport> {
+    let unit = doc.rotary_unit(&setup1.machine)?;
+    let m = &setup1.machine.p;
+    Some(RotaryReport {
+        centre_height: r2(unit.centre_height),
+        max_diameter: r2(unit.fit_diameter),
+        max_length: r2(unit.fit_length),
+        a_min: r2(num(m, "rotary_min")?),
+        a_max: r2(num(m, "rotary_max")?),
+        grip_min: r2(unit.grip_min),
+        grip_max: r2(unit.grip_max),
+        centreline: if doc.centre_mark(&setup1.machine) == crate::control::MEASURED {
+            "measured"
+        } else {
+            "assumed"
+        },
+    })
+}
+/// The orientation (the part axis that points up) of setup `base`'s part
+/// once A has turned it by `turn` degrees about +X (`indexed::Turn::turn`),
+/// or None when that is not one of the six.
+pub fn orientation_at(base: &Setup, turn: f32) -> Option<&'static str> {
+    let angles = ["rx", "ry", "rz"].map(|k| num(&base.p, k).unwrap_or(f32::NAN));
+    let mut turned = base.clone();
+    for (key, value) in ["rx", "ry", "rz"]
+        .iter()
+        .zip(crate::indexed::turned_angles(angles, turn))
+    {
+        turned.p.insert((*key).into(), value.to_string());
+    }
+    up_axis(&turned)
 }
 /// One vise or clamp of the library, told by number and size: never its name,
 /// notes or id. `proposal::build` finds the entry again by `number`.
@@ -58,7 +150,8 @@ pub struct PartReport {
 pub struct LibraryEntry {
     /// Counts from 1 over `library`.
     pub number: usize,
-    /// "Vise" or "Clamp", as the library names its kinds.
+    /// "Vise", "Clamp", or for a round bar "V-block", "Soft jaws" or
+    /// "Collet block", as the library names its kinds.
     pub kind: &'static str,
     /// A vise: `jaw_width`, `jaw_height`, `jaw_thickness`, `max_opening`,
     /// `grip`. A clamp: `length`, `width`, `height`, `bite`. In mm, sorted by
@@ -72,7 +165,9 @@ pub struct LibraryEntry {
 pub fn library(doc: &Document) -> Vec<&crate::holding::Holder> {
     doc.workholding
         .iter()
-        .filter(|h| matches!(h.kind(), "Vise" | "Clamp"))
+        .filter(|h| {
+            matches!(h.kind(), "Vise" | "Clamp") || crate::round_hold::KINDS.contains(&h.kind())
+        })
         .collect()
 }
 /// The number, counted as `library` is, of the entry that holds `setup1`: None
@@ -95,11 +190,7 @@ fn library_report(doc: &Document) -> Vec<LibraryEntry> {
         .enumerate()
         .map(|(n, holder)| LibraryEntry {
             number: n + 1,
-            kind: if holder.kind() == "Vise" {
-                "Vise"
-            } else {
-                "Clamp"
-            },
+            kind: crate::holding::library_kind(holder.kind()).unwrap_or("Clamp"),
             sizes: holder
                 .keys()
                 .iter()
@@ -112,7 +203,9 @@ fn library_report(doc: &Document) -> Vec<LibraryEntry> {
 /// and clearance gap are told: never the library entry's name or notes.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WorkholdingReport {
-    /// "Vise" or "Clamps".
+    /// "Vise", "Clamps" or "Chuck", a round bar's "V-block", "Soft jaws"
+    /// or "Collet block", or "Hold-down screws" (a sheet's, through its
+    /// waste into the spoilboard: each box is a screw's head).
     pub kind: &'static str,
     /// The `workholding_library` number of setup 1's entry, which a later
     /// setup's `holder` of null shares; absent when setup 1 has no entry.
@@ -128,14 +221,67 @@ pub struct WorkholdingReport {
     /// when none reaches above the stock top.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clearance_above_stock_top: Option<f32>,
+    /// The chuck on the rotary A axis, for "Chuck".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chuck: Option<ChuckReport>,
+    /// The round bar a V-block, soft jaws or a collet block holds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round_bar: Option<RoundBarReport>,
+}
+/// Setup 1's round bar on a 3-axis mill (`round_hold`), mm.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RoundBarReport {
+    pub diameter: f32,
+    pub length: f32,
+    /// "X" for a bar lying along X (a V-block, soft jaws bored along X),
+    /// "Z" for one standing (soft jaws bored upright, a collet block).
+    pub along: &'static str,
+}
+/// Setup 1's chuck (`chuck::Rig`), mm.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ChuckReport {
+    /// 3 or 4.
+    pub jaws: usize,
+    pub chuck_diameter: f32,
+    pub jaw_length: f32,
+    /// How long the jaws grip the stock.
+    pub gripped_length: f32,
+    /// How far the stock reaches out of the jaws, towards +X.
+    pub stickout: f32,
+    /// The stock's diameter when it is a round bar.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bar_diameter: Option<f32>,
+    /// "Retracted", "Supports the stock" or "Off the table".
+    pub tailstock: String,
+    /// The A angle every operation runs at.
+    pub a_angle: f32,
 }
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MachineReport {
     pub max_rpm: f32,
     pub max_feed: f32,
     pub travel: [f32; 3],
+    /// What fits in the machine, when it gives the figures (LIO-252): the
+    /// program refuses a part and tool that do not fit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clearance: Option<ClearanceReport>,
     /// The coolant choices the machine has outputs for.
     pub coolants: Vec<&'static str>,
+}
+/// A machine's clearances in mm, as the model is told them; a missing figure
+/// is not checked.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ClearanceReport {
+    /// From the spindle nose, with Z at its top, to the table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nose_to_table: Option<f32>,
+    /// Under the gantry beam, and between its uprights.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gantry_height: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gantry_width: Option<f32>,
+    /// The machine's figures that are only ASSUMED, not measured.
+    pub assumed: Vec<&'static str>,
 }
 /// The project material and its cutting data, as the model sees them.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -168,15 +314,23 @@ pub struct ToolReport {
     /// A chamfer mill's included tip angle, degrees.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tip_angle: Option<f32>,
+    /// A chamfer mill's flat tip, across, mm, when it is not pointed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tip_flat: Option<f32>,
     /// A thread mill's thread angle (55 or 60), and a tap's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_angle: Option<f32>,
     /// A thread mill's finest and coarsest pitch, mm.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pitches: Option<[f32; 2]>,
-    /// How deep a thread mill's neck lets it reach, mm.
+    /// How deep a thread mill's neck lets it reach, mm; a keyseat cutter's
+    /// reach from its head's bottom to its shank.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reach: Option<f32>,
+    /// A keyseat cutter's neck diameter, mm (its `diameter` is the head's
+    /// and its `flute_length` the head's width).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub neck_diameter: Option<f32>,
     /// A thread mill's teeth stacked along it, when more than one: it cuts
     /// only the pitch they are spaced at.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -184,6 +338,13 @@ pub struct ToolReport {
     /// A tap's thread size.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,
+    /// A reamer's tolerance class, like H7.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tolerance: Option<String>,
+    /// A boring head's smallest and largest bore, mm; its `diameter` is
+    /// its body's and its `flute_length` how far its bar reaches below it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bore_range: Option<[f32; 2]>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OrientationReport {
@@ -1020,12 +1181,17 @@ fn orientation(
     planes.truncate(MAX_PLANES);
     let mut holes_left = max_holes;
     for plane in &mut planes {
-        if plane.depth_below_top < 0.01 {
+        let top = plane.depth_below_top < 0.01;
+        if top {
             plane.kind = "top";
-        } else {
+        }
+        // A flat part on a sheet: its cut-outs are openings through the top.
+        if !top || crate::sheet::is_sheet(&setup) {
             let ids = plane.surfaces.iter().copied().collect();
             if let Ok(floor) = crate::pocket::floor(&setup, &ids, mesh) {
-                plane.max_cutter_diameter = Some(r2(floor.largest(MAX_CUTTER)));
+                if !top {
+                    plane.max_cutter_diameter = Some(r2(floor.largest(MAX_CUTTER)));
+                }
                 let sizes = floor.opening_sizes();
                 if sizes.len() > MAX_OPENINGS {
                     truncated = true;
@@ -1178,8 +1344,23 @@ fn machine_report(machine: &crate::model::Machine) -> Result<MachineReport, Stri
         max_rpm,
         max_feed: r2(num(&machine.p, "feed").unwrap_or(0.) * inch),
         travel: ["x", "y", "z"].map(|k| r2(num(&machine.p, k).unwrap_or(0.) * inch)),
+        clearance: clearance_report(machine, inch),
         coolants: crate::control::coolants(machine)?,
     })
+}
+/// The machine's clearances for the report, None when it gives none.
+fn clearance_report(machine: &crate::model::Machine, inch: f32) -> Option<ClearanceReport> {
+    let given = |k: &str| num(&machine.p, k).filter(|v| *v > 0.).map(|v| r2(v * inch));
+    let report = ClearanceReport {
+        nose_to_table: given("nose_to_table"),
+        gantry_height: given("gantry_height"),
+        gantry_width: given("gantry_width"),
+        assumed: crate::envelope::assumed(machine),
+    };
+    (report.nose_to_table.is_some()
+        || report.gantry_height.is_some()
+        || report.gantry_width.is_some())
+    .then_some(report)
 }
 /// The project's material and its cutting data, or why planning cannot use
 /// the project's material. The user's text is cleaned and bounded.
@@ -1225,7 +1406,12 @@ fn basics<'a>(doc: &'a Document, mesh: &Mesh) -> Result<(&'a Setup, &'static str
     if let Some(problem) = holding_problem(doc, Some(mesh)) {
         return Err(problem);
     }
-    Ok((setup1, first, Volume::new(stock, Frame::new(setup1, mesh))))
+    let round = crate::stock::round(setup1, stock);
+    Ok((
+        setup1,
+        first,
+        Volume::new(stock, Frame::new(setup1, mesh)).rounded(round),
+    ))
 }
 /// The whole report, or the first reason planning cannot start. The part must
 /// be a closed solid: no open edges, an enclosed volume, and vertical rays (in
@@ -1285,11 +1471,44 @@ fn workholding_report(
     let kind = match get(&setup1.p, "holding") {
         "Vise" => "Vise",
         "Clamps" => "Clamps",
-        _ => return Ok(None),
+        // The chuck on A; a lathe's chuck is not reported.
+        "Chuck" if crate::chuck::holds(setup1) => "Chuck",
+        // A sheet's hold-down screws, whose heads are boxes like clamps.
+        _ if crate::sheet::screwed(setup1) => "Hold-down screws",
+        holding => match crate::round_hold::Kind::of(holding) {
+            Some(kind) => kind.name(),
+            None => return Ok(None),
+        },
     };
     let resolved = crate::stock::resolve(setup1, Some(mesh))?;
     let (stock, corner) = (resolved.stock, resolved.part.map_or([0.; 3], |p| p.min));
     let boxes = doc.holding_boxes(setup1, crate::holding::Gripped::whole(stock))?;
+    let chuck = match kind {
+        "Chuck" => {
+            let rig = doc.chuck_rig(setup1, stock)?;
+            Some(ChuckReport {
+                jaws: rig.jaws,
+                chuck_diameter: r2(rig.unit.chuck_diameter),
+                jaw_length: r2(rig.unit.jaw_length),
+                gripped_length: r2(rig.grip()),
+                stickout: r2(rig.stickout),
+                bar_diameter: rig.round.then(|| r2(2. * rig.inner)),
+                tailstock: match rig.tail {
+                    crate::chuck::Tail::Off => "Off the table",
+                    crate::chuck::Tail::Retracted(_) => "Retracted",
+                    crate::chuck::Tail::Supports(_) => "Supports the stock",
+                }
+                .into(),
+                a_angle: 0.,
+            })
+        }
+        _ => None,
+    };
+    // A chuck's boxes are all keep-out zones, the stock in its jaws too.
+    let boxes = match chuck {
+        Some(_) => boxes,
+        None => crate::holding::shown(&boxes, stock),
+    };
     let gap = crate::holding::gap(setup1)?;
     let top = boxes
         .iter()
@@ -1299,7 +1518,7 @@ fn workholding_report(
     Ok(Some(WorkholdingReport {
         kind,
         number: own_entry(doc, setup1),
-        boxes: crate::holding::shown(&boxes, stock)
+        boxes: boxes
             .iter()
             .map(|b| {
                 let from_corner = |p: [f32; 3]| [0, 1, 2].map(|k| r2(p[k] - corner[k]));
@@ -1310,6 +1529,16 @@ fn workholding_report(
             .collect(),
         gap: r2(gap),
         clearance_above_stock_top: (needed > 0.).then(|| up2(needed)),
+        chuck,
+        round_bar: crate::round_hold::Kind::of(kind).map(|_| {
+            let lying = crate::stock::round_bar(setup1);
+            let bar = crate::round_hold::Bar::of(lying, stock);
+            RoundBarReport {
+                diameter: r2(bar.diameter()),
+                length: r2(bar.ends[1] - bar.ends[0]),
+                along: if lying { "X" } else { "Z" },
+            }
+        }),
     }))
 }
 fn describe(
@@ -1326,6 +1555,7 @@ fn describe(
             .map(|(up, _)| *up)
             .filter(|up| *up != first),
     );
+    let keyseat = |t: &crate::model::Tool| get(&t.p, "type") == crate::model::KEYSEAT;
     Ok(PartReport {
         units: "mm",
         part_size: mesh.dimensions.map(r2),
@@ -1341,11 +1571,17 @@ fn describe(
                     kind: get(&t.p, "type").to_string(),
                     diameter: num(&t.p, "diameter")?,
                     flutes: num(&t.p, "flutes").filter(|f| *f >= 1. && f.fract() == 0.)? as u32,
-                    flute_length: num(&t.p, "length")?,
+                    flute_length: if keyseat(t) {
+                        num(&t.p, "width")?
+                    } else {
+                        num(&t.p, "length")?
+                    },
                     stickout: num(&t.p, "stickout")?,
                     tip_angle: (get(&t.p, "type") == "Chamfer mill")
                         .then(|| t.tip_angle())
                         .flatten(),
+                    tip_flat: (get(&t.p, "type") == "Chamfer mill" && t.tip_flat() > 0.)
+                        .then(|| t.tip_flat()),
                     thread_angle: match get(&t.p, "type") {
                         "Thread mill" => num(&t.p, "thread_angle"),
                         "Tap" => t.tap_spec().map(|s| s.angle),
@@ -1354,12 +1590,18 @@ fn describe(
                     pitches: (get(&t.p, "type") == "Thread mill")
                         .then(|| t.thread_pitches().map(|(a, b)| [a, b]))
                         .flatten(),
-                    reach: (get(&t.p, "type") == "Thread mill")
+                    reach: (get(&t.p, "type") == "Thread mill" || keyseat(t))
                         .then(|| num(&t.p, "reach"))
                         .flatten(),
+                    neck_diameter: keyseat(t).then(|| num(&t.p, "neck")).flatten(),
                     teeth: (get(&t.p, "type") == "Thread mill" && t.thread_teeth() > 1)
                         .then(|| t.thread_teeth()),
                     thread: t.tap_spec().map(|s| s.name.to_string()),
+                    tolerance: (get(&t.p, "type") == "Reamer")
+                        .then(|| get(&t.p, "tolerance").to_string()),
+                    bore_range: (get(&t.p, "type") == "Boring head")
+                        .then(|| t.bore_range().map(|(a, b)| [a, b]))
+                        .flatten(),
                 })
             })
             .collect(),
@@ -1369,6 +1611,8 @@ fn describe(
             .into_iter()
             .filter_map(|up| orientation(setup1, stock, mesh, up, MAX_HOLES))
             .collect(),
+        rotary: rotary_report(doc, setup1),
+        sheet: sheet_report(setup1, mesh),
     })
 }
 
@@ -1478,6 +1722,8 @@ pub(crate) mod tests {
             boxes: vec![],
             gap: 2.,
             clearance_above_stock_top: None,
+            chuck: None,
+            round_bar: None,
         };
         let json = serde_json::to_string(&none).unwrap();
         assert!(!json.contains("number"), "{json}");

@@ -35,6 +35,12 @@ pub enum Strategy {
     FiveAxis,
     Box,
     Turn,
+    /// A groove below the mouth of a bore (or round a boss) milled by
+    /// circular interpolation with a keyseat cutter (`groove`).
+    Groove,
+    /// Chamfer milling (`chamfer`): a chamfer mill's side along a line or
+    /// picked edges.
+    Chamfer,
 }
 impl Strategy {
     pub fn imported_preview(self) -> bool {
@@ -49,12 +55,14 @@ impl Strategy {
                 | Self::Waterline
                 | Self::Box
                 | Self::Turn
+                | Self::Groove
+                | Self::Chamfer
         )
     }
     pub fn needs_surfaces(self) -> bool {
         matches!(
             self,
-            Self::Face | Self::Adaptive | Self::Pocket | Self::Drill
+            Self::Face | Self::Adaptive | Self::Pocket | Self::Drill | Self::Groove
         )
     }
     pub fn availability(self) -> &'static str {
@@ -73,9 +81,7 @@ impl Strategy {
                 "Available · planar pocket with islands, cleared at a controlled radial engagement"
             }
             Self::Scallop => "Unavailable · constant surface-spacing kernel is not implemented",
-            Self::Indexed => {
-                "Unavailable · indexed tool frames and rotary kinematics are not implemented"
-            }
+            Self::Indexed => crate::indexed::AVAILABILITY,
             Self::Rotary => {
                 "Unavailable · continuous rotary paths and stock simulation are not implemented"
             }
@@ -88,9 +94,13 @@ impl Strategy {
             Self::Turn => {
                 "Available · face, turn, bore, chamfer, groove, thread or part off on a manual lathe"
             }
+            Self::Groove => crate::groove::AVAILABILITY,
+            Self::Chamfer => {
+                "Available · a chamfer mill's side along a line or picked edges: V flanks at depth, edge chamfers, deburring, copied round an axis"
+            }
         }
     }
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 15] = [
         Self::Face,
         Self::Adaptive,
         Self::Pocket,
@@ -104,6 +114,8 @@ impl Strategy {
         Self::FiveAxis,
         Self::Box,
         Self::Turn,
+        Self::Groove,
+        Self::Chamfer,
     ];
     pub fn index(self) -> usize {
         Self::ALL.iter().position(|s| *s == self).unwrap()
@@ -123,6 +135,8 @@ impl Strategy {
             "5-axis surface",
             "Box",
             "Turning",
+            "Internal groove",
+            "Chamfer milling",
         ][self.index()]
     }
     pub fn short(self) -> &'static str {
@@ -140,6 +154,8 @@ impl Strategy {
             "5-axis",
             "Box",
             "Turn",
+            "Groove",
+            "Chamfer",
         ][self.index()]
     }
     pub fn help(self) -> &'static str {
@@ -152,11 +168,13 @@ impl Strategy {
             "Finish shallow surfaces using parallel passes. Set direction, surface spacing and the slope range.",
             "Finish steep walls at constant Z levels. Choose surfaces and a vertical stepdown.",
             "Finish surfaces at approximately constant spacing. Use rest machining to target a previous operation’s remaining stock.",
-            "Position a rotary axis, lock it, then machine a face. Set the indexed angles within the machine travel limits.",
+            "Indexed work is a setup, not an operation: add a setup, choose Reposition → Index rotary axis and list its A angles. Every operation in it runs at each angle.",
             "Finish around a rotary axis. Choose an axis, angular range and line, circular or spiral motion.",
             "Orient the cutter along a surface. Set axis control, tilt limits and lead/lean before checking machine motion.",
             "Remove a rectangular block of material, one axis at a time, on a manual mill.",
             "Turn the bar on a manual lathe: face the end, turn or bore a diameter, chamfer, groove, thread or part off. Choose the kind and its sizes in lathe coordinates.",
+            "Mill a groove below the mouth of a bore, like a circlip groove, with a keyseat cutter: pick the bore's wall, then set the groove's diameter, width and where it lies. Pick a boss's outside wall for a groove round it.",
+            "Run a chamfer mill's side along picked edges or a line: edge chamfers, deburring, or V flanks at a depth. Size it by the chamfer's width or the tip's depth, and copy it round an axis.",
         ][self.index()]
     }
     pub fn features(self) -> &'static [usize] {
@@ -165,7 +183,7 @@ impl Strategy {
             Self::Face | Self::Indexed => &[0, 1],
             Self::Adaptive | Self::Pocket => &[1],
             Self::Contour => &[2, 3],
-            Self::Box | Self::Turn => &[],
+            Self::Box | Self::Turn | Self::Groove | Self::Chamfer => &[],
             _ => &[0, 1, 2, 4],
         }
     }
@@ -176,8 +194,11 @@ impl Strategy {
         if self == Self::Turn {
             return vec!["Tool", "Turn", "Passes"];
         }
+        if self == Self::Groove {
+            return vec!["Tool", "Geometry", "Heights", "Groove"];
+        }
         let mut v = vec!["Tool", "Geometry"];
-        if matches!(self, Self::Indexed | Self::Rotary | Self::FiveAxis) {
+        if matches!(self, Self::Rotary | Self::FiveAxis) {
             v.push("Orientation")
         }
         v.push("Heights");
@@ -207,8 +228,8 @@ pub const FEATURES: [&str; 9] = [
     "Hole 4 · Ø8",
 ];
 
-/// The keys of a setup's vise or clamps.
-const HOLDING: [&str; 7] = [
+/// The keys of a setup's vise, clamps or chuck.
+const HOLDING: [&str; 11] = [
     "holding",
     "holder",
     "holding_gap",
@@ -216,6 +237,10 @@ const HOLDING: [&str; 7] = [
     "vise_offset",
     "vise_grip",
     "clamps",
+    "chuck_jaws",
+    "chuck_stickout",
+    "chuck_tailstock",
+    "chuck_jaw_angle",
 ];
 /// The setup keys a manual setup put first takes from the old first setup,
 /// besides its stock: orientation, zero, offset and holding.
@@ -254,6 +279,89 @@ pub fn tool_label(number: impl std::fmt::Display, name: &str) -> String {
 pub fn names_number(number: impl std::fmt::Display, name: &str) -> bool {
     let t = format!("T{number}");
     name == t || name.starts_with(&format!("{t} "))
+}
+
+/// A rotary unit's geometry on a machine with an A axis (LIO-184): the
+/// `p` key, the form's label and the default, all in mm. EVERY DEFAULT IS
+/// ASSUMED, for a 100 mm 3-jaw chuck on a NEMA23 rotary unit at the left end
+/// of a Jingyan CNC4030's table, and still to be measured (calibration,
+/// LIO-186). Machine files saved before these fields existed lack the keys
+/// and still load: the geometry is then not recorded (`Machine::rotary_unit`
+/// is None) and is not checked, until the machine is edited (which fills
+/// these defaults in, `Machine::fill_rotary_defaults`). The spindle nose's
+/// two (LIO-204), last, are ASSUMED for the CNC4030's 800 W spindle, a Ø65
+/// mm body; a file without them takes these defaults (`NOSE_DEFAULT`) and
+/// the rotary checks say so.
+pub const ROTARY_GEOMETRY: [(&str, &str, &str); 17] = [
+    ("a_centre_y", "A centreline in machine Y · mm", "140"),
+    ("a_centre_z", "A centreline in machine Z · mm", "-40"),
+    ("a_chuck_x", "Chuck face in machine X · mm", "20"),
+    (
+        "a_centre_height",
+        "Centre height above the table · mm",
+        "70",
+    ),
+    ("a_chuck_diameter", "Chuck diameter · mm", "100"),
+    ("a_jaw_length", "Jaw length · mm", "25"),
+    ("a_grip_min", "Smallest part the jaws grip · mm", "5"),
+    ("a_grip_max", "Largest part the jaws grip · mm", "80"),
+    ("a_tail_width", "Tailstock body width (Y) · mm", "60"),
+    ("a_tail_height", "Tailstock body height (Z) · mm", "80"),
+    ("a_tail_length", "Tailstock body length (X) · mm", "90"),
+    ("a_tail_travel", "Tailstock travel · mm", "30"),
+    ("a_tail_x", "Tailstock centre in machine X · mm", "330"),
+    (
+        "a_fit_diameter",
+        "Largest part diameter under the gantry · mm",
+        "80",
+    ),
+    (
+        "a_fit_length",
+        "Longest part between chuck and tailstock · mm",
+        "250",
+    ),
+    ("a_nose_diameter", "Spindle nose diameter · mm", "65"),
+    (
+        "a_nose_length",
+        "Spindle body length above its nose · mm",
+        "185",
+    ),
+];
+/// The spindle nose's diameter and its body's length (mm) a machine file
+/// without them is taken to have: the assumed 800 W spindle's (LIO-204).
+pub const NOSE_DEFAULT: [f32; 2] = [65., 185.];
+
+/// The rotary unit's geometry, mm, as `Machine::rotary_unit` reads it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RotaryUnit {
+    pub centre_y: f32,
+    pub centre_z: f32,
+    pub chuck_x: f32,
+    pub centre_height: f32,
+    pub chuck_diameter: f32,
+    pub jaw_length: f32,
+    pub grip_min: f32,
+    pub grip_max: f32,
+    pub tail_width: f32,
+    pub tail_height: f32,
+    pub tail_length: f32,
+    pub tail_travel: f32,
+    pub tail_x: f32,
+    pub fit_diameter: f32,
+    pub fit_length: f32,
+    /// The spindle nose: its diameter and how far its body reaches up
+    /// from it (LIO-204).
+    pub nose_diameter: f32,
+    pub nose_length: f32,
+    /// Whether the machine file gives no spindle nose, so `NOSE_DEFAULT`'s
+    /// is taken.
+    pub nose_assumed: bool,
+    /// The Z reference the probe touched with the centreline (LIO-207):
+    /// machine X, Y and the machine Z of the probe's tip on the surface
+    /// (`CENTRE_REF`). `centre_z` is where the probe's tip is on the
+    /// centreline; a tool touched off on this surface is related to it.
+    /// None until the Control page saves one.
+    pub reference: Option<[f32; 3]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,17 +439,139 @@ impl Machine {
             );
             p.insert("pivot_z".into(), "120".into());
         }
-        Self {
+        let mut m = Self {
             id: id(),
             version: 1,
             p,
-        }
+        };
+        m.fill_rotary_defaults();
+        m
     }
     pub fn name(&self) -> &str {
         get(&self.p, "name")
     }
     pub fn axes(&self) -> u8 {
         get(&self.p, "axes").parse().unwrap_or(3)
+    }
+    /// Whether the machine has an A axis on its table, turning about X: the
+    /// 4-axis "A table around X". The rotary unit's geometry applies to it.
+    pub fn has_a(&self) -> bool {
+        self.axes() == 4 && get(&self.p, "arrangement").starts_with('A')
+    }
+    /// The rotary unit's geometry; None without an A axis, or when a field
+    /// is missing (a file saved before they existed) or not a number.
+    pub fn rotary_unit(&self) -> Option<RotaryUnit> {
+        if !self.has_a() {
+            return None;
+        }
+        let v = |i: usize| num(&self.p, ROTARY_GEOMETRY[i].0);
+        // A file saved before the spindle nose existed takes the default.
+        let given = |i: usize| !get(&self.p, ROTARY_GEOMETRY[i].0).trim().is_empty();
+        let nose = |i: usize| match given(i) {
+            true => v(i).filter(|n| *n > 0.),
+            false => Some(NOSE_DEFAULT[i - 15]),
+        };
+        Some(RotaryUnit {
+            centre_y: v(0)?,
+            centre_z: v(1)?,
+            chuck_x: v(2)?,
+            centre_height: v(3)?,
+            chuck_diameter: v(4)?,
+            jaw_length: v(5)?,
+            grip_min: v(6)?,
+            grip_max: v(7)?,
+            tail_width: v(8)?,
+            tail_height: v(9)?,
+            tail_length: v(10)?,
+            tail_travel: v(11)?,
+            tail_x: v(12)?,
+            fit_diameter: v(13)?,
+            fit_length: v(14)?,
+            nose_diameter: nose(15)?,
+            nose_length: nose(16)?,
+            nose_assumed: !given(15) || !given(16),
+            reference: centre_reference(&self.p),
+        })
+    }
+    /// What is wrong with the rotary unit's geometry. Nothing is checked
+    /// while no field has been given (an older file): the geometry is not
+    /// recorded then.
+    pub fn rotary_issues(&self) -> Vec<String> {
+        let mut e = vec![];
+        let p = &self.p;
+        if ROTARY_GEOMETRY
+            .iter()
+            .all(|(k, _, _)| get(p, k).trim().is_empty())
+        {
+            return e;
+        }
+        // The form's label without its unit.
+        let name = |k: &str| {
+            let label = ROTARY_GEOMETRY.iter().find(|g| g.0 == k).map_or(k, |g| g.1);
+            label.split(" · ").next().unwrap_or(label).to_string()
+        };
+        for (k, _, _) in ROTARY_GEOMETRY {
+            let ok = match k {
+                "a_centre_y" | "a_centre_z" | "a_chuck_x" | "a_tail_x" => num(p, k).is_some(),
+                // Empty takes the assumed spindle's (`NOSE_DEFAULT`).
+                "a_nose_diameter" | "a_nose_length" if get(p, k).trim().is_empty() => true,
+                "a_grip_min" => num(p, k).is_some_and(|n| n >= 0.),
+                _ => num(p, k).is_some_and(|n| n > 0.),
+            };
+            if !ok {
+                e.push(format!(
+                    "{} must be {}.",
+                    name(k),
+                    match k {
+                        "a_grip_min" => "zero or more",
+                        "a_centre_y" | "a_centre_z" | "a_chuck_x" | "a_tail_x" => "a number",
+                        _ => "greater than zero",
+                    }
+                ))
+            }
+        }
+        // Machine Z is zero at the top and negative down, as in the UC100
+        // profile: the centreline is somewhere in the Z travel below it.
+        let [x, y, z] = ["x", "y", "z"].map(|k| crate::post_check::machine_mm(self, k));
+        for (k, lo, hi) in [
+            ("a_centre_y", 0., y),
+            ("a_centre_z", -z, 0.),
+            ("a_chuck_x", 0., x),
+            ("a_tail_x", 0., x),
+        ] {
+            if num(p, k).is_some_and(|n| !(lo..=hi).contains(&n)) {
+                e.push(format!(
+                    "{} must be inside the machine's travel, from {lo} to {hi} mm.",
+                    name(k)
+                ))
+            }
+        }
+        let Some(u) = self.rotary_unit() else {
+            return e;
+        };
+        if u.grip_max <= u.grip_min {
+            e.push(format!(
+                "{} must be greater than {}.",
+                name("a_grip_max"),
+                name("a_grip_min")
+            ))
+        }
+        if u.grip_max > u.chuck_diameter {
+            e.push(format!(
+                "{} cannot be wider than the chuck.",
+                name("a_grip_max")
+            ))
+        }
+        if u.tail_x <= u.chuck_x {
+            e.push("The tailstock must be at a larger machine X than the chuck face.".into())
+        } else if u.fit_length > u.tail_x - u.chuck_x {
+            e.push(format!(
+                "{} cannot be longer than the {} mm between the chuck face and the tailstock.",
+                name("a_fit_length"),
+                u.tail_x - u.chuck_x
+            ))
+        }
+        e
     }
     pub fn issues(&self) -> Vec<String> {
         let mut e = vec![];
@@ -407,6 +637,7 @@ impl Machine {
             for k in ["rpm", "feed"] {
                 positive(&self.p, k, &mut e)
             }
+            e.extend(crate::envelope::issues(self));
         }
         // Optional: empty takes `forces::SPINDLE_POWER`.
         if !get(&self.p, "power").trim().is_empty() {
@@ -420,6 +651,9 @@ impl Machine {
             for k in ["pivot_x", "pivot_y", "pivot_z"] {
                 finite(&self.p, k, &mut e)
             }
+        }
+        if self.has_a() {
+            e.extend(self.rotary_issues());
         }
         if self.axes() == 5 {
             range(&self.p, "rotary2_min", "rotary2_max", &mut e);
@@ -440,6 +674,16 @@ impl Machine {
         );
         e
     }
+    /// Gives a machine with an A axis the assumed rotary geometry it lacks
+    /// (`ROTARY_GEOMETRY`), when it is edited or turned into one; the values
+    /// it has are kept.
+    pub fn fill_rotary_defaults(&mut self) {
+        if self.has_a() {
+            for (key, _, value) in ROTARY_GEOMETRY {
+                self.p.entry(key.into()).or_insert_with(|| value.into());
+            }
+        }
+    }
     pub fn fill_post_defaults(&mut self) {
         // The plate's thickness and the tip's diameter have no default to fill in.
         for key in POST_KEYS.into_iter().chain(PROBE_KEYS) {
@@ -450,6 +694,20 @@ impl Machine {
         }
     }
 }
+/// The machine key the Control page keeps the A centreline's Z reference
+/// in (LIO-207): "X Y Z", machine mm, as `RotaryUnit::reference`.
+pub const CENTRE_REF: &str = "a_centre_ref";
+/// The A centreline's Z reference in `p` (`CENTRE_REF`), if one is kept.
+pub fn centre_reference(p: &Fields) -> Option<[f32; 3]> {
+    let v: Vec<f32> = (get(p, CENTRE_REF).split_whitespace())
+        .map(|w| w.parse::<f32>().ok().filter(|v| v.is_finite()))
+        .collect::<Option<_>>()?;
+    v.try_into().ok()
+}
+/// The holder length taken for a tool that gives none, mm (LIO-204):
+/// short, so the spindle nose is taken as low as it can plausibly be (an
+/// ER11 collet nut on the 800 W spindle stands about this far below it).
+pub const HOLDER_LENGTH: f32 = 10.;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
     pub id: String,
@@ -517,21 +775,42 @@ impl Tool {
             self.lathe_issues(&mut e);
             return e;
         }
+        // A keyseat cutter's flutes are its head, as wide as its `width`.
+        let keyseat = get(&self.p, "type") == KEYSEAT;
         for k in ["diameter", "flutes", "length", "stickout", "holder"] {
-            positive(&self.p, k, &mut e)
+            if !(keyseat && k == "length") {
+                positive(&self.p, k, &mut e)
+            }
         }
         if num(&self.p, "flutes").is_some_and(|n| n.fract() != 0.) {
             e.push("Flutes must be a whole number.".into())
         }
-        if num(&self.p, "stickout") < num(&self.p, "length") {
+        if keyseat {
+            e.extend(crate::groove::keyseat_issues(&self.p));
+        } else if num(&self.p, "stickout") < num(&self.p, "length") {
             e.push(format!(
                 "Stickout ({} mm) must be at least the flute length ({} mm): how far the tool reaches out of its holder.",
                 get(&self.p, "stickout"),
                 get(&self.p, "length")
             ))
         }
+        // Optional: empty takes `HOLDER_LENGTH`, assumed.
+        if !get(&self.p, "holder_length").trim().is_empty()
+            && !num(&self.p, "holder_length").is_some_and(|v| v >= 0.)
+        {
+            e.push("Holder length must be zero or more.".into())
+        }
         if get(&self.p, "type") == "Chamfer mill" && self.tip_angle().is_none() {
             e.push("Enter a chamfer mill tip angle from 20° to 160°.".into())
+        }
+        // Optional: empty is a pointed tip.
+        if get(&self.p, "type") == "Chamfer mill"
+            && !get(&self.p, "tip_flat").trim().is_empty()
+            && !num(&self.p, "tip_flat")
+                .zip(num(&self.p, "diameter"))
+                .is_some_and(|(f, d)| f >= 0. && f < d)
+        {
+            e.push("The flat tip must be zero or more, and narrower than the tool.".into())
         }
         match get(&self.p, "type") {
             "Thread mill" => {
@@ -573,9 +852,47 @@ impl Tool {
                     )
                 }
             }
+            "Reamer" => {
+                if !REAMER_CLASSES.contains(&get(&self.p, "tolerance")) {
+                    e.push("Choose the reamer's tolerance class, like H7.".into())
+                }
+            }
+            "Boring head" => {
+                if self.bore_range().is_none() {
+                    e.push(
+                        "Bore range must be the smallest and largest bore it sets to, like 12-50."
+                            .into(),
+                    )
+                }
+                positive(&self.p, "bar_diameter", &mut e);
+                positive(&self.p, "dial", &mut e);
+                if let (Some((low, _)), Some(bar)) =
+                    (self.bore_range(), num(&self.p, "bar_diameter"))
+                    && bar >= low
+                {
+                    e.push(
+                        "Bar diameter must be under the smallest bore: the bar goes down the hole it cuts."
+                            .into(),
+                    )
+                }
+                if !BORE_RETRACTS.contains(&get(&self.p, "bore_retract")) {
+                    e.push("Choose how the head leaves the bore.".into())
+                }
+            }
             _ => {}
         }
         e
+    }
+    /// A boring head's smallest and largest bore in mm, from its
+    /// `bore_range` ("12-50"); None unless both are positive and the first
+    /// is under the second.
+    pub fn bore_range(&self) -> Option<(f32, f32)> {
+        let (lo, hi) = get(&self.p, "bore_range").trim().split_once(['-', '–'])?;
+        let (lo, hi) = (
+            lo.trim().parse::<f32>().ok()?,
+            hi.trim().parse::<f32>().ok()?,
+        );
+        (lo.is_finite() && hi.is_finite() && lo > 0. && lo < hi).then_some((lo, hi))
     }
     /// A tap's thread size.
     pub fn tap_spec(&self) -> Option<&'static crate::thread::Spec> {
@@ -656,6 +973,15 @@ impl Tool {
             .filter(|n| n.fract() == 0. && (1. ..=10.).contains(n))
             .map_or(1, |n| n as usize)
     }
+    /// How far the holder reaches up from where the tool comes out of it to
+    /// the spindle nose, mm, and whether it is assumed (`HOLDER_LENGTH`):
+    /// a tool saved before the field existed, or left empty (LIO-204).
+    pub fn holder_length(&self) -> (f32, bool) {
+        match num(&self.p, "holder_length").filter(|v| *v >= 0.) {
+            Some(v) => (v, false),
+            None => (HOLDER_LENGTH, true),
+        }
+    }
     /// A chamfer mill's included tip angle in degrees (90 when not saved),
     /// None when it is outside 20–160°.
     pub fn tip_angle(&self) -> Option<f32> {
@@ -665,6 +991,19 @@ impl Tool {
             90.
         };
         (20. ..=160.).contains(&angle).then_some(angle)
+    }
+    /// A chamfer mill's flat tip, across, mm (`tip_flat`): 0 for a pointed
+    /// one and for a tool saved before the field existed.
+    pub fn tip_flat(&self) -> f32 {
+        num(&self.p, "tip_flat").filter(|v| *v > 0.).unwrap_or(0.)
+    }
+    /// The cone the stock simulation sweeps for this chamfer mill at tip
+    /// angle `angle`: the angle in tenths of a degree, the flat in µm.
+    pub fn chamfer_shape(&self, angle: f32) -> crate::simulation::CutterShape {
+        crate::simulation::CutterShape::Chamfer(
+            (angle * 10.).round() as u16,
+            (self.tip_flat() * 1000.).round().min(f32::from(u16::MAX)) as u16,
+        )
     }
     /// Controller tool number (T#), when it is a whole number 1–9999.
     pub fn number(&self) -> Option<u32> {
@@ -705,9 +1044,11 @@ pub const FACING_MILLING: [&str; 2] = ["Climb", "Conventional"];
 pub const POCKET_ENTRIES: [&str; 2] = ["Profile ramp", "Plunge"];
 /// A Drill operation's cycles. The first four drill; `HELICAL_MILLING`
 /// mills each hole with a flat end mill, `THREAD_MILLING` mills its thread
-/// with a thread mill (on a CNC), and `TAPPING` taps it by hand (on the
-/// manual mill or the lathe).
-pub const DRILL_CYCLES: [&str; 7] = [
+/// with a thread mill (on a CNC), `TAPPING` taps it by hand (on the
+/// manual mill or the lathe), and `REAMING` and `BORING` finish a drilled
+/// or roughed hole to size with a reamer or a boring head (on a CNC or the
+/// manual mill).
+pub const DRILL_CYCLES: [&str; 9] = [
     "Drilling",
     "Chip breaking",
     "Deep drilling",
@@ -715,7 +1056,31 @@ pub const DRILL_CYCLES: [&str; 7] = [
     HELICAL_MILLING,
     THREAD_MILLING,
     TAPPING,
+    REAMING,
+    BORING,
 ];
+/// The Drill cycle that reams each drilled hole to size with a reamer: fed
+/// in and fed back out at a reamer's low speed (`cam::boring`).
+pub const REAMING: &str = "Reaming";
+/// The Drill cycle that bores each roughed hole to size with a boring head:
+/// a pass at each size the head is set out to, the run pausing between
+/// passes for the head to be measured and set (`cam::boring`).
+pub const BORING: &str = "Boring";
+/// How a boring head leaves the bore after each pass (its `bore_retract`):
+/// with the spindle stopped, its edge dragging a fine line up the wall, or
+/// fed out turning, which can rub the wall it has just cut.
+pub const BORE_RETRACTS: [&str; 2] = ["Stop the spindle, rapid out", "Feed out"];
+/// A reamer's tolerance classes (its `tolerance`): the hole fits it makes.
+pub const REAMER_CLASSES: [&str; 4] = ["H6", "H7", "H8", "H9"];
+/// A boring head is set to one size: a Boring bores the holes of one
+/// Hole diameter.
+pub const BORE_ONE_SIZE: &str =
+    "Hole diameter must be the one size a Boring bores: the head is set to it.";
+/// A Boring's pauses are not carried through a chuck-held or indexed
+/// setup's entry moves.
+pub const BORE_IN_CHUCK: &str = "Boring pauses between passes for the head to be set, which a setup held in the chuck or indexed does not carry: bore the hole in a 3-axis setup.";
+/// Reaming and Boring are mill cycles: the lathe drills on its centre.
+pub const FINISH_ON_LATHE: &str = "Reaming and Boring are for a mill: on the lathe, drill on the centre and bore with a boring bar (Turn · Bore).";
 /// The Drill cycle that mills each hole's thread with a thread mill: down
 /// the drilled hole, in to the wall on an arc, one pitch up a turn.
 pub const THREAD_MILLING: &str = "Thread milling";
@@ -745,11 +1110,25 @@ pub fn mill_tool_defaults(kind: &str) -> &'static [(&'static str, &'static str)]
             ("shank", "6"),
             ("flutes", "4"),
         ],
+        KEYSEAT => crate::groove::KEYSEAT_DEFAULTS,
         "Tap" => &[
             ("thread", "M6×1"),
             ("tap_kind", TAP_KINDS[0]),
             ("diameter", "6"),
             ("flutes", "3"),
+        ],
+        "Reamer" => &[("tolerance", "H7"), ("diameter", "10"), ("flutes", "6")],
+        // Its diameter is the head's body, its flute length how far the
+        // bar reaches below it.
+        "Boring head" => &[
+            ("bore_range", "12-50"),
+            ("bar_diameter", "10"),
+            ("dial", "0.01"),
+            ("bore_retract", BORE_RETRACTS[0]),
+            ("diameter", "50"),
+            ("flutes", "1"),
+            ("length", "40"),
+            ("stickout", "90"),
         ],
         _ => &[],
     }
@@ -834,6 +1213,12 @@ pub const POCKET_OPENINGS: [&str; 2] = ["Leave", "Cut through"];
 /// across its cut, near its bottom, that keep the part joined to the stock
 /// around it when the cut goes through.
 pub const CONTOUR_TABS: [&str; 2] = ["No", "Yes"];
+/// The Contour side that cuts inside every hole through the part's outline
+/// (a flat part's cut-outs), whole model, no floor picked.
+pub const CONTOUR_HOLES: &str = "Holes";
+/// The sides a Contour cuts: round the outline, a selected floor's walls,
+/// or the holes through the outline.
+pub const CONTOUR_SIDES: [&str; 3] = ["Outside", "Inside", CONTOUR_HOLES];
 /// What a Drill makes (`holes`): the round holes of the part's surfaces it
 /// selects, or the holes a later setup drops over the fixture pins by in
 /// the stock's leftover (`pin_points`), as its Work zero step placed them.
@@ -913,6 +1298,9 @@ pub fn facing_setting_issues(p: &Fields) -> Vec<String> {
     .collect()
 }
 pub const TOOL_NUMBER_MAX: u32 = 9999;
+/// The tool type of a keyseat (slot) cutter: a thin disc head on a neck,
+/// which cuts a groove sideways below the mouth of a bore (`groove`).
+pub const KEYSEAT: &str = "Keyseat cutter";
 pub const POST_TOOL_LENGTH: [&str; 2] = [
     "Tool table (G43 H#)",
     "Touch off each tool (one program per tool)",
@@ -929,9 +1317,10 @@ pub const POST_KEYS: [&str; 5] = [
 /// A UC100 machine's probe settings (`control::probe_settings`). The plate's
 /// thickness and the probe tip's diameter have no default: they must be
 /// measured.
-pub const PROBE_KEYS: [&str; 5] = [
+pub const PROBE_KEYS: [&str; 6] = [
     "probe_plate",
     "probe_tip",
+    "probe_length",
     "probe_feed",
     "probe_distance",
     "probe_retract",
@@ -977,6 +1366,10 @@ pub fn post_setting_issues(p: &Fields) -> Vec<String> {
     }
     e
 }
+/// The message for a force per tooth to hold that is not a force
+/// (`tooth_load::target`).
+pub const TOOTH_FORCE_ISSUE: &str =
+    "Force per tooth to hold must be a number above zero, or empty for the nominal cut's.";
 /// The height above the stock top at which a new operation's tool travels
 /// between cuts, mm (the "clearance" `Operation::new` starts with).
 pub const CLEARANCE: f32 = 15.;
@@ -986,6 +1379,11 @@ impl Operation {
             ("name", s.name()),
             ("rpm", "8000"),
             ("feed", "1000"),
+            // A new operation keeps its programmed feed: holding the force
+            // on a tooth measures the path, which takes time, and changes
+            // the feeds typed in.
+            ("feed_follows", crate::tooth_load::FEED_FOLLOWS[0]),
+            ("tooth_force", ""),
             ("coolant", "Flood"),
             ("boundary", "Selected geometry"),
             ("containment", "Tool inside boundary"),
@@ -1020,6 +1418,8 @@ impl Operation {
             ("cycle", "Drilling"),
             ("peck", "3"),
             ("dwell", "0.5"),
+            ("bore_cut", "0.3"),
+            ("finish_cut", "0.1"),
             ("through", "Yes"),
             ("breakthrough", "1"),
             ("hole_order", "Optimize travel"),
@@ -1028,8 +1428,6 @@ impl Operation {
             ("ramp_angle", "2"),
             ("lead_in", "2"),
             ("keep_down", "Yes"),
-            ("angle_a", "0"),
-            ("angle_b", "0"),
             ("rotary_axis", "A around X"),
             ("rotary_start", "0"),
             ("rotary_end", "360"),
@@ -1071,6 +1469,12 @@ impl Operation {
         if s == Strategy::Parallel {
             p.insert("surface_stepover".into(), "1".into());
         }
+        // Waterline finishes: no stock left on the walls, and layers close
+        // enough that the steps they leave on a sloping face stay small.
+        if s == Strategy::Waterline {
+            p.insert("stepdown".into(), "1".into());
+            p.insert("allowance".into(), "0".into());
+        }
         if s == Strategy::Box {
             for (k, v) in [
                 ("x_min", "0"),
@@ -1088,6 +1492,18 @@ impl Operation {
                 p.insert(k.into(), v.into());
             }
         }
+        if s == Strategy::Groove {
+            for (k, v) in crate::groove::DEFAULTS {
+                p.insert((*k).into(), (*v).into());
+            }
+        }
+        if s == Strategy::Chamfer {
+            for (k, v) in crate::chamfer::DEFAULTS {
+                p.insert(k.into(), v.into());
+            }
+            p.insert("rpm".into(), "6000".into());
+            p.insert("feed".into(), "300".into());
+        }
         if s == Strategy::Turn {
             p.insert("turn_kind".into(), "Outside".into());
             p.insert("name".into(), "Turn · Outside".into());
@@ -1096,7 +1512,7 @@ impl Operation {
             }
         }
         let geometry = match s {
-            Strategy::Box | Strategy::Turn => vec![],
+            Strategy::Box | Strategy::Turn | Strategy::Groove | Strategy::Chamfer => vec![],
             Strategy::Drill => vec![5, 6, 7, 8],
             Strategy::Face | Strategy::Indexed => vec![0],
             Strategy::Contour => vec![2],
@@ -1184,6 +1600,8 @@ impl Operation {
             Strategy::Drill if self.drills_pin_holes() => vec!["Drill", FLAT],
             Strategy::Drill if self.helical() => vec![FLAT],
             Strategy::Drill if self.thread_milling() => vec!["Thread mill"],
+            Strategy::Drill if self.reaming() => vec!["Reamer"],
+            Strategy::Drill if self.boring() => vec!["Boring head"],
             Strategy::Drill => vec!["Drill", "Chamfer mill"],
             // A Thread is cut by the threading tool, or by a die.
             Strategy::Turn => {
@@ -1193,6 +1611,8 @@ impl Operation {
                     .collect()
             }
             Strategy::Face => vec![FLAT, "Face mill"],
+            Strategy::Groove => vec![KEYSEAT],
+            Strategy::Chamfer => vec!["Chamfer mill"],
             Strategy::Parallel => vec!["Ball end mill", FLAT],
             Strategy::Scallop | Strategy::Indexed | Strategy::Rotary | Strategy::FiveAxis => {
                 vec![FLAT, "Ball end mill", "Bull nose end mill"]
@@ -1227,6 +1647,22 @@ impl Operation {
     pub fn threads(&self) -> bool {
         self.thread_milling() || self.tapping()
     }
+    /// A Drill operation that reams its holes (`REAMING`).
+    pub fn reaming(&self) -> bool {
+        self.strategy == Strategy::Drill
+            && get(&self.p, "cycle") == REAMING
+            && !self.drills_pin_holes()
+    }
+    /// A Drill operation that bores its holes with a boring head (`BORING`).
+    pub fn boring(&self) -> bool {
+        self.strategy == Strategy::Drill
+            && get(&self.p, "cycle") == BORING
+            && !self.drills_pin_holes()
+    }
+    /// A Drill operation that finishes its holes to size, by either cycle.
+    pub fn finishes_holes(&self) -> bool {
+        self.reaming() || self.boring()
+    }
     /// A Facing of the part's outline seen from above rather than a
     /// rectangle: its Model silhouette boundary, grown by `silhouette_extend`.
     pub fn faces_outline(&self) -> bool {
@@ -1257,6 +1693,7 @@ impl Operation {
                 self.strategy,
                 Strategy::Contour | Strategy::Parallel | Strategy::Waterline
             ) && get(&self.p, "boundary") == "Selected geometry")
+            || (self.strategy == Strategy::Chamfer && crate::chamfer::on_edges(&self.p))
     }
     pub fn toggle_feature(&mut self, n: usize) {
         if !self.strategy.features().contains(&n) {
@@ -1558,8 +1995,16 @@ impl Operation {
         preceding: &[Operation],
     ) -> Vec<String> {
         let mut e = vec![];
+        // An older project's Indexed operation that could not be moved into
+        // an indexed setup (`Document::migrate_indexed_operations`).
+        if self.strategy == Strategy::Indexed {
+            e.push(crate::indexed::LEGACY.into())
+        }
         if self.strategy == Strategy::Face {
             e.extend(facing_setting_issues(&self.p));
+        }
+        if self.strategy == Strategy::Chamfer {
+            e.extend(crate::chamfer::issues(&self.p));
         }
         if matches!(self.strategy, Strategy::Pocket | Strategy::Adaptive) {
             e.extend(pocket_setting_issues(&self.p));
@@ -1591,6 +2036,7 @@ impl Operation {
         }
         let tool = tools.iter().find(|t| t.id == self.tool);
         let milling = self.strategy != Strategy::Turn;
+        let s0 = self.strategy;
         if let Some(t) = tool {
             e.extend(t.issues());
             if centre
@@ -1622,13 +2068,20 @@ impl Operation {
                 e.push("Choose a thread mill for Thread milling.".into())
             } else if self.tapping() && get(&t.p, "type") != "Tap" {
                 e.push("Choose a tap for Tapping.".into())
+            } else if s0 == Strategy::Groove && get(&t.p, "type") != KEYSEAT {
+                e.push(crate::groove::NEEDS_KEYSEAT.into())
+            } else if self.reaming() && get(&t.p, "type") != "Reamer" {
+                e.push("Choose a reamer for Reaming.".into())
+            } else if self.boring() && get(&t.p, "type") != "Boring head" {
+                e.push("Choose a boring head for Boring.".into())
             } else if self.strategy == Strategy::Drill
                 && !self.helical()
                 && !self.threads()
+                && !self.finishes_holes()
                 && !["Drill", "Chamfer mill"].contains(&get(&t.p, "type"))
             {
                 e.push(
-                    "Choose a drill, or a chamfer mill to countersink, for a drilling cycle. Helical milling takes a flat end mill, Thread milling a thread mill, Tapping a tap."
+                    "Choose a drill, or a chamfer mill to countersink, for a drilling cycle. Helical milling takes a flat end mill, Thread milling a thread mill, Tapping a tap, Reaming a reamer, Boring a boring head."
                         .into(),
                 )
             } else if milling && !t.is_lathe() && !self.takes(t, m) {
@@ -1668,6 +2121,13 @@ impl Operation {
                 e.push(format!("{} exceeds the saved machine limit.", label(k)));
             }
         }
+        // Empty: the force at the cutting feed on the nominal cut.
+        if crate::tooth_load::follows(self, m)
+            && !get(&self.p, "tooth_force").trim().is_empty()
+            && !num(&self.p, "tooth_force").is_some_and(|f| f > 0.)
+        {
+            e.push(TOOTH_FORCE_ISSUE.into())
+        }
         if manual::is_hand(m)
             && num(&self.p, "rpm").is_some_and(|rpm| rpm > 0. && !manual::on_gear(m, rpm))
         {
@@ -1692,13 +2152,17 @@ impl Operation {
         if s == Strategy::Box && !manual::is_manual(m) {
             e.push(manual::BOX_ON_CNC.into())
         }
+        // A hand machine says so above (one axis at a time, or turning only).
+        if s == Strategy::Groove {
+            e.extend(crate::groove::setting_issues(&self.p));
+        }
         if s == Strategy::Turn && !crate::lathe::is_lathe(m) {
             e.push(crate::lathe::TURN_ON_MILL.into())
         }
         if crate::lathe::is_lathe(m) && !matches!(s, Strategy::Turn | Strategy::Drill) {
             e.push(crate::lathe::ONLY_TURN.into())
         }
-        if matches!(s, Strategy::Indexed | Strategy::Rotary) && m.axes() < 4 {
+        if s == Strategy::Rotary && m.axes() < 4 {
             e.push("This strategy needs at least 4 machine axes.".into())
         }
         if s == Strategy::FiveAxis && (m.axes() != 5 || get(&m.p, "mode") != "Simultaneous 5-axis")
@@ -1715,7 +2179,10 @@ impl Operation {
             if self.helical() {
                 positive(&self.p, "stepdown", &mut e);
                 bounded(&self.p, "stepover", 1., 100., &mut e);
-                bounded(&self.p, "tolerance", 0.001, 0.1, &mut e)
+                bounded(&self.p, "tolerance", 0.001, 0.1, &mut e);
+                if !get(&self.p, "bore_allowance").trim().is_empty() {
+                    bounded(&self.p, "bore_allowance", 0., 5., &mut e)
+                }
             }
             if self.thread_milling() && manual::is_hand(m) {
                 e.push(THREAD_MILL_ON_HAND.into())
@@ -1748,8 +2215,23 @@ impl Operation {
             if ["Chip breaking", "Deep drilling"].contains(&get(&self.p, "cycle")) {
                 positive(&self.p, "peck", &mut e)
             }
-            if get(&self.p, "cycle") == "Counterboring" {
+            if self.finishes_holes() && crate::lathe::is_lathe(m) {
+                e.push(FINISH_ON_LATHE.into())
+            }
+            if get(&self.p, "cycle") == "Counterboring" || self.finishes_holes() {
                 nonnegative(&self.p, "dwell", &mut e)
+            }
+            if self.boring() {
+                // Blank in an operation saved before they were: the defaults.
+                if !get(&self.p, "bore_cut").trim().is_empty() {
+                    positive(&self.p, "bore_cut", &mut e);
+                }
+                if !get(&self.p, "finish_cut").trim().is_empty() {
+                    nonnegative(&self.p, "finish_cut", &mut e);
+                }
+                if !num(&self.p, "hole_diameter").is_some_and(|d| d > 0.) {
+                    e.push(BORE_ONE_SIZE.into())
+                }
             }
             if get(&self.p, "through") == "Yes" {
                 nonnegative(&self.p, "breakthrough", &mut e)
@@ -1786,6 +2268,9 @@ impl Operation {
                         .into(),
                 )
             }
+            if s == Strategy::Waterline {
+                positive(&self.p, "surface_stepover", &mut e);
+            }
             if matches!(
                 s,
                 Strategy::Parallel | Strategy::Scallop | Strategy::Rotary | Strategy::FiveAxis
@@ -1814,6 +2299,12 @@ impl Operation {
                 }
                 positive(&self.p, "tab_width", &mut e);
                 positive(&self.p, "tab_height", &mut e)
+            }
+            if s == Strategy::Contour && get(&self.p, "side") == CONTOUR_HOLES {
+                // Empty cuts every hole the tool fits in.
+                if !get(&self.p, "hole_min").trim().is_empty() {
+                    bounded(&self.p, "hole_min", 0., 10_000., &mut e);
+                }
             }
             if self.faces_outline()
                 && !sample
@@ -1850,24 +2341,6 @@ impl Operation {
         {
             e.push("Rest machining needs an enabled preceding operation.".into())
         }
-        if s == Strategy::Indexed {
-            bounded(
-                &self.p,
-                "angle_a",
-                num(&m.p, "rotary_min").unwrap_or(0.),
-                num(&m.p, "rotary_max").unwrap_or(0.),
-                &mut e,
-            );
-            if m.axes() == 5 {
-                bounded(
-                    &self.p,
-                    "angle_b",
-                    num(&m.p, "rotary2_min").unwrap_or(0.),
-                    num(&m.p, "rotary2_max").unwrap_or(0.),
-                    &mut e,
-                )
-            }
-        }
         if s == Strategy::Rotary {
             range(&self.p, "rotary_start", "rotary_end", &mut e);
             if get(&self.p, "rotary_style") != "Line"
@@ -1892,6 +2365,10 @@ pub struct Setup {
     pub preview_stock: Option<crate::mesh::Bounds>,
     #[serde(skip)]
     pub preview_remaining: Option<std::sync::Arc<crate::rest::RestStock>>,
+    /// How A turns the part of an indexed setup from its base's placement
+    /// (`indexed`), worked out by `Document::sync_turns`; None otherwise.
+    #[serde(skip)]
+    pub turn: Option<crate::indexed::Turn>,
     pub id: String,
     pub machine: Machine,
     pub p: Fields,
@@ -1902,6 +2379,7 @@ impl Setup {
         Self {
             preview_stock: None,
             preview_remaining: None,
+            turn: None,
             id: id(),
             machine,
             p: fields(&[
@@ -1955,9 +2433,15 @@ impl Setup {
         s
     }
     pub fn is_repositioned(&self) -> bool {
-        ["rx", "ry", "rz", "tx", "ty", "tz"]
-            .iter()
-            .any(|k| num(&self.p, k).unwrap_or(0.).abs() > 0.001)
+        // An indexed setup turned by A, other than a whole turn.
+        let turned = self.turn.is_some_and(|t| {
+            let r = t.turn.rem_euclid(360.);
+            r > 0.001 && r < 359.999
+        });
+        turned
+            || ["rx", "ry", "rz", "tx", "ty", "tz"]
+                .iter()
+                .any(|k| num(&self.p, k).unwrap_or(0.).abs() > 0.001)
     }
     /// What is wrong with operation `i`: its own checks (`Operation::issues`)
     /// and those the setup's stock adds (`Operation::stock_issues`).
@@ -1987,6 +2471,7 @@ impl Setup {
             finite(&self.p, k, &mut e)
         }
         nonnegative(&self.p, "clearance", &mut e);
+        e.extend(crate::indexed::issues(self));
         // The machine's own issues say what is wrong with the pins.
         if crate::control::pins_settings(&self.machine.p).is_ok() {
             e.extend(crate::post::pins_issue(self));
@@ -2053,6 +2538,11 @@ pub struct ModelFile {
     pub path: PathBuf,
     pub format: String,
     pub bytes: u64,
+    /// A DXF flat profile's thickness, mm, which the part is extruded to
+    /// (`mesh::load_file`); None for any other format, and for a DXF until
+    /// one is set (`mesh::DXF_THICKNESS`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thickness: Option<f32>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
@@ -2202,11 +2692,12 @@ impl Document {
         self.material = name;
         true
     }
-    /// Gives every operation the speed and feed `material::recommend` gives
-    /// for the selected material, its tool and its setup's machine, whatever
-    /// it had: the same material always gives the same speeds. Drilling
-    /// operations keep theirs (it would give them an end mill's chip load;
-    /// Helical milling, which cuts with an end mill, is given one), and so
+    /// Gives every operation the speed and feed `material::recommend_for`
+    /// gives for the selected material, its tool and its setup's machine,
+    /// whatever it had: the same material always gives the same speeds.
+    /// Drilling operations keep theirs (it would give them an end mill's
+    /// chip load; Helical milling, which cuts with an end mill, is given one,
+    /// and Reaming and Boring theirs at a reamer's and a boring head's rates), and so
     /// do those it cannot give one: without a tool, whose tool has no
     /// diameter or flutes, or whose machine has no maximum spindle speed or
     /// feed. Returns what changed, old to new, and why any was not set, for
@@ -2229,14 +2720,16 @@ impl Document {
                 let (setup, op) = (&self.setups[si], &self.setups[si].operations[oi]);
                 // The chip loads are an end mill's per tooth; a drill's feed
                 // is per revolution, which the library has no data for.
-                if op.strategy == Strategy::Drill && !op.helical() {
+                if op.strategy == Strategy::Drill && !op.helical() && !op.finishes_holes() {
                     if !matches!(self.speed_feed(setup, op), Some(SpeedFeed::InRange { .. })) {
                         drills += 1;
                     }
                     continue;
                 }
                 let recommended = match self.tools.iter().find(|t| t.id == op.tool) {
-                    Some(tool) => crate::material::recommend(&material, tool, &setup.machine),
+                    Some(tool) => {
+                        crate::material::recommend_for(&material, tool, op, &setup.machine)
+                    }
                     None => Err("The operation has no tool.".into()),
                 };
                 let (rpm, feed) = match recommended {
@@ -2370,6 +2863,29 @@ impl Document {
     pub fn holder(&self, id: &str) -> Option<&crate::holding::Holder> {
         self.workholding.iter().find(|h| h.id == id)
     }
+    /// The chuck of `setup` round `stock`, the box it starts from (mm, its
+    /// frame): a round bar when setup 1's stock is one and `setup` faces as
+    /// setup 1 does, else the box (`chuck::rig`).
+    pub fn chuck_rig(
+        &self,
+        setup: &Setup,
+        stock: crate::mesh::Bounds,
+    ) -> Result<crate::chuck::Rig, String> {
+        // An indexed setup's chuck is its base's, round the stock it starts
+        // from, turned to the setup's A angle where it is drawn and checked.
+        if let Some(t) = setup.turn
+            && let Some(base) = self.setups.get(t.base)
+        {
+            return self.chuck_rig(base, t.stock);
+        }
+        let round = self.setups.first().is_some_and(|first| {
+            crate::stock::round_bar(first)
+                && ["rx", "ry", "rz"]
+                    .iter()
+                    .all(|k| num(&first.p, k).unwrap_or(0.) == num(&setup.p, k).unwrap_or(0.))
+        });
+        crate::chuck::rig(setup, stock, round)
+    }
     /// Why `holder` cannot be saved to the library: another entry has its
     /// name (ignoring case).
     pub fn holder_name_issues(&self, holder: &crate::holding::Holder) -> Vec<String> {
@@ -2454,6 +2970,17 @@ impl Document {
         let Some(s) = self.setups.get(setup) else {
             return vec![];
         };
+        if crate::sheet::is_sheet(s) {
+            // A sheet's hold-down screws are checked on the stock and, with
+            // the part known, against its outline.
+            let stock = self.setup_stock(setup, mesh);
+            let mut issues = self.holding_problems(s, || stock.map(crate::holding::Gripped::whole));
+            issues.extend(crate::sheet::holddown_issues(s, stock));
+            if let (Some(stock), Some(mesh)) = (stock, mesh) {
+                issues.extend(crate::sheet::screws_on_part(s, stock, mesh));
+            }
+            return issues;
+        }
         self.holding_problems(s, || {
             self.setup_stock(setup, mesh)
                 .map(crate::holding::Gripped::whole)
@@ -2471,7 +2998,9 @@ impl Document {
         let Some(s) = self.setups.get(setup) else {
             return vec![];
         };
-        self.holding_problems(s, || held)
+        let mut issues = self.holding_problems(s, || held);
+        issues.extend(crate::sheet::holddown_issues(s, held.map(|h| h.stock)));
+        issues
     }
     /// `holding_issues` of `s`, the stock being told by `held` when needed.
     fn holding_problems(
@@ -2480,15 +3009,58 @@ impl Document {
         held: impl FnOnce() -> Option<crate::holding::Gripped>,
     ) -> Vec<String> {
         use crate::holding::{
-            DELETED, NOT_SQUARE, height_issue, layout, machine_refusal, opening_issue,
+            DELETED, Layout, NOT_SQUARE, height_issue, layout, machine_refusal, opening_issue,
             position_issue, refusal,
         };
-        let kind = match get(&s.p, "holding") {
-            "Vise" => "Vise",
-            "Clamps" => "Clamp",
-            "Chuck" => "Chuck",
-            _ => "",
-        };
+        let kind = crate::holding::library_kind(get(&s.p, "holding")).unwrap_or("");
+        // A vise or clamps close on flat sides, which a round bar has not.
+        let round = self.setups.first().is_some_and(crate::stock::round_bar);
+        if round && matches!(kind, "Vise" | "Clamp") {
+            return vec![if s.machine.has_a() {
+                format!(
+                    "A round bar is held in the chuck: a {} is modelled on flat sides. Choose Chuck, or a box stock.",
+                    kind.to_lowercase()
+                )
+            } else {
+                format!(
+                    "A round bar lying along X is held in a V-block or in soft jaws bored along X: a {} is modelled on flat sides. Choose V-block or Soft jaws, or a box stock.",
+                    kind.to_lowercase()
+                )
+            }];
+        }
+        // A V-block, soft jaws and a collet block hold a round bar.
+        if let Some(holds) = crate::round_hold::Kind::of(kind)
+            && !self
+                .setups
+                .first()
+                .is_some_and(|first| crate::stock::is_round(first) || round)
+        {
+            use crate::round_hold::Kind;
+            return vec![format!(
+                "A {} holds a round bar: make setup 1's stock a Round bar{}.",
+                holds.words(),
+                match holds {
+                    Kind::VBlock => ", lying along X",
+                    Kind::Collet => ", standing along Z",
+                    Kind::SoftJaws => "",
+                }
+            )];
+        }
+        if crate::chuck::holds(s) {
+            let mut issues = vec![];
+            if let Err(error) = crate::holding::gap(s) {
+                issues.push(error);
+            }
+            if let Some(held) = held() {
+                match self.chuck_rig(s, held.stock) {
+                    Ok(rig) => issues.extend(rig.issues()),
+                    Err(error) => issues.push(error),
+                }
+            } else if s.machine.rotary_unit().is_none() {
+                issues.push(crate::chuck::NO_UNIT.into());
+            }
+            return issues;
+        }
         let id = get(&s.p, "holder");
         let entry = self.holder(id);
         let mut issues = vec![];
@@ -2537,6 +3109,9 @@ impl Document {
                     issues.extend(opening_issue(&layout, entry, held));
                     issues.extend(position_issue(&layout, entry, held));
                     issues.extend(height_issue(&layout, held.stock));
+                    if let Layout::Round(round) = &layout {
+                        issues.extend(crate::round_hold::issues(round, entry, held.stock));
+                    }
                 }
             }
             _ => {}
@@ -2622,11 +3197,21 @@ impl Document {
         {
             return Err(issue);
         }
-        let layout = crate::holding::layout(setup)?;
-        match self.holder(get(&setup.p, "holder")) {
-            Some(entry) => crate::holding::boxes(&layout, entry, held),
-            None => Ok(vec![]),
+        if crate::chuck::holds(setup) {
+            // Operations run at A0 (`chuck::Rig::hits_at` at any other
+            // angle), an indexed setup's at its first A angle, as its 3D
+            // view shows it.
+            let a = setup.turn.map_or(0., |t| t.a);
+            return Ok(self.chuck_rig(setup, held.stock)?.boxes(a));
         }
+        let layout = crate::holding::layout(setup)?;
+        let mut boxes = match self.holder(get(&setup.p, "holder")) {
+            Some(entry) => crate::holding::boxes(&layout, entry, held)?,
+            None => vec![],
+        };
+        // A sheet's hold-down screws, which refuse as the jaws do.
+        boxes.extend(crate::sheet::holddown_boxes(setup, held.stock)?);
+        Ok(boxes)
     }
     /// `setup`'s modelled workholding in a sentence, for the setup sheet and
     /// the program header (`holding::sentence`). None without workholding and
@@ -2634,6 +3219,16 @@ impl Document {
     /// `holding_issues` says.
     pub fn holding_text(&self, setup: &Setup) -> Option<String> {
         use crate::holding::{Layout, refusal, sentence};
+        if crate::chuck::holds(setup) {
+            // Without the part a later setup's stock is not known: then the
+            // chuck is named without what it grips.
+            let gap = crate::holding::gap(setup).ok()?;
+            let i = self.setups.iter().position(|s| s.id == setup.id)?;
+            return Some(match self.setup_stock(i, None) {
+                Some(stock) => self.chuck_rig(setup, stock).ok()?.sentence(gap),
+                None => format!("{}, gap {gap} mm.", self.holding_label(setup)),
+            });
+        }
         let layout = crate::holding::layout(setup).ok()?;
         let entry = self.holder(get(&setup.p, "holder"))?;
         (layout != Layout::None && refusal(&layout, entry).is_none())
@@ -2648,6 +3243,20 @@ impl Document {
             self.holder(get(&setup.p, "holder"))
                 .map_or(kind.to_string(), |h| h.name().to_string())
         };
+        if crate::chuck::holds(setup) {
+            return format!(
+                "{} chuck on A",
+                if get(&setup.p, "chuck_jaws") == "4-jaw" {
+                    "4-jaw"
+                } else {
+                    "3-jaw"
+                }
+            );
+        }
+        // A sheet held down by its own screws or tape.
+        if let Some(held) = crate::sheet::holddown_label(setup) {
+            return held;
+        }
         match layout(setup) {
             Ok(Layout::None) => fixture_note(setup).map_or("No workholding modelled".into(), |n| {
                 format!("{n}, not modelled")
@@ -2667,7 +3276,24 @@ impl Document {
         let kind = match get(&s.p, "holding") {
             "Vise" => "Vise",
             "Clamps" => "Clamp",
-            "Chuck" => "Chuck",
+            "Chuck" if !crate::chuck::holds(s) => "Chuck",
+            holding if crate::round_hold::Kind::of(holding).is_some() => {
+                self.settle_round(setup);
+                return;
+            }
+            // The chuck on the machine's rotary A axis (`chuck`).
+            "Chuck" => {
+                let p = &mut self.setups[setup].p;
+                for (k, v) in crate::chuck::DEFAULTS {
+                    if get(p, k).trim().is_empty() {
+                        p.insert(k.into(), v.into());
+                    }
+                }
+                if get(p, "holding_gap").trim().is_empty() {
+                    p.insert("holding_gap".into(), "2".into());
+                }
+                return;
+            }
             _ => return,
         };
         let mine = self
@@ -2694,6 +3320,73 @@ impl Document {
             && get(p, key).trim().is_empty()
         {
             p.insert(key.into(), grip);
+        }
+        if get(p, "holding_gap").trim().is_empty() {
+            p.insert("holding_gap".into(), "2".into());
+        }
+    }
+    /// `settle_holding` of a setup held in a V-block, soft jaws or a
+    /// collet block: it points at a library entry of its kind (its own, else
+    /// the first), and without a grip one is filled in from setup 1's bar
+    /// (`stock_diameter`, `stock_length`): soft jaws bored along X up to
+    /// three quarters of the bar's diameter, upright ones a third of its
+    /// length or their height, and a collet two thirds of its length or half
+    /// the bar. Soft jaws are bored as setup 1's bar lies. The clearance gap
+    /// starts at 2 mm.
+    fn settle_round(&mut self, setup: usize) {
+        use crate::round_hold::Kind;
+        let s = &self.setups[setup];
+        let holding = get(&s.p, "holding").to_string();
+        let Some(kind) = Kind::of(&holding) else {
+            return;
+        };
+        let mine = self
+            .holder(get(&s.p, "holder"))
+            .filter(|h| h.kind() == holding);
+        let chosen = mine
+            .or_else(|| self.workholding.iter().find(|h| h.kind() == holding))
+            .cloned();
+        let first = self.setups.first().map(|f| {
+            (
+                num(&f.p, "stock_diameter").filter(|v| *v > 0.),
+                num(&f.p, "stock_length").filter(|v| *v > 0.),
+            )
+        });
+        let lying = match get(&s.p, "jaw_bore") {
+            "X" => true,
+            "Z" => false,
+            _ => self.setups.first().is_some_and(crate::stock::round_bar),
+        };
+        let grip = match (kind, first, &chosen) {
+            (Kind::SoftJaws, Some((Some(d), _)), _) if lying => Some(0.75 * d),
+            (Kind::SoftJaws, Some((_, Some(l))), Some(h)) => {
+                Some((l / 3.).min(num(&h.p, "jaw_height").unwrap_or(l / 3.)))
+            }
+            (Kind::Collet, Some((_, Some(l))), Some(h)) => {
+                let collet = crate::round_hold::ER
+                    .iter()
+                    .find(|row| Some(row.0 as f32) == num(&h.p, "er"))
+                    .map_or(l / 2., |row| row.3 * crate::round_hold::FULL_GRIP);
+                Some(collet.min(l / 2.))
+            }
+            _ => None,
+        };
+        let p = &mut self.setups[setup].p;
+        p.insert(
+            "holder".into(),
+            chosen.map(|h| h.id.clone()).unwrap_or_default(),
+        );
+        // Soft jaws are bored as setup 1's bar lies, unless told.
+        if kind == Kind::SoftJaws && get(p, "jaw_bore").trim().is_empty() {
+            p.insert("jaw_bore".into(), if lying { "X" } else { "Z" }.into());
+        }
+        if let Some(grip) = grip.filter(|_| kind != Kind::VBlock)
+            && get(p, "round_grip").trim().is_empty()
+        {
+            p.insert(
+                "round_grip".into(),
+                format!("{}", (grip * 100.).round() / 100.),
+            );
         }
         if get(p, "holding_gap").trim().is_empty() {
             p.insert("holding_gap".into(), "2".into());
@@ -2843,6 +3536,7 @@ impl Document {
             setup.p.insert("stock_source".into(), source);
             source = setup.id.clone();
         }
+        self.sync_indexed();
     }
     pub fn validate_order(&self, setups: &[Setup]) -> Result<(), String> {
         let mut seen = HashSet::new();
@@ -3116,6 +3810,13 @@ impl Document {
                 )
                 .first()
                 .map(|note| format!("Workholding note: {note}\n\n")),
+                // A sheet on its spoilboard, and what holds it down.
+                (self.setup_stock(i, mesh).zip(mesh))
+                    .and_then(|(stock, mesh)| {
+                        let zero = crate::post::datum(setup, stock, mesh).ok()?;
+                        crate::sheet::sentence(setup, stock, zero)
+                    })
+                    .map(|text| format!("Sheet: {text}\n\n")),
             ]
             .into_iter()
             .flatten()
@@ -3154,7 +3855,7 @@ impl Document {
                 get(&setup.p, "tx"),
                 get(&setup.p, "ty"),
                 get(&setup.p, "tz"),
-                get(&setup.p, "reposition"),
+                self.reposition_text(i),
                 requested,
                 get(&setup.p, "notes")
             );
@@ -3177,8 +3878,9 @@ fn label(k: &str) -> String {
 pub const BOX_FIELDS: [&str; 6] = ["x_min", "x_max", "y_min", "y_max", "z_top", "z_bottom"];
 /// The operation editor's text fields, by key: the ones a check's message
 /// names by its `label`.
-const OPERATION_FIELDS: [&str; 58] = [
+const OPERATION_FIELDS: [&str; 74] = [
     "name",
+    "hole_min",
     "x_min",
     "x_max",
     "y_min",
@@ -3193,8 +3895,6 @@ const OPERATION_FIELDS: [&str; 58] = [
     "top",
     "bottom",
     "breakthrough",
-    "angle_a",
-    "angle_b",
     "rotary_start",
     "rotary_end",
     "tilt_min",
@@ -3203,6 +3903,9 @@ const OPERATION_FIELDS: [&str; 58] = [
     "lean_angle",
     "peck",
     "dwell",
+    "bore_cut",
+    "finish_cut",
+    "bore_allowance",
     "thread_depth",
     "thread_passes",
     "direction",
@@ -3237,6 +3940,21 @@ const OPERATION_FIELDS: [&str; 58] = [
     "thread_side",
     "pitch",
     "passes",
+    // A Chamfer milling's.
+    "from_x",
+    "from_y",
+    "to_x",
+    "to_y",
+    "line_z",
+    "tip_z",
+    "chamfer_width",
+    "tip_offset",
+    "extend",
+    "copies",
+    "copy_pitch",
+    "first_angle",
+    "axis_x",
+    "axis_y",
 ];
 /// The operation editor's text field a check's message is about, by its key,
 /// so the editor can show the message at the field. The messages of
@@ -3253,6 +3971,9 @@ pub fn issue_field(issue: &str) -> Option<&'static str> {
     }
     if m.starts_with("chip load ") {
         return Some("feed");
+    }
+    if m.starts_with("force per tooth ") {
+        return Some("tooth_force");
     }
     if m.starts_with("finishing passes ") {
         return Some("finish_passes");
@@ -3335,6 +4056,14 @@ fn the_model_path_is_read_from_a_string_and_written_as_one_when_it_is_text() {
     assert_eq!(file.path, PathBuf::from("/parts/a.stl"));
     let text = serde_json::to_value(&file).unwrap();
     assert_eq!(text["path"], "/parts/a.stl");
+    // A file saved before DXF import has no thickness, and writes none.
+    assert_eq!(file.thickness, None);
+    assert!(text.get("thickness").is_none());
+    let dxf: ModelFile = serde_json::from_str(
+        r#"{"name":"t.dxf","path":"/parts/t.dxf","format":"dxf","bytes":3,"thickness":1.5}"#,
+    )
+    .unwrap();
+    assert_eq!(dxf.thickness, Some(1.5));
 }
 #[cfg(unix)]
 #[test]
@@ -3348,6 +4077,7 @@ fn a_model_path_that_is_not_utf8_survives_a_save_and_load() {
         path: path.clone(),
         format: "stl".into(),
         bytes: 3,
+        thickness: None,
     };
     let json = serde_json::to_string(&file).unwrap();
     let back: ModelFile = serde_json::from_str(&json).unwrap();
@@ -3788,7 +4518,7 @@ mod tests {
             ..Default::default()
         };
         let note = doc.adopt_materials().unwrap();
-        assert_eq!(doc.materials.len(), 22);
+        assert_eq!(doc.materials.len(), 25);
         assert!(note.contains("linked to the library"), "{note}");
         assert_eq!(doc.selected_material().unwrap().name(), "Aluminium 6061-T6");
         assert_eq!(doc.material, "Aluminium 6061-T6");
@@ -3796,7 +4526,7 @@ mod tests {
             doc.adopt_materials().is_none(),
             "a second call changes nothing"
         );
-        assert_eq!(doc.materials.len(), 22);
+        assert_eq!(doc.materials.len(), 25);
 
         let mut odd = Document {
             material: "Inconel 718".into(),
@@ -3804,12 +4534,12 @@ mod tests {
         };
         let note = odd.adopt_materials().unwrap();
         assert!(note.contains("without cutting data"), "{note}");
-        assert_eq!(odd.materials.len(), 23);
+        assert_eq!(odd.materials.len(), 26);
         assert!(odd.selected_material().unwrap().cutting_data().is_none());
 
         let mut none = Document::default();
         assert!(none.adopt_materials().is_none());
-        assert_eq!(none.materials.len(), 22);
+        assert_eq!(none.materials.len(), 25);
         assert!(none.material_id.is_empty());
 
         let mut stale = none.clone();
@@ -3947,7 +4677,7 @@ mod tests {
         };
         assert!(doc.adopt_materials().is_none());
         let names: Vec<_> = doc.materials.iter().map(|m| m.name().to_string()).collect();
-        assert_eq!(names.len(), 14, "{names:?}");
+        assert_eq!(names.len(), 17, "{names:?}");
         assert!(names.contains(&"Aluminium 6082-T6".to_string()));
         assert!(names.contains(&"Walnut".to_string()));
         assert!(!names.contains(&"Aluminium 6061-T6".to_string()));
@@ -3973,10 +4703,10 @@ mod tests {
                 .count(),
             1
         );
-        // An empty library gets all twenty-two and the current set.
+        // An empty library gets all twenty-five and the current set.
         let mut empty = Document::default();
         empty.adopt_materials();
-        assert_eq!((empty.materials.len(), empty.starter_materials), (22, 3));
+        assert_eq!((empty.materials.len(), empty.starter_materials), (25, 4));
     }
     #[test]
     fn choosing_a_material_sets_every_operations_speed_and_feed() {
@@ -4104,7 +4834,7 @@ mod tests {
         assert_eq!(speeds(&doc), before);
     }
     #[test]
-    fn a_library_given_the_alloys_gets_only_the_woods_once() {
+    fn a_library_given_the_alloys_gets_only_the_woods_and_metals_once() {
         let mut doc = Document {
             materials: vec![crate::material::Material::new("My alloy")],
             starter_materials: 2,
@@ -4113,12 +4843,19 @@ mod tests {
         assert!(doc.adopt_materials().is_none());
         let names: Vec<_> = doc.materials.iter().map(|m| m.name()).collect();
         assert_eq!(names[0], "My alloy");
-        assert_eq!(names[1..], crate::material::ADDED_IN_SET_3);
-        assert_eq!(doc.starter_materials, 3);
+        assert_eq!(
+            names[1..],
+            [
+                &crate::material::ADDED_IN_SET_3[..],
+                &crate::material::ADDED_IN_SET_4[..]
+            ]
+            .concat()
+        );
+        assert_eq!(doc.starter_materials, crate::material::STARTER_SET);
         // Deleted after the addition: it does not come back.
         doc.materials.retain(|m| m.name() != "Cherry");
         doc.adopt_materials();
-        assert_eq!(doc.materials.len(), 7);
+        assert_eq!(doc.materials.len(), 10);
         // The user's own spelling of a wood is kept, not doubled.
         let mut mine = Document {
             materials: vec![crate::material::Material::new("oak")],
@@ -4126,8 +4863,63 @@ mod tests {
             ..Document::default()
         };
         mine.adopt_materials();
-        assert_eq!(mine.materials.len(), 7);
+        assert_eq!(mine.materials.len(), 10);
         assert_eq!(mine.materials[0].name(), "oak");
+    }
+    #[test]
+    fn a_library_given_the_woods_gains_bronze_and_two_steels_without_losing_edits() {
+        // A library as the app saved it with set 3: the starters of the
+        // first three sets, one of them edited, one deleted, and the
+        // owner's own.
+        let mut doc = Document::default();
+        doc.adopt_materials();
+        doc.materials = crate::material::starters()
+            .into_iter()
+            .filter(|m| !crate::material::ADDED_IN_SET_4.contains(&m.name()))
+            .collect();
+        doc.starter_materials = 3;
+        doc.materials.retain(|m| m.name() != "Brass C360");
+        let mine = crate::material::Material::new("My alloy");
+        doc.materials.push(mine.clone());
+        let steel = doc
+            .materials
+            .iter_mut()
+            .find(|m| m.name() == "Mild steel 1018")
+            .unwrap();
+        steel.p.insert("vc_max".into(), "170".into());
+        steel.p.insert("hardness".into(), "130 HB".into());
+        let edited = steel.clone();
+        let before = doc.materials.len();
+        assert!(doc.adopt_materials().is_none());
+        assert_eq!(doc.starter_materials, crate::material::STARTER_SET);
+        let names: Vec<_> = doc.materials.iter().map(|m| m.name()).collect();
+        assert_eq!(names.len(), before + 3, "{names:?}");
+        // The new ones come after everything there, in order.
+        assert_eq!(names[before..], crate::material::ADDED_IN_SET_4);
+        // Nothing there is touched or brought back.
+        assert!(doc.materials.contains(&edited));
+        assert!(doc.materials.contains(&mine));
+        assert!(!names.contains(&"Brass C360"));
+        // The new ones carry cutting data, hardness and the bronze's rule.
+        for m in &doc.materials[before..] {
+            assert!(
+                m.cutting_data().is_some() && m.brinell().is_some(),
+                "{}",
+                m.name()
+            );
+        }
+        assert_eq!(doc.materials[before].finish_milling(), Some("Conventional"));
+        // Once: a deleted one stays deleted.
+        doc.materials.retain(|m| m.name() != "Bronze CuSn12");
+        doc.adopt_materials();
+        assert_eq!(doc.materials.len(), before + 2);
+        // A library of the current set gains nothing.
+        let mut current = Document::default();
+        current.adopt_materials();
+        let all = current.materials.len();
+        current.adopt_materials();
+        assert_eq!(current.materials.len(), all);
+        assert_eq!(all, 25);
     }
     fn doc_with_holding(pairs: &[(&str, &str)]) -> Document {
         let mut doc = Document::sample();
@@ -5551,7 +6343,7 @@ mod manual_setups {
     }
     #[test]
     fn box_is_the_twelfth_strategy_with_its_name_and_help() {
-        assert_eq!(Strategy::ALL.len(), 13);
+        assert_eq!(Strategy::ALL.len(), 15);
         assert_eq!(Strategy::Box.index(), 11);
         for s in Strategy::ALL {
             assert!(!s.name().is_empty() && !s.short().is_empty() && !s.help().is_empty());
@@ -6852,5 +7644,201 @@ mod manual_setups {
         assert!(issues(Strategy::Scallop, false));
         assert!(issues(Strategy::Adaptive, true));
         assert!(!issues(Strategy::Adaptive, false));
+    }
+}
+#[cfg(test)]
+mod rotary_unit {
+    use super::*;
+
+    #[test]
+    fn a_4_axis_machine_starts_with_the_assumed_geometry_and_no_issues() {
+        let m = Machine::new(4);
+        assert!(m.has_a());
+        assert_eq!(m.issues(), Vec::<String>::new());
+        let u = m.rotary_unit().unwrap();
+        assert_eq!(
+            (u.chuck_diameter, u.centre_height, u.fit_diameter, u.tail_x),
+            (100., 70., 80., 330.)
+        );
+        for (key, _, value) in ROTARY_GEOMETRY {
+            assert_eq!(get(&m.p, key), value);
+        }
+    }
+
+    #[test]
+    fn the_geometry_is_saved_in_mm_and_comes_back_from_a_file() {
+        let mut m = Machine::new(4);
+        m.p.insert("a_chuck_diameter".into(), "125".into());
+        m.p.insert("a_grip_max".into(), "110".into());
+        let back: Machine = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.p, m.p);
+        assert_eq!(back.rotary_unit(), m.rotary_unit());
+        assert_eq!(back.rotary_unit().unwrap().chuck_diameter, 125.);
+        // Inches change the travel's unit, not the geometry's.
+        let mut inch = back;
+        inch.p.insert("units".into(), "inch".into());
+        assert_eq!(inch.rotary_unit().unwrap().chuck_diameter, 125.);
+    }
+
+    #[test]
+    fn a_machine_file_saved_before_the_geometry_existed_still_loads() {
+        let old = r#"{"id":"m1","version":3,"p":{"name":"Rotary Mill","axes":"4",
+            "mode":"Indexed (3+1)","arrangement":"A table around X","x":"390","y":"280","z":"55",
+            "units":"mm","controller":"LinuxCNC","rpm":"12000","feed":"5000",
+            "rotary_min":"-180","rotary_max":"180","pivot_x":"0","pivot_y":"0","pivot_z":"120"}}"#;
+        let mut m: Machine = serde_json::from_str(old).unwrap();
+        assert!(m.has_a());
+        // Not recorded and not complained about; editing fills in the assumed values.
+        assert_eq!(m.rotary_unit(), None);
+        assert_eq!(m.issues(), Vec::<String>::new());
+        m.fill_rotary_defaults();
+        assert_eq!(m.rotary_unit(), Machine::new(4).rotary_unit());
+        // A value it had is kept.
+        let mut kept = m.clone();
+        kept.p.insert("a_chuck_diameter".into(), "125".into());
+        kept.fill_rotary_defaults();
+        assert_eq!(get(&kept.p, "a_chuck_diameter"), "125");
+        // A library file with such a machine loads whole.
+        let doc: Document =
+            serde_json::from_str(&serde_json::to_string(&Document::default()).unwrap()).unwrap();
+        assert!(doc.machines.is_empty());
+    }
+
+    #[test]
+    fn a_machine_file_saved_before_the_spindle_nose_existed_takes_the_assumed_one() {
+        // A file with the rotary unit of LIO-184 and no spindle nose.
+        let mut m = Machine::new(4);
+        m.p.remove("a_nose_diameter");
+        m.p.remove("a_nose_length");
+        let back: Machine = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        let u = back.rotary_unit().unwrap();
+        assert_eq!(
+            (u.nose_diameter, u.nose_length, u.nose_assumed),
+            (65., 185., true)
+        );
+        assert_eq!(back.issues(), Vec::<String>::new());
+        // The rest of its geometry is as it was.
+        assert_eq!((u.chuck_diameter, u.centre_z), (100., -40.));
+        // Given, it is the machine's; editing fills in the assumed values.
+        let new = Machine::new(4).rotary_unit().unwrap();
+        assert_eq!(
+            (new.nose_diameter, new.nose_length, new.nose_assumed),
+            (65., 185., false)
+        );
+        let mut edited = back;
+        edited.p.insert("a_nose_diameter".into(), "52".into());
+        edited.fill_rotary_defaults();
+        let u = edited.rotary_unit().unwrap();
+        assert_eq!(
+            (u.nose_diameter, u.nose_length, u.nose_assumed),
+            (52., 185., false)
+        );
+        // One that is not a size is refused, and the geometry not taken.
+        edited.p.insert("a_nose_diameter".into(), "0".into());
+        assert_eq!(edited.rotary_unit(), None);
+        assert_eq!(
+            edited.issues(),
+            vec!["Spindle nose diameter must be greater than zero.".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_tool_without_a_holder_length_takes_a_short_assumed_one() {
+        let mut t = Tool::new("Flat", "Flat end mill", "6");
+        assert_eq!(t.holder_length(), (HOLDER_LENGTH, true));
+        assert_eq!(HOLDER_LENGTH, 10.);
+        assert!(t.issues().is_empty());
+        t.p.insert("holder_length".into(), "25".into());
+        assert_eq!(t.holder_length(), (25., false));
+        t.p.insert("holder_length".into(), "0".into());
+        assert_eq!(t.holder_length(), (0., false));
+        t.p.insert("holder_length".into(), "-1".into());
+        assert_eq!(
+            t.issues(),
+            vec!["Holder length must be zero or more.".to_string()]
+        );
+        assert_eq!(t.holder_length(), (HOLDER_LENGTH, true));
+    }
+
+    #[test]
+    fn only_a_4_axis_table_around_x_has_the_geometry() {
+        let mut three = Machine::new(3);
+        three.fill_rotary_defaults();
+        assert!(!three.has_a() && three.rotary_unit().is_none());
+        assert!(!three.p.contains_key("a_chuck_diameter"));
+        let mut b = Machine::new(4);
+        b.p.insert("arrangement".into(), "B table around Y".into());
+        assert!(!b.has_a() && b.rotary_unit().is_none());
+        // Bad geometry is not asked about on a machine without an A axis.
+        b.p.insert("a_chuck_diameter".into(), "-1".into());
+        assert!(b.issues().is_empty());
+    }
+
+    #[test]
+    fn the_geometry_is_validated() {
+        let issues = |edits: &[(&str, &str)]| {
+            // The Jingyan's travel.
+            let mut m = Machine::new(4);
+            for (k, v) in [("x", "390"), ("y", "280"), ("z", "55")] {
+                m.p.insert(k.into(), v.into());
+            }
+            for (k, v) in edits {
+                m.p.insert((*k).into(), (*v).into());
+            }
+            m.issues()
+        };
+        for (edits, expected) in [
+            (
+                &[("a_chuck_diameter", "0")][..],
+                "Chuck diameter must be greater than zero.",
+            ),
+            (
+                &[("a_jaw_length", "abc")],
+                "Jaw length must be greater than zero.",
+            ),
+            (
+                &[("a_tail_travel", "-5")],
+                "Tailstock travel must be greater than zero.",
+            ),
+            (
+                &[("a_grip_min", "-1")],
+                "Smallest part the jaws grip must be zero or more.",
+            ),
+            (
+                &[("a_centre_y", "300")],
+                "A centreline in machine Y must be inside the machine's travel, from 0 to 280 mm.",
+            ),
+            (
+                &[("a_centre_z", "10")],
+                "A centreline in machine Z must be inside the machine's travel, from -55 to 0 mm.",
+            ),
+            (
+                &[("a_centre_z", "-60")],
+                "A centreline in machine Z must be inside the machine's travel, from -55 to 0 mm.",
+            ),
+            (
+                &[("a_grip_max", "4")],
+                "Largest part the jaws grip must be greater than Smallest part the jaws grip.",
+            ),
+            (
+                &[("a_grip_max", "120")],
+                "Largest part the jaws grip cannot be wider than the chuck.",
+            ),
+            (
+                &[("a_tail_x", "10")],
+                "The tailstock must be at a larger machine X than the chuck face.",
+            ),
+            (
+                &[("a_fit_length", "400")],
+                "Longest part between chuck and tailstock cannot be longer than the 310 mm between the chuck face and the tailstock.",
+            ),
+        ] {
+            let found = issues(edits);
+            // A chuck of no size also leaves the jaws wider than it.
+            assert_eq!(found.first(), Some(&expected.to_string()), "{edits:?}");
+            assert!(found.len() <= 2, "{found:?}");
+        }
+        // The centreline may sit on the edges of the travel.
+        assert!(issues(&[("a_centre_y", "280"), ("a_centre_z", "-55")]).is_empty());
     }
 }

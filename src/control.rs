@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uc100::config::MachineConfig;
-use uc100::controller::{Block, Command, Controller, ProbeResult, Snapshot, State};
+use uc100::controller::{Bar, Block, Command, Controller, ProbeResult, Snapshot, State};
 use uc100::diagnostics::{INPUT_PINS, InputTracker};
 use uc100::gcode::{Action as Do, Located, Spindle};
 use uc100::protocol::Status;
@@ -145,6 +145,86 @@ pub fn owners_machine(dir: &Path) -> std::io::Result<Machine> {
         m.p.insert(key.into(), value.into());
     }
     m.p.insert("uc100_profile".into(), path.display().to_string());
+    crate::envelope::jingyan(&mut m);
+    Ok(m)
+}
+
+/// The A axis added to the owner's JY5800 profile for the machine with the
+/// rotary unit (LIO-184): the profile's own text, `[axes.a]` after it. The
+/// pins are the driver's free step/dir pair 8 and 9 and the rest is the
+/// driver's sample A axis: ASSUMED, none of it wired or measured yet.
+pub(crate) const ROTARY_AXIS: &str = "
+[axes.a]
+# ASSUMED (LIO-184), NOT WIRED OR MEASURED: pins 8 and 9 are the driver's free
+# step/dir pair, 44.444 steps per degree is its sample A axis (16000 per turn)
+# and the speeds are its sample's. Measure all of them on the rotary unit
+# (LIO-186) and correct them. The soft limits are the machine's rotary range
+# in AXIS CAM, -180 to 180 degrees.
+steps_per_unit = 44.444
+max_velocity = 3600
+acceleration = 360
+step = { pin = 8, active_low = true }
+dir = { pin = 9, active_low = false }
+reversed = false
+soft_min = -180.0
+soft_max = 180.0
+";
+
+/// The owner's UC100 profile with the rotary unit's A axis: `jy5800.toml`
+/// and `[axes.a]`, added the way the Setup form adds it (LIO-183): the
+/// pinout and steps-per-unit checks of `[commissioning]` were made on X, Y
+/// and Z, so they are unticked, and Reset stays refused until A's pins and
+/// steps per degree are checked in the form.
+pub fn rotary_profile() -> String {
+    let mut d = crate::setup::Draft::from_text(
+        String::new(),
+        "jy5800-rotary.toml".into(),
+        include_str!("../assets/jy5800.toml").into(),
+    )
+    .expect("the shipped profile is TOML");
+    d.edit(crate::setup::Edit::AddAxis("a".into()));
+    d.to_text()
+}
+
+/// `rotary_profile` before it unticked the checks: a copy left unedited on
+/// disk is replaced, since it would let A move on assumed values.
+fn rotary_profile_ungated() -> String {
+    format!("{}{ROTARY_AXIS}", include_str!("../assets/jy5800.toml"))
+}
+
+/// The Jingyan CNC4030 with a rotary unit on the table (LIO-184): the owner's
+/// machine as 4-axis "Indexed (3+1)", A about X, on its own copy of the JY5800
+/// profile with `[axes.a]`, `jy5800-rotary.toml` in `dir` (kept if it is
+/// there). The rotary geometry is the assumed default of `ROTARY_GEOMETRY`.
+/// The owner's 3-axis machine stays what it is.
+pub fn rotary_machine(dir: &Path) -> std::io::Result<Machine> {
+    let path = dir.join("jy5800-rotary.toml");
+    if std::fs::read_to_string(&path).is_ok_and(|t| t == rotary_profile_ungated()) {
+        std::fs::remove_file(&path)?;
+    }
+    if !path.exists() {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(&path, rotary_profile())?;
+    }
+    let mut m = Machine::new(4);
+    for (key, value) in [
+        ("name", "Jingyan CNC4030 + rotary"),
+        ("controller", "UC100"),
+        ("x", "390"),
+        ("y", "280"),
+        ("z", "55"),
+        ("rpm", "24000"),
+        ("feed", "1000"),
+    ] {
+        m.p.insert(key.into(), value.into());
+    }
+    // The pivot is the centreline Machine::new left at its own guess.
+    for (key, from) in [("pivot_y", "a_centre_y"), ("pivot_z", "a_centre_z")] {
+        let value = get(&m.p, from).to_string();
+        m.p.insert(key.into(), value);
+    }
+    m.p.insert("uc100_profile".into(), path.display().to_string());
+    crate::envelope::jingyan(&mut m);
     Ok(m)
 }
 
@@ -156,6 +236,10 @@ pub struct Probe {
     /// The probe tip's diameter, for Probe corner and Probe centre; None
     /// until it is set.
     pub tip: Option<f64>,
+    /// The probe's length from the spindle nose to its tip (LIO-207), for
+    /// the checks' estimate of where a tool of another length puts the
+    /// spindle on an A centreline probed with it; None until it is set.
+    pub length: Option<f64>,
     pub feed: f64,
     /// How far down a probe goes at most.
     pub distance: f64,
@@ -171,7 +255,9 @@ pub fn probe_settings(p: &Fields) -> Result<Probe, Vec<String>> {
         let text = post_setting(p, key).trim();
         match text.parse::<f64>() {
             Ok(v) if (lo..=hi).contains(&v) => Some(v),
-            _ if text.is_empty() && matches!(key, "probe_plate" | "probe_tip") => None,
+            _ if text.is_empty() && matches!(key, "probe_plate" | "probe_tip" | "probe_length") => {
+                None
+            }
             _ => {
                 e.push(format!("{what} must be from {lo} to {hi} {unit}."));
                 None
@@ -181,6 +267,7 @@ pub fn probe_settings(p: &Fields) -> Result<Probe, Vec<String>> {
     let probe = Probe {
         plate: value("probe_plate", "Touch plate thickness", 0., 100., "mm"),
         tip: value("probe_tip", "Probe tip diameter", 0., 50., "mm"),
+        length: value("probe_length", "Probe length", 0., 300., "mm"),
         feed: value("probe_feed", "Probe feed", 1., 1000., "mm/min").unwrap_or(0.),
         distance: value("probe_distance", "Maximum probe distance", 0.1, 200., "mm").unwrap_or(0.),
         retract: value("probe_retract", "Retract after the probe", 0., 100., "mm").unwrap_or(0.),
@@ -310,6 +397,19 @@ pub enum Touch {
     Reference,
     /// The surface is the reference, at this work Z.
     FromReference(f64),
+    /// The probe the A centreline was just probed with touches the Z
+    /// reference itself, no plate (LIO-207): kept with the centreline.
+    CentreReference,
+    /// The tool of tool run `run` touches the A centreline's Z reference
+    /// (LIO-207), whose surface the probe's tip found at machine Z
+    /// `reference`: how much longer than the probe the tool is, and the
+    /// Z work offset that puts the work zero on the centreline for it,
+    /// `on_centre` (the probe's) plus that.
+    ToolReference {
+        run: usize,
+        reference: f64,
+        on_centre: f64,
+    },
 }
 
 /// A probe move sent and not reported yet.
@@ -935,6 +1035,7 @@ impl Routine {
         Probe {
             plate: None,
             tip: Some(self.radius * 2.),
+            length: None,
             feed: self.feed,
             distance: self.distance,
             retract: 0.,
@@ -1172,6 +1273,543 @@ pub fn squareness(pins: &Pins, first: [f64; 2], second: [f64; 2]) -> (bool, Stri
     }
 }
 
+/// What the Rotary section's calibration finds, on a machine with the
+/// rotary A axis (LIO-186). Each starts from where the tip was put, a few
+/// mm over the top of what it probes, and turns A only with the tip up
+/// clear of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Calibrate {
+    /// Where A's centreline is in machine Y and Z, from a test bar in the
+    /// chuck: its sides and top at A and at A + 180°, whose means cancel
+    /// the bar's runout. The tip starts over the bar near the chuck.
+    Centreline,
+    /// The same, farther along the bar, near the tailstock: how far the
+    /// centreline runs off machine X from where it was found near the chuck.
+    Alignment,
+    /// A zero: two touches along Y on a flat on the stock, A turned until
+    /// they are level, and A zeroed there. The tip starts over the flat.
+    AZero,
+}
+
+impl Calibrate {
+    /// The button's words.
+    pub fn label(self) -> &'static str {
+        match self {
+            Calibrate::Centreline => "Probe the centreline",
+            Calibrate::Alignment => "Check the line to the tailstock",
+            Calibrate::AZero => "Find A zero on a flat",
+        }
+    }
+
+    /// Where to put the tip before pressing it, and what it does.
+    pub fn how(self) -> String {
+        match self {
+            Calibrate::Centreline => format!(
+                "Put a ground test bar in the chuck, the probe's clip on it, type its diameter, jog the tip over the middle of the bar a few mm above it and {CHUCK_GAP:.0} mm or more out from the jaws, and press {}: it touches the top, goes down beside the bar on both sides, touches the top over the middle found, lifts {TURN_CLEAR:.0} mm over the bar, turns A half a turn and does it again, then turns A back.",
+                self.label()
+            ),
+            Calibrate::Alignment => format!(
+                "Once the centreline is probed near the chuck: jog the tip over the bar near the tailstock, a few mm above it, and press {}: it probes the bar there as near the chuck and says how far the centreline runs off machine X between the two.",
+                self.label()
+            ),
+            Calibrate::AZero => format!(
+                "Turn A until a flat on the stock (or a jaw face) is about level and on top, jog the tip over its middle a few mm above it and press {}: it touches the flat at the spacing typed either side of the tip along Y, lifts {TURN_CLEAR:.0} mm over the stock, turns A by the slope found (by {DIRECTION_TURN:.0}° or more the first time, to check that +A turns the part the way the machine's Direction says: the top toward −Y, the front, for Positive, toward +Y for Negative; it stops if A turns backwards), and again until the two are level, then zeroes A there.",
+                self.label()
+            ),
+        }
+    }
+}
+
+/// How far over the highest point of the bar or stock the tip lifts before
+/// A turns, and travels beside it (mm).
+pub const TURN_CLEAR: f64 = 5.;
+/// How far out from the chuck's jaws to probe a bar (mm): the tip goes
+/// down beside it.
+pub const CHUCK_GAP: f64 = 10.;
+/// How far past the bar's side and the tip's radius the tip goes down
+/// beside the bar (mm).
+const BAR_SIDE_GAP: f64 = 5.;
+/// The least room between the top of Z's travel and the largest part on A
+/// for a safe retract over it (mm, LIO-191).
+pub const RETRACT_ROOM: f64 = 5.;
+/// Level enough for A zero: its two touches within this of each other (mm).
+const LEVEL: f64 = 0.005;
+/// How often A zero turns A to level the flat before it gives up.
+const LEVEL_TRIES: usize = 6;
+/// The most A zero turns A at once (degrees): a flat farther off level is
+/// turned about level by hand first.
+const LEVEL_TURN: f64 = 20.;
+/// The least A zero's first turn (degrees), even when the flat is level
+/// already: enough for the touches to show which way A turns.
+const DIRECTION_TURN: f64 = 1.;
+
+/// Why A zero stops when A turned the flat the wrong way: by `turned` (°)
+/// for a turn of A by `turn` (°), of the other sign than the machine's
+/// Direction (`sign`) gives. With Direction Positive, +A is the right-hand
+/// rule about +X: it turns the top of the part toward −Y, the front of the
+/// machine; with Negative, toward +Y, the back.
+fn a_backwards(turn: f64, turned: f64, sign: f64) -> String {
+    let (direction, want, got) = if sign < 0. {
+        ("Negative", "+Y, the back", "−Y, the front")
+    } else {
+        ("Positive", "−Y, the front", "+Y, the back")
+    };
+    format!(
+        "A turns backwards: turning A by {turn:+.3}° turned the flat by {turned:+.3}°: +A turns the top of the part toward {got}. The machine's Direction is {direction}, so +A must turn the top of the part toward {want}, or a flat cut at A 90° lands on the opposite face and the jaw checks at each angle are wrong. Either invert A's direction in the machine's profile (Reverse the direction, in the A axis of Setup), save it and jog A+ to check the top now moves toward {want}; or, if A is wired as it should be, set the machine's Direction to match it in the Machine library. Then find A zero again."
+    )
+}
+/// Misalignment over which a check warns (mm), as the fixture plate's
+/// squareness check does.
+pub const ALIGN_LIMIT: f64 = 0.05;
+/// The machine field that says how the centreline was found: empty while it
+/// is assumed, `MEASURED` once probed and saved, or why it went stale.
+pub const CENTRE_MARK: &str = "a_centre_measured";
+/// Why a centreline without its Z reference is not saved or run (LIO-207).
+pub const NO_CENTRE_REFERENCE: &str = "The A centreline's Z is where the probe's tip was, and the probe's length is not a tool's: with the probe still in the spindle, touch a surface that stays put (the table, a block on it, not on A) with Touch the Z reference, then Save the centreline. Each tool is touched off on that surface.";
+/// How near the spot the probe touched the Z reference a tool is touched
+/// off on it (mm, machine X Y): a table or block is flat only so far.
+pub const REFERENCE_SPOT: f64 = 1.;
+pub const MEASURED: &str = "measured";
+
+/// The A centreline found at one place along the bar (machine mm).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Centre {
+    /// Machine X where the bar was probed.
+    pub x: f64,
+    /// The centreline's machine Y and Z there: the means at the two angles,
+    /// Z the top's less the bar's radius.
+    pub y: f64,
+    pub z: f64,
+    /// How far the bar's centre is off the centreline at the first angle,
+    /// in Y and Z: half the difference between the two angles.
+    pub runout: [f64; 2],
+    /// The bar's width across Y the probe found, the tip allowed for: the
+    /// mean at the two angles.
+    pub across: f64,
+    /// The A angles it was probed at.
+    pub angles: [f64; 2],
+    /// The Z reference the probe touched since (LIO-207): machine X, Y and
+    /// the machine Z of its tip on the surface (`Touch::CentreReference`).
+    /// Saved with the centreline: a tool touched off on the same surface
+    /// is related to the centreline by it, whatever its length.
+    pub reference: Option<[f64; 3]>,
+}
+
+impl Centre {
+    /// How far the bar runs out (the radius of the circle its centre turns on).
+    pub fn eccentric(&self) -> f64 {
+        self.runout[0].hypot(self.runout[1])
+    }
+}
+
+/// How far the centreline runs off machine X from `near` the chuck to
+/// `far` along the bar, and what is said of it: whether it is within
+/// `ALIGN_LIMIT` over the length between them.
+pub fn alignment(near: &Centre, far: &Centre) -> (bool, String) {
+    let length = (far.x - near.x).abs();
+    let (dy, dz) = (far.y - near.y, far.z - near.z);
+    let off = dy.hypot(dz);
+    let mut said = format!(
+        "Over {length:.1} mm along X from near the chuck to here, the centreline moves {dy:+.3} mm in Y and {dz:+.3} mm in Z: it runs {off:.3} mm off machine X ({:.4}°). The bar runs out {:.3} mm near the chuck and {:.3} mm here.",
+        off.atan2(length).to_degrees(),
+        near.eccentric(),
+        far.eccentric()
+    );
+    let ok = off <= ALIGN_LIMIT;
+    if !ok {
+        said += &format!(
+            " That is over {ALIGN_LIMIT} mm: square the rotary unit (and line up the tailstock) to X, or a feature cut at the far end is off by up to that much."
+        );
+    }
+    let bent = (far.runout[0] - near.runout[0]).hypot(far.runout[1] - near.runout[1]);
+    if bent > ALIGN_LIMIT {
+        said += &format!(
+            " The runout changes by {bent:.3} mm along the bar: it is bent, or the tailstock holds it off the A axis."
+        );
+    }
+    (ok, said)
+}
+
+/// The room between the top of Z's travel `top` and the largest part the
+/// rotary unit takes, on a centreline at machine Z `centre` (mm), and the
+/// warning when it leaves no safe retract over it (LIO-191).
+pub fn retract_room(top: f64, centre: f64, diameter: f64) -> (f64, Option<String>) {
+    let room = top - (centre + diameter / 2.);
+    let warn = (room < RETRACT_ROOM).then(|| {
+        format!(
+            "With the centreline at machine Z {centre:.3}, the largest part (Ø{diameter:.0} mm) reaches Z {:.3}, {room:.1} mm under the top of Z's travel: less than the {RETRACT_ROOM:.0} mm a retract over it needs. Keep parts under Ø{:.0} mm, or lower the rotary unit; the largest part diameter in the Machine library is left as it is.",
+            centre + diameter / 2.,
+            (2. * (top - RETRACT_ROOM - centre)).max(0.)
+        )
+    });
+    (room, warn)
+}
+
+/// A rotary calibration probed from where the tip was put (machine mm and
+/// degrees).
+struct Turning {
+    what: Calibrate,
+    start: Vec6,
+    /// The bar's or stock's radius, as typed.
+    radius: f64,
+    /// The tip's radius.
+    tip: f64,
+    feed: f64,
+    /// How far down a touch goes at most past the height it started at.
+    distance: f64,
+    /// Machine Z the tip lifts to before A turns and travels at over the
+    /// bar: for the centreline, known once its top is touched.
+    clear: Option<f64>,
+    /// The top of Z's travel.
+    top: f64,
+    /// The A angles: the centreline's two, 180° apart; A zero's tries.
+    angles: Vec<f64>,
+    /// A's soft limits, if it has them.
+    a_range: Option<(f64, f64)>,
+    /// A's degrees per step: A zero levels the flat to within one.
+    a_step: f64,
+    /// Which way +A turns the part, as the machine's Direction says
+    /// (`Rotary::sign`): A zero refuses an A that turns the other way.
+    sign: f64,
+    /// The touches at the current angle.
+    touches: Vec<Vec6>,
+    /// What each angle done found: the centreline's Y, its top's Z and the
+    /// width across Y; A zero's angle, the flat's slope in degrees and the
+    /// difference between its two touches.
+    found: Vec<[f64; 3]>,
+    /// A zero's distance between its two touches along Y.
+    spacing: f64,
+    /// The moves back over the bar with A where it started are made as
+    /// legs: it ends once they are.
+    backed: bool,
+    legs: VecDeque<Leg>,
+    /// The command under way and the counts before it (`Connection::seq`).
+    sent: Option<(Leg, (u64, u64))>,
+}
+
+impl Turning {
+    /// The tip at Y `y` and Z `z` with A at `a`, at the X it started at.
+    fn point(&self, y: f64, z: f64, a: f64) -> Vec6 {
+        let mut p = self.start;
+        (p[1], p[2], p[3]) = (y, z, a);
+        p
+    }
+
+    /// The angle A is at for the touches under way.
+    fn angle(&self) -> f64 {
+        self.angles[self.found.len().min(self.angles.len() - 1)]
+    }
+
+    /// The legs to the next touch, from the last one; None once every touch
+    /// is made.
+    fn plan(&self) -> Option<Vec<Leg>> {
+        use Leg::{Guard, Rapid, Touch};
+        let (n, h) = (self.touches.len(), self.found.len());
+        let (z, a) = (self.start[2], self.angle());
+        let p = |y: f64, z: f64| self.point(y, z, a);
+        let clear = self.clear.unwrap_or(z);
+        // A touch down goes to the maximum distance below where it started.
+        let down = z - self.distance;
+        Some(match self.what {
+            Calibrate::Centreline | Calibrate::Alignment => {
+                if h == 2 {
+                    return None;
+                }
+                // Over the middle found at the first angle for the second.
+                let y = if h == 0 {
+                    self.start[1]
+                } else {
+                    self.found[0][0]
+                };
+                let out = self.radius + self.tip + BAR_SIDE_GAP;
+                // The sides are probed with the ball's centre at the bar's
+                // middle height, where they are upright.
+                let low = (self.touches.first()).map_or(z, |t| t[2] - self.radius - self.tip);
+                match n {
+                    0 if h == 0 => vec![Touch(p(y, down))],
+                    // Up clear of the bar, half a turn, and down onto it.
+                    0 => vec![
+                        Rapid(self.point(y, clear, self.angles[0])),
+                        Rapid(p(y, clear)),
+                        Touch(p(y, down)),
+                    ],
+                    1 => vec![
+                        Rapid(p(y, clear)),
+                        Rapid(p(y - out, clear)),
+                        Guard(p(y - out, low)),
+                        Touch(p(y, low)),
+                    ],
+                    2 => vec![
+                        Rapid(p(y - out, low)),
+                        Rapid(p(y - out, clear)),
+                        Rapid(p(y + out, clear)),
+                        Guard(p(y + out, low)),
+                        Touch(p(y, low)),
+                    ],
+                    _ => {
+                        let mid = (self.touches[1][1] + self.touches[2][1]) / 2.;
+                        vec![
+                            Rapid(p(y + out, low)),
+                            Rapid(p(y + out, clear)),
+                            Rapid(p(mid, clear)),
+                            Touch(p(mid, down)),
+                        ]
+                    }
+                }
+            }
+            Calibrate::AZero => {
+                if h == self.angles.len() {
+                    return None;
+                }
+                let ys = [
+                    self.start[1] - self.spacing / 2.,
+                    self.start[1] + self.spacing / 2.,
+                ];
+                match n {
+                    0 if h == 0 => vec![
+                        Rapid(p(self.start[1], clear)),
+                        Rapid(p(ys[0], clear)),
+                        Touch(p(ys[0], down)),
+                    ],
+                    // Up clear of the stock, A turned by the slope found,
+                    // and down onto the flat again.
+                    0 => {
+                        let before = self.angles[h - 1];
+                        vec![
+                            Rapid(self.point(ys[1], clear, before)),
+                            Rapid(p(ys[1], clear)),
+                            Rapid(p(ys[0], clear)),
+                            Touch(p(ys[0], down)),
+                        ]
+                    }
+                    _ => vec![
+                        Rapid(p(ys[0], clear)),
+                        Rapid(p(ys[1], clear)),
+                        Touch(p(ys[1], down)),
+                    ],
+                }
+            }
+        })
+    }
+
+    /// Where it leaves the tip once every touch is made: up clear over the
+    /// bar with A back where it started, or over the flat.
+    fn last(&self) -> Vec<Vec6> {
+        let clear = self.clear.unwrap_or(self.start[2]);
+        match self.what {
+            Calibrate::AZero => {
+                let y = self.start[1] + self.spacing / 2.;
+                vec![self.point(y, clear, self.angle())]
+            }
+            _ => {
+                let y = self.found.last().map_or(self.start[1], |f| f[0]);
+                vec![
+                    self.point(y, clear, self.angle()),
+                    self.point(y, clear, self.angles[0]),
+                ]
+            }
+        }
+    }
+
+    /// The touches at an angle are made: what they found, and the next
+    /// angle; or why it stops.
+    fn settle(&mut self) -> Result<(), String> {
+        let t = &self.touches;
+        match self.what {
+            Calibrate::Centreline | Calibrate::Alignment => {
+                // A top touched: the tip lifts clear over the highest yet.
+                if let Some(top) = [0, 3].contains(&(t.len() - 1)).then(|| t[t.len() - 1][2]) {
+                    let want = (top + TURN_CLEAR).max(self.clear.unwrap_or(self.start[2]));
+                    let clear = want.min(self.top);
+                    if clear < top + 2. {
+                        return Err(format!(
+                            "The bar's top is at machine Z {top:.3}, {:.1} mm under the top of Z's travel: no room to lift the tip clear over it and turn A. Use a thinner bar, or lower the rotary unit.",
+                            self.top - top
+                        ));
+                    }
+                    self.clear = Some(clear);
+                }
+                if t.len() < 4 {
+                    return Ok(());
+                }
+                let across = t[2][1] - t[1][1] - 2. * self.tip;
+                if (across - 2. * self.radius).abs() > 0.5 {
+                    return Err(format!(
+                        "The probe found the bar {across:.3} mm across Y, not the {:.3} mm typed: check the bar's diameter, the tip's in the Machine library, and that the tip started over the bar's middle.",
+                        2. * self.radius
+                    ));
+                }
+                self.found.push([(t[1][1] + t[2][1]) / 2., t[3][2], across]);
+            }
+            Calibrate::AZero => {
+                if t.len() < 2 {
+                    return Ok(());
+                }
+                let a = self.angle();
+                let rise = t[1][2] - t[0][2];
+                let slope = rise.atan2(t[1][1] - t[0][1]).to_degrees();
+                if self.found.is_empty() && slope.abs() > LEVEL_TURN {
+                    return Err(format!(
+                        "The flat is {:.1}° off level: turn A until it is level within {LEVEL_TURN:.0}°, and press {} again.",
+                        slope.abs(),
+                        self.what.label()
+                    ));
+                }
+                self.found.push([a, slope, rise]);
+                // How the flat turned with A, from the last two angles:
+                // checked after the first turn, and while it is not level.
+                let k = self.found.len();
+                let gain = (k >= 2).then(|| {
+                    let [a0, s0, _] = self.found[k - 2];
+                    (a - a0, slope - s0)
+                });
+                if let Some((turn, turned)) = gain.filter(|_| k == 2 || rise.abs() > LEVEL) {
+                    if (turned / turn).abs() < 0.3 {
+                        return Err(format!(
+                            "Turning A by {turn:.3}° turned the flat by {turned:.3}°: it does not turn with A. Is the stock held in the chuck?"
+                        ));
+                    }
+                    // A turning the other way than the machine's Direction
+                    // says is refused, never adapted to: every A angle a
+                    // program commands would turn the part the other way.
+                    // The first turn, of `DIRECTION_TURN` or more, tells.
+                    if k == 2 && self.sign * turned / turn < 0. {
+                        return Err(a_backwards(turn, turned, self.sign));
+                    }
+                }
+                // Level, or as level as one step of A sets it.
+                let turn = match gain {
+                    // With Direction Positive, +A turns +Y up toward +Z (the
+                    // right-hand rule about +X), with Negative down: a flat
+                    // high on +Y turns back by its slope. The first turn is
+                    // always made, and by at least `DIRECTION_TURN`, so
+                    // that the touches after it show which way A really
+                    // turns.
+                    None if slope.abs() >= DIRECTION_TURN => Some(-self.sign * slope),
+                    None => {
+                        let turn = if slope > 0. {
+                            -self.sign * DIRECTION_TURN
+                        } else {
+                            self.sign * DIRECTION_TURN
+                        };
+                        let inside = |t: f64| {
+                            (self.a_range).is_none_or(|(lo, hi)| (lo..=hi).contains(&(a + t)))
+                        };
+                        Some(if inside(turn) { turn } else { -turn })
+                    }
+                    _ if rise.abs() <= LEVEL => None,
+                    Some((turn, turned)) => Some(-slope * turn / turned),
+                }
+                .filter(|turn| turn.abs() >= self.a_step);
+                if let Some(turn) = turn {
+                    if self.found.len() >= LEVEL_TRIES {
+                        return Err(format!(
+                            "The flat is still {rise:+.3} mm off level over {:.1} mm after turning A {LEVEL_TRIES} times: check that the tip touches the flat both times, not its edges.",
+                            self.spacing
+                        ));
+                    }
+                    let next = a + turn;
+                    if let Some((lo, hi)) = self.a_range
+                        && !(lo..=hi).contains(&next)
+                    {
+                        return Err(format!(
+                            "Levelling the flat needs A at {next:.3}°, outside its soft limits {lo}…{hi}°."
+                        ));
+                    }
+                    self.angles.push(next);
+                }
+            }
+        }
+        self.touches.clear();
+        Ok(())
+    }
+
+    /// The centreline it found, once both angles are done.
+    fn centre(&self) -> Option<Centre> {
+        let [first, second] = [self.found.first()?, self.found.get(1)?];
+        Some(Centre {
+            x: self.start[0],
+            y: (first[0] + second[0]) / 2.,
+            z: (first[1] + second[1]) / 2. - self.radius,
+            runout: [(first[0] - second[0]) / 2., (first[1] - second[1]) / 2.],
+            across: (first[2] + second[2]) / 2.,
+            angles: [self.angles[0], self.angles[1]],
+            reference: None,
+        })
+    }
+}
+
+/// A machine's rotary unit as the Control page calibrates it: its geometry
+/// (`Machine::rotary_unit`) and how its centreline was found (`CENTRE_MARK`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rotary {
+    pub unit: crate::model::RotaryUnit,
+    pub mark: String,
+    /// +1 when the machine's Direction is Positive (+A turns the part by
+    /// the right-hand rule about +X), -1 for Negative (`indexed::sign`).
+    pub sign: f64,
+}
+
+impl Rotary {
+    /// The machine's rotary unit; None without A or its geometry.
+    pub fn of(m: &Machine) -> Option<Self> {
+        Some(Self {
+            unit: m.rotary_unit()?,
+            mark: get(&m.p, CENTRE_MARK).trim().to_string(),
+            sign: crate::indexed::sign(m) as f64,
+        })
+    }
+
+    /// The centreline was probed and saved, and has not gone stale since.
+    pub fn measured(&self) -> bool {
+        self.mark == MEASURED
+    }
+}
+
+/// What the Control page found for the machine's rotary geometry, for the
+/// app to keep in the Machine library (`take`n there).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RotaryKeep {
+    /// The centreline's machine Y and Z, probed: it is measured; and the
+    /// Z reference the probe touched with it (`Centre::reference`).
+    Centreline([f64; 2], [f64; 3]),
+    /// The measured centreline went stale: why (`CENTRE_MARK`).
+    Stale(&'static str),
+}
+
+/// Simulated: where the simulator's test bar really is, off the rotary
+/// unit's assumed geometry (`ROTARY_GEOMETRY`), so the calibration has
+/// something to find: its axis is off in Y and Z and runs off X, and the
+/// bar runs out on it, with a flat ground along it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SimAxis {
+    /// The A axis at the chuck face, off the assumed centreline in Y and Z.
+    pub offset: [f64; 2],
+    /// How far it runs off X in Y and Z per mm along X.
+    pub tilt: [f64; 2],
+    /// The bar's centre off the A axis at the chuck, in Y and Z at A 0.
+    pub runout: [f64; 2],
+    /// How the runout grows per mm along X.
+    pub runout_tilt: [f64; 2],
+    /// The flat's face at A 0, in degrees from +Z toward −Y (A turns it
+    /// that way), and how deep it is; None for a round bar.
+    pub flat: Option<(f64, f64)>,
+}
+
+impl Default for SimAxis {
+    fn default() -> Self {
+        Self {
+            offset: [0.3, -0.2],
+            tilt: [0.0004, -0.0002],
+            runout: [0.02, 0.01],
+            runout_tilt: [0.; 2],
+            // On top at A −45°, 2° off level: clear of the centreline's
+            // touches at A 0 and 180°.
+            flat: Some((47., 1.)),
+        }
+    }
+}
+
 /// Where the simulator's pin 1 stands before its place is recorded: the
 /// pins centred between the front of the table and the default block
 /// (`sim_block`), or between its left end and the block when they spread
@@ -1224,6 +1862,47 @@ fn job(name: &str, actions: Vec<Do>) -> Command {
     }
 }
 
+/// The axes' letters, by the driver's index.
+pub const AXIS_NAMES: [&str; 6] = ["X", "Y", "Z", "A", "B", "C"];
+
+/// A rotary axis (A, B, C): in degrees, without switches.
+pub fn rotary(a: usize) -> bool {
+    a >= 3
+}
+
+/// Pads a state file written before its axes were six (offsets and the
+/// last position of X, Y and Z only) with zeros, so the driver loads it:
+/// it drops a file it cannot read, and with it every offset. A file it
+/// wrote, or none, is left as it is.
+fn pad_state(file: &Path) {
+    let Some(mut doc) = std::fs::read_to_string(file)
+        .ok()
+        .and_then(|t| t.parse::<toml_edit::DocumentMut>().ok())
+    else {
+        return;
+    };
+    let mut padded = false;
+    let mut pad = |a: &mut toml_edit::Array| {
+        while a.len() < 6 {
+            a.push(0.0);
+            padded = true;
+        }
+    };
+    if let Some(wcs) = doc.get_mut("wcs").and_then(|w| w.as_array_mut()) {
+        for system in wcs.iter_mut() {
+            if let Some(a) = system.as_array_mut() {
+                pad(a);
+            }
+        }
+    }
+    if let Some(a) = doc.get_mut("last_position").and_then(|w| w.as_array_mut()) {
+        pad(a);
+    }
+    if padded {
+        let _ = std::fs::write(file, doc.to_string());
+    }
+}
+
 /// How often a held jog is sent again: the driver ends a jog that is not
 /// refreshed within 400 ms, so a lost release cannot run an axis away.
 const JOG_RESEND: Duration = Duration::from_millis(100);
@@ -1237,7 +1916,8 @@ const JOG_START: Duration = Duration::from_millis(400);
 pub enum Action {
     /// Home every axis in the profile's order.
     Home,
-    /// Declare the current position machine zero: X, Y and Z, or one axis.
+    /// Declare the current position machine zero: every axis without a
+    /// home switch (A too), or one axis.
     MachineZero(Option<usize>),
     /// Declare every axis at the machine position it shows, which after
     /// connecting is where the machine was left.
@@ -1250,6 +1930,8 @@ pub enum Action {
     JogRelease,
     /// The step size in mm; None jogs continuously.
     JogStep(Option<f64>),
+    /// A's step size in degrees; None jogs A continuously.
+    JogAngle(Option<f64>),
     /// Jog speed, % of each axis's maximum velocity.
     JogSpeed(f32),
     /// Make the current position work zero of the active coordinate
@@ -1322,6 +2004,21 @@ pub enum Action {
     /// pins give the setup picked in the Run panel (`Connection::pin_offset`),
     /// at the current position. Waits as TouchOff does.
     PinZero,
+    /// The Rotary section's test bar (or stock) diameter field, mm.
+    BarText(String),
+    /// A zero's touch spacing field, mm.
+    SpacingText(String),
+    /// Start a rotary calibration from where the tip is (`Calibrate`).
+    Calibrate(Calibrate),
+    /// The probe the centreline was probed with touches a Z reference
+    /// straight down, with no plate (LIO-207), to be saved with it.
+    TouchCentreReference,
+    /// Keep the centreline found near the chuck in the machine's rotary
+    /// geometry, as measured.
+    SaveCentreline,
+    /// The rotary unit was taken off the table and put back: its measured
+    /// centreline is stale.
+    Remounted,
 }
 
 /// Steps-per-mm calibration: one commanded move, then the travel measured
@@ -1389,6 +2086,8 @@ pub struct Connection {
     declare: VecDeque<(usize, f64)>,
     held: Option<Held>,
     pub jog_step: Option<f64>,
+    /// A's step in degrees (`Action::JogAngle`).
+    pub jog_angle: Option<f64>,
     /// Jog speed, % of each axis's maximum velocity.
     pub jog_speed: f32,
     /// Feed override, %.
@@ -1444,6 +2143,38 @@ pub struct Connection {
     sim_pins: Option<[f64; 2]>,
     /// Simulated: the blocks last sent to the driver.
     sim_sent: Vec<Block>,
+    /// The machine's rotary unit and how its centreline was found: from the
+    /// Machine library at connecting, then as saved and probed. None
+    /// without A or its geometry.
+    pub rotary: Option<Rotary>,
+    /// The Rotary section's test bar diameter and A zero's touch spacing
+    /// fields (mm).
+    pub bar_text: String,
+    pub spacing_text: String,
+    turning: Option<Turning>,
+    /// The centreline found near the chuck since connecting, cleared by
+    /// every E-stop; whether it was saved.
+    pub centre: Option<Centre>,
+    pub centre_saved: bool,
+    /// How the last calibration ended (ok, what it said).
+    pub rotary_said: Option<(bool, String)>,
+    /// What the app is to keep in the machine's rotary geometry (`take`n
+    /// there).
+    pub rotary_keep: Option<RotaryKeep>,
+    /// Y or Z had a machine position at the last tick: an E-stop then
+    /// leaves a measured centreline stale.
+    yz_set: bool,
+    /// Simulated: where the test bar really is.
+    pub sim_axis: SimAxis,
+    /// Simulated: how much longer than the probe the tool in the spindle is
+    /// (mm, LIO-207). Its tip is that much under the simulator's point, so
+    /// the simulator's blocks and bars stand that much higher.
+    pub sim_longer: f64,
+    /// Simulated: a gauge block on the table for a Z reference (LIO-207),
+    /// None without one.
+    pub sim_gauge: Option<Block>,
+    /// Simulated: the bars last sent to the driver.
+    sim_bars_sent: Vec<Bar>,
     /// Keeps macOS from throttling AXIS CAM in the background, which would
     /// starve the controller's motion buffer.
     _nap: uc100::macos::ActivityToken,
@@ -1478,6 +2209,7 @@ impl Connection {
         cfg.controller.simulated = simulated;
         let suffix = if simulated { "-simulated" } else { "" };
         let file = state_dir.join(format!("{}{suffix}.toml", m.id));
+        pad_state(&file);
         let controller = Controller::start(cfg.clone(), Some(file));
         let block = sim_block(&cfg, None).filter(|_| simulated);
         let pins = pins_settings(&m.p);
@@ -1497,6 +2229,7 @@ impl Connection {
             declare: VecDeque::new(),
             held: None,
             jog_step: None,
+            jog_angle: None,
             jog_speed: 50.,
             feed_override: 100.,
             rpm: String::new(),
@@ -1528,6 +2261,19 @@ impl Connection {
             referencing: None,
             sim_pins,
             sim_sent: vec![],
+            rotary: Rotary::of(m),
+            bar_text: String::new(),
+            spacing_text: "10".into(),
+            turning: None,
+            centre: None,
+            centre_saved: false,
+            rotary_said: None,
+            rotary_keep: None,
+            yz_set: false,
+            sim_axis: SimAxis::default(),
+            sim_longer: 0.,
+            sim_gauge: None,
+            sim_bars_sent: vec![],
         };
         c.send_sim_blocks();
         Ok(c)
@@ -1547,7 +2293,8 @@ impl Connection {
         let on_pins = (self.run.as_ref())
             .and_then(|r| r.checked()?.first())
             .is_some_and(|p| p.pins.is_some());
-        let off = pin_probe || (on_pins && !self.pin_referenced);
+        // The test bar on A stands where the block would.
+        let off = pin_probe || (on_pins && !self.pin_referenced) || self.sim_bar().is_some();
         if let Some((min, max)) = self.block.filter(|_| !off) {
             out.push(Block { min, max });
         }
@@ -1581,16 +2328,65 @@ impl Connection {
         Some([at[0], at[1], lo[2] + pins.height])
     }
 
-    /// Simulated: sends the blocks when they changed since last sent.
+    /// Simulated: sends the blocks and the test bar when they changed since
+    /// last sent.
     fn send_sim_blocks(&mut self) {
         if !self.simulated {
             return;
         }
-        let world = self.sim_world();
+        let up = self.sim_longer;
+        let mut world = self.sim_world();
+        world.extend(self.sim_gauge);
+        for b in &mut world {
+            (b.min[2], b.max[2]) = (b.min[2] + up, b.max[2] + up);
+        }
         if world != self.sim_sent {
             self.send(Command::SimBlocks(world.clone()));
             self.sim_sent = world;
         }
+        let mut bars: Vec<Bar> = self.sim_bar().into_iter().collect();
+        for b in &mut bars {
+            b.axis[1] += up;
+        }
+        if bars != self.sim_bars_sent {
+            self.send(Command::SimBars(bars.clone()));
+            self.sim_bars_sent = bars;
+        }
+    }
+
+    /// Simulated: the test bar in the chuck, of the diameter typed, from the
+    /// chuck face along the longest part, on the A axis where `sim_axis`
+    /// puts it. The simulator's tip is a point at the tip's bottom: the bar
+    /// is the tip's radius larger and that much lower, so it touches where
+    /// the ball would. None until a diameter is typed.
+    pub fn sim_bar(&self) -> Option<Bar> {
+        let (true, Some(r), Some(diameter)) = (self.simulated, &self.rotary, self.bar_diameter())
+        else {
+            return None;
+        };
+        let tip = self.probe.as_ref().ok()?.tip.unwrap_or_default() / 2.;
+        let assumed = |k: &str| -> f64 {
+            let g = crate::model::ROTARY_GEOMETRY.iter().find(|g| g.0 == k);
+            g.and_then(|g| g.2.parse().ok()).unwrap_or_default()
+        };
+        let a = &self.sim_axis;
+        let chuck = r.unit.chuck_x as f64;
+        let radius = diameter / 2.;
+        Some(Bar {
+            x: [chuck, chuck + r.unit.fit_length as f64],
+            axis: [
+                assumed("a_centre_y") + a.offset[0],
+                assumed("a_centre_z") + a.offset[1] - tip,
+            ],
+            tilt: a.tilt,
+            runout: a.runout,
+            runout_tilt: a.runout_tilt,
+            radius: radius + tip,
+            flat: a.flat.map(|(at, depth)| {
+                let t = at.to_radians();
+                ([-t.sin(), t.cos()], radius - depth + tip)
+            }),
+        })
     }
 
     /// The simulator's block takes the X/Y size of the stock of the setup
@@ -1711,6 +2507,13 @@ impl Connection {
             self.inputs.observe(self.opened.elapsed(), st);
         }
         if self.snapshot.state == Some(State::EStop) {
+            // The machine position the centreline is in is gone: a measured
+            // one holds only once Y and Z are set where they were, which
+            // nothing checks.
+            if self.yz_set {
+                self.centre = None;
+                self.stale("an E-stop");
+            }
             self.forced.clear();
             // What the pins said is over: the panel says to reference again.
             if self.pin_referenced {
@@ -1726,8 +2529,10 @@ impl Connection {
                 None => self.probed = Some((false, message)),
             }
         }
+        self.yz_set = self.snapshot.referenced[1] || self.snapshot.referenced[2];
         self.edges_step();
         self.routine_step();
+        self.turning_step();
         // Any state but Idle (E-stop, a move) drops what is left, so nothing
         // is declared later by surprise.
         if self.idle() {
@@ -1804,7 +2609,7 @@ impl Connection {
         match action {
             Action::Home if self.idle() && self.home_switches() => self.send(Command::Home(vec![])),
             Action::MachineZero(axis) if self.idle() => {
-                let axes = axis.map_or(0..3, |a| a..a + 1);
+                let axes = axis.map_or(0..6, |a| a..a + 1);
                 let zero: Vec<_> = axes
                     .filter(|&a| self.axis(a) && self.switchless(a))
                     .map(|a| (a, 0.))
@@ -1818,8 +2623,15 @@ impl Connection {
                     .collect();
                 self.declared(&here);
             }
-            Action::JogPress(axis, negative) if self.manual() && self.axis(axis) => {
-                match self.jog_step {
+            Action::JogPress(axis, negative)
+                if self.manual() && self.axis(axis) && self.jog_blocked(axis).is_none() =>
+            {
+                let step = if rotary(axis) {
+                    self.jog_angle
+                } else {
+                    self.jog_step
+                };
+                match step {
                     Some(step) => self.send(Command::JogStep {
                         axis,
                         distance: if negative { -step } else { step },
@@ -1848,6 +2660,7 @@ impl Connection {
                 }
             }
             Action::JogStep(step) => self.jog_step = step,
+            Action::JogAngle(step) => self.jog_angle = step,
             Action::JogSpeed(percent) => self.jog_speed = percent.clamp(1., 100.),
             Action::WorkZero(axis) if self.manual() => {
                 if let (Some(run), None | Some(2)) = (&mut self.run, axis) {
@@ -1934,9 +2747,12 @@ impl Connection {
             Action::CalMeasured(text) => self.calibration.measured = text,
             Action::CalMove => {
                 let axis = self.calibration.axis;
-                if let (true, Some(distance), Some(st)) =
-                    (self.idle(), self.cal_distance(), &self.snapshot.status)
-                {
+                if let (true, None, Some(distance), Some(st)) = (
+                    self.idle(),
+                    self.jog_blocked(axis),
+                    self.cal_distance(),
+                    &self.snapshot.status,
+                ) {
                     self.calibration.start = Some(st.position[axis]);
                     self.send(Command::JogStep {
                         axis,
@@ -2004,6 +2820,17 @@ impl Connection {
                     }
                 }
             }
+            Action::BarText(text) if self.turning.is_none() => self.bar_text = text,
+            Action::SpacingText(text) if self.turning.is_none() => self.spacing_text = text,
+            Action::Calibrate(what) => self.start_turning(what),
+            Action::SaveCentreline => self.save_centre(),
+            Action::TouchCentreReference if self.centre_reference_blocked().is_none() => {
+                self.start_probe(Touch::CentreReference)
+            }
+            Action::Remounted if self.turning.is_none() => {
+                self.centre = None;
+                self.stale("a remount");
+            }
             Action::TestOutput(pin, Some(high)) if self.can_force(pin) => {
                 self.forced.insert(pin, high);
                 self.send(Command::TestOutput {
@@ -2019,6 +2846,12 @@ impl Connection {
     /// Picking and checking a setup is the app's: it needs the part.
     pub fn run_act(&mut self, action: crate::run::Action, doc: &crate::model::Document) {
         use crate::run::Action as R;
+        if let R::ProbeCentreReference = action {
+            if let Ok(touch) = self.a_reference(doc) {
+                self.start_probe(touch);
+            }
+            return;
+        }
         let Some(mut run) = self.run.take() else {
             return;
         };
@@ -2038,8 +2871,10 @@ impl Connection {
                 self.send(Command::Resume)
             }
             R::Stop if crate::run::busy(state.as_ref()) => self.send(Command::Stop),
-            R::RecordReference if self.manual() => run.reference = Some(self.snapshot.work_pos[2]),
-            R::ZFromReference if self.manual() => {
+            R::RecordReference if self.manual() => {
+                run.record_reference(self, self.snapshot.work_pos[2])
+            }
+            R::ZFromReference if self.manual() && run.reference_a_problem(self).is_none() => {
                 if let Some(z) = run.reference {
                     self.send(Command::SetWork { axis: 2, value: z });
                     run.touched = true;
@@ -2047,7 +2882,7 @@ impl Connection {
                 }
             }
             R::ProbeReference => self.start_probe(Touch::Reference),
-            R::ProbeFromReference => {
+            R::ProbeFromReference if run.reference_a_problem(self).is_none() => {
                 if let Some(z) = run.reference {
                     self.start_probe(Touch::FromReference(z));
                 }
@@ -2159,7 +2994,11 @@ impl Connection {
     /// A probe move or probing routine is under way: planning is locked
     /// (`App::locked`).
     pub fn probing(&self) -> bool {
-        self.probing.is_some() || self.edges.is_some() || self.routine.is_some() || self.pin_start
+        self.probing.is_some()
+            || self.edges.is_some()
+            || self.routine.is_some()
+            || self.turning.is_some()
+            || self.pin_start
     }
 
     /// The feature being probed (`Feature`), if one is.
@@ -2191,8 +3030,14 @@ impl Connection {
     }
 
     /// Probes straight down, up to the maximum distance or the bottom of Z.
+    /// The probe touches the A centreline's Z reference itself, no plate.
     fn start_probe(&mut self, touch: Touch) {
-        let (None, Ok(probe)) = (self.probe_blocked(), self.probe.clone()) else {
+        let itself = touch == Touch::CentreReference;
+        let blocked = match itself {
+            true => self.probe_ready(&[2]),
+            false => self.probe_blocked(),
+        };
+        let (None, Ok(probe)) = (blocked, self.probe.clone()) else {
             return;
         };
         let mut target = self.snapshot.machine_pos;
@@ -2203,7 +3048,7 @@ impl Connection {
         self.probing = Some(Probing {
             touch,
             probe,
-            plate: probe.plate.filter(|_| !self.direct()),
+            plate: probe.plate.filter(|_| !self.direct() && !itself),
             target: target[2],
             seq: self.seq(),
         });
@@ -2245,8 +3090,9 @@ impl Connection {
             Touch::Reference => {
                 // The surface under the plate, at today's work offset.
                 let surface = trip - now + s.work_pos[2] - plate;
-                if let Some(run) = &mut self.run {
-                    run.reference = Some(surface);
+                if let Some(mut run) = self.run.take() {
+                    run.record_reference(self, surface);
+                    self.run = Some(run);
                 }
                 match p.plate {
                     Some(plate) => format!(
@@ -2256,6 +3102,53 @@ impl Connection {
                         format!("Reference surface recorded: Z {surface:.3}, touched directly.")
                     }
                 }
+            }
+            Touch::CentreReference => {
+                let at = [s.machine_pos[0], s.machine_pos[1], trip];
+                let said = match self.centre.as_mut() {
+                    Some(c) => {
+                        c.reference = Some(at);
+                        self.centre_saved = false;
+                        format!(
+                            "Z reference touched with the probe at machine X {:.3} Y {:.3} Z {trip:.3}, {:.3} mm under the centreline. Save the centreline to keep both; each tool is then touched off on this surface (Run panel → Touch off on the A reference).",
+                            at[0],
+                            at[1],
+                            c.z - trip
+                        )
+                    }
+                    None => "The centreline went before the reference was touched: probe it again."
+                        .into(),
+                };
+                self.rotary_said = Some((self.centre.is_some(), said.clone()));
+                said
+            }
+            Touch::ToolReference {
+                run: i,
+                reference,
+                on_centre,
+            } => {
+                // How much longer than the probe the tool is: its tip on the
+                // surface the probe's tip found at `reference`.
+                let longer = trip - plate - reference;
+                let offset = on_centre + longer;
+                self.send(Command::SetWork {
+                    axis: 2,
+                    value: now - offset,
+                });
+                let tool = (self.run.as_ref())
+                    .and_then(|r| r.checked()?.get(i))
+                    .map(|p| (p.ops[0].tool_id.clone(), p.ops[0].tool));
+                if let (Some(run), Some((id, _))) = (&mut self.run, &tool) {
+                    run.length = Some((id.clone(), longer, reference));
+                    run.touched = true;
+                    run.zeroed = true;
+                }
+                format!(
+                    "Work Z set on the A centreline for T{}: its tip is {:.3} mm {} the probe's (Z offset {offset:.3}).",
+                    tool.map_or(0, |t| t.1),
+                    longer.abs(),
+                    if longer >= 0. { "under" } else { "over" },
+                )
             }
             Touch::WorkZ(at) | Touch::FromReference(at) => {
                 self.send(Command::SetWork {
@@ -2397,9 +3290,16 @@ impl Connection {
         if !self.idle() {
             return Err("The machine is not Idle.".into());
         }
-        if !self.unset_limited_axes().is_empty() || !(0..2).all(|a| self.snapshot.referenced[a]) {
+        let mut unset = self.unset_limited_axes();
+        unset.extend((0..2).filter(|&a| !self.snapshot.referenced[a]));
+        unset.sort_unstable();
+        unset.dedup();
+        if !unset.is_empty() {
+            let names: Vec<&str> = unset.iter().map(|&a| AXIS_NAMES[a]).collect();
             return Err(format!(
-                "X and Y need a machine position first: {}.",
+                "{} {} a machine position first: {}.",
+                names.join(", "),
+                if names.len() == 1 { "needs" } else { "need" },
                 if self.home_switches() {
                     "home"
                 } else {
@@ -2610,28 +3510,10 @@ impl Connection {
                 Leg::Touch(to) => Leg::Touch(self.inside(to)),
             };
             let name = format!("Probe {}", r.feature.label());
-            let seq = self.seq();
-            match leg {
-                // A rapid that goes nowhere is no command: the driver would
-                // report no outcome for it.
-                Leg::Rapid(to) if (0..6).all(|a| (to[a] - now[a]).abs() < 1e-9) => continue,
-                Leg::Rapid(to) => self.send(job(&name, moves_from(now, &[to]))),
-                Leg::Guard(to) => self.send(job(
-                    &name,
-                    vec![Do::Probe {
-                        target: to,
-                        feed: r.feed / 60.,
-                        must_trip: false,
-                    }],
-                )),
-                // G38.3: a miss is not an error; it is reported as one here.
-                Leg::Touch(to) => self.send(Command::Probe {
-                    target: to,
-                    feed: r.feed,
-                    must_trip: false,
-                }),
+            match self.send_leg(&name, leg, r.feed, now) {
+                Some(sent) => r.sent = Some(sent),
+                None => continue,
             }
-            r.sent = Some((leg, seq));
             self.routine = Some(r);
             return;
         }
@@ -2725,6 +3607,478 @@ impl Connection {
                 ));
             }
         }
+    }
+
+    /// The test bar's (or stock's) diameter typed in the Rotary section.
+    pub fn bar_diameter(&self) -> Option<f64> {
+        let d: f64 = self.bar_text.trim().parse().ok()?;
+        (1. ..=200.).contains(&d).then_some(d)
+    }
+
+    /// A zero's spacing between its two touches along Y, as typed.
+    pub fn spacing(&self) -> Option<f64> {
+        let d: f64 = self.spacing_text.trim().parse().ok()?;
+        (1. ..=100.).contains(&d).then_some(d)
+    }
+
+    /// The rotary calibration under way, if one is.
+    pub fn calibrating(&self) -> Option<Calibrate> {
+        self.turning.as_ref().map(|t| t.what)
+    }
+
+    /// The A centreline's machine Z the stock turns about: the one probed
+    /// since the last E-stop, or the machine's measured one. None while it
+    /// is assumed.
+    fn known_centre_z(&self) -> Option<f64> {
+        (self.centre.map(|c| c.z)).or_else(|| {
+            let r = self.rotary.as_ref().filter(|r| r.measured())?;
+            Some(r.unit.centre_z as f64)
+        })
+    }
+
+    /// The top of Z's travel: its soft maximum.
+    fn z_top(&self) -> Option<f64> {
+        self.config.axes.get(2)?.soft_max
+    }
+
+    /// Machine Z the tip lifts to over the stock before A zero turns A: the
+    /// stock's top at any angle and `TURN_CLEAR` over it, or why there is
+    /// none.
+    fn stock_clear(&self) -> Result<f64, String> {
+        let (Some(z), Some(d)) = (self.known_centre_z(), self.bar_diameter()) else {
+            return Err("Probe the A centreline first: A zero turns A with the tip lifted over the stock, which needs the centreline and the stock's diameter.".into());
+        };
+        let clear = z + d / 2. + TURN_CLEAR;
+        match self.z_top() {
+            Some(top) if top < clear => Err(format!(
+                "Turning A clear of a Ø{d} mm stock needs the tip at machine Z {clear:.3}, over the top of Z's travel ({top}): use a smaller stock."
+            )),
+            _ => Ok(clear),
+        }
+    }
+
+    /// The two angles the centreline is probed at: where A is and half a
+    /// turn on (or back), two steps inside A's soft limits: A stops on a
+    /// whole step, which at a limit can be past it. A tenth of a degree
+    /// short of half a turn leaves the runout cancelled to within 0.1 µm
+    /// per mm of it.
+    fn half_turn(&self) -> Result<[f64; 2], String> {
+        let a = self.snapshot.machine_pos[3];
+        let axis = self.config.axes.get(3);
+        let margin = axis.map_or(0., |x| 2. / x.steps_per_unit);
+        let range = axis.and_then(|x| Some((x.soft_min? + margin, x.soft_max? - margin)));
+        let near = |b: f64| {
+            let c = range.map_or(b, |(lo, hi)| b.clamp(lo, hi));
+            ((c - b).abs() <= 0.1).then_some(c)
+        };
+        [a + 180., a - 180.]
+            .into_iter()
+            .find_map(near)
+            .map(|b| [a, b])
+            .ok_or_else(|| "A cannot turn half a turn either way from here inside its soft limits: jog A nearer 0° first.".into())
+    }
+
+    /// Why a rotary calibration cannot start now; None when it can.
+    pub fn calibrate_blocked(&self, what: Calibrate) -> Option<String> {
+        if self.rotary.is_none() || !self.axis(3) {
+            return Some(
+                "This machine has no rotary A axis with its rotary unit's geometry.".into(),
+            );
+        }
+        if let Some(why) = self.probe_ready(&[0, 1, 2]) {
+            return Some(why);
+        }
+        // The driver refuses A moves before then too; nothing here asks it.
+        if !self.snapshot.referenced[3] {
+            return Some(
+                "A has no machine position (every E-stop clears it): set machine A first, as calibration turns it."
+                    .into(),
+            );
+        }
+        if let Ok(Probe { tip: None, .. }) = &self.probe {
+            return Some("Probe tip diameter is not set: set it in the Machine library.".into());
+        }
+        if self.bar_diameter().is_none() {
+            return Some(match what {
+                Calibrate::AZero => "Type the stock's diameter, from 1 to 200 mm.".into(),
+                _ => "Type the test bar's diameter, measured, from 1 to 200 mm.".into(),
+            });
+        }
+        match what {
+            Calibrate::Centreline => self.half_turn().err(),
+            Calibrate::Alignment if self.centre.is_none() => Some(
+                "Probe the centreline near the chuck first: the line to the tailstock is measured from it."
+                    .into(),
+            ),
+            Calibrate::Alignment => self.half_turn().err(),
+            Calibrate::AZero if self.spacing().is_none() => {
+                Some("Type the touch spacing, from 1 to 100 mm.".into())
+            }
+            Calibrate::AZero => self.stock_clear().err(),
+        }
+    }
+
+    /// Why the probe cannot touch the A centreline's Z reference now
+    /// (LIO-207); None when it can.
+    pub fn centre_reference_blocked(&self) -> Option<String> {
+        if self.rotary.is_none() || !self.axis(3) {
+            return Some(
+                "This machine has no rotary A axis with its rotary unit's geometry.".into(),
+            );
+        }
+        if self.turning.is_some() {
+            return Some("A calibration is under way.".into());
+        }
+        if self.centre.is_none() {
+            return Some("Probe the centreline first: the Z reference is touched with the same probe, before it comes out of the spindle.".into());
+        }
+        self.probe_ready(&[0, 1, 2])
+    }
+
+    /// The touch of the next tool run's tool on the A centreline's Z
+    /// reference (LIO-207), or why it cannot be made now: only for a tool
+    /// run that turns A, about a measured centreline saved with its
+    /// reference, with the tool over the spot the probe touched.
+    pub fn a_reference(&self, doc: &crate::model::Document) -> Result<Touch, String> {
+        let run = self.run.as_ref().ok_or("Pick a setup in the Run panel.")?;
+        let p = (run.checked())
+            .and_then(|p| p.get(run.next))
+            .ok_or("The setup cannot run: see the Run panel.")?;
+        let setup = (doc.setups.get(run.setup)).ok_or(crate::run::REMOVED)?;
+        if crate::run::a_angles(&p.blocks).is_empty() {
+            return Err("This tool run does not turn A: touch it off as for any setup.".into());
+        }
+        if doc.centre_mark(&setup.machine) != MEASURED {
+            return Err("The A centreline is not measured and current: probe it under Control → Rotary A first.".into());
+        }
+        let unit = doc.rotary_unit(&setup.machine);
+        let at = unit.and_then(|u| u.reference).ok_or(NO_CENTRE_REFERENCE)?;
+        let on_centre = crate::run::on_centre(doc, setup, p).ok_or(
+            "Where the A centreline is in this setup is not known: check the first setup's stock.",
+        )?[1];
+        let s = &self.snapshot;
+        let off = (s.machine_pos[0] - at[0] as f64).hypot(s.machine_pos[1] - at[1] as f64);
+        if !(s.referenced[0] && s.referenced[1]) || off > REFERENCE_SPOT {
+            return Err(format!(
+                "Jog over the Z reference first, to machine X {:.3} Y {:.3} (within {REFERENCE_SPOT} mm), where the probe touched it.",
+                at[0], at[1]
+            ));
+        }
+        if let Some(why) = self.probe_blocked() {
+            return Err(why);
+        }
+        Ok(Touch::ToolReference {
+            run: run.next,
+            reference: at[2] as f64,
+            on_centre,
+        })
+    }
+
+    /// Starts a rotary calibration from where the tip is.
+    fn start_turning(&mut self, what: Calibrate) {
+        if self.calibrate_blocked(what).is_some() {
+            return;
+        }
+        let (Ok(probe), Some(radius), Some(top)) = (
+            self.probe.clone(),
+            self.bar_diameter().map(|d| d / 2.),
+            self.z_top(),
+        ) else {
+            return;
+        };
+        let start = self.snapshot.machine_pos;
+        let (angles, clear) = match what {
+            Calibrate::AZero => match self.stock_clear() {
+                Ok(clear) => (vec![start[3]], Some(clear.max(start[2]))),
+                Err(_) => return,
+            },
+            _ => match self.half_turn() {
+                Ok(angles) => (angles.to_vec(), None),
+                Err(_) => return,
+            },
+        };
+        let a = self.config.axes.get(3);
+        self.turning = Some(Turning {
+            what,
+            start,
+            radius,
+            tip: probe.tip.unwrap_or_default() / 2.,
+            feed: probe.feed,
+            distance: probe.distance,
+            clear,
+            top,
+            angles,
+            a_range: a.and_then(|x| Some((x.soft_min?, x.soft_max?))),
+            a_step: a.map_or(0.01, |x| 1. / x.steps_per_unit),
+            sign: self.rotary.as_ref().map_or(1., |r| r.sign),
+            touches: vec![],
+            found: vec![],
+            spacing: self.spacing().unwrap_or(10.),
+            backed: false,
+            legs: VecDeque::new(),
+            sent: None,
+        });
+        self.rotary_said = None;
+        self.turning_step();
+    }
+
+    /// Follows a rotary calibration: once a command has ended, checks how
+    /// and sends the next, until every touch is made. A turns only in a
+    /// rapid that moves nothing else, sent with the tip lifted clear and
+    /// the probe touching nothing.
+    fn turning_step(&mut self) {
+        let Some(mut r) = self.turning.take() else {
+            return;
+        };
+        let how = r.what.how();
+        if let Some((leg, seq)) = r.sent {
+            let Some((ok, message, result)) = self.ended(seq) else {
+                self.turning = Some(r);
+                return;
+            };
+            let tripped = result.filter(|r| r.tripped).map(|r| r.position);
+            let failed = match (leg, tripped) {
+                _ if !ok => Some(message),
+                (Leg::Guard(_), Some(p)) => Some(format!(
+                    "The probe touched something at machine X {:.3} Y {:.3} Z {:.3} going down beside the bar: the bar is wider than typed, the tip started off its middle, or a jaw is in the way. {how}",
+                    p[0], p[1], p[2]
+                )),
+                (Leg::Touch(_), Some(p)) => {
+                    r.touches.push(p);
+                    r.settle().err()
+                }
+                (Leg::Touch(to), None) => Some(format!(
+                    "No contact up to machine X {:.3} Y {:.3} Z {:.3}. {how}",
+                    to[0], to[1], to[2]
+                )),
+                _ => None,
+            };
+            if let Some(why) = failed {
+                self.rotary_said = Some((false, why));
+                return;
+            }
+            r.sent = None;
+        }
+        loop {
+            if r.legs.is_empty() {
+                match r.plan() {
+                    Some(legs) => r.legs = legs.into(),
+                    None if !r.backed => {
+                        r.backed = true;
+                        r.legs = r.last().into_iter().map(Leg::Rapid).collect();
+                        continue;
+                    }
+                    None => return self.turning_done(r),
+                }
+            }
+            let now = self.snapshot.machine_pos;
+            let leg = match r.legs.pop_front().unwrap() {
+                Leg::Rapid(to) => Leg::Rapid(self.inside(to)),
+                Leg::Guard(to) => Leg::Guard(self.inside(to)),
+                Leg::Touch(to) => Leg::Touch(self.inside(to)),
+            };
+            let mut leg = leg;
+            // A stops on a whole step of where it was sent: within a
+            // hundredth of a degree it stays where it is (a probe never
+            // moves A).
+            let (Leg::Rapid(to) | Leg::Guard(to) | Leg::Touch(to)) = &mut leg;
+            if (to[3] - now[3]).abs() < 0.01 {
+                to[3] = now[3];
+            }
+            if let Leg::Rapid(to) = &mut leg
+                && to[3] != now[3]
+            {
+                let touching = (self.config.inputs.probe)
+                    .and_then(|pin| self.snapshot.status.as_ref()?.input_active(pin));
+                // The machine stops on a whole step of the target before.
+                let moves = (0..3).any(|a| (to[a] - now[a]).abs() > 0.01);
+                to[..3].copy_from_slice(&now[..3]);
+                let why = if moves {
+                    Some("A would turn while the tip moves.")
+                } else if touching != Some(false) {
+                    Some("The probe reads touching (or its input is not read): A does not turn.")
+                } else if !self.snapshot.referenced[3] {
+                    Some("A has no machine position: A does not turn.")
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    self.rotary_said = Some((
+                        false,
+                        format!(
+                            "{why} Nothing is set: the tip stopped at machine X {:.3} Y {:.3} Z {:.3} A {:.3}°.",
+                            now[0], now[1], now[2], now[3]
+                        ),
+                    ));
+                    return;
+                }
+            }
+            match self.send_leg(r.what.label(), leg, r.feed, now) {
+                Some(sent) => r.sent = Some(sent),
+                None => continue,
+            }
+            self.turning = Some(r);
+            return;
+        }
+    }
+
+    /// Every touch of a rotary calibration is made, Idle, the tip up clear
+    /// over the bar: says what it found; A zero zeroes A.
+    fn turning_done(&mut self, r: Turning) {
+        if !self.manual() {
+            self.rotary_said = Some((false, stopped_after(&self.snapshot.state)));
+            return;
+        }
+        match r.what {
+            Calibrate::Centreline => {
+                let Some(c) = r.centre() else { return };
+                let mut ok = true;
+                let mut said = format!(
+                    "A centreline found at machine X {:.3}: Y {:.3}, Z {:.3}, the means at A {:.3}° and {:.3}° (Z is the top's less the bar's {:.3} mm radius, with this probe in the spindle). The bar is {:.3} mm across and runs out {:.3} mm.",
+                    c.x,
+                    c.y,
+                    c.z,
+                    c.angles[0],
+                    c.angles[1],
+                    r.radius,
+                    c.across,
+                    c.eccentric()
+                );
+                if c.eccentric() > ALIGN_LIMIT {
+                    said += &format!(
+                        " That runout is over {ALIGN_LIMIT} mm: the centreline still holds, the two angles cancel it, but check the bar is true and seated in the jaws."
+                    );
+                }
+                if let Some(rot) = &self.rotary {
+                    let (y, z) = (rot.unit.centre_y as f64, rot.unit.centre_z as f64);
+                    said += &format!(
+                        " That is {:+.3} mm in Y and {:+.3} mm in Z from the machine's {} Y {y:.3} Z {z:.3}. Save it to keep it.",
+                        c.y - y,
+                        c.z - z,
+                        if rot.measured() {
+                            "measured"
+                        } else {
+                            "assumed"
+                        }
+                    );
+                }
+                ok &= c.eccentric() <= ALIGN_LIMIT;
+                self.centre = Some(c);
+                self.centre_saved = false;
+                self.rotary_said = Some((ok, said));
+            }
+            Calibrate::Alignment => {
+                let (Some(near), Some(far)) = (self.centre, r.centre()) else {
+                    return;
+                };
+                if (far.x - near.x).abs() < 20. {
+                    self.rotary_said = Some((
+                        false,
+                        format!(
+                            "Probed {:.1} mm along X from where the centreline was found: probe the bar near the tailstock, farther along.",
+                            (far.x - near.x).abs()
+                        ),
+                    ));
+                    return;
+                }
+                self.rotary_said = Some(alignment(&near, &far));
+            }
+            Calibrate::AZero => {
+                let Some(&[a, slope, rise]) = r.found.last() else {
+                    return;
+                };
+                self.send(Command::SetWork { axis: 3, value: 0. });
+                self.rotary_said = Some((
+                    true,
+                    format!(
+                        "A zero set at machine A {a:.3}°, where the flat is level: its two touches {:.1} mm apart along Y are {rise:+.3} mm apart ({slope:+.3}°), after {} turn{} of A.",
+                        r.spacing,
+                        r.found.len() - 1,
+                        if r.found.len() == 2 { "" } else { "s" }
+                    ),
+                ));
+            }
+        }
+    }
+
+    /// Keeps the centreline found near the chuck in the machine's rotary
+    /// geometry, as measured, and says whether the largest part leaves room
+    /// to retract over it (LIO-191).
+    fn save_centre(&mut self) {
+        let (Some(c), false, Some(rot)) = (self.centre, self.centre_saved, self.rotary.as_mut())
+        else {
+            return;
+        };
+        if self.turning.is_some() {
+            return;
+        }
+        // Its Z is the probe's: kept only with the reference that relates
+        // each tool to the probe (LIO-207).
+        let Some(reference) = c.reference else {
+            self.rotary_said = Some((false, NO_CENTRE_REFERENCE.into()));
+            return;
+        };
+        rot.unit.centre_y = c.y as f32;
+        rot.unit.centre_z = c.z as f32;
+        rot.unit.reference = Some(reference.map(|v| v as f32));
+        rot.mark = MEASURED.into();
+        let fit = rot.unit.fit_diameter as f64;
+        self.rotary_keep = Some(RotaryKeep::Centreline([c.y, c.z], reference));
+        self.centre_saved = true;
+        let mut said = format!(
+            "Centreline saved in the machine as measured: Y {:.3}, Z {:.3}, {:.3} mm over the Z reference at X {:.3} Y {:.3}.",
+            c.y,
+            c.z,
+            c.z - reference[2],
+            reference[0],
+            reference[1]
+        );
+        let warn = self.z_top().and_then(|top| retract_room(top, c.z, fit).1);
+        if let Some(w) = &warn {
+            said += &format!(" {w}");
+        }
+        self.rotary_said = Some((warn.is_none(), said));
+    }
+
+    /// A measured centreline went stale (`why`): the machine is to say so.
+    fn stale(&mut self, why: &'static str) {
+        if let Some(rot) = self.rotary.as_mut().filter(|r| r.measured()) {
+            rot.mark = format!("stale after {why}");
+            self.rotary_keep = Some(RotaryKeep::Stale(why));
+        }
+    }
+
+    /// Sends one leg of a probing routine, as job `name` for a move: the
+    /// command and the counts before it, or None for a rapid that goes
+    /// nowhere, which is no command (the driver would report no outcome
+    /// for it).
+    fn send_leg(
+        &mut self,
+        name: &str,
+        leg: Leg,
+        feed: f64,
+        now: Vec6,
+    ) -> Option<(Leg, (u64, u64))> {
+        let seq = self.seq();
+        match leg {
+            Leg::Rapid(to) if (0..6).all(|a| (to[a] - now[a]).abs() < 1e-9) => return None,
+            Leg::Rapid(to) => self.send(job(name, moves_from(now, &[to]))),
+            Leg::Guard(to) => self.send(job(
+                name,
+                vec![Do::Probe {
+                    target: to,
+                    feed: feed / 60.,
+                    must_trip: false,
+                }],
+            )),
+            // G38.3: a miss is not an error; it is reported as one here.
+            Leg::Touch(to) => self.send(Command::Probe {
+                target: to,
+                feed,
+                must_trip: false,
+            }),
+        }
+        Some((leg, seq))
     }
 
     /// Where the operator touches off the setup to run, in plan mm, and the
@@ -2923,6 +4277,17 @@ impl Connection {
         a < 6 && self.config.axis_enabled(a)
     }
 
+    /// Why a jog of `axis` (or a calibration move) cannot start now: a
+    /// rotary axis never moves before its machine position is declared, as
+    /// a program would not move it either. The driver checks that for a
+    /// program but not for a jog. None when it can.
+    pub fn jog_blocked(&self, axis: usize) -> Option<String> {
+        (rotary(axis) && self.axis(axis) && !self.snapshot.referenced[axis]).then(|| {
+            let name = AXIS_NAMES[axis];
+            format!("{name} has no machine position (every E-stop clears it): set machine {name} first, then jog it.")
+        })
+    }
+
     /// An axis without a home switch: declaring its machine position
     /// references it. The driver references an axis with a switch only by
     /// homing, and a declaration takes that away.
@@ -3014,7 +4379,10 @@ impl Connection {
 
     /// Idle, and no probing routine is between two of its moves.
     pub fn idle(&self) -> bool {
-        self.snapshot.state == Some(State::Idle) && self.edges.is_none() && self.routine.is_none()
+        self.snapshot.state == Some(State::Idle)
+            && self.edges.is_none()
+            && self.routine.is_none()
+            && self.turning.is_none()
     }
 
     /// Jog, work zero, MDI and the spindle are allowed: Idle, or paused in a program.
@@ -3022,6 +4390,7 @@ impl Connection {
         matches!(self.snapshot.state, Some(State::Idle | State::Paused(_)))
             && self.edges.is_none()
             && self.routine.is_none()
+            && self.turning.is_none()
     }
 
     /// Every enabled axis has a home switch, so Home can run.
@@ -3270,6 +4639,47 @@ soft_max = 0.0
     }
 
     #[test]
+    fn a_state_file_of_x_y_and_z_is_padded_to_six_axes_and_any_other_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old.toml");
+        std::fs::write(
+            &old,
+            "wcs = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0, 7.0, 8.0, 9.0]]\nactive_wcs = 1\nlast_position = [4.0, 5.0, 6.0]\n",
+        )
+        .unwrap();
+        pad_state(&old);
+        let doc: toml_edit::DocumentMut = std::fs::read_to_string(&old).unwrap().parse().unwrap();
+        let floats = |v: &toml_edit::Item| -> Vec<f64> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_float().unwrap())
+                .collect()
+        };
+        let wcs = doc["wcs"].as_array().unwrap();
+        let system = |i: usize| -> Vec<f64> {
+            let a = wcs.get(i).unwrap().as_array().unwrap();
+            a.iter().map(|x| x.as_float().unwrap()).collect()
+        };
+        assert_eq!(system(0), [1., 2., 3., 0., 0., 0.]);
+        assert_eq!(system(1), [4., 5., 6., 7., 8., 9.]);
+        assert_eq!(floats(&doc["last_position"]), [4., 5., 6., 0., 0., 0.]);
+        assert_eq!(doc["active_wcs"].as_integer(), Some(1));
+        // A file of six axes, one that is not TOML, and none, stay as they are.
+        for text in [
+            "wcs = [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]]\nactive_wcs = 0\n",
+            "not = [toml",
+        ] {
+            std::fs::write(&old, text).unwrap();
+            pad_state(&old);
+            assert_eq!(std::fs::read_to_string(&old).unwrap(), text);
+        }
+        let none = dir.path().join("none.toml");
+        pad_state(&none);
+        assert!(!none.exists());
+    }
+
+    #[test]
     fn a_profile_that_is_missing_is_refused_not_kept() {
         let dir = tempfile::tempdir().unwrap();
         let profile = dir.path().join("gone.toml");
@@ -3386,6 +4796,1680 @@ soft_max = 0.0
         until(&mut c, 3.0, "Idle after the release", |s| {
             s.state == Some(State::Idle)
         });
+    }
+
+    /// Runs `actions` as a job on the simulated UC100 with `profile`, after
+    /// Set machine zero sets its first `axes` axes; returns the outcome and
+    /// where the machine ends.
+    fn simulated_job(
+        profile: &str,
+        axes: usize,
+        actions: Vec<Do>,
+    ) -> (uc100::controller::ProgramOutcome, [f64; 6]) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile.toml");
+        std::fs::write(&path, profile).unwrap();
+        let mut c =
+            Connection::open(&uc100(&path.display().to_string(), "Simulated"), dir.path()).unwrap();
+        until(&mut c, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        c.send(Command::Reset);
+        until(&mut c, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        c.act(Action::MachineZero(None));
+        until(&mut c, 3.0, "the axes set", |s| {
+            s.state == Some(State::Idle) && s.referenced[..axes].iter().all(|r| *r)
+        });
+        let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
+        c.send(job("job", actions));
+        until(&mut c, 10.0, "the job's end", |s| {
+            s.program_outcome.as_ref().is_some_and(|o| o.seq > seq)
+        });
+        let o = c.snapshot.program_outcome.clone().unwrap();
+        if o.ok {
+            until(&mut c, 3.0, "Idle after the job", |s| {
+                s.state == Some(State::Idle)
+            });
+        }
+        (o, c.snapshot.machine_pos)
+    }
+
+    /// The JY5800's Z soft limit is Z 0, where retracts end: a job that
+    /// feeds Z down, cuts and rapids back up to Z 0 exactly finishes on the
+    /// simulated UC100 (LIO-200; it used to end with "Soft limit reached").
+    #[test]
+    fn a_retract_to_the_z_soft_limit_finishes_on_the_simulator() {
+        let to = |x: f64, z: f64, feed: Option<f64>| Do::Move {
+            target: [x, 10., z, 0., 0., 0.],
+            feed,
+        };
+        let (o, at) = simulated_job(
+            LIMITED,
+            3,
+            vec![
+                to(10., 0., None),
+                to(10., -2., Some(5.)),
+                to(20., -2., Some(10.)),
+                to(20., 0., None),
+                to(30., 0., None),
+                Do::End,
+            ],
+        );
+        assert!(o.ok, "{} at {at:?}", o.message);
+        assert!((at[0] - 30.).abs() < 1e-3 && at[2].abs() < 1e-3, "{at:?}");
+    }
+
+    /// A job that indexes A between two X cuts on the simulated UC100 (the
+    /// driver from LIO-182): it ends with A at the commanded 90 degrees and
+    /// X where the second cut ends. Z retracts to its soft maximum, Z 0.
+    #[test]
+    fn a_job_indexes_a_between_xyz_cuts_on_the_simulator() {
+        let a = "[axes.a]\nsteps_per_unit = 44.444\nmax_velocity = 3600.0\nacceleration = 360.0\nstep = { pin = 8 }\ndir = { pin = 9 }\n";
+        let to = |x: f64, z: f64, a: f64, feed: Option<f64>| Do::Move {
+            target: [x, 10., z, a, 0., 0.],
+            feed,
+        };
+        // Set machine zero here sets A with X, Y and Z (LIO-185).
+        let (o, at) = simulated_job(
+            &format!("{LIMITED}{a}"),
+            4,
+            vec![
+                to(10., 0., 0., None),
+                to(10., -2., 0., Some(5.)),
+                to(20., -2., 0., Some(10.)),
+                to(20., 0., 0., None),
+                to(20., 0., 90., None),
+                to(20., -2., 90., Some(5.)),
+                to(30., -2., 90., Some(10.)),
+                to(30., 0., 90., None),
+                Do::End,
+            ],
+        );
+        assert!(o.ok, "{} at {at:?}", o.message);
+        assert!((at[3] - 90.).abs() < 0.03, "{at:?}");
+        assert!((at[0] - 30.).abs() < 1e-3 && at[2].abs() < 1e-3, "{at:?}");
+    }
+
+    /// A Boring's run on the simulated UC100 (LIO-248): lowered from its
+    /// checked program, it stops the spindle and pauses before each pass,
+    /// saying the size to set the boring head to, and goes on to its end
+    /// after each Resume. Its feeds and dwells are sped up, the order kept.
+    #[test]
+    fn a_boring_run_pauses_to_set_the_head_and_goes_on_after_resume_on_the_simulator() {
+        use crate::cam::boring::tests::{bored, head, on_uc100};
+        let (doc, mesh, _) = bored(true, head(crate::model::BORE_RETRACTS[0]), |_| {});
+        let dir = tempfile::tempdir().unwrap();
+        let programs = crate::run::programs(&on_uc100(doc, dir.path()), &mesh, 0).unwrap();
+        let p = (programs.iter())
+            .find(|p| {
+                p.blocks
+                    .iter()
+                    .any(|b| matches!(b, crate::post::Block::Pause { .. }))
+            })
+            .unwrap();
+        // Placed by its own extents: inside X and Y, its highest point 1 mm
+        // under the top of Z's travel (the retracts go to Z 0).
+        let e = crate::post::extents(&p.blocks);
+        let d = p.datum;
+        let offset = [
+            f64::from(50. - (e.min[0] - d[0])),
+            f64::from(50. - (e.min[1] - d[1])),
+            f64::from(-1. - (e.max[2] - d[2])),
+            0.,
+            0.,
+            0.,
+        ];
+        assert!(e.max[2] - e.min[2] < 50., "{e:?}");
+        let lowered = crate::run::lower(p, 0, offset, [0.; 6]).unwrap();
+        let actions: Vec<Do> = (lowered.into_iter())
+            .map(|l| match l.action {
+                Do::Move {
+                    target,
+                    feed: Some(_),
+                } => Do::Move {
+                    target,
+                    feed: Some(40.),
+                },
+                Do::Dwell { .. } => Do::Dwell { seconds: 0.05 },
+                a => a,
+            })
+            .collect();
+        let mut c = zeroed_sim(dir.path(), LIMITED, None, 3);
+        let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
+        c.send(job("bore", actions));
+        for (pass, said) in [(1, "set it to Ø31.90"), (2, "Set the head out 0.10")] {
+            until(
+                &mut c,
+                120.0,
+                "the pause before a pass",
+                |s| matches!(&s.state, Some(State::Paused(r)) if r.contains(&format!("pass {pass} of 2"))),
+            );
+            let Some(State::Paused(reason)) = c.snapshot.state.clone() else {
+                unreachable!()
+            };
+            assert!(reason.contains(said), "{reason}");
+            c.send(Command::Resume);
+            until(
+                &mut c,
+                3.0,
+                "running again",
+                |s| !matches!(&s.state, Some(State::Paused(r)) if r.contains(&format!("pass {pass} of 2"))),
+            );
+        }
+        until(&mut c, 120.0, "the job's end", |s| {
+            s.program_outcome.as_ref().is_some_and(|o| o.seq > seq)
+        });
+        let o = c.snapshot.program_outcome.clone().unwrap();
+        assert!(o.ok, "{}", o.message);
+    }
+
+    /// A connection to the simulated UC100 with `profile`, Idle with Set
+    /// machine zero here made on its first `axes` axes.
+    fn zeroed_sim(dir: &Path, profile: &str, m: Option<&Machine>, axes: usize) -> Connection {
+        let path = dir.join("profile.toml");
+        std::fs::write(&path, profile).unwrap();
+        let mut m = m.cloned().unwrap_or_else(|| Machine::new(3));
+        for (k, v) in [
+            ("controller", "UC100"),
+            ("uc100_profile", &*path.display().to_string()),
+            ("uc100_connection", "Simulated"),
+        ] {
+            m.p.insert(k.into(), v.into());
+        }
+        let mut c = Connection::open(&m, dir).unwrap();
+        until(&mut c, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        c.send(Command::Reset);
+        until(&mut c, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        c.act(Action::MachineZero(None));
+        until(&mut c, 3.0, "the axes set", |s| {
+            s.state == Some(State::Idle) && s.referenced[..axes].iter().all(|r| *r)
+        });
+        c
+    }
+
+    /// Waits until the machine stands still: the same position 200 ms
+    /// apart. A Hold first runs out what the controller has buffered
+    /// (`buffer_ms`), then decelerates. Where it stopped.
+    fn settled(c: &mut Connection) -> [f64; 6] {
+        let cap = Instant::now() + Duration::from_secs(60);
+        let mut last = c.snapshot.machine_pos;
+        loop {
+            wait(c, 200);
+            let now = c.snapshot.machine_pos;
+            if now == last {
+                return now;
+            }
+            assert!(Instant::now() < cap, "the machine did not stop: {now:?}");
+            last = now;
+        }
+    }
+
+    /// Machine Z where `actions` leave the tool before action `i`.
+    fn at_z(actions: &[Located], i: usize) -> f64 {
+        (actions[..i].iter().rev())
+            .find_map(|l| match l.action {
+                Do::Move { target, .. } => Some(target[2]),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    /// Lets the simulator run for `ms` milliseconds.
+    fn wait(c: &mut Connection, ms: u64) {
+        let end = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < end {
+            c.refresh();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Hold in the middle of an index move stops A where it is, and Resume
+    /// finishes the turn at its angle; Stop ends one there, A keeping its
+    /// machine position. X, Y and Z never move (LIO-192).
+    #[test]
+    fn hold_resume_and_stop_work_while_a_turns_alone() {
+        let a = "[axes.a]\nsteps_per_unit = 40.0\nmax_velocity = 3600.0\nacceleration = 360.0\nstep = { pin = 8 }\ndir = { pin = 9 }\nsoft_min = -360.0\nsoft_max = 360.0\n";
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = zeroed_sim(dir.path(), &format!("{LIMITED}{a}"), None, 4);
+        // An index block lowers to a rapid of A alone (`run::lower`).
+        let turn = |a: f64| Do::Move {
+            target: [0., 0., 0., a, 0., 0.],
+            feed: None,
+        };
+        let still = |s: &Snapshot| s.machine_pos[..3].iter().all(|v| v.abs() < 1e-9);
+        let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
+        c.send(job("index", vec![turn(180.), Do::End]));
+        until(&mut c, 5.0, "A partway to 180", |s| {
+            s.state == Some(State::Run) && (40.0..120.0).contains(&s.machine_pos[3])
+        });
+        c.send(Command::FeedHold);
+        until(&mut c, 5.0, "Hold", |s| s.state == Some(State::Hold));
+        let held = settled(&mut c)[3];
+        wait(&mut c, 300);
+        assert_eq!(c.snapshot.state, Some(State::Hold));
+        assert!(
+            (c.snapshot.machine_pos[3] - held).abs() < 1e-9,
+            "A moved while held"
+        );
+        assert!(held > 40. && held < 179.9, "{held}");
+        assert!(still(&c.snapshot));
+        c.send(Command::Resume);
+        until(&mut c, 10.0, "the turn's end", |s| {
+            s.program_outcome.as_ref().is_some_and(|o| o.seq > seq)
+        });
+        let o = c.snapshot.program_outcome.clone().unwrap();
+        assert!(o.ok, "{}", o.message);
+        until(&mut c, 3.0, "Idle", |s| s.state == Some(State::Idle));
+        assert!(
+            (c.snapshot.machine_pos[3] - 180.).abs() < 0.03,
+            "{:?}",
+            c.snapshot.machine_pos
+        );
+        assert!(still(&c.snapshot));
+        // Stop partway back: A stops between, and keeps its position.
+        let seq = o.seq;
+        c.send(job("back", vec![turn(0.), Do::End]));
+        until(&mut c, 5.0, "A partway back", |s| {
+            s.state == Some(State::Run) && (60.0..140.0).contains(&s.machine_pos[3])
+        });
+        c.send(Command::Stop);
+        until(&mut c, 5.0, "the stop", |s| {
+            s.program_outcome.as_ref().is_some_and(|o| o.seq > seq)
+        });
+        assert!(!c.snapshot.program_outcome.as_ref().unwrap().ok);
+        until(&mut c, 3.0, "Idle after the stop", |s| {
+            s.state == Some(State::Idle)
+        });
+        let stopped = settled(&mut c)[3];
+        wait(&mut c, 300);
+        assert!((c.snapshot.machine_pos[3] - stopped).abs() < 1e-9);
+        assert!(stopped > 0.1 && stopped < 140., "{stopped}");
+        assert!(c.snapshot.referenced[3] && still(&c.snapshot));
+    }
+
+    /// The simulated rotary mill for `an_indexed_bar_runs_at_four_angles`:
+    /// the travel of `Machine::new(4)` (600 × 400 × 300) as soft limits, A
+    /// from -360 to 360 degrees as `bar_job` has it.
+    const ROTARY_SIM: &str = r#"
+[controller]
+step_rate = "100kHz"
+[motion]
+junction_deviation = 0.02
+arc_tolerance = 0.002
+buffer_ms = 400
+default_feed = 500
+[axes.x]
+steps_per_unit = 20.0
+max_velocity = 60000.0
+acceleration = 20000.0
+step = { pin = 2 }
+dir = { pin = 3 }
+soft_min = 0.0
+soft_max = 600.0
+[axes.y]
+steps_per_unit = 20.0
+max_velocity = 60000.0
+acceleration = 20000.0
+step = { pin = 4 }
+dir = { pin = 5 }
+soft_min = 0.0
+soft_max = 400.0
+[axes.z]
+steps_per_unit = 20.0
+max_velocity = 30000.0
+acceleration = 20000.0
+step = { pin = 6 }
+dir = { pin = 7 }
+soft_min = -300.0
+soft_max = 0.0
+[axes.a]
+steps_per_unit = 40.0
+max_velocity = 7200.0
+acceleration = 720.0
+step = { pin = 8 }
+dir = { pin = 9 }
+soft_min = -360.0
+soft_max = 360.0
+[outputs]
+spindle_pwm = { pin = 16 }
+spindle_max_rpm = 24000
+"#;
+
+    /// A contour round a part in a Ø40 bar in the chuck in setup 1, then
+    /// the indexed setup after it at A 90 and 180, on the simulated UC100
+    /// (LIO-206): setup 1 comes down from above the jaws over its first cut,
+    /// not over the stock's corner in them, and both run to the end, A
+    /// still in setup 1 and turning alone in setup 2.
+    #[test]
+    fn a_bar_in_the_chuck_runs_setup_1_then_its_indexed_setup() {
+        use crate::indexed::tests::{bar_job, cutter, on_the_bar, prism};
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mesh = prism(30.);
+        let mut op = on_the_bar(&cutter("12"));
+        for (k, v) in [("feed", "20000"), ("stepdown", "10"), ("coolant", "Off")] {
+            op.p.insert(k.into(), v.into());
+        }
+        let mut doc = bar_job(&mesh, 20., "100", "-150", "90, 180", op);
+        let mut first = doc.setups[1].operations[0].clone();
+        first.id = crate::model::id();
+        first.p.insert("allowance".into(), "1".into());
+        doc.setups[0].operations = vec![first];
+        doc.tools[0].p.insert("number".into(), "1".into());
+        doc.file = Some(crate::model::ModelFile {
+            name: "bar.stl".into(),
+            path: "bar.stl".into(),
+            format: "STL".into(),
+            bytes: 1,
+            thickness: None,
+        });
+        let path = dir.path().join("profile.toml");
+        let m = &mut doc.setups[0].machine;
+        for (k, v) in [
+            ("controller", "UC100"),
+            ("uc100_profile", &*path.display().to_string()),
+            ("uc100_connection", "Simulated"),
+            ("feed", "60000"),
+            ("post_dwell", "0.2"),
+            (CENTRE_MARK, MEASURED),
+            (crate::model::CENTRE_REF, "10 10 -200"),
+        ] {
+            m.p.insert(k.into(), v.into());
+        }
+        doc.machines = vec![doc.setups[0].machine.clone()];
+        doc.sync_stock_sources();
+        doc.sync_indexed();
+        doc.sync_turns(Some(&mesh));
+        let m = doc.setups[0].machine.clone();
+        let mut c = zeroed_sim(dir.path(), ROTARY_SIM, Some(&m), 4);
+        // Both setups share the work zero on the measured centreline.
+        let zero = doc.at_angle(1, 0., &mesh).unwrap().machine_zero.unwrap();
+        let here = c.snapshot.machine_pos;
+        for (axis, z) in zero.iter().map(|z| *z as f64).chain([0.]).enumerate() {
+            c.send(Command::SetWork {
+                axis,
+                value: here[axis] - z,
+            });
+            until(&mut c, 2.0, "the work offset", |s| {
+                (s.work_offset[axis] - z).abs() < 1e-6
+            });
+        }
+        let clearance = crate::cam::number(&doc.setups[0].operations[0], "clearance").unwrap();
+        let swing = doc.swing(0, &mesh, clearance).unwrap();
+        for (si, angles) in [(0, &[0.][..]), (1, &[90., 180.][..])] {
+            let (programs, left) = crate::run::check(&doc, &mesh, si);
+            let programs = programs.unwrap_or_else(|e| panic!("{si}: {e:?}"));
+            let mut run = crate::run::Run::new(&doc, si, 0);
+            run.checked_as(
+                std::sync::Arc::new(Ok(programs)),
+                Some(std::sync::Arc::new(left)),
+                None,
+            );
+            // Touched off on the A reference, as long as the probe.
+            run.length = Some((doc.tools[0].id.clone(), 0., -200.));
+            c.run = Some(run);
+            let problems = c.run.as_ref().unwrap().problems(&c, &doc);
+            assert!(problems.is_empty(), "{si}: {problems:?}");
+            // Setup 1 does not turn A, and its tool comes down over the
+            // first cut from at or above all that A swings.
+            let (start, offset) = (c.snapshot.machine_pos, c.snapshot.work_offset);
+            let p = c.run.as_ref().unwrap().checked().unwrap()[0].clone();
+            let actions = crate::run::lower(&p, 0, offset, start).unwrap();
+            let moves: Vec<([f64; 6], Option<f64>)> = (actions.iter())
+                .filter_map(|l| match l.action {
+                    Do::Move { target, feed } => Some((target, feed)),
+                    _ => None,
+                })
+                .collect();
+            if si == 0 {
+                assert!(moves.iter().all(|(t, _)| t[3] == start[3]), "{moves:?}");
+                let plan_z = |m: [f64; 6]| m[2] - offset[2] + p.datum[2] as f64;
+                let feed = moves.iter().position(|(_, f)| f.is_some()).unwrap();
+                let over = (moves[..feed].iter())
+                    .rposition(|(t, _)| plan_z(*t) >= swing.z as f64 - 1e-3)
+                    .unwrap();
+                for (t, _) in &moves[over..=feed] {
+                    assert_eq!(&t[..2], &moves[over].0[..2], "{moves:?}");
+                }
+            }
+            let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
+            c.run_act(R::CycleStart, &doc);
+            assert!(c.run.as_ref().unwrap().running.is_some(), "{si}");
+            let mut reached = vec![false; angles.len()];
+            let cap = Instant::now() + Duration::from_secs(600);
+            while !c
+                .snapshot
+                .program_outcome
+                .as_ref()
+                .is_some_and(|o| o.seq > seq)
+            {
+                c.refresh();
+                if let Some(r) = &mut c.run {
+                    r.refresh(c.snapshot.program_outcome.as_ref());
+                }
+                let s = &c.snapshot;
+                for (k, a) in angles.iter().enumerate() {
+                    reached[k] |=
+                        s.state == Some(State::Run) && (s.machine_pos[3] - a).abs() < 0.03;
+                }
+                if si == 0 {
+                    assert!(s.machine_pos[3].abs() < 1e-9, "A turned in setup 1");
+                }
+                assert!(Instant::now() < cap, "{si} did not end: {:?}", s.log);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let o = c.snapshot.program_outcome.clone().unwrap();
+            assert!(o.ok, "{si}: {} {:?}", o.message, c.snapshot.log);
+            assert!(reached.iter().all(|r| *r), "{si}: {reached:?}");
+            until(&mut c, 3.0, "Idle after the job", |s| {
+                s.state == Some(State::Idle)
+            });
+            if let Some(r) = &mut c.run {
+                r.refresh(c.snapshot.program_outcome.as_ref());
+            }
+            let run = c.run.as_ref().unwrap();
+            assert!(
+                run.running.is_none() && run.done[0],
+                "{si}: {:?}",
+                run.outcome
+            );
+            assert!(c.snapshot.machine_pos[3].abs() < 0.03);
+        }
+    }
+    /// Runs `c` until the probe straight down under way has ended and the
+    /// machine is Idle again, its lift done: whether it touched, and what
+    /// it said.
+    fn probe_ended(c: &mut Connection) -> (bool, String) {
+        let cap = Instant::now() + Duration::from_secs(30);
+        loop {
+            c.refresh();
+            if c.probing.is_none()
+                && c.snapshot.state == Some(State::Idle)
+                && let Some(said) = c.probed.clone()
+            {
+                wait(c, 300);
+                return said;
+            }
+            assert!(
+                Instant::now() < cap,
+                "the probe did not end: {:?}",
+                c.snapshot.log
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// LIO-207 on the simulated UC100: the A centreline is probed with a
+    /// 50 mm probe, whose tip touches a gauge block on the table as the Z
+    /// reference, saved with it. The cutter is 15 mm longer than the probe
+    /// (50 mm out of a 15 mm holder), then 10 mm shorter (40 mm, no
+    /// holder): the simulator's tip is that much under its point. With the
+    /// work zero on the probe's centreline, as LIO-192 asked for, the run is
+    /// refused: how the tool's tip relates to it is not known, and it would
+    /// cut 15 mm deep. Touched off on the reference with the plate, work Z
+    /// is set that much higher (lower), and every cut at A 90 and A 180 is
+    /// as deep under the bar's real top, and as far from its real axis, as
+    /// planned. The longer tool's job then runs to its end.
+    #[test]
+    fn an_indexed_cut_is_as_deep_with_a_tool_longer_or_shorter_than_the_probe() {
+        use crate::indexed::tests::{bar_job, cutter, on_the_bar, prism};
+        use crate::run::Action as R;
+        for (longer, stickout, holder, run_it) in
+            [(15., "50", "15", true), (-10., "40", "0", false)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mesh = prism(30.);
+            let mut op = on_the_bar(&cutter("12"));
+            for (k, v) in [("feed", "20000"), ("stepdown", "10"), ("coolant", "Off")] {
+                op.p.insert(k.into(), v.into());
+            }
+            let mut doc = bar_job(&mesh, 20., "100", "-150", "90, 180", op);
+            for (k, v) in [
+                ("number", "1"),
+                ("stickout", stickout),
+                ("holder_length", holder),
+            ] {
+                doc.tools[0].p.insert(k.into(), v.into());
+            }
+            doc.file = Some(crate::model::ModelFile {
+                name: "bar.stl".into(),
+                path: "bar.stl".into(),
+                format: "STL".into(),
+                bytes: 1,
+                thickness: None,
+            });
+            let path = dir.path().join("profile.toml");
+            let m = &mut doc.setups[0].machine;
+            for (k, v) in [
+                ("controller", "UC100"),
+                ("uc100_profile", &*path.display().to_string()),
+                ("uc100_connection", "Simulated"),
+                ("feed", "60000"),
+                ("post_dwell", "0.2"),
+                (CENTRE_MARK, MEASURED),
+                ("probe_tip", "2"),
+                ("probe_feed", "1000"),
+                ("probe_distance", "20"),
+                ("probe_plate", "5"),
+                ("probe_length", "50"),
+            ] {
+                m.p.insert(k.into(), v.into());
+            }
+            doc.machines = vec![doc.setups[0].machine.clone()];
+            doc.sync_stock_sources();
+            doc.sync_indexed();
+            doc.sync_turns(Some(&mesh));
+            let m = doc.setups[0].machine.clone();
+            let profile =
+                format!("{ROTARY_SIM}[inputs]\nprobe = {{ pin = 13, active_low = true }}\n");
+            let mut c = zeroed_sim(dir.path(), &profile, Some(&m), 4);
+            // The probe found the centreline where the project has it: its
+            // tip is on the bar's axis at machine Y 140 Z -150.
+            let unit = doc.rotary_unit(&m).unwrap();
+            let (cy, cz) = (unit.centre_y as f64, unit.centre_z as f64);
+            c.centre = Some(Centre {
+                x: unit.chuck_x as f64 + 10.,
+                y: cy,
+                z: cz,
+                runout: [0.; 2],
+                across: 40.,
+                angles: [0., 180.],
+                reference: None,
+            });
+            // Not saved without the reference that relates a tool to it.
+            c.act(Action::SaveCentreline);
+            assert_eq!(c.rotary_said, Some((false, NO_CENTRE_REFERENCE.into())));
+            assert!(c.rotary_keep.is_none() && !c.centre_saved);
+            // The probe touches the gauge block's top, at machine Z -200.
+            c.sim_gauge = Some(Block {
+                min: [20., 20., -300.],
+                max: [60., 60., -200.],
+            });
+            rapid_a(&mut c, [40., 40., -190., 0.]);
+            c.act(Action::TouchCentreReference);
+            let (ok, said) = probe_ended(&mut c);
+            assert!(ok, "{said}");
+            let at = c.centre.unwrap().reference.expect("the probe's reference");
+            assert!(
+                (at[2] + 200.).abs() < 0.051 && (at[0] - 40.).abs() < 0.03,
+                "{at:?}"
+            );
+            c.act(Action::SaveCentreline);
+            let Some(RotaryKeep::Centreline(_, kept)) = c.rotary_keep.take() else {
+                panic!("{:?}", c.rotary_said);
+            };
+            assert_eq!(kept, at);
+            // The app keeps it in the library (`App::keep_rotary`).
+            (doc.machines[0].p).insert(
+                crate::model::CENTRE_REF.into(),
+                format!("{:.3} {:.3} {:.3}", at[0], at[1], at[2]),
+            );
+            // The work zero on the probe's centreline, A0 at machine A0.
+            let zero = doc.at_angle(1, 0., &mesh).unwrap().machine_zero.unwrap();
+            let here = c.snapshot.machine_pos;
+            for (axis, z) in zero.iter().map(|z| *z as f64).chain([0.]).enumerate() {
+                c.send(Command::SetWork {
+                    axis,
+                    value: here[axis] - z,
+                });
+                until(&mut c, 2.0, "the work offset", |s| {
+                    (s.work_offset[axis] - z).abs() < 1e-6
+                });
+            }
+            // The cutter goes in: its tip `longer` under the probe's.
+            c.sim_longer = longer;
+            let (programs, left) = crate::run::check(&doc, &mesh, 1);
+            let programs = programs.unwrap_or_else(|e| panic!("{longer}: {e:?}"));
+            let p = programs[0].clone();
+            let mut run = crate::run::Run::new(&doc, 1, 0);
+            run.checked_as(
+                std::sync::Arc::new(Ok(programs)),
+                Some(std::sync::Arc::new(left)),
+                None,
+            );
+            c.run = Some(run);
+            let on_centre = crate::run::on_centre(&doc, &doc.setups[1], &p).unwrap();
+            assert!((c.snapshot.work_offset[2] - on_centre[1]).abs() < 1e-6);
+            let problems = c.run.as_ref().unwrap().problems(&c, &doc);
+            assert!(
+                problems.len() == 1
+                    && problems[0]
+                        .contains("T1 Flat is not touched off on the A centreline's Z reference"),
+                "{longer}: {problems:?}"
+            );
+            // The plate on the gauge block; the tool 10 mm over it.
+            let plate = 5.;
+            c.sim_gauge.as_mut().unwrap().max[2] += plate;
+            rapid_a(&mut c, [40.5, 40., -185. + longer, 0.]);
+            assert!(c.a_reference(&doc).is_ok(), "{:?}", c.a_reference(&doc));
+            c.run_act(R::ProbeCentreReference, &doc);
+            let (ok, said) = probe_ended(&mut c);
+            assert!(ok, "{said}");
+            let (id, d, from) = c.run.as_ref().unwrap().length.clone().unwrap();
+            assert!((from - at[2]).abs() < 1e-3, "{from} {at:?}");
+            assert!(
+                id == doc.tools[0].id && (d - longer).abs() < 0.051,
+                "{d} {said}"
+            );
+            let want = on_centre[1] + d;
+            until(&mut c, 2.0, "work Z on the centreline", |s| {
+                (s.work_offset[2] - want).abs() < 1e-6
+            });
+            let problems = c.run.as_ref().unwrap().problems(&c, &doc);
+            assert!(problems.is_empty(), "{longer}: {problems:?}");
+            // Another tool touched off last is no relation for this one.
+            let run = c.run.as_mut().unwrap();
+            let kept = run.length.replace(("another tool".into(), d, from));
+            let problems = c.run.as_ref().unwrap().problems(&c, &doc);
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| p.contains("is not touched off on the A centreline's Z reference")),
+                "{problems:?}"
+            );
+            c.run.as_mut().unwrap().length = kept;
+            // Nor is a length measured from a reference saved before.
+            let saved = doc.machines[0].p[crate::model::CENTRE_REF].clone();
+            (doc.machines[0].p).insert(
+                crate::model::CENTRE_REF.into(),
+                format!("{:.3} {:.3} {:.3}", at[0], at[1], at[2] + 1.),
+            );
+            let problems = c.run.as_ref().unwrap().problems(&c, &doc);
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| p.contains("is not touched off on the A centreline's Z reference")),
+                "{problems:?}"
+            );
+            doc.machines[0]
+                .p
+                .insert(crate::model::CENTRE_REF.into(), saved);
+            assert!(c.run.as_ref().unwrap().problems(&c, &doc).is_empty());
+            // Every cut at A 90 and A 180: the tip, `longer` under the
+            // machine's point, is as deep under the bar's real top (the
+            // probe's centreline + its 20 mm radius) and as far across from
+            // its axis as planned.
+            let (start, offset) = (c.snapshot.machine_pos, c.snapshot.work_offset);
+            let actions = crate::run::lower(&p, 0, offset, start).unwrap();
+            let axis = doc.setups[1].turn.unwrap().axis;
+            for a in [90., 180.] {
+                let cuts: Vec<[f64; 6]> = (actions.iter())
+                    .filter_map(|l| match l.action {
+                        Do::Move {
+                            target,
+                            feed: Some(_),
+                        } if (target[3] - a).abs() < 1e-6 => Some(target),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(!cuts.is_empty(), "{longer}: no cut at A {a}");
+                for t in &cuts {
+                    // The plan's point, in the setup's frame.
+                    let plan = [
+                        t[1] - offset[1] + p.datum[1] as f64,
+                        t[2] - offset[2] + p.datum[2] as f64,
+                    ];
+                    let tip = [t[1], t[2] - longer];
+                    let depth = [cz + 20. - tip[1], axis[1] as f64 + 20. - plan[1]];
+                    let across = [tip[0] - cy, plan[0] - axis[0] as f64];
+                    assert!(
+                        (depth[0] - depth[1]).abs() < 0.06 && (across[0] - across[1]).abs() < 1e-6,
+                        "{longer} at A {a}: {t:?} {depth:?} {across:?}"
+                    );
+                }
+                // At the probe's work zero the same cut would have been
+                // `longer` deeper: 15 mm at A 90 and at A 180, which puts a
+                // feature cut at A 180 30 mm from the one at A 0.
+                let deepest = cuts.iter().map(|t| t[2]).fold(f64::INFINITY, f64::min);
+                let planned = axis[1] as f64 + 20. - (deepest - offset[2] + p.datum[2] as f64);
+                let at_probes = cz + 20. - (deepest - (offset[2] - on_centre[1]) - longer);
+                assert!(
+                    (at_probes - planned - longer).abs() < 0.06,
+                    "{at_probes} {planned}"
+                );
+            }
+            if !run_it {
+                continue;
+            }
+            let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
+            c.run_act(R::CycleStart, &doc);
+            assert!(c.run.as_ref().unwrap().running.is_some());
+            let cap = Instant::now() + Duration::from_secs(600);
+            while !(c.snapshot.program_outcome.as_ref()).is_some_and(|o| o.seq > seq) {
+                c.refresh();
+                if let Some(r) = &mut c.run {
+                    r.refresh(c.snapshot.program_outcome.as_ref());
+                }
+                assert!(
+                    Instant::now() < cap,
+                    "the job did not end: {:?}",
+                    c.snapshot.log
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let o = c.snapshot.program_outcome.clone().unwrap();
+            assert!(o.ok, "{} {:?}", o.message, c.snapshot.log);
+        }
+    }
+
+    /// LIO-209's job on the library CNC4030 + rotary (55 mm of Z, the A
+    /// centreline at machine Y 140 Z -40, a Ø100 chuck, its face at machine
+    /// X 20): the four sides of a square part `x0` mm along a Ø`bar` bar
+    /// `stickout` mm out of the jaws faced, so that it comes out square,
+    /// joined to the bar at a shoulder (LIO-211), at A 0, 90, 180 and -90,
+    /// on `controller`, its UC100 profile in `dir`.
+    fn library_bar_job(
+        dir: &Path,
+        mesh: &crate::mesh::Mesh,
+        x0: f32,
+        stickout: &str,
+        bar: f32,
+        controller: &str,
+    ) -> crate::model::Document {
+        use crate::indexed::tests::{bar_job, cutter, faced_square};
+        let mut op = faced_square(&cutter("12"), mesh);
+        for (k, v) in [("feed", "20000"), ("stepdown", "10"), ("coolant", "Off")] {
+            op.p.insert(k.into(), v.into());
+        }
+        let path = dir.join("profile.toml");
+        let mut doc = bar_job(mesh, x0, stickout, "-40", "0, 90, 180, -90", op);
+        let mut m = rotary_machine(dir).unwrap();
+        for (k, v) in [
+            ("controller", controller),
+            ("uc100_profile", &*path.display().to_string()),
+            ("uc100_connection", "Simulated"),
+            ("feed", "60000"),
+            ("post_dwell", "0.2"),
+            (CENTRE_MARK, MEASURED),
+            (crate::model::CENTRE_REF, "10 10 -50"),
+        ] {
+            m.p.insert(k.into(), v.into());
+        }
+        doc.setups[0].machine = m;
+        let p = &mut doc.setups[0].p;
+        p.insert("stock_diameter".into(), bar.to_string());
+        // The part on the bar's axis.
+        let s = mesh.display_scale();
+        let tz = bar / 2. - mesh.dimensions[2] / 2. - 4. / s;
+        p.insert("tz".into(), tz.to_string());
+        doc.tools[0].p.insert("number".into(), "1".into());
+        doc.file = Some(crate::model::ModelFile {
+            name: "bar.stl".into(),
+            path: "bar.stl".into(),
+            format: "STL".into(),
+            bytes: 1,
+            thickness: None,
+        });
+        doc.machines = vec![doc.setups[0].machine.clone()];
+        doc.sync_indexed();
+        doc.sync_stock_sources();
+        doc.sync_turns(Some(mesh));
+        doc
+    }
+
+    /// Setup 2 of `doc` (`library_bar_job`, on the UC100) picked to run on
+    /// the simulated UC100 with the library machine's travel and A range:
+    /// its work zero where the setup has it on the A centreline, A zero at
+    /// machine A 0, the tool touched off on the A reference as long as the
+    /// probe, and the tool at the top of Z over the bar's free end
+    /// (machine X 150 Y 140 Z 0).
+    fn library_run(
+        dir: &Path,
+        doc: &crate::model::Document,
+        mesh: &crate::mesh::Mesh,
+    ) -> Connection {
+        let profile = [
+            ("soft_max = 600.0", "soft_max = 390.0"),
+            ("soft_max = 400.0", "soft_max = 280.0"),
+            ("soft_min = -300.0", "soft_min = -55.0"),
+            ("soft_min = -360.0", "soft_min = -180.0"),
+            ("soft_max = 360.0", "soft_max = 180.0"),
+        ]
+        .iter()
+        .fold(ROTARY_SIM.to_string(), |p, (from, to)| p.replace(from, to));
+        let m = doc.setups[1].machine.clone();
+        let mut c = zeroed_sim(dir, &profile, Some(&m), 4);
+        let (programs, left) = crate::run::check(doc, mesh, 1);
+        let programs = programs.unwrap_or_else(|e| panic!("{e:?}"));
+        let zero = doc.at_angle(1, 0., mesh).unwrap().machine_zero.unwrap();
+        let here = c.snapshot.machine_pos;
+        for (axis, z) in zero.iter().map(|z| *z as f64).chain([0.]).enumerate() {
+            c.send(Command::SetWork {
+                axis,
+                value: here[axis] - z,
+            });
+            until(&mut c, 2.0, "the work offset", |s| {
+                (s.work_offset[axis] - z).abs() < 1e-6
+            });
+        }
+        go_to(&mut c, [150., 140., 0., 0.]);
+        let mut run = crate::run::Run::new(doc, 1, 0);
+        run.checked_as(
+            std::sync::Arc::new(Ok(programs)),
+            Some(std::sync::Arc::new(left)),
+            None,
+        );
+        run.length = Some((doc.tools[0].id.clone(), 0., -50.));
+        c.run = Some(run);
+        c
+    }
+
+    /// Rapids the simulated machine to machine X, Y, Z and A `to`, each
+    /// alone, Z first, and waits until it is there.
+    fn go_to(c: &mut Connection, to: [f64; 4]) {
+        let mut at = c.snapshot.machine_pos;
+        let mut legs = vec![];
+        for k in [2, 0, 1, 3] {
+            at[k] = to[k];
+            legs.push(at);
+        }
+        let start = c.snapshot.machine_pos;
+        c.send(job("To the start", moves_from(start, &legs)));
+        until(c, 30.0, "the start", |s| {
+            s.state == Some(State::Idle) && (0..4).all(|k| (s.machine_pos[k] - to[k]).abs() < 1e-3)
+        });
+    }
+
+    /// LIO-209: the library CNC4030 + rotary, 55 mm of Z with the A
+    /// centreline at machine Z -40 and a Ø100 chuck. Its jaws reach 55.9 mm
+    /// from the centreline, above the top of the Z travel, but a contour
+    /// round a part 20 mm along a Ø40 bar is over the bar: A turns 15 mm
+    /// over the bar's top, at machine Z -5. The job at A 0, 90, 180 and -90
+    /// (its A turns ±180°) exports at 60
+    /// and 100 mm of stick-out, and at 100 runs to the end on the simulated
+    /// UC100, every turn of A at that height. A Ø80 bar leaves 15 mm of
+    /// clearance over it above the Z travel: export and the run refuse it
+    /// with the numbers.
+    #[test]
+    fn a_four_angle_bar_job_on_the_library_rotary_machine_exports_and_runs() {
+        use crate::indexed::tests::{height, prism};
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mesh = prism(30.);
+        let job = |mesh: &crate::mesh::Mesh, x0, stickout, bar, controller| {
+            library_bar_job(dir.path(), mesh, x0, stickout, bar, controller)
+        };
+        let doc = job(&mesh, 20., "100", 40., "UC100");
+        let m = doc.setups[1].machine.clone();
+        let unit = m.rotary_unit().unwrap();
+        assert_eq!((unit.centre_z, unit.chuck_diameter), (-40., 100.));
+        assert_eq!(get(&m.p, "z"), "55");
+        // Along all of A the jaws are out of reach; under the tool A swings
+        // only the bar.
+        assert!(doc.swing(1, &mesh, 15.).is_err());
+        let plan = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap().plan;
+        let swing = height(&doc, &mesh, 1, &plan, 15.);
+        assert_eq!((swing.what, swing.radius), ("the stock reaches", 20.));
+        assert!((swing.machine_z - -5.).abs() < 1e-3, "{swing:?}");
+        // Both stick-outs export, as LinuxCNC programs. At 60 mm the part
+        // is shorter and nearer the bar's end: the Ø65 spindle nose comes
+        // down to the part's bottom, 50 mm over the centreline, so it stays
+        // its radius and the gap off the jaws in X.
+        let short = prism(15.);
+        for (mesh, x0, stickout) in [(&mesh, 20., "100"), (&short, 42., "60")] {
+            let linuxcnc = job(mesh, x0, stickout, 40., "LinuxCNC");
+            let exported = crate::post::post_job(&linuxcnc, mesh);
+            let result = &exported.setups[1].result;
+            assert!(result.is_ok(), "{stickout}: {result:?}");
+        }
+        // The Ø80 bar: refused by export and the run, with its numbers.
+        let words = [
+            "at machine Z 15 with the tool over X",
+            "(the A centreline at Z -40 + 40 mm, as far as the stock reaches from it at any angle, + 15 mm clearance)",
+            "15 mm above the top of the machine's 55 mm Z travel (Z 0)",
+        ];
+        let says = |e: &[String]| words.iter().all(|w| e.iter().any(|e| e.contains(w)));
+        // Facing from the bar's top to the square's sides, 30 mm, within the
+        // cutter's reach.
+        let thick = |controller| job(&mesh, 20., "100", 80., controller);
+        let exported = crate::post::post_job(&thick("LinuxCNC"), &mesh);
+        let refused = exported.setups[1].result.as_ref().unwrap_err();
+        assert!(says(refused), "{refused:?}");
+        let refused = crate::run::check(&thick("UC100"), &mesh, 1).0.unwrap_err();
+        assert!(says(&refused), "{refused:?}");
+        // The Ø40 job runs on the simulated UC100, its travel and A range
+        // the library machine's, the tool over the bar's free end.
+        let mut c = library_run(dir.path(), &doc, &mesh);
+        let problems = c.run.as_ref().unwrap().problems(&c, &doc);
+        assert!(problems.is_empty(), "{problems:?}");
+        // Every turn of A with the tool at that height, inside the travel.
+        let (start, offset) = (c.snapshot.machine_pos, c.snapshot.work_offset);
+        let p = c.run.as_ref().unwrap().checked().unwrap()[0].clone();
+        let actions = crate::run::lower(&p, 0, offset, start).unwrap();
+        let plan_z = |m: [f64; 6]| m[2] - offset[2] + p.datum[2] as f64;
+        let mut at = start;
+        let mut turns = vec![];
+        for l in &actions {
+            if let Do::Move { target, .. } = l.action {
+                if (target[3] - at[3]).abs() > 1e-9 {
+                    assert!(plan_z(target) >= swing.z as f64 - 1e-3, "{l:?} {swing:?}");
+                    assert!(target[2] <= 1e-6, "{l:?}");
+                    turns.push(target[3]);
+                }
+                at = target;
+            }
+        }
+        assert_eq!(turns, [90., 180., -90., 0.]);
+        let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
+        c.run_act(R::CycleStart, &doc);
+        assert!(c.run.as_ref().unwrap().running.is_some());
+        let mut reached = [false; 4];
+        let cap = Instant::now() + Duration::from_secs(600);
+        while !c
+            .snapshot
+            .program_outcome
+            .as_ref()
+            .is_some_and(|o| o.seq > seq)
+        {
+            c.refresh();
+            if let Some(r) = &mut c.run {
+                r.refresh(c.snapshot.program_outcome.as_ref());
+            }
+            let s = &c.snapshot;
+            for (k, a) in [0., 90., 180., -90.].iter().enumerate() {
+                reached[k] |= s.state == Some(State::Run) && (s.machine_pos[3] - a).abs() < 0.03;
+            }
+            assert!(Instant::now() < cap, "the job did not end: {:?}", s.log);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let o = c.snapshot.program_outcome.clone().unwrap();
+        assert!(o.ok, "{} {:?}", o.message, c.snapshot.log);
+        assert_eq!(reached, [true; 4]);
+        until(&mut c, 3.0, "Idle after the job", |s| {
+            s.state == Some(State::Idle)
+        });
+        if let Some(r) = &mut c.run {
+            r.refresh(c.snapshot.program_outcome.as_ref());
+        }
+        let run = c.run.as_ref().unwrap();
+        assert!(run.running.is_none() && run.done[0], "{:?}", run.outcome);
+        assert!(c.snapshot.machine_pos[3].abs() < 0.03);
+    }
+    /// LIO-212: the library CNC4030 + rotary retracts to machine Z home, so
+    /// a run on it retracts as export does, to the top of Z, and its checks
+    /// take that retract: with clearance-plane retracts both refuse the job
+    /// alike, the plane under the jaws' reach. Run and export make the same
+    /// moves. From wherever the machine is the run goes up (never down),
+    /// across, turns A and comes down, each move checked against the chuck
+    /// at the A it is made at: parked over the jaws at machine X25 Z0 A30,
+    /// Cycle Start is refused with what it would hit; beside the chuck the
+    /// run goes along X first (LIO-213), at the start and from a later
+    /// operation alike; from over the bar's free end it starts, at any A.
+    #[test]
+    fn a_run_on_the_library_rotary_machine_retracts_up_as_export_does_and_checks_its_way_in() {
+        use crate::indexed::tests::prism;
+        use crate::model::{POST_RETRACT, POST_TOOL_LENGTH};
+        use crate::post::PostSettings;
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mesh = prism(30.);
+        // A second operation, for a start partway.
+        let job = |controller| {
+            let mut doc = library_bar_job(dir.path(), &mesh, 20., "100", 40., controller);
+            let mut second = doc.setups[1].operations[0].clone();
+            second.id = crate::model::id();
+            doc.setups[1].operations.push(second);
+            doc.sync_turns(Some(&mesh));
+            doc
+        };
+        let doc = job("UC100");
+        // Export in touch-off mode, as a run is made.
+        let mut linuxcnc = job("LinuxCNC");
+        (linuxcnc.setups[0].machine.p)
+            .insert("post_tool_length".into(), POST_TOOL_LENGTH[1].into());
+        linuxcnc.sync_indexed();
+        // One retract for the run, its checks and export: the top of Z.
+        let settings = PostSettings::for_uc100(&doc.setups[1].machine).unwrap();
+        assert!(settings.machine_home);
+        let exported = PostSettings::from_machine(&linuxcnc.setups[1].machine).unwrap();
+        assert_eq!(settings, exported);
+        // Retracting to the clearance plane, both refuse it alike.
+        for (d, run) in [(&doc, true), (&linuxcnc, false)] {
+            let mut plane = d.clone();
+            (plane.setups[0].machine.p).insert("post_retract".into(), POST_RETRACT[1].into());
+            plane.sync_indexed();
+            let refused = match run {
+                true => crate::run::check(&plane, &mesh, 1).0.unwrap_err(),
+                false => (crate::post::post_job(&plane, &mesh).setups[1]
+                    .result
+                    .clone())
+                .unwrap_err(),
+            };
+            assert!(
+                refused
+                    .iter()
+                    .any(|e| e.contains("is not above the chuck jaw")),
+                "run {run}: {refused:?}"
+            );
+        }
+        // Run and export make the same moves, from the tool over the bar's
+        // free end at the top of Z.
+        let mut c = library_run(dir.path(), &doc, &mesh);
+        let problems = |c: &Connection| c.run.as_ref().unwrap().problems(c, &doc);
+        assert!(problems(&c).is_empty(), "{:?}", problems(&c));
+        let p = c.run.as_ref().unwrap().checked().unwrap()[0].clone();
+        let offset = c.snapshot.work_offset;
+        let moves = |k: usize, start: Vec6| -> Vec<Vec6> {
+            (crate::run::lower(&p, k, offset, start).unwrap().iter())
+                .filter_map(|l| match l.action {
+                    Do::Move { target, .. } => Some(target),
+                    _ => None,
+                })
+                .collect()
+        };
+        let programs = crate::post::post_job(&linuxcnc, &mesh).setups[1]
+            .result
+            .clone()
+            .unwrap();
+        let replay = crate::ngc::replay(&programs[0].text).unwrap();
+        // The exported program's moves at the work offset, from `start`.
+        let posted = |start: Vec6| -> Vec<Vec6> {
+            let mut at = start;
+            let mut out = vec![];
+            for step in (replay.steps.iter()).filter(|s| s.kind != crate::ngc::StepKind::Dwell) {
+                let mut to = at;
+                for k in 0..3 {
+                    if let Some(v) = step.to[k] {
+                        to[k] = if step.machine { v } else { v + offset[k] };
+                    }
+                }
+                if let Some(a) = step.a {
+                    to[3] = a + offset[3];
+                }
+                if (0..4).any(|k| (to[k] - at[k]).abs() > 2e-3) {
+                    out.push(to);
+                    at = to;
+                }
+            }
+            out
+        };
+        // From the top of Z, and from 10 mm under it, where both first
+        // retract up, Z alone.
+        let start = c.snapshot.machine_pos;
+        let mut under = start;
+        under[2] = -10.;
+        for from in [start, under] {
+            let (run, posted) = (moves(0, from), posted(from));
+            assert_eq!(run.len(), posted.len());
+            for (r, e) in run.iter().zip(&posted) {
+                assert!(
+                    (0..4).all(|k| (r[k] - e[k]).abs() < 2e-3),
+                    "run {r:?}, export {e:?}"
+                );
+            }
+        }
+        assert_eq!(moves(0, under)[0][..3], [150., 140., 0.]);
+        // The way in: up, never down; across with A still; A alone; down.
+        let way = |found: &[Vec6], from: Vec6| -> Vec<&str> {
+            let mut at = from;
+            let mut out = vec![];
+            for m in found {
+                let d: Vec<bool> = (0..4).map(|k| (m[k] - at[k]).abs() > 1e-9).collect();
+                out.push(match (d[0] || d[1], d[2], d[3]) {
+                    (false, true, false) if m[2] > at[2] => "up",
+                    (false, true, false) => "down",
+                    (true, false, false) => "across",
+                    (false, false, true) => "turn",
+                    _ => "other",
+                });
+                at = *m;
+                if out.last() == Some(&"down") {
+                    break;
+                }
+            }
+            out
+        };
+        // Parked over the jaws at the top of Z, A at 30°: across at Z 0, A
+        // turned there to A0 over the first cut, then down; the way across
+        // starts within the chuck's reach (its body is Ø100 round the
+        // centreline at Z -40, up to Z 10), and Cycle Start is refused.
+        let refused = |c: &Connection| -> Vec<String> {
+            problems(c)
+                .into_iter()
+                .filter(|p| p.starts_with("From where the machine is, Cycle Start would bring the"))
+                .collect()
+        };
+        go_to(&mut c, [25., 140., 0., 30.]);
+        let here = c.snapshot.machine_pos;
+        assert_eq!(way(&moves(0, here), here), ["across", "turn", "down"]);
+        assert!(moves(0, here)[..2].iter().all(|m| m[2] == 0.));
+        let said = refused(&c);
+        assert!(
+            said.len() == 1
+                && said[0].contains("of the chuck")
+                && said[0].contains("on the way across at A 30°"),
+            "{said:?}"
+        );
+        c.run_act(R::CycleStart, &doc);
+        assert!(c.run.as_ref().unwrap().running.is_none());
+        // Beside the chuck's body, off to +Y and down: up to the top of Z,
+        // then across would pass over the body, which reaches above it. From
+        // beside the jaws, 20 mm farther along X, the way across is clear of
+        // it. From beside the body the run goes along X first, beside it,
+        // to the first cut's X, then across (LIO-213).
+        go_to(&mut c, [30., 205., -30., 0.]);
+        assert!(refused(&c).is_empty(), "{:?}", problems(&c));
+        go_to(&mut c, [10., 205., -30., 0.]);
+        let here = c.snapshot.machine_pos;
+        let found = moves(0, here);
+        assert_eq!(way(&found, here), ["up", "across", "across", "down"]);
+        assert_eq!(found[1][1], 205.);
+        assert_eq!(found[2][0], found[1][0]);
+        assert!(problems(&c).is_empty(), "{:?}", problems(&c));
+        // So from the second operation, as after a Stop.
+        c.run_act(R::From(0, 1), &doc);
+        let found = moves(1, here);
+        assert_eq!(way(&found, here), ["up", "across", "across", "down"]);
+        assert!(refused(&c).is_empty(), "{:?}", problems(&c));
+        c.run_act(R::From(0, 0), &doc);
+        // Over the bar's free end, down at -10 at A -120: up to the top of
+        // Z, across, A turned to A0 over the first cut, down; all clear.
+        go_to(&mut c, [150., 140., -10., -120.]);
+        let here = c.snapshot.machine_pos;
+        assert_eq!(way(&moves(0, here), here), ["up", "across", "turn", "down"]);
+        assert!(problems(&c).is_empty(), "{:?}", problems(&c));
+    }
+
+    /// LIO-213: on the library CNC4030 + rotary, a run started from machine
+    /// home (X0 Y0 Z0 A0) goes across at the top of Z, clear of the chuck,
+    /// and runs to the end on the simulated UC100. From beside the chuck's
+    /// body, where the usual way across would pass over the body (which
+    /// reaches above the top of Z), it goes up, along X alone beside it to
+    /// the first cut's X, then across in Y, and runs to the end. Where the
+    /// program ends, at the top of Z over its last cut with A at A0, the
+    /// next Cycle Start is clear, by the usual way. Over the jaws with jaw 1
+    /// at A 30°, no way out is clear (A turned first sweeps the jaw through
+    /// the tool, X first passes along it): the refusal says how to jog
+    /// clear. With the clearance plane, export and the run refuse a setup
+    /// in the chuck.
+    #[test]
+    fn a_run_on_the_library_rotary_machine_starts_from_machine_home_and_ends_where_it_starts_again()
+    {
+        use crate::indexed::tests::prism;
+        use crate::model::POST_RETRACT;
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mesh = prism(30.);
+        let doc = library_bar_job(dir.path(), &mesh, 20., "100", 40., "UC100");
+        let mut c = library_run(dir.path(), &doc, &mesh);
+        let length = c.run.as_ref().unwrap().length.clone();
+        let problems = |c: &Connection| c.run.as_ref().unwrap().problems(c, &doc);
+        let p = c.run.as_ref().unwrap().checked().unwrap()[0].clone();
+        let offset = c.snapshot.work_offset;
+        let moves = |start: Vec6| -> Vec<Vec6> {
+            (crate::run::lower(&p, 0, offset, start).unwrap().iter())
+                .filter_map(|l| match l.action {
+                    Do::Move { target, .. } => Some(target),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Cycle Start, the job run to its end, and a new run of the setup
+        // picked as after it.
+        let run_to_end = |c: &mut Connection| {
+            let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
+            c.run_act(R::CycleStart, &doc);
+            assert!(
+                c.run.as_ref().unwrap().running.is_some(),
+                "{:?}",
+                problems(c)
+            );
+            let cap = Instant::now() + Duration::from_secs(600);
+            while !(c.snapshot.program_outcome.as_ref()).is_some_and(|o| o.seq > seq) {
+                c.refresh();
+                if let Some(r) = &mut c.run {
+                    r.refresh(c.snapshot.program_outcome.as_ref());
+                }
+                assert!(
+                    Instant::now() < cap,
+                    "the job did not end: {:?}",
+                    c.snapshot.log
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let o = c.snapshot.program_outcome.clone().unwrap();
+            assert!(o.ok, "{} {:?}", o.message, c.snapshot.log);
+            until(c, 3.0, "Idle after the job", |s| {
+                s.state == Some(State::Idle)
+            });
+            if let Some(r) = &mut c.run {
+                r.refresh(c.snapshot.program_outcome.as_ref());
+            }
+            assert!(c.run.as_ref().unwrap().done[0]);
+            let (programs, left) = crate::run::check(&doc, &mesh, 1);
+            let mut again = crate::run::Run::new(&doc, 1, 0);
+            again.checked_as(
+                std::sync::Arc::new(Ok(programs.unwrap())),
+                Some(std::sync::Arc::new(left)),
+                None,
+            );
+            again.length = length.clone();
+            c.run = Some(again);
+        };
+        // From machine home: across at Z0, X and Y together, then down onto
+        // the first cut; A is at its angle already.
+        go_to(&mut c, [0., 0., 0., 0.]);
+        assert!(problems(&c).is_empty(), "{:?}", problems(&c));
+        let found = moves(c.snapshot.machine_pos);
+        let first = found[1];
+        assert_eq!(found[0][..4], [first[0], first[1], 0., 0.]);
+        assert!(first[2] < 0. && first[0] > 100., "{first:?}");
+        run_to_end(&mut c);
+        // It ends at the top of Z over its last cut, A at A0: started again
+        // from there, the usual way in is clear.
+        let end = c.snapshot.machine_pos;
+        assert!(
+            end[2].abs() < 1e-3 && end[3].abs() < 0.03 && end[0] > 100.,
+            "{end:?}"
+        );
+        assert!(problems(&c).is_empty(), "{:?}", problems(&c));
+        assert_eq!(moves(end)[0][..2], first[..2]);
+        // From beside the chuck's body, down: up, X alone at Y205, Y alone,
+        // down; it runs to the end, which is clear again.
+        go_to(&mut c, [10., 205., -30., 0.]);
+        assert!(problems(&c).is_empty(), "{:?}", problems(&c));
+        let found = moves(c.snapshot.machine_pos);
+        assert_eq!(found[0][..4], [10., 205., 0., 0.]);
+        assert_eq!(found[1][..4], [first[0], 205., 0., 0.]);
+        assert_eq!(found[2][..4], [first[0], first[1], 0., 0.]);
+        run_to_end(&mut c);
+        let again = c.snapshot.machine_pos;
+        assert!(
+            (0..4).all(|k| (again[k] - end[k]).abs() < 0.03),
+            "{again:?}"
+        );
+        assert!(problems(&c).is_empty(), "{:?}", problems(&c));
+        // Over the jaws, jaw 1 at A 30°: refused, saying how to jog clear.
+        go_to(&mut c, [35., 140., 0., 30.]);
+        let said = problems(&c);
+        assert!(
+            said.iter()
+                .any(|e| e.contains("chuck jaw 1 on the way across at A 30°")),
+            "{said:?}"
+        );
+        let jog = said
+            .iter()
+            .find(|e| e.starts_with("No other way out is clear either"));
+        let jog = jog.unwrap_or_else(|| panic!("{said:?}"));
+        assert!(
+            jog.contains("Jog the tool up to machine Z 0.000, A to machine A 60.000° (no jaw up), X to machine X ")
+                && jog.contains("over the first cut, watching the chuck, then press Cycle Start."),
+            "{jog}"
+        );
+        c.run_act(R::CycleStart, &doc);
+        assert!(c.run.as_ref().unwrap().running.is_none());
+        // With the clearance plane, the run and export refuse it alike.
+        let wants = "a setup in the chuck retracts to machine Z home";
+        let mut plane = doc.clone();
+        (plane.setups[0].machine.p).insert("post_retract".into(), POST_RETRACT[1].into());
+        plane.sync_indexed();
+        let refused = crate::run::check(&plane, &mesh, 1).0.unwrap_err();
+        assert!(refused.iter().any(|e| e.contains(wants)), "{refused:?}");
+        (plane.setups[0].machine.p).insert("controller".into(), "LinuxCNC".into());
+        plane.sync_indexed();
+        let refused = (crate::post::post_job(&plane, &mesh).setups[1]
+            .result
+            .clone())
+        .unwrap_err();
+        assert!(refused.iter().any(|e| e.contains(wants)), "{refused:?}");
+    }
+
+    /// A Ø40 bar milled square at A 0, 90, 180 and 270 in one job on the
+    /// simulated UC100 (LIO-192): admitted only on a measured, current A
+    /// centreline with the work zero on it and every A inside its soft
+    /// limits; lowered with A turning alone between the angles; held and
+    /// resumed in the middle of a turn; it ends with A at the angles it was
+    /// commanded to, back at A0.
+    #[test]
+    fn an_indexed_bar_runs_at_four_angles_turning_a_alone() {
+        use crate::indexed::tests::{bar_job, cutter, faced_square, prism};
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mesh = prism(30.);
+        // Its four sides faced, each at the angle that brings it on top.
+        let mut op = faced_square(&cutter("12"), &mesh);
+        // A few seconds a pass: fast feeds, deep steps.
+        for (k, v) in [("feed", "20000"), ("stepdown", "10"), ("coolant", "Off")] {
+            op.p.insert(k.into(), v.into());
+        }
+        // From A0 the first turn is to A90; the same job from A 0 is run
+        // after it, below.
+        let mut doc = bar_job(&mesh, 20., "100", "-150", "90, 180, 270, 0", op);
+        doc.tools[0].p.insert("number".into(), "1".into());
+        doc.file = Some(crate::model::ModelFile {
+            name: "bar.stl".into(),
+            path: "bar.stl".into(),
+            format: "STL".into(),
+            bytes: 1,
+            thickness: None,
+        });
+        let path = dir.path().join("profile.toml");
+        let m = &mut doc.setups[0].machine;
+        for (k, v) in [
+            ("controller", "UC100"),
+            ("uc100_profile", &*path.display().to_string()),
+            ("uc100_connection", "Simulated"),
+            ("feed", "60000"),
+            ("post_dwell", "0.2"),
+            (CENTRE_MARK, MEASURED),
+            (crate::model::CENTRE_REF, "10 10 -200"),
+        ] {
+            m.p.insert(k.into(), v.into());
+        }
+        doc.machines = vec![doc.setups[0].machine.clone()];
+        doc.sync_stock_sources();
+        doc.sync_turns(Some(&mesh));
+        let m = doc.setups[1].machine.clone();
+        assert_eq!(m.id, doc.setups[0].machine.id);
+        let mut c = zeroed_sim(dir.path(), ROTARY_SIM, Some(&m), 4);
+        // Started at the angle A is at, the tool comes down from above all
+        // that A swings over the first cut, as after an index move, not over
+        // the stock's corner in the chuck (LIO-205): run and export agree.
+        let mut at_zero = doc.clone();
+        (at_zero.setups[1].p).insert(crate::indexed::ANGLES.into(), "0, 90, 180, 270".into());
+        at_zero.sync_turns(Some(&mesh));
+        // The same job on LinuxCNC exports.
+        let mut linuxcnc = at_zero.clone();
+        (linuxcnc.setups[0].machine.p).insert("controller".into(), "LinuxCNC".into());
+        linuxcnc.sync_indexed();
+        let exported = crate::post::post_job(&linuxcnc, &mesh);
+        assert!(
+            exported.setups[1].result.is_ok(),
+            "{:?}",
+            exported.setups[1].result
+        );
+        let at_zero_programs = crate::run::check(&at_zero, &mesh, 1)
+            .0
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let (programs, left) = crate::run::check(&doc, &mesh, 1);
+        let programs = programs.unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(programs.len(), 1);
+        // The work zero on the measured centreline, A0 at machine A0.
+        let zero = doc.at_angle(1, 0., &mesh).unwrap().machine_zero.unwrap();
+        let here = c.snapshot.machine_pos;
+        let set = |c: &mut Connection, axis: usize, offset: f64| {
+            c.send(Command::SetWork {
+                axis,
+                value: here[axis] - offset,
+            });
+            until(c, 2.0, "the work offset", |s| {
+                (s.work_offset[axis] - offset).abs() < 1e-6
+            });
+        };
+        for (axis, z) in zero.iter().enumerate() {
+            set(&mut c, axis, *z as f64);
+        }
+        set(&mut c, 3, 0.);
+        let mut run = crate::run::Run::new(&doc, 1, 0);
+        run.checked_as(
+            std::sync::Arc::new(Ok(programs)),
+            Some(std::sync::Arc::new(left)),
+            None,
+        );
+        // Touched off on the A reference, as long as the probe.
+        run.length = Some((doc.tools[0].id.clone(), 0., -200.));
+        c.run = Some(run);
+        let problems =
+            |c: &Connection, doc: &crate::model::Document| c.run.as_ref().unwrap().problems(c, doc);
+        let has = |c: &Connection, doc: &crate::model::Document, t: &str| {
+            problems(c, doc).iter().any(|p| p.contains(t))
+        };
+        assert!(problems(&c, &doc).is_empty(), "{:?}", problems(&c, &doc));
+        // An assumed centreline refuses the run and says where to measure
+        // it; so does one gone stale, on the Control page or in the library.
+        c.rotary.as_mut().unwrap().mark = String::new();
+        assert!(has(&c, &doc, "assumed, not measured") && has(&c, &doc, "Control → Rotary A"));
+        c.rotary.as_mut().unwrap().mark = "stale after an E-stop".into();
+        assert!(has(&c, &doc, "went stale after an E-stop"));
+        c.rotary.as_mut().unwrap().mark = MEASURED.into();
+        doc.machines[0]
+            .p
+            .insert(CENTRE_MARK.into(), "stale after a remount".into());
+        assert!(has(&c, &doc, "went stale after a remount"));
+        doc.machines[0]
+            .p
+            .insert(CENTRE_MARK.into(), MEASURED.into());
+        // The work zero within 0.02 mm of the centreline, not 0.03.
+        set(&mut c, 1, zero[1] as f64 + 0.03);
+        assert!(
+            has(&c, &doc, "off the A centreline"),
+            "{:?}",
+            problems(&c, &doc)
+        );
+        set(&mut c, 2, zero[2] as f64 - 0.01);
+        set(&mut c, 1, zero[1] as f64 + 0.01);
+        assert!(problems(&c, &doc).is_empty(), "{:?}", problems(&c, &doc));
+        set(&mut c, 1, zero[1] as f64);
+        set(&mut c, 2, zero[2] as f64);
+        // A 100° work offset would turn A to machine 370°, past 360.
+        set(&mut c, 3, 100.);
+        assert!(
+            has(&c, &doc, "machine A 370.000°"),
+            "{:?}",
+            problems(&c, &doc)
+        );
+        set(&mut c, 3, 0.);
+        assert!(problems(&c, &doc).is_empty(), "{:?}", problems(&c, &doc));
+        // The tool 20 mm under the top of Z, where the tool run's retract
+        // to machine home (Machine::new's Safe retract) lifts it (LIO-212).
+        go_to(&mut c, [0., 0., -20., 0.]);
+        assert!(problems(&c, &doc).is_empty(), "{:?}", problems(&c, &doc));
+        // Lowered: A turns alone, to each angle in order, then back to A0.
+        let (start, offset) = (c.snapshot.machine_pos, c.snapshot.work_offset);
+        let p = c.run.as_ref().unwrap().checked().unwrap()[0].clone();
+        let actions = crate::run::lower(&p, 0, offset, start).unwrap();
+        assert_eq!(crate::run::combined(&actions, start), None);
+        let mut turns = vec![];
+        let mut at = start;
+        for l in &actions {
+            if let Do::Move { target, feed } = l.action {
+                if (target[3] - at[3]).abs() > 1e-9 {
+                    assert!(feed.is_none() && target[..3] == at[..3], "{l:?}");
+                    turns.push(target[3]);
+                }
+                at = target;
+            }
+        }
+        assert_eq!(turns, [90., 180., 270., 0.]);
+        // Each turn as export makes it: the tool up at or above what A
+        // swings under it, A alone, then on. The first follows the tool
+        // run's Z-only retract, the spindle start, its dwell and the
+        // approach in X and Y over the first cut (LIO-209).
+        let clearance = crate::cam::number(&doc.setups[1].operations[0], "clearance").unwrap();
+        let sim = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap();
+        let swing = crate::indexed::tests::height(&doc, &mesh, 1, &sim.plan, clearance);
+        let plan_z = |m: [f64; 6]| m[2] - offset[2] + p.datum[2] as f64;
+        let mut at = start;
+        let mut first = None;
+        for (i, l) in actions.iter().enumerate() {
+            if let Do::Move { target, .. } = l.action {
+                if (target[3] - at[3]).abs() > 1e-9 {
+                    assert!(plan_z(target) >= swing.z as f64 - 1e-3, "{l:?} {swing:?}");
+                    first.get_or_insert(i);
+                }
+                at = target;
+            }
+        }
+        let i = first.unwrap();
+        let before: Vec<(usize, [f64; 6])> = (0..i)
+            .filter_map(|k| match actions[k].action {
+                Do::Move { target, .. } => Some((k, target)),
+                _ => None,
+            })
+            .collect();
+        let [.., (r, retract), (k, across)] = before[..] else {
+            panic!("{before:?}");
+        };
+        assert!(
+            retract[..2] == start[..2] && retract[2] == 0. && retract[3] == start[3],
+            "{retract:?}"
+        );
+        assert!(
+            across[2] == retract[2] && across[3] == start[3],
+            "{across:?}"
+        );
+        assert_eq!(k, i - 1);
+        let between: Vec<&Do> = actions[r + 1..k].iter().map(|l| &l.action).collect();
+        assert!(
+            matches!(between.first(), Some(Do::Spindle { .. }))
+                && matches!(between.last(), Some(Do::Dwell { .. }))
+                && between.iter().all(|a| matches!(
+                    a,
+                    Do::Spindle { .. } | Do::Coolant { .. } | Do::Dwell { .. }
+                )),
+            "{between:?}"
+        );
+        let next = (i + 1..actions.len())
+            .find(|&k| matches!(actions[k].action, Do::Move { .. }))
+            .unwrap();
+        assert!(
+            matches!(actions[next].action, Do::Move { target, feed: None } if target[..2] == across[..2] && target[2] < at_z(&actions, i) && target[3] == 90.),
+            "{:?}",
+            actions[next]
+        );
+        // Cycle Start; Hold in the middle of the turn to 180, then Resume.
+        let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
+        c.run_act(R::CycleStart, &doc);
+        assert!(
+            c.run.as_ref().unwrap().running.is_some(),
+            "{:?}",
+            problems(&c, &doc)
+        );
+        let mut reached = [false; 4];
+        let mut held = None;
+        let cap = Instant::now() + Duration::from_secs(600);
+        loop {
+            c.refresh();
+            if let Some(r) = &mut c.run {
+                r.refresh(c.snapshot.program_outcome.as_ref());
+            }
+            let s = c.snapshot.clone();
+            for (k, a) in [0., 90., 180., 270.].iter().enumerate() {
+                reached[k] |= s.state == Some(State::Run) && (s.machine_pos[3] - a).abs() < 0.03;
+            }
+            if held.is_none()
+                && s.state == Some(State::Run)
+                && (92.0..110.0).contains(&s.machine_pos[3])
+            {
+                c.run_act(R::Hold, &doc);
+                until(&mut c, 5.0, "Hold", |s| s.state == Some(State::Hold));
+                let a = settled(&mut c);
+                wait(&mut c, 300);
+                assert_eq!(c.snapshot.machine_pos, a, "the machine moved while held");
+                assert_eq!(c.snapshot.state, Some(State::Hold));
+                // Stopped short of 180, X, Y and Z where the turn began.
+                assert!(a[3] < 179.9 && a[..3] == s.machine_pos[..3], "{a:?}");
+                held = Some(a[3]);
+                c.run_act(R::Resume, &doc);
+            }
+            if c.snapshot
+                .program_outcome
+                .as_ref()
+                .is_some_and(|o| o.seq > seq)
+            {
+                break;
+            }
+            assert!(Instant::now() < cap, "the job did not end: {:?}", s.log);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let o = c.snapshot.program_outcome.clone().unwrap();
+        assert!(o.ok, "{} {:?}", o.message, c.snapshot.log);
+        assert!(held.is_some(), "A was never caught turning");
+        assert_eq!(reached, [true; 4]);
+        until(&mut c, 3.0, "Idle after the job", |s| {
+            s.state == Some(State::Idle)
+        });
+        if let Some(r) = &mut c.run {
+            r.refresh(c.snapshot.program_outcome.as_ref());
+        }
+        let run = c.run.as_ref().unwrap();
+        assert!(run.running.is_none() && run.done[0], "{:?}", run.outcome);
+        assert!(
+            c.snapshot.machine_pos[3].abs() < 0.03,
+            "{:?}",
+            c.snapshot.machine_pos
+        );
+        // The live carve followed A (LIO-190): the volume it cut at each
+        // angle leaves the square on the bar's axis, the bar round it gone
+        // (LIO-211).
+        let (carved, _) = run.carved_volume().expect("a live carve of the volume");
+        assert!(run.stock().is_none(), "the top view is not carved");
+        let base = crate::volume::Frame::new(&doc.setups[0], &mesh);
+        let c0 = 4. / mesh.display_scale() + mesh.dimensions[2] / 2.;
+        let filled = |dy: f32, dz: f32| carved.filled(base.map([0., dy, c0 + dz]), base);
+        for (dy, dz) in [(7., 0.), (-7., 0.), (0., 7.), (0., -7.), (6., -6.)] {
+            assert!(filled(dy, dz), "inside the square at {dy} {dz}");
+        }
+        for (dy, dz) in [(14., 4.), (-14., -4.), (4., 14.), (-4., -14.)] {
+            assert!(!filled(dy, dz), "outside the square at {dy} {dz}");
+        }
+        // The same job from A0, its first angle: A turns to 90, 180, 270 and
+        // back to 0, and the tool first comes down over the first cut from
+        // at or above all that A swings, straight down to its feed.
+        let mut run = crate::run::Run::new(&at_zero, 1, 0);
+        run.checked_as(std::sync::Arc::new(Ok(at_zero_programs)), None, None);
+        run.length = Some((doc.tools[0].id.clone(), 0., -200.));
+        c.run = Some(run);
+        assert!(
+            problems(&c, &at_zero).is_empty(),
+            "{:?}",
+            problems(&c, &at_zero)
+        );
+        let (start, offset) = (c.snapshot.machine_pos, c.snapshot.work_offset);
+        let p = c.run.as_ref().unwrap().checked().unwrap()[0].clone();
+        let plan_z = |m: [f64; 6]| m[2] - offset[2] + p.datum[2] as f64;
+        let actions = crate::run::lower(&p, 0, offset, start).unwrap();
+        let mut turns = vec![];
+        let mut at = start;
+        let mut moves = vec![];
+        for l in &actions {
+            if let Do::Move { target, feed } = l.action {
+                if (target[3] - at[3]).abs() > 1e-9 {
+                    turns.push(target[3]);
+                }
+                moves.push((target, feed));
+                at = target;
+            }
+        }
+        assert_eq!(turns, [90., 180., 270., 0.]);
+        let feed = moves.iter().position(|(_, f)| f.is_some()).unwrap();
+        let over = (moves[..feed].iter())
+            .rposition(|(t, _)| plan_z(*t) >= swing.z as f64 - 1e-3)
+            .unwrap();
+        for (t, _) in &moves[over..=feed] {
+            assert_eq!((&t[..2], t[3]), (&moves[over].0[..2], 0.), "{moves:?}");
+        }
+        let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
+        c.run_act(R::CycleStart, &at_zero);
+        assert!(c.run.as_ref().unwrap().running.is_some());
+        let mut reached = [false; 4];
+        let cap = Instant::now() + Duration::from_secs(600);
+        while !c
+            .snapshot
+            .program_outcome
+            .as_ref()
+            .is_some_and(|o| o.seq > seq)
+        {
+            c.refresh();
+            if let Some(r) = &mut c.run {
+                r.refresh(c.snapshot.program_outcome.as_ref());
+            }
+            let s = &c.snapshot;
+            for (k, a) in [0., 90., 180., 270.].iter().enumerate() {
+                reached[k] |= s.state == Some(State::Run) && (s.machine_pos[3] - a).abs() < 0.03;
+            }
+            assert!(Instant::now() < cap, "the job did not end: {:?}", s.log);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let o = c.snapshot.program_outcome.clone().unwrap();
+        assert!(o.ok, "{} {:?}", o.message, c.snapshot.log);
+        assert_eq!(reached, [true; 4]);
     }
 
     #[test]
@@ -3682,6 +6766,7 @@ soft_max = 0.0
         let probe = Probe {
             plate: None,
             tip: Some(4.),
+            length: None,
             feed: 100.,
             distance: 20.,
             retract: 5.,
@@ -3782,6 +6867,7 @@ soft_max = 0.0
         let probe = Probe {
             plate: None,
             tip: Some(4.),
+            length: None,
             feed: 100.,
             distance: 20.,
             retract: 5.,
@@ -3919,6 +7005,7 @@ soft_max = 0.0
         let probe = Probe {
             plate: None,
             tip: Some(4.),
+            length: None,
             feed: 100.,
             distance: 30.,
             retract: 5.,
@@ -4041,6 +7128,7 @@ soft_max = 0.0
         let probe = Probe {
             plate: None,
             tip: Some(4.),
+            length: None,
             feed: 100.,
             distance: 30.,
             retract: 5.,
@@ -4134,6 +7222,7 @@ soft_max = 0.0
         let probe = Probe {
             plate: None,
             tip: Some(4.),
+            length: None,
             feed: 100.,
             distance: 20.,
             retract: 5.,
@@ -4144,6 +7233,7 @@ soft_max = 0.0
         let (lo, hi) = ([100., 50., -70.], [224., 134., -30.]);
         let start = [165., 90., -15., 0., 0., 0.];
         let clamp = |proud: f32| HoldBox {
+            shape: Default::default(),
             label: "clamp on +X (offset 0)".into(),
             bounds: Bounds {
                 min: [94., 0., 40.],
@@ -4478,6 +7568,7 @@ probe = { pin = 13, active_low = true }
         let probe = Probe {
             plate: None,
             tip: Some(4.),
+            length: None,
             feed: 100.,
             distance: 20.,
             retract: 5.,
@@ -4744,5 +7835,558 @@ probe = { pin = 13, active_low = true }
         // Declaring X another way is not from the pin.
         c.act(Action::MachineZero(Some(0)));
         assert!(!c.pin_referenced);
+    }
+
+    /// Like the JY5800 with the rotary unit's A axis and the probe, fine
+    /// enough (200 steps per mm) and fast for the simulator.
+    const ROTARY_PROBED: &str = r#"
+[controller]
+step_rate = "100kHz"
+[axes.x]
+steps_per_unit = 200.0
+max_velocity = 24000.0
+acceleration = 20000.0
+step = { pin = 2 }
+dir = { pin = 3 }
+soft_min = 0.0
+soft_max = 390.0
+[axes.y]
+steps_per_unit = 200.0
+max_velocity = 24000.0
+acceleration = 20000.0
+step = { pin = 4 }
+dir = { pin = 5 }
+soft_min = 0.0
+soft_max = 280.0
+[axes.z]
+steps_per_unit = 200.0
+max_velocity = 24000.0
+acceleration = 20000.0
+step = { pin = 6 }
+dir = { pin = 7 }
+soft_min = -55.0
+soft_max = 0.0
+[axes.a]
+steps_per_unit = 44.444
+max_velocity = 36000.0
+acceleration = 7200.0
+step = { pin = 8 }
+dir = { pin = 9 }
+soft_min = -180.0
+soft_max = 180.0
+[inputs]
+probe = { pin = 13, active_low = true }
+"#;
+
+    /// The rotary machine on the simulator with the test bar `axis` puts,
+    /// a Ø20 bar typed, a 2 mm tip: Idle, with A not set when `set_a` is
+    /// false.
+    fn rotary_bench(dir: &Path, axis: SimAxis, set_a: bool) -> Connection {
+        let profile = dir.join("rotary-probed.toml");
+        std::fs::write(&profile, ROTARY_PROBED).unwrap();
+        let mut m = rotary_machine(dir).unwrap();
+        for (k, v) in [
+            ("uc100_profile", profile.display().to_string().as_str()),
+            ("uc100_connection", "Simulated"),
+            ("probe_tip", "2"),
+            ("probe_feed", "1000"),
+            ("probe_distance", "20"),
+        ] {
+            m.p.insert(k.into(), v.into());
+        }
+        let mut c = Connection::open(&m, dir).unwrap();
+        c.sim_axis = axis;
+        c.act(Action::BarText("20".into()));
+        until(&mut c, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        c.send(Command::Reset);
+        until(&mut c, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        for a in 0..if set_a { 4 } else { 3 } {
+            c.act(Action::MachineZero(Some(a)));
+            until(&mut c, 3.0, "the axis set", |s| {
+                s.referenced[a] && s.state == Some(State::Idle)
+            });
+        }
+        c
+    }
+
+    /// Runs `c` until the rotary calibration under way has ended and the
+    /// machine is Idle: how it ended.
+    fn calibrated(c: &mut Connection, what: Calibrate) -> (bool, String) {
+        c.act(Action::Calibrate(what));
+        assert_eq!(
+            c.calibrating(),
+            Some(what),
+            "{:?}",
+            c.calibrate_blocked(what)
+        );
+        let cap = Instant::now() + Duration::from_secs(180);
+        loop {
+            c.refresh();
+            if c.calibrating().is_none()
+                && c.snapshot.state == Some(State::Idle)
+                && let Some(said) = c.rotary_said.clone()
+            {
+                return said;
+            }
+            assert!(
+                Instant::now() < cap,
+                "timed out calibrating: {:?} {:?}",
+                c.snapshot.state,
+                c.snapshot.log
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Rapids `c` to machine X, Y, Z and A, Z first up to 1 mm under the
+    /// top (the simulator can stop a hair past a target at a soft limit).
+    fn rapid_a(c: &mut Connection, at: [f64; 4]) {
+        let now = c.snapshot.machine_pos;
+        let mut up = now;
+        up[2] = -1.;
+        let mut over = up;
+        (over[0], over[1], over[3]) = (at[0], at[1], at[3]);
+        let mut down = over;
+        down[2] = at[2];
+        c.send(job("To the bar", moves_from(now, &[up, over, down])));
+        until(c, 10.0, "the rapid", |s| {
+            s.state == Some(State::Idle) && (0..4).all(|a| (s.machine_pos[a] - at[a]).abs() < 0.03)
+        });
+    }
+
+    /// On the simulator, a Ø20 test bar on an A axis 0.3 mm off the assumed
+    /// centreline in Y and -0.2 mm in Z, running off X by 0.4 and -0.2 µm per
+    /// mm, the bar running out on it: Probe the centreline near the chuck
+    /// finds the axis there, its runout cancelled; Check the line to the
+    /// tailstock finds it running off X over 0.05 mm; Save keeps it as
+    /// measured and warns that a Ø80 part leaves no room to retract (LIO-191);
+    /// an E-stop leaves it stale.
+    #[test]
+    fn the_a_centreline_is_probed_its_line_checked_saved_and_stale_after_an_e_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let axis = SimAxis {
+            runout: [0.03, -0.02],
+            ..SimAxis::default()
+        };
+        let mut c = rotary_bench(dir.path(), axis, true);
+        let unit = c.rotary.as_ref().unwrap().unit;
+        let truth = |x: f64| {
+            let along = x - unit.chuck_x as f64;
+            [
+                140. + axis.offset[0] + axis.tilt[0] * along,
+                -40. + axis.offset[1] + axis.tilt[1] * along,
+            ]
+        };
+        // Over the bar near the chuck, 0.4 mm off its middle, 3 mm over it.
+        let x = unit.chuck_x as f64 + CHUCK_GAP + 5.;
+        rapid_a(&mut c, [x, 140.7, -27., 0.]);
+        let (ok, said) = calibrated(&mut c, Calibrate::Centreline);
+        assert!(ok, "{said}");
+        let found = c.centre.unwrap();
+        let [y, z] = truth(x);
+        assert!(
+            (found.y - y).abs() < 0.01 && (found.z - z).abs() < 0.01,
+            "{found:?} not Y {y:.3} Z {z:.3}: {said}"
+        );
+        // At A 0 the bar's centre is off by its runout, at 180° by minus it.
+        assert!(
+            (found.runout[0] - 0.03).abs() < 0.01 && (found.runout[1] + 0.02).abs() < 0.01,
+            "{found:?}"
+        );
+        assert!((found.across - 20.).abs() < 0.01, "{found:?}");
+        assert!(
+            found.angles[0].abs() < 0.03 && (found.angles[1] - 180.).abs() < 0.1,
+            "{found:?}"
+        );
+        // A back where it was, the tip lifted clear over the bar.
+        let at = c.snapshot.machine_pos;
+        assert!(
+            at[3].abs() < 0.03 && at[2] > z + 10. + TURN_CLEAR - 0.1,
+            "{at:?}"
+        );
+        assert!(said.contains("assumed Y 140.000 Z -40.000"), "{said}");
+        // Near the tailstock, 165 mm on: 0.066 mm off in Y, -0.033 in Z.
+        let far = x + 165.;
+        rapid_a(&mut c, [far, 140.3, -27., 0.]);
+        let (ok, said) = calibrated(&mut c, Calibrate::Alignment);
+        let [fy, fz] = truth(far);
+        let off = (fy - y).hypot(fz - z);
+        assert!(!ok && said.contains("over 0.05 mm"), "{said}");
+        let runs: f64 = said
+            .split("runs ")
+            .nth(1)
+            .and_then(|s| s.split(' ').next())
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((runs - off).abs() < 0.01, "{said} not {off:.3}");
+        // Not saved before the probe touches the Z reference (LIO-207): a
+        // gauge block on the table, its top at machine Z -50.
+        c.act(Action::SaveCentreline);
+        assert_eq!(c.rotary_said, Some((false, NO_CENTRE_REFERENCE.into())));
+        assert!(c.rotary_keep.is_none());
+        c.sim_gauge = Some(Block {
+            min: [20., 20., -55.],
+            max: [60., 60., -50.],
+        });
+        rapid_a(&mut c, [40., 40., -45., 0.]);
+        c.act(Action::TouchCentreReference);
+        let (ok, said) = probe_ended(&mut c);
+        assert!(ok, "{said}");
+        let reference = c.centre.unwrap().reference.unwrap();
+        assert!((reference[2] + 50.).abs() < 0.03, "{reference:?}");
+        // Save: measured, kept for the app, and Ø80 on it reaches the top.
+        c.act(Action::SaveCentreline);
+        let (ok, said) = c.rotary_said.clone().unwrap();
+        assert!(!ok && said.contains("less than the 5 mm"), "{said}");
+        assert_eq!(
+            c.rotary_keep.take(),
+            Some(RotaryKeep::Centreline([found.y, found.z], reference))
+        );
+        assert!(c.rotary.as_ref().unwrap().measured() && c.centre_saved);
+        // Every E-stop leaves it stale: the machine position is gone.
+        c.send(Command::EStop);
+        until(&mut c, 3.0, "E-stop", |s| s.state == Some(State::EStop));
+        c.refresh();
+        assert_eq!(c.rotary_keep.take(), Some(RotaryKeep::Stale("an E-stop")));
+        assert_eq!(c.rotary.as_ref().unwrap().mark, "stale after an E-stop");
+        assert!(c.centre.is_none());
+    }
+
+    /// A zero on the simulator: a flat on the stock 2° off level at A −45°
+    /// is levelled by turning A, and A is zeroed where it is level, at
+    /// machine A −47°. The simulated A turns the convention's way, so its
+    /// direction check passes.
+    #[test]
+    fn a_zero_levels_a_flat_and_zeroes_a_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = rotary_bench(dir.path(), SimAxis::default(), true);
+        // Without the centreline A zero does not know how high to lift.
+        assert!(
+            c.calibrate_blocked(Calibrate::AZero)
+                .unwrap()
+                .contains("centreline first")
+        );
+        let rot = c.rotary.as_mut().unwrap();
+        (rot.unit.centre_y, rot.unit.centre_z) = (140.3, -40.2);
+        rot.mark = MEASURED.into();
+        let x = rot.unit.chuck_x as f64 + 30.;
+        c.act(Action::SpacingText("6".into()));
+        rapid_a(&mut c, [x, 140., -28., -45.]);
+        let (ok, said) = calibrated(&mut c, Calibrate::AZero);
+        assert!(ok, "{said}");
+        let s = &c.snapshot;
+        assert!(
+            (s.machine_pos[3] + 47.).abs() < 0.05,
+            "{:?}: {said}",
+            s.machine_pos
+        );
+        until(&mut c, 3.0, "A zeroed", |s| s.work_pos[3].abs() < 1e-6);
+        assert!(said.contains("A zero set at machine A -4"), "{said}");
+    }
+
+    /// Nothing turns A before it is set: every calibration is refused, and
+    /// so is a turn the machine has lost A's position for.
+    #[test]
+    fn a_calibration_never_turns_a_before_it_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = rotary_bench(dir.path(), SimAxis::default(), false);
+        for what in [
+            Calibrate::Centreline,
+            Calibrate::Alignment,
+            Calibrate::AZero,
+        ] {
+            let why = c.calibrate_blocked(what).unwrap();
+            assert!(why.contains("A has no machine position"), "{why}");
+            c.act(Action::Calibrate(what));
+            assert_eq!(c.calibrating(), None);
+        }
+        // No bar typed: none starts either.
+        c.act(Action::MachineZero(Some(3)));
+        until(&mut c, 3.0, "A set", |s| s.referenced[3]);
+        c.act(Action::BarText(String::new()));
+        assert!(
+            c.calibrate_blocked(Calibrate::Centreline)
+                .unwrap()
+                .contains("diameter")
+        );
+    }
+
+    /// Walked over a model of the bar: every move that turns A is a rapid
+    /// of A alone, with the tip lifted `TURN_CLEAR` over the bar's top, and
+    /// every touch and guarded move keeps A where it is.
+    #[test]
+    fn the_centreline_turns_a_only_with_the_tip_up_clear() {
+        let bar = Bar {
+            x: [20., 270.],
+            axis: [140.3, -41.2],
+            tilt: [0.; 2],
+            runout: [0.2, 0.1],
+            runout_tilt: [0.; 2],
+            radius: 11.,
+            flat: None,
+        };
+        let probe = Probe {
+            plate: None,
+            tip: Some(2.),
+            length: None,
+            feed: 100.,
+            distance: 20.,
+            retract: 0.,
+        };
+        let mut t = Turning {
+            what: Calibrate::Centreline,
+            start: [40., 141., -27., 0., 0., 0.],
+            radius: 10.,
+            tip: probe.tip.unwrap() / 2.,
+            feed: probe.feed,
+            distance: probe.distance,
+            clear: None,
+            top: 0.,
+            angles: vec![0., 180.],
+            a_range: None,
+            a_step: 0.0225,
+            sign: 1.,
+            touches: vec![],
+            found: vec![],
+            spacing: 10.,
+            backed: false,
+            legs: VecDeque::new(),
+            sent: None,
+        };
+        let mut at = t.start;
+        let mut turns = 0;
+        let mut highest = f64::NEG_INFINITY;
+        while let Some(legs) = t.plan() {
+            for leg in legs {
+                let to = match leg {
+                    Leg::Rapid(to) | Leg::Guard(to) | Leg::Touch(to) => to,
+                };
+                // A move from a touch starts on the bar: a hair inside it
+                // does not count.
+                let grow = if matches!(leg, Leg::Touch(_)) {
+                    0.
+                } else {
+                    -1e-6
+                };
+                let hit = bar.entry(at[3], [at[0], at[1], at[2]], [to[0], to[1], to[2]], grow);
+                if (to[3] - at[3]).abs() > 1e-9 {
+                    turns += 1;
+                    assert!(
+                        matches!(leg, Leg::Rapid(_)) && (0..3).all(|a| to[a] == at[a]),
+                        "{leg:?} from {at:?}"
+                    );
+                    assert!(
+                        at[2] >= highest + TURN_CLEAR - 1e-9,
+                        "A turns at Z {} over a top at {highest}",
+                        at[2]
+                    );
+                }
+                match leg {
+                    Leg::Touch(_) => {
+                        let f = hit.unwrap_or_else(|| panic!("no contact up to {to:?}"));
+                        at = std::array::from_fn(|a| at[a] + (to[a] - at[a]) * f);
+                        highest = highest.max(at[2]);
+                        t.touches.push(at);
+                        t.settle().unwrap();
+                    }
+                    _ => {
+                        assert!(hit.is_none(), "{leg:?} from {at:?} hits the bar");
+                        at = to;
+                    }
+                }
+            }
+        }
+        for to in t.last() {
+            if to[3] != at[3] {
+                assert!(
+                    (0..3).all(|a| to[a] == at[a]) && at[2] >= highest + TURN_CLEAR - 1e-9,
+                    "{to:?} from {at:?}"
+                );
+            }
+            at = to;
+        }
+        assert_eq!((turns, at[3]), (1, 0.));
+        let c = t.centre().unwrap();
+        // The tip is the bar: the model's bar stands for the bar plus the
+        // tip's radius, a tip's radius lower.
+        assert!(
+            (c.y - 140.3).abs() < 1e-6 && (c.z + 40.2).abs() < 1e-6,
+            "{c:?}"
+        );
+        assert!(
+            (c.runout[0] - 0.2).abs() < 1e-6 && (c.runout[1] - 0.1).abs() < 1e-6,
+            "{c:?}"
+        );
+    }
+
+    /// A zero walked over a model of a bar with a flat `flat_at` degrees
+    /// from +Z toward −Y at A 0 (as `SimAxis::flat`), its A wired `wired`:
+    /// 1 the convention's way, −1 backwards. The A it levels the flat at,
+    /// or why it stops.
+    /// A zero walked over the simulator's bar with a flat `flat_at` degrees
+    /// from level, A turning it by `wired` × A, on a machine whose
+    /// Direction is `sign`.
+    fn a_zero_walk(flat_at: f64, wired: f64, sign: f64) -> Result<f64, String> {
+        let t = flat_at.to_radians();
+        let bar = Bar {
+            x: [20., 270.],
+            axis: [140., -40.],
+            tilt: [0.; 2],
+            runout: [0.; 2],
+            runout_tilt: [0.; 2],
+            radius: 12.,
+            flat: Some(([-t.sin(), t.cos()], 10.)),
+        };
+        let mut t = Turning {
+            what: Calibrate::AZero,
+            start: [40., 140., -27., 0., 0., 0.],
+            radius: 12.,
+            tip: 0.,
+            feed: 100.,
+            distance: 20.,
+            clear: Some(-20.),
+            top: 0.,
+            angles: vec![0.],
+            a_range: Some((-180., 180.)),
+            a_step: 0.0225,
+            sign,
+            touches: vec![],
+            found: vec![],
+            spacing: 6.,
+            backed: false,
+            legs: VecDeque::new(),
+            sent: None,
+        };
+        let mut at = t.start;
+        while let Some(legs) = t.plan() {
+            for leg in legs {
+                let to = match leg {
+                    Leg::Rapid(to) | Leg::Guard(to) | Leg::Touch(to) => to,
+                };
+                if matches!(leg, Leg::Touch(_)) {
+                    let xyz = |p: Vec6| [p[0], p[1], p[2]];
+                    let f = bar
+                        .entry(wired * at[3], xyz(at), xyz(to), 0.)
+                        .ok_or("no contact")?;
+                    at = std::array::from_fn(|a| at[a] + (to[a] - at[a]) * f);
+                    t.touches.push(at);
+                    t.settle()?;
+                } else {
+                    at = to;
+                }
+            }
+        }
+        Ok(t.angle())
+    }
+
+    /// +A is the right-hand rule about +X on a machine whose Direction is
+    /// Positive (LIO-210): the simulator's bar turns that way, A zero levels
+    /// a flat by it, and an A wired backwards is refused, even on a flat
+    /// level already, never adapted to. A machine whose Direction is
+    /// Negative takes +A the other way (LIO-212): A zero levels the flat on
+    /// an A that turns so, and refuses one that turns by the right-hand
+    /// rule.
+    #[test]
+    fn a_zero_refuses_an_a_that_turns_backwards() {
+        // The simulator's bar, its centre 1 mm up at A 0, has it 1 mm
+        // toward −Y at A 90: the top of the part moves toward the front.
+        let bar = Bar {
+            x: [20., 270.],
+            axis: [140., -40.],
+            tilt: [0.; 2],
+            runout: [0., 1.],
+            runout_tilt: [0.; 2],
+            radius: 1.,
+            flat: None,
+        };
+        let down = |y: f64| bar.entry(90., [100., y, 0.], [100., y, -80.], 0.);
+        assert!(down(139.).is_some() && down(141.).is_none());
+        for (flat, level) in [(2., -2.), (0.4, -0.4), (0., 0.), (-3., 3.)] {
+            let a = a_zero_walk(flat, 1., 1.).unwrap();
+            assert!((a - level).abs() < 0.03, "{flat}°: A {a}");
+            let a = a_zero_walk(flat, -1., -1.).unwrap();
+            assert!((a + level).abs() < 0.03, "Negative, {flat}°: A {a}");
+        }
+        for flat in [2., 0.4, 0., -3.] {
+            let why = a_zero_walk(flat, -1., 1.).unwrap_err();
+            assert!(
+                why.starts_with("A turns backwards")
+                    && why.contains("+A turns the top of the part toward +Y")
+                    && why.contains("The machine's Direction is Positive")
+                    && why.contains("Reverse the direction"),
+                "{flat}°: {why}"
+            );
+            let why = a_zero_walk(flat, 1., -1.).unwrap_err();
+            assert!(
+                why.starts_with("A turns backwards")
+                    && why.contains("+A turns the top of the part toward −Y")
+                    && why.contains("The machine's Direction is Negative")
+                    && why.contains("Direction to match it"),
+                "Negative, {flat}°: {why}"
+            );
+        }
+        // The machine's Direction is what A zero takes.
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = rotary_machine(dir.path()).unwrap();
+        assert_eq!(Rotary::of(&m).unwrap().sign, 1.);
+        m.p.insert("direction".into(), "Negative".into());
+        assert_eq!(Rotary::of(&m).unwrap().sign, -1.);
+    }
+
+    #[test]
+    fn the_retract_room_over_the_largest_part_is_checked() {
+        // The rotary unit's assumed centreline: a Ø80 part reaches Z 0.
+        let (room, warn) = retract_room(0., -40., 80.);
+        assert_eq!(room, 0.);
+        let warn = warn.unwrap();
+        assert!(
+            warn.contains("reaches Z 0.000") && warn.contains("Keep parts under Ø70 mm"),
+            "{warn}"
+        );
+        assert_eq!(retract_room(0., -50., 80.), (10., None));
+    }
+}
+#[cfg(test)]
+mod rotary_machine_tests {
+    use super::*;
+
+    #[test]
+    fn the_rotary_machine_is_a_4_axis_on_a_profile_with_the_a_axis_and_the_owners_stays_3_axis() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = owners_machine(dir.path()).unwrap();
+        assert_eq!((owner.axes(), get(&owner.p, "mode")), (3, "3-axis"));
+        assert!(owner.rotary_unit().is_none());
+        let a = rotary_machine(dir.path()).unwrap();
+        assert_eq!(a.name(), "Jingyan CNC4030 + rotary");
+        assert!(a.has_a() && a.issues().is_empty(), "{:?}", a.issues());
+        assert_eq!(get(&a.p, "arrangement"), "A table around X");
+        // Its own profile file, the owner's left alone.
+        assert_ne!(get(&a.p, "uc100_profile"), get(&owner.p, "uc100_profile"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("jy5800.toml")).unwrap(),
+            include_str!("../assets/jy5800.toml")
+        );
+        let cfg = profile(&a).unwrap();
+        let soft = |i| {
+            let x = cfg.axes.get(i).unwrap();
+            (x.soft_min.unwrap(), x.soft_max.unwrap())
+        };
+        assert_eq!(soft(3), (-180., 180.));
+        for (i, k) in ["x", "y", "z"].into_iter().enumerate() {
+            let (lo, hi) = soft(i);
+            assert_eq!(hi - lo, num_f(&a, k), "{k}");
+        }
+        assert!(profile(&owner).unwrap().axes.get(3).is_none());
+        // The pivot is the A centreline.
+        assert_eq!(get(&a.p, "pivot_y"), get(&a.p, "a_centre_y"));
+    }
+
+    fn num_f(m: &Machine, k: &str) -> f64 {
+        get(&m.p, k).parse().unwrap()
     }
 }

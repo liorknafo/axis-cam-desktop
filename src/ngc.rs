@@ -1,6 +1,7 @@
 //! Strict reader for the LinuxCNC subset that `post` writes. It replays modal
 //! state so each exported program can be compared with the simulated moves.
-//! Any word the postprocessor never emits is an error, not ignored.
+//! Any word the postprocessor never emits is an error, not ignored: A only
+//! alone on a G0 line, as an index (`post::Block::Index`) writes it.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Spindle {
@@ -82,6 +83,9 @@ pub struct Step {
     pub machine: bool,
     pub from: [Option<f64>; 3],
     pub to: [Option<f64>; 3],
+    /// A (degrees) before and after the step: None until a line sets it.
+    pub a_from: Option<f64>,
+    pub a: Option<f64>,
     pub seconds: f64,
     pub state: State,
 }
@@ -140,7 +144,7 @@ fn words(code: &str) -> Result<Vec<(char, f64)>, String> {
     let mut i = 0;
     while i < chars.len() {
         let letter = chars[i];
-        if !"GMTSFHPXYZ".contains(letter) {
+        if !"GMTSFHPXYZA".contains(letter) {
             return Err(format!("unsupported word {letter}"));
         }
         let mut end = i + 1;
@@ -162,6 +166,7 @@ pub fn replay(text: &str) -> Result<Replay, String> {
     let mut out = Replay::default();
     let mut state = State::default();
     let mut position: [Option<f64>; 3] = [None; 3];
+    let mut a_at: Option<f64> = None;
     let mut motion: Option<StepKind> = None;
     for (index, raw) in text.lines().enumerate() {
         let line = index + 1;
@@ -176,6 +181,7 @@ pub fn replay(text: &str) -> Result<Replay, String> {
         let mut g: Vec<i64> = vec![];
         let mut m: Vec<i64> = vec![];
         let mut axes: [Option<f64>; 3] = [None; 3];
+        let mut a_word: Option<f64> = None;
         let (mut f, mut s, mut t, mut h, mut p) = (None, None, None, None, None);
         for (letter, value) in words(&code).map_err(|e| fail(&e))? {
             let slot = match letter {
@@ -197,6 +203,7 @@ pub fn replay(text: &str) -> Result<Replay, String> {
                 'X' => &mut axes[0],
                 'Y' => &mut axes[1],
                 'Z' => &mut axes[2],
+                'A' => &mut a_word,
                 'F' => &mut f,
                 'S' => &mut s,
                 'T' => &mut t,
@@ -281,7 +288,7 @@ pub fn replay(text: &str) -> Result<Replay, String> {
         state.mist |= m.contains(&7);
         state.flood |= m.contains(&8);
         if has(40) {
-            if axes.iter().any(Option::is_some) {
+            if axes.iter().any(Option::is_some) || a_word.is_some() {
                 return Err(fail("G4 with axis words"));
             }
             let seconds = p.filter(|v| *v >= 0.).ok_or_else(|| fail("G4 needs P"))?;
@@ -291,6 +298,8 @@ pub fn replay(text: &str) -> Result<Replay, String> {
                 machine: false,
                 from: position,
                 to: position,
+                a_from: a_at,
+                a: a_at,
                 seconds,
                 state: state.clone(),
             });
@@ -336,6 +345,40 @@ pub fn replay(text: &str) -> Result<Replay, String> {
         if machine && (motions == 0 || axes.iter().all(Option::is_none)) {
             return Err(fail("G53 needs G0 or G1 and an axis word"));
         }
+        if let Some(a) = a_word {
+            // An index: A alone, at rapid, in the work offset; never with
+            // X, Y or Z, at a feed or in machine coordinates.
+            if axes.iter().any(Option::is_some) {
+                return Err(fail("A with X, Y or Z on one line"));
+            }
+            if machine || motion != Some(StepKind::Rapid) {
+                return Err(fail("A only on a G0 line in work coordinates"));
+            }
+            if !(state.metric
+                && state.absolute
+                && state.xy_plane
+                && state.per_minute
+                && state.comp_off
+                && state.cycle_off)
+            {
+                return Err(fail("motion before G17 G21 G40 G80 G90 G94"));
+            }
+            if state.offset.is_none() {
+                return Err(fail("motion before a work offset"));
+            }
+            out.steps.push(Step {
+                line,
+                kind: StepKind::Rapid,
+                machine: false,
+                from: position,
+                to: position,
+                a_from: a_at,
+                a: Some(a),
+                seconds: 0.,
+                state: state.clone(),
+            });
+            a_at = Some(a);
+        }
         if axes.iter().any(Option::is_some) {
             let kind = motion.ok_or_else(|| fail("axis words without G0 or G1"))?;
             if !(state.metric
@@ -375,6 +418,8 @@ pub fn replay(text: &str) -> Result<Replay, String> {
                 machine,
                 from,
                 to,
+                a_from: a_at,
+                a: a_at,
                 seconds: 0.,
                 state: state.clone(),
             });
@@ -398,6 +443,28 @@ fn take<'a>(steps: &'a [Step], i: &mut usize, what: &str) -> Result<&'a Step, St
 fn near(a: Option<f64>, b: f64) -> bool {
     a.is_some_and(|a| (a - b).abs() <= TOL)
 }
+/// Whether the replayed A `found` is the simulated `want`: the same angle,
+/// or none set when the simulation has none (a 3-axis program never
+/// commands A).
+fn same_a(found: Option<f64>, want: Option<f32>) -> bool {
+    match want {
+        Some(w) => near(found, f64::from(w)),
+        None => found.is_none(),
+    }
+}
+/// `same_a` for step `s`, or the error that says where A is wrong.
+fn a_ok(s: &Step, want: Option<f32>) -> Result<(), String> {
+    if same_a(s.a, want) {
+        return Ok(());
+    }
+    let said = |a: Option<f64>| a.map_or("no A".to_string(), |a| format!("A{a:.3}"));
+    Err(format!(
+        "line {}: {} does not match the simulated {}",
+        s.line,
+        said(s.a),
+        said(want.map(f64::from))
+    ))
+}
 /// State that must be active whenever an operation moves.
 /// The spindle runs in the operation's direction at its rounded speed.
 fn spinning(st: &State, op: &OpState) -> bool {
@@ -415,6 +482,39 @@ fn tool_ok(st: &State, op: &OpState, settings: &PostSettings) -> bool {
     } else {
         st.tool.is_none() && st.length == Length::Off
     }
+}
+/// `active`, but for a move after a plan's stop (`simulation::Stop`): the
+/// spindle and coolant are off.
+fn active_stopped(
+    s: &Step,
+    op: &OpState,
+    settings: &PostSettings,
+    offset: &str,
+) -> Result<(), String> {
+    let st = &s.state;
+    if st.spindle != Spindle::Off || st.mist || st.flood {
+        return Err(format!(
+            "line {}: the spindle or coolant runs after the stop for {}",
+            s.line, op.name
+        ));
+    }
+    let mut running = st.clone();
+    running.spindle = if op.clockwise {
+        Spindle::Cw
+    } else {
+        Spindle::Ccw
+    };
+    running.rpm = f64::from(op.rpm.round());
+    (running.mist, running.flood) = op.coolant;
+    active(
+        &Step {
+            state: running,
+            ..s.clone()
+        },
+        op,
+        settings,
+        offset,
+    )
 }
 fn active(s: &Step, op: &OpState, settings: &PostSettings, offset: &str) -> Result<(), String> {
     let st = &s.state;
@@ -468,11 +568,27 @@ pub fn verify(
     let steps = &r.steps;
     let mut i = 0;
     let mut at: [Option<f64>; 3] = [None; 3];
+    // The A the program has turned to, and the A the simulation is at.
+    let mut at_a: Option<f64> = None;
+    let mut want_a: Option<f32> = None;
     // The operation of the most recent Start: its tool is the one loaded.
     let mut current: Option<usize> = None;
+    // A Stop has stopped the spindle and coolant, until the next Run.
+    let mut stopped = false;
     for block in blocks {
         match block {
-            Block::Stop | Block::Run { .. } | Block::End => {}
+            Block::Stop => stopped = true,
+            Block::Run { .. } => stopped = false,
+            Block::End => {}
+            Block::Pause { message, .. } => {
+                if !r
+                    .messages
+                    .iter()
+                    .any(|m| *m == crate::post::comment(message))
+                {
+                    return Err(format!("the pause \"{message}\" says nothing"));
+                }
+            }
             Block::Start { op, .. } => current = Some(*op),
             Block::Retract => {
                 let s = take(steps, &mut i, "a safe retract")?;
@@ -509,6 +625,7 @@ pub fn verify(
                         s.line
                     ));
                 }
+                a_ok(s, want_a)?;
                 if s.machine {
                     at[2] = None;
                 } else {
@@ -560,7 +677,9 @@ pub fn verify(
                     ));
                 }
                 active(s, &ops[*op], settings, offset)?;
+                a_ok(s, want_a)?;
                 at = s.to;
+                at_a = s.a;
             }
             Block::Descend { op, xy, z } => {
                 let s = take(steps, &mut i, "the descent")?;
@@ -576,7 +695,28 @@ pub fn verify(
                     ));
                 }
                 active(s, &ops[*op], settings, offset)?;
+                a_ok(s, want_a)?;
                 at = s.to;
+                at_a = s.a;
+            }
+            Block::Index { a, .. } => {
+                // A alone turns, from another A, X Y Z still.
+                let s = take(steps, &mut i, "the turn of A")?;
+                if s.machine
+                    || s.kind != StepKind::Rapid
+                    || s.to != s.from
+                    || s.a == s.a_from
+                    || at_a == s.a
+                {
+                    return Err(format!(
+                        "line {}: expected G0 A{} alone",
+                        s.line,
+                        crate::post::coord(*a)
+                    ));
+                }
+                want_a = Some(*a);
+                a_ok(s, want_a)?;
+                at_a = s.a;
             }
             Block::Move {
                 op,
@@ -591,8 +731,14 @@ pub fn verify(
                 active(s, &ops[*op], settings, offset)?;
             }
             Block::Move {
-                op, kind, to, feed, ..
+                op,
+                kind,
+                to,
+                feed,
+                a,
+                ..
             } => {
+                want_a = *a;
                 let w = work(*to);
                 let expected = if *kind == Kind::Rapid {
                     StepKind::Rapid
@@ -611,9 +757,15 @@ pub fn verify(
                             s.line, s.state.feed
                         ));
                     }
-                    active(s, &ops[*op], settings, offset)?;
+                    if stopped && expected == StepKind::Rapid {
+                        active_stopped(s, &ops[*op], settings, offset)?;
+                    } else {
+                        active(s, &ops[*op], settings, offset)?;
+                    }
+                    a_ok(s, want_a)?;
                     at = s.to;
-                } else if !(0..3).all(|k| near(at[k], w[k])) {
+                    at_a = s.a;
+                } else if !(0..3).all(|k| near(at[k], w[k])) || !same_a(at_a, want_a) {
                     // Only a move shorter than the output resolution may be absent.
                     let line = steps.get(i).map_or(0, |s| s.line);
                     return Err(format!(

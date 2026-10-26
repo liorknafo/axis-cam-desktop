@@ -362,7 +362,11 @@ impl PartGrid {
     /// is never deep: a thread's teeth are finer than the cells, and
     /// threading it (a tap drill past its crests, a thread mill to its
     /// roots) removes cells there that are the part's.
-    pub fn new(stock: &Volume, geometry: &Geometry, threads: &[crate::thread::Thread]) -> Self {
+    pub(crate) fn new(
+        stock: &Volume,
+        geometry: &Geometry,
+        threads: &[crate::thread::Thread],
+    ) -> Self {
         let index = Index::new(geometry);
         let mut inside = vec![false; stock.occupied.len()];
         for y in 0..stock.n[1] {
@@ -559,11 +563,111 @@ fn tool_axis(plan: &Plan, index: &Index, top: f32) -> (f32, [f32; 3], f32) {
     }
     (worst, at, lowest)
 }
+/// `axis_problems` of `sim`, setup `si`'s: an indexed setup's at each of
+/// its A angles, against the part posed there (`indexed`), each said with
+/// its angle; another's against the part as `geometry` places it.
+pub(crate) fn angle_problems(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    sim: &Simulation,
+    geometry: &Geometry,
+    index: &Index,
+) -> Vec<String> {
+    if sim.turns.is_empty() {
+        let board = crate::stock::below(&doc.setups[si]);
+        return axis_problems_over(&sim.plan, geometry, index, si, board);
+    }
+    let mut out = vec![];
+    for &(a, _) in &sim.turns {
+        let posed = match doc.setup_at(&doc.setups[si], si, a, mesh) {
+            Ok(posed) => posed,
+            Err(e) => {
+                out.push(e);
+                continue;
+            }
+        };
+        let geometry = Geometry::new(&posed, mesh);
+        let mut plan = sim.plan.clone();
+        plan.moves
+            .retain(|m| m.motion != Motion::Index && m.a.is_some_and(|b| (a - b).abs() < 1e-4));
+        let at = crate::indexed::degrees(a);
+        out.extend(
+            axis_problems(&plan, &geometry, &Index::new(&geometry), si)
+                .into_iter()
+                .map(|p| format!("At A {at}°: {p}")),
+        );
+    }
+    out
+}
+/// The cone of the Chamfer milling `op` of setup `si` (from 0) against the
+/// part, past the chamfers it is meant to cut (`chamfer::gouge_problem`): an
+/// indexed setup's at each of its A angles, as `angle_problems`.
+fn chamfer_problems(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    op: &crate::model::Operation,
+    sim: &Simulation,
+    geometry: &Geometry,
+    index: &Index,
+) -> Vec<String> {
+    let Some(tool) = doc.tools.iter().find(|t| t.id == op.tool) else {
+        return vec![];
+    };
+    let check = |setup: &crate::model::Setup, plan: &Plan, geometry: &Geometry, index: &Index| {
+        match crate::chamfer::allowances(setup, op, tool, mesh) {
+            Ok(allowed) => crate::chamfer::gouge_problem(plan, geometry, index, &allowed),
+            Err(e) => Some(e),
+        }
+    };
+    if sim.turns.is_empty() {
+        return check(&doc.setups[si], &sim.plan, geometry, index)
+            .into_iter()
+            .collect();
+    }
+    let mut out = vec![];
+    for &(a, _) in &sim.turns {
+        let posed = match doc.setup_at(&doc.setups[si], si, a, mesh) {
+            Ok(posed) => posed,
+            Err(e) => {
+                out.push(e);
+                continue;
+            }
+        };
+        let geometry = Geometry::new(&posed, mesh);
+        let mut plan = sim.plan.clone();
+        plan.moves
+            .retain(|m| m.motion != Motion::Index && m.a.is_some_and(|b| (a - b).abs() < 1e-4));
+        let at = crate::indexed::degrees(a);
+        out.extend(
+            check(&posed, &plan, &geometry, &Index::new(&geometry))
+                .map(|p| format!("At A {at}°: {p}")),
+        );
+    }
+    out
+}
 /// The tool axis problems of one generated operation in setup `si` (from 0):
 /// more than 0.1 mm of part above the tool tip, whatever the strategy, and
 /// moves below the floor. The floor is the stock's bottom in setup 1; later
 /// setups rest on the part, whose underside may be all that is left there.
-fn axis_problems(plan: &Plan, geometry: &Geometry, index: &Index, si: usize) -> Vec<String> {
+pub(crate) fn axis_problems(
+    plan: &Plan,
+    geometry: &Geometry,
+    index: &Index,
+    si: usize,
+) -> Vec<String> {
+    axis_problems_over(plan, geometry, index, si, 0.)
+}
+/// `axis_problems` of setup 1 on a sheet, whose floor is `board` mm under
+/// the stock's bottom: the spoilboard's allowance (`stock::below`).
+pub(crate) fn axis_problems_over(
+    plan: &Plan,
+    geometry: &Geometry,
+    index: &Index,
+    si: usize,
+    board: f32,
+) -> Vec<String> {
     let b = geometry.bounds;
     let (worst, at, lowest) = tool_axis(plan, index, b.max[2]);
     let mut problems = vec![];
@@ -577,13 +681,19 @@ fn axis_problems(plan: &Plan, geometry: &Geometry, index: &Index, si: usize) -> 
         ));
     }
     let floor = if si == 0 {
-        plan.stock.min[2]
+        plan.stock.min[2] - board
     } else {
         plan.stock.min[2].max(b.min[2])
     };
     let below = floor - lowest;
     if below > 0.001 {
-        problems.push(if si == 0 {
+        problems.push(if si == 0 && board > 0. {
+            format!(
+                "The tool goes {} mm into the spoilboard under the sheet, past its {} mm allowance. Reduce the depth or the breakthrough.",
+                mm(below + board),
+                mm(board)
+            )
+        } else if si == 0 {
             format!(
                 "The tool goes {} mm below the bottom of the stock, where the vise or table is. Reduce the depth or the breakthrough.",
                 mm(below)
@@ -745,8 +855,9 @@ pub fn coverage(
 /// One problem per operation (of a setup that is not a lathe's) whose speed
 /// or feed lies outside the project material's cutting data, per value, or
 /// that cannot be checked (no material, no cutting data, a tool or operation
-/// without the numbers), naming its setup and operation. Each message is one
-/// line of at most 300 characters: it names the material.
+/// without the numbers), naming its setup and operation, and per finishing
+/// operation not milled the way the material asks (`finishing::issue`). Each
+/// message is one line of at most 300 characters: it names the material.
 fn cutting_data_problems(built: &Document) -> Vec<Problem> {
     let mut problems = vec![];
     for (si, setup) in built.setups.iter().enumerate() {
@@ -769,7 +880,11 @@ fn cutting_data_problems(built: &Document) -> Vec<Problem> {
                 Some(SpeedFeed::Unchecked(why)) => vec![unchecked(&why)],
                 None => vec![unchecked("Choose a material with cutting data.")],
             };
-            problems.extend(messages.into_iter().map(|message| Problem {
+            let messages = messages.into_iter().chain(
+                (built.selected_material())
+                    .and_then(|material| crate::finishing::issue(material, op)),
+            );
+            problems.extend(messages.map(|message| Problem {
                 setup: si + 1,
                 operation: Some(oi + 1),
                 stage: "cutting data",
@@ -1018,9 +1133,12 @@ fn run(
                     // were checked against the part when it was generated
                     // (`turn::generate`), and the stock check below sees
                     // them in the volume.
+                    // An indexed setup's at each of its A angles.
                     let lathe = sim.plan.is_lathe();
                     for message in (!lathe)
-                        .then(|| axis_problems(&sim.plan, &geometries[si], &indexes[si], si))
+                        .then(|| {
+                            angle_problems(built, mesh, si, sim, &geometries[si], &indexes[si])
+                        })
                         .into_iter()
                         .flatten()
                     {
@@ -1030,6 +1148,24 @@ fn run(
                             stage: "gouge",
                             message,
                         });
+                    }
+                    if op.strategy == crate::model::Strategy::Chamfer {
+                        for message in chamfer_problems(
+                            built,
+                            mesh,
+                            si,
+                            op,
+                            sim,
+                            &geometries[si],
+                            &indexes[si],
+                        ) {
+                            axis.push(Problem {
+                                setup: si + 1,
+                                operation: Some(oi + 1),
+                                stage: "gouge",
+                                message,
+                            });
+                        }
                     }
                 }
                 Err(message) => problems.push(Problem {
@@ -1044,7 +1180,11 @@ fn run(
         |si, oi, stock| {
             let part = part.get_or_insert_with(|| PartGrid::new(stock, &geometries[0], &threads));
             let (count, bounds) = part.gouged(stock);
-            if count > gouged {
+            // A Chamfer milling's cone is checked against the part itself
+            // (`chamfer_problems`), the chamfers it is meant to cut let be.
+            let chamfer =
+                built.setups[si].operations[oi].strategy == crate::model::Strategy::Chamfer;
+            if count > gouged && !chamfer {
                 let size = geometries[0].bounds;
                 removed.push(count - gouged);
                 candidates.push(Problem {
@@ -1139,6 +1279,23 @@ fn run(
                     stage: "export",
                     message: message.clone(),
                 });
+            }
+        }
+        // An indexed setup's moves on the machine: its travel, Z reach and A;
+        // and a cut parting the bar in the chuck. Each said once, with its
+        // operation: the export's refusal above says them too.
+        for (si, sims) in results.iter().enumerate() {
+            for (oi, message) in crate::rotary_check::problems(job_doc, mesh, si, sims) {
+                let operation = oi.map(|oi| oi + 1);
+                match (export.iter_mut()).find(|p| p.setup == si + 1 && p.message == message) {
+                    Some(said) => said.operation = said.operation.or(operation),
+                    None => export.push(Problem {
+                        setup: si + 1,
+                        operation,
+                        stage: "export",
+                        message,
+                    }),
+                }
             }
         }
         if export.is_empty() && held.is_empty() {
@@ -1789,6 +1946,19 @@ mod tests {
         let (json, summary, passed) =
             crate::check_plan(&[project.clone(), good_file.clone()]).unwrap();
         assert!(passed && summary.starts_with("The plan passes every check: 6 operations"));
+        // With a third path the passing job is saved as a project.
+        let saved = dir.path().join("saved.axis.json");
+        let with_job = [
+            project.clone(),
+            good_file.clone(),
+            saved.display().to_string(),
+        ];
+        assert!(crate::check_plan(&with_job).unwrap().2);
+        let job = crate::storage::load(&saved).unwrap();
+        assert_eq!(
+            job.setups.iter().map(|s| s.operations.len()).sum::<usize>(),
+            6
+        );
         let printed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(printed["passed"], true);
         assert_eq!(crate::exit_code(&Ok(passed)), 0);
@@ -1808,7 +1978,12 @@ mod tests {
             .into_owned();
         for args in [
             vec![project.clone()],
-            vec![project.clone(), good_file.clone(), "extra".into()],
+            vec![
+                project.clone(),
+                good_file.clone(),
+                "job.json".into(),
+                "extra".into(),
+            ],
             vec![project.clone(), not_json],
             vec![missing.clone(), good_file.clone()],
         ] {
@@ -1885,6 +2060,69 @@ mod tests {
         ] {
             op.p.insert(k.into(), v.into());
         }
+    }
+    #[test]
+    fn a_climbing_finish_in_bronze_is_a_cutting_data_problem_naming_the_operation() {
+        let (mut job, mesh, report) = good_job();
+        let bronze = job
+            .materials
+            .iter()
+            .find(|m| m.name() == "Bronze CuSn12")
+            .unwrap()
+            .id
+            .clone();
+        assert!(job.select_material(&bronze));
+        let finishing = |job: &Document| -> Vec<String> {
+            cutting_data_problems(job)
+                .into_iter()
+                .filter(|p| p.message.contains("finishing passes"))
+                .map(|p| format!("{}/{:?}: {}", p.setup, p.operation, p.message))
+                .collect()
+        };
+        // Only one Pocket (setup 1, operation 2) has a finishing pass.
+        for op in job.setups.iter_mut().flat_map(|s| &mut s.operations) {
+            op.p.insert("finish_passes".into(), "0".into());
+        }
+        let pocket = &mut job.setups[0].operations[1];
+        pocket.p.insert("finish_passes".into(), "1".into());
+        pocket.p.insert("pocket_milling".into(), "Climb".into());
+        let found = finishing(&job);
+        assert_eq!(
+            found,
+            [
+                "1/Some(2): Bronze CuSn12's finishing passes are milled conventional, not climb: set the milling direction to Conventional, or the finishing passes to 0."
+            ]
+        );
+        // The check as a whole refuses the plan for it.
+        let check = check_built(&job, &mesh, &report);
+        assert!(!check.passed);
+        assert!(
+            stages(&check)
+                .iter()
+                .any(|m| m.starts_with("cutting data 1/Some(2): Bronze CuSn12's finishing"))
+        );
+        // Conventional, or no finishing passes, is not a problem; nor is
+        // climbing in aluminium.
+        let set = |job: &mut Document, key: &str, value: &str| {
+            job.setups[0].operations[1]
+                .p
+                .insert(key.into(), value.into());
+        };
+        set(&mut job, "pocket_milling", "Conventional");
+        assert_eq!(finishing(&job), Vec::<String>::new());
+        set(&mut job, "pocket_milling", "Climb");
+        set(&mut job, "finish_passes", "0");
+        assert_eq!(finishing(&job), Vec::<String>::new());
+        set(&mut job, "finish_passes", "1");
+        let alu = job
+            .materials
+            .iter()
+            .find(|m| m.name() == "Aluminium 6061-T6")
+            .unwrap()
+            .id
+            .clone();
+        assert!(job.select_material(&alu));
+        assert_eq!(finishing(&job), Vec::<String>::new());
     }
     #[test]
     fn a_job_the_app_cannot_save_stops_at_structure() {
@@ -2199,6 +2437,7 @@ mod tests {
     fn plan_of(setups: Vec<(&str, Vec<proposal::ProposedOp>)>) -> Proposal {
         Proposal {
             summary: String::new(),
+            chuck: None,
             setups: setups
                 .into_iter()
                 .enumerate()
@@ -2213,6 +2452,7 @@ mod tests {
                     .into(),
                     workholding: String::new(),
                     holder: None,
+                    a_angles: None,
                     operations,
                     from: None,
                 })
@@ -2455,7 +2695,9 @@ mod tests {
         // Each hit is reported once, under its own stage and operation, one
         // for each clamp and part of the tool. Setup 2 has the clamps the app
         // suggested for its toolpaths: facing the whole stock runs through
-        // any place they can be.
+        // any place they can be. Its Facing first meets the -Y clamp where
+        // it rises over the air past the stock's edge (`air::trim`), made
+        // before the clamps were suggested.
         assert_eq!(
             stages(&check),
             vec![
@@ -2468,7 +2710,7 @@ mod tests {
                 "workholding 1/Some(4): Drill by planner: the tool hits the clamp on +X (offset 0) at X48.0 Y-10.0 Z15.0 (within the 2 mm gap).",
                 "workholding 2/Some(1): Face by planner: the tool hits the clamp on -X (offset 0) at X-67.0 Y-15.7 Z1.0 (within the 2 mm gap).",
                 "workholding 2/Some(1): Face by planner: the tool hits the clamp on +X (offset 0) at X67.0 Y-15.7 Z1.0 (within the 2 mm gap).",
-                "workholding 2/Some(1): Face by planner: the tool hits the clamp on -Y (offset 0) at X-10.0 Y-47.0 Z1.0 (within the 2 mm gap).",
+                "workholding 2/Some(1): Face by planner: the tool hits the clamp on -Y (offset 0) at X-10.0 Y-46.4 Z18.0 (within the 2 mm gap).",
                 "workholding 2/Some(1): Face by planner: the tool hits the clamp on +Y (offset 0) at X-10.0 Y23.5 Z1.0 (within the 2 mm gap).",
             ]
         );
@@ -2742,9 +2984,16 @@ mod tests {
         assert_eq!((notch.setup, notch.operation), (1, 1));
         assert!(notch.minutes > 0.);
         // The notch's minutes and its one tool change (3 min), the CNC's own
-        // minutes as before, and the stock moving once (10 min).
+        // minutes as before but for the air the notch leaves its Facing
+        // (`air::trim`), and the stock moving once (10 min).
         assert!((check.manual_minutes - (notch.minutes + 3.)).abs() < 0.11);
-        assert!((check.cnc_minutes - plain.total_minutes).abs() < 0.11);
+        assert!(
+            check.cnc_minutes <= plain.total_minutes + 0.11
+                && check.cnc_minutes > plain.total_minutes - 1.,
+            "{} vs {}",
+            check.cnc_minutes,
+            plain.total_minutes
+        );
         assert_eq!(check.move_minutes, 10.);
         let sum = check.manual_minutes + check.cnc_minutes + check.move_minutes;
         assert!((check.total_minutes - sum).abs() < 0.11);
@@ -3090,6 +3339,7 @@ mod totem {
             path,
             format: "step".into(),
             bytes: 0,
+            thickness: None,
         });
         doc.sync_stock_sources();
         aluminium(&mut doc);
@@ -3147,6 +3397,7 @@ mod totem {
         };
         let proposal = Proposal {
             summary: "Top, then the underside".into(),
+            chuck: None,
             setups: vec![
                 ProposedSetup {
                     orientation: "+Z".into(),
@@ -3154,6 +3405,7 @@ mod totem {
                     origin: "Stock top center".into(),
                     workholding: "Vise on the stock's frame".into(),
                     holder: None,
+                    a_angles: None,
                     operations: vec![
                         cut("Face", 1, &top, 1200., &|_| {}),
                         cut("Pocket", 1, &well, 1200., &|o| {
@@ -3197,6 +3449,7 @@ mod totem {
                     origin: "Stock top front-left".into(),
                     workholding: "Vise on the frame".into(),
                     holder: None,
+                    a_angles: None,
                     operations: vec![
                         cut("Face", 1, &at("-Z", 0.), 1200., &|_| {}),
                         cut("Pocket", 1, &underside, 1200., &|o| o.stepdown = Some(2.)),

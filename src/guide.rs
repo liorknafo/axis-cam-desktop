@@ -146,6 +146,23 @@ pub enum Step {
         holes: Vec<[f32; 3]>,
         mouths: Vec<f32>,
     },
+    /// One pass of a Boring (1-based `index` of `of`): the boring head set
+    /// to `size` (Ø mm), from `before` (what the last pass left, or None
+    /// before the first: set it to `size`), turning out `dial` mm on the
+    /// diameter a division; then each hole of `holes` (X and Y centres and
+    /// the Z it is bored to; `mouths` the Z its cut starts at) bored and
+    /// left with the spindle stopped, or fed back out when `feed_out`.
+    Bore {
+        op: usize,
+        index: usize,
+        of: usize,
+        size: f32,
+        before: Option<f32>,
+        dial: f32,
+        feed_out: bool,
+        holes: Vec<[f32; 3]>,
+        mouths: Vec<f32>,
+    },
     /// The stock after the operation.
     Check { op: usize },
     /// The stock leaves for setup `next` (none for the last setup).
@@ -662,8 +679,12 @@ fn passes(
 /// The Z, from `zero`, each hole's cut starts at, in `holes`' order: the
 /// top of its first cutting move.
 fn mouths(plan: &Plan, zero: [f32; 3]) -> Vec<f32> {
+    mouths_of(&plan.moves, zero)
+}
+/// `mouths` of the holes `moves` cut.
+fn mouths_of(moves: &[Move], zero: [f32; 3]) -> Vec<f32> {
     let mut out: Vec<([f32; 2], f32)> = vec![];
-    for m in plan.moves.iter().filter(|m| m.cutting_pass) {
+    for m in moves.iter().filter(|m| m.cutting_pass) {
         let at = [m.to[0] - zero[0], m.to[1] - zero[1]];
         let top = m.from[2].max(m.to[2]) - zero[2];
         match out.last_mut() {
@@ -678,8 +699,12 @@ fn tenths_down(turns: f32) -> f32 {
     (turns * 10. + 1e-3).floor() / 10.
 }
 fn holes(plan: &Plan, zero: [f32; 3]) -> Vec<[f32; 3]> {
+    holes_of(&plan.moves, zero)
+}
+/// `holes` of the holes `moves` cut.
+fn holes_of(moves: &[Move], zero: [f32; 3]) -> Vec<[f32; 3]> {
     let mut holes: Vec<[f32; 3]> = vec![];
-    for m in plan.moves.iter().filter(|m| m.cutting_pass) {
+    for m in moves.iter().filter(|m| m.cutting_pass) {
         let at: [f32; 3] = std::array::from_fn(|k| m.to[k] - zero[k]);
         match holes.last_mut() {
             Some(h) if h[0] == at[0] && h[1] == at[1] => h[2] = h[2].min(at[2]),
@@ -927,6 +952,34 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                         steps.push(Step::Check { op: oi });
                     }
                 }
+            }
+            Strategy::Drill if op.boring() => {
+                sides([0; 2], &mut steps);
+                // Each pass's moves: from its stop to the next pass's.
+                let passes: Vec<(usize, f32)> = (plan.stops.iter())
+                    .filter_map(|s| Some((s.at, s.size?)))
+                    .collect();
+                let head = doc.tools.iter().find(|t| t.id == op.tool);
+                let dial = head.and_then(|t| num(&t.p, "dial")).unwrap_or(0.);
+                let feed_out = head
+                    .is_some_and(|t| get(&t.p, "bore_retract") == crate::model::BORE_RETRACTS[1]);
+                count = passes.len();
+                for (k, &(at, size)) in passes.iter().enumerate() {
+                    let end = passes.get(k + 1).map_or(plan.moves.len(), |p| p.0);
+                    let moves = &plan.moves[at..end];
+                    steps.push(Step::Bore {
+                        op: oi,
+                        index: k + 1,
+                        of: passes.len(),
+                        size,
+                        before: k.checked_sub(1).map(|j| passes[j].1),
+                        dial,
+                        feed_out,
+                        holes: holes_of(moves, zero),
+                        mouths: mouths_of(moves, zero),
+                    });
+                }
+                steps.push(Step::Check { op: oi });
             }
             Strategy::Drill => {
                 sides([0; 2], &mut steps);
@@ -1601,6 +1654,7 @@ pub(crate) mod tests {
                 Step::Face { .. } => "Face",
                 Step::Square { .. } => "Square",
                 Step::Holes { .. } => "Holes",
+                Step::Bore { .. } => "Bore",
                 Step::Check { .. } => "Check",
                 Step::HandOver { .. } => "HandOver",
                 Step::Lathe(l) => l.title(),

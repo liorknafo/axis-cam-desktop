@@ -461,6 +461,7 @@ impl App {
                     path: path.clone(),
                     format: format.into(),
                     bytes: std::fs::metadata(path).unwrap().len(),
+                    thickness: None,
                 };
                 let _ = self.update(Message::FileImported(Some(Ok((info, Some(mesh))))));
                 self.stock = false;
@@ -486,6 +487,7 @@ impl App {
                         path: path.clone(),
                         format: "3mf".into(),
                         bytes: std::fs::metadata(path).unwrap().len(),
+                        thickness: None,
                     },
                     Some(mesh),
                 ))))]
@@ -1644,6 +1646,7 @@ impl App {
             summary:
                 "Face the top and clear the pocket, then turn the part over and face the underside."
                     .into(),
+            chuck: None,
             setups: vec![
                 ProposedSetup {
                     orientation: up.into(),
@@ -1651,6 +1654,7 @@ impl App {
                     origin: "Stock top center".into(),
                     workholding: "Vise on the long sides.".into(),
                     holder: None,
+                    a_angles: None,
                     operations: vec![
                         op("Face", plane(up, "top")),
                         op("Pocket", floor.clone()),
@@ -1664,6 +1668,7 @@ impl App {
                     origin: "Model origin".into(),
                     workholding: "Turn over; the vise on the long sides.".into(),
                     holder: Some(1),
+                    a_angles: None,
                     operations: vec![op("Face", plane("-Z", "top"))],
                     from: None,
                 },
@@ -1723,12 +1728,14 @@ impl App {
         };
         let proposal = Proposal {
             summary: "Face the top, clear the main pocket and cut the outline from the top. The holes and the side features need tools and setups this plan does not have.".into(),
+            chuck: None,
             setups: vec![ProposedSetup {
                 orientation: first.up.into(),
                 name: "Top".into(),
                 origin: "Stock top center".into(),
                 workholding: "Vise on the long sides.".into(),
                 holder: None,
+                a_angles: None,
                 operations: vec![
                     op("Face", plane(0.)),
                     op("Pocket", plane(12.)),
@@ -2639,6 +2646,7 @@ flood = { pin = 8 }
             path: path.clone(),
             format: "3mf".into(),
             bytes: 1,
+            thickness: None,
         };
         let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
         a.doc.setup_mut().operations.clear();
@@ -3258,6 +3266,7 @@ flood = { pin = 8 }
             path: "plate.stl".into(),
             format: "stl".into(),
             bytes: 1,
+            thickness: None,
         };
         let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
         let mut mill = crate::model::Tool::new("T7 Flat end mill 2", "Flat end mill", "2");
@@ -4940,6 +4949,23 @@ flood = { pin = 8 }
         path: &std::path::Path,
         cursor: iced::mouse::Cursor,
     ) {
+        render_element_at(a.view(), size, path, cursor);
+    }
+    /// Draws `element`, `size` px, headless (tiny-skia) to `path`.
+    fn render_element(
+        element: iced::Element<'_, Message>,
+        size: iced::Size,
+        path: &std::path::Path,
+    ) {
+        render_element_at(element, size, path, iced::mouse::Cursor::Unavailable);
+    }
+    /// `render_element` with the pointer at `cursor`.
+    fn render_element_at(
+        element: iced::Element<'_, Message>,
+        size: iced::Size,
+        path: &std::path::Path,
+        cursor: iced::mouse::Cursor,
+    ) {
         use futures_util::FutureExt;
         use iced::advanced::renderer::{self, Headless};
         let mut renderer = <iced::Renderer as Headless>::new(
@@ -4951,7 +4977,7 @@ flood = { pin = 8 }
         .flatten()
         .expect("tiny-skia renderer");
         let mut ui = iced_runtime::UserInterface::build(
-            a.view(),
+            element,
             size,
             iced_runtime::user_interface::Cache::new(),
             &mut renderer,
@@ -5285,6 +5311,504 @@ flood = { pin = 8 }
         }
         eprintln!("{}", a.status);
     }
+    #[test]
+    fn holding_the_force_per_tooth_is_chosen_with_the_feed_and_the_simulation_says_its_feeds() {
+        use crate::tooth_load::FEED_FOLLOWS;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), FAST, &[0, 1]);
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.update(Message::Tab("Tool".into()));
+        let texts = page_texts(&a);
+        let feed = (texts.iter())
+            .position(|t| t == "Cutting feed · mm/min")
+            .unwrap_or_else(|| panic!("{texts:?}"));
+        let choice = (texts.iter())
+            .position(|t| t == "Feed along the path")
+            .unwrap_or_else(|| panic!("{texts:?}"));
+        assert!(choice > feed);
+        lacks(&a, &["Force per tooth to hold · N"]);
+        let _ = a.update(Message::Edit(
+            Target::Operation,
+            "feed_follows",
+            FEED_FOLLOWS[1].into(),
+        ));
+        let texts = page_texts(&a);
+        let field = (texts.iter())
+            .position(|t| t == "Force per tooth to hold · N")
+            .unwrap_or_else(|| panic!("{texts:?}"));
+        // Empty: the nominal cut's, said under it.
+        assert!(
+            texts[field + 1..].iter().any(|t| t
+                .starts_with("Automatic: one tooth's force at the cutting feed")
+                && t.contains("5.0 mm wide")),
+            "{texts:?}"
+        );
+        // A force that is not one is an error at its field.
+        let _ = a.update(Message::Edit(Target::Operation, "tooth_force", "-3".into()));
+        let texts = page_texts(&a);
+        let field = texts
+            .iter()
+            .position(|t| t == "Force per tooth to hold · N")
+            .unwrap();
+        assert_eq!(
+            (texts[field + 1].as_str(), texts[field + 2].as_str()),
+            ("Error", crate::model::TOOTH_FORCE_ISSUE)
+        );
+        let _ = a.update(Message::Edit(Target::Operation, "tooth_force", "".into()));
+        let _ = a.update(Message::Generate);
+        let sim = a.active_simulation().expect("a simulation");
+        let held = sim.held.expect("held");
+        assert!(held.slowest < held.fastest, "{held:?}");
+        // The load along the moves came with the feeds: the path is
+        // coloured at once.
+        assert!(sim.tooth_load.is_some() && a.tooth_load_job.is_none());
+        let said = format!(
+            "Feed {:.0}–{:.0} mm/min to hold {:.0} N per tooth",
+            held.slowest, held.fastest, held.target
+        );
+        shows(&a, &[said.as_str()]);
+    }
+    /// Renders the fixture job's Pocket, its path coloured by the force on
+    /// one tooth (`tooth_load`), from above and from the front, partway and
+    /// done, to $AXIS_RENDER_DIR (/tmp/tooth-load-renders), and says how long
+    /// the load took: for looking at, with --ignored. $AXIS_STRATEGY=adaptive
+    /// makes it an Adaptive ($AXIS_STEPDOWN mm deep levels, 12 without; the
+    /// Pocket's 10 without);
+    /// $AXIS_HOLD=1 holds the force on a tooth (`tooth_load::hold`), its
+    /// feeds said. The level pictures are coloured by the load measured
+    /// again along the moves as they are, on the scale of $AXIS_PEAK N (the
+    /// peak without), so a run with and one without compare.
+    #[test]
+    #[ignore]
+    fn render_the_tooth_load() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/tooth-load-renders".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), FAST, &[0, 1]);
+        let strategy = std::env::var("AXIS_STRATEGY").unwrap_or_default();
+        {
+            let op = &mut a.doc.setups[0].operations[1];
+            if strategy == "adaptive" {
+                op.strategy = Strategy::Adaptive;
+                op.p.insert("name".into(), Strategy::Adaptive.name().into());
+                op.p.insert("optimal_load".into(), "1.5".into());
+                op.p.insert(
+                    "stepdown".into(),
+                    std::env::var("AXIS_STEPDOWN")
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or("12".into()),
+                );
+            }
+            op.p.insert("feed".into(), "1200".into());
+            if strategy != "adaptive"
+                && let Some(stepdown) = std::env::var("AXIS_STEPDOWN")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+            {
+                op.p.insert("stepdown".into(), stepdown);
+            }
+            if std::env::var("AXIS_HOLD").is_ok_and(|v| v == "1") {
+                op.p.insert(
+                    "feed_follows".into(),
+                    crate::tooth_load::FEED_FOLLOWS[1].into(),
+                );
+            }
+        }
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(1));
+        let started = std::time::Instant::now();
+        let _ = a.update(Message::Generate);
+        let sim = a.active_simulation().expect("a simulation");
+        let load = sim.tooth_load.as_ref().expect("a tooth load");
+        let samples: usize = load.moves.iter().map(Vec::len).sum();
+        let mut sorted: Vec<f32> = load.moves.iter().flatten().copied().collect();
+        sorted.sort_by(f32::total_cmp);
+        let quantile = |q: f32| sorted[((sorted.len() - 1) as f32 * q) as usize];
+        let timed = std::time::Instant::now();
+        let again = crate::tooth_load::of(sim, &a.doc).unwrap();
+        let measured = timed.elapsed().as_secs_f32();
+        // How flat the load measured again is about what was held.
+        let mut engaged: Vec<f32> = again
+            .moves
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|f| *f > 0.)
+            .collect();
+        engaged.sort_by(f32::total_cmp);
+        let at = |q: f32| engaged[((engaged.len() - 1) as f32 * q) as usize];
+        let target = sim.held.map_or(at(0.5), |h| h.target);
+        let near = engaged
+            .iter()
+            .filter(|f| (**f / target - 1.).abs() <= 0.15)
+            .count();
+        let feeds: Vec<f32> = (sim.plan.moves.iter())
+            .filter(|m| m.motion == crate::simulation::Motion::Feed)
+            .map(|m| m.feed)
+            .collect();
+        eprintln!(
+            "held {:?}: {:.1} min, {} feed moves at {:.0}–{:.0} mm/min; measured again: 5% {:.0} N, 25% {:.0}, median {:.0}, 75% {:.0}, 95% {:.0}, peak {:.0}; {:.0}% of {} cutting samples within 15% of {target:.0} N",
+            sim.held,
+            sim.plan.duration / 60.,
+            feeds.len(),
+            feeds.iter().copied().fold(f32::MAX, f32::min),
+            feeds.iter().copied().fold(0., f32::max),
+            at(0.05),
+            at(0.25),
+            at(0.5),
+            at(0.75),
+            at(0.95),
+            again.peak,
+            near as f32 * 100. / engaged.len() as f32,
+            engaged.len()
+        );
+        // Where the load is not near it: on moves down (ramps), at the
+        // least or the most feed, or elsewhere.
+        let mut kinds = std::collections::BTreeMap::<&str, (usize, f32)>::new();
+        let programmed: f32 = 1200.;
+        for ((m, forces), facing) in sim.plan.moves.iter().zip(&again.moves).zip(&again.facing) {
+            for (&f, &facing) in forces.iter().zip(facing) {
+                if f <= 0. || (f / target - 1.).abs() <= 0.15 {
+                    continue;
+                }
+                let kind = if m.to[2] < m.from[2] - 1e-4 {
+                    "down"
+                } else if sim.held.is_some_and(|h| m.feed <= h.slowest) {
+                    "slowest"
+                } else if sim.held.is_some_and(|h| m.feed >= h.fastest) {
+                    "fastest"
+                } else if f < target && m.feed * facing * 1.1 >= 1.5 * programmed {
+                    "under, at the thickest chip"
+                } else if f < target {
+                    "under"
+                } else {
+                    "over"
+                };
+                let e = kinds.entry(kind).or_default();
+                (e.0, e.1) = (e.0 + 1, e.1 + f);
+            }
+        }
+        for (kind, (n, sum)) in &kinds {
+            eprintln!(
+                "  off target, {kind}: {n} samples, mean {:.0} N",
+                sum / *n as f32
+            );
+        }
+        // The most force over each stretch of level cutting a cutter's
+        // radius long: what a feed, which cannot change every sample, holds.
+        let mut stretches: Vec<f32> = vec![];
+        let (mut most, mut length) = (0_f32, 0_f32);
+        for (m, forces) in sim.plan.moves.iter().zip(&again.moves) {
+            let level =
+                m.motion == crate::simulation::Motion::Feed && (m.to[2] - m.from[2]).abs() < 1e-4;
+            if !level {
+                (most, length) = (0., 0.);
+                continue;
+            }
+            let piece = ((0..3).map(|k| (m.to[k] - m.from[k]).powi(2)).sum::<f32>()).sqrt()
+                / forces.len().max(1) as f32;
+            for &f in forces {
+                most = most.max(f);
+                length += piece;
+                if length >= sim.plan.radius {
+                    if most > 0. {
+                        stretches.push(most);
+                    }
+                    (most, length) = (0., 0.);
+                }
+            }
+        }
+        stretches.sort_by(f32::total_cmp);
+        let q = |p: f32| stretches[((stretches.len() - 1) as f32 * p) as usize];
+        eprintln!(
+            "  stretches of level cutting: {} at most 10% 25% 50% 75% 90% {:.0} {:.0} {:.0} {:.0} {:.0} N; {:.0}% within 15% of {target:.0} N",
+            stretches.len(),
+            q(0.1),
+            q(0.25),
+            q(0.5),
+            q(0.75),
+            q(0.9),
+            stretches
+                .iter()
+                .filter(|f| (**f / target - 1.).abs() <= 0.15)
+                .count() as f32
+                * 100.
+                / stretches.len() as f32
+        );
+        // The load the hold worked out along the moves, beside the one
+        // measured again.
+        let derived: Vec<f32> = load
+            .moves
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|f| *f > 0.)
+            .collect();
+        eprintln!(
+            "  as held: {:.0}% of {} cutting samples within 15% of {target:.0} N",
+            derived
+                .iter()
+                .filter(|f| (**f / target - 1.).abs() <= 0.15)
+                .count() as f32
+                * 100.
+                / derived.len() as f32,
+            derived.len()
+        );
+        let peak = std::env::var("AXIS_PEAK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(again.peak);
+        let load = &again;
+        eprintln!(
+            "generate + load {:.1} s, load alone {:.1} s: {} moves, {samples} samples, peak {:.1} N, median {:.1} N, 90% {:.1} N, in the air {}",
+            started.elapsed().as_secs_f32() - timed.elapsed().as_secs_f32(),
+            measured,
+            sim.plan.moves.len(),
+            again.peak,
+            quantile(0.5),
+            quantile(0.9),
+            sorted.iter().filter(|f| **f == 0.).count()
+        );
+        // The cutting moves of each level from above, close up, each piece
+        // in its load's colour.
+        let plan = &sim.plan;
+        let feeds = || {
+            plan.moves.iter().enumerate().filter(|(i, m)| {
+                m.motion == crate::simulation::Motion::Feed && !load.moves[*i].is_empty()
+            })
+        };
+        let (lo, hi) = feeds().fold(([f32::MAX; 2], [f32::MIN; 2]), |(lo, hi), (_, m)| {
+            (
+                std::array::from_fn(|k| lo[k].min(m.from[k]).min(m.to[k])),
+                std::array::from_fn(|k| hi[k].max(m.from[k]).max(m.to[k])),
+            )
+        });
+        let (lo, hi) = (lo.map(|v| v - 6.), hi.map(|v| v + 6.));
+        let scale = 900. / (hi[0] - lo[0]).max(hi[1] - lo[1]);
+        let (w, h) = (
+            ((hi[0] - lo[0]) * scale) as usize + 1,
+            ((hi[1] - lo[1]) * scale) as usize + 1,
+        );
+        let mut levels: Vec<f32> = vec![];
+        for (_, m) in feeds().filter(|(_, m)| m.from[2] == m.to[2]) {
+            if !levels.iter().any(|z| (z - m.to[2]).abs() < 0.01) {
+                levels.push(m.to[2]);
+            }
+        }
+        levels.sort_by(|a, b| b.total_cmp(a));
+        for (n, z) in levels.iter().enumerate() {
+            let at_level: Vec<f32> = feeds()
+                .filter(|(_, m)| (m.to[2] - z).abs() < 0.01)
+                .flat_map(|(i, _)| load.moves[i].iter().copied())
+                .collect();
+            let most = at_level.iter().copied().fold(0., f32::max);
+            eprintln!(
+                "level {n} at Z {z:.2}: {} samples, most {most:.0} N",
+                at_level.len()
+            );
+            let mut rgb = vec![255_u8; w * h * 3];
+            // Moves down to the level that end on it, ramps and plunges too.
+            for (i, m) in feeds().filter(|(_, m)| (m.to[2] - z).abs() < 0.01) {
+                let pieces = &load.moves[i];
+                for (k, force) in pieces.iter().enumerate() {
+                    let colour = crate::tooth_load::colour(*force, peak);
+                    for s in 0..=20 {
+                        let t = (k as f32 + s as f32 / 20.) / pieces.len() as f32;
+                        let x = ((m.from[0] + (m.to[0] - m.from[0]) * t - lo[0]) * scale) as usize;
+                        let y = ((hi[1] - m.from[1] - (m.to[1] - m.from[1]) * t) * scale) as usize;
+                        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                            let (x, y) = ((x + dx).min(w - 1), (y + dy).min(h - 1));
+                            rgb[(y * w + x) * 3..][..3].copy_from_slice(&colour[..3]);
+                        }
+                    }
+                }
+            }
+            let file = std::fs::File::create(out.join(format!("level-{n}.png"))).unwrap();
+            let mut png = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
+            png.set_color(png::ColorType::Rgb);
+            png.set_depth(png::BitDepth::Eight);
+            png.write_header().unwrap().write_image_data(&rgb).unwrap();
+        }
+        let size = iced::Size::new(1600., 1100.);
+        // The stock surface, built in line rather than in the background.
+        let mesh = |a: &mut App| {
+            a.stock_mesh_job = None;
+            let key = a.stock_mesh_key().expect("a simulation with stock");
+            let sim = a.active_simulation().unwrap();
+            let snapshot =
+                crate::stock_surface::Snapshot::of(sim.volume.as_ref().unwrap(), a.stock_detail);
+            let seconds = sim.seconds;
+            let result = snapshot.build().map(std::sync::Arc::new);
+            a.stock_mesh_job = Some(key.clone());
+            let _ = a.update(Message::StockMeshed {
+                key,
+                seconds,
+                result,
+            });
+        };
+        for camera in ["TOP", "ISO"] {
+            let _ = a.update(Message::Camera(camera));
+            a.camera.zoom = 2.;
+            for at in [0.3, 0.6, 1.] {
+                let _ = a.update(Message::Scrub(at));
+                mesh(&mut a);
+                let _ = a.view();
+                render_png(
+                    &a,
+                    size,
+                    &out.join(format!(
+                        "{}-{:03}.png",
+                        camera.to_lowercase(),
+                        (at * 100.) as u32
+                    )),
+                );
+            }
+        }
+    }
+
+    /// Headless source frames for the LIO-253 narrated video. Each scene is
+    /// recorded at 12 fps; static frames are held when the narration is laid
+    /// over them. This is deliberately ignored and leaves no project data.
+    #[test]
+    #[ignore]
+    fn record_tooth_load_video() {
+        use crate::model::Strategy;
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").expect("AXIS_RENDER_DIR for the video"),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let adaptive = std::env::var("AXIS_STRATEGY").as_deref() == Ok("adaptive");
+        let sample = std::env::var("AXIS_RECORDER_SAMPLE").is_ok();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), FAST, &[0, 1]);
+        {
+            let op = &mut a.doc.setups[0].operations[1];
+            op.p.insert("feed".into(), "1200".into());
+            if adaptive {
+                op.strategy = Strategy::Adaptive;
+                op.p.insert("name".into(), Strategy::Adaptive.name().into());
+                op.p.insert("optimal_load".into(), "1.5".into());
+                op.p.insert("stepdown".into(), "12".into());
+            }
+        }
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.update(Message::Generate);
+        a.scrub_live = usize::MAX;
+        a.stock_detail = crate::stock_surface::Detail::Draft;
+        let sim = a.active_simulation().expect("simulation");
+        let load = sim.tooth_load.as_ref().expect("measured tooth load");
+        eprintln!(
+            "video {}: peak {:.1} N, {} moves, {:.1} s",
+            if adaptive { "adaptive" } else { "pocket" },
+            load.peak,
+            sim.plan.moves.len(),
+            sim.plan.duration
+        );
+        let mut levels: Vec<f32> = Vec::new();
+        for m in &sim.plan.moves {
+            if m.motion == crate::simulation::Motion::Feed
+                && (m.from[2] - m.to[2]).abs() < 0.01
+                && !levels.iter().any(|z| (z - m.to[2]).abs() < 0.01)
+            {
+                levels.push(m.to[2]);
+            }
+        }
+        levels.sort_by(|x, y| y.total_cmp(x));
+        let mut windows = Vec::new();
+        for &z in &levels {
+            let moves: Vec<_> = sim
+                .plan
+                .moves
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| {
+                    m.motion == crate::simulation::Motion::Feed
+                        && (m.from[2] - z).abs() < 0.01
+                        && (m.to[2] - z).abs() < 0.01
+                })
+                .collect();
+            if moves.is_empty() {
+                continue;
+            }
+            let start = moves
+                .iter()
+                .map(|(_, m)| m.start)
+                .fold(f32::INFINITY, f32::min);
+            let end = moves.iter().map(|(_, m)| m.end).fold(0., f32::max);
+            let peak = moves
+                .iter()
+                .flat_map(|(i, _)| load.moves[*i].iter().copied())
+                .fold(0., f32::max);
+            eprintln!(
+                "level Z {z:.2}: {:.3}..{:.3}, peak {peak:.1} N",
+                start / sim.plan.duration,
+                end / sim.plan.duration
+            );
+            windows.push((z, start / sim.plan.duration, end / sim.plan.duration, peak));
+        }
+        // The finished map is kept on screen long enough for its scale to be
+        // read. The other scenes scrub through cuts at a steady screen rate.
+        let scenes: Vec<(&str, &str, f32, f32, usize)> = if adaptive {
+            vec![
+                ("adaptive-intro", "TOP", 0.02, 0.02, 1),
+                ("adaptive-rings", "TOP", 0.04, 0.98, 84),
+                ("adaptive-map", "ISO", 1., 1., 1),
+            ]
+        } else {
+            let deep = windows
+                .iter()
+                .max_by(|a, b| a.3.total_cmp(&b.3))
+                .expect("deep level");
+            let shallow = windows
+                .iter()
+                .filter(|w| w.3 < deep.3 * 0.5)
+                .max_by(|a, b| a.3.total_cmp(&b.3))
+                .expect("shallow level");
+            vec![
+                ("pocket-intro", "TOP", 0.02, 0.02, 1),
+                ("deep", "TOP", deep.1.max(0.), deep.2.min(1.), 120),
+                ("shallow", "TOP", shallow.1.max(0.), shallow.2.min(1.), 60),
+                ("pocket-map", "ISO", 1., 1., 1),
+            ]
+        };
+        let size = iced::Size::new(1600., 1100.);
+        let mut frame = 0;
+        let mut manifest = String::from("scene\tfirst\tcount\tstart\tend\n");
+        for (scene, camera, start, end, count) in scenes {
+            let _ = a.update(Message::Camera(camera));
+            a.camera.zoom = if camera == "TOP" { 4.0 } else { 3.6 };
+            let first = frame;
+            let indices: Vec<usize> = if sample && count > 1 {
+                vec![0, count / 2, count - 1]
+            } else {
+                (0..count).collect()
+            };
+            for i in indices {
+                let at = if count == 1 {
+                    start
+                } else {
+                    start + (end - start) * i as f32 / (count - 1) as f32
+                };
+                let _ = a.update(Message::Scrub(at));
+                if a.stock_mesh_key().is_some() {
+                    mesh_the_stock(&mut a);
+                }
+                render_png(&a, size, &out.join(format!("frame-{frame:05}.png")));
+                frame += 1;
+            }
+            manifest.push_str(&format!(
+                "{scene}\t{first}\t{}\t{start:.4}\t{end:.4}\n",
+                frame - first
+            ));
+            eprintln!("recorded {scene}: {} frames", frame - first);
+        }
+        std::fs::write(out.join("manifest.tsv"), manifest).unwrap();
+    }
 
     /// Renders the fixture pins to PNGs in `$AXIS_RENDER_DIR` (default
     /// /tmp/fp-renders) for a look: the Machine library's pins, the flipped
@@ -5292,6 +5816,376 @@ flood = { pin = 8 }
     /// pins, setup 1's Drill of those holes, and the Control page's Run steps
     /// before and after X Y from the pins. Not a check: run it with
     /// --ignored.
+    /// Renders the setup editor's Stock and Holding steps for the fixture
+    /// block on a Ø110 × 200 mm round bar in a 3-jaw chuck on a 4-axis
+    /// machine (a Ø200 chuck), 170 mm out of the jaws, the tailstock drawn
+    /// back, to $AXIS_RENDER_DIR (/tmp/chuck-renders). Not a check: run it
+    /// with --ignored.
+    #[test]
+    #[ignore]
+    fn render_the_chuck() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/chuck-renders".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let (mut doc, mesh) = crate::post::fixture::job();
+        let mut m = Machine::new(4);
+        for (k, v) in [
+            ("a_chuck_diameter", "200"),
+            ("a_grip_max", "150"),
+            ("a_fit_diameter", "150"),
+        ] {
+            m.p.insert(k.into(), v.into());
+        }
+        for s in &mut doc.setups {
+            s.machine = m.clone();
+        }
+        doc.machines = vec![m];
+        for (k, v) in [
+            ("stock_type", "Round bar"),
+            ("stock_diameter", "110"),
+            ("stock_length", "200"),
+            ("holding", "Chuck"),
+            ("chuck_stickout", "170"),
+        ] {
+            doc.setups[0].p.insert(k.into(), v.into());
+        }
+        // The part on the bar's axis, its top 35 mm under the bar's.
+        let low = crate::stock::resolve(&doc.setups[0], Some(&mesh))
+            .unwrap()
+            .part
+            .unwrap();
+        doc.setups[0]
+            .p
+            .insert("tz".into(), (35. - low.min[2]).to_string());
+        doc.settle_holding(0);
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.page = Page::Work;
+        a.selected = None;
+        let _ = a.update(Message::SelectSetup(0));
+        let size = iced::Size::new(1600., 1100.);
+        for (step, name) in [("Stock", "1-stock.png"), ("Holding", "2-holding.png")] {
+            let _ = a.update(Message::SetupStep(step));
+            let _ = a.view();
+            render_png(&a, size, &out.join(name));
+        }
+        // The Job view after the Pocket: the bar cut, its corners never
+        // material.
+        let ops = &a.doc.setups[0].operations;
+        let pocket = ops.iter().position(|o| o.name() == "Pocket").unwrap();
+        let _ = a.update(Message::SelectOp(pocket));
+        a.simulation = crate::planner::view_after(
+            &a.doc,
+            a.part_mesh().unwrap(),
+            0,
+            pocket,
+            crate::stock_surface::Detail::Draft,
+        );
+        assert!(a.simulation.is_some());
+        a.stock = true;
+        let _ = a.view();
+        render_png(&a, size, &out.join("3-job-view.png"));
+    }
+    /// The setups list, the Job view and the setup editor with setup 2
+    /// indexed on A (LIO-188): `cargo test render_the_indexed_setup --
+    /// --ignored`.
+    #[test]
+    #[ignore]
+    fn render_the_indexed_setup() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/indexed-renders".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let (mut doc, mesh) = crate::post::fixture::job();
+        let mut m = Machine::new(4);
+        for (k, v) in [
+            ("a_chuck_diameter", "200"),
+            ("a_grip_max", "150"),
+            ("a_fit_diameter", "150"),
+        ] {
+            m.p.insert(k.into(), v.into());
+        }
+        for s in &mut doc.setups {
+            s.machine = m.clone();
+        }
+        doc.machines = vec![m];
+        for (k, v) in [
+            ("stock_type", "Round bar"),
+            ("stock_diameter", "110"),
+            ("stock_length", "200"),
+            ("holding", "Chuck"),
+            ("chuck_stickout", "170"),
+            ("origin", crate::indexed::ORIGINS[0]),
+        ] {
+            doc.setups[0].p.insert(k.into(), v.into());
+        }
+        let low = crate::stock::resolve(&doc.setups[0], Some(&mesh))
+            .unwrap()
+            .part
+            .unwrap();
+        doc.setups[0]
+            .p
+            .insert("tz".into(), (35. - low.min[2]).to_string());
+        doc.settle_holding(0);
+        let mut later = doc.setups[0].duplicate("G55");
+        later.p.insert("name".into(), "Side flats".into());
+        later
+            .p
+            .insert("reposition".into(), crate::indexed::ACTION.into());
+        later
+            .p
+            .insert(crate::indexed::ANGLES.into(), "90, 180, -90".into());
+        doc.setups.push(later);
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.touch();
+        assert_eq!(a.doc.setups[1].turn.map(|t| t.a), Some(90.));
+        a.page = Page::Work;
+        a.selected = None;
+        a.stock = true;
+        // Tall enough for the Holding step's A angles and their warning.
+        let size = iced::Size::new(1600., 1500.);
+        for (si, step, name) in [
+            (1, "Holding", "1-indexed-holding.png"),
+            (1, "Work zero", "2-indexed-zero.png"),
+            (0, "Work zero", "3-setup-1-zero.png"),
+        ] {
+            let _ = a.update(Message::SelectSetup(si));
+            let _ = a.update(Message::SetupStep(step));
+            let _ = a.view();
+            render_png(&a, size, &out.join(name));
+        }
+    }
+    /// The 4-axis scene (LIO-190), to $AXIS_RENDER_DIR (/tmp/four-axis-renders):
+    /// the Job view after a square is milled on a bar at A 90, 180, 270 and
+    /// 0°, its four sides faced out to the bar's free end, joined to the bar
+    /// at a shoulder (LIO-211), and while A turns from 270° to 0°, and the Control page's machine view
+    /// with the rotary unit at A 0 and 30°. Not a check: `cargo test
+    /// render_the_four_axis_scene -- --ignored`.
+    #[test]
+    #[ignore]
+    fn render_the_four_axis_scene() {
+        use crate::indexed::tests::{bar_job, cutter, faced_square, prism};
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/four-axis-renders".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let mesh = prism(30.);
+        let mut doc = bar_job(
+            &mesh,
+            30.,
+            "100",
+            "-150",
+            "90, 180, 270, 0",
+            faced_square(&cutter("12"), &mesh),
+        );
+        doc.file = Some(crate::model::ModelFile {
+            name: "square-bar.stl".into(),
+            path: dir.path().join("square-bar.stl"),
+            format: "stl".into(),
+            bytes: 0,
+            thickness: None,
+        });
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.page = Page::Work;
+        a.selected = None;
+        a.stock = true;
+        a.camera.zoom = 3.;
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::SelectOp(0));
+        let detail = crate::stock_surface::Detail::Draft;
+        let mesh = a.part_mesh().unwrap().clone();
+        let mut sim = crate::planner::view_after(&a.doc, &mesh, 1, 0, detail).unwrap();
+        let size = iced::Size::new(1600., 1000.);
+        a.simulation = Some(sim.clone());
+        assert_eq!(a.shown_a(), Some(0.));
+        // Each picture also seen from the bar's free end, along the A axis.
+        let end = crate::viewport::Camera {
+            yaw: std::f32::consts::FRAC_PI_2,
+            pitch: 0.,
+            zoom: 3.,
+            pan: [0., 0.],
+        };
+        let iso = a.camera;
+        let close = crate::viewport::Camera {
+            zoom: 7.,
+            pan: [230., 0.],
+            ..iso
+        };
+        // End-on close up: the square in front of the round shoulder.
+        let end_close = crate::viewport::Camera { zoom: 12., ..end };
+        let shots = |a: &mut App, name: &str| {
+            for (camera, view) in [
+                (iso, ""),
+                (end, "-end-on"),
+                (end_close, "-end-on-close"),
+                (close, "-close"),
+            ] {
+                a.camera = camera;
+                let _ = a.view();
+                render_png(a, size, &out.join(format!("{name}{view}.png")));
+            }
+        };
+        shots(&mut a, "1-job-after-four-angles");
+        // Halfway through the index move from 270° back to 0°: the stock cut
+        // at 90, 180 and 270° turning, the chuck's jaws with it.
+        let last = (sim.plan.moves.iter())
+            .rfind(|m| m.motion == crate::simulation::Motion::Index)
+            .unwrap()
+            .clone();
+        sim.seek((last.start + last.end) / 2. / sim.plan.duration);
+        let volume = sim.volume.clone().unwrap();
+        let surface = crate::stock_surface::Snapshot::of(&volume, detail)
+            .build()
+            .unwrap();
+        sim.stock_surface = Some(std::sync::Arc::new(surface));
+        sim.stock_surface_version = volume.version;
+        a.simulation = Some(sim);
+        assert_eq!(a.shown_a(), Some(135.));
+        shots(&mut a, "2-job-turning-from-270-to-0");
+        // The machine view with the rotary unit the machine library places.
+        let mut m = Machine::new(4);
+        m.fill_rotary_defaults();
+        let rig = crate::chuck::Rig::on_machine(m.rotary_unit().unwrap(), 1.);
+        for (angle, name) in [
+            (0., "3-machine-rotary-a0.png"),
+            (30., "4-machine-rotary-a30.png"),
+        ] {
+            let view = crate::machine_view::MachineView {
+                pos: [150., 120., -10.],
+                known: true,
+                envelope: [[0., 0., -55.], [390., 280., 0.]],
+                assumed: false,
+                block: None,
+                zero: [40., 140., -40.],
+                rotary: Some(rig.clone()),
+                a: angle,
+            };
+            let element: iced::Element<'_, Message> = iced::widget::canvas(view)
+                .width(iced::Fill)
+                .height(iced::Fill)
+                .into();
+            render_element(element, iced::Size::new(900., 640.), &out.join(name));
+        }
+    }
+    /// LIO-209: the Ø40 bar's 4-angle job on the library CNC4030 + rotary
+    /// (55 mm of Z, the A centreline at machine Z -40, a Ø100 chuck), in
+    /// the Job view after its four angles and halfway through its last
+    /// index move, and in the machine view with the tool where A turns:
+    /// 15 mm over the bar, below the top of the Z travel, the jaws turning
+    /// beside it.
+    #[test]
+    #[ignore]
+    fn render_the_index_height_on_the_library_rotary() {
+        use crate::indexed::tests::{bar_job, cutter, faced_square, prism};
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/index-height-renders".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let mesh = prism(30.);
+        let mut doc = bar_job(
+            &mesh,
+            20.,
+            "100",
+            "-40",
+            "0, 90, 180, -90",
+            faced_square(&cutter("12"), &mesh),
+        );
+        doc.setups[0].machine = crate::control::rotary_machine(dir.path()).unwrap();
+        doc.machines = vec![doc.setups[0].machine.clone()];
+        doc.sync_indexed();
+        doc.sync_stock_sources();
+        doc.sync_turns(Some(&mesh));
+        doc.file = Some(crate::model::ModelFile {
+            name: "square-bar.stl".into(),
+            path: dir.path().join("square-bar.stl"),
+            format: "stl".into(),
+            bytes: 0,
+            thickness: None,
+        });
+        let at = doc.at_angle(1, 0., &mesh).unwrap();
+        let machine_zero = at.machine_zero.unwrap();
+        let on_machine = |p: [f32; 3]| -> [f32; 3] {
+            std::array::from_fn(|k| p[k] - at.zero[k] + machine_zero[k])
+        };
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.page = Page::Work;
+        a.selected = None;
+        a.stock = true;
+        a.camera.zoom = 3.;
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::SelectOp(0));
+        let detail = crate::stock_surface::Detail::Draft;
+        let mesh = a.part_mesh().unwrap().clone();
+        let mut sim = crate::planner::view_after(&a.doc, &mesh, 1, 0, detail).unwrap();
+        let size = iced::Size::new(1600., 1000.);
+        a.simulation = Some(sim.clone());
+        let end = crate::viewport::Camera {
+            yaw: std::f32::consts::FRAC_PI_2,
+            pitch: 0.,
+            zoom: 3.,
+            pan: [0., 0.],
+        };
+        let iso = a.camera;
+        let shots = |a: &mut App, name: &str| {
+            for (camera, view) in [(iso, ""), (end, "-end-on")] {
+                a.camera = camera;
+                let _ = a.view();
+                render_png(a, size, &out.join(format!("{name}{view}.png")));
+            }
+        };
+        shots(&mut a, "1-job-after-four-angles");
+        let last = (sim.plan.moves.iter())
+            .rfind(|m| m.motion == crate::simulation::Motion::Index)
+            .unwrap()
+            .clone();
+        sim.seek((last.start + last.end) / 2. / sim.plan.duration);
+        let volume = sim.volume.clone().unwrap();
+        let surface = crate::stock_surface::Snapshot::of(&volume, detail)
+            .build()
+            .unwrap();
+        sim.stock_surface = Some(std::sync::Arc::new(surface));
+        sim.stock_surface_version = volume.version;
+        a.simulation = Some(sim);
+        shots(&mut a, "2-job-turning-to-a0");
+        // The machine view: the tool where A turns, the jaws at 45° and at
+        // 90° beside it.
+        let m = &a.doc.setups[0].machine;
+        let rig = crate::chuck::Rig::on_machine(m.rotary_unit().unwrap(), 1.);
+        let pos = on_machine(last.from);
+        assert!(pos[2] < 0., "{pos:?}");
+        for (angle, name) in [
+            (45., "3-machine-turning-a45.png"),
+            (90., "4-machine-a90.png"),
+        ] {
+            let view = crate::machine_view::MachineView {
+                pos,
+                known: true,
+                envelope: [[0., 0., -55.], [390., 280., 0.]],
+                assumed: false,
+                block: None,
+                zero: machine_zero,
+                rotary: Some(rig.clone()),
+                a: angle,
+            };
+            let element: iced::Element<'_, Message> = iced::widget::canvas(view)
+                .width(iced::Fill)
+                .height(iced::Fill)
+                .into();
+            render_element(element, iced::Size::new(900., 640.), &out.join(name));
+        }
+    }
     #[test]
     #[ignore]
     fn render_the_fixture_pins() {
@@ -6641,6 +7535,8 @@ flood = { pin = 8 }
                 assumed,
                 block: None,
                 zero: [0.; 3],
+                rotary: None,
+                a: 0.,
             }
         };
         // No soft limits: the warning of the unreferenced machine, with its
@@ -6938,6 +7834,282 @@ flood = { pin = 8 }
         assert_eq!(conn(&a).snapshot.state, Some(State::Idle));
     }
 
+    /// The A axis of a rotary unit, in degrees, to put after `LIMITED`'s
+    /// or `FAST`'s axes: 40 steps per degree, so every step here is whole.
+    const A_AXIS: &str = r#"
+[axes.a]
+steps_per_unit = 40.0
+max_velocity = 3600.0
+acceleration = 360.0
+step = { pin = 9 }
+dir = { pin = 14 }
+soft_min = -180.0
+soft_max = 180.0
+"#;
+
+    /// LIO-185 on the simulated UC100: A jogs, in degree steps or held,
+    /// only once Set machine gave it a position; Zero A sets G54's A offset
+    /// and leaves G55's; MDI takes A words; E-stop clears A's position as
+    /// the others' and nothing moves A until it is set again; the state
+    /// file keeps A's offset and where it was left. The page shows A in
+    /// degrees, and on a machine without A nothing of it.
+    #[test]
+    fn a_jogs_and_zeroes_in_degrees_and_never_moves_before_set_machine() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), &format!("{LIMITED}{A_AXIS}"));
+        idle(&mut a);
+        assert_eq!(conn(&a).unset_limited_axes(), vec![0, 1, 2, 3]);
+        assert!(conn(&a).jog_blocked(3).is_some() && conn(&a).jog_blocked(0).is_none());
+        let _ = a.update(Message::Machine(Action::JogAngle(Some(15.))));
+        let _ = a.update(Message::Machine(Action::JogPress(3, false)));
+        let _ = a.update(Message::Machine(Action::JogAngle(None)));
+        let _ = a.update(Message::Machine(Action::JogPress(3, false)));
+        assert_eq!(conn(&a).held(), None);
+        tick_for(&mut a, 200);
+        assert_eq!(conn(&a).snapshot.state, Some(State::Idle));
+        assert!(at(&a)[3].abs() < 1e-9, "{:?}", at(&a));
+        // Set machine A: A alone, X, Y and Z still wait for theirs.
+        let _ = a.update(Message::Machine(Action::MachineZero(Some(3))));
+        tick_until(&mut a, 3.0, "A set", |s| s.referenced[3]);
+        assert_eq!(conn(&a).unset_limited_axes(), vec![0, 1, 2]);
+        assert_eq!(conn(&a).jog_blocked(3), None);
+        // A 15° step, whatever the mm step is.
+        let _ = a.update(Message::Machine(Action::JogStep(Some(1.))));
+        let _ = a.update(Message::Machine(Action::JogAngle(Some(15.))));
+        let _ = a.update(Message::Machine(Action::JogPress(3, false)));
+        assert_eq!(conn(&a).held(), None);
+        tick_until(&mut a, 3.0, "A at 15°", |s| {
+            s.state == Some(State::Idle) && (s.machine_pos[3] - 15.).abs() < 1e-3
+        });
+        assert!(at(&a)[..3].iter().all(|v| v.abs() < 1e-9), "{:?}", at(&a));
+        // Held past the driver's 400 ms: the keepalive keeps A turning.
+        let _ = a.update(Message::Machine(Action::JogAngle(None)));
+        let _ = a.update(Message::Machine(Action::JogPress(3, true)));
+        assert_eq!(conn(&a).held(), Some((3, true)));
+        tick_for(&mut a, 700);
+        assert_eq!(conn(&a).snapshot.state, Some(State::Jog));
+        assert!(at(&a)[3] < 10., "{:?}", at(&a));
+        let _ = a.update(Message::Machine(Action::JogRelease));
+        tick_until(&mut a, 3.0, "Idle after the release", |s| {
+            s.state == Some(State::Idle)
+        });
+        // Zero A in G54; G55 keeps its own A offset.
+        let _ = a.update(Message::Machine(Action::WorkZero(Some(3))));
+        tick_until(&mut a, 2.0, "A zeroed in G54", |s| {
+            s.work_pos[3].abs() < 1e-6
+        });
+        let zero = at(&a)[3];
+        assert!((conn(&a).snapshot.work_offset[3] - zero).abs() < 1e-6);
+        let _ = a.update(Message::Machine(Action::Wcs(1)));
+        tick_until(&mut a, 2.0, "G55", |s| {
+            s.active_wcs == 1 && (s.work_pos[3] - zero).abs() < 1e-6
+        });
+        let _ = a.update(Message::Machine(Action::Wcs(0)));
+        tick_until(&mut a, 2.0, "G54", |s| {
+            s.active_wcs == 0 && s.work_pos[3].abs() < 1e-6
+        });
+        // MDI takes A words, in the work system.
+        mdi(&mut a, "G0 A90");
+        assert!((conn(&a).snapshot.work_pos[3] - 90.).abs() < 1e-3);
+        assert!((at(&a)[3] - zero - 90.).abs() < 1e-3, "{:?}", at(&a));
+        // A in degrees on the page: its row, its DRO and its jog controls.
+        a.page = Page::Control;
+        let texts = page_texts(&a);
+        let has = |t: &str| texts.iter().any(|x| x == t);
+        assert!(
+            has("90.000°") && has("A+") && has("A−") && has("15°") && has("Zero A"),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("Home/End (A)")),
+            "{texts:?}"
+        );
+        // E-stop clears A's position with the others': A neither jogs nor
+        // runs an MDI line until it is set again.
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+        assert!(!conn(&a).snapshot.referenced[3]);
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        assert_eq!(conn(&a).unset_limited_axes(), vec![0, 1, 2, 3]);
+        let left = at(&a)[3];
+        let _ = a.update(Message::Machine(Action::JogAngle(Some(15.))));
+        let _ = a.update(Message::Machine(Action::JogPress(3, false)));
+        // Nor does a calibration move, whose Move button says why.
+        for action in [
+            Action::CalAxis(3),
+            Action::CalDistance("90".into()),
+            Action::CalMove,
+        ] {
+            let _ = a.update(Message::Machine(action));
+        }
+        let _ = a.update(Message::ControlSetup(true));
+        assert!(
+            page_texts(&a)
+                .iter()
+                .any(|t| t.starts_with("A has no machine position")),
+            "{:?}",
+            page_texts(&a)
+        );
+        let _ = a.update(Message::ControlSetup(false));
+        mdi(&mut a, "G0 A0");
+        assert_eq!(at(&a)[3], left);
+        assert!(
+            conn(&a)
+                .snapshot
+                .log
+                .iter()
+                .any(|l| l.starts_with("MDI:") && l.contains("declare A with Set machine")),
+            "{:?}",
+            conn(&a).snapshot.log
+        );
+        let texts = page_texts(&a);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("A has no machine position")),
+            "{texts:?}"
+        );
+        // The state file keeps A: G54's A offset and where A was left.
+        let _ = a.update(Message::Disconnect);
+        idle(&mut a);
+        assert!((conn(&a).snapshot.work_offset[3] - zero).abs() < 1e-6);
+        assert!((at(&a)[3] - left).abs() < 1e-3, "{:?}", at(&a));
+        let _ = a.update(Message::Machine(Action::KeepPosition));
+        tick_until(&mut a, 3.0, "every axis set", |s| {
+            s.referenced[..4].iter().all(|r| *r)
+        });
+        assert!((at(&a)[3] - left).abs() < 1e-3);
+        let _ = a.update(Message::Disconnect);
+        // Without [axes.a] the page has nothing of A.
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), LIMITED);
+        idle(&mut a);
+        a.page = Page::Control;
+        let texts = page_texts(&a);
+        assert!(
+            !texts.iter().any(|t| t.ends_with('°')
+                || t.starts_with("A") && t.len() <= 2
+                || t.contains("Home/End")),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|t| t == "Z+") && !texts.iter().any(|t| t == "Zero A"));
+    }
+
+    /// A state file from before A (offsets and position of X, Y and Z
+    /// only) loads: every work system keeps its X, Y and Z, A is 0.
+    #[test]
+    fn a_state_file_without_a_loads_with_its_offsets() {
+        use crate::control::Action;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), &format!("{LIMITED}{A_AXIS}"));
+        let id = a.doc.machines[0].id.clone();
+        let file = dir
+            .path()
+            .join("uc100")
+            .join(format!("{id}-simulated.toml"));
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let mut wcs = vec!["[10.0, 20.0, -5.0]", "[1.0, 2.0, 3.0]"];
+        wcs.extend(std::iter::repeat_n("[0.0, 0.0, 0.0]", 4));
+        std::fs::write(
+            &file,
+            format!(
+                "wcs = [{}]\nactive_wcs = 1\nlast_position = [12.0, 7.0, -3.0]\n",
+                wcs.join(", ")
+            ),
+        )
+        .unwrap();
+        idle(&mut a);
+        let s = &conn(&a).snapshot;
+        assert_eq!(s.active_wcs, 1);
+        assert_eq!(s.work_offset, [1., 2., 3., 0., 0., 0.]);
+        let here = at(&a);
+        assert!(
+            [12., 7., -3., 0.]
+                .iter()
+                .zip(here)
+                .all(|(w, v)| (w - v).abs() < 1e-3),
+            "{here:?}"
+        );
+        // The driver switches work systems by MDI, which waits for A's
+        // machine position; setting it leaves every offset as it was.
+        let _ = a.update(Message::Machine(Action::MachineZero(Some(3))));
+        tick_until(&mut a, 3.0, "A set", |s| s.referenced[3]);
+        assert_eq!(conn(&a).snapshot.work_offset, [1., 2., 3., 0., 0., 0.]);
+        let _ = a.update(Message::Machine(Action::Wcs(0)));
+        tick_until(&mut a, 2.0, "G54", |s| s.active_wcs == 0);
+        assert_eq!(conn(&a).snapshot.work_offset, [10., 20., -5., 0., 0., 0.]);
+    }
+
+    /// Cycle Start waits for A's machine position, as long as it has none:
+    /// from connecting and after every E-stop. X, Y and Z without one only
+    /// turn the soft limits off (`run::limits_unchecked`).
+    #[test]
+    fn cycle_start_names_a_while_it_has_no_machine_position() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_on(dir.path(), &format!("{FAST}{A_AXIS}"));
+        idle(&mut a);
+        check_run(&mut a, 0);
+        let unset = |a: &App| {
+            problems(a)
+                .into_iter()
+                .find(|p| p.contains("no machine position"))
+        };
+        let starts = |a: &App, t: &str| unset(a).is_some_and(|p| p.starts_with(t));
+        let unchecked = |a: &App| crate::run::limits_unchecked(conn(a)).unwrap_or_default();
+        assert!(
+            starts(&a, "A has no machine position"),
+            "{:?}",
+            problems(&a)
+        );
+        assert!(unchecked(&a).starts_with("X, Y, Z have no machine position"));
+        let _ = a.update(Message::Machine(Action::MachineZero(Some(3))));
+        tick_until(&mut a, 3.0, "A set", |s| s.referenced[3]);
+        assert_eq!(unset(&a), None, "{:?}", problems(&a));
+        assert!(unchecked(&a).starts_with("X, Y, Z have no machine position"));
+        // Set machine zero here sets A with X, Y and Z.
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        assert!(
+            starts(&a, "A has no machine position"),
+            "{:?}",
+            problems(&a)
+        );
+        let _ = a.update(Message::Machine(Action::MachineZero(None)));
+        tick_until(&mut a, 3.0, "every axis set", |s| {
+            s.referenced[..4].iter().all(|r| *r)
+        });
+        assert_eq!(unset(&a), None, "{:?}", problems(&a));
+        // After an E-stop, X, Y and Z set one by one leave A listed alone.
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        for axis in 0..3 {
+            let _ = a.update(Message::Machine(Action::MachineZero(Some(axis))));
+        }
+        tick_until(&mut a, 3.0, "X, Y and Z set", |s| {
+            s.referenced[..3].iter().all(|r| *r)
+        });
+        assert!(
+            starts(&a, "A has no machine position"),
+            "{:?}",
+            problems(&a)
+        );
+    }
+
     #[test]
     fn a_jog_into_a_soft_limit_ends_at_the_limit() {
         use crate::control::Action;
@@ -6985,6 +8157,8 @@ flood = { pin = 8 }
             (Named::ArrowDown, (1, true)),
             (Named::PageUp, (2, false)),
             (Named::PageDown, (2, true)),
+            (Named::Home, (3, false)),
+            (Named::End, (3, true)),
         ];
         for (key, jog) in keys {
             assert_eq!(crate::jog_key(key), Some(jog));
@@ -7977,6 +9151,64 @@ flood = { pin = 8 }
     }
 
     #[test]
+    fn the_rotary_profile_refuses_reset_until_a_is_checked_and_then_calibrates_a_in_degrees() {
+        use crate::control::Action;
+        use crate::setup::{Edit, Msg};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), &crate::control::rotary_profile());
+        a.page = Page::Control;
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        // A's assumed pins and steps per degree are not verified: no Reset.
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Reset refused", |s| {
+            s.log
+                .iter()
+                .any(|l| l.starts_with("Cannot reset: machine setup is unverified"))
+        });
+        assert_eq!(conn(&a).snapshot.state, Some(State::EStop));
+        // Check them in the form and save: the machine reconnects.
+        let _ = a.update(Message::ControlSetup(true));
+        setup_edit(&mut a, Edit::ADirection(true));
+        for flag in ["pinout_verified", "steps_per_unit_verified"] {
+            setup_edit(&mut a, Edit::Flag(format!("commissioning.{flag}"), true));
+        }
+        let _ = a.update(Message::Setup(Msg::Save));
+        tick_until(&mut a, 3.0, "E-stop after reconnecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        let _ = a.update(Message::Machine(Action::MachineZero(Some(3))));
+        tick_until(&mut a, 3.0, "A set", |s| s.referenced[3]);
+        for action in [
+            Action::CalAxis(3),
+            Action::CalDistance("90".into()),
+            Action::CalMove,
+        ] {
+            let _ = a.update(Message::Machine(action));
+        }
+        let _ = a.view();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        tick_until(&mut a, 8.0, "A at 90", |s| {
+            s.state == Some(State::Idle) && (s.machine_pos[3] - 90.).abs() < 1e-3
+        });
+        // 90 degrees at the profile's 44.444 steps per degree.
+        assert_eq!(conn(&a).cal_pulses(), Some(4000));
+        let _ = a.update(Message::Machine(Action::CalMeasured("89".into())));
+        let v = conn(&a).calibrated().unwrap().unwrap();
+        assert!((v - 4000. / 89.).abs() < 1e-9, "{v}");
+        let _ = a.view();
+        let _ = a.update(Message::Setup(Msg::UseCalibration));
+        assert_eq!(draft(&a).number("axes.a.steps_per_unit"), "44.944");
+    }
+
+    #[test]
     fn saving_while_connected_reconnects_with_the_new_profile() {
         use crate::control::Action;
         use crate::setup::{Edit, Msg};
@@ -8332,7 +9564,7 @@ flood = { pin = 8 }
         assert_eq!(page.machine, NcMachine::LinuxCnc);
         assert_eq!(page.title, "NC review");
         assert_eq!(page.intro, "Check each setup, then export LinuxCNC G-code.");
-        assert!(page.note.starts_with("LinuxCNC 3-axis output"));
+        assert!(page.note.starts_with("LinuxCNC 3-axis or indexed A output"));
         assert!(page.ready && page.run_buttons().is_empty() && page.problems().is_empty());
         assert!(matches!(page.cards[0].1, NcCard::Programs(_)));
         let _ = b.view();
@@ -8608,7 +9840,7 @@ flood = { pin = 8 }
         crate::storage::save(&project, &legacy).unwrap();
         let (doc, notes) = crate::storage::load_reporting(&project).unwrap();
         assert_eq!(notes, [linked]);
-        assert_eq!(doc.materials.len(), 22);
+        assert_eq!(doc.materials.len(), 25);
         assert_eq!(doc.selected_material().unwrap().name(), "Brass C360");
         // Open: the status carries the note.
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
@@ -8671,7 +9903,7 @@ flood = { pin = 8 }
             b.status,
             "Choose New project, Open, or Continue your previous project."
         );
-        assert_eq!((b.doc.material_id, b.doc.materials.len()), (id, 23));
+        assert_eq!((b.doc.material_id, b.doc.materials.len()), (id, 26));
         assert!(!b.dirty);
         // A workspace that needed no migration starts clean, and so does a blank one.
         let c = App::from_workspace(path, None);
@@ -8745,13 +9977,13 @@ flood = { pin = 8 }
         let dir = tempfile::tempdir().unwrap();
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
         // A blank workspace starts with the starter materials.
-        assert_eq!(a.doc.materials.len(), 22);
+        assert_eq!(a.doc.materials.len(), 25);
         let user = crate::material::Material::new("Titanium Gr5");
         assert!(user.issues().is_empty());
         let titanium = user.id.clone();
         a.doc.materials.push(user);
         let _ = a.update(Message::NewProject);
-        assert_eq!(a.doc.materials.len(), 23);
+        assert_eq!(a.doc.materials.len(), 26);
         assert!(a.doc.material_id.is_empty() && a.doc.material.is_empty());
         // The user's own copy of a starter, renamed in another case and
         // edited, is kept; no starter is added next to it.
@@ -8773,8 +10005,8 @@ flood = { pin = 8 }
         let mut unique = names.clone();
         unique.sort();
         unique.dedup();
-        assert_eq!(names.len(), 23);
-        assert_eq!(unique.len(), 23, "{names:?}");
+        assert_eq!(names.len(), 26);
+        assert_eq!(unique.len(), 26, "{names:?}");
         assert!(a.doc.materials.iter().any(|m| m.id == titanium));
         assert_eq!(a.doc.material_id, mine);
         assert_eq!(
@@ -8792,15 +10024,15 @@ flood = { pin = 8 }
         );
         // Opening it again, and a new project, add nothing more.
         let _ = a.update(Message::OpenSample);
-        assert_eq!(a.doc.materials.len(), 23);
+        assert_eq!(a.doc.materials.len(), 26);
         let _ = a.update(Message::NewProject);
-        assert_eq!(a.doc.materials.len(), 23);
+        assert_eq!(a.doc.materials.len(), 26);
         assert!(a.doc.material_id.is_empty());
         // An example opened from a library without the user's edits links
         // its material to the starter.
         let mut fresh = App::from_workspace(dir.path().join("other").join("workspace.json"), None);
         let _ = fresh.update(Message::OpenSample);
-        assert_eq!(fresh.doc.materials.len(), 22);
+        assert_eq!(fresh.doc.materials.len(), 25);
         assert_eq!(
             fresh.doc.selected_material().unwrap().name(),
             "Aluminium 6061-T6"
@@ -8841,11 +10073,11 @@ flood = { pin = 8 }
         let dir = tempfile::tempdir().unwrap();
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
         a.doc.materials.retain(|m| m.name() != "Aluminium 6061-T6");
-        assert_eq!(a.doc.materials.len(), 21);
+        assert_eq!(a.doc.materials.len(), 24);
         let _ = a.update(Message::OpenSample);
         // The deleted starter is not brought back with its data: the example's
         // material is added to the library without cutting data, and says so.
-        assert_eq!(a.doc.materials.len(), 22);
+        assert_eq!(a.doc.materials.len(), 25);
         let selected = a.doc.selected_material().unwrap();
         assert_eq!(selected.name(), "Aluminium 6061-T6");
         assert!(selected.cutting_data().is_none());
@@ -8857,7 +10089,7 @@ flood = { pin = 8 }
         // New project and a second Explore example keep that entry once.
         let _ = a.update(Message::NewProject);
         let _ = a.update(Message::OpenSample);
-        assert_eq!(a.doc.materials.len(), 22);
+        assert_eq!(a.doc.materials.len(), 25);
         assert!(a.status.contains("linked to the library"), "{}", a.status);
     }
     #[test]
@@ -8866,9 +10098,9 @@ flood = { pin = 8 }
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
         a.doc.materials.retain(|m| m.name() != "Aluminium 5052-H32");
         let _ = a.update(Message::NewProject);
-        assert_eq!(a.doc.materials.len(), 21);
+        assert_eq!(a.doc.materials.len(), 24);
         let _ = a.update(Message::OpenSample);
-        assert_eq!(a.doc.materials.len(), 21);
+        assert_eq!(a.doc.materials.len(), 24);
         assert!(
             !a.doc
                 .materials
@@ -10723,6 +11955,168 @@ flood = { pin = 8 }
         );
         let _ = a.view();
     }
+    /// The Geometry tab's holes of a Drill at several A angles: each read at
+    /// the angle that cuts it, and read again when the angles change (the
+    /// kept answer is keyed on them and on A's turn) (LIO-246, review 2).
+    #[test]
+    fn a_drill_at_several_angles_lists_its_holes_and_follows_the_angles() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        let (mut doc, mesh) =
+            crate::indexed::tests::radial_job("30, 90, 150, 210, 270, 330", &[0, 1, 2, 3, 4, 5]);
+        doc.file = Some(crate::model::ModelFile {
+            name: "radial-holes.3mf".into(),
+            path: dir.path().join("radial-holes.3mf"),
+            format: "3mf".into(),
+            bytes: 0,
+            thickness: None,
+        });
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh.clone());
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectSetup(1));
+        let op = a.doc.setups[1].operations[0].clone();
+        let holes = |a: &App| a.drill_holes(&op, &mesh).as_ref().clone().map(|h| h.len());
+        assert_eq!(holes(&a), Ok(6));
+        let walls = |a: &App| {
+            a.pocket_holes(&op, &mesh)
+                .as_ref()
+                .as_ref()
+                .map(|h| h.len())
+                .ok()
+        };
+        assert_eq!(walls(&a), Some(6));
+        // Two of the angles: two of the holes.
+        a.doc.setups[1]
+            .p
+            .insert(crate::indexed::ANGLES.into(), "30, 90".into());
+        a.doc.sync_turns(Some(&mesh));
+        assert_eq!(holes(&a), Ok(2));
+        assert_eq!(walls(&a), Some(2));
+    }
+    /// On a Drill at several A angles each row's remove drops its own hole:
+    /// the tube's three pairs of holes at A 30, 90 and 150, read each in its
+    /// angle's frame, all at the same centre there (LIO-246, review 3).
+    #[test]
+    fn each_remove_of_a_drill_at_several_angles_drops_its_own_hole() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut doc, mesh) = crate::indexed::tests::radial_doc(
+            "radial-tube",
+            "30, 90, 150",
+            ("3.3", "45"),
+            14.3,
+            |x, _| (x - 20.).abs() < 2.2,
+        );
+        doc.file = Some(crate::model::ModelFile {
+            name: "radial-tube.3mf".into(),
+            path: dir.path().join("radial-tube.3mf"),
+            format: "3mf".into(),
+            bytes: 0,
+            thickness: None,
+        });
+        let fresh = || {
+            let mut a = fresh_app(&dir);
+            a.replace_document(doc.clone(), None);
+            a.imported_mesh = Some(mesh.clone());
+            a.page = Page::Work;
+            let _ = a.update(Message::SelectSetup(1));
+            let _ = a.update(Message::SelectOp(0));
+            a
+        };
+        let a = fresh();
+        let op = a.doc.setups[1].operations[0].clone();
+        let drilled = a.drill_holes(&op, &mesh).as_ref().clone().unwrap();
+        let picked = a.pocket_holes(&op, &mesh);
+        let picked = picked.as_ref().as_ref().unwrap();
+        assert_eq!((drilled.len(), picked.len()), (3, 3));
+        let rows: Vec<usize> = (drilled.iter())
+            .map(|h| crate::ui::picked_row(picked, h).unwrap())
+            .collect();
+        let mut distinct = rows.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 3, "{rows:?}");
+        // Each says its angle, its X and Y the same in each angle's frame.
+        assert_eq!(
+            drilled
+                .iter()
+                .map(|h| crate::indexed::at_angle(h.a))
+                .collect::<Vec<_>>(),
+            [" at A30°", " at A90°", " at A150°"]
+        );
+        for (h, &i) in drilled.iter().zip(&rows) {
+            let mut a = fresh();
+            let _ = a.update(Message::DropHole(i));
+            let op = a.doc.setups[1].operations[0].clone();
+            let left: Vec<Option<f32>> = (a.drill_holes(&op, &mesh).as_ref().clone().unwrap())
+                .iter()
+                .map(|h| h.a)
+                .collect();
+            // The hole opposite stays picked, but no angle turns it up now.
+            assert_eq!(left.len(), 2, "{left:?}");
+            assert!(
+                !left.contains(&h.a),
+                "dropped row {i} at {:?}: {left:?}",
+                h.a
+            );
+        }
+    }
+    /// "Stock after this setup" on an indexed setup with the bar in the
+    /// chuck: the view shows the round bar as its four angles leave it, every
+    /// angle's cuts (#288 with LIO-246).
+    #[test]
+    fn stock_after_an_indexed_setup_is_the_bar_its_angles_leave() {
+        use crate::indexed::tests::{bar_job, cutter, faced_square, prism};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        let mesh = prism(30.);
+        let mut doc = bar_job(
+            &mesh,
+            30.,
+            "100",
+            "-150",
+            "90, 180, 270, 0",
+            faced_square(&cutter("12"), &mesh),
+        );
+        doc.file = Some(crate::model::ModelFile {
+            name: "square-bar.stl".into(),
+            path: dir.path().join("square-bar.stl"),
+            format: "stl".into(),
+            bytes: 0,
+            thickness: None,
+        });
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.smoke_dir = Some(dir.path().to_path_buf());
+        a.page = Page::Work;
+        a.selected = None;
+        let _ = a.refresh_left_stock();
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::SetupEnd);
+        let _ = a.refresh_start_mesh();
+        let view = crate::ui::scene_viewport(&a).unwrap();
+        let (volume, surface) = view.start_stock.expect("the stock setup 2 leaves");
+        assert!(!surface.triangles.is_empty());
+        // The bar along X, cut.
+        assert!(volume.bar_x.is_some() && volume.remaining < volume.material);
+        let (_, _, before) = a.start_source().unwrap();
+        assert_eq!(before, (1, 1));
+        let job = a.left_stock.job.clone().unwrap();
+        let cuts: Vec<_> = job.cuts.iter().filter(|c| c.source < before).collect();
+        assert_eq!(
+            cuts.len(),
+            a.left_stock.after[1].clone().unwrap().cuts.len()
+        );
+        // The Facing's cuts at each of its four angles: each angle's frame.
+        let mut frames: Vec<_> = vec![];
+        for c in cuts.iter().filter(|c| c.source == (1, 0)) {
+            if !frames.contains(&c.frame) {
+                frames.push(c.frame);
+            }
+        }
+        assert_eq!(frames.len(), 4);
+        let _ = a.view();
+    }
     #[test]
     fn the_view_shows_the_stock_a_setup_leaves_when_its_end_is_selected() {
         let dir = tempfile::tempdir().unwrap();
@@ -12507,6 +13901,7 @@ flood = { pin = 8 }
             path: path.clone(),
             format: "obj".into(),
             bytes: std::fs::metadata(&path).unwrap().len(),
+            thickness: None,
         };
         let _ = a.update(Message::FileImported(Some(Ok((info, Some(mesh))))));
         assert!(!a.import_busy);
@@ -12716,6 +14111,7 @@ flood = { pin = 8 }
             path: "part.obj".into(),
             format: "obj".into(),
             bytes: 10,
+            thickness: None,
         };
         let _ = a.update(Message::FileImported(Some(Ok((
             file,
@@ -12856,6 +14252,7 @@ flood = { pin = 8 }
             path: path.clone(),
             format: "3mf".into(),
             bytes: 1,
+            thickness: None,
         };
         let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
         a
@@ -12870,6 +14267,7 @@ flood = { pin = 8 }
             path: "part.stl".into(),
             format: "stl".into(),
             bytes: 1,
+            thickness: None,
         };
         let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
         let tool = a.doc.setup().operations[0].tool.clone();
@@ -13145,6 +14543,7 @@ flood = { pin = 8 }
             path: "part.stl".into(),
             format: "stl".into(),
             bytes: 1,
+            thickness: None,
         };
         let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
         let tool = a.doc.setup().operations[0].tool.clone();
@@ -13161,6 +14560,7 @@ flood = { pin = 8 }
             path: "half-ball.stl".into(),
             format: "stl".into(),
             bytes: 1,
+            thickness: None,
         };
         let mesh = crate::cam::tests::half_ball_on_plate();
         let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
@@ -13291,6 +14691,7 @@ flood = { pin = 8 }
                 path: "two-half-balls.stl".into(),
                 format: "stl".into(),
                 bytes: 1,
+                thickness: None,
             };
             let mesh = crate::cam::tests::two_half_balls();
             let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
@@ -13512,6 +14913,7 @@ flood = { pin = 8 }
             path: "part.stl".into(),
             format: "stl".into(),
             bytes: 1,
+            thickness: None,
         };
         let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
         let tool = a.doc.setup().operations[0].tool.clone();
@@ -16842,6 +18244,7 @@ flood = { pin = 8 }
             path: dir.path().join("other.stl"),
             format: "stl".into(),
             bytes: 1,
+            thickness: None,
         };
         let other = box_mesh([30., 20., 10.]);
         let _ = a.update(Message::FileImported(Some(Ok((file, Some(other))))));
@@ -18206,9 +19609,9 @@ flood = { pin = 8 }
         // own checks covered the plan as applied, not later edits.
         assert_eq!(
             program_note(Held::No),
-            "LinuxCNC 3-axis output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Fixtures, clamps and the machine body are not checked: preview each program in LinuxCNC and air-cut first."
+            "LinuxCNC 3-axis or indexed A output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Fixtures, clamps and the machine body are not checked: preview each program in LinuxCNC and air-cut first."
         );
-        let base = "LinuxCNC 3-axis output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. ";
+        let base = "LinuxCNC 3-axis or indexed A output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. ";
         assert_eq!(
             program_note(Held::Every),
             format!(
@@ -20771,10 +22174,25 @@ flood = { pin = 8 }
     }
     #[test]
     fn a_lathe_setup_offers_a_chuck_and_a_mill_setup_a_vise_or_clamps() {
-        assert_eq!(crate::ui::holding_choices(true), ["None", "Chuck"]);
+        // A 3-axis mill also holds a round bar in a V-block, soft jaws or a
+        // collet block (LIO-249).
+        let lathe = crate::lathe::defaults();
+        assert_eq!(crate::ui::holding_choices(&lathe), ["None", "Chuck"]);
         assert_eq!(
-            crate::ui::holding_choices(false),
-            ["None", "Vise", "Clamps"]
+            crate::ui::holding_choices(&Machine::new(3)),
+            [
+                "None",
+                "Vise",
+                "Clamps",
+                "V-block",
+                "Soft jaws",
+                "Collet block"
+            ]
+        );
+        // A mill with a rotary A axis also holds the stock in the chuck on A.
+        assert_eq!(
+            crate::ui::holding_choices(&Machine::new(4)),
+            ["None", "Vise", "Clamps", "Chuck"]
         );
         let dir = tempfile::tempdir().unwrap();
         let mut a = holding_app(&dir);
@@ -20783,7 +22201,9 @@ flood = { pin = 8 }
         let _ = a.update(Message::SetupStep("Holding"));
         shows(
             &a,
-            &["The vise or clamps that hold the stock, from the workholding library."],
+            &[
+                "The vise or clamps that hold the stock, or the V-block, soft jaws or collet block that hold a round bar, from the workholding library.",
+            ],
         );
         edit_setup(&mut a, &[("holding", "Vise")]);
         shows(&a, &["Vise", "Suggest layout", "Jaw offset · mm"]);
@@ -20960,8 +22380,10 @@ flood = { pin = 8 }
         assert!(!adds(&a, Strategy::Face));
         assert!(!adds(&a, Strategy::FiveAxis));
         assert!(adds(&a, Strategy::Drill) && adds(&a, Strategy::Box));
-        // The ten dimmed tiles each say why; Box and Drill are not dimmed.
-        assert_eq!(reasons(&a, one_axis), Strategy::ALL.len() - 3);
+        // The ten dimmed tiles each say why; Box and Drill are not dimmed,
+        // and Indexed points to indexed setups.
+        assert_eq!(reasons(&a, one_axis), Strategy::ALL.len() - 4);
+        assert_eq!(reasons(&a, crate::indexed::POINTER), 1);
         assert_eq!(reasons(&a, box_on_cnc), 0);
         // Back on the CNC setup only Box is dimmed.
         a.doc.active = a.doc.setups[1].id.clone();
@@ -21039,7 +22461,7 @@ flood = { pin = 8 }
                 "{s:?}"
             );
         }
-        // The eleven others each say why.
+        // The twelve others each say why.
         assert_eq!(reasons(&a, only_turn), Strategy::ALL.len() - 2);
         assert_eq!(reasons(&a, turn_on_mill), 0);
         // Back on the CNC setup.

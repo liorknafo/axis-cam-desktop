@@ -1157,6 +1157,7 @@ impl Motions {
                 feed: rate,
                 start: self.plan.duration,
                 end,
+                a: None,
             });
             self.plan.duration = end;
         }
@@ -1246,6 +1247,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
             tool_length: job.tool_length,
             holder_radius: job.holder_radius,
             neck: None,
+            stops: vec![],
             display_scale: job.scale,
             duration: 0.,
             target: zones

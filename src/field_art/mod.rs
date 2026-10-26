@@ -1,5 +1,6 @@
-//! Pictures for single fields: workholding, stock, the lathe and its
-//! tools, probing, the post, linking, manual machines and cutting data.
+//! Pictures for single fields: workholding (a round bar's too), stock, the
+//! lathe and its tools, probing, the post, linking, manual machines and
+//! cutting data.
 //! Each group draws one moment of its 5 s phase, picked by its number;
 //! the drawing toolkit is `illustration`'s.
 use crate::help::Diagram;
@@ -8,6 +9,7 @@ use iced::widget::canvas::Frame;
 mod cnc;
 mod lathe;
 mod machine;
+mod round;
 mod turning;
 mod workholding;
 
@@ -26,6 +28,7 @@ pub fn draw(d: Diagram, f: &mut Frame, time: f32) -> bool {
         Diagram::Manual(n) => machine::manual(f, time, phase, n),
         Diagram::Machine(n) => machine::machine(f, time, phase, n),
         Diagram::Cutting(n) => machine::cutting(f, time, phase, n),
+        Diagram::Round(n) => round::round(f, time, phase, n),
         _ => return false,
     }
     true

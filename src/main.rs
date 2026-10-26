@@ -1,19 +1,28 @@
 mod adaptive;
+mod air;
 mod analysis;
 mod cam;
+mod chamfer;
 mod choice_diagram;
 mod choice_help;
+mod chuck;
 mod control;
+mod dxf;
+mod envelope;
 mod facing;
 #[cfg(test)]
 mod fake_openai;
 mod field_art;
+mod finishing;
 mod forces;
 mod gpu_mesh;
+mod groove;
 mod guide;
 mod help;
 mod holding;
+mod hole_stages;
 mod illustration;
+mod indexed;
 mod lathe;
 mod look;
 mod machine_view;
@@ -34,11 +43,14 @@ mod post_check;
 mod progress;
 mod proposal;
 mod rest;
+mod rotary_check;
+mod round_hold;
 mod run;
 mod section;
 mod session;
 mod settings;
 mod setup;
+mod sheet;
 mod simulation;
 mod smoke;
 mod step;
@@ -50,6 +62,7 @@ mod surface;
 mod thread;
 mod threading;
 mod three_mf;
+mod tooth_load;
 mod turn;
 mod ui;
 mod uncut;
@@ -190,6 +203,9 @@ pub enum Message {
     /// Add the operations that drill and thread the setup's threaded holes
     /// (`threading::add`).
     AddThreading,
+    /// Add the drilling (and roughing) before the selected Reaming or
+    /// Boring, on its holes (`hole_stages::add`).
+    AddHoleStages,
     /// Fill the selected Turn thread's side, diameter, pitch and end from
     /// the thread on the part's axis (`lathe::thread_from_part`).
     ThreadFromPart,
@@ -226,6 +242,8 @@ pub enum Message {
     SquareToStock,
     AssignMachine(String),
     NewMachine,
+    /// Adds the Jingyan CNC4030 with its rotary unit to the Machine library.
+    AddRotaryMachine,
     EditMachine(String),
     WizardStep(usize),
     SaveMachine,
@@ -362,6 +380,9 @@ pub enum Message {
     /// The simulation replayed to where the slider was let go: the epoch
     /// of that catch-up and the simulation.
     Replayed(u64, Replayed),
+    /// The load on each tooth along the path of the simulation of this id
+    /// (`App::measure_tooth_load`).
+    ToothLoaded(String, Option<std::sync::Arc<tooth_load::ToothLoad>>),
     /// The part's holes worked out off the window's thread for picking by
     /// their outline (`App::refresh_part_holes`), with their key.
     PartHoles(u64, PartHoles),
@@ -625,7 +646,7 @@ pub struct SetupHolding {
 }
 /// Setup settings that decide how the setup is held and nothing the earlier
 /// setups' cuts leave behind: an edit of one keeps the stock worked out.
-const HOLDING_KEYS: [&str; 7] = [
+const HOLDING_KEYS: [&str; 11] = [
     "holding",
     "holder",
     "vise_axis",
@@ -633,6 +654,10 @@ const HOLDING_KEYS: [&str; 7] = [
     "vise_grip",
     "clamps",
     "holding_gap",
+    "chuck_jaws",
+    "chuck_stickout",
+    "chuck_tailstock",
+    "chuck_jaw_angle",
 ];
 /// What `cam::holes` answers for the Drill editor's list.
 pub(crate) type DrillHoles = Result<Vec<cam::Hole>, String>;
@@ -887,6 +912,24 @@ fn holding_checks(doc: &Document, mesh: &mesh::Mesh, left: &LeftStock, key: u64)
                 .map(|v| holding::Bands::new(v, frame, part));
             let held = holding::held_by(doc, setup, stock, bands.as_ref());
             let (mut problems, mut margins) = (vec![], vec![]);
+            if chuck::holds(setup)
+                && doc.holding_issues_with(si, Some(held)).is_empty()
+                && let Ok(rig) = doc.chuck_rig(setup, held.stock)
+            {
+                let removed = before.as_deref().map(|v| rest::Removed::new(v, frame));
+                problems.extend(rig.grip_issue(removed.as_ref()));
+                let bites = left.bites.get(si).into_iter().flatten();
+                let bites = bites.map(|(oi, b)| (*oi, b.as_slice()));
+                if problems.is_empty() {
+                    for (oi, margin) in forces::chuck_margins(doc, si, bites, &rig) {
+                        let name = setup.operations[oi].name();
+                        margins.push(forces::chuck_line(name, margin.as_ref()));
+                        if let Some(m) = margin {
+                            problems.extend(forces::chuck_issues(name, &m));
+                        }
+                    }
+                }
+            }
             if let (Some(layout), Some(holder)) = (layout, doc.holder(get(&setup.p, "holder")))
                 && doc.holding_issues_with(si, Some(held)).is_empty()
             {
@@ -1030,6 +1073,9 @@ pub struct App {
     /// Generate where it is asked, not on a thread of its own: in the
     /// headless smoke run and the unit tests, as their other work is.
     pub(crate) generate_inline: bool,
+    /// The load on each tooth being worked out off the window's thread for
+    /// the simulation of this id, and its Cancel (`App::measure_tooth_load`).
+    pub(crate) tooth_load_job: Option<(String, std::sync::Arc<progress::Progress>)>,
     /// The browser's pictures of stock, each drawn once for what it shows
     /// (`ui::stock_picture`).
     pub(crate) stock_pictures: std::cell::RefCell<Vec<(u64, iced::widget::image::Handle)>>,
@@ -1258,10 +1304,13 @@ pub struct FoundHoles {
     pub round: Vec<Option<cam::Hole>>,
 }
 /// Whether a click on a wall of the part picks its whole hole in `op`: a
-/// Pocket, a Contour, and a Drill of the part's holes (not of the pins').
+/// Pocket, a Contour, a Drill of the part's holes (not of the pins'), and
+/// an Internal groove's bore (a boss's wall it picks as a face).
 pub(crate) fn picks_holes(op: &Operation) -> bool {
-    matches!(op.strategy, Strategy::Pocket | Strategy::Contour)
-        || (op.strategy == Strategy::Drill && !op.drills_pin_holes())
+    matches!(
+        op.strategy,
+        Strategy::Pocket | Strategy::Contour | Strategy::Groove
+    ) || (op.strategy == Strategy::Drill && !op.drills_pin_holes())
 }
 /// Whether a click on the part picks the whole smooth face it lands on in
 /// `op` (`mesh::Mesh::region_of`), a curved one included: Parallel and
@@ -1602,6 +1651,7 @@ impl App {
         if !doc.sample_model {
             doc.sync_stock_sources();
         }
+        doc.sync_turns(None);
         let imported_mesh = None;
         let icons: Vec<_> = [
             include_bytes!("../assets/op-0.svg").as_slice(),
@@ -1617,6 +1667,8 @@ impl App {
             include_bytes!("../assets/op-10.svg"),
             include_bytes!("../assets/op-11.svg"),
             include_bytes!("../assets/op-12.svg"),
+            include_bytes!("../assets/op-13.svg"),
+            include_bytes!("../assets/op-14.svg"),
         ]
         .iter()
         .map(|b| iced::widget::svg::Handle::from_memory(b.to_vec()))
@@ -1693,6 +1745,7 @@ impl App {
             generating: None,
             generation_epoch: 0,
             generate_inline,
+            tooth_load_job: None,
             stock_pictures: Default::default(),
             post_epoch: 0,
             picture_job: None,
@@ -1860,6 +1913,7 @@ impl App {
         self.left_stock = LeftStock::default();
         self.holding_checks = HoldingChecks::default();
         self.imported_mesh = None;
+        self.sync_turns();
         self.import_error = None;
         self.project_dirty = path.is_none();
         self.set_project_file(path);
@@ -1918,18 +1972,38 @@ impl App {
         self.touch();
         self.status = "Setup created without operations. Set stock, origin and workholding, then add an operation.".into();
     }
+    /// Setup 1's DXF thickness field: the text is kept as typed, and a
+    /// positive number becomes the part's thickness (`ModelFile::thickness`),
+    /// which reloads the part extruded to it.
+    fn set_dxf_thickness(&mut self, text: String) -> Task<Message> {
+        let value = text.trim().parse::<f32>().ok();
+        if let Some(first) = self.doc.setups.first_mut() {
+            first.p.insert(sheet::DXF_THICKNESS_KEY.into(), text);
+        }
+        self.touch();
+        let Some(file) = self.doc.file.as_mut().filter(|f| f.format == "dxf") else {
+            return Task::none();
+        };
+        match value.filter(|v| v.is_finite() && *v > 0. && *v <= sheet::MAX_DXF_THICKNESS) {
+            Some(t) if file.thickness != Some(t) => {
+                file.thickness = Some(t);
+                self.restore_model()
+            }
+            _ => Task::none(),
+        }
+    }
     fn restore_model(&mut self) -> Task<Message> {
         self.imported_mesh = None;
         self.import_error = None;
         let Some(file) = &self.doc.file else {
             return Task::none();
         };
-        let path = file.path.clone();
+        let file = file.clone();
         self.import_busy = true;
         self.status = format!("Loading {}…", file.name);
         Task::perform(
             async move {
-                tokio::task::spawn_blocking(move || mesh::load(&path))
+                tokio::task::spawn_blocking(move || mesh::load_file(&file))
                     .await
                     .unwrap_or_else(|e| Err(format!("Import worker failed: {e}")))
             },
@@ -2223,6 +2297,9 @@ impl App {
         if let Some(g) = self.generating.take() {
             g.progress.cancel();
         }
+        if let Some((_, job)) = self.tooth_load_job.take() {
+            job.cancel();
+        }
         self.generation_epoch += 1;
         let epoch = self.generation_epoch;
         let progress = std::sync::Arc::new(progress::Progress::default());
@@ -2285,6 +2362,37 @@ impl App {
             },
         )
     }
+    /// Works out the load on each tooth along the simulation's path
+    /// (`tooth_load::of`) off the window's thread, on a copy, after its
+    /// preview is shown: the path takes its colours when it is done
+    /// (`Message::ToothLoaded`). One for an earlier simulation is cancelled.
+    /// Inline in the smoke run and tests.
+    fn measure_tooth_load(&mut self) -> Task<Message> {
+        if let Some((_, job)) = self.tooth_load_job.take() {
+            job.cancel();
+        }
+        // A feed held to the load came with it (`tooth_load::hold`).
+        let Some(simulation) = self.simulation.as_mut().filter(|s| s.tooth_load.is_none()) else {
+            return Task::none();
+        };
+        if self.generate_inline {
+            simulation.tooth_load = tooth_load::of(simulation, &self.doc).map(std::sync::Arc::new);
+            return Task::none();
+        }
+        let progress = std::sync::Arc::new(progress::Progress::default());
+        let id = simulation.id.clone();
+        self.tooth_load_job = Some((id.clone(), progress.clone()));
+        let (copy, doc) = (simulation.clone(), self.doc.clone());
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    progress.run(|| tooth_load::of(&copy, &doc).map(std::sync::Arc::new))
+                })
+                .await
+            },
+            move |load| Message::ToothLoaded(id.clone(), load.ok().flatten()),
+        )
+    }
     /// Stops the generation under way, if any: what it makes is dropped.
     fn cancel_generation(&mut self) {
         if let Some(g) = self.generating.take() {
@@ -2298,6 +2406,48 @@ impl App {
     /// it is stale (another started since, or it was cancelled).
     fn finished(&mut self, epoch: u64) -> Option<Generating> {
         self.generating.take_if(|g| g.epoch == epoch)
+    }
+    /// Keeps what the Control page found for the rotary unit of machine
+    /// `id` (LIO-186): its centreline probed, marked measured, or the mark
+    /// gone stale; in its draft too if it is being edited. Like the pins'
+    /// place it is a measurement: no setup's check is made out of date.
+    fn keep_rotary(&mut self, id: &str, keep: control::RotaryKeep) {
+        let keep = |m: &mut Machine| {
+            if m.id != id {
+                return;
+            }
+            match keep {
+                control::RotaryKeep::Centreline([y, z], [rx, ry, rz]) => {
+                    m.p.insert("a_centre_y".into(), format!("{y:.3}"));
+                    m.p.insert("a_centre_z".into(), format!("{z:.3}"));
+                    m.p.insert(model::CENTRE_REF.into(), format!("{rx:.3} {ry:.3} {rz:.3}"));
+                    m.p.insert(control::CENTRE_MARK.into(), control::MEASURED.into());
+                }
+                control::RotaryKeep::Stale(why)
+                    if get(&m.p, control::CENTRE_MARK) == control::MEASURED =>
+                {
+                    m.p.insert(control::CENTRE_MARK.into(), format!("stale after {why}"));
+                }
+                control::RotaryKeep::Stale(_) => {}
+            }
+        };
+        self.doc.machines.iter_mut().for_each(keep);
+        keep(&mut self.machine_draft);
+        self.dirty = true;
+        self.project_dirty = true;
+        self.last_edit = Instant::now();
+    }
+    /// Works out how A turns each indexed setup (`Document::sync_turns`),
+    /// with the part when it is there.
+    fn sync_turns(&mut self) {
+        let mesh = if self.doc.file.is_some() {
+            self.imported_mesh.as_ref()
+        } else if self.doc.sample_model {
+            Some(&self.sample_mesh)
+        } else {
+            None
+        };
+        self.doc.sync_turns(mesh);
     }
     fn touch(&mut self) {
         // A generation under way makes the job as it was.
@@ -2317,6 +2467,7 @@ impl App {
                 post::sync_pin_drilling(&mut self.doc, mesh);
             }
         }
+        self.sync_turns();
         self.audit_report.clear();
         self.invalidate_post();
         // A running plan and a preview describe the job as it was.
@@ -2412,6 +2563,21 @@ impl App {
         let setup = self.doc.setups.get(live.setup)?;
         (setup.id == self.doc.active).then_some((live.tip, live.radius, live.stickout))
     }
+    /// The machine's A (degrees, in work coordinates, as programs command
+    /// it) while a tool run of the active setup cuts, on a machine with A.
+    pub fn live_a(&self) -> Option<f32> {
+        let c = self.control.as_ref()?;
+        let live = c.run.as_ref()?.live(&c.snapshot)?;
+        let setup = self.doc.setups.get(live.setup)?;
+        (setup.id == self.doc.active && c.axis(3)).then_some(c.snapshot.work_pos[3] as f32)
+    }
+    /// The A the Job view draws the active indexed setup's part, stock and
+    /// chuck at: the machine's while a run of it cuts (`live_a`), else the
+    /// simulation's (`Simulation::a_now`). None for a setup not indexed.
+    pub fn shown_a(&self) -> Option<f32> {
+        self.doc.active_setup()?.turn?;
+        self.live_a().or_else(|| self.active_simulation()?.a_now())
+    }
     /// The stock the run of the active setup has carved (`run::Run::stock`),
     /// for the Control page's 3D view: MANUFACTURE keeps the part and the
     /// planned stock.
@@ -2425,6 +2591,19 @@ impl App {
             return None;
         }
         r.stock()
+    }
+    /// The stock a run of the active setup that turns A has carved, as a
+    /// volume (`run::Run::carved_volume`), for the Control page's 3D view.
+    pub fn live_volume(&self) -> Option<(&volume::Volume, u64)> {
+        if self.page != Page::Control {
+            return None;
+        }
+        let r = self.control.as_ref()?.run.as_ref()?;
+        let setup = self.doc.setups.get(r.setup)?;
+        if setup.id != self.doc.active {
+            return None;
+        }
+        r.carved_volume()
     }
     /// The machine moves, or a tool run of the Run panel or a probe is under way:
     /// planning is locked (`while_locked`) and no preview or check is worked
@@ -2604,9 +2783,10 @@ impl App {
                             .setup()
                             .operation_issues_in(i, &self.doc.tools, self.is_sample());
                     if self.doc.file.is_some() {
-                        issues.extend(surface::issues(
+                        issues.extend(indexed::surface_issues(
+                            &self.doc,
+                            self.doc.index(),
                             o,
-                            self.doc.setup(),
                             self.imported_mesh.as_ref(),
                         ));
                     }
@@ -2618,11 +2798,12 @@ impl App {
     pub fn job_issues(&self) -> Vec<String> {
         let mut issues = self.doc.issues();
         if self.doc.file.is_some() {
-            for setup in &self.doc.setups {
+            for (si, setup) in self.doc.setups.iter().enumerate() {
                 for operation in setup.operations.iter().filter(|o| o.enabled) {
-                    issues.extend(surface::issues(
+                    issues.extend(indexed::surface_issues(
+                        &self.doc,
+                        si,
                         operation,
-                        setup,
                         self.imported_mesh.as_ref(),
                     ));
                 }
@@ -2977,9 +3158,7 @@ impl App {
         let setup = self.doc.setup();
         let mut hasher = std::hash::DefaultHasher::new();
         mesh.fingerprint.hash(&mut hasher);
-        for key in ["rx", "ry", "rz", "tx", "ty", "tz"] {
-            get(&setup.p, key).hash(&mut hasher);
-        }
+        self.hash_placement(&mut hasher);
         op.surfaces
             .as_ref()
             .map(|s| (&s.mesh_fingerprint, &s.ids))
@@ -2997,7 +3176,17 @@ impl App {
         }
         #[cfg(test)]
         DRILL_HOLE_RUNS.with(|n| n.set(n.get() + 1));
-        let found = std::sync::Arc::new(cam::holes(setup, op, mesh));
+        // At several A angles, each hole read at the angle that cuts it.
+        let found = (self
+            .doc
+            .holes_listed(self.doc.index(), op, mesh, |posed, op| {
+                cam::holes(posed, op, mesh)
+            }))
+        .map(|listed| {
+            listed.map(|l| (l.into_iter().map(|(a, h)| cam::Hole { a: Some(a), ..h })).collect())
+        })
+        .unwrap_or_else(|| cam::holes(setup, op, mesh));
+        let found = std::sync::Arc::new(found);
         *kept = Some((key, found.clone()));
         found
     }
@@ -3021,7 +3210,17 @@ impl App {
             .iter()
             .flat_map(|s| s.ids.iter().copied())
             .collect();
-        let found = std::sync::Arc::new(pocket::holes(self.doc.setup(), &ids, mesh));
+        let found = (self
+            .doc
+            .holes_listed(self.doc.index(), op, mesh, |posed, op| {
+                let ids = (op.surfaces.iter()).flat_map(|s| s.ids.iter().copied());
+                pocket::holes(posed, &ids.collect(), mesh)
+            }))
+        .map(|listed| {
+            listed.map(|l| (l.into_iter().map(|(a, h)| pocket::Hole { a: Some(a), ..h })).collect())
+        })
+        .unwrap_or_else(|| pocket::holes(self.doc.setup(), &ids, mesh));
+        let found = std::sync::Arc::new(found);
         *kept = Some((key, found.clone()));
         found
     }
@@ -3136,16 +3335,32 @@ impl App {
         }
         out
     }
+    /// What the active setup's holes are read in, for the kept hole lists:
+    /// its placement; for an indexed setup all its fields and its machine's
+    /// (its A angles, its Reposition action, the A centreline and limits),
+    /// its A turn, and its base setup's fields and machine's.
+    fn hash_placement(&self, hasher: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        let si = self.doc.index();
+        let setup = self.doc.setup();
+        for key in ["rx", "ry", "rz", "tx", "ty", "tz"] {
+            get(&setup.p, key).hash(hasher);
+        }
+        if indexed::is_indexed(setup) || indexed::is_label_only(setup) {
+            (&setup.p, &setup.machine.p).hash(hasher);
+            format!("{:?}", setup.turn).hash(hasher);
+            if let Some(base) = self.doc.index_base(si).and_then(|b| self.doc.setups.get(b)) {
+                (&base.p, &base.machine.p).hash(hasher);
+            }
+        }
+    }
     /// What the holes a Pocket's or Contour's walls pick are worked out from:
     /// the part, the setup's placement and the selected surfaces.
     fn holes_key(&self, op: &Operation, mesh: &mesh::Mesh) -> u64 {
         use std::hash::{Hash, Hasher};
-        let setup = self.doc.setup();
         let mut hasher = std::hash::DefaultHasher::new();
         mesh.fingerprint.hash(&mut hasher);
-        for key in ["rx", "ry", "rz", "tx", "ty", "tz"] {
-            get(&setup.p, key).hash(&mut hasher);
-        }
+        self.hash_placement(&mut hasher);
         op.surfaces
             .as_ref()
             .map(|s| (&s.mesh_fingerprint, &s.ids))
@@ -3536,7 +3751,7 @@ impl App {
             return Task::none();
         };
         let holes = match &shown.guide.steps[at] {
-            guide::Step::Holes { holes, .. } => holes.len(),
+            guide::Step::Holes { holes, .. } | guide::Step::Bore { holes, .. } => holes.len(),
             _ => 0,
         };
         match action {
@@ -4328,6 +4543,9 @@ impl App {
                     }
                     self.touch()
                 }
+                Target::Setup if k == sheet::DXF_THICKNESS_KEY => {
+                    return self.set_dxf_thickness(v);
+                }
                 Target::Setup => {
                     // A pick_list repeats the chosen item, which may be the
                     // default it shows for an empty value: not a change.
@@ -4346,7 +4564,13 @@ impl App {
                         return Task::none();
                     }
                     let holder = get(&self.doc.setup().p, "holder").to_string();
-                    self.doc.setup_mut().p.insert(k.into(), v);
+                    // Index rotary axis turns the stock about A at the angles
+                    // the setup lists; another action takes them away.
+                    if k == "reposition" {
+                        indexed::set_reposition(&mut self.doc.setup_mut().p, &v);
+                    } else {
+                        self.doc.setup_mut().p.insert(k.into(), v);
+                    }
                     if matches!(k, "holding" | "holder") {
                         self.doc.settle_holding(self.doc.index());
                     }
@@ -4392,6 +4616,9 @@ impl App {
                             }
                             .into(),
                         );
+                    }
+                    if matches!(k, "axes" | "arrangement") {
+                        self.machine_draft.fill_rotary_defaults();
                     }
                 }
                 Target::Tool => {
@@ -4564,6 +4791,9 @@ impl App {
                     return Task::none();
                 }
                 let fingerprint = mesh.fingerprint.clone();
+                // An indexed setup reads the click at the A angle that turns
+                // its hole up, which may not be the one shown.
+                let setup = self.doc.picking_pose(self.doc.index(), mesh, n);
                 // A Pocket, an inside Contour or a Drill takes a wall as its
                 // hole: every wall of it, added or removed together. A face
                 // that is neither a floor nor a wall (a cone, a chamfer, a
@@ -4572,20 +4802,28 @@ impl App {
                 let drill = self
                     .operation()
                     .is_some_and(|o| o.strategy == Strategy::Drill);
-                let angles = ["rx", "ry", "rz"].map(|k| num(&self.doc.setup().p, k).unwrap_or(0.));
+                // As the setup turns the part, by A too for an indexed one.
+                let angles = crate::stock::Placement::new(mesh, Some(&setup)).rotation();
                 let up = mesh::rotation(mesh.surfaces[n].normal, angles)[2].abs();
-                let wall = pocket::is_wall(self.doc.setup(), mesh, n);
+                let wall = pocket::is_wall(&setup, mesh, n);
                 let sloped = !wall && up < 0.5f32.to_radians().cos();
+                // An Internal groove takes a boss's wall, no hole's, as a face.
+                let picks_holes = picks_holes
+                    && !(self
+                        .operation()
+                        .is_some_and(|o| o.strategy == Strategy::Groove)
+                        && wall
+                        && pocket::hole_walls(&setup, mesh, n).is_err());
                 if picks_holes && (wall || sloped) {
                     // What a click here picks: the wall's hole, or the hole
                     // past a sloping face (a cone, a chamfer, a fillet) or past
                     // the one a wall's outline crosses (a screw hole's lip).
-                    let found = match wall.then(|| pocket::hole_walls(self.doc.setup(), mesh, n)) {
+                    let found = match wall.then(|| pocket::hole_walls(&setup, mesh, n)) {
                         Some(Err(e)) if e == pocket::LEANING => {
-                            pocket::hole_near(self.doc.setup(), mesh, n).unwrap_or(Err(e))
+                            pocket::hole_near(&setup, mesh, n).unwrap_or(Err(e))
                         }
                         Some(found) => found,
-                        None => match pocket::hole_near(self.doc.setup(), mesh, n) {
+                        None => match pocket::hole_near(&setup, mesh, n) {
                             Some(Ok(walls)) => Ok(walls),
                             _ => Err(format!(
                                 "That face slopes {:.0}°: it is no floor, and no hole past it can be picked from it. Click a flat floor, or a wall of a hole.",
@@ -4607,13 +4845,13 @@ impl App {
                     let clicked: Option<std::collections::HashSet<usize>> =
                         found.as_ref().ok().map(|w| w.iter().copied().collect());
                     let this = (clicked.as_ref())
-                        .and_then(|c| pocket::holes(self.doc.setup(), c, mesh).ok())
+                        .and_then(|c| pocket::holes(&setup, c, mesh).ok())
                         .unwrap_or_default();
                     let drop = pocket::dropped(now, &picked, n, clicked.as_ref(), &this);
                     // A Drill drills round holes: it reads the hole as it
                     // drills it, and names it by the diameter it drills.
                     let round = if drill {
-                        cam::drill_holes_of(self.doc.setup(), mesh, &this)
+                        cam::drill_holes_of(&setup, mesh, &this)
                     } else {
                         vec![]
                     };
@@ -4690,12 +4928,19 @@ impl App {
                         && let Some(r) = round.first().and_then(|r| r.as_ref())
                         && let Some(mesh) = self.imported_mesh.take()
                     {
+                        // At several A angles, the same hole at the angle
+                        // it was read at (`picking_pose`).
+                        let at = (self.operation())
+                            .filter(|op| indexed::holes_at_angles(op, self.doc.setup()))
+                            .and(setup.turn.map(|t| t.a));
                         let held = (self.operation())
                             .and_then(|op| self.drill_holes(op, &mesh).as_ref().clone().ok())
                             .is_some_and(|holes| {
                                 holes.iter().any(|h| {
-                                    (h.center[0] - r.center[0]).hypot(h.center[1] - r.center[1])
-                                        <= 0.05
+                                    h.a == at
+                                        && (h.center[0] - r.center[0])
+                                            .hypot(h.center[1] - r.center[1])
+                                            <= 0.05
                                 })
                             });
                         self.imported_mesh = Some(mesh);
@@ -4747,7 +4992,10 @@ impl App {
                     return Task::none();
                 };
                 let ((x, y), (w, d)) = (hole.centre(), hole.size());
-                let said = format!("Dropped the hole at X{x:.2} Y{y:.2} ({w:.2} × {d:.2} mm).");
+                let said = format!(
+                    "Dropped the hole at X{x:.2} Y{y:.2}{} ({w:.2} × {d:.2} mm).",
+                    indexed::at_angle(hole.a)
+                );
                 let drop: std::collections::HashSet<usize> = hole.walls.iter().copied().collect();
                 let keep: std::collections::HashSet<usize> =
                     (holes.as_ref().as_ref().unwrap().iter())
@@ -4810,6 +5058,29 @@ impl App {
                 match threading::add(&self.doc, si, mesh) {
                     Ok(added) => {
                         self.doc.setups[si].operations.extend(added.ops);
+                        self.touch();
+                        self.status = added.status;
+                    }
+                    Err(why) => self.status = why,
+                }
+            }
+            Message::AddHoleStages => {
+                let (si, Some(oi)) = (self.doc.index(), self.selected) else {
+                    return Task::none();
+                };
+                let Some(mesh) = self.part_mesh() else {
+                    return Task::none();
+                };
+                match hole_stages::add(&self.doc, si, oi, mesh) {
+                    Ok(added) => {
+                        let n = added.ops.len();
+                        let ops = &mut self.doc.setups[si].operations;
+                        ops.splice(oi..oi, added.ops);
+                        if let Some(cut) = added.bore_cut {
+                            ops[oi + n].p.insert("bore_cut".into(), cut.to_string());
+                        }
+                        // The finishing operation stays the one open.
+                        self.selected = Some(oi + n);
                         self.touch();
                         self.status = added.status;
                     }
@@ -5003,6 +5274,7 @@ impl App {
                             self.playing = true;
                             self.last_tick = Instant::now();
                         }
+                        return self.measure_tooth_load();
                     }
                     Err(error) => self.status = error,
                 }
@@ -5061,10 +5333,15 @@ impl App {
                                     Ok(sim) => (
                                         true,
                                         format!(
-                                            "Generated {} moves · {:.1} min · inherits stock after {} operations",
+                                            "Generated {} moves · {:.1} min · inherits stock after {} operations{}",
                                             sim.plan.moves.len(),
                                             sim.plan.duration / 60.,
-                                            sim.preceding
+                                            sim.preceding,
+                                            match sim.air {
+                                                Some(air) if air.nothing => " · cuts nothing on the stock it starts from".to_string(),
+                                                Some(air) => format!(" · air taken out, {:.1} min saved", air.saved / 60.),
+                                                None => String::new(),
+                                            }
                                         ),
                                     ),
                                     Err(error) => (false, error),
@@ -5177,10 +5454,7 @@ impl App {
                         .expect("every face is a turn");
                     self.doc.turn_setup(i, turn);
                 }
-                self.doc
-                    .setup_mut()
-                    .p
-                    .insert("reposition".into(), "Reclamp and probe origin".into());
+                indexed::set_reposition(&mut self.doc.setup_mut().p, "Reclamp and probe origin");
                 self.touch();
             }
             Message::TurnStock(face, table) => {
@@ -5227,10 +5501,30 @@ impl App {
                 self.wizard_step = 0;
                 self.page = Page::Wizard;
             }
+            Message::AddRotaryMachine => {
+                let dir = self
+                    .state_path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."));
+                match control::rotary_machine(dir) {
+                    Ok(m) => {
+                        self.status = format!(
+                            "{} is in the Machine library, with an assumed rotary unit still to be measured.",
+                            m.name()
+                        );
+                        self.doc.machines.push(m);
+                        self.touch();
+                    }
+                    Err(e) => {
+                        self.status = format!("Could not write the rotary UC100 profile: {e}.")
+                    }
+                }
+            }
             Message::EditMachine(id) => {
                 if let Some(m) = self.doc.machines.iter().find(|m| m.id == id) {
                     self.machine_draft = m.clone();
                     self.machine_draft.fill_post_defaults();
+                    self.machine_draft.fill_rotary_defaults();
                     self.wizard_step = 0;
                     self.page = Page::Wizard;
                 }
@@ -5594,9 +5888,21 @@ impl App {
                 let errors = self.machine_draft.issues();
                 if errors.is_empty() {
                     let mut m = self.machine_draft.clone();
+                    // A centreline typed over the probed one is no longer
+                    // the measurement.
+                    let saved = self.doc.machines.iter().find(|x| x.id == m.id);
+                    if saved.is_some_and(|x| {
+                        ["a_centre_y", "a_centre_z"]
+                            .iter()
+                            .any(|k| get(&x.p, k) != get(&m.p, k))
+                    }) {
+                        m.p.remove(control::CENTRE_MARK);
+                        m.p.remove(model::CENTRE_REF);
+                    }
                     if let Some(c) = self.control.as_mut().filter(|c| c.machine_id == m.id) {
                         c.probe = control::probe_settings(&m.p);
                         c.pins = control::pins_settings(&m.p);
+                        c.rotary = control::Rotary::of(&m);
                     }
                     if let Some(i) = self.doc.machines.iter().position(|x| x.id == m.id) {
                         m.version += 1;
@@ -5749,6 +6055,14 @@ impl App {
             Message::NewHolder(kind) => {
                 let name = format!("New {}", kind.to_lowercase());
                 self.holder_draft = holding::Holder::new(kind, &name);
+                // A round part's holding starts at typical sizes to measure.
+                if let Some(typical) = round_hold::starters()
+                    .into_iter()
+                    .find(|h| h.kind() == kind)
+                {
+                    self.holder_draft.p = typical.p;
+                    self.holder_draft.p.insert("name".into(), name);
+                }
                 self.page = Page::Workholding
             }
             Message::SaveHolder => {
@@ -5771,7 +6085,7 @@ impl App {
             }
             Message::DeleteHolder(id) => {
                 let using = self.doc.setups.iter().find(|s| {
-                    matches!(get(&s.p, "holding"), "Vise" | "Clamps" | "Chuck")
+                    holding::library_kind(get(&s.p, "holding")).is_some()
                         && get(&s.p, "holder") == id
                 });
                 if let Some(setup) = using {
@@ -5892,7 +6206,10 @@ impl App {
                     async {
                         let file = rfd::AsyncFileDialog::new()
                             .set_title("Import CAD or mesh")
-                            .add_filter("CAD and mesh", &["step", "stp", "3mf", "stl", "obj"])
+                            .add_filter(
+                                "CAD and mesh",
+                                &["step", "stp", "3mf", "stl", "obj", "dxf"],
+                            )
                             .pick_file()
                             .await?;
                         let p = file.path();
@@ -5910,6 +6227,9 @@ impl App {
                             path: p.to_path_buf(),
                             format: ext.clone(),
                             bytes: meta.len(),
+                            // A DXF is a flat profile, extruded to this until
+                            // its thickness is set.
+                            thickness: (ext == "dxf").then_some(mesh::DXF_THICKNESS),
                         };
                         let path = p.to_path_buf();
                         let mesh =
@@ -5943,6 +6263,22 @@ impl App {
                     "{} geometry loaded. Facing and Pocket can select planar surfaces, Parallel finishing any face, curved ones included, and generate bounded previews.",
                     f.format.to_uppercase()
                 );
+                // A flat profile: its thickness is set on setup 1's Stock
+                // step, and a sheet is what it is cut from.
+                if let Some(t) = f.thickness {
+                    let profile = std::fs::read_to_string(&f.path)
+                        .ok()
+                        .and_then(|text| dxf::parse(&text).ok())
+                        .map_or(String::new(), |p| format!(" {}", p.describe()));
+                    self.status = format!(
+                        "DXF flat profile loaded, {t} mm thick.{profile} Set its thickness and the sheet under Stock in setup 1."
+                    );
+                    if let Some(first) = self.doc.setups.first_mut() {
+                        first
+                            .p
+                            .insert(sheet::DXF_THICKNESS_KEY.into(), t.to_string());
+                    }
+                }
                 self.doc.sample_model = false;
                 self.doc.file = Some(f);
                 for setup in &mut self.doc.setups {
@@ -5972,6 +6308,7 @@ impl App {
                 match result {
                     Ok(mesh) => {
                         self.imported_mesh = Some(mesh);
+                        self.sync_turns();
                         self.undo = None;
                         self.invalidate_post();
                         self.status = "Saved model geometry restored.".into();
@@ -6251,6 +6588,19 @@ impl App {
                 }
                 self.part_holes = Some((key, found.0));
             }
+            Message::ToothLoaded(id, load) => {
+                // Only into the simulation it was worked out for, still there.
+                if self
+                    .tooth_load_job
+                    .as_ref()
+                    .is_some_and(|(job, _)| *job == id)
+                {
+                    self.tooth_load_job = None;
+                }
+                if let Some(simulation) = self.simulation.as_mut().filter(|s| s.id == id) {
+                    simulation.tooth_load = load;
+                }
+            }
             Message::Replayed(epoch, replayed) => {
                 let Some((_, at, play)) = self.catching_up.take_if(|c| c.0 == epoch) else {
                     return Task::none();
@@ -6262,9 +6612,15 @@ impl App {
                     .is_some_and(|s| s.id == replayed.0.id)
                     && self.progress == at
                 {
-                    self.simulation = Some(
-                        std::sync::Arc::try_unwrap(replayed.0).unwrap_or_else(|s| (*s).clone()),
-                    );
+                    let mut replayed =
+                        std::sync::Arc::try_unwrap(replayed.0).unwrap_or_else(|s| (*s).clone());
+                    // The load on each tooth may have come while it replayed.
+                    if let Some(current) = &self.simulation
+                        && replayed.tooth_load.is_none()
+                    {
+                        replayed.tooth_load = current.tooth_load.clone();
+                    }
+                    self.simulation = Some(replayed);
                     if play {
                         self.playing = true;
                         self.last_tick = Instant::now();
@@ -6382,6 +6738,11 @@ impl App {
                     .and_then(|c| Some((c.machine_id.clone(), c.recorded.take()?)))
                 {
                     self.record_pins(&id, at);
+                }
+                if let Some((id, keep)) = (self.control.as_mut())
+                    .and_then(|c| Some((c.machine_id.clone(), c.rotary_keep.take()?)))
+                {
+                    self.keep_rotary(&id, keep);
                 }
                 if self.status == LOCKED && !self.locked() {
                     self.status.clear();
@@ -7214,7 +7575,8 @@ pub(crate) fn tab_move(typing: bool, back: bool, jogging: bool) -> TabMove {
     }
 }
 /// The axis and direction a jog key moves: the arrows jog X and Y (up is
-/// +Y, away from the operator), Page Up and Page Down jog Z.
+/// +Y, away from the operator), Page Up and Page Down jog Z, Home and End
+/// jog A (on a machine without A they move nothing).
 fn jog_key(key: iced::keyboard::key::Named) -> Option<(usize, bool)> {
     use iced::keyboard::key::Named;
     match key {
@@ -7224,6 +7586,8 @@ fn jog_key(key: iced::keyboard::key::Named) -> Option<(usize, bool)> {
         Named::ArrowDown => Some((1, true)),
         Named::PageUp => Some((2, false)),
         Named::PageDown => Some((2, true)),
+        Named::Home => Some((3, false)),
+        Named::End => Some((3, true)),
         _ => None,
     }
 }
@@ -7247,7 +7611,7 @@ fn planning_project(project: &str) -> Result<(Document, mesh::Mesh), String> {
         .file
         .clone()
         .ok_or("The project has no imported part.")?;
-    let mesh = mesh::load(std::path::Path::new(&file.path))?;
+    let mesh = mesh::load_file(&file)?;
     if let Some(unmet) = analysis::preconditions(&doc, Some(&mesh))
         .into_iter()
         .find(|p| !p.ok)
@@ -7274,15 +7638,26 @@ fn proposal_schema(args: &[String]) -> Result<String, String> {
 /// Checks a proposal file against a saved project with every planner check.
 /// Returns the JSON report, a one-line summary and whether the plan passed;
 /// `Err` when the check could not run.
+/// With a third path, a passing plan's job is saved there as a project, which
+/// `--export-gcode` takes.
 fn check_plan(args: &[String]) -> Result<(String, String, bool), String> {
-    let [project, proposal] = args else {
-        return Err("Usage: axis-cam --check-plan <project.json> <proposal.json>".into());
+    let (project, proposal, job_path) = match args {
+        [project, proposal] => (project, proposal, None),
+        [project, proposal, job] => (project, proposal, Some(job)),
+        _ => {
+            return Err(
+                "Usage: axis-cam --check-plan <project.json> <proposal.json> [<job.json>]".into(),
+            );
+        }
     };
     let (doc, mesh) = planning_project(project)?;
     let report = analysis::report(&doc, &mesh)?;
     let text = std::fs::read_to_string(proposal).map_err(|e| format!("{proposal}: {e}"))?;
     let proposal = proposal::parse(&text)?;
-    let (check, _) = plan_check::check(&doc, &mesh, &report, &proposal);
+    let (check, job) = plan_check::check(&doc, &mesh, &report, &proposal);
+    if let (Some(path), Some(job)) = (job_path, job) {
+        storage::save(std::path::Path::new(path), &job)?;
+    }
     let json = serde_json::to_string_pretty(&check).map_err(|e| e.to_string())?;
     let summary = if check.passed {
         let split = check
@@ -7331,7 +7706,7 @@ fn export_document(mut doc: Document, folder: &str) -> Result<String, String> {
         .file
         .clone()
         .ok_or("The project has no imported part.")?;
-    let mesh = mesh::load(std::path::Path::new(&file.path))?;
+    let mesh = mesh::load_file(&file)?;
     let job = post::post_job(&doc, &mesh);
     for e in &job.errors {
         eprintln!("! {e}");

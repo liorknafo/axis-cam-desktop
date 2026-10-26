@@ -7,7 +7,36 @@ use crate::model::{Document, Fields, Setup, fields, get, id, num};
 use crate::simulation::{Motion, Plan};
 use serde::{Deserialize, Serialize};
 
-pub const KINDS: [&str; 3] = ["Vise", "Clamp", "Chuck"];
+pub const KINDS: [&str; 6] = [
+    "Vise",
+    "Clamp",
+    "Chuck",
+    crate::round_hold::V_BLOCK,
+    crate::round_hold::SOFT_JAWS,
+    crate::round_hold::COLLET_BLOCK,
+];
+/// A setup's modelled workholding: none, a vise or clamps from the library,
+/// a chuck: a lathe's from the library, or on a mill the one on the
+/// machine's rotary A axis (`chuck`), or a round part's V-block, soft jaws
+/// or collet block (`round_hold`).
+pub const CHOICES: [&str; 7] = [
+    "None",
+    "Vise",
+    "Clamps",
+    "Chuck",
+    crate::round_hold::V_BLOCK,
+    crate::round_hold::SOFT_JAWS,
+    crate::round_hold::COLLET_BLOCK,
+];
+/// The library kind a setup's `holding` choice takes its entry from: the
+/// same name but for "Clamps", whose entries are each a "Clamp". None for
+/// no workholding and anything else.
+pub fn library_kind(holding: &str) -> Option<&'static str> {
+    match holding {
+        "Clamps" => Some("Clamp"),
+        other => KINDS.iter().find(|k| **k == other).copied(),
+    }
+}
 const NOTE: &str = "Measure yours: these are typical sizes.";
 /// How far below the stock bottom a vise jaw is modelled to reach.
 const JAW_DEPTH: f32 = 100.;
@@ -48,7 +77,7 @@ impl Holder {
                 "grip",
             ],
             "Chuck" => &["jaws", "min_grip", "max_grip", "jaw_length", "body"],
-            _ => &["length", "width", "height", "bite"],
+            kind => crate::round_hold::keys(kind).unwrap_or(&["length", "width", "height", "bite"]),
         }
     }
     /// Whether the entry is on machine `m`: one it lists, else, with no list,
@@ -67,7 +96,7 @@ impl Holder {
             e.push("Notes can be at most 500 characters.".into());
         }
         if !KINDS.contains(&self.kind()) {
-            e.push("Choose Vise, Clamp or Chuck.".into());
+            e.push("Choose Vise, Clamp, Chuck, V-block, Soft jaws or Collet block.".into());
         }
         for k in self.keys() {
             // A chuck's jaws are 3 or 4, said below.
@@ -80,6 +109,15 @@ impl Holder {
                     k.replace('_', " ")
                 ));
             }
+        }
+        // Optional: empty takes `envelope::VISE_BASE` for a vise and the table for clamps.
+        if !get(&self.p, "base_height").trim().is_empty()
+            && !num(&self.p, "base_height").is_some_and(|v| v >= 0.)
+        {
+            e.push(
+                "The height above the table must be zero or more, or empty for a typical one."
+                    .into(),
+            );
         }
         // Optional: empty takes the typical force (`forces::VISE_FORCE`, `forces::CLAMP_FORCE`).
         if !get(&self.p, "force").trim().is_empty()
@@ -104,6 +142,7 @@ impl Holder {
                 e.push("The chuck body must be wider than the largest grip.".into());
             }
         }
+        e.extend(crate::round_hold::holder_issues(self));
         if self.kind() == "Clamp"
             && num(&self.p, "bite")
                 .zip(num(&self.p, "length"))
@@ -124,6 +163,7 @@ pub fn starters() -> Vec<Holder> {
         ("jaw_thickness", "20"),
         ("max_opening", "120"),
         ("grip", "8"),
+        ("base_height", &crate::envelope::VISE_BASE.to_string()),
         ("force", &vise_force),
     ] {
         v.p.insert(k.into(), x.into());
@@ -207,6 +247,9 @@ pub enum Layout {
         grip: f32,
         stickout: f32,
     },
+    /// A round bar in a V-block, soft jaws or a collet block on a 3-axis
+    /// mill (`round_hold`).
+    Round(crate::round_hold::Round),
 }
 /// Encodes clamp positions as stored on the setup ("-X:0;+X:10").
 pub fn clamps_text(clamps: &[(Side, f32)]) -> String {
@@ -270,6 +313,9 @@ pub fn layout(setup: &Setup) -> Result<Layout, String> {
     let holder = get(p, "holder").to_string();
     match get(p, "holding") {
         "" | "None" => Ok(Layout::None),
+        // The chuck on a machine's rotary A axis is modelled by `chuck`,
+        // apart from the library's lathe chucks.
+        "Chuck" if crate::chuck::holds(setup) => Ok(Layout::None),
         "Vise" => {
             let grip = number(get(p, "vise_grip"))
                 .filter(|g| *g > 0.)
@@ -310,6 +356,16 @@ pub fn layout(setup: &Setup) -> Result<Layout, String> {
                 gap: gap(setup)?,
             })
         }
+        holding if crate::round_hold::Kind::of(holding).is_some() => {
+            let kind =
+                crate::round_hold::Kind::of(holding).unwrap_or(crate::round_hold::Kind::VBlock);
+            Ok(Layout::Round(crate::round_hold::layout(
+                setup,
+                kind,
+                holder,
+                gap(setup)?,
+            )?))
+        }
         "Chuck" => {
             let positive = |key, what| {
                 number(get(p, key))
@@ -332,6 +388,7 @@ pub fn check_clamps(setup: &Setup, text: &str) -> Result<(), String> {
     let copy = Setup {
         preview_stock: None,
         preview_remaining: None,
+        turn: None,
         id: setup.id.clone(),
         machine: setup.machine.clone(),
         p: fields(&[("holding", "Clamps"), ("clamps", text)]),
@@ -342,7 +399,24 @@ pub fn check_clamps(setup: &Setup, text: &str) -> Result<(), String> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HoldBox {
     pub label: String,
+    /// What the checks keep the tool out of.
     pub bounds: Bounds,
+    /// What the 3D view draws for it.
+    pub shape: Shape,
+}
+/// How a holding box is drawn.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum Shape {
+    /// As its box.
+    #[default]
+    Box,
+    /// As a turned solid (a chuck's), which its box holds.
+    Prism(std::sync::Arc<crate::chuck::Prism>),
+    /// Not at all: a keep-out the checks alone use.
+    Hidden,
+    /// As its box, never cut at the stock's bottom: a solid that stands
+    /// below the bar as it is (a V-block, a collet block: `round_hold`).
+    Whole,
 }
 /// What a setup's workholding holds, in mm in the setup's frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -570,6 +644,7 @@ pub fn refusal(layout: &Layout, holder: &Holder) -> Option<String> {
         Layout::Vise { .. } => "Vise",
         Layout::Clamps { .. } => "Clamp",
         Layout::Chuck { .. } => "Chuck",
+        Layout::Round(round) => round.kind.name(),
     };
     if holder.kind() != want && KINDS.contains(&holder.kind()) {
         return Some(format!(
@@ -588,16 +663,21 @@ pub fn refusal(layout: &Layout, holder: &Holder) -> Option<String> {
 }
 /// Why `machine` cannot take the workholding a setup chose (its `holding`
 /// key): a lathe holds its bar in a chuck, not a vise or clamps, and a chuck
-/// is for a lathe. None for no workholding.
+/// is for a lathe, or for a machine with a rotary A axis about X, whose
+/// chuck on A is `chuck`'s. None for no workholding.
 pub fn machine_refusal(holding: &str, machine: &crate::model::Machine) -> Option<String> {
     let lathe = crate::lathe::is_lathe(machine);
     match holding {
         "Vise" | "Clamps" if lathe => {
             Some("A lathe holds the stock in a chuck, not a vise or clamps. Choose a chuck.".into())
         }
-        "Chuck" if !lathe => {
-            Some("A chuck is for a lathe setup. Choose a vise or clamps for this machine.".into())
-        }
+        holding if lathe && crate::round_hold::Kind::of(holding).is_some() => Some(format!(
+            "A lathe holds the stock in a chuck, not a {}. Choose a chuck.",
+            holding.to_lowercase()
+        )),
+        "Chuck" if !lathe && !machine.has_a() => Some(
+            "A chuck is for a lathe setup, or a machine with a rotary A axis. Choose a vise or clamps for this machine.".into(),
+        ),
         _ => None,
     }
 }
@@ -638,7 +718,7 @@ pub fn position_issue(
 ) -> Option<String> {
     let length = held.into().on(layout).dimensions();
     match layout {
-        Layout::None | Layout::Chuck { .. } => None,
+        Layout::None | Layout::Chuck { .. } | Layout::Round(_) => None,
         Layout::Vise { axis_y, offset, .. } => {
             let along = length[usize::from(!*axis_y)] / 2. + num(&holder.p, "jaw_width")? / 2.;
             (offset.abs() >= along).then(|| {
@@ -690,11 +770,13 @@ pub fn boxes(
     ];
     Ok(match layout {
         Layout::None => vec![],
+        Layout::Round(round) => crate::round_hold::boxes(round, holder, held.stock),
         // The body of the chuck, about the spindle axis (X = Y = 0), from the
         // jaws' end back along the bar.
         Layout::Chuck { stickout, .. } => {
             let (top, half) = (jaws_end(held.stock, *stickout), n("body") / 2.);
             vec![HoldBox {
+                shape: Default::default(),
                 label: "chuck body".into(),
                 bounds: Bounds {
                     min: [-half, -half, top - BODY_DEPTH],
@@ -725,6 +807,7 @@ pub fn boxes(
                     (min[along], max[along]) = (c - w / 2., c + w / 2.);
                     (min[2], max[2]) = (z0, z1);
                     HoldBox {
+                        shape: Default::default(),
                         label: format!("vise jaw on {sign}{}", if *axis_y { "Y" } else { "X" }),
                         bounds: Bounds { min, max },
                     }
@@ -755,6 +838,7 @@ pub fn boxes(
                     (min[along], max[along]) = (c - w / 2., c + w / 2.);
                     (min[2], max[2]) = (stock.max[2], stock.max[2] + h);
                     HoldBox {
+                        shape: Default::default(),
                         label: format!("clamp on {} (offset {})", side.label(), mm(offset)),
                         bounds: Bounds { min, max },
                     }
@@ -775,6 +859,7 @@ pub fn pin_boxes(on: Option<&crate::post::OnPins>, stock: Bounds) -> Vec<HoldBox
     let r = on.diameter / 2.;
     (on.places.iter().enumerate())
         .map(|(i, c)| HoldBox {
+            shape: Default::default(),
             label: format!("fixture pin {}", i + 1),
             bounds: Bounds {
                 min: [c[0] - r, c[1] - r, stock.min[2]],
@@ -786,7 +871,8 @@ pub fn pin_boxes(on: Option<&crate::post::OnPins>, stock: Bounds) -> Vec<HoldBox
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
     pub label: String,
-    /// "tool" (cutter and shank, tip to stickout) or "holder" (above the stickout).
+    /// "tool" (cutter and shank, tip to stickout) or "holder" (above the
+    /// stickout); on the rotary, also "spindle nose" (`chuck::InSpindle`).
     pub part: &'static str,
     /// The tip where the move, clipped to the heights at which the part can
     /// touch the box, first touches the box's footprint (the rectangle itself,
@@ -847,11 +933,13 @@ fn xy_closest(b: &Bounds, p: [f64; 2], q: [f64; 2]) -> (f64, f64) {
         .min_by(|x, y| x.0.total_cmp(&y.0))
         .unwrap_or((f64::INFINITY, 0.))
 }
-/// The parts of a tool that can touch workholding: (name, radius, lowest and
-/// highest height above the tip). The tool is a vertical cylinder of the
-/// cutter `radius` from the tip up by `stickout`, the holder one of
-/// `holder_radius` from there upward.
-fn parts(radius: f32, stickout: f32, holder_radius: f32) -> [(&'static str, f32, f32, f32); 2] {
+/// A part of a tool that can touch workholding: (name, radius, lowest and
+/// highest height above the tip), a vertical cylinder.
+pub type Part = (&'static str, f32, f32, f32);
+/// The parts of a tool that can touch workholding. The tool is a vertical
+/// cylinder of the cutter `radius` from the tip up by `stickout`, the holder
+/// one of `holder_radius` from there upward.
+pub fn parts(radius: f32, stickout: f32, holder_radius: f32) -> [Part; 2] {
     [
         ("tool", radius, 0., stickout),
         ("holder", holder_radius, stickout, f32::INFINITY),
@@ -893,9 +981,23 @@ pub fn hits_segments(
     boxes: &[HoldBox],
     gap: f32,
 ) -> Vec<Hit> {
+    hits_parts(
+        segments,
+        &parts(radius, stickout, holder_radius),
+        boxes,
+        gap,
+    )
+}
+/// `hits_segments` for a tool made of `tool`'s parts.
+pub fn hits_parts(
+    segments: &[([f32; 3], [f32; 3])],
+    tool: &[Part],
+    boxes: &[HoldBox],
+    gap: f32,
+) -> Vec<Hit> {
     let mut out = vec![];
     for b in boxes {
-        for (part, part_radius, low, high) in parts(radius, stickout, holder_radius) {
+        for &(part, part_radius, low, high) in tool {
             let reach = f64::from(part_radius) + f64::from(gap);
             let found = segments.iter().find_map(|&(from, to)| {
                 let (from, to) = (from.map(f64::from), to.map(f64::from));
@@ -1009,6 +1111,7 @@ pub fn sentence(layout: &Layout, holder: &Holder) -> String {
     let name = holder.name().trim();
     match layout {
         Layout::None => String::new(),
+        Layout::Round(round) => crate::round_hold::sentence(round, holder),
         Layout::Chuck { grip, stickout, .. } => format!(
             "{name}, grip {} mm, stickout {} mm.",
             mm(*grip),
@@ -1073,14 +1176,19 @@ pub fn plane_message(
 }
 /// The boxes as the 3D view draws them: nothing lower than the bottom of
 /// `stock`. The jaws are modelled far below it for the check, which keeps
-/// them whole.
+/// them whole. A chuck's turned solids are drawn whole, and what the checks
+/// alone use (`Shape::Hidden`) not at all.
 pub fn shown(boxes: &[HoldBox], stock: Bounds) -> Vec<HoldBox> {
     boxes
         .iter()
+        .filter(|b| b.shape != Shape::Hidden)
         .map(|b| {
             let mut bounds = b.bounds;
-            bounds.min[2] = bounds.min[2].max(stock.min[2]);
+            if b.shape == Shape::Box {
+                bounds.min[2] = bounds.min[2].max(stock.min[2]);
+            }
             HoldBox {
+                shape: b.shape.clone(),
                 label: b.label.clone(),
                 bounds,
             }
@@ -1282,6 +1390,17 @@ pub fn request(setup: &Setup, holder: Option<&Holder>) -> Result<Request, String
         "Chuck" => {
             return Err("A chuck has no layout to suggest: set its grip and stickout.".into());
         }
+        holding if crate::round_hold::Kind::of(holding).is_some() => {
+            return Err(format!(
+                "A {} has no layout to suggest: set its offset{}.",
+                holding.to_lowercase(),
+                if holding == crate::round_hold::V_BLOCK {
+                    ""
+                } else {
+                    " and grip"
+                }
+            ));
+        }
         _ => return Err("Choose a vise or clamps for this setup first.".into()),
     };
     let gap = gap(setup)?;
@@ -1385,6 +1504,7 @@ pub fn gathered<'a>(
 /// as boxes, which the texts about what is checked say only of such setups.
 pub fn modelled(setup: &Setup) -> bool {
     matches!(get(&setup.p, "holding"), "Vise" | "Clamps")
+        || crate::round_hold::Kind::of(get(&setup.p, "holding")).is_some()
 }
 /// How many of a job's setups model their workholding (`modelled`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1458,12 +1578,14 @@ pub fn placement(layout: &Layout) -> Vec<(&'static str, String)> {
         Layout::Chuck { grip, stickout, .. } => {
             vec![("grip", mm(*grip)), ("stickout", mm(*stickout))]
         }
+        Layout::Round(round) => crate::round_hold::placement(round),
     }
 }
 /// Where `layout` puts the jaws or clamps, for a status line.
 fn describe(layout: &Layout) -> String {
     match layout {
         Layout::None => String::new(),
+        Layout::Round(round) => format!("{}, offset {} mm", round.kind.words(), mm(round.offset)),
         Layout::Chuck { grip, stickout, .. } => {
             format!(
                 "chuck, grip {} mm, stickout {} mm",
@@ -1971,8 +2093,9 @@ pub fn holdable(
     };
     let n = setup + 1;
     match layout {
-        // The chuck's grip is not checked against earlier cuts yet.
-        Layout::None | Layout::Chuck { .. } => {}
+        // The chuck's grip, and a round holding's, is not checked against
+        // earlier cuts yet.
+        Layout::None | Layout::Chuck { .. } | Layout::Round(_) => {}
         Layout::Vise { axis_y, grip, .. } => {
             let (across, along) = if *axis_y { (1, 0) } else { (0, 1) };
             let axis = if *axis_y { "Y" } else { "X" };
@@ -2156,6 +2279,7 @@ mod tests {
                 feed: 500.,
                 start: 0.,
                 end: 0.,
+                a: None,
             })
             .collect();
         p
@@ -2206,7 +2330,17 @@ mod tests {
             h_keys(&three),
             ["jaws", "min_grip", "max_grip", "jaw_length", "body"]
         );
-        assert_eq!(KINDS, ["Vise", "Clamp", "Chuck"]);
+        assert_eq!(
+            KINDS,
+            [
+                "Vise",
+                "Clamp",
+                "Chuck",
+                "V-block",
+                "Soft jaws",
+                "Collet block"
+            ]
+        );
     }
     fn h_keys(h: &Holder) -> Vec<&'static str> {
         h.keys().to_vec()
@@ -2266,7 +2400,7 @@ mod tests {
             other
                 .issues()
                 .iter()
-                .any(|e| e.contains("Vise, Clamp or Chuck"))
+                .any(|e| e.contains("Vise, Clamp, Chuck, V-block, Soft jaws or Collet block"))
         );
         assert!(vise().issues().is_empty());
     }
@@ -2285,6 +2419,31 @@ mod tests {
             .p
             .insert("machines".into(), format!("{},{}", cnc.id, lathe.id));
         assert!(listed.fits(&lathe) && listed.fits(&cnc));
+    }
+    /// A Chuck is the library's on a lathe (and refused on a plain mill),
+    /// and the one on the rotary A axis (`chuck`) on a machine with A.
+    #[test]
+    fn a_chuck_is_the_lathes_from_the_library_and_the_one_on_a_on_a_rotary_machine() {
+        let keys = [
+            ("holding", "Chuck"),
+            ("holder", "c1"),
+            ("grip", "30"),
+            ("stickout", "45"),
+        ];
+        let lathe = lathe_setup(&keys);
+        assert!(!crate::chuck::holds(&lathe));
+        assert!(matches!(layout(&lathe), Ok(Layout::Chuck { .. })));
+        assert_eq!(machine_refusal("Chuck", &lathe.machine), None);
+        let mill = setup(&keys);
+        assert!(!crate::chuck::holds(&mill));
+        assert!(matches!(layout(&mill), Ok(Layout::Chuck { .. })));
+        assert!(machine_refusal("Chuck", &mill.machine).is_some());
+        let mut rotary = setup(&keys);
+        rotary.machine = Machine::new(4);
+        assert!(crate::chuck::holds(&rotary));
+        // Its boxes are the chuck's on A, not a library layout.
+        assert_eq!(layout(&rotary), Ok(Layout::None));
+        assert_eq!(machine_refusal("Chuck", &rotary.machine), None);
     }
     #[test]
     fn a_chuck_layout_is_read_from_the_setup_keys() {
@@ -2375,6 +2534,10 @@ mod tests {
                     .contains("for a lathe setup")
             );
         }
+        // A mill with a rotary A axis holds the stock in the chuck on A.
+        let rotary = crate::model::Machine::new(4);
+        assert_eq!(machine_refusal("Chuck", &rotary), None);
+        assert_eq!(machine_refusal("Vise", &rotary), None);
         for m in [&lathe, &cnc] {
             for none in ["", "None"] {
                 assert_eq!(machine_refusal(none, m), None);
@@ -4647,6 +4810,7 @@ mod tests {
                 feed: 100.,
                 start: 0.,
                 end: 0.,
+                a: None,
             })
             .collect();
         p
@@ -4771,6 +4935,7 @@ mod tests {
     #[test]
     fn the_mill_hit_logic_is_unchanged_for_a_plan_that_is_not_a_lathes() {
         let jaw = HoldBox {
+            shape: Default::default(),
             label: "vise jaw".into(),
             bounds: Bounds {
                 min: [-50., 10., -100.],

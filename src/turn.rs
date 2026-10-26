@@ -345,6 +345,7 @@ impl Cut {
                 feed: rate,
                 start: self.duration,
                 end,
+                a: None,
             });
             self.duration = end;
         }
@@ -367,6 +368,7 @@ impl Cut {
                 feed: 0.,
                 start: self.duration,
                 end,
+                a: None,
             });
             self.duration = end;
         }
@@ -520,6 +522,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
             .unwrap_or(reach),
         holder_radius: radius.max(0.05),
         neck: None,
+        stops: vec![],
         display_scale: resolved.display_scale,
         duration: cut.duration,
         target,
@@ -1469,6 +1472,7 @@ pub(crate) mod tests {
             path: std::path::PathBuf::from("shaft.stl"),
             format: "stl".into(),
             bytes: 0,
+            thickness: None,
         });
     }
     /// Adds a Turn of `kind` (or a Drill on the centre, "Drill") to the

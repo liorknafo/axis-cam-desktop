@@ -136,6 +136,20 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
                 "Drill the hole first. Thread passes go round the thread more than once, each further out, the last to the full depth; a Spring pass goes round once more to true the size. From the model reads each hole's size from its modeled thread. A manual mill or a lathe cannot mill a thread: tap it.",
             )
         }
+        ("cycle", crate::model::REAMING) => {
+            diagram = Some(Diagram::DrillCycle(7));
+            (
+                "Ream each drilled hole to size with a reamer: feed in to the bottom, an optional dwell, and feed back out the same way (pulled out at a rapid, it scores the wall). Its speed and feed come from the material at a reamer's rate: a third of the surface speed.",
+                "Drill the hole a little under the reamer first: 0.1 under up to Ø5, 0.2 up to Ø20 (Ø9.8 for a Ø10 H7), 0.3 over; Add the drilling before it adds that drill. A hole not drilled, or drilled more than 0.5 under, is refused, and so is a reamer whose flutes are shorter than the hole is deep. On a CNC or the manual mill.",
+            )
+        }
+        ("cycle", crate::model::BORING) => {
+            diagram = Some(Diagram::DrillCycle(8));
+            (
+                "Bore the holes of one Hole diameter with a boring head, a pass at each size up to it: feed in, dwell, then out with the spindle stopped (a rapid) or fed out, as the head says. Before each pass the run stops the spindle and pauses: measure the bore, set the head out as it says, and resume.",
+                "Rough the hole first, to at least the head's smallest bore: Add drilling and roughing before it drills it and, on a CNC, mills it out to 0.6 under; on the manual mill the drills step up and the head roughs the rest. The passes start from how far it is open, take at most Cut per pass off the radius, and end with the Last pass. A hole outside the head's range, or deeper than its bar reaches below the body, is refused. On the manual mill the Steps page shows each pass: the size to measure, the head setting and each hole on the DRO.",
+            )
+        }
         ("cycle", crate::model::TAPPING) => {
             diagram = Some(Diagram::DrillCycle(6));
             (
@@ -244,6 +258,10 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "Follow the model's outer projected silhouette. Offset the center outward by cutter radius and radial allowance, then cut in depth layers. Full-depth reach must fit the saved tool.",
             "",
         ),
+        ("side", "Holes") => (
+            "Follow the inside of every hole through the part's outline seen from above: a flat part's cut-outs and round holes, offset into each by the cutter radius and radial allowance, cut in depth layers down to the bottom offset. The holes narrower than Smallest hole, and those the tool does not fit, are left; the slugs come free.",
+            "",
+        ),
         ("side", "On center") => (
             "Record a path centered on the selected chain. This option belongs to the illustrative sample workflow; imported contour generation supports Inside and Outside only.",
             "",
@@ -263,6 +281,14 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
         ("compensation", "Inverse wear") => (
             "Record the opposite wear-compensation sign convention. This sample preference is not implemented for imported machining or controller output.",
             "",
+        ),
+        ("feed_follows", "Programmed feed") => (
+            "Every cutting move runs at the cutting feed, as programmed: where the cutter wraps into a corner or takes a full slot each tooth takes more force, and where it only skims a wall less.",
+            "Ramps and plunges keep their own slower feeds.",
+        ),
+        ("feed_follows", "Hold the force per tooth") => (
+            "The feed changes along the path so each tooth takes about the same force: slower where more of the cutter is in the material (a corner, a slot), faster where little is (a light side cut). The force is the nominal cut's at the cutting feed, or the one typed in below.",
+            "Moves are split where the feed changes by more than a tenth, each with its own F word; the minutes, the preview and the export all use the new feeds. Measuring the force along the path takes seconds for a long path. A feed is never faster than the machine's most feed or three times the programmed, than gives one and a half times the programmed chip at the thickest chip (feeding up a light cut's thin chip), or, down a ramp or plunge, than its programmed feed, and never slower than a quarter of the move's own feed (a ramp's of its quarter feed). In the air the programmed feed is kept. A faster stretch shorter than two thirds of the cutter's radius is not taken. The force model is simple (kc1.1, a 30° helix): check the first part.",
         ),
         ("coolant", "Flood") => (
             "Flood coolant: LinuxCNC export writes M8 when the operation starts, and M9 when the coolant changes, at a tool change and at the end of the program. The preview does not simulate coolant.",
@@ -285,11 +311,47 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("stock_type", "Round bar") => (
-            "A round bar of the entered diameter and length along the setup Z axis, centred on X 0 Y 0, from Z 0 up. The simulation starts from the cylinder; lathe cuts turn it.",
+            "A round bar of the entered diameter and length along the setup Z axis, centred on X 0 Y 0, from Z 0 up; lathe cuts turn it. On a machine with a rotary A axis it lies along X, centred in X/Y on Z=0, for the chuck on A. The simulation cuts the bar; checks use its box.",
+            "",
+        ),
+        ("stock_type", "Sheet") => (
+            "A flat sheet of Sheet X × Sheet Y, centred on X 0 Y 0, lying on a spoilboard at the part's bottom and as thick as the part unless Sheet thickness says more. A cut through it may go on into the spoilboard by the allowance, never deeper.",
+            "Hold it down under Workholding with screws through its waste, whose heads every move keeps clear of, or with tape.",
+        ),
+        ("holddown", "None") => (
+            "Nothing chosen: a sheet must be held down, so its setup reports it until Screws or Tape is chosen.",
+            "",
+        ),
+        ("holddown", "Screws") => (
+            "Screws through the sheet's waste into the spoilboard, outside the part's outline. Their heads are checked like clamps: every move keeps clear of them by the gap. They hold only the waste, so an outside contour that cuts through must leave tabs.",
+            "",
+        ),
+        ("holddown", "Tape") => (
+            "Double-sided tape under the sheet holds the part and the waste: nothing stands in the cutter's way, and the part stays put when it is cut free, so tabs are optional.",
             "",
         ),
         ("stock_type", "Relative round bar") => (
             "A round bar along the setup Z axis, on X 0 Y 0: the part's largest distance from the axis plus Radial, and Top and Bottom past its ends.",
+            "",
+        ),
+        ("chuck_jaws", "3-jaw") => (
+            "A self-centring 3-jaw chuck: it grips round stock. A box is refused in it.",
+            "",
+        ),
+        ("chuck_jaws", "4-jaw") => (
+            "A 4-jaw chuck, for a box (jaws square on its sides) or round stock.",
+            "",
+        ),
+        ("chuck_tailstock", "Retracted") => (
+            "The tailstock stays on the table with its centre drawn back: its centre, quill and body are checked, and the stock must end short of the centre.",
+            "",
+        ),
+        ("chuck_tailstock", "Supports the stock") => (
+            "The tailstock's centre is in the stock's free end: checked as it stands, and the stick-out bends less. The end must be within the quill's travel.",
+            "",
+        ),
+        ("chuck_tailstock", "Off the table") => (
+            "The tailstock is taken off the table: it is not checked, and the stick-out bends as a free end.",
             "",
         ),
         ("stock_type", "Fixed size box") => (
@@ -299,6 +361,14 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
         ("origin", "Model origin") => (
             "Program zero is the imported file's own 0,0,0, placed with this setup's rotation and translation. With the probe, Probe corner on the Control page finds it from the front-left corner of the stock top, set off from it as the program has it. Check that the point can be located on the machine before choosing it.",
             "The LinuxCNC program lists the part's box in work coordinates and, while no earlier setup has cut it, the stock top's Z, to touch off on a part wall or that stock top.",
+        ),
+        ("origin", "A axis at stock end") => (
+            "For work on the rotary A axis: Y0 Z0 on the A centreline, X0 at the stock's free (+X) end face. The Control page's Rotary A calibration measures the centreline and finds A zero on a flat; touch off X0 on the end face. A turns the stock about this zero, so an indexed setup keeps it.",
+            "The machine's rotary geometry gives where the centreline is; while it is assumed (not probed) or has gone stale, indexed setups say so.",
+        ),
+        ("origin", "A axis at chuck face") => (
+            "For work on the rotary A axis: Y0 Z0 on the A centreline, X0 on the chuck's face. Needs the stock held in the chuck (Modelled workholding). A turns the stock about this zero, so an indexed setup keeps it.",
+            "The face is where the jaws' back is, the stick-out and the jaw length in from the stock's free end; Y0 Z0 and A0 come from the Control page's Rotary A calibration.",
         ),
         ("post_tool_length", "Tool table (G43 H#)") => (
             "Write T# M6, then G43 H# after each tool change. LinuxCNC applies the length stored for that tool number, so measure every tool into its tool table first.",
@@ -345,7 +415,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("fixture", "Chuck") => (
-            "Record chuck workholding, typically for rotary access. Jaw geometry, grip and rotary collision checks are not simulated. This choice only describes the setup: the chuck is not checked, but a vise or clamps modelled under Modelled workholding are.",
+            "Record chuck workholding. This choice only describes the setup: to have the chuck checked (its jaws, grip, tailstock, every A angle), choose Chuck under Modelled workholding, on a machine with a rotary A axis.",
             "",
         ),
         ("fixture", "Custom fixture") => (
@@ -357,12 +427,12 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("reposition", "Reclamp and probe origin") => (
-            "Document a manual flip or reclamping followed by probing. Set the new rotation/translation separately. Earlier removed material is retained across the setup change.",
+            "Document a manual flip or reclamping followed by probing. Set the new rotation/translation separately. Earlier removed material is retained across the setup change. Setups indexed on A after it turn the stock in this new clamping.",
             "",
         ),
         ("reposition", "Index rotary axis") => (
-            "Record rotary indexing before this setup. The label does not command a rotary move or solve machine angles. Use placement fields to preview orientation; indexed machine kinematics remain pending.",
-            "",
+            "A turns the stock in the clamping of the setup before it: no re-clamp, no re-probing. This setup's frame is that one's turned about the A centreline by each A angle listed, and it keeps that setup's work zero, offset, machine and chuck.",
+            "List one angle (90) or several for the same operations (0, 90, 180, -90). Every operation in the setup is generated at each angle in turn, as 3-axis cuts on the stock and part as A poses them, and between angles the tool retracts above all that A swings (the stock, the part and the jaws, at any angle, plus the operation's clearance), A turns, and the tool comes back down; every operation enters that way, from above all A swings over its first cut, even at the angle A is already at; a retract above the Z travel is refused, never cut short. Every move is checked on the machine, the stock at the centre height: X, Y and Z within the travel, A within the machine's A range and a UC100 profile's soft limits, a cut below the Z travel or a retract above it refused with how far and the stock's diameter, and the tool, its holder and the spindle kept clear of the chuck, its jaws, the rotary head and the tailstock at each angle's cuts and while A turns. Positive A turns the part by the right-hand rule about +X: clockwise seen from the chuck along +X, so a flat on the part's +Y side is on top at A90. Needs a machine with A around X. A work zero on the A axis has Y0 Z0 on the centreline the Control page's Rotary A calibration measures; while it is assumed or stale, the setup says so. LinuxCNC programs turn A with G0 A alone, the tool above all that A swings; a run on the UC100 turns A the same way, alone, and starts only on a measured, current A centreline with the work zero on it (within 0.02 mm).",
         ),
         ("reposition", "Change fixture") => (
             "Document moving the part to different workholding. Set the new placement and locating instructions. Stock remains the result of earlier enabled operations.",
@@ -393,7 +463,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("mode", "Indexed (3+1)") => (
-            "Save a single rotary axis that positions before cutting and stays fixed during XYZ motion. Automatic index-angle solving and machine motion are not implemented.",
+            "Save a single rotary axis that positions before cutting and stays fixed during XYZ motion. Index a setup (Reposition → Index rotary axis) to run its operations at each A angle it lists. The rotary unit's place and chuck and tailstock sizes are saved with the machine (Rotary unit); programs and UC100 runs turn A alone.",
             "",
         ),
         ("mode", "Indexed (3+2)") => (
@@ -408,11 +478,19 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "Save coordinated XYZ and two-rotary capability. Tool-axis planning, singularity handling and machine kinematics are not yet available.",
             "",
         ),
-        ("direction" | "direction2", "Positive") if matches!(target, Target::Machine) => (
+        ("direction", "Positive") if matches!(target, Target::Machine) => (
+            "Positive A turns the part by the right-hand rule about +X: the top of the part toward −Y, the front. The indexed setups, the chuck checks, the program header and Find A zero all take it.",
+            "",
+        ),
+        ("direction", "Negative") if matches!(target, Target::Machine) => (
+            "Positive A turns the part the other way: the top of the part toward +Y, the back. The indexed setups, the chuck checks, the program header and Find A zero all take it; the controller's A is not reversed by it.",
+            "",
+        ),
+        ("direction2", "Positive") if matches!(target, Target::Machine) => (
             "Record the positive rotary sign convention for this axis. Match the machine documentation; this setting is saved for future kinematics.",
             "",
         ),
-        ("direction" | "direction2", "Negative") if matches!(target, Target::Machine) => (
+        ("direction2", "Negative") if matches!(target, Target::Machine) => (
             "Record the reversed rotary sign convention for this axis. This changes the intended sign mapping, not the current part placement or a live machine command.",
             "",
         ),
@@ -453,12 +531,76 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("type", "Chamfer mill") => (
-            "A pointed cone of its tip angle. Drilling with it countersinks each detected opening: it plunges until the cone is as wide as the opening at its rim. A hole countersunk in the model takes only a chamfer mill of its countersink's angle. Chamfers along edges are not generated.",
+            "A pointed cone of its tip angle. Drilling with it countersinks each detected opening: it plunges until the cone is as wide as the opening at its rim. A hole countersunk in the model takes only a chamfer mill of its countersink's angle. Chamfer milling runs its side along edges or a line.",
+            "",
+        ),
+        ("chamfer_source", "Selected edges") => (
+            "The cone's side runs along the edges of the faces you pick: a level face's outline and hole mouths, or one edge when you also pick the wall beside it.",
+            "Pick on the part with Select surfaces on part. Edges narrows which edges of the level faces are broken. Edges are sized by the chamfer's width.",
+        ),
+        ("chamfer_source", "Line") => (
+            "The cone's side runs along a straight line given by its ends and its height in work coordinates. It needs no part, for flanks at a depth.",
+            "Which side of the line the tool is on is Tool side. Copies repeat it round an axis.",
+        ),
+        ("chamfer_edges", "All edges") => (
+            "Every edge of the picked level faces is chamfered: their outer outlines and the mouths of their holes.",
+            "",
+        ),
+        ("chamfer_edges", "Outer contour") => (
+            "Only the outer outline of the picked level faces is chamfered; the holes in them are left alone.",
+            "",
+        ),
+        ("chamfer_edges", "Hole mouths") => (
+            "Only the mouths of the holes in the picked level faces are chamfered; the outer outline is left alone.",
+            "",
+        ),
+        ("chamfer_side", "Left") => (
+            "The tool is on the left of the line, looking from its start to its end, and cuts that side away.",
+            "",
+        ),
+        ("chamfer_side", "Right") => (
+            "The tool is on the right of the line, looking from its start to its end, and cuts that side away.",
+            "",
+        ),
+        ("chamfer_side", "Alternate") => (
+            "The tool is on the left for the first copy, on the right for the second, and so on. It cuts the flanks of a row of teeth that face alternately.",
+            "",
+        ),
+        ("chamfer_size", "Chamfer width") => (
+            "The chamfer is this wide on the face. The tip goes a tip offset under its lower end, and the axis is set off the edge so the cone's side cuts all of it.",
+            "",
+        ),
+        ("chamfer_size", "Tip depth") => (
+            "The tip goes to a given Z. The axis is set off the line by the cone's radius at the line's height, so the cone's side lies on the line.",
             "",
         ),
         ("type", "Thread mill") => (
             "A single-tooth cutter on a neck that mills a thread inside a drilled hole, on a CNC. It cuts any pitch in its range, so one covers many sizes. The hole must be drilled first, and the mill must fit down it.",
             "Its thread angle must match the thread's, and its Reach (neck) is how deep it can thread.",
+        ),
+        ("type", "Keyseat cutter") => (
+            "A thin disc head on a narrower neck that cuts sideways: an internal groove below the mouth of a bore, like a circlip groove, by circular interpolation on a CNC. Its flutes are its head, as tall as its width.",
+            "The head must fit down the bore with 0.2 mm clear a side, its neck must clear the bore while it cuts, and its reach is how far down the bore it can cut.",
+        ),
+        ("groove_from", "Land from the top of the bore") => (
+            "The groove's near edge is the land below the top of the bore: the face this setup has up.",
+            "",
+        ),
+        ("groove_from", "Land from the bottom of the bore") => (
+            "The groove's near edge is the land above the bottom of the bore: the far face, cut from this one when the cutter reaches that deep.",
+            "",
+        ),
+        ("groove_from", "Depth below the stock top") => (
+            "The groove's top edge is this deep below the stock top.",
+            "",
+        ),
+        ("type", "Reamer") => (
+            "A tool of one size that finishes a drilled hole to it, to its tolerance class (H7 for a bearing's or a bush's fit), with the Reaming cycle on a CNC or the manual mill. Its flutes must be as long as the hole is deep.",
+            "Drill the hole a little under it first: Ø9.8 for a Ø10.",
+        ),
+        ("type", "Boring head") => (
+            "An adjustable head with a single-point bar that bores a roughed hole to size on a CNC or the manual mill, set out by its dial between passes. Bore range is the smallest and largest bore it sets to; the bar goes down the hole, so it is narrower than the smallest; Reach is how deep the bar goes below the head's body.",
+            "Out of the bore says how it leaves each pass: with the spindle stopped and a rapid (its edge leaves a fine line up the wall), or fed out turning (it can rub the wall). The dial graduation is how much one division sets it out on the diameter.",
         ),
         ("type", "Tap") => (
             "A tool that cuts an internal thread of one size, turned by hand into a drilled hole on the manual mill or the lathe. The CNC cannot tap: use a thread mill. The hole must be drilled first.",
@@ -538,7 +680,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("rest", "Yes") => (
-            "Record the intention to machine material remaining from an earlier operation. Fully cleared top layers are skipped automatically. This saved preference does not yet isolate leftover islands or corners; other air cuts can remain. Imported Pocket and Adaptive clearing need no setting: they cut only where earlier operations left material.",
+            "Record the intention to machine material left by an earlier operation. Fully cleared top layers are skipped automatically, and feed through air becomes a retract and a rapid where quicker. This does not yet isolate leftover islands or corners. Pocket and Adaptive clearing need no setting: they cut only where earlier operations left material.",
             "",
         ),
         ("rest", "No") => (
@@ -655,12 +797,12 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "controller" if value == "UC100" => plain("AXIS CAM drives this machine itself through the UC100 driver: connect, reset and E-stop it on the Control page. G-code export is not offered for it.".to_string()),
             "uc100_connection" if value == "Simulated" => plain("Connect to a simulated UC100 inside AXIS CAM: the driver's controller, planner and checks run, but no hardware is opened and nothing moves. Its saved offsets and position are kept apart from the real machine's.".to_string()),
             "uc100_connection" => plain("Connect to the real UC100 over USB (macOS). The machine starts in E-stop; press Reset on the Control page to enable it.".to_string()),
-            "controller" if value == "LinuxCNC" => plain("LinuxCNC has a 3-axis postprocessor. Export checks every setup and replays each program against the simulated moves before writing it.".to_string()),
+            "controller" if value == "LinuxCNC" => plain("LinuxCNC has a 3-axis postprocessor, which also indexes A on a machine with A around X (G0 A alone, never during a move). Export checks every setup and replays each program against the simulated moves before writing it.".to_string()),
             "controller" => plain(format!(
                 "Save {value} as the intended controller family for planning. Only LinuxCNC output is implemented, so G-code export is refused for this machine."
             )),
             "arrangement" => plain(format!(
-                "Save the {value} rotary layout. {} A rotates about X, B about Y, and C about Z. This records the machine configuration; inverse kinematics are not implemented.",
+                "Save the {value} rotary layout. {} A rotates about X, B about Y, and C about Z. This records the machine configuration, and for an A table around X the rotary unit's place and size under Rotary unit; inverse kinematics are not implemented.",
                 if value.contains("head-head") {
                     "Both rotary axes are on the spindle head."
                 } else if value.contains("head-table") {

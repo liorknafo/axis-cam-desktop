@@ -122,7 +122,7 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
             .map(|d| work(leftover_box(&d.after, setup, mesh))),
     );
     let jaws: Vec<Bounds> = match &guide.steps[0] {
-        Step::Hold { holding, .. } if matches!(get(&setup.p, "holding"), "Vise" | "Clamps") => {
+        Step::Hold { holding, .. } if crate::holding::modelled(setup) => {
             let held = Gripped {
                 stock: holding.stock.translated(zero),
                 band: holding.band.translated(zero),
@@ -1399,6 +1399,10 @@ fn progress(g: &Guide, s: &Section, at: usize, item: usize) -> String {
             format!("pass {index}/{of}")
         }
         Step::Holes { holes, .. } => format!("hole {}/{}", item + 1, holes.len()),
+        Step::Bore {
+            index, of, holes, ..
+        } if holes.len() > 1 => format!("pass {index}/{of} · hole {}/{}", item + 1, holes.len()),
+        Step::Bore { index, of, .. } => format!("pass {index}/{of}"),
         _ if s.steps.len() > 1 => format!("{}/{}", at - s.steps.start + 1, s.steps.len()),
         _ => String::new(),
     }
@@ -1497,7 +1501,8 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
             tags.push(chip(page.tool_name(op, d)));
         }
         if s.count > 0 {
-            let what = if o.strategy == Strategy::Drill {
+            // A Boring's count is its passes.
+            let what = if o.strategy == Strategy::Drill && !o.boring() {
                 "hole"
             } else {
                 "pass"
@@ -1545,7 +1550,10 @@ fn next_label(g: &Guide, at: usize, item: usize) -> String {
         Step::Pass { .. }
         | Step::Lathe(crate::guide::LatheStep::Pass { .. })
         | Step::Lathe(crate::guide::LatheStep::ThreadPass { .. }) => "Pass done ▶".into(),
-        Step::Holes { holes, .. } if item + 1 < holes.len() => "Hole done ▶".into(),
+        Step::Holes { holes, .. } | Step::Bore { holes, .. } if item + 1 < holes.len() => {
+            "Hole done ▶".into()
+        }
+        Step::Bore { index, of, .. } if index < of => "Pass done ▶".into(),
         _ if s.op.is_some() && at + 1 == s.steps.end => "Section done ▶".into(),
         _ => "Next ▶".into(),
     }
@@ -2053,12 +2061,19 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 ];
                 ("Tap".into(), "one hole at a time, by hand", left, right)
             } else {
+                // A reamer is fed back out: pulled out at a rapid, it scores
+                // the wall it has just cut.
+                let reaming = p.setup.operations.get(*op).is_some_and(|o| o.reaming());
+                let mut said = vec![
+                    chip(p.tool_name(*op, 2. * r)),
+                    chip(format!("{} rpm", rpm.round())),
+                    warn_chip("centres"),
+                ];
+                if reaming {
+                    said.push(warn_chip("feed back out"));
+                }
                 let right = column![
-                    chips(vec![
-                        chip(p.tool_name(*op, 2. * r)),
-                        chip(format!("{} rpm", rpm.round())),
-                        warn_chip("centres")
-                    ]),
+                    chips(said),
                     label(format!("Hole {} of {}", i + 1, holes.len())),
                     readout(
                         Readout {
@@ -2093,7 +2108,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             axis: "Z".into(),
                             value: dro(h[2]),
                             lock: None,
-                            tags: vec!["drill to".into(), format!("{} deep", mm(depth))],
+                            tags: vec![
+                                if reaming { "ream to" } else { "drill to" }.into(),
+                                format!("{} deep", mm(depth))
+                            ],
                             lit: Lit::Next,
                             big: false
                         },
@@ -2104,8 +2122,149 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                         i
                     ),
                 ];
-                ("Holes".into(), "one hole at a time", left, right)
+                let title = if reaming { "Ream" } else { "Holes" };
+                (title.into(), "one hole at a time", left, right)
             }
+        }
+        Step::Bore {
+            op,
+            index,
+            of,
+            size,
+            before,
+            dial,
+            feed_out,
+            holes,
+            mouths,
+        } => {
+            let stock = p.before(*op);
+            let i = p.item.min(holes.len().saturating_sub(1));
+            let r = size / 2.;
+            let mut shapes = p.cut_before(*op);
+            shapes.extend(
+                holes
+                    .iter()
+                    .enumerate()
+                    .map(|(n, h)| Shape::Hole([h[0], h[1], stock.max[2]], r, n + 1, lit(n, i))),
+            );
+            let h = holes.get(i).copied().unwrap_or([0.; 3]);
+            let mouth = mouths.get(i).copied().unwrap_or(stock.max[2]);
+            // The bore as this pass leaves it, over what the last one left.
+            let ring = |r: f32| Bounds {
+                min: [h[0] - r, h[1] - r, h[2]],
+                max: [h[0] + r, h[1] + r, mouth],
+            };
+            let mut side = vec![Shape::Hatch(ring(r), Hatch::Cut)];
+            if let Some(b) = before {
+                side.push(Shape::Hatch(ring(b / 2.), Hatch::Earlier));
+            }
+            side.push(Shape::Never(
+                [h[0] - 2. * r, 0., h[2]],
+                [h[0] + 2. * r, 0., h[2]],
+                format!("Z {}", dro(h[2])),
+            ));
+            let left = column![
+                p.drawing(0, stock, shapes, 260.),
+                p.drawing(1, stock, side, 150.)
+            ]
+            .spacing(6)
+            .into();
+            let rpm = p
+                .setup
+                .operations
+                .get(*op)
+                .and_then(|o| num(&o.p, "rpm"))
+                .unwrap_or(0.);
+            let first = i == 0;
+            let mut said = vec![
+                chip(p.tool_name(*op, *size)),
+                chip(format!("{} rpm", rpm.round())),
+            ];
+            if first {
+                said.push(warn_chip("spindle off to set the head"));
+            }
+            said.push(if *feed_out {
+                chip("feed back out")
+            } else {
+                warn_chip("spindle off, then raise")
+            });
+            let mut order = 0u8;
+            let mut next = || {
+                order += 1;
+                Some(order)
+            };
+            let mut right = column![chips(said), label(format!("Pass {index} of {of}"))];
+            // Before the pass: measure what the last left, then set the
+            // head out by the difference; before the first, set it.
+            if first && let Some(b) = before {
+                right = right.push(readout(
+                    Readout {
+                        order: next(),
+                        lead: Some("measure".into()),
+                        axis: "bore".into(),
+                        value: format!("Ø{b:.2}"),
+                        lock: None,
+                        tags: vec!["what the last pass left".into()],
+                        lit: Lit::Next,
+                        big: false,
+                    },
+                    None,
+                ));
+            }
+            let out = before.map(|b| size - b);
+            let mut head_tags = match out {
+                Some(d) if first => vec![format!("out {d:.2} on Ø")],
+                Some(_) => vec!["as set".into()],
+                None if first => vec!["set to".into()],
+                None => vec!["as set".into()],
+            };
+            if let (true, Some(d)) = (first, out.filter(|_| *dial > 0.)) {
+                head_tags.push(format!("{} divisions", (d / dial).round()));
+            }
+            right = right.push(readout(
+                Readout {
+                    order: if first { next() } else { None },
+                    lead: None,
+                    axis: "head".into(),
+                    value: format!("Ø{size:.2}"),
+                    lock: None,
+                    tags: head_tags,
+                    lit: if first { Lit::Next } else { Lit::Done },
+                    big: first,
+                },
+                None,
+            ));
+            for (axis, value, lock, tags) in [
+                ("X", h[0], Some("X"), vec!["centre".to_string()]),
+                ("Y", h[1], Some("Y"), vec!["centre".to_string()]),
+                (
+                    "Z",
+                    h[2],
+                    None,
+                    vec!["bore to".to_string(), format!("{} deep", mm(mouth - h[2]))],
+                ),
+            ] {
+                right = right.push(readout(
+                    Readout {
+                        order: next(),
+                        lead: None,
+                        axis: axis.into(),
+                        value: dro(value),
+                        lock: lock.map(String::from),
+                        tags,
+                        lit: Lit::Next,
+                        big: false,
+                    },
+                    None,
+                ));
+            }
+            if holes.len() > 1 {
+                right = right.push(tiles(
+                    (1..=holes.len()).map(|n| (n.to_string(), None)).collect(),
+                    i,
+                ));
+            }
+            ("Bore".into(), "set the head, then each hole", left, right)
         }
         Step::Check { op } => {
             let j = p.done(*op);
@@ -2459,6 +2618,7 @@ pub(crate) mod tests {
                 .join("examples/four-setup-block.3mf"),
             format: "3mf".into(),
             bytes: 1,
+            thickness: None,
         });
         doc.active = doc.setups[0].id.clone();
         edit(&mut doc);
@@ -2496,6 +2656,101 @@ pub(crate) mod tests {
     fn after(t: &[String], lead: &str) -> Vec<String> {
         let i = (t.iter().position(|s| s == lead)).unwrap_or_else(|| panic!("{lead} in {t:?}"));
         t[i + 1..i + 3].to_vec()
+    }
+    /// The plate's Ø32 bore through 28 on the manual mill (LIO-248):
+    /// drilled Ø12, then bored with the head 1 mm a pass on the radius;
+    /// the Steps page open on it.
+    fn bored_app() -> App {
+        use crate::cam::boring::tests::{drill, drilling, head, job, ring};
+        let mesh = ring(32., 60., 28.);
+        let manual = crate::manual::defaults();
+        let on = |mut t: Tool| {
+            t.p.insert("machines".into(), manual.id.clone());
+            t
+        };
+        let (d, h) = (on(drill("12")), on(head(crate::model::BORE_RETRACTS[0])));
+        let mut hole = drilling(&mesh, &d, "Drilling");
+        hole.p.insert("breakthrough".into(), "4.5".into());
+        let mut bore = drilling(&mesh, &h, crate::model::BORING);
+        for (k, v) in [("hole_diameter", "32"), ("bore_cut", "1")] {
+            bore.p.insert(k.into(), v.into());
+        }
+        for op in [&mut hole, &mut bore] {
+            op.p.insert("rpm".into(), "640".into());
+            op.p.insert("feed".into(), "60".into());
+        }
+        let (mut doc, _) = job(&mesh, manual, vec![(d, hole), (h, bore)]);
+        doc.file = Some(crate::model::ModelFile {
+            name: "ring.3mf".into(),
+            path: "ring.3mf".into(),
+            format: "3mf".into(),
+            bytes: 1,
+            thickness: None,
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        a.test_dir = Some(dir);
+        a.doc = doc;
+        a.imported_mesh = Some(mesh);
+        let _ = a.update(Message::Page(Page::Control));
+        build(&mut a);
+        a
+    }
+    #[test]
+    fn a_bore_pass_shows_what_to_measure_the_head_setting_and_the_hole() {
+        let mut a = bored_app();
+        let g = guide(&a);
+        let passes: Vec<usize> = (g.steps.iter().enumerate())
+            .filter(|(_, s)| matches!(s, Step::Bore { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        // Ø12 to Ø31.9, at most 2 mm on the diameter a pass, then Ø32.
+        assert_eq!(passes.len(), 11, "{:?}", g.steps);
+        send(&mut a, GuideAction::Go(passes[0]));
+        let t = texts(&a);
+        assert_eq!(after(&t, "head")[0], "Ø13.99", "{t:?}");
+        assert!(t.iter().any(|s| s == "set to") && !t.iter().any(|s| s == "measure"));
+        // The last pass: measure what the one before left, set the head out
+        // by the difference, then the hole and its depth.
+        send(&mut a, GuideAction::Go(passes[10]));
+        let t = texts(&a);
+        for want in [
+            "PASS 11 OF 11",
+            "11 passes",
+            "measure",
+            "Ø31.90",
+            "Ø32.00",
+            "out 0.10 on Ø · 10 divisions",
+            "spindle off to set the head",
+            "spindle off, then raise",
+            "bore to · 31 deep",
+            "640 rpm",
+        ] {
+            assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
+        }
+        assert_eq!(
+            after(&t, "head"),
+            ["Ø32.00", "out 0.10 on Ø · 10 divisions"]
+        );
+    }
+    /// The last boring pass at 1280 × 800, in AXIS_RENDER_DIR (default
+    /// /tmp/manual-steps), with the first beside it.
+    #[test]
+    #[ignore]
+    fn render_a_bore_pass() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/manual-steps".into()),
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = bored_app();
+        let passes: Vec<usize> = (guide(&a).steps.iter().enumerate())
+            .filter(|(_, s)| matches!(s, Step::Bore { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        for (name, at) in [("12-bore-first", passes[0]), ("13-bore-last", passes[10])] {
+            send(&mut a, GuideAction::Go(at));
+            render(&a, (1280, 800), &dir.join(format!("{name}.png")));
+        }
     }
     #[test]
     fn the_face_step_shows_the_tool_the_gear_and_the_depth_and_no_passes() {
@@ -3005,6 +3260,7 @@ pub(crate) mod tests {
             path: std::path::PathBuf::from("sleeve.stl"),
             format: "stl".into(),
             bytes: 1,
+            thickness: None,
         });
         doc.active = doc.setups[0].id.clone();
         edit(&mut doc);

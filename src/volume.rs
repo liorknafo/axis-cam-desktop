@@ -21,9 +21,41 @@ impl Frame {
             ..Self::axes(setup)
         }
     }
-    /// The axes of `setup`'s frame, which its rotation alone gives, at no shift.
+    /// The setup's frame of a part placed as it is, unturned: a frame for a
+    /// cut that is no part's (`tooth_load::nominal`).
+    pub fn identity() -> Self {
+        Self {
+            basis: [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+            shift: [0.; 3],
+        }
+    }
+    /// Its numbers, bit for bit: a key to what was worked out in it.
+    pub fn key(&self) -> [u32; 12] {
+        let [a, b, c] = self.basis;
+        let s = self.shift;
+        [
+            a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2], s[0], s[1], s[2],
+        ]
+        .map(f32::to_bits)
+    }
+    /// This frame with the part turned about the line along X through Y, Z
+    /// `axis` (mm) by `turn` degrees, by the right-hand rule about +X: an
+    /// indexed setup's frame at an A angle (`indexed`).
+    pub fn turned(self, axis: [f32; 2], turn: f32) -> Self {
+        let turn_axis = |v| crate::indexed::turn_point(v, [0., 0.], turn);
+        Self {
+            basis: self.basis.map(turn_axis),
+            shift: crate::indexed::turn_point(self.shift, axis, turn),
+        }
+    }
+    /// The axes of `setup`'s frame, which its rotation alone gives (turned
+    /// by A for an indexed setup), at no shift.
     fn axes(setup: &Setup) -> Self {
         let angles = ["rx", "ry", "rz"].map(|k| num(&setup.p, k).unwrap_or(0.));
+        let angles = match setup.turn {
+            Some(t) => crate::indexed::turned_angles(angles, t.turn),
+            None => angles,
+        };
         Self {
             basis: [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]].map(|p| rotation(p, angles)),
             shift: [0.; 3],
@@ -222,6 +254,9 @@ pub struct Volume {
     /// Whether the stock started as a round bar (`bar`): the cylinder in
     /// `bounds` (`crate::stock::bar`), not the whole box.
     pub round: bool,
+    /// The round bar along X the stock is on a rotary setup (`chuck`), in
+    /// its frame; None otherwise.
+    pub bar_x: Option<crate::stock::Round>,
 }
 impl Volume {
     /// A round bar's stock: `new`, with the voxels whose centres lie outside
@@ -258,6 +293,19 @@ impl Volume {
         let size = bounds.dimensions();
         let step = size.into_iter().fold(0., f32::max) / 96.;
         let n = size.map(|v| (v / step).ceil().clamp(1., 96.) as usize);
+        Self::of(bounds, frame, n)
+    }
+    /// The stock `bounds` in cells at most `most` mm on a side, and no
+    /// larger than `new`'s: a finer grid for a check that must tell a few
+    /// millimetres apart (`rotary_check`'s part-off), cut with `carve`.
+    pub fn finer(bounds: Bounds, frame: Frame, most: f32) -> Self {
+        let size = bounds.dimensions();
+        let coarse = Self::new(bounds, frame);
+        let n = std::array::from_fn(|k| coarse.n[k].max((size[k] / most).ceil().max(1.) as usize));
+        Self::of(bounds, frame, n)
+    }
+    fn of(bounds: Bounds, frame: Frame, n: [usize; 3]) -> Self {
+        let size = bounds.dimensions();
         let cell = std::array::from_fn(|k| size[k] / n[k] as f32);
         let count = n.iter().product();
         Self {
@@ -271,7 +319,28 @@ impl Volume {
             cuts: std::sync::Arc::new(vec![]),
             version: 0,
             round: false,
+            bar_x: None,
         }
+    }
+    /// The stock as the round bar `round` inside its box: the voxels whose
+    /// centres lie outside the bar hold no material. Unchanged for None.
+    pub fn rounded(mut self, round: Option<crate::stock::Round>) -> Self {
+        let Some(bar) = round else {
+            return self;
+        };
+        for z in 0..self.n[2] {
+            for y in 0..self.n[1] {
+                for x in 0..self.n[0] {
+                    let i = self.index([x, y, z]);
+                    if self.occupied[i] != 0 && !bar.contains(self.point([x, y, z], 0.5)) {
+                        self.occupied[i] = 0;
+                        self.remaining -= 1;
+                    }
+                }
+            }
+        }
+        self.bar_x = round;
+        self
     }
     pub fn index(&self, p: [usize; 3]) -> usize {
         (p[2] * self.n[1] + p[1]) * self.n[0] + p[0]
@@ -417,6 +486,27 @@ impl Volume {
             cuts.push(cut);
         }
         self.version = self.version.wrapping_add(1);
+        self.clear(ranges, a, b, radius, flute, shape, current);
+    }
+    /// Takes away what `cut`, made on another grid of the same stock (its
+    /// `cuts`), sweeps, without keeping it among this grid's cuts.
+    pub fn carve(&mut self, cut: &crate::stock_surface::Cut) {
+        let (a, b, r, flute) = (cut.a, cut.b, cut.radius, cut.flute);
+        if let Some(ranges) = self.ranges(a, b, r, flute, cut.shape, cut.frame) {
+            self.clear(ranges, a, b, r, flute, cut.shape, cut.frame);
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn clear(
+        &mut self,
+        ranges: [(usize, usize); 3],
+        a: [f32; 3],
+        b: [f32; 3],
+        radius: f32,
+        flute: f32,
+        shape: CutterShape,
+        current: Frame,
+    ) {
         for z in ranges[2].0..ranges[2].1 {
             for y in ranges[1].0..ranges[1].1 {
                 for x in ranges[0].0..ranges[0].1 {
@@ -536,12 +626,122 @@ pub(crate) fn swept(
         + match shape {
             CutterShape::Ball => r - (r * r - radial).max(0.).sqrt(),
             CutterShape::Flat => 0.,
-            CutterShape::Drill | CutterShape::Chamfer(_) => rise * radial.sqrt(),
+            CutterShape::Drill | CutterShape::Chamfer(..) => {
+                rise * (radial.sqrt() - shape.flat()).max(0.)
+            }
             // Rings and thread mills return above.
             CutterShape::Revolve | CutterShape::Thread { .. } => 0.,
         };
     p[2] >= bottom - 0.00001
 }
+/// The cuts made so far, kept in buckets over the stock's plan in `frame`
+/// so a point is tested against the cuts near it only: a long cut in
+/// stretches a bucket or its radius long, whichever is more (a wide cut in
+/// small buckets would fill many), each with the box it sweeps in the
+/// frame, which a point outside of is not tested against. Each bucket
+/// holds its cuts in the order they were kept.
+pub(crate) struct History {
+    frame: Frame,
+    min: [f32; 2],
+    cell: f32,
+    n: [usize; 2],
+    buckets: Vec<Vec<(u32, Bounds)>>,
+    cuts: Vec<crate::stock_surface::Cut>,
+}
+impl History {
+    pub(crate) fn new(frame: Frame, over: Bounds, cell: f32) -> Self {
+        let n = [0, 1].map(|k| ((over.max[k] - over.min[k]) / cell).ceil().max(1.) as usize);
+        Self {
+            frame,
+            min: [over.min[0], over.min[1]],
+            cell,
+            n,
+            buckets: vec![vec![]; n[0] * n[1]],
+            cuts: vec![],
+        }
+    }
+    fn bucket(&self, x: f32, k: usize) -> usize {
+        (((x - self.min[k]) / self.cell).floor().max(0.) as usize).min(self.n[k] - 1)
+    }
+    /// Keep `cut`, the latest so far: its number.
+    pub(crate) fn add(&mut self, cut: crate::stock_surface::Cut) -> u32 {
+        let id = self.cuts.len() as u32;
+        // The cut's stretches, each the box it sweeps in its own frame.
+        let boxes: Vec<Bounds> = match cut.ring() {
+            Some(ring) => vec![ring],
+            None => {
+                let (below, above) = cut.shape.span();
+                let r = cut.radius;
+                let length = (0..3).map(|k| (cut.b[k] - cut.a[k]).powi(2)).sum::<f32>();
+                let pieces = (length.sqrt() / self.cell.max(r)).ceil().max(1.) as usize;
+                let at = |t: f32| -> [f32; 3] {
+                    std::array::from_fn(|k| cut.a[k] + (cut.b[k] - cut.a[k]) * t)
+                };
+                (0..pieces)
+                    .map(|i| {
+                        let (p, q) = (
+                            at(i as f32 / pieces as f32),
+                            at((i + 1) as f32 / pieces as f32),
+                        );
+                        Bounds {
+                            min: [
+                                p[0].min(q[0]) - r,
+                                p[1].min(q[1]) - r,
+                                p[2].min(q[2]) - below,
+                            ],
+                            max: [
+                                p[0].max(q[0]) + r,
+                                p[1].max(q[1]) + r,
+                                p[2].max(q[2]) + cut.flute + above,
+                            ],
+                        }
+                    })
+                    .collect()
+            }
+        };
+        for own in boxes {
+            let at = cut.frame.transfer_bounds(own, self.frame);
+            let [x0, y0] = [0, 1].map(|k| self.bucket(at.min[k], k));
+            let [x1, y1] = [0, 1].map(|k| self.bucket(at.max[k], k));
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let bucket = &mut self.buckets[y * self.n[0] + x];
+                    match bucket.last_mut() {
+                        // The cut's last stretch here too: one box round both.
+                        Some((last, b)) if *last == id => {
+                            for k in 0..3 {
+                                b.min[k] = b.min[k].min(at.min[k]);
+                                b.max[k] = b.max[k].max(at.max[k]);
+                            }
+                        }
+                        _ => bucket.push((id, at)),
+                    }
+                }
+            }
+        }
+        self.cuts.push(cut);
+        id
+    }
+    /// Whether a cut kept before cut `before` swept the point `p` of the
+    /// frame: the latest cuts first, the likeliest to have.
+    pub(crate) fn swept(&self, p: [f32; 3], before: u32) -> bool {
+        let bucket = &self.buckets[self.bucket(p[1], 1) * self.n[0] + self.bucket(p[0], 0)];
+        let earlier = &bucket[..bucket.partition_point(|(id, _)| *id < before)];
+        earlier.iter().rev().any(|(id, b)| {
+            if (0..3).any(|k| p[k] < b.min[k] || p[k] > b.max[k]) {
+                return false;
+            }
+            let c = &self.cuts[*id as usize];
+            let q = if c.frame == self.frame {
+                p
+            } else {
+                self.frame.transfer(p, c.frame)
+            };
+            swept(q, c.a, c.b, c.radius, c.flute, c.shape)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

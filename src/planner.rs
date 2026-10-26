@@ -43,6 +43,11 @@ pub trait Backend {
     fn pictures(&self) -> bool {
         false
     }
+    /// Whether the run's machine has a rotary A axis, so its proposals
+    /// follow `proposal::schema_on` (with the chuck and the A angles), told
+    /// once the part report is made; a backend that asks for structured
+    /// output sends that schema. The default ignores it.
+    fn rotary(&self, _rotary: bool) {}
 }
 /// The stage a run is in; `n` counts model requests from 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +256,17 @@ CHANGING THE CURRENT PLAN
 - `kept_operations` lists operations of the current plan that you cannot see or change (strategies the format does not offer). They stay in their setups at their place: keep those setups, with their `from` and orientation, and do not count them against the limits.
 - Say in `summary`, in a sentence or two for the user, what you changed. When the change cannot be made with these tools and strategies, reply with the current plan unchanged and say why in `summary`.
 - The earlier messages of the chat, if any, are for context only: `current_plan` is the job as it stands now.";
+/// The part report's `rotary` bullet, on a machine with a rotary A axis.
+const ROTARY_PART: &str =
+    "- `rotary`, present when the machine has a rotary A axis: see ROTARY A AXIS.\n";
+/// The ROTARY A AXIS section, with its blank line after it.
+const ROTARY: &str = "ROTARY A AXIS
+- `rotary` in the part report is the machine's A axis, a chuck on the table that turns the stock about X: `centre_height` is the A centreline above the table, `max_diameter` the widest stock (across its corners) and `max_length` the longest (from the chuck's face) that fits, `a_min` and `a_max` the A limits in degrees, `grip_min` and `grip_max` what the jaws grip (a round bar's diameter; a box's thinner side up to its diagonal), and `centreline` says whether the A centreline was `measured` by the operator or is only `assumed`. When it is `assumed`, add a warning that the centreline must be probed on the Control page before cutting.
+- Hold the stock in the chuck instead of a vise when the part is long and slim, or has features on several sides that A can turn to instead of re-clamping. Then give `chuck`, otherwise null: `stock` is `Round bar` (give `diameter`) or `Box` (give `width` across Y and `height` in Z), `length` long along X; `jaws` `3-jaw` for a round bar and `4-jaw` for a box; `stickout` is how much of the stock reaches out of the jaws, `tailstock` is `Retracted`, `Supports the stock` or `Off the table`; `free_end` is the stock left beyond the part's free end (null: 2 mm). The program turns setup 1 to its `orientation`, which may be any of the six, and places the part on the stock's axis in the stick-out: the part must lie within the stick-out and the jaws must grip at least half their length of the stock, so cut only the stick-out. The report's orientations and stock margins are made for the project's own stock; the check report's `stocks` have the chuck's. Setup 1's `origin` is `A axis at stock end` or `A axis at chuck face` (X0 on the stock's free end face, or on the chuck's face; Y0 Z0 on the A centreline).
+- A later setup with `a_angles` (degrees, within `a_min` to `a_max`, such as [0, 90, 180, -90] on a -180 to 180 range) is not re-clamped: A turns the stock in setup 1's chuck, which it keeps along with its work zero. Every operation of that setup runs at each of its angles in turn, on the stock the angles before left. Its `orientation` is the part axis that faces up at its first angle; a different one is refused, with the right one. Positive A turns +Y towards +Z (the right-hand rule about +X), so with `+Z` up in setup 1 the first angle 90 brings `+Y` up, 180 brings `-Z` up and -90 brings `-Y` up (0 keeps `+Z`; 270, where the A range reaches it, is the same as -90). Its `origin` is ignored and its `holder` is null; it uses no work offset of its own. Use it instead of a flip: when the same operations are right for every angle (an outside Contour all round, a Parallel or Waterline finish) list the angles in one setup and keep `surfaces` empty; to turn the bar into a square (or any prism) face its sides: one Face in a setup of all the angles, whose `surfaces` are the top plane's IDs of every orientation those angles bring up (+Z, +Y, -Z and -Y for [0, 90, 180, 270] with `+Z` up in setup 1), which the program faces at each angle where it is on top, with the tool's centre out to each face's edges (`facing_area` and the stock's `stock_margin` do not apply). Size the chuck's box so that the faces leave 2 mm or more to cut, and give the part a shoulder to the bar: the part's end face towards the jaws is left covered, so list it in `unmachined` as joined to the bar, never part it off the bar there (the program refuses a loose piece, a web under 3 mm or too weak for the cut, and a part-off the jaws do not hold); when each side needs its own operations make one setup per side with a single angle. Give a setup after the last indexed one `a_angles` null to clamp again (usually not needed).
+- The program refuses a plan that does not fit, with the check's message and the stage `export` or `workholding`, by setup and operation: the cut's depth below the Z travel and the retract above it (turning A needs room over everything that swings, the stock, the part and the jaws), X Y and Z travel, the A range, the stock too big for the unit or the jaws, and the tool or its holder within `gap` of the chuck, its jaws, the rotary head and the tailstock, at each angle and while A turns. Answer those with a smaller or shorter stock, a shorter stick-out, a shorter tool or `Off the table`, a lower `clearance`, or leave the feature in `unmachined`. Check a draft with `check_plan`, as for the other setups.
+
+";
 /// The PLANNING THE HOLDING section, with its blank line after it: how the
 /// planner is to hold every setup, which stock it starts from and what a holder
 /// needs of it. With `tools`, a last rule names the planner tools that test a
@@ -263,7 +279,7 @@ fn holding_rules(tools: bool) -> String {
     };
     format!("PLANNING THE HOLDING
 - Decide, before you plan any operation, how every setup is held and what stock it starts from. A later setup starts from the stock the earlier setups left, not from the whole block: a faced top makes the flipped stock shorter, and cut sides make it narrower. A holder that does not fit that stock, or has nothing to grip on it, makes the plan fail.
-- `workholding_library` lists the vises and clamps you may choose from, by `number` from 1, with their sizes in mm and no names. A `Vise` has `jaw_width`, `jaw_height`, `jaw_thickness`, `max_opening` (the widest stock it opens to across its jaws) and `grip` (how far up from the stock's bottom the jaws hold it). A `Clamp` has `length`, `width`, `height` and `bite` (how far it reaches onto the stock top).
+- `workholding_library` lists the vises and clamps you may choose from, by `number` from 1, with their sizes in mm and no names. A `Vise` has `jaw_width`, `jaw_height`, `jaw_thickness`, `max_opening` (the widest stock it opens to across its jaws) and `grip` (how far up from the stock's bottom the jaws hold it). A `Clamp` has `length`, `width`, `height` and `bite` (how far it reaches onto the stock top). A round bar's holders: a `V-block` (`angle`, `v_width`, `width`, `height`, `length`, `clamp_width`, `clamp_height`) holds a bar lying along X, `Soft jaws` (`bore`, the diameter they are bored to, and a vise's sizes) one lying or standing, a `Collet block` (`er`, `block`, `height`) one standing; choose them only for a round bar.
 - Each setup's `holder` is a `number` from `workholding_library`, or null. Setup 1 is held by the user's own entry, whose `number` is given in the report's `workholding` (which is absent when setup 1 models no vise or clamps): its `holder` is null or that `number` and cannot be changed. For a later setup null means the same holder as setup 1 when setup 1 has an entry, and no modelled holding when it has none; choose a `number` when the stock it starts from suits another holder better, for example clamps when the earlier setups took the material a vise would grip, or a vise that opens wider. The program lays the chosen holder out (a vise's axis and grip, the clamps' sides and positions) for the setup's toolpaths: you choose only the entry.
 - A vise closes on the material in its grip band, from the stock's bottom up to the grip: across the jaws, the stock is as wide as that band. Walls an earlier setup cut through the whole band, such as walls an outside Contour finished, can be gripped, even under stock left wider above them; sides cut through only part of the band cannot, as the jaws then close on the wider stock with part of their face on air.
 - A vise needs, in the stock the setup starts from: material at both jaws from the bottom up to the grip (at least 60 % of each jaw's contact face), material under the band to rest on (at least half of it), stock at least 1 mm above the grip, and a band no wider across the jaws than `max_opening`. Clamps need material under each clamp's bite (at least 60 % of it). A part cut free of the material the holder grips cannot be held either.
@@ -278,6 +294,11 @@ fn holding_rules(tools: bool) -> String {
 pub fn instructions() -> String {
     instructions_with(false, false, false)
 }
+/// `instructions_for` for a machine without a rotary A axis, as the tests read it.
+#[cfg(test)]
+pub fn instructions_with(pictures: bool, tool: bool, overview: bool) -> String {
+    instructions_for(pictures, tool, overview, false)
+}
 /// What the model is told before it sees the part. Every limit the builder
 /// and the generators enforce is stated, so a correct plan passes first time.
 /// With `tool` (the planner tools are offered), a TOOLS section lists them
@@ -286,7 +307,14 @@ pub fn instructions() -> String {
 /// PICTURES section before RULES explains the pictures: with `overview`, the
 /// overview the conversation carries; with `tool`, the view_model tool and its
 /// limits.
-pub fn instructions_with(pictures: bool, tool: bool, overview: bool) -> String {
+/// With `rotary` (the machine has an A axis), the report's `rotary` and a ROTARY
+/// A AXIS section say how to use it; without, the text is the same as it was.
+pub fn instructions_for(pictures: bool, tool: bool, overview: bool, rotary: bool) -> String {
+    let (rotary_part, rotary) = if rotary {
+        (ROTARY_PART, ROTARY)
+    } else {
+        ("", "")
+    };
     let tools = if tool {
         planner_tools::instructions(pictures)
     } else {
@@ -329,36 +357,43 @@ pub fn instructions_with(pictures: bool, tool: bool, overview: bool) -> String {
     format!("You plan CNC milling jobs for AXIS CAM Studio, a 3-axis CAM program. You receive a JSON part report and reply with one JSON proposal that matches the given schema. The program then generates every operation, simulates the stock, runs its export safety checks and tells you what failed, so you can correct the proposal.
 
 THE PART REPORT
-- Lengths are millimetres. `tools` lists the only tools you may use, by `number`, with their `diameter`, `flutes`, flute length and stickout, and a chamfer mill's `tip_angle`. `machine` gives the maximum rpm and feed, and in `coolants` the coolant choices the machine has outputs for. `material` is the project's material with its cutting data (see SPEEDS AND FEEDS).
+- Lengths are millimetres. `tools` lists the only tools you may use, by `number`, with their `diameter`, `flutes`, flute length and stickout, and a chamfer mill's `tip_angle` (and `tip_flat`, its flat tip across, when it is not pointed). `machine` gives the maximum rpm and feed, and in `coolants` the coolant choices the machine has outputs for. `material` is the project's material with its cutting data (see SPEEDS AND FEEDS).
 - `orientations` lists six ways to clamp the part, named by the part axis that points up. The first entry is setup 1, where the stock is defined; your first setup must use it. Each orientation may be used by one setup only, so a plan has at most 6 setups. Add another setup only for features that cannot be reached otherwise.
 - In each orientation, `planes` are the horizontal faces visible from above, with their `surfaces` IDs. `kind` is `top` for the highest face and `floor` for lower faces. `depth_below_top` is measured from the model's top in that orientation. `stock_margin` is the untouched stock beyond the model: top, bottom, -X, +X, -Y, +Y. Faces that an earlier setup machined have no stock left on them.
 - A floor's `max_cutter_diameter` is the largest flat cutter, up to 50 mm, that has somewhere to cut on it: everything of the part above the floor keeps the cutter out, but past an edge where the part falls away below the floor (a ledge, a notch through a wall) the cutter may stand over the lower area, so such a floor takes a large cutter. A floor's `openings` are the holes through it, of any shape, with nothing of the part over or under them (cut-outs through a plate), each with its box, its `depth` from the floor down to where its walls end, and the largest flat cutter that fits inside it (`max_cutter_diameter`). A plane's `holes` give the largest drill that fits (`diameter`, a bore's nominal size: a drill of exactly that diameter fits), the opening diameter (`opening_diameter`, larger at a counterbore or a countersink), the depth and whether the hole goes through. `countersink` is null, or the cone the opening narrows down in: its included `angle` in degrees and its `depth` below the plane.
 - `freeform_area` is the visible area that is neither horizontal nor vertical; only Parallel finishing follows it.
 - `truncated` true means the orientation has more planes or holes than are listed; only listed surfaces can be used.
-- `workholding`, when present, is setup 1's modelled vise or clamps, with its `number` in `workholding_library` (see WORKHOLDING).
+- `workholding`, when present, is setup 1's modelled vise or clamps, with its `number` in `workholding_library`, or its chuck (see WORKHOLDING).
 - `workholding_library` lists the vises and clamps you may choose from, by `number`, with their sizes (see PLANNING THE HOLDING).
-
-STRATEGIES (the only six)
+- `sheet`, when present, says setup 1's stock is a sheet of `size` (X, Y, thickness) lying on a spoilboard, for a flat part cut from it: a cut through the sheet may go on into the board by `spoilboard_allowance` mm, never deeper, so in setup 1 `bottom_offset` and a through drill's `breakthrough` may take a cut that far below the model's bottom. `holddown` is what holds the sheet: `Screws` through its waste, whose heads are setup 1's `workholding` boxes (kind `Hold-down screws`), or `Tape`. `needs_tabs` true says the screws hold only the waste: an outside Contour that cuts through must leave `tabs`. On a sheet the top plane lists `openings` too: the part's cut-outs, which a Contour `inside_holes` cuts (a Pocket needs a floor).
+{rotary_part}
+STRATEGIES (the only eight)
 - Face: flattens the top. `surfaces` = the top plane's IDs. Tool: flat end mill or face mill. `stepdown` at most the flute length, `stepover_percent` 1-100. Facing needs stock above the face: use it only where the orientation's `stock_margin[0]` is greater than `bottom_offset`. `bottom_offset` above 0 leaves that much stock on the face. `facing_area` `stock` (or null) faces the whole stock top, `model` only over the model's outline seen from above, a little past it, leaving the stock beyond for later operations. Face makes levels × passes strokes: levels = (`stock_margin[0]` − `bottom_offset`) ÷ `stepdown`, rounded up; passes = (the faced width in Y + the tool diameter) ÷ the stepover in mm, rounded up, plus 1. The faced width is the stock's (the model's Y size + `stock_margin[4]` + `stock_margin[5]`), or the model's Y size with `facing_area` `model`, which also goes once round the outline at each level.
 - Pocket: clears from the stock top down to each floor it lists, each to its own depth, the highest first; a deeper floor inside a shallower one starts where that one stops. `surfaces` = all IDs of one or more floor planes of the orientation. Tool: a flat end mill no wider than the largest `max_cutter_diameter` of those floors; a floor it does not fit is skipped. A Pocket only goes where earlier operations left material, so the same Pocket again with a smaller cutter is a rest pass: it cleans the corners and narrow places a larger cutter could not reach, in a fraction of the time; give it `finish_passes` 0. `through` true also cuts each of the floors' `openings` down to where its walls end plus `breakthrough` (null means 1 mm), and the ones narrower than the cutter are left for a smaller one; their corners keep the cutter's radius, so finish cut-outs that need tight corners (switch cut-outs) with a rest pass of the smallest cutter that reaches; with `through` false or null the openings are cleared over at the floor's height only. `stepover_percent` at most 50, `stepdown` at most the flute length. The floor's depth plus the stock above the top must be less than the tool's stickout. `radial_allowance` and `axial_allowance` leave stock. `pocket_entry` is `Profile ramp` or `Plunge`; `ramp_angle` null or 0.1-15 degrees, also with `Plunge`. `finish_passes` a whole number 0-20. Its moves are about levels × the points of all its offset rings, and three settings multiply them: a smaller `stepover_percent` adds rings, each finish pass repeats the outermost ring at every level, and a smaller `ramp_angle` adds ramp moves at every entry (the tool stays down from ring to ring and enters again only for the deepest loop of each separate spot).
 - Contour, `contour_mode` `outside`: one path around the whole model outline, from the stock top down to the model's bottom plus `bottom_offset`. `surfaces` empty. Flat end mill, `stepdown` at most the flute length, `finish_passes` a whole number 0-20. The cut depth from the stock top must be less than the stickout; for a tall part use `bottom_offset` to stop higher and finish from the opposite side. It removes one tool width around the outline, not all surrounding stock. Its moves are about levels × the outline's points.
 - Contour, `contour_mode` `inside_floor`: the walls of one floor. `surfaces` = that floor's IDs. The tool and depth rules of Pocket apply: a flat end mill no wider than the floor's `max_cutter_diameter`, depth within the stickout, `stepdown` at most the flute length, `finish_passes` a whole number 0-20; `pocket_entry` and `ramp_angle` work as for Pocket, but its stepover is fixed at 40 %, so `stepover_percent` changes nothing. Its moves are about levels × the points of its rings, as for Pocket: each finish pass repeats the outermost ring at every level, and a smaller `ramp_angle` adds ramp moves at every entry (the tool stays down from ring to ring and enters again only for the deepest loop of each separate spot).
-- Drill: drills the holes of one plane. `surfaces` = that plane's IDs. Tool: a drill no wider than the hole's `diameter` (one of exactly that diameter fits). With a chamfer mill instead it countersinks each hole: its point goes down until its cone is as wide as the hole's `opening_diameter` at the plane, so choose one at least that wide, and drill the holes before it. A hole with a `countersink` needs a chamfer mill whose `tip_angle` is the countersink's `angle` (within 0.5°); another is refused. Countersink every hole that has one, or list it in `unmachined`. `hole_diameter` limits it to holes whose `diameter` equals it (not `opening_diameter`); null drills every hole of the plane. The drill's depth is measured from the stock top: `stock_margin[0]` + the plane's `depth_below_top` + the hole's `depth` + `breakthrough` must be less than the drill's flute length. `drill_cycle` is `Drilling`, `Chip breaking`, `Deep drilling` (both need `peck`), `Counterboring`, `Helical milling`, `Thread milling` or `Tapping`.
+- Contour, `contour_mode` `inside_holes`: inside every hole through the model's outline seen from above (a flat part's cut-outs, round holes too), from the stock top down to the model's bottom plus `bottom_offset`. `surfaces` empty. Flat end mill. `hole_diameter` null cuts every hole the tool fits in; a number cuts only the holes at least that wide, leaving the smaller ones to a Drill. The slugs come free.
+- Contour `tabs`, for `contour_mode` `outside` only (null otherwise): holding tabs that keep the part joined to the stock round it where the cut goes through, `count` (1-50) on each outline, each `width` wide and `height` thick, placed by the program on the outline's straight sides and gentle curves, never on corners, short segments or tight arcs: each needs its width plus the tool's diameter plus 2 mm of outline that turns by 29° at most. Tabs need stock beside the part to join.
+- Drill: drills the holes of one plane. `surfaces` = that plane's IDs. Tool: a drill no wider than the hole's `diameter` (one of exactly that diameter fits). With a chamfer mill instead it countersinks each hole: its point goes down until its cone is as wide as the hole's `opening_diameter` at the plane, so choose one at least that wide, and drill the holes before it. A hole with a `countersink` needs a chamfer mill whose `tip_angle` is the countersink's `angle` (within 0.5°); another is refused. Countersink every hole that has one, or list it in `unmachined`. `hole_diameter` limits it to holes whose `diameter` equals it (not `opening_diameter`); null drills every hole of the plane. The drill's depth is measured from the stock top: `stock_margin[0]` + the plane's `depth_below_top` + the hole's `depth` + `breakthrough` must be less than the drill's flute length. `drill_cycle` is `Drilling`, `Chip breaking`, `Deep drilling` (both need `peck`), `Counterboring`, `Helical milling`, `Thread milling`, `Tapping`, `Reaming` or `Boring`.
 - Drill, `drill_cycle` `Helical milling`: mills each hole of the plane with a flat end mill instead of a drill, down a helix of `stepdown` per turn to a flat floor, so one end mill cuts holes of any size it fits and blind holes keep flat bottoms (a drill leaves its 118° point). Tool: a flat end mill no wider than the smallest selected hole's `diameter`; use `hole_diameter` to leave out the holes it does not fit. A hole over twice the cutter's diameter is cut in rings `stepover_percent` (1-100) apart. `stepdown` at most the flute length; the depth rule of drilling applies with the flute length. Not on a manual mill.
 - Threads: a hole with a `thread` is tapped or thread-milled after it is drilled. First drill it with a drill of its `tap_drill` (or Helical milling to that size), through its `length` and, when blind, a pitch and a half deeper. Then a Drill of the same plane with `drill_cycle` `Thread milling` on a CNC: tool a thread mill whose `pitches` range holds the thread's `pitch`, whose `thread_angle` is the thread's, narrower than `tap_drill` and whose `reach` is at least the thread's `length` plus half a pitch; it cuts the size and hand modeled. `Tapping` is only for a manual mill or a lathe (the CNC cannot tap): tool a tap of the thread's size. Use `hole_diameter` (the hole's `diameter`) to keep each to the holes of one thread size. Thread every hole that has a `thread`, or list it in `unmachined`.
+- Reamed and bored holes (a fit such as H7, on a CNC): `Reaming` finishes a hole with a reamer (`kind` `Reamer`, its `diameter` the hole's, its `flute_length` more than the stock above the plane plus the hole's `depth` plus `breakthrough`); drill it first with a drill 0.1 under the reamer up to 5 mm, 0.2 up to 20 mm (9.8 for 10), 0.3 over. `Boring` finishes the holes of one size with a boring head (`kind` `Boring head`: `bore_range` must hold the hole's `diameter`, and its `flute_length`, how far the bar reaches below its body, must exceed the hole's depth from the stock top); give `hole_diameter`. Rough the hole first, to at least the head's smallest bore: drill it, then `Helical milling` with a flat end mill to 0.6 under the size. The run pauses between boring passes for the head to be set out.
 - Drill, through holes: `through` may be true only in setup 1, and only when every hole the operation selects is a through hole in the report; use `hole_diameter` to select only those. Setups after the first rest on the face where a drill would exit, so drill through holes in setup 1, or set `through` false and list the exit in `unmachined`. With `through` true, `breakthrough` extends the drill below the hole; null means 1 mm. It is at most half the drill diameter plus 1 mm and never more than the stock below the model (`stock_margin[1]`).
 - Parallel: surface-following finishing of the whole model from above. `surfaces` empty. Ball or flat end mill. `surface_stepover` at most the tool radius, `tolerance` 0.01-1. The pass count times the samples per pass must stay under {samples}: (the model's Y size ÷ `surface_stepover`) × (the model's X size ÷ step), where step = min(`surface_stepover`, √(8 × tool radius × `tolerance`), 1 mm) and must be at least 0.05 mm.
-- Waterline: constant-height passes around the model, always from the model's top down to its bottom plus `bottom_offset`. `surfaces` empty. Flat end mill, `stepdown` at most the flute length. That height must be less than the tool's stickout. It cuts that height ÷ `stepdown` layers, its moves about layers × the outline's points.
+- Waterline: constant-height passes around the model, always from the model's top down to its bottom plus `bottom_offset`. `surfaces` empty. Flat end mill, `stepdown` at most the flute length. That height must be less than the tool's stickout. `surface_stepover` is the most its neighbouring layers' loops may lie apart across a sloping face: over a face of slope θ (flatter than 1° excepted) layers are at most `surface_stepover` × tan θ apart instead of `stepdown`. It cuts about that height ÷ `stepdown` layers, plus each sloping face's width seen from above ÷ `surface_stepover` layers, its moves about layers × the outline's points.
+- Groove: an internal groove below the mouth of one bore (a circlip groove, an undercut nothing from above reaches), by circular interpolation. `surfaces` = the IDs of the plane the bore opens in, and `hole_diameter` the bore's `diameter`, so it picks that one hole. Tool: a `Keyseat cutter` (its `diameter` the head's, `flute_length` the head's width, `neck_diameter`, and `reach` from the head's bottom to the shank). `groove_diameter` and `groove_width` the groove's size; `groove_from` is `Land from the top of the bore` (the face of this setup), `Land from the bottom of the bore` or `Depth below the stock top`, and `groove_land` the land (or depth) in mm; `spring_pass` true repeats the last circle. The head goes down the bore's axis, arcs out to the groove, circles, arcs back to the axis and comes up it; a groove wider than the head takes several passes along the axis. Refused: a head within 0.2 mm a side of the bore, a neck that would rub the bore (groove depth more than the head radius less the neck radius less 0.2 mm), a head wider than the groove, a groove outside the bore, and a groove whose far edge is deeper below the bore's top than `reach`. Bore the hole first (Drill with `Helical milling`). Cut a groove near the far face from that face in a later setup, or with `Land from the bottom of the bore` when the reach allows.
+- Chamfer: a chamfer mill run level with the side of its cone on edges or on a line, in one pass each: edge chamfers, deburring, and V flanks at a depth. Tool: a chamfer mill (its `tip_angle`, and `tip_flat` across when it is not pointed). Give `chamfer` (null for every other strategy). `chamfer.source` `edges`: `surfaces` = the IDs of a level face of the orientation (its outline and hole mouths are the edges; `edges` `outer` or `holes` keeps only one kind). `source` `line`: `surfaces` empty, `line` [x1, y1, x2, y2] and `line_z` in work coordinates, `side` the side of the line the tool is on looking from its start to its end (`left`, `right`, or `alternate` from left for successive copies). Size it by `width` (the chamfer's width on the face; the tip goes `tip_offset`, null 0.5, below its lower end; the tool's axis is the tip flat's radius plus `tip_offset` × tan(half the tip angle) off the edge) or by `tip_z` (the tip's work Z; the axis is the cone's radius at `line_z` off the line), the other null. The cone must be no wider than the tool where it meets the face or the line. `copies` (null 1) repeats it turned `first_angle` + k × `copy_pitch` degrees anticlockwise about the vertical axis through `axis` [x, y] (work coordinates, null the work zero). The program checks the whole cone against the part, not only its centre line.
 
 WORKHOLDING
-- `workholding` in the part report, when present, describes what holds the stock in setup 1. `kind` is `Vise` (two jaws on opposite sides of the stock) or `Clamps`. `boxes` lists each jaw or clamp as [x0, y0, z0, x1, y1, z1] in setup 1's axes, in mm from the model's -X/-Y/bottom corner. A clamp lies over the stock top; a jaw reaches from the stock's bottom up to its top, which is its z1.
+- `workholding` in the part report, when present, describes what holds the stock in setup 1. `kind` is `Vise` (two jaws on opposite sides of the stock), `Clamps`, `Chuck`, or for a round bar `V-block`, `Soft jaws` or `Collet block`, with `round_bar` giving its `diameter`, `length` and `along` (`X` lying, `Z` standing); a lying bar's work zero may be on its axis (`Bar axis at left end`, `Bar axis center`). `boxes` lists each jaw or clamp as [x0, y0, z0, x1, y1, z1] in setup 1's axes, in mm from the model's -X/-Y/bottom corner. A clamp lies over the stock top; a jaw reaches from the stock's bottom up to its top, which is its z1.
+- A `Chuck` holds the stock on the machine's rotary A axis, along X, by its -X end: `chuck` gives its `jaws` (3 or 4), its `chuck_diameter`, the `jaw_length`, the `gripped_length` of stock in the jaws, the `stickout` beyond them towards +X, the `bar_diameter` of a round bar, where the `tailstock` is and the `a_angle` every operation runs at (0: indexed angles are not planned). Its `boxes` are the chuck body, each jaw, the rotary head, the tailstock's centre, quill and body when it is on the table, and the stock gripped in the jaws: no tool may come within `gap` of the gripped stock either, so cut only the stick-out, from its +X end to `gap` plus the tool's radius short of the jaws.
 - The boxes are keep-out zones. The program grows each box by `gap` mm on every side and refuses any move, rapids and retracts included, that brings the cutter or the tool holder within `gap` of a box. A refused move comes back as a problem with the stage `workholding`, by setup and operation. Parallels, bolts, the table and the machine body are not checked.
 - The later setups (every setup after the first) are held by the library entry their `holder` names, or by setup 1's own entry when it is null (see PLANNING THE HOLDING). That entry is laid out by the program once it has generated the setup's toolpaths: it picks the sides and positions that keep them clearest of those toolpaths, and the preview shows the result. What still comes within `gap` of it is reported with the stage `workholding` too.
 - Keep the plan clear of the boxes. Do not face or contour where a clamp sits over the stock edge, and do not let a tool work beside a jaw below the jaws' top. Keep outside contours above the jaws' top by giving them a `bottom_offset` greater than the jaw's z1 plus `gap`, and finish the walls below from the setup turned over, whose vise can grip the walls finished above (see PLANNING THE HOLDING); or move them to a setup where the sides are free.
 - `clearance_above_stock_top` is present when a box and its gap reach above the stock top, and says how far. The default `clearance` of 15 already covers a height below 15, so leave `clearance` null then. When the height is 15 or more, give every operation a `clearance` greater than it: a machine that retracts to a clearance plane refuses a plan whose plane (the highest `clearance` in a setup) is not above the boxes and their gap, and rapids then pass over the boxes. Otherwise leave `clearance` null.
 - A `workholding` problem names its place in the setup's work coordinates (X, Y and Z measured from the setup's work zero, Z up), not from the model's corner as the report's boxes are: convert before comparing.
 
-{holding}SPEEDS AND FEEDS
+{rotary}{holding}SPEEDS AND FEEDS
 - `material` in the report holds the cutting data for carbide tools: `vc_min_m_per_min` and `vc_max_m_per_min` give the surface speed range in m/min, and `chip_load_mm` the chip load per tooth in mm in five bands by tool diameter. A band holds the diameters up to its `up_to_mm` (and above the previous band's), with its `min` and `max`; the last band, with `up_to_mm` null, holds every larger diameter.
 - The program computes, for every operation, the surface speed Vc = π × D × rpm ÷ 1000 (m/min) and the chip load fz = feed ÷ (rpm × flutes) (mm per tooth), from the tool's diameter D and `flutes` in `tools` and the operation's `rpm` and `feed`. Vc must lie between `vc_min_m_per_min` and `vc_max_m_per_min`, and fz between the `min` and `max` of the band of the tool's diameter; under 3 mm the band's `min` and `max` shrink in proportion to the diameter (a Ø1 tool takes a third of them, a Ø0.5 a sixth). Choose a Vc in range and set rpm = Vc × 1000 ÷ (π × D), then choose an fz in the band and set feed = fz × rpm × flutes. For example, a 3-flute Ø10 mm tool at 8000 rpm and 1000 mm/min runs at Vc = 251 m/min with fz = 0.042 mm per tooth.
 - Drills are checked like end mills: a Drill's `feed` is divided by rpm × flutes in the same way and must give a chip load inside the band of the drill's diameter, so choose drill feeds inside those bands. A small drill needs a high rpm to reach the surface speed.
@@ -371,9 +406,10 @@ WORKHOLDING
 - Every number must be finite.
 - Every operation is limited to {samples} moves (Parallel to {samples} samples, as above): what memory holds, far past any real job. A finer stepdown or stepover multiplies the moves and the cutting time: choose them for the cut, not to stay under the limit.
 - The program refuses any move whose tool centre line passes through the part, and any move below the bottom of the stock. In setups after the first, nothing may go below the part's underside.
-- `bottom_offset`, `radial_allowance` and `axial_allowance` cannot be negative. Only a through drill's breakthrough in setup 1 goes below the model, into the stock beneath it.
+- `bottom_offset`, `radial_allowance` and `axial_allowance` cannot be negative, but for a `sheet` in setup 1 `bottom_offset` may be down to -`spoilboard_allowance`. Only a through drill's breakthrough in setup 1 goes below the model, into the stock beneath it. On a `sheet` a cut in setup 1 may also go into the spoilboard, by its allowance at most.
 - Order operations in a setup: Face, then Pocket (larger cutters before the rest passes of smaller ones), then Contour, then Drill (drills before chamfer mills), then finishing.
 - No tool tip may go deeper below the stock top than the tool's stickout.
+- When `machine.clearance` is present, the program also refuses a stock that stands taller than `gantry_height` (the vise's height under it plus the stock's height) or wider than `gantry_width`, and a tool whose stick-out and holder, from the highest the tip travels, reach past `nose_to_table` (the spindle nose at Z top, over the table). Stand a tall part on its shorter side or use a shorter tool; a figure named in `assumed` was not measured, so say so when a plan is close to it.
 - Choose each operation's spindle speed and feed from the material's cutting data (see SPEEDS AND FEEDS), within the machine's limits.
 - Set each operation's `coolant` to one of `machine.coolants`: coolant the machine has no output for is refused.
 - Set the fields a strategy does not use to null. A null field takes the program's default: `stepdown` 2, `stepover_percent` 40, `surface_stepover` 1, `tolerance` 0.01, `peck` 3, `finish_passes` 1, `ramp_angle` 2, `breakthrough` 1, `clearance` 15, allowances and `bottom_offset` 0.
@@ -907,12 +943,21 @@ async fn ask(
         } else {
             ToolChoice::Auto
         };
+        let report = &state.scene.report;
         let tools = if sight.tool {
-            planner_tools::offered_with(sight.pictures, sight.edit)
+            planner_tools::offered_for(
+                sight.pictures,
+                proposal::schema_with(sight.edit, report.rotary.is_some()),
+            )
         } else {
             vec![]
         };
-        let mut system = instructions_with(sight.pictures, sight.tool, sight.overview);
+        let mut system = instructions_for(
+            sight.pictures,
+            sight.tool,
+            sight.overview,
+            report.rotary.is_some(),
+        );
         if sight.edit {
             system.push_str(EDITING);
         }
@@ -1106,6 +1151,7 @@ where
             )
         })?
         .map_err(|e| fail(e, vec![], None, 0))?;
+    backend.rotary(report.rotary.is_some());
     let part = serde_json::to_string(&report).map_err(|e| fail(e.to_string(), vec![], None, 0))?;
     // The plan to change, read before anything is sent.
     let current = if edit {
@@ -1334,6 +1380,8 @@ pub struct OpenAiBackend {
     stream: Arc<std::sync::Mutex<String>>,
     /// Whether the run may show the model pictures.
     pictures: bool,
+    /// Whether the run's machine has a rotary A axis (`Backend::rotary`).
+    rotary: std::sync::atomic::AtomicBool,
 }
 impl OpenAiBackend {
     pub fn new(
@@ -1348,6 +1396,7 @@ impl OpenAiBackend {
             plain: false.into(),
             stream,
             pictures,
+            rotary: false.into(),
         }
     }
 }
@@ -1364,7 +1413,7 @@ impl Backend for OpenAiBackend {
             model: self.model.clone(),
             messages: messages.to_vec(),
             schema_name: "machining_plan",
-            schema: proposal::schema_for(edit),
+            schema: proposal::schema_with(edit, self.rotary.load(Ordering::Relaxed)),
             tools: tools.to_vec(),
             tool_choice: choice,
         };
@@ -1383,6 +1432,10 @@ impl Backend for OpenAiBackend {
     }
     fn pictures(&self) -> bool {
         self.pictures
+    }
+    fn rotary(&self, rotary: bool) {
+        self.rotary
+            .store(rotary, std::sync::atomic::Ordering::Relaxed);
     }
 }
 /// The stock after the whole job, meshed at Standard detail for the
@@ -1710,6 +1763,7 @@ pub(crate) mod tests {
             "√(8 × tool radius × `tolerance`)".into(),
             "at least 0.05 mm".into(),
             "layers, its moves about layers × the outline's points".into(),
+            "`surface_stepover` × tan θ".into(),
             // The report and the check report.
             "`truncated`".into(),
             "setup 1's frame".into(),
@@ -3318,12 +3372,14 @@ pub(crate) mod tests {
             .clone();
         Proposal {
             summary: "Face and contour.".into(),
+            chuck: None,
             setups: vec![proposal::ProposedSetup {
                 orientation: report.orientations[0].up.into(),
                 name: "Top".into(),
                 origin: "Stock top center".into(),
                 workholding: "Vise.".into(),
                 holder: None,
+                a_angles: None,
                 operations: vec![
                     proposal::tests::op("Face", 1, top),
                     proposal::tests::op("Contour", 1, vec![]),
@@ -5412,5 +5468,145 @@ pub(crate) mod tests {
         let p = &applied(&third).setups[0].p.clone();
         assert_eq!(get(p, "notes"), "Mine");
         assert!(!p.contains_key(PLANNER_NOTE_KEY));
+    }
+    #[test]
+    fn a_rotary_machine_gets_the_axis_in_its_report_and_prompt_a_3_axis_one_nothing_new() {
+        let (_, _, rotary) = crate::fake_openai::rotary::report();
+        let unit = rotary.rotary.as_ref().unwrap();
+        assert_eq!(
+            (unit.centre_height, unit.max_diameter, unit.max_length),
+            (70., 80., 250.)
+        );
+        assert_eq!((unit.a_min, unit.a_max), (-360., 360.));
+        assert_eq!((unit.grip_min, unit.grip_max), (5., 80.));
+        // The geometry is the machine's assumed one until the A centreline is probed.
+        assert_eq!(unit.centreline, "assumed");
+        let json = serde_json::to_value(&rotary).unwrap();
+        assert_eq!(json["rotary"]["centreline"], "assumed");
+        let text = instructions_for(true, true, true, true);
+        for words in [
+            "ROTARY A AXIS",
+            "`centre_height`",
+            "`max_diameter`",
+            "`a_min`",
+            "`grip_min`",
+            "`assumed`",
+            "`a_angles`",
+            "`chuck`",
+        ] {
+            assert!(text.contains(words), "{words}");
+        }
+        // The same text and schema without the axis as before it existed.
+        let (_, _, flat) = block();
+        assert!(flat.rotary.is_none());
+        assert!(!serde_json::to_string(&flat).unwrap().contains("rotary"));
+        assert_eq!(proposal::schema_on(&flat), proposal::schema());
+        assert_eq!(
+            instructions_for(true, true, true, false),
+            instructions_with(true, true, true)
+        );
+        let plain = instructions_with(true, true, true);
+        assert!(!plain.contains("ROTARY") && !plain.contains("a_angles"));
+        assert!(!proposal::schema().to_string().contains("a_angles"));
+        let schema = proposal::schema_on(&rotary).to_string();
+        assert!(schema.contains("a_angles") && schema.contains("\"chuck\""));
+    }
+    #[tokio::test]
+    async fn a_square_bar_is_planned_as_a_chuck_and_four_indexed_angles_after_a_stock_too_big_for_z()
+     {
+        use crate::fake_openai::{Fake, rotary};
+        use crate::session::SessionStore;
+        let (doc, mesh, _) = rotary::report();
+        let fake = Fake::start(rotary::replies(rotary::too_big(), rotary::good())).await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::session::FileStore(dir.path().join("s.json")));
+        let session = crate::session::sample();
+        store.save(&session).unwrap();
+        let client = crate::openai::Client::new(
+            crate::oauth::Endpoints::local(&fake.base),
+            "oaiapp_1".into(),
+            store,
+            session,
+        );
+        let backend = OpenAiBackend::new(
+            std::sync::Arc::new(client),
+            "gpt-6.1-sol".into(),
+            std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+            false,
+        );
+        let mut events = vec![];
+        let outcome = plan(&backend, doc, mesh, &Busy::default(), |e| events.push(e))
+            .await
+            .unwrap();
+        // The oversized stock is refused with the check's own message ...
+        let Some(Event::Checked(1, StepResult::Problems { shown, .. })) =
+            events.iter().find(|e| matches!(e, Event::Checked(1, _)))
+        else {
+            panic!("{events:?}")
+        };
+        assert!(
+            shown.iter().any(
+                |l| l.starts_with("Setup 2, operation 1: Index moves turn A")
+                    && l.contains("as far as the stock reaches from it at any angle")
+                    && l.contains("1.11 mm above the top of the machine's 100 mm Z")
+            ),
+            "{shown:?}"
+        );
+        // ... which the model is sent, and the second plan passes. Its four
+        // sides are faced, at the angle each is up, to a square joined to the
+        // bar at a shoulder (LIO-214): all that stock still covers is the
+        // part's end face on the bar, which the plan lists as gripped, so the
+        // planner asks once to machine it, and the same plan, answered
+        // again, stands.
+        assert_eq!((outcome.requests, outcome.chosen), (3, 3), "{events:?}");
+        assert!(events.contains(&Event::Stage(Progress::Extending(3))));
+        let sent = fake.seen("/v1/responses");
+        assert_eq!(sent.len(), 3);
+        let first = sent[0].json();
+        assert!(first.to_string().contains("ROTARY A AXIS"));
+        let schema = first["text"]["format"]["schema"].to_string();
+        assert!(
+            schema.contains("a_angles") && schema.contains("\"chuck\""),
+            "{schema}"
+        );
+        let covered = sent[2].json();
+        let covered = covered["input"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            covered.contains(r#""covered_planes":[{"orientation":"-X""#)
+                && covered.contains(r#""covered_other":[]"#)
+                && covered.matches(r#""orientation""#).count() == 1,
+            "{covered}"
+        );
+        let again = sent[1].json().to_string();
+        assert!(
+            again.contains("above the top of the machine's 100 mm Z travel"),
+            "{again}"
+        );
+        // The job is the chuck and the one indexed setup, as the setups page makes them.
+        let job = &outcome.job;
+        assert_eq!(job.setups.len(), 2);
+        let (first, second) = (&job.setups[0], &job.setups[1]);
+        assert_eq!(first.p["holding"], "Chuck");
+        assert_eq!(first.p["stock_type"], "Fixed size box");
+        assert_eq!(first.p["origin"], crate::indexed::ORIGINS[0]);
+        assert!(crate::indexed::is_indexed(second));
+        // Its one operation faces the square's four sides, each where it is
+        // on top, with the tool's centre out to the face's edges.
+        let face = &second.operations[0];
+        assert_eq!(face.strategy, crate::model::Strategy::Face);
+        assert_eq!(face.surfaces.as_ref().unwrap().ids.len(), 4);
+        assert_eq!(face.p["containment"], "Tool center on boundary");
+        assert_eq!(
+            crate::indexed::angles(second).unwrap(),
+            [0., 90., 180., 270.]
+        );
+        assert_eq!(second.p["offset"], first.p["offset"]);
+        assert_eq!(
+            outcome.report.rotary.as_ref().unwrap().centreline,
+            "assumed"
+        );
     }
 }

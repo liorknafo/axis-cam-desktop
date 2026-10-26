@@ -11,6 +11,7 @@ use crate::{
 };
 use clipper2::{EndType, FillRule, JoinType, Milli, Paths, union};
 use std::collections::{HashMap, HashSet};
+pub(crate) mod boring;
 pub(crate) type Polygon = Vec<(f64, f64)>;
 pub(crate) type Region = Paths<Milli>;
 /// The most moves (or samples) a toolpath may have: what memory takes, not
@@ -187,12 +188,12 @@ fn plane_slope(p: &[[f32; 3]; 3]) -> Option<f32> {
     let gy = (a[0] * b[2] - b[0] * a[2]) / det;
     Some((gx * gx + gy * gy).sqrt())
 }
-struct Builder {
-    plan: Plan,
-    pos: [f32; 3],
-    feed: f32,
-    clearance: f32,
-    retract: f32,
+pub(crate) struct Builder {
+    pub(crate) plan: Plan,
+    pub(crate) pos: [f32; 3],
+    pub(crate) feed: f32,
+    pub(crate) clearance: f32,
+    pub(crate) retract: f32,
     retract_margin: f32,
     /// Rapid rate, mm/min: the hand rapid on a manual mill.
     rapid: f32,
@@ -200,7 +201,12 @@ struct Builder {
     single_axis: bool,
 }
 impl Builder {
-    fn new(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Self, String> {
+    pub(crate) fn new(
+        setup: &Setup,
+        op: &Operation,
+        tool: &Tool,
+        mesh: &Mesh,
+    ) -> Result<Self, String> {
         if !op.enabled {
             return Err("Enable the operation before generating it.".into());
         }
@@ -256,6 +262,7 @@ impl Builder {
                 tool_length,
                 holder_radius: positive("holder")? / 2.,
                 neck: None,
+                stops: vec![],
                 display_scale: stock.display_scale,
                 duration: 0.,
                 target: top,
@@ -281,7 +288,13 @@ impl Builder {
     }
     /// A move to `to`. With `single_axis`, legs of one axis each: Z first
     /// when it rises, then X, then Y, then Z when it falls.
-    fn push(&mut self, to: [f32; 3], motion: Motion, cut: bool, rate: f32) -> Result<(), String> {
+    pub(crate) fn push(
+        &mut self,
+        to: [f32; 3],
+        motion: Motion,
+        cut: bool,
+        rate: f32,
+    ) -> Result<(), String> {
         if !self.single_axis {
             return self.leg(to, motion, cut, rate);
         }
@@ -320,6 +333,7 @@ impl Builder {
                 feed: rate,
                 start: self.plan.duration,
                 end,
+                a: None,
             });
             self.plan.duration = end;
         }
@@ -338,11 +352,12 @@ impl Builder {
                 feed: 0.,
                 start: self.plan.duration,
                 end,
+                a: None,
             });
             self.plan.duration = end;
         }
     }
-    fn retract(&mut self) -> Result<(), String> {
+    pub(crate) fn retract(&mut self) -> Result<(), String> {
         self.push(
             [self.pos[0], self.pos[1], self.clearance],
             Motion::Rapid,
@@ -353,7 +368,7 @@ impl Builder {
     fn start(&mut self, p: [f32; 3]) -> Result<(), String> {
         self.start_at(p, self.plan.rest_top)
     }
-    fn start_at(&mut self, p: [f32; 3], top: Option<f32>) -> Result<(), String> {
+    pub(crate) fn start_at(&mut self, p: [f32; 3], top: Option<f32>) -> Result<(), String> {
         self.retract()?;
         self.push(
             [p[0], p[1], self.clearance],
@@ -367,7 +382,7 @@ impl Builder {
         self.push([p[0], p[1], approach], Motion::Rapid, false, self.rapid)?;
         self.push(p, Motion::Feed, false, self.feed * 0.25)
     }
-    fn stroke(&mut self, points: &[[f32; 3]]) -> Result<(), String> {
+    pub(crate) fn stroke(&mut self, points: &[[f32; 3]]) -> Result<(), String> {
         if points.len() < 2 {
             return Ok(());
         }
@@ -393,7 +408,7 @@ impl Builder {
         }
         self.retract()
     }
-    fn finish(mut self) -> Result<Plan, String> {
+    pub(crate) fn finish(mut self) -> Result<Plan, String> {
         self.retract()?;
         if self
             .plan
@@ -427,6 +442,8 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
         Strategy::Parallel => parallel(setup, op, tool, mesh),
         Strategy::Waterline => waterline(setup, op, tool, mesh),
         Strategy::Box => boxed(setup, op, tool, mesh),
+        Strategy::Groove => crate::groove::generate(setup, op, tool, mesh),
+        Strategy::Chamfer => crate::chamfer::generate(setup, op, tool, mesh),
         _ => Err(op.strategy.availability().into()),
     }
 }
@@ -453,8 +470,11 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
     if get(&op.p, "compensation") != "In computer" {
         return Err("Only In computer compensation is supported. Controller compensation needs a postprocessor.".into());
     }
-    if get(&op.p, "boundary") != "Model silhouette" || get(&op.p, "side") != "Outside" {
-        return Err("Choose Model silhouette / Outside, or Selected geometry / Inside and select a recessed planar floor.".into());
+    // Holes: inside every hole through the part's outline, the cut-outs of
+    // a flat part, which a Drill does not make.
+    let holes = get(&op.p, "side") == crate::model::CONTOUR_HOLES;
+    if get(&op.p, "boundary") != "Model silhouette" || !(holes || get(&op.p, "side") == "Outside") {
+        return Err("Choose Model silhouette / Outside or Holes, or Selected geometry / Inside and select a recessed planar floor.".into());
     }
     let g = Geometry::new(setup, mesh);
     let radial = number(op, "allowance")?;
@@ -473,7 +493,20 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
         .into();
     let target = g.bounds.min[2] + number(op, "bottom")?;
     let top = b.plan.stock.max[2] + number(op, "top")?.max(0.);
-    if target < b.plan.stock.min[2] || target >= top || top - target >= b.plan.tool_length {
+    // A sheet's cut goes on into the spoilboard, by its allowance at most.
+    let board = stock::below(setup);
+    if target < b.plan.stock.min[2] - board - 0.0001 {
+        return Err(if board > 0. {
+            format!(
+                "The contour would go {:.2} mm into the spoilboard, deeper than its {board} mm allowance: raise Bottom offset.",
+                b.plan.stock.min[2] - target
+            )
+        } else {
+            "Contour depth must be within stock and tool reach; bottom is relative to model bottom."
+                .into()
+        });
+    }
+    if target >= top || top - target >= b.plan.tool_length {
         return Err("Contour depth must be within stock and tool reach; bottom is relative to model bottom.".into());
     }
     let down = number(op, "stepdown")?;
@@ -487,10 +520,52 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
             "Use a positive stepdown within flute length and 0–20 whole finishing passes.".into(),
         );
     }
+    // The outer outlines, or for Holes the holes the tool fits in that are
+    // at least `hole_min` wide (narrower ones are left for a Drill), each
+    // turned to run anticlockwise.
+    let offset = f64::from(b.plan.radius + radial + (b.plan.radius * 0.01).max(0.02));
+    let hole_min = if holes {
+        num(&op.p, "hole_min").unwrap_or(0.).max(0.)
+    } else {
+        0.
+    };
+    let paths: Vec<Polygon> = (paths.into_iter())
+        .filter(|p| if holes { area(p) < 0. } else { area(p) > 0. })
+        .filter(|p| {
+            let (lo, hi) = p.iter().fold(
+                ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]),
+                |(lo, hi), q| {
+                    (
+                        [lo[0].min(q.0), lo[1].min(q.1)],
+                        [hi[0].max(q.0), hi[1].max(q.1)],
+                    )
+                },
+            );
+            // A round hole's chords read it up to `HOLE_MIN_SLACK` narrower.
+            ((hi[0] - lo[0]).min(hi[1] - lo[1]) + 2. * offset) as f32 >= hole_min - HOLE_MIN_SLACK
+        })
+        .map(|mut p| {
+            if holes {
+                p.reverse();
+            }
+            p
+        })
+        .collect();
+    if holes && paths.is_empty() {
+        return Err(format!(
+            "The part has no hole through its outline that a Ø{:.2} tool fits in{}.",
+            2. * b.plan.radius,
+            if hole_min > 0. {
+                format!(" and that is at least {hole_min} mm wide")
+            } else {
+                String::new()
+            }
+        ));
+    }
     // From the highest material in the ring the cutter sweeps round each
     // outline, not in the outlines' box: the part inside the ring stands
     // above where earlier cuts may have cleared round it.
-    let outer: Vec<Polygon> = paths.iter().filter(|p| area(p) > 0.).cloned().collect();
+    let outer: Vec<Polygon> = paths.clone();
     let ring: Vec<Polygon> = Region::from(outer)
         .inflate(b.plan.radius as f64, JoinType::Round, EndType::Joined, 2.)
         .into();
@@ -513,7 +588,8 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
     b.plan.milling_direction = if climb { "Climb" } else { "Conventional" };
     b.plan.target = target;
     b.plan.levels = levels;
-    let tabs = if pocket_setting(&op.p, "tabs") == CONTOUR_TABS[1] {
+    // Tabs hold the part in the sheet or stock round it: an outside contour's.
+    let tabs = if pocket_setting(&op.p, "tabs") == CONTOUR_TABS[1] && !holes {
         let count = number(op, "tab_count")?;
         let width = number(op, "tab_width")?;
         let height = number(op, "tab_height")?;
@@ -531,6 +607,7 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
         }
         Some(Tabs {
             count: count as usize,
+            width,
             // The tool's centre rises over the tab and its own diameter.
             lift: width + 2. * b.plan.radius,
             top: tab_top,
@@ -538,13 +615,20 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
     } else {
         None
     };
+    if tabs.is_none()
+        && !holes
+        && target <= b.plan.stock.min[2] + 0.001
+        && let Some(loose) = crate::sheet::loose_part(setup)
+    {
+        return Err(loose.into());
+    }
     let loops: Vec<Vec<[f32; 2]>> = paths
         .iter()
-        .filter(|p| area(p) > 0.)
         .map(|path| {
             let mut points: Vec<_> = path.iter().map(|p| [p.0 as f32, p.1 as f32]).collect();
             // Solid is inside the outer profile: CW spindle climb travels CW.
-            if climb == b.plan.spindle_clockwise {
+            // Round a hole the solid is outside: climb travels anticlockwise.
+            if (climb == b.plan.spindle_clockwise) != holes {
                 points.reverse();
             }
             if let Some(&first) = points.first() {
@@ -553,6 +637,7 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
             points
         })
         .collect();
+    let mut spans: Vec<Vec<(f32, f32)>> = vec![];
     if let Some(tabs) = &tabs {
         let stock = b.plan.stock;
         let through = target <= stock.min[2] + 0.001;
@@ -579,7 +664,8 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
                 .map(|w| w[0][0] * w[1][1] - w[1][0] * w[0][1])
                 .sum::<f32>()
                 > 0.;
-            for (start, end) in outline.spans(tabs) {
+            let placed = outline.spans(tabs)?;
+            for &(start, end) in &placed {
                 let (c, d) = outline.at((start + end) / 2.);
                 let out = if anticlockwise {
                     [d[1], -d[0]]
@@ -595,6 +681,7 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
                         && q[1] < stock.max[1]),
                 );
             }
+            spans.push(placed);
         }
         if through && loose > 0 {
             return Err(format!(
@@ -608,9 +695,9 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
     for level in 1..=levels {
         crate::progress::report(level)?;
         let z = (cutting_top - level as f32 * down).max(target);
-        for points in &loops {
+        for (i, points) in loops.iter().enumerate() {
             let points = match &tabs {
-                Some(tabs) if z < tabs.top => tabbed(points, z, tabs),
+                Some(tabs) if z < tabs.top => tabbed(points, z, tabs, &spans[i]),
                 _ => points.iter().map(|p| [p[0], p[1], z]).collect(),
             };
             for _ in 0..=if level == levels { finish as usize } else { 0 } {
@@ -890,14 +977,29 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
 }
 /// The stock, mm, a tab must reach past the cut's outer edge.
 const WALL: f32 = 2.;
+/// How much narrower than a Holes contour's smallest hole a hole may read
+/// and still be cut, mm: a round hole's chords lie inside its circle.
+const HOLE_MIN_SLACK: f32 = 0.05;
 /// An outside Contour's holding tabs: `count` on each outline, evenly
 /// spaced, over each of which the tool's centre rises to `top` along
 /// `lift` mm of its path.
 struct Tabs {
     count: usize,
+    /// Each tab's own width, at its narrowest.
+    width: f32,
     lift: f32,
     top: f32,
 }
+/// How far a tab's stretch of the path may turn, over the tab and its
+/// margins: a straight side does not, an arc of radius R does by its length
+/// over R, a corner by its angle.
+const TAB_TURN: f32 = 0.5;
+/// The path either side of a tab that must not turn either, mm.
+const TAB_MARGIN: f32 = 1.;
+/// The least path between two tabs, mm.
+const TAB_GAP: f32 = 1.;
+/// The step along the path at which tab centres are tried, mm.
+const TAB_STEP: f32 = 0.25;
 /// A closed tool path (its last point its first) and how far along it
 /// each of its points is, mm.
 struct Outline<'a> {
@@ -916,17 +1018,78 @@ impl<'a> Outline<'a> {
     fn length(&self) -> f32 {
         *self.along.last().unwrap()
     }
-    /// Where each of `tabs` starts and ends along the path. Their centres
-    /// are spaced evenly, half a spacing from the start, so that none spans
-    /// the start while they fit (`lift` × `count` under the path's length).
-    fn spans(&self, tabs: &Tabs) -> Vec<(f32, f32)> {
-        let spacing = self.length() / tabs.count as f32;
-        (0..tabs.count)
-            .map(|i| {
-                let centre = (i as f32 + 0.5) * spacing;
-                (centre - tabs.lift / 2., centre + tabs.lift / 2.)
-            })
-            .collect()
+    /// How much the path turns at each of its points, radians, as a running
+    /// sum along it: `turned[i]` is the turning at points 1..=i.
+    fn turned(&self) -> Vec<f32> {
+        let p = self.points;
+        let mut sum = vec![0f32; p.len()];
+        for i in 1..p.len().saturating_sub(1) {
+            let (a, b) = (
+                [p[i][0] - p[i - 1][0], p[i][1] - p[i - 1][1]],
+                [p[i + 1][0] - p[i][0], p[i + 1][1] - p[i][1]],
+            );
+            let turn = (a[0] * b[1] - a[1] * b[0]).atan2(a[0] * b[0] + a[1] * b[1]);
+            sum[i] = sum[i - 1] + turn.abs();
+        }
+        if let Some(last) = sum.len().checked_sub(1).filter(|&l| l > 0) {
+            sum[last] = sum[last - 1];
+        }
+        sum
+    }
+    /// Where each of `tabs` starts and ends along the path, placed
+    /// automatically: each on a stretch of the path that turns by at most
+    /// `TAB_TURN` over the tab and `TAB_MARGIN` either side of it (a
+    /// straight side, or an arc of a large enough radius; never a corner, a
+    /// short segment between corners or a tight arc), as near as such
+    /// stretches allow to centres spaced evenly half a spacing from the
+    /// start, `TAB_GAP` apart at least, none spanning the start. Refused
+    /// when fewer fit than asked.
+    fn spans(&self, tabs: &Tabs) -> Result<Vec<(f32, f32)>, String> {
+        let length = self.length();
+        let half = tabs.lift / 2. + TAB_MARGIN;
+        let turned = self.turned();
+        // The turning strictly inside the stretch `from`..`to`.
+        let turning = |from: f32, to: f32| {
+            let i = self.along.partition_point(|&a| a <= from);
+            let j = self.along.partition_point(|&a| a < to);
+            if j <= i {
+                0.
+            } else {
+                turned[j - 1] - if i == 0 { 0. } else { turned[i - 1] }
+            }
+        };
+        let steps = ((length - 2. * half) / TAB_STEP).floor().max(-1.) as i64;
+        let fits: Vec<f32> = (0..=steps)
+            .map(|k| half + k as f32 * TAB_STEP)
+            .filter(|&c| turning(c - half, c + half) <= TAB_TURN)
+            .collect();
+        let spacing = length / tabs.count as f32;
+        let mut centres: Vec<f32> = vec![];
+        for i in 0..tabs.count {
+            let ideal = (i as f32 + 0.5) * spacing;
+            let best = (fits.iter().copied())
+                .filter(|c| centres.iter().all(|o| (c - o).abs() >= tabs.lift + TAB_GAP))
+                .min_by(|a, b| (a - ideal).abs().total_cmp(&(b - ideal).abs()));
+            match best {
+                Some(c) => centres.push(c),
+                None => {
+                    return Err(format!(
+                        "Only {} of {} tabs {:.2} mm wide fit on the straight sides and gentle curves of a {:.2} mm outline: a tab needs {:.2} mm of it turning by {:.0}° at most, away from corners and short segments. Use fewer or narrower tabs.",
+                        centres.len(),
+                        tabs.count,
+                        tabs.width,
+                        length,
+                        2. * half,
+                        TAB_TURN.to_degrees()
+                    ));
+                }
+            }
+        }
+        centres.sort_by(f32::total_cmp);
+        Ok(centres
+            .into_iter()
+            .map(|c| (c - tabs.lift / 2., c + tabs.lift / 2.))
+            .collect())
     }
     /// The point `s` mm along the path, and the way the path runs there
     /// (a unit vector).
@@ -947,7 +1110,7 @@ impl<'a> Outline<'a> {
 /// The closed path `points` (its last point its first) at height `z`,
 /// rising straight up to the tabs' top at the start of each tab
 /// (`Outline::spans`) and dropping straight back down at its end.
-fn tabbed(points: &[[f32; 2]], z: f32, tabs: &Tabs) -> Vec<[f32; 3]> {
+fn tabbed(points: &[[f32; 2]], z: f32, tabs: &Tabs, spans: &[(f32, f32)]) -> Vec<[f32; 3]> {
     let outline = Outline::new(points);
     let along = &outline.along;
     // Along the path: each vertex (None), each tab's start (Some(true))
@@ -957,7 +1120,7 @@ fn tabbed(points: &[[f32; 2]], z: f32, tabs: &Tabs) -> Vec<[f32; 3]> {
         .enumerate()
         .map(|(i, &s)| (s, None, i))
         .collect();
-    for (start, end) in outline.spans(tabs) {
+    for &(start, end) in spans {
         events.extend([(start, Some(true), 0), (end, Some(false), 0)]);
     }
     events.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -998,6 +1161,10 @@ pub struct Hole {
     pub countersink: Option<Countersink>,
     /// The thread modeled in it.
     pub thread: Option<crate::thread::Thread>,
+    /// The A angle (degrees) it is read at when an operation of an indexed
+    /// setup of several angles lists it (`Document::holes_listed`): its
+    /// centre is in the setup's frame at that angle. None otherwise.
+    pub a: Option<f32>,
 }
 impl Hole {
     /// The widest drill the hole takes: its bore, which a drill may fill
@@ -1064,8 +1231,15 @@ pub fn holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, St
     };
     if !walls.is_empty() {
         let rims = rims(&g);
+        // The holes that stop just through their own wall at this A angle of
+        // an indexed setup of several (`indexed::holes_by_angle`).
+        let own_wall: std::collections::HashSet<usize> = (get(&op.p, crate::indexed::OWN_WALL)
+            .split_whitespace())
+        .filter_map(|w| w.parse().ok())
+        .collect();
         for picked in crate::pocket::holes(setup, &walls, mesh)? {
-            if let Some(h) = drill_hole(&g, &picked, &rims)
+            let stop = picked.walls.iter().any(|w| own_wall.contains(w));
+            if let Some(h) = drill_hole(&g, &picked, &rims, stop)
                 && !holes.iter().any(|o| same_centre(o, &h))
             {
                 holes.push(h);
@@ -1134,6 +1308,7 @@ fn drill_hole(
     g: &Geometry,
     hole: &crate::pocket::Hole,
     rims: &[(f32, Vec<Polygon>)],
+    stop: bool,
 ) -> Option<Hole> {
     let corners: Vec<[f32; 3]> = (g.triangles.iter())
         .filter(|t| t.feature.is_some_and(|id| hole.walls.contains(&id)))
@@ -1176,7 +1351,19 @@ fn drill_hole(
     if found.is_none() && ring.len() >= 8 {
         found = round_hole(g, &ring, top);
     }
-    found
+    let mut found = found?;
+    // With `stop`, at an A angle of an indexed setup of several, a hole over
+    // a cavity is drilled just through its own wall, its breakthrough on
+    // from there (`indexed::holes_by_angle` says which). Everywhere else it
+    // is read as main reads it: on through what lies under it, as a
+    // cross-hole through both walls of a tube in a vise is.
+    if stop
+        && let Some(ring) = wall_ring(g, &hole.walls)
+        && found.bottom < ring.bottom - 0.05
+    {
+        (found.bottom, found.through) = (ring.bottom, true);
+    }
+    Some(found)
 }
 /// The centre of area of `region` seen from above, its holes taken out;
 /// None when it has no area.
@@ -1193,6 +1380,143 @@ fn centre_of_area(region: &Region) -> Option<(f64, f64)> {
     }
     (twice.abs() > 1e-9).then(|| (x / (3. * twice), y / (3. * twice)))
 }
+/// Whether anything of the part lies under a drill of radius `r` at
+/// `centre` below the height `z` (at its centre and 16 points `r` from it):
+/// what a plunge on would cut. Nothing there over a hole opposite at least
+/// as wide as the drill.
+pub(crate) fn part_under_disc(g: &Geometry, centre: [f32; 2], r: f32, z: f32) -> bool {
+    std::iter::once(centre)
+        .chain((0..16).map(|k| {
+            let t = k as f32 * std::f32::consts::PI / 8.;
+            [centre[0] + r * t.cos(), centre[1] + r * t.sin()]
+        }))
+        .any(|p| {
+            (g.triangles.iter())
+                .filter_map(|tri| plane_height(&tri.p, p))
+                .any(|h| h < z - 0.05)
+        })
+}
+/// The ring of a hole's walls in `g` (`wall_ring`), which every reading of
+/// a hole picked by its walls on the rotary takes, so that two never
+/// disagree on where a hole is.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WallRing {
+    /// The middle of its walls' triangles' corners, and their mean distance
+    /// from it.
+    pub centre: [f32; 2],
+    pub r: f32,
+    /// How far inside `r` its facets' chords come (the nearest any edge of
+    /// its walls' triangles comes to `centre`, across): what a drill of its
+    /// size clears less than its vertices.
+    pub sagitta: f32,
+    /// The highest and the lowest of them.
+    pub top: f32,
+    pub bottom: f32,
+}
+impl WallRing {
+    /// Whether `other` is on this one's axis, under it.
+    pub fn over(&self, other: &WallRing) -> bool {
+        (self.centre[0] - other.centre[0]).hypot(self.centre[1] - other.centre[1]) < self.r / 2.
+            && other.top < self.bottom
+    }
+}
+/// The ring of a hole's walls `walls` in `g`. None without a triangle of
+/// them.
+pub(crate) fn wall_ring(g: &Geometry, walls: &[usize]) -> Option<WallRing> {
+    let corners: Vec<[f32; 3]> = (g.triangles.iter())
+        .filter(|t| t.feature.is_some_and(|id| walls.contains(&id)))
+        .flat_map(|t| t.p)
+        .collect();
+    if corners.is_empty() {
+        return None;
+    }
+    let n = corners.len() as f32;
+    let centre = [0, 1].map(|k| corners.iter().map(|p| p[k]).sum::<f32>() / n);
+    let r = (corners.iter())
+        .map(|p| (p[0] - centre[0]).hypot(p[1] - centre[1]))
+        .sum::<f32>()
+        / n;
+    let top = corners
+        .iter()
+        .map(|p| p[2])
+        .fold(f32::NEG_INFINITY, f32::max);
+    let bottom = corners.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min);
+    // The nearest an edge of the walls' triangles comes to the middle.
+    let to_edge = |a: [f32; 3], b: [f32; 3]| {
+        let (d, q) = (
+            [b[0] - a[0], b[1] - a[1]],
+            [centre[0] - a[0], centre[1] - a[1]],
+        );
+        let t =
+            ((q[0] * d[0] + q[1] * d[1]) / (d[0] * d[0] + d[1] * d[1]).max(1e-12)).clamp(0., 1.);
+        (q[0] - t * d[0]).hypot(q[1] - t * d[1])
+    };
+    let inner = (g.triangles.iter())
+        .filter(|t| t.feature.is_some_and(|id| walls.contains(&id)))
+        .flat_map(|t| [(t.p[0], t.p[1]), (t.p[1], t.p[2]), (t.p[2], t.p[0])])
+        .map(|(a, b)| to_edge(a, b))
+        .fold(r, f32::min);
+    Some(WallRing {
+        centre,
+        r,
+        sagitta: (r - inner).max(0.),
+        top,
+        bottom,
+    })
+}
+/// Whether a hole of radius `r` at `centre` whose walls end at the height
+/// `z` opens there into a cavity: nothing solid under it (at 16 points 0.8
+/// `r` from its centre, the first face under `z` is no underside of the
+/// part), and the part past the cavity round it (`part_past_gap`), as a
+/// tube's bore is under a hole through its wall. Not a counterbore over its
+/// bore, whose shoulder is solid under it.
+pub(crate) fn into_cavity(g: &Geometry, centre: [f32; 2], r: f32, z: f32) -> bool {
+    let solid_under = (0..16).any(|k| {
+        let t = k as f32 * std::f32::consts::PI / 8.;
+        let p = [centre[0] + 0.8 * r * t.cos(), centre[1] + 0.8 * r * t.sin()];
+        (g.triangles.iter())
+            .filter_map(|tri| plane_height(&tri.p, p).map(|h| (h, tri)))
+            .filter(|(h, _)| *h < z - 0.05)
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .is_some_and(|(_, tri)| up_of(tri) < -0.1)
+    });
+    !solid_under && part_past_gap(g, centre, r, z, false)
+}
+/// The Z of triangle `t`'s unit normal: up for a face of the part facing up.
+fn up_of(t: &Triangle) -> f32 {
+    let [a, b, c] = t.p;
+    let (u, v) = (
+        [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+        [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
+    );
+    let n = [
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    ];
+    n[2] / (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-12)
+}
+/// Whether the part has a face past a gap from the height `z` round a hole
+/// of radius `r` at `centre` (at 16 points 1.2 `r` from it): with `above`,
+/// one facing down over `z`, the underside of something of the part over
+/// the hole; else one facing up under `z`, the top of something under it.
+pub(crate) fn part_past_gap(g: &Geometry, centre: [f32; 2], r: f32, z: f32, above: bool) -> bool {
+    (0..16).any(|k| {
+        let t = k as f32 * std::f32::consts::PI / 8.;
+        let p = [centre[0] + 1.2 * r * t.cos(), centre[1] + 1.2 * r * t.sin()];
+        g.triangles.iter().any(|tri| {
+            let Some(h) = plane_height(&tri.p, p) else {
+                return false;
+            };
+            let up = up_of(tri);
+            if above {
+                h > z + 0.05 && up < -0.1
+            } else {
+                h < z - 0.05 && up > 0.1
+            }
+        })
+    })
+}
 /// The heights of the part's flat faces facing up, lowest first, each with
 /// its loops (`rim_loops`): where a hole's rim is looked for.
 fn rims(g: &Geometry) -> Vec<(f32, Vec<Polygon>)> {
@@ -1207,7 +1531,7 @@ fn rims(g: &Geometry) -> Vec<(f32, Vec<Polygon>)> {
     heights.into_iter().map(|z| (z, rim_loops(g, z))).collect()
 }
 /// Whether the loop `l` goes round the point `p` (even-odd).
-fn encloses(l: &Polygon, p: (f64, f64)) -> bool {
+pub(crate) fn encloses(l: &Polygon, p: (f64, f64)) -> bool {
     let mut odd = false;
     for (a, b) in l.iter().zip(l.iter().cycle().skip(1)) {
         if (a.1 > p.1) != (b.1 > p.1) && p.0 < a.0 + (p.1 - a.1) / (b.1 - a.1) * (b.0 - a.0) {
@@ -1246,7 +1570,8 @@ pub fn largest_drill(hole: &Hole) -> f32 {
     ((hole.diameter + 2. * hole.sagitta + 0.01) * 10. + 1e-3).floor() / 10.
 }
 /// Each of `holes` (the part's holes a wall click picks) read as a drill
-/// reads it (`drill_hole`): None for one that is not round.
+/// reads it (`drill_hole`, to main's depth): None for one that is not
+/// round.
 pub fn drill_holes_of(
     setup: &Setup,
     mesh: &Mesh,
@@ -1254,7 +1579,10 @@ pub fn drill_holes_of(
 ) -> Vec<Option<Hole>> {
     let g = Geometry::with_threads(setup, mesh);
     let rims = rims(&g);
-    holes.iter().map(|h| drill_hole(&g, h, &rims)).collect()
+    holes
+        .iter()
+        .map(|h| drill_hole(&g, h, &rims, false))
+        .collect()
 }
 /// The round hole whose opening is the loop `path` at the height `top`,
 /// going down from it along Z; None when the loop is not round or nothing
@@ -1359,6 +1687,7 @@ fn round_hole(g: &Geometry, path: &Polygon, top: f32) -> Option<Hole> {
         through,
         countersink: countersink(g, center, top, radius, path.len()),
         thread,
+        a: None,
     })
 }
 /// The countersink of the opening of radius `radius` round `center` in the
@@ -1897,6 +2226,8 @@ fn next_hole(holes: &mut Vec<Hole>, pos: [f32; 3], op: &Operation) -> Hole {
     };
     holes.remove(index)
 }
+/// Why a Drill's depth is refused: past its flutes, or below the hole.
+pub(crate) const TOO_DEEP: &str = "Drilling depth must fit the flute length, and the bottom offset cannot take the drill below the hole bottom: only Through does, below a hole that goes through the part.";
 /// Whether a Drill operation goes through, and how far past a through
 /// hole's exit (Breakthrough, 0 when it does not).
 fn breakthrough(op: &Operation) -> Result<(bool, f32), String> {
@@ -1921,6 +2252,12 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     }
     if op.tapping() {
         return tap(setup, op, tool, mesh);
+    }
+    if op.reaming() {
+        return boring::ream(setup, op, tool, mesh);
+    }
+    if op.boring() {
+        return boring::bore(setup, op, tool, mesh);
     }
     let mut b = Builder::new(setup, op, tool, mesh)?;
     // A chamfer mill countersinks each opening rather than drilling it.
@@ -1969,7 +2306,7 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
             .tip_angle()
             .ok_or("Enter a chamfer mill tip angle from 20° to 160°.")?;
         b.plan.milling_direction = "Countersinking · axial feed";
-        CutterShape::Chamfer((angle * 10.).round() as u16)
+        tool.chamfer_shape(angle)
     } else {
         CutterShape::Drill
     };
@@ -1985,7 +2322,7 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         // A countersink is cut by a cone of its own angle: a sharper one
         // would cut into its wall and the bore under it, a blunter one would
         // leave the cone but for its rim.
-        if let (CutterShape::Chamfer(tenths), Some(c)) = (b.plan.shape, h.countersink)
+        if let (CutterShape::Chamfer(tenths, _), Some(c)) = (b.plan.shape, h.countersink)
             && (f32::from(tenths) / 10. - c.angle).abs() > 0.5
         {
             let angle = (c.angle * 10.).round() / 10.;
@@ -2003,6 +2340,14 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
                 h.opening
             ));
         }
+        // A flat tip wider than the bore would flatten the countersink.
+        if chamfer && b.plan.shape.flat() * 2. >= h.diameter {
+            return Err(format!(
+                "The chamfer mill's {:.2} mm flat tip is as wide as the Ø{:.2} hole it would countersink. Choose a pointed one.",
+                b.plan.shape.flat() * 2.,
+                h.diameter
+            ));
+        }
         if !chamfer && b.plan.radius * 2. > h.widest_drill() {
             return Err(format!(
                 "The Ø{:.2} drill exceeds an opening Ø{:.2}. Choose a smaller drill or a diameter filter.",
@@ -2017,9 +2362,10 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
             ));
         }
         let top = b.plan.stock.max[2] + number(op, "top")?.max(0.);
-        // A chamfer mill's cone is as wide as the opening at its rim.
+        // A chamfer mill's cone is as wide as the opening at its rim; it
+        // rises from the edge of its flat tip.
         let target = if chamfer {
-            h.top - h.opening / 2. * rise + number(op, "bottom")?
+            h.top - (h.opening / 2. - b.plan.shape.flat()) * rise + number(op, "bottom")?
         } else {
             h.bottom + number(op, "bottom")? - breakthrough
         };
@@ -2028,7 +2374,7 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
             || target < b.plan.stock.min[2] - breakthrough - 0.001
             || top - target >= b.plan.flute_length
         {
-            return Err("Drilling depth must fit the flute length, and the bottom offset cannot take the drill below the hole bottom: only Through does, below a hole that goes through the part.".into());
+            return Err(TOO_DEEP.into());
         }
         let cutting_top = crate::rest::start_over(
             setup,
@@ -2149,6 +2495,16 @@ fn helical(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
     if !(0.001..=0.1).contains(&tolerance) {
         return Err("Helical milling needs a tolerance of 0.001–0.1 mm.".into());
     }
+    // What a Boring or a Reaming after it takes off, on the diameter
+    // (`finishing`): blank leaves nothing.
+    let leave = if get(&op.p, "bore_allowance").trim().is_empty() {
+        0.
+    } else {
+        number(op, "bore_allowance")?
+    };
+    if !(0. ..=5.).contains(&leave) {
+        return Err("Bore allowance must be 0–5 mm on the diameter.".into());
+    }
     let r = b.plan.radius;
     // Climb inside a hole: counterclockwise with the spindle clockwise.
     let turn = if b.plan.spindle_clockwise { 1. } else { -1. };
@@ -2160,7 +2516,7 @@ fn helical(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
     while !holes.is_empty() {
         crate::progress::report(count - holes.len())?;
         let h = next_hole(&mut holes, b.pos, op);
-        let (floor, diameter) = (h.bottom, h.diameter);
+        let (floor, diameter) = (h.bottom, h.diameter - leave);
         // As for a drill, a cutter of the bore's size fits: it may be as
         // wide as the bore at its tessellation's vertices.
         if 2. * r > diameter + 2. * h.sagitta + 0.01 {
@@ -2669,7 +3025,14 @@ fn tap(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, 
 /// Whether the stock is gone from the upright cylinder of `radius` round
 /// `centre` between `bottom` and `top` before this operation: earlier cuts
 /// emptied it (`RestStock::bored`), or, with none, it is clear of the stock.
-fn bored(setup: &Setup, b: &Builder, centre: [f32; 2], radius: f32, top: f32, bottom: f32) -> bool {
+pub(crate) fn bored(
+    setup: &Setup,
+    b: &Builder,
+    centre: [f32; 2],
+    radius: f32,
+    top: f32,
+    bottom: f32,
+) -> bool {
     match &setup.preview_remaining {
         Some(rest) => rest.bored(centre, radius, top, bottom),
         None => {
@@ -3110,14 +3473,16 @@ fn waterline(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
     let target = g.bounds.min[2] + number(op, "bottom")?;
     let top = g.bounds.max[2] + number(op, "top")?.max(0.);
     let down = number(op, "stepdown")?;
+    let across = number(op, "surface_stepover")?;
     if allowance < 0.
         || down <= 0.
+        || across <= 0.
         || down > b.plan.flute_length
         || target < g.bounds.min[2]
         || target >= top
         || top - target >= b.plan.tool_length
     {
-        return Err("Use nonnegative allowances, a target above model bottom, positive stepdown within flute length, and adequate tool reach.".into());
+        return Err("Use nonnegative allowances, a target above model bottom, positive stepdown and stepover, a stepdown within flute length, and adequate tool reach.".into());
     }
     // Every level's loops go round what of the model stands above it, so
     // the cutter stays within its diameter and the allowance of the model's
@@ -3154,11 +3519,84 @@ fn waterline(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
         }
         None => target,
     };
-    let levels = ((cutting_top - target) / down).ceil().max(1.) as usize;
-    if levels > CEILING {
-        return Err(too_many("moves"));
+    // Neighbouring loops round a face of slope θ lie dz ÷ tan θ apart across
+    // it, so a stepdown that suits a wall leaves a gentle slope as separate
+    // trenches with ridges between them. Each level is the stepdown below
+    // the last, or closer where the faces it passes slope gently enough
+    // that the loops would lie more than the stepover apart. Faces flatter
+    // than 1° are floors, which waterline loops do not finish.
+    let flat = 1f32.to_radians().tan();
+    let slopes: Vec<(f32, f32, f32)> = (g.triangles.iter())
+        .filter(|t| picked.is_none() || group_of(t).is_some())
+        .filter_map(|t| {
+            let [a, b, c] = t.p;
+            let (u, v) = (
+                [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+                [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
+            );
+            let n = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
+            let (side, up) = (n[0].hypot(n[1]), n[2].abs());
+            (side >= up * flat && up > 0.).then(|| {
+                let z = t.p.map(|p| p[2]);
+                (
+                    z[0].min(z[1]).min(z[2]),
+                    z[0].max(z[1]).max(z[2]),
+                    side / up,
+                )
+            })
+        })
+        .collect();
+    let fits = |lo: f32, hi: f32| {
+        (slopes.iter())
+            .filter(|s| s.1 > lo && s.0 < hi)
+            .map(|s| across * s.2)
+            .fold(down, f32::min)
+            .max(0.01)
+    };
+    // A level just under the top of each run of sloping faces: the one
+    // below it stays clear of the slope's top edge, so without it a fin of
+    // stock is left there, as wide as the steps across the slope and as tall
+    // as the stock above it. Not at the top itself, where the slope is only
+    // its edge, which a wall standing on it hides from the picked faces.
+    let mut tops = vec![];
+    let mut by_top: Vec<_> = slopes.iter().collect();
+    by_top.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut low = f32::INFINITY;
+    for s in by_top {
+        if s.1 < low - 0.0001 {
+            tops.push(s.1 - 0.01);
+        }
+        low = low.min(s.0);
     }
-    b.plan.levels = levels;
+    let mut heights = vec![];
+    let mut z = cutting_top;
+    while z > target + 0.0001 {
+        let mut step = down;
+        loop {
+            let most = fits((z - step).max(target), z);
+            if most >= step.min(z - target) - 0.0001 {
+                break;
+            }
+            step = most;
+        }
+        if let Some(top) = (tops.iter()).find(|t| **t < z - 0.0001 && **t > z - step + 0.0001) {
+            step = z - top;
+        }
+        z = if z - step < target + 0.0001 {
+            target
+        } else {
+            z - step
+        };
+        heights.push(z);
+        if heights.len() > CEILING {
+            return Err(too_many("moves"));
+        }
+    }
+    let levels = heights.len();
     b.plan.target = target;
     let climb = pocket_setting(&op.p, "pocket_milling") == "Climb";
     if !crate::model::FACING_MILLING.contains(&pocket_setting(&op.p, "pocket_milling")) {
@@ -3168,10 +3606,12 @@ fn waterline(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
     // The cuts of each group of picked faces, level by level, made once
     // every level is worked out.
     let mut later: Vec<Vec<Vec<[f32; 3]>>> = vec![vec![]; picked.as_ref().map_or(0, Vec::len)];
+    // The levels that cut: picked faces' levels above them cut nothing.
+    let mut cutting = 0;
     crate::progress::expect(levels);
-    for level in 1..=levels {
-        crate::progress::report(level)?;
-        let z = (cutting_top - level as f32 * down).max(target);
+    for (level, &z) in heights.iter().enumerate() {
+        crate::progress::report(level + 1)?;
+        let mut cuts_here = false;
         let mut polys = vec![];
         // Projection of all geometry above the level accounts for the vertical cutter/shank corridor.
         for triangle in &g.triangles {
@@ -3225,6 +3665,7 @@ fn waterline(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
             let Some(near) = &near_faces else {
                 points.push(points[0]);
                 b.stroke(&points)?;
+                cuts_here = true;
                 continue;
             };
             // The loop in short steps, each point kept where the cutter
@@ -3246,6 +3687,7 @@ fn waterline(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
                 if !kept.iter().any(|k| *k) {
                     continue;
                 }
+                cuts_here = true;
                 if kept.iter().all(|k| *k) {
                     let mut closed = dense.clone();
                     closed.push(closed[0]);
@@ -3268,7 +3710,9 @@ fn waterline(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
                 }
             }
         }
+        cutting += cuts_here as usize;
     }
+    b.plan.levels = cutting.max(1);
     for cut in later.iter().flatten() {
         b.stroke(cut)?;
     }
@@ -3617,6 +4061,102 @@ pub(crate) mod tests {
         assert_eq!(narrow.rest_top, None);
         assert_eq!(narrow.levels, plan.levels);
     }
+    /// A closed path through `corners` (its last point its first), with
+    /// points every `step` mm along its sides.
+    fn path(corners: &[[f32; 2]], step: f32) -> Vec<[f32; 2]> {
+        let mut out = vec![];
+        for (i, a) in corners.iter().enumerate() {
+            let b = corners[(i + 1) % corners.len()];
+            let n = (((b[0] - a[0]).hypot(b[1] - a[1])) / step).ceil().max(1.) as usize;
+            out.extend((0..n).map(|k| {
+                let t = k as f32 / n as f32;
+                [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+            }));
+        }
+        out.push(out[0]);
+        out
+    }
+    fn circle(r: f32, n: usize) -> Vec<[f32; 2]> {
+        let mut out: Vec<[f32; 2]> = (0..n)
+            .map(|i| {
+                let a = i as f32 * std::f32::consts::TAU / n as f32;
+                [r * a.cos(), r * a.sin()]
+            })
+            .collect();
+        out.push(out[0]);
+        out
+    }
+    #[test]
+    fn tabs_go_on_straight_sides_evenly_spaced_never_on_corners_short_segments_or_tight_arcs() {
+        let tabs = |count, width: f32| Tabs {
+            count,
+            width,
+            lift: width + 4.,
+            top: 1.,
+        };
+        // A 100 × 40 rectangle, its sides split into 1 mm segments: 4 tabs
+        // 6 mm wide, each wholly on one side, clear of the corners by the
+        // margin, 1 mm apart at least, near the even spacing of 70 mm.
+        let points = path(&[[0., 0.], [100., 0.], [100., 40.], [0., 40.]], 1.);
+        let outline = Outline::new(&points);
+        let spans = outline.spans(&tabs(4, 6.)).unwrap();
+        assert_eq!(spans.len(), 4);
+        let corners = [0., 100., 140., 240., 280.];
+        for (i, &(a, b)) in spans.iter().enumerate() {
+            assert!((b - a - 10.).abs() < 1e-4);
+            assert!(
+                corners
+                    .iter()
+                    .all(|&c| a - TAB_MARGIN >= c - 1e-3 || b + TAB_MARGIN <= c + 1e-3),
+                "{a}..{b} spans a corner"
+            );
+            let even = (i as f32 + 0.5) * 70.;
+            assert!(((a + b) / 2. - even).abs() <= 6., "{i}: {a}..{b}");
+            if i > 0 {
+                assert!(a - spans[i - 1].1 >= TAB_GAP - 1e-3);
+            }
+        }
+        // A notch of 2 mm steps in the bottom side: none lands on it, though
+        // the even spacing puts the first there.
+        let notched = path(
+            &[
+                [0., 0.],
+                [30., 0.],
+                [30., 2.],
+                [32., 2.],
+                [32., 0.],
+                [34., 0.],
+                [34., 2.],
+                [36., 2.],
+                [36., 0.],
+                [100., 0.],
+                [100., 40.],
+                [0., 40.],
+            ],
+            1.,
+        );
+        let outline = Outline::new(&notched);
+        let at = |q: [f32; 2]| outline.along[notched.iter().position(|p| *p == q).unwrap()];
+        let notch = (at([30., 0.]), at([36., 0.]));
+        for (a, b) in outline.spans(&tabs(4, 6.)).unwrap() {
+            assert!(
+                b + TAB_MARGIN <= notch.0 + 1e-3 || a - TAB_MARGIN >= notch.1 - 1e-3,
+                "{a}..{b}"
+            );
+        }
+        // A Ø10 circle turns too much under any tab; a Ø400 one barely.
+        let small = circle(5., 72);
+        let error = Outline::new(&small).spans(&tabs(2, 3.)).unwrap_err();
+        assert!(
+            error.starts_with("Only 0 of 2 tabs 3.00 mm wide fit"),
+            "{error}"
+        );
+        let large = circle(200., 720);
+        assert_eq!(Outline::new(&large).spans(&tabs(6, 6.)).unwrap().len(), 6);
+        // More tabs than the sides hold are refused with how many fit.
+        let error = Outline::new(&points).spans(&tabs(30, 6.)).unwrap_err();
+        assert!(error.starts_with("Only "), "{error}");
+    }
     #[test]
     fn contour_tabs_keep_the_part_joined_to_the_stock_around_it() {
         let mesh = block();
@@ -3753,7 +4293,7 @@ pub(crate) mod tests {
                 }
             }
         }
-        op.p.insert("stepdown".into(), "1".into());
+        op.p.insert("stepdown".into(), "0.5".into());
         let c = generate(&setup, &op, &tool, &mesh).unwrap();
         assert!(c.levels > a.levels);
         assert_plan(a);
@@ -4068,6 +4608,111 @@ pub(crate) mod tests {
             assert_plan(plan);
         }
     }
+    /// A 30 × 16 mm wedge whose top slopes 21° down from 13.5 mm at X 0 to
+    /// 2 mm at X 30, like the ramps under the TOTEM case.
+    fn ramp() -> (Mesh, impl Fn(f32) -> f32) {
+        let rise = 21f32.to_radians().tan();
+        let high = 2. + 30. * rise;
+        let mut t = vec![];
+        quad(
+            &mut t,
+            [
+                [0., 0., high],
+                [30., 0., 2.],
+                [30., 16., 2.],
+                [0., 16., high],
+            ],
+        );
+        quad(
+            &mut t,
+            [[0., 0., 0.], [0., 16., 0.], [30., 16., 0.], [30., 0., 0.]],
+        );
+        quad(
+            &mut t,
+            [[0., 0., 0.], [30., 0., 0.], [30., 0., 2.], [0., 0., high]],
+        );
+        quad(
+            &mut t,
+            [
+                [30., 16., 0.],
+                [0., 16., 0.],
+                [0., 16., high],
+                [30., 16., 2.],
+            ],
+        );
+        quad(
+            &mut t,
+            [[0., 16., 0.], [0., 0., 0.], [0., 0., high], [0., 16., high]],
+        );
+        quad(
+            &mut t,
+            [[30., 0., 0.], [30., 16., 0.], [30., 16., 2.], [30., 0., 2.]],
+        );
+        (mesh::normalize(t).unwrap(), move |x: f32| high - x * rise)
+    }
+    #[test]
+    fn waterline_levels_close_up_over_a_gentle_slope() {
+        let (mesh, surface) = ramp();
+        let (setup, mut op, tool) = fixture(Strategy::Waterline);
+        op.p.insert("stepdown".into(), "2".into());
+        op.p.insert("surface_stepover".into(), "0.5".into());
+        let g = Geometry::new(&setup, &mesh);
+        // The stock left over the ramp, at most, and the cutting levels.
+        let finish = |op: &Operation| {
+            let plan = generate(&setup, op, &tool, &mesh).unwrap();
+            let levels: Vec<f32> = (plan.moves.iter())
+                .filter(|m| m.cutting_pass)
+                .map(|m| m.to[2])
+                .fold(vec![], |mut l, z| {
+                    if !l.iter().any(|w: &f32| (w - z).abs() < 0.0001) {
+                        l.push(z);
+                    }
+                    l
+                });
+            let mut sim = Simulation::new(plan.clone());
+            sim.seek(1.);
+            let mut most = 0f32;
+            for y in 0..sim.stock.ny {
+                for x in 0..sim.stock.nx {
+                    let px = sim.stock.bounds.min[0] + (x as f32 + 0.5) * sim.stock.dx;
+                    let py = sim.stock.bounds.min[1] + (y as f32 + 0.5) * sim.stock.dy;
+                    if px > g.bounds.min[0] + 1.
+                        && px < g.bounds.max[0] - 1.
+                        && py > g.bounds.min[1] + 1.
+                        && py < g.bounds.max[1] - 1.
+                    {
+                        let over = px - g.bounds.min[0];
+                        let left = sim.stock.heights[y * sim.stock.nx + x]
+                            - (g.bounds.min[2] + surface(over));
+                        most = most.max(left);
+                    }
+                }
+            }
+            (plan, levels, most)
+        };
+        // Over the ramp the levels are 0.5 × tan 21° = 0.19 mm apart, not
+        // the stepdown's 2 mm, so the loops 0.5 mm apart across it clear it
+        // to steps that high.
+        let (plan, mut levels, most) = finish(&op);
+        levels.sort_by(f32::total_cmp);
+        let over_ramp: Vec<f32> = (levels.iter())
+            .map(|z| z - g.bounds.min[2])
+            .filter(|z| *z > 2.001)
+            .collect();
+        for pair in over_ramp.windows(2) {
+            assert!(pair[1] - pair[0] < 0.193, "{pair:?}");
+        }
+        assert!(over_ramp.len() > 55, "{}", over_ramp.len());
+        assert!(most < 0.4, "{most} mm left over the ramp");
+        assert_eq!(plan.levels, levels.len());
+        assert_plan(plan);
+        // With a stepover wider than the cutter, levels go the stepdown
+        // apart: 5.2 mm across the ramp, trenches with ridges between.
+        op.p.insert("surface_stepover".into(), "100".into());
+        let (_, wide, ridges) = finish(&op);
+        assert!(wide.len() < 10, "{}", wide.len());
+        assert!(ridges > 1.5, "{ridges} mm left over the ramp");
+    }
     #[test]
     fn waterline_finishes_only_the_picked_curved_face() {
         let mesh = half_ball_on_plate();
@@ -4108,11 +4753,21 @@ pub(crate) mod tests {
         let points = feeds(&plan);
         let r = plan.radius;
         // Every loop goes round the dome at its own height, the cutter's side
-        // on the dome, and none goes round the plate or below its top.
+        // on the dome, and none goes round the plate or below its top. Within
+        // half a mm of the top, where the level under the top goes round the
+        // facets of the dome's cap, those lie up to a few tenths inside the
+        // sphere.
         for p in &points {
             let h = p[2] - centre[2];
             assert!(h > -0.001, "{p:?}");
             let ring = (100. - h.min(10.).powi(2)).max(0.).sqrt();
+            if h > 9.5 {
+                assert!(
+                    off_axis(p) - r > 0. && off_axis(p) - ring - r < 0.1,
+                    "{p:?}"
+                );
+                continue;
+            }
             assert!(
                 (off_axis(p) - ring - r).abs() < 0.1,
                 "{p:?}: {} from the axis, the dome {ring} there, centre {centre:?}",
@@ -4385,7 +5040,7 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 plan.shape,
-                CutterShape::Chamfer(angle.parse::<u16>().unwrap() * 10)
+                CutterShape::Chamfer(angle.parse::<u16>().unwrap() * 10, 0)
             );
             assert_plan(plan);
         }
@@ -5054,6 +5709,40 @@ pub(crate) mod tests {
         assert_eq!(plan.levels, 4);
         assert_plan(plan);
     }
+    /// A cross-hole through both walls of a tube in a plain 3-axis setup, +Y
+    /// up: the top hole picked by its walls is drilled on through the bore
+    /// and the hole opposite, to the part's bottom, as main drills it (the
+    /// own-wall depth is for indexed setups of several angles only, where
+    /// the opposite hole gets its own angle; LIO-246, review 3).
+    #[test]
+    fn a_tubes_cross_hole_picked_by_its_walls_goes_through_both_walls_in_3_axis() {
+        let mesh = mesh::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/radial-tube.3mf"),
+        )
+        .unwrap();
+        let (setup, mut op, _) = fixture(Strategy::Drill);
+        let setup = crate::analysis::oriented(&setup, "+Y").unwrap();
+        let top = crate::pocket::part_holes(&setup, &mesh)
+            .into_iter()
+            .max_by(|a, b| a.top.total_cmp(&b.top))
+            .unwrap();
+        op.geometry.clear();
+        op.surfaces = Some(crate::surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: top.walls.clone(),
+        });
+        let g = Geometry::new(&setup, &mesh);
+        let found = holes(&setup, &op, &mesh).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        let h = &found[0];
+        assert!(h.through, "{h:?}");
+        assert!(
+            (h.bottom - g.bounds.min[2]).abs() < 0.01,
+            "{h:?} {:?}",
+            g.bounds
+        );
+        assert!(h.top - h.bottom > 39.5, "{h:?}");
+    }
     #[test]
     fn a_screw_hole_over_a_recess_whose_edge_is_off_level_reads_as_a_level_one() {
         // A Ø24 x 10 disc with a Ø2 screw hole from its top through to a
@@ -5278,7 +5967,7 @@ pub(crate) mod tests {
         assert_ne!(generate(&setup, &plain, &tool, &mesh).unwrap_err(), refusal);
     }
     #[test]
-    fn all_thirteen_strategies_have_an_explicit_executable_or_unavailable_contract() {
+    fn all_fifteen_strategies_have_an_explicit_executable_or_unavailable_contract() {
         let mesh = block();
         for strategy in Strategy::ALL {
             assert!(!strategy.availability().is_empty());
@@ -5295,7 +5984,7 @@ pub(crate) mod tests {
                 .iter()
                 .filter(|s| s.imported_preview())
                 .count(),
-            9
+            11
         );
     }
     /// FNV-1a over every bit of every move, and the move count and duration.
@@ -6342,6 +7031,7 @@ pub(crate) mod tests {
             path: "examples/threaded-plate.3mf".into(),
             format: "3MF".into(),
             bytes: 1,
+            thickness: None,
         });
         for (n, t) in doc.tools.iter_mut().enumerate() {
             t.p.insert("number".into(), (n + 1).to_string());

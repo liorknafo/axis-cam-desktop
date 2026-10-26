@@ -12,6 +12,10 @@ pub enum Motion {
     Rapid,
     Feed,
     Dwell,
+    /// A turns to the move's `a` from the move before's, X, Y and Z still,
+    /// above everything A swings (`indexed`): between the A angles of an
+    /// indexed setup.
+    Index,
 }
 #[derive(Debug, Clone)]
 pub struct Move {
@@ -23,6 +27,10 @@ pub struct Move {
     pub feed: f32,
     pub start: f32,
     pub end: f32,
+    /// The A angle (degrees, as the machine is commanded) the move is made
+    /// at, the one an `Index` move turns to: Some on every move of an
+    /// indexed setup's operation (`indexed`), None on a 3-axis one.
+    pub a: Option<f32>,
 }
 impl Move {
     pub fn at(&self, seconds: f32) -> [f32; 3] {
@@ -43,9 +51,11 @@ pub enum CutterShape {
     /// A drill: flat flutes over a 118° point, the cone `POINT_RISE` gives,
     /// with the programmed tip at its apex.
     Drill,
-    /// A chamfer mill: a cone of this included angle, in tenths of a degree,
-    /// from its pointed tip up to its diameter.
-    Chamfer(u16),
+    /// A chamfer mill: a cone of the first included angle, in tenths of a
+    /// degree, from its tip up to its diameter, over a flat tip the second
+    /// across, in µm (0 for a pointed one): the programmed point is the
+    /// flat's centre.
+    Chamfer(u16, u16),
     /// A lathe cut: the ring `volume::Volume::revolve` makes, every point of
     /// the cut's frame whose Z lies between `a[0]` and `b[0]` and whose
     /// distance from its Z axis lies between `a[1]` and `b[1]`.
@@ -110,11 +120,21 @@ impl CutterShape {
     pub fn rise(self) -> Option<f32> {
         match self {
             CutterShape::Drill => Some(POINT_RISE),
-            CutterShape::Chamfer(tenths) => Some(1. / (f32::from(tenths) / 20.).to_radians().tan()),
+            CutterShape::Chamfer(tenths, _) => {
+                Some(1. / (f32::from(tenths) / 20.).to_radians().tan())
+            }
             CutterShape::Flat
             | CutterShape::Ball
             | CutterShape::Revolve
             | CutterShape::Thread { .. } => None,
+        }
+    }
+    /// The radius of a chamfer mill's flat tip, mm (`Chamfer`): its cone
+    /// rises from this far from the axis. 0 for every other cutter.
+    pub fn flat(self) -> f32 {
+        match self {
+            CutterShape::Chamfer(_, um) => f32::from(um) / 2000.,
+            _ => 0.,
         }
     }
 }
@@ -151,6 +171,21 @@ pub struct Plan {
     /// the simulation turns each ring away when its move ends, instead of
     /// sweeping the cutter along the moves. Empty for every other plan.
     pub rings: Vec<Ring>,
+    /// Where the spindle stops partway through (`cam::boring`), in order.
+    /// Empty for most plans.
+    pub stops: Vec<Stop>,
+}
+/// A stop of the spindle partway through a plan: before move `at` the
+/// spindle and coolant stop and, with a `pause`, the program waits there,
+/// saying it, for the operator to resume (`post::Block::Pause`). They start
+/// again before the next feed move. A boring head's pause before a pass
+/// carries the `size` the head is set to for it (the manual mill's guide
+/// shows it).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stop {
+    pub at: usize,
+    pub pause: Option<String>,
+    pub size: Option<f32>,
 }
 impl Plan {
     /// Whether this is a lathe plan: its moves are a side view (X the
@@ -220,13 +255,24 @@ pub fn facing_raise(setup: &Setup, operation: &Operation, mesh: &Mesh) -> Option
 /// Whether a Face operation's selected surface faces down in its setup,
 /// away from the spindle.
 pub fn facing_faces_down(setup: &Setup, operation: &Operation, mesh: &Mesh) -> bool {
-    let angles = ["rx", "ry", "rz"].map(|k| num(&setup.p, k).unwrap_or(0.));
+    // By A too for an indexed setup posed at an angle (`indexed`).
+    let angles = stock::Placement::new(mesh, Some(setup)).rotation();
     (operation.surfaces.as_ref())
         .and_then(|s| s.ids.first())
         .and_then(|&id| mesh.surfaces.get(id))
         .is_some_and(|s| crate::mesh::rotation(s.normal, angles)[2] < 0.)
 }
 pub fn generate(
+    setup: &Setup,
+    operation: &Operation,
+    tool: &Tool,
+    mesh: &Mesh,
+) -> Result<Plan, String> {
+    let plan = generate_plan(setup, operation, tool, mesh)?;
+    // On a sheet every cut stops within the spoilboard's allowance.
+    crate::sheet::floor_issue(setup, &plan).map_or(Ok(plan), Err)
+}
+fn generate_plan(
     setup: &Setup,
     operation: &Operation,
     tool: &Tool,
@@ -527,6 +573,7 @@ pub fn generate(
         tool_length,
         holder_radius,
         neck: None,
+        stops: vec![],
         display_scale: scale,
         duration: 0.,
         target,
@@ -560,6 +607,7 @@ pub fn generate(
                 feed: rate,
                 start: plan.duration,
                 end,
+                a: None,
             });
             plan.duration = end;
         }
@@ -625,7 +673,7 @@ pub struct StockGrid {
     pub heights: Vec<f32>,
 }
 impl StockGrid {
-    fn new(bounds: Bounds) -> Self {
+    pub(crate) fn new(bounds: Bounds) -> Self {
         let size = bounds.dimensions();
         let cell = size[0].max(size[1]) / 96.;
         let nx = (size[0] / cell).ceil().clamp(1., 96.) as usize;
@@ -729,7 +777,9 @@ impl StockGrid {
                         // The cone's lowest point over the covered interval:
                         // where the tip's descent balances the cone's rise,
                         // or an end of the interval when the move is steeper
-                        // than the cone, as a flat end is lowest there.
+                        // than the cone, as a flat end is lowest there. A
+                        // flat tip lowers the cone by its radius: exact for
+                        // level moves and plunges.
                         let perp = if length < 1e-10 {
                             (point[0] - a[0]).powi(2) + (point[1] - a[1]).powi(2)
                         } else {
@@ -754,7 +804,7 @@ impl StockGrid {
                         };
                         let d = (point[0] - a[0] - contact * (b[0] - a[0])).powi(2)
                             + (point[1] - a[1] - contact * (b[1] - a[1])).powi(2);
-                        a[2] + contact * dz + rise * d.sqrt()
+                        a[2] + contact * dz + rise * (d.sqrt() - shape.flat()).max(0.)
                     } else if length < 1e-10 {
                         a[2].min(b[2])
                     } else {
@@ -797,6 +847,10 @@ pub struct Simulation {
     pub volume: Option<crate::volume::Volume>,
     pub initial_volume: Option<crate::volume::Volume>,
     pub frame: Option<crate::volume::Frame>,
+    /// The frame at each A angle of an indexed setup's operation (`indexed`):
+    /// a move at A `a` cuts the part posed by the frame listed for `a`.
+    /// Empty for a 3-axis operation, whose moves are all in `frame`.
+    pub turns: Vec<(f32, crate::volume::Frame)>,
     pub preceding: usize,
     /// Setup and operation (from 0, document order) this simulation plays.
     /// Stamped on every cut it makes; `(0, 0)` outside a sequence.
@@ -813,6 +867,18 @@ pub struct Simulation {
     /// What the operation cuts, stretch by stretch (`forces::bites`), once
     /// asked: the export and a run's checks both ask.
     pub bites: std::sync::OnceLock<Vec<crate::forces::Bite>>,
+    /// The load on one tooth along the moves (`tooth_load::of`), worked out
+    /// off the window's thread once the preview is shown
+    /// (`App::measure_tooth_load`); None until then and for an operation
+    /// that is not milled.
+    pub tooth_load: Option<std::sync::Arc<crate::tooth_load::ToothLoad>>,
+    /// The stretches of air taken out of the plan (`air::trim`); None where
+    /// none were.
+    pub air: Option<crate::air::Trimmed>,
+    /// The force on a tooth the feed was changed along the moves to hold,
+    /// and the feeds it took (`tooth_load::hold`); None for an operation
+    /// whose feed is the programmed one.
+    pub held: Option<crate::tooth_load::Held>,
 }
 impl Simulation {
     pub fn new(plan: Plan) -> Self {
@@ -826,6 +892,7 @@ impl Simulation {
             volume: None,
             initial_volume: None,
             frame: None,
+            turns: vec![],
             preceding: 0,
             source: (0, 0),
             stock_epoch: 0,
@@ -838,7 +905,44 @@ impl Simulation {
             current: 0,
             revision: 0,
             bites: Default::default(),
+            tooth_load: None,
+            air: None,
+            held: None,
         }
+    }
+    /// The frame move `m` cuts in: the one `turns` lists for its A angle,
+    /// else `frame`.
+    pub fn frame_of(&self, m: &Move) -> Option<crate::volume::Frame> {
+        self.frame_at(m.a)
+    }
+    /// The frame a move at A `a` cuts in (`frame_of`).
+    pub fn frame_at(&self, a: Option<f32>) -> Option<crate::volume::Frame> {
+        a.and_then(|a| {
+            self.turns
+                .iter()
+                .find(|(b, _)| (a - b).abs() < 1e-4)
+                .map(|t| t.1)
+        })
+        .or(self.frame)
+    }
+    /// The A (degrees, as the machine is commanded) at the playback time:
+    /// the current move's, turning from the move before's to its own during
+    /// an index move. None for a 3-axis operation.
+    pub fn a_now(&self) -> Option<f32> {
+        let moves = &self.plan.moves;
+        let i = self.current.min(moves.len().checked_sub(1)?);
+        let m = &moves[i];
+        let to = m.a?;
+        if m.motion != Motion::Index || self.seconds >= m.end {
+            return Some(to);
+        }
+        let from = i
+            .checked_sub(1)
+            .and_then(|j| moves[j].a)
+            .or(self.turns.first().map(|t| t.0))
+            .unwrap_or(to);
+        let t = ((self.seconds - m.start) / (m.end - m.start).max(1e-6)).clamp(0., 1.);
+        Some(from + (to - from) * t)
     }
     /// `forces::bites` of this simulation, worked out once.
     pub fn bites(&self) -> &[crate::forces::Bite] {
@@ -893,9 +997,21 @@ impl Simulation {
             let to = movement.at(seconds.min(movement.end));
             // A lathe plan cuts with its rings, below, not along its moves.
             if movement.motion == Motion::Feed && !self.plan.is_lathe() {
-                self.stock
-                    .cut_shape(from, to, self.plan.radius, self.plan.shape);
-                if let (Some(volume), Some(frame)) = (&mut self.volume, self.frame) {
+                let frame = self.frame_of(movement);
+                // The top-down grid is the setup's frame's, its first A
+                // angle's: a move at another angle cuts the volume only.
+                let own = movement
+                    .a
+                    .zip(self.turns.first())
+                    .is_none_or(|(a, t)| (a - t.0).abs() < 1e-4);
+                // A height per column cannot hold the undercut a keyseat
+                // head cuts below a bore's wall (`groove`): it is in the
+                // volume and its cutter history only.
+                if own && self.plan.strategy != Strategy::Groove {
+                    self.stock
+                        .cut_shape(from, to, self.plan.radius, self.plan.shape);
+                }
+                if let (Some(volume), Some(frame)) = (&mut self.volume, frame) {
                     volume.cut(
                         from,
                         to,
@@ -1002,7 +1118,14 @@ pub fn sequence_walk(
         .filter(|(_, _, o)| o.enabled)
         .count();
     let mut part = 0;
+    // The A the machine is at: 0 in a setup that is not indexed, the last
+    // angle an indexed setup's operation turned to.
+    let mut machine_a = 0.;
     for (si, saved_setup) in doc.setups.iter().enumerate() {
+        let indexed = crate::indexed::is_indexed(saved_setup) && doc.index_base(si).is_some();
+        if !indexed {
+            machine_a = 0.;
+        }
         let frame = Frame::new(saved_setup, mesh);
         let mut setup = saved_setup.clone();
         // Stock is automatic in document order; inherited geometry supersedes
@@ -1015,11 +1138,24 @@ pub fn sequence_walk(
             setup.preview_stock = starts;
         } else if blocked.is_none() {
             match stock::resolve(&setup, Some(mesh)) {
-                Ok(s) => volume = Some(Volume::stock(s.stock, frame, stock::is_round(&setup))),
+                Ok(s) => {
+                    let round = stock::round(&setup, s.stock);
+                    volume =
+                        Some(Volume::stock(s.stock, frame, stock::is_round(&setup)).rounded(round))
+                }
                 Err(error) => blocked = Some(format!("{}: {error}", setup.name())),
             }
         }
         begin(si, starts.filter(|_| blocked.is_none()));
+        // The vise jaws or clamps, which no link `air::trim` makes comes near.
+        let holding = if indexed {
+            vec![]
+        } else {
+            crate::air::workholding(doc, &setup, mesh, volume.as_ref(), frame)
+        };
+        // The stock an indexed setup starts from, which each angle's own box
+        // is taken from.
+        let began = if indexed { volume.clone() } else { None };
         for (oi, op) in setup.operations.iter().enumerate() {
             if !op.enabled {
                 if stop == Some((si, oi)) {
@@ -1042,6 +1178,7 @@ pub fn sequence_walk(
                 .map(|v| std::sync::Arc::new(crate::rest::RestStock::new(v, frame)));
             let mut issues = setup.issues();
             issues.extend(setup.operation_issues(oi, &doc.tools));
+            let source = (index(si), index(oi));
             let plan = if let Some(issue) = issues.first() {
                 Err(issue.clone())
             } else {
@@ -1049,12 +1186,37 @@ pub fn sequence_walk(
                     .iter()
                     .find(|t| t.id == op.tool)
                     .ok_or_else(|| "Choose a saved tool.".to_string())
-                    .and_then(|t| generate(&setup, op, t, mesh))
+                    .and_then(|t| {
+                        if !indexed {
+                            return generate(&setup, op, t, mesh)
+                                .and_then(|plan| {
+                                    crate::indexed::enter_held(doc, si, op, mesh, plan)
+                                })
+                                .and_then(|plan| match &volume {
+                                    // Its stretches through air, replaced.
+                                    Some(v) => crate::air::trim(
+                                        plan, &setup, op, v, frame, source, &holding,
+                                    ),
+                                    None => Ok((plan, None)),
+                                })
+                                .map(|(plan, air)| (plan, vec![], air));
+                        }
+                        let start = crate::indexed::Start {
+                            begin: began.as_ref(),
+                            now: volume.as_ref(),
+                            a: machine_a,
+                            source,
+                        };
+                        crate::indexed::generate(doc, si, &setup, op, t, mesh, start)
+                            .map(|posed| (posed.plan, posed.turns, None))
+                    })
             };
-            let result=plan.and_then(|plan| {
+            let result=plan.and_then(|(plan, turns, air)| {
                 if let Some(reason)=&blocked {return Err(format!("Cannot inherit remaining stock because an earlier operation/setup failed: {reason}"));}
                 let mut sim=Simulation::new(plan);
-                sim.volume=volume.clone();sim.initial_volume=volume.clone();sim.frame=Some(frame);sim.preceding=preceding;sim.source=(index(si),index(oi));
+                sim.volume=volume.clone();sim.initial_volume=volume.clone();sim.frame=Some(frame);sim.turns=turns;sim.preceding=preceding;sim.source=source;sim.air=air;
+                // The feed changed along the path to hold the force on a tooth.
+                crate::tooth_load::hold(&mut sim, doc, &setup.machine, op)?;
                 if let Some((previous,stock))=&grid&& *previous==frame && stock.bounds==sim.plan.stock {sim.stock=stock.clone();sim.initial_stock=stock.clone();}
                 Ok(sim)
             });
@@ -1068,6 +1230,9 @@ pub fn sequence_walk(
                     volume = finished.volume;
                     grid = Some((frame, finished.stock));
                     preceding += 1;
+                    if let Some(a) = sim.plan.moves.last().and_then(|m| m.a) {
+                        machine_a = a;
+                    }
                 }
                 Ok(_) => {}
                 Err(error) => {

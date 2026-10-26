@@ -2566,6 +2566,7 @@ mod tests {
             path: std::path::PathBuf::from("part.stl"),
             format: "stl".into(),
             bytes: 1,
+            thickness: None,
         });
         doc.active = doc.setups[0].id.clone();
         a.doc = doc;

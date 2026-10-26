@@ -25,7 +25,9 @@ pub fn load(path: &Path) -> Result<Document, String> {
 }
 /// Loads a project with what the load changed worth saying: tools saved
 /// without a tool number numbered in library order (`NUMBERED_TOOLS`), then
-/// the note of linking a legacy material to the library. An empty workholding
+/// Indexed operations moved into indexed setups
+/// (`Document::migrate_indexed_operations`), then the note of linking a
+/// legacy material to the library. An empty workholding
 /// library is given the starters without a note.
 pub fn load_reporting(path: &Path) -> Result<(Document, Vec<String>), String> {
     let meta = fs::metadata(path).map_err(|e| e.to_string())?;
@@ -70,8 +72,10 @@ pub fn load_reporting(path: &Path) -> Result<(Document, Vec<String>), String> {
     if d.number_tools() {
         notes.push(NUMBERED_TOOLS.to_string());
     }
+    notes.extend(d.migrate_indexed_operations());
     notes.extend(d.adopt_materials());
     d.adopt_holders();
+    notes.extend(crate::envelope::adopt(&mut d));
     d.validate_structure()?;
     Ok((d, notes))
 }
@@ -217,7 +221,7 @@ mod tests {
             material,
             ["The project material \"Aluminium 6061-T6\" was linked to the library."]
         );
-        assert_eq!(doc.materials.len(), 22);
+        assert_eq!(doc.materials.len(), 25);
         assert!(doc.selected_material().unwrap().cutting_data().is_some());
     }
     #[test]
@@ -227,7 +231,7 @@ mod tests {
         let mut doc = Document::default();
         doc.adopt_materials();
         save(&path, &doc).unwrap();
-        assert_eq!(load(&path).unwrap().materials.len(), 22);
+        assert_eq!(load(&path).unwrap().materials.len(), 25);
         let first = doc.materials[0].id.clone();
         doc.materials[1].id = first;
         save(&path, &doc).unwrap();
@@ -280,6 +284,7 @@ mod tests {
             path: PathBuf::from("/models/part.stl"),
             format: "stl".into(),
             bytes: 10,
+            thickness: None,
         });
         let value = serde_json::to_value(&doc).unwrap();
         for units in [
@@ -319,6 +324,143 @@ mod tests {
         doc.workholding[1].id.clear();
         save(&path, &doc).unwrap();
         assert!(load(&path).is_err());
+    }
+    /// A project written before round bars and the chuck (LIO-187), with a
+    /// fixed box held in a vise and a chuck fixture note, as such a file
+    /// holds it: it loads unchanged, its stock is the same box, it models
+    /// no chuck and its simulation stock is that whole box.
+    #[test]
+    fn a_box_stock_project_from_before_the_chuck_loads_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("box.axis.json");
+        let mut doc = Document::sample();
+        let vise = doc
+            .workholding
+            .first()
+            .map(|h| h.id.clone())
+            .unwrap_or_default();
+        for (k, v) in [
+            ("stock_type", "Fixed size box"),
+            ("stock_x", "140"),
+            ("stock_y", "100"),
+            ("stock_z", "40"),
+            ("holding", "Vise"),
+            ("holder", vise.as_str()),
+            ("fixture", "Chuck"),
+        ] {
+            doc.setup_mut().p.insert(k.into(), v.into());
+        }
+        let value = serde_json::to_value(&doc).unwrap();
+        let text = serde_json::to_string(&value).unwrap();
+        // A setup keeps a round bar's sizes (`stock_diameter`) for the
+        // lathe's bar from the start; nothing else of the bar or the chuck.
+        for new in ["Round bar", "\"chuck_", "\"holding\":\"Chuck\""] {
+            assert!(!text.contains(new), "{new}");
+        }
+        fs::write(&path, &text).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.setups[0].p, doc.setups[0].p);
+        let setup = &loaded.setups[0];
+        assert!(!crate::stock::round_bar(setup) && !crate::chuck::holds(setup));
+        let stock = crate::stock::resolve(setup, None).unwrap().stock;
+        assert_eq!((stock.min, stock.max), ([-70., -50., 0.], [70., 50., 40.]));
+        assert_eq!(crate::stock::round(setup, stock), None);
+        let mesh = crate::mesh::sample();
+        let frame = crate::volume::Frame::new(setup, &mesh);
+        let v = crate::volume::Volume::new(stock, frame).rounded(crate::stock::round(setup, stock));
+        assert_eq!(v.remaining, v.occupied.len());
+        assert_eq!(crate::holding::fixture_note(setup), None);
+        assert_eq!(
+            loaded.holding_label(setup),
+            doc.holding_label(&doc.setups[0])
+        );
+    }
+    #[test]
+    fn a_project_with_index_rotary_axis_as_a_label_loads_unchanged() {
+        // Before LIO-188 "Index rotary axis" only recorded a label: the
+        // setup had its own rotation, translation and probed origin.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("indexed-label.axis.json");
+        let mut doc = Document::sample();
+        let mut later = doc.setups[0].clone();
+        later.id = "later".into();
+        for (k, v) in [
+            ("name", "Side"),
+            ("reposition", "Index rotary axis"),
+            ("rx", "90"),
+            ("ty", "4"),
+            ("origin", "Stock top front-left"),
+            ("offset", "G55"),
+        ] {
+            later.p.insert(k.into(), v.into());
+        }
+        doc.setups.push(later);
+        doc.sync_stock_sources();
+        let text = serde_json::to_string(&serde_json::to_value(&doc).unwrap()).unwrap();
+        assert!(!text.contains("a_angles"));
+        fs::write(&path, &text).unwrap();
+        let mut loaded = load(&path).unwrap();
+        loaded.sync_stock_sources();
+        let mesh = crate::mesh::sample();
+        loaded.sync_turns(Some(&mesh));
+        for (a, b) in loaded.setups.iter().zip(&doc.setups) {
+            assert_eq!(a.p, b.p);
+            assert_eq!(a.turn, None);
+        }
+        let setup = &loaded.setups[1];
+        assert!(!crate::indexed::is_indexed(setup) && crate::indexed::is_label_only(setup));
+        let (a, b) = (
+            crate::volume::Frame::new(setup, &mesh),
+            crate::volume::Frame::new(&doc.setups[1], &mesh),
+        );
+        assert_eq!(a.map([1., 2., 3.]), b.map([1., 2., 3.]));
+        assert_eq!(
+            crate::stock::Placement::new(&mesh, Some(setup)).bounds,
+            crate::stock::Placement::new(&mesh, Some(&doc.setups[1])).bounds
+        );
+        // Saved again, its setups are as they were.
+        assert_eq!(
+            serde_json::to_value(&loaded.setups).unwrap(),
+            serde_json::to_value(&doc.setups).unwrap()
+        );
+    }
+    #[test]
+    fn a_project_with_an_indexed_operation_loads_it_into_an_indexed_setup() {
+        use crate::model::{Machine, Strategy};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("indexed-operation.axis.json");
+        let mut doc = Document::sample();
+        doc.setups.truncate(1);
+        doc.setups[0].machine = Machine::new(4);
+        let op = &mut doc.setups[0].operations[0];
+        op.strategy = Strategy::Indexed;
+        op.p.insert("angle_a".into(), "90".into());
+        op.p.insert("angle_b".into(), "0".into());
+        let (id, name) = (op.id.clone(), op.name().to_string());
+        let count = doc.setups[0].operations.len();
+        // As an older build saved it: the strategy by name.
+        let text = serde_json::to_string(&doc).unwrap();
+        assert!(text.contains(r#""strategy":"Indexed""#));
+        fs::write(&path, &text).unwrap();
+        let (loaded, notes) = load_reporting(&path).unwrap();
+        // The Facing operation it was, at A 90° in setup 1's clamping; the
+        // operations after it follow at A 0°.
+        assert_eq!(loaded.setups.len(), 3);
+        let side = &loaded.setups[1];
+        assert!(crate::indexed::is_indexed(side));
+        assert_eq!(get(&side.p, crate::indexed::ANGLES), "90");
+        assert_eq!(side.operations.len(), 1);
+        assert_eq!(
+            (side.operations[0].id.as_str(), side.operations[0].strategy),
+            (id.as_str(), Strategy::Face)
+        );
+        assert_eq!(get(&loaded.setups[2].p, crate::indexed::ANGLES), "0");
+        assert_eq!(loaded.setups[2].operations.len(), count - 1);
+        assert!(loaded.setups[0].operations.is_empty());
+        assert!(
+            notes.iter().any(|n| n.starts_with(&format!("{name}: the Indexed operation at A 90° is a Facing operation in a new indexed setup"))),
+            "{notes:?}"
+        );
     }
     #[test]
     fn legacy_relative_dimensions_are_preserved_and_new_offsets_roundtrip() {
