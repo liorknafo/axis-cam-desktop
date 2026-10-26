@@ -29,6 +29,8 @@ pub const HELIX: f32 = 30.;
 const ANGLES: usize = 72;
 /// How far ahead of the edge, along its normal, material is looked for, mm.
 const AHEAD: f32 = 0.005;
+/// How tall the lowest slice of a cutter's side is, mm (`elements`).
+const FOOT: f32 = 0.05;
 /// The most samples an operation's path is cut in: a longer path is
 /// sampled more coarsely.
 const MOST: f32 = 150_000.;
@@ -137,11 +139,24 @@ fn elements(shape: CutterShape, radius: f32, flute: f32, helix: f32) -> Vec<Elem
             0.
         }
     };
+    // The side's lowest `FOOT` alone, so that a thin band at the foot of
+    // the flutes (what each of a Waterline's close levels takes off a wall)
+    // is met; the rest in slices.
     let height = (flute - side_from).max(0.);
-    let slices = (height / 0.25).ceil().clamp(1., 40.);
-    let dz = height / slices;
-    for i in 0..slices as usize {
-        add(radius, side_from + (i as f32 + 0.5) * dz, [1., 0.], dz);
+    let foot = FOOT.min(height);
+    add(radius, side_from + foot / 2., [1., 0.], foot);
+    let rest = height - foot;
+    if rest > 0. {
+        let slices = (rest / 0.25).ceil().clamp(1., 40.);
+        let dz = rest / slices;
+        for i in 0..slices as usize {
+            add(
+                radius,
+                side_from + foot + (i as f32 + 0.5) * dz,
+                [1., 0.],
+                dz,
+            );
+        }
     }
     out
 }

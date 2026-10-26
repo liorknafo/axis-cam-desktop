@@ -35,9 +35,10 @@ const SAVING: f32 = 0.5;
 const SHARE: f32 = 0.9;
 /// How far apart up the flutes the cutter's side is sampled, mm.
 const RISE: f32 = 0.5;
-/// How much farther than the setup's gap a link keeps from the vise jaws
-/// or clamps, mm: the controller's blend at its corners.
-const HOLDING: f32 = 1.;
+/// How much farther than the setup's gap and the controller's blend (by
+/// which the export grows the workholding) a link keeps from the vise
+/// jaws or clamps, mm.
+const HOLDING: f32 = 0.1;
 
 /// What `trim` changed in a plan.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -48,7 +49,9 @@ pub struct Trimmed {
     pub air: f32,
     /// The time saved, s.
     pub saved: f32,
-    /// Whether no move of the plan cut anything: only a retract is left.
+    /// Whether no move of the plan cuts anything: the plan is left as it
+    /// is, for the user to see (a spring pass, or an operation the earlier
+    /// ones made needless).
     pub nothing: bool,
 }
 
@@ -117,8 +120,19 @@ pub fn trim(
     let Some(cutting) = cutting(&plan, volume, frame, source)? else {
         return Ok((plan, None));
     };
-    let gap = crate::holding::gap(setup).unwrap_or_default().max(0.) + HOLDING;
-    Ok(relink(plan, op, volume, frame, &cutting, (holding, gap)))
+    // The controller's blend: the export grows the workholding and the
+    // column a rapid descends through by it.
+    let blend = crate::post::PostSettings::for_machine(&setup.machine).map_or(1., |s| s.blend);
+    let gap = crate::holding::gap(setup).unwrap_or_default().max(0.) + blend + HOLDING;
+    Ok(relink(
+        plan,
+        op,
+        volume,
+        frame,
+        &cutting,
+        (holding, gap),
+        blend,
+    ))
 }
 
 /// The vise jaws, clamps, chuck or hold-down screws of `setup`, as the
@@ -444,6 +458,7 @@ fn relink(
     frame: Frame,
     cutting: &[[f32; 2]],
     (holding, gap): (&[HoldBox], f32),
+    blend: f32,
 ) -> (Plan, Option<Trimmed>) {
     // The plan's clearance: where its rapids cross.
     let clearance = (plan.moves.iter())
@@ -453,21 +468,52 @@ fn relink(
     if !clearance.is_finite() {
         return (plan, None);
     }
-    // A descent rapids down to the retract margin over the highest
-    // material left (as the export's check takes it), then feeds.
+    // A descent rapids down to the retract margin over what the export's
+    // check proves its column clear to (`post_check`): the highest material
+    // left, lower where the earlier cuts cleared the column (`RestStock`)
+    // or where the tool already went down there; then it feeds.
     let margin = num(&op.p, "retract").filter(|v| *v > 0.).unwrap_or(2.);
-    let high = if volume.cuts.is_empty() {
-        plan.stock.max[2]
-    } else {
+    let rest = (!volume.cuts.is_empty()).then(|| crate::rest::RestStock::new(volume, frame));
+    let high = rest.as_ref().map_or(plan.stock.max[2], |rest| {
         let unbounded = Bounds {
             min: [f32::INFINITY; 3],
             max: [f32::NEG_INFINITY; 3],
         };
-        crate::rest::RestStock::new(volume, frame)
-            .left(unbounded)
-            .max[2]
+        rest.left(unbounded).max[2]
+    });
+    let high = high.min(plan.stock.max[2]);
+    // The lowest the tool went at each point so far, as the check keeps it.
+    let key = |p: [f32; 3]| ((p[0] * 1000.).round() as i64, (p[1] * 1000.).round() as i64);
+    let mut visited: std::collections::HashMap<(i64, i64), f32> = Default::default();
+    let visit = |p: [f32; 3], visited: &mut std::collections::HashMap<(i64, i64), f32>| {
+        let z = visited.entry(key(p)).or_insert(p[2]);
+        *z = z.min(p[2]);
     };
-    let approach = (high.min(plan.stock.max[2]) + margin).min(clearance);
+    // The height a descent onto `e` rapids down to, and whether the column
+    // is proven clear all the way down to `e`.
+    let approach = |e: [f32; 3], visited: &std::collections::HashMap<(i64, i64), f32>| {
+        let r = plan.radius + blend;
+        let column = Bounds {
+            min: [e[0] - r, e[1] - r, e[2]],
+            max: [e[0] + r, e[1] + r, high],
+        };
+        let been = visited.get(&key(e)).copied().unwrap_or(f32::INFINITY);
+        // The proof only where the tool has not been down there already.
+        let proven = match &rest {
+            _ if been <= e[2] => e[2],
+            Some(rest) if rest.beside(column) => e[2],
+            Some(rest) => rest.top(column, e[2] - 0.001, high),
+            None => high,
+        };
+        // Clear only where the earlier cuts or the tool's own moves took
+        // the column down to `e`: the top of stock no cut touched is no
+        // proof, as the stock may stand higher than its box.
+        let floor = proven.min(been).min(high);
+        (
+            (floor.max(e[2]) + margin).min(clearance),
+            floor <= e[2] + 0.001 && floor < high - 0.001,
+        )
+    };
     // The plan's moves in pieces, each cutting or not.
     let mut pieces = vec![];
     let mut along = 0.;
@@ -512,17 +558,36 @@ fn relink(
     let from = |p: &Piece| lerp(moves[p.index].from, moves[p.index].to, p.t[0]);
     let to = |p: &Piece| lerp(moves[p.index].from, moves[p.index].to, p.t[1]);
     let seconds = |p: &Piece| (moves[p.index].end - moves[p.index].start) * (p.t[1] - p.t[0]);
-    let first = pieces.iter().position(|p| p.cuts);
+    // A plan that cuts nothing is left as it is, and said.
+    if !pieces.iter().any(|p| p.cuts) {
+        let nothing = Trimmed {
+            nothing: true,
+            ..Default::default()
+        };
+        return (plan, Some(nothing));
+    }
+    // A link's descent feeds at the plan's cutting feed down a column
+    // proven clear, as Adaptive's own links feed down, ending `pad` short
+    // of what the cutter meets; elsewhere, onto stock no earlier cut
+    // touched, which may stand higher than its box, at the plunge rate the
+    // strategies' own entries take (`cam::Builder::start_at`).
+    let feed = (moves.iter())
+        .filter(|m| m.motion == Motion::Feed && m.cutting_pass)
+        .map(|m| m.feed)
+        .fold(0., f32::max);
     let mut out: Vec<Out> = vec![];
-    let keep = |p: &Piece, out: &mut Vec<_>| {
+    let keep = |p: &Piece, out: &mut Vec<_>, visited: &mut _| {
         let m = &moves[p.index];
-        out.push((Some(*p), from(p), to(p), m.motion, m.feed));
+        let (a, b) = (from(p), to(p));
+        visit(a, visited);
+        visit(b, visited);
+        out.push((Some(*p), a, b, m.motion, m.feed));
     };
     let mut trimmed = Trimmed::default();
     let mut i = 0;
     while i < pieces.len() {
         if pieces[i].cuts {
-            keep(&pieces[i], &mut out);
+            keep(&pieces[i], &mut out, &mut visited);
             i += 1;
             continue;
         }
@@ -540,10 +605,9 @@ fn relink(
         let start = from(&stretch[0]);
         let end = to(&stretch[stretch.len() - 1]);
         // The link: up to clearance, across, down at rapid to the approach,
-        // then fed down at the feed of the move it leads into: the column
-        // over a point the cutter reached through air is clear (as
-        // Adaptive's links take it), and the point is `pad` short of what
-        // it cuts.
+        // then fed down: the column over a point the cutter reached through
+        // air is clear (as Adaptive's links take it), and the point is
+        // `pad` short of what it cuts.
         let mut link: Vec<([f32; 3], Motion, f32)> = vec![];
         let mut at = start;
         let mut go = |p: [f32; 3], motion: Motion, rate: f32, at: &mut [f32; 3]| {
@@ -559,13 +623,14 @@ fn relink(
             &mut at,
         );
         if j < pieces.len() {
-            let feed = moves[pieces[j].index].feed;
+            let (approach, clear) = approach(end, &visited);
             go([end[0], end[1], at[2]], Motion::Rapid, RAPID, &mut at);
             if end[2] >= approach {
                 go(end, Motion::Rapid, RAPID, &mut at);
             } else {
+                let rate = if clear { feed } else { feed * 0.25 };
                 go([end[0], end[1], approach], Motion::Rapid, RAPID, &mut at);
-                go(end, Motion::Feed, feed, &mut at);
+                go(end, Motion::Feed, rate, &mut at);
             }
         }
         let mut was = start;
@@ -577,7 +642,6 @@ fn relink(
             })
             .sum();
         let stretch_seconds: f32 = stretch.iter().map(seconds).sum();
-        let whole = first.is_none();
         let clear = || {
             let mut was = start;
             let segments: Vec<([f32; 3], [f32; 3])> = (link.iter())
@@ -595,21 +659,21 @@ fn relink(
         };
         let replace = air > 0.
             && !dwells
-            && (whole
-                || (stretch_seconds - link_seconds > SAVING
-                    && link_seconds < SHARE * stretch_seconds))
+            && stretch_seconds - link_seconds > SAVING
+            && link_seconds < SHARE * stretch_seconds
             && clear();
         if replace {
             trimmed.stretches += 1;
             trimmed.air += air;
             let mut was = start;
             for (p, motion, rate) in link {
+                visit(p, &mut visited);
                 out.push((None, was, p, motion, rate));
                 was = p;
             }
         } else {
             for p in stretch {
-                keep(p, &mut out);
+                keep(p, &mut out, &mut visited);
             }
         }
         i = j;
@@ -617,7 +681,6 @@ fn relink(
     if trimmed.stretches == 0 {
         return (plan, None);
     }
-    trimmed.nothing = first.is_none();
     // Whole moves again where a move's pieces were all kept, and timed.
     let mut moves_out: Vec<Move> = vec![];
     // The move and fraction the last one kept ends at.
@@ -651,20 +714,6 @@ fn relink(
         });
         clock += seconds;
         ends = piece.map(|p| (p.index, p.t[1]));
-    }
-    if moves_out.is_empty() {
-        // Nothing cut and the tool already clear: it stays where it is.
-        let at = plan.moves[0].from;
-        moves_out.push(Move {
-            from: at,
-            to: at,
-            motion: Motion::Rapid,
-            cutting_pass: false,
-            feed: RAPID,
-            start: 0.,
-            end: 0.,
-            a: None,
-        });
     }
     let mut plan = plan;
     trimmed.saved = plan.duration - clock;
@@ -753,8 +802,9 @@ mod tests {
         assert!(feeds_between(&plan, 30., -100., -66.) > 0);
         assert!(feeds_between(&plan, 30., 66., 100.) > 0);
         assert_eq!(feeds_between(&plan, 30., -50., 50.), 0, "{:#?}", plan.moves);
-        // Up to clearance, across it, down to 5 mm over the stock top and
-        // fed down from there at the pass's feed.
+        // Up to clearance, across it, down to 5 mm over the stock top (the
+        // slot is no wider than the cutter, so no column over it is proven
+        // clear) and fed down from there at the plunge rate.
         let up = (plan.moves.iter())
             .position(|m| m.motion == Motion::Rapid && m.to[2] == 50. && m.from[2] == 30.)
             .expect("a retract");
@@ -763,11 +813,35 @@ mod tests {
         assert_eq!((down.motion, down.to[2]), (Motion::Rapid, 45.));
         assert_eq!(
             (feed.motion, feed.feed, feed.to[2]),
-            (Motion::Feed, 600., 30.)
+            (Motion::Feed, 150., 30.)
         );
         assert!(plan.moves[up].from[0] > -66. && feed.to[0] < 66.);
         assert!((air.saved - (original.duration - plan.duration)).abs() < 1e-3);
         assert!(air.saved > 3., "{air:?}");
+    }
+    #[test]
+    fn a_descent_into_a_column_the_earlier_cuts_cleared_rapids_to_just_over_it() {
+        // A field cleared from Z10 up, X -65 to 65 and Y -20 to 20, and a
+        // pass across it at Z10: the descent past it rapids down to 5 mm
+        // over the floor, where the earlier cuts clear the column, not to 5
+        // mm over the stock top, and feeds the rest at the pass's feed.
+        let earlier: Vec<([f32; 3], [f32; 3])> = [10., 15.]
+            .into_iter()
+            .flat_map(|z| [-15., -7.5, 0., 7.5, 15.].map(|y| ([-60., y, z], [60., y, z])))
+            .collect();
+        let volume = stock(&earlier);
+        let (plan, air) = trimmed(plan(&[[-100., 0., 10.], [100., 0., 10.]]), &volume);
+        assert_eq!(air.expect("trimmed").stretches, 1);
+        continuous(&plan);
+        let up = (plan.moves.iter())
+            .position(|m| m.motion == Motion::Rapid && m.from[2] == 10. && m.to[2] == 50.)
+            .expect("a retract");
+        let (down, feed) = (&plan.moves[up + 2], &plan.moves[up + 3]);
+        assert_eq!(
+            (down.to[2], feed.motion, feed.feed, feed.to[2]),
+            (15., Motion::Feed, 600., 10.)
+        );
+        assert!(down.to[0] > 50. && down.to[0] < 60., "{down:?}");
     }
     #[test]
     fn a_short_gap_is_fed_across() {
@@ -783,13 +857,18 @@ mod tests {
         let volume = stock(&[([-90., 0., 30.], [90., 0., 30.])]);
         let shave = |y: f32| plan(&fine([-60., y, 30.], [60., y, 30.], 0.05));
         assert_eq!(trimmed(shave(-0.1), &volume).1, None);
-        // 0.01 mm, under `DEPTH`: the pass is air, so it is all taken out
-        // but the retract.
-        let (plan, air) = trimmed(shave(-0.01), &volume);
-        let air = air.expect("trimmed");
-        assert!(air.nothing, "{air:?}");
-        assert!(plan.moves.iter().all(|m| m.motion == Motion::Rapid));
-        continuous(&plan);
+        // 0.01 mm, under `DEPTH`: the pass cuts nothing, and is left as it
+        // is for the user to see.
+        let original = shave(-0.01);
+        let (plan, air) = trimmed(original.clone(), &volume);
+        assert_eq!(
+            air,
+            Some(Trimmed {
+                nothing: true,
+                ..Default::default()
+            })
+        );
+        assert_eq!(plan.moves.len(), original.moves.len());
     }
     #[test]
     fn a_skin_left_on_a_floor_is_cut() {

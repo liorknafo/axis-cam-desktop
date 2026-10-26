@@ -2560,20 +2560,22 @@ fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
             );
             // What `air::trim` took out of the path.
             if let Some(air) = sim.air {
-                playback = playback.push(
-                    muted(if air.nothing {
-                        "Cuts nothing on the stock it starts from: its path through air is taken out".to_string()
-                    } else {
-                        format!(
-                            "Air taken out: {} stretch{} ({:.0} mm of feed) replaced by rapids, {:.1} min saved",
-                            air.stretches,
-                            if air.stretches == 1 { "" } else { "es" },
-                            air.air,
-                            air.saved / 60.
-                        )
-                    })
-                    .size(12),
-                );
+                playback = playback.push(if air.nothing {
+                    bold(
+                        "Cuts nothing: the earlier operations already took its material. Disable it, or keep it as a spring pass.",
+                        12,
+                    )
+                    .color(WARN)
+                } else {
+                    muted(format!(
+                        "Air taken out: {} stretch{} ({:.0} mm of feed) replaced by rapids, {:.1} min saved",
+                        air.stretches,
+                        if air.stretches == 1 { "" } else { "es" },
+                        air.air,
+                        air.saved / 60.
+                    ))
+                    .size(12)
+                });
             }
             // The scale the path's colours are in (`tooth_load::colour`).
             if sim.tooth_load.is_none()
