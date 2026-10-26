@@ -5577,6 +5577,7 @@ flood = { pin = 8 }
         use crate::tooth_load::FEED_FOLLOWS;
         let dir = tempfile::tempdir().unwrap();
         let mut a = run_app_of(dir.path(), FAST, &[0, 1]);
+        a.sim_details = true;
         a.page = Page::Work;
         let _ = a.update(Message::SelectOp(1));
         let _ = a.update(Message::Tab("Tool".into()));
@@ -16156,6 +16157,40 @@ soft_max = 180.0
         ui.operate(&renderer, &mut texts);
         texts.0
     }
+    /// Folded, as it starts, the simulation strip keeps one line of stats and
+    /// a Details button, so the 3D view above it is taller; Details brings
+    /// the rest back.
+    #[test]
+    fn the_simulation_strip_folds_its_details_under_a_button() {
+        let mut a = imported_app();
+        let top = a
+            .imported_mesh
+            .as_ref()
+            .unwrap()
+            .surfaces
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.center[2].total_cmp(&b.center[2]))
+            .unwrap()
+            .0;
+        let _ = a.update(Message::Surface(top));
+        let _ = a.update(Message::Generate);
+        assert!(a.active_simulation().is_some(), "{}", a.status);
+        let size = iced::Size::new(1180., 760.);
+        let strip = |a: &App| {
+            let texts = laid_out_texts(a, size);
+            let y = |words: &str| texts.iter().find(|(t, _)| t.starts_with(words)).map(|t| t.1.y);
+            let has = |words: &str| texts.iter().any(|(t, _)| t.contains(words));
+            (y("OPERATION SIMULATION").unwrap(), has("total removed"), has(" · Spindle "), has("Hide details"))
+        };
+        assert!(!a.sim_details);
+        let folded = strip(&a);
+        assert_eq!((folded.1, folded.2, folded.3), (true, false, false));
+        let _ = a.update(Message::ToggleSimDetails);
+        let open = strip(&a);
+        assert_eq!((open.1, open.2, open.3), (true, true, true));
+        assert!(folded.0 > open.0, "folded {} open {}", folded.0, open.0);
+    }
     /// The top of the simulation strip and of the 3D view's hint line under
     /// the scene, in `a`'s window at `size`, with the stock line it shows.
     fn play_frame(a: &App, size: iced::Size) -> (f32, f32, String) {
@@ -16180,6 +16215,7 @@ soft_max = 180.0
     #[test]
     fn the_view_stands_still_while_play_updates_the_stock_surface() {
         let mut a = imported_app();
+        a.sim_details = true;
         let top = a
             .imported_mesh
             .as_ref()

@@ -2469,7 +2469,24 @@ fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
             ),
             widget::tooltip::Position::Top
         ),
-        space().width(Fill)
+        space().width(Fill),
+        muted(detail).size(12)
+    ]
+    .spacing(15)
+    .align_y(Alignment::Center);
+    // The part's size beside the checkboxes and the hint beside the legend:
+    // every line here is a line the 3D view above loses.
+    let hint = row![
+        uncut_legend(app),
+        space().width(Fill),
+        muted(if app.picking_section && app.section_on {
+            "Click a face of the part to cut through it · drag to orbit"
+        } else if app.picking {
+            "Click a highlighted feature to select it · drag to orbit"
+        } else {
+            "Drag to orbit · right-drag to pan · scroll to zoom"
+        })
+        .size(12)
     ]
     .spacing(15)
     .align_y(Alignment::Center);
@@ -2477,17 +2494,8 @@ fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
         column![
             toggles,
             section_controls(app),
-            muted(detail).size(12),
             uncut_line(app).map(|line| muted(line).size(12)),
-            uncut_legend(app),
-            muted(if app.picking_section && app.section_on {
-                "Click a face of the part to cut through it · drag to orbit"
-            } else if app.picking {
-                "Click a highlighted feature to select it · drag to orbit"
-            } else {
-                "Drag to orbit · right-drag to pan · scroll to zoom"
-            })
-            .size(12)
+            hint
         ]
         .spacing(7),
     )
@@ -2520,7 +2528,17 @@ fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
         .spacing(8)
     ]
     .spacing(8);
-    if let Some((heading, lines, ok, checking)) = run_check(app) {
+    // Folded, a simulation's strip says the check's first line and one line
+    // of stats; Details brings back the rest (`Message::ToggleSimDetails`).
+    let folded = !app.sim_details && ready && app.active_simulation().is_some();
+    if let Some((heading, mut lines, ok, checking)) = run_check(app) {
+        if folded && ok {
+            lines.clear();
+        } else if folded && lines.len() > 1 {
+            let more = lines.len() - 1;
+            lines.truncate(1);
+            lines.push(format!("{more} more under Details"));
+        }
         let said: Element<'_, Message> = if ok {
             let heading = if checking {
                 muted(heading).size(12)
@@ -2561,6 +2579,45 @@ fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
             playback = playback.push(muted("Replaying the toolpath to here…").size(12));
         }
         if let Some(sim) = app.active_simulation() {
+            // A slow stock update is said here while folded, as the Detail
+            // row that says it otherwise is hidden.
+            let summary = match stock_surface_notice(app).filter(|_| folded) {
+                Some(notice) => bold(notice, 12).color(WARN),
+                None => muted(format!(
+                    "{:.1} / {:.1} min · ≈{:.1} cm³ this operation · ≈{:.1} cm³ total removed",
+                    sim.seconds / 60.,
+                    sim.plan.duration / 60.,
+                    (sim.removed_volume() - sim.inherited_volume()) / 1000.,
+                    sim.removed_volume() / 1000.
+                ))
+                .size(12),
+            };
+            playback = playback.push(
+                row![
+                    container(summary.wrapping(Wrapping::None))
+                        .width(Fill)
+                        .clip(true),
+                    btn(
+                        if folded { "Details" } else { "Hide details" },
+                        Message::ToggleSimDetails,
+                        false
+                    )
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+            // Cutting nothing is a warning, so it stays when folded.
+            if folded && sim.air.is_some_and(|air| air.nothing) {
+                playback = playback.push(
+                    bold(
+                        "Cuts nothing on the stock it starts from. Disable it, or keep it as a spring pass.",
+                        12,
+                    )
+                    .color(WARN),
+                );
+            }
+        }
+        if let Some(sim) = app.active_simulation().filter(|_| !folded) {
             playback = playback.push(
                 muted(format!(
                     "{} · Spindle {} · Stock after {} earlier operations{}",
@@ -2574,16 +2631,6 @@ fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
                     sim.plan
                         .rest_top
                         .map_or(String::new(), |z| format!(" · Cutting start Z {z:.2} mm"))
-                ))
-                .size(12),
-            );
-            playback = playback.push(
-                muted(format!(
-                    "{:.1} / {:.1} min · ≈{:.1} cm³ this operation · ≈{:.1} cm³ total removed",
-                    sim.seconds / 60.,
-                    sim.plan.duration / 60.,
-                    (sim.removed_volume() - sim.inherited_volume()) / 1000.,
-                    sim.removed_volume() / 1000.
                 ))
                 .size(12),
             );

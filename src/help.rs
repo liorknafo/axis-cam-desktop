@@ -1445,6 +1445,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Show or hide the faces of the part that the stock still covers after every setup, in magenta. With the simulated stock shown, just those faces are drawn over it, where the stock surface does not hide them. A selected one is striped blue and magenta. Off, the part is drawn as it is without them.",
             "",
         ),
+        ToggleSimDetails => (
+            "Show or hide the simulation's details: how it mills, the air taken out, the feed, the path's colours, the stock's Detail and every line of the run check. Hidden, the strip keeps the time, the volume and the check's first line, so the 3D view keeps its height.",
+            "",
+        ),
         TogglePaths => (
             "Show or hide the cutter path. Pocket shows cuts on the current depth layer; Facing shows the latest cutting pass. Both show the active rapid; the example project shows illustrative paths.",
             "",
@@ -4802,6 +4806,7 @@ mod tests {
             Scrub(0.),
             ToggleStock,
             ToggleUncut,
+            ToggleSimDetails,
             Section(crate::section::Edit::Toggle),
             Section(crate::section::Edit::Axis(0)),
             Section(crate::section::Edit::PickFace),
