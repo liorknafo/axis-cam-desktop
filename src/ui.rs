@@ -227,7 +227,8 @@ fn bar_btn<'a>(label: &str, msg: Message, active: bool) -> HelpButton<'a> {
 /// The workspace switcher at the start of the toolbar, like Fusion 360's:
 /// MANUFACTURE plans the job, MACHINE (the Control page) runs it. While the
 /// machine moves it stays on MACHINE.
-fn switcher(app: &App) -> Element<'_, Message> {
+/// On the dark MACHINE bar (`dark`) it is smaller, with light text.
+fn switcher(app: &App, dark: bool) -> Element<'_, Message> {
     const WORKSPACES: [&str; 2] = ["MANUFACTURE", "MACHINE"];
     let font = Font {
         weight: iced::font::Weight::Bold,
@@ -235,8 +236,17 @@ fn switcher(app: &App) -> Element<'_, Message> {
     };
     let picker: Element<_> = if app.locked() {
         row![
-            container(text(WORKSPACES[1]).size(14).font(font).color(MUTED)).padding([7, 12]),
-            muted("Manufacture opens when the machine stops.")
+            container(text(WORKSPACES[1]).size(14).font(font).color(if dark {
+                ON_DARK
+            } else {
+                MUTED
+            }))
+            .padding([7, 12]),
+            muted("Manufacture opens when the machine stops.").color(if dark {
+                ON_DARK
+            } else {
+                MUTED
+            })
         ]
         .spacing(6)
         .align_y(Alignment::Center)
@@ -257,11 +267,21 @@ fn switcher(app: &App) -> Element<'_, Message> {
             },
         )
         .font(font)
-        .text_size(14)
+        .text_size(if dark { 13 } else { 14 })
         .style(choice_style)
-        .padding([7, 12])
+        .padding(if dark { [4, 10] } else { [7, 12] })
         .into()
     };
+    if dark {
+        return help::wrap(
+            picker,
+            Help::text(
+                "Workspace",
+                "MANUFACTURE plans the job: the part, setups, operations, the libraries, the AI planner and the NC review. MACHINE drives the CNC through the UC100: connect, jog, zero, probe and run a setup, and set up its profile. While the machine moves (a tool run, held or paused, a probe, a jog or homing) only MACHINE is open.",
+            ),
+            widget::tooltip::Position::Bottom,
+        );
+    }
     let icon = if app.page == Page::Control || app.locked() {
         include_bytes!("../assets/tb-machine.svg").as_slice()
     } else {
@@ -968,7 +988,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
             background: Some(Color::from_rgb8(29, 46, 63).into()),
             ..Default::default()
         });
-    let mut top_row = row![switcher(app), rule::vertical(1)]
+    let mut top_row = row![switcher(app, false), rule::vertical(1)]
         .spacing(5)
         .align_y(Alignment::Center);
     let pages = [
@@ -1060,9 +1080,15 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .spacing(15)
         .align_y(Alignment::Center),
     )
-    .padding([8, 14])
+    .padding([4, 14])
     .style(panel_style);
-    let mut layout = column![brand, docbar].spacing(0);
+    // MACHINE has one bar over the Control page (LIO-274): every pixel of a
+    // 13" laptop's window goes to the console under it.
+    let mut layout = if manufacture {
+        column![brand, docbar]
+    } else {
+        column![machine_bar(app)]
+    };
     if manufacture && app.page != Page::Home && !app.doc.setups.is_empty() {
         layout = layout.push(ribbon(app));
     }
@@ -6181,7 +6207,7 @@ pub(crate) fn run_check(app: &App) -> Option<(String, Vec<String>, bool, bool)> 
     };
     let mark = op_mark(app, Some(r), i);
     let lines = refusal_lines(r, i);
-    let machine = "The machine's position and the work zero are checked on the Run panel.";
+    let machine = "The machine's position and the work zero are checked on the Control page.";
     let (heading, lines, ok) = match mark {
         OpMark::Suppressed => return None,
         OpMark::Ready => (
@@ -7078,17 +7104,294 @@ pub(crate) fn limits_off_warning(
     (!lines.is_empty()).then_some(("Soft limits are OFF", lines))
 }
 
-/// The Control page: the UC100 machine, its connection and its live state.
-fn control(app: &App) -> Element<'_, Message> {
-    use crate::control::Action;
-    use uc100::{controller::State, gcode::Spindle};
-    // A setup on the manual mill or the lathe shows its steps, with or
-    // without the CNC connected.
-    if app.steps_page() {
-        return crate::steps::view(app);
+/// The tabs of the Control page's centre (LIO-274): one task at a time, the
+/// jog, position and spindle staying on the left and the operations on the
+/// right whichever is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlTab {
+    /// The 3D view of the job or of the machine.
+    Job,
+    /// The manual tool change between tool runs, while one is due.
+    ToolChange,
+    WorkZero,
+    Probe,
+    /// Rotary A's calibration, on a machine with the rotary unit.
+    Rotary,
+    Mdi,
+    /// The connection, the machine zero, the soft limits and the log.
+    Machine,
+}
+impl ControlTab {
+    fn label(self) -> &'static str {
+        match self {
+            ControlTab::Job => "Job",
+            ControlTab::ToolChange => "Tool change",
+            ControlTab::WorkZero => "Work zero",
+            ControlTab::Probe => "Probe",
+            ControlTab::Rotary => "Rotary A",
+            ControlTab::Mdi => "MDI",
+            ControlTab::Machine => "Machine",
+        }
     }
+}
+/// The machine's phase as the Control page's tabs follow it: a change of
+/// phase, and only that, switches the tab (`App::phase_tab`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Idle,
+    /// A tool run is being cut.
+    Cutting,
+    /// The next tool run wants another tool (`run::Run::tool_change`).
+    ToolChange,
+}
+/// The phase of the machine connected, if any.
+pub(crate) fn phase(c: Option<&crate::control::Connection>) -> Phase {
+    match c.and_then(|c| c.run.as_ref()) {
+        Some(r) if r.running.is_some() => Phase::Cutting,
+        Some(r) if r.tool_change().is_some() => Phase::ToolChange,
+        _ => Phase::Idle,
+    }
+}
+/// What the Job tab's view shows: the setup's stock in 3D, the machine's
+/// travel with the tool in it, or the stock from above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobView {
+    Stock,
+    Machine,
+    Top,
+}
+/// The Control page's frame at a 1440 × 790 window, the usable window of a
+/// 13" laptop: the bar of the MACHINE workspace, the run bar, and the
+/// widths of the left (the hands: position, jog, spindle) and right (the
+/// operations) columns. The centre takes the rest.
+pub(crate) const MACHINE_BAR: f32 = 44.;
+pub(crate) const RUN_BAR: f32 = 64.;
+pub(crate) const HANDS: f32 = 340.;
+pub(crate) const PROGRAM: f32 = 400.;
+/// A DRO line of the Position card, and the work value's width: a sign,
+/// four digits, three decimals and a degree sign in 24 px monospace. With A
+/// the four lines are a little lower, so the left column still fits.
+fn dro_row(axes: usize) -> (f32, u32) {
+    if axes > 3 { (42., 21) } else { (46., 24) }
+}
+const DRO_VALUE: f32 = 156.;
+/// A jog button.
+const JOG: (f32, f32) = (50., 36.);
+const GREEN: Color = Color::from_rgb8(39, 130, 93);
+const AMBER: Color = Color::from_rgb8(166, 101, 32);
+const RUN_BLUE: Color = Color::from_rgb8(37, 99, 201);
+/// The light text of the dark MACHINE bar.
+const ON_DARK: Color = Color::from_rgb8(176, 190, 206);
+
+/// One line of `size` px text in `color`, cut at `chars` characters with an
+/// ellipsis and clipped, so that it never wraps and nothing under or beside
+/// it moves as it changes; the whole text is on hover when it was cut.
+fn one_line<'a>(
+    title: &str,
+    s: impl Into<String>,
+    size: u32,
+    color: Color,
+    chars: usize,
+) -> Element<'a, Message> {
+    let s = s.into();
+    let cut = ellipsize(&s, chars);
+    let line = container(
+        text(cut.clone())
+            .size(size)
+            .color(color)
+            .wrapping(Wrapping::None),
+    )
+    .width(Fill)
+    .clip(true);
+    if cut == s {
+        line.into()
+    } else {
+        help::wrap(line, Help::text(title, s), widget::tooltip::Position::Top)
+    }
+}
+/// A short muted line whose whole text, often a paragraph, is on hover.
+fn hint<'a>(title: &str, s: impl Into<String>, chars: usize) -> Element<'a, Message> {
+    one_line(title, s, 12, MUTED, chars)
+}
+
+/// `act` with its padding: `pad` top and bottom, and at the sides.
+fn act_with<'a>(
+    label: impl Into<String>,
+    msg: Option<Message>,
+    on: bool,
+    width: Option<Length>,
+    pad: [u16; 2],
+) -> Element<'a, Message> {
+    let label = label.into();
+    let face = text(label.clone()).size(12);
+    let face = match width {
+        Some(_) => face.width(Fill).align_x(Alignment::Center),
+        None => face,
+    };
+    let b = button(face)
+        .width(width.unwrap_or(Length::Shrink))
+        .padding(pad)
+        .on_press_maybe(msg.clone())
+        .style(move |_, status| {
+            let (background, text_color) = match status {
+                _ if on => (ACTIVE_TILE, BLUE),
+                button::Status::Disabled => (BG, MUTED),
+                button::Status::Hovered | button::Status::Pressed => (HOVER_BUTTON, INK),
+                _ => (Color::WHITE, INK),
+            };
+            button::Style {
+                background: Some(background.into()),
+                text_color,
+                border: Border {
+                    color: if on { BLUE } else { LINE },
+                    width: 1.,
+                    radius: 4.into(),
+                },
+                ..Default::default()
+            }
+        });
+    match msg {
+        Some(m) => HelpButton::new(b, &m, label).into(),
+        None => b.into(),
+    }
+}
+/// A small `act`, for the dense rows of the Control page.
+fn small<'a>(label: impl Into<String>, msg: Option<Message>, on: bool) -> Element<'a, Message> {
+    act_with(label, msg, on, None, [4, 8])
+}
+/// A card of the Control page: white, framed, `height` px tall when given,
+/// so that what it holds never pushes the cards under it.
+fn card<'a>(body: impl Into<Element<'a, Message>>, height: Option<f32>) -> Element<'a, Message> {
+    let c = container(body)
+        .padding([10, 12])
+        .width(Fill)
+        .style(panel_style)
+        .clip(true);
+    match height {
+        Some(h) => c.height(h).into(),
+        None => c.height(Fill).into(),
+    }
+}
+/// A coloured tag: SIMULATED, TOOL CHANGE.
+fn chip<'a>(label: &str, background: Color) -> Element<'a, Message> {
+    container(bold(label.to_string(), 11).color(Color::WHITE))
+        .padding([3, 8])
+        .style(move |_| container::Style {
+            background: Some(background.into()),
+            border: Border {
+                radius: 4.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .into()
+}
+/// The machine's state on the MACHINE bar, a fixed width so that nothing
+/// beside it moves as it changes; "Tool change" while one is due.
+fn state_pill<'a>(c: &crate::control::Connection) -> Element<'a, Message> {
+    use uc100::controller::State;
+    let state = c.snapshot.state.as_ref();
+    let tool_change = phase(Some(c)) == Phase::ToolChange && state == Some(&State::Idle);
+    let (label, background) = match state {
+        _ if tool_change => ("Tool change", Color::from_rgb8(209, 139, 22)),
+        None => ("Connecting…", Color::from_rgb8(106, 118, 134)),
+        Some(State::Idle) => ("Idle", Color::from_rgb8(47, 138, 87)),
+        Some(State::EStop) => ("E-stop", Color::from_rgb8(200, 30, 30)),
+        Some(State::Hold | State::Paused(_)) => (
+            state.map_or("", State::label),
+            Color::from_rgb8(209, 139, 22),
+        ),
+        Some(State::Disconnected) => ("Disconnected", Color::from_rgb8(106, 118, 134)),
+        Some(s) => (s.label(), RUN_BLUE),
+    };
+    container(bold(label.to_string(), 12).color(Color::WHITE))
+        .center_x(112)
+        .padding([4, 0])
+        .style(move |_| container::Style {
+            background: Some(background.into()),
+            border: Border {
+                radius: 12.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .into()
+}
+/// The bar of the MACHINE workspace, the one bar over the Control page: the
+/// workspace switcher, Control and Controller configuration, the project,
+/// and while connected the machine, SIMULATED, its state and the E-stop,
+/// the one on the page (LIO-274).
+fn machine_bar(app: &App) -> Element<'_, Message> {
+    let mut bar = row![
+        bold("AXIS", 19).color(Color::WHITE),
+        switcher(app, true),
+        bar_btn("Control", Message::ControlSetup(false), !app.machine_setup),
+        bar_btn(
+            "Controller configuration",
+            Message::ControlSetup(true),
+            app.machine_setup
+        ),
+        container(
+            text(ellipsize(&app.doc.title, 30))
+                .size(12)
+                .color(ON_DARK)
+                .wrapping(Wrapping::None)
+        )
+        .width(Fill)
+        .clip(true),
+        help::wrap(
+            text(project_note(app)).size(11).color(ON_DARK),
+            Help::text(
+                "Project file",
+                match &app.project_path {
+                    Some(p) => p.display().to_string(),
+                    None =>
+                        "Save it from MANUFACTURE: Save or Save as… there choose the file.".into(),
+                }
+            ),
+            widget::tooltip::Position::Bottom,
+        ),
+        text(workspace_note(app)).size(11).color(ON_DARK),
+    ]
+    .spacing(12)
+    .align_y(Alignment::Center);
+    if let Some(c) = &app.control {
+        use uc100::controller::State;
+        let name = (app.doc.machines.iter())
+            .find(|m| m.id == c.machine_id)
+            .map_or("", |m| m.name());
+        bar = bar.push(
+            text(ellipsize(name, 18))
+                .size(12)
+                .color(Color::from_rgb8(223, 230, 239)),
+        );
+        if c.simulated {
+            bar = bar.push(chip("SIMULATED", Color::from_rgb8(194, 122, 18)));
+        }
+        bar = bar.push(state_pill(c));
+        if c.snapshot.state == Some(State::EStop) {
+            bar = bar.push(primary("Reset", Message::MachineReset));
+        }
+        bar = bar.push(estop());
+    }
+    container(bar)
+        .height(MACHINE_BAR)
+        .width(Fill)
+        .padding([0, 12])
+        .center_y(MACHINE_BAR)
+        .style(|_| container::Style {
+            background: Some(Color::from_rgb8(29, 43, 58).into()),
+            ..Default::default()
+        })
+        .into()
+}
+
+/// The machine picker, Real or Simulated, Connect or Disconnect, and the
+/// question before switching to another machine while one is connected:
+/// the whole page while not connected, the Machine tab while connected.
+fn connect_controls(app: &App) -> Column<'_, Message> {
     let target = app.control_target();
-    let mut left = column![bold("Machine", 18)].spacing(10);
+    let mut col = column![].spacing(10);
     let machines: Vec<&Machine> = app
         .doc
         .machines
@@ -7096,17 +7399,19 @@ fn control(app: &App) -> Element<'_, Message> {
         .filter(|m| get(&m.p, "controller") == "UC100")
         .collect();
     if machines.is_empty() {
-        left = left
+        col = col
             .push(note("No UC100 machine yet. In the Machine library, set a machine's controller to UC100 and choose its UC100 profile file."))
             .push(btn("Machine library", Message::Page(Page::Machines), false));
     }
+    let mut picker = Row::new().spacing(6);
     for m in &machines {
-        left = left.push(btn(
+        picker = picker.push(btn(
             m.name(),
             Message::ControlMachine(m.id.clone()),
             target.is_some_and(|t| t.id == m.id),
         ));
     }
+    col = col.push(picker.wrap());
     if let (Some(c), Some(to)) = (
         &app.control,
         (app.switch_machine.as_ref()).and_then(|id| app.doc.machines.iter().find(|m| &m.id == id)),
@@ -7114,7 +7419,7 @@ fn control(app: &App) -> Element<'_, Message> {
         let from = (app.doc.machines.iter())
             .find(|m| m.id == c.machine_id)
             .map_or("the machine", |m| m.name());
-        left = left.push(
+        col = col.push(
             container(
                 column![
                     bold(format!("Switch to {}?", to.name()), 14),
@@ -7142,229 +7447,1086 @@ fn control(app: &App) -> Element<'_, Message> {
         } else {
             "Manual mill steps"
         };
-        left = left.push(secondary(steps, Message::ShowGuide));
+        col = col.push(secondary(steps, Message::ShowGuide));
     }
     if let Some(m) = target {
         let sim = crate::control::simulated(m);
-        left = left.push(muted("Connection")).push(
+        col = col.push(
             row![
+                muted("Connection"),
                 btn("Real (USB)", Message::MachineConnection(false), !sim),
                 btn("Simulated", Message::MachineConnection(true), sim),
             ]
-            .spacing(6),
+            .spacing(6)
+            .align_y(Alignment::Center),
         );
         if app.control.as_ref().is_some_and(|c| c.machine_id == m.id) {
-            left = left.push(note(if sim {
+            col = col.push(muted(if sim {
                 "Real (USB) disconnects the simulator and connects to the machine itself."
             } else {
                 "Simulated disconnects the machine (it is left in E-stop) and connects to the simulator."
             }));
         }
         // The profile is read only while disconnected, not on every 33 ms tick.
-        left = match &app.control {
-            Some(_) => left.push(secondary("Disconnect", Message::Disconnect)),
+        col = match &app.control {
+            Some(_) => col.push(secondary("Disconnect", Message::Disconnect)),
             None => match crate::control::profile(m) {
-                Ok(_) => left.push(primary("Connect", Message::Connect)),
-                Err(e) => left.push(warnings(vec![e])),
+                Ok(_) => col.push(primary("Connect", Message::Connect)),
+                Err(e) => col.push(warnings(vec![e])),
             },
         };
     } else if app.control.is_some() {
         // The machine left the library while connected: the connection is
         // still live and still ends here.
-        left = left.push(secondary("Disconnect", Message::Disconnect));
+        col = col.push(secondary("Disconnect", Message::Disconnect));
     }
-    let Some(c) = &app.control else {
-        let main: Element<_> = if app.machine_setup {
-            crate::setup::view(app)
-        } else {
-            container(muted("Not connected."))
-                .padding(16)
-                .width(Fill)
-                .into()
-        };
-        return row![
-            container(left).padding(16).width(300).style(panel_style),
-            main
-        ]
-        .spacing(12)
-        .padding(12)
-        .height(Fill)
-        .into();
-    };
+    col
+}
+/// The driver's log, the last 40 lines, newest at the bottom.
+// ponytail: the last 40 lines; keep more if someone needs older ones.
+fn machine_log(c: &crate::control::Connection) -> Element<'_, Message> {
     let s = &c.snapshot;
-    // ponytail: the last 40 log lines, newest last; a scrollable log when someone needs older lines.
-    let log = s
-        .log
-        .iter()
-        .skip(s.log.len().saturating_sub(40))
+    let log = (s.log.iter().skip(s.log.len().saturating_sub(40)))
         .fold(column![].spacing(2), |col, line| {
             col.push(text(line.clone()).size(12).font(Font::MONOSPACE))
         });
-    let left = container(
-        column![
-            left,
-            rule::horizontal(1),
-            bold("Log", 14),
-            scrollable(log).anchor_bottom().height(Fill)
-        ]
-        .spacing(10),
-    )
-    .padding(16)
-    .width(300)
-    .height(Fill)
-    .style(panel_style);
+    scrollable(log)
+        .anchor_bottom()
+        .height(Fill)
+        .width(Fill)
+        .into()
+}
+
+/// The Control page: a console that does not scroll (LIO-274). The run bar
+/// across the top; under it the hands on the left (position, jog, spindle
+/// and feed), always there; one task at a time in the centre's tabs; the
+/// operations on the right. Not connected, the machine to connect to.
+fn control(app: &App) -> Element<'_, Message> {
+    // A setup on the manual mill or the lathe shows its steps, with or
+    // without the CNC connected.
+    if app.steps_page() {
+        return crate::steps::view(app);
+    }
     if app.machine_setup {
-        return row![left, crate::setup::view(app)]
+        let mut col = column![bold("Machine", 18), connect_controls(app)].spacing(10);
+        if let Some(c) = &app.control {
+            col = col
+                .push(rule::horizontal(1))
+                .push(bold("Log", 14))
+                .push(machine_log(c));
+        }
+        let sidebar = container(col)
+            .padding(16)
+            .width(300)
+            .height(Fill)
+            .style(panel_style);
+        return row![sidebar, crate::setup::view(app)]
             .spacing(12)
             .padding(12)
             .height(Fill)
             .into();
     }
-    let mut head = row![bold(
-        s.state.as_ref().map_or("Connecting…", State::label),
-        28
-    )]
-    .spacing(12)
-    .align_y(Alignment::Center);
-    if c.simulated {
-        head = head.push(
-            container(bold("SIMULATED", 12).color(Color::WHITE))
-                .padding([4, 8])
-                .style(|_| container::Style {
-                    background: Some(Color::from_rgb8(196, 120, 20).into()),
-                    border: Border {
-                        radius: 4.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }),
+    let Some(c) = &app.control else {
+        return container(
+            container(
+                column![
+                    bold("Machine", 18),
+                    connect_controls(app),
+                    muted("Not connected.")
+                ]
+                .spacing(12),
+            )
+            .padding(18)
+            .width(460)
+            .style(panel_style),
+        )
+        .padding(24)
+        .center_x(Fill)
+        .height(Fill)
+        .into();
+    };
+    column![
+        run_bar(app, c),
+        row![
+            hands(c),
+            centre(app, c),
+            container(program(app, c)).width(PROGRAM).height(Fill)
+        ]
+        .spacing(10)
+        .padding(10)
+        .height(Fill)
+    ]
+    .height(Fill)
+    .into()
+}
+
+/// The green Cycle Start button, greyed out without a message.
+fn cycle_start<'a>(msg: Option<Message>) -> Element<'a, Message> {
+    let on = msg.is_some();
+    let b = button(
+        bold("Cycle Start", 14)
+            .color(Color::WHITE)
+            .width(Fill)
+            .align_x(Alignment::Center),
+    )
+    .width(132)
+    .on_press_maybe(msg.clone())
+    .padding([10, 14])
+    .style(move |_, status| button::Style {
+        background: Some(
+            if !on {
+                Color::from_rgb8(166, 186, 176)
+            } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+                Color::from_rgb8(28, 108, 74)
+            } else {
+                GREEN
+            }
+            .into(),
+        ),
+        text_color: Color::WHITE,
+        border: Border {
+            radius: 4.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    match msg {
+        Some(m) => HelpButton::new(b, &m, "Cycle Start").into(),
+        None => b.into(),
+    }
+}
+
+/// The setups the run bar lists for machine `machine_id`: those that use
+/// it, except a manual mill's, which have steps instead of a run.
+pub(crate) fn run_setups<'a>(doc: &'a Document, machine_id: &str) -> Vec<(usize, &'a Setup)> {
+    (doc.setups.iter().enumerate())
+        .filter(|(_, x)| x.machine.id == machine_id && !crate::manual::is_hand(&x.machine))
+        .collect()
+}
+/// A setup as the run bar names it.
+fn setup_label(si: usize, x: &Setup) -> String {
+    format!(
+        "{}. {}{}",
+        si + 1,
+        x.name(),
+        crate::indexed::label(x)
+            .map(|a| format!(" · {a}"))
+            .unwrap_or_default()
+    )
+}
+
+/// What the run bar says: the line of what comes next, is being cut, or
+/// what holds Cycle Start back (the first reason; all of them on hover and
+/// under the operations), as its parts and colours.
+pub(crate) fn run_line(
+    app: &App,
+    c: &crate::control::Connection,
+) -> (Vec<(String, Color)>, Vec<String>) {
+    use uc100::controller::State;
+    let s = &c.snapshot;
+    let state = s.state.as_ref();
+    let plain = |t: &str| vec![(t.to_string(), INK)];
+    if state == Some(&State::EStop) {
+        let why = s
+            .estop_reason
+            .clone()
+            .unwrap_or_else(|| "press Reset to enable the machine.".into());
+        return (vec![(format!("E-stop: {why}"), ERROR[1])], vec![]);
+    }
+    if let Some(State::Paused(reason)) = state {
+        return (vec![(format!("Paused: {reason}"), AMBER)], vec![]);
+    }
+    if run_setups(&app.doc, &c.machine_id).is_empty() {
+        return (
+            plain(
+                "No setup uses this machine: in MANUFACTURE, choose it as a setup's machine to run that setup here.",
+            ),
+            vec![],
         );
     }
-    if s.state == Some(State::EStop) {
-        head = head.push(primary("Reset", Message::MachineReset));
-    }
-    // Fixed above the part of the page that scrolls: the state, the E-stop
-    // and the Run strip, so Cycle Start, Hold, Resume and Stop never scroll
-    // out of sight below the tool-run list or the manual controls (#71).
-    let mut fixed = column![head.push(estop())].spacing(12).width(Fill);
-    if s.state == Some(State::EStop)
-        && let Some(reason) = &s.estop_reason
-    {
-        fixed = fixed.push(text(reason.clone()).size(13));
-    }
-    let fixed = fixed.push(run_strip(app, c));
-    let mut main = column![].spacing(12).width(Fill);
-    if let Some(id) = &s.identity {
-        let v = |o: &Option<String>| o.clone().unwrap_or_else(|| "?".into());
-        main = main.push(muted(format!(
-            "UC100 firmware {} · hardware {} · bootloader {}",
-            v(&id.firmware),
-            v(&id.hardware_id),
-            v(&id.bootloader)
-        )));
-    }
-    let (unlimited, unset) = (c.unlimited_axes(), c.unset_limited_axes());
-    let limits: Element<_> =
-        if let Some((heading, lines)) = limits_off_warning(&unlimited, &unset, c.home_switches()) {
-            caution(heading, lines)
-        } else {
-            let range = |a: usize| {
-                let x = c.config.axes.get(a)?;
-                Some(format!("{} {}…{}", AXES[a], x.soft_min?, x.soft_max?))
-            };
-            let ranges: Vec<String> = (0..3).filter_map(range).collect();
-            // A rotary axis's range is in degrees, after the mm.
-            let angles: String = (3..6)
-                .filter_map(range)
-                .map(|r| format!(", {r}°"))
-                .collect();
-            muted(format!("Soft limits on: {} mm{angles}.", ranges.join(", ")))
-                .color(Color::from_rgb8(39, 130, 93))
-                .into()
-        };
-    main = main.push(limits);
-    // The setup picked to run, beside its tool runs, with the machine's tool
-    // while a tool run cuts: MANUFACTURE is out of reach while it moves.
-    let job = c
-        .run
-        .as_ref()
-        .filter(|r| {
-            app.doc
-                .setups
-                .get(r.setup)
-                .is_some_and(|x| x.id == app.doc.active)
-        })
-        .and_then(|_| scene(app, None))
-        .map(|view| {
-            machine_panel(
-                "Job",
-                column![
-                    container(view).height(360),
-                    (app.doc.active_setup().and_then(crate::indexed::label))
-                        .map(|a| muted(format!("{} at {a}", app.doc.setup().name()))),
-                    muted("Drag to orbit · right-drag to pan · scroll to zoom. The machine's tool is red while a tool run cuts, and the stock is cut away where it goes."),
-                    uncut_line(app).map(muted),
-                    uncut_legend(app)
-                ],
-            )
-        });
-    main = match (run_panel(app, c), job) {
-        (Some(runs), Some(job)) => main.push(row![runs, job].spacing(12)),
-        (Some(runs), None) => main.push(runs),
-        (None, Some(job)) => main.push(job),
-        (None, None) => main,
+    let Some(run) = &c.run else {
+        return (
+            plain("Pick a setup to run: it is checked as export would check it."),
+            vec![],
+        );
     };
-    let enabled: Vec<usize> = (0..6).filter(|&a| s.axes_enabled[a]).collect();
-    let mono = |v: String| text(v).size(14).font(Font::MONOSPACE).width(110);
-    let mut table = column![row![
-        bold("Axis", 12).width(50),
-        bold("Machine", 12).width(110),
-        bold(format!("Work (G{})", 54 + s.active_wcs), 12).width(110),
-        bold("Position set", 12)
-    ]]
-    .spacing(4);
-    for &i in &enabled {
-        table = table.push(row![
-            text(AXES[i]).size(14).width(50),
-            mono(reading(i, s.machine_pos[i])),
-            mono(reading(i, s.work_pos[i])),
-            text(if s.referenced[i] { "Yes" } else { "No" }).size(14),
-        ]);
-    }
-    let idle = |a: Action| c.idle().then_some(Message::Machine(a));
-    // A declared position references only an axis without a home switch.
-    let declared: Vec<usize> = enabled
-        .iter()
-        .copied()
-        .filter(|&a| c.switchless(a))
-        .collect();
-    let mut zero = column![bold("Machine zero", 13)].spacing(10);
-    if !declared.is_empty() {
-        let mut here = row![act(
-            "Set machine zero here",
-            idle(Action::MachineZero(None)),
-            false
-        )]
-        .spacing(6)
-        .align_y(Alignment::Center)
-        .push(muted("or one axis"));
-        for &a in &declared {
-            here = here.push(act(AXES[a], idle(Action::MachineZero(Some(a))), false));
+    let programs = match run.programs.as_deref() {
+        None if run.stale => return (plain(crate::run::CHECK_WAITS), vec![]),
+        None => {
+            return (
+                plain("Checking the setup: simulating the job up to it…"),
+                vec![],
+            );
         }
-        zero = zero.push(here).push(act(
-            "Keep the last position",
-            idle(Action::KeepPosition),
+        Some(Err(problems)) => {
+            let first = problems.first().cloned().unwrap_or_default();
+            return (
+                vec![("This setup cannot run: ".into(), AMBER), (first, AMBER)],
+                problems.clone(),
+            );
+        }
+        Some(Ok(programs)) => programs,
+    };
+    if let Some((p, op, block)) = run.progress(s.current_line) {
+        let i = run.running.as_ref().map_or(0, |r| r.index);
+        let blocks = run.running_blocks().map_or(1, <[_]>::len);
+        return (
+            vec![
+                ("Cutting ".into(), INK),
+                (p.ops[op].name.clone(), INK),
+                (
+                    format!(
+                        " · tool run {} of {} · operation {} of {} · block {} of {blocks}",
+                        i + 1,
+                        programs.len(),
+                        op + 1,
+                        p.ops.len(),
+                        block + 1
+                    ),
+                    MUTED,
+                ),
+            ],
+            vec![],
+        );
+    }
+    let mut problems = run.problems(c, &app.doc);
+    problems.extend(app.planning_busy().map(String::from));
+    let mut parts = match (run.tool_change(), programs.get(run.next)) {
+        (Some(p), _) => {
+            let o = &p.ops[0];
+            vec![(
+                format!(
+                    "Tool change: {} for {}",
+                    crate::model::tool_label(o.tool, &o.tool_name),
+                    o.name
+                ),
+                INK,
+            )]
+        }
+        (None, Some(p)) => {
+            let o = &p.ops[run.from.min(p.ops.len() - 1)];
+            vec![(
+                format!(
+                    "Next: {} · {}",
+                    o.name,
+                    crate::model::tool_label(o.tool, &o.tool_name)
+                ),
+                INK,
+            )]
+        }
+        (None, None) => vec![],
+    };
+    match problems.first() {
+        Some(first) if parts.is_empty() => parts.push((first.clone(), INK)),
+        Some(first) => parts.push((format!("   ✗ {first}"), AMBER)),
+        None => parts.push(("   ✓ ready for Cycle Start".into(), GREEN)),
+    }
+    (parts, problems)
+}
+
+/// The run bar across the top of the Control page, one fixed height: the
+/// setup to run, what comes next or is being cut (or what holds Cycle Start
+/// back), the setup's progress and time left, and Cycle Start, Hold,
+/// Resume and Stop now, always in the same places, greyed when they cannot
+/// be used (LIO-274).
+pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Message> {
+    use crate::run::Action as R;
+    use uc100::controller::State;
+    let s = &c.snapshot;
+    let state = s.state.as_ref();
+    let msg = |on: bool, a: R| on.then_some(Message::Run(a));
+    let setups = run_setups(&app.doc, &c.machine_id);
+    let picked = c.run.as_ref().map(|r| r.setup);
+    let labels: Vec<String> = setups.iter().map(|(si, x)| setup_label(*si, x)).collect();
+    let index: Vec<usize> = setups.iter().map(|(si, _)| *si).collect();
+    let current = picked
+        .and_then(|p| index.iter().position(|&si| si == p))
+        .map(|k| labels[k].clone());
+    let picker: Element<_> = if setups.is_empty() || c.setup_locked() {
+        container(
+            text(current.clone().unwrap_or_else(|| "No setup".into()))
+                .size(13)
+                .wrapping(Wrapping::None),
+        )
+        .width(200)
+        .clip(true)
+        .into()
+    } else {
+        let options = labels.clone();
+        help::wrap(
+            pick_list(labels, current, move |l: String| {
+                let k = options.iter().position(|o| *o == l).unwrap_or(0);
+                Message::Run(R::Setup(index[k]))
+            })
+            .placeholder("Pick a setup")
+            .text_size(13)
+            .width(200)
+            .style(choice_style),
+            help::command(&Message::Run(R::Setup(0)), "Setup to run".into()),
+            widget::tooltip::Position::Bottom,
+        )
+    };
+    let (parts, problems) = run_line(app, c);
+    let mut line = Row::new();
+    let mut left = 118usize;
+    for (t, color) in parts {
+        let cut = ellipsize(&t, left.max(1));
+        left = left.saturating_sub(cut.chars().count());
+        line = line.push(text(cut).size(13).color(color).wrapping(Wrapping::None));
+    }
+    let line = container(line).width(Fill).clip(true);
+    let line: Element<_> = if problems.is_empty() {
+        line.into()
+    } else {
+        help::wrap(
+            line,
+            Help::text("Before Cycle Start", problems.join("\n")),
+            widget::tooltip::Position::Bottom,
+        )
+    };
+    let (done, times) = match c.run.as_ref().and_then(|r| run_times(r, s)) {
+        Some((done, short, long)) => (
+            done,
+            help::wrap(
+                text(short).size(12).color(MUTED).wrapping(Wrapping::None),
+                Help::text("Time left", long),
+                widget::tooltip::Position::Bottom,
+            ),
+        ),
+        None => (0., Element::from(space().width(0))),
+    };
+    let what = column![
+        line,
+        row![
+            widget::progress_bar(0.0..=1.0, done).girth(8),
+            container(times).width(Length::Shrink)
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center)
+    ]
+    .spacing(6)
+    .width(Fill);
+    let run = c.run.as_ref();
+    let can_start = run.is_some_and(|r| {
+        r.checked().is_some() && r.problems(c, &app.doc).is_empty() && app.planning_busy().is_none()
+    });
+    let big =
+        |label: &str, m: Option<Message>| act_with(label.to_string(), m, false, None, [11, 14]);
+    let buttons = row![
+        cycle_start(can_start.then_some(Message::Run(R::CycleStart))),
+        big(
+            "Hold",
+            msg(run.is_some() && state == Some(&State::Run), R::Hold)
+        ),
+        big(
+            "Resume",
+            msg(
+                run.is_some() && matches!(state, Some(State::Hold | State::Paused(_))),
+                R::Resume
+            )
+        ),
+        space().width(14),
+        big(
+            "Stop now",
+            msg(run.is_some() && crate::run::busy(state), R::Stop)
+        ),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+    container(
+        row![picker, what, buttons]
+            .spacing(16)
+            .align_y(Alignment::Center),
+    )
+    .height(RUN_BAR)
+    .width(Fill)
+    .padding([0, 12])
+    .center_y(RUN_BAR)
+    .style(|_| container::Style {
+        background: Some(Color::WHITE.into()),
+        border: Border {
+            color: LINE,
+            width: 1.,
+            radius: 0.into(),
+        },
+        text_color: Some(INK),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The run bar's times: how much of the setup is cut (0 to 1), a short line
+/// (the setup's estimate and what is left), and in full what is left of
+/// the tool run and its operation and what the estimate counts. None until
+/// the check is timed.
+fn run_times(
+    run: &crate::run::Run,
+    s: &uc100::controller::Snapshot,
+) -> Option<(f32, String, String)> {
+    use crate::run::clock;
+    let total = run.setup_time()?;
+    let left = run.left(s)?;
+    let count = run.checked()?.len();
+    let done = if total > 0. {
+        (1. - left.setup / total).clamp(0., 1.)
+    } else {
+        0.
+    };
+    let short = format!("Setup {} · {} left", clock(total), clock(left.setup));
+    let mut parts = vec![format!("Setup {} in all", clock(total))];
+    let running = run.running.as_ref();
+    let i = running.map_or(run.next, |r| r.index);
+    if i >= count {
+        parts.push("all tool runs cut".into());
+    } else {
+        parts.push(format!("{} left", clock(left.setup)));
+        parts.push(format!("tool run {}: {} left", i + 1, clock(left.run)));
+        if let Some((op, op_left, op_all)) = left.op {
+            parts.push(format!(
+                "operation {}: {} left of {}",
+                op + 1,
+                clock(op_left),
+                clock(op_all)
+            ));
+        }
+    }
+    let feed = (s.feed_override * 100.).round();
+    let note = if (feed - 100.).abs() < 0.5 {
+        "Estimated from the machine profile's axis speeds and accelerations, with the spindle spin-up and dwells. Manual tool changes and holds are not counted.".to_string()
+    } else {
+        format!(
+            "Estimated from the machine profile's axis speeds and accelerations, with the spindle spin-up and dwells; what is left at the feed override of {feed:.0} %, the setup in all at 100 %. Manual tool changes and holds are not counted."
+        )
+    };
+    Some((done, short, format!("{}.\n\n{note}", parts.join(" · "))))
+}
+
+/// The left column of the Control page: the position, the jog and the
+/// spindle and feed, on screen in every phase. Each card has a fixed
+/// height and every changing text one line of fixed width, so that nothing
+/// around the jog pad moves while the machine does: leaving a jog button
+/// stops the jog (LIO-274).
+fn hands(c: &crate::control::Connection) -> Element<'_, Message> {
+    column![position_card(c), jog_card(c), spindle_card(c)]
+        .spacing(10)
+        .width(HANDS)
+        .height(Fill)
+        .into()
+}
+
+/// The Position card: each axis's work position large, its machine
+/// position small with whether it is set, Zero and ½; Zero all and Go to X0
+/// Y0 under them.
+fn position_card(c: &crate::control::Connection) -> Element<'_, Message> {
+    use crate::control::Action;
+    let s = &c.snapshot;
+    let enabled: Vec<usize> = (0..6).filter(|&a| s.axes_enabled[a]).collect();
+    let manual = |a: Action| c.manual().then_some(Message::Machine(a));
+    let mono = |bold: bool| Font {
+        weight: if bold {
+            iced::font::Weight::Bold
+        } else {
+            iced::font::Weight::Normal
+        },
+        ..Font::MONOSPACE
+    };
+    let mut col = column![
+        row![
+            bold("Position", 14),
+            space().width(Fill),
+            muted(format!("Work G{}", 54 + s.active_wcs)),
+        ]
+        .align_y(Alignment::Center)
+        .height(22)
+    ];
+    let (line, size) = dro_row(enabled.len());
+    for &a in &enabled {
+        let mark: Element<_> = if s.referenced[a] {
+            text("✓").size(11).color(GREEN).into()
+        } else {
+            text("not set").size(10).color(AMBER).into()
+        };
+        let values = column![
+            text(reading(a, s.work_pos[a]))
+                .size(size)
+                .font(mono(true))
+                .width(Fill)
+                .align_x(Alignment::End)
+                .wrapping(Wrapping::None),
+            row![
+                text(format!("M {}", reading(a, s.machine_pos[a])))
+                    .size(11)
+                    .font(mono(false))
+                    .color(MUTED)
+                    .width(Fill)
+                    .align_x(Alignment::End)
+                    .wrapping(Wrapping::None),
+                container(mark).width(40),
+            ]
+            .spacing(4)
+        ]
+        .width(DRO_VALUE);
+        col = col.push(
+            container(
+                row![
+                    bold(AXES[a], 18).width(20),
+                    values,
+                    space().width(Fill),
+                    small("Zero", manual(Action::WorkZero(Some(a))), false),
+                    small("½", manual(Action::WorkHalf(a)), false),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .height(line)
+            .center_y(line),
+        );
+    }
+    let mut foot = row![small("Zero all", manual(Action::WorkZero(None)), false)]
+        .spacing(6)
+        .align_y(Alignment::Center);
+    if c.axis(0) && c.axis(1) {
+        let to = c.to_work_xy();
+        foot = foot.push(small(
+            "Go to X0 Y0",
+            to.as_ref()
+                .is_ok()
+                .then_some(Message::Machine(Action::ToWorkXY)),
             false,
         ));
+        if let (Err(why), true) = (to, c.manual()) {
+            foot = foot.push(hint("Go to X0 Y0", why, 30));
+        }
     }
-    if c.home_switches() {
-        zero = zero.push(act("Home", idle(Action::Home), false));
+    col = col.push(container(foot).height(32).center_y(32));
+    card(col, Some(position_height(enabled.len())))
+}
+/// The Position card's height for `axes` axes.
+fn position_height(axes: usize) -> f32 {
+    22. + dro_row(axes).0 * axes as f32 + 32. + 22.
+}
+
+/// The key that jogs `axis` toward `negative` (`main::jog_key`), as the jog
+/// button's tooltip names it.
+pub(crate) fn jog_key_name(axis: usize, negative: bool) -> &'static str {
+    match (axis, negative) {
+        (0, true) => "← Left arrow",
+        (0, false) => "→ Right arrow",
+        (1, false) => "↑ Up arrow",
+        (1, true) => "↓ Down arrow",
+        (2, false) => "Page Up",
+        (2, true) => "Page Down",
+        (3, false) => "Home",
+        _ => "End",
     }
-    if let Some(pins) = pin_block(c) {
-        zero = zero.push(pins);
+}
+
+/// The Jog card: the step, the pad and the speed. Hold a button to jog;
+/// letting go, anywhere, or leaving the button stops it. Each button's
+/// tooltip names its key; the keys jog while the pad is on screen
+/// (`App::jog_pad_shown`).
+fn jog_card(c: &crate::control::Connection) -> Element<'_, Message> {
+    use crate::control::Action;
+    use uc100::controller::State;
+    let s = &c.snapshot;
+    let can_jog = c.manual() || s.state == Some(State::Jog);
+    let a_axis = c.axis(3);
+    let keys = if a_axis {
+        "Hold a button, an arrow key (X, Y), Page Up/Down (Z) or Home/End (A) to jog, and let go to stop. The keys jog while the Control page is open and no text field is being edited."
+    } else {
+        "Hold a button, an arrow key (X, Y) or Page Up/Down (Z) to jog, and let go to stop. The keys jog while the Control page is open and no text field is being edited."
+    };
+    let badge = container(
+        text(if can_jog { "keys jog" } else { "locked" })
+            .size(11)
+            .color(if can_jog { GREEN } else { MUTED }),
+    )
+    .padding([1, 7])
+    .style(move |_| container::Style {
+        background: Some(
+            if can_jog {
+                Color::from_rgb8(230, 244, 236)
+            } else {
+                Color::from_rgb8(237, 240, 244)
+            }
+            .into(),
+        ),
+        border: Border {
+            radius: 9.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let head = row![
+        bold("Jog", 14),
+        container(help::wrap(
+            badge,
+            Help::text("Jog keys", keys),
+            widget::tooltip::Position::Right
+        ))
+        .width(70),
+        help::wrap(
+            slider(1.0..=100.0, c.jog_speed, |v| Message::Machine(
+                Action::JogSpeed(v)
+            ))
+            .step(1.0_f32),
+            help::command(&Message::Machine(Action::JogSpeed(0.)), "Jog speed".into()),
+            widget::tooltip::Position::Top,
+        ),
+        help::wrap(
+            text(format!("{:.0} %", c.jog_speed))
+                .size(11)
+                .color(MUTED)
+                .width(36)
+                .align_x(Alignment::End)
+                .wrapping(Wrapping::None),
+            Help::text(
+                "Jog speed",
+                format!("X jogs at {:.0} mm/min at this speed.", c.jog_feed(0))
+            ),
+            widget::tooltip::Position::Top,
+        ),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .height(22);
+    let mut modes = row![small(
+        "Cont.",
+        Some(Message::Machine(Action::JogStep(None))),
+        c.jog_step.is_none()
+    )]
+    .spacing(4);
+    for step in [0.01, 0.1, 1., 10.] {
+        modes = modes.push(small(
+            if step == 10. {
+                "10 mm".to_string()
+            } else {
+                format!("{step}")
+            },
+            Some(Message::Machine(Action::JogStep(Some(step)))),
+            c.jog_step == Some(step),
+        ));
     }
+    let mut col = column![head, modes].spacing(7);
+    // A steps in degrees, on its own row: a step in mm means nothing to it.
+    if a_axis {
+        let mut angles = row![
+            text("A").size(12).width(14),
+            small(
+                "Cont.",
+                Some(Message::Machine(Action::JogAngle(None))),
+                c.jog_angle.is_none()
+            )
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center);
+        for step in [0.1, 1., 15., 90.] {
+            angles = angles.push(small(
+                format!("{step}°"),
+                Some(Message::Machine(Action::JogAngle(Some(step)))),
+                c.jog_angle == Some(step),
+            ));
+        }
+        // Why A does not jog, in the row's own width: nothing moves.
+        angles = angles.push(one_line(
+            "A",
+            c.jog_blocked(3).unwrap_or_default(),
+            11,
+            AMBER,
+            14,
+        ));
+        col = col.push(angles);
+    }
+    let (w, h) = JOG;
+    let jog = |axis: usize, negative: bool| -> Element<'_, Message> {
+        if !c.axis(axis) {
+            return space().width(w).height(h).into();
+        }
+        let can_jog = can_jog && c.jog_blocked(axis).is_none();
+        let held = c.held() == Some((axis, negative));
+        let label = format!("{}{}", AXES[axis], if negative { "−" } else { "+" });
+        let face = container(bold(label, 14).color(if held {
+            Color::WHITE
+        } else if can_jog {
+            INK
+        } else {
+            MUTED
+        }))
+        .center_x(w)
+        .center_y(h)
+        .style(move |_| container::Style {
+            background: Some(
+                if held {
+                    BLUE
+                } else if can_jog {
+                    Color::from_rgb8(244, 246, 249)
+                } else {
+                    BG
+                }
+                .into(),
+            ),
+            border: Border {
+                color: if held { BLUE } else { BUTTON_EDGE },
+                width: 1.,
+                radius: 6.into(),
+            },
+            ..Default::default()
+        });
+        let release = Message::Machine(Action::JogRelease);
+        // The key's tooltip floats over the page: it moves nothing.
+        widget::tooltip(
+            mouse_area(face)
+                .on_press(Message::Machine(Action::JogPress(axis, negative)))
+                .on_release(release.clone())
+                .on_exit(release),
+            container(
+                text(jog_key_name(axis, negative))
+                    .size(12)
+                    .color(Color::WHITE),
+            )
+            .padding([3, 8])
+            .style(|_| container::Style {
+                background: Some(Color::from_rgb8(29, 43, 58).into()),
+                border: Border {
+                    radius: 5.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            widget::tooltip::Position::Top,
+        )
+        .gap(4)
+        .into()
+    };
+    let label = |t: &'static str| {
+        container(text(t).size(11).color(DIMMED_TEXT))
+            .center_x(w)
+            .center_y(h)
+    };
+    let gap = || space().width(w).height(h);
+    let mut pad = row![
+        column![gap(), jog(0, true), gap()].spacing(6),
+        column![jog(1, false), label("XY"), jog(1, true)].spacing(6),
+        column![gap(), jog(0, false), gap()].spacing(6),
+        space().width(10),
+        column![jog(2, false), label("Z"), jog(2, true)].spacing(6),
+    ]
+    .spacing(6);
+    if a_axis {
+        pad = pad
+            .push(space().width(10))
+            .push(column![jog(3, false), label("A"), jog(3, true)].spacing(6));
+    }
+    col = col.push(container(pad).center_x(Fill));
+    card(col, Some(jog_height(a_axis)))
+}
+/// The Jog card's height, with or without A.
+fn jog_height(a_axis: bool) -> f32 {
+    let rows = 22. + 7. + 26. + 7. + (JOG.1 * 3. + 12.) + 22.;
+    if a_axis { rows + 7. + 26. } else { rows }
+}
+
+/// The Spindle and feed card: the spindle's state, speed and direction,
+/// Spindle off, the coolant, the feed override and the feed now.
+fn spindle_card(c: &crate::control::Connection) -> Element<'_, Message> {
+    use crate::control::Action;
+    use uc100::gcode::Spindle;
+    let s = &c.snapshot;
+    let start = |state| {
+        (c.spindle_ok(state) && c.rpm_value().is_some())
+            .then_some(Message::Machine(Action::Spindle(state)))
+    };
+    let (turning, color) = if !c.rpm.trim().is_empty() && c.rpm_value().is_none() {
+        (
+            format!("RPM 1 to {:.0}", c.config.outputs.spindle_max_rpm),
+            AMBER,
+        )
+    } else {
+        match s.spindle {
+            Some(Spindle::Cw) => (format!("CW {:.0} rpm", s.rpm), INK),
+            Some(Spindle::Ccw) => (format!("CCW {:.0} rpm", s.rpm), INK),
+            _ => ("Off".into(), MUTED),
+        }
+    };
+    let mut notes = vec![];
+    if !c.reversible() {
+        notes.push("No CCW: the profile has no spindle direction output.");
+    }
+    if c.config.outputs.flood.is_none() && c.config.outputs.mist.is_none() {
+        notes.push("The profile has no coolant outputs.");
+    }
+    let title: Element<_> = if notes.is_empty() {
+        bold("Spindle", 14).into()
+    } else {
+        help::wrap(
+            bold("Spindle", 14),
+            Help::text("Spindle and coolant", notes.join(" ")),
+            widget::tooltip::Position::Right,
+        )
+    };
+    let mut head = row![
+        title,
+        text(turning)
+            .size(14)
+            .font(Font::MONOSPACE)
+            .color(color)
+            .width(Fill)
+            .wrapping(Wrapping::None),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+    let coolant = |on: bool, label: &'static str, f: fn(bool) -> Action| {
+        checkbox(on)
+            .label(label)
+            .on_toggle(move |b| Message::Machine(f(b)))
+            .text_size(12)
+    };
+    if c.config.outputs.flood.is_some() {
+        head = head.push(coolant(s.flood, "Flood", Action::Flood));
+    }
+    if c.config.outputs.mist.is_some() {
+        head = head.push(coolant(s.mist, "Mist", Action::Mist));
+    }
+    let mut spin = row![
+        help::field(
+            text_input("RPM", &c.rpm)
+                .on_input(|v| Message::Machine(Action::Rpm(v)))
+                .width(80)
+                .padding([5, 8])
+                .size(13),
+            "control_rpm",
+            "Spindle speed · RPM",
+            Target::Machine
+        ),
+        small("CW", start(Spindle::Cw), s.spindle == Some(Spindle::Cw))
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+    if c.reversible() {
+        spin = spin.push(small(
+            "CCW",
+            start(Spindle::Ccw),
+            s.spindle == Some(Spindle::Ccw),
+        ));
+    }
+    spin = spin.push(small(
+        "Spindle off",
+        Some(Message::Machine(Action::Spindle(Spindle::Off))),
+        false,
+    ));
+    let feed = row![
+        bold("Feed", 14),
+        text(format!("{:.0} %", c.feed_override))
+            .size(13)
+            .font(Font::MONOSPACE)
+            .width(48),
+        help::wrap(
+            slider(10.0..=200.0, c.feed_override, |v| Message::Machine(
+                Action::FeedOverride(v)
+            ))
+            .step(5.0_f32),
+            help::command(
+                &Message::Machine(Action::FeedOverride(100.)),
+                "Feed override".into()
+            ),
+            widget::tooltip::Position::Top,
+        ),
+        small(
+            "100 %",
+            Some(Message::Machine(Action::FeedOverride(100.))),
+            false
+        ),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    card(
+        column![
+            head.height(24),
+            spin,
+            rule::horizontal(1),
+            feed,
+            text(format!("Feed now {:.0} mm/min", s.feed_rate))
+                .size(11)
+                .color(MUTED)
+                .wrapping(Wrapping::None),
+        ]
+        .spacing(6),
+        None,
+    )
+}
+
+/// A tab of the Control page's centre.
+fn control_tab<'a>(tab: ControlTab, shown: bool, alert: bool) -> Element<'a, Message> {
+    let color = match (shown, alert) {
+        (_, true) => AMBER,
+        (true, false) => BLUE,
+        _ => MUTED,
+    };
+    let face = text(tab.label()).size(13).color(color).font(Font {
+        weight: if shown {
+            iced::font::Weight::Semibold
+        } else {
+            iced::font::Weight::Normal
+        },
+        ..Font::DEFAULT
+    });
+    button(
+        column![
+            face,
+            container(space().height(2)).width(Fill).style(move |_| {
+                container::Style {
+                    background: shown.then(|| color.into()),
+                    ..Default::default()
+                }
+            })
+        ]
+        .spacing(7)
+        .width(Length::Shrink),
+    )
+    .padding([8, 10])
+    .on_press(Message::ControlTab(tab))
+    .style(|_, status| button::Style {
+        background: matches!(status, button::Status::Hovered | button::Status::Pressed)
+            .then(|| HOVER_BUTTON.into()),
+        ..Default::default()
+    })
+    .into()
+}
+/// The tabs the centre offers now: Tool change while one is due, Rotary A
+/// on a machine with the rotary unit.
+pub(crate) fn control_tabs(c: &crate::control::Connection) -> Vec<ControlTab> {
+    let mut tabs = vec![ControlTab::Job];
+    if phase(Some(c)) == Phase::ToolChange {
+        tabs.push(ControlTab::ToolChange);
+    }
+    tabs.extend([ControlTab::WorkZero, ControlTab::Probe]);
+    if c.rotary.is_some() && c.axis(3) {
+        tabs.push(ControlTab::Rotary);
+    }
+    tabs.extend([ControlTab::Mdi, ControlTab::Machine]);
+    tabs
+}
+/// The centre of the Control page: one task at a time in its tabs.
+fn centre<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Message> {
+    let tabs = control_tabs(c);
+    let shown = if tabs.contains(&app.control_tab) {
+        app.control_tab
+    } else {
+        ControlTab::Job
+    };
+    let mut bar = Row::new().spacing(2).align_y(Alignment::End);
+    for &t in &tabs {
+        bar = bar.push(control_tab(t, t == shown, t == ControlTab::ToolChange));
+    }
+    if shown == ControlTab::Job {
+        bar = bar.push(space().width(Fill));
+        for (view, label) in [
+            (JobView::Stock, "Stock"),
+            (JobView::Machine, "Machine"),
+            (JobView::Top, "Top"),
+        ] {
+            bar = bar.push(
+                container(small(
+                    label,
+                    Some(Message::ControlView(view)),
+                    app.control_view == view,
+                ))
+                .padding([0, 1]),
+            );
+        }
+        bar = bar.push(space().width(6));
+    }
+    let body: Element<_> = match shown {
+        ControlTab::Job => job_tab(app, c),
+        ControlTab::ToolChange => tool_change_tab(app, c),
+        ControlTab::WorkZero => work_zero_tab(app, c),
+        ControlTab::Probe => probe_tab(c),
+        ControlTab::Rotary => rotary_tab(c).unwrap_or_else(|| space().into()),
+        ControlTab::Mdi => mdi_tab(c),
+        ControlTab::Machine => machine_tab(app, c),
+    };
+    container(
+        column![
+            container(bar.align_y(Alignment::Center)).padding([0, 6]),
+            rule::horizontal(1),
+            container(body).padding([10, 14]).height(Fill).width(Fill)
+        ]
+        .height(Fill),
+    )
+    .width(Fill)
+    .height(Fill)
+    .style(panel_style)
+    .clip(true)
+    .into()
+}
+/// The safety net of a tab whose content may grow past its area (a run that
+/// starts partway on pins): it scrolls inside the tab, never the page.
+fn tab_scroll<'a>(body: Column<'a, Message>) -> Element<'a, Message> {
+    scrollable(body.padding(iced::Padding {
+        right: SCROLLBAR_GUTTER,
+        ..Default::default()
+    }))
+    .height(Fill)
+    .width(Fill)
+    .into()
+}
+
+/// The Job tab: the one 3D view, of the setup's stock as it is cut (the
+/// machine's tool red), or of the machine's travel with the tool in it.
+fn job_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Message> {
+    let picked = c.run.as_ref().filter(|r| {
+        app.doc
+            .setups
+            .get(r.setup)
+            .is_some_and(|x| x.id == app.doc.active)
+    });
+    let stock = (app.control_view != JobView::Machine && picked.is_some())
+        .then(|| scene(app, None))
+        .flatten();
+    let mut col = column![].spacing(6).height(Fill);
+    match stock {
+        Some(view) => {
+            col = col.push(container(view).height(Fill).width(Fill)).push(hint(
+                "Job",
+                format!(
+                    "{}Drag to orbit · right-drag to pan · scroll to zoom. The machine's tool is red while a tool run cuts, and the stock is cut away where it goes.",
+                    (app.doc.active_setup().and_then(crate::indexed::label))
+                        .map(|a| format!("{} at {a} · ", app.doc.setup().name()))
+                        .unwrap_or_default()
+                ),
+                110,
+            ));
+            if let Some(line) = uncut_line(app) {
+                col = col.push(hint("Completeness", line, 110));
+            }
+            if let Some(legend) = uncut_legend(app) {
+                col = col.push(legend);
+            }
+        }
+        None => {
+            col = col
+                .push(container(canvas(machine_model(app, c)).width(Fill).height(Fill)).height(Fill))
+                .push(hint(
+                    "Machine",
+                    if picked.is_none() && app.control_view != JobView::Machine {
+                        "The machine's travel, the tool in it: pick a setup in the run bar to see its stock."
+                    } else {
+                        "The box is where the tool tip can travel; the red dot is the tool tip, the green ring the work zero. Drag to turn."
+                    },
+                    110,
+                ));
+        }
+    }
+    col.into()
+}
+/// The machine's travel and the tool in it, for the Job tab.
+fn machine_model<'a>(
+    app: &'a App,
+    c: &'a crate::control::Connection,
+) -> crate::machine_view::MachineView {
+    let s = &c.snapshot;
     let (envelope, assumed) = crate::machine_view::MachineView::envelope(&c.config);
-    let model = crate::machine_view::MachineView {
+    crate::machine_view::MachineView {
         pos: [
             s.machine_pos[0] as f32,
             s.machine_pos[1] as f32,
@@ -7384,334 +8546,559 @@ fn control(app: &App) -> Element<'_, Message> {
             crate::chuck::Rig::on_machine(r.unit, sign)
         }),
         a: s.machine_pos[3] as f32,
-    };
-    let position = machine_panel(
-        "Position",
-        column![
-            table,
-            zero,
-            note(if declared.is_empty() {
-                HOME_NOTE
-            } else {
-                MACHINE_ZERO_NOTE
-            })
-        ],
-    );
-    let model = container(canvas(model).width(Fill).height(400))
-        .padding(1)
-        .width(Fill)
-        .style(panel_style);
-    let can_jog = c.manual() || s.state == Some(State::Jog);
-    let mut modes = row![act(
-        "Continuous",
-        Some(Message::Machine(Action::JogStep(None))),
-        c.jog_step.is_none()
-    )]
-    .spacing(6);
-    for step in [0.01, 0.1, 1., 10.] {
-        modes = modes.push(act(
-            format!("{step} mm"),
-            Some(Message::Machine(Action::JogStep(Some(step)))),
-            c.jog_step == Some(step),
-        ));
     }
-    // A steps in degrees, on its own row: a step in mm means nothing to it.
-    let angles = c.axis(3).then(|| {
-        let mut angles = row![
-            text("A").size(13).width(24),
-            act(
-                "Continuous",
-                Some(Message::Machine(Action::JogAngle(None))),
-                c.jog_angle.is_none()
-            )
+}
+
+/// A numbered step of the Tool change or Work zero tab: done, the one to do
+/// now, or one to come, with its buttons.
+fn step_box<'a>(
+    n: usize,
+    done: bool,
+    now: bool,
+    body: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let mark = container(
+        text(if done {
+            "✓".to_string()
+        } else {
+            n.to_string()
+        })
+        .size(12)
+        .color(if done || now { Color::WHITE } else { INK }),
+    )
+    .center_x(22)
+    .center_y(22)
+    .style(move |_| container::Style {
+        background: Some(
+            if done {
+                Color::from_rgb8(47, 138, 87)
+            } else if now {
+                Color::from_rgb8(209, 139, 22)
+            } else {
+                Color::from_rgb8(237, 240, 244)
+            }
+            .into(),
+        ),
+        border: Border {
+            radius: 11.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    container(
+        row![mark, body.into()]
+            .spacing(10)
+            .align_y(Alignment::Start),
+    )
+    .padding([7, 10])
+    .width(Fill)
+    .style(move |_| container::Style {
+        background: now.then(|| Color::from_rgb8(255, 250, 240).into()),
+        border: Border {
+            color: if now {
+                Color::from_rgb8(230, 184, 102)
+            } else {
+                LINE
+            },
+            width: 1.,
+            radius: 7.into(),
+        },
+        ..Default::default()
+    })
+    .into()
+}
+/// The reference surface's line and its buttons: Record reference, Set Z
+/// from reference, and with a probe input the same by probe. For a setup of
+/// more than one tool run.
+fn reference_rows<'a>(
+    c: &'a crate::control::Connection,
+    run: &'a crate::run::Run,
+) -> Column<'a, Message> {
+    use crate::run::Action as R;
+    let s = &c.snapshot;
+    let running = run.running.is_some();
+    let msg = |on: bool, a: R| on.then_some(Message::Run(a));
+    let manual = c.manual() && !running;
+    let set_ok = run.reference.is_some() && run.reference_a_problem(c).is_none();
+    let mut col = column![
+        row![
+            small("Record reference", msg(manual, R::RecordReference), false),
+            small(
+                "Set Z from reference",
+                msg(manual && set_ok, R::ZFromReference),
+                false
+            ),
+            muted(match (run.reference, run.reference_a) {
+                (Some(z), Some(a)) =>
+                    format!("Reference: Z {z:.3} (G{}) at A {a:.3}°", 54 + s.active_wcs),
+                (Some(z), None) => format!("Reference: Z {z:.3} (G{})", 54 + s.active_wcs),
+                (None, _) => "Reference surface: not recorded".into(),
+            })
+            .wrapping(Wrapping::None),
         ]
         .spacing(6)
-        .align_y(Alignment::Center);
-        for step in [0.1, 1., 15., 90.] {
-            angles = angles.push(act(
-                format!("{step}°"),
-                Some(Message::Machine(Action::JogAngle(Some(step)))),
-                c.jog_angle == Some(step),
-            ));
-        }
-        angles
-    });
-    // Hold to jog: a press starts it; a release, anywhere, or leaving the
-    // button stops it.
-    let jog = |axis: usize, negative: bool| -> Element<'_, Message> {
-        if !c.axis(axis) {
-            return space().width(64).height(44).into();
-        }
-        let can_jog = can_jog && c.jog_blocked(axis).is_none();
-        let held = c.held() == Some((axis, negative));
-        let label = format!("{}{}", AXES[axis], if negative { "−" } else { "+" });
-        let face = container(bold(label, 15).color(if held {
-            Color::WHITE
-        } else if can_jog {
-            INK
-        } else {
-            MUTED
-        }))
-        .center_x(64)
-        .center_y(44)
-        .style(move |_| container::Style {
-            background: Some(
-                if held {
-                    BLUE
-                } else if can_jog {
-                    Color::WHITE
-                } else {
-                    BG
-                }
-                .into(),
-            ),
-            border: Border {
-                color: if held { BLUE } else { LINE },
-                width: 1.,
-                radius: 6.into(),
-            },
-            ..Default::default()
-        });
-        let release = Message::Machine(Action::JogRelease);
-        mouse_area(face)
-            .on_press(Message::Machine(Action::JogPress(axis, negative)))
-            .on_release(release.clone())
-            .on_exit(release)
-            .into()
-    };
-    let gap = || space().width(64).height(44);
-    let pad = row![
-        column![gap(), jog(0, true), gap()].spacing(6),
-        column![jog(1, false), gap(), jog(1, true)].spacing(6),
-        column![gap(), jog(0, false), gap()].spacing(6),
-        space().width(18),
-        column![jog(2, false), gap(), jog(2, true)].spacing(6),
+        .align_y(Alignment::Center)
     ]
     .spacing(6);
-    let pad = if c.axis(3) {
-        pad.push(space().width(18))
-            .push(column![jog(3, false), gap(), jog(3, true)].spacing(6))
-    } else {
-        pad
-    };
-    let speed = row![
-        text(format!(
-            "Speed {:.0} % · X {:.0} mm/min",
-            c.jog_speed,
-            c.jog_feed(0)
-        ))
-        .size(12)
-        .width(190),
-        help::wrap(
-            slider(1.0..=100.0, c.jog_speed, |v| Message::Machine(
-                Action::JogSpeed(v)
-            ))
-            .step(1.0_f32),
-            help::command(&Message::Machine(Action::JogSpeed(0.)), "Jog speed".into()),
-            widget::tooltip::Position::Right,
-        )
-    ]
-    .spacing(10)
-    .align_y(Alignment::Center);
-    let keys = if c.axis(3) {
-        "Hold a button, an arrow key (X, Y), Page Up/Down (Z) or Home/End (A) to jog, and let go to stop. These keys jog while these controls are on screen and no text field is being edited."
-    } else {
-        "Hold a button, an arrow key (X, Y) or Page Up/Down (Z) to jog, and let go to stop. The arrow and Page keys jog while these controls are on screen and no text field is being edited."
-    };
-    let mut jog_column = column![modes];
-    if let Some(angles) = angles {
-        jog_column = jog_column.push(angles);
-    }
-    let mut jog_column = jog_column.push(pad).push(speed);
-    if let Some(why) = c.jog_blocked(3) {
-        jog_column = jog_column.push(text(why).size(12).color(Color::from_rgb8(166, 101, 32)));
-    }
-    let jog_panel = machine_panel("Jog", jog_column.push(muted(keys)));
-    let manual = |a: Action| c.manual().then_some(Message::Machine(a));
-    // A milling machine's DRO: each axis's work position with Zero, ½ and
-    // a value to set it to.
-    let mut dro = column![].spacing(6);
-    for &a in &enabled {
-        dro = dro.push(
+    if c.config.inputs.probe.is_some() {
+        let probe = c.probe_blocked().is_none() && !running;
+        col = col.push(
             row![
-                bold(AXES[a], 18).width(24),
-                // Right-aligned so the decimal points line up, as on a DRO.
-                text(reading(a, s.work_pos[a]))
-                    .size(22)
-                    .font(Font {
-                        weight: iced::font::Weight::Bold,
-                        ..Font::MONOSPACE
-                    })
-                    .width(140)
-                    .align_x(Alignment::End),
-                space().width(12),
-                act(
-                    format!("Zero {}", AXES[a]),
-                    manual(Action::WorkZero(Some(a))),
+                small("Probe reference", msg(probe, R::ProbeReference), false),
+                small(
+                    "Probe Z from reference",
+                    msg(probe && set_ok, R::ProbeFromReference),
                     false
                 ),
-                act("1/2", manual(Action::WorkHalf(a)), false),
-                help::field(
-                    text_input("Value", &c.presets[a])
-                        .on_input(move |v| Message::Machine(Action::WorkText(a, v)))
-                        .on_submit_maybe(
-                            (c.manual() && c.preset(a).is_some())
-                                .then_some(Message::Machine(Action::WorkSet(a)))
-                        )
-                        .width(80)
-                        .padding([7, 9])
-                        .size(13),
-                    "work_set",
-                    &format!(
-                        "Set {} · {}",
-                        AXES[a],
-                        if crate::control::rotary(a) {
-                            "°"
-                        } else {
-                            "mm"
-                        }
-                    ),
-                    Target::Machine
-                ),
-                act(
-                    format!("Set {}", AXES[a]),
-                    manual(Action::WorkSet(a)).filter(|_| c.preset(a).is_some()),
-                    false
+                hint(
+                    "Probe reference",
+                    if c.direct() {
+                        "The same with the plate's lead on the reference surface, which the tool touches."
+                    } else {
+                        "The same with the touch plate on the reference surface."
+                    },
+                    40
                 ),
             ]
             .spacing(6)
             .align_y(Alignment::Center),
         );
+        if let Some(note) = probe_note(c) {
+            col = col.push(note);
+        }
     }
-    let mut zeros = row![act("Zero all", manual(Action::WorkZero(None)), false)]
+    if let Some(why) = run.reference_a_problem(c).filter(|_| !running) {
+        col = col.push(hint("Reference", why, 90));
+    }
+    col
+}
+/// Touch off on the A reference, for a next tool run that turns A: its
+/// tool touched off on the Z reference the probe touched with the A
+/// centreline (LIO-207). None for one that does not turn A.
+fn a_reference_row<'a>(
+    app: &'a App,
+    c: &'a crate::control::Connection,
+    run: &'a crate::run::Run,
+) -> Option<Element<'a, Message>> {
+    use crate::run::Action as R;
+    let p =
+        (run.checked()?.get(run.next)).filter(|p| !crate::run::a_angles(&p.blocks).is_empty())?;
+    let running = run.running.is_some();
+    let o = &p.ops[0];
+    let ready = c.a_reference(&app.doc);
+    let said = match run.length.as_ref().filter(|(id, ..)| *id == o.tool_id) {
+        Some((_, d, _)) => format!(
+            "T{} is touched off on the A centreline's Z reference: its tip is {:.3} mm {} the probe's, and its work Z is on the centreline.",
+            o.tool,
+            d.abs(),
+            if *d >= 0. { "under" } else { "over" }
+        ),
+        None => format!(
+            "T{} {}: with it in the spindle, jog over the Z reference the probe touched with the A centreline, put the touch plate on it and press Touch off on the A reference. That sets its work Z on the centreline, whatever its length.",
+            o.tool, o.tool_name
+        ),
+    };
+    let mut col = column![
+        row![
+            small(
+                "Touch off on the A reference",
+                (ready.is_ok() && !running).then_some(Message::Run(R::ProbeCentreReference)),
+                false
+            ),
+            hint("A reference", said, 60),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+    ]
+    .spacing(4);
+    if let (Err(why), false) = (&ready, running) {
+        col = col.push(hint("A reference", why.clone(), 90));
+    }
+    Some(col.into())
+}
+
+/// The Tool change tab, while the next tool run wants another tool: what
+/// to do, step by step, with its buttons; it opens by itself when the tool
+/// change is due.
+fn tool_change_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Message> {
+    let Some(run) = c.run.as_ref() else {
+        return space().into();
+    };
+    let (Some(p), Some(programs)) = (run.tool_change(), run.checked()) else {
+        return muted("No tool change is due.").into();
+    };
+    let s = &c.snapshot;
+    let o = &p.ops[0];
+    let new = crate::model::tool_label(o.tool, &o.tool_name);
+    let old = (run.next.checked_sub(1))
+        .and_then(|i| programs.get(i))
+        .map(|q| crate::model::tool_label(q.ops[0].tool, &q.ops[0].tool_name));
+    let recorded = run.reference.is_some();
+    let touched = run.touched;
+    let mut col = column![
+        row![
+            chip("TOOL CHANGE", Color::from_rgb8(209, 139, 22)),
+            bold(
+                format!(
+                    "{}next {new} for tool run {}: {}",
+                    old.map(|o| format!("{o} done · ")).unwrap_or_default(),
+                    run.next + 1,
+                    o.name
+                ),
+                14
+            )
+            .wrapping(Wrapping::None),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+    ]
+    .spacing(8);
+    col = col.push(step_box(
+        1,
+        true,
+        false,
+        text("The last tool run ended with the spindle and coolant off at the clearance plane. X and Y zero stay as they are.").size(12),
+    ));
+    col = col.push(step_box(
+        2,
+        recorded,
+        !recorded,
+        column![
+            text("If no reference is recorded, touch the old tool on a surface that stays put (a vise jaw, the table, a block) and record it.").size(12),
+            reference_rows(c, run)
+        ]
+        .spacing(6),
+    ));
+    col = col.push(step_box(
+        3,
+        touched,
+        recorded && !touched,
+        text(format!(
+            "Jog up and put in {new}, stickout {:.1} mm. Jog is live on the left.",
+            o.stickout
+        ))
+        .size(12),
+    ));
+    let mut four = column![text("Touch the new tool on the same surface and press Set Z from reference above (or Probe Z from reference), or Zero Z on the stock top if no tool run has cut it.").size(12)].spacing(6);
+    let with_a = app
+        .doc
+        .setups
+        .get(run.setup)
+        .is_some_and(|x| x.machine.has_a())
+        && c.axis(3);
+    if with_a {
+        // A turns the stock and the chuck: a reference on them is touched
+        // off at the angle it was recorded at.
+        let first = crate::run::a_angles(&p.blocks);
+        let back = match first.first() {
+            Some(a) => format!(
+                "Cycle Start's first moves retract Z, then turn A alone back to {}° for this tool run. It turns A, so touch the new tool off with Touch off on the A reference: Set Z from reference does not relate it to the probed centreline.",
+                crate::indexed::degrees(*a)
+            ),
+            None => "This tool run does not turn A: turn A back to A0 before Cycle Start.".into(),
+        };
+        four = four.push(hint(
+            "A axis",
+            match run.reference_a {
+                Some(ra) => format!(
+                    "A axis: the reference was recorded with A at {ra:.3}°. Touch the new tool off with A there (Set Z from reference waits for it), then {}",
+                    back[..1].to_lowercase() + &back[1..]
+                ),
+                None => format!(
+                    "A axis: record the reference and touch both tools off at the same A angle; A where it is now ({:.3}°) will do. {back}",
+                    s.work_pos[3]
+                ),
+            },
+            100,
+        ));
+    }
+    if let Some(row) = a_reference_row(app, c, run) {
+        four = four.push(row);
+    }
+    col = col.push(step_box(4, false, touched, four));
+    col = col.push(step_box(
+        5,
+        false,
+        false,
+        text(format!(
+            "Jog clear and press Cycle Start: it continues with {}.",
+            o.name
+        ))
+        .size(12),
+    ));
+    tab_scroll(col)
+}
+
+/// The Work zero tab: each axis set to a value, the work system, the work
+/// zero on the stock for the setup picked, step by step until its first
+/// tool run, and the reference surface for its tool changes.
+fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Message> {
+    use crate::control::Action;
+    use crate::run::Action as R;
+    let s = &c.snapshot;
+    let idle = |a: Action| c.idle().then_some(Message::Machine(a));
+    let manual = |a: Action| c.manual().then_some(Message::Machine(a));
+    let mut set = row![muted("Set").width(28)]
         .spacing(6)
         .align_y(Alignment::Center);
-    if c.axis(0) && c.axis(1) {
-        let to = c.to_work_xy();
-        // A move, apart from the buttons that only set offsets.
-        zeros = zeros.push(space().width(18)).push(act(
-            "Go to X0 Y0",
-            to.is_ok().then_some(Message::Machine(Action::ToWorkXY)),
-            false,
-        ));
-        zeros = zeros.push(muted(match (to, c.manual()) {
-            (Err(why), true) => why,
-            _ => "Rapid at the current Z: lift Z clear of the part first.".into(),
-        }));
+    for a in (0..6).filter(|&a| s.axes_enabled[a]) {
+        set = set
+            .push(help::field(
+                text_input(AXES[a], &c.presets[a])
+                    .on_input(move |v| Message::Machine(Action::WorkText(a, v)))
+                    .on_submit_maybe(
+                        (c.manual() && c.preset(a).is_some())
+                            .then_some(Message::Machine(Action::WorkSet(a))),
+                    )
+                    .width(70)
+                    .padding([5, 8])
+                    .size(13),
+                "work_set",
+                &format!(
+                    "Set {} · {}",
+                    AXES[a],
+                    if crate::control::rotary(a) {
+                        "°"
+                    } else {
+                        "mm"
+                    }
+                ),
+                Target::Machine,
+            ))
+            .push(small(
+                format!("Set {}", AXES[a]),
+                manual(Action::WorkSet(a)).filter(|_| c.preset(a).is_some()),
+                false,
+            ))
+            .push(space().width(6));
     }
-    let mut systems = row![].spacing(4);
+    let mut systems = row![muted("Work system").width(80)]
+        .spacing(4)
+        .align_y(Alignment::Center);
     for i in 0..6 {
-        systems = systems.push(act(
+        systems = systems.push(small(
             format!("G{}", 54 + i),
             idle(Action::Wcs(i)),
             s.active_wcs == i,
         ));
     }
-    // What stops every probe, said once under the heading; each button
-    // below says only what stops it alone.
+    let mut col = column![
+        set,
+        systems,
+        hint(
+            "Work zero",
+            "Zero makes the current position work zero in the active coordinate system; ½ halves the position shown, Set gives it the value typed. For the middle of a part by hand, zero X with an edge finder on its left side, touch its right side and press ½ on X. G54 to G59 each keep their own; they change only while Idle.",
+            110
+        ),
+    ]
+    .spacing(8);
+    let Some(run) = &c.run else {
+        return tab_scroll(col.push(muted(
+            "Pick a setup in the run bar: its work zero on the stock is set here.",
+        )));
+    };
+    let running = run.running.is_some();
+    if let Some(steps) = work_zero_steps(app, c) {
+        // The buttons act on the checked setup the steps are from, which an
+        // edit may have changed: like the probes, they wait while its check
+        // is out of date, and say so (#39).
+        let checked = c.run_program();
+        let mut buttons = row![].spacing(6).align_y(Alignment::Center);
+        if c.sim_zero().is_some() {
+            let ready = checked.is_ok() && c.idle() && c.unset_limited_axes().is_empty();
+            buttons = buttons.push(small(
+                "Move there",
+                ready.then_some(Message::Machine(Action::ToSimZero)),
+                false,
+            ));
+        }
+        let manual = checked.is_ok() && c.manual();
+        let pins = checked.as_ref().is_ok_and(|p| p.pins.is_some());
+        if pins {
+            buttons = buttons.push(small(
+                "Set X Y from the pins",
+                (manual && c.pin_offset().is_ok()).then_some(Message::Machine(Action::PinZero)),
+                false,
+            ));
+        }
+        let blocked = c.partway_blocked();
+        buttons = buttons.push(match c.touch_off() {
+            _ if blocked.is_some() => small("Zero Z on the stock top", None, false),
+            Some((_, work)) if pins || run.partway() => small(
+                format!("Set Z{}", crate::post::exact_mm(work[2] as f32)),
+                manual.then_some(Message::Machine(Action::TouchOff)),
+                false,
+            ),
+            Some((_, work)) => small(
+                touch_label(work),
+                manual.then_some(Message::Machine(Action::TouchOff)),
+                false,
+            ),
+            None => small(
+                "Zero all",
+                manual.then_some(Message::Machine(Action::WorkZero(None))),
+                false,
+            ),
+        });
+        if run.partway() {
+            buttons = buttons.push(small(
+                "Keep this work zero",
+                (checked.is_ok() && !run.zeroed && !running).then_some(Message::Run(R::KeepZero)),
+                run.zeroed,
+            ));
+        }
+        if let Err(why) = checked {
+            buttons = buttons.push(hint("Work zero", why, 50));
+        }
+        let mut list = column![bold("Work zero on the stock", 13)].spacing(4);
+        for line in steps {
+            list = list.push(text(line).size(12));
+        }
+        col = col.push(rule::horizontal(1)).push(list).push(buttons);
+    } else if run.checked().is_some() {
+        col = col.push(rule::horizontal(1)).push(muted(
+            "The setup's work zero was set on the stock before its first tool run: X and Y stay as they are from here.",
+        ));
+    }
+    if run.checked().is_some_and(|p| p.len() > 1) {
+        col = col
+            .push(rule::horizontal(1))
+            .push(bold("Reference surface, for the tool changes", 13))
+            .push(reference_rows(c, run));
+    }
+    if let Some(row) = a_reference_row(app, c, run) {
+        col = col.push(row);
+    }
+    tab_scroll(col)
+}
+
+/// The Probe tab: Probe Z, the setup's work zero from its stock, and a
+/// feature at the tip. Without a probe input in the profile, one line and
+/// the way to the Controller configuration (LIO-273).
+fn probe_tab(c: &crate::control::Connection) -> Element<'_, Message> {
+    use crate::control::{Action, Feature};
+    if c.config.inputs.probe.is_none() {
+        return row![
+            muted(
+                "This machine's UC100 profile has no probe input: add one under Inputs to probe."
+            ),
+            secondary("Controller configuration", Message::ControlSetup(true)),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center)
+        .into();
+    }
+    // What stops every probe, said once at the top; each button below says
+    // only what stops it alone.
     let global = c.probe_ready(&[2]).filter(|_| !c.probing());
     let own_why = |why: Option<String>| why.filter(|w| Some(w) != global.as_ref());
     let blocked = c.probe_z_blocked();
     // The stock top's work Z the plate lies on.
     let top = c.stock_top().unwrap_or_default();
-    let mut probe = column![bold("Probe", 13)].spacing(10);
+    let mut col = column![].spacing(10);
     if let Some(why) = &global {
-        probe = probe.push(
-            text(why.clone())
-                .size(12)
-                .color(Color::from_rgb8(166, 101, 32)),
-        );
+        col = col.push(one_line("Probe", why.clone(), 12, AMBER, 110));
     }
-    let probe = probe.push(
+    if let Some(note) = probe_note(c) {
+        col = col.push(note);
+    }
+    col = col.push(
         row![
-            act(
+            small(
                 "Probe Z",
                 blocked.is_none().then_some(Message::Machine(Action::ProbeZ)),
                 c.probing() && !c.edging() && c.feature().is_none()
             ),
-            muted(match (own_why(blocked.clone()), &c.probe) {
-                (Some(why), _) if !c.probing() => why,
-                (_, Ok(p)) if c.direct() => format!(
-                    "{} conducts: no plate. The clip stays on the tool and the plate's lead goes on bare metal of the stock; touch the tool to the stock by hand first and see the probe input go active. Feeds down at {} mm/min, up to {} mm. Work Z where the tool touches the stock top becomes {}, then the tool lifts {} mm.",
-                    c.material.as_ref().map_or("The stock", |(name, _)| name.as_str()),
-                    p.feed,
-                    p.distance,
-                    crate::post::exact_mm(top as f32),
-                    p.retract
-                ),
-                (_, Ok(p)) => format!(
-                    "{}: touch plate on the stock top under the tool, the clip on the tool. Feeds down at {} mm/min, up to {} mm. Work Z at the plate's top becomes {} mm, the stock top Z {}, then the tool lifts {} mm.",
-                    match &c.material {
-                        Some((name, _)) => format!("{name} does not conduct"),
-                        None => "No material chosen".into(),
-                    },
-                    p.feed,
-                    p.distance,
-                    crate::post::exact_mm((top + p.plate.unwrap_or_default()) as f32),
-                    crate::post::exact_mm(top as f32),
-                    p.retract
-                ),
-                _ => String::new(),
-            })
+            hint(
+                "Probe Z",
+                match (own_why(blocked.clone()), &c.probe) {
+                    (Some(why), _) if !c.probing() => why,
+                    (_, Ok(p)) if c.direct() => format!(
+                        "{} conducts: no plate. The clip stays on the tool and the plate's lead goes on bare metal of the stock; touch the tool to the stock by hand first and see the probe input go active. Feeds down at {} mm/min, up to {} mm. Work Z where the tool touches the stock top becomes {}, then the tool lifts {} mm.",
+                        c.material.as_ref().map_or("The stock", |(name, _)| name.as_str()),
+                        p.feed,
+                        p.distance,
+                        crate::post::exact_mm(top as f32),
+                        p.retract
+                    ),
+                    (_, Ok(p)) => format!(
+                        "{}: touch plate on the stock top under the tool, the clip on the tool. Feeds down at {} mm/min, up to {} mm. Work Z at the plate's top becomes {} mm, the stock top Z {}, then the tool lifts {} mm.",
+                        match &c.material {
+                            Some((name, _)) => format!("{name} does not conduct"),
+                            None => "No material chosen".into(),
+                        },
+                        p.feed,
+                        p.distance,
+                        crate::post::exact_mm((top + p.plate.unwrap_or_default()) as f32),
+                        crate::post::exact_mm(top as f32),
+                        p.retract
+                    ),
+                    _ => String::new(),
+                },
+                80
+            )
         ]
         .spacing(8)
         .align_y(Alignment::Center),
     );
-    let mut probe = probe;
     // The setup's own work zero, from the spot picked.
     let spots = c.probe_spots();
     let setup_probe: Element<_> = match c.edges_setup() {
-        Err(why) => muted(why).into(),
+        Err(why) => hint("Setup work zero", why, 90),
         Ok((refs, p)) => {
             let blocked = c.edges_blocked();
             let name = crate::control::probe_name(refs);
             row![
-                act(
+                small(
                     name,
                     blocked.is_none().then_some(Message::Machine(Action::ProbeEdges)),
                     c.edging()
                 ),
-                muted(match (own_why(blocked.clone()), &c.probe) {
-                    (Some(why), _) if !c.edging() => why,
-                    (_, Ok(pr)) => {
-                        let own = crate::post::references(&p.origin) == Some(refs)
-                            && crate::post::stock_zero(&p.origin).is_some();
-                        format!(
-                            "Jog the probe above the stock top, over {}, and press {name}: it touches off {}, allowing for the {} mm tip, at {} mm/min, and sets the X, Y and Z work zero on {}{}.",
-                            crate::control::probe_spot(refs),
-                            crate::post::probe_spots(refs, p.stock),
-                            pr.tip.unwrap_or_default(),
-                            pr.feed,
-                            p.origin,
-                            if own {
-                                String::new()
-                            } else {
-                                let size = p.stock.dimensions();
-                                format!(
-                                    ", placed from there by the setup's {} × {} × {} mm stock: measure the stock first",
-                                    crate::post::exact_mm(size[0]),
-                                    crate::post::exact_mm(size[1]),
-                                    crate::post::exact_mm(size[2])
-                                )
-                            }
-                        )
-                    }
-                    _ => String::new(),
-                })
+                hint(
+                    &name,
+                    match (own_why(blocked.clone()), &c.probe) {
+                        (Some(why), _) if !c.edging() => why,
+                        (_, Ok(pr)) => {
+                            let own = crate::post::references(&p.origin) == Some(refs)
+                                && crate::post::stock_zero(&p.origin).is_some();
+                            format!(
+                                "Jog the probe above the stock top, over {}, and press {name}: it touches off {}, allowing for the {} mm tip, at {} mm/min, and sets the X, Y and Z work zero on {}{}.",
+                                crate::control::probe_spot(refs),
+                                crate::post::probe_spots(refs, p.stock),
+                                pr.tip.unwrap_or_default(),
+                                pr.feed,
+                                p.origin,
+                                if own {
+                                    String::new()
+                                } else {
+                                    let size = p.stock.dimensions();
+                                    format!(
+                                        ", placed from there by the setup's {} × {} × {} mm stock: measure the stock first",
+                                        crate::post::exact_mm(size[0]),
+                                        crate::post::exact_mm(size[1]),
+                                        crate::post::exact_mm(size[2])
+                                    )
+                                }
+                            )
+                        }
+                        _ => String::new(),
+                    },
+                    70
+                )
             ]
             .spacing(8)
             .align_y(Alignment::Center)
             .into()
         }
     };
-    let mut setup_col = column![bold("Setup work zero, from its stock", 12)].spacing(8);
+    let mut setup_col = column![bold("Setup work zero, from its stock", 13)].spacing(6);
     if !spots.is_empty() {
         setup_col = setup_col.push(probe_from_grid(c, spots));
     }
-    probe = probe.push(setup_col.push(setup_probe));
+    col = col.push(setup_col.push(setup_probe));
     // Features found where the tip is, without a setup.
-    let feature = |f: crate::control::Feature| {
-        act(
+    let feature = |f: Feature| {
+        small(
             f.label(),
             c.feature_blocked(f)
                 .is_none()
@@ -7719,7 +9106,6 @@ fn control(app: &App) -> Element<'_, Message> {
             c.feature() == Some(f),
         )
     };
-    use crate::control::Feature;
     let corners = column![
         row![feature(Feature::CORNERS[0]), feature(Feature::CORNERS[1])].spacing(4),
         row![feature(Feature::CORNERS[2]), feature(Feature::CORNERS[3])].spacing(4),
@@ -7731,802 +9117,202 @@ fn control(app: &App) -> Element<'_, Message> {
     }
     let features = row![
         column![muted("Surface"), feature(Feature::Top)].spacing(4),
-        column![muted("Edge, probing toward"), edges].spacing(4),
-        column![muted("Outside corner, seen from above"), corners].spacing(4),
-        column![muted("Inside"), feature(Feature::Bore)].spacing(4),
-        column![muted("Outside"), feature(Feature::Boss)].spacing(4),
-    ]
-    .spacing(18);
-    let why = own_why(c.feature_blocked(Feature::Bore)).filter(|_| !c.probing());
-    probe = probe.push(
+        column![muted("Edge, toward"), edges].spacing(4),
+        column![muted("Outside corner"), corners].spacing(4),
         column![
-            bold("Feature at the tip, no setup needed", 12),
-            features,
-            muted(match (why, c.feature()) {
-                (_, Some(f)) => f.how(),
-                (Some(why), None) => why,
-                (None, None) => "Put the tip as each button's card says and press it: the surface, side, corner or centre found becomes work zero in the active work system, on the axes it sets.".into(),
-            }),
+            muted("Inside / outside"),
+            row![feature(Feature::Bore), feature(Feature::Boss)].spacing(4)
         ]
-        .spacing(8),
+        .spacing(4),
+    ]
+    .spacing(14);
+    let why = own_why(c.feature_blocked(Feature::Bore)).filter(|_| !c.probing());
+    col = col.push(
+        column![
+            bold("Feature at the tip, no setup needed", 13),
+            features,
+            hint(
+                "Feature at the tip",
+                match (why, c.feature()) {
+                    (_, Some(f)) => f.how(),
+                    (Some(why), None) => why,
+                    (None, None) => "Put the tip as each button's card says and press it: the surface, side, corner or centre found becomes work zero in the active work system, on the axes it sets.".into(),
+                },
+                110
+            ),
+        ]
+        .spacing(6),
     );
-    if let Some(note) = probe_note(c) {
-        probe = probe.push(note);
-    }
     // The test bar on A stands where the block would (Rotary A).
     if let Some((lo, hi)) = c.block.filter(|_| c.sim_bar().is_none()) {
-        probe = probe.push(muted(format!(
-            "Simulated: a block at machine X {:.0}…{:.0}, Y {:.0}…{:.0}, its top at Z {:.3}, stands for the stock{}.",
-            lo[0],
-            hi[0],
-            lo[1],
-            hi[1],
-            hi[2],
-            if c.config.inputs.probe.is_some() {
-                " and trips the probe"
-            } else {
-                ""
-            }
-        )));
-    }
-    let work_panel = machine_panel(
-        &format!("Work zero (G{})", 54 + s.active_wcs),
-        column![
-            dro,
-            zeros,
-            systems,
-            muted(
-                "Zero makes the current position work zero in the active coordinate system; 1/2 halves the position shown, Set gives it the value typed. For the middle of a part by hand, zero X with an edge finder on its left side, touch its right side and press 1/2 on X. G54 to G59 each keep their own; they change only while Idle."
+        col = col.push(hint(
+            "Simulated",
+            format!(
+                "Simulated: a block at machine X {:.0}…{:.0}, Y {:.0}…{:.0}, its top at Z {:.3}, stands for the stock and trips the probe.",
+                lo[0], hi[0], lo[1], hi[1], hi[2],
             ),
-            rule::horizontal(1),
-            probe
-        ],
-    );
-    let start = |state| {
-        (c.spindle_ok(state) && c.rpm_value().is_some())
-            .then_some(Message::Machine(Action::Spindle(state)))
-    };
-    let mut spindle_row = row![
-        help::field(
-            text_input("RPM", &c.rpm)
-                .on_input(|v| Message::Machine(Action::Rpm(v)))
-                .width(90)
-                .padding([7, 9])
-                .size(13),
-            "control_rpm",
-            "Spindle speed · RPM",
-            Target::Machine
-        ),
-        act("CW", start(Spindle::Cw), s.spindle == Some(Spindle::Cw))
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center);
-    if c.reversible() {
-        spindle_row = spindle_row.push(act(
-            "CCW",
-            start(Spindle::Ccw),
-            s.spindle == Some(Spindle::Ccw),
+            110,
         ));
     }
-    spindle_row = spindle_row.push(act(
-        "Stop",
-        Some(Message::Machine(Action::Spindle(Spindle::Off))),
-        false,
-    ));
-    let turning = match s.spindle {
-        Some(Spindle::Cw) => format!("CW at {:.0} rpm", s.rpm),
-        Some(Spindle::Ccw) => format!("CCW at {:.0} rpm", s.rpm),
-        _ => "off".into(),
-    };
-    let mut spindle = column![spindle_row, muted(format!("Spindle {turning}."))];
-    if !c.rpm.trim().is_empty() && c.rpm_value().is_none() {
-        spindle = spindle.push(muted(format!(
-            "Enter an RPM from 1 to {:.0}.",
-            c.config.outputs.spindle_max_rpm
+    tab_scroll(col)
+}
+
+/// The MDI tab: one G-code line to run.
+fn mdi_tab(c: &crate::control::Connection) -> Element<'_, Message> {
+    use crate::control::Action;
+    let send =
+        (c.manual() && !c.mdi.trim().is_empty()).then_some(Message::Machine(Action::MdiSend));
+    column![
+        row![
+            help::field(
+                text_input("One G-code line, for example G0 X10 Y10", &c.mdi)
+                    .on_input(|v| Message::Machine(Action::MdiText(v)))
+                    .on_submit_maybe(send.clone())
+                    .padding([7, 9])
+                    .size(13),
+                "mdi_line",
+                "MDI line",
+                Target::Machine
+            ),
+            act("Send", send, false)
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+        muted("Runs the line when Idle, or while a program is paused. Enter sends it too."),
+        bold("Log", 13),
+        machine_log(c),
+    ]
+    .spacing(10)
+    .height(Fill)
+    .into()
+}
+
+/// The Machine tab: the machine and its connection, the firmware, the soft
+/// limits, the machine zero and the fixture pins, beside the log.
+fn machine_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Message> {
+    use crate::control::Action;
+    let s = &c.snapshot;
+    let mut col = connect_controls(app);
+    if let Some(id) = &s.identity {
+        let v = |o: &Option<String>| o.clone().unwrap_or_else(|| "?".into());
+        col = col.push(muted(format!(
+            "UC100 firmware {} · hardware {} · bootloader {}",
+            v(&id.firmware),
+            v(&id.hardware_id),
+            v(&id.bootloader)
         )));
     }
-    if !c.reversible() {
-        spindle = spindle.push(muted(
-            "No CCW: the profile has no spindle direction output.",
+    let (unlimited, unset) = (c.unlimited_axes(), c.unset_limited_axes());
+    col = col.push(
+        if let Some((heading, lines)) = limits_off_warning(&unlimited, &unset, c.home_switches()) {
+            caution(heading, lines)
+        } else {
+            let range = |a: usize| {
+                let x = c.config.axes.get(a)?;
+                Some(format!("{} {}…{}", AXES[a], x.soft_min?, x.soft_max?))
+            };
+            let ranges: Vec<String> = (0..3).filter_map(range).collect();
+            // A rotary axis's range is in degrees, after the mm.
+            let angles: String = (3..6)
+                .filter_map(range)
+                .map(|r| format!(", {r}°"))
+                .collect();
+            muted(format!("Soft limits on: {} mm{angles}.", ranges.join(", ")))
+                .color(GREEN)
+                .into()
+        },
+    );
+    let idle = |a: Action| c.idle().then_some(Message::Machine(a));
+    let enabled: Vec<usize> = (0..6).filter(|&a| s.axes_enabled[a]).collect();
+    // A declared position references only an axis without a home switch.
+    let declared: Vec<usize> = enabled
+        .iter()
+        .copied()
+        .filter(|&a| c.switchless(a))
+        .collect();
+    let mut zero = column![bold("Machine zero", 13)].spacing(8);
+    if !declared.is_empty() {
+        let mut here = row![small(
+            "Set machine zero here",
+            idle(Action::MachineZero(None)),
+            false
+        )]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .push(muted("or one axis"));
+        for &a in &declared {
+            here = here.push(small(AXES[a], idle(Action::MachineZero(Some(a))), false));
+        }
+        zero = zero.push(here).push(small(
+            "Keep the last position",
+            idle(Action::KeepPosition),
+            false,
         ));
     }
-    let coolant = |on: bool, label: &'static str, f: fn(bool) -> Action| {
-        checkbox(on)
-            .label(label)
-            .on_toggle(move |b| Message::Machine(f(b)))
-            .text_size(12)
-    };
-    if c.config.outputs.flood.is_some() {
-        spindle = spindle.push(coolant(s.flood, "Flood (M8)", Action::Flood));
+    if c.home_switches() {
+        zero = zero.push(small("Home", idle(Action::Home), false));
     }
-    if c.config.outputs.mist.is_some() {
-        spindle = spindle.push(coolant(s.mist, "Mist (M7)", Action::Mist));
+    zero = zero.push(muted(if declared.is_empty() {
+        HOME_NOTE
+    } else {
+        MACHINE_ZERO_NOTE
+    }));
+    if let Some(pins) = pin_block(c) {
+        zero = zero.push(pins);
     }
-    if c.config.outputs.flood.is_none() && c.config.outputs.mist.is_none() {
-        spindle = spindle.push(muted("The profile has no coolant outputs."));
-    }
-    let mut overrides = column![
-        row![
-            text(format!("Feed override {:.0} %", c.feed_override))
-                .size(12)
-                .width(140),
-            help::wrap(
-                slider(10.0..=200.0, c.feed_override, |v| Message::Machine(
-                    Action::FeedOverride(v)
-                ))
-                .step(5.0_f32),
-                help::command(
-                    &Message::Machine(Action::FeedOverride(100.)),
-                    "Feed override".into()
-                ),
-                widget::tooltip::Position::Right,
-            )
-        ]
-        .spacing(10)
-        .align_y(Alignment::Center),
-        muted(format!("Feed now {:.0} mm/min.", s.feed_rate))
-    ];
+    col = col.push(rule::horizontal(1)).push(zero);
     if c.limit_inputs() {
-        overrides = overrides.push(
+        col = col.push(
             checkbox(s.limits_override)
                 .label("Override limit switches")
                 .on_toggle(|b| Message::Machine(Action::OverrideLimits(b)))
                 .text_size(12),
         );
-        overrides = overrides.push(muted("To drive off a limit switch that tripped. It turns itself off a second after no switch is active."));
+        col = col.push(muted("To drive off a limit switch that tripped. It turns itself off a second after no switch is active."));
     }
-    // Jog beside the position, so both fit without scrolling; the work zero
-    // under them across the page, as a DRO under the jog; the model beside
-    // the spindle.
-    main = main
-        .push(row![position, jog_panel].spacing(12))
-        .push(work_panel);
-    if let Some(rotary) = rotary_panel(c) {
-        main = main.push(rotary);
-    }
-    main = main.push(
-        row![
-            model,
-            column![
-                machine_panel("Spindle and coolant", spindle),
-                machine_panel("Overrides", overrides)
-            ]
-            .spacing(12)
-        ]
-        .spacing(12),
-    );
-    let send =
-        (c.manual() && !c.mdi.trim().is_empty()).then_some(Message::Machine(Action::MdiSend));
-    main = main.push(machine_panel(
-        "MDI",
-        column![
-            row![
-                help::field(
-                    text_input("One G-code line, for example G0 X10 Y10", &c.mdi)
-                        .on_input(|v| Message::Machine(Action::MdiText(v)))
-                        .on_submit_maybe(send.clone())
-                        .padding([7, 9])
-                        .size(13),
-                    "mdi_line",
-                    "MDI line",
-                    Target::Machine
-                ),
-                act("Send", send, false)
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
-            muted("Runs the line when Idle, or while a program is paused. Enter sends it too.")
-        ],
-    ));
     row![
-        left,
-        column![
-            fixed.padding(4),
-            scrollable(main.padding(4))
-                .id("control")
-                .height(Fill)
-                .width(Fill)
-        ]
-        .spacing(4)
-        .height(Fill)
-        .width(Fill)
+        tab_scroll(col),
+        column![bold("Log", 13), machine_log(c)]
+            .spacing(8)
+            .width(Fill)
+            .height(Fill)
     ]
-    .spacing(12)
-    .padding(12)
+    .spacing(14)
     .height(Fill)
     .into()
 }
-/// The green Cycle Start button, greyed out without a message.
-fn cycle_start<'a>(msg: Option<Message>) -> Element<'a, Message> {
-    let on = msg.is_some();
-    let b = button(bold("Cycle Start", 14).color(Color::WHITE))
-        .on_press_maybe(msg.clone())
-        .padding([8, 18])
-        .style(move |_, status| button::Style {
-            background: Some(
-                if !on {
-                    Color::from_rgb8(166, 186, 176)
-                } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-                    Color::from_rgb8(28, 108, 74)
-                } else {
-                    Color::from_rgb8(39, 130, 93)
-                }
-                .into(),
-            ),
-            text_color: Color::WHITE,
+
+/// The icon of an operation's row: done, being cut, next, to come, skipped.
+fn stage_icon<'a>(stage: crate::run::Stage) -> Element<'a, Message> {
+    use crate::run::Stage;
+    let (glyph, fill, edge) = match stage {
+        Stage::Done => ("✓", Some(Color::from_rgb8(47, 138, 87)), None),
+        Stage::Cutting => ("▶", Some(RUN_BLUE), None),
+        Stage::Next => ("", None, Some(RUN_BLUE)),
+        Stage::ToCome => ("", None, Some(BUTTON_EDGE)),
+        Stage::Skipped => ("–", Some(BUTTON_EDGE), None),
+    };
+    container(text(glyph).size(10).color(Color::WHITE))
+        .center_x(18)
+        .center_y(18)
+        .style(move |_| container::Style {
+            background: fill.map(Into::into),
             border: Border {
-                radius: 4.into(),
-                ..Default::default()
+                color: edge.unwrap_or(Color::TRANSPARENT),
+                width: if edge.is_some() { 2. } else { 0. },
+                radius: 9.into(),
             },
             ..Default::default()
-        });
-    match msg {
-        Some(m) => HelpButton::new(b, &m, "Cycle Start").into(),
-        None => b.into(),
-    }
+        })
+        .into()
 }
-
-/// The setups the Run strip lists for machine `machine_id`: those that use
-/// it, except a manual mill's, which have steps instead of a run.
-pub(crate) fn run_setups<'a>(doc: &'a Document, machine_id: &str) -> Vec<(usize, &'a Setup)> {
-    (doc.setups.iter().enumerate())
-        .filter(|(_, x)| x.machine.id == machine_id && !crate::manual::is_hand(&x.machine))
-        .collect()
-}
-
-/// The Run strip: the setup of this machine run tool run by tool run, with
-/// Cycle Start, Hold, Resume and Stop, fixed above the part of the Control
-/// page that scrolls, so they never scroll out of sight below the tool-run
-/// list or the manual controls (#71). It shows the setup picked, the tool
-/// run Cycle Start starts, the progress of the tool run being cut or what
-/// holds Cycle Start back, and how the last tool run ended. The tool runs
-/// themselves, the manual tool change between them and the work zero on
-/// the stock are in the Tool runs panel (`run_panel`), which scrolls.
-pub(crate) fn run_strip<'a>(
-    app: &'a App,
-    c: &'a crate::control::Connection,
-) -> Element<'a, Message> {
-    use crate::run::Action as R;
-    use uc100::controller::State;
-    let s = &c.snapshot;
-    let running = c.run.as_ref().is_some_and(|r| r.running.is_some());
-    let msg = |on: bool, a: R| on.then_some(Message::Run(a));
-    let mut body = column![].spacing(10);
-    let setups = run_setups(&app.doc, &c.machine_id);
-    if setups.is_empty() {
-        body = body.push(muted("No setup uses this machine. In MANUFACTURE, choose it as a setup's machine (Assign to current setup) to run that setup here."));
-    } else {
-        let mut pick = row![muted("Setup")].spacing(6).align_y(Alignment::Center);
-        for (si, x) in setups {
-            let picked = c.run.as_ref().is_some_and(|r| r.setup == si);
-            pick = pick.push(act(
-                format!(
-                    "{}. {}{}",
-                    si + 1,
-                    x.name(),
-                    crate::indexed::label(x)
-                        .map(|a| format!(" · {a}"))
-                        .unwrap_or_default()
-                ),
-                msg(!c.setup_locked(), R::Setup(si)),
-                picked,
-            ));
-        }
-        body = body.push(pick);
-    }
-    let Some(run) = &c.run else {
-        return machine_panel(
-            "Run",
-            body.push(muted("Pick a setup: AXIS CAM checks it as export would and runs it here, one tool run at a time.")),
-        );
-    };
-    let programs = match run.programs.as_deref() {
-        // Out of date and not checked yet: the check waits for the machine to
-        // stop, so that nothing competes with the driver feeding it (#167).
-        None if run.stale => {
-            return machine_panel("Run", body.push(muted(crate::run::CHECK_WAITS)));
-        }
-        None => {
-            return machine_panel(
-                "Run",
-                body.push(muted("Checking the setup: simulating the job up to it…")),
-            );
-        }
-        Some(Err(problems)) => {
-            return machine_panel(
-                "Run",
-                body.push(caution("This setup cannot run", problems.clone()))
-                    .push(act("Check again", msg(true, R::Check), false)),
-            );
-        }
-        Some(Ok(programs)) => programs,
-    };
-    let count = programs.len();
-    // The tool run Cycle Start starts: the list marks it "next" below.
-    if !running && let Some(p) = programs.get(run.next) {
-        let from = match p.ops.get(run.from).filter(|_| run.from > 0) {
-            Some(o) => format!(", from its operation {}: {}", run.from + 1, o.name),
-            None => String::new(),
-        };
-        body = body.push(muted(format!(
-            "Next tool run: {} of {count}, {}{from}",
-            run.next + 1,
-            crate::model::tool_label(p.ops[0].tool, &p.ops[0].tool_name)
-        )));
-    }
-    let mut problems = run.problems(c, &app.doc);
-    problems.extend(app.planning_busy().map(String::from));
-    let state = s.state.as_ref();
-    body = body.push(
-        row![
-            cycle_start(problems.is_empty().then_some(Message::Run(R::CycleStart))),
-            act("Hold", msg(state == Some(&State::Run), R::Hold), false),
-            act(
-                "Resume",
-                msg(
-                    matches!(state, Some(State::Hold | State::Paused(_))),
-                    R::Resume
-                ),
-                false
-            ),
-            act("Stop", msg(crate::run::busy(state), R::Stop), false),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
-    );
-    // A program's pause (a boring head to set): what it asks, until Resume.
-    if let Some(State::Paused(reason)) = state {
-        body = body.push(note(format!("Paused: {reason}")));
-    }
-    body = body.push(muted(
-        "Space holds from any page while no text field is being edited, and resumes on this page.",
-    ));
-    if let Some(line) = run_times(run, s) {
-        body = body.push(line);
-    }
-    if let Some((p, op, block)) = run.progress(s.current_line) {
-        let i = run.running.as_ref().map_or(0, |r| r.index);
-        let blocks = run.running_blocks().map_or(1, <[_]>::len);
-        body = body
-            .push(
-                text(format!(
-                    "Tool run {} of {count} · operation {} of {}: {} · block {} of {}",
-                    i + 1,
-                    op + 1,
-                    p.ops.len(),
-                    p.ops[op].name,
-                    block + 1,
-                    blocks
-                ))
-                .size(13),
-            )
-            .push(widget::progress_bar(0.0..=blocks as f32, block as f32 + 1.));
-    } else if !problems.is_empty() && !crate::run::busy(state) {
-        body = body.push(caution("Before Cycle Start", problems));
-        let off = run.coolant_off(c, &app.doc);
-        if !off.is_empty() {
-            let ops = &app.doc.setups[run.setup].operations;
-            let names: Vec<&str> = off.iter().map(|&i| ops[i].name()).collect();
-            body = body.push(act(
-                format!("Set coolant to Off: {}", names.join(", ")),
-                msg(!running, R::CoolantOff),
-                false,
-            ));
-        }
-    }
-    if !crate::run::busy(state)
-        && let Some(line) = crate::run::limits_unchecked(c)
-    {
-        body = body.push(caution("Soft limits are off for Cycle Start", vec![line]));
-    }
-    if let Some((ok, message)) = &run.outcome {
-        body = body.push(text(message.clone()).size(12).color(if *ok {
-            Color::from_rgb8(39, 130, 93)
-        } else {
-            Color::from_rgb8(166, 101, 32)
-        }));
-    }
-    machine_panel(&format!("Run · {}", run.name), body)
-}
-
-/// The Run strip's times: the whole setup's estimate and what is left of it,
-/// of the tool run being cut or next and, while one cuts, of its
-/// operation; and what the estimate counts. None until the check is timed.
-fn run_times<'a>(
-    run: &crate::run::Run,
-    s: &uc100::controller::Snapshot,
-) -> Option<Element<'a, Message>> {
-    use crate::run::clock;
-    let total = run.setup_time()?;
-    let left = run.left(s)?;
-    let count = run.checked()?.len();
-    let mut parts = vec![format!("Setup {} in all", clock(total))];
-    let running = run.running.as_ref();
-    let (i, k) = running.map_or((run.next, run.from), |r| (r.index, r.from));
-    let fresh = running.is_none() && (i, k) == (0, 0) && !run.done.contains(&true);
-    if i >= count {
-        parts.push("all tool runs cut".into());
-    } else if running.is_some() {
-        parts.push(format!("{} left", clock(left.setup)));
-        if i + 1 < count {
-            parts.push(format!("tool run {}: {} left", i + 1, clock(left.run)));
-        }
-        if let Some((op, op_left, op_all)) = left.op {
-            parts.push(format!(
-                "operation {}: {} left of {}",
-                op + 1,
-                clock(op_left),
-                clock(op_all)
-            ));
-        }
-    } else {
-        if !fresh {
-            let from = if k > 0 {
-                format!(", operation {}", k + 1)
-            } else {
-                String::new()
-            };
-            parts.push(format!(
-                "{} left from tool run {}{from}",
-                clock(left.setup),
-                i + 1
-            ));
-        }
-        if count > 1 && (fresh || i + 1 < count) {
-            parts.push(format!("tool run {}: {}", i + 1, clock(left.run)));
-        }
-    }
-    let feed = (s.feed_override * 100.).round();
-    let note = if (feed - 100.).abs() < 0.5 {
-        "Estimated from the machine profile's axis speeds and accelerations, with the spindle spin-up and dwells. Manual tool changes and holds are not counted.".to_string()
-    } else {
-        format!(
-            "Estimated from the machine profile's axis speeds and accelerations, with the spindle spin-up and dwells; what is left at the feed override of {feed:.0} %, the setup in all at 100 %. Manual tool changes and holds are not counted."
-        )
-    };
-    Some(
-        column![bold(parts.join(" · "), 13), muted(note).size(11)]
-            .spacing(2)
-            .into(),
-    )
-}
-
-/// The Tool runs panel, in the part of the Control page that scrolls, under
-/// the Run strip: the setup's tool runs (Cycle Start starts the one marked
-/// next), the manual tool change between tool runs, and the work zero on
-/// the stock before the first. None until the setup is checked; the Run
-/// strip says what is being done or why it cannot run.
-pub(crate) fn run_panel<'a>(
-    app: &'a App,
-    c: &'a crate::control::Connection,
-) -> Option<Element<'a, Message>> {
-    use crate::run::Action as R;
-    let s = &c.snapshot;
-    let run = c.run.as_ref()?;
-    let programs = run.checked()?;
-    let running = run.running.is_some();
-    let msg = |on: bool, a: R| on.then_some(Message::Run(a));
-    let mut body = column![].spacing(10);
-    let count = programs.len();
-    let left = run.left(s);
-    body = body.push(muted(
-        "Each operation in the order it is cut, with the stock as it leaves it: cut faces are green. Start here makes Cycle Start begin with that operation, those before it taken as cut.",
-    ));
-    // Where A is, on a machine with A, and while an index move turns it.
-    let with_a = app
-        .doc
-        .setups
-        .get(run.setup)
-        .is_some_and(|x| x.machine.has_a())
-        && c.axis(3);
-    if with_a {
-        let turning = run
-            .progress(s.current_line)
-            .and_then(|(_, _, b)| match run.running_blocks()?.get(b)? {
-                crate::post::Block::Index { a, .. } => Some(*a),
-                _ => None,
-            })
-            .filter(|_| running);
-        let mut line = if s.referenced[3] {
-            format!(
-                "A now: {:.3}° in G{} (machine A {:.3}°)",
-                s.work_pos[3],
-                54 + s.active_wcs,
-                s.machine_pos[3]
-            )
-        } else {
-            "A now: no machine position".to_string()
-        };
-        if let Some(a) = turning {
-            line += &format!(
-                " · index move: turning A alone to {}°, X Y Z still",
-                crate::indexed::degrees(a)
-            );
-        }
-        body = body.push(bold(line, 13));
-    }
-    // Operations are numbered through the setup, across its tool runs.
-    let mut number = 0;
-    for (i, p) in programs.iter().enumerate() {
-        let mark = if run.running.as_ref().is_some_and(|r| r.index == i) {
-            "running"
-        } else if run.done[i] {
-            "done"
-        } else if i == run.next {
-            "next"
-        } else if i < run.next {
-            "skipped"
-        } else {
-            ""
-        };
-        body = body.push(
-            row![
-                text(mark).size(12).width(52),
-                act(
-                    format!(
-                        "Tool run {} of {count}: {}",
-                        i + 1,
-                        crate::model::tool_label(p.ops[0].tool, &p.ops[0].tool_name)
-                    ),
-                    msg(!running, R::Next(i)),
-                    i == run.next,
-                ),
-                muted({
-                    let ops = match p.ops.len() {
-                        1 => "1 operation".to_string(),
-                        n => format!("{n} operations"),
-                    };
-                    match run.times.as_ref().and_then(|t| t.run(i, 0)) {
-                        Some(t) => format!("{ops} · {}", crate::run::clock(t)),
-                        None => ops,
-                    }
-                }),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-        );
-        let mut cards = row![].spacing(8);
-        let times = run.op_times(i);
-        let left = left.filter(|_| run.running.as_ref().is_some_and(|r| r.index == i));
-        for (k, ((o, &oi), stage)) in p
-            .ops
-            .iter()
-            .zip(&p.indexes)
-            .zip(run.stages(i, s.current_line))
-            .enumerate()
-        {
-            number += 1;
-            use crate::run::Stage;
-            let start = (!matches!(stage, Stage::Next | Stage::Cutting) && !c.probing())
-                .then_some(msg(!running, R::From(i, k)));
-            let time = match (left.and_then(|l| l.op), &times) {
-                (Some((op, op_left, op_all)), _) if op == k => Some(format!(
-                    "{} left of {}",
-                    crate::run::clock(op_left),
-                    crate::run::clock(op_all)
-                )),
-                (_, Some(t)) => t.get(k).map(|&t| format!("Time {}", crate::run::clock(t))),
-                _ => None,
-            };
-            // The setup and the A angles the operation is cut at.
-            let angles = crate::run::op_angles(&p.blocks, k);
-            let at = with_a.then(|| {
-                let a = if angles.is_empty() {
-                    "A 0°".to_string()
-                } else {
-                    crate::indexed::angles_text(&angles)
-                };
-                format!("Setup {} · {a}", run.setup + 1)
-            });
-            cards = cards.push(op_card(number, o, run.picture(oi), stage, time, start, at));
-        }
-        body = body.push(cards.wrap().vertical_spacing(8));
-    }
-    if run.stale && run.programs.is_some() {
-        body = body
-            .push(caution(
-                "The project changed since this setup was checked",
-                vec!["Check it again before the next tool run.".into()],
-            ))
-            .push(act("Check again", msg(!running, R::Check), false));
-    }
-    if let Some(p) = run.tool_change() {
-        let o = &p.ops[0];
-        body = body.push(note(format!(
-            "Tool change for tool run {}: {} (stickout {:.1} mm). The last tool run ended with the spindle and coolant off at the clearance plane. 1. If no reference is recorded, touch the old tool on a surface that stays put (a vise jaw, the table, a block) and press Record reference. 2. Jog up and change to T{}. 3. Touch the new tool on the same surface and press Set Z from reference, or Zero Z on the stock top if no tool run has cut it. With a touch plate on that surface, Probe reference and Probe Z from reference do steps 1 and 3. 4. Jog clear and press Cycle Start. X/Y zero stays as it is.",
-            run.next + 1,
-            crate::model::tool_label(o.tool, &o.tool_name),
-            o.stickout,
-            o.tool
-        )));
-        if with_a {
-            // A turns the stock and the chuck: a reference on them is
-            // touched off at the angle it was recorded at.
-            let first = crate::run::a_angles(&p.blocks);
-            let back = match first.first() {
-                Some(a) => format!(
-                    "Cycle Start's first moves retract Z, then turn A alone back to {}° for this tool run. It turns A, so touch the new tool off with Touch off on the A reference: Set Z from reference does not relate it to the probed centreline.",
-                    crate::indexed::degrees(*a)
-                ),
-                None => {
-                    "This tool run does not turn A: turn A back to A0 before Cycle Start.".into()
-                }
-            };
-            body = body.push(note(match run.reference_a {
-                Some(ra) => format!(
-                    "A axis: the reference was recorded with A at {ra:.3}°. Touch the new tool off with A there (Set Z from reference waits for it), then {}",
-                    back[..1].to_lowercase() + &back[1..]
-                ),
-                None => format!(
-                    "A axis: record the reference and touch both tools off at the same A angle; A where it is now ({:.3}°) will do. {back}",
-                    s.work_pos[3]
-                ),
-            }));
-        }
-    }
-    // A tool run that turns A runs only with its tool touched off on the
-    // Z reference the probe touched with the centreline (LIO-207).
-    if let Some(p) =
-        (programs.get(run.next)).filter(|p| !crate::run::a_angles(&p.blocks).is_empty())
-    {
-        let o = &p.ops[0];
-        let ready = c.a_reference(&app.doc);
-        let said = match run.length.as_ref().filter(|(id, ..)| *id == o.tool_id) {
-            Some((_, d, _)) => format!(
-                "T{} is touched off on the A centreline's Z reference: its tip is {:.3} mm {} the probe's, and its work Z is on the centreline.",
-                o.tool,
-                d.abs(),
-                if *d >= 0. { "under" } else { "over" }
-            ),
-            None => format!(
-                "T{} {}: with it in the spindle, jog over the Z reference the probe touched with the A centreline, put the touch plate on it and press Touch off on the A reference. That sets its work Z on the centreline, whatever its length.",
-                o.tool, o.tool_name
-            ),
-        };
-        body = body.push(
-            row![
-                act(
-                    "Touch off on the A reference",
-                    msg(ready.is_ok() && !running, R::ProbeCentreReference),
-                    false
-                ),
-                muted(said),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-        );
-        if let (Err(why), false) = (&ready, running) {
-            body = body.push(muted(why.clone()));
-        }
-    }
-    if count > 1 {
-        let manual = c.manual() && !running;
-        body = body.push(
-            row![
-                muted(match (run.reference, run.reference_a) {
-                    (Some(z), Some(a)) => format!(
-                        "Reference surface: Z {z:.3} (G{}) at A {a:.3}°",
-                        54 + s.active_wcs
-                    ),
-                    (Some(z), None) =>
-                        format!("Reference surface: Z {z:.3} (G{})", 54 + s.active_wcs),
-                    (None, _) => "Reference surface: not recorded".into(),
-                }),
-                act("Record reference", msg(manual, R::RecordReference), false),
-                act(
-                    "Set Z from reference",
-                    msg(
-                        manual && run.reference.is_some() && run.reference_a_problem(c).is_none(),
-                        R::ZFromReference
-                    ),
-                    false
-                ),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-        );
-        if let Some(why) = run.reference_a_problem(c).filter(|_| !running) {
-            body = body.push(muted(why));
-        }
-        if c.config.inputs.probe.is_some() {
-            let probe = c.probe_blocked().is_none() && !running;
-            body = body.push(
-                row![
-                    act("Probe reference", msg(probe, R::ProbeReference), false),
-                    act(
-                        "Probe Z from reference",
-                        msg(
-                            probe
-                                && run.reference.is_some()
-                                && run.reference_a_problem(c).is_none(),
-                            R::ProbeFromReference
-                        ),
-                        false
-                    ),
-                    muted(if c.direct() {
-                        "The same with the plate's lead on the reference surface, which the tool touches."
-                    } else {
-                        "The same with the touch plate on the reference surface."
-                    }),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
-            );
-            if let Some(note) = probe_note(c) {
-                body = body.push(note);
-            }
-        }
-    }
-    if let Some(steps) = work_zero_steps(app, c) {
-        use crate::control::Action;
-        // The buttons act on the checked setup the steps are from, which an
-        // edit may have changed: like the probes, they wait while its check
-        // is out of date, and say so (#39).
-        let checked = c.run_program();
-        let mut buttons = row![].spacing(8).align_y(Alignment::Center);
-        if c.sim_zero().is_some() {
-            let ready = checked.is_ok() && c.idle() && c.unset_limited_axes().is_empty();
-            buttons = buttons.push(act(
-                "Move there",
-                ready.then_some(Message::Machine(Action::ToSimZero)),
-                false,
-            ));
-        }
-        let manual = checked.is_ok() && c.manual();
-        let pins = checked.as_ref().is_ok_and(|p| p.pins.is_some());
-        if pins {
-            buttons = buttons.push(act(
-                "Set X Y from the pins",
-                (manual && c.pin_offset().is_ok()).then_some(Message::Machine(Action::PinZero)),
-                false,
-            ));
-        }
-        let blocked = c.partway_blocked();
-        buttons = buttons.push(match c.touch_off() {
-            _ if blocked.is_some() => act("Zero Z on the stock top", None, false),
-            Some((_, work)) if pins || run.partway() => act(
-                format!("Set Z{}", crate::post::exact_mm(work[2] as f32)),
-                manual.then_some(Message::Machine(Action::TouchOff)),
-                false,
-            ),
-            Some((_, work)) => act(
-                touch_label(work),
-                manual.then_some(Message::Machine(Action::TouchOff)),
-                false,
-            ),
-            None => act(
-                "Zero all",
-                manual.then_some(Message::Machine(Action::WorkZero(None))),
-                false,
-            ),
-        });
-        if run.partway() {
-            buttons = buttons.push(act(
-                "Keep this work zero",
-                (checked.is_ok() && !run.zeroed && !running).then_some(Message::Run(R::KeepZero)),
-                run.zeroed,
-            ));
-        }
-        if let Err(why) = checked {
-            buttons = buttons.push(muted(why));
-        }
-        body = body
-            .push(bold("Work zero on the stock", 13))
-            .push(note(steps.join("\n")))
-            .push(buttons);
-    }
-    Some(machine_panel("Tool runs", body))
-}
-/// The size the Tool runs panel shows its pictures of the stock at.
-const OP_CARD_PICTURE: (f32, f32) = (150., 112.5);
-/// One operation of a tool run in the Tool runs panel, the `n`th the setup
-/// cuts: the picture of the stock it leaves (a blank while that is worked
-/// out), its name, strategy and tool, and its `stage`. The one being cut is
-/// framed in blue, those done in green, those skipped greyed. `time` is how
-/// long it takes, or what is left of it while it is cut. With `start`, a
-/// Start here button that makes it the one Cycle Start begins with (greyed
-/// while that message is None).
-fn op_card<'a>(
+/// One operation of the setup in the Operations list, the `n`th it cuts: its
+/// stage, name and time, the part of it cut while it is cut, and Start here,
+/// which makes it the one Cycle Start begins with (greyed while that
+/// message is None). The picture of the stock it leaves, its strategy and
+/// tool are on hover.
+#[allow(clippy::too_many_arguments)]
+fn op_row<'a>(
     n: usize,
     o: &'a crate::post::OpState,
     picture: Option<&widget::image::Handle>,
@@ -8534,77 +9320,334 @@ fn op_card<'a>(
     time: Option<String>,
     start: Option<Option<Message>>,
     angles: Option<String>,
+    cut: Option<f32>,
 ) -> Element<'a, Message> {
     use crate::run::Stage;
-    let (w, h) = OP_CARD_PICTURE;
+    let (w, h) = OP_PICTURE;
     let picture: Element<'a, Message> = match picture {
         Some(p) => widget::image(p.clone()).width(w).height(h).into(),
-        None => container(muted("Picturing the stock…").size(11))
-            .width(w)
-            .height(h)
+        None => container(text("Picturing the stock…").size(11))
             .center_x(w)
             .center_y(h)
             .into(),
     };
-    const DONE: Color = Color::from_rgb8(39, 130, 93);
-    const CUTTING: Color = Color::from_rgb8(37, 110, 190);
-    let (label, color) = match stage {
-        Stage::Done => ("✓ Done", DONE),
-        Stage::Cutting => ("▶ Cutting now", CUTTING),
-        Stage::Next => ("Next: Cycle Start cuts it", CUTTING),
-        Stage::Skipped => ("Skipped: taken as cut", MUTED),
-        Stage::ToCome => ("To come", MUTED),
+    let said = match stage {
+        Stage::Done => "Done",
+        Stage::Cutting => "Cutting now",
+        Stage::Next => "Next: Cycle Start cuts it",
+        Stage::Skipped => "Skipped: taken as cut",
+        Stage::ToCome => "To come",
     };
-    let mut card = column![
+    let mut tip = column![
         picture,
-        row![
-            bold(format!("{n}."), 12),
-            text(ellipsize(&o.name, 20))
-                .size(12)
-                .wrapping(Wrapping::None)
-        ]
-        .spacing(4),
-        muted(if o.name == o.strategy {
+        text(format!("{n}. {}", o.name)).size(12),
+        text(format!(
+            "{} · {}",
+            o.strategy,
             crate::model::tool_label(o.tool, &o.tool_name)
-        } else {
-            format!("{} · T{}", o.strategy, o.tool)
-        })
+        ))
         .size(11),
-        text(label).size(12).color(color),
+        text(said).size(11),
     ]
-    .spacing(4)
+    .spacing(3)
     .width(w);
-    if let Some(time) = time {
-        card = card.push(muted(time).size(11));
+    if let Some(angles) = &angles {
+        tip = tip.push(text(angles.clone()).size(11));
     }
-    if let Some(angles) = angles {
-        card = card.push(muted(angles).size(11).wrapping(Wrapping::Word));
-    }
-    if let Some(start) = start {
-        card = card.push(act("Start here", start, false));
-    }
-    container(card)
-        .padding(8)
-        .style(move |_| {
-            let (background, border, width) = match stage {
-                Stage::Cutting => (SELECTED_ROW, CUTTING, 2.),
-                Stage::Done => (Color::from_rgb8(243, 249, 245), DONE, 1.),
-                Stage::Next => (Color::WHITE, CUTTING, 1.),
-                Stage::Skipped => (Color::from_rgb8(241, 243, 245), LINE, 1.),
-                Stage::ToCome => (Color::WHITE, LINE, 1.),
-            };
-            container::Style {
-                background: Some(background.into()),
-                border: Border {
-                    color: border,
-                    width,
-                    radius: 6.into(),
-                },
-                text_color: Some(INK),
-                ..Default::default()
-            }
+    let strong = matches!(stage, Stage::Cutting | Stage::Next);
+    let name = text(format!("{n}. {}", ellipsize(&o.name, 30)))
+        .size(13)
+        .color(if stage == Stage::Skipped { MUTED } else { INK })
+        .font(Font {
+            weight: if strong {
+                iced::font::Weight::Semibold
+            } else {
+                iced::font::Weight::Normal
+            },
+            ..Font::DEFAULT
         })
-        .into()
+        .wrapping(Wrapping::None);
+    let line = row![
+        stage_icon(stage),
+        container(name).width(Fill).clip(true),
+        text(time.unwrap_or_default())
+            .size(11)
+            .color(MUTED)
+            .width(96)
+            .align_x(Alignment::End)
+            .wrapping(Wrapping::None),
+        match start {
+            Some(m) => act_with("Start here", m, false, Some(Length::Fixed(74.)), [3, 4]),
+            None => space().width(74).into(),
+        },
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .height(28);
+    let mut body = column![line].spacing(3);
+    if let Some(cut) = cut {
+        body = body.push(widget::progress_bar(0.0..=1.0, cut).girth(5));
+    }
+    let row = container(body).padding([2, 6]).style(move |_| {
+        let (background, border) = match stage {
+            Stage::Cutting => (
+                Some(Color::from_rgb8(238, 244, 254)),
+                Color::from_rgb8(188, 210, 245),
+            ),
+            Stage::Next => (
+                Some(Color::from_rgb8(241, 250, 244)),
+                Color::from_rgb8(191, 227, 204),
+            ),
+            _ => (None, Color::TRANSPARENT),
+        };
+        container::Style {
+            background: background.map(Into::into),
+            border: Border {
+                color: border,
+                width: 1.,
+                radius: 6.into(),
+            },
+            text_color: Some(INK),
+            ..Default::default()
+        }
+    });
+    widget::tooltip(
+        row,
+        container(tip).padding(8).style(|_| container::Style {
+            background: Some(Color::from_rgb8(27, 44, 61).into()),
+            text_color: Some(Color::from_rgb8(236, 242, 249)),
+            border: Border {
+                radius: 7.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        widget::tooltip::Position::Left,
+    )
+    .gap(8)
+    .into()
+}
+/// The size the Operations list's hover shows its picture of the stock at.
+const OP_PICTURE: (f32, f32) = (150., 112.5);
+
+/// The right column of the Control page: the setup's operations in the
+/// order they are cut, grouped by tool run, where each stands, and under
+/// them what holds Cycle Start back, in full.
+pub(crate) fn program<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Message> {
+    use crate::run::Action as R;
+    use uc100::controller::State;
+    let s = &c.snapshot;
+    let msg = |on: bool, a: R| on.then_some(Message::Run(a));
+    let mut head = row![bold("Operations", 14), space().width(Fill)].align_y(Alignment::Center);
+    let mut list = column![].spacing(2);
+    let Some(run) = &c.run else {
+        return card(
+            column![
+                head,
+                muted("Pick a setup in the run bar: its operations are listed here.")
+            ]
+            .spacing(10),
+            None,
+        );
+    };
+    let running = run.running.is_some();
+    let state = s.state.as_ref();
+    match run.programs.as_deref() {
+        None => {
+            list = list.push(muted(if run.stale {
+                crate::run::CHECK_WAITS
+            } else {
+                "Checking the setup…"
+            }))
+        }
+        Some(Err(problems)) => {
+            list = list
+                .push(caution("This setup cannot run", problems.clone()))
+                .push(act("Check again", msg(true, R::Check), false));
+        }
+        Some(Ok(programs)) => {
+            let count = programs.len();
+            let ops: usize = programs.iter().map(|p| p.ops.len()).sum();
+            let tools = format!("{} · {}", plural(ops, "op"), plural(count, "tool run"));
+            head = head.push(muted(match run.setup_time() {
+                Some(t) => format!("{} · {tools}", crate::run::clock(t)),
+                None => tools,
+            }));
+            let left = run.left(s);
+            // Where A is, on a machine with A, and while an index move turns it.
+            let with_a = app
+                .doc
+                .setups
+                .get(run.setup)
+                .is_some_and(|x| x.machine.has_a())
+                && c.axis(3);
+            if with_a {
+                let turning = run
+                    .progress(s.current_line)
+                    .and_then(|(_, _, b)| match run.running_blocks()?.get(b)? {
+                        crate::post::Block::Index { a, .. } => Some(*a),
+                        _ => None,
+                    })
+                    .filter(|_| running);
+                let mut line = if s.referenced[3] {
+                    format!(
+                        "A now: {:.3}° in G{} (machine A {:.3}°)",
+                        s.work_pos[3],
+                        54 + s.active_wcs,
+                        s.machine_pos[3]
+                    )
+                } else {
+                    "A now: no machine position".to_string()
+                };
+                if let Some(a) = turning {
+                    line += &format!(
+                        " · index move: turning A alone to {}°, X Y Z still",
+                        crate::indexed::degrees(a)
+                    );
+                }
+                list = list.push(one_line("A", line, 12, INK, 60));
+            }
+            // Operations are numbered through the setup, across its tool runs.
+            let mut number = 0;
+            for (i, p) in programs.iter().enumerate() {
+                list = list.push(
+                    container(
+                        row![
+                            text(format!(
+                                "TOOL RUN {} · {}",
+                                i + 1,
+                                crate::model::tool_label(p.ops[0].tool, &p.ops[0].tool_name)
+                            ))
+                            .size(11)
+                            .color(MUTED)
+                            .width(Fill)
+                            .wrapping(Wrapping::None),
+                            muted(
+                                run.times
+                                    .as_ref()
+                                    .and_then(|t| t.run(i, 0))
+                                    .map(crate::run::clock)
+                                    .unwrap_or_default()
+                            )
+                            .size(11),
+                        ]
+                        .spacing(6),
+                    )
+                    .padding(iced::Padding {
+                        top: 8.,
+                        bottom: 2.,
+                        left: 6.,
+                        right: 6.,
+                    }),
+                );
+                let times = run.op_times(i);
+                let left = left.filter(|_| run.running.as_ref().is_some_and(|r| r.index == i));
+                for (k, ((o, &oi), stage)) in p
+                    .ops
+                    .iter()
+                    .zip(&p.indexes)
+                    .zip(run.stages(i, s.current_line))
+                    .enumerate()
+                {
+                    number += 1;
+                    use crate::run::Stage;
+                    let start =
+                        (!matches!(stage, Stage::Next | Stage::Cutting) && !c.probing()).then_some(
+                            msg(!running, if k == 0 { R::Next(i) } else { R::From(i, k) }),
+                        );
+                    let (time, cut) = match (left.and_then(|l| l.op), &times) {
+                        (Some((op, op_left, op_all)), _) if op == k => (
+                            Some(format!(
+                                "{} left of {}",
+                                crate::run::clock(op_left),
+                                crate::run::clock(op_all)
+                            )),
+                            Some(if op_all > 0. {
+                                1. - op_left / op_all
+                            } else {
+                                0.
+                            }),
+                        ),
+                        (_, Some(t)) => (t.get(k).map(|&t| crate::run::clock(t)), None),
+                        _ => (None, None),
+                    };
+                    // The setup and the A angles the operation is cut at.
+                    let angles = crate::run::op_angles(&p.blocks, k);
+                    let at = with_a.then(|| {
+                        let a = if angles.is_empty() {
+                            "A 0°".to_string()
+                        } else {
+                            crate::indexed::angles_text(&angles)
+                        };
+                        format!("Setup {} · {a}", run.setup + 1)
+                    });
+                    list = list.push(op_row(
+                        number,
+                        o,
+                        run.picture(oi),
+                        stage,
+                        time,
+                        start,
+                        at,
+                        cut,
+                    ));
+                }
+            }
+        }
+    }
+    // What holds Cycle Start back, in full: the run bar says the first.
+    let mut checks = column![].spacing(8);
+    if run.stale && run.programs.is_some() {
+        checks = checks
+            .push(caution(
+                "The project changed since this setup was checked",
+                vec!["Check it again before the next tool run.".into()],
+            ))
+            .push(act("Check again", msg(!running, R::Check), false));
+    }
+    if run.checked().is_some() && !crate::run::busy(state) {
+        let mut problems = run.problems(c, &app.doc);
+        problems.extend(app.planning_busy().map(String::from));
+        if !problems.is_empty() {
+            checks = checks.push(caution("Before Cycle Start", problems));
+            let off = run.coolant_off(c, &app.doc);
+            if !off.is_empty() {
+                let ops = &app.doc.setups[run.setup].operations;
+                let names: Vec<&str> = off.iter().map(|&i| ops[i].name()).collect();
+                checks = checks.push(act(
+                    format!("Set coolant to Off: {}", names.join(", ")),
+                    msg(!running, R::CoolantOff),
+                    false,
+                ));
+            }
+        }
+        if let Some(line) = crate::run::limits_unchecked(c) {
+            checks = checks.push(caution("Soft limits are off for Cycle Start", vec![line]));
+        }
+    }
+    if let Some(State::Paused(reason)) = state {
+        checks = checks.push(note(format!("Paused: {reason}")));
+    }
+    if let Some((ok, message)) = &run.outcome {
+        checks = checks.push(
+            text(message.clone())
+                .size(12)
+                .color(if *ok { GREEN } else { AMBER }),
+        );
+    }
+    card(
+        column![
+            head.height(24),
+            scrollable(column![list, checks].spacing(12).padding(iced::Padding {
+                right: SCROLLBAR_GUTTER,
+                ..Default::default()
+            }))
+            .id("operations")
+            .height(Fill)
+        ]
+        .spacing(6),
+        None,
+    )
 }
 /// Work zero on the stock, in the Run panel until the setup's first tool run
 /// starts: how to put the work zero its tool runs are cut from on the stock,
@@ -8623,9 +9666,9 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
     steps.push(if (0..3).all(|a| s.referenced[a]) {
         "1. X, Y and Z have a machine position.".into()
     } else if c.home_switches() {
-        "1. Optional: Home under Position, so that the soft limits are on. Without it Cycle Start runs with them off.".into()
+        "1. Optional: Home in the Machine tab, so that the soft limits are on. Without it Cycle Start runs with them off.".into()
     } else {
-        "1. Optional: Set machine zero under Position, so that the soft limits are on: jog X to its left end, Y to its front end and Z to the top first. Without it Cycle Start runs with them off.".into()
+        "1. Optional: Set machine zero in the Machine tab, so that the soft limits are on: jog X to its left end, Y to its front end and Z to the top first. Without it Cycle Start runs with them off.".into()
     });
     steps.push(if p.offset == format!("G{}", 54 + s.active_wcs) {
         format!("2. {} is the active work system.", p.offset)
@@ -8709,7 +9752,7 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
         // Probe Z sets Z, and X and Y are zeroed by hand.
         let probe_z = |top: f64| {
             format!(
-                "{}, Probe Z under Work zero sets Z{}.",
+                "{}, Probe Z in the Probe tab sets Z{}.",
                 if c.direct() {
                     "With the plate's lead on the stock"
                 } else {
@@ -8720,7 +9763,7 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
         };
         steps.push(match (c.edges_setup(), c.stock_top()) {
             (Ok((refs, _)), _) if c.sides_blocked().is_none() => format!(
-                "With the plate's lead on the stock and the clip on the tool, {} under Work zero does 3 and 4.",
+                "With the plate's lead on the stock and the clip on the tool, {} in the Probe tab does 3 and 4.",
                 crate::control::probe_name(refs)
             ),
             (Ok(_), Ok(top)) => {
@@ -8828,7 +9871,7 @@ fn pin_steps(
         (_, true, true) => "1. X and Y are referenced from pin 1 since the last E-stop, and Z has a machine position.".into(),
         (false, ..) => "1. Under Position, set machine zero, then with the part off the pins Record the pins' place (once for the plate).".into(),
         (true, _, false) => "1. Under Position, set machine zero on Z at the top of its travel, then with the part off the pins Reference X Y from pin 1 (after every E-stop or power cycle).".into(),
-        (true, false, true) => "1. With the part off the pins, jog the probe a few mm above the middle of pin 1 and press Reference X Y from pin 1 under Position: every E-stop clears it.".into(),
+        (true, false, true) => "1. With the part off the pins, jog the probe a few mm above the middle of pin 1 and press Reference X Y from pin 1 in the Machine tab: every E-stop clears it.".into(),
     });
     steps.push(if p.offset == format!("G{}", 54 + s.active_wcs) {
         format!("2. {} is the active work system.", p.offset)
@@ -8855,7 +9898,7 @@ fn pin_steps(
                 }
             });
             format!(
-                "4. Jog the tool tip over {spot}, down until it just pinches a sheet of paper, and press Set Z{}, or put the touch plate there and press Probe Z under Work zero. {}",
+                "4. Jog the tool tip over {spot}, down until it just pinches a sheet of paper, and press Set Z{}, or put the touch plate there and press Probe Z in the Probe tab. {}",
                 crate::post::exact_mm(work[2] as f32),
                 fits_check(c)
             )
@@ -8868,7 +9911,7 @@ fn pin_steps(
 /// tool run fits the soft limits, which needs a machine position.
 fn fits_check(c: &crate::control::Connection) -> &'static str {
     if c.snapshot.referenced[..3].iter().all(|r| *r) {
-        "The checks above then say whether every tool run fits the soft limits from there."
+        "The checks under Operations then say whether every tool run fits the soft limits from there."
     } else {
         "Without a machine position the checks cannot say whether every tool run fits the machine's travel."
     }
@@ -9045,10 +10088,10 @@ fn pin_block<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>>
     }
     Some(col.into())
 }
-/// The Rotary A panel on a machine with the rotary unit (LIO-186): how the
+/// The Rotary A tab on a machine with the rotary unit (LIO-186): how the
 /// A centreline was found, the calibration probes, Save the centreline and
 /// Rotary unit remounted, why a probe cannot start and how the last ended.
-fn rotary_panel<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>> {
+fn rotary_tab<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>> {
     use crate::control::{Action, Calibrate};
     let rot = c.rotary.as_ref().filter(|_| c.axis(3))?;
     let (green, amber) = (
@@ -9141,7 +10184,9 @@ fn rotary_panel<'a>(c: &crate::control::Connection) -> Option<Element<'a, Messag
             false
         ),
     ]
-    .spacing(6);
+    .spacing(6)
+    .wrap()
+    .vertical_spacing(6);
     let how = match c.calibrating() {
         Some(what) => format!("{} E-stop stops it.", what.how()),
         None => match c.calibrate_blocked(Calibrate::Centreline) {
@@ -9171,7 +10216,7 @@ fn rotary_panel<'a>(c: &crate::control::Connection) -> Option<Element<'a, Messag
             bar.x[1],
         )));
     }
-    Some(machine_panel("Rotary A", col))
+    Some(tab_scroll(col))
 }
 const HOME_NOTE: &str = "Home references every axis on its switch. Every E-stop clears the machine position: home again after one.";
 const MACHINE_ZERO_NOTE: &str = "Every E-stop clears the machine position: set it again after one. Without home switches, jog X to its left end, Y to its front end (gantry toward you) and Z to the top, then Set machine zero here. Keep the last position takes the position AXIS CAM saved at the last disconnect: only if nothing moved the machine since.";
@@ -11922,6 +12967,77 @@ pub(crate) mod probe {
                 Seen::Scroll(..) => None,
             })
             .collect()
+    }
+    struct Bounds(Vec<(Option<Id>, iced::Rectangle)>);
+    impl Operation for Bounds {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+        fn scrollable(
+            &mut self,
+            id: Option<&Id>,
+            bounds: iced::Rectangle,
+            _: iced::Rectangle,
+            _: iced::Vector,
+            _: &mut dyn Scrollable,
+        ) {
+            self.0.push((id.cloned(), bounds));
+        }
+    }
+    /// The scrollables of `page`: their ids and where they are.
+    pub(crate) fn scrollables(
+        page: Element<'_, Message>,
+        window: Size,
+    ) -> Vec<(Option<Id>, iced::Rectangle)> {
+        let mut renderer = renderer();
+        let mut ui = UserInterface::build(page, window, Cache::default(), &mut renderer);
+        let mut bounds = Bounds(vec![]);
+        ui.operate(&renderer, &mut bounds);
+        bounds.0
+    }
+    /// What pressing the left button gives at every `step` px of `area`,
+    /// with the point it was pressed at.
+    pub(crate) fn presses(
+        page: Element<'_, Message>,
+        window: Size,
+        area: iced::Rectangle,
+        step: f32,
+    ) -> Vec<(Point, Message)> {
+        let mut renderer = renderer();
+        let mut ui = UserInterface::build(page, window, Cache::default(), &mut renderer);
+        let mut out = vec![];
+        let mut x = area.x;
+        while x < area.x + area.width {
+            let mut y = area.y;
+            while y < area.y + area.height {
+                let at = Point::new(x, y);
+                let events = [
+                    Event::Mouse(mouse::Event::CursorMoved { position: at }),
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                ];
+                let mut messages = vec![];
+                let _ = ui.update(
+                    &events,
+                    mouse::Cursor::Available(at),
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                out.extend(messages.into_iter().map(|m| (at, m)));
+                let _ = ui.update(
+                    &[Event::Mouse(mouse::Event::ButtonReleased(
+                        mouse::Button::Left,
+                    ))],
+                    mouse::Cursor::Available(at),
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut vec![],
+                );
+                y += step;
+            }
+            x += step;
+        }
+        out
     }
     /// The messages that pressing and releasing the left button gives, at
     /// every eighth point of `page`.

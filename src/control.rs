@@ -1975,7 +1975,7 @@ pub enum Action {
     /// plus the touch plate's thickness on stock that does not conduct.
     ProbeZ,
     /// Probe corner, Probe edge or Probe centre: the X, Y and Z work zero
-    /// of the setup picked in the Run panel, from its stock.
+    /// of the setup picked in the run bar, from its stock.
     ProbeEdges,
     /// The stock-top spot Probe corner, Probe edge or Probe centre finds the
     /// setup's work zero from (`post::Checked::probe_from`): None for the
@@ -3110,7 +3110,7 @@ impl Connection {
                         c.reference = Some(at);
                         self.centre_saved = false;
                         format!(
-                            "Z reference touched with the probe at machine X {:.3} Y {:.3} Z {trip:.3}, {:.3} mm under the centreline. Save the centreline to keep both; each tool is then touched off on this surface (Run panel → Touch off on the A reference).",
+                            "Z reference touched with the probe at machine X {:.3} Y {:.3} Z {trip:.3}, {:.3} mm under the centreline. Save the centreline to keep both; each tool is then touched off on this surface (Work zero tab → Touch off on the A reference).",
                             at[0],
                             at[1],
                             c.z - trip
@@ -3185,16 +3185,16 @@ impl Connection {
     /// checked for the project as it is, or why there is none.
     pub fn run_program(&self) -> Result<&crate::post::Checked, String> {
         let Some(run) = &self.run else {
-            return Err("Pick a setup in the Run panel.".into());
+            return Err("Pick a setup in the run bar.".into());
         };
         let p = match run.programs.as_deref() {
             None => return Err("Checking the setup…".into()),
             Some(Ok(p)) if !p.is_empty() => &p[0],
-            Some(_) => return Err("The setup cannot run: see the Run panel.".into()),
+            Some(_) => return Err("The setup cannot run: see Operations.".into()),
         };
         if run.stale {
             return Err(
-                "The project changed since the setup was checked: check it again in the Run panel."
+                "The project changed since the setup was checked: check it again under Operations."
                     .into(),
             );
         }
@@ -3206,7 +3206,7 @@ impl Connection {
     /// finds it.
     pub fn edges_setup(&self) -> Result<([crate::post::At; 2], &crate::post::Checked), String> {
         if self.run.is_none() {
-            return Err("Probe corner, Probe edge and Probe centre set the work zero of the setup picked in the Run panel, from its stock.".into());
+            return Err("Probe corner, Probe edge and Probe centre set the work zero of the setup picked in the run bar, from its stock.".into());
         }
         let p = self.run_program()?;
         let spots = self.probe_spots();
@@ -3410,7 +3410,7 @@ impl Connection {
         let pins = self.pins_set()?;
         let Some(at) = pins.reference else {
             return Err(
-                "The pins' place is not recorded yet: Record the pins' place under Position."
+                "The pins' place is not recorded yet: Record the pins' place in the Machine tab."
                     .into(),
             );
         };
@@ -3740,10 +3740,10 @@ impl Connection {
     /// run that turns A, about a measured centreline saved with its
     /// reference, with the tool over the spot the probe touched.
     pub fn a_reference(&self, doc: &crate::model::Document) -> Result<Touch, String> {
-        let run = self.run.as_ref().ok_or("Pick a setup in the Run panel.")?;
+        let run = self.run.as_ref().ok_or("Pick a setup in the run bar.")?;
         let p = (run.checked())
             .and_then(|p| p.get(run.next))
-            .ok_or("The setup cannot run: see the Run panel.")?;
+            .ok_or("The setup cannot run: see Operations.")?;
         let setup = (doc.setups.get(run.setup)).ok_or(crate::run::REMOVED)?;
         if crate::run::a_angles(&p.blocks).is_empty() {
             return Err("This tool run does not turn A: touch it off as for any setup.".into());
@@ -4568,7 +4568,7 @@ pub fn focus_first() -> impl iced::advanced::widget::Operation {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Like the JY5800: X, Y, Z with soft limits and no switches.
@@ -7839,7 +7839,7 @@ probe = { pin = 13, active_low = true }
 
     /// Like the JY5800 with the rotary unit's A axis and the probe, fine
     /// enough (200 steps per mm) and fast for the simulator.
-    const ROTARY_PROBED: &str = r#"
+    pub(crate) const ROTARY_PROBED: &str = r#"
 [controller]
 step_rate = "100kHz"
 [axes.x]

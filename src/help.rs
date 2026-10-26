@@ -1069,7 +1069,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "Checks cover generation, machine limits, rapids into material and holder clearance, and, in a setup that models a vise or clamps, the jaws or clamps as boxes with a clearance gap over every program move, links, approaches and retracts included; parallels, bolts, the table, the machine body and other fixtures are not checked.",
         ),
         RunOnMachine(_) => (
-            "Open the MACHINE workspace with this setup picked in the Run panel, once you Connect if the machine is not connected yet. The UC100 runs the setup directly, one tool run at a time, after the same checks as export; no G-code file is written.",
+            "Open the MACHINE workspace with this setup picked in the run bar, once you Connect if the machine is not connected yet. The UC100 runs the setup directly, one tool run at a time, after the same checks as export; no G-code file is written.",
             "",
         ),
         Page(crate::Page::Wizard) | NewMachine => (
@@ -1518,6 +1518,15 @@ pub fn command(m: &Message, label: String) -> Help {
         Run(a) => run_help(a),
         Guide(a) => guide_help(a),
         ControlSetup(false) => ("Jog, zero and run the machine.", ""),
+        ControlView(crate::ui::JobView::Stock) => (
+            "Show the setup's stock in 3D as it is cut: the machine's tool is red while a tool run cuts.",
+            "",
+        ),
+        ControlView(crate::ui::JobView::Machine) => (
+            "Show the machine's travel, the tool tip in it and the work zero.",
+            "",
+        ),
+        ControlView(crate::ui::JobView::Top) => ("Look at the setup's stock from above.", ""),
         ControlSetup(true) => (
             "Edit the machine's UC100 profile, watch its inputs, test its outputs and calibrate steps per mm (per degree for A).",
             "",
@@ -1635,7 +1644,7 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
             "Spindle speed for CW and CCW, in revolutions per minute.",
             "",
         ),
-        Spindle(uc100::gcode::Spindle::Off) => ("Stop the spindle.", ""),
+        Spindle(uc100::gcode::Spindle::Off) => ("Spindle off: stop the spindle.", ""),
         Spindle(_) => (
             "Start the spindle at the RPM above. Stop it before changing direction.",
             "",
@@ -1653,10 +1662,10 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
         ),
         ProbeZ => (
             "With the touch plate on the stock top under the tool and the clip on the tool, feed Z down until the tool touches the plate, at most the maximum probe distance. Work Z there becomes the stock top's Z plus the plate's thickness; the tool lifts. On a metal project the plate's lead goes on the stock: no thickness. Without contact nothing is set.",
-            "The stock top's Z is the program's for the setup picked in the Run panel (Z 0, or the stock's height for a work zero on the bottom), and Z 0 without one.",
+            "The stock top's Z is the program's for the setup picked in the run bar (Z 0, or the stock's height for a work zero on the bottom), and Z 0 without one.",
         ),
         ProbeEdges => (
-            "Probe corner, Probe edge or Probe centre, by the work zero of the setup picked in the Run panel. From above the stock top it touches the top, then the sides at the spots the program header names, and sets the X, Y and Z work zero exactly where the program has it. Anything touched on the way, a miss, Stop or E-stop ends it with nothing set.",
+            "Probe corner, Probe edge or Probe centre, by the work zero of the setup picked in the run bar. From above the stock top it touches the top, then the sides at the spots the program header names, and sets the X, Y and Z work zero exactly where the program has it. Anything touched on the way, a miss, Stop or E-stop ends it with nothing set.",
             "With the probe above the stock top where Z0 is touched off, it touches the top, then the sides at the spots the program header names, 1 mm to 10 mm below the top (less on low stock), allowing for the tip's radius, and sets the X, Y and Z work zero exactly where the program has it: on the top or the bottom, and for Model origin from the front-left corner. A side whose first touch was off its spot is touched again on it.",
         ),
         TouchOff => (
@@ -1778,10 +1787,13 @@ fn run_help(a: &crate::run::Action) -> (&'static str, &'static str) {
             "Run the next tool run: its moves at the current work zero, checked against the soft limits first. The tool first rises or drops to the clearance plane where it stands, so leave it where a straight vertical move is safe.",
             "",
         ),
-        Hold => ("Feed hold: slow to a stop and wait. Resume continues.", ""),
+        Hold => (
+            "Feed hold: slow to a stop and wait. Resume continues. Space holds from any page while no text field is being edited, and resumes on the Control page.",
+            "",
+        ),
         Resume => ("Continue after a feed hold or a pause.", ""),
         Stop => (
-            "Slow to a stop, then end the tool run with the spindle and coolant off.",
+            "Stop now: slow to a stop at once, then end the tool run with the spindle and coolant off.",
             "",
         ),
         RecordReference => (
@@ -4807,6 +4819,9 @@ mod tests {
             LoadModels,
             ControlSetup(false),
             ControlSetup(true),
+            ControlView(crate::ui::JobView::Stock),
+            ControlView(crate::ui::JobView::Machine),
+            ControlView(crate::ui::JobView::Top),
             Setup(crate::setup::Msg::Save),
             Setup(crate::setup::Msg::UseCalibration),
             Setup(crate::setup::Msg::Revert),

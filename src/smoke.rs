@@ -1281,12 +1281,15 @@ impl App {
                     "machine zero: {}",
                     self.smoke_machine_state()
                 );
-                vec![Message::Tick]
+                vec![
+                    Message::Tick,
+                    Message::ControlView(crate::ui::JobView::Machine),
+                ]
             }
             121 => {
-                // The setup picked in the Run panel, checked here (the smoke
-                // run leaves the tasks its steps return alone), with the Run
-                // strip above it.
+                // The setup picked in the run bar, checked here (the smoke
+                // run leaves the tasks its steps return alone).
+                let _ = self.update(Message::ControlView(crate::ui::JobView::Stock));
                 let _ = self.update(Message::Run(crate::run::Action::Setup(0)));
                 let epoch = self
                     .control
@@ -1308,16 +1311,16 @@ impl App {
             }
             // The Setup view: the profile of the connected machine.
             122 => vec![Message::ControlSetup(true)],
-            // Back on the Control page, the work zero under the jog: each
-            // axis's DRO line with Zero, ½ and Set, a value typed for X, and
-            // the probes. No setup picked: the one of screen 97 cannot run,
-            // and the fixed Run strip listing why leaves little of the page.
+            // Back on the Control page, the Work zero tab: each axis's
+            // value to set, a value typed for X. No setup picked: the one of
+            // screen 97 cannot run.
             123 => {
                 if let Some(c) = &mut self.control {
                     c.run = None;
                 }
                 vec![
                     Message::ControlSetup(false),
+                    Message::ControlTab(crate::ui::ControlTab::WorkZero),
                     Message::Machine(crate::control::Action::WorkText(0, "-5".into())),
                 ]
             }
@@ -1354,20 +1357,6 @@ impl App {
             125 => {
                 let line = self.smoke_lathe_check();
                 eprintln!("Screen 101: {line}");
-            }
-            // The machine drawn under the work zero, in view.
-            120 => {
-                return iced::widget::operation::scroll_to(
-                    "control",
-                    iced::widget::scrollable::AbsoluteOffset { x: 0., y: 970. },
-                );
-            }
-            // The work zero under the position table and the jog.
-            123 => {
-                return iced::widget::operation::scroll_to(
-                    "control",
-                    iced::widget::scrollable::AbsoluteOffset { x: 0., y: 420. },
-                );
             }
             116 => {
                 // The stock setup 2 starts from is the one worked out, and the
@@ -1486,7 +1475,7 @@ impl App {
                     iced::widget::scrollable::AbsoluteOffset { x: 0., y: 0. },
                 )
             };
-            return Task::batch([top("inspector"), top("planner-result"), top("control")]);
+            return Task::batch([top("inspector"), top("planner-result")]);
         }
         Task::none()
     }
@@ -2106,6 +2095,8 @@ mist = { pin = 9 }
         let id = a.doc.machines[0].id.clone();
         let _ = a.update(Message::Connect);
         assert!(a.control.is_some());
+        // Disconnect is in the Machine tab with the connection.
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Machine));
         let _ = a.update(Message::DeleteMachine(id.clone()));
         assert_eq!(a.doc.machines.len(), 1);
         assert_eq!(
@@ -2656,6 +2647,199 @@ flood = { pin = 8 }
         tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
         let _ = a.view();
         render_png(&a, size, &out.join("3-tool-change.png"));
+    }
+
+    /// The jog buttons' places on the Control page at 1440 × 790, by the
+    /// direction each jogs: where a press gives `JogPress`.
+    fn jog_pad(a: &App) -> Vec<(iced::Point, usize, bool)> {
+        let window = iced::Size::new(1440., 790.);
+        let area = iced::Rectangle::new(
+            iced::Point::ORIGIN,
+            iced::Size::new(crate::ui::HANDS + 20., window.height),
+        );
+        crate::ui::probe::presses(a.view(), window, area, 6.)
+            .into_iter()
+            .filter_map(|(at, m)| match m {
+                Message::Machine(crate::control::Action::JogPress(axis, negative)) => {
+                    Some((at, axis, negative))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Nothing around the jog pad moves while the machine jogs: leaving a
+    /// jog button stops the jog, so a button that moved from under the
+    /// pointer would stop it (LIO-274). The page itself never scrolls at
+    /// 1440 × 790: only the lists in it do, inside their own area.
+    #[test]
+    fn the_jog_pad_stays_put_while_the_machine_jogs_and_the_page_does_not_scroll() {
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let still = jog_pad(&a);
+        for axis in 0..3 {
+            for negative in [false, true] {
+                assert!(
+                    still.iter().any(|&(_, x, n)| (x, n) == (axis, negative)),
+                    "no jog button for axis {axis} {negative}"
+                );
+            }
+        }
+        let _ = a.update(Message::Machine(crate::control::Action::JogPress(1, false)));
+        tick_until(&mut a, 3.0, "jogging", |s| s.state == Some(State::Jog));
+        let moving = jog_pad(&a);
+        let _ = a.update(Message::Machine(crate::control::Action::JogRelease));
+        assert_eq!(still, moving);
+        // Every scrollable is inside the page under the run bar, none of it
+        // the page's: the page has no scrollbar.
+        let window = iced::Size::new(1440., 790.);
+        let top = crate::ui::MACHINE_BAR + crate::ui::RUN_BAR;
+        for tab in [
+            crate::ui::ControlTab::Job,
+            crate::ui::ControlTab::WorkZero,
+            crate::ui::ControlTab::Probe,
+            crate::ui::ControlTab::Mdi,
+            crate::ui::ControlTab::Machine,
+        ] {
+            let _ = a.update(Message::ControlTab(tab));
+            for (id, at) in crate::ui::probe::scrollables(a.view(), window) {
+                assert!(
+                    at.y >= top && at.width < window.width - crate::ui::HANDS,
+                    "{tab:?}: {id:?} at {at:?} scrolls the page"
+                );
+            }
+        }
+    }
+
+    /// The jog keys jog only while the jog pad is on screen: not in the
+    /// Controller configuration view nor on another page (LIO-273). The two
+    /// Stops say which they stop, and without a probe input the Probe tab is
+    /// one line and the way to the profile.
+    #[test]
+    fn the_keys_jog_only_with_the_pad_on_screen_and_the_stops_say_what_they_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        idle(&mut a);
+        let key = |a: &mut App| {
+            let _ = a.update(Message::JogKey(1, false, false));
+            let _ = a.update(Message::JogKeyChecked(1, false, false));
+            let held = conn(a).held();
+            let _ = a.update(Message::JogKeyUp);
+            held
+        };
+        assert!(a.jog_pad_shown());
+        assert_eq!(key(&mut a), Some((1, false)));
+        let _ = a.update(Message::ControlSetup(true));
+        assert!(!a.jog_pad_shown());
+        assert_eq!(key(&mut a), None);
+        let _ = a.update(Message::ControlSetup(false));
+        a.page = Page::Home;
+        assert!(!a.jog_pad_shown());
+        assert_eq!(key(&mut a), None);
+        a.page = Page::Control;
+        let texts = page_texts(&a);
+        let has = |t: &str| texts.iter().any(|x| x == t);
+        assert!(has("Stop now") && has("Spindle off") && !has("Stop"), "{texts:?}");
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Probe));
+        let texts = page_texts(&a);
+        assert!(
+            texts.iter().any(|t| t.contains("has no probe input"))
+                && !texts.iter().any(|t| t == "Probe Z"),
+            "{texts:?}"
+        );
+    }
+
+    /// Renders the Control page at 1440 × 790, the usable window of a 13"
+    /// laptop, in each state and tab to `$AXIS_RENDER_DIR` (default
+    /// /tmp/control-page): not connected, E-stop, idle, before the run,
+    /// cutting, the tool change, and a machine with A; and once at
+    /// 1440 × 900 and 1920 × 1080. Not a check: run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_the_control_page() {
+        use crate::run::{Action as R, Stage::*};
+        use crate::ui::ControlTab as T;
+        use uc100::controller::State;
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/control-page".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let size = iced::Size::new(1440., 790.);
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        let _ = a.view();
+        render_png(&a, size, &out.join("00-not-connected.png"));
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        render_png(&a, size, &out.join("01-e-stop.png"));
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        render_png(&a, size, &out.join("02-connected-idle.png"));
+        zero(&mut a);
+        check_run_pictured(&mut a, dir.path(), 0);
+        render_png(&a, size, &out.join("03-before-the-run.png"));
+        for (tab, name) in [
+            (T::WorkZero, "work-zero"),
+            (T::Probe, "probe"),
+            (T::Mdi, "mdi"),
+            (T::Machine, "machine"),
+        ] {
+            let _ = a.update(Message::ControlTab(tab));
+            render_png(&a, size, &out.join(format!("04-tab-{name}.png")));
+        }
+        let _ = a.update(Message::ControlView(crate::ui::JobView::Machine));
+        let _ = a.update(Message::ControlTab(T::Job));
+        render_png(&a, size, &out.join("04-tab-job-machine.png"));
+        let _ = a.update(Message::ControlView(crate::ui::JobView::Stock));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        let mut deadline = Deadline::new(30.);
+        while run_of(&a).stages(0, conn(&a).snapshot.current_line) != [Done, Cutting, ToCome] {
+            let _ = a.update(Message::Tick);
+            assert!(deadline.within(&conn(&a).snapshot));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = a.update(Message::Tick);
+        render_png(&a, size, &out.join("05-cutting.png"));
+        render_png(
+            &a,
+            iced::Size::new(1440., 900.),
+            &out.join("05-cutting-1440x900.png"),
+        );
+        render_png(
+            &a,
+            iced::Size::new(1920., 1080.),
+            &out.join("05-cutting-1920x1080.png"),
+        );
+        run_until(&mut a, 30.0, "tool run 1", |r| r.done[0]);
+        tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
+        // The tick's phase change opens the tab once no field has the focus.
+        let _ = a.update(Message::ControlPhaseTab(T::ToolChange, false));
+        render_png(&a, size, &out.join("06-tool-change.png"));
+        let _ = a.update(Message::Disconnect);
+        // A machine with the rotary unit: A in the position, jog and tabs.
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let mut m = crate::control::rotary_machine(dir.path()).unwrap();
+        let profile = dir.path().join("rotary-probed.toml");
+        std::fs::write(&profile, crate::control::tests::ROTARY_PROBED).unwrap();
+        m.p.insert("uc100_profile".into(), profile.display().to_string());
+        m.p.insert("uc100_connection".into(), "Simulated".into());
+        a.doc.machines.push(m);
+        a.page = Page::Control;
+        idle(&mut a);
+        render_png(&a, size, &out.join("07-rotary-idle.png"));
+        for (tab, name) in [(T::Rotary, "rotary"), (T::Probe, "probe")] {
+            let _ = a.update(Message::ControlTab(tab));
+            render_png(&a, size, &out.join(format!("07-rotary-tab-{name}.png")));
+        }
     }
 
     /// Renders the operation editor's Cycle tab with Helical milling, and
@@ -3973,11 +4157,11 @@ flood = { pin = 8 }
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
     }
 
-    /// The Run strip, fixed above the part of the Control page that scrolls,
-    /// holds Cycle Start, Hold, Resume and Stop however long the tool-run
-    /// list is; the list is under it, in the Tool runs panel (#71).
+    /// The run bar holds Cycle Start, Hold, Resume and Stop now however long
+    /// the setup is; its operations are in the Operations list beside it
+    /// (#71, LIO-274).
     #[test]
-    fn the_run_strip_keeps_cycle_start_and_stop_above_a_long_tool_run_list() {
+    fn the_run_bar_keeps_cycle_start_and_stop_now_beside_a_long_operations_list() {
         use iced::advanced::widget::{Tree, tree::Tag};
         /// The buttons in a widget tree: the nodes that keep a button's state.
         fn buttons(t: &Tree, button: Tag) -> usize {
@@ -3989,8 +4173,8 @@ flood = { pin = 8 }
         )
         .tag;
         let counts = |a: &App| {
-            let strip = crate::ui::run_strip(a, conn(a));
-            let runs = crate::ui::run_panel(a, conn(a)).expect("the tool runs");
+            let strip = crate::ui::run_bar(a, conn(a));
+            let runs = crate::ui::program(a, conn(a));
             (
                 buttons(&Tree::new(strip.as_widget()), button),
                 buttons(&Tree::new(runs.as_widget()), button),
@@ -4004,24 +4188,18 @@ flood = { pin = 8 }
         assert_eq!(two.len(), 2);
         let _ = a.view();
         let (strip, runs) = counts(&a);
-        // The setup's button, then Cycle Start, Hold, Resume and Stop.
-        let setups = a
-            .doc
-            .setups
-            .iter()
-            .filter(|x| x.machine.id == conn(&a).machine_id)
-            .count();
-        assert_eq!(strip, setups + 4);
-        assert!(runs >= 2, "{runs}");
+        // Cycle Start, Hold, Resume and Stop now; the setup is a list.
+        assert_eq!(strip, 4);
+        assert!(runs >= 1, "{runs}");
         // Twelve tool runs: the two, six times over.
         let epoch = run_of(&a).epoch;
         let many: Vec<_> = (0..6).flat_map(|_| two.clone()).collect();
         let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(Ok(many))));
         assert_eq!(run_of(&a).checked().map(<[_]>::len), Some(12));
         let _ = a.view();
-        // The strip is the same; the ten more tool runs are in the list under
-        // it, each of one operation: its button and the card's Start here.
-        assert_eq!(counts(&a), (strip, runs + 20));
+        // The bar is the same; the ten more tool runs are in the list beside
+        // it, each of one operation with its Start here.
+        assert_eq!(counts(&a), (strip, runs + 10));
     }
 
     /// The machine has no home or limit switches, and every E-stop clears its
@@ -4080,8 +4258,11 @@ flood = { pin = 8 }
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
         let line = crate::run::limits_unchecked(conn(&a)).expect("the warning");
         assert!(
-            line.starts_with("The UC100 profile sets no soft limits on X, Y and Z, so nothing stops the machine")
-                && line.ends_with("Add soft_min and soft_max for X, Y and Z to the profile to turn them on."),
+            line.starts_with(
+                "The UC100 profile sets no soft limits on X, Y and Z, so nothing stops the machine"
+            ) && line.ends_with(
+                "Add soft_min and soft_max for X, Y and Z to the profile to turn them on."
+            ),
             "{line}"
         );
         let _ = a.view();
@@ -4209,7 +4390,7 @@ flood = { pin = 8 }
         let line = crate::run::limits_unchecked(conn(&a)).unwrap();
         assert!(
             line.starts_with("X, Y, Z have no machine position")
-                && line.ends_with("Set machine zero under Position to turn them on."),
+                && line.ends_with("Set machine zero in the Machine tab to turn them on."),
             "{line}"
         );
     }
@@ -4361,13 +4542,18 @@ flood = { pin = 8 }
         let mut setup = crate::model::Setup::new(hand, "G55");
         setup.p.insert("name".into(), "Hand mill".into());
         a.doc.setups.push(setup);
-        let texts = page_texts(&a);
-        assert!(texts.contains(&format!("1. {name}")), "{texts:?}");
-        assert!(!texts.iter().any(|t| t.contains("Hand mill")), "{texts:?}");
+        let listed: Vec<usize> = crate::ui::run_setups(&a.doc, &conn(&a).machine_id)
+            .iter()
+            .map(|(si, _)| *si)
+            .collect();
+        assert_eq!(listed, [0]);
         let _ = a.update(Message::Run(crate::run::Action::Setup(1)));
         assert!(conn(&a).run.is_none());
         let _ = a.update(Message::Run(crate::run::Action::Setup(0)));
         assert_eq!(run_of(&a).setup, 0);
+        let texts = page_texts(&a);
+        assert!(texts.iter().any(|t| t.contains(&name)), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("Hand mill")), "{texts:?}");
     }
 
     /// The blind review's dead end (LIO-140): machine zero where the machine
@@ -4386,7 +4572,7 @@ flood = { pin = 8 }
         check_run(&mut a, 0);
         let steps = |a: &App| work_zero_steps(a, conn(a)).expect("the guide").join("\n");
         assert!(
-            steps(&a).contains("1. Optional: Set machine zero under Position"),
+            steps(&a).contains("1. Optional: Set machine zero in the Machine tab"),
             "{}",
             steps(&a)
         );
@@ -4594,7 +4780,7 @@ flood = { pin = 8 }
         let _ = a.view();
         let steps = |a: &App| work_zero_steps(a, conn(a)).expect("the guide").join("\n");
         assert!(
-            steps(&a).contains("Reference X Y from pin 1 under Position"),
+            steps(&a).contains("Reference X Y from pin 1 in the Machine tab"),
             "{}",
             steps(&a)
         );
@@ -7152,7 +7338,7 @@ flood = { pin = 8 }
         let mut a = run_app_on(dir.path(), &probe_profile());
         zeroed(&mut a);
         let why = edges_blocked(&a);
-        assert!(why.contains("picked in the Run panel"), "{why}");
+        assert!(why.contains("picked in the run bar"), "{why}");
         // Model origin is found from the front-left corner of the stock top.
         a.doc.setups[0]
             .p
@@ -7989,18 +8175,24 @@ soft_max = 180.0
         mdi(&mut a, "G0 A90");
         assert!((conn(&a).snapshot.work_pos[3] - 90.).abs() < 1e-3);
         assert!((at(&a)[3] - zero - 90.).abs() < 1e-3, "{:?}", at(&a));
-        // A in degrees on the page: its row, its DRO and its jog controls.
+        // A in degrees on the page: its DRO line, its jog controls (Home
+        // and End named on their tooltips) and its Set in the Work zero tab.
         a.page = Page::Control;
         let texts = page_texts(&a);
         let has = |t: &str| texts.iter().any(|x| x == t);
         assert!(
-            has("90.000°") && has("A+") && has("A−") && has("15°") && has("Zero A"),
+            has("90.000°") && has("A") && has("A+") && has("A−") && has("15°") && has("Zero"),
             "{texts:?}"
         );
-        assert!(
-            texts.iter().any(|t| t.contains("Home/End (A)")),
-            "{texts:?}"
+        assert_eq!(
+            (
+                crate::ui::jog_key_name(3, false),
+                crate::ui::jog_key_name(3, true)
+            ),
+            ("Home", "End")
         );
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        assert!(page_texts(&a).iter().any(|t| t == "Set A"));
         // E-stop clears A's position with the others': A neither jogs nor
         // runs an MDI line until it is set again.
         let _ = a.update(Message::MachineEStop);
@@ -8042,11 +8234,13 @@ soft_max = 180.0
             "{:?}",
             conn(&a).snapshot.log
         );
+        // The jog card's A row says so, in full on hover.
         let texts = page_texts(&a);
         assert!(
-            texts
-                .iter()
-                .any(|t| t.starts_with("A has no machine position")),
+            texts.iter().any(|t| t.starts_with("A has no"))
+                && conn(&a)
+                    .jog_blocked(3)
+                    .is_some_and(|w| w.starts_with("A has no machine position")),
             "{texts:?}"
         );
         // The state file keeps A: G54's A offset and where A was left.
@@ -8543,7 +8737,12 @@ soft_max = 180.0
         let dir = tempfile::tempdir().unwrap();
         let mut a = run_app(dir.path());
         zeroed(&mut a);
-        let (tags, cards) = laid(&a).run(Helps::default()).expect("the Control page");
+        // The fields are in the hands and in the Work zero and MDI tabs.
+        let (mut tags, cards) = laid(&a).run(Helps::default()).expect("the Control page");
+        for tab in [crate::ui::ControlTab::WorkZero, crate::ui::ControlTab::Mdi] {
+            let _ = a.update(Message::ControlTab(tab));
+            tags.extend(laid(&a).run(Helps::default()).expect("the tab").0);
+        }
         for (key, command) in [
             ("control_rpm", Ctl::Rpm(String::new())),
             ("mdi_line", Ctl::MdiText(String::new())),
@@ -9351,6 +9550,7 @@ soft_max = 180.0
         // The connected machine itself asks nothing.
         let _ = a.update(Message::ControlMachine(first.clone()));
         assert!(a.switch_machine.is_none());
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Machine));
         let _ = a.update(Message::ControlMachine("other".into()));
         assert_eq!(conn(&a).machine_id, first);
         shows(&a, &["Switch to Second router?", "Disconnect and switch"]);
@@ -9390,6 +9590,8 @@ soft_max = 180.0
         a.control.as_mut().unwrap().mdi = "G0 X1".into();
         let _ = a.update(Message::MachineConnection(true));
         assert_eq!(conn(&a).mdi, "G0 X1");
+        // Connected, the switch is in the Machine tab.
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Machine));
         shows(
             &a,
             &["Real (USB) disconnects the simulator and connects to the machine itself."],

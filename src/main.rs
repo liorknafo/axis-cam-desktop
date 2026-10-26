@@ -275,6 +275,13 @@ pub enum Message {
     Machine(control::Action),
     /// The Control page's Control | Setup switch.
     ControlSetup(bool),
+    /// A tab of the Control page's centre picked (LIO-274).
+    ControlTab(ui::ControlTab),
+    /// The machine's phase changed to one that shows this tab, and whether
+    /// a text field had the focus then: the tab is not switched under it.
+    ControlPhaseTab(ui::ControlTab, bool),
+    /// What the Control page's Job tab shows: the stock, the machine, from above.
+    ControlView(ui::JobView),
     Setup(setup::Msg),
     /// A jog key went down and no widget took it (axis, negative, repeat).
     JogKey(usize, bool, bool),
@@ -1230,6 +1237,12 @@ pub struct App {
     pub control: Option<control::Connection>,
     /// The Control page shows the controller configuration.
     pub machine_setup: bool,
+    /// The tab the Control page's centre shows (LIO-274).
+    pub control_tab: ui::ControlTab,
+    /// The machine's phase at the last tick: a change switches the tab.
+    pub control_phase: ui::Phase,
+    /// What the Job tab's view shows.
+    pub control_view: ui::JobView,
     /// The profile being edited in the controller configuration, for the machine with this id.
     pub profile_draft: Option<(String, Result<setup::Draft, String>)>,
     /// The UC100 machine chosen on the Control page (machine id).
@@ -1435,6 +1448,9 @@ fn while_locked(m: &Message) -> bool {
             | MachineEStop
             | Machine(_)
             | ControlSetup(_)
+            | ControlTab(_)
+            | ControlPhaseTab(..)
+            | ControlView(_)
             | Setup(_)
             | JogKey(..)
             | JogKeyChecked(..)
@@ -1726,6 +1742,9 @@ impl App {
             help_animating: false,
             control: None,
             machine_setup: false,
+            control_tab: ui::ControlTab::Job,
+            control_phase: ui::Phase::Idle,
+            control_view: ui::JobView::Stock,
             profile_draft: None,
             control_machine: None,
             switch_machine: None,
@@ -3775,6 +3794,35 @@ impl App {
         }
         Some(hasher.finish())
     }
+    /// The Control page's jog pad is on screen: connected, on the Control
+    /// page, not its Controller configuration view nor a manual setup's
+    /// Steps page. The jog keys jog only then (LIO-273).
+    pub(crate) fn jog_pad_shown(&self) -> bool {
+        self.page == Page::Control
+            && !self.machine_setup
+            && self.control.is_some()
+            && !self.steps_page()
+    }
+    /// The Control page's centre switches tab only when the machine's phase
+    /// changes (`ui::Phase`), never on a tick that leaves it, and never under
+    /// a focused text field: a tool change shows its tab, cutting the Job.
+    fn phase_tab(&mut self) -> Task<Message> {
+        let phase = ui::phase(self.control.as_ref());
+        if phase == self.control_phase {
+            return Task::none();
+        }
+        self.control_phase = phase;
+        let tab = match phase {
+            ui::Phase::ToolChange => ui::ControlTab::ToolChange,
+            ui::Phase::Cutting => ui::ControlTab::Job,
+            ui::Phase::Idle if self.control_tab == ui::ControlTab::ToolChange => {
+                ui::ControlTab::Job
+            }
+            ui::Phase::Idle => return Task::none(),
+        };
+        iced::advanced::widget::operate(control::typing())
+            .map(move |typing| Message::ControlPhaseTab(tab, typing))
+    }
     /// MACHINE shows the Steps page: the active setup is on a hand machine.
     pub(crate) fn steps_page(&self) -> bool {
         self.page == Page::Control
@@ -5746,7 +5794,27 @@ impl App {
             Message::ControlSetup(on) => {
                 self.machine_setup = on;
                 if on {
+                    // The jog pad goes off screen: a jog held by key stops.
+                    if self.jog_key.take().is_some()
+                        && let Some(c) = &mut self.control
+                    {
+                        c.act(control::Action::JogRelease);
+                    }
                     self.open_profile(false);
+                }
+            }
+            Message::ControlTab(tab) => self.control_tab = tab,
+            Message::ControlPhaseTab(tab, typing) => {
+                if !typing {
+                    self.control_tab = tab;
+                }
+            }
+            Message::ControlView(view) => {
+                self.control_view = view;
+                match view {
+                    ui::JobView::Stock => return self.update(Message::Camera("ISO")),
+                    ui::JobView::Top => return self.update(Message::Camera("TOP")),
+                    ui::JobView::Machine => {}
                 }
             }
             Message::Setup(setup::Msg::Edit(e)) => {
@@ -5807,17 +5875,13 @@ impl App {
                     c.act(action);
                 }
             }
-            // Keys jog only while the Control page shows the jog controls,
-            // not in its Controller configuration view, and not while a
-            // text field has the focus: iced's text field keeps the left and
-            // right arrows but lets up, down and Page Up/Down through.
+            // Keys jog only while the jog pad is on screen (`jog_pad_shown`),
+            // and not while a text field has the focus: iced's text field
+            // keeps the left and right arrows but lets up, down and Page
+            // Up/Down through.
             Message::JogKey(axis, negative, repeat) => {
                 // A held key is kept going by the tick; a step is one per press.
-                if repeat
-                    || self.page != Page::Control
-                    || self.machine_setup
-                    || self.control.is_none()
-                {
+                if repeat || !self.jog_pad_shown() {
                     return Task::none();
                 }
                 self.jog_key = Some((axis, negative));
@@ -5829,8 +5893,7 @@ impl App {
                 // must not start a jog that nothing would stop.
                 if !typing
                     && self.jog_key == Some((axis, negative))
-                    && self.page == Page::Control
-                    && !self.machine_setup
+                    && self.jog_pad_shown()
                     && let Some(c) = &mut self.control
                 {
                     c.act(control::Action::JogPress(axis, negative));
@@ -5841,8 +5904,7 @@ impl App {
             // the form's first field, except while the keys jog the machine:
             // a Tab there must not give a field the jog keys.
             Message::TabKey(back) => {
-                let jogging =
-                    self.page == Page::Control && !self.machine_setup && self.control.is_some();
+                let jogging = self.jog_pad_shown();
                 return iced::advanced::widget::operate(control::typing()).then(move |typing| {
                     let step = match tab_move(typing, back, jogging) {
                         TabMove::Stay => return Task::none(),
@@ -5896,9 +5958,7 @@ impl App {
                 if let Some(c) = &self.control {
                     match c.snapshot.state {
                         Some(State::Run) => c.send(Command::FeedHold),
-                        Some(State::Hold) if self.page == Page::Control && !self.machine_setup => {
-                            c.send(Command::Resume)
-                        }
+                        Some(State::Hold) if self.jog_pad_shown() => c.send(Command::Resume),
                         _ => {}
                     }
                 }
@@ -6863,15 +6923,16 @@ impl App {
                         use uc100::controller::State;
                         self.status = match state {
                             State::Disconnected if connecting.is_some() => format!(
-                                "Could not connect to {name}; see the log on the Control page."
+                                "Could not connect to {name}; see the log in the Control page's Machine tab."
                             ),
                             State::Disconnected => format!(
-                                "Lost the connection to {name}; see the log on the Control page."
+                                "Lost the connection to {name}; see the log in the Control page's Machine tab."
                             ),
                             s => format!("Connected to {name}: {}", s.label()),
                         };
                     }
                 }
+                let phase_tab = self.phase_tab();
                 if let Some((id, at)) = (self.control.as_mut())
                     .and_then(|c| Some((c.machine_id.clone(), c.recorded.take()?)))
                 {
@@ -6953,6 +7014,7 @@ impl App {
                 return Task::batch([
                     close,
                     settled,
+                    phase_tab,
                     self.picture_run(),
                     self.refresh_stock_surface(),
                     self.refresh_start_mesh(),

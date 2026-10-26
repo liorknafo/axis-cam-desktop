@@ -560,7 +560,7 @@ impl Run {
             match self.partly() {
                 None => e.push(format!("The check did not work out the stock operation {}, {}, starts from: pick its first operation, or check the setup again.", from + 1, first.name)),
                 Some(_) if !self.zeroed => e.push(format!(
-                    "This run starts at {}, after operations taken as cut: set the work zero on the stock they left under Work zero on the stock below, or press Keep this work zero there if it is still the one they were cut with.",
+                    "This run starts at {}, after operations taken as cut: set the work zero on the stock they left in the Work zero tab, or press Keep this work zero there if it is still the one they were cut with.",
                     first.name
                 )),
                 Some(_) => {}
@@ -580,7 +580,7 @@ impl Run {
             .collect();
         if !a_unset.is_empty() {
             e.push(format!(
-                "{} {} no machine position (every E-stop clears it), so the soft limits are off. {} under Position, then Cycle Start.",
+                "{} {} no machine position (every E-stop clears it), so the soft limits are off. {} in the Machine tab, then Cycle Start.",
                 a_unset.join(", "),
                 if a_unset.len() == 1 { "has" } else { "have" },
                 if c.home_switches() { "Home again" } else { "Set machine zero again" }
@@ -1433,7 +1433,7 @@ pub fn limits_unchecked(c: &Connection) -> Option<String> {
         .collect();
     if !unset.is_empty() {
         lines.push(format!(
-            "{} {} no machine position (every E-stop clears it), so Cycle Start runs with the soft limits off and does not check that the job fits the machine's travel. Make sure the work zero is on the stock (touch it off again after an E-stop, as the drives may lose steps) and watch the machine. {} under Position to turn them on.",
+            "{} {} no machine position (every E-stop clears it), so Cycle Start runs with the soft limits off and does not check that the job fits the machine's travel. Make sure the work zero is on the stock (touch it off again after an E-stop, as the drives may lose steps) and watch the machine. {} in the Machine tab to turn them on.",
             unset.join(", "),
             if unset.len() == 1 { "has" } else { "have" },
             if c.home_switches() { "Home" } else { "Set machine zero" }
@@ -2237,19 +2237,20 @@ fn pin_problems(c: &Connection, setup: &crate::model::Setup, p: &Checked) -> Vec
     }
     let Some(at) = pins.reference else {
         e.push(
-            "The pins' place is not recorded: Record the pins' place under Position first.".into(),
+            "The pins' place is not recorded: Record the pins' place in the Machine tab first."
+                .into(),
         );
         return e;
     };
     if !c.pin_referenced {
-        e.push("X and Y are not referenced from pin 1 since the machine was connected or E-stopped: Reference X Y from pin 1 under Position first.".into());
+        e.push("X and Y are not referenced from pin 1 since the machine was connected or E-stopped: Reference X Y from pin 1 in the Machine tab first.".into());
         return e;
     }
     let want = [0, 1].map(|a| at[a] - on.pin1[a] as f64);
     let s = &c.snapshot;
     if (0..2).any(|a| (s.work_offset[a] - want[a]).abs() > 1e-3) {
         e.push(format!(
-            "The X/Y work offset of {} is not the one the pins give, machine X {:.3} Y {:.3}: press Set X Y from the pins under Work zero on the stock.",
+            "The X/Y work offset of {} is not the one the pins give, machine X {:.3} Y {:.3}: press Set X Y from the pins in the Work zero tab.",
             p.offset, want[0], want[1]
         ));
     }
