@@ -440,8 +440,13 @@ pub(crate) fn outline(f: Outline) -> Result<Plan, String> {
                 // check has it (its blend could dip into what is left):
                 // there it feeds across just over the level before, or goes
                 // over the stock where plunging back down from there takes
-                // less time than that feed.
-                let over = if approach >= f.top {
+                // less time than that feed. One at or just over the top
+                // keeps the blend margin over it (`post_check::blend_margin`),
+                // as a link between operations does: just over the level
+                // before is the top itself on the second level.
+                let clear =
+                    f.top + crate::post_check::BLEND_HEIGHT * crate::post::blend(&f.setup.machine);
+                let over = if approach >= clear {
                     approach
                 } else {
                     f.clearance
@@ -449,8 +454,8 @@ pub(crate) fn outline(f: Outline) -> Result<Plan, String> {
                 let across = (a.0 - here.0).hypot(a.1 - here.1) as f32 / feed;
                 let (height, motion, rate) = if !inner {
                     (f.clearance, Motion::Rapid, 6000.)
-                } else if hop >= f.top {
-                    (hop, Motion::Rapid, 6000.)
+                } else if hop >= f.top - 0.0005 {
+                    (hop.max(clear), Motion::Rapid, 6000.)
                 } else if across <= (over - z) / (feed * 0.25) {
                     (hop, Motion::Feed, feed)
                 } else {
@@ -734,6 +739,43 @@ mod tests {
             }
             assert!(fed > 0 || !fed_links, "{pattern} {retract}: {fed}");
             assert!(over > 0 || !over_links, "{pattern} {retract}: {over}");
+        }
+    }
+    #[test]
+    fn a_link_just_over_the_level_before_at_the_stock_top_keeps_the_blend_margin() {
+        // Faced 0.5 mm a level, as the TOTEM bottom's Facing: on the second
+        // level just over the first is the stock top itself, where a rapid
+        // across is refused, its blend could dip into the stock ("0.000 mm
+        // over the stock top: less than 2.5 times the path blending
+        // tolerance"). The rows link 2.5 times the machine's G64 P (0.010 by
+        // default) over the top instead, never between it and there.
+        for (pattern, link) in [
+            ("Both ways (zigzag)", "Retract each pass"),
+            ("One way", "Keep tool down"),
+        ] {
+            let (setup, mut op, tool, mesh) = l_part(6.);
+            op.p.insert("facing_pattern".into(), pattern.into());
+            op.p.insert("facing_link".into(), link.into());
+            op.p.insert("stepdown".into(), "0.5".into());
+            let plan = crate::simulation::generate(&setup, &op, &tool, &mesh).unwrap();
+            assert!(plan.levels > 2, "{}", plan.levels);
+            let top = plan.stock.max[2];
+            let clear = top + crate::post_check::BLEND_HEIGHT * crate::post::blend(&setup.machine);
+            assert!(clear > top + 0.02, "{clear}");
+            let mut kept = 0;
+            for m in &plan.moves {
+                if m.motion != Motion::Rapid || m.from[..2] == m.to[..2] {
+                    continue;
+                }
+                let z = m.from[2].min(m.to[2]);
+                assert!(
+                    z < top - 1e-4 || z >= clear - 1e-5,
+                    "{pattern}: a rapid across {:.4} mm over the top: {m:?}",
+                    z - top
+                );
+                kept += usize::from((z - clear).abs() < 1e-5);
+            }
+            assert!(kept > 0, "{pattern}: no link at the margin");
         }
     }
     #[test]
