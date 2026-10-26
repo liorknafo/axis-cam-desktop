@@ -781,6 +781,58 @@ pub fn is_wall(setup: &Setup, mesh: &Mesh, id: usize) -> bool {
         .get(id)
         .is_some_and(|s| crate::mesh::rotation(s.normal, angles)[2].abs() < WALL)
 }
+/// Whether mesh surface `id` is sloped, as `setup` turns the part: facing
+/// up, but neither level nor a wall (a ramp, a fillet, a dome). A Pocket or
+/// an Adaptive clearing clears the stock over it in steps (`slope_floors`).
+pub fn is_sloped(setup: &Setup, mesh: &Mesh, id: usize) -> bool {
+    let angles = crate::stock::Placement::new(mesh, Some(setup)).rotation();
+    mesh.surfaces.get(id).is_some_and(|s| {
+        let up = crate::mesh::rotation(s.normal, angles)[2];
+        (WALL..LEVEL).contains(&up)
+    })
+}
+/// The z of a level face's unit normal, at least: within 0.5° of facing
+/// straight up or down.
+pub const LEVEL: f32 = 0.999_961_9;
+/// The selected sloped faces `ids`, one group that touches, as `setup`
+/// places the part (mm): their outline seen from above, and the heights of
+/// the floors they are cleared as, evenly from their lowest point up, at
+/// most `stepdown` apart, to under their highest.
+fn slope_floors(
+    setup: &Setup,
+    mesh: &Mesh,
+    ids: &[usize],
+    stepdown: f32,
+) -> Result<(Region, Vec<f32>), String> {
+    let placement = Placement::new(mesh, Some(setup));
+    let scale = mesh.display_scale();
+    let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
+    let mut loops = vec![];
+    for face in (mesh.faces.iter()).filter(|f| f.feature.is_some_and(|id| ids.contains(&id))) {
+        let points: Vec<[f32; 3]> = (face.points.iter())
+            .map(|p| placement.transform(*p).map(|v| v / scale))
+            .collect();
+        for p in &points {
+            (low, high) = (low.min(p[2]), high.max(p[2]));
+        }
+        let mut p: Polygon = points.iter().map(|p| (p[0] as f64, p[1] as f64)).collect();
+        let a = area(&p);
+        if a < 0. {
+            p.reverse();
+        }
+        if a.abs() >= 0.000001 {
+            loops.push(p);
+        }
+    }
+    if loops.is_empty() {
+        return Err("The selected sloped face has no usable XY area.".into());
+    }
+    let steps = ((high - low) / stepdown).ceil().max(1.);
+    let planes = (0..steps as usize)
+        .map(|k| low + (high - low) * k as f32 / steps)
+        .collect();
+    Ok((outline(&region(loops)?), planes))
+}
 /// Where triangle `p` crosses the height `z`: the points on its two edges
 /// that pass it. Each is worked out from its edge's ends in one order, so
 /// the two triangles on an edge find the same point.
@@ -1834,11 +1886,16 @@ fn floor_job(
     let ids: std::collections::HashSet<_> = selection.ids.iter().copied().collect();
     // The selected walls pick holes, each cut down its outline.
     let picked = holes(setup, &ids, mesh)?;
+    // The selected sloped faces (a ramp, a fillet, a dome) are cleared as
+    // floors a stepdown apart (`slope_floors`).
+    let sloped: Vec<usize> = (selection.ids.iter().copied())
+        .filter(|&id| is_sloped(setup, mesh, id))
+        .collect();
     // The selected faces by height, highest first: each floor is cleared to
     // its own height, as one pocket.
     let mut heights: Vec<(f32, usize)> = ids
         .iter()
-        .filter(|&&id| !is_wall(setup, mesh, id))
+        .filter(|&&id| !is_wall(setup, mesh, id) && !sloped.contains(&id))
         .filter_map(|&id| {
             let s = mesh.surfaces.get(id)?;
             Some((placement.transform(s.center)[2] / scale, id))
@@ -1858,7 +1915,7 @@ fn floor_job(
         .iter()
         .map(|g| floor(setup, g, mesh))
         .collect::<Result<Vec<_>, _>>()?;
-    if floors.is_empty() && picked.is_empty() {
+    if floors.is_empty() && picked.is_empty() && sloped.is_empty() {
         return Err("The selected floor contains no triangles.".into());
     }
     if floors
@@ -1946,7 +2003,7 @@ fn floor_job(
     if through && !floors.is_empty() && floors.iter().all(|f| f.openings.is_empty()) {
         return Err("The selected floor has no openings that go through the part. Set Openings to Leave, or select the floor around the openings.".into());
     }
-    let several = floors.len() + picked.len() > 1;
+    let several = floors.len() + picked.len() + usize::from(!sloped.is_empty()) > 1;
     // Every zone with the area it clears round and the height of the floor
     // under it, for `banded`; the part above each floor, which it seeks
     // again at that height.
@@ -2055,6 +2112,45 @@ fn floor_job(
             let (x, y) = h.centre();
             return Err(format!(
                 "The hole at X{x:.2} Y{y:.2} is too narrow for this tool and radial allowance. Choose a smaller cutter."
+            ));
+        }
+    }
+    // Each group of touching sloped faces, as floors from its lowest point
+    // up: each clears the stock over the faces down to its height, clear of
+    // the part above it, so the faces are left in steps no taller than the
+    // stepdown, for a finishing pass. A floor too narrow for this tool is
+    // left, as a corner is.
+    for group in surface::connected(mesh, &sloped) {
+        let (area, planes) = slope_floors(setup, mesh, &group, stepdown)?;
+        // Grown by the keep-out, so the tool reaches the slope's foot from
+        // past it, where the lowest floor stands.
+        let area = area.inflate(inset, JoinType::Round, EndType::Polygon, 2.);
+        for plane in planes {
+            let target = plane + bottom + axial;
+            if target >= top - 0.0001 {
+                continue;
+            }
+            // The part from 1 µm over the plane, not `part_above`'s 10: up a
+            // slope 10 µm of height is more than the margin across it.
+            let above = part_above(setup, mesh, plane - 0.009)?;
+            let centres = Centres::Floor {
+                area: area.clone(),
+                above: above.clone(),
+                reach: radius as f64,
+                keepout: inset,
+            };
+            if !centres.at(0.)?.contains_points() {
+                continue;
+            }
+            aboves.push((plane, above));
+            members.push((
+                Zone {
+                    centres,
+                    top,
+                    target,
+                },
+                area.clone(),
+                plane,
             ));
         }
     }
@@ -3107,7 +3203,7 @@ mod tests {
         assert!(b.stock.removed_volume() < a.stock.removed_volume());
     }
     #[test]
-    fn pocket_rejects_overhangs_and_floors_that_are_not_horizontal() {
+    fn pocket_rejects_overhangs_and_clears_a_tilted_floor_in_steps() {
         let (mut setup, mut op, tool, mesh) = fixture();
         let scale = mesh.display_scale();
         let mut triangles: Vec<[[f32; 3]; 3]> = mesh
@@ -3124,13 +3220,13 @@ mod tests {
                 .unwrap_err()
                 .contains("obstructs")
         );
+        // Turned 10°, the floor slopes: it is cleared in steps
+        // (`slope_floors`), not refused.
         op.surfaces.as_mut().unwrap().mesh_fingerprint = mesh.fingerprint.clone();
         setup.p.insert("rx".into(), "10".into());
-        assert!(
-            generate(&setup, &op, &tool, &mesh)
-                .unwrap_err()
-                .contains("perpendicular")
-        );
+        assert!(is_sloped(&setup, &mesh, op.surfaces.as_ref().unwrap().ids[0]));
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert!(plan.levels > 1, "{} levels", plan.levels);
     }
     /// `tris` as a part on a zero-margin stock, with a Pocket of a flat
     /// cutter of `diameter` on its faces at the heights `floors`.

@@ -1223,12 +1223,20 @@ impl Viewport<'_> {
                 .collect()
         };
         // Where a click picks a whole smooth face (Parallel and Waterline
-        // finishing), the pointer shows all of it.
+        // finishing, a sloped face in a Pocket or an Adaptive clearing), the
+        // pointer shows all of it.
+        let steps = |h: usize| {
+            self.operation
+                .is_some_and(|o| matches!(o.strategy, Strategy::Pocket | Strategy::Adaptive))
+                && self
+                    .setup
+                    .is_some_and(|s| crate::pocket::is_sloped(s, self.mesh, h))
+        };
         let hovered_face: std::collections::HashSet<usize> = match hovered {
             Some(h)
                 if !self.sample
                     && !self.section.picking
-                    && self.operation.is_some_and(crate::picks_faces) =>
+                    && (self.operation.is_some_and(crate::picks_faces) || steps(h)) =>
             {
                 self.mesh.region_of(h).into_iter().collect()
             }

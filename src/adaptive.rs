@@ -2531,6 +2531,71 @@ mod tests {
         }
     }
     #[test]
+    fn a_ramp_is_cleared_in_steps_never_into_it() {
+        // A 30 × 12 mm part: level at Z 4 to X −5, a ramp 21.8° down to Z 0
+        // at X 5, level on from there. The ramp picked, Ø4, 1 mm stepdown.
+        let mut tris = vec![];
+        quad(&mut tris, -15., -6., -5., 6., 4.);
+        quad(&mut tris, 5., -6., 15., 6., 0.);
+        let (a, b, c, d) = ([-5., -6., 4.], [5., -6., 0.], [5., 6., 0.], [-5., 6., 4.]);
+        tris.extend([[a, b, c], [a, c, d]]);
+        quad(&mut tris, -15., -6., 15., 6., -4.);
+        let (setup, mut op, tool, mesh) = part(tris, &[], 4.);
+        let ramp: Vec<usize> = (mesh.surfaces.iter().enumerate())
+            .filter(|(_, s)| (0.9..0.99).contains(&s.normal[2]))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(ramp.len(), 1);
+        assert!(crate::pocket::is_sloped(&setup, &mesh, ramp[0]));
+        op.surfaces.as_mut().unwrap().ids = ramp;
+        op.p.insert("stepdown".into(), "1".into());
+        assert_eq!(
+            surface::issues(&op, &setup, Some(&mesh)),
+            Vec::<String>::new()
+        );
+        let scale = mesh.display_scale();
+        let dz = stock::Placement::new(&mesh, Some(&setup)).bounds.min[2] / scale + 4.;
+        // The part's height at X.
+        let height = |x: f32| (4. - 0.4 * (x + 5.)).clamp(0., 4.);
+        for strategy in [Strategy::Adaptive, Strategy::Pocket] {
+            let mut op = op.clone();
+            op.strategy = strategy;
+            let plan = if strategy == Strategy::Adaptive {
+                generate(&setup, &op, &tool, &mesh)
+            } else {
+                crate::pocket::generate(&setup, &op, &tool, &mesh)
+            }
+            .unwrap_or_else(|e| panic!("{strategy:?}: {e}"));
+            let r = plan.radius;
+            // Never under the part anywhere under the cutter, which is
+            // highest at the uphill end of the cutter's chord over it.
+            for m in plan.moves.iter().filter(|m| m.motion == Motion::Feed) {
+                for i in 0..=10 {
+                    let p = m.at(m.start + (m.end - m.start) * i as f32 / 10.);
+                    let off = (p[1].abs() - 6.).max(0.);
+                    if off >= r || p[0] - r >= 15. || p[0] + r <= -15. {
+                        continue;
+                    }
+                    let half = (r * r - off * off).sqrt();
+                    assert!(
+                        p[2] - dz >= height(p[0] - half) - 0.001,
+                        "{strategy:?} {p:?} dz {dz} r {r}: {m:?}"
+                    );
+                }
+            }
+            // A step at each millimetre, down to the ramp's foot: the
+            // lowest from just past it.
+            for z in [0., 1., 2., 3.] {
+                assert!(
+                    plan.moves.iter().any(|m| m.cutting_pass
+                        && m.to[0] < 5. + 2. * r
+                        && (m.to[2] - dz - z).abs() < 0.001),
+                    "{strategy:?}: no cut at Z {z}"
+                );
+            }
+        }
+    }
+    #[test]
     fn a_notch_in_a_wall_of_any_width_clears_and_its_corners_are_slowed() {
         // The 20 × 16 mm pocket with a notch 3 mm deep into its right wall.
         for width in [1.5, 2.5, 3., 4., 5.5, 7.] {
@@ -2763,5 +2828,124 @@ mod tests {
                 .unwrap_err()
                 .contains("Adaptive clearing")
         );
+    }
+    /// The TOTEM aluminium bottom's 21° ramp, turned over as its second
+    /// setup turns it, roughed by an Adaptive clearing on the ramp's faces:
+    /// it clears the stock over the ramp in steps, never into the part. The
+    /// part is not ours to ship: point `AXIS_RAMP_STL` at
+    /// `TOTEM_alu_bottom_L` as a binary STL that numbers its CAD faces (as
+    /// `native/step_preview.cpp` writes) and run `cargo test --release
+    /// totem_bottoms_ramp -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn the_totem_bottoms_ramp_is_roughed() {
+        let Ok(path) = std::env::var("AXIS_RAMP_STL") else {
+            eprintln!("skipped: set AXIS_RAMP_STL to the TOTEM bottom's STL");
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        let mesh = mesh::load(&path).unwrap();
+        let (mut doc, _) = crate::post::fixture::job();
+        let file = doc.file.as_mut().unwrap();
+        (file.path, file.name, file.format) = (path, "bottom.stl".into(), "stl".into());
+        let mut tool = Tool::new("Flat 3", "Flat end mill", "3");
+        for (k, v) in [("length", "12"), ("stickout", "25"), ("number", "4")] {
+            tool.p.insert(k.into(), v.into());
+        }
+        let setup = &mut doc.setups[0];
+        setup.p.insert("rx".into(), "180".into());
+        for (k, _) in stock::OFFSETS {
+            setup.p.insert(k.into(), "2".into());
+        }
+        setup.p.insert("stock_top".into(), "0".into());
+        let placement = stock::Placement::new(&mesh, Some(setup));
+        // The ramp: the faces 21° from level, looking up.
+        let ramp: Vec<usize> = (mesh.surfaces.iter().enumerate())
+            .filter(|(_, s)| {
+                let up = mesh::rotation(s.normal, placement.rotation())[2];
+                (0.92..0.945).contains(&up)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let zs: Vec<f32> = (mesh.faces.iter())
+            .filter(|f| f.feature.is_some_and(|id| ramp.contains(&id)))
+            .flat_map(|f| f.points.iter().map(|p| placement.transform(*p)[2]))
+            .collect();
+        eprintln!(
+            "ramp: surfaces {ramp:?}, Z {:.2}..{:.2}; part Z {:.2}..{:.2}",
+            zs.iter().copied().fold(f32::INFINITY, f32::min),
+            zs.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+            placement.bounds.min[2],
+            placement.bounds.max[2],
+        );
+        let selection = Some(surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: ramp.clone(),
+        });
+        let mut rough = Operation::new(Strategy::Adaptive, tool.id.clone());
+        rough.geometry.clear();
+        rough.surfaces = selection.clone();
+        for (k, v) in [("stepdown", "1"), ("optimal_load", "0.4")] {
+            rough.p.insert(k.into(), v.into());
+        }
+        // Then finished along its fall line (X) with a Ø3 ball.
+        let mut ball = Tool::new("Ball 3", "Ball end mill", "3");
+        for (k, v) in [("length", "12"), ("stickout", "25"), ("number", "5")] {
+            ball.p.insert(k.into(), v.into());
+        }
+        let mut finish = Operation::new(Strategy::Parallel, ball.id.clone());
+        finish.geometry.clear();
+        finish.surfaces = selection;
+        for (k, v) in [("boundary", "Selected geometry"), ("allowance", "0")] {
+            finish.p.insert(k.into(), v.into());
+        }
+        setup.operations = vec![rough, finish];
+        doc.tools.extend([tool, ball]);
+        let (mut results, mut stocks) = (vec![], vec![]);
+        crate::simulation::sequence_with(
+            &doc,
+            &mesh,
+            None,
+            |_, _, r| results.push(r.map(|s| (s.plan.levels, s.plan.moves.len()))),
+            |_, _, v| stocks.push(v.clone()),
+        );
+        eprintln!("{results:?}");
+        let (levels, moves) = results[0].clone().unwrap();
+        assert!(levels > 1 && moves > 0, "{levels} levels, {moves} moves");
+        let on_ramp = |f: &(usize, &mesh::Face)| f.1.feature.is_some_and(|id| ramp.contains(&id));
+        let total = mesh.faces.iter().enumerate().filter(on_ramp).count();
+        let mut left = vec![];
+        for (n, stock) in stocks.iter().enumerate() {
+            let gouged = crate::plan_check::PartGrid::in_job(stock, &doc, &mesh).gouged(stock);
+            assert_eq!(gouged.0, 0, "after operation {}: gouged {gouged:?}", n + 1);
+            let uncut = crate::uncut::uncut(stock, &doc.setups[0], &mesh);
+            left.push(
+                (mesh.faces.iter().enumerate())
+                    .filter(on_ramp)
+                    .filter(|(i, _)| uncut.faces[*i])
+                    .count(),
+            );
+            eprintln!(
+                "after operation {}: {} of the ramp's {total} triangles still under stock",
+                n + 1,
+                left[n]
+            );
+            for (i, f) in mesh.faces.iter().enumerate().filter(on_ramp) {
+                let c = f.points.iter().fold([0.; 3], |s, p| {
+                    let p = placement.transform(*p);
+                    [s[0] + p[0] / 3., s[1] + p[1] / 3., s[2] + p[2] / 3.]
+                });
+                eprintln!(
+                    "  surface {} at {c:.2?} {}",
+                    f.feature.unwrap(),
+                    if uncut.faces[i] { "under stock" } else { "cut" }
+                );
+            }
+        }
+        assert!(
+            left[0] < total,
+            "roughing cut nothing of the ramp: {left:?}"
+        );
+        assert_eq!(left.last(), Some(&0), "{left:?}");
     }
 }

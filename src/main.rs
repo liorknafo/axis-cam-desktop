@@ -5013,7 +5013,15 @@ impl App {
                         .is_some_and(|o| o.strategy == Strategy::Groove)
                         && wall
                         && pocket::hole_walls(&setup, mesh, n).is_err());
-                if picks_holes && (wall || sloped) {
+                // A Pocket takes a sloped face no hole lies past as a face
+                // to clear the stock over in steps (`pocket::slope_floors`).
+                let near = (picks_holes && sloped)
+                    .then(|| pocket::hole_near(&setup, mesh, n))
+                    .flatten();
+                let pocket_op = self
+                    .operation()
+                    .is_some_and(|o| o.strategy == Strategy::Pocket);
+                if picks_holes && (wall || (sloped && (near.is_some() || !pocket_op))) {
                     // What a click here picks: the wall's hole, or the hole
                     // past a sloping face (a cone, a chamfer, a fillet) or past
                     // the one a wall's outline crosses (a screw hole's lip).
@@ -5022,7 +5030,7 @@ impl App {
                             pocket::hole_near(&setup, mesh, n).unwrap_or(Err(e))
                         }
                         Some(found) => found,
-                        None => match pocket::hole_near(&setup, mesh, n) {
+                        None => match near {
                             Some(Ok(walls)) => Ok(walls),
                             _ => Err(format!(
                                 "That face slopes {:.0}°: it is no floor, and no hole past it can be picked from it. Click a flat floor, or a wall of a hole.",
@@ -5151,8 +5159,13 @@ impl App {
                 }
                 // Parallel and Waterline finishing take a whole face, curved or
                 // flat: every surface of the smooth face clicked, added or
-                // removed together.
-                let face = if self.operation().is_some_and(picks_faces) {
+                // removed together. So does a Pocket or an Adaptive clearing
+                // a sloped face is clicked in (`pocket::is_sloped`).
+                let steps = self
+                    .operation()
+                    .is_some_and(|o| matches!(o.strategy, Strategy::Pocket | Strategy::Adaptive))
+                    && pocket::is_sloped(&setup, mesh, n);
+                let face = if steps || self.operation().is_some_and(picks_faces) {
                     mesh.region_of(n)
                 } else {
                     vec![n]

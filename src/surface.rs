@@ -311,7 +311,16 @@ pub fn issues(operation: &Operation, setup: &Setup, mesh: Option<&Mesh>) -> Vec<
         if picks_holes && up < crate::pocket::WALL {
             continue;
         }
-        if up < 0.5f32.to_radians().cos() {
+        // A Pocket or an Adaptive clearing clears the stock over a sloped
+        // face in steps (`pocket::slope_floors`).
+        if matches!(
+            operation.strategy,
+            crate::model::Strategy::Pocket | crate::model::Strategy::Adaptive
+        ) && crate::pocket::is_sloped(setup, mesh, id)
+        {
+            continue;
+        }
+        if up < crate::pocket::LEVEL {
             result.push(format!(
                 "Surface {} is not perpendicular to setup Z. Reposition the part in another setup.",
                 id + 1
