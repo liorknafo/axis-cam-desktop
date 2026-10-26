@@ -2695,7 +2695,9 @@ mod tests {
         // Each hit is reported once, under its own stage and operation, one
         // for each clamp and part of the tool. Setup 2 has the clamps the app
         // suggested for its toolpaths: facing the whole stock runs through
-        // any place they can be.
+        // any place they can be. Its Facing first meets the -Y clamp where
+        // it rises over the air past the stock's edge (`air::trim`), made
+        // before the clamps were suggested.
         assert_eq!(
             stages(&check),
             vec![
@@ -2708,7 +2710,7 @@ mod tests {
                 "workholding 1/Some(4): Drill by planner: the tool hits the clamp on +X (offset 0) at X48.0 Y-10.0 Z15.0 (within the 2 mm gap).",
                 "workholding 2/Some(1): Face by planner: the tool hits the clamp on -X (offset 0) at X-67.0 Y-15.7 Z1.0 (within the 2 mm gap).",
                 "workholding 2/Some(1): Face by planner: the tool hits the clamp on +X (offset 0) at X67.0 Y-15.7 Z1.0 (within the 2 mm gap).",
-                "workholding 2/Some(1): Face by planner: the tool hits the clamp on -Y (offset 0) at X-10.0 Y-47.0 Z1.0 (within the 2 mm gap).",
+                "workholding 2/Some(1): Face by planner: the tool hits the clamp on -Y (offset 0) at X-10.0 Y-46.4 Z18.0 (within the 2 mm gap).",
                 "workholding 2/Some(1): Face by planner: the tool hits the clamp on +Y (offset 0) at X-10.0 Y23.5 Z1.0 (within the 2 mm gap).",
             ]
         );
@@ -2982,9 +2984,16 @@ mod tests {
         assert_eq!((notch.setup, notch.operation), (1, 1));
         assert!(notch.minutes > 0.);
         // The notch's minutes and its one tool change (3 min), the CNC's own
-        // minutes as before, and the stock moving once (10 min).
+        // minutes as before but for the air the notch leaves its Facing
+        // (`air::trim`), and the stock moving once (10 min).
         assert!((check.manual_minutes - (notch.minutes + 3.)).abs() < 0.11);
-        assert!((check.cnc_minutes - plain.total_minutes).abs() < 0.11);
+        assert!(
+            check.cnc_minutes <= plain.total_minutes + 0.11
+                && check.cnc_minutes > plain.total_minutes - 1.,
+            "{} vs {}",
+            check.cnc_minutes,
+            plain.total_minutes
+        );
         assert_eq!(check.move_minutes, 10.);
         let sum = check.manual_minutes + check.cnc_minutes + check.move_minutes;
         assert!((check.total_minutes - sum).abs() < 0.11);

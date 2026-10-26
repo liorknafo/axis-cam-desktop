@@ -2318,38 +2318,54 @@ pub(crate) mod tests {
         assert!(sim.turns.is_empty());
         let mut fresh = doc.setups[0].clone();
         fresh.p.insert("stock_source".into(), "fresh".into());
-        let direct = crate::simulation::generate(&fresh, &op, &doc.tools[0], &mesh).unwrap();
+        let kernel = crate::simulation::generate(&fresh, &op, &doc.tools[0], &mesh).unwrap();
+        // `plan` with its air taken out as the sequence takes it
+        // (`air::trim`), held as `held` holds it.
+        let trimmed = |plan: crate::simulation::Plan,
+                       held: &crate::model::Document,
+                       sim: &crate::simulation::Simulation| {
+            let mut setup = held.setups[0].clone();
+            setup.p.insert("stock_source".into(), "fresh".into());
+            let (volume, frame) = (sim.initial_volume.as_ref().unwrap(), sim.frame.unwrap());
+            let holding = crate::air::workholding(held, &setup, &mesh, Some(volume), frame);
+            crate::air::trim(plan, &setup, &op, volume, frame, sim.source, &holding)
+                .unwrap()
+                .0
+        };
+        // `b` is `a` move for move, timed alike.
+        let same = |a: &[crate::simulation::Move], b: &[crate::simulation::Move]| {
+            assert_eq!(a.len(), b.len());
+            let shift = b[0].start - a[0].start;
+            for (a, b) in a.iter().zip(b) {
+                assert_eq!((a.from, a.to, a.motion, a.a), (b.from, b.to, b.motion, b.a));
+                assert!((a.start + shift - b.start).abs() < 1e-3);
+                assert!((a.end + shift - b.end).abs() < 1e-3);
+            }
+        };
         // Held in the chuck it enters from above the jaws (LIO-206); from
-        // its first feed on it is the kernel's, move for move.
+        // its first feed on it is the kernel's, move for move. The sequence
+        // takes the air out of that.
+        let entered = enter_held(&doc, 0, &op, &mesh, kernel.clone()).unwrap();
         let feed = |p: &crate::simulation::Plan| {
             (p.moves.iter())
                 .position(|m| m.motion == Motion::Feed)
                 .unwrap()
         };
-        let (kernel, entered) = (
-            &direct.moves[feed(&direct)..],
-            &sim.plan.moves[feed(&sim.plan)..],
+        same(
+            &kernel.moves[feed(&kernel)..],
+            &entered.moves[feed(&entered)..],
         );
-        assert_eq!(kernel.len(), entered.len());
-        let shift = entered[0].start - kernel[0].start;
-        for (a, b) in kernel.iter().zip(entered) {
-            assert_eq!((a.from, a.to, a.motion), (b.from, b.to, b.motion));
-            assert!((a.start + shift - b.start).abs() < 1e-3);
-            assert!((a.end + shift - b.end).abs() < 1e-3);
-        }
-        // In a vise or clamps it is the kernel's plan itself.
+        same(&trimmed(entered, &doc, &sim).moves, &sim.plan.moves);
+        // In a vise or clamps it is the kernel's plan itself, its air
+        // taken out.
         for holding in ["Vise", "Clamps"] {
             let mut held = doc.clone();
             held.setups[0].p.insert("holding".into(), holding.into());
             let sim = prepare(&held, &mesh, 0, 0).unwrap();
-            assert_eq!(direct.moves.len(), sim.plan.moves.len(), "{holding}");
-            for (a, b) in direct.moves.iter().zip(&sim.plan.moves) {
-                assert_eq!(
-                    (a.from, a.to, a.motion, a.start, a.end, a.a),
-                    (b.from, b.to, b.motion, b.start, b.end, b.a)
-                );
-            }
-            assert_eq!(direct.duration, sim.plan.duration);
+            let direct = trimmed(kernel.clone(), &held, &sim);
+            same(&direct.moves, &sim.plan.moves);
+            assert_eq!(direct.moves[0].start, sim.plan.moves[0].start, "{holding}");
+            assert_eq!(direct.duration, sim.plan.duration, "{holding}");
         }
         // The indexed setup after it starts with A turning from 0 to 90.
         let indexed = prepare(&doc, &mesh, 1, 0).unwrap();

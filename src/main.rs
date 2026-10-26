@@ -1,4 +1,5 @@
 mod adaptive;
+mod air;
 mod analysis;
 mod cam;
 mod chamfer;
@@ -5332,10 +5333,15 @@ impl App {
                                     Ok(sim) => (
                                         true,
                                         format!(
-                                            "Generated {} moves · {:.1} min · inherits stock after {} operations",
+                                            "Generated {} moves · {:.1} min · inherits stock after {} operations{}",
                                             sim.plan.moves.len(),
                                             sim.plan.duration / 60.,
-                                            sim.preceding
+                                            sim.preceding,
+                                            match sim.air {
+                                                Some(air) if air.nothing => " · cuts nothing on the stock it starts from".to_string(),
+                                                Some(air) => format!(" · air taken out, {:.1} min saved", air.saved / 60.),
+                                                None => String::new(),
+                                            }
                                         ),
                                     ),
                                     Err(error) => (false, error),

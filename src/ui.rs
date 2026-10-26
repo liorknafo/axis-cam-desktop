@@ -2560,6 +2560,25 @@ fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
                 ))
                 .size(12),
             );
+            // What `air::trim` took out of the path.
+            if let Some(air) = sim.air {
+                playback = playback.push(if air.nothing {
+                    bold(
+                        "Cuts nothing on the stock it starts from. Disable it, or keep it as a spring pass.",
+                        12,
+                    )
+                    .color(WARN)
+                } else {
+                    muted(format!(
+                        "Air taken out: {} stretch{} ({:.0} mm of feed) replaced by rapids, {:.1} min saved",
+                        air.stretches,
+                        if air.stretches == 1 { "" } else { "es" },
+                        air.air,
+                        air.saved / 60.
+                    ))
+                    .size(12)
+                });
+            }
             // The scale the path's colours are in (`tooth_load::colour`).
             if sim.tooth_load.is_none()
                 && app
@@ -11781,7 +11800,7 @@ fn operation_audit(app: &App) -> Element<'_, Message> {
             .style(panel_style),
         );
     }
-    c=c.push(note("Remaining 3D stock carries through all enabled operations and setups, including flips. Fully cleared top layers are skipped automatically. Leftover-region rest machining, collision checks beyond modelled vise jaws and clamps, multi-axis kinematics and controllers other than LinuxCNC remain unavailable. Unavailable strategies stay visible for planning, but cannot be added as imported-part machining operations."));
+    c=c.push(note("Remaining 3D stock carries through all enabled operations and setups, including flips. Fully cleared top layers are skipped automatically, and a milling path's stretches through air are replaced by a retract and a rapid where that is quicker. Leftover-region rest machining, collision checks beyond modelled vise jaws and clamps, multi-axis kinematics and controllers other than LinuxCNC remain unavailable. Unavailable strategies stay visible for planning, but cannot be added as imported-part machining operations."));
     container(scrollable(c))
         .padding(24)
         .width(Fill)
