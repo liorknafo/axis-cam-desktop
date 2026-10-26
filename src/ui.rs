@@ -7013,7 +7013,7 @@ fn reading(a: usize, v: f64) -> String {
 }
 
 /// "X", "X and Y", "X, Y and Z".
-fn axis_names(axes: &[usize]) -> String {
+pub(crate) fn axis_names(axes: &[usize]) -> String {
     let names: Vec<&str> = axes.iter().map(|&a| AXES[a]).collect();
     match names.split_last() {
         Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),

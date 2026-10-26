@@ -971,15 +971,20 @@ panel, at once when that machine is connected, or when you press
    active one): by hand, with **Probe Z** on a plate, or with **Probe corner**,
    **Probe edge** or **Probe centre**. **Cycle Start** stays grey, with the reasons listed, until the
    tool run can start: the machine Idle, the AXIS CAM machine's X/Y/Z travel
-   equal to the profile's soft limits, X, Y and Z with a machine position,
-   the tool run inside the soft limits at this work zero, a spindle speed,
+   equal to the profile's soft limits on each axis that has them, X, Y and
+   Z with a machine position, the tool run inside the soft limits at this
+   work zero, a spindle speed,
    direction and coolant the profile can give, the spindle stopped or
    already turning the tool run's way (a spindle left running by hand the
    other way must be stopped first: the driver E-stops a reversal), and the
    setup checked since the last edit. When operations ask for flood or mist
    coolant the profile has no output for, **Set coolant to Off** under the
    reasons names them, sets each one's coolant to Off and checks the setup
-   again (LIO-145).
+   again (LIO-145). A profile without soft limits on X, Y or Z (taken out to
+   turn them off) does not keep Cycle Start grey: the Run panel says the
+   profile sets none on those axes, so nothing stops the machine at the end
+   of its travel and the job is not checked against it, and the tool run
+   cuts.
 
    Until the first tool run starts, **Work zero on the stock**, in the Tool
    runs panel, walks through it. It names the setup's work zero and work

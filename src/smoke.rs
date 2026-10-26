@@ -4058,6 +4058,63 @@ flood = { pin = 8 }
         assert!((z - plane as f64).abs() < 1e-3, "{z}");
     }
 
+    /// A profile without soft limits, turned off for now by taking them out,
+    /// does not stop Cycle Start: the Run panel says nothing stops the machine
+    /// at the end of its travel and the job is not checked against it, and
+    /// the tool run cuts, machine zero set or not.
+    #[test]
+    fn cycle_start_runs_without_soft_limits_in_the_profile() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let none: String = FAST
+            .lines()
+            .filter(|l| !l.starts_with("soft_"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert!(!none.contains("soft_"));
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_on(dir.path(), &none);
+        zeroed(&mut a);
+        assert_eq!(conn(&a).unlimited_axes(), vec![0, 1, 2]);
+        check_run(&mut a, 0);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let line = crate::run::limits_unchecked(conn(&a)).expect("the warning");
+        assert!(
+            line.starts_with("The UC100 profile sets no soft limits on X, Y and Z, so nothing stops the machine")
+                && line.ends_with("Add soft_min and soft_max for X, Y and Z to the profile to turn them on."),
+            "{line}"
+        );
+        let _ = a.view();
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        run_until(&mut a, 30.0, "tool run 1", |r| r.done[0]);
+        tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
+        assert!(run_of(&a).outcome.as_ref().unwrap().0);
+        // Without Z's alone: the warning names Z, and X and Y keep their
+        // travel check, which this work zero passes.
+        let z = FAST.replace("soft_min = -80.0\nsoft_max = 0.0\n", "");
+        let other = tempfile::tempdir().unwrap();
+        let mut a = run_app_on(other.path(), &z);
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let line = crate::run::limits_unchecked(conn(&a)).unwrap();
+        assert!(
+            line.starts_with("The UC100 profile sets no soft limits on Z,")
+                && !line.contains("machine position"),
+            "{line}"
+        );
+        // After an E-stop X and Y wait for their position too, Z does not.
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| !s.referenced[0]);
+        let line = crate::run::limits_unchecked(conn(&a)).unwrap();
+        assert!(
+            line.starts_with("The UC100 profile sets no soft limits on Z,")
+                && line.contains(" X, Y have no machine position"),
+            "{line}"
+        );
+    }
+
     #[test]
     fn cycle_start_waits_for_what_the_run_panel_lists() {
         use crate::run::Action as R;
