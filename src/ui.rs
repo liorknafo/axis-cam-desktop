@@ -2495,6 +2495,18 @@ fn section_controls(app: &App) -> Option<Element<'_, Message>> {
             .into(),
     )
 }
+/// How far the simulation is, as the strip says it: to a tenth under 10%,
+/// rounded above, and 100% only at the end.
+fn percent(progress: f32) -> String {
+    let p = (progress * 100.).clamp(0., 100.);
+    if p < 9.95 {
+        format!("{p:.1}%")
+    } else if progress < 1. {
+        format!("{:.0}%", p.min(99.))
+    } else {
+        "100%".into()
+    }
+}
 /// The 3D view's toolbar, the simulation strip under it, and the strip's
 /// controls under that: Play and the timeline, the stats and Details, or
 /// what to do for a preview. The open details go above the controls, so
@@ -2673,7 +2685,7 @@ fn scene_panels(
             btn("Restart", Message::Scrub(0.), false),
             help::wrap(slider(0.0..=1.0, app.progress, Message::Scrub).on_release(Message::ScrubDone).step(0.001_f32).width(Fill), Help::text("Simulation progress", "Scrub forward or backward. Playback recomputes the remaining stock and cutter position at that time. Restart restores the stock left by all preceding enabled operations and setups."), widget::tooltip::Position::Top),
             // As wide as "100%", so the slider keeps its length.
-            muted(format!("{}%", (app.progress * 100.) as u32)).width(34).align_x(Alignment::End),
+            muted(percent(app.progress)).width(34).align_x(Alignment::End),
             help::wrap(pick_list(if app.active_simulation().is_some() { vec![1f32, 10., 30., 60., 120.] } else { vec![0.5f32, 1., 2., 4.] }, Some(app.speed), Message::Speed).text_size(12).style(choice_style).padding(5),crate::choice_help::selected("speed","Playback speed",&app.speed.to_string(),Target::Operation,&Fields::new()),widget::tooltip::Position::Top),
             muted("×")
         ].spacing(8).align_y(Alignment::Center));
@@ -14331,6 +14343,17 @@ mod tests {
     use crate::model::Strategy;
     use std::path::Path;
 
+    /// The simulation strip's progress, to a tenth under 10% (LIO-326).
+    #[test]
+    fn the_progress_is_rounded_and_full_only_at_the_end() {
+        use super::percent;
+        assert_eq!(percent(0.), "0.0%");
+        assert_eq!(percent(3.0 / 154.9), "1.9%");
+        assert_eq!(percent(0.0996), "10%");
+        assert_eq!(percent(0.887), "89%");
+        assert_eq!(percent(0.998), "99%");
+        assert_eq!(percent(1.), "100%");
+    }
     /// The Control page is short under 860 px of height and narrow under
     /// 1360 px of width (LIO-275).
     #[test]
