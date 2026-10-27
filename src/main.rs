@@ -2347,15 +2347,15 @@ impl App {
             };
             // Clamps hold the stock to the end of the setup: the stock its
             // own operations leave, worked out once for the suggestion.
-            let after = before
-                .filter(|_| !request.vise)
-                .map(|(volume, frame)| {
-                    let own = generated
-                        .iter()
-                        .filter_map(|(oi, plan)| plan.as_ref().map(|plan| (*oi, plan)));
-                    (rest::after_setup(volume.clone(), own, si, *frame), *frame)
-                });
-            let after = after.as_ref().map(|(volume, frame)| with_part(volume, *frame));
+            let after = before.filter(|_| !request.vise).map(|(volume, frame)| {
+                let own = generated
+                    .iter()
+                    .filter_map(|(oi, plan)| plan.as_ref().map(|plan| (*oi, plan)));
+                (rest::after_setup(volume.clone(), own, si, *frame), *frame)
+            });
+            let after = after
+                .as_ref()
+                .map(|(volume, frame)| with_part(volume, *frame));
             let known = holding::Known {
                 earlier: removed.as_ref(),
                 after: after.as_ref(),

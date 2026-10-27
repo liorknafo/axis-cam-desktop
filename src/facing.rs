@@ -98,8 +98,10 @@ fn spans(loops: &[Vec<(f64, f64)>], v: f64) -> Vec<(f64, f64)> {
         }
     }
     at.sort_by(f64::total_cmp);
-    at.chunks_exact(2)
-        .map(|p| (p[0], p[1]))
+    at.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[a, b]| (a, b))
         .filter(|(a, b)| b - a > 0.001)
         .collect()
 }

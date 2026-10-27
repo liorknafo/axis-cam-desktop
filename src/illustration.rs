@@ -415,7 +415,7 @@ fn facing(f: &mut Frame, time: f32, phase: f32) {
     let u = progress(phase, 0.15) * 4.;
     let row = (u as usize).min(3);
     let k = u - row as f32;
-    let x = if row % 2 == 0 {
+    let x = if row.is_multiple_of(2) {
         -48. + 96. * k
     } else {
         48. - 96. * k
@@ -435,7 +435,7 @@ fn facing(f: &mut Frame, time: f32, phase: f32) {
             return;
         } else if i > row {
             (-40., 40.)
-        } else if row % 2 == 0 {
+        } else if row.is_multiple_of(2) {
             ((x + 7.).clamp(-40., 40.), 40.)
         } else {
             (-40., (x - 7.).clamp(-40., 40.))
@@ -445,7 +445,7 @@ fn facing(f: &mut Frame, time: f32, phase: f32) {
     // The zigzag toolpath: rows ±48 across, one row (12) apart.
     let ends = |i: usize, z: f32| {
         let y = -18. + 12. * i as f32;
-        if i % 2 == 0 {
+        if i.is_multiple_of(2) {
             ([-48., y, z], [48., y, z])
         } else {
             ([48., y, z], [-48., y, z])
@@ -960,7 +960,7 @@ fn indexed(f: &mut Frame, time: f32, phase: f32, setup: bool) {
     let rows = cutting * 3.;
     let row = (rows as usize).min(2);
     let k = rows - row as f32;
-    let x = if row % 2 == 0 {
+    let x = if row.is_multiple_of(2) {
         -36. + 72. * k
     } else {
         36. - 72. * k
@@ -970,7 +970,7 @@ fn indexed(f: &mut Frame, time: f32, phase: f32, setup: bool) {
             let y = -18. + 12. * i as f32;
             let (a, b) = if i < row {
                 (x0, x1)
-            } else if row % 2 == 0 {
+            } else if row.is_multiple_of(2) {
                 (x0, (x + 6.).clamp(x0, x1))
             } else {
                 ((x - 6.).clamp(x0, x1), x1)
@@ -1176,7 +1176,7 @@ fn five_axis(f: &mut Frame, time: f32, phase: f32) {
             .collect();
         polyline3(f, &path, CYAN, 1.5);
     }
-    let sign = if row % 2 == 0 { 1. } else { -1. };
+    let sign = if row.is_multiple_of(2) { 1. } else { -1. };
     let x = sign * (-38. + 76. * k);
     let path: Vec<V> = (0..=40)
         .map(|j| surface(sign * (-38. + 76. * k * j as f32 / 40.), y))
@@ -1231,7 +1231,7 @@ fn stepdown(f: &mut Frame, time: f32, phase: f32) {
     let u = progress(phase, 0.12) * 4.;
     let layer = (u as usize).min(3);
     let k = u - layer as f32;
-    let x = if layer % 2 == 0 {
+    let x = if layer.is_multiple_of(2) {
         84. + 110. * k
     } else {
         194. - 110. * k
@@ -1239,7 +1239,7 @@ fn stepdown(f: &mut Frame, time: f32, phase: f32) {
     let above = top + depth * layer as f32;
     let floor = above + depth;
     rect(f, left, top, right, above, BACKGROUND);
-    if layer % 2 == 0 {
+    if layer.is_multiple_of(2) {
         rect(f, left, above, x + 10., floor, BACKGROUND);
     } else {
         rect(f, x - 10., above, right, floor, BACKGROUND);
@@ -1272,7 +1272,7 @@ fn stepover(f: &mut Frame, time: f32, phase: f32) {
     let u = progress(phase, 0.12) * 5.;
     let row = (u as usize).min(4);
     let k = u - row as f32;
-    let x = if row % 2 == 0 {
+    let x = if row.is_multiple_of(2) {
         x0 + r + (x1 - x0 - 2. * r) * k
     } else {
         x1 - r - (x1 - x0 - 2. * r) * k
@@ -1281,7 +1281,7 @@ fn stepover(f: &mut Frame, time: f32, phase: f32) {
     for (i, y) in rows.iter().enumerate().take(row + 1) {
         let (a, b) = if i < row {
             (x0, x1)
-        } else if row % 2 == 0 {
+        } else if row.is_multiple_of(2) {
             (x0, x + r)
         } else {
             (x - r, x1)
@@ -1342,13 +1342,13 @@ fn allowance(f: &mut Frame, time: f32, phase: f32) {
     let above = top + depth * layer as f32;
     let floor = above + depth;
     let (a, b) = (left + skin, right - skin);
-    let x = if layer % 2 == 0 {
+    let x = if layer.is_multiple_of(2) {
         a + 10. + (b - a - 20.) * k
     } else {
         b - 10. - (b - a - 20.) * k
     };
     rect(f, a, top, b, above, BACKGROUND);
-    if layer % 2 == 0 {
+    if layer.is_multiple_of(2) {
         rect(f, a, above, x + 10., floor, BACKGROUND);
     } else {
         rect(f, x - 10., above, b, floor, BACKGROUND);

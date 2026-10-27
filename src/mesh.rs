@@ -60,11 +60,12 @@ impl Clone for Kept {
         Self(Mutex::new(self.lock().clone()))
     }
 }
+type ThreadsByAngles = Vec<([f32; 3], Arc<Vec<crate::thread::Thread>>)>;
 /// The threads `Mesh::threads` found, by angle set, as `Kept` keeps bounds.
 #[derive(Debug, Default)]
-struct KeptThreads(Mutex<Vec<([f32; 3], Arc<Vec<crate::thread::Thread>>)>>);
+struct KeptThreads(Mutex<ThreadsByAngles>);
 impl KeptThreads {
-    fn lock(&self) -> MutexGuard<'_, Vec<([f32; 3], Arc<Vec<crate::thread::Thread>>)>> {
+    fn lock(&self) -> MutexGuard<'_, ThreadsByAngles> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }

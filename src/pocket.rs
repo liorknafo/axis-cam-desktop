@@ -3224,7 +3224,11 @@ mod tests {
         // (`slope_floors`), not refused.
         op.surfaces.as_mut().unwrap().mesh_fingerprint = mesh.fingerprint.clone();
         setup.p.insert("rx".into(), "10".into());
-        assert!(is_sloped(&setup, &mesh, op.surfaces.as_ref().unwrap().ids[0]));
+        assert!(is_sloped(
+            &setup,
+            &mesh,
+            op.surfaces.as_ref().unwrap().ids[0]
+        ));
         let plan = generate(&setup, &op, &tool, &mesh).unwrap();
         assert!(plan.levels > 1, "{} levels", plan.levels);
     }

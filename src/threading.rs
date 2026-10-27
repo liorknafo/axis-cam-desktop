@@ -111,9 +111,7 @@ pub fn add(doc: &Document, si: usize, mesh: &Mesh) -> Result<Added, String> {
         }
         // The thread.
         let cutter = if hand {
-            tools(&doc.tools, machine)
-                .filter(|t| t.tap_spec().is_some_and(|s| s.name == name))
-                .next()
+            tools(&doc.tools, machine).find(|t| t.tap_spec().is_some_and(|s| s.name == name))
         } else {
             thread_mill(&doc.tools, machine, &g.holes)
         };
@@ -393,11 +391,12 @@ mod tests {
     fn doc(machine: Machine, tools: Vec<Tool>) -> Document {
         let mut setup = crate::model::Setup::new(machine.clone(), "G54");
         setup.p.insert("stock_top".into(), "1".into());
-        let mut doc = Document::default();
-        doc.machines = vec![machine];
-        doc.tools = tools;
-        doc.setups = vec![setup];
-        doc
+        Document {
+            machines: vec![machine],
+            tools,
+            setups: vec![setup],
+            ..Default::default()
+        }
     }
     fn tool(name: &str, kind: &str, d: &str, extra: &[(&str, &str)]) -> Tool {
         let mut t = Tool::new(name, kind, d);

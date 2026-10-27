@@ -571,7 +571,7 @@ impl Clamps {
     /// A point of a clamp on `side` (0 −X, 1 +X, 2 −Y, 3 +Y): `u` outward
     /// from the stock's middle, `lat` along the side.
     fn pt(side: usize, u: f32, lat: f32, z: f32) -> V {
-        let u = if side % 2 == 0 { -u } else { u };
+        let u = if side.is_multiple_of(2) { -u } else { u };
         if side < 2 { [u, lat, z] } else { [lat, u, z] }
     }
     fn edge(side: usize) -> f32 {

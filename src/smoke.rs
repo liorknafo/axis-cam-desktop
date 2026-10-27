@@ -2743,7 +2743,10 @@ flood = { pin = 8 }
         a.page = Page::Control;
         let texts = page_texts(&a);
         let has = |t: &str| texts.iter().any(|x| x == t);
-        assert!(has("Stop now") && has("Spindle off") && !has("Stop"), "{texts:?}");
+        assert!(
+            has("Stop now") && has("Spindle off") && !has("Stop"),
+            "{texts:?}"
+        );
         let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Probe));
         let texts = page_texts(&a);
         assert!(
@@ -3043,12 +3046,17 @@ flood = { pin = 8 }
         let (mut a, _, _) = facing_a_floor();
         let first = "Facing stops at the part's top, 6.00 mm above the selected surface plus bottom offset: going lower would cut the part's higher features.";
         let texts = page_texts(&a);
-        assert!(texts.iter().any(|t| *t == format!("{first} …")), "{texts:?}");
+        assert!(
+            texts.iter().any(|t| *t == format!("{first} …")),
+            "{texts:?}"
+        );
         assert!(texts.iter().any(|t| t == "Details"), "{texts:?}");
         let _ = a.update(Message::ToggleWarningDetails);
         let texts = page_texts(&a);
         assert!(
-            texts.iter().any(|t| t.starts_with(first) && t.ends_with("Adaptive clearing.")),
+            texts
+                .iter()
+                .any(|t| t.starts_with(first) && t.ends_with("Adaptive clearing.")),
             "{texts:?}"
         );
         assert!(texts.iter().any(|t| t == "Hide details"), "{texts:?}");
@@ -16216,9 +16224,19 @@ soft_max = 180.0
         let size = iced::Size::new(1180., 760.);
         let strip = |a: &App| {
             let texts = laid_out_texts(a, size);
-            let y = |words: &str| texts.iter().find(|(t, _)| t.starts_with(words)).map(|t| t.1.y);
+            let y = |words: &str| {
+                texts
+                    .iter()
+                    .find(|(t, _)| t.starts_with(words))
+                    .map(|t| t.1.y)
+            };
             let has = |words: &str| texts.iter().any(|(t, _)| t.contains(words));
-            (y("OPERATION SIMULATION").unwrap(), has("total removed"), has(" · Spindle "), has("Hide details"))
+            (
+                y("OPERATION SIMULATION").unwrap(),
+                has("total removed"),
+                has(" · Spindle "),
+                has("Hide details"),
+            )
         };
         assert!(!a.sim_details);
         let folded = strip(&a);
@@ -22224,7 +22242,10 @@ soft_max = 180.0
         // In the window at its least width the 3D view keeps its least: the
         // browser, as drawn, gives way first.
         let least = crate::MIN_WINDOW.width;
-        let _ = a.update(Message::Resized(iced::Size::new(least, crate::WINDOW.height)));
+        let _ = a.update(Message::Resized(iced::Size::new(
+            least,
+            crate::WINDOW.height,
+        )));
         assert_eq!(a.window_width, least);
         let l = layout(&a);
         let (b, i) = crate::ui::fitted(&l, least);

@@ -9292,7 +9292,7 @@ fn probe_tab(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
                     c.edging()
                 ),
                 hint(
-                    &name,
+                    name,
                     match (own_why(blocked.clone()), &c.probe) {
                         (Some(why), _) if !c.edging() => why,
                         (_, Ok(pr)) => {
@@ -13394,7 +13394,7 @@ mod tests {
     /// under its least size.
     #[test]
     fn the_window_opens_no_larger_than_the_screen() {
-        use crate::{MIN_WINDOW, WINDOW, opening_window};
+        use crate::{MIN_WINDOW, opening_window};
         use iced::Size;
         assert_eq!(opening_window(Size::new(1920., 1080.)), None);
         assert_eq!(opening_window(Size::new(2560., 1440.)), None);

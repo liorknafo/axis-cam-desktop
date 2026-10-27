@@ -5971,7 +5971,18 @@ mod tests {
             &[3., 8., 13., 18., 23., 28., 33., 38.],
         );
         let removed = Removed::new(&v, f).with_part(&PartGrid::boxed(&v, part));
-        assert!(holdable(1, &vise_gripping(8.), &vise(), left, Some(&removed), None, &names).is_empty());
+        assert!(
+            holdable(
+                1,
+                &vise_gripping(8.),
+                &vise(),
+                left,
+                Some(&removed),
+                None,
+                &names
+            )
+            .is_empty()
+        );
         assert!(holdable(1, &clamps, &clamp(), left, Some(&removed), None, &names).is_empty());
     }
     #[test]

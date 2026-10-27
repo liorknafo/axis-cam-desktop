@@ -2729,7 +2729,7 @@ pub(crate) fn hole_thread(op: &Operation, h: &Hole) -> Result<HoleThread, String
     } else {
         (h.top - h.bottom - 1.5 * pitch).max(pitch)
     };
-    if !(depth > 0.) {
+    if depth.is_nan() || depth <= 0. {
         return Err("Thread depth must be above 0.".into());
     }
     let bottom = h.top - depth;

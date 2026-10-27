@@ -665,6 +665,9 @@ pub(crate) mod tests {
     /// per turn. `internal` faces its triangles in towards the axis (a
     /// hole's); `taper` is the diameter's change per mm, the wide end at
     /// z = 0 for a hole.
+    // Each argument is a thread parameter the tests vary call by call; a
+    // struct would only rename them at sixteen call sites.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn modeled(
         centre: [f32; 2],
         major: f32,

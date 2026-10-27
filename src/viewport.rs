@@ -709,7 +709,9 @@ impl Viewport<'_> {
             Some(first) => {
                 let geometry = crate::cam::Geometry::new(first, self.mesh);
                 let threads = crate::thread::in_setup(first, self.mesh);
-                removed.with_part(&crate::plan_check::PartGrid::new(volume, &geometry, &threads))
+                removed.with_part(&crate::plan_check::PartGrid::new(
+                    volume, &geometry, &threads,
+                ))
             }
             None => removed,
         };

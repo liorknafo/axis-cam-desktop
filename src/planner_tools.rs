@@ -541,7 +541,8 @@ fn check_holding(arguments: &str, state: &ToolState) -> Answer {
         setup.p.insert("holder".into(), entry.id.clone());
         let plans: Vec<&crate::simulation::Plan> = start.plans.iter().collect();
         let mesh = &state.scene.mesh;
-        let with_part = |v| crate::plan_check::PartGrid::removed(v, start.frame, &checked.job, mesh);
+        let with_part =
+            |v| crate::plan_check::PartGrid::removed(v, start.frame, &checked.job, mesh);
         let removed = start.before.as_deref().map(with_part);
         let after = (!vise).then(|| {
             let own = start.operations.iter().copied().zip(&start.plans);

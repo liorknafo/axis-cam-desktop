@@ -621,11 +621,15 @@ impl Gpu {
         timing.gpu = gpu_started.elapsed().as_secs_f64() * 1e3;
         let read_started = std::time::Instant::now();
         let data = self.read(&[(&vertices, counts[0] * 12), (&indices, counts[1] * 12)])?;
-        let vertices = (bytemuck::cast_slice::<u8, f32>(&data[0]).chunks_exact(3))
-            .map(|v| [v[0], v[1], v[2]])
-            .collect();
-        let triangles = (bytemuck::cast_slice::<u8, u32>(&data[1]).chunks_exact(3))
-            .map(|t| [t[0] as usize, t[1] as usize, t[2] as usize])
+        let vertices = bytemuck::cast_slice::<u8, f32>(&data[0])
+            .as_chunks::<3>()
+            .0
+            .to_vec();
+        let triangles = bytemuck::cast_slice::<u8, u32>(&data[1])
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|t| t.map(|i| i as usize))
             .collect();
         timing.read = read_started.elapsed().as_secs_f64() * 1e3;
         Ok((vertices, triangles))

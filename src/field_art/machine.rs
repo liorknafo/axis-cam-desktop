@@ -1363,7 +1363,7 @@ fn kind(f: &mut Frame, phase: f32) {
         "HAND-OPERATED · DRO",
         "HAND-OPERATED · DIALS",
     ];
-    for j in 0..3 {
+    for (j, name) in names.into_iter().enumerate() {
         let x = 8. + j as f32 * 90.;
         match j {
             0 => cnc_icon(f, x, 28., 1., phase),
@@ -1377,7 +1377,7 @@ fn kind(f: &mut Frame, phase: f32) {
         }
         say_mid(
             f,
-            names[j],
+            name,
             x + 39.,
             98.,
             if j == i { GOLD } else { alpha(TEXT, 0.6) },
