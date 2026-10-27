@@ -9238,11 +9238,11 @@ fn tool_change_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Eleme
     if let Some(row) = a_reference_row(app, c, run) {
         four = four.push(row);
     }
-    col = col.push(step_box(4, false, touched, four));
+    col = col.push(step_box(4, touched, false, four));
     col = col.push(step_box(
         5,
         false,
-        false,
+        touched,
         text(format!(
             "Jog clear and press Cycle Start: it continues with {}.",
             o.name
@@ -10327,7 +10327,13 @@ fn step_list<'a>(
                 },
                 ..Default::default()
             });
-        col = col.push(HelpButton::new(b, &m, os.label(first)));
+        // Its card to the left, as the operations' pictures: below, it
+        // would cover the steps after it and take their clicks (LIO-312).
+        col = col.push(help::wrap(
+            b,
+            help::command(&m, os.label(first)),
+            widget::tooltip::Position::Left,
+        ));
     }
     let mut out = column![
         container(col)
@@ -14142,16 +14148,53 @@ pub(crate) mod probe {
         ui.operate(&renderer, &mut bounds);
         bounds.0
     }
-    /// What pressing the left button gives at every `step` px of `area`,
-    /// with the point it was pressed at.
+    /// What pressing the left button, then releasing it, gives at every
+    /// `step` px of `area`, with the point it was pressed at.
     pub(crate) fn presses(
         page: Element<'_, Message>,
         window: Size,
         area: iced::Rectangle,
         step: f32,
     ) -> Vec<(Point, Message)> {
+        presses_after(page, window, None, area, step)
+    }
+    /// `presses`, after the pointer came to `rest` and stayed there long
+    /// enough for a hover card there to open.
+    pub(crate) fn presses_after(
+        page: Element<'_, Message>,
+        window: Size,
+        rest: Option<Point>,
+        area: iced::Rectangle,
+        step: f32,
+    ) -> Vec<(Point, Message)> {
         let mut renderer = renderer();
         let mut ui = UserInterface::build(page, window, Cache::default(), &mut renderer);
+        if let Some(at) = rest {
+            let off = Point::new(-10., -10.);
+            for (event, cursor) in [
+                (mouse::Event::CursorMoved { position: off }, off),
+                (mouse::Event::CursorMoved { position: at }, at),
+            ] {
+                let _ = ui.update(
+                    &[Event::Mouse(event)],
+                    mouse::Cursor::Available(cursor),
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut vec![],
+                );
+            }
+            std::thread::sleep(crate::help::HELP_DELAY + std::time::Duration::from_millis(100));
+            let redraw = Event::Window(iced::window::Event::RedrawRequested(
+                std::time::Instant::now(),
+            ));
+            let _ = ui.update(
+                &[redraw],
+                mouse::Cursor::Available(at),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut vec![],
+            );
+        }
         let mut out = vec![];
         let mut x = area.x;
         while x < area.x + area.width {
@@ -14170,7 +14213,6 @@ pub(crate) mod probe {
                     &mut clipboard::Null,
                     &mut messages,
                 );
-                out.extend(messages.into_iter().map(|m| (at, m)));
                 let _ = ui.update(
                     &[Event::Mouse(mouse::Event::ButtonReleased(
                         mouse::Button::Left,
@@ -14178,8 +14220,9 @@ pub(crate) mod probe {
                     mouse::Cursor::Available(at),
                     &mut renderer,
                     &mut clipboard::Null,
-                    &mut vec![],
+                    &mut messages,
                 );
+                out.extend(messages.into_iter().map(|m| (at, m)));
                 y += step;
             }
             x += step;

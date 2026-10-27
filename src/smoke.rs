@@ -2390,6 +2390,17 @@ flood = { pin = 8 }
             (s.work_offset[2] - (-22.)).abs() < 1e-6
         });
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // Ready for Cycle Start: the tool change's check 4, the touch-off,
+        // is done too (LIO-312).
+        let _ = a.update(Message::ControlPhaseTab(
+            crate::ui::ControlTab::ToolChange,
+            false,
+        ));
+        let texts = page_texts(&a);
+        let four = (texts.iter())
+            .position(|t| t.starts_with("Touch the new tool"))
+            .expect("check 4");
+        assert_eq!(texts[four - 1], "✓", "{texts:?}");
         // X/Y zero must stay: moving it holds Cycle Start back.
         let _ = a.update(Message::Machine(crate::control::Action::WorkZero(Some(0))));
         tick_until(&mut a, 2.0, "X zero moved", |s| s.work_pos[0].abs() < 1e-6);
@@ -3179,6 +3190,55 @@ flood = { pin = 8 }
             .collect()
     }
 
+    /// A step's hover card leaves the steps after it to be clicked: with
+    /// Hole 1's card open, each hole below still picks itself (LIO-312).
+    #[test]
+    fn a_steps_hover_card_leaves_the_steps_below_it_clickable() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let (oi, n) = (run_of(&a).steps.iter())
+            .find(|s| s.hole)
+            .map(|s| (s.op, s.steps.len()))
+            .expect("the Drilling's holes");
+        assert!(n > 2, "{n}");
+        let _ = a.update(Message::Run(R::Steps(Some(oi))));
+        let window = iced::Size::new(1440., 790.);
+        let _ = a.update(Message::Resized(window));
+        let column = iced::Rectangle::new(
+            iced::Point::new(window.width - 420., 0.),
+            iced::Size::new(420., window.height),
+        );
+        // The middle of each step row, where a press picks it.
+        let presses = crate::ui::probe::presses(a.view(), window, column, 4.);
+        let rows: Vec<iced::Point> = (0..n)
+            .map(|s| {
+                let at: Vec<_> = (presses.iter())
+                    .filter(|(_, m)| matches!(m, Message::Run(R::PickStep(o, t)) if (*o, *t) == (oi, s)))
+                    .map(|(at, _)| *at)
+                    .collect();
+                assert!(!at.is_empty(), "step {s} of {oi} has no place to press: {presses:?}");
+                at[at.len() / 2]
+            })
+            .collect();
+        for (s, &at) in rows.iter().enumerate().skip(1) {
+            let pressed = crate::ui::probe::presses_after(
+                a.view(),
+                window,
+                Some(rows[0]),
+                iced::Rectangle::new(at, iced::Size::new(1., 1.)),
+                1.,
+            );
+            assert!(
+                matches!(pressed[..], [(_, Message::Run(R::PickStep(o, t)))] if (o, t) == (oi, s)),
+                "step {s} under Hole 1's card: {pressed:?}"
+            );
+        }
+    }
+
     /// Nothing around the jog pad moves while the machine jogs: leaving a
     /// jog button stops the jog, so a button that moved from under the
     /// pointer would stop it (LIO-274). The page itself never scrolls at
@@ -3396,6 +3456,11 @@ flood = { pin = 8 }
         // The tick's phase change opens the tab once no field has the focus.
         let _ = a.update(Message::ControlPhaseTab(T::ToolChange, false));
         shot(&mut a, "06-tool-change");
+        // Z set from the reference: check 4 done, Cycle Start next (LIO-312).
+        let _ = a.update(Message::Run(R::RecordReference));
+        let _ = a.update(Message::Run(R::ZFromReference));
+        run_until(&mut a, 2.0, "Set Z from reference", |r| r.touched);
+        shot(&mut a, "06-tool-change-z-set");
         // Resume (LIO-275): where a run stopped, after hole 2 of the Drill,
         // kept in the journal; the setup picked again, as in a new session.
         a.control.as_mut().unwrap().run.as_mut().unwrap().stopped = Some(crate::run::Stopped {

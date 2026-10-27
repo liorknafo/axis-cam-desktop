@@ -273,7 +273,7 @@ pub fn wrap<'a>(
         card: None,
     })
 }
-const HELP_DELAY: Duration = Duration::from_millis(600);
+pub(crate) const HELP_DELAY: Duration = Duration::from_millis(600);
 /// How long an open card stays once the pointer is off both the control
 /// and the card: the time to cross the gap between them.
 const LINGER: Duration = Duration::from_millis(250);

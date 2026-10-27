@@ -2145,6 +2145,20 @@ pub fn check_steps(
                 }
                 sim.initial_volume = Some(volume);
             }
+            // Steps taken as cut are in the stock already: the stock before
+            // this operation and those before it has them cut, so the live
+            // carve starts from it (LIO-312). ponytail: the top view only;
+            // an indexed setup's moves (at an A) stay out of it.
+            let before = Arc::make_mut(&mut left.before);
+            let moves = (steps.iter().filter_map(|&s| found.steps.get(s)))
+                .flat_map(|s| &sim.plan.moves[s.moves.clone()])
+                .filter(|m| m.a.is_none());
+            for m in moves {
+                for b in before.iter_mut().filter(|b| b.op <= *oi) {
+                    b.stock
+                        .cut_shape(m.from, m.to, sim.plan.radius, sim.plan.shape);
+                }
+            }
             sim.plan = cut_plan(&sim.plan, &found.steps, steps);
         }
     }
@@ -4466,6 +4480,25 @@ mod tests {
                 .count()
         };
         assert!(ops(&skipped[0]) < ops(full));
+    }
+
+    /// Steps taken as cut are in the stock a run's live carve starts from
+    /// (LIO-312): the stock before their operation, and before those ahead
+    /// of it, has them cut; the stock after their operation is as it was.
+    #[test]
+    fn steps_taken_as_cut_are_in_the_stock_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let (doc, mesh) = four_ops(dir.path());
+        let (_, whole) = check_steps(&doc, &mesh, 0, &[], &[]);
+        let (_, cut) = check_steps(&doc, &mesh, 0, &[], &[(2, vec![0, 1])]);
+        let left = |l: &Left, oi: usize| -> f32 {
+            let b = l.before.iter().find(|b| b.op == oi).unwrap();
+            b.stock.heights.iter().sum()
+        };
+        for oi in 0..=2 {
+            assert!(left(&cut, oi) < left(&whole, oi), "before operation {oi}");
+        }
+        assert_eq!(left(&cut, 3), left(&whole, 3));
     }
 
     /// The journal of where a run stopped (LIO-275) is written and read
