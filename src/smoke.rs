@@ -7838,10 +7838,12 @@ flood = { pin = 8 }
             let _ = a.view();
             let (ok, message) = probed(a);
             assert!(ok, "{message}");
-            // The work offset is set, then the tip moves back.
-            tick_for(a, 100);
+            // The work offset is set, then the tip moves back: a job of its
+            // own, ended once its outcome is in.
+            let seq = conn(a).snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
             tick_until(a, 5.0, "back where it started", |s| {
                 s.state == Some(State::Idle)
+                    && s.program_outcome.as_ref().is_some_and(|o| o.seq > seq)
             });
             message
         };
@@ -8125,8 +8127,21 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::Hold));
         tick_until(&mut a, 2.0, "Hold", |s| s.state == Some(State::Hold));
         assert!(go_clicks(&a).is_empty(), "{:?}", go_clicks(&a));
-        // Held once the machine has slowed to a stop.
-        tick_for(&mut a, 300);
+        // Held once the machine has slowed to a stop: the position the same
+        // for 50 of the controller's 4 ms loops.
+        let since = std::cell::Cell::new(None);
+        tick_until(&mut a, 3.0, "the hold to stop", |s| {
+            let Some(timer) = s.status.map(|st| st.timer) else {
+                return false;
+            };
+            match since.get() {
+                Some((t, p)) if p == s.machine_pos => timer.wrapping_sub(t) >= 50,
+                _ => {
+                    since.set(Some((timer, s.machine_pos)));
+                    false
+                }
+            }
+        });
         let held = conn(&a).snapshot.machine_pos;
         for g in [Go::Axis(0), Go::All, Go::WorkXY0, Go::ZTop] {
             let _ = a.update(Message::Machine(Action::GoTo(g)));
@@ -9058,8 +9073,9 @@ flood = { pin = 8 }
         assert_eq!(conn(&a).held(), Some((0, false)));
         // Past the driver's 400 ms timeout: the tick keeps the jog going.
         tick_for(&mut a, 700);
-        assert_eq!(conn(&a).snapshot.state, Some(State::Jog));
-        assert!(at(&a)[0] > 5., "{:?}", at(&a));
+        tick_until(&mut a, 3.0, "X jogging past 5", |s| {
+            s.state == Some(State::Jog) && s.machine_pos[0] > 5.
+        });
         let _ = a.update(Message::Machine(Action::JogRelease));
         assert_eq!(conn(&a).held(), None);
         tick_until(&mut a, 3.0, "Idle after the release", |s| {
@@ -9150,8 +9166,9 @@ soft_max = 180.0
         let _ = a.update(Message::Machine(Action::JogPress(3, true)));
         assert_eq!(conn(&a).held(), Some((3, true)));
         tick_for(&mut a, 700);
-        assert_eq!(conn(&a).snapshot.state, Some(State::Jog));
-        assert!(at(&a)[3] < 10., "{:?}", at(&a));
+        tick_until(&mut a, 3.0, "A jogging below 10°", |s| {
+            s.state == Some(State::Jog) && s.machine_pos[3] < 10.
+        });
         let _ = a.update(Message::Machine(Action::JogRelease));
         tick_until(&mut a, 3.0, "Idle after the release", |s| {
             s.state == Some(State::Idle)
@@ -9404,15 +9421,11 @@ soft_max = 180.0
         let x = at(&a)[0];
         let _ = a.update(Message::Machine(Action::JogStep(Some(10.))));
         let _ = a.update(Message::Machine(Action::JogPress(0, true)));
-        tick_for(&mut a, 100);
+        tick_until(&mut a, 3.0, "Jog refused", |s| {
+            assert_eq!(s.machine_pos[0], x);
+            s.log.iter().any(|l| l.starts_with("Jog refused"))
+        });
         assert_eq!(at(&a)[0], x);
-        assert!(
-            conn(&a)
-                .snapshot
-                .log
-                .iter()
-                .any(|l| l.starts_with("Jog refused"))
-        );
     }
 
     #[test]
