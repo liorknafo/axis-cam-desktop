@@ -1469,11 +1469,21 @@ impl Operation {
         if s == Strategy::Parallel {
             p.insert("surface_stepover".into(), "1".into());
         }
-        // Waterline finishes: no stock left on the walls, and layers close
-        // enough that the steps they leave on a sloping face stay small.
+        // Surface finishes leave no stock on the part.
+        if matches!(
+            s,
+            Strategy::Parallel
+                | Strategy::Waterline
+                | Strategy::Scallop
+                | Strategy::Rotary
+                | Strategy::FiveAxis
+        ) {
+            p.insert("allowance".into(), "0".into());
+        }
+        // Waterline's layers close enough that the steps they leave on a
+        // sloping face stay small.
         if s == Strategy::Waterline {
             p.insert("stepdown".into(), "1".into());
-            p.insert("allowance".into(), "0".into());
         }
         if s == Strategy::Box {
             for (k, v) in [
@@ -4098,6 +4108,20 @@ mod tests {
         let d = Document::sample();
         assert!(d.issues().is_empty(), "{:?}", d.issues());
         assert!(d.validate_structure().is_ok())
+    }
+    #[test]
+    fn a_new_finishing_leaves_no_stock_and_a_roughing_does() {
+        let allowance = |s| get(&Operation::new(s, String::new()).p, "allowance").to_string();
+        for s in [
+            Strategy::Parallel,
+            Strategy::Waterline,
+            Strategy::Scallop,
+            Strategy::Rotary,
+            Strategy::FiveAxis,
+        ] {
+            assert_eq!(allowance(s), "0", "{}", s.name());
+        }
+        assert_eq!(allowance(Strategy::Adaptive), "0.3");
     }
     #[test]
     fn empty_geometry_is_invalid() {
