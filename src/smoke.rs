@@ -17000,31 +17000,38 @@ soft_max = 180.0
         /// Each scrollable: the part shown, and all of its content.
         scrolls: Vec<(iced::Rectangle, iced::Rectangle)>,
     }
+    impl iced::advanced::widget::Operation for LaidOut {
+        fn traverse(
+            &mut self,
+            operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation),
+        ) {
+            operate(self);
+        }
+        fn text(
+            &mut self,
+            _id: Option<&iced::advanced::widget::Id>,
+            bounds: iced::Rectangle,
+            text: &str,
+        ) {
+            self.texts.push((text.to_string(), bounds));
+        }
+        fn container(&mut self, _id: Option<&iced::advanced::widget::Id>, bounds: iced::Rectangle) {
+            self.boxes.push(bounds);
+        }
+        fn scrollable(
+            &mut self,
+            _id: Option<&iced::advanced::widget::Id>,
+            bounds: iced::Rectangle,
+            content: iced::Rectangle,
+            _translation: iced::Vector,
+            _state: &mut dyn iced::advanced::widget::operation::Scrollable,
+        ) {
+            self.scrolls.push((bounds, content));
+        }
+    }
     fn laid_out(a: &App, size: iced::Size) -> LaidOut {
         use futures_util::FutureExt;
         use iced::advanced::renderer::Headless;
-        use iced::advanced::widget::{Id, Operation, operation::Scrollable};
-        impl Operation for LaidOut {
-            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
-                operate(self);
-            }
-            fn text(&mut self, _id: Option<&Id>, bounds: iced::Rectangle, text: &str) {
-                self.texts.push((text.to_string(), bounds));
-            }
-            fn container(&mut self, _id: Option<&Id>, bounds: iced::Rectangle) {
-                self.boxes.push(bounds);
-            }
-            fn scrollable(
-                &mut self,
-                _id: Option<&Id>,
-                bounds: iced::Rectangle,
-                content: iced::Rectangle,
-                _translation: iced::Vector,
-                _state: &mut dyn Scrollable,
-            ) {
-                self.scrolls.push((bounds, content));
-            }
-        }
         let mut renderer = <iced::Renderer as Headless>::new(
             iced::Font::DEFAULT,
             iced::Pixels(16.),
