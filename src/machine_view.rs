@@ -637,9 +637,12 @@ impl canvas::Program<Message> for MachineView {
             &canvas::Path::circle(screen(view.flat(self.pos)), 4.),
             Color::from_rgb8(214, 40, 40),
         );
+        // The captions are cut to the view's width (about 6.2 px a character
+        // at 12 px), so that a narrow view does not run them past its edge.
+        let fits = |px: f32| ((bounds.width - 20.) / px).max(1.) as usize;
         for (i, (kind, content)) in self.captions().into_iter().enumerate() {
             frame.fill_text(canvas::Text {
-                content: content.into(),
+                content: crate::ui::ellipsize(content, fits(6.2)),
                 position: Point::new(10., 8. + 16. * i as f32),
                 color: match kind {
                     Caption::Travel => envelope,
@@ -650,14 +653,15 @@ impl canvas::Program<Message> for MachineView {
                 ..Default::default()
             });
         }
+        let foot = match &self.rotary {
+            Some(_) => format!(
+                "CNC4030, assumed dimensions · rotary unit as the machine library places it, A {}° · drag to turn",
+                crate::indexed::degrees(self.a)
+            ),
+            None => "CNC4030, assumed dimensions · drag to turn".into(),
+        };
         frame.fill_text(canvas::Text {
-            content: match &self.rotary {
-                Some(_) => format!(
-                    "CNC4030, assumed dimensions · rotary unit as the machine library places it, A {}° · drag to turn",
-                    crate::indexed::degrees(self.a)
-                ),
-                None => "CNC4030, assumed dimensions · drag to turn".into(),
-            },
+            content: crate::ui::ellipsize(&foot, fits(5.7)),
             position: Point::new(10., bounds.height - 20.),
             color: Color::from_rgb8(110, 128, 145),
             size: 11.into(),

@@ -2655,7 +2655,7 @@ flood = { pin = 8 }
         let window = iced::Size::new(1440., 790.);
         let area = iced::Rectangle::new(
             iced::Point::ORIGIN,
-            iced::Size::new(crate::ui::HANDS + 20., window.height),
+            iced::Size::new(crate::ui::Fit::of(a).hands() + 20., window.height),
         );
         crate::ui::probe::presses(a.view(), window, area, 6.)
             .into_iter()
@@ -2696,7 +2696,8 @@ flood = { pin = 8 }
         // Every scrollable is inside the page under the run bar, none of it
         // the page's: the page has no scrollbar.
         let window = iced::Size::new(1440., 790.);
-        let top = crate::ui::MACHINE_BAR + crate::ui::RUN_BAR;
+        let fit = crate::ui::Fit::of(&a);
+        let top = fit.machine_bar() + fit.run_bar();
         for tab in [
             crate::ui::ControlTab::Job,
             crate::ui::ControlTab::WorkZero,
@@ -2707,7 +2708,7 @@ flood = { pin = 8 }
             let _ = a.update(Message::ControlTab(tab));
             for (id, at) in crate::ui::probe::scrollables(a.view(), window) {
                 assert!(
-                    at.y >= top && at.width < window.width - crate::ui::HANDS,
+                    at.y >= top && at.width < window.width - fit.hands(),
                     "{tab:?}: {id:?} at {at:?} scrolls the page"
                 );
             }
@@ -2752,11 +2753,13 @@ flood = { pin = 8 }
         );
     }
 
-    /// Renders the Control page at 1440 × 790, the usable window of a 13"
-    /// laptop, in each state and tab to `$AXIS_RENDER_DIR` (default
-    /// /tmp/control-page): not connected, E-stop, idle, before the run,
-    /// cutting, the tool change, and a machine with A; and once at
-    /// 1440 × 900 and 1920 × 1080. Not a check: run it with --ignored.
+    /// Renders the Control page in each state and tab to
+    /// `$AXIS_RENDER_DIR` (default /tmp/control-page), a folder for each
+    /// window size: 1440 × 900, 1440 × 790 (the usable window of a 13"
+    /// laptop), 1280 × 690 (the same with larger text), 1120 × 720 and
+    /// 1120 × 690 (the least window). Not connected, E-stop, idle, before the run, each tab,
+    /// cutting, holding, the tool change, and a machine with A; once more
+    /// at 1920 × 1080. Not a check: run it with --ignored.
     #[test]
     #[ignore]
     fn render_the_control_page() {
@@ -2766,25 +2769,38 @@ flood = { pin = 8 }
         let out = std::path::PathBuf::from(
             std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/control-page".into()),
         );
-        std::fs::create_dir_all(&out).unwrap();
-        let size = iced::Size::new(1440., 790.);
+        let shot = |a: &mut App, name: &str| {
+            for (w, h) in [
+                (1440., 900.),
+                (1440., 790.),
+                (1280., 690.),
+                (1120., 720.),
+                (1120., 690.),
+            ] {
+                let size = iced::Size::new(w, h);
+                let _ = a.update(Message::Resized(size));
+                let dir = out.join(format!("{w}x{h}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                render_png(a, size, &dir.join(format!("{name}.png")));
+            }
+        };
         let dir = tempfile::tempdir().unwrap();
         let mut a = ops_app(dir.path());
         let _ = a.view();
-        render_png(&a, size, &out.join("00-not-connected.png"));
+        shot(&mut a, "00-not-connected");
         let _ = a.update(Message::Connect);
         tick_until(&mut a, 3.0, "E-stop after connecting", |s| {
             s.state == Some(State::EStop)
         });
-        render_png(&a, size, &out.join("01-e-stop.png"));
+        shot(&mut a, "01-e-stop");
         let _ = a.update(Message::MachineReset);
         tick_until(&mut a, 3.0, "Idle after Reset", |s| {
             s.state == Some(State::Idle)
         });
-        render_png(&a, size, &out.join("02-connected-idle.png"));
+        shot(&mut a, "02-connected-idle");
         zero(&mut a);
         check_run_pictured(&mut a, dir.path(), 0);
-        render_png(&a, size, &out.join("03-before-the-run.png"));
+        shot(&mut a, "03-before-the-run");
         for (tab, name) in [
             (T::WorkZero, "work-zero"),
             (T::Probe, "probe"),
@@ -2792,11 +2808,11 @@ flood = { pin = 8 }
             (T::Machine, "machine"),
         ] {
             let _ = a.update(Message::ControlTab(tab));
-            render_png(&a, size, &out.join(format!("04-tab-{name}.png")));
+            shot(&mut a, &format!("04-tab-{name}"));
         }
         let _ = a.update(Message::ControlView(crate::ui::JobView::Machine));
         let _ = a.update(Message::ControlTab(T::Job));
-        render_png(&a, size, &out.join("04-tab-job-machine.png"));
+        shot(&mut a, "04-tab-job-machine");
         let _ = a.update(Message::ControlView(crate::ui::JobView::Stock));
         let _ = a.update(Message::Run(R::CycleStart));
         tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
@@ -2806,23 +2822,21 @@ flood = { pin = 8 }
             assert!(deadline.within(&conn(&a).snapshot));
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        let _ = a.update(Message::Tick);
-        render_png(&a, size, &out.join("05-cutting.png"));
-        render_png(
-            &a,
-            iced::Size::new(1440., 900.),
-            &out.join("05-cutting-1440x900.png"),
-        );
-        render_png(
-            &a,
-            iced::Size::new(1920., 1080.),
-            &out.join("05-cutting-1920x1080.png"),
-        );
+        // Held first: the job runs on while the pictures are drawn.
+        let _ = a.update(Message::Run(R::Hold));
+        tick_until(&mut a, 3.0, "Hold", |s| s.state == Some(State::Hold));
+        shot(&mut a, "05-holding");
+        let _ = a.update(Message::Run(R::Resume));
+        tick_until(&mut a, 3.0, "Run", |s| s.state == Some(State::Run));
+        shot(&mut a, "05-cutting");
+        let size = iced::Size::new(1920., 1080.);
+        let _ = a.update(Message::Resized(size));
+        render_png(&a, size, &out.join("05-cutting-1920x1080.png"));
         run_until(&mut a, 30.0, "tool run 1", |r| r.done[0]);
         tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
         // The tick's phase change opens the tab once no field has the focus.
         let _ = a.update(Message::ControlPhaseTab(T::ToolChange, false));
-        render_png(&a, size, &out.join("06-tool-change.png"));
+        shot(&mut a, "06-tool-change");
         let _ = a.update(Message::Disconnect);
         // A machine with the rotary unit: A in the position, jog and tabs.
         let dir = tempfile::tempdir().unwrap();
@@ -2835,10 +2849,16 @@ flood = { pin = 8 }
         a.doc.machines.push(m);
         a.page = Page::Control;
         idle(&mut a);
-        render_png(&a, size, &out.join("07-rotary-idle.png"));
-        for (tab, name) in [(T::Rotary, "rotary"), (T::Probe, "probe")] {
+        shot(&mut a, "07-rotary-idle");
+        for (tab, name) in [
+            (T::WorkZero, "work-zero"),
+            (T::Probe, "probe"),
+            (T::Rotary, "rotary"),
+            (T::Mdi, "mdi"),
+            (T::Machine, "machine"),
+        ] {
             let _ = a.update(Message::ControlTab(tab));
-            render_png(&a, size, &out.join(format!("07-rotary-tab-{name}.png")));
+            shot(&mut a, &format!("07-rotary-tab-{name}"));
         }
     }
 
@@ -22204,7 +22224,7 @@ soft_max = 180.0
         // In the window at its least width the 3D view keeps its least: the
         // browser, as drawn, gives way first.
         let least = crate::MIN_WINDOW.width;
-        let _ = a.update(Message::Resized(least));
+        let _ = a.update(Message::Resized(iced::Size::new(least, crate::WINDOW.height)));
         assert_eq!(a.window_width, least);
         let l = layout(&a);
         let (b, i) = crate::ui::fitted(&l, least);
@@ -22233,7 +22253,7 @@ soft_max = 180.0
         );
         // The page builds at both window widths.
         let _ = a.view();
-        let _ = a.update(Message::Resized(1920.));
+        let _ = a.update(Message::Resized(iced::Size::new(1920., 1080.)));
         let _ = a.view();
         // A new app on the same workspace starts with the saved layout.
         assert_eq!(fresh_app(&dir).settings.layout, l);

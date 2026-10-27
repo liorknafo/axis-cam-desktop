@@ -144,9 +144,24 @@ fn read_saved_session(
 const EDIT_PAUSE: Duration = Duration::from_millis(700);
 /// The window's size when it opens, and the least it can be made: the Work
 /// page's sidebars leave the 3D view `ui::VIEW_MIN` wide at the least
-/// (`ui::fitted`).
+/// (`ui::fitted`), and the Control page fits 690 px of height, what a 13"
+/// MacBook with larger text leaves. It opens no larger than its screen
+/// (`opening_window`).
 pub(crate) const WINDOW: Size = Size::new(1440., 930.);
-pub(crate) const MIN_WINDOW: Size = Size::new(1120., 720.);
+pub(crate) const MIN_WINDOW: Size = Size::new(1120., 690.);
+/// What a screen's bars take from its height besides the window's content:
+/// the window's title bar, and macOS's menu bar and Dock or Windows'
+/// taskbar. A 13" MacBook's 900 points leave the window 790.
+const SCREEN_BARS: f32 = 110.;
+/// The window's size on a screen `monitor` large: `WINDOW`, made smaller
+/// where the screen is (never under `MIN_WINDOW`), or None where it fits.
+pub(crate) fn opening_window(monitor: Size) -> Option<Size> {
+    let fits = Size::new(
+        WINDOW.width.min(monitor.width).max(MIN_WINDOW.width),
+        (WINDOW.height.min(monitor.height - SCREEN_BARS)).max(MIN_WINDOW.height),
+    );
+    (fits != WINDOW).then_some(fits)
+}
 /// Sends the user to a URL in their browser; see `App::open_browser`.
 type BrowserOpener = std::sync::Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 /// A loaded project, its path, and the notes of the load (`load_reporting`).
@@ -379,8 +394,11 @@ pub enum Message {
     SidebarWidth(settings::Side, f32, bool),
     /// Opens or closes the operation inspector's About disclosure.
     ToggleStrategyHelp,
-    /// The window is this wide, in logical pixels.
-    Resized(f32),
+    /// The window is this large, in logical pixels.
+    Resized(Size),
+    /// The window opened at this size: it is made smaller where its screen
+    /// is (`opening_window`).
+    WindowOpened(iced::window::Id, Size),
     Viewport(viewport::Event),
     /// Orbit, pan or zoom in the plan preview's 3D view.
     PlanViewport(viewport::Event),
@@ -1176,6 +1194,9 @@ pub struct App {
     /// The window's width, in logical pixels, from its last resize; the
     /// Work page's sidebars are fitted to it (`ui::fitted`).
     pub window_width: f32,
+    /// The window's height, likewise; the Control page is compact in a
+    /// short or narrow window (`ui::Fit`).
+    pub window_height: f32,
     pub sample_mesh: mesh::Mesh,
     pub imported_mesh: Option<mesh::Mesh>,
     pub import_busy: bool,
@@ -1484,6 +1505,7 @@ fn while_locked(m: &Message) -> bool {
             | SidebarWidth(..)
             | ToggleStrategyHelp
             | Resized(_)
+            | WindowOpened(..)
             | Viewport(_)
             | PlanViewport(_)
             | Speed(_)
@@ -1846,6 +1868,7 @@ impl App {
             account_restored: false,
             camera: viewport::Camera::default(),
             window_width: WINDOW.width,
+            window_height: WINDOW.height,
             sample_mesh: mesh::sample(),
             imported_mesh,
             import_busy: false,
@@ -6670,7 +6693,16 @@ impl App {
                 layout.strategy_help_open = !layout.strategy_help_open;
                 self.save_settings();
             }
-            Message::Resized(width) => self.window_width = width,
+            Message::Resized(size) => {
+                self.window_width = size.width;
+                self.window_height = size.height;
+            }
+            Message::WindowOpened(id, size) => {
+                let _ = self.update(Message::Resized(size));
+                return iced::window::monitor_size(id).and_then(move |monitor| {
+                    opening_window(monitor).map_or(Task::none(), |s| iced::window::resize(id, s))
+                });
+            }
             Message::PlanViewport(e) => steer(&mut self.plan_camera, &e),
             Message::Viewport(e) => match e {
                 viewport::Event::Orbit(..)
@@ -7711,9 +7743,10 @@ fn on_event(
 ) -> Option<Message> {
     match event {
         iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::Close(window)),
-        iced::Event::Window(
-            iced::window::Event::Resized(size) | iced::window::Event::Opened { size, .. },
-        ) => Some(Message::Resized(size.width)),
+        iced::Event::Window(iced::window::Event::Resized(size)) => Some(Message::Resized(size)),
+        iced::Event::Window(iced::window::Event::Opened { size, .. }) => {
+            Some(Message::WindowOpened(window, size))
+        }
         iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
             key: iced::keyboard::Key::Character(c),
             modifiers,

@@ -1796,10 +1796,13 @@ fn run_help(a: &crate::run::Action) -> (&'static str, &'static str) {
             "",
         ),
         Hold => (
-            "Feed hold: slow to a stop and wait. Resume continues. Space holds from any page while no text field is being edited, and resumes on the Control page.",
+            "Feed hold: slow to a stop and wait. Resume continues; in a narrow window this button becomes Resume while held. Space holds from any page while no text field is being edited, and resumes on the Control page.",
             "",
         ),
-        Resume => ("Continue after a feed hold or a pause.", ""),
+        Resume => (
+            "Continue after a feed hold or a pause. In a narrow window it shares one button with Hold.",
+            "",
+        ),
         Stop => (
             "Stop now: slow to a stop at once, then end the tool run with the spindle and coolant off.",
             "",

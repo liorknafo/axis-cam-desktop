@@ -762,8 +762,8 @@ fn checks_summary<'a>(checks: &Checks, open: bool) -> Element<'a, Message> {
             format!("{total} warning{plural} · nothing is blocked")
         };
         let title = bold(title, 12).color(heading);
-        let folds = !error
-            && (lines.iter()).any(|l| leading_sentences(&l.text, 0).len() < l.text.len());
+        let folds =
+            !error && (lines.iter()).any(|l| leading_sentences(&l.text, 0).len() < l.text.len());
         let mut lines_column = column![if folds {
             row![
                 title.width(Fill),
@@ -3800,7 +3800,11 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
     }
     // Pinned under the body: the checks no field on the open tab shows,
     // Generate and the operation's actions.
-    let mut foot = column![rule::horizontal(1), checks_summary(checks, app.warning_details)].spacing(13);
+    let mut foot = column![
+        rule::horizontal(1),
+        checks_summary(checks, app.warning_details)
+    ]
+    .spacing(13);
     if let Some((heading, lines)) = holding_warning(app) {
         foot = foot.push(caution(heading, lines));
     }
@@ -7233,23 +7237,72 @@ pub enum JobView {
     Machine,
     Top,
 }
-/// The Control page's frame at a 1440 × 790 window, the usable window of a
-/// 13" laptop: the bar of the MACHINE workspace, the run bar, and the
-/// widths of the left (the hands: position, jog, spindle) and right (the
-/// operations) columns. The centre takes the rest.
-pub(crate) const MACHINE_BAR: f32 = 44.;
-pub(crate) const RUN_BAR: f32 = 64.;
-pub(crate) const HANDS: f32 = 340.;
-pub(crate) const PROGRAM: f32 = 400.;
-/// A DRO line of the Position card, and the work value's width: a sign,
-/// four digits, three decimals and a degree sign in 24 px monospace. With A
-/// the four lines are a little lower, so the left column still fits.
-fn dro_row(axes: usize) -> (f32, u32) {
-    if axes > 3 { (42., 21) } else { (46., 24) }
+/// How the Control page fits the window (LIO-275), from the window's size,
+/// not a setting. Short, under 860 px of height (a 13" laptop's 790, or
+/// larger text): thinner bars, smaller DRO digits and jog keys, tighter
+/// cards and no hint lines. Narrow, under 1360 px of width: narrower
+/// columns, tighter tabs, and Hold and Resume one button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Fit {
+    pub short: bool,
+    pub narrow: bool,
 }
+impl Fit {
+    pub(crate) fn window(width: f32, height: f32) -> Fit {
+        Fit {
+            short: height < 860.,
+            narrow: width < 1360.,
+        }
+    }
+    pub(crate) fn of(app: &App) -> Fit {
+        Fit::window(app.window_width, app.window_height)
+    }
+    /// The bar of the MACHINE workspace and the run bar under it.
+    pub(crate) fn machine_bar(self) -> f32 {
+        if self.short { 38. } else { 44. }
+    }
+    pub(crate) fn run_bar(self) -> f32 {
+        if self.short { 54. } else { 64. }
+    }
+    /// The widths of the left (the hands: position, jog, spindle) and right
+    /// (the operations) columns; the centre takes the rest.
+    pub(crate) fn hands(self) -> f32 {
+        if self.narrow { 310. } else { 340. }
+    }
+    pub(crate) fn program(self) -> f32 {
+        if self.narrow { 350. } else { 400. }
+    }
+    /// The gap between the cards and round them.
+    fn gap(self) -> f32 {
+        if self.short { 8. } else { 10. }
+    }
+    /// A card's padding, top and bottom.
+    fn pad(self) -> f32 {
+        if self.short { 8. } else { 10. }
+    }
+    /// A DRO line of the Position card and its digits' size. With A the
+    /// four lines are a little lower, so the left column still fits.
+    fn dro_row(self, axes: usize) -> (f32, u32) {
+        match (self.short, axes > 3) {
+            (false, false) => (46., 24),
+            (false, true) => (42., 21),
+            (true, false) => (38., 20),
+            (true, true) => (34., 18),
+        }
+    }
+    /// A hint line's characters, `n` in the full centre: narrow, the centre
+    /// at the least window is about 3/5 as wide.
+    fn chars(self, n: usize) -> usize {
+        if self.narrow { n * 3 / 5 } else { n }
+    }
+    /// A jog button.
+    fn jog(self) -> (f32, f32) {
+        if self.short { (46., 30.) } else { (50., 36.) }
+    }
+}
+/// The work value's width in the Position card: a sign, four digits, three
+/// decimals and a degree sign in 24 px monospace.
 const DRO_VALUE: f32 = 156.;
-/// A jog button.
-const JOG: (f32, f32) = (50., 36.);
 const GREEN: Color = Color::from_rgb8(39, 130, 93);
 const AMBER: Color = Color::from_rgb8(166, 101, 32);
 const RUN_BLUE: Color = Color::from_rgb8(37, 99, 201);
@@ -7334,9 +7387,13 @@ fn small<'a>(label: impl Into<String>, msg: Option<Message>, on: bool) -> Elemen
 }
 /// A card of the Control page: white, framed, `height` px tall when given,
 /// so that what it holds never pushes the cards under it.
-fn card<'a>(body: impl Into<Element<'a, Message>>, height: Option<f32>) -> Element<'a, Message> {
+fn card<'a>(
+    body: impl Into<Element<'a, Message>>,
+    height: Option<f32>,
+    fit: Fit,
+) -> Element<'a, Message> {
     let c = container(body)
-        .padding([10, 12])
+        .padding([fit.pad(), fit.pad() + 2.])
         .width(Fill)
         .style(panel_style)
         .clip(true);
@@ -7395,39 +7452,61 @@ fn state_pill<'a>(c: &crate::control::Connection) -> Element<'a, Message> {
 /// and while connected the machine, SIMULATED, its state and the E-stop,
 /// the one on the page (LIO-274).
 fn machine_bar(app: &App) -> Element<'_, Message> {
+    let fit = Fit::of(app);
     let mut bar = row![
         bold("AXIS", 19).color(Color::WHITE),
         switcher(app, true),
         bar_btn("Control", Message::ControlSetup(false), !app.machine_setup),
         bar_btn(
-            "Controller configuration",
+            if fit.narrow {
+                "Configuration"
+            } else {
+                "Controller configuration"
+            },
             Message::ControlSetup(true),
             app.machine_setup
         ),
-        container(
-            text(ellipsize(&app.doc.title, 30))
-                .size(12)
-                .color(ON_DARK)
-                .wrapping(Wrapping::None)
-        )
-        .width(Fill)
-        .clip(true),
-        help::wrap(
-            text(project_note(app)).size(11).color(ON_DARK),
-            Help::text(
-                "Project file",
-                match &app.project_path {
-                    Some(p) => p.display().to_string(),
-                    None =>
-                        "Save it from MANUFACTURE: Save or Save as… there choose the file.".into(),
-                }
-            ),
-            widget::tooltip::Position::Bottom,
-        ),
-        text(workspace_note(app)).size(11).color(ON_DARK),
     ]
     .spacing(12)
     .align_y(Alignment::Center);
+    let file = Help::text(
+        "Project file",
+        format!(
+            "{}{}: {}",
+            if fit.narrow {
+                format!("{} · ", workspace_note(app))
+            } else {
+                String::new()
+            },
+            project_note(app),
+            match &app.project_path {
+                Some(p) => p.display().to_string(),
+                None => "save it from MANUFACTURE: Save or Save as… there choose the file.".into(),
+            }
+        ),
+    );
+    let title = container(
+        text(ellipsize(&app.doc.title, if fit.narrow { 22 } else { 30 }))
+            .size(12)
+            .color(ON_DARK)
+            .wrapping(Wrapping::None),
+    )
+    .width(Fill)
+    .clip(true);
+    // Narrow, the project file's note is the title's hover alone.
+    bar = if fit.narrow {
+        bar.push(help::wrap(title, file, widget::tooltip::Position::Bottom))
+    } else {
+        bar.push(title).push(help::wrap(
+            text(project_note(app)).size(11).color(ON_DARK),
+            file,
+            widget::tooltip::Position::Bottom,
+        ))
+    };
+    // Narrow, the workspace's note is on the title's hover unless saving failed.
+    if !fit.narrow || app.save_error.is_some() {
+        bar = bar.push(text(workspace_note(app)).size(11).color(ON_DARK));
+    }
     if let Some(c) = &app.control {
         use uc100::controller::State;
         let name = (app.doc.machines.iter())
@@ -7448,10 +7527,10 @@ fn machine_bar(app: &App) -> Element<'_, Message> {
         bar = bar.push(estop());
     }
     container(bar)
-        .height(MACHINE_BAR)
+        .height(fit.machine_bar())
         .width(Fill)
         .padding([0, 12])
-        .center_y(MACHINE_BAR)
+        .center_y(fit.machine_bar())
         .style(|_| container::Style {
             background: Some(Color::from_rgb8(29, 43, 58).into()),
             ..Default::default()
@@ -7618,15 +7697,16 @@ fn control(app: &App) -> Element<'_, Message> {
         .height(Fill)
         .into();
     };
+    let fit = Fit::of(app);
     column![
         run_bar(app, c),
         row![
-            hands(c),
+            hands(c, fit),
             centre(app, c),
-            container(program(app, c)).width(PROGRAM).height(Fill)
+            container(program(app, c)).width(fit.program()).height(Fill)
         ]
-        .spacing(10)
-        .padding(10)
+        .spacing(fit.gap())
+        .padding(fit.gap())
         .height(Fill)
     ]
     .height(Fill)
@@ -7634,17 +7714,17 @@ fn control(app: &App) -> Element<'_, Message> {
 }
 
 /// The green Cycle Start button, greyed out without a message.
-fn cycle_start<'a>(msg: Option<Message>) -> Element<'a, Message> {
+fn cycle_start<'a>(msg: Option<Message>, fit: Fit) -> Element<'a, Message> {
     let on = msg.is_some();
     let b = button(
-        bold("Cycle Start", 14)
+        bold("Cycle Start", if fit.short { 13 } else { 14 })
             .color(Color::WHITE)
             .width(Fill)
             .align_x(Alignment::Center),
     )
-    .width(132)
+    .width(if fit.narrow { 108 } else { 132 })
     .on_press_maybe(msg.clone())
-    .padding([10, 14])
+    .padding(if fit.short { [7, 10] } else { [10, 14] })
     .style(move |_, status| button::Style {
         background: Some(
             if !on {
@@ -7807,6 +7887,7 @@ pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
     use uc100::controller::State;
     let s = &c.snapshot;
     let state = s.state.as_ref();
+    let fit = Fit::of(app);
     let msg = |on: bool, a: R| on.then_some(Message::Run(a));
     let setups = run_setups(&app.doc, &c.machine_id);
     let picked = c.run.as_ref().map(|r| r.setup);
@@ -7815,13 +7896,14 @@ pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
     let current = picked
         .and_then(|p| index.iter().position(|&si| si == p))
         .map(|k| labels[k].clone());
+    let picker_width = if fit.narrow { 170 } else { 200 };
     let picker: Element<_> = if setups.is_empty() || c.setup_locked() {
         container(
             text(current.clone().unwrap_or_else(|| "No setup".into()))
                 .size(13)
                 .wrapping(Wrapping::None),
         )
-        .width(200)
+        .width(picker_width)
         .clip(true)
         .into()
     } else {
@@ -7833,7 +7915,7 @@ pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
             })
             .placeholder("Pick a setup")
             .text_size(13)
-            .width(200)
+            .width(picker_width)
             .style(choice_style),
             help::command(&Message::Run(R::Setup(0)), "Setup to run".into()),
             widget::tooltip::Position::Bottom,
@@ -7841,15 +7923,24 @@ pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
     };
     let (parts, problems) = run_line(app, c);
     let mut line = Row::new();
-    let mut left = 118usize;
+    let whole: String = parts.iter().map(|(t, _)| t.as_str()).collect();
+    // The line's characters at 13 px, about 6.7 px each, in what the setup
+    // list and the buttons leave of the window: 118 at 1440 px.
+    let mut left = ((app.window_width - if fit.narrow { 500. } else { 650. }) / 6.7) as usize;
     for (t, color) in parts {
         let cut = ellipsize(&t, left.max(1));
         left = left.saturating_sub(cut.chars().count());
         line = line.push(text(cut).size(13).color(color).wrapping(Wrapping::None));
     }
     let line = container(line).width(Fill).clip(true);
-    let line: Element<_> = if problems.is_empty() {
+    let line: Element<_> = if problems.is_empty() && left > 0 {
         line.into()
+    } else if problems.is_empty() {
+        help::wrap(
+            line,
+            Help::text("Run", whole.trim()),
+            widget::tooltip::Position::Bottom,
+        )
     } else {
         help::wrap(
             line,
@@ -7877,44 +7968,55 @@ pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
         .spacing(10)
         .align_y(Alignment::Center)
     ]
-    .spacing(6)
+    .spacing(if fit.short { 4 } else { 6 })
     .width(Fill);
     let run = c.run.as_ref();
     let can_start = run.is_some_and(|r| {
         r.checked().is_some() && r.problems(c, &app.doc).is_empty() && app.planning_busy().is_none()
     });
-    let big =
-        |label: &str, m: Option<Message>| act_with(label.to_string(), m, false, None, [11, 14]);
-    let buttons = row![
-        cycle_start(can_start.then_some(Message::Run(R::CycleStart))),
-        big(
-            "Hold",
-            msg(run.is_some() && state == Some(&State::Run), R::Hold)
-        ),
-        big(
-            "Resume",
-            msg(
-                run.is_some() && matches!(state, Some(State::Hold | State::Paused(_))),
-                R::Resume
-            )
-        ),
-        space().width(14),
-        big(
-            "Stop now",
-            msg(run.is_some() && crate::run::busy(state), R::Stop)
-        ),
-    ]
+    let pad = if fit.short { [8, 10] } else { [11, 14] };
+    let big = |label: &str, m: Option<Message>| act_with(label.to_string(), m, false, None, pad);
+    let hold = msg(run.is_some() && state == Some(&State::Run), R::Hold);
+    let resume = msg(
+        run.is_some() && matches!(state, Some(State::Hold | State::Paused(_))),
+        R::Resume,
+    );
+    let mut buttons = row![cycle_start(
+        can_start.then_some(Message::Run(R::CycleStart)),
+        fit
+    )]
     .spacing(6)
     .align_y(Alignment::Center);
+    // Narrow, Hold and Resume share one button of one width: Hold while
+    // it runs, Resume while it holds.
+    buttons = if !fit.narrow {
+        buttons.push(big("Hold", hold)).push(big("Resume", resume))
+    } else if resume.is_some() {
+        buttons.push(act_with(
+            "Resume",
+            resume,
+            false,
+            Some(Length::Fixed(76.)),
+            pad,
+        ))
+    } else {
+        buttons.push(act_with("Hold", hold, false, Some(Length::Fixed(76.)), pad))
+    };
+    let buttons = buttons
+        .push(space().width(if fit.narrow { 6 } else { 14 }))
+        .push(big(
+            "Stop now",
+            msg(run.is_some() && crate::run::busy(state), R::Stop),
+        ));
     container(
         row![picker, what, buttons]
-            .spacing(16)
+            .spacing(if fit.narrow { 12 } else { 16 })
             .align_y(Alignment::Center),
     )
-    .height(RUN_BAR)
+    .height(fit.run_bar())
     .width(Fill)
     .padding([0, 12])
-    .center_y(RUN_BAR)
+    .center_y(fit.run_bar())
     .style(|_| container::Style {
         background: Some(Color::WHITE.into()),
         border: Border {
@@ -7979,18 +8081,22 @@ fn run_times(
 /// height and every changing text one line of fixed width, so that nothing
 /// around the jog pad moves while the machine does: leaving a jog button
 /// stops the jog (LIO-274).
-fn hands(c: &crate::control::Connection) -> Element<'_, Message> {
-    column![position_card(c), jog_card(c), spindle_card(c)]
-        .spacing(10)
-        .width(HANDS)
-        .height(Fill)
-        .into()
+fn hands(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
+    column![
+        position_card(c, fit),
+        jog_card(c, fit),
+        spindle_card(c, fit)
+    ]
+    .spacing(fit.gap())
+    .width(fit.hands())
+    .height(Fill)
+    .into()
 }
 
 /// The Position card: each axis's work position large, its machine
 /// position small with whether it is set, Zero and ½; Zero all and Go to X0
 /// Y0 under them.
-fn position_card(c: &crate::control::Connection) -> Element<'_, Message> {
+fn position_card(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
     use crate::control::Action;
     let s = &c.snapshot;
     let enabled: Vec<usize> = (0..6).filter(|&a| s.axes_enabled[a]).collect();
@@ -8012,7 +8118,7 @@ fn position_card(c: &crate::control::Connection) -> Element<'_, Message> {
         .align_y(Alignment::Center)
         .height(22)
     ];
-    let (line, size) = dro_row(enabled.len());
+    let (line, size) = fit.dro_row(enabled.len());
     for &a in &enabled {
         let mark: Element<_> = if s.referenced[a] {
             text("✓").size(11).color(GREEN).into()
@@ -8068,15 +8174,18 @@ fn position_card(c: &crate::control::Connection) -> Element<'_, Message> {
             false,
         ));
         if let (Err(why), true) = (to, c.manual()) {
-            foot = foot.push(hint("Go to X0 Y0", why, 30));
+            foot = foot.push(hint("Go to X0 Y0", why, fit.chars(30)));
         }
     }
-    col = col.push(container(foot).height(32).center_y(32));
-    card(col, Some(position_height(enabled.len())))
+    let foot_height = if fit.short { 28. } else { 32. };
+    col = col.push(container(foot).height(foot_height).center_y(foot_height));
+    card(col, Some(position_height(enabled.len(), fit)), fit)
 }
-/// The Position card's height for `axes` axes.
-fn position_height(axes: usize) -> f32 {
-    22. + dro_row(axes).0 * axes as f32 + 32. + 22.
+/// The Position card's height for `axes` axes: the title, the DRO lines,
+/// the foot, the padding and the frame.
+fn position_height(axes: usize, fit: Fit) -> f32 {
+    let foot = if fit.short { 28. } else { 32. };
+    22. + fit.dro_row(axes).0 * axes as f32 + foot + 2. * fit.pad() + 2.
 }
 
 /// The key that jogs `axis` toward `negative` (`main::jog_key`), as the jog
@@ -8098,7 +8207,7 @@ pub(crate) fn jog_key_name(axis: usize, negative: bool) -> &'static str {
 /// letting go, anywhere, or leaving the button stops it. Each button's
 /// tooltip names its key; the keys jog while the pad is on screen
 /// (`App::jog_pad_shown`).
-fn jog_card(c: &crate::control::Connection) -> Element<'_, Message> {
+fn jog_card(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
     use crate::control::Action;
     use uc100::controller::State;
     let s = &c.snapshot;
@@ -8180,7 +8289,7 @@ fn jog_card(c: &crate::control::Connection) -> Element<'_, Message> {
             c.jog_step == Some(step),
         ));
     }
-    let mut col = column![head, modes].spacing(7);
+    let mut col = column![head, modes].spacing(jog_gap(fit));
     // A steps in degrees, on its own row: a step in mm means nothing to it.
     if a_axis {
         let mut angles = row![
@@ -8210,7 +8319,7 @@ fn jog_card(c: &crate::control::Connection) -> Element<'_, Message> {
         ));
         col = col.push(angles);
     }
-    let (w, h) = JOG;
+    let (w, h) = fit.jog();
     let jog = |axis: usize, negative: bool| -> Element<'_, Message> {
         if !c.axis(axis) {
             return space().width(w).height(h).into();
@@ -8291,17 +8400,29 @@ fn jog_card(c: &crate::control::Connection) -> Element<'_, Message> {
             .push(column![jog(3, false), label("A"), jog(3, true)].spacing(6));
     }
     col = col.push(container(pad).center_x(Fill));
-    card(col, Some(jog_height(a_axis)))
+    card(col, Some(jog_height(a_axis, fit)), fit)
 }
-/// The Jog card's height, with or without A.
-fn jog_height(a_axis: bool) -> f32 {
-    let rows = 22. + 7. + 26. + 7. + (JOG.1 * 3. + 12.) + 22.;
-    if a_axis { rows + 7. + 26. } else { rows }
+/// The space between the Jog card's rows.
+fn jog_gap(fit: Fit) -> f32 {
+    if fit.short { 5. } else { 7. }
+}
+/// The Jog card's height, with or without A: the title, the steps, the pad
+/// of three rows, the padding and the frame.
+fn jog_height(a_axis: bool, fit: Fit) -> f32 {
+    let gap = jog_gap(fit);
+    let rows = 22. + gap + 26. + gap + (fit.jog().1 * 3. + 12.) + 2. * fit.pad() + 2.;
+    if a_axis { rows + gap + 26. } else { rows }
 }
 
+/// The least height the Spindle card's rows need: the title, the speed,
+/// the rule, the feed and its line, the gaps, the padding and the frame.
+#[cfg(test)]
+fn spindle_height(fit: Fit) -> f32 {
+    24. + 28. + 1. + 26. + 15. + 4. * if fit.short { 4. } else { 6. } + 2. * fit.pad() + 2.
+}
 /// The Spindle and feed card: the spindle's state, speed and direction,
 /// Spindle off, the coolant, the feed override and the feed now.
-fn spindle_card(c: &crate::control::Connection) -> Element<'_, Message> {
+fn spindle_card(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
     use crate::control::Action;
     use uc100::gcode::Spindle;
     let s = &c.snapshot;
@@ -8423,13 +8544,14 @@ fn spindle_card(c: &crate::control::Connection) -> Element<'_, Message> {
                 .color(MUTED)
                 .wrapping(Wrapping::None),
         ]
-        .spacing(6),
+        .spacing(if fit.short { 4 } else { 6 }),
         None,
+        fit,
     )
 }
 
 /// A tab of the Control page's centre.
-fn control_tab<'a>(tab: ControlTab, shown: bool, alert: bool) -> Element<'a, Message> {
+fn control_tab<'a>(tab: ControlTab, shown: bool, alert: bool, fit: Fit) -> Element<'a, Message> {
     let color = match (shown, alert) {
         (_, true) => AMBER,
         (true, false) => BLUE,
@@ -8456,7 +8578,7 @@ fn control_tab<'a>(tab: ControlTab, shown: bool, alert: bool) -> Element<'a, Mes
         .spacing(7)
         .width(Length::Shrink),
     )
-    .padding([8, 10])
+    .padding(if fit.narrow { [8, 7] } else { [8, 10] })
     .on_press(Message::ControlTab(tab))
     .style(|_, status| button::Style {
         background: matches!(status, button::Status::Hovered | button::Status::Pressed)
@@ -8481,6 +8603,7 @@ pub(crate) fn control_tabs(c: &crate::control::Connection) -> Vec<ControlTab> {
 }
 /// The centre of the Control page: one task at a time in its tabs.
 fn centre<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Message> {
+    let fit = Fit::of(app);
     let tabs = control_tabs(c);
     let shown = if tabs.contains(&app.control_tab) {
         app.control_tab
@@ -8489,40 +8612,33 @@ fn centre<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Me
     };
     let mut bar = Row::new().spacing(2).align_y(Alignment::End);
     for &t in &tabs {
-        bar = bar.push(control_tab(t, t == shown, t == ControlTab::ToolChange));
+        bar = bar.push(control_tab(t, t == shown, t == ControlTab::ToolChange, fit));
     }
-    if shown == ControlTab::Job {
-        bar = bar.push(space().width(Fill));
-        for (view, label) in [
-            (JobView::Stock, "Stock"),
-            (JobView::Machine, "Machine"),
-            (JobView::Top, "Top"),
-        ] {
-            bar = bar.push(
-                container(small(
-                    label,
-                    Some(Message::ControlView(view)),
-                    app.control_view == view,
-                ))
-                .padding([0, 1]),
-            );
-        }
-        bar = bar.push(space().width(6));
+    // Narrow, the view switcher leaves the tabs their room: it is in the
+    // Job tab's foot.
+    if shown == ControlTab::Job && !fit.narrow {
+        bar = bar
+            .push(space().width(Fill))
+            .push(job_views(app))
+            .push(space().width(6));
     }
     let body: Element<_> = match shown {
         ControlTab::Job => job_tab(app, c),
         ControlTab::ToolChange => tool_change_tab(app, c),
         ControlTab::WorkZero => work_zero_tab(app, c),
-        ControlTab::Probe => probe_tab(c),
+        ControlTab::Probe => probe_tab(c, fit),
         ControlTab::Rotary => rotary_tab(c).unwrap_or_else(|| space().into()),
-        ControlTab::Mdi => mdi_tab(c),
+        ControlTab::Mdi => mdi_tab(c, fit),
         ControlTab::Machine => machine_tab(app, c),
     };
     container(
         column![
             container(bar.align_y(Alignment::Center)).padding([0, 6]),
             rule::horizontal(1),
-            container(body).padding([10, 14]).height(Fill).width(Fill)
+            container(body)
+                .padding(if fit.short { [8, 12] } else { [10, 14] })
+                .height(Fill)
+                .width(Fill)
         ]
         .height(Fill),
     )
@@ -8546,7 +8662,24 @@ fn tab_scroll<'a>(body: Column<'a, Message>) -> Element<'a, Message> {
 
 /// The Job tab: the one 3D view, of the setup's stock as it is cut (the
 /// machine's tool red), or of the machine's travel with the tool in it.
+/// The Job tab's view switcher: the stock, the machine, the stock from above.
+fn job_views(app: &App) -> Element<'_, Message> {
+    let mut views = row![].spacing(2);
+    for (view, label) in [
+        (JobView::Stock, "Stock"),
+        (JobView::Machine, "Machine"),
+        (JobView::Top, "Top"),
+    ] {
+        views = views.push(small(
+            label,
+            Some(Message::ControlView(view)),
+            app.control_view == view,
+        ));
+    }
+    views.into()
+}
 fn job_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Message> {
+    let fit = Fit::of(app);
     let picked = c.run.as_ref().filter(|r| {
         app.doc
             .setups
@@ -8557,9 +8690,24 @@ fn job_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, M
         .then(|| scene(app, None))
         .flatten();
     let mut col = column![].spacing(6).height(Fill);
+    // The line under the view, how to turn it: short, a hover card on the
+    // switcher's left; narrow, the switcher is on its right.
+    let foot = |title: &str, line: String| -> Option<Element<'a, Message>> {
+        match (fit.short, fit.narrow) {
+            (false, false) => Some(hint(title, line, 110)),
+            (false, true) => Some(
+                row![hint(title, line, 60), job_views(app)]
+                    .spacing(8)
+                    .into(),
+            ),
+            (true, false) => None,
+            (true, true) => Some(row![space().width(Fill), job_views(app)].into()),
+        }
+    };
     match stock {
         Some(view) => {
-            col = col.push(container(view).height(Fill).width(Fill)).push(hint(
+            col = col.push(container(view).height(Fill).width(Fill));
+            col = col.extend(foot(
                 "Job",
                 format!(
                     "{}Drag to orbit · right-drag to pan · scroll to zoom. The machine's tool is red while a tool run cuts, and the stock is cut away where it goes.",
@@ -8567,10 +8715,9 @@ fn job_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, M
                         .map(|a| format!("{} at {a} · ", app.doc.setup().name()))
                         .unwrap_or_default()
                 ),
-                110,
             ));
             if let Some(line) = uncut_line(app) {
-                col = col.push(hint("Completeness", line, 110));
+                col = col.push(hint("Completeness", line, fit.chars(110)));
             }
             if let Some(legend) = uncut_legend(app) {
                 col = col.push(legend);
@@ -8579,14 +8726,14 @@ fn job_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, M
         None => {
             col = col
                 .push(container(canvas(machine_model(app, c)).width(Fill).height(Fill)).height(Fill))
-                .push(hint(
+                .extend(foot(
                     "Machine",
                     if picked.is_none() && app.control_view != JobView::Machine {
                         "The machine's travel, the tool in it: pick a setup in the run bar to see its stock."
                     } else {
                         "The box is where the tool tip can travel; the red dot is the tool tip, the green ring the work zero. Drag to turn."
-                    },
-                    110,
+                    }
+                    .into(),
                 ));
         }
     }
@@ -8686,6 +8833,7 @@ fn step_box<'a>(
 fn reference_rows<'a>(
     c: &'a crate::control::Connection,
     run: &'a crate::run::Run,
+    fit: Fit,
 ) -> Column<'a, Message> {
     use crate::run::Action as R;
     let s = &c.snapshot;
@@ -8701,11 +8849,13 @@ fn reference_rows<'a>(
                 msg(manual && set_ok, R::ZFromReference),
                 false
             ),
-            muted(match (run.reference, run.reference_a) {
-                (Some(z), Some(a)) =>
+            muted(match (run.reference, run.reference_a, fit.narrow) {
+                (Some(z), Some(a), false) =>
                     format!("Reference: Z {z:.3} (G{}) at A {a:.3}°", 54 + s.active_wcs),
-                (Some(z), None) => format!("Reference: Z {z:.3} (G{})", 54 + s.active_wcs),
-                (None, _) => "Reference surface: not recorded".into(),
+                (Some(z), Some(a), true) => format!("Z {z:.3} at A {a:.1}°"),
+                (Some(z), None, _) => format!("Reference: Z {z:.3} (G{})", 54 + s.active_wcs),
+                (None, _, false) => "Reference surface: not recorded".into(),
+                (None, _, true) => "Not recorded".into(),
             })
             .wrapping(Wrapping::None),
         ]
@@ -8730,7 +8880,7 @@ fn reference_rows<'a>(
                     } else {
                         "The same with the touch plate on the reference surface."
                     },
-                    40
+                    fit.chars(40)
                 ),
             ]
             .spacing(6)
@@ -8741,7 +8891,7 @@ fn reference_rows<'a>(
         }
     }
     if let Some(why) = run.reference_a_problem(c).filter(|_| !running) {
-        col = col.push(hint("Reference", why, 90));
+        col = col.push(hint("Reference", why, fit.chars(90)));
     }
     col
 }
@@ -8754,6 +8904,7 @@ fn a_reference_row<'a>(
     run: &'a crate::run::Run,
 ) -> Option<Element<'a, Message>> {
     use crate::run::Action as R;
+    let fit = Fit::of(app);
     let p =
         (run.checked()?.get(run.next)).filter(|p| !crate::run::a_angles(&p.blocks).is_empty())?;
     let running = run.running.is_some();
@@ -8778,14 +8929,14 @@ fn a_reference_row<'a>(
                 (ready.is_ok() && !running).then_some(Message::Run(R::ProbeCentreReference)),
                 false
             ),
-            hint("A reference", said, 60),
+            hint("A reference", said, fit.chars(60)),
         ]
         .spacing(8)
         .align_y(Alignment::Center)
     ]
     .spacing(4);
     if let (Err(why), false) = (&ready, running) {
-        col = col.push(hint("A reference", why.clone(), 90));
+        col = col.push(hint("A reference", why.clone(), fit.chars(90)));
     }
     Some(col.into())
 }
@@ -8794,6 +8945,7 @@ fn a_reference_row<'a>(
 /// to do, step by step, with its buttons; it opens by itself when the tool
 /// change is due.
 fn tool_change_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Message> {
+    let fit = Fit::of(app);
     let Some(run) = c.run.as_ref() else {
         return space().into();
     };
@@ -8820,7 +8972,13 @@ fn tool_change_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Eleme
                 ),
                 14
             )
-            .wrapping(Wrapping::None),
+            .width(Fill)
+            // Narrow, a long tool or operation name wraps, not cut.
+            .wrapping(if fit.narrow {
+                Wrapping::Word
+            } else {
+                Wrapping::None
+            }),
         ]
         .spacing(8)
         .align_y(Alignment::Center)
@@ -8838,7 +8996,7 @@ fn tool_change_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Eleme
         !recorded,
         column![
             text("If no reference is recorded, touch the old tool on a surface that stays put (a vise jaw, the table, a block) and record it.").size(12),
-            reference_rows(c, run)
+            reference_rows(c, run, fit)
         ]
         .spacing(6),
     ));
@@ -8882,7 +9040,7 @@ fn tool_change_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Eleme
                     s.work_pos[3]
                 ),
             },
-            100,
+            fit.chars(100),
         ));
     }
     if let Some(row) = a_reference_row(app, c, run) {
@@ -8905,7 +9063,9 @@ fn tool_change_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Eleme
 /// The Work zero tab: each axis set to a value, the work system, the work
 /// zero on the stock for the setup picked, step by step until its first
 /// tool run, and the reference surface for its tool changes.
+const WORK_ZERO_NOTE: &str = "Zero makes the current position work zero in the active coordinate system; ½ halves the position shown, Set gives it the value typed. For the middle of a part by hand, zero X with an edge finder on its left side, touch its right side and press ½ on X. G54 to G59 each keep their own; they change only while Idle.";
 fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Message> {
+    let fit = Fit::of(app);
     use crate::control::Action;
     use crate::run::Action as R;
     let s = &c.snapshot;
@@ -8923,7 +9083,7 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
                         (c.manual() && c.preset(a).is_some())
                             .then_some(Message::Machine(Action::WorkSet(a))),
                     )
-                    .width(70)
+                    .width(if fit.narrow { 56 } else { 70 })
                     .padding([5, 8])
                     .size(13),
                 "work_set",
@@ -8943,11 +9103,21 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
                 manual(Action::WorkSet(a)).filter(|_| c.preset(a).is_some()),
                 false,
             ))
-            .push(space().width(6));
+            .push(space().width(if fit.narrow { 2 } else { 6 }));
     }
-    let mut systems = row![muted("Work system").width(80)]
-        .spacing(4)
-        .align_y(Alignment::Center);
+    // Narrow, X Y Z and A wrap rather than run off the tab.
+    let set: Element<_> = if fit.narrow {
+        set.wrap().into()
+    } else {
+        set.into()
+    };
+    let mut systems = row![help::wrap(
+        muted("Work system").width(80),
+        Help::text("Work zero", WORK_ZERO_NOTE),
+        widget::tooltip::Position::Top,
+    )]
+    .spacing(4)
+    .align_y(Alignment::Center);
     for i in 0..6 {
         systems = systems.push(small(
             format!("G{}", 54 + i),
@@ -8955,16 +9125,11 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
             s.active_wcs == i,
         ));
     }
-    let mut col = column![
-        set,
-        systems,
-        hint(
-            "Work zero",
-            "Zero makes the current position work zero in the active coordinate system; ½ halves the position shown, Set gives it the value typed. For the middle of a part by hand, zero X with an edge finder on its left side, touch its right side and press ½ on X. G54 to G59 each keep their own; they change only while Idle.",
-            110
-        ),
-    ]
-    .spacing(8);
+    let mut col = column![set, systems].spacing(8);
+    // Short, the hint is on the work systems' hover.
+    if !fit.short {
+        col = col.push(hint("Work zero", WORK_ZERO_NOTE, fit.chars(110)));
+    }
     let Some(run) = &c.run else {
         return tab_scroll(col.push(muted(
             "Pick a setup in the run bar: its work zero on the stock is set here.",
@@ -9021,7 +9186,7 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
             ));
         }
         if let Err(why) = checked {
-            buttons = buttons.push(hint("Work zero", why, 50));
+            buttons = buttons.push(hint("Work zero", why, fit.chars(50)));
         }
         let mut list = column![bold("Work zero on the stock", 13)].spacing(4);
         for line in steps {
@@ -9037,7 +9202,7 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
         col = col
             .push(rule::horizontal(1))
             .push(bold("Reference surface, for the tool changes", 13))
-            .push(reference_rows(c, run));
+            .push(reference_rows(c, run, Fit::of(app)));
     }
     if let Some(row) = a_reference_row(app, c, run) {
         col = col.push(row);
@@ -9048,17 +9213,16 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
 /// The Probe tab: Probe Z, the setup's work zero from its stock, and a
 /// feature at the tip. Without a probe input in the profile, one line and
 /// the way to the Controller configuration (LIO-273).
-fn probe_tab(c: &crate::control::Connection) -> Element<'_, Message> {
+fn probe_tab(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
     use crate::control::{Action, Feature};
     if c.config.inputs.probe.is_none() {
-        return row![
+        return column![
             muted(
                 "This machine's UC100 profile has no probe input: add one under Inputs to probe."
             ),
             secondary("Controller configuration", Message::ControlSetup(true)),
         ]
         .spacing(10)
-        .align_y(Alignment::Center)
         .into();
     }
     // What stops every probe, said once at the top; each button below says
@@ -9070,7 +9234,7 @@ fn probe_tab(c: &crate::control::Connection) -> Element<'_, Message> {
     let top = c.stock_top().unwrap_or_default();
     let mut col = column![].spacing(10);
     if let Some(why) = &global {
-        col = col.push(one_line("Probe", why.clone(), 12, AMBER, 110));
+        col = col.push(one_line("Probe", why.clone(), 12, AMBER, fit.chars(110)));
     }
     if let Some(note) = probe_note(c) {
         col = col.push(note);
@@ -9108,7 +9272,7 @@ fn probe_tab(c: &crate::control::Connection) -> Element<'_, Message> {
                     ),
                     _ => String::new(),
                 },
-                80
+                fit.chars(80)
             )
         ]
         .spacing(8)
@@ -9117,7 +9281,7 @@ fn probe_tab(c: &crate::control::Connection) -> Element<'_, Message> {
     // The setup's own work zero, from the spot picked.
     let spots = c.probe_spots();
     let setup_probe: Element<_> = match c.edges_setup() {
-        Err(why) => hint("Setup work zero", why, 90),
+        Err(why) => hint("Setup work zero", why, fit.chars(90)),
         Ok((refs, p)) => {
             let blocked = c.edges_blocked();
             let name = crate::control::probe_name(refs);
@@ -9156,7 +9320,7 @@ fn probe_tab(c: &crate::control::Connection) -> Element<'_, Message> {
                         }
                         _ => String::new(),
                     },
-                    70
+                    fit.chars(70)
                 )
             ]
             .spacing(8)
@@ -9199,6 +9363,12 @@ fn probe_tab(c: &crate::control::Connection) -> Element<'_, Message> {
         .spacing(4),
     ]
     .spacing(14);
+    // Narrow, the corners and the bore wrap under the edges.
+    let features: Element<_> = if fit.narrow {
+        features.wrap().vertical_spacing(8).into()
+    } else {
+        features.into()
+    };
     let why = own_why(c.feature_blocked(Feature::Bore)).filter(|_| !c.probing());
     col = col.push(
         column![
@@ -9211,7 +9381,7 @@ fn probe_tab(c: &crate::control::Connection) -> Element<'_, Message> {
                     (Some(why), None) => why,
                     (None, None) => "Put the tip as each button's card says and press it: the surface, side, corner or centre found becomes work zero in the active work system, on the axes it sets.".into(),
                 },
-                110
+                fit.chars(110)
             ),
         ]
         .spacing(6),
@@ -9224,18 +9394,18 @@ fn probe_tab(c: &crate::control::Connection) -> Element<'_, Message> {
                 "Simulated: a block at machine X {:.0}…{:.0}, Y {:.0}…{:.0}, its top at Z {:.3}, stands for the stock and trips the probe.",
                 lo[0], hi[0], lo[1], hi[1], hi[2],
             ),
-            110,
+            fit.chars(110),
         ));
     }
     tab_scroll(col)
 }
 
 /// The MDI tab: one G-code line to run.
-fn mdi_tab(c: &crate::control::Connection) -> Element<'_, Message> {
+fn mdi_tab(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
     use crate::control::Action;
     let send =
         (c.manual() && !c.mdi.trim().is_empty()).then_some(Message::Machine(Action::MdiSend));
-    column![
+    let mut col = column![
         row![
             help::field(
                 text_input("One G-code line, for example G0 X10 Y10", &c.mdi)
@@ -9251,13 +9421,15 @@ fn mdi_tab(c: &crate::control::Connection) -> Element<'_, Message> {
         ]
         .spacing(6)
         .align_y(Alignment::Center),
-        muted("Runs the line when Idle, or while a program is paused. Enter sends it too."),
-        bold("Log", 13),
-        machine_log(c),
     ]
     .spacing(10)
-    .height(Fill)
-    .into()
+    .height(Fill);
+    if !fit.short {
+        col = col.push(muted(
+            "Runs the line when Idle, or while a program is paused. Enter sends it too.",
+        ));
+    }
+    col.push(bold("Log", 13)).push(machine_log(c)).into()
 }
 
 /// The Machine tab: the machine and its connection, the firmware, the soft
@@ -9343,6 +9515,10 @@ fn machine_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'
         );
         col = col.push(muted("To drive off a limit switch that tripped. It turns itself off a second after no switch is active."));
     }
+    // Narrow, the log is the MDI tab's alone.
+    if Fit::of(app).narrow {
+        return tab_scroll(col);
+    }
     row![
         tab_scroll(col),
         column![bold("Log", 13), machine_log(c)]
@@ -9394,6 +9570,7 @@ fn op_row<'a>(
     start: Option<Option<Message>>,
     angles: Option<String>,
     cut: Option<f32>,
+    fit: Fit,
 ) -> Element<'a, Message> {
     use crate::run::Stage;
     let (w, h) = OP_PICTURE;
@@ -9446,7 +9623,7 @@ fn op_row<'a>(
         text(time.unwrap_or_default())
             .size(11)
             .color(MUTED)
-            .width(96)
+            .width(if fit.narrow { 84 } else { 96 })
             .align_x(Alignment::End)
             .wrapping(Wrapping::None),
         match start {
@@ -9454,9 +9631,9 @@ fn op_row<'a>(
             None => space().width(74).into(),
         },
     ]
-    .spacing(8)
+    .spacing(if fit.narrow { 6 } else { 8 })
     .align_y(Alignment::Center)
-    .height(28);
+    .height(if fit.short { 26 } else { 28 });
     let mut body = column![line].spacing(3);
     if let Some(cut) = cut {
         body = body.push(widget::progress_bar(0.0..=1.0, cut).girth(5));
@@ -9510,6 +9687,7 @@ pub(crate) fn program<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
     use crate::run::Action as R;
     use uc100::controller::State;
     let s = &c.snapshot;
+    let fit = Fit::of(app);
     let msg = |on: bool, a: R| on.then_some(Message::Run(a));
     let mut head = row![bold("Operations", 14), space().width(Fill)].align_y(Alignment::Center);
     let mut list = column![].spacing(2);
@@ -9521,6 +9699,7 @@ pub(crate) fn program<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
             ]
             .spacing(10),
             None,
+            fit,
         );
     };
     let running = run.running.is_some();
@@ -9663,6 +9842,7 @@ pub(crate) fn program<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
                         start,
                         at,
                         cut,
+                        fit,
                     ));
                 }
             }
@@ -9720,6 +9900,7 @@ pub(crate) fn program<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
         ]
         .spacing(6),
         None,
+        fit,
     )
 }
 /// Work zero on the stock, in the Run panel until the setup's first tool run
@@ -13151,6 +13332,87 @@ pub(crate) mod probe {
 mod tests {
     use crate::model::Strategy;
     use std::path::Path;
+
+    /// The Control page is short under 860 px of height and narrow under
+    /// 1360 px of width (LIO-275).
+    #[test]
+    fn the_control_page_is_short_and_narrow_from_the_window_size() {
+        use super::Fit;
+        let fit = |w, h| {
+            let f = Fit::window(w, h);
+            (f.short, f.narrow)
+        };
+        assert_eq!(fit(1920., 1080.), (false, false));
+        assert_eq!(fit(1440., 930.), (false, false));
+        assert_eq!(fit(1440., 900.), (false, false));
+        assert_eq!(fit(1440., 860.), (false, false));
+        assert_eq!(fit(1440., 859.), (true, false));
+        assert_eq!(fit(1440., 790.), (true, false));
+        assert_eq!(fit(1360., 900.), (false, false));
+        assert_eq!(fit(1359., 900.), (false, true));
+        assert_eq!(fit(1280., 690.), (true, true));
+        assert_eq!(fit(1120., 720.), (true, true));
+        // Each compact frame is smaller than the full one.
+        let (full, short, narrow) = (
+            Fit::window(1440., 900.),
+            Fit::window(1440., 790.),
+            Fit::window(1280., 900.),
+        );
+        assert!(short.machine_bar() < full.machine_bar() && short.run_bar() < full.run_bar());
+        assert_eq!(narrow.machine_bar(), full.machine_bar());
+        assert!(narrow.hands() < full.hands() && narrow.program() < full.program());
+        assert_eq!(short.hands(), full.hands());
+        // The status line under the page: 12 px text, 4 px over and under.
+        const STATUS_BAR: f32 = 24.;
+        // The left column's fixed cards leave the Spindle card its room
+        // under the bars and over the status line, with and without A.
+        for (w, h) in [
+            (1440., 900.),
+            (1440., 790.),
+            (1280., 690.),
+            (1120., 720.),
+            (1120., 690.),
+        ] {
+            let fit = Fit::window(w, h);
+            for axes in [3, 4] {
+                let left = h
+                    - STATUS_BAR
+                    - fit.machine_bar()
+                    - fit.run_bar()
+                    - 4. * fit.gap()
+                    - super::position_height(axes, fit)
+                    - super::jog_height(axes > 3, fit);
+                assert!(
+                    left >= super::spindle_height(fit),
+                    "{w} x {h}, {axes} axes: {left} px for the Spindle card"
+                );
+            }
+        }
+    }
+
+    /// The window opens no larger than its screen leaves it, and never
+    /// under its least size.
+    #[test]
+    fn the_window_opens_no_larger_than_the_screen() {
+        use crate::{MIN_WINDOW, WINDOW, opening_window};
+        use iced::Size;
+        assert_eq!(opening_window(Size::new(1920., 1080.)), None);
+        assert_eq!(opening_window(Size::new(2560., 1440.)), None);
+        assert_eq!(opening_window(Size::new(1440., 1040.)), None);
+        // A 13" MacBook: 900 points, less the menu bar, the Dock and the
+        // title bar.
+        assert_eq!(
+            opening_window(Size::new(1440., 900.)),
+            Some(Size::new(1440., 790.))
+        );
+        assert_eq!(
+            opening_window(Size::new(1366., 768.)),
+            Some(Size::new(1366., 690.))
+        );
+        assert_eq!(opening_window(Size::new(800., 600.)), Some(MIN_WINDOW));
+        let fits = opening_window(Size::new(1280., 800.)).unwrap();
+        assert_eq!(fits, Size::new(1280., 690.));
+    }
 
     #[test]
     fn a_drill_operations_pass_and_helical_checks_open_its_cycle_tab() {

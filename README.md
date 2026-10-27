@@ -206,7 +206,7 @@ Open **Start → Explore example project** first. This loads the housing, sample
 
 Viewport: left-drag orbits about the part's surface at the view's centre (so a zoomed-in detail stays in view as it turns), right/middle-drag pans, scroll zooms toward the pointer (the point under it stays put), from 0.3× to 100× of the fitted view; ISO/TOP/FRONT/RIGHT reset the camera: TOP shows +X to the right and +Y up, FRONT, from −Y, +X to the right and +Z up, and RIGHT, from +X, +Y to the right, and dragging turns the model the way the mouse goes. **Fit**, beside them, puts the scene back in the view from where it looks: the zoom and the pan go back, the direction stays. Command/Ctrl+N starts a blank project, Command/Ctrl+S saves a project and Command/Ctrl+O opens one. In a form, Tab moves to the next field and Shift+Tab to the previous one, for example through the stock offsets; the field's value arrives selected, so typing replaces it. With no field focused, Tab and F1 reach the first field and the field help (see **Contextual help for choices**).
 
-Layout: the browser and the inspector each fold to a strip with the ‹ › button at their top, and the strip's button brings them back. Drag the line between either and the 3D view to resize it: the browser from 170 to 420 px, the inspector from 320 to 560 px. The 3D view keeps at least 500 px, also in the window at its least size (1120 × 720): the browser gives way first, then the inspector, and the widths come back in a wider window. The widths, whether each sidebar is open and whether About is open are saved in `settings.json` with the other non-secret settings. The inspector keeps the operation's icon and name and one row of tabs of one width at the top, and the configuration checks, **Generate**, Duplicate, Suppress, Delete, Move up and Move down at the bottom; only the parameters scroll. What the strategy does and what it is available for are behind **About ‹strategy›**, closed until opened. The setup editor keeps its title, its steps and its actions in sight the same way.
+Layout: the browser and the inspector each fold to a strip with the ‹ › button at their top, and the strip's button brings them back. Drag the line between either and the 3D view to resize it: the browser from 170 to 420 px, the inspector from 320 to 560 px. The 3D view keeps at least 500 px, also in the window at its least size (1120 × 690): the browser gives way first, then the inspector, and the widths come back in a wider window. The widths, whether each sidebar is open and whether About is open are saved in `settings.json` with the other non-secret settings. The inspector keeps the operation's icon and name and one row of tabs of one width at the top, and the configuration checks, **Generate**, Duplicate, Suppress, Delete, Move up and Move down at the bottom; only the parameters scroll. What the strategy does and what it is available for are behind **About ‹strategy›**, closed until opened. The setup editor keeps its title, its steps and its actions in sight the same way.
 
 The fit scale stays constant while orbiting and panning. Full-resolution viewport frames are uploaded as small tiles with filtering gutters, keeping them below Iced 0.14's asynchronous image-upload threshold and preventing missing model frames during camera movement.
 
@@ -677,6 +677,25 @@ the same places, greyed when they cannot be used. Under it three columns:
 The long explanations (Probe Z's, the probes', the work zero's, the jog
 keys', the estimate's) are hover cards on the line that names them. Not
 connected, the page is the machine picker, Real or Simulated and Connect.
+
+**Smaller windows (LIO-275).** The page follows the window's size, with no
+setting. In a short window, under 860 px of height (a 13" laptop's 790, or
+1280 × 690 with larger text), the MACHINE bar is 38 px and the run bar 54 px,
+the DRO figures and jog keys are smaller, the cards tighter, and the hint
+lines under the 3D view, under the work systems and in MDI are left out (the
+work zero's is on the **Work system** hover). In a narrow window, under
+1360 px of width, the hands are 310 px and Operations 350 px, the tabs
+tighter, **Controller configuration** reads **Configuration**, the project
+file's and the workspace's notes are on the project title's hover (a failed
+save still shows), **Hold** and **Resume** are one button (Hold while it
+runs, Resume while it holds), the Job tab's Stock / Machine / Top move to the
+line under its view, the Machine tab leaves the log to the MDI tab, the Set
+fields and the probe features wrap, and hint lines are cut sooner, whole on
+hover. At 1440 × 790, at 1280 × 690 (a 13" MacBook with larger text) and
+down to the least window, now 1120 × 690, nothing on the page scrolls or is
+cut off. The window opens at 1440 × 930, made smaller to fit the screen it
+opens on less 110 px for the title bar, menu bar and Dock or taskbar: 1440 ×
+790 on a 13" MacBook.
 
 A workspace whose Machine library is empty starts with the owner's machine,
 the **Jingyan CNC4030** (CNC4030-800W, JY5800) on the UC100, ready to
