@@ -2681,6 +2681,135 @@ flood = { pin = 8 }
         assert!(run_of(&a).outcome.as_ref().unwrap().0);
     }
 
+    /// The Drill's tool run started at its operation, its work zero and
+    /// tool kept: Cycle Start sent and running, `run_app`'s Face and Drill.
+    fn drilling(a: &mut App) -> crate::run::OpSteps {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        zeroed(a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(a, 0);
+        let _ = a.update(Message::Run(R::Next(1)));
+        let _ = a.update(Message::Run(R::KeepZero));
+        assert!(problems(a).is_empty(), "{:?}", problems(a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(a, 3.0, "the Drill's tool run", |s| {
+            s.state == Some(State::Run)
+        });
+        run_of(a).op_steps(1).expect("the Drill's holes").clone()
+    }
+
+    /// Stop after step (LIO-275) armed while the Drill drills: the tool run
+    /// stops once a hole is done, the tool over the stock, never in a hole;
+    /// then Z goes up to the clearance plane and the spindle is off; where it
+    /// stopped is kept on disk, and the next hole is the start, checked
+    /// again. Pressed twice it is disarmed, and it is offered only while a
+    /// tool run runs.
+    #[test]
+    fn stop_after_step_stops_between_two_holes_with_z_up() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        let _ = a.update(Message::Run(R::StopAfterStep));
+        assert!(a.control.as_ref().is_none());
+        let drill = drilling(&mut a);
+        let p = &run_of(&a).checked().unwrap()[1];
+        let plane = crate::post::clearance_plane(&p.blocks) - p.datum[2];
+        let _ = a.update(Message::Run(R::StopAfterStep));
+        let _ = a.update(Message::Run(R::StopAfterStep));
+        assert!(!run_of(&a).stop_after);
+        let _ = a.update(Message::Run(R::StopAfterStep));
+        assert!(run_of(&a).stop_after);
+        let _ = a.view();
+        // Where the tool stops: over the stock top (work Z 0).
+        let mut deadline = Deadline::new(30.);
+        loop {
+            let _ = a.update(Message::Tick);
+            let s = &conn(&a).snapshot;
+            if run_of(&a).running.is_none() && s.state == Some(State::Idle) {
+                break;
+            }
+            assert!(deadline.within(s));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let stopped = conn(&a).snapshot.work_pos[2];
+        let run = run_of(&a);
+        let (ok, message) = run.outcome.clone().unwrap();
+        assert!(
+            !ok && message.starts_with("Stopped after hole"),
+            "{message}"
+        );
+        assert!(!run.done[1] && !run.stop_after);
+        assert!(
+            stopped > 0.5,
+            "the tool stopped at work Z {stopped}, in the stock"
+        );
+        // The journal: the hole done; the next hole the start.
+        let path = dir.path().join("uc100");
+        let journal = std::fs::read_dir(&path)
+            .unwrap()
+            .flatten()
+            .find(|e| e.file_name().to_string_lossy().ends_with("-journal.json"))
+            .map(|e| crate::run::Journal::read(&e.path()).unwrap())
+            .expect("the journal on disk");
+        let last = journal.step.unwrap();
+        assert!(last + 1 < drill.steps.len(), "{last}");
+        assert_eq!(
+            (journal.op, journal.steps, journal.why.as_str()),
+            (1, drill.steps.len(), "Stop after step")
+        );
+        assert_eq!(journal.fingerprint, drill.fingerprint);
+        assert!(
+            message.ends_with(&format!("hole {}", last + 1)),
+            "{message}"
+        );
+        // Z up to the clearance plane, the spindle off.
+        // (No move when the stop left it there already.)
+        tick_until(&mut a, 5.0, "Z up", |s| {
+            s.state == Some(State::Idle) && (s.work_pos[2] - plane as f64).abs() < 1e-3
+        });
+        let s = conn(&a).snapshot.clone();
+        assert!(
+            (s.work_pos[2] - plane as f64).abs() < 1e-3,
+            "{}",
+            s.work_pos[2]
+        );
+        assert_eq!(s.spindle, Some(uc100::gcode::Spindle::Off));
+        // The next hole is the start, once the setup is checked again.
+        assert!(run_of(&a).programs.is_none() && problems(&a).len() == 1);
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((1, last + 1)));
+        assert_eq!(run_of(&a).open, Some(1));
+    }
+
+    /// An E-stop while a hole is drilled (LIO-275): that hole counts as not
+    /// done, the journal keeps the one before it, and it is the start, cut
+    /// again from its start.
+    #[test]
+    fn an_e_stop_mid_step_cuts_that_step_again() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        let drill = drilling(&mut a);
+        assert!(drill.steps.len() >= 2);
+        // Into the second hole, before its cutting is done.
+        run_until(&mut a, 30.0, "hole 2", |r| {
+            let line = None;
+            r.step_at(line)
+                .is_some_and(|(oi, s, done)| oi == 1 && s == 1 && !done)
+        });
+        let _ = a.update(Message::MachineEStop);
+        run_until(&mut a, 5.0, "the E-stop", |r| r.running.is_none());
+        let journal = a.control.as_ref().unwrap().journal().expect("the journal");
+        assert_eq!((journal.op, journal.step), (1, Some(0)), "{journal:?}");
+        assert!(journal.why.contains("E-stop"), "{}", journal.why);
+        assert!(run_of(&a).programs.is_none());
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((1, 1)));
+        let _ = R::Stop;
+    }
+
     /// Cycle Start runs the operations a run does not skip: with the Pocket
     /// already cut and the Drill's material left, tool run 1 cuts the Face
     /// and the Contour, and the Drill's tool run is skipped whole, with no
@@ -3147,6 +3276,12 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::Resume));
         tick_until(&mut a, 3.0, "Run", |s| s.state == Some(State::Run));
         shot(&mut a, "05-cutting");
+        // Stop after step armed while it cuts (LIO-275), then disarmed: no
+        // tick passes between, so it stops nothing.
+        let _ = a.update(Message::Run(R::StopAfterStep));
+        assert!(run_of(&a).stop_after);
+        shot(&mut a, "05-stop-after-step");
+        let _ = a.update(Message::Run(R::StopAfterStep));
         let size = iced::Size::new(1920., 1080.);
         let _ = a.update(Message::Resized(size));
         render_png(&a, size, &out.join("05-cutting-1920x1080.png"));

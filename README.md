@@ -1222,6 +1222,29 @@ bar, at once when that machine is connected, or when you press
      step's entry and **waits there**, spindle on; **Resume** feeds in.
    Each skip of steps and each start at one checks the setup again, keeping
    what was done and where Cycle Start starts.
+
+   **Stop after step**, beside Stop now in the run bar ("After step" in a
+   narrow window), arms a stop while a tool run runs; pressed again it
+   disarms. The run bar then says "stops after this step". When the step
+   being cut ends, the driver's Stop is sent while the tool rises out of it
+   to its operation's clearance (or crosses there), never while it comes
+   down into the next one, so it slows down over the stock; the tool run
+   ends there, the spindle and coolant off, and the tool goes up to the
+   setup's clearance plane. The UC100 driver cannot end a job at a line
+   sent ahead, so this is the driver's own controlled Stop, timed by the
+   run from the program line the driver reports: a step whose rise is
+   missed (the window busy) stops after the next one instead.
+
+   Where a run stopped is kept on disk, beside the machine's saved position
+   (`uc100/<machine id>-journal.json` in the workspace folder, the
+   simulator's apart): the project and setup, the operation and its last
+   step done, the work system and offset, the tool, the time, why, and a
+   fingerprint of the operation's program and tool. It is written after
+   Stop after step, after an E-stop or a lost connection (the step being cut
+   then counts as not done: it is cut again from its start) and when the
+   machine is disconnected or the app closed mid-run; a tool run that ends
+   done removes it. The step after the last one done becomes the start (the
+   next operation after an operation's last step), checked again first.
 4. Between tool runs with different tools, the **Tool change** tab opens
    with the steps: the last one ended with the spindle and coolant off at the setup's
    clearance plane. Touch the old tool

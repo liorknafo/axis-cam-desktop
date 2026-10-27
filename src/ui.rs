@@ -7837,24 +7837,32 @@ pub(crate) fn run_line(
     if let Some((p, op, block)) = run.progress(s.current_line) {
         let i = run.running.as_ref().map_or(0, |r| r.index);
         let blocks = run.running_blocks().map_or(1, <[_]>::len);
-        return (
-            vec![
-                ("Cutting ".into(), INK),
-                (p.ops[op].name.clone(), INK),
-                (
-                    format!(
-                        " · tool run {} of {} · operation {} of {} · block {} of {blocks}",
-                        i + 1,
-                        programs.len(),
-                        op + 1,
-                        p.ops.len(),
-                        block + 1
-                    ),
-                    MUTED,
+        // The step being cut, of how many, when the operation has steps.
+        let step = (run.step_at(s.current_line))
+            .and_then(|(oi, n, _)| Some((oi, n, run.op_steps(oi)?.steps.len())))
+            .filter(|t| t.2 > 1)
+            .map_or(String::new(), |(oi, n, count)| {
+                format!(" · {} of {count}", run.step_label(oi, n))
+            });
+        let mut parts = vec![
+            ("Cutting ".into(), INK),
+            (p.ops[op].name.clone(), INK),
+            (
+                format!(
+                    "{step} · tool run {} of {} · operation {} of {} · block {} of {blocks}",
+                    i + 1,
+                    programs.len(),
+                    op + 1,
+                    p.ops.len(),
+                    block + 1
                 ),
-            ],
-            vec![],
-        );
+                MUTED,
+            ),
+        ];
+        if run.stop_after {
+            parts.insert(2, (" · stops after this step".into(), AMBER));
+        }
+        return (parts, vec![]);
     }
     let mut problems = run.problems(c, &app.doc);
     problems.extend(app.planning_busy().map(String::from));
@@ -8017,8 +8025,27 @@ pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
     } else {
         buttons.push(act_with("Hold", hold, false, Some(Length::Fixed(76.)), pad))
     };
+    // Stop after step, armed or not, one width beside Stop now: short
+    // where the bar is narrow.
+    let armed = run.is_some_and(|r| r.stop_after);
+    let after = act_with(
+        if fit.narrow {
+            "After step"
+        } else {
+            "Stop after step"
+        },
+        msg(
+            run.is_some_and(|r| r.running.is_some())
+                && matches!(state, Some(State::Run | State::Hold)),
+            R::StopAfterStep,
+        ),
+        armed,
+        Some(Length::Fixed(if fit.narrow { 78. } else { 116. })),
+        pad,
+    );
     let buttons = buttons
         .push(space().width(if fit.narrow { 6 } else { 14 }))
+        .push(after)
         .push(big(
             "Stop now",
             msg(run.is_some() && crate::run::busy(state), R::Stop),

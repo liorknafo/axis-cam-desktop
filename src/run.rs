@@ -72,6 +72,9 @@ pub enum Action {
     /// The tool in the spindle is the one the steps before a start at a
     /// step were cut with, its Z unchanged since (`Run::tool_kept`).
     KeepToolZ,
+    /// Arm Stop after step while a tool run runs, or disarm it
+    /// (`Run::stop_after`).
+    StopAfterStep,
 }
 
 /// How a run skips an operation of its setup (`Run::skips`).
@@ -261,6 +264,104 @@ pub struct Run {
     /// The setup is to be checked again, once the machine stands still: a
     /// start at a step was set from where a tool run stopped.
     pub recheck: bool,
+    /// Stop after step is armed: the running tool run stops once the step
+    /// it cuts ends, the tool back at its operation's clearance.
+    pub stop_after: bool,
+    /// The step the driver was told to stop after (Stop sent at its end):
+    /// its operation (index in the setup) and step.
+    stopping: Option<(usize, usize)>,
+    /// Where the last tool run stopped short, until the connection keeps it
+    /// (`Connection::observe`): in the journal, and as the next start.
+    pub stopped: Option<Stopped>,
+    /// A tool run ended done since the connection last looked: the journal
+    /// of where one stopped is over.
+    pub completed: bool,
+    /// The project's title, for the journal.
+    project: String,
+    /// The journal of where a run of this setup stopped, read when it was
+    /// picked: a start there once the check finds its program unchanged
+    /// (`checked_as`).
+    pub journal: Option<Journal>,
+    /// The journal the start Cycle Start starts at came from, and what
+    /// the check found of one that no longer holds.
+    pub resumed: Option<Journal>,
+    pub journal_note: Option<String>,
+}
+
+/// Where a tool run stopped short (LIO-275): after a step (Stop after
+/// step), or in one (an E-stop, the connection lost, the app closed),
+/// whose step then counts as not done.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stopped {
+    /// The operation it was in (index in the setup), and its last step
+    /// done; None for none.
+    pub op: usize,
+    pub last: Option<usize>,
+    /// After a step: the machine Z of the clearance plane, where the tool
+    /// is lifted to once the machine stops.
+    pub up: Option<f64>,
+    /// Why: "Stop after step", the driver's message.
+    pub why: String,
+}
+
+/// The journal of where a run stopped (LIO-275), kept on disk beside the
+/// machine's saved position (`Connection::journal`): it survives closing
+/// the app, and holds only while the operation's program is the one its
+/// fingerprint is of (`OpSteps::fingerprint`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Journal {
+    pub project: String,
+    /// The setup's id and name.
+    pub setup: String,
+    pub setup_name: String,
+    /// The operation it stopped in (index in the setup), its name, how
+    /// many steps it has and its last step done (None: none).
+    pub op: usize,
+    pub op_name: String,
+    pub steps: usize,
+    pub step: Option<usize>,
+    /// The work system and work offset the steps were cut with.
+    pub wcs: usize,
+    pub offset: [f64; 6],
+    /// The tool's id and label.
+    pub tool: String,
+    pub tool_label: String,
+    /// When, in seconds since 1970.
+    pub time: u64,
+    pub fingerprint: u64,
+    /// Why it stopped.
+    pub why: String,
+}
+
+impl Journal {
+    pub fn read(path: &std::path::Path) -> Option<Self> {
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    }
+
+    pub fn write(&self, path: &std::path::Path) -> Result<(), String> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let data = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
+        crate::storage::write_atomic(path, &data)
+    }
+
+    /// How long ago it stopped, at `now` (seconds since 1970): "12 min
+    /// ago", "3 h ago", "2 days ago".
+    pub fn ago(&self, now: u64) -> String {
+        let s = now.saturating_sub(self.time);
+        match s {
+            0..120 => "just now".into(),
+            120..7200 => format!("{} min ago", s / 60),
+            7200..172800 => format!("{} h ago", s / 3600),
+            _ => format!("{} days ago", s / 86400),
+        }
+    }
+}
+
+/// Seconds since 1970, now.
+pub fn now() -> u64 {
+    (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)).map_or(0, |d| d.as_secs())
 }
 
 /// The stock before an operation of the setup being run, seen from above,
@@ -338,6 +439,14 @@ impl Run {
             picked: None,
             tool_kept: false,
             recheck: false,
+            stop_after: false,
+            stopping: None,
+            stopped: None,
+            completed: false,
+            project: doc.title.clone(),
+            journal: None,
+            resumed: None,
+            journal_note: None,
         }
     }
 
@@ -614,6 +723,47 @@ impl Run {
             left.filter(|l| self.checked().is_some() && (!l.after.is_empty() || l.last.is_some()));
         self.times = times.filter(|_| self.checked().is_some());
         self.pictures.clear();
+        // Where a run of this setup stopped: the start after it, while the
+        // program of its operation is the one it stopped in.
+        if let Some(j) = self.journal.take().filter(|_| self.checked().is_some()) {
+            let same = self
+                .op_steps(j.op)
+                .is_some_and(|s| s.fingerprint == j.fingerprint);
+            if same && j.setup == self.setup_id {
+                self.resume_after(j.op, j.step);
+                self.resumed = Some(j);
+            } else {
+                self.journal_note = Some(format!(
+                    "This setup last stopped in {} ({}), but its program has changed since, so where it stopped is not picked: pick the start in the Operations list.",
+                    j.op_name, j.why
+                ));
+            }
+        }
+    }
+
+    /// The journal of where this run stopped (`stopped`), the machine at
+    /// work system `wcs` and work `offset`.
+    pub fn journal_of(&self, st: &Stopped, wcs: usize, offset: [f64; 6]) -> Option<Journal> {
+        let (p, k) = (self.checked()?.iter())
+            .find_map(|p| Some((p, p.indexes.iter().position(|&o| o == st.op)?)))?;
+        let o = &p.ops[k];
+        let steps = self.op_steps(st.op);
+        Some(Journal {
+            project: self.project.clone(),
+            setup: self.setup_id.clone(),
+            setup_name: self.name.clone(),
+            op: st.op,
+            op_name: o.name.clone(),
+            steps: steps.map_or(0, |s| s.steps.len()),
+            step: st.last,
+            wcs,
+            offset,
+            tool: o.tool_id.clone(),
+            tool_label: crate::model::tool_label(o.tool, &o.tool_name),
+            time: now(),
+            fingerprint: steps.map_or(0, |s| s.fingerprint),
+            why: st.why.clone(),
+        })
     }
 
     /// The picture of the stock operation `op` (its index in the setup)
@@ -664,6 +814,9 @@ impl Run {
         if o.seq <= r.seq {
             return;
         }
+        let stopping = self.stopping.take();
+        self.stop_after = false;
+        let mut message = o.message.clone();
         if o.ok {
             self.finish_carve();
             let Some(r) = &self.running else {
@@ -672,6 +825,7 @@ impl Run {
             self.done[r.index] = true;
             self.next = r.index + 1;
             self.from = 0;
+            self.completed = true;
         } else if o.message.contains(NOT_STARTED) {
             let Before {
                 xy,
@@ -680,9 +834,140 @@ impl Run {
                 touched,
             } = r.before.clone();
             (self.xy, self.zero, self.last, self.touched) = (xy, zero, last, touched);
+        } else if let Some((op, s)) = stopping {
+            // Stopped after a step, the tool at its clearance: lifted to the
+            // clearance plane once the machine stands still.
+            let up = self.checked().and_then(|c| c.get(r.index)).and_then(|p| {
+                let plane = clearance_plane(p.from(r.from).ok()?);
+                Some(match p.settings.machine_home {
+                    true => 0.,
+                    false => plane as f64 - p.datum[2] as f64 + r.offset[2],
+                })
+            });
+            message = format!("Stopped after {}", self.step_label(op, s));
+            self.stopped = Some(Stopped {
+                op,
+                last: Some(s),
+                up,
+                why: "Stop after step".into(),
+            });
+        } else if o.message.contains("E-stop") || o.message.contains("E-STOP") {
+            // In a step: it counts as not done.
+            self.stopped = self.stopped_in("an E-stop");
         }
-        self.outcome = Some((o.ok, o.message.clone()));
+        self.outcome = Some((o.ok, message));
         self.running = None;
+    }
+
+    /// Where the running tool run is, stopped now in a step that then
+    /// counts as not done (`why`): the operation and step of the block the
+    /// tool tip is on (the first until it is found), the last step done of
+    /// it being the one before, or that one if its cutting was done.
+    pub fn stopped_in(&self, why: &str) -> Option<Stopped> {
+        let r = self.running.as_ref()?;
+        let p = self.checked()?.get(r.index)?;
+        let block = r.on.map_or(0, |o| o.0);
+        let (op, s, done) = match r.marks.get(block).copied().flatten() {
+            Some(mark) => match self.mark_step(p, mark) {
+                Some(step) => step,
+                None => (*p.indexes.get(mark.0)?, 0, false),
+            },
+            None => (*p.indexes.get(r.from)?, 0, false),
+        };
+        let steps = self.op_steps(op).map_or(0, |o| o.steps.len());
+        let last = if done && steps > 1 {
+            Some(s)
+        } else {
+            s.checked_sub(1)
+        };
+        Some(Stopped {
+            op,
+            last: last.filter(|_| steps > 1),
+            up: None,
+            why: why.into(),
+        })
+    }
+
+    /// Makes the start after step `last` of operation `oi` (index in the
+    /// setup; None: before its first) the one Cycle Start starts at, as
+    /// after a stop there (`Stopped`, `Journal`), and unfolds its steps: the
+    /// next step, the operation's start, or the next operation sent after
+    /// its last. A start at a step is checked first (`recheck`).
+    pub fn resume_after(&mut self, oi: usize, last: Option<usize>) {
+        let Some(programs) = self.checked() else {
+            return;
+        };
+        let count = self.op_steps(oi).map_or(0, |s| s.steps.len());
+        let next = last.map_or(0, |l| l + 1);
+        let sent = |o: usize| {
+            (programs.iter().enumerate()).find_map(|(i, p)| {
+                let k = p.indexes.iter().position(|&x| x == o)?;
+                Some((i, k))
+            })
+        };
+        if next > 0 && next < count {
+            // Nothing is started until the check answers with its program.
+            if self.start_at_step(oi, next) {
+                (self.recheck, self.programs) = (true, None);
+            }
+        } else {
+            let after = if next == 0 {
+                sent(oi)
+            } else {
+                (programs.iter().flat_map(|p| &p.indexes))
+                    .find(|&&o| o > oi)
+                    .and_then(|&o| sent(o))
+            };
+            match after {
+                Some((i, k)) => self.start_at(i, k),
+                None => (self.next, self.from) = (programs.len(), 0),
+            }
+        }
+        self.open = Some(oi).filter(|_| count > 1);
+    }
+
+    /// Whether Stop after step stops the running tool run now (`stop_after`
+    /// armed, the machine running, `s` its snapshot), and then which step
+    /// it ends: the driver's line is past the last feed move of a step, on
+    /// a move that starts at the operation's clearance (across, or the way
+    /// down to the next step, all rapids in the air), so that its planner,
+    /// which the stop slows down from, is there; the tool, behind it by the
+    /// motion buffer, comes up to it and stops.
+    pub fn stop_due(&mut self, s: &uc100::controller::Snapshot) -> bool {
+        if !self.stop_after || self.stopping.is_some() || s.state != Some(State::Run) {
+            return false;
+        }
+        let Some((_, _, block)) = self.progress(s.current_line) else {
+            return false;
+        };
+        let (Some(r), Some(blocks)) = (self.running.as_ref(), self.running_blocks()) else {
+            return false;
+        };
+        let Some(mark) = r.marks.get(block).copied().flatten().filter(|m| m.2) else {
+            return false;
+        };
+        let Some(p) = self.checked().and_then(|c| c.get(r.index)) else {
+            return false;
+        };
+        let Some((op, step, _)) = self.mark_step(p, mark) else {
+            return false;
+        };
+        // The driver's line is where its planner is, which the stop slows
+        // down from: at the clearance, up there or on its way down into the
+        // next step, in the air over the stock. A rise to it is not yet there.
+        let clear = self.op_steps(op).map_or(f32::INFINITY, |o| o.clear);
+        let there = match &blocks[block] {
+            Block::Move { kind, from, .. } => {
+                *kind != Kind::Feed && from[2] >= clear - AT_CLEARANCE
+            }
+            Block::Descend { .. } => false,
+            _ => true,
+        };
+        if !there {
+            return false;
+        }
+        self.stopping = Some((op, step));
+        true
     }
 
     /// Why Cycle Start cannot start the next tool run now; empty when it can.
@@ -3811,6 +4096,14 @@ mod tests {
             picked: None,
             tool_kept: false,
             recheck: false,
+            stop_after: false,
+            stopping: None,
+            stopped: None,
+            completed: false,
+            project: String::new(),
+            journal: None,
+            resumed: None,
+            journal_note: None,
         };
         let (_, op, block) = run.progress(Some(3)).unwrap();
         assert_eq!((op, block), (0, 2));

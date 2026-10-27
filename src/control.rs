@@ -2202,6 +2202,11 @@ pub struct Connection {
     pub sim_gauge: Option<Block>,
     /// Simulated: the bars last sent to the driver.
     sim_bars_sent: Vec<Bar>,
+    /// Where a run stopped on this machine is kept (`run::Journal`): beside
+    /// its saved position, one file per machine, the simulator's apart.
+    journal: std::path::PathBuf,
+    /// After a Stop after step: the machine Z to lift the tool to once Idle.
+    z_up: Option<f64>,
     /// Keeps macOS from throttling AXIS CAM in the background, which would
     /// starve the controller's motion buffer.
     _nap: uc100::macos::ActivityToken,
@@ -2236,6 +2241,7 @@ impl Connection {
         cfg.controller.simulated = simulated;
         let suffix = if simulated { "-simulated" } else { "" };
         let file = state_dir.join(format!("{}{suffix}.toml", m.id));
+        let journal = state_dir.join(format!("{}{suffix}-journal.json", m.id));
         pad_state(&file);
         let controller = Controller::start(cfg.clone(), Some(file));
         let block = sim_block(&cfg, None).filter(|_| simulated);
@@ -2303,6 +2309,8 @@ impl Connection {
             sim_longer: 0.,
             sim_gauge: None,
             sim_bars_sent: vec![],
+            journal,
+            z_up: None,
         };
         c.send_sim_blocks();
         Ok(c)
@@ -2527,11 +2535,18 @@ impl Connection {
 
     /// Acts on the snapshot `refresh` read.
     fn observe(&mut self) {
+        let mut stop = false;
         if let Some(run) = &mut self.run {
             run.refresh(self.snapshot.program_outcome.as_ref());
             run.carve(&self.snapshot);
             run.track(&self.snapshot);
+            // Stop after step: the driver's Stop as the step ends.
+            stop = run.stop_due(&self.snapshot);
         }
+        if stop {
+            self.send(Command::Stop);
+        }
+        self.keep_journal();
         if let Some(st) = &self.snapshot.status {
             self.inputs.observe(self.opened.elapsed(), st);
         }
@@ -2562,6 +2577,17 @@ impl Connection {
         self.edges_step();
         self.routine_step();
         self.turning_step();
+        // Stopped after a step: Z up to the clearance plane, once Idle.
+        if self.idle()
+            && let Some(z) = self.z_up.take()
+        {
+            let now = self.snapshot.machine_pos;
+            let mut up = now;
+            up[2] = z.max(now[2]);
+            if up != now {
+                self.send(job("Z up after the step", moves_from(now, &[up])));
+            }
+        }
         // Any state but Idle (E-stop, a move) drops what is left, so nothing
         // is declared later by surprise.
         if self.idle() {
@@ -2909,6 +2935,11 @@ impl Connection {
             }
             R::ClearSteps => run.picked = None,
             R::KeepToolZ if run.at_step().is_some() => run.tool_kept = true,
+            R::StopAfterStep
+                if run.running.is_some() && matches!(state, Some(State::Run | State::Hold)) =>
+            {
+                run.stop_after = !run.stop_after
+            }
             R::CycleStart => {
                 if let Some(job) = run.cycle_start(self, doc) {
                     self.send(job);
@@ -4629,6 +4660,47 @@ impl Connection {
     }
 
     /// Disables the machine and stops the controller thread.
+    /// Keeps where the run's last tool run stopped short in the journal
+    /// (`run::Journal`), and after a Stop after step lifts the tool once the
+    /// machine is Idle; a tool run ended done ends the journal.
+    fn keep_journal(&mut self) {
+        let s = &self.snapshot;
+        let Some(run) = &mut self.run else {
+            return;
+        };
+        if std::mem::take(&mut run.completed) {
+            let _ = std::fs::remove_file(&self.journal);
+        }
+        let Some(st) = run.stopped.take() else {
+            return;
+        };
+        self.z_up = st.up;
+        if let Some(j) = run.journal_of(&st, s.active_wcs, s.work_offset)
+            && let Err(e) = j.write(&self.journal)
+            && let Some((_, message)) = &mut run.outcome
+        {
+            *message += &format!(" Where it stopped could not be kept: {e}.");
+        }
+        // The start after it is next.
+        run.resume_after(st.op, st.last);
+    }
+
+    /// The journal of where a run stopped on this machine, if any.
+    pub fn journal(&self) -> Option<crate::run::Journal> {
+        crate::run::Journal::read(&self.journal)
+    }
+
+    /// Keeps where a running tool run is in the journal before the
+    /// connection ends (`why`): the step it is in counts as not done.
+    pub fn leaving(&mut self, why: &str) {
+        if let Some(st) = self.run.as_ref().and_then(|r| r.stopped_in(why))
+            && let Some(run) = &mut self.run
+        {
+            run.stopped = Some(st);
+            self.keep_journal();
+        }
+    }
+
     pub fn close(self) {
         let Connection { controller, .. } = self;
         controller.send(Command::Disconnect);

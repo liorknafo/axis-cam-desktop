@@ -2862,7 +2862,8 @@ impl App {
     /// Disables the machine and stops its controller, if connected.
     pub fn disconnect_machine(&mut self) {
         self.switch_machine = None;
-        if let Some(c) = self.control.take() {
+        if let Some(mut c) = self.control.take() {
+            c.leaving("disconnected while it ran");
             c.close();
             self.status = "Disconnected from the machine.".into();
         }
