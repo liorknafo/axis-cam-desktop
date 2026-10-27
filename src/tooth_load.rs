@@ -164,7 +164,8 @@ fn elements(shape: CutterShape, radius: f32, flute: f32, helix: f32) -> Vec<Elem
 
 /// The load on one tooth along `sim`'s moves (`ToothLoad`), cut by a tool
 /// with `flutes` wound at `helix` degrees at `rpm` in `material` (None
-/// counts as steel, `forces::kc`). None for a plan that is not milled
+/// counts as steel, `forces::kc`), each move in the frame it cuts in (an
+/// indexed setup's at its A angle). None for a plan that is not milled
 /// (a lathe's, a drill's, a tap's or a thread mill's), or without the
 /// stock it starts from.
 pub fn measure(
@@ -186,12 +187,37 @@ pub fn measure(
         return None;
     }
     let (kc, mc) = crate::forces::kc(material);
-    let stock = volume.frame.transfer_bounds(volume.bounds, frame);
+    // The frames the moves cut in: `frame`, and in an indexed setup the
+    // part posed at each A angle (`Simulation::frame_of`). Each keeps every
+    // cut, those at the angles before included.
+    let mut frames = vec![frame];
+    for &(_, f) in &sim.turns {
+        if !frames.contains(&f) {
+            frames.push(f);
+        }
+    }
+    let in_frame = |m: &Move| {
+        let f = sim.frame_of(m);
+        frames.iter().position(|g| Some(*g) == f).unwrap_or(0)
+    };
+    let stocks: Vec<Bounds> = (frames.iter())
+        .map(|&f| volume.frame.transfer_bounds(volume.bounds, f))
+        .collect();
     let bar = volume.round.then(|| crate::stock::bar(volume.bounds));
-    let extent = (stock.max[0] - stock.min[0]).max(stock.max[1] - stock.min[1]);
-    let mut history = crate::volume::History::new(frame, stock, plan.radius.max(extent / 400.));
+    let mut histories: Vec<_> = (frames.iter().zip(&stocks))
+        .map(|(&f, stock)| {
+            let extent = (stock.max[0] - stock.min[0]).max(stock.max[1] - stock.min[1]);
+            crate::volume::History::new(f, *stock, plan.radius.max(extent / 400.))
+        })
+        .collect();
+    let mut add = |cut: Cut| {
+        (histories.iter_mut())
+            .map(|h| h.add(cut.clone()))
+            .last()
+            .unwrap_or(0)
+    };
     for cut in volume.cuts.iter() {
-        history.add(cut.clone());
+        add(cut.clone());
     }
     let length = |m: &crate::simulation::Move| {
         (0..3)
@@ -208,26 +234,28 @@ pub fn measure(
         .iter()
         .map(|m| {
             (cutting(m) && length(m) > 0.).then(|| {
-                history.add(Cut {
+                add(Cut {
                     a: m.from,
                     b: m.to,
                     radius: plan.radius,
                     flute: plan.flute_length,
                     shape: plan.shape,
-                    frame,
+                    frame: frames[in_frame(m)],
                     source: sim.source,
                 })
             })
         })
         .collect();
-    // Whether `p` is still material: in the stock, swept by no cut before
-    // cut `before`, nor by the move under way from `a` to `b`.
-    let solid = |p: [f32; 3], before: u32, a: [f32; 3], b: [f32; 3]| {
-        let q = frame.transfer(p, volume.frame);
+    // Whether `p` of frame `f` is still material: in the stock (a rotary
+    // setup's bar too), swept by no cut before cut `before`, nor by the
+    // move under way from `a` to `b`.
+    let solid = |f: usize, p: [f32; 3], before: u32, a: [f32; 3], b: [f32; 3]| {
+        let q = frames[f].transfer(p, volume.frame);
         (0..3).all(|k| (volume.bounds.min[k]..=volume.bounds.max[k]).contains(&q[k]))
             && bar.is_none_or(|(c, r)| (q[0] - c[0]).hypot(q[1] - c[1]) <= r)
+            && volume.bar_x.is_none_or(|bar| bar.contains(q))
             && !swept(p, a, b, plan.radius, plan.flute_length, plan.shape)
-            && !history.swept(p, before)
+            && !histories[f].swept(p, before)
     };
     let edge = elements(plan.shape, plan.radius, plan.flute_length, helix);
     let step_angle = TAU / ANGLES as f32;
@@ -246,13 +274,14 @@ pub fn measure(
         })
         .collect();
     let step = sample_step(plan);
-    let top = plan.stock.max[2].max(stock.max[2]);
     // The force on one tooth midway along each piece of move `index`, and
     // how thin the chip is there (`ToothLoad::facing`).
     let measure_move = |index: usize| -> (Vec<f32>, Vec<f32>) {
         let (m, Some(before)) = (&plan.moves[index], numbers[index]) else {
             return (vec![], vec![]);
         };
+        let f = in_frame(m);
+        let top = plan.stock.max[2].max(stocks[f].max[2]);
         let l = length(m);
         let v: [f32; 3] = std::array::from_fn(|k| (m.to[k] - m.from[k]) / l);
         let chip = m.feed / (rpm * flutes);
@@ -282,7 +311,7 @@ pub fn measure(
                         here[1] + e.rho * s + AHEAD * n[1],
                         here[2] + e.z + AHEAD * n[2],
                     ];
-                    if solid(p, before, m.from, here) {
+                    if solid(f, p, before, m.from, here) {
                         most = most.max(facing);
                         // The tooth whose flute's lowest point is `behind`
                         // angles back from here.
@@ -627,9 +656,10 @@ struct Refed {
 /// the cutting moves where the feed wanted changes (`refeed`), re-times the
 /// plan, and keeps the load along the new moves (`Simulation::tooth_load`)
 /// and what was held (`Simulation::held`). The load is measured once for
-/// the same plan from the same stock. Nothing changes for an operation whose feed
-/// does not follow the load, an indexed one, or one whose load cannot be
-/// measured; an error only for a cancelled generation.
+/// the same plan from the same stock. An indexed setup's operation is
+/// measured at each A angle in that angle's frame (`measure`). Nothing
+/// changes for an operation whose feed does not follow the load, or one
+/// whose load cannot be measured; an error only for a cancelled generation.
 pub fn hold(
     sim: &mut Simulation,
     doc: &Document,
@@ -639,7 +669,7 @@ pub fn hold(
     use std::hash::{Hash, Hasher};
     static KNOWN: std::sync::Mutex<Vec<(u64, std::sync::Arc<ToothLoad>)>> =
         std::sync::Mutex::new(vec![]);
-    if !follows(op, machine) || sim.plan.moves.iter().any(|m| m.a.is_some()) {
+    if !follows(op, machine) {
         return Ok(());
     }
     let positive = |p, key| num(p, key).filter(|v| *v > 0.);
@@ -668,19 +698,24 @@ pub fn hold(
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let plan = &sim.plan;
     for m in &plan.moves {
-        for v in [m.from, m.to, [m.feed, m.end - m.start, 0.]] {
+        for v in [
+            m.from,
+            m.to,
+            [m.feed, m.end - m.start, m.a.unwrap_or(f32::NAN)],
+        ] {
             v.map(f32::to_bits).hash(&mut h);
         }
         (m.motion as u8).hash(&mut h);
     }
     format!(
-        "{:?} {} {} {} {} {:?}",
+        "{:?} {} {} {} {} {:?} {:?}",
         plan.shape,
         plan.radius,
         plan.flute_length,
         plan.spindle_clockwise,
         plan.milling_direction,
-        sim.frame
+        sim.frame,
+        sim.turns
     )
     .hash(&mut h);
     [flutes, rpm, kc, mc, HELIX].map(f32::to_bits).hash(&mut h);
@@ -723,7 +758,12 @@ pub fn hold(
         op,
         tool,
         material,
-        level_depth(&sim.plan, &load),
+        level_depth(&sim.plan, &load, |a| {
+            match (a, &sim.initial_volume, sim.frame_at(a)) {
+                (Some(_), Some(v), Some(f)) => top_in(v, f),
+                _ => sim.plan.rest_top.unwrap_or(sim.plan.stock.max[2]),
+            }
+        }),
         Some((&sim.plan, &load)),
     ) else {
         return Ok(());
@@ -754,33 +794,47 @@ pub fn hold(
     Ok(())
 }
 /// How deep a plan's levels cut, mm: the most its cuts along a level step
-/// down from the level above, the first from where it starts cutting
-/// (`Plan::rest_top`, else the stock's top). A level is the Z of feed moves
-/// along which a tooth takes a tenth of the operation's most force or
-/// more (`load`): not one the cutter only travels along, over what it has
-/// cleared (an Adaptive's, half a millimetre over the level before). None
-/// without a level below that.
-fn level_depth(plan: &Plan, load: &ToothLoad) -> Option<f32> {
-    let top = plan.rest_top.unwrap_or(plan.stock.max[2]);
+/// down from the level above at the same A angle, the first from where it
+/// starts cutting at that angle (`top`: `Plan::rest_top`, else the stock's
+/// top). A level is the Z of feed moves along which a tooth takes a tenth
+/// of the operation's most force or more (`load`): not one the cutter only
+/// travels along, over what it has cleared (an Adaptive's, half a
+/// millimetre over the level before). None without a level below that.
+fn level_depth(plan: &Plan, load: &ToothLoad, top: impl Fn(Option<f32>) -> f32) -> Option<f32> {
     let cuts = |i: usize| {
         load.moves[i]
             .iter()
             .any(|f| *f >= 0.1 * load.peak && *f > 0.)
     };
-    let mut levels: Vec<f32> = (plan.moves.iter().enumerate())
+    let mut levels: Vec<(Option<u32>, f32)> = (plan.moves.iter().enumerate())
         .filter(|(i, m)| m.motion == Motion::Feed && m.from != m.to && cuts(*i))
-        .filter(|(_, m)| (m.to[2] - m.from[2]).abs() < 1e-4 && m.to[2] < top - 1e-3)
-        .map(|(_, m)| m.to[2])
+        .filter(|(_, m)| (m.to[2] - m.from[2]).abs() < 1e-4 && m.to[2] < top(m.a) - 1e-3)
+        .map(|(_, m)| (m.a.map(f32::to_bits), m.to[2]))
         .collect();
-    levels.sort_by(|a, b| b.total_cmp(a));
-    levels.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
-    let mut above = top;
+    levels.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)));
+    levels.dedup_by(|a, b| a.0 == b.0 && (a.1 - b.1).abs() < 1e-3);
+    let mut above: Option<(Option<u32>, f32)> = None;
     let mut most = 0_f32;
-    for z in levels {
-        most = most.max(above - z);
-        above = z;
+    for (a, z) in levels {
+        let from = match above {
+            Some((b, from)) if b == a => from,
+            _ => top(a.map(f32::from_bits)),
+        };
+        most = most.max(from - z);
+        above = Some((a, z));
     }
     (most > 0.).then_some(most)
+}
+/// The top of the stock `v` started as, in frame `f`: its box's, or a
+/// rotary setup's bar's (`Volume::bar_x`), the higher of its axis's ends
+/// and its radius over it.
+fn top_in(v: &crate::volume::Volume, f: Frame) -> f32 {
+    let Some(bar) = v.bar_x else {
+        return v.frame.transfer_bounds(v.bounds, f).max[2];
+    };
+    let [y, z] = bar.axis;
+    let ends = [v.bounds.min[0], v.bounds.max[0]].map(|x| v.frame.transfer([x, y, z], f)[2]);
+    ends[0].max(ends[1]) + bar.radius
 }
 /// `shape` as numbers, for a key.
 fn shape_key(shape: CutterShape) -> [u16; 4] {
@@ -1432,7 +1486,10 @@ mod tests {
             "{:?}",
             load.moves[2]
         );
-        assert_eq!(level_depth(&s.plan, &load), Some(1.));
+        assert_eq!(
+            level_depth(&s.plan, &load, |_| s.plan.stock.max[2]),
+            Some(1.)
+        );
     }
     #[test]
     fn the_nominal_force_is_the_one_measured_along_that_cut() {
@@ -1624,6 +1681,54 @@ mod tests {
         let (full, _) = target(&ops[5], tool(&ops[5]), material, None, None).unwrap();
         let target = held[2].held.unwrap().target;
         assert!(target > 0. && target <= full * 1.001, "{target} vs {full}");
+    }
+    #[test]
+    fn a_held_indexed_facing_is_measured_at_each_angle_in_its_own_frame() {
+        use crate::indexed::tests::{bar_job, cutter, faced_square, prism};
+        use crate::simulation::prepare;
+        // The Ø40 bar faced square, a side at each of four angles.
+        let mesh = prism(30.);
+        let op = faced_square(&cutter("12"), &mesh);
+        let mut doc = bar_job(&mesh, 20., "100", "-150", "90, 180, 270, 0", op);
+        let programmed = prepare(&doc, &mesh, 1, 0).unwrap();
+        assert!(programmed.held.is_none());
+        let op = &mut doc.setups[1].operations[0];
+        op.p.insert("feed_follows".into(), FEED_FOLLOWS[1].into());
+        let held = prepare(&doc, &mesh, 1, 0).unwrap();
+        let h = held.held.expect("an indexed setup's feed holds the force");
+        assert!(h.slowest < h.fastest, "{h:?}");
+        assert!(held.plan.moves.len() > programmed.plan.moves.len());
+        let timed: f32 = (held.plan.moves.iter()).map(|m| m.end - m.start).sum();
+        assert!((timed - held.plan.duration).abs() < 0.01);
+        // Each piece keeps its move's A, the angles in the same order.
+        let angles = |s: &Simulation| {
+            let mut v: Vec<f32> = vec![];
+            for a in s.plan.moves.iter().map(|m| m.a.unwrap()) {
+                if v.last() != Some(&a) {
+                    v.push(a);
+                }
+            }
+            v
+        };
+        assert_eq!(angles(&held), [90., 180., 270., 0.]);
+        assert_eq!(angles(&held), angles(&programmed));
+        // Every angle meets its own side of the bar, the stock the angles
+        // before left: in the setup's frame alone the later angles would
+        // pass where the first one had cut, through nothing.
+        let load = held.tooth_load.as_ref().unwrap();
+        assert_eq!(load.moves.len(), held.plan.moves.len());
+        for a in [90., 180., 270., 0.] {
+            let most = (held.plan.moves.iter().zip(&load.moves))
+                .filter(|(m, _)| m.a == Some(a))
+                .flat_map(|(_, f)| f.iter().copied())
+                .fold(0., f32::max);
+            assert!(most > 0.5 * h.target, "A{a}: {most} vs {}", h.target);
+        }
+        // The target: the Facing's nominal cut, no deeper than its stepdown.
+        let tool = &doc.tools[0];
+        let op = &doc.setups[1].operations[0];
+        let (full, _) = target(op, tool, doc.selected_material(), None, None).unwrap();
+        assert!(h.target <= full * 1.001, "{} vs {full}", h.target);
     }
     #[test]
     fn colours_run_from_blue_to_red() {
