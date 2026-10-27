@@ -2327,13 +2327,20 @@ fn workspace(app: &App) -> Element<'_, Message> {
     // The view, its toolbar and the simulation strip share what is left;
     // the camera's frame is worked out from all of it (`scene_frame`). The
     // panels scroll past the room the frame leaves them, so open details
-    // and a long run check never cut the scene off.
+    // and a long run check never cut the scene off. The strip's controls
+    // stay under the scrolled part, in sight (LIO-310): with a fixed width
+    // in a Shrink-wide column, iced lays them out before the Fill-wide
+    // scrollable, which gets what they leave.
     let middle = responsive(move |size| {
-        let (toolbar, simulation) = scene_panels(app);
+        let (toolbar, simulation, controls) = scene_panels(app);
         let frame = scene_frame(size.height);
         let scene = scene(app, Some(frame)).unwrap_or_else(|| no_scene(app));
-        let panels =
-            container(scrollable(column![toolbar, simulation])).max_height(size.height - frame);
+        let panels = column![
+            scrollable(column![toolbar, simulation]),
+            container(controls).width(size.width)
+        ]
+        .width(Length::Shrink);
+        let panels = container(panels).max_height(size.height - frame);
         column![scene, panels].into()
     });
     // A UC100 machine takes no G-code file: its setups run from MACHINE.
@@ -2372,7 +2379,6 @@ fn workspace(app: &App) -> Element<'_, Message> {
 fn no_scene(app: &App) -> Element<'_, Message> {
     container(column![bold(if app.import_busy { "Loading geometry…" } else if !app.doc.has_model() { "Import your part" } else { "Model preview unavailable" },25),muted(app.doc.file.as_ref().map(|f|f.name.clone()).unwrap_or_default()),note(app.import_error.clone().unwrap_or_else(|| "Import STEP, STP, 3MF, STL, OBJ or DXF to view your model. Geometry loads in the background; a STEP conversion may take up to two minutes.".into())),primary("Import model",Message::Import),secondary("Start screen",Message::Page(Page::Home))].spacing(20).max_width(380)).center(Fill).into()
 }
-/// The 3D view's toolbar and the simulation strip under it.
 /// The section's controls under the 3D view while it is on: the axis it is
 /// square to or the face it goes through, the slider that moves it across
 /// the scene, where it is, and the side cut away. None while it is off.
@@ -2436,7 +2442,17 @@ fn section_controls(app: &App) -> Option<Element<'_, Message>> {
             .into(),
     )
 }
-fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
+/// The 3D view's toolbar, the simulation strip under it, and the strip's
+/// controls under that: Play and the timeline, the stats and Details, or
+/// what to do for a preview. The open details go above the controls, so
+/// that Details keeps its place.
+fn scene_panels(
+    app: &App,
+) -> (
+    Element<'_, Message>,
+    Element<'_, Message>,
+    Element<'_, Message>,
+) {
     let detail = if app.is_sample() && app.section_on {
         "Sample housing · selectable demo geometry · cutting through a face needs an imported part"
             .to_string()
@@ -2588,13 +2604,14 @@ fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
         };
         playback = playback.push(said);
     }
+    let mut controls = column![].spacing(8);
     // A generation under way, off the window's thread: how far it has got,
     // and Cancel.
     if let Some(generating) = generation_progress(app) {
-        playback = playback.push(generating);
+        controls = controls.push(generating);
     }
     if ready {
-        playback = playback.push(row![
+        controls = controls.push(row![
             btn(if app.playing || app.catching_up.is_some_and(|c| c.2) { "Pause" } else if app.progress >= 1. { "Replay" } else { "Play" }, Message::Play, app.playing),
             btn("Restart", Message::Scrub(0.), false),
             help::wrap(slider(0.0..=1.0, app.progress, Message::Scrub).on_release(Message::ScrubDone).step(0.001_f32).width(Fill), Help::text("Simulation progress", "Scrub forward or backward. Playback recomputes the remaining stock and cutter position at that time. Restart restores the stock left by all preceding enabled operations and setups."), widget::tooltip::Position::Top),
@@ -2604,11 +2621,11 @@ fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
             muted("×")
         ].spacing(8).align_y(Alignment::Center));
         if app.scrub_pending {
-            playback = playback.push(
+            controls = controls.push(
                 muted("A long toolpath: the stock catches up when the slider stops.").size(12),
             );
         } else if app.catching_up.is_some() {
-            playback = playback.push(muted("Replaying the toolpath to here…").size(12));
+            controls = controls.push(muted("Replaying the toolpath to here…").size(12));
         }
         if let Some(sim) = app.active_simulation() {
             // A slow stock update is said here while folded, as the Detail
@@ -2624,7 +2641,7 @@ fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
                 ))
                 .size(12),
             };
-            playback = playback.push(
+            controls = controls.push(
                 row![
                     container(summary.wrapping(Wrapping::None))
                         .width(Fill)
@@ -2639,7 +2656,7 @@ fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
             );
             // Cutting nothing is a warning, so it stays when folded.
             if folded && sim.air.is_some_and(|air| air.nothing) {
-                playback = playback.push(
+                controls = controls.push(
                     bold(
                         "Cuts nothing on the stock it starts from. Disable it, or keep it as a spring pass.",
                         12,
@@ -2753,10 +2770,11 @@ fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
         } else if app.is_sample() && app.operation().is_some_and(|o| o.enabled) {
             empty = empty.push(secondary("Generate sample preview", Message::Generate));
         }
-        playback = playback.push(empty);
+        controls = controls.push(empty);
     }
     let simulation = container(playback).padding([12, 16]).style(panel_style);
-    (toolbar.into(), simulation.into())
+    let controls = container(controls).padding([12, 16]).style(panel_style);
+    (toolbar.into(), simulation.into(), controls.into())
 }
 /// How long the stock mesher works before the strip says so: Play meshes
 /// the stock again for each frame, mostly in well under this.

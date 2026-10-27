@@ -16999,18 +16999,56 @@ soft_max = 180.0
                 content.height > panels.height,
                 "{size:?}: nothing to scroll"
             );
-            // The column the view shares with the panels.
+            // The column the view shares with the panels and, under them,
+            // the strip's controls (LIO-310).
             let shared = (laid.boxes.iter())
                 .filter(|b| {
                     (b.x - panels.x).abs() < 0.5
                         && b.y < panels.y
-                        && (b.y + b.height - panels.y - panels.height).abs() < 0.5
+                        && b.y + b.height > panels.y + panels.height
                 })
                 .min_by(|p, q| p.height.total_cmp(&q.height))
                 .unwrap();
             let view = panels.y - shared.y;
             let frame = crate::ui::scene_frame(shared.height);
             assert!(view >= frame - 0.5, "{size:?}: view {view} frame {frame}");
+        }
+    }
+    /// At the smallest window, the folded strip of an operation Run refuses
+    /// keeps Play and the Details line in sight under the 3D view: only the
+    /// panels above them scroll (LIO-310).
+    #[test]
+    fn a_refused_run_check_keeps_play_in_sight_at_the_smallest_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_on(dir.path(), LIMITED);
+        a.doc.adopt_holders();
+        a.smoke_dir = Some(dir.path().to_path_buf());
+        a.page = Page::Work;
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        let _ = a.update(Message::SetClamps("-X:0;+X:0;-Y:0;+Y:0".into()));
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Generate);
+        let _ = a.refresh_ready();
+        assert!(!a.sim_details && !crate::ui::run_check(&a).unwrap().2);
+        let size = crate::MIN_WINDOW;
+        let laid = laid_out(&a, size);
+        let find = |words: &str| {
+            (laid.texts.iter())
+                .find(|(t, _)| t == words)
+                .unwrap_or_else(|| panic!("no {words:?}"))
+                .1
+        };
+        let hint = find("Drag to orbit · right-drag to pan · scroll to zoom");
+        let (panels, content) = *(laid.scrolls.iter())
+            .find(|(_, content)| content.contains(hint.center()))
+            .unwrap();
+        assert!(content.height > panels.height, "nothing scrolls");
+        for words in ["Play", "Details"] {
+            let at = find(words);
+            assert!(
+                at.y >= panels.y + panels.height && at.y + at.height <= size.height,
+                "{words} at {at:?}, panels {panels:?}"
+            );
         }
     }
     /// The playback percentage says "44%", not "044%", and is as wide at
