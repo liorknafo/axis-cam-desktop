@@ -923,7 +923,7 @@ impl Run {
                 None => (self.next, self.from) = (programs.len(), 0),
             }
         }
-        self.open = Some(oi).filter(|_| count > 1);
+        self.open = (count > 1).then_some(oi);
     }
 
     /// Whether Stop after step stops the running tool run now (`stop_after`
@@ -4300,7 +4300,7 @@ mod tests {
         let clear: Vec<Option<f32>> = (p.indexes.iter()).map(|&oi| Some(of(oi).clear)).collect();
         let marks = step_marks(&p.blocks, &clear);
         for (k, &oi) in p.indexes.iter().enumerate() {
-            let last = marks.iter().flatten().filter(|m| m.0 == k).last().unwrap();
+            let last = marks.iter().flatten().rfind(|m| m.0 == k).unwrap();
             assert_eq!(last.1 + 1, of(oi).steps.len(), "operation {oi}");
             assert!(
                 last.2,
@@ -4405,6 +4405,106 @@ mod tests {
                 .count()
         };
         assert!(ops(&skipped[0]) < ops(full));
+    }
+
+    /// The journal of where a run stopped (LIO-275) is written and read
+    /// back whole; picked with its setup, it makes the step after the one
+    /// done the start once its operation's program is the one it stopped
+    /// in, and unfolds its steps; changed, it says so and starts nothing.
+    #[test]
+    fn a_journal_resumes_its_unchanged_program_only() {
+        let (doc, _) = fixture::job();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("uc100").join("m-journal.json");
+        let steps = |fingerprint| {
+            let step = Step {
+                moves: 0..1,
+                z: Some(5.),
+                seconds: 1.,
+            };
+            Left {
+                steps: vec![OpSteps {
+                    op: 0,
+                    clear: 15.,
+                    hole: false,
+                    steps: vec![step; 3],
+                    fingerprint,
+                }],
+                ..Default::default()
+            }
+        };
+        let fresh = |left: &Left| {
+            let mut run = Run::new(&doc, 0, 0);
+            run.checked_as(
+                Arc::new(Ok(vec![program()])),
+                Some(Arc::new(left.clone())),
+                None,
+            );
+            run
+        };
+        let run = fresh(&steps(7));
+        let stopped = Stopped {
+            op: 0,
+            last: Some(0),
+            up: None,
+            why: "Stop after step".into(),
+        };
+        let journal = run
+            .journal_of(&stopped, 0, [1., 2., 3., 0., 0., 0.])
+            .unwrap();
+        assert_eq!((journal.steps, journal.fingerprint), (3, 7));
+        journal.write(&path).unwrap();
+        let read = Journal::read(&path).unwrap();
+        assert_eq!(read, journal);
+        // Unchanged: level 2 is the start, checked again first.
+        let mut run = Run::new(&doc, 0, 0);
+        run.journal = Some(read.clone());
+        run.checked_as(
+            Arc::new(Ok(vec![program()])),
+            Some(Arc::new(steps(7))),
+            None,
+        );
+        assert_eq!(run.start_step, Some((0, 1)));
+        assert!(run.recheck && run.programs.is_none() && run.resumed.is_some());
+        assert_eq!(run.open, Some(0));
+        // The answer keeps it.
+        run.checked_as(
+            Arc::new(Ok(vec![program()])),
+            Some(Arc::new(steps(7))),
+            None,
+        );
+        assert_eq!(run.at_step(), Some((0, 1)));
+        // Changed: nothing is picked, and that is said.
+        let mut run = Run::new(&doc, 0, 0);
+        run.journal = Some(read);
+        run.checked_as(
+            Arc::new(Ok(vec![program()])),
+            Some(Arc::new(steps(8))),
+            None,
+        );
+        assert_eq!((run.start_step, run.recheck), (None, false));
+        assert!(run.journal_note.as_ref().unwrap().contains("changed"));
+        assert_eq!(read_ago(), "3 h ago");
+    }
+
+    fn read_ago() -> String {
+        let j = Journal {
+            project: String::new(),
+            setup: String::new(),
+            setup_name: String::new(),
+            op: 0,
+            op_name: String::new(),
+            steps: 0,
+            step: None,
+            wcs: 0,
+            offset: [0.; 6],
+            tool: String::new(),
+            tool_label: String::new(),
+            time: 1000,
+            fingerprint: 0,
+            why: String::new(),
+        };
+        j.ago(1000 + 3 * 3600 + 60)
     }
 
     #[test]

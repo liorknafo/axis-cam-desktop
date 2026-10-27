@@ -2807,7 +2807,32 @@ flood = { pin = 8 }
         assert!(run_of(&a).programs.is_none());
         answer_skips(&mut a, 0);
         assert_eq!(run_of(&a).at_step(), Some((1, 1)));
-        let _ = R::Stop;
+        // Picked again, as in a new session: the journal picks hole 2, its
+        // steps unfolded, and the run bar says so.
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(run_of(&a).recheck && run_of(&a).programs.is_none());
+        answer_skips(&mut a, 0);
+        let run = run_of(&a);
+        assert_eq!((run.at_step(), run.open), (Some((1, 1)), Some(1)));
+        assert!(run.resumed.is_some());
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+            s.state == Some(uc100::controller::State::Idle)
+        });
+        let (line, _) = crate::ui::run_line(&a, conn(&a));
+        assert!(
+            line[0].0.starts_with("Start ") && line[0].0.ends_with(" at hole 2"),
+            "{line:?}"
+        );
+        // After the E-stop: the machine position too, before Cycle Start.
+        assert!(
+            problems(&a)
+                .iter()
+                .any(|p| p.contains("no machine position")),
+            "{:?}",
+            problems(&a)
+        );
     }
 
     /// Cycle Start runs the operations a run does not skip: with the Pocket
@@ -3290,6 +3315,21 @@ flood = { pin = 8 }
         // The tick's phase change opens the tab once no field has the focus.
         let _ = a.update(Message::ControlPhaseTab(T::ToolChange, false));
         shot(&mut a, "06-tool-change");
+        // Resume (LIO-275): where a run stopped, after hole 2 of the Drill,
+        // kept in the journal; the setup picked again, as in a new session.
+        a.control.as_mut().unwrap().run.as_mut().unwrap().stopped = Some(crate::run::Stopped {
+            op: 3,
+            last: Some(1),
+            up: None,
+            why: "Stop after step".into(),
+        });
+        let _ = a.update(Message::Tick);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_with_stock(&mut a, dir.path(), 0);
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((3, 2)));
+        let _ = a.update(Message::ControlPhaseTab(T::Start, false));
+        shot(&mut a, "08-resume");
         let _ = a.update(Message::Disconnect);
         // A machine with the rotary unit: A in the position, jog and tabs.
         let dir = tempfile::tempdir().unwrap();

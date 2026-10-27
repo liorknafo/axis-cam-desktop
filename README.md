@@ -1245,6 +1245,13 @@ bar, at once when that machine is connected, or when you press
    machine is disconnected or the app closed mid-run; a tool run that ends
    done removes it. The step after the last one done becomes the start (the
    next operation after an operation's last step), checked again first.
+   Picking the setup again, in this session or the next, reads it: if the
+   operation's program is the one it stopped in, its steps unfold with that
+   step "starts here", the run bar says **Start <operation> at <step>** and
+   the **Start at a step** tab says when and why it stopped, with the checks
+   above (the machine position, the work zero it was cut with, said when the
+   offset now differs from the one recorded, and the tool's Z). A changed
+   program picks nothing and says so under the Operations list.
 4. Between tool runs with different tools, the **Tool change** tab opens
    with the steps: the last one ended with the spindle and coolant off at the setup's
    clearance plane. Touch the old tool

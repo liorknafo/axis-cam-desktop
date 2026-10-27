@@ -9233,6 +9233,17 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
     };
     let mut col =
         column![bold(format!("▶ Start {} at {step}", o.name), 14).wrapping(wrap)].spacing(8);
+    if let Some(j) = (run.resumed.as_ref()).filter(|j| j.op == oi && j.step == Some(n - 1)) {
+        col = col.push(
+            text(format!(
+                "It stopped after {before} {} ({}), and the program is unchanged, so {step} is picked for you. Pick another step in the Operations list if you like: the checks are the same.",
+                j.ago(crate::run::now()),
+                j.why
+            ))
+            .size(12)
+            .color(MUTED),
+        );
+    }
     let idle = |a: Action| c.idle().then_some(Message::Machine(a));
     // 1. The machine position, which the work zero is kept in.
     let placed = (0..3).all(|a| s.referenced[a]);
@@ -9268,6 +9279,9 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
     // 2. The work zero the steps before were cut with.
     let manual = run.running.is_none() && c.manual();
     let offset = &p.offset;
+    let recorded = (run.resumed.as_ref())
+        .filter(|j| j.op == oi)
+        .filter(|j| (0..3).any(|a| (j.offset[a] - s.work_offset[a]).abs() > 1e-3));
     let mut two = column![
         text(format!(
             "Work zero {offset}, the one {before} was cut with: keep it, or set it again on the stock the steps left."
@@ -9275,6 +9289,21 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
         .size(12)
     ]
     .spacing(6);
+    if let Some(j) = recorded {
+        two = two.push(
+            text(format!(
+                "{offset} is not the work offset recorded when it stopped: X {:.3} Y {:.3} Z {:.3} then, X {:.3} Y {:.3} Z {:.3} now.",
+                j.offset[0],
+                j.offset[1],
+                j.offset[2],
+                s.work_offset[0],
+                s.work_offset[1],
+                s.work_offset[2]
+            ))
+            .size(12)
+            .color(AMBER),
+        );
+    }
     two = two.push(
         row![
             small(
@@ -10695,6 +10724,9 @@ pub(crate) fn program<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
     }
     if let Some(State::Paused(reason)) = state {
         checks = checks.push(note(format!("Paused: {reason}")));
+    }
+    if let Some(n) = &run.journal_note {
+        checks = checks.push(note(n.clone()));
     }
     if let Some((ok, message)) = &run.outcome {
         checks = checks.push(

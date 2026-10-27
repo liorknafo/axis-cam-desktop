@@ -6046,7 +6046,11 @@ impl App {
                     return Task::none();
                 }
                 self.run_epoch += 1;
-                c.run = Some(run::Run::new(&self.doc, si, self.run_epoch));
+                // Where a run of it stopped, picked once it is checked.
+                let journal = c.journal().filter(|j| j.setup == self.doc.setups[si].id);
+                let mut r = run::Run::new(&self.doc, si, self.run_epoch);
+                r.journal = journal;
+                c.run = Some(r);
                 // A spot picked to probe from was for the setup before.
                 c.probe_spot = None;
                 // The setup picked to run is the one the 3D views show.
