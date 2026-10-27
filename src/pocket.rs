@@ -796,13 +796,19 @@ pub fn is_sloped(setup: &Setup, mesh: &Mesh, id: usize) -> bool {
 pub const LEVEL: f32 = 0.999_961_9;
 /// The selected sloped faces `ids`, one group that touches, as `setup`
 /// places the part (mm): their outline seen from above, and the heights of
-/// the floors they are cleared as, evenly from their lowest point up, at
-/// most `stepdown` apart, to under their highest.
+/// the floors they are cleared as: their lowest point, and over it, to
+/// under their highest, those whose targets (`offset` over them) are a
+/// whole number of stepdowns under the cutting top (`top`). The floors are
+/// at most `stepdown` apart, and the floors of every sloped face are at the
+/// same heights, so `banded` makes no thin bands between one face's and
+/// another's, each cut as a level of its own.
 fn slope_floors(
     setup: &Setup,
     mesh: &Mesh,
     ids: &[usize],
+    top: f32,
     stepdown: f32,
+    offset: f32,
 ) -> Result<(Region, Vec<f32>), String> {
     let placement = Placement::new(mesh, Some(setup));
     let scale = mesh.display_scale();
@@ -827,10 +833,16 @@ fn slope_floors(
     if loops.is_empty() {
         return Err("The selected sloped face has no usable XY area.".into());
     }
-    let steps = ((high - low) / stepdown).ceil().max(1.);
-    let planes = (0..steps as usize)
-        .map(|k| low + (high - low) * k as f32 / steps)
-        .collect();
+    let mut planes = vec![low];
+    for k in 1.. {
+        let plane = top - k as f32 * stepdown - offset;
+        if plane <= low + 0.001 {
+            break;
+        }
+        if plane < high - 0.0001 {
+            planes.push(plane);
+        }
+    }
     Ok((outline(&region(loops)?), planes))
 }
 /// Where triangle `p` crosses the height `z`: the points on its two edges
@@ -2121,7 +2133,7 @@ fn floor_job(
     // stepdown, for a finishing pass. A floor too narrow for this tool is
     // left, as a corner is.
     for group in surface::connected(mesh, &sloped) {
-        let (area, planes) = slope_floors(setup, mesh, &group, stepdown)?;
+        let (area, planes) = slope_floors(setup, mesh, &group, top, stepdown, bottom + axial)?;
         // Grown by the keep-out, so the tool reaches the slope's foot from
         // past it, where the lowest floor stands.
         let area = area.inflate(inset, JoinType::Round, EndType::Polygon, 2.);

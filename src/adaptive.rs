@@ -2530,6 +2530,52 @@ mod tests {
                 && (m.to[2] - dz - z).abs() < 0.001));
         }
     }
+    /// Two ramps of different heights picked together share their floors'
+    /// heights, a stepdown apart from the stock top: each cut is at one of
+    /// them or at a ramp's foot, with no thin band between one ramp's
+    /// floors and the other's.
+    #[test]
+    fn ramps_of_different_heights_are_cut_at_the_same_levels() {
+        // Level at Z 4 to X −5, and a ridge at Z 4 along Y 0 between two
+        // ramps: down to Z 0 at X 5 on the south, to Z 1 on the north.
+        let mut tris = vec![];
+        quad(&mut tris, -15., -12., -5., 12., 4.);
+        quad(&mut tris, -5., -1., 5., 1., 4.);
+        for (y0, y1, foot) in [(-12., -1., 0.), (1., 12., 1.)] {
+            quad(&mut tris, 5., y0, 15., y1, foot);
+            let (a, b, c, d) = ([-5., y0, 4.], [5., y0, foot], [5., y1, foot], [-5., y1, 4.]);
+            tris.extend([[a, b, c], [a, c, d]]);
+        }
+        quad(&mut tris, 5., -1., 15., 1., 4.);
+        quad(&mut tris, -15., -12., 15., 12., -4.);
+        let (setup, mut op, tool, mesh) = part(tris, &[], 4.);
+        let ramps: Vec<usize> = (mesh.surfaces.iter().enumerate())
+            .filter(|(_, s)| (0.9..0.99).contains(&s.normal[2]))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(ramps.len(), 2);
+        op.surfaces.as_mut().unwrap().ids = ramps;
+        op.p.insert("stepdown".into(), "1.5".into());
+        let dz =
+            stock::Placement::new(&mesh, Some(&setup)).bounds.min[2] / mesh.display_scale() + 4.;
+        for strategy in [Strategy::Adaptive, Strategy::Pocket] {
+            let mut op = op.clone();
+            op.strategy = strategy;
+            let plan = if strategy == Strategy::Adaptive {
+                generate(&setup, &op, &tool, &mesh)
+            } else {
+                crate::pocket::generate(&setup, &op, &tool, &mesh)
+            }
+            .unwrap_or_else(|e| panic!("{strategy:?}: {e}"));
+            let mut heights: Vec<f32> = (plan.moves.iter())
+                .filter(|m| m.cutting_pass && m.from[2] == m.to[2])
+                .map(|m| ((m.to[2] - dz) * 1000.).round() / 1000.)
+                .collect();
+            heights.sort_by(|a, b| b.total_cmp(a));
+            heights.dedup();
+            assert_eq!(heights, [2.5, 1., 0.], "{strategy:?}");
+        }
+    }
     #[test]
     fn a_ramp_is_cleared_in_steps_never_into_it() {
         // A 30 × 12 mm part: level at Z 4 to X −5, a ramp 21.8° down to Z 0
@@ -2942,10 +2988,12 @@ mod tests {
                 );
             }
         }
-        assert!(
-            left[0] < total,
-            "roughing cut nothing of the ramp: {left:?}"
-        );
+        // The roughing leaves steps up to a stepdown tall, over half a
+        // millimetre of stock somewhere on every triangle; the finishing
+        // takes only those.
+        let (rough, both) = (stocks[0].removed_volume(), stocks[1].removed_volume());
+        eprintln!("removed: {rough:.0} mm³ roughing, {both:.0} mm³ with the finishing");
+        assert!(rough > 0.8 * both, "{rough} of {both} mm³");
         assert_eq!(left.last(), Some(&0), "{left:?}");
     }
 }
