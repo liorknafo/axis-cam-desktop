@@ -10860,6 +10860,58 @@ soft_max = 180.0
         }
     }
 
+    /// The empty Work page's scroll bar, there only in a window too short for
+    /// the page, takes its own room beside the "Your workspace is empty"
+    /// panel rather than being drawn over its edge; where the page fits there
+    /// is no bar and the panel spans the whole width as before (LIO-329).
+    #[test]
+    fn the_empty_work_pages_scroll_bar_is_beside_its_panel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("w.json"), None);
+        a.page = Page::Work;
+        for (size, scrolls) in [
+            (iced::Size::new(1093., 536.), true),
+            (iced::Size::new(1093., 614.), true),
+            (iced::Size::new(1440., 900.), false),
+            (iced::Size::new(1920., 1040.), false),
+        ] {
+            let _ = a.update(Message::Resized(size));
+            let laid = laid_out(&a, size);
+            let heading = (laid.texts.iter())
+                .find(|(t, _)| t == "Your workspace is empty.")
+                .unwrap()
+                .1;
+            let (shown, content) = *(laid.scrolls.iter())
+                .find(|(b, _)| b.contains(heading.center()))
+                .unwrap_or_else(|| panic!("{size:?}: the page does not scroll"));
+            assert_eq!(content.height > shown.height + 0.5, scrolls, "{size:?}");
+            let right = shown.x + shown.width;
+            // The panel: within the scrollable, wider than its 730 column.
+            let panel = *(laid.boxes.iter())
+                .filter(|b| {
+                    b.width > 800.
+                        && b.contains(heading.center())
+                        && b.x >= shown.x - 0.5
+                        && b.x + b.width <= right + 0.5
+                })
+                .min_by(|p, q| p.width.total_cmp(&q.width))
+                .unwrap_or_else(|| panic!("{size:?}: no panel"));
+            if scrolls {
+                // The bar is 10 wide at the scrollable's right.
+                assert!(
+                    panel.x + panel.width <= right - 10. - 0.5,
+                    "{size:?}: the panel's right edge {} under the bar at {right}",
+                    panel.x + panel.width
+                );
+            } else {
+                assert!(
+                    (panel.x - shown.x).abs() < 0.5 && (panel.x + panel.width - right).abs() < 0.5,
+                    "{size:?}: {panel:?} not the whole of {shown:?}"
+                );
+            }
+        }
+    }
+
     /// The operation editor's Delete asks first, as a setup's does: Cancel
     /// keeps the operation, another selection closes the question, and
     /// Delete operation removes it. The question shows in place of the

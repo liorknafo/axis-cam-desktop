@@ -1261,9 +1261,12 @@ fn blank_project(app: &App) -> Element<'_, Message> {
             Message::RecoverPrevious,
         ));
     }
-    container(scrollable(
-        container(body).padding(28).width(Fill).style(panel_style),
-    ))
+    // As the Home page's (LIO-327): the embedded bar takes its own room beside
+    // the panel only while it shows, never the panel's edge (LIO-329).
+    container(
+        scrollable(container(body).padding(28).width(Fill).style(panel_style))
+            .spacing(SCROLLBAR_GUTTER - 10.),
+    )
     .padding(36)
     .center(Fill)
     .into()
