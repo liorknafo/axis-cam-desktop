@@ -1562,11 +1562,18 @@ type Member = (Zone, Region, f32);
 /// together down to the higher, and the lower on from there. A zone alone,
 /// or holding the others of its pocket, keeps its own centres; the same
 /// zones together in the band below go on down through it.
+///
+/// A height less than `thin` (the axial allowance) under the one above it
+/// is taken up to that one: a band that thin would clear the whole pocket
+/// again for a few hundredths of a millimetre (a hole's rim on a pad just
+/// over the floor round it). A floor is then left up to `thin` more than
+/// its allowance, never less.
 fn banded(
-    members: Vec<Member>,
+    mut members: Vec<Member>,
     above: &mut impl FnMut(f32) -> Result<Region, String>,
     reach: f64,
     keepout: f64,
+    thin: f32,
 ) -> Result<Vec<Zone>, String> {
     let shapes = (members.iter())
         .map(|m| m.0.centres.at(0.))
@@ -1574,6 +1581,23 @@ fn banded(
     let mut heights: Vec<f32> = members.iter().flat_map(|m| [m.0.top, m.0.target]).collect();
     heights.sort_by(|a, b| b.total_cmp(a));
     heights.dedup_by(|low, high| *high - *low < 0.001);
+    let mut up: Vec<(f32, f32)> = vec![];
+    let mut kept: Option<f32> = None;
+    for &h in &heights {
+        match kept {
+            Some(k) if k - h < thin => up.push((h, k)),
+            _ => kept = Some(h),
+        }
+    }
+    let raise = |z: f32| {
+        (up.iter())
+            .find(|(from, _)| (from - z).abs() < 0.001)
+            .map_or(z, |&(_, to)| to)
+    };
+    for (zone, _, _) in &mut members {
+        (zone.top, zone.target) = (raise(zone.top), raise(zone.target));
+    }
+    heights.retain(|h| !up.iter().any(|(from, _)| from == h));
     let mut cut: Vec<(Vec<usize>, Zone)> = vec![];
     for band in heights.windows(2) {
         let (high, low) = (band[0], band[1]);
@@ -2181,7 +2205,7 @@ fn floor_job(
         aboves.push((z, r.clone()));
         Ok(r)
     };
-    let zones = banded(members, &mut above, radius as f64, inset)?;
+    let zones = banded(members, &mut above, radius as f64, inset, axial)?;
     let deepest = zones.iter().map(|z| z.target).fold(f32::INFINITY, f32::min);
     if tool_length < flute_length || top - deepest >= tool_length {
         return Err("Pocket depth must be less than tool stickout, with stickout at least the flute length. Choose a tool with adequate reach.".into());
@@ -3351,6 +3375,43 @@ mod tests {
         // The report gives the floor a cutter of any size its wall allows.
         let ids = op.surfaces.as_ref().unwrap().ids.iter().copied().collect();
         assert_eq!(floor(&setup, &ids, &mesh).unwrap().largest(50.), 50.);
+    }
+    #[test]
+    fn floors_closer_than_the_axial_allowance_are_cleared_as_one_level() {
+        // Two floors side by side in a rim, at Z 0 and a pad 0.05 mm over
+        // it: with 0.2 mm left on them the lower is cut at the higher's
+        // height, not again over the whole pocket 0.05 mm under it.
+        let mut tris = vec![];
+        for (x, y, xx, yy) in [
+            (-20., -15., 20., -10.),
+            (-20., 10., 20., 15.),
+            (-20., -10., -15., 10.),
+            (15., -10., 20., 10.),
+        ] {
+            quad(&mut tris, x, y, xx, yy, 6.);
+        }
+        quad(&mut tris, -15., -10., -3., 10., 0.05);
+        quad(&mut tris, -3., -10., 15., 10., 0.);
+        quad(&mut tris, -20., -15., 20., 15., -4.);
+        let (setup, mut op, tool, mesh, dz) = part(tris, &[0., 0.05], 4.);
+        let levels = |op: &Operation| {
+            let plan = generate(&setup, op, &tool, &mesh).unwrap();
+            let mut zs: Vec<f32> = cutting(&plan).iter().map(|p| p[2] - dz).collect();
+            zs.sort_by(f32::total_cmp);
+            zs.dedup_by(|a, b| (*a - *b).abs() < 0.001);
+            zs
+        };
+        op.p.insert("axial_allowance".into(), "0.2".into());
+        let zs = levels(&op);
+        assert!((zs[0] - 0.25).abs() < 0.001, "{zs:?}");
+        assert!(!zs.iter().any(|z| (z - 0.2).abs() < 0.001), "{zs:?}");
+        // Without an allowance each floor is cut to its own height.
+        op.p.insert("axial_allowance".into(), "0".into());
+        let zs = levels(&op);
+        assert!(
+            (zs[0]).abs() < 0.001 && zs.iter().any(|z| (z - 0.05).abs() < 0.001),
+            "{zs:?}"
+        );
     }
     #[test]
     fn openings_are_cleared_over_or_cut_through_past_their_walls() {
