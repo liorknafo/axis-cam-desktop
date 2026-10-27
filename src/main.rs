@@ -146,7 +146,8 @@ const EDIT_PAUSE: Duration = Duration::from_millis(700);
 /// page's sidebars leave the 3D view `ui::VIEW_MIN` wide at the least
 /// (`ui::fitted`), and the Control page fits 690 px of height, what a 13"
 /// MacBook with larger text leaves. It opens no larger than its screen
-/// (`opening_window`).
+/// (`opening_window`), and on a screen narrower than `MIN_WINDOW` its least
+/// width is the screen's (`least_window`).
 pub(crate) const WINDOW: Size = Size::new(1440., 930.);
 pub(crate) const MIN_WINDOW: Size = Size::new(1120., 690.);
 /// What a screen's bars take from its height besides the window's content:
@@ -154,13 +155,21 @@ pub(crate) const MIN_WINDOW: Size = Size::new(1120., 690.);
 /// taskbar. A 13" MacBook's 900 points leave the window 790.
 const SCREEN_BARS: f32 = 110.;
 /// The window's size on a screen `monitor` large: `WINDOW`, made smaller
-/// where the screen is (never under `MIN_WINDOW`), or None where it fits.
+/// where the screen is (never under `MIN_WINDOW`'s height, nor its width
+/// on a screen that wide), or None where it fits.
 pub(crate) fn opening_window(monitor: Size) -> Option<Size> {
     let fits = Size::new(
-        WINDOW.width.min(monitor.width).max(MIN_WINDOW.width),
+        WINDOW.width.min(monitor.width),
         (WINDOW.height.min(monitor.height - SCREEN_BARS)).max(MIN_WINDOW.height),
     );
     (fits != WINDOW).then_some(fits)
+}
+/// The window's least size on a screen narrower than `MIN_WINDOW`: as wide
+/// as the screen, so the window's right side, the status bar's end among
+/// it, is never held past the screen's edge (LIO-309). None on a screen
+/// that wide.
+pub(crate) fn least_window(monitor: Size) -> Option<Size> {
+    (monitor.width < MIN_WINDOW.width).then_some(Size::new(monitor.width, MIN_WINDOW.height))
 }
 /// Sends the user to a URL in their browser; see `App::open_browser`.
 type BrowserOpener = std::sync::Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
@@ -6759,7 +6768,12 @@ impl App {
             Message::WindowOpened(id, size) => {
                 let _ = self.update(Message::Resized(size));
                 return iced::window::monitor_size(id).and_then(move |monitor| {
-                    opening_window(monitor).map_or(Task::none(), |s| iced::window::resize(id, s))
+                    let least = least_window(monitor)
+                        .map_or(Task::none(), |s| iced::window::set_min_size(id, Some(s)));
+                    least.chain(
+                        opening_window(monitor)
+                            .map_or(Task::none(), |s| iced::window::resize(id, s)),
+                    )
                 });
             }
             Message::PlanViewport(e) => steer(&mut self.plan_camera, &e),

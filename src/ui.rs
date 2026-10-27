@@ -14294,10 +14294,10 @@ mod tests {
     }
 
     /// The window opens no larger than its screen leaves it, and never
-    /// under its least size.
+    /// under its least size where the screen holds it.
     #[test]
     fn the_window_opens_no_larger_than_the_screen() {
-        use crate::{MIN_WINDOW, opening_window};
+        use crate::{MIN_WINDOW, least_window, opening_window};
         use iced::Size;
         assert_eq!(opening_window(Size::new(1920., 1080.)), None);
         assert_eq!(opening_window(Size::new(2560., 1440.)), None);
@@ -14312,9 +14312,20 @@ mod tests {
             opening_window(Size::new(1366., 768.)),
             Some(Size::new(1366., 690.))
         );
-        assert_eq!(opening_window(Size::new(800., 600.)), Some(MIN_WINDOW));
         let fits = opening_window(Size::new(1280., 800.)).unwrap();
         assert_eq!(fits, Size::new(1280., 690.));
+        // A screen narrower than the least window: the window is as wide as
+        // the screen and can be made no wider (LIO-309).
+        assert_eq!(
+            opening_window(Size::new(1000., 900.)),
+            Some(Size::new(1000., 790.))
+        );
+        assert_eq!(
+            least_window(Size::new(1000., 900.)),
+            Some(Size::new(1000., MIN_WINDOW.height))
+        );
+        assert_eq!(least_window(Size::new(1280., 800.)), None);
+        assert_eq!(least_window(MIN_WINDOW), None);
     }
 
     #[test]

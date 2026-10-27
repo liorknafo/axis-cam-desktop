@@ -17214,6 +17214,42 @@ soft_max = 180.0
             "{label:?}"
         );
     }
+    /// On a screen narrower than the least window the window opens as wide
+    /// as the screen (`least_window`), and there every page, MACHINE's
+    /// Control page among them, keeps the status bar's right-hand text whole
+    /// on one line inside it, a long status giving way, and lays out no
+    /// wider than the window (LIO-309).
+    #[test]
+    fn the_status_bars_right_side_stays_whole_in_a_window_a_small_screen_wide() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_on(dir.path(), FAST);
+        a.status = "Word ".repeat(100);
+        let screen = iced::Size::new(1000., 900.);
+        let size = crate::opening_window(screen).unwrap();
+        assert_eq!(size.width, screen.width);
+        for page in [
+            Page::Home,
+            Page::Work,
+            Page::Machines,
+            Page::Tools,
+            Page::Post,
+            Page::Control,
+        ] {
+            a.page = page;
+            let laid = laid_out(&a, size);
+            let (words, right) = (laid.texts.iter())
+                .find(|(t, _)| t.starts_with("mm  |"))
+                .unwrap_or_else(|| panic!("{page:?}: no units and post text"));
+            assert!(
+                right.x + right.width <= size.width - 14. + 0.5 && right.height < 20.,
+                "{page:?}: {words:?} at {right:?}"
+            );
+            assert!(
+                laid.boxes.iter().all(|b| b.x + b.width <= size.width + 0.5),
+                "{page:?}: laid out wider than the window"
+            );
+        }
+    }
     /// The workflow tabs' bar runs the width of the 3D view over it
     /// (LIO-305).
     #[test]
