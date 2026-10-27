@@ -361,14 +361,34 @@ pub const FEED_FOLLOWS: [&str; 2] = ["Programmed feed", "Hold the force per toot
 pub fn follows(op: &Operation, machine: &Machine) -> bool {
     offered(op.strategy, machine) && get(&op.p, "feed_follows") == FEED_FOLLOWS[1]
 }
-/// The strategies whose feed can follow the force on a tooth: the 2.5D
-/// clearing and profiling ones, whose nominal cut is a stepover by a
-/// stepdown, on a machine with a program (not a manual mill or a lathe).
+/// The strategies whose feed can follow the force on a tooth: every one a
+/// CNC mill cuts with a milling cutter's side and end, whose load `measure`
+/// works out: the 2.5D clearing and profiling ones, whose nominal cut is a
+/// stepover by a stepdown, Waterline, Parallel, Chamfer and Groove, on a
+/// machine with a program (not a manual mill or a lathe). Not Drill, Box
+/// (a manual mill's) or Turn, nor the 4th- and 5-axis ones.
 pub fn offered(strategy: Strategy, machine: &Machine) -> bool {
     matches!(
         strategy,
-        Strategy::Face | Strategy::Adaptive | Strategy::Pocket | Strategy::Contour
+        Strategy::Face
+            | Strategy::Adaptive
+            | Strategy::Pocket
+            | Strategy::Contour
+            | Strategy::Waterline
+            | Strategy::Parallel
+            | Strategy::Chamfer
+            | Strategy::Groove
     ) && !crate::manual::is_hand(machine)
+}
+/// Whether `strategy`'s automatic force is the one along its own path
+/// (`typical`), not a nominal cut's: a Parallel's, which follows the
+/// surface with no stepdown, a Chamfer's and a Groove's, whose cut is the
+/// edge's or the groove's, not a stepover by a stepdown.
+pub fn from_the_path(strategy: Strategy) -> bool {
+    matches!(
+        strategy,
+        Strategy::Parallel | Strategy::Chamfer | Strategy::Groove
+    )
 }
 /// Each feed a held operation's moves take is the programmed feed times a
 /// whole power of this: a new F word only where the feed wanted changes
@@ -397,7 +417,8 @@ pub struct NominalCut {
 }
 /// `op`'s nominal cut with `tool`: its stepover (a Pocket's and a Facing's
 /// in % of the diameter, an Adaptive's optimal load) by its stepdown, or a
-/// full slot as deep as its stepdown where it has no stepover (a Contour);
+/// full slot as deep as its stepdown where it has no stepover (a Contour, a
+/// Waterline: a loop at each level, round what stands above it);
 /// no deeper than `level`, the depth its levels cut (`level_depth`), where
 /// that is known, nor than the flutes. None for a strategy whose feed
 /// cannot follow the load (`offered`), or without the numbers.
@@ -410,7 +431,7 @@ pub fn nominal_cut(op: &Operation, tool: &Tool, level: Option<f32>) -> Option<No
             Some(positive(&op.p, "stepover")? / 100. * 2. * radius)
         }
         Strategy::Adaptive => Some(positive(&op.p, "optimal_load")?),
-        Strategy::Contour => None,
+        Strategy::Contour | Strategy::Waterline => None,
         _ => return None,
     };
     let milling = if op.strategy == Strategy::Face {
@@ -531,16 +552,23 @@ pub fn nominal(
 }
 /// The force on one tooth `op`'s feed holds (`follows`), N: the one typed
 /// in, else the one at its programmed feed on its nominal cut
-/// (`nominal_cut`, its levels `level` deep where that is known); with
-/// whether it is that automatic one.
+/// (`nominal_cut`, its levels `level` deep where that is known), or, for a
+/// strategy without one (`from_the_path`), the one along most of its path
+/// as programmed (`typical`, once `path` is measured); with whether it is
+/// that automatic one.
 pub fn target(
     op: &Operation,
     tool: &Tool,
     material: Option<&Material>,
     level: Option<f32>,
+    path: Option<(&Plan, &ToothLoad)>,
 ) -> Option<(f32, bool)> {
     if let Some(typed) = num(&op.p, "tooth_force").filter(|f| *f > 0.) {
         return Some((typed, false));
+    }
+    if from_the_path(op.strategy) {
+        let (plan, load) = path?;
+        return typical(plan, load).map(|force| (force, true));
     }
     let positive = |p, key| num(p, key).filter(|v| *v > 0.);
     let force = nominal(
@@ -551,6 +579,26 @@ pub fn target(
         material,
     )?;
     (force > 0.).then_some((force, true))
+}
+/// The force on one tooth along most of `plan`'s path where a tooth meets
+/// material (`load`): the median over the length cut, N. None where no
+/// tooth does.
+fn typical(plan: &Plan, load: &ToothLoad) -> Option<f32> {
+    let mut cut: Vec<(f32, f32)> = (plan.moves.iter().zip(&load.moves))
+        .flat_map(|(m, forces)| {
+            let piece = distance(m.from, m.to) / forces.len().max(1) as f32;
+            (forces.iter().filter(|f| **f > 0.)).map(move |&f| (f, piece))
+        })
+        .collect();
+    cut.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let half = cut.iter().map(|c| c.1).sum::<f32>() / 2.;
+    let mut along = 0.;
+    cut.into_iter()
+        .find(|c| {
+            along += c.1;
+            along >= half
+        })
+        .map(|c| c.0)
 }
 
 /// What holding the force on a tooth made of an operation's feeds
@@ -599,11 +647,12 @@ pub fn hold(
         return Ok(());
     };
     let material = doc.selected_material();
-    let (Some(flutes), Some(rpm), Some(feed), Some(_)) = (
+    // A target from the path is known once it is measured.
+    let (Some(flutes), Some(rpm), Some(feed), true) = (
         positive(&tool.p, "flutes"),
         positive(&op.p, "rpm"),
         positive(&op.p, "feed"),
-        target(op, tool, material, None),
+        from_the_path(op.strategy) || target(op, tool, material, None, None).is_some(),
     ) else {
         return Ok(());
     };
@@ -669,8 +718,14 @@ pub fn hold(
             load
         }
     };
-    // The nominal cut as deep as the levels that cut are.
-    let Some((target, _)) = target(op, tool, material, level_depth(&sim.plan, &load)) else {
+    // The nominal cut as deep as the levels that cut are, or the path's.
+    let Some((target, _)) = target(
+        op,
+        tool,
+        material,
+        level_depth(&sim.plan, &load),
+        Some((&sim.plan, &load)),
+    ) else {
         return Ok(());
     };
     let refed = refeed(
@@ -1476,6 +1531,99 @@ mod tests {
         let load = pocket.tooth_load.as_ref().unwrap();
         assert_eq!(load.moves.len(), pocket.plan.moves.len());
         assert!(load.peak > 0.5 * h.target);
+    }
+    #[test]
+    fn every_cnc_milling_strategy_offers_the_held_feed() {
+        let mill = Machine::new(3);
+        for s in [
+            Strategy::Face,
+            Strategy::Adaptive,
+            Strategy::Pocket,
+            Strategy::Contour,
+            Strategy::Waterline,
+            Strategy::Parallel,
+            Strategy::Chamfer,
+            Strategy::Groove,
+        ] {
+            assert!(offered(s, &mill), "{s:?}");
+            assert!(!offered(s, &crate::manual::defaults()), "{s:?}");
+        }
+        for s in [
+            Strategy::Drill,
+            Strategy::Box,
+            Strategy::Turn,
+            Strategy::Scallop,
+            Strategy::Indexed,
+            Strategy::Rotary,
+            Strategy::FiveAxis,
+        ] {
+            assert!(!offered(s, &mill), "{s:?}");
+        }
+    }
+    #[test]
+    fn the_paths_force_is_the_median_over_the_length_cut() {
+        // 10 mm at 100 N in two pieces, then 30 mm in three: one in the
+        // air, 10 mm at 20 N and 10 mm at 300 N.
+        let plan = crate::post::fixture::plan(
+            [0., 0., 0.],
+            &[
+                (Motion::Feed, [10., 0., 0.], 600.),
+                (Motion::Feed, [40., 0., 0.], 600.),
+            ],
+        );
+        let load = |second: Vec<f32>| ToothLoad {
+            moves: vec![vec![100., 100.], second],
+            facing: vec![vec![1.; 2], vec![1.; 3]],
+            peak: 300.,
+        };
+        assert_eq!(typical(&plan, &load(vec![0., 20., 300.])), Some(100.));
+        // By length, not by sample: 10 mm at 100 N, 20 mm at 20 N.
+        assert_eq!(typical(&plan, &load(vec![0., 20., 20.])), Some(20.));
+        let air = ToothLoad {
+            moves: vec![vec![0.; 2], vec![0.; 3]],
+            ..load(vec![])
+        };
+        assert_eq!(typical(&plan, &air), None);
+    }
+    #[test]
+    fn a_held_waterline_holds_a_full_slots_force_and_a_parallel_its_paths() {
+        let (mut doc, mesh) = crate::post::fixture::job();
+        // The Face, then the Parallel and the Waterline.
+        for (k, op) in doc.setups[0].operations.iter_mut().enumerate() {
+            op.enabled = matches!(k, 0 | 4 | 5);
+            op.p.insert("stepdown".into(), "3".into());
+        }
+        let run = |doc: &Document| {
+            let mut sims = vec![];
+            crate::simulation::sequence(doc, &mesh, None, |_, _, r| sims.push(r.unwrap()));
+            sims
+        };
+        let programmed = run(&doc);
+        assert!(programmed.iter().all(|s| s.held.is_none()));
+        for op in &mut doc.setups[0].operations[4..] {
+            op.p.insert("feed_follows".into(), FEED_FOLLOWS[1].into());
+        }
+        let held = run(&doc);
+        let ops = &doc.setups[0].operations;
+        let tool = |op: &Operation| doc.tools.iter().find(|t| t.id == op.tool).unwrap();
+        for (k, sim) in [(4, &held[1]), (5, &held[2])] {
+            let h = sim.held.unwrap_or_else(|| panic!("{:?}", ops[k].strategy));
+            assert!(h.slowest < h.fastest, "{:?} {h:?}", ops[k].strategy);
+            assert!(sim.plan.moves.len() > programmed[k - 3].plan.moves.len());
+        }
+        // The Parallel's target: the force along most of its path as
+        // programmed.
+        let parallel = of(&programmed[1], &doc).unwrap();
+        let want = typical(&programmed[1].plan, &parallel).unwrap();
+        assert_eq!(held[1].held.unwrap().target, want);
+        // The Waterline's: a full slot as deep as its levels, at most its
+        // 3 mm stepdown.
+        let slot = nominal_cut(&ops[5], tool(&ops[5]), None).unwrap();
+        assert_eq!((slot.width, slot.depth), (None, 3.));
+        let material = doc.selected_material();
+        let (full, _) = target(&ops[5], tool(&ops[5]), material, None, None).unwrap();
+        let target = held[2].held.unwrap().target;
+        assert!(target > 0. && target <= full * 1.001, "{target} vs {full}");
     }
     #[test]
     fn colours_run_from_blue_to_red() {

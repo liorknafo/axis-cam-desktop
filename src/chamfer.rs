@@ -1692,4 +1692,39 @@ mod tests {
         });
         assert!(level);
     }
+    #[test]
+    fn a_held_chamfer_holds_its_paths_force_and_plunges_no_faster() {
+        let (mut doc, mesh) = crate::post::fixture::job();
+        let spot = mill("90", "0");
+        let mut op = chamfer(
+            &spot,
+            &[
+                ("chamfer_source", "Line"),
+                ("from_x", "-5"),
+                ("to_x", "5"),
+                ("line_z", "0"),
+                ("chamfer_size", "Tip depth"),
+                ("tip_z", "-1"),
+            ],
+        );
+        op.p.insert(
+            "feed_follows".into(),
+            crate::tooth_load::FEED_FOLLOWS[1].into(),
+        );
+        doc.tools.push(spot);
+        doc.setups[0].operations = vec![op];
+        let mut sims = vec![];
+        crate::simulation::sequence(&doc, &mesh, None, |_, _, r| sims.push(r.unwrap()));
+        let h = sims[0].held.expect("held");
+        assert!(h.target > 0., "{h:?}");
+        // The plunge to the tip, at F75, is never fed faster; the level
+        // pass takes about the force held.
+        for m in sims[0].plan.moves.iter().filter(|m| m.cutting_pass) {
+            if m.to[2] < m.from[2] - 1e-4 {
+                assert!(m.feed <= 75., "{m:?}");
+            }
+        }
+        let load = sims[0].tooth_load.as_ref().unwrap();
+        assert!(load.peak > 0.5 * h.target && load.peak < 2. * h.target);
+    }
 }

@@ -5676,6 +5676,35 @@ flood = { pin = 8 }
         );
         shows(&a, &[said.as_str()]);
     }
+    #[test]
+    fn a_waterline_and_a_parallel_offer_the_held_feed_with_their_automatic_force() {
+        use crate::tooth_load::FEED_FOLLOWS;
+        let dir = tempfile::tempdir().unwrap();
+        // The fixture's Face, then its Parallel or its Waterline.
+        for (op, automatic) in [
+            (
+                4,
+                "Automatic: the force one tooth takes along most of the path",
+            ),
+            (
+                5,
+                "Automatic: one tooth's force at the cutting feed on the nominal cut, a full slot",
+            ),
+        ] {
+            let mut a = run_app_of(dir.path(), FAST, &[0, op]);
+            a.page = Page::Work;
+            let _ = a.update(Message::SelectOp(1));
+            let _ = a.update(Message::Tab("Tool".into()));
+            shows(&a, &["Feed along the path"]);
+            let _ = a.update(Message::Edit(
+                Target::Operation,
+                "feed_follows",
+                FEED_FOLLOWS[1].into(),
+            ));
+            let texts = page_texts(&a);
+            assert!(texts.iter().any(|t| t.starts_with(automatic)), "{texts:?}");
+        }
+    }
     /// Renders the fixture job's Pocket, its path coloured by the force on
     /// one tooth (`tooth_load`), from above and from the front, partway and
     /// done, to $AXIS_RENDER_DIR (/tmp/tooth-load-renders), and says how long

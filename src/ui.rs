@@ -2980,6 +2980,10 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     ));
                     let tool = app.doc.tools.iter().find(|tool| tool.id == o.tool);
                     let automatic = tool.and_then(|tool| {
+                        // No nominal cut: the force along the path, once measured.
+                        if crate::tooth_load::from_the_path(o.strategy) {
+                            return Some("Automatic: the force one tooth takes along most of the path at the cutting feed, measured when the operation is generated. The simulation says the force held.".into());
+                        }
                         let cut = crate::tooth_load::nominal_cut(o, tool, None)?;
                         let force = crate::tooth_load::nominal(
                             &cut,

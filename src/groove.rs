@@ -908,6 +908,26 @@ pub(crate) mod tests {
         assert_eq!(sim.plan.neck, Some([5., 20., 6.]));
     }
     #[test]
+    fn a_held_groove_feeds_its_second_passes_thin_band_faster() {
+        // The first pass takes 1.2 mm of the 1.3 mm groove, the second the
+        // 0.1 mm left: holding the force along most of the path feeds the
+        // second faster.
+        let tool = keyseat(25., 1.2, 10., 20.);
+        let (programmed, _, _) = plate_groove(tool.clone(), |_| {});
+        let (held, _, _) = plate_groove(tool, |op| {
+            op.p.insert(
+                "feed_follows".into(),
+                crate::tooth_load::FEED_FOLLOWS[1].into(),
+            );
+        });
+        let (programmed, held) = (programmed.unwrap(), held.unwrap());
+        assert!(programmed.held.is_none());
+        let h = held.held.expect("held");
+        assert!(h.target > 0. && h.slowest < h.fastest, "{h:?}");
+        // Its circle is short moves: each takes one feed, timed again.
+        assert!(held.plan.duration != programmed.plan.duration);
+    }
+    #[test]
     fn passes_cover_a_groove_wider_than_the_head() {
         let g = |w: f32| Groove {
             radius: 17.,
