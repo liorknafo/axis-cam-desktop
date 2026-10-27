@@ -7194,6 +7194,8 @@ pub enum ControlTab {
     Job,
     /// The manual tool change between tool runs, while one is due.
     ToolChange,
+    /// The checks before a start at a step (LIO-275), while one is picked.
+    Start,
     WorkZero,
     Probe,
     /// Rotary A's calibration, on a machine with the rotary unit.
@@ -7207,6 +7209,7 @@ impl ControlTab {
         match self {
             ControlTab::Job => "Job",
             ControlTab::ToolChange => "Tool change",
+            ControlTab::Start => "Start at a step",
             ControlTab::WorkZero => "Work zero",
             ControlTab::Probe => "Probe",
             ControlTab::Rotary => "Rotary A",
@@ -7224,12 +7227,15 @@ pub enum Phase {
     Cutting,
     /// The next tool run wants another tool (`run::Run::tool_change`).
     ToolChange,
+    /// Cycle Start starts at a step (`run::Run::at_step`).
+    Start,
 }
 /// The phase of the machine connected, if any.
 pub(crate) fn phase(c: Option<&crate::control::Connection>) -> Phase {
     match c.and_then(|c| c.run.as_ref()) {
         Some(r) if r.running.is_some() => Phase::Cutting,
         Some(r) if r.tool_change().is_some() => Phase::ToolChange,
+        Some(r) if r.at_step().is_some() => Phase::Start,
         _ => Phase::Idle,
     }
 }
@@ -7866,14 +7872,15 @@ pub(crate) fn run_line(
         }
         (None, Some(p)) => {
             let o = &p.ops[run.from.min(p.ops.len() - 1)];
-            vec![(
-                format!(
+            let line = match run.at_step() {
+                Some((oi, n)) => format!("Start {} at {}", o.name, run.step_label(oi, n)),
+                None => format!(
                     "Next: {} · {}",
                     o.name,
                     crate::model::tool_label(o.tool, &o.tool_name)
                 ),
-                INK,
-            )]
+            };
+            vec![(line, INK)]
         }
         (None, None) => vec![],
     };
@@ -8699,8 +8706,10 @@ fn control_tab<'a>(tab: ControlTab, shown: bool, alert: bool, fit: Fit) -> Eleme
 /// on a machine with the rotary unit.
 pub(crate) fn control_tabs(c: &crate::control::Connection) -> Vec<ControlTab> {
     let mut tabs = vec![ControlTab::Job];
-    if phase(Some(c)) == Phase::ToolChange {
-        tabs.push(ControlTab::ToolChange);
+    match phase(Some(c)) {
+        Phase::ToolChange => tabs.push(ControlTab::ToolChange),
+        Phase::Start => tabs.push(ControlTab::Start),
+        _ => {}
     }
     tabs.extend([ControlTab::WorkZero, ControlTab::Probe]);
     if c.rotary.is_some() && c.axis(3) {
@@ -8720,7 +8729,8 @@ fn centre<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Me
     };
     let mut bar = Row::new().spacing(2).align_y(Alignment::End);
     for &t in &tabs {
-        bar = bar.push(control_tab(t, t == shown, t == ControlTab::ToolChange, fit));
+        let alert = matches!(t, ControlTab::ToolChange | ControlTab::Start);
+        bar = bar.push(control_tab(t, t == shown, alert, fit));
     }
     // Narrow, the view switcher leaves the tabs their room: it is in the
     // Job tab's foot.
@@ -8733,6 +8743,7 @@ fn centre<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Me
     let body: Element<_> = match shown {
         ControlTab::Job => job_tab(app, c),
         ControlTab::ToolChange => tool_change_tab(app, c),
+        ControlTab::Start => start_tab(app, c),
         ControlTab::WorkZero => work_zero_tab(app, c),
         ControlTab::Probe => probe_tab(c, fit),
         ControlTab::Rotary => rotary_tab(c).unwrap_or_else(|| space().into()),
@@ -9168,6 +9179,140 @@ fn tool_change_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Eleme
     tab_scroll(col)
 }
 
+/// The Start at a step tab (LIO-275): the checks before Cycle Start starts
+/// at a step, whether picked in the Operations list or where a run stopped
+/// (`run::Run::resumed`), each done or to do with its buttons: the machine
+/// position, the work zero the steps before were cut with, the tool's Z;
+/// and what Cycle Start then does.
+fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Message> {
+    use crate::control::Action;
+    use crate::run::Action as R;
+    let fit = Fit::of(app);
+    let Some(run) = c.run.as_ref() else {
+        return space().into();
+    };
+    let (Some((oi, n)), Some(p)) = (run.at_step(), run.checked().and_then(|c| c.get(run.next)))
+    else {
+        return muted("No start at a step is picked.").into();
+    };
+    let s = &c.snapshot;
+    let o = &p.ops[run.from.min(p.ops.len() - 1)];
+    let step = run.step_label(oi, n);
+    let before = run.step_label(oi, n - 1);
+    let wrap = if fit.narrow {
+        Wrapping::Word
+    } else {
+        Wrapping::None
+    };
+    let mut col =
+        column![bold(format!("▶ Start {} at {step}", o.name), 14).wrapping(wrap)].spacing(8);
+    let idle = |a: Action| c.idle().then_some(Message::Machine(a));
+    // 1. The machine position, which the work zero is kept in.
+    let placed = (0..3).all(|a| s.referenced[a]);
+    let mut one = column![
+        text(if placed {
+            "Machine position: X, Y and Z have theirs, which the work zero is kept in."
+        } else {
+            "Machine position: X, Y or Z has none (an E-stop or a new session clears it). Set it where it was, so that the work zero below is where it was:"
+        })
+        .size(12)
+    ]
+    .spacing(6);
+    if !placed {
+        let mut b = row![].spacing(6);
+        if c.home_switches() {
+            b = b.push(small("Home again", idle(Action::Home), false));
+        } else {
+            b = b
+                .push(small(
+                    "Set machine zero here",
+                    idle(Action::MachineZero(None)),
+                    false,
+                ))
+                .push(small(
+                    "Keep the last position",
+                    idle(Action::KeepPosition),
+                    false,
+                ));
+        }
+        one = one.push(b);
+    }
+    col = col.push(step_box(1, placed, !placed, one));
+    // 2. The work zero the steps before were cut with.
+    let manual = run.running.is_none() && c.manual();
+    let offset = &p.offset;
+    let mut two = column![
+        text(format!(
+            "Work zero {offset}, the one {before} was cut with: keep it, or set it again on the stock the steps left."
+        ))
+        .size(12)
+    ]
+    .spacing(6);
+    two = two.push(
+        row![
+            small(
+                "Keep it",
+                (manual && !run.zeroed).then_some(Message::Run(R::KeepZero)),
+                run.zeroed
+            ),
+            small(
+                "Probe the stock again",
+                Some(Message::ControlTab(ControlTab::WorkZero)),
+                false
+            ),
+        ]
+        .spacing(6),
+    );
+    col = col.push(step_box(2, run.zeroed, placed && !run.zeroed, two));
+    // 3. The tool's Z.
+    let tool = crate::model::tool_label(o.tool, &o.tool_name);
+    let kept = run.tool_kept || run.touched;
+    let three = column![
+        text(format!(
+            "{tool}'s Z: the same tool, not taken out since, or touched off again."
+        ))
+        .size(12),
+        row![
+            small(
+                "Same tool, keep Z",
+                (manual && !kept).then_some(Message::Run(R::KeepToolZ)),
+                run.tool_kept
+            ),
+            small(
+                "Set Z from reference",
+                (manual && run.reference.is_some() && run.reference_a_problem(c).is_none())
+                    .then_some(Message::Run(R::ZFromReference)),
+                run.touched
+            ),
+        ]
+        .spacing(6)
+    ]
+    .spacing(6);
+    col = col.push(step_box(3, kept, run.zeroed && !kept, three));
+    // 4. What Cycle Start does.
+    let over = (p.from(run.from).ok().into_iter().flatten()).find_map(|b| match b {
+        crate::post::Block::Descend { xy, .. } => Some(*xy),
+        _ => None,
+    });
+    let at = over.map_or(String::new(), |xy| {
+        format!(
+            " to X {:.1} Y {:.1}",
+            xy[0] - p.datum[0],
+            xy[1] - p.datum[1]
+        )
+    });
+    col = col.push(step_box(
+        4,
+        false,
+        false,
+        text(format!(
+            "Cycle Start: spindle on, rapid at the clearance plane{at}, down over the entry, then it waits there; Resume feeds in and cuts on from {step}."
+        ))
+        .size(12),
+    ));
+    tab_scroll(col)
+}
+
 /// The Work zero tab: each axis set to a value, the work system, the work
 /// zero on the stock for the setup picked, step by step until its first
 /// tool run, and the reference surface for its tool changes.
@@ -9438,7 +9583,7 @@ fn probe_tab(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
     };
     let mut setup_col = column![bold("Setup work zero, from its stock", 13)].spacing(6);
     if !spots.is_empty() {
-        setup_col = setup_col.push(probe_from_grid(c, spots));
+        setup_col = setup_col.push(probe_from_grid(c, &spots));
     }
     col = col.push(setup_col.push(setup_probe));
     // Features found where the tip is, without a setup.
@@ -9667,8 +9812,11 @@ fn stage_icon<'a>(stage: crate::run::Stage) -> Element<'a, Message> {
 /// stage, name and time, the part of it cut while it is cut, and `ends`
 /// after the time: Start here, which makes it the one Cycle Start begins
 /// with, and ⋯, its skips; or for one the run skips (`skipped`), Don't skip.
-/// `open`, its skips, takes the place of all but the stage. The picture of
-/// the stock it leaves, its strategy and tool are on hover.
+/// `open`, its skips, takes the place of its time and ends, its name kept,
+/// cut short. With steps (LIO-275), ▸ or ▾ before the name unfolds or folds
+/// them (`toggle`: whether they are unfolded, and the message), and `note`
+/// after it says how many. The picture of the stock it leaves, its strategy
+/// and tool are on hover.
 #[allow(clippy::too_many_arguments)]
 fn op_row<'a>(
     n: usize,
@@ -9681,6 +9829,7 @@ fn op_row<'a>(
     angles: Option<String>,
     cut: Option<f32>,
     skipped: Option<crate::run::Skip>,
+    steps: Option<(bool, Message, String)>,
     fit: Fit,
 ) -> Element<'a, Message> {
     use crate::run::{Skip, Stage};
@@ -9767,14 +9916,23 @@ fn op_row<'a>(
             .wrapping(Wrapping::None)
             .into(),
     };
+    let mut named = row![].spacing(4).align_y(Alignment::Center);
+    if let Some((unfolded, m, note)) = steps {
+        let toggle = button(text(if unfolded { "▾" } else { "▸" }).size(11).color(MUTED))
+            .padding([0, 2])
+            .on_press(m.clone())
+            .style(|_, _| button::Style::default());
+        named = named
+            .push(HelpButton::new(toggle, &m, note.clone()))
+            .push(name)
+            .push(text(note).size(10).color(MUTED).wrapping(Wrapping::None));
+    } else {
+        named = named.push(name);
+    }
+    let named = container(named).width(Fill).clip(true);
     let line = match open {
-        Some(open) => row![stage_icon(stage), open],
-        None => row![
-            stage_icon(stage),
-            container(name).width(Fill).clip(true),
-            time
-        ]
-        .extend(ends),
+        Some(open) => row![stage_icon(stage), named, open],
+        None => row![stage_icon(stage), named, time].extend(ends),
     }
     .spacing(if fit.narrow { 6 } else { 8 })
     .align_y(Alignment::Center)
@@ -9824,6 +9982,338 @@ fn op_row<'a>(
 }
 /// The size the Operations list's hover shows its picture of the stock at.
 const OP_PICTURE: (f32, f32) = (150., 112.5);
+
+/// What the step list of an operation in the Operations list shows with:
+/// the operation's stage and estimated seconds, the setup's work zero (plan
+/// Z), whether steps can be picked, and how many lines it may take.
+struct StepsShown {
+    stage: crate::run::Stage,
+    op_time: Option<f32>,
+    datum: f32,
+    may: bool,
+    lines: usize,
+}
+
+/// How many lines an operation's step list may take so that the Operations
+/// list does not scroll (LIO-275): what the card leaves under its head, the
+/// tool runs' headings and operations' rows (`listed`), the picked steps'
+/// buttons and room for the checks under the list. Three at the least.
+fn step_budget(app: &App, (runs, ops): (usize, usize), picked: bool) -> usize {
+    let fit = Fit::of(app);
+    let card = app.window_height
+        - fit.machine_bar()
+        - fit.run_bar()
+        - 26.
+        - 2. * fit.gap()
+        - 2. * fit.pad()
+        - 30.;
+    let row = if fit.short { 32. } else { 34. };
+    let used = ops as f32 * row + runs as f32 * 26. + if picked { 64. } else { 0. } + 96.;
+    (((card - used) / STEP_LINE).floor() as usize).clamp(3, 16)
+}
+
+/// A step list line's height with its spacing.
+const STEP_LINE: f32 = 22.;
+
+/// Which of `n` steps get a line of their own when `max` lines are all
+/// there is room for (LIO-275): those in `keep`, the first first, while
+/// they fit, then their neighbours; each run of the others is one folded
+/// line. Each line is the steps it shows.
+fn step_lines(n: usize, keep: &[usize], max: usize) -> Vec<std::ops::RangeInclusive<usize>> {
+    let lines = |shown: &[bool]| {
+        (0..shown.len())
+            .filter(|&i| shown[i] || i == 0 || shown[i - 1])
+            .count()
+    };
+    let mut shown = vec![n <= max; n];
+    for &k in keep.iter().filter(|&&k| k < n) {
+        if !shown[k] {
+            shown[k] = true;
+            if lines(&shown) > max {
+                shown[k] = false;
+            }
+        }
+    }
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for i in 0..n {
+            if !shown[i] && (i > 0 && shown[i - 1] || i + 1 < n && shown[i + 1]) {
+                shown[i] = true;
+                if lines(&shown) > max {
+                    shown[i] = false;
+                } else {
+                    grew = true;
+                }
+            }
+        }
+    }
+    let mut out = vec![];
+    let mut i = 0;
+    while i < n {
+        let a = i;
+        i += 1;
+        while !shown[a] && i < n && !shown[i] {
+            i += 1;
+        }
+        out.push(a..=i - 1);
+    }
+    out
+}
+
+/// The steps of operation `os` under its row (LIO-275): a line each, its
+/// mark, label, Z and how it stands, and its estimated time; long runs of
+/// them folded into one line (`step_lines`). A click picks a step, a
+/// Shift-click the steps up to it; under the steps picked, Skip: already
+/// cut (or Don't skip), Start at the first and Clear.
+fn step_list<'a>(
+    run: &'a crate::run::Run,
+    os: &'a crate::run::OpSteps,
+    shown: StepsShown,
+    line: Option<u32>,
+    fit: Fit,
+) -> Element<'a, Message> {
+    use crate::run::{Action as R, StepStage as S, clock};
+    let oi = os.op;
+    let stages = run.step_stages(oi, shown.stage, line);
+    // The plan's seconds scaled to the operation's estimate over the steps
+    // it sends.
+    let sent: f32 = (os.steps.iter().zip(&stages))
+        .filter(|(_, s)| !matches!(s, S::Cut | S::Before))
+        .map(|(s, _)| s.seconds)
+        .sum();
+    let scale = shown.op_time.filter(|_| sent > 0.).map_or(1., |t| t / sent);
+    let seconds = |r: &std::ops::RangeInclusive<usize>| -> f32 {
+        os.steps[r.clone()].iter().map(|s| s.seconds * scale).sum()
+    };
+    let z = |s: usize| {
+        os.steps[s]
+            .z
+            .map(|z| format!("Z {:.2}", z - shown.datum).replace('-', "−"))
+    };
+    let picked = run.picked.filter(|p| p.0 == oi).map(|p| p.1..=p.2);
+    let is_picked = |s: usize| picked.as_ref().is_some_and(|p| p.contains(&s));
+    let mut keep: Vec<usize> = vec![];
+    keep.extend(
+        picked
+            .clone()
+            .into_iter()
+            .flat_map(|p| [*p.start(), *p.end()]),
+    );
+    keep.extend((0..stages.len()).filter(|&s| matches!(stages[s], S::Next | S::Cutting)));
+    // Where done meets the rest.
+    if let Some(d) = (0..stages.len()).rposition(|s| stages[s] == S::Done) {
+        keep.extend([d, d + 1]);
+    }
+    keep.extend(picked.clone().into_iter().flatten());
+    let said = |s: S| match s {
+        S::Done => "done",
+        S::Cutting => "cutting",
+        S::Next => "starts here",
+        S::Cut => "skipped",
+        S::Before => "taken as cut",
+        S::ToCome => "",
+    };
+    let mut col = column![].spacing(2);
+    let lh = STEP_LINE - 2.;
+    for r in step_lines(os.steps.len(), &keep, shown.lines) {
+        let first = *r.start();
+        let one = r.start() == r.end();
+        let stage = stages[first];
+        let uniform = r.clone().all(|s| stages[s] == stage);
+        let detail = if one {
+            let parts: Vec<String> = z(first)
+                .into_iter()
+                .chain(Some(said(stage).to_string()).filter(|s| !s.is_empty()))
+                .collect();
+            parts.join(" · ")
+        } else if uniform && stage != S::ToCome {
+            said(stage).to_string()
+        } else {
+            match (z(first), z(*r.end())) {
+                (Some(a), Some(b)) => format!("{a} … {}", b.trim_start_matches("Z ")),
+                _ => String::new(),
+            }
+        };
+        let (glyph, fill, edge) = match stage {
+            _ if one && is_picked(first) => ("✓", Some(RUN_BLUE), RUN_BLUE),
+            S::Done => ("✓", Some(Color::from_rgb8(47, 138, 87)), Color::TRANSPARENT),
+            S::Cutting | S::Next => ("▶", Some(RUN_BLUE), RUN_BLUE),
+            S::Cut | S::Before => ("–", Some(BUTTON_EDGE), Color::TRANSPARENT),
+            S::ToCome => ("", None, BUTTON_EDGE),
+        };
+        let mark: Element<_> = if one {
+            container(text(glyph).size(9).color(Color::WHITE))
+                .center_x(13)
+                .center_y(13)
+                .style(move |_| container::Style {
+                    background: fill.map(Into::into),
+                    border: Border {
+                        color: edge,
+                        width: 1.5,
+                        radius: 3.into(),
+                    },
+                    ..Default::default()
+                })
+                .into()
+        } else {
+            space().width(13).into()
+        };
+        let label = if one {
+            os.label(first)
+        } else {
+            os.labels(r.clone())
+        };
+        let font = Font {
+            style: if one {
+                iced::font::Style::Normal
+            } else {
+                iced::font::Style::Italic
+            },
+            weight: if one && stage == S::Next {
+                iced::font::Weight::Semibold
+            } else {
+                iced::font::Weight::Normal
+            },
+            ..Font::DEFAULT
+        };
+        let ink = if one { INK } else { MUTED };
+        let face = row![
+            mark,
+            text(label)
+                .size(11)
+                .font(font)
+                .color(ink)
+                .width(if fit.narrow { 74 } else { 84 })
+                .wrapping(Wrapping::None),
+            container(
+                text(detail)
+                    .size(11)
+                    .color(MUTED)
+                    .font(font)
+                    .wrapping(Wrapping::None)
+            )
+            .width(Fill)
+            .clip(true),
+            text(clock(seconds(&r)))
+                .size(11)
+                .color(MUTED)
+                .wrapping(Wrapping::None),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        let lit = one && is_picked(first);
+        let m = Message::Run(R::PickStep(oi, first));
+        let b = button(face)
+            .height(lh)
+            .width(Fill)
+            .padding([0, 6])
+            .on_press_maybe(shown.may.then(|| m.clone()))
+            .style(move |_, status| button::Style {
+                background: Some(
+                    match status {
+                        _ if lit => Color::from_rgb8(227, 237, 253),
+                        button::Status::Hovered if !lit => HOVER_BUTTON,
+                        _ => Color::TRANSPARENT,
+                    }
+                    .into(),
+                ),
+                text_color: INK,
+                border: Border {
+                    radius: 4.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        col = col.push(HelpButton::new(b, &m, os.label(first)));
+    }
+    let mut out = column![
+        container(col)
+            .padding(iced::Padding {
+                left: 6.,
+                ..Default::default()
+            })
+            .style(|_| container::Style {
+                border: Border {
+                    color: LINE,
+                    width: 0.,
+                    radius: 0.into(),
+                },
+                ..Default::default()
+            })
+    ]
+    .spacing(4)
+    .padding(iced::Padding {
+        left: if fit.narrow { 22. } else { 28. },
+        right: 4.,
+        bottom: 4.,
+        ..Default::default()
+    });
+    // The steps picked: their name and time, and what can be done to them.
+    if let Some(p) = picked {
+        let all_cut = p.clone().all(|s| stages[s] == S::Cut);
+        let done = shown.stage == crate::run::Stage::Done;
+        let first = *p.start();
+        let skip = if all_cut {
+            small(
+                "Don't skip",
+                shown.may.then_some(Message::Run(R::SkipSteps(false))),
+                false,
+            )
+        } else {
+            // Not every step: then it is the operation that is skipped.
+            let left = (0..stages.len())
+                .any(|s| !p.contains(&s) && !matches!(stages[s], S::Cut | S::Before));
+            small(
+                "Skip: already cut",
+                (shown.may && left && !done).then_some(Message::Run(R::SkipSteps(true))),
+                false,
+            )
+        };
+        let start = small(
+            format!("Start at {}", os.label(first).to_lowercase()),
+            (shown.may && !matches!(stages[first], S::Cut | S::Next))
+                .then_some(Message::Run(R::StartStep)),
+            false,
+        );
+        let mut head = row![
+            bold(os.labels(p.clone()), 12),
+            muted(format!("· {}", clock(seconds(&p)))).size(11),
+            space().width(Fill),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center);
+        if !fit.narrow {
+            head = head.push(muted("Shift-click picks a range").size(10));
+        }
+        out = out.push(
+            container(
+                column![
+                    head,
+                    row![
+                        skip,
+                        start,
+                        small("Clear", Some(Message::Run(R::ClearSteps)), false)
+                    ]
+                    .spacing(6)
+                ]
+                .spacing(5),
+            )
+            .padding([6, 8])
+            .width(Fill)
+            .style(|_| container::Style {
+                background: Some(Color::from_rgb8(247, 249, 252).into()),
+                border: Border {
+                    color: LINE,
+                    width: 1.,
+                    radius: 6.into(),
+                },
+                ..Default::default()
+            }),
+        );
+    }
+    out.into()
+}
 
 /// The right column of the Control page: the setup's operations in the
 /// order they are cut, grouped by tool run, where each stands, and under
@@ -9944,6 +10434,8 @@ pub(crate) fn program<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
             // Skips are offered only while the machine stands in a manual
             // state, nothing running or probing.
             let may_skip = c.manual() && !running && !c.probing();
+            // The tool runs and operations listed, for the steps' room.
+            let listed = (rows.len(), rows.iter().map(|p| p.ops.len()).sum::<usize>());
             // Operations are numbered through the setup, across its tool runs.
             let mut number = 0;
             for (w, p) in rows.iter().enumerate() {
@@ -10007,6 +10499,7 @@ pub(crate) fn program<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
                             None,
                             None,
                             Some(how),
+                            None,
                             fit,
                         ));
                         continue;
@@ -10057,29 +10550,27 @@ pub(crate) fn program<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
                             ),
                             None => leave,
                         };
-                        row![
-                            muted("Skip:"),
-                            act_with(
+                        // Its name stays, cut short: narrow, without "Skip:".
+                        row![]
+                            .push((!fit.narrow).then(|| muted("Skip:")))
+                            .push(act_with(
                                 "Already cut",
                                 msg(true, R::Skip(oi, Some(crate::run::Skip::Cut))),
                                 false,
                                 None,
                                 [3, 6],
-                            ),
-                            leave,
-                            space().width(Fill),
-                            act_with(
+                            ))
+                            .push(leave)
+                            .push(act_with(
                                 "✕",
                                 msg(true, R::More(None)),
                                 false,
                                 Some(more_width),
-                                [3, 0]
-                            ),
-                        ]
-                        .spacing(6)
-                        .align_y(Alignment::Center)
-                        .width(Fill)
-                        .into()
+                                [3, 0],
+                            ))
+                            .spacing(if fit.narrow { 4 } else { 6 })
+                            .align_y(Alignment::Center)
+                            .into()
                     });
                     let (time, cut) = match (left.and_then(|l| l.op), &times[i]) {
                         (Some((op, op_left, op_all)), _) if op == k => (
@@ -10107,6 +10598,16 @@ pub(crate) fn program<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
                         };
                         format!("Setup {} · {a}", run.setup + 1)
                     });
+                    // Its steps (LIO-275), unfolded under it on ▾.
+                    let steps = run.op_steps(oi).filter(|s| s.steps.len() > 1);
+                    let unfolded = steps.is_some() && run.open == Some(oi);
+                    let toggle = steps.map(|s| {
+                        let n = s.steps.len();
+                        let what = s.kind().1.to_lowercase();
+                        let m = Message::Run(R::Steps((!unfolded).then_some(oi)));
+                        (unfolded, m, format!("{n} {what}"))
+                    });
+                    let op_time = times[i].as_ref().and_then(|t| t.get(k).copied());
                     list = list.push(op_row(
                         number,
                         o,
@@ -10118,8 +10619,19 @@ pub(crate) fn program<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
                         at,
                         cut,
                         None,
+                        toggle,
                         fit,
                     ));
+                    if let Some(os) = steps.filter(|_| unfolded) {
+                        let shown = StepsShown {
+                            stage,
+                            op_time,
+                            datum: p.datum[2],
+                            may: may_skip,
+                            lines: step_budget(app, listed, run.picked.is_some_and(|p| p.0 == oi)),
+                        };
+                        list = list.push(step_list(run, os, shown, s.current_line, fit));
+                    }
                 }
             }
         }
@@ -10352,7 +10864,7 @@ fn partway_steps(run: &crate::run::Run) -> Vec<String> {
     )];
     let datum = p.datum[2];
     // Where the check cannot tell the surface, step 3 says so.
-    match run.partly() {
+    match run.partly().as_deref() {
         Some(partly) if partly.cut.is_empty() && partly.surface.is_some() => steps.push(
             "They did not cut the stock where the work zero is found: find it as before them."
                 .into(),
@@ -10466,7 +10978,7 @@ fn touch_label(work: [f64; 3]) -> String {
 /// setup, is greyed out, and the reason shows under the grid.
 fn probe_from_grid<'a>(
     c: &'a crate::control::Connection,
-    spots: &'a [([crate::post::At; 2], Result<(), String>)],
+    spots: &[([crate::post::At; 2], Result<(), String>)],
 ) -> Element<'a, Message> {
     use crate::control::Action;
     use crate::post::At::{Max, Mid, Min};

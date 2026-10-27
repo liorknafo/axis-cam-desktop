@@ -55,6 +55,23 @@ pub enum Action {
     /// Open the skips of operation `oi` (index in the setup) on its row of
     /// the Operations list, or close them (None).
     More(Option<usize>),
+    /// Unfold the steps of operation `oi` (index in the setup) under its
+    /// row, or fold them (None).
+    Steps(Option<usize>),
+    /// Pick step `s` of operation `oi`: with Shift held, the steps from the
+    /// one picked before to it (`Run::pick`).
+    PickStep(usize, usize),
+    /// Pick no step.
+    ClearSteps,
+    /// Take the steps picked as cut, or (false) skip none of that
+    /// operation's steps: the setup is checked again (`Run::skip_steps`).
+    SkipSteps(bool),
+    /// Start at the first step picked: the steps and operations before it
+    /// are taken as cut (`Run::start_step`).
+    StartStep,
+    /// The tool in the spindle is the one the steps before a start at a
+    /// step were cut with, its Z unchanged since (`Run::tool_kept`).
+    KeepToolZ,
 }
 
 /// How a run skips an operation of its setup (`Run::skips`).
@@ -84,6 +101,51 @@ pub struct Running {
     paths: Vec<Option<[[f32; 3]; 2]>>,
     /// The block the tool tip is on and how far along it (`track`).
     on: Option<(usize, f32)>,
+    /// The step of each of its blocks (`step_marks`).
+    marks: Vec<Option<Mark>>,
+}
+
+/// Where a block of a running program is in the steps of its operation:
+/// the operation (index in the program), the step of it as sent (counted
+/// in the program, the steps taken as cut not sent), and whether the tool
+/// has risen to the operation's clearance since that step's last feed
+/// move: its cutting done.
+type Mark = (usize, usize, bool);
+
+/// The `Mark` of each of `blocks`, the operations' clearances `clear` (by
+/// index in the program; None for one without steps): a step starts at the
+/// first feed move after the tool, between two feed moves, rose to the
+/// clearance (`plan_steps`), a retract to the clearance plane rising too.
+fn step_marks(blocks: &[Block], clear: &[Option<f32>]) -> Vec<Option<Mark>> {
+    let n = clear.len();
+    let (mut count, mut fed, mut high) = (vec![0; n], vec![false; n], vec![false; n]);
+    let mut last = None;
+    (blocks.iter())
+        .map(|b| {
+            let op = match b {
+                Block::Retract | Block::Stop | Block::End => last,
+                _ => op_of(b),
+            }
+            .filter(|&o| o < n)?;
+            match b {
+                Block::Move {
+                    kind: Kind::Feed, ..
+                } => {
+                    if fed[op] && high[op] {
+                        count[op] += 1;
+                    }
+                    (fed[op], high[op], last) = (true, false, Some(op));
+                }
+                Block::Move { from, to, .. } => {
+                    let c = clear[op].unwrap_or(f32::INFINITY);
+                    high[op] |= fed[op] && from[2].max(to[2]) >= c - AT_CLEARANCE;
+                }
+                Block::Retract => high[op] |= fed[op],
+                _ => {}
+            }
+            Some((op, count[op], high[op]))
+        })
+        .collect()
 }
 
 /// The run's record of its tool runs before a Cycle Start.
@@ -181,6 +243,24 @@ pub struct Run {
     /// The operation (index in the setup) whose row shows its skips
     /// (`Action::More`).
     pub menu: Option<usize>,
+    /// The steps of the setup's operations, from the last check (`Left::steps`).
+    pub steps: Vec<OpSteps>,
+    /// The steps it takes as cut, by operation (index in the setup): not
+    /// sent, the steps after them re-entered from the clearance (`cut_plan`).
+    pub cut_steps: Vec<(usize, Vec<usize>)>,
+    /// The step Cycle Start starts at, of an operation (index in the setup),
+    /// after 0: the steps before it are taken as cut, and its operation is
+    /// the start (`next`, `from`).
+    pub start_step: Option<(usize, usize)>,
+    /// The operation whose steps are unfolded under its row.
+    pub open: Option<usize>,
+    /// The steps picked, of an operation: the first and last picked.
+    pub picked: Option<(usize, usize, usize)>,
+    /// The tool's Z was kept for a start at a step (`Action::KeepToolZ`).
+    pub tool_kept: bool,
+    /// The setup is to be checked again, once the machine stands still: a
+    /// start at a step was set from where a tool run stopped.
+    pub recheck: bool,
 }
 
 /// The stock before an operation of the setup being run, seen from above,
@@ -251,6 +331,13 @@ impl Run {
             beneath: vec![],
             keep: None,
             menu: None,
+            steps: vec![],
+            cut_steps: vec![],
+            start_step: None,
+            open: None,
+            picked: None,
+            tool_kept: false,
+            recheck: false,
         }
     }
 
@@ -508,7 +595,16 @@ impl Run {
             self.layout = Some(programs.clone());
         }
         self.beneath = left.as_ref().map_or_else(Vec::new, |l| l.beneath.clone());
-        self.zeroed = false;
+        self.steps = left.as_ref().map_or_else(Vec::new, |l| l.steps.clone());
+        // A start at a step the check did not keep (a step of an operation
+        // gone, or no longer in steps) is no start.
+        if let Some((oi, n)) = self.start_step
+            && self.op_steps(oi).is_none_or(|s| n >= s.steps.len())
+            && !self.steps.is_empty()
+        {
+            self.start_step = None;
+        }
+        (self.zeroed, self.tool_kept, self.recheck) = (false, false, false);
         self.programs = Some(programs);
         self.before = left
             .as_ref()
@@ -620,7 +716,30 @@ impl Run {
             }
         };
         let first = &p.ops[from];
-        if self.partway() {
+        let unset = unset_axes(c);
+        if let Some((oi, n)) = self.at_step() {
+            let step = self.step_label(oi, n);
+            if !self.zeroed {
+                e.push(format!(
+                    "This run starts {} at {step}, the steps before it taken as cut: keep the work zero they were cut with (Keep it, under Start at a step), or set it on the stock they left.",
+                    first.name
+                ));
+            }
+            if !unset.is_empty() {
+                e.push(format!(
+                    "{} {} no machine position, so the work zero the steps before {step} were cut with is not where it was: {} in the Machine tab first.",
+                    unset.join(", "),
+                    if unset.len() == 1 { "has" } else { "have" },
+                    if c.home_switches() { "Home again" } else { "Set machine zero again (or Keep the last position)" }
+                ));
+            }
+            if !self.tool_kept && !self.touched {
+                e.push(format!(
+                    "Confirm {}'s Z for the start at {step}: Same tool, keep Z if it was not taken out since, or Set Z from reference.",
+                    crate::model::tool_label(first.tool, &first.tool_name)
+                ));
+            }
+        } else if self.partway() {
             match self.partly() {
                 None => e.push(format!("The check did not work out the stock operation {}, {}, starts from: pick its first operation, or check the setup again.", from + 1, first.name)),
                 Some(_) if !self.zeroed => e.push(format!(
@@ -637,7 +756,6 @@ impl Run {
         // does not stop Cycle Start (`limits_unchecked`). On A it does: the
         // driver runs nothing while A has soft limits and no position, and a
         // program never moves an A without one.
-        let unset = unset_axes(c);
         let a_unset: Vec<&str> = (3..6)
             .filter(|&a| c.axis(a) && !s.referenced[a])
             .map(|a| AXES[a])
@@ -830,16 +948,51 @@ impl Run {
         let programs = self.checked()?;
         let (count, p) = (programs.len(), &programs[self.next]);
         let s = &c.snapshot;
-        let actions = lower(p, self.from, s.work_offset, s.machine_pos).ok()?;
+        let mut actions = lower(p, self.from, s.work_offset, s.machine_pos).ok()?;
+        // At a step, it waits over the step's entry with the spindle on,
+        // after the rapids there, until Resume feeds in (LIO-275).
+        if let Some((oi, n)) = self.at_step()
+            && let Some(line) = (p.from(self.from).ok()?.iter())
+                .position(|b| matches!(b, Block::Descend { .. }))
+                .map(|i| i as u32 + 1)
+        {
+            let at = actions
+                .iter()
+                .rposition(|l| l.line <= line)
+                .map_or(0, |i| i + 1);
+            let reason = format!(
+                "Over the entry of {}: Resume feeds in.",
+                self.step_label(oi, n)
+            );
+            actions.insert(
+                at,
+                Located {
+                    line,
+                    action: Do::Pause { reason },
+                },
+            );
+        }
         // Where the tool tip is, in plan coordinates: the first retract's start.
         let tip =
             std::array::from_fn(|k| (s.machine_pos[k] - s.work_offset[k]) as f32 + p.datum[k]);
-        let paths = paths(p.from(self.from).ok()?, tip);
+        let blocks = p.from(self.from).ok()?;
+        let paths = paths(blocks, tip);
+        let clear: Vec<Option<f32>> = (p.indexes.iter())
+            .map(|&oi| {
+                Some(self.op_steps(oi)?)
+                    .filter(|s| s.steps.len() > 1)
+                    .map(|s| s.clear)
+            })
+            .collect();
+        let marks = step_marks(blocks, &clear);
         let tool = p.ops[0].tool_id.clone();
         let zero = (p.origin.clone(), p.datum);
         let mut name = format!("{} · tool run {} of {count}", self.name, self.next + 1);
         if self.from > 0 {
             name += &format!(" from {}", p.ops[self.from].name);
+        }
+        if let Some((oi, n)) = self.at_step() {
+            name += &format!(" at {}", self.step_label(oi, n));
         }
         self.running = Some(Running {
             index: self.next,
@@ -854,6 +1007,7 @@ impl Run {
             },
             paths,
             on: None,
+            marks,
         });
         self.xy
             .get_or_insert((s.active_wcs, [s.work_offset[0], s.work_offset[1]]));
@@ -898,19 +1052,214 @@ impl Run {
         let start =
             (self.checked()).and_then(|c| c.get(self.next)?.indexes.get(self.from).copied());
         let cut = |&(oi, how): &(usize, Skip)| how == Skip::Cut && start.is_some_and(|s| oi < s);
-        !self.started()
-            && self.checked().is_some()
-            && ((self.next, self.from) != (0, 0) || self.skips.iter().any(cut))
+        // So are steps taken as cut before it.
+        let steps = |(oi, cut): &(usize, Vec<usize>)| {
+            !cut.is_empty() && start.is_some_and(|s| *oi < s || *oi == s && cut.contains(&0))
+        };
+        let early = (self.next, self.from) != (0, 0)
+            || self.skips.iter().any(cut)
+            || self.cut_steps.iter().any(steps);
+        self.checked().is_some() && (self.at_step().is_some() || !self.started() && early)
+    }
+
+    /// The start at a step Cycle Start starts at (`start_step`), while its
+    /// operation is the start: the operation (index in the setup) and step.
+    pub fn at_step(&self) -> Option<(usize, usize)> {
+        let (oi, n) = self.start_step?;
+        let p = self.checked()?.get(self.next)?;
+        (self.running.is_none() && p.indexes.get(self.from) == Some(&oi)).then_some((oi, n))
+    }
+
+    /// The steps of operation `oi` (index in the setup), from the check.
+    pub fn op_steps(&self, oi: usize) -> Option<&OpSteps> {
+        self.steps.iter().find(|s| s.op == oi)
+    }
+
+    /// Step `n` of operation `oi` as a sentence says it: "level 14".
+    pub fn step_label(&self, oi: usize, n: usize) -> String {
+        (self.op_steps(oi))
+            .map_or(format!("step {}", n + 1), |s| s.label(n))
+            .to_lowercase()
+    }
+
+    /// The steps of operation `oi` the check takes as cut: those skipped,
+    /// and those before a start at one of its steps.
+    pub fn cut_of(&self, oi: usize) -> Vec<usize> {
+        let mut cut: Vec<usize> = (self.cut_steps.iter())
+            .filter(|c| c.0 == oi)
+            .flat_map(|c| c.1.iter().copied())
+            .collect();
+        if let Some((o, n)) = self.start_step
+            && o == oi
+        {
+            cut.extend(0..n);
+        }
+        cut.sort_unstable();
+        cut.dedup();
+        cut
+    }
+
+    /// Every operation's steps the check takes as cut (`cut_of`).
+    pub fn all_cut(&self) -> Vec<(usize, Vec<usize>)> {
+        let mut ops: Vec<usize> = self.cut_steps.iter().map(|c| c.0).collect();
+        ops.extend(self.start_step.map(|s| s.0));
+        ops.sort_unstable();
+        ops.dedup();
+        (ops.into_iter())
+            .map(|oi| (oi, self.cut_of(oi)))
+            .filter(|c| !c.1.is_empty())
+            .collect()
+    }
+
+    /// What was done and where Cycle Start starts, by operation (index in
+    /// the setup), for a check that keeps them (`keep`).
+    fn progress_kept(&self, programs: &[Checked]) -> (Vec<usize>, Option<usize>) {
+        let done: Vec<usize> = (programs.iter().zip(&self.done))
+            .filter(|(_, d)| **d)
+            .flat_map(|(p, _)| p.indexes.iter().copied())
+            .collect();
+        let start = (programs.get(self.next)).and_then(|p| p.indexes.get(self.from).copied());
+        (done, start)
+    }
+
+    /// Picks step `s` of operation `oi`, or with `range` the steps from the
+    /// one picked first to it, while the machine stands in a manual state.
+    pub fn pick(&mut self, oi: usize, s: usize, range: bool) {
+        if self.op_steps(oi).is_none_or(|o| s >= o.steps.len()) {
+            return;
+        }
+        self.picked = match self.picked {
+            Some((o, first, _)) if range && o == oi => Some((oi, first.min(s), first.max(s))),
+            _ => Some((oi, s, s)),
+        };
+    }
+
+    /// Takes the steps picked as cut (`cut`), or skips none of their
+    /// operation's steps (not `cut`), while no tool run runs: not every step
+    /// of the operation, and not one of a tool run done in this run.
+    /// Whether it changed, and the setup is to be checked again, keeping
+    /// what was done and where Cycle Start starts (`keep`).
+    pub fn skip_steps(&mut self, cut: bool) -> bool {
+        let Some((oi, first, last)) = self.picked else {
+            return false;
+        };
+        let Some(programs) = self.checked().filter(|_| self.running.is_none()) else {
+            return false;
+        };
+        let keep = self.progress_kept(programs);
+        let count = self.op_steps(oi).map_or(0, |s| s.steps.len());
+        let mut now: Vec<usize> = (self.cut_steps.iter())
+            .find(|c| c.0 == oi)
+            .map_or_else(Vec::new, |c| c.1.clone());
+        let before = now.clone();
+        if cut {
+            now.extend(first..=last);
+            now.sort_unstable();
+            now.dedup();
+        } else {
+            now.clear();
+        }
+        let started = match self.start_step {
+            Some((o, n)) if o == oi => n,
+            _ => 0,
+        };
+        let all = (0..count).all(|s| now.contains(&s) || s < started);
+        if now == before || keep.0.contains(&oi) || cut && all {
+            return false;
+        }
+        self.cut_steps.retain(|c| c.0 != oi);
+        if !now.is_empty() {
+            self.cut_steps.push((oi, now));
+        }
+        (self.keep, self.picked, self.carving) = (Some(keep), None, None);
+        true
+    }
+
+    /// Makes the first step picked the one Cycle Start starts at, while no
+    /// tool run runs: the steps before it and the operations before its
+    /// operation are taken as cut, as before a Start here. Whether it
+    /// changed, and the setup is to be checked again (`keep`).
+    pub fn start_step(&mut self) -> bool {
+        let Some((oi, n, _)) = self.picked else {
+            return false;
+        };
+        self.start_at_step(oi, n)
+    }
+
+    /// `start_step` at step `n` of operation `oi` (index in the setup).
+    pub fn start_at_step(&mut self, oi: usize, n: usize) -> bool {
+        let Some(programs) = self.checked().filter(|_| self.running.is_none()) else {
+            return false;
+        };
+        let (done, _) = self.progress_kept(programs);
+        let start = (n > 0).then_some((oi, n));
+        if self.start_step == start && self.at_step() == start && start.is_some() {
+            return false;
+        }
+        // The steps it starts after are taken as cut by the start, not
+        // skipped: a skip of them is dropped.
+        for c in &mut self.cut_steps {
+            if c.0 == oi {
+                c.1.retain(|&s| s >= n);
+            }
+        }
+        self.cut_steps.retain(|c| !c.1.is_empty());
+        // Done in this run, its tool run is cut again from that step.
+        let done: Vec<usize> = done.into_iter().filter(|&o| o < oi).collect();
+        self.start_step = start;
+        (self.keep, self.picked, self.carving) = (Some((done, Some(oi))), None, None);
+        (self.zeroed, self.tool_kept) = (false, false);
+        true
     }
 
     /// What a run that starts partway finds of the work zero (`partway`,
     /// `Checked::partly`). None when it does not start partway, or the
     /// check did not work it out.
-    pub fn partly(&self) -> Option<&Partly> {
+    pub fn partly(&self) -> Option<std::borrow::Cow<'_, Partly>> {
+        use std::borrow::Cow;
         if !self.partway() {
             return None;
         }
-        self.checked()?.get(self.next)?.partly.get(self.from)
+        let programs = self.checked()?;
+        let before = programs.get(self.next)?.partly.get(self.from)?;
+        if self.at_step().is_none() {
+            return Some(Cow::Borrowed(before));
+        }
+        // Inside an operation the check does not follow the stock, but it
+        // knows it before the operation and after it (before the next one
+        // sent): a spot neither cut is as it was, a surface the same in both
+        // is that surface. Cut steps only take material away.
+        let after = (programs.iter().flat_map(|p| &p.partly))
+            .skip_while(|p| !std::ptr::eq(*p, before))
+            .nth(1);
+        let unknown = "stock the steps before the start cut, which the check does not follow";
+        Some(Cow::Owned(match after {
+            Some(after) => Partly {
+                cut: after.cut.clone(),
+                surface: before.surface.filter(|s| after.surface == Some(*s)),
+                top_cut: after.top_cut,
+                probe_from: (after.probe_from.iter())
+                    .map(|(r, ok)| {
+                        let was = before.probe_from.iter().find(|(b, _)| b == r);
+                        let ok = match (ok, was) {
+                            (Ok(()), Some((_, Ok(())))) => Ok(()),
+                            (Err(e), _) => Err(e.clone()),
+                            (_, Some((_, Err(e)))) => Err(e.clone()),
+                            _ => Err(format!("The check cannot follow the {unknown}.")),
+                        };
+                        (*r, ok)
+                    })
+                    .collect(),
+            },
+            None => Partly {
+                cut: vec![unknown.into()],
+                surface: None,
+                top_cut: true,
+                probe_from: (before.probe_from.iter())
+                    .map(|(r, _)| (*r, Err(format!("The check cannot follow the {unknown}."))))
+                    .collect(),
+            },
+        }))
     }
 
     /// Skips operation `oi` (index in the setup) as `how` says, or skips it
@@ -970,6 +1319,7 @@ impl Run {
     /// changed, and the setup is checked again anyway.
     pub fn unskip(&mut self) {
         (self.skips, self.keep, self.menu) = (vec![], None, None);
+        (self.cut_steps, self.start_step, self.picked) = (vec![], None, None);
     }
 
     /// Makes operation `k` of tool run `i` the one Cycle Start starts at:
@@ -980,6 +1330,14 @@ impl Run {
             .and_then(|c| c.get(i))
             .map_or(0, |p| p.ops.len());
         if self.running.is_none() && k < ops {
+            // A start at a step is checked again without it.
+            if self.start_step.take().is_some()
+                && let Some(programs) = self.checked()
+            {
+                let (done, _) = self.progress_kept(programs);
+                let start = programs[i].indexes.get(k).copied();
+                (self.keep, self.recheck) = (Some((done, start)), true);
+            }
             (self.next, self.from) = (i, k);
             self.zeroed = false;
             // The stock is the one this start finds again.
@@ -1034,6 +1392,78 @@ impl Run {
                 None if done => Stage::Done,
                 None if i < self.next => Stage::Skipped,
                 None => Stage::ToCome,
+            })
+            .collect()
+    }
+}
+
+/// Where a step of an operation stands, for the Operations list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepStage {
+    Done,
+    Cutting,
+    /// Cycle Start starts at it.
+    Next,
+    /// Skipped: taken as cut, not sent (`Run::cut_steps`).
+    Cut,
+    /// Before the start at a step: taken as cut, not sent.
+    Before,
+    ToCome,
+}
+
+impl Run {
+    /// The step the running tool run is in, of the block the tool tip is
+    /// on (the driver's line until it is found): its operation (index in
+    /// the setup), the step, and whether its cutting is done.
+    pub fn step_at(&self, line: Option<u32>) -> Option<(usize, usize, bool)> {
+        let r = self.running.as_ref()?;
+        let p = self.checked()?.get(r.index)?;
+        let block = match r.on {
+            Some((b, _)) => b,
+            None => self.progress(line)?.2,
+        };
+        self.mark_step(p, (*r.marks.get(block)?)?)
+    }
+
+    /// A `Mark` of program `p`'s as a step of its operation: the operation
+    /// (index in the setup), the step (index in its steps), and whether its
+    /// cutting is done.
+    fn mark_step(&self, p: &Checked, (op, sent, done): Mark) -> Option<(usize, usize, bool)> {
+        let oi = *p.indexes.get(op)?;
+        let n = self.op_steps(oi)?.steps.len();
+        let cut = self.cut_of(oi);
+        let s = (0..n).filter(|s| !cut.contains(s)).nth(sent)?;
+        Some((oi, s, done))
+    }
+
+    /// Where each step of operation `oi` (index in the setup) stands, the
+    /// operation's own stage being `stage` and the machine at program line
+    /// `line`.
+    pub fn step_stages(&self, oi: usize, stage: Stage, line: Option<u32>) -> Vec<StepStage> {
+        let Some(os) = self.op_steps(oi) else {
+            return vec![];
+        };
+        let skipped: Vec<usize> = (self.cut_steps.iter())
+            .filter(|c| c.0 == oi)
+            .flat_map(|c| c.1.iter().copied())
+            .collect();
+        let start = self.start_step.filter(|s| s.0 == oi).map(|s| s.1);
+        let now = self.step_at(line).filter(|n| n.0 == oi);
+        let first =
+            (0..os.steps.len()).find(|s| !skipped.contains(s) && start.is_none_or(|n| *s >= n));
+        (0..os.steps.len())
+            .map(|s| match stage {
+                _ if skipped.contains(&s) => StepStage::Cut,
+                _ if start.is_some_and(|n| s < n) => StepStage::Before,
+                Stage::Done => StepStage::Done,
+                Stage::Skipped => StepStage::Before,
+                Stage::Cutting => match now {
+                    Some((_, c, done)) if s < c || s == c && done => StepStage::Done,
+                    Some((_, c, _)) if s == c => StepStage::Cutting,
+                    _ => StepStage::ToCome,
+                },
+                Stage::Next if first == Some(s) => StepStage::Next,
+                Stage::Next | Stage::ToCome => StepStage::ToCome,
             })
             .collect()
     }
@@ -1329,6 +1759,21 @@ pub fn check_skipping(
     si: usize,
     skips: &[(usize, Skip)],
 ) -> (Result<Vec<Checked>, Vec<String>>, Left) {
+    check_steps(doc, mesh, si, skips, &[])
+}
+
+/// `check_skipping` of a run that also takes steps of its operations as
+/// cut (`Run::all_cut`): their simulations' plans lose those steps
+/// (`cut_plan`) after the steps were found (`Left::steps`), so that the
+/// programs, their checks and every start re-enter the step after a cut
+/// one from the clearance, as a Start here enters an operation.
+pub fn check_steps(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    skips: &[(usize, Skip)],
+    cut_steps: &[(usize, Vec<usize>)],
+) -> (Result<Vec<Checked>, Vec<String>>, Left) {
     if si >= doc.setups.len() {
         return (Err(vec![REMOVED.into()]), Left::default());
     }
@@ -1344,11 +1789,235 @@ pub fn check_skipping(
             o.enabled = false;
         }
     }
-    let (sims, mut left) = simulated_with(&doc, mesh, si);
+    let (mut sims, mut left) = simulated_with(&doc, mesh, si);
+    left.steps = op_steps(&doc, si, &sims);
+    for (oi, steps) in cut_steps {
+        let Some(found) = left.steps.iter().find(|s| s.op == *oi) else {
+            continue;
+        };
+        if let Some((_, Ok(sim))) = sims.iter_mut().find(|(o, _)| o == oi)
+            && !steps.is_empty()
+            && steps.len() < found.steps.len()
+        {
+            sim.plan = cut_plan(&sim.plan, &found.steps, steps);
+        }
+    }
     let programs =
         crate::post::checked_to_start(&doc, mesh, si, &sims, PostSettings::for_uc100, &cut);
     left.beneath = beneath(&doc, si, &sims, &cut);
     (programs, left)
+}
+
+/// A step of an operation (LIO-275): a stretch of its plan from the tool at
+/// its clearance to the tool at its clearance again, a Z level, a pass, a
+/// hole or a band, which a run can skip, start at or stop after.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Step {
+    /// Its plan moves: the first starts with the tool at the clearance (the
+    /// operation's first move, or the first after it rose there).
+    pub moves: std::ops::Range<usize>,
+    /// The plan Z its level feed moves cut at, when they are all at one.
+    pub z: Option<f32>,
+    /// Its seconds in the plan, at the programmed feeds.
+    pub seconds: f32,
+}
+
+/// The steps of one operation of a setup, as the run's check found them
+/// (`op_steps`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpSteps {
+    /// The operation's index in the setup.
+    pub op: usize,
+    /// Its clearance: the highest plan Z it moves at.
+    pub clear: f32,
+    /// A drilling cycle: each step is a hole.
+    pub hole: bool,
+    pub steps: Vec<Step>,
+    /// FNV-1a of its plan's moves and its tool (`fingerprint`): a journal of
+    /// where a run stopped holds for these steps only (`Journal`).
+    pub fingerprint: u64,
+}
+
+impl OpSteps {
+    /// What its steps are called: holes, levels when each cuts at one Z,
+    /// else passes.
+    pub fn kind(&self) -> (&'static str, &'static str) {
+        if self.hole {
+            ("Hole", "Holes")
+        } else if self.steps.iter().all(|s| s.z.is_some()) {
+            ("Level", "Levels")
+        } else {
+            ("Pass", "Passes")
+        }
+    }
+
+    /// Step `s`'s label: "Level 14", "Hole 3", "Pass 2".
+    pub fn label(&self, s: usize) -> String {
+        format!("{} {}", self.kind().0, s + 1)
+    }
+
+    /// Steps `range`'s label: "Levels 5–9", or one step's.
+    pub fn labels(&self, range: std::ops::RangeInclusive<usize>) -> String {
+        match range.end() - range.start() {
+            0 => self.label(*range.start()),
+            _ => format!(
+                "{} {}–{}",
+                self.kind().1,
+                range.start() + 1,
+                range.end() + 1
+            ),
+        }
+    }
+}
+
+/// How far below its clearance the tool may be and still be at it, mm.
+const AT_CLEARANCE: f32 = 0.01;
+
+/// The steps of `plan` (`Step`): split where the tool, between two feed
+/// moves, is at the plan's clearance, its highest Z, which must be above the
+/// stock top. Empty for a plan that turns A, a lathe's, or one with no feed
+/// move; one step for a plan that never goes back up there between feeds.
+pub fn plan_steps(plan: &crate::simulation::Plan) -> Vec<Step> {
+    use crate::simulation::Motion;
+    let moves = &plan.moves;
+    let feed = |i: usize| moves[i].motion == Motion::Feed;
+    let Some(last) = (0..moves.len()).rposition(feed) else {
+        return vec![];
+    };
+    if plan.is_lathe() || moves.iter().any(|m| m.a.is_some()) {
+        return vec![];
+    }
+    let clear = (moves.iter())
+        .map(|m| m.from[2].max(m.to[2]))
+        .fold(f32::NEG_INFINITY, f32::max);
+    if clear <= plan.stock.max[2] {
+        return vec![];
+    }
+    // Between two feeds, the first move that starts at the clearance; a
+    // stretch of rapids that only rises to it starts the step after them.
+    let mut starts = vec![0];
+    let mut fed = None;
+    for i in 0..=last {
+        if feed(i) {
+            if let Some(f) = fed
+                && i > f + 1
+                && let Some(s) = (f + 1..=i).find(|&j| moves[j].from[2] >= clear - AT_CLEARANCE)
+            {
+                starts.push(s);
+            }
+            fed = Some(i);
+        }
+    }
+    let ends = starts.iter().skip(1).copied().chain([moves.len()]);
+    (starts.iter().zip(ends))
+        .map(|(&a, b)| {
+            let level: Vec<f32> = (moves[a..b].iter())
+                .filter(|m| m.motion == Motion::Feed && (m.from[2] - m.to[2]).abs() < 1e-4)
+                .map(|m| m.to[2])
+                .collect();
+            let z = level
+                .first()
+                .copied()
+                .filter(|z| level.iter().all(|v| (v - z).abs() < 0.005));
+            Step {
+                moves: a..b,
+                z,
+                seconds: moves[a..b].iter().map(|m| m.end - m.start).sum(),
+            }
+        })
+        .collect()
+}
+
+/// The steps of setup `si`'s operations that generated, from the check's
+/// simulations `sims` (`plan_steps`).
+fn op_steps(doc: &Document, si: usize, sims: &Sims) -> Vec<OpSteps> {
+    (sims.iter())
+        .filter_map(|(oi, r)| {
+            let plan = &r.as_ref().ok()?.plan;
+            let op = doc.setups[si].operations.get(*oi)?;
+            let clear = (plan.moves.iter())
+                .map(|m| m.from[2].max(m.to[2]))
+                .fold(f32::NEG_INFINITY, f32::max);
+            Some(OpSteps {
+                op: *oi,
+                clear,
+                hole: op.strategy == crate::model::Strategy::Drill,
+                steps: plan_steps(plan),
+                fingerprint: fingerprint(plan, &op.tool),
+            })
+        })
+        .collect()
+}
+
+/// FNV-1a over every bit of `plan`'s moves and the id of `tool`: stable
+/// across builds, unlike `std`'s hasher, for a journal kept on disk.
+pub fn fingerprint(plan: &crate::simulation::Plan, tool: &str) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    let mut eat = |w: u64| h = (h ^ w).wrapping_mul(0x100000001b3);
+    for m in &plan.moves {
+        for v in m.from.iter().chain(&m.to).chain([&m.feed]) {
+            eat(u64::from(v.to_bits()));
+        }
+        eat(m.motion as u64);
+    }
+    for b in tool.bytes() {
+        eat(u64::from(b));
+    }
+    h
+}
+
+/// `plan` without its `steps` `cut` (indexes in `steps`, not all of them):
+/// the moves of the others, in order. Where cut steps were, a rapid across
+/// at the clearance joins the step before them, where it rose to it, to
+/// where the one after them starts, as the plan moves between two of its
+/// steps; cut first, the plan starts where the first kept step does, which
+/// a program enters as it enters an operation. Its stops follow their moves.
+pub fn cut_plan(
+    plan: &crate::simulation::Plan,
+    steps: &[Step],
+    cut: &[usize],
+) -> crate::simulation::Plan {
+    use crate::simulation::{Motion, Move, Stop};
+    let mut out = crate::simulation::Plan {
+        moves: vec![],
+        stops: vec![],
+        ..plan.clone()
+    };
+    let mut new = vec![None; plan.moves.len()];
+    let mut gap = false;
+    for (s, step) in steps.iter().enumerate() {
+        if cut.contains(&s) {
+            gap = true;
+            continue;
+        }
+        let first = &plan.moves[step.moves.start];
+        if let Some(last) = out.moves.last().filter(|_| gap).cloned() {
+            out.moves.push(Move {
+                from: last.to,
+                to: first.from,
+                motion: Motion::Rapid,
+                cutting_pass: false,
+                feed: first.feed,
+                start: last.end,
+                end: last.end,
+                a: None,
+            });
+        }
+        gap = false;
+        for i in step.moves.clone() {
+            new[i] = Some(out.moves.len());
+            out.moves.push(plan.moves[i].clone());
+        }
+    }
+    out.stops = (plan.stops.iter())
+        .filter_map(|s| {
+            Some(Stop {
+                at: new.get(s.at).copied().flatten()?,
+                ..s.clone()
+            })
+        })
+        .collect();
+    out
 }
 
 /// This setup's cuts by the 5 mm square of the grid their removal box
@@ -1542,6 +2211,7 @@ fn simulated_with(doc: &Document, mesh: &Mesh, si: usize) -> (Sims, Left) {
             last,
             before: Arc::new(before),
             beneath: vec![],
+            steps: vec![],
         },
     )
 }
@@ -1562,6 +2232,9 @@ pub struct Left {
     /// The operations whose material a run cannot leave, each with why
     /// (`beneath`).
     pub beneath: Vec<(usize, String)>,
+    /// The steps of each operation that generated (`op_steps`), as found
+    /// before any was taken as cut.
+    pub steps: Vec<OpSteps>,
 }
 
 /// How many stocks `op_pictures` meshes at once: each mesher also runs
@@ -3111,6 +3784,7 @@ mod tests {
                 },
                 paths: vec![],
                 on: None,
+                marks: vec![],
             }),
             xy: None,
             zero: None,
@@ -3130,6 +3804,13 @@ mod tests {
             beneath: vec![],
             keep: None,
             menu: None,
+            steps: vec![],
+            cut_steps: vec![],
+            start_step: None,
+            open: None,
+            picked: None,
+            tool_kept: false,
+            recheck: false,
         };
         let (_, op, block) = run.progress(Some(3)).unwrap();
         assert_eq!((op, block), (0, 2));
@@ -3233,8 +3914,204 @@ mod tests {
             },
             paths: vec![],
             on: None,
+            marks: vec![],
         });
         assert!(!run.skip(4, Some(Skip::Cut)) && run.skips.is_empty());
+    }
+
+    /// The fixture job's Face, Pocket, Contour and Drill on a UC100 (the
+    /// template profile in `dir`): its Parallel and Waterline off, to be quick.
+    fn four_ops(dir: &std::path::Path) -> (Document, Mesh) {
+        let (mut doc, mesh) = fixture::job();
+        let profile = dir.join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let m = &mut doc.setups[0].machine;
+        m.p.insert("controller".into(), "UC100".into());
+        m.p.insert("uc100_profile".into(), profile.display().to_string());
+        for o in &mut doc.setups[0].operations[4..] {
+            o.enabled = false;
+        }
+        (doc, mesh)
+    }
+
+    /// Real programs split into steps where the tool, between two feeds, is
+    /// back at the operation's clearance (LIO-275): the Face's two Z levels,
+    /// the Contour's levels, the Drill's holes, the Pocket's passes. Each
+    /// step starts at the clearance and they cover the plan; a plan without
+    /// steps taken as cut re-enters each kept one from the clearance and
+    /// splits into those same steps; the running program's marks count them
+    /// as the plan does.
+    #[test]
+    fn real_programs_split_into_levels_passes_and_holes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (doc, mesh) = four_ops(dir.path());
+        let sims = simulated(&doc, &mesh, 0);
+        let steps = op_steps(&doc, 0, &sims);
+        let of = |oi: usize| steps.iter().find(|s| s.op == oi).unwrap();
+        let plan = |oi: usize| {
+            &sims
+                .iter()
+                .find(|s| s.0 == oi)
+                .unwrap()
+                .1
+                .as_ref()
+                .unwrap()
+                .plan
+        };
+        let (face, pocket, contour, drill) = (of(0), of(1), of(2), of(3));
+        assert_eq!((face.steps.len(), face.kind().0), (2, "Level"));
+        assert!(face.steps[0].z.unwrap() > face.steps[1].z.unwrap());
+        assert!(contour.steps.len() > 1, "{:?}", contour.steps);
+        assert_eq!(drill.kind().0, "Hole");
+        // One hole a step, its pecks in it.
+        let p = plan(3);
+        let mut holes: Vec<[i64; 2]> = (p.moves.iter())
+            .filter(|m| m.motion == crate::simulation::Motion::Feed)
+            .map(|m| [0, 1].map(|k| (m.to[k] * 100.).round() as i64))
+            .collect();
+        holes.dedup();
+        assert_eq!(drill.steps.len(), holes.len());
+        assert!(pocket.steps.len() > 1, "{:?}", pocket.steps.len());
+        assert_eq!(face.labels(0..=1), "Levels 1–2");
+        for os in [face, pocket, contour, drill] {
+            let p = plan(os.op);
+            assert_eq!(os.steps[0].moves.start, 0);
+            assert_eq!(os.steps.last().unwrap().moves.end, p.moves.len());
+            for w in os.steps.windows(2) {
+                assert_eq!(w[0].moves.end, w[1].moves.start);
+                assert!(p.moves[w[1].moves.start].from[2] >= os.clear - AT_CLEARANCE);
+            }
+            // Cut: the first two, then the second alone.
+            for cut in [vec![0, 1], vec![1]] {
+                if cut.len() >= os.steps.len() {
+                    continue;
+                }
+                let less = cut_plan(p, &os.steps, &cut);
+                let kept: Vec<&Step> = (0..os.steps.len())
+                    .filter(|s| !cut.contains(s))
+                    .map(|s| &os.steps[s])
+                    .collect();
+                let again = plan_steps(&less);
+                assert_eq!(again.len(), kept.len(), "{:?} cut {cut:?}", p.strategy);
+                assert!(less.moves[0].from[2] >= os.clear - AT_CLEARANCE);
+                for w in less.moves.windows(2) {
+                    assert_eq!(w[0].to, w[1].from, "{:?} cut {cut:?}", p.strategy);
+                }
+            }
+        }
+        // The whole program's marks count each operation's steps.
+        let programs =
+            crate::post::checked_to_start(&doc, &mesh, 0, &sims, PostSettings::for_uc100, &[])
+                .unwrap();
+        let p = &programs[0];
+        let clear: Vec<Option<f32>> = (p.indexes.iter()).map(|&oi| Some(of(oi).clear)).collect();
+        let marks = step_marks(&p.blocks, &clear);
+        for (k, &oi) in p.indexes.iter().enumerate() {
+            let last = marks.iter().flatten().filter(|m| m.0 == k).last().unwrap();
+            assert_eq!(last.1 + 1, of(oi).steps.len(), "operation {oi}");
+            assert!(
+                last.2,
+                "the last step of operation {oi} rose to the clearance"
+            );
+        }
+    }
+
+    /// A start at a step re-enters as a Start here does (LIO-275): the
+    /// Contour from its third level is sent from there, its program from
+    /// the operation the tool change's safe start (a retract, the spindle,
+    /// across at the clearance plane, down onto the level's entry at the
+    /// operation's clearance), lowered as a rapid at the clearance first;
+    /// Cycle Start then waits over the entry. A skip of steps leaves them
+    /// out, the steps after re-entered across at the clearance.
+    #[test]
+    fn a_start_at_a_step_reenters_from_the_clearance() {
+        let dir = tempfile::tempdir().unwrap();
+        let (doc, mesh) = four_ops(dir.path());
+        let (whole, left) = check_steps(&doc, &mesh, 0, &[], &[]);
+        let whole = whole.unwrap();
+        let contour = left.steps.iter().find(|s| s.op == 2).unwrap().clone();
+        let (programs, _) = check_steps(&doc, &mesh, 0, &[], &[(2, vec![0, 1])]);
+        let programs = programs.unwrap();
+        let p = &programs[0];
+        let k = p.indexes.iter().position(|&oi| oi == 2).unwrap();
+        let blocks = p.from(k).unwrap();
+        let entry = {
+            let sims = simulated(&doc, &mesh, 0);
+            let plan = &sims
+                .iter()
+                .find(|s| s.0 == 2)
+                .unwrap()
+                .1
+                .as_ref()
+                .unwrap()
+                .plan;
+            plan.moves[contour.steps[2].moves.start].from
+        };
+        let head: Vec<&Block> = blocks.iter().take(8).collect();
+        assert!(matches!(head[0], Block::Stop) && matches!(head[1], Block::Retract));
+        let approach = blocks.iter().find_map(|b| match b {
+            Block::Approach { xy, .. } => Some(*xy),
+            _ => None,
+        });
+        let descend = blocks.iter().find_map(|b| match b {
+            Block::Descend { xy, z, .. } => Some((*xy, *z)),
+            _ => None,
+        });
+        assert_eq!(approach, Some([entry[0], entry[1]]));
+        assert_eq!(descend, Some(([entry[0], entry[1]], entry[2])));
+        assert!(entry[2] >= contour.clear - AT_CLEARANCE);
+        // Its first moves: Z alone up to the clearance plane, across there
+        // over the entry, then down to it (nothing when the plane is the
+        // operation's clearance).
+        let plane = clearance_plane(blocks);
+        let start = [300., 200., -100., 0., 0., 0.];
+        let moves: Vec<[f64; 6]> = (lower(p, k, [0.; 6], start).unwrap().iter())
+            .filter_map(|l| match l.action {
+                Do::Move { target, .. } => Some(target),
+                _ => None,
+            })
+            .collect();
+        let at = |q: [f32; 3]| -> [f64; 3] { std::array::from_fn(|i| (q[i] - p.datum[i]) as f64) };
+        let top = (plane - p.datum[2]) as f64;
+        assert_eq!(moves[0], [300., 200., top, 0., 0., 0.]);
+        assert_eq!(moves[1][..3], [at(entry)[0], at(entry)[1], top]);
+        assert!(top >= at(entry)[2] - 1e-4);
+        if top > at(entry)[2] + 1e-4 {
+            assert_eq!(moves[2][..3], at(entry));
+        }
+        // Fewer blocks than from the Contour's start, the levels before cut.
+        let full = &whole[0];
+        assert!(blocks.len() < full.from(k).unwrap().len());
+        // The run starts there: Cycle Start's start, and the pause over the
+        // entry it lowers with.
+        let mut run = Run::new(&doc, 0, 0);
+        run.checked_as(
+            Arc::new(Ok(whole.clone())),
+            Some(Arc::new(left.clone())),
+            None,
+        );
+        run.pick(2, 2, false);
+        assert!(run.start_step());
+        assert_eq!(run.all_cut(), [(2, vec![0, 1])]);
+        run.checked_as(
+            Arc::new(Ok(programs.clone())),
+            Some(Arc::new(left.clone())),
+            None,
+        );
+        assert_eq!((run.next, run.from, run.at_step()), (0, k, Some((2, 2))));
+        assert!(run.partway());
+        assert_eq!(run.step_label(2, 2), contour.label(2).to_lowercase());
+        // A skip of the Contour's second level: the third follows the first,
+        // across at the clearance.
+        let (skipped, _) = check_steps(&doc, &mesh, 0, &[], &[(2, vec![1])]);
+        let skipped = skipped.unwrap();
+        let ops = |p: &Checked| {
+            p.blocks
+                .iter()
+                .filter(|b| matches!(b, Block::Move { op, .. } if *op == k))
+                .count()
+        };
+        assert!(ops(&skipped[0]) < ops(full));
     }
 
     #[test]

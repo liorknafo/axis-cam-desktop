@@ -310,6 +310,8 @@ pub enum Message {
     /// Tab went down: the next text field, or the previous one with Shift;
     /// with none focused, the form's first field.
     TabKey(bool),
+    /// Shift went down or up: a click on a step then picks a range.
+    Shift(bool),
     /// F1 went down: the help of the focused text field, pinned.
     HelpKey,
     /// The focused text field F1 found, or none: pins its help, or puts the
@@ -1291,6 +1293,8 @@ pub struct App {
     pub jog_key: Option<(usize, bool)>,
     /// Counts the checks of setups to run, so a late answer is ignored.
     run_epoch: u64,
+    /// Shift is held (`Message::Shift`).
+    pub shift: bool,
     pub project_path: Option<PathBuf>,
     pub project_dirty: bool,
     pub planner: Planner,
@@ -1785,6 +1789,7 @@ impl App {
             run_on_connect: None,
             jog_key: None,
             run_epoch: 0,
+            shift: false,
             smoke_pending: false,
             smoke_frames: 0,
             smoke_changed: Instant::now(),
@@ -3166,12 +3171,12 @@ impl App {
         let Some(si) = r.follow(&self.doc) else {
             return Task::none();
         };
-        let (epoch, skips) = (r.epoch, r.skips.clone());
+        let (epoch, skips, steps) = (r.epoch, r.skips.clone(), r.all_cut());
         let doc = self.doc.clone();
         let mesh = self.part_mesh().cloned();
         let check = move || {
             let (programs, left) = match mesh {
-                Some(mesh) => run::check_skipping(&doc, &mesh, si, &skips),
+                Some(mesh) => run::check_steps(&doc, &mesh, si, &skips, &steps),
                 None => (
                     Err(vec![
                         "Load the imported part before running a setup.".into(),
@@ -3279,7 +3284,7 @@ impl App {
         }
         self.run_epoch += 1;
         if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
-            (r.epoch, r.programs, r.stale) = (self.run_epoch, None, false);
+            (r.epoch, r.programs, r.stale, r.recheck) = (self.run_epoch, None, false, false);
         }
         self.check_run()
     }
@@ -3852,8 +3857,14 @@ impl App {
         self.control_phase = phase;
         let tab = match phase {
             ui::Phase::ToolChange => ui::ControlTab::ToolChange,
+            ui::Phase::Start => ui::ControlTab::Start,
             ui::Phase::Cutting => ui::ControlTab::Job,
-            ui::Phase::Idle if self.control_tab == ui::ControlTab::ToolChange => {
+            ui::Phase::Idle
+                if matches!(
+                    self.control_tab,
+                    ui::ControlTab::ToolChange | ui::ControlTab::Start
+                ) =>
+            {
                 ui::ControlTab::Job
             }
             ui::Phase::Idle => return Task::none(),
@@ -6084,6 +6095,32 @@ impl App {
                     return self.recheck_run();
                 }
             }
+            // The same for steps: a skip of them, or a start at one.
+            Message::Run(a @ (run::Action::SkipSteps(_) | run::Action::StartStep)) => {
+                let Some(r) = (self.control.as_mut())
+                    .filter(|c| c.manual() && !c.probing())
+                    .and_then(|c| c.run.as_mut())
+                else {
+                    return Task::none();
+                };
+                let changed = match a {
+                    run::Action::SkipSteps(cut) => r.skip_steps(cut),
+                    _ => r.start_step(),
+                };
+                if changed {
+                    return self.recheck_run();
+                }
+            }
+            Message::Run(run::Action::PickStep(oi, s)) => {
+                if let Some(r) = (self.control.as_mut())
+                    .filter(|c| c.manual() && !c.probing())
+                    .and_then(|c| c.run.as_mut())
+                    .filter(|r| r.running.is_none())
+                {
+                    r.pick(oi, s, self.shift);
+                }
+            }
+            Message::Shift(down) => self.shift = down,
             Message::Run(run::Action::CoolantOff) => {
                 let Some((c, r)) = self
                     .control
@@ -7083,6 +7120,7 @@ impl App {
                     && self.page == Page::Control
                     && !self.locked()
                     && stale.is_some_and(|r| r.stale && r.running.is_none())
+                    || !self.locked() && stale.is_some_and(|r| r.recheck && r.running.is_none())
                 {
                     self.recheck_run()
                 } else {
@@ -7802,6 +7840,9 @@ fn on_event(
             modifiers,
             ..
         }) => Some(Message::TabKey(modifiers.shift())),
+        iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) => {
+            Some(Message::Shift(modifiers.shift()))
+        }
         // A focused text field takes Space as a character.
         iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
             key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Space),

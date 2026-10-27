@@ -2450,9 +2450,9 @@ flood = { pin = 8 }
     fn answer_skips(a: &mut App, si: usize) {
         use std::sync::Arc;
         let epoch = run_of(a).epoch;
-        let skips = run_of(a).skips.clone();
+        let (skips, steps) = (run_of(a).skips.clone(), run_of(a).all_cut());
         let (programs, left) =
-            crate::run::check_skipping(&a.doc, a.part_mesh().unwrap(), si, &skips);
+            crate::run::check_steps(&a.doc, a.part_mesh().unwrap(), si, &skips, &steps);
         let times = crate::run::Times::checked(&programs, &conn(a).config);
         let left = crate::run::Left {
             after: vec![],
@@ -2592,6 +2592,93 @@ flood = { pin = 8 }
         assert!(skip(&mut a, 3, Some(Cut)));
         a.touch();
         assert!(run_of(&a).skips.is_empty() && run_of(&a).stale);
+    }
+
+    /// A hole of the Drill skipped as cut, then a start at a later one
+    /// (LIO-275): each checks the setup again, keeping where Cycle Start
+    /// starts; the start is the Drill's tool run, and waits for the work zero
+    /// the holes before were drilled with and the drill's Z to be kept;
+    /// Cycle Start rapids over the hole's entry, at the Drill's clearance,
+    /// and waits there with the spindle on; Resume drills the rest.
+    #[test]
+    fn a_start_at_a_step_waits_over_its_entry_until_resume() {
+        use crate::run::{Action as R, Stage, StepStage as S};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let drill = run_of(&a).op_steps(1).expect("the Drill's holes").clone();
+        assert!(
+            drill.hole && drill.steps.len() >= 3,
+            "{}",
+            drill.steps.len()
+        );
+        let blocks = |a: &App| run_of(a).checked().unwrap()[1].blocks.len();
+        let all = blocks(&a);
+        // Hole 2 already drilled.
+        let _ = a.update(Message::Run(R::Steps(Some(1))));
+        let _ = a.update(Message::Run(R::PickStep(1, 1)));
+        let _ = a.view();
+        let _ = a.update(Message::Run(R::SkipSteps(true)));
+        assert!(run_of(&a).programs.is_none());
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).cut_steps, [(1, vec![1])]);
+        assert!(blocks(&a) < all);
+        assert_eq!(
+            run_of(&a).step_stages(1, Stage::ToCome, None)[..3],
+            [S::ToCome, S::Cut, S::ToCome]
+        );
+        assert_eq!((run_of(&a).next, run_of(&a).from), (0, 0));
+        // Start at hole 3: the Drill's tool run is next, from there; the
+        // holes before it are taken as cut by the start, the skip of hole 2
+        // with them.
+        let _ = a.update(Message::Run(R::PickStep(1, 2)));
+        let _ = a.update(Message::Run(R::StartStep));
+        answer_skips(&mut a, 0);
+        let run = run_of(&a);
+        assert_eq!((run.next, run.at_step()), (1, Some((1, 2))));
+        assert!(run.cut_steps.is_empty());
+        assert_eq!(
+            run.step_stages(1, Stage::Next, None)[..3],
+            [S::Before, S::Before, S::Next]
+        );
+        let _ = a.view();
+        let wants = problems(&a);
+        assert!(wants.iter().any(|p| p.contains("Keep it")), "{wants:?}");
+        assert!(
+            wants.iter().any(|p| p.contains("Same tool, keep Z")),
+            "{wants:?}"
+        );
+        let _ = a.update(Message::Run(R::KeepZero));
+        let _ = a.update(Message::Run(R::KeepToolZ));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5.0, "the pause over the entry", |s| {
+            matches!(s.state, Some(State::Paused(_)))
+        });
+        let s = conn(&a).snapshot.clone();
+        let Some(State::Paused(why)) = &s.state else {
+            unreachable!()
+        };
+        assert!(why.contains("hole 3"), "{why}");
+        // Over the entry, at the Drill's clearance, the spindle on.
+        let sims = crate::run::simulated_for_tests(&a.doc, a.part_mesh().unwrap(), 0);
+        let plan = &sims[1].1.as_ref().unwrap().plan;
+        let entry = plan.moves[drill.steps[2].moves.start].from;
+        let datum = run_of(&a).checked().unwrap()[1].datum;
+        for k in 0..3 {
+            assert!(
+                (s.work_pos[k] - (entry[k] - datum[k]) as f64).abs() < 0.06,
+                "{:?} {entry:?}",
+                s.work_pos
+            );
+        }
+        assert_ne!(s.spindle, Some(uc100::gcode::Spindle::Off));
+        let _ = a.update(Message::Run(R::Resume));
+        run_until(&mut a, 30.0, "the Drill's tool run", |r| r.done[1]);
+        assert!(run_of(&a).outcome.as_ref().unwrap().0);
     }
 
     /// Cycle Start runs the operations a run does not skip: with the Pocket
@@ -3020,6 +3107,31 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::More(None)));
         assert!(skip(&mut a, 2, None) && skip(&mut a, 3, None));
         answer_with_stock(&mut a, dir.path(), 0);
+        // The step list (LIO-275): the operation with the most steps
+        // unfolded, then a range of them picked by Shift-click.
+        let most = (run_of(&a).steps.iter())
+            .max_by_key(|s| s.steps.len())
+            .map(|s| (s.op, s.steps.len()))
+            .unwrap();
+        assert!(most.1 > 1, "{most:?}");
+        let _ = a.update(Message::Run(R::Steps(Some(most.0))));
+        shot(&mut a, "04-steps");
+        let _ = a.update(Message::Run(R::PickStep(most.0, 1)));
+        let _ = a.update(Message::Shift(true));
+        let _ = a.update(Message::Run(R::PickStep(most.0, (most.1 - 1).min(3))));
+        let _ = a.update(Message::Shift(false));
+        assert_eq!(run_of(&a).picked, Some((most.0, 1, (most.1 - 1).min(3))));
+        shot(&mut a, "04-steps-picked");
+        // A start at the first picked: its checks in the Start at a step tab.
+        let _ = a.update(Message::Run(R::StartStep));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((most.0, 1)));
+        let _ = a.update(Message::ControlPhaseTab(T::Start, false));
+        shot(&mut a, "04-start-at-step");
+        let _ = a.update(Message::Run(R::Next(0)));
+        answer_with_stock(&mut a, dir.path(), 0);
+        let _ = a.update(Message::ControlTab(T::Job));
+        let _ = a.update(Message::Run(R::Steps(None)));
         let _ = a.update(Message::Run(R::CycleStart));
         tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
         let mut deadline = Deadline::new(30.);

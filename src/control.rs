@@ -2903,6 +2903,12 @@ impl Connection {
             R::More(oi) => {
                 run.menu = oi.filter(|_| self.manual() && run.running.is_none() && !self.probing())
             }
+            R::Steps(oi) => {
+                run.open = oi;
+                run.picked = run.picked.filter(|p| Some(p.0) == oi);
+            }
+            R::ClearSteps => run.picked = None,
+            R::KeepToolZ if run.at_step().is_some() => run.tool_kept = true,
             R::CycleStart => {
                 if let Some(job) = run.cycle_start(self, doc) {
                     self.send(job);
@@ -3287,14 +3293,14 @@ impl Connection {
     /// run from (`post::Checked::probe_from`), each with why it cannot: on
     /// the stock the operations before the start leave, for a run that
     /// starts partway (`post::Partly::probe_from`).
-    pub fn probe_spots(&self) -> &[([crate::post::At; 2], Result<(), String>)] {
+    pub fn probe_spots(&self) -> Vec<([crate::post::At; 2], Result<(), String>)> {
         let (Some(run), Ok(p)) = (&self.run, self.run_program()) else {
-            return &[];
+            return vec![];
         };
         if run.partway() {
-            run.partly().map_or(&[], |x| &x.probe_from)
+            run.partly().map_or_else(Vec::new, |x| x.probe_from.clone())
         } else {
-            &p.probe_from
+            p.probe_from.clone()
         }
     }
 

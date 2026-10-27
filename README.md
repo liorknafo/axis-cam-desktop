@@ -1182,6 +1182,46 @@ bar, at once when that machine is connected, or when you press
    Picking another setup, or any change to the project, ends the skips: the
    setup is checked again without them. When a skip's check refuses the
    setup, the Operations list offers **Don't skip** for each.
+
+   An operation that goes back up to its clearance between cuts has
+   **steps**: each stretch of its program from the tool at its clearance
+   (the highest Z it moves at, above the stock top) to the tool there again,
+   a Z level, a pass, a hole or a band. They are found in the generated
+   moves, the same way for every strategy: between two feed moves, where the
+   tool is at the clearance, a step ends and the next begins. A step is
+   called **Level n · Z −6.50** when its level feed moves all cut at one Z,
+   **Hole n** in a Drill, otherwise **Pass n**, with its estimated time (its
+   share of the operation's). An operation that does not turn A and has
+   more than one step has **▸** before its name, with how many ("38
+   levels"): **▾** unfolds them under its row, one line each, long runs of
+   them folded into one line ("Levels 1–12 · done · 0:51") so that the
+   column does not scroll. Click a step to pick it, Shift-click another to
+   pick the steps between; under them, while the machine stands still and
+   no tool run runs:
+   - **Skip: already cut** leaves the steps picked out of the program, and
+     the stock is taken as cut through them: after the step before them the
+     tool rises, rapids over at the clearance and comes down into the step
+     after them, as it does between steps (**Don't skip** takes them back).
+     There is no Leave the material for steps: within one operation the
+     steps after them nearly always cut beneath them, at a feed made for
+     less (said on the button's hover). Not every step of an operation:
+     that is the operation's own skip.
+   - **Start at level 5** makes the first step picked the start: the steps
+     before it and the operations before its operation are taken as cut, as
+     before a Start here, and the program enters it as Start here enters an
+     operation (the tool change's safe start: retract, spindle and coolant
+     on, across at the clearance plane, down over the step's entry). The run
+     bar says **Start <operation> at level 5**, and Cycle Start waits for the
+     checks of a start at a step in the **Start at a step** tab: X, Y and Z
+     with their machine position (Home again, or Set machine zero again, if
+     an E-stop or a new session lost it), the work zero the steps before were
+     cut with (**Keep it**, or set it again on the stock: the check knows the
+     stock before and after the operation, so a probe spot or surface the
+     operation leaves as it was is offered), and the tool's Z (**Same tool,
+     keep Z**, or Set Z from reference). Cycle Start then rapids over the
+     step's entry and **waits there**, spindle on; **Resume** feeds in.
+   Each skip of steps and each start at one checks the setup again, keeping
+   what was done and where Cycle Start starts.
 4. Between tool runs with different tools, the **Tool change** tab opens
    with the steps: the last one ended with the spindle and coolant off at the setup's
    clearance plane. Touch the old tool

@@ -1872,6 +1872,32 @@ fn run_help(a: &crate::run::Action) -> (&'static str, &'static str) {
             "",
         ),
         More(None) => ("Close the skips without skipping.", ""),
+        Steps(Some(_)) => (
+            "Show this operation's steps: each stretch from the tool at its clearance to the next, a Z level, a pass, a hole or a band, with its estimated time. Pick one, or Shift-click another for a range, to skip them or start at one.",
+            "",
+        ),
+        Steps(None) => ("Fold this operation's steps away.", ""),
+        PickStep(..) => (
+            "Pick this step; Shift-click another to pick the steps between. Then skip them as already cut, or start at the first. Picked while the machine stands still and no tool run runs.",
+            "",
+        ),
+        ClearSteps => ("Pick no step.", ""),
+        SkipSteps(true) => (
+            "Skip the steps picked, already cut: they are not sent, and the stock is taken as cut through them. After the step before them the tool rises, rapids over at the clearance and comes down into the step after them, as it does between steps.",
+            "No Leave the material for steps: within one operation the steps after these nearly always cut beneath them, at a feed made for less. The setup is checked again.",
+        ),
+        SkipSteps(false) => (
+            "Don't skip this operation's steps: the setup is checked again with all of them.",
+            "",
+        ),
+        StartStep => (
+            "Start at the first step picked: the steps before it and the operations before this one are taken as cut. Cycle Start re-enters as a Start here does: across at the clearance, down over the step's entry, and waits there until Resume feeds in.",
+            "Before Cycle Start: the machine position, the work zero the steps were cut with (Keep it, or set it again) and the tool's Z (Same tool, keep Z, or Set Z from reference).",
+        ),
+        KeepToolZ => (
+            "The tool in the spindle is the one the steps before this start were cut with, not taken out since: its Z is kept for the start at a step.",
+            "",
+        ),
     }
 }
 
@@ -4971,6 +4997,14 @@ mod tests {
             Run::Skip(0, None),
             Run::More(Some(0)),
             Run::More(None),
+            Run::Steps(Some(0)),
+            Run::Steps(None),
+            Run::PickStep(0, 0),
+            Run::ClearSteps,
+            Run::SkipSteps(true),
+            Run::SkipSteps(false),
+            Run::StartStep,
+            Run::KeepToolZ,
         ] {
             messages.push(Message::Run(a));
         }
