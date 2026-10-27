@@ -17199,6 +17199,43 @@ soft_max = 180.0
             );
         }
     }
+    /// Why Run will refuse is in sight under the 3D view at the smallest
+    /// window, where the toolbar would fill the room the panels scroll in:
+    /// the strip goes above it there. At the opening size, with room for
+    /// both, the toolbar stays first (LIO-318).
+    #[test]
+    fn a_refusal_is_in_sight_under_the_3d_view_at_the_smallest_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_on(dir.path(), LIMITED);
+        a.doc.adopt_holders();
+        a.smoke_dir = Some(dir.path().to_path_buf());
+        a.page = Page::Work;
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        let _ = a.update(Message::SetClamps("-X:0;+X:0;-Y:0;+Y:0".into()));
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Generate);
+        let _ = a.refresh_ready();
+        assert!(!a.sim_details && !crate::ui::run_check(&a).unwrap().2);
+        for (size, strip_first) in [(crate::MIN_WINDOW, true), (crate::WINDOW, false)] {
+            let laid = laid_out(&a, size);
+            let find = |words: &str| {
+                (laid.texts.iter())
+                    .find(|(t, _)| t.starts_with(words))
+                    .unwrap_or_else(|| panic!("{size:?}: no {words:?}"))
+                    .1
+            };
+            let hint = find("Drag to orbit");
+            let refusal = find("Workholding problem");
+            let (panels, _) = *(laid.scrolls.iter())
+                .find(|(_, content)| content.contains(hint.center()))
+                .unwrap();
+            assert!(
+                refusal.y >= panels.y && refusal.y + refusal.height <= panels.y + panels.height,
+                "{size:?}: refusal at {refusal:?}, panels {panels:?}"
+            );
+            assert_eq!(refusal.y < hint.y, strip_first, "{size:?}");
+        }
+    }
     /// The playback percentage says "44%", not "044%", and is as wide at
     /// 100%, so the slider beside it keeps its length (LIO-305).
     #[test]

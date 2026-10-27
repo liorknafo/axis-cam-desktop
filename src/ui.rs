@@ -2247,6 +2247,12 @@ const PANELS: f32 = 320.;
 pub(crate) fn scene_frame(height: f32) -> f32 {
     (height - PANELS).max(height * 0.5)
 }
+/// The room (logical pixels) under the 3D view that shows the toolbar, the
+/// strip's heading and a refusal's heading over the strip's pinned controls
+/// (some 80, 65 and 95). With less, a refusal goes above the toolbar.
+const REFUSAL_IN_SIGHT: f32 = 250.;
+/// What the section's controls add to the toolbar.
+const SECTION_LINE: f32 = 40.;
 /// The 3D view `scene` shows. None without a part to show.
 pub(crate) fn scene_viewport(app: &App) -> Option<Viewport<'_>> {
     let s = app.doc.active_setup();
@@ -2355,14 +2361,20 @@ fn workspace(app: &App) -> Element<'_, Message> {
     // in a Shrink-wide column, iced lays them out before the Fill-wide
     // scrollable, which gets what they leave.
     let middle = responsive(move |size| {
-        let (toolbar, simulation, controls) = scene_panels(app);
+        let (toolbar, simulation, controls, refused) = scene_panels(app);
         let frame = scene_frame(size.height);
         let scene = scene(app, Some(frame)).unwrap_or_else(|| no_scene(app));
-        let panels = column![
-            scrollable(column![toolbar, simulation]),
-            container(controls).width(size.width)
-        ]
-        .width(Length::Shrink);
+        // Where the room is too short to show the toolbar and then why Run
+        // will refuse, the strip goes first: the toggles scroll (LIO-318).
+        let short =
+            size.height - frame < REFUSAL_IN_SIGHT + if app.section_on { SECTION_LINE } else { 0. };
+        let scrolled = if refused && short {
+            column![simulation, toolbar]
+        } else {
+            column![toolbar, simulation]
+        };
+        let panels = column![scrollable(scrolled), container(controls).width(size.width)]
+            .width(Length::Shrink);
         let panels = container(panels).max_height(size.height - frame);
         column![scene, panels].into()
     });
@@ -2468,13 +2480,15 @@ fn section_controls(app: &App) -> Option<Element<'_, Message>> {
 /// The 3D view's toolbar, the simulation strip under it, and the strip's
 /// controls under that: Play and the timeline, the stats and Details, or
 /// what to do for a preview. The open details go above the controls, so
-/// that Details keeps its place.
+/// that Details keeps its place. Last, whether the strip says why Run will
+/// refuse.
 fn scene_panels(
     app: &App,
 ) -> (
     Element<'_, Message>,
     Element<'_, Message>,
     Element<'_, Message>,
+    bool,
 ) {
     let detail = if app.is_sample() && app.section_on {
         "Sample housing · selectable demo geometry · cutting through a face needs an imported part"
@@ -2601,6 +2615,7 @@ fn scene_panels(
     // Folded, a simulation's strip says the check's first line and one line
     // of stats; Details brings back the rest (`Message::ToggleSimDetails`).
     let folded = !app.sim_details && ready && app.active_simulation().is_some();
+    let mut refused = false;
     if let Some((heading, mut lines, ok, checking)) = run_check(app) {
         if folded && ok {
             lines.clear();
@@ -2623,6 +2638,7 @@ fn scene_panels(
         } else if lines.is_empty() {
             muted(heading).size(12).into()
         } else {
+            refused = true;
             caution(heading, lines)
         };
         playback = playback.push(said);
@@ -2797,7 +2813,7 @@ fn scene_panels(
     }
     let simulation = container(playback).padding([12, 16]).style(panel_style);
     let controls = container(controls).padding([12, 16]).style(panel_style);
-    (toolbar.into(), simulation.into(), controls.into())
+    (toolbar.into(), simulation.into(), controls.into(), refused)
 }
 /// How long the stock mesher works before the strip says so: Play meshes
 /// the stock again for each frame, mostly in well under this.
