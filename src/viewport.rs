@@ -1935,11 +1935,12 @@ impl Viewport<'_> {
                     && (sim.plan.strategy == Strategy::Parallel
                         || ((movement.to[2] - pos[2]).abs() < 0.001
                             && (movement.from[2] - pos[2]).abs() < 0.001));
-                // With the load on each tooth, every cut so far stays drawn
-                // in its colour, to be looked over when the run ends; without
-                // it, this level's alone.
+                // This level's cuts alone while the run goes on: the levels
+                // above, cut already, would hide the stock they cut. When it
+                // has ended with the load on each tooth, every cut stays
+                // drawn in its colour, to be looked over.
                 if feed
-                    && sim.tooth_load.is_none()
+                    && (sim.tooth_load.is_none() || sim.seconds < sim.plan.duration)
                     && !pocket_layer
                     && Some(index) != last_cut
                     && index != sim.current
