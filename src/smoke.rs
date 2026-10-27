@@ -2935,10 +2935,15 @@ flood = { pin = 8 }
         assert!(run_of(&a).pictures.is_empty() && run_of(&a).left.is_some());
         let _ = a.update(Message::MachineEStop);
         tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+        // The E-stop makes the step being cut the start (LIO-275), checked
+        // again for a start at a later step: answered here.
+        if run_of(&a).programs.is_none() {
+            answer_with_stock(&mut a, dir.path(), 0);
+        }
         // Once tool run 1 is done, as when it ends.
         let r = a.control.as_mut().unwrap().run.as_mut().unwrap();
         r.running = None;
-        (r.done[0], r.next) = (true, 1);
+        (r.done[0], r.next, r.from, r.start_step) = (true, 1, 0, None);
         assert_eq!(stages(&a, 0), [Done, Done, Done]);
         assert_eq!(stages(&a, 1), [Next]);
         // Stopped: Cycle Start waits for the pictures, which the Tick makes.
@@ -4713,9 +4718,9 @@ flood = { pin = 8 }
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
     }
 
-    /// The run bar holds Cycle Start, Hold, Resume and Stop now however long
-    /// the setup is; its operations are in the Operations list beside it
-    /// (#71, LIO-274).
+    /// The run bar holds Cycle Start, Hold, Resume, Stop after step and Stop
+    /// now however long the setup is; its operations are in the Operations
+    /// list beside it (#71, LIO-274).
     #[test]
     fn the_run_bar_keeps_cycle_start_and_stop_now_beside_a_long_operations_list() {
         use iced::advanced::widget::{Tree, tree::Tag};
@@ -4744,8 +4749,9 @@ flood = { pin = 8 }
         assert_eq!(two.len(), 2);
         let _ = a.view();
         let (strip, runs) = counts(&a);
-        // Cycle Start, Hold, Resume and Stop now; the setup is a list.
-        assert_eq!(strip, 4);
+        // Cycle Start, Hold, Resume, Stop after step and Stop now; the
+        // setup is a list.
+        assert_eq!(strip, 5);
         assert!(runs >= 1, "{runs}");
         // Twelve tool runs: the two, six times over.
         let epoch = run_of(&a).epoch;
