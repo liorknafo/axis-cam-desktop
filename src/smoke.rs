@@ -2443,16 +2443,36 @@ flood = { pin = 8 }
     /// `App::check_run` does, pictures made in line.
     fn answer_with_stock(a: &mut App, dir: &std::path::Path, si: usize) {
         use std::sync::Arc;
-        let epoch = run_of(a).epoch;
         let (programs, left) = crate::run::check(&a.doc, a.part_mesh().unwrap(), si);
         let times = crate::run::Times::checked(&programs, &conn(a).config);
+        answer_stock(a, dir, (Arc::new(programs), Arc::new(left), times));
+    }
+
+    /// A check's answer: its programs, the stock it leaves and their times.
+    type StockCheck = (
+        std::sync::Arc<Result<Vec<crate::post::Checked>, Vec<String>>>,
+        std::sync::Arc<crate::run::Left>,
+        Option<std::sync::Arc<crate::run::Times>>,
+    );
+
+    /// The run's check of setup `si` as `App::check_run` makes it, with the
+    /// run's skips and steps taken as cut. It takes seconds: worked out
+    /// before a tool run that it is answered during, which would otherwise
+    /// cut on meanwhile to wherever the load lets it (LIO-313).
+    fn stock_check(a: &App, si: usize) -> StockCheck {
+        use std::sync::Arc;
+        let (skips, steps) = (run_of(a).skips.clone(), run_of(a).all_cut());
+        let (programs, left) =
+            crate::run::check_steps(&a.doc, a.part_mesh().unwrap(), si, &skips, &steps);
+        let times = crate::run::Times::checked(&programs, &conn(a).config);
+        (Arc::new(programs), Arc::new(left), times)
+    }
+
+    /// Answers the run's check with `check`, pictures made in line.
+    fn answer_stock(a: &mut App, dir: &std::path::Path, (programs, left, times): StockCheck) {
+        let epoch = run_of(a).epoch;
         a.smoke_dir = Some(dir.to_path_buf());
-        let _ = a.update(Message::RunCheckedStock(
-            epoch,
-            Arc::new(programs),
-            Arc::new(left),
-            times,
-        ));
+        let _ = a.update(Message::RunCheckedStock(epoch, programs, left, times));
         a.smoke_dir = None;
     }
 
@@ -2794,6 +2814,15 @@ flood = { pin = 8 }
         assert_eq!(run_of(&a).open, Some(1));
     }
 
+    /// `run_app`'s Drill fed at 600 mm/min, a few seconds a hole: long
+    /// enough to E-stop in it however loaded the test machine is. At FAST's
+    /// 30000 mm/min the tool is past it before the E-stop lands (LIO-313).
+    fn slow_holes(a: &mut App) {
+        let op = &mut a.doc.setups[0].operations[1];
+        assert_eq!(op.strategy, Strategy::Drill);
+        op.p.insert("feed".into(), "600".into());
+    }
+
     /// An E-stop while a hole is drilled (LIO-275): that hole counts as not
     /// done, the journal keeps the one before it, and it is the start, cut
     /// again from its start.
@@ -2802,6 +2831,7 @@ flood = { pin = 8 }
         use crate::run::Action as R;
         let dir = tempfile::tempdir().unwrap();
         let mut a = run_app(dir.path());
+        slow_holes(&mut a);
         let drill = drilling(&mut a);
         assert!(drill.steps.len() >= 2);
         // Into the second hole, before its cutting is done.
@@ -2844,6 +2874,51 @@ flood = { pin = 8 }
             "{:?}",
             problems(&a)
         );
+    }
+
+    /// A check answered while the Drill drills waits to be pictured (#167).
+    /// The E-stop in hole 2 makes that hole the start, which the setup is
+    /// checked again for: the stock of the check before is dropped, not
+    /// pictured under the new check's epoch as if it were its own, and the
+    /// new check's is pictured once it answers (LIO-313).
+    #[test]
+    fn a_check_again_after_an_e_stop_pictures_its_own_stock() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        slow_holes(&mut a);
+        zeroed(&mut a);
+        check_run_pictured(&mut a, dir.path(), 0);
+        assert_eq!(run_of(&a).pictures.len(), 2);
+        let check = stock_check(&a, 0);
+        let _ = a.update(Message::Run(R::Next(1)));
+        let _ = a.update(Message::Run(R::KeepZero));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(&mut a, 30.0, "hole 2", |r| {
+            r.step_at(None)
+                .is_some_and(|(oi, s, done)| oi == 1 && s == 1 && !done)
+        });
+        answer_stock(&mut a, dir.path(), check);
+        assert!(run_of(&a).pictures.is_empty() && run_of(&a).left.is_some());
+        let epoch = run_of(&a).epoch;
+        let _ = a.update(Message::MachineEStop);
+        run_until(&mut a, 5.0, "the E-stop", |r| r.running.is_none());
+        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+        // Checked again, its stock not yet worked out: nothing to picture.
+        let run = run_of(&a);
+        assert!(
+            run.epoch > epoch && run.programs.is_none(),
+            "{:?}",
+            run.outcome
+        );
+        assert_eq!((a.picture_job, run.left.is_some()), (None, false));
+        let check = stock_check(&a, 0);
+        answer_stock(&mut a, dir.path(), check);
+        assert_eq!(run_of(&a).at_step(), Some((1, 1)));
+        assert_eq!(run_of(&a).pictures.len(), 2);
+        assert_eq!(a.picture_job, None);
     }
 
     /// The Face and the Pocket, one tool run, its Cycle Start sent, and
@@ -3005,6 +3080,7 @@ flood = { pin = 8 }
         assert_eq!(stages(&a, 1), [ToCome]);
         let _ = a.view();
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let check = stock_check(&a, 0);
         let _ = a.update(Message::Run(R::CycleStart));
         tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
         let mut deadline = Deadline::new(30.);
@@ -3016,32 +3092,29 @@ flood = { pin = 8 }
         // The pictures stay through the run.
         assert_eq!(run_of(&a).pictures.len(), 4);
         // A check answered while the machine cuts is not pictured then: the
-        // meshing would compete with the driver feeding it (#167).
-        answer_with_stock(&mut a, dir.path(), 0);
-        let _ = a.update(Message::Tick);
+        // meshing would compete with the driver feeding it (#167). Cycle
+        // Start waits for its pictures.
+        let busy = Some("The stock after each operation is still being pictured: wait a moment.");
+        answer_stock(&mut a, dir.path(), check);
         assert!(run_of(&a).pictures.is_empty() && run_of(&a).left.is_some());
-        let _ = a.update(Message::MachineEStop);
-        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
-        // The E-stop makes the step being cut the start (LIO-275), checked
-        // again for a start at a later step: answered here.
-        if run_of(&a).programs.is_none() {
-            answer_with_stock(&mut a, dir.path(), 0);
+        assert_eq!(a.planning_busy(), busy);
+        // Nor by the Tick, until tool run 1 ends; then the Tick pictures it.
+        let epoch = run_of(&a).epoch;
+        let mut deadline = Deadline::new(60.);
+        while a.picture_job.is_none() {
+            let _ = a.update(Message::Tick);
+            assert!(
+                run_of(&a).running.is_none() || run_of(&a).left.is_some(),
+                "pictured while tool run 1 cuts"
+            );
+            assert!(deadline.within(&conn(&a).snapshot), "{:?}", stages(&a, 0));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        // Once tool run 1 is done, as when it ends.
-        let r = a.control.as_mut().unwrap().run.as_mut().unwrap();
-        r.running = None;
-        (r.done[0], r.next, r.from, r.start_step) = (true, 1, 0, None);
+        assert!(run_of(&a).outcome.as_ref().is_some_and(|o| o.0));
         assert_eq!(stages(&a, 0), [Done, Done, Done]);
         assert_eq!(stages(&a, 1), [Next]);
-        // Stopped: Cycle Start waits for the pictures, which the Tick makes.
-        assert_eq!(
-            a.planning_busy(),
-            Some("The stock after each operation is still being pictured: wait a moment.")
-        );
-        let epoch = run_of(&a).epoch;
-        let _ = a.update(Message::Tick);
         assert!(a.picture_job == Some(epoch) && run_of(&a).left.is_none());
-        assert!(a.planning_busy().is_some());
+        assert_eq!(a.planning_busy(), busy);
         let _ = a.update(Message::RunPictures(epoch, pictures(&a)));
         assert_eq!(run_of(&a).pictures.len(), 4);
         assert_eq!(a.planning_busy(), None);

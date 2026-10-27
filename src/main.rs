@@ -3315,7 +3315,10 @@ impl App {
         }
         true
     }
-    /// Checks the setup being run again, keeping its progress.
+    /// Checks the setup being run again, keeping its progress. The stock
+    /// the check before left, not pictured yet (it answered while the
+    /// machine cut), is dropped: pictured now, it would pass for the new
+    /// check's, whose epoch the picture job takes (LIO-313).
     fn recheck_run(&mut self) -> Task<Message> {
         if self.check_waits() {
             return Task::none();
@@ -3323,6 +3326,7 @@ impl App {
         self.run_epoch += 1;
         if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
             (r.epoch, r.programs, r.stale, r.recheck) = (self.run_epoch, None, false, false);
+            r.left = None;
         }
         self.check_run()
     }
