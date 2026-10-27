@@ -679,7 +679,34 @@ fn relink(
             }
         } else {
             for p in stretch {
-                keep(p, &mut out, &mut visited);
+                // A rapid of the plan's own straight down into the stock,
+                // Pocket's to just over the level before, may have been
+                // proven by where the tool went down in a stretch replaced
+                // earlier (LIO-306): where it no longer is, it stops at the
+                // approach and feeds on down.
+                let (a, b) = (from(p), to(p));
+                let down = moves[p.index].motion == Motion::Rapid
+                    && length([a[0], a[1], 0.], [b[0], b[1], 0.]) <= 1e-5
+                    && b[2] < a[2]
+                    && b[2] < high;
+                let (approach, clear) = if down {
+                    approach(b, &visited)
+                } else {
+                    (b[2], true)
+                };
+                if b[2] >= approach - 1e-4 {
+                    keep(p, &mut out, &mut visited);
+                    continue;
+                }
+                let mut was = a;
+                if a[2] > approach {
+                    let over = [b[0], b[1], approach];
+                    out.push((None, a, over, Motion::Rapid, RAPID));
+                    was = over;
+                }
+                let rate = if clear { feed } else { feed * 0.25 };
+                out.push((None, was, b, Motion::Feed, rate));
+                visit(b, &mut visited);
             }
         }
         i = j;
@@ -848,6 +875,65 @@ mod tests {
             (15., Motion::Feed, 600., 10.)
         );
         assert!(down.to[0] > 50. && down.to[0] < 60., "{down:?}");
+    }
+    #[test]
+    fn a_pockets_descent_to_the_level_before_stays_proven_where_that_level_was_relinked() {
+        // A slot cleared at Z30 from X-90 to 0, and a Pocket's two levels
+        // along it from X-90: Z30, in the slot's air as far as X0, then Z29,
+        // whose loop rapids down to 0.5 mm over the level before, where the
+        // tool went down at Z30 (LIO-306).
+        let volume = stock(&[([-90., 0., 30.], [0., 0., 30.])]);
+        let moves = [
+            (Motion::Rapid, [-90., 0., 45.], 6000.),
+            (Motion::Feed, [-90., 0., 30.], 150.),
+            (Motion::Feed, [90., 0., 30.], 600.),
+            (Motion::Rapid, [90., 0., 50.], 6000.),
+            (Motion::Rapid, [-90., 0., 50.], 6000.),
+            (Motion::Rapid, [-90., 0., 30.5], 6000.),
+            (Motion::Feed, [-90., 0., 29.], 150.),
+            (Motion::Feed, [90., 0., 29.], 600.),
+            (Motion::Rapid, [90., 0., 50.], 6000.),
+        ];
+        let mut original = crate::post::fixture::plan([-90., 0., 50.], &moves);
+        (original.stock, original.radius, original.flute_length) = (STOCK, 5., 25.);
+        original.strategy = Strategy::Pocket;
+        let (plan, air) = trimmed(original, &volume);
+        assert!(air.expect("trimmed").stretches >= 1);
+        continuous(&plan);
+        // Z30's way down at X-90 is gone, and the slot's walls stand inside
+        // the column the export checks (the cutter's radius and the blend):
+        // Z29's descent there no longer rapids to Z30.5, but stops where the
+        // check proves the column clear, over the stock top, and feeds on.
+        let rest = crate::rest::RestStock::new(&volume, frame());
+        let mut been: Vec<[f32; 3]> = vec![];
+        for m in &plan.moves {
+            let down = m.motion == Motion::Rapid
+                && m.from[..2] == m.to[..2]
+                && m.to[2] < m.from[2]
+                && m.to[2] < STOCK.max[2];
+            if down {
+                let r = 5. + 1.;
+                let column = Bounds {
+                    min: [m.to[0] - r, m.to[1] - r, m.to[2]],
+                    max: [m.to[0] + r, m.to[1] + r, STOCK.max[2]],
+                };
+                let revisited =
+                    (been.iter()).any(|p| p[..2] == m.to[..2] && p[2] <= m.to[2] + 1e-3);
+                let proven = rest.beside(column)
+                    || rest.top(column, m.to[2] - 0.001, STOCK.max[2]) <= m.to[2] + 1e-3;
+                assert!(revisited || proven, "unproven rapid down to {:?}", m.to);
+            }
+            been.extend([m.from, m.to]);
+        }
+        assert!(
+            !(plan.moves.iter()).any(|m| m.motion == Motion::Rapid && m.to == [-90., 0., 30.5]),
+            "{:#?}",
+            plan.moves
+        );
+        let fed = (plan.moves.iter())
+            .find(|m| m.motion == Motion::Feed && m.to == [-90., 0., 30.5])
+            .expect("Z29's entry");
+        assert!(fed.from[2] > STOCK.max[2], "{fed:?}");
     }
     #[test]
     fn a_short_gap_is_fed_across() {
