@@ -2835,6 +2835,82 @@ flood = { pin = 8 }
         );
     }
 
+    /// The Face and the Pocket, one tool run, its Cycle Start sent, and
+    /// Stop after step armed once the tool cuts step `s` of operation `oi`:
+    /// the stop's journal once the machine is Idle (LIO-311).
+    fn stop_after(a: &mut App, oi: usize, s: usize) -> crate::run::Journal {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        zeroed(a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(a, 0);
+        assert!(problems(a).is_empty(), "{:?}", problems(a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(a, 30.0, "the step", |r| {
+            r.step_at(None)
+                .is_some_and(|(o, n, done)| (o, n, done) == (oi, s, false))
+        });
+        let _ = a.update(Message::Run(R::StopAfterStep));
+        assert!(run_of(a).stop_after);
+        run_until(a, 30.0, "the stop", |r| r.running.is_none());
+        tick_until(a, 5.0, "Idle", |s| s.state == Some(State::Idle));
+        a.control.as_ref().unwrap().journal().expect("the journal")
+    }
+
+    /// Stop after step armed in the Face's last level, the Pocket next in
+    /// its tool run (LIO-311): it stops at the Face's end, though the Face's
+    /// last move is its rise to the clearance, and not after the Pocket's
+    /// first level; the Pocket is the start then.
+    #[test]
+    fn stop_after_step_armed_in_the_face_stops_at_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), FAST, &[0, 1]);
+        let left = crate::run::check_steps(&a.doc, a.part_mesh().unwrap(), 0, &[], &[]).1;
+        let levels = left.steps.iter().find(|s| s.op == 0).unwrap().steps.len();
+        let journal = stop_after(&mut a, 0, levels - 1);
+        assert_eq!((journal.op, journal.step), (0, Some(levels - 1)));
+        let run = run_of(&a);
+        let (ok, message) = run.outcome.clone().unwrap();
+        assert!(
+            !ok && message == format!("Stopped after {}", run.step_label(0, levels - 1)),
+            "{message}"
+        );
+        assert!(!run.done[0]);
+        assert_eq!((run.next, run.from, run.at_step()), (0, 1, None));
+        // Over the stock top (work Z 0), not in the Pocket.
+        let z = conn(&a).snapshot.work_pos[2];
+        assert!(z > 0.5, "the tool stopped at work Z {z}");
+    }
+
+    /// Stopped after the Pocket's first level, the Face before it in its
+    /// tool run (LIO-311): the start at its second level checks, the level
+    /// done taken off the stock the Pocket's re-entry descends into, and
+    /// runs to the end of the tool run.
+    #[test]
+    fn a_resume_after_the_pockets_first_level_checks_and_runs() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), FAST, &[0, 1]);
+        let journal = stop_after(&mut a, 1, 0);
+        assert_eq!((journal.op, journal.step), (1, Some(0)));
+        assert!(run_of(&a).programs.is_none());
+        answer_skips(&mut a, 0);
+        let run = run_of(&a);
+        assert!(run.checked().is_some(), "{:?}", run.programs);
+        assert_eq!(run.at_step(), Some((1, 1)));
+        let _ = a.update(Message::Run(R::KeepZero));
+        let _ = a.update(Message::Run(R::KeepToolZ));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5.0, "the pause over the entry", |s| {
+            matches!(s.state, Some(State::Paused(_)))
+        });
+        let _ = a.update(Message::Run(R::Resume));
+        run_until(&mut a, 60.0, "the Pocket's tool run", |r| r.done[0]);
+        assert!(run_of(&a).outcome.as_ref().unwrap().0);
+    }
+
     /// Cycle Start runs the operations a run does not skip: with the Pocket
     /// already cut and the Drill's material left, tool run 1 cuts the Face
     /// and the Contour, and the Drill's tool run is skipped whole, with no

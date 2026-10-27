@@ -661,6 +661,22 @@ impl Run {
         left: Option<Arc<Left>>,
         times: Option<Arc<Times>>,
     ) {
+        // A start at a step, or steps taken as cut, that the check refuses:
+        // dropped, and the setup checked again from that operation's start,
+        // so that it never stays without a start to pick (LIO-311).
+        if let Err(why) = programs.as_ref()
+            && (self.start_step.is_some() || !self.cut_steps.is_empty())
+            && why.first().is_none_or(|w| w != REMOVED)
+        {
+            self.journal_note = Some(format!(
+                "The start at a step or the steps taken as cut could not be checked, so they are dropped and the operation starts at its first step: {} Pick another start in the Operations list if you like.",
+                why.join(" ")
+            ));
+            (self.start_step, self.resumed, self.picked) = (None, None, None);
+            self.cut_steps.clear();
+            (self.programs, self.recheck) = (None, true);
+            return;
+        }
         // Refused, the progress stays kept for the skip's undoing (`skip`).
         let keep = programs
             .as_ref()
@@ -943,13 +959,44 @@ impl Run {
         let (Some(r), Some(blocks)) = (self.running.as_ref(), self.running_blocks()) else {
             return false;
         };
-        let Some(mark) = r.marks.get(block).copied().flatten().filter(|m| m.2) else {
+        let Some(mark) = r.marks.get(block).copied().flatten() else {
             return false;
         };
         let Some(p) = self.checked().and_then(|c| c.get(r.index)) else {
             return false;
         };
-        let Some((op, step, _)) = self.mark_step(p, mark) else {
+        // The end of an operation is a step's end too (LIO-311): on the way
+        // into the next operation sent, before its first feed, the one before
+        // it, risen to its clearance after its last feed, did its last step.
+        // Its last move may be that rise, which is not yet at the clearance.
+        let ended = || {
+            for (m, b) in r.marks[..block].iter().zip(&blocks[..block]).rev() {
+                let m = (*m)?;
+                if m.0 != mark.0 {
+                    return (m.0 + 1 == mark.0 && m.2).then_some(m.0);
+                }
+                if matches!(
+                    b,
+                    Block::Move {
+                        kind: Kind::Feed,
+                        ..
+                    }
+                ) {
+                    return None;
+                }
+            }
+            None
+        };
+        let step = match mark.2 {
+            true => self.mark_step(p, mark),
+            false => ended().and_then(|k| {
+                let oi = *p.indexes.get(k)?;
+                let cut = self.cut_of(oi);
+                let n = self.op_steps(oi)?.steps.len();
+                Some((oi, (0..n).rev().find(|s| !cut.contains(s))?, true))
+            }),
+        };
+        let Some((op, step, _)) = step else {
             return false;
         };
         // The driver's line is where its planner is, which the stop slows
@@ -1262,12 +1309,10 @@ impl Run {
             std::array::from_fn(|k| (s.machine_pos[k] - s.work_offset[k]) as f32 + p.datum[k]);
         let blocks = p.from(self.from).ok()?;
         let paths = paths(blocks, tip);
+        // An operation of one step ends it too, once risen to its clearance
+        // (LIO-311).
         let clear: Vec<Option<f32>> = (p.indexes.iter())
-            .map(|&oi| {
-                Some(self.op_steps(oi)?)
-                    .filter(|s| s.steps.len() > 1)
-                    .map(|s| s.clear)
-            })
+            .map(|&oi| self.op_steps(oi).map(|s| s.clear))
             .collect();
         let marks = step_marks(blocks, &clear);
         let tool = p.ops[0].tool_id.clone();
@@ -2084,6 +2129,22 @@ pub fn check_steps(
             && !steps.is_empty()
             && steps.len() < found.steps.len()
         {
+            // Taken as cut, they cut the stock the operation starts from:
+            // the checks of the steps sent see that material gone (LIO-311).
+            if let Some(mut volume) = sim.initial_volume.take() {
+                let plan = &sim.plan;
+                for m in (steps.iter())
+                    .filter_map(|&s| found.steps.get(s))
+                    .flat_map(|s| &plan.moves[s.moves.clone()])
+                    .filter(|m| m.motion == crate::simulation::Motion::Feed)
+                {
+                    if let Some(frame) = sim.frame_at(m.a) {
+                        let (r, flute) = (plan.radius, plan.flute_length);
+                        volume.cut(m.from, m.to, r, flute, plan.shape, frame, sim.source);
+                    }
+                }
+                sim.initial_volume = Some(volume);
+            }
             sim.plan = cut_plan(&sim.plan, &found.steps, steps);
         }
     }
@@ -4474,6 +4535,20 @@ mod tests {
             None,
         );
         assert_eq!(run.at_step(), Some((0, 1)));
+        // Refused, it is dropped and the setup checked again from the
+        // operation's start, which the setup can then run (LIO-311).
+        let why = "Face: a rapid descends to X1 Y2 Z-3 through material.";
+        run.checked_as(Arc::new(Err(vec![why.into()])), None, None);
+        assert_eq!((run.start_step, run.recheck), (None, true));
+        assert!(run.programs.is_none() && run.resumed.is_none());
+        assert!(run.journal_note.as_ref().unwrap().contains(why));
+        run.checked_as(
+            Arc::new(Ok(vec![program()])),
+            Some(Arc::new(steps(7))),
+            None,
+        );
+        assert!(run.checked().is_some());
+        assert_eq!((run.next, run.from, run.at_step()), (0, 0, None));
         // Changed: nothing is picked, and that is said.
         let mut run = Run::new(&doc, 0, 0);
         run.journal = Some(read);
