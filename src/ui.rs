@@ -3798,16 +3798,14 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
         }
         _ => {}
     }
-    // Pinned under the body: the checks no field on the open tab shows,
-    // Generate and the operation's actions.
-    let mut foot = column![
-        rule::horizontal(1),
-        checks_summary(checks, app.warning_details)
-    ]
-    .spacing(13);
+    // Under the form, scrolling with it: the checks no field on the open tab
+    // shows. Pinned, they could take the whole height and leave none to it.
+    c = c.push(checks_summary(checks, app.warning_details));
     if let Some((heading, lines)) = holding_warning(app) {
-        foot = foot.push(caution(heading, lines));
+        c = c.push(caution(heading, lines));
     }
+    // Pinned under the body: Generate and the operation's actions.
+    let mut foot = column![rule::horizontal(1)].spacing(13);
     foot = foot.push(
         primary(
             if app.is_sample() {
@@ -4360,11 +4358,13 @@ fn setup_editor(app: &App) -> Panel<'_> {
         "Work zero" => setup_zero(app, c),
         _ => setup_machine(app, c),
     };
-    // Pinned under the body: the checks and the setup's actions.
+    // Under the form, scrolling with it: the checks (`operation_editor`).
     let mut issues = s.issues();
     issues.extend(app.doc.skew_issue(app.doc.index()));
     issues.extend(app.doc.index_issues(app.doc.index()));
-    let mut foot = column![warnings(issues)].spacing(12);
+    let c = c.push(warnings(issues));
+    // Pinned under the body: the setup's actions.
+    let mut foot = Column::new().spacing(12);
     if app.confirm_delete_setup {
         foot=foot.push(note("Delete this setup and its operations? Later stock will be rebuilt from the revised setup order.")).push(row![secondary("Cancel",Message::ConfirmDeleteSetup(false)),danger("Delete setup",Message::ConfirmDeleteSetup(true))].spacing(5));
     } else {
