@@ -5921,6 +5921,13 @@ impl App {
             }
             Message::Machine(action) => {
                 if let Some(c) = &mut self.control {
+                    // A Go refused says why in the status line; nothing moves.
+                    if let control::Action::GoTo(go) = &action {
+                        self.status = match c.go_to(*go) {
+                            Ok(_) => String::new(),
+                            Err(why) => why,
+                        };
+                    }
                     c.act(action);
                 }
             }

@@ -1632,8 +1632,32 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
             "Make the current position the value beside it on this axis, in the active coordinate system.",
             "",
         ),
-        ToWorkXY => (
-            "Rapid X and Y to work X0 Y0, Z staying where it is: lift Z clear first. Soft limits apply.",
+        MoveTo(true) => (
+            "Show Move to: a work position to type and Go for each axis, in place of Zero and ½, and Go for all of them at once, Z up first. Only a Go moves the machine.",
+            "",
+        ),
+        MoveTo(false) => (
+            "Close Move to: Zero and ½ are back. The targets typed stay.",
+            "",
+        ),
+        TargetText(..) | TargetEnter(_) => (
+            "The work position to move this axis to, in the active work system (mm, ° for A). Enter keeps it and moves nothing: only Go does. Empty: the axis stays where it is.",
+            "",
+        ),
+        GoTo(crate::control::Go::Axis(_)) => (
+            "Rapid this axis alone to its target. X, Y or A alone is refused while the tool is under the stock top of the setup picked: raise Z first, or Go with Z up first. Every target is checked against the soft limits before anything moves.",
+            "",
+        ),
+        GoTo(crate::control::Go::All) => (
+            "Rapid to every target typed, Z up first: Z rises to the highest of where it is, its target and the stock top of the setup picked, then X, Y (and A) move, then Z goes down to its target. Axes left empty stay. Every point is checked against the soft limits before anything moves.",
+            "",
+        ),
+        GoTo(crate::control::Go::WorkXY0) => (
+            "Rapid X and Y to work X0 Y0, Z up first: under the stock top of the setup picked, Z rises to it first and stays there. Otherwise Z stays where it is. Soft limits apply.",
+            "",
+        ),
+        GoTo(crate::control::Go::ZTop) => (
+            "Rapid Z alone to the top of its travel, its soft maximum in the profile. X, Y and A stay where they are.",
             "",
         ),
         ProbeFrom(_) => (
@@ -1905,6 +1929,10 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         }
         (Target::Machine, "rotary_spacing") => {
             let (body, more) = machine_help(&crate::control::Action::SpacingText(String::new()));
+            (body, more, None)
+        }
+        (Target::Machine, "move_target") => {
+            let (body, more) = machine_help(&crate::control::Action::TargetText(0, String::new()));
             (body, more, None)
         }
         (Target::Machine, "work_set") => {
@@ -4866,7 +4894,14 @@ mod tests {
             Ctl::WorkHalf(0),
             Ctl::WorkText(0, String::new()),
             Ctl::WorkSet(0),
-            Ctl::ToWorkXY,
+            Ctl::MoveTo(true),
+            Ctl::MoveTo(false),
+            Ctl::TargetText(0, String::new()),
+            Ctl::TargetEnter(0),
+            Ctl::GoTo(crate::control::Go::Axis(0)),
+            Ctl::GoTo(crate::control::Go::All),
+            Ctl::GoTo(crate::control::Go::WorkXY0),
+            Ctl::GoTo(crate::control::Go::ZTop),
             Ctl::Wcs(0),
             Ctl::Rpm(String::new()),
             Ctl::Spindle(uc100::gcode::Spindle::Off),

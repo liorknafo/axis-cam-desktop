@@ -7299,14 +7299,18 @@ impl Fit {
     fn chars(self, n: usize) -> usize {
         if self.narrow { n * 3 / 5 } else { n }
     }
+    /// The work value's width in the Position card: a sign, four digits,
+    /// three decimals and a degree sign in 24 px monospace; narrow, 16 px
+    /// less, so that Move to's target field and Go fit beside it (the
+    /// figures of A, 21 px or smaller, take less).
+    fn dro_value(self) -> f32 {
+        if self.narrow { 140. } else { 156. }
+    }
     /// A jog button.
     fn jog(self) -> (f32, f32) {
         if self.short { (46., 30.) } else { (50., 36.) }
     }
 }
-/// The work value's width in the Position card: a sign, four digits, three
-/// decimals and a degree sign in 24 px monospace.
-const DRO_VALUE: f32 = 156.;
 const GREEN: Color = Color::from_rgb8(39, 130, 93);
 const AMBER: Color = Color::from_rgb8(166, 101, 32);
 const RUN_BLUE: Color = Color::from_rgb8(37, 99, 201);
@@ -8099,9 +8103,11 @@ fn hands(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
 
 /// The Position card: each axis's work position large, its machine
 /// position small with whether it is set, Zero and ½; Zero all and Go to X0
-/// Y0 under them.
+/// Y0 under them. With Move to (LIO-275) a target field and Go in place of
+/// Zero and ½, and under them the Go of every axis typed, Z up first, and
+/// the presets X0 Y0 and Z top. The card's height is the same either way.
 fn position_card(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
-    use crate::control::Action;
+    use crate::control::{Action, Go};
     let s = &c.snapshot;
     let enabled: Vec<usize> = (0..6).filter(|&a| s.axes_enabled[a]).collect();
     let manual = |a: Action| c.manual().then_some(Message::Machine(a));
@@ -8113,12 +8119,60 @@ fn position_card(c: &crate::control::Connection, fit: Fit) -> Element<'_, Messag
         },
         ..Font::MONOSPACE
     };
+    // A Go's button, greyed with why on hover while the machine cannot
+    // move; a target that cannot be gone to is refused on the click, in
+    // the status line (`Connection::go_to`).
+    let go_button = |label: String, go: Go, width: Option<Length>| {
+        let ready = c.go_ready(&c.go_axes(go)).and_then(|()| match go {
+            Go::Axis(a) if c.targets[a].trim().is_empty() => {
+                Err(format!("Type the work {} to go to first.", AXES[a]))
+            }
+            Go::All if c.go_axes(go) == [2] && c.targets[2].trim().is_empty() => {
+                Err("Type a work position to go to first.".into())
+            }
+            _ => Ok(()),
+        });
+        let msg = ready.is_ok().then_some(Message::Machine(Action::GoTo(go)));
+        let b = act_with(label.clone(), msg, false, width, [4, 8]);
+        match ready {
+            Ok(()) => b,
+            Err(why) => help::wrap(b, Help::text(&label, why), widget::tooltip::Position::Top),
+        }
+    };
+    let toggle: Element<_> = if c.move_to {
+        act_with(
+            "Move to ✕",
+            Some(Message::Machine(Action::MoveTo(false))),
+            true,
+            None,
+            [2, 8],
+        )
+    } else if c.manual() {
+        act_with(
+            "Move to…",
+            Some(Message::Machine(Action::MoveTo(true))),
+            false,
+            None,
+            [2, 8],
+        )
+    } else {
+        help::wrap(
+            act_with("Move to…", None, false, None, [2, 8]),
+            Help::text(
+                "Move to",
+                "Move to moves the machine only while it is Idle: not while it runs, holds or probes, nor in E-stop.",
+            ),
+            widget::tooltip::Position::Top,
+        )
+    };
     let mut col = column![
         row![
             bold("Position", 14),
             space().width(Fill),
             muted(format!("Work G{}", 54 + s.active_wcs)),
+            toggle,
         ]
+        .spacing(8)
         .align_y(Alignment::Center)
         .height(22)
     ];
@@ -8148,42 +8202,92 @@ fn position_card(c: &crate::control::Connection, fit: Fit) -> Element<'_, Messag
             ]
             .spacing(4)
         ]
-        .width(DRO_VALUE);
+        .width(fit.dro_value());
+        let line_row = if c.move_to {
+            let unit = if crate::control::rotary(a) {
+                "°"
+            } else {
+                "mm"
+            };
+            let field = text_input(AXES[a], &c.targets[a])
+                .on_input_maybe(
+                    c.manual()
+                        .then_some(move |v| Message::Machine(Action::TargetText(a, v))),
+                )
+                .on_submit(target_enter(a))
+                .width(Fill)
+                .padding([4, 6])
+                .size(12);
+            row![
+                bold(AXES[a], 18).width(20),
+                values,
+                help::field(
+                    field,
+                    "move_target",
+                    &format!("Move to {} · {unit}", AXES[a]),
+                    Target::Machine,
+                ),
+                go_button(format!("Go {}", AXES[a]), Go::Axis(a), None),
+            ]
+        } else {
+            row![
+                bold(AXES[a], 18).width(20),
+                values,
+                space().width(Fill),
+                small("Zero", manual(Action::WorkZero(Some(a))), false),
+                small("½", manual(Action::WorkHalf(a)), false),
+            ]
+        };
         col = col.push(
-            container(
-                row![
-                    bold(AXES[a], 18).width(20),
-                    values,
-                    space().width(Fill),
-                    small("Zero", manual(Action::WorkZero(Some(a))), false),
-                    small("½", manual(Action::WorkHalf(a)), false),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
-            )
-            .height(line)
-            .center_y(line),
+            container(line_row.spacing(8).align_y(Alignment::Center))
+                .height(line)
+                .center_y(line),
         );
     }
-    let mut foot = row![small("Zero all", manual(Action::WorkZero(None)), false)]
-        .spacing(6)
-        .align_y(Alignment::Center);
-    if c.axis(0) && c.axis(1) {
-        let to = c.to_work_xy();
-        foot = foot.push(small(
-            "Go to X0 Y0",
-            to.as_ref()
-                .is_ok()
-                .then_some(Message::Machine(Action::ToWorkXY)),
-            false,
-        ));
-        if let (Err(why), true) = (to, c.manual()) {
-            foot = foot.push(hint("Go to X0 Y0", why, fit.chars(30)));
+    let mut foot = row![].spacing(6).align_y(Alignment::Center);
+    if c.move_to {
+        let typed: Vec<String> = (enabled.iter())
+            .filter(|&&a| !c.targets[a].trim().is_empty())
+            .map(|&a| format!("{}{}", AXES[a], c.targets[a].trim()))
+            .collect();
+        // Too long for the card, the targets are cut and "Z up" kept.
+        let room = if fit.narrow { 25 } else { 30 };
+        let to = format!("Go {}", typed.join(" "));
+        let label = format!("{} · Z up first", to.trim_end());
+        let label = if label.chars().count() <= room {
+            label
+        } else {
+            format!("{} · Z up", ellipsize(&to, room - 7))
+        };
+        foot = foot.push(go_button(label, Go::All, Some(Fill)));
+        if c.axis(0) && c.axis(1) {
+            foot = foot.push(go_button("X0 Y0".into(), Go::WorkXY0, None));
+        }
+        if c.axis(2) && c.config.axes.get(2).is_some_and(|z| z.soft_max.is_some()) {
+            foot = foot.push(go_button("Z top".into(), Go::ZTop, None));
+        }
+    } else {
+        foot = foot.push(small("Zero all", manual(Action::WorkZero(None)), false));
+        if c.axis(0) && c.axis(1) {
+            let to = c.to_work_xy();
+            foot = foot.push(small(
+                "Go to X0 Y0",
+                (to.as_ref().is_ok()).then_some(Message::Machine(Action::GoTo(Go::WorkXY0))),
+                false,
+            ));
+            if let (Err(why), true) = (to, c.manual()) {
+                foot = foot.push(hint("Go to X0 Y0", why, fit.chars(30)));
+            }
         }
     }
     let foot_height = if fit.short { 28. } else { 32. };
     col = col.push(container(foot).height(foot_height).center_y(foot_height));
     card(col, Some(position_height(enabled.len(), fit)), fit)
+}
+/// What Enter in an axis's Move to target sends: the value is kept, and
+/// the machine does not move; only a Go moves it.
+pub(crate) fn target_enter(a: usize) -> Message {
+    Message::Machine(crate::control::Action::TargetEnter(a))
 }
 /// The Position card's height for `axes` axes: the title, the DRO lines,
 /// the foot, the padding and the frame.
@@ -13300,13 +13404,23 @@ pub(crate) mod probe {
     /// The messages that pressing and releasing the left button gives, at
     /// every eighth point of `page`.
     pub(crate) fn clicks(page: Element<'_, Message>, window: Size) -> Vec<Message> {
+        clicks_in(page, window, iced::Rectangle::with_size(window), 8.)
+    }
+    /// The messages that pressing and releasing the left button gives, at
+    /// every `step` px of `area`.
+    pub(crate) fn clicks_in(
+        page: Element<'_, Message>,
+        window: Size,
+        area: iced::Rectangle,
+        step: f32,
+    ) -> Vec<Message> {
         let mut renderer = renderer();
         let mut ui = UserInterface::build(page, window, Cache::default(), &mut renderer);
         let mut messages = vec![];
-        let mut x = 0.;
-        while x < window.width {
-            let mut y = 0.;
-            while y < window.height {
+        let mut x = area.x;
+        while x < area.x + area.width {
+            let mut y = area.y;
+            while y < area.y + area.height {
                 let at = Point::new(x, y);
                 let events = [
                     Event::Mouse(mouse::Event::CursorMoved { position: at }),
@@ -13320,9 +13434,9 @@ pub(crate) mod probe {
                     &mut clipboard::Null,
                     &mut messages,
                 );
-                y += 8.;
+                y += step;
             }
-            x += 8.;
+            x += step;
         }
         messages
     }

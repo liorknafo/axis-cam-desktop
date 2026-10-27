@@ -1946,8 +1946,15 @@ pub enum Action {
     /// Make the current position the axis's Set field value in the active
     /// coordinate system.
     WorkSet(usize),
-    /// Rapid X and Y to work X0 Y0 at the height the tool is at.
-    ToWorkXY,
+    /// Show or hide Move to in the Position card.
+    MoveTo(bool),
+    /// An axis's Move to target field (`Connection::targets`).
+    TargetText(usize, String),
+    /// Enter in a target field: the value is kept, and nothing moves.
+    TargetEnter(usize),
+    /// Rapid to work positions in the active work system (`Go`), checked
+    /// first (`Connection::go_to`).
+    GoTo(Go),
     /// Select G54 (0) … G59 (5).
     Wcs(usize),
     /// The RPM field.
@@ -2019,6 +2026,21 @@ pub enum Action {
     /// The rotary unit was taken off the table and put back: its measured
     /// centreline is stale.
     Remounted,
+}
+
+/// What a Go of the Position card moves to, in the active work system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Go {
+    /// One axis alone to its target (Go X, Go Y, Go Z, Go A).
+    Axis(usize),
+    /// Every axis with a target, Z up first: Z up to the highest of where
+    /// it is, its target and the stock top of the setup picked in the run
+    /// bar, then the others, then Z down to its target.
+    All,
+    /// X0 Y0, Z up first as for All (Go to X0 Y0).
+    WorkXY0,
+    /// The top of Z's travel, its soft maximum (Z top).
+    ZTop,
 }
 
 /// Steps-per-mm calibration: one commanded move, then the travel measured
@@ -2115,6 +2137,11 @@ pub struct Connection {
     routine: Option<Routine>,
     /// Each axis's Set field (`Action::WorkSet`).
     pub presets: [String; 6],
+    /// The Position card shows Move to: a target field and Go per axis in
+    /// place of Zero and ½ (`Action::MoveTo`).
+    pub move_to: bool,
+    /// Each axis's Move to target, a work position (`Action::GoTo`).
+    pub targets: [String; 6],
     /// How the last probe ended (ok, what it did).
     pub probed: Option<(bool, String)>,
     /// The simulator's block (min and max corners, machine mm).
@@ -2251,6 +2278,8 @@ impl Connection {
             probe_spot: None,
             routine: None,
             presets: Default::default(),
+            move_to: false,
+            targets: Default::default(),
             probed: None,
             block,
             pins,
@@ -2689,13 +2718,23 @@ impl Connection {
                     self.send(Command::SetWork { axis: a, value });
                 }
             }
-            Action::ToWorkXY if self.to_work_xy().is_ok() => {
-                let now = self.snapshot.machine_pos;
-                let mut to = now;
-                for (v, work) in to.iter_mut().zip(self.snapshot.work_pos).take(2) {
-                    *v -= work;
+            Action::MoveTo(on) => self.move_to = on,
+            Action::TargetText(a, text) if a < 6 => self.targets[a] = text,
+            Action::TargetEnter(a) if a < 6 => {
+                let kept = self.targets[a].trim().to_string();
+                self.targets[a] = kept;
+            }
+            Action::GoTo(go) => {
+                if let Ok(points) = self.go_to(go) {
+                    let name = match go {
+                        Go::Axis(a) => format!("Go {}", AXIS_NAMES[a]),
+                        Go::All => "Go, Z up first".into(),
+                        Go::WorkXY0 => "Go to X0 Y0".into(),
+                        Go::ZTop => "Z top".into(),
+                    };
+                    let now = self.snapshot.machine_pos;
+                    self.send(job(&name, moves_from(now, &points)));
                 }
-                self.send(job("To X0 Y0", moves_from(now, &[to])));
             }
             Action::Wcs(i) if self.idle() && i < 6 => {
                 self.send(Command::Mdi(format!("G{}", 54 + i)))
@@ -3285,13 +3324,40 @@ impl Connection {
         v.is_finite().then_some(v)
     }
 
-    /// Why Go to X0 Y0 cannot move now.
-    pub fn to_work_xy(&self) -> Result<(), String> {
+    /// An axis's Move to target, when it is a number.
+    pub fn target(&self, a: usize) -> Option<f64> {
+        let v: f64 = self.targets.get(a)?.trim().parse().ok()?;
+        v.is_finite().then_some(v)
+    }
+
+    /// The axes a Go moves: those with a target, and Z, which a Go of
+    /// several axes lifts first.
+    pub fn go_axes(&self, go: Go) -> Vec<usize> {
+        match go {
+            Go::Axis(a) => vec![a],
+            Go::All => {
+                let typed = (0..6).filter(|&a| self.axis(a) && !self.targets[a].trim().is_empty());
+                let mut axes: Vec<usize> = typed.chain([2]).collect();
+                axes.sort_unstable();
+                axes.dedup();
+                axes
+            }
+            Go::WorkXY0 => vec![0, 1, 2],
+            Go::ZTop => vec![2],
+        }
+    }
+
+    /// Why no Go can move `axes` now, whatever the targets: the machine
+    /// must be Idle, and each axis it moves, and every axis with a soft
+    /// limit, must have a machine position.
+    pub fn go_ready(&self, axes: &[usize]) -> Result<(), String> {
         if !self.idle() {
             return Err("The machine is not Idle.".into());
         }
         let mut unset = self.unset_limited_axes();
-        unset.extend((0..2).filter(|&a| !self.snapshot.referenced[a]));
+        unset.extend(
+            (axes.iter().copied()).filter(|&a| self.axis(a) && !self.snapshot.referenced[a]),
+        );
         unset.sort_unstable();
         unset.dedup();
         if !unset.is_empty() {
@@ -3308,6 +3374,125 @@ impl Connection {
             ));
         }
         Ok(())
+    }
+
+    /// Why Go to X0 Y0 cannot move now, whatever the tool's height.
+    pub fn to_work_xy(&self) -> Result<(), String> {
+        self.go_ready(&self.go_axes(Go::WorkXY0))
+    }
+
+    /// The work Z of the stock top of the setup picked in the run bar, as
+    /// its check has it; None without one.
+    pub fn stock_top_z(&self) -> Option<f64> {
+        let p = self.run.as_ref()?.checked()?.first()?;
+        Some((p.stock.max[2] - p.datum[2]) as f64)
+    }
+
+    /// The machine positions a Go passes through, every one checked before
+    /// anything moves, or why it is refused: a target that is no number,
+    /// one outside the soft limits, or Go X, Y or A alone with the tool
+    /// under the stock top of the setup picked (`stock_top_z`). A Go of
+    /// several axes lifts Z first to the highest of where it is, its target
+    /// and that stock top, so it is not refused there.
+    pub fn go_to(&self, go: Go) -> Result<Vec<Vec6>, String> {
+        if let Go::Axis(a) = go
+            && !self.axis(a)
+        {
+            return Err(format!("This machine has no {}.", AXIS_NAMES[a]));
+        }
+        self.go_ready(&self.go_axes(go))?;
+        let s = &self.snapshot;
+        let (now, work) = (s.machine_pos, s.work_pos);
+        let mut to: [Option<f64>; 6] = [None; 6];
+        match go {
+            Go::Axis(a) => {
+                to[a] =
+                    Some(self.typed(a)?.ok_or_else(|| {
+                        format!("Type the work {} to go to first.", AXIS_NAMES[a])
+                    })?)
+            }
+            Go::All => {
+                for a in (0..6).filter(|&a| self.axis(a)) {
+                    to[a] = self.typed(a)?;
+                }
+                if to.iter().all(Option::is_none) {
+                    return Err("Type a work position to go to first.".into());
+                }
+            }
+            Go::WorkXY0 => (to[0], to[1]) = (Some(0.), Some(0.)),
+            Go::ZTop => {
+                let top = (self.config.axes.get(2).and_then(|z| z.soft_max)).ok_or(
+                    "Z has no soft maximum in the profile, so the top of its travel is not known.",
+                )?;
+                to[2] = Some(top - now[2] + work[2]);
+            }
+        }
+        let machine = |a: usize, w: f64| now[a] + w - work[a];
+        let top = self.stock_top_z();
+        let points = match go {
+            Go::Axis(a) => {
+                if a != 2
+                    && let Some(top) = top
+                    && work[2] < top - 1e-3
+                {
+                    return Err(format!(
+                        "The tool is at Z {:.3}, under the stock top at Z {top:.3}: Go {} alone would move it through the stock. Raise Z first, or Go with Z up first.",
+                        work[2], AXIS_NAMES[a]
+                    ));
+                }
+                let mut p = now;
+                p[a] = machine(a, to[a].unwrap_or(work[a]));
+                vec![p]
+            }
+            _ => {
+                let up_z = [Some(work[2]), to[2], top]
+                    .into_iter()
+                    .flatten()
+                    .fold(f64::MIN, f64::max);
+                let mut up = now;
+                up[2] = machine(2, up_z);
+                let mut over = up;
+                for a in (0..6).filter(|&a| a != 2) {
+                    if let Some(t) = to[a] {
+                        over[a] = machine(a, t);
+                    }
+                }
+                let mut down = over;
+                if let Some(t) = to[2] {
+                    down[2] = machine(2, t);
+                }
+                vec![up, over, down]
+            }
+        };
+        for p in &points {
+            for a in (0..6).filter(|&a| (p[a] - now[a]).abs() > 1e-9) {
+                let Some(x) = self.config.axes.get(a) else {
+                    continue;
+                };
+                if let (Some(lo), Some(hi)) = (x.soft_min, x.soft_max)
+                    && !(lo - 1e-6..=hi + 1e-6).contains(&p[a])
+                {
+                    return Err(format!(
+                        "{name} {:.3} is machine {name} {:.3}, outside the soft limits {lo:.3} to {hi:.3}: nothing moved.",
+                        p[a] - now[a] + work[a],
+                        p[a],
+                        name = AXIS_NAMES[a]
+                    ));
+                }
+            }
+        }
+        Ok(points.into_iter().map(|p| self.inside(p)).collect())
+    }
+
+    /// An axis's target field: None when it is empty, or why it is no
+    /// number.
+    fn typed(&self, a: usize) -> Result<Option<f64>, String> {
+        let typed = self.targets[a].trim();
+        if typed.is_empty() {
+            return Ok(None);
+        }
+        (self.target(a).map(Some))
+            .ok_or_else(|| format!("{}'s target \"{typed}\" is not a number.", AXIS_NAMES[a]))
     }
 
     /// Why probing feature `f` cannot start now; None when it can.

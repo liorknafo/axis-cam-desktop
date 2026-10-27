@@ -2804,6 +2804,7 @@ flood = { pin = 8 }
         zero(&mut a);
         check_run_pictured(&mut a, dir.path(), 0);
         shot(&mut a, "03-before-the-run");
+        move_to_shot(&mut a, &shot, "03-move-to", &["62", "42", "2"]);
         for (tab, name) in [
             (T::WorkZero, "work-zero"),
             (T::Probe, "probe"),
@@ -2863,6 +2864,27 @@ flood = { pin = 8 }
             let _ = a.update(Message::ControlTab(tab));
             shot(&mut a, &format!("07-rotary-tab-{name}"));
         }
+        let _ = a.update(Message::ControlTab(T::Job));
+        let _ = a.update(Message::Machine(crate::control::Action::MachineZero(None)));
+        tick_until(&mut a, 3.0, "machine zero", |s| {
+            s.referenced[..4].iter().all(|r| *r)
+        });
+        move_to_shot(&mut a, &shot, "07-rotary-move-to", &["62", "42", "2", "90"]);
+    }
+
+    /// `shot` of the Control page with Move to open and `targets` typed
+    /// (X, Y, Z, A), then Move to closed with the fields emptied.
+    fn move_to_shot(a: &mut App, shot: &dyn Fn(&mut App, &str), name: &str, targets: &[&str]) {
+        use crate::control::Action;
+        let _ = a.update(Message::Machine(Action::MoveTo(true)));
+        for (axis, v) in targets.iter().enumerate() {
+            let _ = a.update(Message::Machine(Action::TargetText(axis, v.to_string())));
+        }
+        shot(a, name);
+        for axis in 0..targets.len() {
+            let _ = a.update(Message::Machine(Action::TargetText(axis, String::new())));
+        }
+        let _ = a.update(Message::Machine(Action::MoveTo(false)));
     }
 
     /// Renders the operation editor's Cycle tab with Helical milling, and
@@ -7197,7 +7219,7 @@ flood = { pin = 8 }
         // Go to X0 Y0: X and Y move, Z stays.
         let z = conn(&a).snapshot.machine_pos[2];
         assert_eq!(conn(&a).to_work_xy(), Ok(()));
-        let _ = a.update(Message::Machine(Action::ToWorkXY));
+        let _ = a.update(Message::Machine(Action::GoTo(crate::control::Go::WorkXY0)));
         tick_until(&mut a, 5.0, "at X0 Y0", |s| {
             s.state == Some(State::Idle) && s.work_pos[..2].iter().all(|v| v.abs() < 1e-3)
         });
@@ -7211,6 +7233,200 @@ flood = { pin = 8 }
         tick_for(&mut a, 50);
         assert!(conn(&a).snapshot.work_pos[0].abs() < 1e-3);
         assert!(conn(&a).to_work_xy().is_err());
+    }
+
+    /// The Gos the Position card's buttons send, clicked all over it.
+    fn go_clicks(a: &App) -> Vec<crate::control::Go> {
+        let window = iced::Size::new(1440., 790.);
+        let area = iced::Rectangle::new(
+            iced::Point::ORIGIN,
+            iced::Size::new(crate::ui::Fit::of(a).hands() + 20., 420.),
+        );
+        crate::ui::probe::clicks_in(a.view(), window, area, 5.)
+            .into_iter()
+            .filter_map(|m| match m {
+                Message::Machine(crate::control::Action::GoTo(go)) => Some(go),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Move to (LIO-275), through the simulated UC100: Enter in a target
+    /// field keeps the value and moves nothing; Go X moves X alone and Go Z
+    /// Z alone, under the stock top of the setup picked too; there Go X
+    /// alone is refused, saying why in the status line; the Go of every
+    /// axis lifts Z to the stock top first, then moves X and Y, then lowers
+    /// Z to its target; and X0 Y0 lifts Z to the stock top first and leaves
+    /// it there.
+    #[test]
+    fn move_to_goes_one_axis_alone_or_every_axis_z_up_first() {
+        use crate::control::{Action, Go};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let top = conn(&a).stock_top_z().expect("the setup's stock top");
+        let at = |a: &App| conn(a).snapshot.work_pos;
+        let near = |v: f64, w: f64| (v - w).abs() < 1e-3;
+        let go = |a: &mut App, g: Go| {
+            let _ = a.update(Message::Machine(Action::GoTo(g)));
+        };
+        let target = |a: &mut App, axis: usize, v: &str| {
+            let _ = a.update(Message::Machine(Action::TargetText(axis, v.into())));
+        };
+        let _ = a.update(Message::Machine(Action::MoveTo(true)));
+        let start = at(&a);
+        // Enter keeps the target and moves nothing.
+        target(&mut a, 0, " 30 ");
+        let _ = a.update(crate::ui::target_enter(0));
+        tick_for(&mut a, 300);
+        assert_eq!(conn(&a).targets[0], "30");
+        assert_eq!(conn(&a).snapshot.state, Some(State::Idle));
+        assert_eq!(at(&a), start);
+        // With X typed, the card offers Go X, the Go of every axis, X0 Y0
+        // and Z top; Go Y and Go Z wait for a target.
+        let offered = go_clicks(&a);
+        for g in [Go::Axis(0), Go::All, Go::WorkXY0, Go::ZTop] {
+            assert!(offered.contains(&g), "{g:?} not offered: {offered:?}");
+        }
+        assert!(!offered.contains(&Go::Axis(1)) && !offered.contains(&Go::Axis(2)));
+        // Go X: X alone.
+        go(&mut a, Go::Axis(0));
+        assert!(a.status.is_empty(), "{}", a.status);
+        tick_until(&mut a, 3.0, "at X30", |s| {
+            s.state == Some(State::Idle) && (s.work_pos[0] - 30.).abs() < 1e-3
+        });
+        assert!(near(at(&a)[1], start[1]) && near(at(&a)[2], start[2]));
+        // Go Z alone goes under the stock top.
+        target(&mut a, 2, &format!("{:.3}", top - 5.));
+        go(&mut a, Go::Axis(2));
+        tick_until(&mut a, 3.0, "under the stock top", |s| {
+            s.state == Some(State::Idle) && (s.work_pos[2] - (top - 5.)).abs() < 1e-3
+        });
+        assert!(near(at(&a)[0], 30.));
+        // There Go X alone is refused, and nothing moves.
+        target(&mut a, 0, "-60");
+        go(&mut a, Go::Axis(0));
+        assert!(a.status.contains("under the stock top"), "{}", a.status);
+        tick_for(&mut a, 200);
+        assert!(near(at(&a)[0], 30.));
+        // Every axis at once: up to the stock top, across, down to Z.
+        target(&mut a, 1, "60");
+        target(&mut a, 2, &format!("{:.3}", top - 2.));
+        let off: Vec<f64> = (0..3)
+            .map(|i| conn(&a).snapshot.machine_pos[i] - at(&a)[i])
+            .collect();
+        let plan = conn(&a).go_to(Go::All).unwrap();
+        let work = |p: &[f64; 6]| [p[0] - off[0], p[1] - off[1], p[2] - off[2]];
+        let plan: Vec<[f64; 3]> = plan.iter().map(work).collect();
+        assert_eq!(plan.len(), 3);
+        assert!(near(plan[0][0], 30.) && near(plan[0][2], top), "{plan:?}");
+        assert!(near(plan[1][0], -60.) && near(plan[1][1], 60.) && near(plan[1][2], top));
+        assert!(
+            near(plan[2][0], -60.) && near(plan[2][2], top - 2.),
+            "{plan:?}"
+        );
+        go(&mut a, Go::All);
+        assert!(a.status.is_empty(), "{}", a.status);
+        let mut seen = vec![];
+        let mut deadline = Deadline::new(5.);
+        loop {
+            let _ = a.update(Message::Tick);
+            let s = &conn(&a).snapshot;
+            seen.push(s.work_pos);
+            if s.state == Some(State::Idle)
+                && near(s.work_pos[0], -60.)
+                && near(s.work_pos[1], 60.)
+                && near(s.work_pos[2], top - 2.)
+            {
+                break;
+            }
+            assert!(
+                deadline.within(s),
+                "timed out going: {:?} {:?}",
+                s.state,
+                s.log
+            );
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        // X and Y moved only with Z at the stock top.
+        let across: Vec<_> = (seen.iter())
+            .filter(|p| !near(p[0], 30.) && !(near(p[0], -60.) && near(p[1], 60.)))
+            .collect();
+        assert!(
+            across.iter().all(|p| p[2] > top - 1e-3),
+            "under the stock top across: {across:?}"
+        );
+        assert!(
+            seen.iter().any(|p| near(p[2], top)),
+            "never at the stock top"
+        );
+        // X0 Y0 lifts Z to the stock top first and leaves it there.
+        go(&mut a, Go::WorkXY0);
+        tick_until(&mut a, 3.0, "at X0 Y0", |s| {
+            s.state == Some(State::Idle) && s.work_pos[..2].iter().all(|v| v.abs() < 1e-3)
+        });
+        assert!(near(at(&a)[2], top), "{:?}", at(&a));
+    }
+
+    /// Move to refuses a target outside the soft limits before anything
+    /// moves, saying why in the status line, for one axis and for all at
+    /// once; while the machine runs or holds no Go is offered and none
+    /// moves it. Opening Move to moves nothing round the jog pad.
+    #[test]
+    fn move_to_refuses_a_target_past_the_soft_limits_and_waits_while_the_machine_runs() {
+        use crate::control::{Action, Go};
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let pad = jog_pad(&a);
+        let _ = a.update(Message::Machine(Action::MoveTo(true)));
+        assert_eq!(jog_pad(&a), pad);
+        // Work X 500 is machine X 695, past the X travel of 390 mm.
+        let before = conn(&a).snapshot.machine_pos;
+        let _ = a.update(Message::Machine(Action::TargetText(0, "500".into())));
+        for g in [Go::Axis(0), Go::All] {
+            a.status.clear();
+            let _ = a.update(Message::Machine(Action::GoTo(g)));
+            assert!(
+                a.status
+                    .contains("machine X 695.000, outside the soft limits 0.000 to 390.000"),
+                "{g:?}: {}",
+                a.status
+            );
+        }
+        tick_for(&mut a, 200);
+        assert_eq!(conn(&a).snapshot.machine_pos, before);
+        assert_eq!(conn(&a).snapshot.state, Some(State::Idle));
+        // Running, then holding: nothing offered, nothing moves.
+        let _ = a.update(Message::Machine(Action::TargetText(0, "10".into())));
+        assert!(conn(&a).go_to(Go::Axis(0)).is_ok());
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        assert_eq!(
+            conn(&a).go_ready(&[0]),
+            Err("The machine is not Idle.".to_string())
+        );
+        let _ = a.update(Message::Machine(Action::GoTo(Go::Axis(0))));
+        assert_eq!(a.status, "The machine is not Idle.");
+        let _ = a.update(Message::Run(R::Hold));
+        tick_until(&mut a, 2.0, "Hold", |s| s.state == Some(State::Hold));
+        assert!(go_clicks(&a).is_empty(), "{:?}", go_clicks(&a));
+        // Held once the machine has slowed to a stop.
+        tick_for(&mut a, 300);
+        let held = conn(&a).snapshot.machine_pos;
+        for g in [Go::Axis(0), Go::All, Go::WorkXY0, Go::ZTop] {
+            let _ = a.update(Message::Machine(Action::GoTo(g)));
+        }
+        tick_for(&mut a, 200);
+        assert_eq!(conn(&a).snapshot.state, Some(State::Hold));
+        assert_eq!(conn(&a).snapshot.machine_pos, held);
+        let _ = a.update(Message::Run(R::Stop));
+        run_until(&mut a, 5.0, "the stop", |r| r.running.is_none());
     }
 
     /// Picking another setup in the Run strip while a probe is under way
