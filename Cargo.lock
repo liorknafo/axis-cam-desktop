@@ -5720,7 +5720,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 [[package]]
 name = "uc100"
 version = "0.1.0"
-source = "git+https://github.com/liorknafo/UC100-driver.git?rev=a04b276d7dd32a423994764102f935047512537d#a04b276d7dd32a423994764102f935047512537d"
+source = "git+https://github.com/liorknafo/UC100-driver.git?rev=5695a0013c788a661502257681f12f9d39408d23#5695a0013c788a661502257681f12f9d39408d23"
 dependencies = [
  "anyhow",
  "clap",
