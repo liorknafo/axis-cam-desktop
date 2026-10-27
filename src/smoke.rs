@@ -10618,6 +10618,126 @@ soft_max = 180.0
         }
     }
 
+    /// On a screen too short for the least window's height the window opens
+    /// as short as the screen leaves it (`least_window`), and there every
+    /// page, the connected Control page with and without A among them,
+    /// keeps the status bar inside the window and lays out nothing past its
+    /// bottom but what scrolls (LIO-315).
+    #[test]
+    fn every_page_fits_a_window_a_short_screen_high() {
+        // 1366 × 768 at 125%, 1920 × 1080 at 175%, 1600 × 900 at 150% and
+        // 1920 × 1080 at 150%.
+        let screens = [(1093., 614.), (1097., 617.), (1067., 600.), (1280., 720.)]
+            .map(|(w, h): (f32, f32)| iced::Size::new(w, h));
+        // What does not hold, every page's at once.
+        let holds = |a: &mut App, what: &str| {
+            let mut wrong = Vec::new();
+            for screen in screens {
+                let size = crate::opening_window(screen).unwrap();
+                let least = crate::least_window(screen).unwrap();
+                assert_eq!(size.height, least.height, "{screen:?}");
+                // Each text's height with room to spare, at the same fit
+                // (`ui::Fit`: short under 860).
+                let roomy = iced::Size::new(size.width, 859.);
+                let _ = a.update(Message::Resized(roomy));
+                let mut natural = std::collections::HashMap::new();
+                for (t, b) in laid_out(a, roomy).texts {
+                    let h = natural.entry(t).or_insert(b.height);
+                    *h = h.min(b.height);
+                }
+                let _ = a.update(Message::Resized(size));
+                let laid = laid_out(a, size);
+                let words = (laid.texts.iter())
+                    .find(|(t, _)| t.starts_with("mm  |"))
+                    .unwrap_or_else(|| panic!("{what} at {size:?}: no status bar"))
+                    .1;
+                if words.y + words.height > size.height + 0.5 {
+                    wrong.push(format!("{what} at {size:?}: the status bar at {words:?}"));
+                }
+                let within = |b: &iced::Rectangle, c: &iced::Rectangle| {
+                    b.x >= c.x - 0.5
+                        && b.y >= c.y - 0.5
+                        && b.x + b.width <= c.x + c.width + 0.5
+                        && b.y + b.height <= c.y + c.height + 0.5
+                };
+                // The status bar: the window wide, round its words.
+                let bar = (laid.boxes.iter())
+                    .filter(|b| b.width >= size.width - 0.5 && within(&words, b))
+                    .min_by(|p, q| p.height.total_cmp(&q.height))
+                    .unwrap();
+                // Nothing over it but what holds it, or scrolls: a card
+                // pushed down, or squeezed so that its words run out of it,
+                // is.
+                let over = |b: &iced::Rectangle| {
+                    b.y + b.height > bar.y + 0.5
+                        && !within(&words, b)
+                        && !within(b, bar)
+                        && !(laid.scrolls.iter()).any(|(_, c)| within(b, c))
+                };
+                let boxes: Vec<_> = laid.boxes.iter().filter(|b| over(b)).collect();
+                let texts: Vec<_> = laid.texts.iter().filter(|(_, b)| over(b)).collect();
+                if !boxes.is_empty() || !texts.is_empty() {
+                    wrong.push(format!(
+                        "{what} at {size:?}: over the status bar at {bar:?}: {boxes:?} {texts:?}"
+                    ));
+                }
+                // Nor squeezed: a column out of room lays out what does not
+                // fit flat, a button's words among it.
+                let flat: Vec<_> = (laid.texts.iter())
+                    .filter(|(t, b)| natural.get(t).is_some_and(|h| b.height < h - 0.5))
+                    .collect();
+                if !flat.is_empty() {
+                    wrong.push(format!("{what} at {size:?}: squeezed {flat:?}"));
+                }
+            }
+            wrong
+        };
+        let mut wrong = Vec::new();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_on(dir.path(), FAST);
+        for page in [
+            Page::Home,
+            Page::Work,
+            Page::Machines,
+            Page::Tools,
+            Page::Materials,
+            Page::Workholding,
+            Page::Post,
+            Page::Control,
+        ] {
+            a.page = page;
+            wrong.extend(holds(&mut a, &format!("{page:?}")));
+        }
+        idle(&mut a);
+        wrong.extend(holds(&mut a, "Control, connected"));
+        let _ = a.update(Message::Disconnect);
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_on(dir.path(), &format!("{FAST}{A_AXIS}"));
+        idle(&mut a);
+        wrong.extend(holds(&mut a, "Control with A, connected"));
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+        // The Control page's left column scrolls only where its cards do
+        // not fit: on the short screen, not from the least window up.
+        for (size, scrolls) in [
+            (iced::Size::new(1093., 536.), true),
+            (crate::MIN_WINDOW, false),
+            (iced::Size::new(1440., 790.), false),
+        ] {
+            let _ = a.update(Message::Resized(size));
+            let laid = laid_out(&a, size);
+            let feed = (laid.texts.iter())
+                .find(|(t, _)| t.starts_with("Feed now"))
+                .unwrap()
+                .1;
+            assert_eq!(
+                (laid.scrolls.iter()).any(|(_, c)| c.contains(feed.center())),
+                scrolls,
+                "{size:?}"
+            );
+        }
+        let _ = a.update(Message::Disconnect);
+    }
+
     /// The operation editor's Delete asks first, as a setup's does: Cancel
     /// keeps the operation, another selection closes the question, and
     /// Delete operation removes it. The question shows in place of the
@@ -17135,6 +17255,7 @@ soft_max = 180.0
         assert!(!ok && lines.len() > 5, "{lines:?}");
         a.sim_details = true;
         for size in [crate::MIN_WINDOW, iced::Size::new(1180., 760.)] {
+            let _ = a.update(Message::Resized(size));
             let laid = laid_out(&a, size);
             let hint = (laid.texts.iter())
                 .find(|(t, _)| t.starts_with("Drag to orbit"))
@@ -17217,6 +17338,7 @@ soft_max = 180.0
         let _ = a.refresh_ready();
         assert!(!a.sim_details && !crate::ui::run_check(&a).unwrap().2);
         for (size, strip_first) in [(crate::MIN_WINDOW, true), (crate::WINDOW, false)] {
+            let _ = a.update(Message::Resized(size));
             let laid = laid_out(&a, size);
             let find = |words: &str| {
                 (laid.texts.iter())
@@ -17338,6 +17460,7 @@ soft_max = 180.0
             Page::Control,
         ] {
             a.page = page;
+            let _ = a.update(Message::Resized(size));
             let laid = laid_out(&a, size);
             let (words, right) = (laid.texts.iter())
                 .find(|(t, _)| t.starts_with("mm  |"))

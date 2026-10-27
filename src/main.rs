@@ -146,30 +146,58 @@ const EDIT_PAUSE: Duration = Duration::from_millis(700);
 /// page's sidebars leave the 3D view `ui::VIEW_MIN` wide at the least
 /// (`ui::fitted`), and the Control page fits 690 px of height, what a 13"
 /// MacBook with larger text leaves. It opens no larger than its screen
-/// (`opening_window`), and on a screen narrower than `MIN_WINDOW` its least
-/// width is the screen's (`least_window`).
+/// (`opening_window`), and on a screen narrower or shorter than `MIN_WINDOW`
+/// leaves it its least size is what the screen does (`least_window`).
 pub(crate) const WINDOW: Size = Size::new(1440., 930.);
 pub(crate) const MIN_WINDOW: Size = Size::new(1120., 690.);
 /// What a screen's bars take from its height besides the window's content:
 /// the window's title bar, and macOS's menu bar and Dock or Windows'
 /// taskbar. A 13" MacBook's 900 points leave the window 790.
 const SCREEN_BARS: f32 = 110.;
+/// What a screen's bars take from its height at the least: Windows' title
+/// bar and frame (32) and taskbar (48), less the 2 px a 1366 × 768 screen's
+/// 690 has always run onto the taskbar's edge; macOS's menu bar and title
+/// bar take less. A screen whose height less these is under `MIN_WINDOW`'s
+/// holds the window only shorter (`least_window`); `SCREEN_BARS` alone
+/// would shrink a 1366 × 768 screen's window for nothing.
+const LEAST_BARS: f32 = 78.;
 /// The window's size on a screen `monitor` large: `WINDOW`, made smaller
-/// where the screen is (never under `MIN_WINDOW`'s height, nor its width
-/// on a screen that wide), or None where it fits.
+/// where the screen is (never under its least size, `least_window`), or
+/// None where it fits.
 pub(crate) fn opening_window(monitor: Size) -> Option<Size> {
+    let least = least_window(monitor).unwrap_or(MIN_WINDOW);
     let fits = Size::new(
         WINDOW.width.min(monitor.width),
-        (WINDOW.height.min(monitor.height - SCREEN_BARS)).max(MIN_WINDOW.height),
+        (WINDOW.height.min(monitor.height - SCREEN_BARS)).max(least.height),
     );
     (fits != WINDOW).then_some(fits)
 }
-/// The window's least size on a screen narrower than `MIN_WINDOW`: as wide
-/// as the screen, so the window's right side, the status bar's end among
-/// it, is never held past the screen's edge (LIO-309). None on a screen
-/// that wide.
+/// The window's least size on a screen narrower than `MIN_WINDOW`, or
+/// shorter than it and the screen's bars (`LEAST_BARS`): as wide as the
+/// screen, so the window's right side, the status bar's end among it, is
+/// never held past the screen's edge (LIO-309), and as high as the screen
+/// leaves it, so neither is its bottom, the whole status bar and the
+/// Control page's foot (LIO-315). None on a screen that large.
 pub(crate) fn least_window(monitor: Size) -> Option<Size> {
-    (monitor.width < MIN_WINDOW.width).then_some(Size::new(monitor.width, MIN_WINDOW.height))
+    let least = Size::new(
+        MIN_WINDOW.width.min(monitor.width),
+        MIN_WINDOW.height.min(monitor.height - LEAST_BARS),
+    );
+    (least != MIN_WINDOW).then_some(least)
+}
+/// Where the window opens on a screen `monitor` large: centred at the size
+/// it opens at (`opening_window`), not the size it is made at before that
+/// (iced's centring of `WINDOW` puts the title bar above a screen under 930
+/// high, and the resize keeps the top left corner), and no lower than
+/// leaves the screen's bars their room.
+pub(crate) fn opening_place(_made: Size, monitor: Size) -> iced::Point {
+    let size = opening_window(monitor).unwrap_or(WINDOW);
+    iced::Point::new(
+        ((monitor.width - size.width) / 2.).max(0.),
+        ((monitor.height - size.height) / 2.)
+            .min(monitor.height - SCREEN_BARS - size.height)
+            .max(0.),
+    )
 }
 /// Sends the user to a URL in their browser; see `App::open_browser`.
 type BrowserOpener = std::sync::Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
@@ -8327,7 +8355,7 @@ fn main() -> iced::Result {
             exit_on_close_request: false,
             ..Default::default()
         })
-        .centered()
+        .position(iced::window::Position::SpecificWith(opening_place))
         .antialiasing(true)
         .default_font(iced::Font::with_name("Helvetica Neue"))
         .run()

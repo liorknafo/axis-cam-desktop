@@ -1213,16 +1213,20 @@ fn start_screen(app: &App) -> Element<'_, Message> {
             Message::RecoverPrevious,
         ));
     }
-    container(
+    // A short screen's window (LIO-315) scrolls it, never squeezes it.
+    container(scrollable(
         container(
-            row![
-                container(intro).padding(28).width(Fill),
-                container(recent).padding(26).width(380).style(panel_style)
-            ]
-            .spacing(36),
+            container(
+                row![
+                    container(intro).padding(28).width(Fill),
+                    container(recent).padding(26).width(380).style(panel_style)
+                ]
+                .spacing(36),
+            )
+            .max_width(1060),
         )
-        .max_width(1060),
-    )
+        .center_x(Fill),
+    ))
     .padding(32)
     .center(Fill)
     .into()
@@ -8184,14 +8188,27 @@ fn run_times(
 /// spindle and feed, on screen in every phase. Each card has a fixed
 /// height and every changing text one line of fixed width, so that nothing
 /// around the jog pad moves while the machine does: leaving a jog button
-/// stops the jog (LIO-274).
+/// stops the jog (LIO-274). In a window shorter than the cards, a short
+/// screen's (LIO-315), the column scrolls, the Spindle card at its least,
+/// its thin scroll bar over the cards' padding.
 fn hands(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
-    column![
-        position_card(c, fit),
-        jog_card(c, fit),
-        spindle_card(c, fit)
-    ]
-    .spacing(fit.gap())
+    let axes = (0..6).filter(|&a| c.snapshot.axes_enabled[a]).count();
+    let least = position_height(axes, fit)
+        + jog_height(c.axis(3), fit)
+        + spindle_height(fit)
+        + 2. * fit.gap();
+    responsive(move |size| {
+        let cards = column![position_card(c, fit), jog_card(c, fit)].spacing(fit.gap());
+        if size.height >= least {
+            cards.push(spindle_card(c, fit, None)).height(Fill).into()
+        } else {
+            let bar = scrollable::Scrollbar::new().width(4).scroller_width(4);
+            scrollable(cards.push(spindle_card(c, fit, Some(spindle_height(fit)))))
+                .direction(scrollable::Direction::Vertical(bar))
+                .height(Fill)
+                .into()
+        }
+    })
     .width(fit.hands())
     .height(Fill)
     .into()
@@ -8620,13 +8637,17 @@ fn jog_height(a_axis: bool, fit: Fit) -> f32 {
 
 /// The least height the Spindle card's rows need: the title, the speed,
 /// the rule, the feed and its line, the gaps, the padding and the frame.
-#[cfg(test)]
 fn spindle_height(fit: Fit) -> f32 {
     24. + 28. + 1. + 26. + 15. + 4. * if fit.short { 4. } else { 6. } + 2. * fit.pad() + 2.
 }
 /// The Spindle and feed card: the spindle's state, speed and direction,
-/// Spindle off, the coolant, the feed override and the feed now.
-fn spindle_card(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
+/// Spindle off, the coolant, the feed override and the feed now; `height`
+/// tall, or the rest of the column.
+fn spindle_card(
+    c: &crate::control::Connection,
+    fit: Fit,
+    height: Option<f32>,
+) -> Element<'_, Message> {
     use crate::control::Action;
     use uc100::gcode::Spindle;
     let s = &c.snapshot;
@@ -8749,7 +8770,7 @@ fn spindle_card(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message
                 .wrapping(Wrapping::None),
         ]
         .spacing(if fit.short { 4 } else { 6 }),
-        None,
+        height,
         fit,
     )
 }
@@ -14384,7 +14405,47 @@ mod tests {
             Some(Size::new(1000., MIN_WINDOW.height))
         );
         assert_eq!(least_window(Size::new(1280., 800.)), None);
-        assert_eq!(least_window(MIN_WINDOW), None);
+        assert_eq!(least_window(Size::new(1366., 768.)), None);
+        assert_eq!(least_window(Size::new(1120., 768.)), None);
+        // A screen too short for the least window and its bars: the window
+        // is as high as the screen leaves it, and can be made no higher
+        // (LIO-315). 1366 × 768 at 125%, 1920 × 1080 at 175% and 150%,
+        // 1600 × 900 at 150%.
+        assert_eq!(
+            least_window(Size::new(1120., 767.)),
+            Some(Size::new(1120., 689.))
+        );
+        for (screen, window) in [
+            ((1093., 614.), (1093., 536.)),
+            ((1097., 617.), (1097., 539.)),
+            ((1280., 720.), (1280., 642.)),
+            ((1067., 600.), (1067., 522.)),
+        ] {
+            let (screen, window) = (Size::new(screen.0, screen.1), Size::new(window.0, window.1));
+            assert_eq!(opening_window(screen), Some(window), "{screen:?}");
+            assert_eq!(
+                least_window(screen),
+                Some(Size::new(window.width.min(MIN_WINDOW.width), window.height)),
+                "{screen:?}"
+            );
+        }
+    }
+
+    /// The window opens centred at the size it opens at, and on a short
+    /// screen at its top, so that its title bar and its status bar are both
+    /// on the screen (LIO-315).
+    #[test]
+    fn the_window_opens_on_the_screen() {
+        use crate::{WINDOW, opening_place};
+        use iced::{Point, Size};
+        let at = |w, h| opening_place(WINDOW, Size::new(w, h));
+        assert_eq!(at(2560., 1440.), Point::new(560., 255.));
+        // Centred, its foot would be on the taskbar.
+        assert_eq!(at(1920., 1080.), Point::new(240., 40.));
+        assert_eq!(at(1440., 900.), Point::new(0., 0.));
+        assert_eq!(at(1366., 768.), Point::new(0., 0.));
+        assert_eq!(at(1093., 614.), Point::new(0., 0.));
+        assert_eq!(at(1000., 900.), Point::new(0., 0.));
     }
 
     #[test]
