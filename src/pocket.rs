@@ -1575,6 +1575,8 @@ type Member = (Zone, Region, f32);
 /// just over the floor round it). A floor is then left up to `thin` more
 /// than its allowance, never less. A target is never taken up to a height
 /// only a zone starts at (the stock's top): a shallow pocket keeps its cut.
+/// Nor is a target with no allowance over its floor (an opening cut through
+/// past its walls): it is cut as deep as asked.
 fn banded(
     mut members: Vec<Member>,
     above: &mut impl FnMut(f32) -> Result<Region, String>,
@@ -1585,27 +1587,39 @@ fn banded(
     let shapes = (members.iter())
         .map(|m| m.0.centres.at(0.))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut heights: Vec<f32> = members.iter().flat_map(|m| [m.0.top, m.0.target]).collect();
-    heights.sort_by(|a, b| b.total_cmp(a));
-    heights.dedup_by(|low, high| *high - *low < 0.001);
-    let target = |h: f32| members.iter().any(|m| (m.0.target - h).abs() < 0.001);
+    let heights = |members: &[Member]| {
+        let mut heights: Vec<f32> = members.iter().flat_map(|m| [m.0.top, m.0.target]).collect();
+        heights.sort_by(|a, b| b.total_cmp(a));
+        heights.dedup_by(|low, high| *high - *low < 0.001);
+        heights
+    };
+    let at = |a: f32, b: f32| (a - b).abs() < 0.001;
+    // Whether a member's target stands its allowance over its floor.
+    let allowed = |m: &Member| m.0.target >= m.2 + thin - 0.001;
+    let target = |h: f32| members.iter().any(|m| at(m.0.target, h));
+    let fixed = |h: f32| members.iter().any(|m| at(m.0.target, h) && !allowed(m));
     let mut up: Vec<(f32, f32)> = vec![];
     let mut kept: Option<f32> = None;
-    for &h in &heights {
+    for h in heights(&members) {
         match kept {
-            Some(k) if k - h < thin && target(k) => up.push((h, k)),
+            Some(k) if k - h < thin && target(k) && !fixed(h) => up.push((h, k)),
             _ => kept = Some(h),
         }
     }
     let raise = |z: f32| {
         (up.iter())
-            .find(|(from, _)| (from - z).abs() < 0.001)
+            .find(|&&(from, _)| at(from, z))
             .map_or(z, |&(_, to)| to)
     };
-    for (zone, _, _) in &mut members {
-        (zone.top, zone.target) = (raise(zone.top), raise(zone.target));
+    for member in &mut members {
+        let target = if allowed(member) {
+            raise(member.0.target)
+        } else {
+            member.0.target
+        };
+        (member.0.top, member.0.target) = (raise(member.0.top).max(target), target);
     }
-    heights.retain(|h| !up.iter().any(|(from, _)| from == h));
+    let heights = heights(&members);
     let mut cut: Vec<(Vec<usize>, Zone)> = vec![];
     for band in heights.windows(2) {
         let (high, low) = (band[0], band[1]);
@@ -3558,6 +3572,47 @@ mod tests {
                 .iter()
                 .any(|p| (p[2] - dz - 0.2).abs() < 0.001)
         );
+    }
+    #[test]
+    fn an_opening_cut_through_keeps_its_depth_beside_a_floor_just_over_it() {
+        // The window's opening ends at Z −4; a separate pocket's floor at
+        // Z −4.1 has its target, 0.2 mm over it, 0.1 mm over the opening's
+        // end. The opening still goes through, to its end less Breakthrough.
+        let mut tris = window();
+        for tri in &mut tris {
+            for p in tri {
+                p[0] -= 20.;
+            }
+        }
+        for (x, y, xx, yy, z) in [
+            (-5., -15., 35., -10., 6.),
+            (-5., 10., 35., 15., 6.),
+            (-5., -10., 5., 10., 6.),
+            (25., -10., 35., 10., 6.),
+            (5., -10., 25., 10., -4.1),
+            (-5., -15., 35., 15., -5.),
+        ] {
+            quad(&mut tris, x, y, xx, yy, z);
+        }
+        let (setup, mut op, tool, mesh, dz) = part(tris, &[0., -4.1], 2.);
+        op.p.insert("axial_allowance".into(), "0.2".into());
+        op.p.insert("openings".into(), "Cut through".into());
+        for breakthrough in [0., 0.05] {
+            op.p.insert("breakthrough".into(), breakthrough.to_string());
+            let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+            let low = |left: bool| {
+                (plan.moves.iter())
+                    .filter(|m| m.cutting_pass && (m.to[0] < -10.) == left)
+                    .map(|m| m.to[2] - dz)
+                    .fold(f32::INFINITY, f32::min)
+            };
+            assert!(
+                (low(true) + 4. + breakthrough).abs() < 0.001,
+                "{}",
+                low(true)
+            );
+            assert!((low(false) + 3.9).abs() < 0.001, "{}", low(false));
+        }
     }
     #[test]
     fn openings_are_cleared_over_or_cut_through_past_their_walls() {
