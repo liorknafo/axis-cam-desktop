@@ -32,14 +32,22 @@ const SIDES: [&str; 6] = ["−X", "+X", "−Y", "+Y", "the bottom", "the top"];
 /// leaves in a sharp inside corner.
 const SLIVER: f32 = 2.;
 
+/// A piece of a face (`Uncut::pieces`): its corners, in the mesh's own
+/// coordinates as `Mesh::faces` has them, and whether it is under stock.
+pub type Piece = ([[f32; 3]; 3], bool);
 /// The faces of the part still under stock.
 #[derive(Debug, Clone, Default)]
 pub struct Uncut {
-    /// Per face of the mesh (`Mesh::faces`): whether at least half of it is
-    /// still under stock.
+    /// Per face of the mesh (`Mesh::faces`): whether any of it is still under
+    /// stock: all of it, or where `pieces` says.
     pub faces: Vec<bool>,
-    /// Those faces, joined where they share an edge, largest first. Those
-    /// of regions under `SLIVER` are left out, here and in `faces`.
+    /// Per face only partly under stock: the pieces it is sampled in, which
+    /// make up the whole face, so it is drawn piece by piece and magenta only
+    /// where the stock is. Empty for every other face (or all of them).
+    pub pieces: Vec<Vec<Piece>>,
+    /// Those faces, joined where they share an edge, largest first, of the
+    /// area under stock. Those of regions under `SLIVER` are left out, here,
+    /// in `faces` and in `share`.
     pub regions: Vec<Region>,
     /// The share of the part's surface still under stock, from 0 to 1.
     pub share: f32,
@@ -83,12 +91,18 @@ pub fn uncut(stock: &Volume, setup1: &Setup, mesh: &Mesh) -> Uncut {
     let first = Frame::new(setup1, mesh);
     let cuts = Cuts::new(stock);
     let mut faces = vec![false; mesh.faces.len()];
-    // Per face still under stock: its area and points (mm, setup 1).
-    let mut found: HashMap<usize, (f32, [[f32; 3]; 3])> = HashMap::new();
+    let mut pieces = vec![vec![]; mesh.faces.len()];
+    // Per face still under stock: the area of it that is, its points, and
+    // the triangles of it that are (mm, setup 1).
+    type Tri = [[f32; 3]; 3];
+    let mut found: HashMap<usize, (f32, Tri, Vec<Tri>)> = HashMap::new();
     let (mut total, mut covered) = (0., 0.);
     for (i, face) in mesh.faces.iter().enumerate() {
-        let [a, b, c] = match face.points[..] {
-            [a, b, c] => [a, b, c].map(|p| placement.transform(p).map(|v| v / scale)),
+        let (raw, [a, b, c]) = match face.points[..] {
+            [a, b, c] => (
+                [a, b, c],
+                [a, b, c].map(|p| placement.transform(p).map(|v| v / scale)),
+            ),
             _ => continue,
         };
         let (u, v) = (sub(b, a), sub(c, a));
@@ -105,39 +119,63 @@ pub fn uncut(stock: &Volume, setup1: &Setup, mesh: &Mesh) -> Uncut {
         // ponytail: trusts the mesh's winding for which side is outside; a
         // face wound inwards samples the part and reads as under stock.
         // The face in triangles with no edge over `SPLIT`, each sampled in
-        // pieces of at most `PIECE`; their shares weigh by area.
+        // pieces of at most `PIECE`, all the same size within a triangle. A
+        // triangle under stock or cut all over is kept whole.
         let mut parts = vec![];
         split([a, b, c], 0, &mut parts);
-        let mut share = 0.;
+        let mut drawn: Vec<([[f32; 3]; 3], bool)> = vec![];
         for [a, b, c] in parts {
             let (u, v) = (sub(b, a), sub(c, a));
             let k = (longest(a, b, c) / PIECE).ceil().clamp(1., 8.) as usize;
-            let (mut samples, mut under) = (0, 0);
-            // The centres of the k² pieces of the part: k(k+1)/2 with a corner
-            // at its first corner, and the k(k-1)/2 turned the other way.
+            let at = |s: f32, t: f32| -> [f32; 3] {
+                std::array::from_fn(|q| a[q] + s / k as f32 * u[q] + t / k as f32 * v[q])
+            };
+            let mut cells = vec![];
+            // The k² pieces of the part, each sampled at its centre: k(k+1)/2
+            // with a corner at its first corner, and the k(k-1)/2 turned the
+            // other way.
             for i in 0..k {
                 for j in 0..k - i {
-                    for (shift, piece) in [(1. / 3., true), (2. / 3., i + j + 1 < k)] {
-                        if !piece {
-                            continue;
-                        }
-                        let (s, t) = ((i as f32 + shift) / k as f32, (j as f32 + shift) / k as f32);
-                        let p: [f32; 3] =
-                            std::array::from_fn(|q| a[q] + s * u[q] + t * v[q] + n[q] * OFFSET);
-                        samples += 1;
-                        under += usize::from(cuts.left(moved(p, first, stock.frame)));
+                    let (x, y) = (i as f32, j as f32);
+                    let turned = [at(x + 1., y), at(x + 1., y + 1.), at(x, y + 1.)];
+                    for (shift, piece) in [
+                        (1. / 3., Some([at(x, y), at(x + 1., y), at(x, y + 1.)])),
+                        (2. / 3., (i + j + 1 < k).then_some(turned)),
+                    ] {
+                        let Some(piece) = piece else { continue };
+                        let centre = at(x + shift, y + shift);
+                        let p: [f32; 3] = std::array::from_fn(|q| centre[q] + n[q] * OFFSET);
+                        cells.push((piece, cuts.left(moved(p, first, stock.frame))));
                     }
                 }
             }
-            share += cross(u, v) / 2. * under as f32 / samples as f32;
+            match cells.iter().filter(|(_, under)| *under).count() {
+                0 => drawn.push(([a, b, c], false)),
+                n if n == cells.len() => drawn.push(([a, b, c], true)),
+                _ => drawn.extend(cells),
+            }
         }
         let area = twice / 2.;
-        share /= area;
+        let under: Vec<_> = (drawn.iter())
+            .filter(|(_, under)| *under)
+            .map(|(t, _)| *t)
+            .collect();
+        let left: f32 = (under.iter())
+            .map(|t| cross(sub(t[1], t[0]), sub(t[2], t[0])) / 2.)
+            .sum();
         total += area;
-        covered += area * share;
-        if share >= 0.5 {
-            faces[i] = true;
-            found.insert(i, (area, [a, b, c]));
+        covered += left;
+        if under.is_empty() {
+            continue;
+        }
+        faces[i] = true;
+        if under.len() < drawn.len() {
+            pieces[i] = (drawn.into_iter())
+                .map(|(t, under)| (t.map(|q| carried(q, [a, b, c], raw)), under))
+                .collect();
+            found.insert(i, (left, [a, b, c], under));
+        } else {
+            found.insert(i, (area, [a, b, c], vec![[a, b, c]]));
         }
     }
     // Faces under stock that share an edge make one region.
@@ -148,8 +186,10 @@ pub fn uncut(stock: &Volume, setup1: &Setup, mesh: &Mesh) -> Uncut {
         }
         i
     }
+    // ponytail: a face only partly under stock joins its neighbours by all
+    // its edges, also those its pieces under stock do not reach.
     let mut edges: HashMap<[[i64; 3]; 2], usize> = HashMap::new();
-    for (&i, (_, p)) in &found {
+    for (&i, (_, p, _)) in &found {
         for e in 0..3 {
             let mut key = [p[e], p[(e + 1) % 3]].map(|v| v.map(|x| (x * 1000.).round() as i64));
             key.sort_unstable();
@@ -165,7 +205,8 @@ pub fn uncut(stock: &Volume, setup1: &Setup, mesh: &Mesh) -> Uncut {
         }
     }
     // Per region: its faces, area, bounds, and the sides of the part's box
-    // its faces lie on and its corners meet (`SIDES` order).
+    // its faces lie on and its corners meet (`SIDES` order), of what of its
+    // faces is under stock.
     struct Group {
         faces: Vec<usize>,
         area: f32,
@@ -174,7 +215,7 @@ pub fn uncut(stock: &Volume, setup1: &Setup, mesh: &Mesh) -> Uncut {
         meets: [bool; 6],
     }
     let mut grouped: HashMap<usize, Group> = HashMap::new();
-    for (&i, (area, p)) in &found {
+    for (&i, (area, _, under)) in &found {
         let group = grouped.entry(top(&mut root, i)).or_insert(Group {
             faces: vec![],
             area: 0.,
@@ -187,24 +228,28 @@ pub fn uncut(stock: &Volume, setup1: &Setup, mesh: &Mesh) -> Uncut {
         });
         group.faces.push(i);
         group.area += area;
-        for v in p {
-            for (k, &x) in v.iter().enumerate().take(3) {
-                group.bounds.min[k] = group.bounds.min[k].min(x - part.min[k]);
-                group.bounds.max[k] = group.bounds.max[k].max(x - part.min[k]);
+        for p in under {
+            for v in p {
+                for (k, &x) in v.iter().enumerate().take(3) {
+                    group.bounds.min[k] = group.bounds.min[k].min(x - part.min[k]);
+                    group.bounds.max[k] = group.bounds.max[k].max(x - part.min[k]);
+                }
             }
-        }
-        for side in 0..6 {
-            let (k, edge) = (side / 2, [part.min, part.max][side % 2][side / 2]);
-            let at = |v: &[f32; 3]| (v[k] - edge).abs() < 0.01;
-            group.on[side] |= p.iter().all(at);
-            group.meets[side] |= p.iter().any(at);
+            for side in 0..6 {
+                let (k, edge) = (side / 2, [part.min, part.max][side % 2][side / 2]);
+                let at = |v: &[f32; 3]| (v[k] - edge).abs() < 0.01;
+                group.on[side] |= p.iter().all(at);
+                group.meets[side] |= p.iter().any(at);
+            }
         }
     }
     let mut regions = vec![];
     for group in grouped.into_values() {
         if group.area < SLIVER {
+            covered -= group.area;
             for i in group.faces {
                 faces[i] = false;
+                pieces[i].clear();
             }
             continue;
         }
@@ -222,13 +267,32 @@ pub fn uncut(stock: &Volume, setup1: &Setup, mesh: &Mesh) -> Uncut {
     regions.sort_by(|a, b| b.area.total_cmp(&a.area));
     Uncut {
         faces,
+        pieces,
         regions,
-        share: if total > 0. { covered / total } else { 0. },
+        share: if total > 0. {
+            covered.max(0.) / total
+        } else {
+            0.
+        },
     }
 }
 /// `p` in frame `from` as frame `to` sees it.
 fn moved(p: [f32; 3], from: Frame, to: Frame) -> [f32; 3] {
     if from == to { p } else { from.transfer(p, to) }
+}
+/// `q`, a point of the triangle `from`, at the same place in the triangle
+/// `to`, which `from` is a moved copy of.
+fn carried(q: [f32; 3], from: [[f32; 3]; 3], to: [[f32; 3]; 3]) -> [f32; 3] {
+    let dot = |x: [f32; 3], y: [f32; 3]| (0..3).map(|k| x[k] * y[k]).sum::<f32>();
+    let (u, v, d) = (
+        sub(from[1], from[0]),
+        sub(from[2], from[0]),
+        sub(q, from[0]),
+    );
+    let (uu, uv, vv, du, dv) = (dot(u, u), dot(u, v), dot(v, v), dot(d, u), dot(d, v));
+    let den = uu * vv - uv * uv;
+    let (s, t) = ((vv * du - uv * dv) / den, (uu * dv - uv * du) / den);
+    std::array::from_fn(|k| to[0][k] + s * (to[1][k] - to[0][k]) + t * (to[2][k] - to[0][k]))
 }
 fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     std::array::from_fn(|k| a[k] - b[k])
@@ -321,9 +385,83 @@ impl<'a> Cuts<'a> {
     }
 }
 
+/// A face 100 mm long along X and 20 mm wide, its points (mm, setup 1), and
+/// a block over it that one cut clears up to 45 mm along it, so a little over
+/// half of it is still under stock: the part with X over the corner's + 45.
+#[cfg(test)]
+pub(crate) fn half_cut_face() -> (Mesh, Setup, [[f32; 3]; 3], Volume) {
+    let mesh =
+        crate::mesh::normalize(vec![[[0., 0., 0.], [100., 0., 0.], [50., 20., 0.]]]).unwrap();
+    let setup = Setup::new(crate::model::Machine::new(3), "G54");
+    let placement = Placement::new(&mesh, Some(&setup));
+    let scale = mesh.display_scale();
+    let [a, b, c]: [[f32; 3]; 3] = std::array::from_fn(|k| {
+        placement
+            .transform(mesh.faces[0].points[k])
+            .map(|v| v / scale)
+    });
+    let frame = Frame::new(&setup, &mesh);
+    let bounds = Bounds {
+        min: [a[0], a[1], a[2]],
+        max: [b[0], c[1], a[2] + 10.],
+    };
+    let mut stock = Volume::new(bounds, frame);
+    // A flat Ø60 cutter along Y with its centre 15 mm along: X up to 45.
+    std::sync::Arc::make_mut(&mut stock.cuts).push(crate::stock_surface::Cut {
+        a: [a[0] + 15., a[1] - 40., a[2]],
+        b: [a[0] + 15., c[1] + 40., a[2]],
+        radius: 30.,
+        flute: 10.,
+        shape: crate::simulation::CutterShape::Flat,
+        frame,
+        source: (0, 0),
+    });
+    (mesh, setup, [a, b, c], stock)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::post::fixture;
+    #[test]
+    fn a_long_face_half_cut_is_under_stock_only_where_the_stock_is() {
+        let (mesh, setup, [a, b, c], stock) = super::half_cut_face();
+        assert!((b[0] - a[0] - 100.).abs() < 0.01 && (c[1] - a[1] - 20.).abs() < 0.01);
+        let uncut = super::uncut(&stock, &setup, &mesh);
+        assert!(uncut.faces[0]);
+        // The face in pieces that make it up, back in setup 1 as `uncut`
+        // places them, each under stock just where its centre is past 45.
+        let placement = crate::stock::Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        let placed = |t: &[[f32; 3]; 3]| t.map(|p| placement.transform(p).map(|v| v / scale));
+        let area =
+            |t: [[f32; 3]; 3]| super::cross(super::sub(t[1], t[0]), super::sub(t[2], t[0])) / 2.;
+        let along = |t: [[f32; 3]; 3]| t.iter().map(|p| p[0] - a[0]).sum::<f32>() / 3.;
+        let pieces = &uncut.pieces[0];
+        assert!(pieces.len() > 2, "{pieces:?}");
+        let whole: f32 = pieces.iter().map(|(t, _)| area(placed(t))).sum();
+        assert!((whole - 1000.).abs() < 0.5, "{whole}");
+        let mut under = 0.;
+        for (t, left) in pieces {
+            let t = placed(t);
+            assert!(t.iter().all(|p| (p[2] - a[2]).abs() < 0.01), "{t:?}");
+            assert_eq!(*left, along(t) > 45., "{t:?}");
+            if *left {
+                under += area(t);
+            }
+        }
+        // What lies past 45: 595 mm² of 1000, in pieces of up to 5 mm.
+        assert!((under - 595.).abs() < 40., "{under}");
+        assert!(
+            (uncut.share - under / 1000.).abs() < 0.001,
+            "{}",
+            uncut.share
+        );
+        let [region] = &uncut.regions[..] else {
+            panic!("{:?}", uncut.regions)
+        };
+        assert!((region.area - under).abs() < 0.01, "{region:?}");
+        assert!(region.bounds.min[0] > 40., "{region:?}");
+    }
     #[test]
     fn a_round_bars_box_corners_are_no_stock() {
         let bounds = crate::mesh::Bounds {
@@ -469,6 +607,141 @@ mod tests {
         let uncut = super::uncut(&stock, &setup, &mesh);
         assert!(uncut.share > 0.8, "{}", uncut.share);
         assert!(uncut.faces.iter().all(|f| *f));
+    }
+    /// After the TOTEM bottom's Adaptive and Parallel over its ramp, nothing
+    /// along the ramp's top edge is magenta: the long triangles of the face
+    /// the ramp runs into are under stock only away from it. The part is not
+    /// ours to ship: point `AXIS_RAMP_WS` at the workspace with both
+    /// operations (its part a binary STL that numbers its CAD faces) and run
+    /// `cargo test --release totem_ramps_top_edge -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn the_totem_ramps_top_edge_is_not_magenta() {
+        let Ok(path) = std::env::var("AXIS_RAMP_WS") else {
+            eprintln!("skipped: set AXIS_RAMP_WS to the TOTEM bottom's workspace");
+            return;
+        };
+        let doc = crate::storage::load(std::path::Path::new(&path)).unwrap();
+        let mesh = crate::mesh::load(&doc.file.as_ref().unwrap().path).unwrap();
+        let setup = &doc.setups[0];
+        let ramp: Vec<usize> = (setup.operations.iter())
+            .filter_map(|o| o.surfaces.as_ref())
+            .flat_map(|s| s.ids.clone())
+            .collect();
+        assert!(!ramp.is_empty());
+        let mut last = None;
+        crate::simulation::sequence_with(
+            &doc,
+            &mesh,
+            None,
+            |_, _, r| assert!(r.is_ok()),
+            |_, _, v| last = Some(v.clone()),
+        );
+        let uncut = super::uncut(last.as_ref().unwrap(), setup, &mesh);
+        let placement = crate::stock::Placement::new(&mesh, Some(setup));
+        let scale = mesh.display_scale();
+        let placed = |p: [f32; 3]| placement.transform(p).map(|v| v / scale);
+        let on_ramp = |i: usize| mesh.faces[i].feature.is_some_and(|id| ramp.contains(&id));
+        // The ramp's top edge: its corners at its highest.
+        let corners: Vec<[f32; 3]> = (0..mesh.faces.len())
+            .filter(|i| on_ramp(*i))
+            .flat_map(|i| mesh.faces[i].points.iter().map(|p| placed(*p)))
+            .collect();
+        let top = corners
+            .iter()
+            .map(|p| p[2])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let edge: Vec<_> = corners.iter().filter(|p| p[2] > top - 0.01).collect();
+        let lo: [f32; 3] =
+            std::array::from_fn(|k| edge.iter().map(|p| p[k]).fold(f32::INFINITY, f32::min));
+        let hi: [f32; 3] =
+            std::array::from_fn(|k| edge.iter().map(|p| p[k]).fold(f32::NEG_INFINITY, f32::max));
+        // How far a point lies from the edge (mm).
+        let far = |c: [f32; 3]| {
+            (0..3)
+                .map(|k| (lo[k] - c[k]).max(c[k] - hi[k]).max(0.).powi(2))
+                .sum::<f32>()
+                .sqrt()
+        };
+        let on_edge = |p: [f32; 3]| far(p) < 0.01;
+        // That, beside it: None past its ends or within half a piece of
+        // them. There the wall keeps a band of stock, about 1 mm wide, in its
+        // corners with the walls at the ramp's ends, past its picked faces,
+        // and the pieces it is magenta in reach up to half their size more.
+        let long = (0..3).fold(0, |m, k| if hi[k] - lo[k] > hi[m] - lo[m] { k } else { m });
+        let ends = super::PIECE / 2.;
+        let beside = |c: [f32; 3]| {
+            (lo[long] + ends..=hi[long] - ends)
+                .contains(&c[long])
+                .then(|| far(c))
+        };
+        let placed_face = |i: usize| [0, 1, 2].map(|k| placed(mesh.faces[i].points[k]));
+        let area =
+            |t: [[f32; 3]; 3]| super::cross(super::sub(t[1], t[0]), super::sub(t[2], t[0])) / 2.;
+        // The face the ramp runs into: that of the other triangles on its
+        // top edge.
+        let wall: Vec<usize> = (0..mesh.faces.len())
+            .filter(|i| {
+                !on_ramp(*i) && placed_face(*i).iter().filter(|p| on_edge(**p)).count() >= 2
+            })
+            .filter_map(|i| mesh.faces[i].feature)
+            .collect();
+        eprintln!("top edge {lo:.2?}..{hi:.2?}, into surfaces {wall:?}");
+        // What is magenta, drawn as now (whole faces and pieces under stock)
+        // or as before, a face whole once half of it was under stock: the
+        // nearest a point of it comes to the edge, beside it (mm), with the
+        // triangle it is on. Faces looking down (under the ramp's lip, where
+        // no cutter from above reaches) or along the edge (the walls at the
+        // ramp's ends, past its picked faces) are left out.
+        let nearest = |before: bool| {
+            let mut best: Option<(f32, usize, [f32; 3])> = None;
+            for i in (0..mesh.faces.len()).filter(|i| uncut.faces[*i]) {
+                let normal = mesh.surfaces[mesh.faces[i].feature.unwrap()].normal;
+                let normal = crate::mesh::rotation(normal, placement.rotation());
+                if normal[2] < 0. || normal[long].abs() > 0.9 {
+                    continue;
+                }
+                let under: Vec<[[f32; 3]; 3]> = (uncut.pieces[i].iter())
+                    .filter(|(_, under)| *under)
+                    .map(|(t, _)| t.map(placed))
+                    .collect();
+                let half = under.iter().map(|t| area(*t)).sum::<f32>() >= area(placed_face(i)) / 2.;
+                let magenta = match (uncut.pieces[i].is_empty(), before) {
+                    (true, _) => vec![placed_face(i)],
+                    (false, true) if half => vec![placed_face(i)],
+                    (false, true) => vec![],
+                    (false, false) => under,
+                };
+                // Each triangle at the centres of its pieces of up to 0.5 mm.
+                for [a, b, c] in magenta {
+                    let n = (super::longest(a, b, c) / 0.5).ceil().clamp(1., 200.) as usize;
+                    for (x, y) in (0..n).flat_map(|x| (0..n - x).map(move |y| (x, y))) {
+                        let (s, t) = (
+                            (x as f32 + 1. / 3.) / n as f32,
+                            (y as f32 + 1. / 3.) / n as f32,
+                        );
+                        let p =
+                            std::array::from_fn(|k| a[k] + s * (b[k] - a[k]) + t * (c[k] - a[k]));
+                        if let Some(off) = beside(p)
+                            && best.is_none_or(|(d, _, _)| off < d)
+                        {
+                            best = Some((off, i, p));
+                        }
+                    }
+                }
+            }
+            best
+        };
+        let (before, now) = (nearest(true), nearest(false));
+        eprintln!("magenta nearest the edge: before {before:.2?}, now {now:.2?}");
+        // Before, the wall's long triangle ran along it; now nothing within
+        // 2 mm of it is magenta.
+        let on_wall = |i: usize| mesh.faces[i].feature.is_some_and(|id| wall.contains(&id));
+        assert!(
+            before.is_some_and(|(off, i, _)| off < 0.5 && on_wall(i)),
+            "{before:?}"
+        );
+        assert!(now.is_none_or(|(off, _, _)| off > 2.), "{now:?}");
     }
     #[test]
     fn a_face_is_split_into_at_most_the_samples_a_run_can_afford() {

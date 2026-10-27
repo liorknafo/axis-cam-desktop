@@ -359,6 +359,7 @@ impl View {
             start_stock: None,
             live_volume: None,
             uncut: &[],
+            uncut_pieces: &[],
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -483,6 +484,7 @@ fn paint(scene: &Scene, args: &Args, view: &View) -> Picture {
         start_stock: None,
         live_volume: None,
         uncut: &[],
+        uncut_pieces: &[],
         show_uncut: true,
         section: Sectioning {
             cut: view.section.map(|(s, _)| s),

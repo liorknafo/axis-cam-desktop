@@ -2298,6 +2298,10 @@ pub(crate) fn scene_viewport(app: &App) -> Option<Viewport<'_>> {
             .and_then(|(found, _)| found.as_ref().ok())
             .map(|found| found.faces.as_slice())
             .unwrap_or(&[]),
+        uncut_pieces: shown_uncut(app)
+            .and_then(|(found, _)| found.as_ref().ok())
+            .map(|found| found.pieces.as_slice())
+            .unwrap_or(&[]),
         show_uncut: app.show_uncut,
         section: viewport::Sectioning {
             cut: app.view_section(),
@@ -13037,6 +13041,7 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             start_stock: None,
             live_volume: None,
             uncut: &[],
+            uncut_pieces: &[],
             show_uncut: true,
             section: Default::default(),
             frame: None,

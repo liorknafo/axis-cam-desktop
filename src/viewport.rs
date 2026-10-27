@@ -276,6 +276,10 @@ pub struct Viewport<'a> {
     /// leaves it under stock (`uncut::Uncut::faces`); those are drawn in
     /// `UNCUT`. Empty when that is not known.
     pub uncut: &'a [bool],
+    /// Per face of those only partly under stock, the pieces it is drawn in
+    /// (`uncut::Uncut::pieces`): in `UNCUT` only those under stock. Empty
+    /// when none is.
+    pub uncut_pieces: &'a [Vec<crate::uncut::Piece>],
     /// Whether those faces are drawn in `UNCUT` at all ("Show uncut faces").
     /// With a simulation and the stock shown the part itself is not drawn, so
     /// then just these faces are, after the stock and depth-tested against it.
@@ -1215,8 +1219,8 @@ impl Viewport<'_> {
                 })
             }) || face.feature.is_some_and(|f| marked.contains(&f))
         };
-        let project = |face: &Face| -> Vec<(Point, f32)> {
-            face.points
+        let project = |points: &[[f32; 3]]| -> Vec<(Point, f32)> {
+            points
                 .iter()
                 .map(|v| {
                     let pt = p.p(*v);
@@ -1244,6 +1248,25 @@ impl Viewport<'_> {
             }
             _ => Default::default(),
         };
+        // A face only partly under stock is drawn in its pieces
+        // (`uncut::Uncut::pieces`), placed as the face is and cut by the
+        // section as it is, each with whether it is under stock; any other
+        // face whole.
+        let placement = Placement::new(self.mesh, self.setup);
+        let turned = self.turner();
+        let shapes = |fi: usize, face: &Face| -> Vec<(Vec<[f32; 3]>, bool)> {
+            let uncut = self.show_uncut && self.uncut.get(fi) == Some(&true);
+            match self.uncut_pieces.get(fi) {
+                Some(pieces) if uncut && !pieces.is_empty() => (pieces.iter())
+                    .map(|(t, under)| {
+                        let points: Vec<_> =
+                            t.iter().map(|q| turned(placement.transform(*q))).collect();
+                        (cut.map_or(points.clone(), |cut| cut.clip(&points)), *under)
+                    })
+                    .collect(),
+                _ => vec![(face.points.clone(), uncut)],
+            }
+        };
         // A selected face still under stock is striped in the selection's
         // blue and the magenta (`hatch`).
         let hatch = hatch(ratio);
@@ -1256,61 +1279,62 @@ impl Viewport<'_> {
             let hover = face.feature.is_some()
                 && (face.feature == hovered || hovered_face.contains(&face.feature.unwrap()));
             let kept = !hover && face.feature.is_some_and(|f| marked.contains(&f));
-            let uncut = self.show_uncut && self.uncut.get(fi) == Some(&true);
-            let striped = !hover && uncut && selected;
-            let color = if hover {
-                [242, 190, 93, 255]
-            } else if uncut {
-                uncut_color(light)
-            } else if selected {
-                SELECTED
-            } else {
-                [
-                    (light * 0.80 * 255.) as u8,
-                    (light * 0.91 * 255.) as u8,
-                    (light * 255.) as u8,
-                    255,
-                ]
-            };
-            let v = project(face);
-            for i in 1..v.len().saturating_sub(1) {
-                let tri = [v[0], v[i], v[i + 1]];
-                let minx = tri
-                    .iter()
-                    .map(|(p, _)| p.x)
-                    .fold(f32::INFINITY, f32::min)
-                    .floor()
-                    .max(0.) as u32;
-                let maxx = tri
-                    .iter()
-                    .map(|(p, _)| p.x)
-                    .fold(f32::NEG_INFINITY, f32::max)
-                    .ceil()
-                    .clamp(0., w as f32) as u32;
-                let miny = tri
-                    .iter()
-                    .map(|(p, _)| p.y)
-                    .fold(f32::INFINITY, f32::min)
-                    .floor()
-                    .max(0.) as u32;
-                let maxy = tri
-                    .iter()
-                    .map(|(p, _)| p.y)
-                    .fold(f32::NEG_INFINITY, f32::max)
-                    .ceil()
-                    .clamp(0., h as f32) as u32;
-                for y in miny..maxy {
-                    for x in minx..maxx {
-                        if let Some(z) =
-                            triangle_depth(tri, Point::new(x as f32 + 0.5, y as f32 + 0.5))
-                        {
-                            let index = (y * w + x) as usize;
-                            if z > depths[index] {
-                                depths[index] = z;
-                                let color = if striped { hatch(color, x, y) } else { color };
-                                rgba[index * 4..index * 4 + 4].copy_from_slice(&color);
-                                if let Some(plain) = plain.get_mut(index) {
-                                    *plain = kept;
+            for (points, uncut) in shapes(fi, face) {
+                let striped = !hover && uncut && selected;
+                let color = if hover {
+                    [242, 190, 93, 255]
+                } else if uncut {
+                    uncut_color(light)
+                } else if selected {
+                    SELECTED
+                } else {
+                    [
+                        (light * 0.80 * 255.) as u8,
+                        (light * 0.91 * 255.) as u8,
+                        (light * 255.) as u8,
+                        255,
+                    ]
+                };
+                let v = project(&points);
+                for i in 1..v.len().saturating_sub(1) {
+                    let tri = [v[0], v[i], v[i + 1]];
+                    let minx = tri
+                        .iter()
+                        .map(|(p, _)| p.x)
+                        .fold(f32::INFINITY, f32::min)
+                        .floor()
+                        .max(0.) as u32;
+                    let maxx = tri
+                        .iter()
+                        .map(|(p, _)| p.x)
+                        .fold(f32::NEG_INFINITY, f32::max)
+                        .ceil()
+                        .clamp(0., w as f32) as u32;
+                    let miny = tri
+                        .iter()
+                        .map(|(p, _)| p.y)
+                        .fold(f32::INFINITY, f32::min)
+                        .floor()
+                        .max(0.) as u32;
+                    let maxy = tri
+                        .iter()
+                        .map(|(p, _)| p.y)
+                        .fold(f32::NEG_INFINITY, f32::max)
+                        .ceil()
+                        .clamp(0., h as f32) as u32;
+                    for y in miny..maxy {
+                        for x in minx..maxx {
+                            if let Some(z) =
+                                triangle_depth(tri, Point::new(x as f32 + 0.5, y as f32 + 0.5))
+                            {
+                                let index = (y * w + x) as usize;
+                                if z > depths[index] {
+                                    depths[index] = z;
+                                    let color = if striped { hatch(color, x, y) } else { color };
+                                    rgba[index * 4..index * 4 + 4].copy_from_slice(&color);
+                                    if let Some(plain) = plain.get_mut(index) {
+                                        *plain = kept;
+                                    }
                                 }
                             }
                         }
@@ -1452,20 +1476,22 @@ impl Viewport<'_> {
                 if !behind_stock || self.uncut.get(fi) != Some(&true) {
                     continue;
                 }
-                let v = project(face);
                 let color = uncut_color(face_light(&whole[fi]));
                 let striped = selected_by(face);
-                for i in 1..v.len().saturating_sub(1) {
-                    raster_rows_with(
-                        &mut rgba,
-                        &mut depths,
-                        w,
-                        0..h,
-                        [v[0], v[i], v[i + 1]],
-                        |x, y| {
-                            if striped { hatch(color, x, y) } else { color }
-                        },
-                    );
+                for (points, _) in shapes(fi, face).into_iter().filter(|(_, under)| *under) {
+                    let v = project(&points);
+                    for i in 1..v.len().saturating_sub(1) {
+                        raster_rows_with(
+                            &mut rgba,
+                            &mut depths,
+                            w,
+                            0..h,
+                            [v[0], v[i], v[i + 1]],
+                            |x, y| {
+                                if striped { hatch(color, x, y) } else { color }
+                            },
+                        );
+                    }
                 }
             }
         } else if self.show_stock
@@ -4019,6 +4045,7 @@ mod tests {
             start_stock: None,
             live_volume: None,
             uncut: &[],
+            uncut_pieces: &[],
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -4047,6 +4074,7 @@ mod tests {
         let all = vec![true; mesh.faces.len()];
         let uncut = Viewport {
             uncut: &all,
+            uncut_pieces: &[],
             ..bare
         };
         let (_, _, rgba) = uncut.pixels(&p, bounds, None);
@@ -4176,6 +4204,7 @@ mod tests {
                 live_volume: None,
                 start_stock: None,
                 uncut: &[],
+                uncut_pieces: &[],
                 show_uncut: true,
                 section: Sectioning {
                     cut: Some(Section::across(k, &mesh, Some(&setup), camera.toward())),
@@ -4255,6 +4284,7 @@ mod tests {
             start_stock: None,
             live_volume: None,
             uncut: &[],
+            uncut_pieces: &[],
             show_uncut: false,
             section: Default::default(),
             frame: None,
@@ -4344,6 +4374,7 @@ mod tests {
             start_stock: None,
             live_volume: None,
             uncut: &all,
+            uncut_pieces: &[],
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -4371,6 +4402,7 @@ mod tests {
         // Nothing marked uncut: nothing magenta either.
         let none = Viewport {
             uncut: &[],
+            uncut_pieces: &[],
             show_uncut: true,
             section: Default::default(),
             ..off
@@ -4415,6 +4447,7 @@ mod tests {
             live_volume: None,
             start_stock: None,
             uncut: &[],
+            uncut_pieces: &[],
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -4505,6 +4538,7 @@ mod tests {
             live_volume: None,
             start_stock,
             uncut: &[],
+            uncut_pieces: &[],
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -4582,6 +4616,7 @@ mod tests {
             live_volume: None,
             start_stock: None,
             uncut: &[],
+            uncut_pieces: &[],
             show_uncut: false,
             section: Default::default(),
             frame: None,
@@ -4715,6 +4750,7 @@ mod tests {
             start_stock: None,
             live_volume: None,
             uncut: &all,
+            uncut_pieces: &[],
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -4801,6 +4837,7 @@ mod tests {
                 start_stock: None,
                 live_volume: None,
                 uncut,
+                uncut_pieces: &[],
                 show_uncut: true,
                 section: Default::default(),
                 frame: None,
@@ -4819,6 +4856,60 @@ mod tests {
         // worked out again, a new allocation whether or not the same faces.
         assert_ne!(key(&all), key(&[]));
         assert_ne!(key(&all), key(&all.clone()));
+    }
+    #[test]
+    fn a_long_face_half_cut_is_magenta_only_on_the_half_under_stock() {
+        // A face 100 mm long whose first 45 mm the job cuts: just over half
+        // of it is under stock, but only that part is drawn magenta.
+        let (mesh, setup, [a, _, _], stock) = crate::uncut::half_cut_face();
+        let uncut = crate::uncut::uncut(&stock, &setup, &mesh);
+        let view = Viewport {
+            setup: Some(&setup),
+            operation: None,
+            mesh: &mesh,
+            simulation: None,
+            sample: false,
+            camera: Camera::default(),
+            picking: false,
+            pin_holes: Default::default(),
+            hole_outlines: vec![],
+            pin_aim: Default::default(),
+            show_stock: false,
+            show_paths: false,
+            progress: None,
+            holding: vec![],
+            first_setup: None,
+            framed: vec![],
+            leftover: None,
+            live: None,
+            a: None,
+            live_stock: None,
+            start_stock: None,
+            live_volume: None,
+            uncut: &uncut.faces,
+            uncut_pieces: &uncut.pieces,
+            show_uncut: true,
+            section: Default::default(),
+            frame: None,
+        };
+        let size = (600, 450);
+        let p = Projector::fit(view.camera, (600., 450.), view.scene_bounds());
+        let (rgba, _) = view.render(&p, size, 1., None, &[]);
+        // The pixel at `x` mm along the face, 4 mm in from its long edge.
+        let scale = mesh.display_scale();
+        let magenta = |x: f32| {
+            let at = p.p([a[0] + x, a[1] + 4., a[2]].map(|v| v * scale));
+            let i = (at.y as usize * size.0 as usize + at.x as usize) * 4;
+            let px = &rgba[i..i + 4];
+            assert_eq!(px[3], 255, "nothing drawn {x} mm along");
+            px[0] > px[1].saturating_add(60) && px[2] > px[1].saturating_add(40)
+        };
+        for x in [12., 20., 30., 38.] {
+            assert!(!magenta(x), "magenta {x} mm along, where it is cut");
+        }
+        for x in [52., 60., 70., 85.] {
+            assert!(magenta(x), "not magenta {x} mm along, under stock");
+        }
     }
     #[test]
     fn a_later_setups_known_box_is_drawn_as_its_stock_and_otherwise_none_is() {
@@ -4853,6 +4944,7 @@ mod tests {
             start_stock: None,
             live_volume: None,
             uncut: &[],
+            uncut_pieces: &[],
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -4938,6 +5030,7 @@ mod tests {
             start_stock: None,
             live_volume: None,
             uncut: &[],
+            uncut_pieces: &[],
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -5081,6 +5174,7 @@ mod tests {
             start_stock: None,
             live_volume: None,
             uncut: &[],
+            uncut_pieces: &[],
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -5191,6 +5285,7 @@ mod tests {
             start_stock: None,
             live_volume: None,
             uncut: &[],
+            uncut_pieces: &[],
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -5264,6 +5359,7 @@ mod tests {
             start_stock: None,
             live_volume: None,
             uncut: &[],
+            uncut_pieces: &[],
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -5379,6 +5475,7 @@ mod tests {
             start_stock: None,
             live_volume: None,
             uncut: &[],
+            uncut_pieces: &[],
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -5447,6 +5544,7 @@ mod tests {
             start_stock: None,
             live_volume: None,
             uncut: &[],
+            uncut_pieces: &[],
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -5511,6 +5609,7 @@ mod tests {
             start_stock: None,
             live_volume: None,
             uncut: &[],
+            uncut_pieces: &[],
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -5567,6 +5666,7 @@ mod tests {
             start_stock: None,
             live_volume: None,
             uncut: &[],
+            uncut_pieces: &[],
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -5621,6 +5721,7 @@ mod tests {
             start_stock: None,
             live_volume: None,
             uncut: &[],
+            uncut_pieces: &[],
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -5689,6 +5790,7 @@ mod tests {
             live_volume: None,
             start_stock: None,
             uncut: &[],
+            uncut_pieces: &[],
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -5885,6 +5987,7 @@ mod tests {
             start_stock: None,
             live_volume: None,
             uncut: &[],
+            uncut_pieces: &[],
             show_uncut: true,
             section: Default::default(),
             frame: None,
