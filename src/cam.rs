@@ -3127,6 +3127,8 @@ struct SurfaceGrid {
     ny: usize,
     step: f32,
     origin: [f32; 2],
+    /// How far past the part's box the samples go, mm: whole steps.
+    reach: f32,
     z: Vec<Option<f32>>,
     /// The cells cut, by cell (`nx - 1` a row), when only picked faces are;
     /// None when every cell with all four heights is.
@@ -3192,7 +3194,14 @@ fn finish_grid(
     if step < 0.05 {
         return Err("Requested finishing sampling is below the 0.05 mm preview limit.".into());
     }
-    let dims = g.bounds.dimensions();
+    // The part's box and `reach` round it, as far as the cutter's centre
+    // goes past the outline (`silhouette` below): whole steps, so the
+    // samples over the part stay where they were, and short of r, where a
+    // wall's edge holds the ball at its equator and its height falls sheer.
+    let r = b.plan.radius;
+    let reach = ((r / step).ceil() - 1.).max(0.) * step;
+    let origin = [g.bounds.min[0] - reach, g.bounds.min[1] - reach];
+    let dims = g.bounds.dimensions().map(|d| d + 2. * reach);
     if dims[..2]
         .iter()
         .any(|d| !d.is_finite() || d / step > CEILING as f32)
@@ -3212,7 +3221,6 @@ fn finish_grid(
         return Err("Set slope limits in increasing order within 0–90°.".into());
     }
     // Triangle rasterization evaluates only its expanded footprint, not the entire mesh per sample.
-    let r = b.plan.radius;
     // ponytail: at most 256 squares a side; finer bins if fine meshes make the heights between samples slow.
     let bin = ((r / step).ceil() as usize)
         .max(nx.max(ny).div_ceil(256))
@@ -3227,12 +3235,10 @@ fn finish_grid(
             let hi = t.p.iter().map(|p| p[k]).fold(f32::NEG_INFINITY, f32::max);
             let count = if k == 0 { nx } else { ny };
             (
-                ((lo - r - g.bounds.min[k]) / step)
+                ((lo - r - origin[k]) / step)
                     .floor()
                     .clamp(0., count as f32) as usize,
-                ((hi + r - g.bounds.min[k]) / step)
-                    .ceil()
-                    .clamp(0., count as f32) as usize,
+                ((hi + r - origin[k]) / step).ceil().clamp(0., count as f32) as usize,
             )
         });
         // A long sampling runs off the window's thread: how far, and Cancel,
@@ -3259,10 +3265,7 @@ fn finish_grid(
             && picked.is_none_or(|ids| t.feature.is_some_and(|f| ids.contains(&f)));
         for y in ranges[1].0..ranges[1].1 {
             for x in ranges[0].0..ranges[0].1 {
-                let xy = [
-                    g.bounds.min[0] + x as f32 * step,
-                    g.bounds.min[1] + y as f32 * step,
-                ];
+                let xy = [origin[0] + x as f32 * step, origin[1] + y as f32 * step];
                 let i = y * nx + x;
                 if let Some(height) = drop_triangle(&t.p, xy, r, b.plan.shape == CutterShape::Ball)
                 {
@@ -3283,8 +3286,15 @@ fn finish_grid(
             }
         }
     }
-    // Only cutter centers over the model XY silhouette. This also avoids joining disconnected islands.
-    let silhouette: Vec<Polygon> = g.silhouette(false, op)?.into();
+    // Only cutter centres within `reach` of the model's XY silhouette, where
+    // it touches the part. A slope rising from the outline at θ is touched
+    // at its foot by a ball r·sin θ past it: with centres only over the
+    // outline a fin was left there, up to r(1/cos θ − 1) and a cell's slope
+    // tall (LIO-330). Islands more than 2·reach apart stay apart.
+    let silhouette: Vec<Polygon> = g
+        .silhouette(false, op)?
+        .inflate(reach as f64, JoinType::Round, EndType::Polygon, 2.)
+        .into();
     crate::progress::stage(stage + 1, stages);
     crate::progress::expect(ny);
     for y in 0..ny {
@@ -3292,8 +3302,8 @@ fn finish_grid(
         for x in 0..nx {
             let i = y * nx + x;
             let xy = (
-                g.bounds.min[0] as f64 + x as f64 * step as f64,
-                g.bounds.min[1] as f64 + y as f64 * step as f64,
+                origin[0] as f64 + x as f64 * step as f64,
+                origin[1] as f64 + y as f64 * step as f64,
             );
             // Picked faces keep every height: the cells round them hold the
             // cutter up where it reaches past their edge (`cells`).
@@ -3338,7 +3348,8 @@ fn finish_grid(
         nx,
         ny,
         step,
-        origin: [g.bounds.min[0], g.bounds.min[1]],
+        origin,
+        reach,
         z,
         cells,
         bins,
@@ -3433,6 +3444,16 @@ impl SurfaceGrid {
     ) {
         let xy = [(a[0] + b[0]) / 2., (a[1] + b[1]) / 2.];
         if (b[0] - a[0]).hypot(b[1] - a[1]) < 0.01 {
+            // Too close to split, as where a wall's edge holds the ball at
+            // its equator: across at the higher height, up or down at the
+            // lower end, so the straight move cuts no corner off the cliff.
+            if (a[2] - b[2]).abs() > tolerance {
+                out.push(if a[2] > b[2] {
+                    [b[0], b[1], a[2]]
+                } else {
+                    [a[0], a[1], b[2]]
+                });
+            }
             return;
         }
         let Some(z) = self.sample(g, xy) else { return };
@@ -3493,16 +3514,33 @@ fn parallel_rows(
     if rows > CEILING || count > CEILING || rows.saturating_mul(count) > CEILING {
         return Err(too_many("samples"));
     }
+    // Rows and samples where they were over the part's box, and as many
+    // more either side as reach the grid's samples past it.
+    let du = (max(&along) - min(&along)) / count.max(1) as f32;
+    let wide = grid.reach * (sin.abs() + cos.abs());
+    let (rows_out, out) = (
+        (wide / spacing).ceil() as usize,
+        if du > 0. {
+            (wide / du).ceil() as usize
+        } else {
+            0
+        },
+    );
     b.plan.levels += rows;
+    let (rows, count) = (rows + 2 * rows_out, count + 2 * out);
     crate::progress::stage(stage, stages);
     crate::progress::expect(rows + 1);
     for row in 0..=rows {
         crate::progress::report(row)?;
-        let v = min(&across) + row as f32 * spacing;
+        let v = min(&across) + (row as f32 - rows_out as f32) * spacing;
         let mut stroke = vec![];
         for j in 0..=count {
-            let index = if row % 2 == 0 { j } else { count - j };
-            let u = min(&along) + (max(&along) - min(&along)) * index as f32 / count.max(1) as f32;
+            let index = if row % 2 == rows_out % 2 {
+                j
+            } else {
+                count - j
+            };
+            let u = min(&along) + (index as f32 - out as f32) * du;
             let xy = [u * cos - v * sin, u * sin + v * cos];
             if let Some(z) = grid.sample(g, xy) {
                 let p = [xy[0], xy[1], z];
@@ -4476,6 +4514,51 @@ pub(crate) mod tests {
             })
             .fold(f32::INFINITY, f32::min);
         assert!(near < 0.02, "the ball comes within {near} mm of the corner");
+        assert_plan(plan);
+    }
+    /// A 45° ramp rising along X from the part's outline, where a wall 2 mm
+    /// tall stands under it, 10 mm along Y. A Ø4 ball finishing the part goes
+    /// past the outline until it touches the ramp's foot, leaving less than
+    /// `uncut`'s 0.5 mm there: with its centre kept over the outline it
+    /// stayed r(√2 − 1), 0.83 mm, off it (LIO-330).
+    #[test]
+    fn parallel_finishes_a_slope_rising_from_the_outline_down_to_its_foot() {
+        let profile = [(0., 0.), (10., 0.), (10., 12.), (0., 2.)];
+        let at = |(x, z): (f32, f32), y: f32| [x, y, z];
+        let mut t = vec![];
+        for (i, &p) in profile.iter().enumerate() {
+            let q = profile[(i + 1) % profile.len()];
+            quad(&mut t, [at(p, 0.), at(p, 10.), at(q, 10.), at(q, 0.)]);
+        }
+        quad(&mut t, profile.map(|p| at(p, 0.)));
+        quad(&mut t, [3, 2, 1, 0].map(|i| at(profile[i], 10.)));
+        let mesh = mesh::normalize(t).unwrap();
+        let (setup, op, tool) = fixture(Strategy::Parallel);
+        let min = Geometry::new(&setup, &mesh).bounds.min;
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        let r = plan.radius;
+        let feeds: Vec<_> = plan.moves.iter().filter(|m| m.cutting_pass).collect();
+        // Points 0.5 mm off the ramp along its normal, from its foot up.
+        for y in [2., 4.5, 7., 8.5] {
+            for x in [0.02, 0.3, 0.7, 1.5] {
+                let p = [
+                    min[0] + x - 0.5 / 2f32.sqrt(),
+                    min[1] + y,
+                    min[2] + 2. + x + 0.5 / 2f32.sqrt(),
+                ];
+                assert!(
+                    (feeds.iter()).any(|m| crate::volume::swept(
+                        p,
+                        m.from,
+                        m.to,
+                        r,
+                        plan.flute_length,
+                        CutterShape::Ball
+                    )),
+                    "stock is left 0.5 mm off the ramp {x} mm from its foot, {y} mm along it"
+                );
+            }
+        }
         assert_plan(plan);
     }
     /// A half ball R10 on a Ø40 x 4 mm round plate: 64 sides, the dome in
