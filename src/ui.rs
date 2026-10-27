@@ -767,10 +767,9 @@ fn checks_summary<'a>(checks: &Checks, open: bool) -> Element<'a, Message> {
         let mut lines_column = column![if folds {
             row![
                 title.width(Fill),
-                btn(
+                secondary(
                     if open { "Hide details" } else { "Details" },
                     Message::ToggleWarningDetails,
-                    false
                 )
             ]
             .align_y(Alignment::Center)
@@ -2231,7 +2230,7 @@ fn scene(app: &App, frame: Option<f32>) -> Option<Element<'_, Message>> {
 /// 3D view take at their tallest as a rule: the strip playing a preview,
 /// with its check (some 220), and the toolbar with the uncut faces' lines
 /// (100 to 130). The camera
-/// fits the scene in the rest (`scene_frame`).
+/// fits the scene in the rest (`scene_frame`); taller panels scroll.
 const PANELS: f32 = 320.;
 /// How high the frame the 3D view's camera fits the scene in is, when the
 /// view, its toolbar and the simulation strip share `height`: all of it but
@@ -2326,11 +2325,16 @@ fn workspace(app: &App) -> Element<'_, Message> {
     )
     .padding([12, 14]);
     // The view, its toolbar and the simulation strip share what is left;
-    // the camera's frame is worked out from all of it (`scene_frame`).
+    // the camera's frame is worked out from all of it (`scene_frame`). The
+    // panels scroll past the room the frame leaves them, so open details
+    // and a long run check never cut the scene off.
     let middle = responsive(move |size| {
         let (toolbar, simulation) = scene_panels(app);
-        let scene = scene(app, Some(scene_frame(size.height))).unwrap_or_else(|| no_scene(app));
-        column![scene, toolbar, simulation].into()
+        let frame = scene_frame(size.height);
+        let scene = scene(app, Some(frame)).unwrap_or_else(|| no_scene(app));
+        let panels =
+            container(scrollable(column![toolbar, simulation])).max_height(size.height - frame);
+        column![scene, panels].into()
     });
     // A UC100 machine takes no G-code file: its setups run from MACHINE.
     let uc100 =
@@ -2356,6 +2360,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
         ]
         .spacing(2),
     )
+    .width(Fill)
     .padding([5, 8])
     .style(panel_style);
     column![heading, middle, workflow]
@@ -2593,7 +2598,8 @@ fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
             btn(if app.playing || app.catching_up.is_some_and(|c| c.2) { "Pause" } else if app.progress >= 1. { "Replay" } else { "Play" }, Message::Play, app.playing),
             btn("Restart", Message::Scrub(0.), false),
             help::wrap(slider(0.0..=1.0, app.progress, Message::Scrub).on_release(Message::ScrubDone).step(0.001_f32).width(Fill), Help::text("Simulation progress", "Scrub forward or backward. Playback recomputes the remaining stock and cutter position at that time. Restart restores the stock left by all preceding enabled operations and setups."), widget::tooltip::Position::Top),
-            muted(format!("{:03}%", (app.progress * 100.) as u32)),
+            // As wide as "100%", so the slider keeps its length.
+            muted(format!("{}%", (app.progress * 100.) as u32)).width(34).align_x(Alignment::End),
             help::wrap(pick_list(if app.active_simulation().is_some() { vec![1f32, 10., 30., 60., 120.] } else { vec![0.5f32, 1., 2., 4.] }, Some(app.speed), Message::Speed).text_size(12).style(choice_style).padding(5),crate::choice_help::selected("speed","Playback speed",&app.speed.to_string(),Target::Operation,&Fields::new()),widget::tooltip::Position::Top),
             muted("×")
         ].spacing(8).align_y(Alignment::Center));
@@ -2623,10 +2629,9 @@ fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
                     container(summary.wrapping(Wrapping::None))
                         .width(Fill)
                         .clip(true),
-                    btn(
+                    secondary(
                         if folded { "Details" } else { "Hide details" },
                         Message::ToggleSimDetails,
-                        false
                     )
                 ]
                 .spacing(8)

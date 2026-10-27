@@ -16912,16 +16912,41 @@ soft_max = 180.0
     }
     /// The bounds of each text `a`'s window lays out at `size`, by its words.
     fn laid_out_texts(a: &App, size: iced::Size) -> Vec<(String, iced::Rectangle)> {
+        laid_out(a, size).texts
+    }
+    /// What `a`'s window lays out at `size`.
+    #[derive(Default)]
+    struct LaidOut {
+        /// Each text, by its words.
+        texts: Vec<(String, iced::Rectangle)>,
+        /// Each container, column, row and stack.
+        boxes: Vec<iced::Rectangle>,
+        /// Each scrollable: the part shown, and all of its content.
+        scrolls: Vec<(iced::Rectangle, iced::Rectangle)>,
+    }
+    fn laid_out(a: &App, size: iced::Size) -> LaidOut {
         use futures_util::FutureExt;
         use iced::advanced::renderer::Headless;
-        use iced::advanced::widget::{Id, Operation};
-        struct Texts(Vec<(String, iced::Rectangle)>);
-        impl Operation for Texts {
+        use iced::advanced::widget::{Id, Operation, operation::Scrollable};
+        impl Operation for LaidOut {
             fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
                 operate(self);
             }
             fn text(&mut self, _id: Option<&Id>, bounds: iced::Rectangle, text: &str) {
-                self.0.push((text.to_string(), bounds));
+                self.texts.push((text.to_string(), bounds));
+            }
+            fn container(&mut self, _id: Option<&Id>, bounds: iced::Rectangle) {
+                self.boxes.push(bounds);
+            }
+            fn scrollable(
+                &mut self,
+                _id: Option<&Id>,
+                bounds: iced::Rectangle,
+                content: iced::Rectangle,
+                _translation: iced::Vector,
+                _state: &mut dyn Scrollable,
+            ) {
+                self.scrolls.push((bounds, content));
             }
         }
         let mut renderer = <iced::Renderer as Headless>::new(
@@ -16938,9 +16963,98 @@ soft_max = 180.0
             iced_runtime::user_interface::Cache::new(),
             &mut renderer,
         );
-        let mut texts = Texts(vec![]);
-        ui.operate(&renderer, &mut texts);
-        texts.0
+        let mut laid = LaidOut::default();
+        ui.operate(&renderer, &mut laid);
+        laid
+    }
+    /// The 3D view keeps the height its camera frames the scene in
+    /// (`ui::scene_frame`) however tall the panels under it get: open
+    /// details and a long run check scroll under it (LIO-305).
+    #[test]
+    fn open_details_and_a_long_run_check_scroll_under_the_3d_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_on(dir.path(), LIMITED);
+        a.doc.adopt_holders();
+        a.smoke_dir = Some(dir.path().to_path_buf());
+        a.page = Page::Work;
+        // Clamps in the facing's way: Run's check refuses with 11 lines.
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        let _ = a.update(Message::SetClamps("-X:0;+X:0;-Y:0;+Y:0".into()));
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Generate);
+        let _ = a.refresh_ready();
+        let (_, lines, ok, _) = crate::ui::run_check(&a).unwrap();
+        assert!(!ok && lines.len() > 5, "{lines:?}");
+        a.sim_details = true;
+        for size in [crate::MIN_WINDOW, iced::Size::new(1180., 760.)] {
+            let laid = laid_out(&a, size);
+            let hint = (laid.texts.iter())
+                .find(|(t, _)| t.starts_with("Drag to orbit"))
+                .unwrap()
+                .1;
+            let (panels, content) = *(laid.scrolls.iter())
+                .find(|(_, content)| content.contains(hint.center()))
+                .unwrap_or_else(|| panic!("{size:?}: the panels do not scroll"));
+            assert!(
+                content.height > panels.height,
+                "{size:?}: nothing to scroll"
+            );
+            // The column the view shares with the panels.
+            let shared = (laid.boxes.iter())
+                .filter(|b| {
+                    (b.x - panels.x).abs() < 0.5
+                        && b.y < panels.y
+                        && (b.y + b.height - panels.y - panels.height).abs() < 0.5
+                })
+                .min_by(|p, q| p.height.total_cmp(&q.height))
+                .unwrap();
+            let view = panels.y - shared.y;
+            let frame = crate::ui::scene_frame(shared.height);
+            assert!(view >= frame - 0.5, "{size:?}: view {view} frame {frame}");
+        }
+    }
+    /// The playback percentage says "44%", not "044%", and is as wide at
+    /// 100%, so the slider beside it keeps its length (LIO-305).
+    #[test]
+    fn the_playback_percentage_has_no_leading_zeros_and_keeps_its_width() {
+        let (mut a, _, _) = facing_a_floor();
+        let _ = a.update(Message::Generate);
+        assert!(a.playback_ready(), "{}", a.status);
+        let size = iced::Size::new(1180., 760.);
+        let at = |a: &mut App, progress: f32, words: &str| {
+            a.progress = progress;
+            let texts = laid_out_texts(a, size);
+            (texts.iter())
+                .find(|(t, _)| t == words)
+                .unwrap_or_else(|| panic!("no {words:?} in {texts:?}"))
+                .1
+        };
+        let some = at(&mut a, 0.44, "44%");
+        let all = at(&mut a, 1., "100%");
+        assert_eq!((some.x, some.width), (all.x, all.width));
+    }
+    /// The workflow tabs' bar runs the width of the 3D view over it
+    /// (LIO-305).
+    #[test]
+    fn the_workflow_tab_bar_spans_the_workspace() {
+        let (a, _, _) = facing_a_floor();
+        let laid = laid_out(&a, iced::Size::new(1180., 760.));
+        let tab = |words: &str| {
+            (laid.texts.iter())
+                .find(|(t, _)| t.starts_with(words))
+                .unwrap()
+                .1
+        };
+        let (first, hint) = (tab("01  Setup"), tab("Drag to orbit"));
+        let bar = (laid.boxes.iter())
+            .filter(|b| b.contains(first.center()) && b.height < 60.)
+            .max_by(|p, q| p.width.total_cmp(&q.width))
+            .unwrap();
+        // The hint ends at the panels' right edge, less their padding.
+        assert!(
+            bar.x + bar.width > hint.x + hint.width,
+            "bar {bar:?} hint {hint:?}"
+        );
     }
     /// Folded, as it starts, the simulation strip keeps one line of stats and
     /// a Details button, so the 3D view above it is taller; Details brings
@@ -16961,7 +17075,9 @@ soft_max = 180.0
         let _ = a.update(Message::Surface(top));
         let _ = a.update(Message::Generate);
         assert!(a.active_simulation().is_some(), "{}", a.status);
-        let size = iced::Size::new(1180., 760.);
+        // A window where the folded strip fits under the view and the open
+        // one does not: smaller, both scroll at the panels' most (LIO-305).
+        let size = iced::Size::new(1600., 1100.);
         let strip = |a: &App| {
             let texts = laid_out_texts(a, size);
             let y = |words: &str| {
