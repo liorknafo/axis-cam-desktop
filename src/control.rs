@@ -2900,6 +2900,9 @@ impl Connection {
             R::Next(i) if i < run.done.len() && !self.probing() => run.start_at(i, 0),
             R::From(i, k) if !self.probing() => run.start_at(i, k),
             R::KeepZero if run.running.is_none() && run.partway() => run.zeroed = true,
+            R::More(oi) => {
+                run.menu = oi.filter(|_| self.manual() && run.running.is_none() && !self.probing())
+            }
             R::CycleStart => {
                 if let Some(job) = run.cycle_start(self, doc) {
                     self.send(job);

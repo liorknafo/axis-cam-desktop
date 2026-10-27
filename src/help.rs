@@ -1855,6 +1855,23 @@ fn run_help(a: &crate::run::Action) -> (&'static str, &'static str) {
             "Set the coolant of the operations listed to Off, in every tool run of this setup: they ask for flood or mist coolant the UC100 profile has no output for. Then check the setup again.",
             "",
         ),
+        Skip(_, Some(crate::run::Skip::Cut)) => (
+            "Skip this operation, already cut: nothing of it is sent, and the operations after it take its stock as removed, as those before a Start here do. A tool run left with nothing to cut is skipped whole, with no tool change for it.",
+            "Skipped before the start of the setup's first tool run, Cycle Start waits for the work zero on the stock it left, or Keep this work zero.",
+        ),
+        Skip(_, Some(crate::run::Skip::Left)) => (
+            "Skip this operation and leave its material: the setup is checked again without it, so the later operations' programs and checks see the stock uncut. Not offered when a later operation of the setup cuts beneath it.",
+            "",
+        ),
+        Skip(_, None) => (
+            "Don't skip this operation: the setup is checked again with it, and Cycle Start cuts it.",
+            "",
+        ),
+        More(Some(_)) => (
+            "Skip this operation: already cut, or leaving its material. Offered while the machine stands still and no tool run runs, for an operation not cut yet in this run.",
+            "",
+        ),
+        More(None) => ("Close the skips without skipping.", ""),
     }
 }
 
@@ -4949,6 +4966,11 @@ mod tests {
             Run::ProbeFromReference,
             Run::ProbeCentreReference,
             Run::CoolantOff,
+            Run::Skip(0, Some(crate::run::Skip::Cut)),
+            Run::Skip(0, Some(crate::run::Skip::Left)),
+            Run::Skip(0, None),
+            Run::More(Some(0)),
+            Run::More(None),
         ] {
             messages.push(Message::Run(a));
         }

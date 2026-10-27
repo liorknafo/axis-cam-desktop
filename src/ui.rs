@@ -9664,10 +9664,11 @@ fn stage_icon<'a>(stage: crate::run::Stage) -> Element<'a, Message> {
         .into()
 }
 /// One operation of the setup in the Operations list, the `n`th it cuts: its
-/// stage, name and time, the part of it cut while it is cut, and Start here,
-/// which makes it the one Cycle Start begins with (greyed while that
-/// message is None). The picture of the stock it leaves, its strategy and
-/// tool are on hover.
+/// stage, name and time, the part of it cut while it is cut, and `ends`
+/// after the time: Start here, which makes it the one Cycle Start begins
+/// with, and ⋯, its skips; or for one the run skips (`skipped`), Don't skip.
+/// `open`, its skips, takes the place of all but the stage. The picture of
+/// the stock it leaves, its strategy and tool are on hover.
 #[allow(clippy::too_many_arguments)]
 fn op_row<'a>(
     n: usize,
@@ -9675,29 +9676,37 @@ fn op_row<'a>(
     picture: Option<&widget::image::Handle>,
     stage: crate::run::Stage,
     time: Option<String>,
-    start: Option<Option<Message>>,
+    ends: Vec<Element<'a, Message>>,
+    open: Option<Element<'a, Message>>,
     angles: Option<String>,
     cut: Option<f32>,
+    skipped: Option<crate::run::Skip>,
     fit: Fit,
 ) -> Element<'a, Message> {
-    use crate::run::Stage;
+    use crate::run::{Skip, Stage};
     let (w, h) = OP_PICTURE;
-    let picture: Element<'a, Message> = match picture {
-        Some(p) => widget::image(p.clone()).width(w).height(h).into(),
-        None => container(text("Picturing the stock…").size(11))
-            .center_x(w)
-            .center_y(h)
-            .into(),
+    let picture: Option<Element<'a, Message>> = match picture {
+        Some(p) => Some(widget::image(p.clone()).width(w).height(h).into()),
+        // Material left is not simulated: there is no picture to wait for.
+        None if skipped == Some(Skip::Left) => None,
+        None => Some(
+            container(text("Picturing the stock…").size(11))
+                .center_x(w)
+                .center_y(h)
+                .into(),
+        ),
     };
-    let said = match stage {
-        Stage::Done => "Done",
-        Stage::Cutting => "Cutting now",
-        Stage::Next => "Next: Cycle Start cuts it",
-        Stage::Skipped => "Skipped: taken as cut",
-        Stage::ToCome => "To come",
+    let said = match (skipped, stage) {
+        (Some(Skip::Cut), _) => "Skipped: already cut, its stock taken as removed",
+        (Some(Skip::Left), _) => "Skipped: material left, the setup checked without it",
+        (_, Stage::Done) => "Done",
+        (_, Stage::Cutting) => "Cutting now",
+        (_, Stage::Next) => "Next: Cycle Start cuts it",
+        (_, Stage::Skipped) => "Skipped: taken as cut",
+        (_, Stage::ToCome) => "To come",
     };
     let mut tip = column![
-        picture,
+        column![].push(picture),
         text(format!("{n}. {}", o.name)).size(12),
         text(format!(
             "{} · {}",
@@ -9712,10 +9721,14 @@ fn op_row<'a>(
     if let Some(angles) = &angles {
         tip = tip.push(text(angles.clone()).size(11));
     }
-    let strong = matches!(stage, Stage::Cutting | Stage::Next);
+    let strong = matches!(stage, Stage::Cutting | Stage::Next) && skipped.is_none();
     let name = text(format!("{n}. {}", ellipsize(&o.name, 30)))
         .size(13)
-        .color(if stage == Stage::Skipped { MUTED } else { INK })
+        .color(if stage == Stage::Skipped || skipped.is_some() {
+            MUTED
+        } else {
+            INK
+        })
         .font(Font {
             weight: if strong {
                 iced::font::Weight::Semibold
@@ -9725,20 +9738,44 @@ fn op_row<'a>(
             ..Font::DEFAULT
         })
         .wrapping(Wrapping::None);
-    let line = row![
-        stage_icon(stage),
-        container(name).width(Fill).clip(true),
-        text(time.unwrap_or_default())
+    // A skipped one says how in place of its time.
+    let time: Element<'a, Message> = match skipped {
+        Some(how) => container(
+            text(match how {
+                Skip::Cut => "skipped: already cut",
+                Skip::Left => "skipped: material left",
+            })
+            .size(10)
+            .color(MUTED)
+            .wrapping(Wrapping::None),
+        )
+        .padding([1, 4])
+        .style(|_| container::Style {
+            background: Some(Color::from_rgb8(237, 240, 244).into()),
+            border: Border {
+                radius: 3.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .into(),
+        None => text(time.unwrap_or_default())
             .size(11)
             .color(MUTED)
             .width(if fit.narrow { 84 } else { 96 })
             .align_x(Alignment::End)
-            .wrapping(Wrapping::None),
-        match start {
-            Some(m) => act_with("Start here", m, false, Some(Length::Fixed(74.)), [3, 4]),
-            None => space().width(74).into(),
-        },
-    ]
+            .wrapping(Wrapping::None)
+            .into(),
+    };
+    let line = match open {
+        Some(open) => row![stage_icon(stage), open],
+        None => row![
+            stage_icon(stage),
+            container(name).width(Fill).clip(true),
+            time
+        ]
+        .extend(ends),
+    }
     .spacing(if fit.narrow { 6 } else { 8 })
     .align_y(Alignment::Center)
     .height(if fit.short { 26 } else { 28 });
@@ -9824,6 +9861,17 @@ pub(crate) fn program<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
             list = list
                 .push(caution("This setup cannot run", problems.clone()))
                 .push(act("Check again", msg(true, R::Check), false));
+            // A skip may be why: each can be undone here.
+            for &(oi, _) in &run.skips {
+                let name = (app.doc.setups.get(run.setup))
+                    .and_then(|s| s.operations.get(oi))
+                    .map_or("", |o| o.name());
+                list = list.push(act(
+                    format!("Don't skip {name}"),
+                    msg(c.manual() && !running, R::Skip(oi, None)),
+                    false,
+                ));
+            }
         }
         Some(Ok(programs)) => {
             let count = programs.len();
@@ -9867,29 +9915,62 @@ pub(crate) fn program<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
                 }
                 list = list.push(one_line("A", line, 12, INK, 60));
             }
+            // The rows are the tool runs as checked without a skip: a skipped
+            // operation keeps its place, and a tool run of skipped ones its
+            // heading. Each other is found in the programs sent.
+            let rows = (run.layout.as_deref())
+                .and_then(|l| l.as_ref().ok())
+                .map_or(programs.as_slice(), Vec::as_slice);
+            let skipped = |oi: usize| run.skips.iter().find(|s| s.0 == oi).map(|s| s.1);
+            // Each row's place in the programs: they send the rows not
+            // skipped, in order.
+            let mut sent = (programs.iter().enumerate())
+                .flat_map(|(i, p)| (0..p.ops.len()).map(move |k| (i, k)));
+            let places: Vec<Vec<Option<(usize, usize)>>> = (rows.iter())
+                .map(|p| {
+                    (p.indexes.iter())
+                        .map(|&oi| match skipped(oi) {
+                            Some(_) => None,
+                            None => sent.next(),
+                        })
+                        .collect()
+                })
+                .collect();
+            let stages: Vec<_> = (0..count).map(|i| run.stages(i, s.current_line)).collect();
+            let times: Vec<_> = (0..count).map(|i| run.op_times(i)).collect();
+            let firsts: Vec<_> = (programs.iter().enumerate())
+                .map(|(i, p)| run.times.as_ref().and_then(|t| t.ops(i, p)))
+                .collect();
+            // Skips are offered only while the machine stands in a manual
+            // state, nothing running or probing.
+            let may_skip = c.manual() && !running && !c.probing();
             // Operations are numbered through the setup, across its tool runs.
             let mut number = 0;
-            for (i, p) in programs.iter().enumerate() {
+            for (w, p) in rows.iter().enumerate() {
+                let sent: Vec<(usize, usize)> = places[w].iter().flatten().copied().collect();
+                // A tool run's time is its operations' cut from its first.
+                let time = if sent.is_empty() {
+                    "skipped".to_string()
+                } else {
+                    (sent.iter())
+                        .map(|&(i, k)| Some(*firsts[i].as_ref()?.get(k)?))
+                        .sum::<Option<f32>>()
+                        .map(crate::run::clock)
+                        .unwrap_or_default()
+                };
                 list = list.push(
                     container(
                         row![
                             text(format!(
                                 "TOOL RUN {} · {}",
-                                i + 1,
+                                w + 1,
                                 crate::model::tool_label(p.ops[0].tool, &p.ops[0].tool_name)
                             ))
                             .size(11)
                             .color(MUTED)
                             .width(Fill)
                             .wrapping(Wrapping::None),
-                            muted(
-                                run.times
-                                    .as_ref()
-                                    .and_then(|t| t.run(i, 0))
-                                    .map(crate::run::clock)
-                                    .unwrap_or_default()
-                            )
-                            .size(11),
+                            muted(time).size(11),
                         ]
                         .spacing(6),
                     )
@@ -9900,22 +9981,107 @@ pub(crate) fn program<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
                         right: 6.,
                     }),
                 );
-                let times = run.op_times(i);
-                let left = left.filter(|_| run.running.as_ref().is_some_and(|r| r.index == i));
-                for (k, ((o, &oi), stage)) in p
-                    .ops
-                    .iter()
-                    .zip(&p.indexes)
-                    .zip(run.stages(i, s.current_line))
-                    .enumerate()
-                {
+                for ((o, &oi), place) in p.ops.iter().zip(&p.indexes).zip(&places[w]) {
                     number += 1;
                     use crate::run::Stage;
-                    let start =
-                        (!matches!(stage, Stage::Next | Stage::Cutting) && !c.probing()).then_some(
-                            msg(!running, if k == 0 { R::Next(i) } else { R::From(i, k) }),
+                    let start_width = Some(Length::Fixed(74.));
+                    let more_width = Length::Fixed(22.);
+                    if let Some(how) = skipped(oi) {
+                        list = list.push(op_row(
+                            number,
+                            o,
+                            None,
+                            Stage::Skipped,
+                            None,
+                            vec![
+                                act_with(
+                                    "Don't skip",
+                                    msg(may_skip, R::Skip(oi, None)),
+                                    false,
+                                    start_width,
+                                    [3, 4],
+                                ),
+                                space().width(more_width).into(),
+                            ],
+                            None,
+                            None,
+                            None,
+                            Some(how),
+                            fit,
+                        ));
+                        continue;
+                    }
+                    let Some((i, k)) = *place else {
+                        continue;
+                    };
+                    let p = &programs[i];
+                    let stage = stages[i].get(k).copied().unwrap_or(Stage::ToCome);
+                    let left = left.filter(|_| run.running.as_ref().is_some_and(|r| r.index == i));
+                    let start = (!matches!(stage, Stage::Next | Stage::Cutting) && !c.probing())
+                        .then(|| msg(!running, if k == 0 { R::Next(i) } else { R::From(i, k) }));
+                    // An operation not cut yet in this run can be skipped.
+                    let skippable = may_skip && matches!(stage, Stage::Next | Stage::ToCome);
+                    let open = run.menu == Some(oi) && skippable;
+                    let mut ends = vec![
+                        match start {
+                            Some(m) => act_with("Start here", m, false, start_width, [3, 4]),
+                            None => space().width(74).into(),
+                        },
+                        if skippable {
+                            act_with(
+                                "⋯",
+                                msg(true, R::More(Some(oi))),
+                                false,
+                                Some(more_width),
+                                [3, 0],
+                            )
+                        } else {
+                            space().width(more_width).into()
+                        },
+                    ];
+                    let open = open.then(|| {
+                        ends.clear();
+                        let leave = act_with(
+                            "Leave the material",
+                            (!run.beneath.iter().any(|b| b.0 == oi))
+                                .then_some(Message::Run(R::Skip(oi, Some(crate::run::Skip::Left)))),
+                            false,
+                            None,
+                            [3, 6],
                         );
-                    let (time, cut) = match (left.and_then(|l| l.op), &times) {
+                        let leave = match run.beneath.iter().find(|b| b.0 == oi) {
+                            Some((_, why)) => help::wrap(
+                                leave,
+                                Help::text("Leave the material", why.clone()),
+                                widget::tooltip::Position::Top,
+                            ),
+                            None => leave,
+                        };
+                        row![
+                            muted("Skip:"),
+                            act_with(
+                                "Already cut",
+                                msg(true, R::Skip(oi, Some(crate::run::Skip::Cut))),
+                                false,
+                                None,
+                                [3, 6],
+                            ),
+                            leave,
+                            space().width(Fill),
+                            act_with(
+                                "✕",
+                                msg(true, R::More(None)),
+                                false,
+                                Some(more_width),
+                                [3, 0]
+                            ),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center)
+                        .width(Fill)
+                        .into()
+                    });
+                    let (time, cut) = match (left.and_then(|l| l.op), &times[i]) {
                         (Some((op, op_left, op_all)), _) if op == k => (
                             Some(format!(
                                 "{} left of {}",
@@ -9947,9 +10113,11 @@ pub(crate) fn program<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
                         run.picture(oi),
                         stage,
                         time,
-                        start,
+                        ends,
+                        open,
                         at,
                         cut,
+                        None,
                         fit,
                     ));
                 }

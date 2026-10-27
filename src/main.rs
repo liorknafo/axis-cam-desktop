@@ -2644,9 +2644,11 @@ impl App {
         }
         self.drop_plan();
         // A setup being run was checked as it was, and may have been moved.
+        // Its skips were for that setup: it is checked again without them.
         if let Some(run) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
             run.stale = true;
             run.follow(&self.doc);
+            run.unskip();
         }
         self.dirty = true;
         self.project_dirty = true;
@@ -3164,12 +3166,12 @@ impl App {
         let Some(si) = r.follow(&self.doc) else {
             return Task::none();
         };
-        let epoch = r.epoch;
+        let (epoch, skips) = (r.epoch, r.skips.clone());
         let doc = self.doc.clone();
         let mesh = self.part_mesh().cloned();
         let check = move || {
             let (programs, left) = match mesh {
-                Some(mesh) => run::check(&doc, &mesh, si),
+                Some(mesh) => run::check_skipping(&doc, &mesh, si, &skips),
                 None => (
                     Err(vec![
                         "Load the imported part before running a setup.".into(),
@@ -6072,6 +6074,16 @@ impl App {
                 };
             }
             Message::Run(run::Action::Check) => return self.recheck_run(),
+            // Only while the machine stands in a manual state and nothing
+            // runs or probes; the setup is checked again with the skip.
+            Message::Run(run::Action::Skip(oi, how)) => {
+                let Some(c) = self.control.as_mut().filter(|c| c.manual() && !c.probing()) else {
+                    return Task::none();
+                };
+                if c.run.as_mut().is_some_and(|r| r.skip(oi, how)) {
+                    return self.recheck_run();
+                }
+            }
             Message::Run(run::Action::CoolantOff) => {
                 let Some((c, r)) = self
                     .control
@@ -6118,9 +6130,7 @@ impl App {
                     && let Some(r) = c.run.as_mut()
                     && r.epoch == epoch
                 {
-                    // A check without stock (the smoke run's) is not pictured.
-                    let left = (!left.after.is_empty() || left.last.is_some()).then_some(left);
-                    r.checked_as(programs, left, times);
+                    r.checked_as(programs, Some(left), times);
                     c.fit_sim_block();
                     return self.picture_run();
                 }

@@ -2788,16 +2788,7 @@ fn walk<'a>(
                 .into(),
         ]);
     }
-    // Touch-off mode: one program per run of the same tool, touched off before it starts.
-    let mut groups: Vec<std::ops::Range<usize>> = vec![];
-    for k in 0..ops.len() {
-        match groups.last_mut() {
-            Some(g) if settings.tool_table || ops[g.start].tool_id == ops[k].tool_id => {
-                g.end = k + 1
-            }
-            _ => groups.push(k..k + 1),
-        }
-    }
+    let groups = groups(&ops, settings.tool_table);
     let indexes: Vec<usize> = sims.iter().map(|(oi, _)| *oi).collect();
     let tools = (simulations.iter().zip(&indexes))
         .map(|(sim, &oi)| tool_parts(doc, setup, &setup.operations[oi].tool, &sim.plan))
@@ -2812,6 +2803,18 @@ fn walk<'a>(
         groups,
         tools,
     })
+}
+/// The runs of `ops` that make one program each (`Walk::groups`): touch-off
+/// mode splits them at every change of tool, a tool table not at all.
+fn groups(ops: &[OpState], tool_table: bool) -> Vec<std::ops::Range<usize>> {
+    let mut groups: Vec<std::ops::Range<usize>> = vec![];
+    for k in 0..ops.len() {
+        match groups.last_mut() {
+            Some(g) if tool_table || ops[g.start].tool_id == ops[k].tool_id => g.end = k + 1,
+            _ => groups.push(k..k + 1),
+        }
+    }
+    groups
 }
 /// A workholding problem of one setup's programs: the operation it is about,
 /// an index in the setup's operations, and the message.
@@ -3074,6 +3077,27 @@ fn index_problems(
 /// made, mm: the output's resolution.
 const EPS_INDEX: f32 = 0.0005;
 impl Walk<'_> {
+    /// The walk without the operations `cut` (indexes in the setup), regrouped:
+    /// what a run sends when they are taken as cut (`run::Skip::Cut`). Their
+    /// stock stays cut, as the simulations of the others start from it; a
+    /// tool run of them alone is gone, and the runs of one tool either side
+    /// of it are one.
+    fn without(&self, cut: &[usize]) -> Self {
+        let kept: Vec<usize> = (0..self.ops.len())
+            .filter(|&k| !cut.contains(&self.indexes[k]))
+            .collect();
+        let ops: Vec<OpState> = kept.iter().map(|&k| self.ops[k].clone()).collect();
+        Walk {
+            settings: self.settings,
+            zero: self.zero,
+            stock: self.stock,
+            groups: groups(&ops, self.settings.tool_table),
+            ops,
+            simulations: kept.iter().map(|&k| self.simulations[k]).collect(),
+            indexes: kept.iter().map(|&k| self.indexes[k]).collect(),
+            tools: kept.iter().map(|&k| self.tools[k].clone()).collect(),
+        }
+    }
     /// The plans of the operations of `group`, one of `groups`.
     fn plans(&self, group: &std::ops::Range<usize>) -> Vec<&Plan> {
         self.simulations[group.clone()]
@@ -3417,18 +3441,20 @@ pub(crate) fn checked(
     sims: &[(usize, Result<Simulation, String>)],
     settings: Settings,
 ) -> Result<Vec<Checked>, Vec<String>> {
-    checked_with(doc, mesh, si, sims, settings, false)
+    checked_with(doc, mesh, si, sims, settings, false, &[])
 }
 /// `checked` for a run, which may start at any operation: with each
-/// program's `starts` and `partly`.
+/// program's `starts` and `partly`. The operations `cut` (indexes in the
+/// setup) are taken as cut and not sent (`Walk::without`).
 pub(crate) fn checked_to_start(
     doc: &Document,
     mesh: &Mesh,
     si: usize,
     sims: &[(usize, Result<Simulation, String>)],
     settings: Settings,
+    cut: &[usize],
 ) -> Result<Vec<Checked>, Vec<String>> {
-    checked_with(doc, mesh, si, sims, settings, true)
+    checked_with(doc, mesh, si, sims, settings, true, cut)
 }
 fn checked_with(
     doc: &Document,
@@ -3437,6 +3463,7 @@ fn checked_with(
     sims: &[(usize, Result<Simulation, String>)],
     settings: Settings,
     to_start: bool,
+    cut: &[usize],
 ) -> Result<Vec<Checked>, Vec<String>> {
     let setup = &doc.setups[si];
     if crate::manual::is_hand(&setup.machine) {
@@ -3502,6 +3529,18 @@ fn checked_with(
     } else {
         vec![]
     };
+    // The operations taken as cut are left out of the programs only: the work
+    // zero is found, and what each start finds of it, as with them.
+    let sent = walk.without(cut);
+    let partly: Vec<Partly> = (sent.indexes.iter())
+        .filter_map(|oi| {
+            partly
+                .get(walk.indexes.iter().position(|o| o == oi)?)
+                .cloned()
+        })
+        .collect();
+    let (ops, simulations, groups) = (&sent.ops, &sent.simulations, &sent.groups);
+    let walk = &sent;
     let count = groups.len();
     let mut out = vec![];
     for (i, g) in groups.iter().enumerate() {
@@ -3513,7 +3552,7 @@ fn checked_with(
         problems.extend(crate::post_check::check_setup(
             setup, group_ops, group_sims, &blocks, &settings, zero,
         ));
-        problems.extend(index_problems(doc, mesh, si, &walk, g, &blocks));
+        problems.extend(index_problems(doc, mesh, si, walk, g, &blocks));
         let tools: Vec<(usize, &Plan)> = g
             .clone()
             .map(|k| (walk.indexes[k], &walk.simulations[k].plan))
@@ -3560,7 +3599,7 @@ fn checked_with(
                     &settings,
                     zero,
                 );
-                problems.extend(index_problems(doc, mesh, si, &walk, &range, &start));
+                problems.extend(index_problems(doc, mesh, si, walk, &range, &start));
                 if !indexed {
                     problems.extend(
                         walk.held(setup, &range, &start, &boxes)

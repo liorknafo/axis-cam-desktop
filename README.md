@@ -1155,6 +1155,33 @@ bar, at once when that machine is connected, or when you press
    pressed (it is still the one those operations were cut with, or Z was
    set by hand on a surface they left); each new start, and each new check
    of the setup, asks again.
+
+   A row not cut yet in this run has **⋯** while the machine stands still
+   and no tool run runs (not while it runs or holds): it opens the row's
+   skips in its place. **Already cut** skips the operation: nothing of it is
+   sent, and the operations after it take its stock as removed, as those
+   before a Start here do (the check's simulation still cuts it, and one
+   skipped before the start asks for the work zero on the stock it left, as
+   above). **Leave the material** skips it and keeps its material: the setup
+   is checked again with the operation left out, as if disabled, so the
+   later operations' programs and checks (rapids into the stock, the
+   holder, the jaws) see the stock uncut. Those checks look at rapids, not
+   at feed moves that would cut the material left at a depth and feed made
+   for less, so Leave the material is greyed, with why on hover ("Contour
+   cuts beneath it"), for an operation a later one of the setup cuts
+   beneath: a point just over that one's tool tip, every millimetre along
+   its feed moves, where the setup's stock had material, that this one
+   removed first. Each skip checks the setup again, keeping what was done
+   and where Cycle Start starts. The row is then greyed, with "skipped:
+   already cut" or "skipped: material left" in place of its time and **Don't
+   skip** in place of Start here, and its time leaves the setup's, its tool
+   run's and the time left. A tool
+   run whose operations are all skipped keeps its heading, "skipped", and
+   Cycle Start passes it with no tool change for it (the runs of one tool on
+   either side of it become one). The last operation sent is not skipped.
+   Picking another setup, or any change to the project, ends the skips: the
+   setup is checked again without them. When a skip's check refuses the
+   setup, the Operations list offers **Don't skip** for each.
 4. Between tool runs with different tools, the **Tool change** tab opens
    with the steps: the last one ended with the spindle and coolant off at the setup's
    clearance plane. Touch the old tool

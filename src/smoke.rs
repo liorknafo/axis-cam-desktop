@@ -2445,6 +2445,195 @@ flood = { pin = 8 }
         a.smoke_dir = None;
     }
 
+    /// Answers the run's check of setup `si` as `App::check_run` does, with
+    /// the run's skips, the stock it leaves not pictured.
+    fn answer_skips(a: &mut App, si: usize) {
+        use std::sync::Arc;
+        let epoch = run_of(a).epoch;
+        let skips = run_of(a).skips.clone();
+        let (programs, left) =
+            crate::run::check_skipping(&a.doc, a.part_mesh().unwrap(), si, &skips);
+        let times = crate::run::Times::checked(&programs, &conn(a).config);
+        let left = crate::run::Left {
+            after: vec![],
+            last: None,
+            ..left
+        };
+        let _ = a.update(Message::RunCheckedStock(
+            epoch,
+            Arc::new(programs),
+            Arc::new(left),
+            times,
+        ));
+    }
+
+    /// Asks to skip operation `oi` of setup 0 (`how`), and answers the check
+    /// it asks for. Whether it asked.
+    fn skip(a: &mut App, oi: usize, how: Option<crate::run::Skip>) -> bool {
+        let _ = a.update(Message::Run(crate::run::Action::Skip(oi, how)));
+        let asked = run_of(a).programs.is_none();
+        if asked {
+            answer_skips(a, 0);
+        }
+        asked
+    }
+
+    /// The operations (index in the setup) of each tool run the run sends.
+    fn sent(a: &App) -> Vec<Vec<usize>> {
+        (run_of(a).checked().unwrap().iter())
+            .map(|p| p.indexes.clone())
+            .collect()
+    }
+
+    /// Skipping an operation of the fixture's Face, Pocket, Contour and
+    /// Drill checks the setup again: taken as cut, it is not sent and its
+    /// time leaves the totals; its material left, the operations after it
+    /// are checked from the stock with it; a tool run of skipped operations
+    /// is gone; Face's material cannot be left, as every later operation
+    /// cuts beneath it; each skip is undone; and none is taken while a tool
+    /// run runs or holds.
+    #[test]
+    fn a_skipped_operation_is_checked_again_without_it_and_undone() {
+        use crate::run::{Action as R, Skip::*, Stage::*};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert_eq!(sent(&a), [vec![0, 1, 2], vec![3]]);
+        let run = run_of(&a);
+        let total = run.setup_time().unwrap();
+        let pocket = run.op_times(0).unwrap()[1];
+        assert!(pocket > 1., "{pocket}");
+        let before = |a: &App, op: usize| -> f32 {
+            let b = run_of(a).before.iter().find(|b| b.op == op).unwrap();
+            b.stock.heights.iter().sum()
+        };
+        let drill_from = before(&a, 3);
+        // Every operation after the Face cuts beneath it; nothing after the
+        // Drill.
+        let beneath = run.beneath.clone();
+        assert!(
+            beneath
+                .iter()
+                .any(|(oi, why)| *oi == 0 && why.contains("cuts beneath it")),
+            "{beneath:?}"
+        );
+        assert!(!beneath.iter().any(|b| b.0 == 3), "{beneath:?}");
+        assert!(!skip(&mut a, 0, Some(Left)));
+        assert!(run_of(&a).skips.is_empty() && run_of(&a).checked().is_some());
+        // The Pocket already cut, in the middle of tool run 1: the Face and
+        // the Contour are sent, the start stays on the Face.
+        assert!(skip(&mut a, 1, Some(Cut)));
+        assert_eq!(sent(&a), [vec![0, 2], vec![3]]);
+        let run = run_of(&a);
+        assert_eq!(run.stages(0, None), [Next, ToCome]);
+        assert!(
+            !run.partway() && problems(&a).is_empty(),
+            "{:?}",
+            problems(&a)
+        );
+        let t = run.setup_time().unwrap();
+        assert!(
+            t < total - pocket / 2.,
+            "{t} of {total}, the Pocket {pocket}"
+        );
+        let left = run.left(&conn(&a).snapshot).unwrap().setup;
+        assert!((left - t).abs() < 1e-3, "{left} {t}");
+        // The rows stay those of the whole setup.
+        let rows = |a: &App| -> Vec<Vec<usize>> {
+            let l = run_of(a).layout.as_deref().unwrap().as_ref().unwrap();
+            l.iter().map(|p| p.indexes.clone()).collect()
+        };
+        assert_eq!(rows(&a), [vec![0, 1, 2], vec![3]]);
+        // The Contour's material left: the Drill is checked from the stock
+        // with it.
+        assert!(!run.beneath.iter().any(|b| b.0 == 2), "{:?}", run.beneath);
+        assert!(skip(&mut a, 2, Some(Left)));
+        assert_eq!(sent(&a), [vec![0], vec![3]]);
+        assert!(
+            before(&a, 3) > drill_from + 1.,
+            "{} {drill_from}",
+            before(&a, 3)
+        );
+        // The Drill already cut: its tool run is gone.
+        assert!(skip(&mut a, 3, Some(Cut)));
+        assert_eq!(sent(&a), [vec![0]]);
+        assert!(run_of(&a).setup_time().unwrap() < t);
+        // The last operation sent is not skipped.
+        assert!(!skip(&mut a, 0, Some(Cut)));
+        // Each undone: the setup as it was.
+        for oi in [3, 2, 1] {
+            assert!(skip(&mut a, oi, None));
+        }
+        assert!(run_of(&a).skips.is_empty());
+        assert_eq!(sent(&a), [vec![0, 1, 2], vec![3]]);
+        assert!((run_of(&a).setup_time().unwrap() - total).abs() < 1e-3);
+        assert_eq!(run_of(&a).stages(0, None), [Next, ToCome, ToCome]);
+        // Not while tool run 1 runs or holds: the skips are not opened
+        // either.
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        assert!(!skip(&mut a, 2, Some(Cut)));
+        let _ = a.update(Message::Run(R::More(Some(2))));
+        assert_eq!(run_of(&a).menu, None);
+        let _ = a.update(Message::Run(R::Hold));
+        tick_until(&mut a, 3.0, "Hold", |s| s.state == Some(State::Hold));
+        assert!(!skip(&mut a, 3, Some(Left)));
+        let _ = a.update(Message::Run(R::More(Some(3))));
+        assert_eq!(run_of(&a).menu, None);
+        assert!(run_of(&a).skips.is_empty() && run_of(&a).checked().is_some());
+        let _ = a.update(Message::Run(R::Stop));
+        tick_until(&mut a, 3.0, "Idle", |s| s.state == Some(State::Idle));
+        // Stopped, the skips open again; a project change clears them.
+        let _ = a.update(Message::Run(R::More(Some(3))));
+        assert_eq!(run_of(&a).menu, Some(3));
+        assert!(skip(&mut a, 3, Some(Cut)));
+        a.touch();
+        assert!(run_of(&a).skips.is_empty() && run_of(&a).stale);
+    }
+
+    /// Cycle Start runs the operations a run does not skip: with the Pocket
+    /// already cut and the Drill's material left, tool run 1 cuts the Face
+    /// and the Contour, and the Drill's tool run is skipped whole, with no
+    /// tool change for it.
+    #[test]
+    fn a_tool_run_of_skipped_operations_is_skipped_with_no_tool_change() {
+        use crate::run::{Action as R, Skip::*};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(skip(&mut a, 1, Some(Cut)) && skip(&mut a, 3, Some(Left)));
+        assert_eq!(sent(&a), [vec![0, 2]]);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        let names: Vec<String> = (run_of(&a).running_blocks().unwrap().iter())
+            .filter_map(|b| match b {
+                crate::post::Block::Start { op, .. } => {
+                    Some(run_of(&a).checked().unwrap()[0].ops[*op].name.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let ops = &a.doc.setups[0].operations;
+        assert_eq!(names, [ops[0].name(), ops[2].name()], "{names:?}");
+        run_until(&mut a, 30.0, "tool run 1", |r| r.done[0]);
+        assert!(run_of(&a).outcome.as_ref().unwrap().0);
+        assert!(run_of(&a).tool_change().is_none());
+        assert!(problems(&a).iter().any(|p| p.contains("Every tool run")));
+        // What was cut stays cut: the Drill taken back is next, and the
+        // Pocket stays skipped.
+        assert!(skip(&mut a, 3, None));
+        assert_eq!(sent(&a), [vec![0, 2], vec![3]]);
+        assert_eq!(
+            (run_of(&a).done.clone(), run_of(&a).next),
+            (vec![true, false], 1)
+        );
+    }
+
     /// The Tool runs panel shows each operation with a picture of the stock
     /// it leaves, each different, and where it stands: the first marked
     /// next, then the one being cut and those done before it while its tool
@@ -2818,6 +3007,19 @@ flood = { pin = 8 }
         let _ = a.update(Message::ControlTab(T::Job));
         shot(&mut a, "04-tab-job-machine");
         let _ = a.update(Message::ControlView(crate::ui::JobView::Stock));
+        // The Contour skipped as cut, the Drill with its material left (its
+        // tool run with it), and the Face's skips open: the Pocket cuts
+        // beneath it, so its material cannot be left.
+        assert!(skip(&mut a, 2, Some(crate::run::Skip::Cut)));
+        assert!(skip(&mut a, 3, Some(crate::run::Skip::Left)));
+        assert!(run_of(&a).beneath.iter().any(|b| b.0 == 0));
+        let _ = a.update(Message::Run(R::More(Some(0))));
+        shot(&mut a, "04-skips");
+        let _ = a.update(Message::Run(R::More(Some(1))));
+        shot(&mut a, "04-skips-pocket");
+        let _ = a.update(Message::Run(R::More(None)));
+        assert!(skip(&mut a, 2, None) && skip(&mut a, 3, None));
+        answer_with_stock(&mut a, dir.path(), 0);
         let _ = a.update(Message::Run(R::CycleStart));
         tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
         let mut deadline = Deadline::new(30.);
@@ -4265,8 +4467,8 @@ flood = { pin = 8 }
         assert_eq!(run_of(&a).checked().map(<[_]>::len), Some(12));
         let _ = a.view();
         // The bar is the same; the ten more tool runs are in the list beside
-        // it, each of one operation with its Start here.
-        assert_eq!(counts(&a), (strip, runs + 10));
+        // it, each of one operation with its Start here and ⋯.
+        assert_eq!(counts(&a), (strip, runs + 20));
     }
 
     /// The machine has no home or limit switches, and every E-stop clears its

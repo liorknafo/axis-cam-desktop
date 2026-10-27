@@ -49,6 +49,23 @@ pub enum Action {
     /// Set Off the coolant the profile has no output for (`coolant_off`),
     /// then check again.
     CoolantOff,
+    /// Skip operation `oi` (index in the setup) in this run as `Skip` says,
+    /// or (None) skip it no more: the setup is checked again (`Run::skip`).
+    Skip(usize, Option<Skip>),
+    /// Open the skips of operation `oi` (index in the setup) on its row of
+    /// the Operations list, or close them (None).
+    More(Option<usize>),
+}
+
+/// How a run skips an operation of its setup (`Run::skips`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Skip {
+    /// It is not sent, and the operations after it take its stock as cut,
+    /// as those before a Start here are (`post::checked_to_start`).
+    Cut,
+    /// It is not sent, and its material stays: the setup is checked without
+    /// it, as if it were disabled.
+    Left,
 }
 
 /// The tool run the machine is cutting.
@@ -150,6 +167,20 @@ pub struct Run {
     /// How long its tool runs take (`Times`), worked out with the check:
     /// None while checking, or when the setup cannot run.
     pub times: Option<Arc<Times>>,
+    /// The operations it skips (index in the setup), each how (`skip`).
+    pub skips: Vec<(usize, Skip)>,
+    /// The tool runs as the last check without a skip found them: the
+    /// Operations list's rows, skipped ones too.
+    pub layout: Option<Arc<Result<Vec<Checked>, Vec<String>>>>,
+    /// The operations whose material cannot be left (`Skip::Left`), each
+    /// with why (`Left::beneath`).
+    pub beneath: Vec<(usize, String)>,
+    /// What was done and where Cycle Start starts, by operation (index in
+    /// the setup), when a skip asked for the check: kept over its answer.
+    keep: Option<(Vec<usize>, Option<usize>)>,
+    /// The operation (index in the setup) whose row shows its skips
+    /// (`Action::More`).
+    pub menu: Option<usize>,
 }
 
 /// The stock before an operation of the setup being run, seen from above,
@@ -215,6 +246,11 @@ impl Run {
             before: Arc::new(vec![]),
             carving: None,
             times: None,
+            skips: vec![],
+            layout: None,
+            beneath: vec![],
+            keep: None,
+            menu: None,
         }
     }
 
@@ -429,29 +465,57 @@ impl Run {
         left: Option<Arc<Left>>,
         times: Option<Arc<Times>>,
     ) {
-        // The start stays on its operation only when its tool run still has
-        // the same operations; the work zero is set for it again.
-        let ops = |p: Option<&Checked>| p.map(|p| (p.indexes.clone(), p.ops.clone()));
-        let before = ops(self.checked().and_then(|c| c.get(self.next)));
-        let count = programs.as_ref().as_ref().map_or(0, Vec::len);
-        if self.done.len() != count {
-            self.done = vec![false; count];
-            self.next = 0;
-        }
-        let after = ops(programs
+        // Refused, the progress stays kept for the skip's undoing (`skip`).
+        let keep = programs
             .as_ref()
             .as_ref()
             .ok()
-            .and_then(|c| c.get(self.next)));
-        if before.is_none() || before != after {
-            self.from = 0;
+            .and_then(|_| self.keep.take());
+        if let (Some((done, start)), Ok(new)) = (keep, programs.as_ref()) {
+            // A skip's check: what was done stays done, and Cycle Start starts
+            // where it did, or at the first operation after it still sent.
+            self.done = (new.iter())
+                .map(|p| p.indexes.iter().all(|oi| done.contains(oi)))
+                .collect();
+            (self.next, self.from) = start
+                .and_then(|start| {
+                    (new.iter().enumerate()).find_map(|(i, p)| {
+                        let k = p.indexes.iter().position(|&oi| oi >= start)?;
+                        Some((i, k))
+                    })
+                })
+                .unwrap_or((new.len(), 0));
+        } else {
+            // The start stays on its operation only when its tool run still
+            // has the same operations; the work zero is set for it again.
+            let ops = |p: Option<&Checked>| p.map(|p| (p.indexes.clone(), p.ops.clone()));
+            let before = ops(self.checked().and_then(|c| c.get(self.next)));
+            let count = programs.as_ref().as_ref().map_or(0, Vec::len);
+            if self.done.len() != count {
+                self.done = vec![false; count];
+                self.next = 0;
+            }
+            let after = ops(programs
+                .as_ref()
+                .as_ref()
+                .ok()
+                .and_then(|c| c.get(self.next)));
+            if before.is_none() || before != after {
+                self.from = 0;
+            }
         }
+        if self.skips.is_empty() {
+            self.layout = Some(programs.clone());
+        }
+        self.beneath = left.as_ref().map_or_else(Vec::new, |l| l.beneath.clone());
         self.zeroed = false;
         self.programs = Some(programs);
         self.before = left
             .as_ref()
             .map_or_else(Default::default, |l| l.before.clone());
-        self.left = left.filter(|_| self.checked().is_some());
+        // A check without stock (the smoke run's) is not pictured.
+        self.left =
+            left.filter(|l| self.checked().is_some() && (!l.after.is_empty() || l.last.is_some()));
         self.times = times.filter(|_| self.checked().is_some());
         self.pictures.clear();
     }
@@ -830,7 +894,13 @@ impl Run {
     /// before taken as cut. Its work zero is set on the stock they leave
     /// (`partly`), and Cycle Start waits for it (`zeroed`).
     pub fn partway(&self) -> bool {
-        !self.started() && self.checked().is_some() && (self.next, self.from) != (0, 0)
+        // An operation taken as cut before the start (`Skip::Cut`) is one.
+        let start =
+            (self.checked()).and_then(|c| c.get(self.next)?.indexes.get(self.from).copied());
+        let cut = |&(oi, how): &(usize, Skip)| how == Skip::Cut && start.is_some_and(|s| oi < s);
+        !self.started()
+            && self.checked().is_some()
+            && ((self.next, self.from) != (0, 0) || self.skips.iter().any(cut))
     }
 
     /// What a run that starts partway finds of the work zero (`partway`,
@@ -841,6 +911,65 @@ impl Run {
             return None;
         }
         self.checked()?.get(self.next)?.partly.get(self.from)
+    }
+
+    /// Skips operation `oi` (index in the setup) as `how` says, or skips it
+    /// no more (None), while no tool run runs: one that has not been cut in
+    /// this run, whose material may be left (`beneath`), and not the last one
+    /// sent. Whether it changed, and the setup is to be checked again: what
+    /// was done and where Cycle Start starts are kept over that (`keep`).
+    /// A skip whose check refused the setup can be undone: what was done is
+    /// then the one kept from before it.
+    pub fn skip(&mut self, oi: usize, how: Option<Skip>) -> bool {
+        self.menu = None;
+        if self.running.is_some() || self.programs.is_none() {
+            return false;
+        }
+        let now = self.skips.iter().find(|s| s.0 == oi).map(|s| s.1);
+        let (keep, sent) = match self.checked() {
+            Some(programs) => {
+                let done: Vec<usize> = (programs.iter().zip(&self.done))
+                    .filter(|(_, d)| **d)
+                    .flat_map(|(p, _)| p.indexes.iter().copied())
+                    .collect();
+                let mut start =
+                    (programs.get(self.next)).and_then(|p| p.indexes.get(self.from).copied());
+                // Undone, it is the start again when the start moved past
+                // it to the next operation sent, or there is none.
+                let between =
+                    |s: usize| (programs.iter().flat_map(|p| &p.indexes)).any(|&o| o > oi && o < s);
+                if how.is_none() && start.is_none_or(|s| oi < s && !between(s)) {
+                    start = Some(oi);
+                }
+                let sent = programs.iter().map(|p| p.ops.len()).sum::<usize>();
+                ((done, start), sent)
+            }
+            // Refused: only undone.
+            None if how.is_none() => (self.keep.clone().unwrap_or_default(), 0),
+            None => return false,
+        };
+        let refused = match how {
+            _ if now == how || keep.0.contains(&oi) => true,
+            Some(_) if now.is_none() && sent <= 1 => true,
+            Some(Skip::Left) => self.beneath.iter().any(|b| b.0 == oi),
+            _ => false,
+        };
+        if refused {
+            return false;
+        }
+        self.keep = Some(keep);
+        self.skips.retain(|s| s.0 != oi);
+        if let Some(how) = how {
+            self.skips.push((oi, how));
+        }
+        self.carving = None;
+        true
+    }
+
+    /// Skips nothing any more, without asking for a check: the project
+    /// changed, and the setup is checked again anyway.
+    pub fn unskip(&mut self) {
+        (self.skips, self.keep, self.menu) = (vec![], None, None);
     }
 
     /// Makes operation `k` of tool run `i` the one Cycle Start starts at:
@@ -1188,15 +1317,160 @@ pub fn programs(doc: &Document, mesh: &Mesh, si: usize) -> Result<Vec<Checked>, 
 /// `programs`, and the stock that simulation leaves after each operation
 /// of the setup, for its pictures (`op_pictures`).
 pub fn check(doc: &Document, mesh: &Mesh, si: usize) -> (Result<Vec<Checked>, Vec<String>>, Left) {
+    check_skipping(doc, mesh, si, &[])
+}
+
+/// `check` of a run that `skips` operations (`Run::skips`): those whose
+/// material is left are disabled for it, those taken as cut simulated but
+/// not sent.
+pub fn check_skipping(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    skips: &[(usize, Skip)],
+) -> (Result<Vec<Checked>, Vec<String>>, Left) {
     if si >= doc.setups.len() {
         return (Err(vec![REMOVED.into()]), Left::default());
     }
     if doc.file.is_none() {
         return (Err(vec![NO_PART.into()]), Left::default());
     }
-    let (sims, left) = simulated_with(doc, mesh, si);
-    let programs = crate::post::checked_to_start(doc, mesh, si, &sims, PostSettings::for_uc100);
+    let of =
+        |how: Skip| -> Vec<usize> { (skips.iter()).filter(|s| s.1 == how).map(|s| s.0).collect() };
+    let (cut, left_out) = (of(Skip::Cut), of(Skip::Left));
+    let mut doc = std::borrow::Cow::Borrowed(doc);
+    for &oi in &left_out {
+        if let Some(o) = doc.to_mut().setups[si].operations.get_mut(oi) {
+            o.enabled = false;
+        }
+    }
+    let (sims, mut left) = simulated_with(&doc, mesh, si);
+    let programs =
+        crate::post::checked_to_start(&doc, mesh, si, &sims, PostSettings::for_uc100, &cut);
+    left.beneath = beneath(&doc, si, &sims, &cut);
     (programs, left)
+}
+
+/// This setup's cuts by the 5 mm square of the grid their removal box
+/// reaches (`rest::removal_box`), each square's in the order they were
+/// made: which of them first removed a point (`rest::FirstCut`) looks at a
+/// few.
+struct Squares<'a> {
+    lo: [f32; 2],
+    n: [usize; 2],
+    first: Vec<crate::rest::FirstCut<'a>>,
+}
+
+const SQUARE: f32 = 5.;
+
+impl<'a> Squares<'a> {
+    fn new(cuts: &[&'a crate::stock_surface::Cut], frame: crate::volume::Frame) -> Self {
+        let boxes: Vec<_> = (cuts.iter())
+            .map(|c| crate::rest::removal_box(c, frame))
+            .collect();
+        let lo = [0, 1].map(|k| boxes.iter().map(|b| b.min[k]).fold(f32::INFINITY, f32::min));
+        let hi = [0, 1].map(|k| {
+            boxes
+                .iter()
+                .map(|b| b.max[k])
+                .fold(f32::NEG_INFINITY, f32::max)
+        });
+        if boxes.is_empty() {
+            return Self {
+                lo,
+                n: [0; 2],
+                first: vec![],
+            };
+        }
+        // ponytail: 400 squares a side at most, the last one then reaching
+        // to the far end; wider squares if that is ever slow.
+        let n = [0, 1].map(|k| (((hi[k] - lo[k]) / SQUARE) as usize + 1).min(400));
+        let mut lists = vec![vec![]; n[0] * n[1]];
+        let at = |v: f32, k: usize| (((v - lo[k]) / SQUARE).max(0.) as usize).min(n[k] - 1);
+        for (c, b) in cuts.iter().zip(&boxes) {
+            for y in at(b.min[1], 1)..=at(b.max[1], 1) {
+                for x in at(b.min[0], 0)..=at(b.max[0], 0) {
+                    lists[y * n[0] + x].push(*c);
+                }
+            }
+        }
+        Self {
+            lo,
+            n,
+            first: (lists.into_iter())
+                .map(|l| crate::rest::FirstCut::new(l, frame))
+                .collect(),
+        }
+    }
+
+    fn by(&self, p: [f32; 3]) -> Option<(u16, u16)> {
+        let at = |k: usize| {
+            let i = ((p[k] - self.lo[k]) / SQUARE).floor();
+            (i >= 0. && self.n[k] > 0).then(|| (i as usize).min(self.n[k] - 1))
+        };
+        let (x, y) = (at(0)?, at(1)?);
+        self.first.get(y * self.n[0] + x)?.by(p)
+    }
+}
+
+/// The operations of setup `si` (index in it) whose material a run cannot
+/// leave (`Skip::Left`), each with why: a later one of the setup, not taken
+/// as cut (`cut`), cuts beneath it. Its feed moves would then cut what it
+/// leaves at a feed and depth made for less, which the checks see only of
+/// rapids. From the check's simulations `sims`: at points 0.05 mm over the
+/// tool tip, every millimetre along each later operation's feed moves, where
+/// the setup's stock had material, the operation whose cut first removed it.
+fn beneath(doc: &Document, si: usize, sims: &Sims, cut: &[usize]) -> Vec<(usize, String)> {
+    use crate::simulation::{Motion, Simulation};
+    let ok: Vec<(usize, &Simulation)> = (sims.iter())
+        .filter_map(|(oi, r)| Some((*oi, r.as_ref().ok()?)))
+        .collect();
+    let (Some((_, first)), Some((_, last))) = (ok.first(), ok.last()) else {
+        return vec![];
+    };
+    let (Some(start), Some(volume)) = (&first.initial_volume, &last.initial_volume) else {
+        return vec![];
+    };
+    let own: Vec<&crate::stock_surface::Cut> = (volume.cuts.iter())
+        .filter(|c| c.source.0 == first.source.0)
+        .collect();
+    let mut squares = std::collections::HashMap::new();
+    let mut out: Vec<(usize, String)> = vec![];
+    for &(oi, sim) in ok.iter().skip(1).filter(|(oi, _)| !cut.contains(oi)) {
+        for m in sim.plan.moves.iter().filter(|m| m.motion == Motion::Feed) {
+            let Some(frame) = sim.frame_at(m.a) else {
+                continue;
+            };
+            let squares =
+                (squares.entry(m.a.map(f32::to_bits))).or_insert_with(|| Squares::new(&own, frame));
+            let length = (0..3)
+                .map(|k| (m.to[k] - m.from[k]).powi(2))
+                .sum::<f32>()
+                .sqrt();
+            let steps = length.ceil().max(1.) as usize;
+            for j in 0..=steps {
+                let t = j as f32 / steps as f32;
+                let mut p: [f32; 3] =
+                    std::array::from_fn(|k| m.from[k] + t * (m.to[k] - m.from[k]));
+                p[2] += 0.05;
+                if !start.filled(p, frame) {
+                    continue;
+                }
+                if let Some((s, earlier)) = squares.by(p)
+                    && s == sim.source.0
+                    && earlier < sim.source.1
+                    && !out.iter().any(|b| b.0 == earlier as usize)
+                {
+                    let name = doc.setups[si].operations.get(oi).map_or("", |o| o.name());
+                    out.push((
+                        earlier as usize,
+                        format!("{name} cuts beneath it: its moves would cut the material left at a feed made for less."),
+                    ));
+                }
+            }
+        }
+    }
+    out
 }
 
 const NO_PART: &str = "Import a part before running a setup. The example project's paths are illustrative and cannot be machined.";
@@ -1267,6 +1541,7 @@ fn simulated_with(doc: &Document, mesh: &Mesh, si: usize) -> (Sims, Left) {
             after,
             last,
             before: Arc::new(before),
+            beneath: vec![],
         },
     )
 }
@@ -1284,6 +1559,9 @@ pub struct Left {
     /// The stock before each operation that could be generated on, seen
     /// from above (`Run::before`).
     pub before: Arc<Vec<OpStock>>,
+    /// The operations whose material a run cannot leave, each with why
+    /// (`beneath`).
+    pub beneath: Vec<(usize, String)>,
 }
 
 /// How many stocks `op_pictures` meshes at once: each mesher also runs
@@ -2847,6 +3125,11 @@ mod tests {
             before: Default::default(),
             times: None,
             carving: None,
+            skips: vec![],
+            layout: None,
+            beneath: vec![],
+            keep: None,
+            menu: None,
         };
         let (_, op, block) = run.progress(Some(3)).unwrap();
         assert_eq!((op, block), (0, 2));
@@ -2860,6 +3143,98 @@ mod tests {
         assert!(run.running.is_some());
         run.refresh(Some(&o(1, true)));
         assert!(run.running.is_none() && run.done[0] && run.next == 1);
+    }
+
+    /// A skip's check keeps, by operation, what was done and where Cycle
+    /// Start starts; one taken as cut before the start asks for the work
+    /// zero on the stock it left (`partway`); an operation of a tool run done
+    /// in this run is not skipped, nor is the material of one a later one
+    /// cuts beneath left (`beneath`), nor anything while a tool run runs;
+    /// and a skip whose check refused the setup is undone with the progress
+    /// from before it.
+    #[test]
+    fn a_skip_keeps_what_was_done_and_where_cycle_start_starts() {
+        let (doc, _) = fixture::job();
+        let mut run = Run::new(&doc, 0, 0);
+        let p = program();
+        let answer = |run: &mut Run, runs: &[&[usize]]| {
+            let programs = (runs.iter())
+                .map(|r| Checked {
+                    indexes: r.to_vec(),
+                    ops: vec![p.ops[0].clone(); r.len()],
+                    ..p.clone()
+                })
+                .collect();
+            run.checked_as(Arc::new(Ok(programs)), None, None);
+        };
+        let whole: &[&[usize]] = &[&[0, 1, 2], &[3], &[4]];
+        answer(&mut run, whole);
+        // The first operation taken as cut, before the start.
+        assert!(!run.partway());
+        assert!(run.skip(0, Some(Skip::Cut)));
+        assert_eq!(run.skips, [(0, Skip::Cut)]);
+        answer(&mut run, &[&[1, 2], &[3], &[4]]);
+        assert_eq!((run.next, run.from), (0, 0));
+        assert!(run.partway());
+        // Its material left instead: the stock is the setup's.
+        assert!(run.skip(0, Some(Skip::Left)));
+        answer(&mut run, &[&[1, 2], &[3], &[4]]);
+        assert!(!run.partway());
+        assert!(run.skip(0, None) && run.skips.is_empty());
+        answer(&mut run, whole);
+        assert_eq!((run.next, run.from, run.partway()), (0, 0, false));
+        // The rows are the tool runs without a skip.
+        assert_eq!(run.layout.as_deref().unwrap().as_ref().unwrap().len(), 3);
+        // Tool run 1 done: its operations stay, the next is skipped.
+        (run.done[0], run.next) = (true, 1);
+        assert!(!run.skip(1, Some(Skip::Cut)));
+        run.beneath = vec![(4, "Drilling cuts beneath it".into())];
+        assert!(!run.skip(4, Some(Skip::Left)));
+        assert!(run.skip(3, Some(Skip::Cut)));
+        answer(&mut run, &[&[0, 1, 2], &[4]]);
+        assert_eq!(
+            (run.done.clone(), run.next, run.from),
+            (vec![true, false], 1, 0)
+        );
+        assert_eq!(run.layout.as_deref().unwrap().as_ref().unwrap().len(), 3);
+        // Undone, it is next again.
+        assert!(run.skip(3, None));
+        answer(&mut run, whole);
+        assert_eq!((run.done.clone(), run.next), (vec![true, false, false], 1));
+        // Both later tool runs skipped: there is nothing next.
+        assert!(run.skip(3, Some(Skip::Cut)));
+        answer(&mut run, &[&[0, 1, 2], &[4]]);
+        assert!(run.skip(4, Some(Skip::Cut)));
+        answer(&mut run, &[&[0, 1, 2]]);
+        assert_eq!((run.done.clone(), run.next), (vec![true], 1));
+        for oi in [4, 3] {
+            assert!(run.skip(oi, None));
+        }
+        answer(&mut run, whole);
+        assert_eq!((run.done.clone(), run.next), (vec![true, false, false], 1));
+        // A refused check: the skip is undone, what was done kept.
+        assert!(run.skip(3, Some(Skip::Left)));
+        run.checked_as(Arc::new(Err(vec!["refused".into()])), None, None);
+        assert!(!run.skip(4, Some(Skip::Cut)));
+        assert!(run.skip(3, None));
+        answer(&mut run, whole);
+        assert_eq!((run.done.clone(), run.next), (vec![true, false, false], 1));
+        // Not while a tool run runs.
+        run.running = Some(Running {
+            index: 1,
+            from: 0,
+            seq: 0,
+            offset: [0.; 6],
+            before: Before {
+                xy: None,
+                zero: None,
+                last: None,
+                touched: false,
+            },
+            paths: vec![],
+            on: None,
+        });
+        assert!(!run.skip(4, Some(Skip::Cut)) && run.skips.is_empty());
     }
 
     #[test]
