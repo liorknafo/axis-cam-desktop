@@ -17154,6 +17154,66 @@ soft_max = 180.0
         let all = at(&mut a, 1., "100%");
         assert_eq!((some.x, some.width), (all.x, all.width));
     }
+    /// In the window at its least width each camera button over the 3D view,
+    /// and the work zero's Change link, is whole and inside the view's
+    /// column (LIO-308).
+    #[test]
+    fn the_camera_buttons_fit_over_the_3d_view_in_the_least_window() {
+        let (a, _, _) = facing_a_floor();
+        let wide = laid_out_texts(&a, iced::Size::new(1920., 1080.));
+        let laid = laid_out(&a, crate::MIN_WINDOW);
+        let find = |texts: &[(String, iced::Rectangle)], words: &str| {
+            (texts.iter())
+                .find(|(t, _)| t == words)
+                .unwrap_or_else(|| panic!("no {words:?}"))
+                .1
+        };
+        // The workflow tabs' bar spans the view's column.
+        let first = find(&laid.texts, "01  Setup");
+        let column = (laid.boxes.iter())
+            .filter(|b| b.contains(first.center()) && b.height < 60.)
+            .max_by(|p, q| p.width.total_cmp(&q.width))
+            .unwrap();
+        let change = (laid.texts.iter())
+            .find(|(t, _)| t.ends_with("· Change"))
+            .unwrap()
+            .0
+            .clone();
+        for words in ["Fit", "ISO", "TOP", "FRONT", "RIGHT", &change] {
+            let at = find(&laid.texts, words);
+            assert!(
+                at.x >= column.x && at.x + at.width <= column.x + column.width,
+                "{words} {at:?} column {column:?}"
+            );
+            assert_eq!(at.width, find(&wide, words).width, "{words} squeezed");
+        }
+    }
+    /// In the window at its least width the brand bar's label and its notes
+    /// keep to one line, and the label stays in the window (LIO-308).
+    #[test]
+    fn the_brand_bar_keeps_to_one_line_in_the_least_window() {
+        let (mut a, _, _) = facing_a_floor();
+        a.dirty = true;
+        let wide = laid_out_texts(&a, iced::Size::new(1920., 1080.));
+        let least = laid_out_texts(&a, crate::MIN_WINDOW);
+        for words in ["NATIVE PROTOTYPE", "Saving workspace…"] {
+            let find = |texts: &[(String, iced::Rectangle)]| {
+                (texts.iter())
+                    .find(|(t, _)| t == words)
+                    .unwrap_or_else(|| panic!("no {words:?}"))
+                    .1
+            };
+            assert_eq!(find(&least).height, find(&wide).height, "{words}");
+        }
+        let label = (least.iter())
+            .find(|(t, _)| t == "NATIVE PROTOTYPE")
+            .unwrap()
+            .1;
+        assert!(
+            label.x + label.width <= crate::MIN_WINDOW.width,
+            "{label:?}"
+        );
+    }
     /// The workflow tabs' bar runs the width of the 3D view over it
     /// (LIO-305).
     #[test]

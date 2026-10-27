@@ -910,7 +910,7 @@ pub fn project_note(app: &App) -> String {
                 let tail: String = name[name.len() - SHOWN / 2 + 1..].iter().collect();
                 shown = format!("{head}…{tail}");
             }
-            // Unsaved first: a narrow header wraps the name, not the mark.
+            // Unsaved first: a narrow header cuts off the name, not the mark.
             if app.project_dirty {
                 format!("Unsaved · {shown}")
             } else {
@@ -986,25 +986,32 @@ pub fn view(app: &App) -> Element<'_, Message> {
         Some(p) => p.display().to_string(),
         None => "Use Save or Save as… to choose the file this project is kept in. Until then it lives only in the workspace.".into(),
     };
-    let brand = brand
-        .push(space().width(Fill))
-        .push(help::wrap(
+    // The notes keep to one line on the right; a narrow window cuts off
+    // their end, never the label after them.
+    let notes = row![
+        space().width(Fill),
+        help::wrap(
             text(project_note(app))
                 .size(12)
+                .wrapping(Wrapping::None)
                 .color(Color::from_rgb8(214, 228, 240)),
             Help::text("Project file", where_saved),
             widget::tooltip::Position::Bottom,
-        ))
-        .push(space().width(10))
-        .push(
-            text(workspace_note(app))
-                .size(12)
-                .color(Color::from_rgb8(183, 204, 222)),
-        )
+        ),
+        space().width(10),
+        text(workspace_note(app))
+            .size(12)
+            .wrapping(Wrapping::None)
+            .color(Color::from_rgb8(183, 204, 222)),
+    ]
+    .align_y(Alignment::Center);
+    let brand = brand
+        .push(container(notes).width(Fill).clip(true))
         .push(space().width(10))
         .push(
             text("NATIVE PROTOTYPE")
                 .size(10)
+                .wrapping(Wrapping::None)
                 .color(Color::from_rgb8(228, 193, 122)),
         );
     let brand = container(brand)
@@ -2284,35 +2291,51 @@ pub(crate) fn scene_viewport(app: &App) -> Option<Viewport<'_>> {
 }
 fn workspace(app: &App) -> Element<'_, Message> {
     let s = app.doc.active_setup();
+    // The camera buttons keep their width; the setup's lines on the left
+    // get what is left and are cut off in a narrow view.
     let heading = container(
         row![
-            column![
-                bold(s.map(|s| s.name()).unwrap_or("Imported model"), 15),
-                match s {
-                    // The work zero, one click from its step.
-                    Some(s) => Element::from(
-                        row![
-                            muted(format!(
-                                "{} / {} / {}Work zero:",
-                                get(&s.p, "offset"),
-                                app.doc.holding_label(s),
-                                crate::indexed::label(s)
-                                    .map(|a| format!("{a} / "))
-                                    .unwrap_or_default(),
-                            )),
-                            button(text(format!("{} · Change", get(&s.p, "origin"))).size(12))
+            container(
+                column![
+                    bold(s.map(|s| s.name()).unwrap_or("Imported model"), 15)
+                        .wrapping(Wrapping::None),
+                    match s {
+                        // The work zero, one click from its step, first so a
+                        // narrow view cuts off the offset and holding instead.
+                        Some(s) => Element::from(
+                            row![
+                                muted("Work zero:").wrapping(Wrapping::None),
+                                button(
+                                    text(format!("{} · Change", get(&s.p, "origin")))
+                                        .size(12)
+                                        .wrapping(Wrapping::None)
+                                )
                                 .padding([2, 6])
                                 .on_press(Message::SetupStep("Work zero"))
                                 .style(|_, status| flat(false, status)),
-                        ]
-                        .spacing(4)
-                        .align_y(Alignment::Center)
-                    ),
-                    None => muted("Create your first machining setup when you are ready.").into(),
-                }
-            ]
-            .spacing(3),
-            space().width(Fill),
+                                muted(format!(
+                                    "{} / {}{}",
+                                    get(&s.p, "offset"),
+                                    app.doc.holding_label(s),
+                                    crate::indexed::label(s)
+                                        .map(|a| format!(" / {a}"))
+                                        .unwrap_or_default(),
+                                ))
+                                .wrapping(Wrapping::None),
+                            ]
+                            .spacing(4)
+                            .align_y(Alignment::Center)
+                        ),
+                        None => muted("Create your first machining setup when you are ready.")
+                            .wrapping(Wrapping::None)
+                            .into(),
+                    }
+                ]
+                .spacing(3)
+            )
+            .width(Fill)
+            .clip(true),
+            space().width(6),
             btn("Fit", Message::Camera("FIT"), false),
             space().width(6),
             btn("ISO", Message::Camera("ISO"), false),
