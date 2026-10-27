@@ -10811,6 +10811,55 @@ soft_max = 180.0
         let _ = a.update(Message::Disconnect);
     }
 
+    /// The Home page's scroll bar, there only in a window too short for the
+    /// page, takes its own room beside the "Continue where you left off"
+    /// card rather than being drawn over its edge; where the page fits there
+    /// is no bar and the page is centred in the whole width (LIO-327).
+    #[test]
+    fn the_home_pages_scroll_bar_is_beside_its_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("w.json"), None);
+        a.page = Page::Home;
+        for (size, scrolls) in [
+            (iced::Size::new(1093., 536.), true),
+            (iced::Size::new(1440., 900.), false),
+            (iced::Size::new(1920., 1040.), false),
+        ] {
+            let _ = a.update(Message::Resized(size));
+            let laid = laid_out(&a, size);
+            let heading = (laid.texts.iter())
+                .find(|(t, _)| t == "Continue where you left off")
+                .unwrap()
+                .1;
+            let card = *(laid.boxes.iter())
+                .filter(|b| (b.width - 380.).abs() < 0.5 && b.contains(heading.center()))
+                .min_by(|p, q| p.height.total_cmp(&q.height))
+                .unwrap_or_else(|| panic!("{size:?}: no card"));
+            let (shown, content) = *(laid.scrolls.iter())
+                .find(|(b, _)| b.contains(card.center()))
+                .unwrap_or_else(|| panic!("{size:?}: the page does not scroll"));
+            assert_eq!(content.height > shown.height + 0.5, scrolls, "{size:?}");
+            // The bar is 10 wide at the scrollable's right.
+            let right = shown.x + shown.width;
+            assert!(
+                card.x + card.width <= right - 10. - 0.5,
+                "{size:?}: the card's right edge {} under the bar at {right}",
+                card.x + card.width
+            );
+            if !scrolls {
+                // The page's row, 1060 at most, as far from either side.
+                let row = *(laid.boxes.iter())
+                    .filter(|b| (b.width - 1060.).abs() < 0.5 && b.contains(card.center()))
+                    .min_by(|p, q| p.height.total_cmp(&q.height))
+                    .unwrap_or_else(|| panic!("{size:?}: no row"));
+                assert!(
+                    ((row.x - shown.x) - (right - row.x - row.width)).abs() < 1.,
+                    "{size:?}: {row:?} off centre in {shown:?}"
+                );
+            }
+        }
+    }
+
     /// The operation editor's Delete asks first, as a setup's does: Cancel
     /// keeps the operation, another selection closes the question, and
     /// Delete operation removes it. The question shows in place of the

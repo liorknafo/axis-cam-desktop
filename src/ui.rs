@@ -1213,20 +1213,27 @@ fn start_screen(app: &App) -> Element<'_, Message> {
             Message::RecoverPrevious,
         ));
     }
-    // A short screen's window (LIO-315) scrolls it, never squeezes it.
-    container(scrollable(
-        container(
+    // A short screen's window (LIO-315) scrolls it, never squeezes it. The
+    // bar is embedded: only while it shows does it take `SCROLLBAR_GUTTER`
+    // beside the content, never the card's edge (LIO-327); at full size
+    // there is none and the content is centred in the whole width.
+    container(
+        scrollable(
             container(
-                row![
-                    container(intro).padding(28).width(Fill),
-                    container(recent).padding(26).width(380).style(panel_style)
-                ]
-                .spacing(36),
+                container(
+                    row![
+                        container(intro).padding(28).width(Fill),
+                        container(recent).padding(26).width(380).style(panel_style)
+                    ]
+                    .spacing(36),
+                )
+                .max_width(1060),
             )
-            .max_width(1060),
+            .center_x(Fill),
         )
-        .center_x(Fill),
-    ))
+        // The bar's own 10 and the spacing make the gutter.
+        .spacing(SCROLLBAR_GUTTER - 10.),
+    )
     .padding(32)
     .center(Fill)
     .into()
