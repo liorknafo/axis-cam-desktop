@@ -364,6 +364,8 @@ pub enum Message {
     /// Details in the simulation strip: its stats, the Detail row and every
     /// line of the run check, shown or folded to one summary line.
     ToggleSimDetails,
+    /// The inspector's warnings in full, or each at its first sentence.
+    ToggleWarningDetails,
     /// A change to the 3D view's section.
     Section(section::Edit),
     TogglePaths,
@@ -1186,6 +1188,8 @@ pub struct App {
     pub show_uncut: bool,
     /// Whether the simulation strip shows its details (`ToggleSimDetails`).
     pub sim_details: bool,
+    /// Whether the inspector's warnings are shown in full (`ToggleWarningDetails`).
+    pub warning_details: bool,
     /// The 3D view's section (`section`), with the fingerprint of the part
     /// it was set on: a face's number means another face on another part.
     /// Kept while the section is off, so turning it on again brings it back.
@@ -1472,6 +1476,7 @@ fn while_locked(m: &Message) -> bool {
             | ToggleStock
             | ToggleUncut
             | ToggleSimDetails
+            | ToggleWarningDetails
             | Section(_)
             | TogglePaths
             | Camera(_)
@@ -1850,6 +1855,7 @@ impl App {
             stock: true,
             show_uncut: true,
             sim_details: false,
+            warning_details: false,
             section: None,
             section_on: false,
             picking_section: false,
@@ -6605,6 +6611,7 @@ impl App {
             Message::ToggleStock => self.stock = !self.stock,
             Message::ToggleUncut => self.show_uncut = !self.show_uncut,
             Message::ToggleSimDetails => self.sim_details = !self.sim_details,
+            Message::ToggleWarningDetails => self.warning_details = !self.warning_details,
             Message::Section(edit) => self.edit_section(edit),
             Message::TogglePaths => self.paths = !self.paths,
             Message::Camera(view) => {

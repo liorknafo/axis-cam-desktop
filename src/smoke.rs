@@ -3016,6 +3016,23 @@ flood = { pin = 8 }
         let _ = a.update(Message::SelectOp(face));
         (a, face, top / mesh.display_scale())
     }
+    /// The inspector's warning box, pinned under the form, says each warning's
+    /// first sentence; Details says them in full.
+    #[test]
+    fn the_inspectors_warnings_fold_to_their_first_sentence() {
+        let (mut a, _, _) = facing_a_floor();
+        let first = "Facing stops at the part's top, 6.00 mm above the selected surface plus bottom offset: going lower would cut the part's higher features.";
+        let texts = page_texts(&a);
+        assert!(texts.iter().any(|t| *t == format!("{first} …")), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "Details"), "{texts:?}");
+        let _ = a.update(Message::ToggleWarningDetails);
+        let texts = page_texts(&a);
+        assert!(
+            texts.iter().any(|t| t.starts_with(first) && t.ends_with("Adaptive clearing.")),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|t| t == "Hide details"), "{texts:?}");
+    }
     #[test]
     fn a_facing_of_a_floor_below_the_top_faces_the_whole_top() {
         let (mut a, face, top) = facing_a_floor();

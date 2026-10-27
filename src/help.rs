@@ -1449,6 +1449,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Show or hide the simulation's details: how it mills, the air taken out, the feed, the path's colours, the stock's Detail and every line of the run check. Hidden, the strip keeps the time, the volume and the check's first line, so the 3D view keeps its height.",
             "",
         ),
+        ToggleWarningDetails => (
+            "Show the operation's warnings in full, or each at its first sentence. Warnings only advise: Generate and export still work. Errors are always shown in full.",
+            "",
+        ),
         TogglePaths => (
             "Show or hide the cutter path. Pocket shows cuts on the current depth layer; Facing shows the latest cutting pass. Both show the active rapid; the example project shows illustrative paths.",
             "",
@@ -4807,6 +4811,7 @@ mod tests {
             ToggleStock,
             ToggleUncut,
             ToggleSimDetails,
+            ToggleWarningDetails,
             Section(crate::section::Edit::Toggle),
             Section(crate::section::Edit::Axis(0)),
             Section(crate::section::Edit::PickFace),

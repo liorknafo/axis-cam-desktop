@@ -375,7 +375,7 @@ fn hinted_field<'a>(
     ]
     .spacing(5);
     for check in checks {
-        c = c.push(check_line(check));
+        c = c.push(check_line(check, false));
     }
     help::field(c, key, label, target)
 }
@@ -716,19 +716,28 @@ impl Checks {
             .collect()
     }
 }
-/// A check as one line: its label in its colour, then its text.
-fn check_line<'a>(check: &Check) -> Element<'a, Message> {
+/// A check as one line: its label in its colour, then its text, `short` at
+/// its first sentence.
+fn check_line<'a>(check: &Check, short: bool) -> Element<'a, Message> {
     let [_, heading, body] = check.colors();
+    let first = leading_sentences(&check.text, 0);
+    let said = if short && first.len() < check.text.len() {
+        format!("{first} …")
+    } else {
+        check.text.clone()
+    };
     row![
         bold(check.label(), 12).color(heading),
-        text(check.text.clone()).size(12).color(body).width(Fill)
+        text(said).size(12).color(body).width(Fill)
     ]
     .spacing(6)
     .into()
 }
 /// Under the form: that the checks passed, or the errors and the warnings no
 /// field on the open tab shows, in a box each, with how many the fields show.
-fn checks_summary<'a>(checks: &Checks) -> Element<'a, Message> {
+/// The warnings, which only advise, say their first sentence unless `open`:
+/// the box is pinned under the form and takes the form's room.
+fn checks_summary<'a>(checks: &Checks, open: bool) -> Element<'a, Message> {
     if checks.list.is_empty() {
         return container(
             muted("Configuration checks passed").color(Color::from_rgb8(39, 130, 93)),
@@ -750,9 +759,26 @@ fn checks_summary<'a>(checks: &Checks) -> Element<'a, Message> {
             let verb = if total == 1 { "stops" } else { "stop" };
             format!("{total} error{plural} {verb} Generate and export")
         } else {
-            format!("{total} warning{plural} · Generate and export still allowed")
+            format!("{total} warning{plural} · nothing is blocked")
         };
-        let mut lines_column = column![bold(title, 12).color(heading)].spacing(5);
+        let title = bold(title, 12).color(heading);
+        let folds = !error
+            && (lines.iter()).any(|l| leading_sentences(&l.text, 0).len() < l.text.len());
+        let mut lines_column = column![if folds {
+            row![
+                title.width(Fill),
+                btn(
+                    if open { "Hide details" } else { "Details" },
+                    Message::ToggleWarningDetails,
+                    false
+                )
+            ]
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            Element::from(title)
+        }]
+        .spacing(5);
         let at_fields = total - lines.len();
         if at_fields > 0 {
             let (whose, s) = if at_fields == 1 {
@@ -767,7 +793,7 @@ fn checks_summary<'a>(checks: &Checks) -> Element<'a, Message> {
             );
         }
         for line in lines {
-            lines_column = lines_column.push(check_line(line));
+            lines_column = lines_column.push(check_line(line, folds && !open));
         }
         c = c.push(
             container(lines_column)
@@ -3774,7 +3800,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
     }
     // Pinned under the body: the checks no field on the open tab shows,
     // Generate and the operation's actions.
-    let mut foot = column![rule::horizontal(1), checks_summary(checks)].spacing(13);
+    let mut foot = column![rule::horizontal(1), checks_summary(checks, app.warning_details)].spacing(13);
     if let Some((heading, lines)) = holding_warning(app) {
         foot = foot.push(caution(heading, lines));
     }
