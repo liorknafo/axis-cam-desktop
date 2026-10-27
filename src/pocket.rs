@@ -1569,11 +1569,12 @@ type Member = (Zone, Region, f32);
 /// or holding the others of its pocket, keeps its own centres; the same
 /// zones together in the band below go on down through it.
 ///
-/// A height less than `thin` (the axial allowance) under the one above it
-/// is taken up to that one: a band that thin would clear the whole pocket
-/// again for a few hundredths of a millimetre (a hole's rim on a pad just
-/// over the floor round it). A floor is then left up to `thin` more than
-/// its allowance, never less.
+/// A height less than `thin` (the axial allowance) under a target above it
+/// is taken up to that target: a band that thin would clear the whole
+/// pocket again for a few hundredths of a millimetre (a hole's rim on a pad
+/// just over the floor round it). A floor is then left up to `thin` more
+/// than its allowance, never less. A target is never taken up to a height
+/// only a zone starts at (the stock's top): a shallow pocket keeps its cut.
 fn banded(
     mut members: Vec<Member>,
     above: &mut impl FnMut(f32) -> Result<Region, String>,
@@ -1587,11 +1588,12 @@ fn banded(
     let mut heights: Vec<f32> = members.iter().flat_map(|m| [m.0.top, m.0.target]).collect();
     heights.sort_by(|a, b| b.total_cmp(a));
     heights.dedup_by(|low, high| *high - *low < 0.001);
+    let target = |h: f32| members.iter().any(|m| (m.0.target - h).abs() < 0.001);
     let mut up: Vec<(f32, f32)> = vec![];
     let mut kept: Option<f32> = None;
     for &h in &heights {
         match kept {
-            Some(k) if k - h < thin => up.push((h, k)),
+            Some(k) if k - h < thin && target(k) => up.push((h, k)),
             _ => kept = Some(h),
         }
     }
@@ -3530,6 +3532,31 @@ mod tests {
         assert!(
             (zs[0]).abs() < 0.001 && zs.iter().any(|z| (z - 0.05).abs() < 0.001),
             "{zs:?}"
+        );
+    }
+    #[test]
+    fn a_floor_shallower_than_the_axial_allowance_under_the_stock_top_is_still_cut() {
+        // A floor 0.3 mm under a rim, 0.2 mm left on it: its target is 0.1
+        // mm under the stock's top, and that 0.1 mm is cut, as it was.
+        let mut tris = vec![];
+        quad(&mut tris, -10., -8., 10., 8., 0.);
+        for (x, y, xx, yy) in [
+            (-15., -12., 15., -8.),
+            (-15., 8., 15., 12.),
+            (-15., -8., -10., 8.),
+            (10., -8., 15., 8.),
+        ] {
+            quad(&mut tris, x, y, xx, yy, 0.3);
+        }
+        quad(&mut tris, -15., -12., 15., 12., -4.);
+        let (setup, mut op, tool, mesh, dz) = part(tris, &[0.], 2.);
+        op.p.insert("axial_allowance".into(), "0.2".into());
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert!((plan.target - dz - 0.2).abs() < 0.001 && plan.levels == 1);
+        assert!(
+            cutting(&plan)
+                .iter()
+                .any(|p| (p[2] - dz - 0.2).abs() < 0.001)
         );
     }
     #[test]

@@ -2730,7 +2730,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Allowance),
         ),
         (_, "axial_allowance") => (
-            "Material intentionally left on floors, in mm. A finishing operation removes it to reach the nominal depth.",
+            "Material intentionally left on floors, in mm. A finishing operation removes it to reach the nominal depth. In a Pocket, floors closer together than this are cleared at the higher one's level, so the lower keeps up to this much more: never less than you set.",
             "",
             Some(Allowance),
         ),
