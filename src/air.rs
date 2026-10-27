@@ -344,20 +344,31 @@ fn cutting(
             .collect::<Option<Vec<_>>>()
     })
     .ok_or("Generation cancelled.")?;
-    let mut stretches: Vec<[f32; 2]> = found
-        .into_iter()
-        .flatten()
-        .map(|s| [s - lag - pad, s + pad])
-        .collect();
-    // A move made again, a finishing pass, is kept.
-    let mut seen = std::collections::HashSet::new();
+    let mut found: Vec<f32> = found.into_iter().flatten().collect();
+    found.sort_by(f32::total_cmp);
+    // A move made again where it cut the first time, a finishing pass, is
+    // kept; made again where it cut nothing, it is air too.
+    let mut first = std::collections::HashMap::new();
     let key = |p: [f32; 3]| p.map(|v| (v * 1e4).round() as i64);
+    let mut again = vec![];
     for f in feeds {
         let m = &plan.moves[f.index];
-        if !seen.insert((key(m.from), key(m.to))) {
-            stretches.push([f.at, f.at + f.length]);
+        let [a, b] = *first
+            .entry((key(m.from), key(m.to)))
+            .or_insert([f.at, f.at + f.length]);
+        let i = found.partition_point(|&s| s < a);
+        if f.at > a && found.get(i).is_some_and(|&s| s <= b) {
+            again.push([f.at, f.at + f.length]);
         }
     }
+    let cuts = found.into_iter().map(|s| [s - lag - pad, s + pad]);
+    Ok(Some(merged(cuts.chain(again), total)))
+}
+
+/// `stretches` (mm of feed) sorted, the overlapping joined, within the
+/// path's `total`.
+fn merged(stretches: impl IntoIterator<Item = [f32; 2]>, total: f32) -> Vec<[f32; 2]> {
+    let mut stretches: Vec<[f32; 2]> = stretches.into_iter().collect();
     stretches.sort_by(|a, b| a[0].total_cmp(&b[0]));
     let mut merged: Vec<[f32; 2]> = vec![];
     for [a, b] in stretches {
@@ -367,7 +378,7 @@ fn cutting(
             _ => merged.push([a, b]),
         }
     }
-    Ok(Some(merged))
+    merged
 }
 
 /// The points of a cutter of `shape`, `radius` and `flute` with its tip at
@@ -985,6 +996,41 @@ mod tests {
         ];
         let twice: Vec<[f32; 3]> = lap.iter().chain(&lap[1..]).copied().collect();
         assert_eq!(trimmed(plan(&twice), &volume).1, None);
+    }
+    #[test]
+    fn a_pass_made_again_over_air_is_air() {
+        // The slot along X at Y0 cut from X-60 to 60, and a pass that cuts
+        // past it to X100 and goes back along it to X-60, then the same
+        // again: the second time along the slot's cleared stretch runs
+        // through air as the first time did, and is taken out with it.
+        let volume = stock(&[([-60., 0., 30.], [60., 0., 30.])]);
+        let lap = [
+            [-60., 0., 30.],
+            [-30., 0., 30.],
+            [0., 0., 30.],
+            [30., 0., 30.],
+            [100., 0., 30.],
+            [30., 0., 30.],
+            [0., 0., 30.],
+            [-30., 0., 30.],
+            [-60., 0., 30.],
+        ];
+        let twice: Vec<[f32; 3]> = lap.iter().chain(&lap[1..]).copied().collect();
+        let (trimmed, air) = trimmed(plan(&twice), &volume);
+        assert!(
+            air.is_some_and(|a| !a.nothing && a.stretches >= 2),
+            "{air:?}"
+        );
+        continuous(&trimmed);
+        // Out past the slot's end both times, where the first pass cut and
+        // the second finishes; nothing fed along the slot's middle.
+        assert!(feeds_between(&trimmed, 30., 70., 100.) >= 2);
+        assert_eq!(
+            feeds_between(&trimmed, 30., -25., 25.),
+            0,
+            "{:#?}",
+            trimmed.moves
+        );
     }
     #[test]
     fn the_fixture_jobs_facing_and_parallel_leave_the_stock_they_did() {
