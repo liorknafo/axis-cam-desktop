@@ -3131,6 +3131,16 @@ struct SurfaceGrid {
     /// The cells cut, by cell (`nx - 1` a row), when only picked faces are;
     /// None when every cell with all four heights is.
     cells: Option<Vec<bool>>,
+    /// The triangles (`Geometry::triangles`) that can hold the cutter up
+    /// over each square of `bin` by `bin` samples, `bins_x` squares a row.
+    bins: Vec<Vec<u32>>,
+    bin: usize,
+    bins_x: usize,
+    radius: f32,
+    ball: bool,
+    /// What each height adds to where the cutter touches the part: the
+    /// finishing offset and the tolerance.
+    lift: f32,
 }
 /// The faces a finishing operation (Parallel, Waterline) is given: None for
 /// the whole part (Model silhouette), or the picked faces in groups that
@@ -3203,6 +3213,12 @@ fn finish_grid(
     }
     // Triangle rasterization evaluates only its expanded footprint, not the entire mesh per sample.
     let r = b.plan.radius;
+    // ponytail: at most 256 squares a side; finer bins if fine meshes make the heights between samples slow.
+    let bin = ((r / step).ceil() as usize)
+        .max(nx.max(ny).div_ceil(256))
+        .max(1);
+    let bins_x = nx.div_ceil(bin);
+    let mut bins = vec![vec![]; bins_x * ny.div_ceil(bin)];
     crate::progress::stage(stage, stages);
     crate::progress::expect(g.triangles.len());
     for (i, t) in g.triangles.iter().enumerate() {
@@ -3222,6 +3238,11 @@ fn finish_grid(
         // A long sampling runs off the window's thread: how far, and Cancel,
         // at each triangle (a large one takes milliseconds).
         crate::progress::report(i)?;
+        for by in ranges[1].0 / bin..=ranges[1].1.min(ny - 1) / bin {
+            for bx in ranges[0].0 / bin..=ranges[0].1.min(nx - 1) / bin {
+                bins[by * bins_x + bx].push(i as u32);
+            }
+        }
         let a = std::array::from_fn::<_, 3, _>(|i| t.p[1][i] - t.p[0][i]);
         let c = std::array::from_fn::<_, 3, _>(|i| t.p[2][i] - t.p[0][i]);
         let n = [
@@ -3320,6 +3341,12 @@ fn finish_grid(
         origin: [g.bounds.min[0], g.bounds.min[1]],
         z,
         cells,
+        bins,
+        bin,
+        bins_x,
+        radius: r,
+        ball: b.plan.shape == CutterShape::Ball,
+        lift: offset + tolerance,
     })
 }
 fn contains(paths: &[Polygon], p: (f64, f64)) -> bool {
@@ -3356,8 +3383,10 @@ fn contains_or_edge(paths: &[Polygon], p: (f64, f64)) -> bool {
         })
 }
 impl SurfaceGrid {
-    // Conservative cell maximum; do not interpolate below sampled tool clearance.
-    fn sample(&self, xy: [f32; 2]) -> Option<f32> {
+    /// The cutter's height over `xy`, where the grid cuts there: on the part
+    /// as at each sample, rather than the highest of the cell's four, which
+    /// lifts it on a slope and off the floor a cell before a wall.
+    fn sample(&self, g: &Geometry, xy: [f32; 2]) -> Option<f32> {
         let u = (xy[0] - self.origin[0]) / self.step;
         let v = (xy[1] - self.origin[1]) / self.step;
         if u < -0.0001 || v < -0.0001 {
@@ -3382,7 +3411,38 @@ impl SurfaceGrid {
             self.z[(y + 1) * self.nx + x]?,
             self.z[(y + 1) * self.nx + x + 1]?,
         ];
-        Some(values.into_iter().fold(f32::NEG_INFINITY, f32::max))
+        let bin = (y / self.bin) * self.bins_x + x / self.bin;
+        (self.bins[bin].iter())
+            .filter_map(|&i| drop_triangle(&g.triangles[i as usize].p, xy, self.radius, self.ball))
+            .reduce(f32::max)
+            .map(|z| z + self.lift)
+            // Nothing within reach (over a hole): the cell's highest sample.
+            .or(Some(values.into_iter().fold(f32::NEG_INFINITY, f32::max)))
+    }
+    /// The points between `a` and `b` that keep a straight move within
+    /// `tolerance` of the cutter's height: where that jumps, as up a wall at
+    /// the top of a slope, the cutter follows the slope into the corner
+    /// rather than climbing from the sample before it.
+    fn refine(
+        &self,
+        g: &Geometry,
+        a: [f32; 3],
+        b: [f32; 3],
+        tolerance: f32,
+        out: &mut Vec<[f32; 3]>,
+    ) {
+        let xy = [(a[0] + b[0]) / 2., (a[1] + b[1]) / 2.];
+        if (b[0] - a[0]).hypot(b[1] - a[1]) < 0.01 {
+            return;
+        }
+        let Some(z) = self.sample(g, xy) else { return };
+        if (z - (a[2] + b[2]) / 2.).abs() <= tolerance {
+            return;
+        }
+        let m = [xy[0], xy[1], z];
+        self.refine(g, a, m, tolerance, out);
+        out.push(m);
+        self.refine(g, m, b, tolerance, out);
     }
 }
 fn parallel(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
@@ -3416,6 +3476,7 @@ fn parallel_rows(
     (stage, stages): (usize, usize),
 ) -> Result<(), String> {
     let spacing = number(op, "surface_stepover")?;
+    let tolerance = number(op, "tolerance")?;
     let (sin, cos) = number(op, "direction")?.to_radians().sin_cos();
     let corners = [
         [g.bounds.min[0], g.bounds.min[1]],
@@ -3443,8 +3504,12 @@ fn parallel_rows(
             let index = if row % 2 == 0 { j } else { count - j };
             let u = min(&along) + (max(&along) - min(&along)) * index as f32 / count.max(1) as f32;
             let xy = [u * cos - v * sin, u * sin + v * cos];
-            if let Some(z) = grid.sample(xy) {
-                stroke.push([xy[0], xy[1], z]);
+            if let Some(z) = grid.sample(g, xy) {
+                let p = [xy[0], xy[1], z];
+                if let Some(&last) = stroke.last() {
+                    grid.refine(g, last, p, tolerance, &mut stroke);
+                }
+                stroke.push(p);
             } else {
                 b.stroke(&stroke)?;
                 stroke.clear();
@@ -4340,6 +4405,77 @@ pub(crate) mod tests {
         assert_ne!(plan.moves[3].to, rotated.moves[3].to);
         op.p.insert("slope_max".into(), "10".into());
         assert!(generate(&setup, &op, &tool, &mesh).is_err());
+        assert_plan(plan);
+    }
+    /// A ramp rising 4 in 10 (21.8°) along X into a wall 4 mm tall, 10 mm
+    /// along Y: only the ramp picked, a Ø4 ball finishing it at no offset
+    /// goes up it into the corner, touching ramp and wall at once, and
+    /// nowhere below where the part holds it (LIO-316).
+    #[test]
+    fn parallel_finishes_a_picked_ramp_into_the_corner_with_a_wall() {
+        let profile = [
+            (0., 0.),
+            (16., 0.),
+            (16., 10.),
+            (10., 10.),
+            (10., 6.),
+            (0., 2.),
+        ];
+        let at = |(x, z): (f32, f32), y: f32| [x, y, z];
+        let mut t = vec![];
+        for (i, &p) in profile.iter().enumerate() {
+            let q = profile[(i + 1) % profile.len()];
+            quad(&mut t, [at(p, 0.), at(p, 10.), at(q, 10.), at(q, 0.)]);
+        }
+        for piece in [
+            [(0., 0.), (10., 0.), (10., 6.), (0., 2.)],
+            [(10., 0.), (16., 0.), (16., 10.), (10., 10.)],
+        ] {
+            quad(&mut t, piece.map(|p| at(p, 0.)));
+            quad(&mut t, [3, 2, 1, 0].map(|i| at(piece[i], 10.)));
+        }
+        let mesh = mesh::normalize(t).unwrap();
+        let (setup, mut op, tool) = fixture(Strategy::Parallel);
+        let g = Geometry::new(&setup, &mesh);
+        let min = g.bounds.min;
+        let on_ramp = |p: &[f32; 3]| (p[2] - min[2] - 2. - 0.4 * (p[0] - min[0])).abs() < 0.001;
+        let ramp: Vec<usize> = (g.triangles.iter())
+            .filter(|t| t.p.iter().all(on_ramp))
+            .filter_map(|t| t.feature)
+            .collect();
+        assert!(!ramp.is_empty());
+        op.p.insert("boundary".into(), "Selected geometry".into());
+        op.surfaces = Some(surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: ramp,
+        });
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        let r = plan.radius;
+        let clearance = |p: [f32; 3]| {
+            (g.triangles.iter())
+                .filter_map(|t| drop_triangle(&t.p, [p[0], p[1]], r, true))
+                .fold(f32::NEG_INFINITY, f32::max)
+        };
+        let feeds: Vec<_> = plan.moves.iter().filter(|m| m.cutting_pass).collect();
+        for m in &feeds {
+            let mid = std::array::from_fn(|i| (m.from[i] + m.to[i]) / 2.);
+            for p in [m.to, mid] {
+                assert!(p[2] >= clearance(p) - 0.001, "{p:?} below {}", clearance(p));
+            }
+        }
+        // In the corner the ball is r from the wall, on the ramp: its tip
+        // r·(1/cos θ − 1) above the ramp under its centre, and the
+        // tolerance (0.05) above that.
+        let x = 10. - r;
+        let z = 2. + 0.4 * x + r * (1. / 0.4f32.atan().cos() - 1.) + 0.05;
+        let near = (feeds.iter())
+            .map(|m| {
+                (m.to[0] - min[0] - x)
+                    .abs()
+                    .max((m.to[2] - min[2] - z).abs())
+            })
+            .fold(f32::INFINITY, f32::min);
+        assert!(near < 0.02, "the ball comes within {near} mm of the corner");
         assert_plan(plan);
     }
     /// A half ball R10 on a Ø40 x 4 mm round plate: 64 sides, the dome in

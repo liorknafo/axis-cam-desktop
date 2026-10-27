@@ -768,7 +768,10 @@ impl StockGrid {
                             (projection
                                 - dz * (radius * radius - perp).max(0.).sqrt()
                                     / (length.sqrt() * (length + dz * dz).sqrt()))
-                            .clamp((projection - half).max(0.), (projection + half).min(1.))
+                            .clamp(
+                                (projection - half).clamp(0., 1.),
+                                (projection + half).clamp(0., 1.),
+                            )
                         };
                         let d = (point[0] - a[0] - contact * (b[0] - a[0])).powi(2)
                             + (point[1] - a[1] - contact * (b[1] - a[1])).powi(2);
@@ -800,7 +803,10 @@ impl StockGrid {
                             } else {
                                 0.
                             };
-                            t.clamp((projection - half).max(0.), (projection + half).min(1.))
+                            t.clamp(
+                                (projection - half).clamp(0., 1.),
+                                (projection + half).clamp(0., 1.),
+                            )
                         };
                         let d = (point[0] - a[0] - contact * (b[0] - a[0])).powi(2)
                             + (point[1] - a[1] - contact * (b[1] - a[1])).powi(2);
