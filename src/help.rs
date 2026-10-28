@@ -2400,7 +2400,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(MillingDirection),
         ),
         (_, "pocket_entry") => (
-            "Profile ramp descends along the pocket contour at the ramp angle, then cuts the loop at depth. Plunge feeds straight down and needs a plunge-capable end mill. Both enter at 25% feed. Unbranched chains spiral at depth, blending between laps and ending with a complete wall contour. Contours keep their short links where a safe spiral will not fit. Between chains the tool steps at most 1.5 stepovers clear of walls and islands; where it cannot, it retracts and enters again.",
+            "Profile ramp descends along the contour at the ramp angle; Plunge feeds straight down and needs a plunge-capable end mill. Both enter at 25% feed. At depth the loops spiral into each other, ending with the whole wall. Between spirals the tool steps up to 1.5 stepovers clear of walls and islands, or retracts and enters again.",
             "A loop too short for its ramp, one the ramp would have to go round more than ten times (twice in a rest pass's corners, where little of the cutter meets material), plunges instead. Below the first level a loop the tool enters again rapids down to 0.5 mm over the level before, where the cutter has already been.",
             Some(Ramp),
         ),
