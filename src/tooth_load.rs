@@ -876,8 +876,9 @@ struct Feeding {
 /// machine's most feed and `FASTEST` times the move's, and at least
 /// `SLOWEST` of it; rounded down
 /// to a whole power of `FEED_STEP` times the programmed feed. Where no
-/// tooth meets material the move's programmed feed is kept, or a slower
-/// one a sample from a cut. A feed faster than those round it for less
+/// tooth meets material there is no chip to keep: the machine's most feed,
+/// or `FASTEST` times the programmed one where it has none, or a slower one
+/// a sample from a cut. A feed faster than those round it for less
 /// than two samples along the path (two thirds of the cutter's radius) is
 /// brought down to theirs: at a sample, never faster than wanted. Each cutting move is split
 /// where its feed changes, each piece taking its own; every move is timed
@@ -889,8 +890,9 @@ fn refeed(plan: &Plan, load: &ToothLoad, f: Feeding) -> Refed {
     let reach = sample_step(plan) as f64;
     // Each cutting move's feed at each of its samples, then smoothed over
     // each run of cutting moves the cutter goes along without a rapid.
-    // In the air a sample wants no feed of its own: the programmed one
-    // there, or a slower one coming from a cut a sample ahead or behind.
+    // In the air a sample wants no feed of its own: the fastest there,
+    // or a slower one coming from a cut a sample ahead or behind.
+    let flying = f.fastest.min(f.programmed * FASTEST);
     let mut feeds: Vec<Vec<f32>> = vec![vec![]; plan.moves.len()];
     let mut run: Vec<(usize, Option<f32>)> = vec![];
     let mut wanted = vec![];
@@ -901,7 +903,7 @@ fn refeed(plan: &Plan, load: &ToothLoad, f: Feeding) -> Refed {
             let low = slide(wanted, along, reach, false);
             let smoothed = slide(&low, along, reach, true);
             for (&(i, air), feed) in run.iter().zip(smoothed) {
-                feeds[i].push(air.map_or(feed, |programmed| feed.min(programmed)));
+                feeds[i].push(air.map_or(feed, |fastest| feed.min(fastest)));
             }
             run.clear();
             wanted.clear();
@@ -936,7 +938,7 @@ fn refeed(plan: &Plan, load: &ToothLoad, f: Feeding) -> Refed {
                     .min(m.feed * FASTEST)
                     .max(m.feed * SLOWEST)
             };
-            run.push((i, (force <= 0.).then_some(m.feed)));
+            run.push((i, (force <= 0.).then_some(flying)));
             wanted.push(feed);
             along.push(travelled + (k as f64 + 0.5) * piece);
         }
@@ -1357,28 +1359,35 @@ mod tests {
         assert!(refed.moves.iter().all(|m| m.feed >= 150.));
     }
     #[test]
-    fn moves_in_the_air_keep_the_programmed_feed() {
-        // Above the stock throughout: nothing changes.
+    fn moves_in_the_air_take_the_fastest_feed() {
+        // Above the stock throughout: the machine's most feed.
         let above = sim(&[[-60., 0., 41.], [60., 0., 41.]], CutterShape::Flat, &[]);
-        let refed = refeed(&above.plan, &load(&above, HELIX), feeding(100., 2000.));
+        let refed = refeed(&above.plan, &load(&above, HELIX), feeding(100., 1000.));
         assert_eq!(refed.moves.len(), above.plan.moves.len());
-        assert!(refed.moves.iter().all(|m| m.feed == 600.));
+        assert!(refed.moves.iter().all(|m| m.feed == 1000.));
+        // On a machine with no most feed, `FASTEST` times the programmed.
+        let refed = refeed(
+            &above.plan,
+            &load(&above, HELIX),
+            feeding(100., f32::INFINITY),
+        );
+        assert!(refed.moves.iter().all(|m| m.feed == 600. * FASTEST));
         // Back along the slot it cut, over nothing: slowed only within a
-        // cutter's reach of the slot's end, 600 mm/min beyond.
+        // cutter's reach of the slot's end, 1000 mm/min beyond.
         let back = sim(
             &[[-60., 0., 36.], [60., 0., 36.], [-60., 0., 36.]],
             CutterShape::Flat,
             &[],
         );
         let load = load(&back, HELIX);
-        let refed = refeed(&back.plan, &load, feeding(load.peak / 2., 2000.));
+        let refed = refeed(&back.plan, &load, feeding(load.peak / 2., 1000.));
         assert!(piece_at(&refed, [0., 0., 36.]).0 < 400.);
         let last = refed.moves.last().unwrap();
-        assert_eq!((last.to, last.feed), ([-60., 0., 36.], 600.));
+        assert_eq!((last.to, last.feed), ([-60., 0., 36.], 1000.));
         let returning: Vec<&Move> = (refed.moves.iter())
             .filter(|m| m.to[0] < m.from[0] && m.from[0] + m.to[0] < 2. * (60. - 3. * 5.))
             .collect();
-        assert!(!returning.is_empty() && returning.iter().all(|m| m.feed == 600.));
+        assert!(!returning.is_empty() && returning.iter().all(|m| m.feed == 1000.));
     }
     #[test]
     fn a_short_fast_stretch_is_smoothed_away_and_a_short_slow_one_kept() {
