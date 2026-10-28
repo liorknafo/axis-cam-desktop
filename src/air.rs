@@ -584,6 +584,27 @@ fn relink(
         };
         return (plan, Some(nothing));
     }
+    // The level each move cuts at, or the one before it where it cuts at
+    // none (a flat feed's Z), and the one after: a link from one level to
+    // another keeps going up to clearance, where a run on the UC100 splits
+    // the operation into the steps it can start at (`run::plan_steps`).
+    let flat = |m: &Move| m.motion == Motion::Feed && (m.from[2] - m.to[2]).abs() < 1e-4;
+    let mut before = vec![None; moves.len()];
+    let mut level = None;
+    for (k, m) in moves.iter().enumerate() {
+        if flat(m) {
+            level = Some(m.to[2]);
+        }
+        before[k] = level;
+    }
+    let mut after = vec![None; moves.len()];
+    level = None;
+    for (k, m) in moves.iter().enumerate().rev() {
+        if flat(m) {
+            level = Some(m.to[2]);
+        }
+        after[k] = level;
+    }
     // A link's descent feeds at the plan's cutting feed down a column
     // proven clear, as Adaptive's own links feed down, ending `pad` short
     // of what the cutter meets; elsewhere, onto stock no earlier cut
@@ -678,7 +699,11 @@ fn relink(
         };
         // The plan's last retract stays at clearance, where the next
         // operation starts.
-        let across = j < pieces.len();
+        let across = j < pieces.len()
+            && match (before[stretch[0].index], after[pieces[j].index]) {
+                (Some(a), Some(b)) => (a - b).abs() < 0.005,
+                _ => false,
+            };
         let link = Some(link_at(hop))
             .filter(|link| across && clear(link))
             .unwrap_or_else(|| link_at(clearance));
