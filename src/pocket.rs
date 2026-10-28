@@ -1456,15 +1456,21 @@ fn distance(p: &Polygon, q: (f64, f64)) -> f64 {
         })
         .fold(f64::INFINITY, f64::min)
 }
-/// `region` with its holes filled.
+/// `region` with its holes filled: its outlines joined into one, so that an
+/// outline inside another (an island in a hole, or a sliver left beside an
+/// edge) is no edge of its own for the rings offset from it to follow.
 fn outline(region: &Region) -> Region {
-    let loops: Vec<Polygon> = region.clone().into();
-    Paths::from(
-        loops
-            .into_iter()
-            .filter(|p| area(p) > 0.)
-            .collect::<Vec<_>>(),
-    )
+    let filled = |region: Region| -> Vec<Polygon> {
+        let loops: Vec<Polygon> = region.into();
+        loops.into_iter().filter(|p| area(p) > 0.).collect()
+    };
+    // Joined twice: an island in a hole is an outline again once the hole
+    // is gone, inside the one round it.
+    (0..2).fold(region.clone(), |region, _| {
+        let loops = filled(region);
+        union::<Milli>(loops.clone(), Vec::<Polygon>::new(), FillRule::NonZero)
+            .unwrap_or_else(|_| Paths::from(loops))
+    })
 }
 /// The box the tool sweeps with its centre in `centres`, at every height.
 pub(crate) fn envelope(centres: &Region, radius: f32) -> crate::mesh::Bounds {
@@ -4598,6 +4604,38 @@ mod tests {
             .moves
             .len()
         );
+    }
+    #[test]
+    fn an_outline_inside_another_leaves_no_edge_for_the_rings() {
+        // A 20 × 20 floor with a sliver inside it and touching its edge, as
+        // a floor's triangles can leave, and a hole with an island in it:
+        // one outline, so each ring is one loop with no edge of the sliver.
+        let square = |x: f64, y: f64, xx: f64, yy: f64| vec![(x, y), (xx, y), (xx, yy), (x, yy)];
+        let mut hole = square(-6., -6., 6., 6.);
+        hole.reverse();
+        let floor: Region = Paths::from(vec![
+            square(-10., -10., 10., 10.),
+            square(-10., -2., -3., -1.9999),
+            hole,
+            square(-3., -3., 3., 3.),
+        ]);
+        let filled: Vec<Polygon> = outline(&floor).into();
+        assert_eq!(filled.len(), 1);
+        assert!((area(&filled[0]) - 400.).abs() < 1e-6);
+        let centres = Centres::Floor {
+            area: outline(&floor),
+            above: Paths::from(vec![square(-20., -20., 20., 20.), {
+                let mut wall = square(-10., -10., 10., 10.);
+                wall.reverse();
+                wall
+            }]),
+            reach: 1.5,
+            keepout: 1.5,
+        };
+        for ring in 0..6 {
+            let loops: Vec<Polygon> = centres.at(ring as f64 * 1.2).unwrap().into();
+            assert_eq!(loops.len(), 1, "ring {ring}: {loops:?}");
+        }
     }
     #[test]
     fn a_rest_pass_goes_down_where_the_earlier_cutter_cleared() {
