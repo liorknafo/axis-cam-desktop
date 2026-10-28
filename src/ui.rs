@@ -2761,10 +2761,15 @@ fn scene_panels(
                     .color(WARN)
                 } else {
                     muted(format!(
-                        "Air taken out: {} stretch{} ({:.0} mm of feed) replaced by rapids, {:.1} min saved",
+                        "Air taken out: {} stretch{} ({:.0} mm of feed) replaced by rapids{}, {:.1} min saved",
                         air.stretches,
                         if air.stretches == 1 { "" } else { "es" },
                         air.air,
+                        match air.lowered {
+                            0 => String::new(),
+                            1 => ", 1 link lowered to just over the stock".into(),
+                            n => format!(", {n} links lowered to just over the stock"),
+                        },
                         air.saved / 60.
                     ))
                     .size(12)
