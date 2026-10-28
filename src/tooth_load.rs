@@ -877,8 +877,8 @@ struct Feeding {
 /// `SLOWEST` of it; rounded down
 /// to a whole power of `FEED_STEP` times the programmed feed. Where no
 /// tooth meets material there is no chip to keep: the machine's most feed,
-/// or `FASTEST` times the programmed one where it has none, or a slower one
-/// a sample from a cut. A feed faster than those round it for less
+/// or `FASTEST` times the programmed one where it has none; within the
+/// cutter's radius and a sample of a cut, the slowest that cut wants there. A feed faster than those round it for less
 /// than two samples along the path (two thirds of the cutter's radius) is
 /// brought down to theirs: at a sample, never faster than wanted. Each cutting move is split
 /// where its feed changes, each piece taking its own; every move is timed
@@ -890,9 +890,12 @@ fn refeed(plan: &Plan, load: &ToothLoad, f: Feeding) -> Refed {
     let reach = sample_step(plan) as f64;
     // Each cutting move's feed at each of its samples, then smoothed over
     // each run of cutting moves the cutter goes along without a rapid.
-    // In the air a sample wants no feed of its own: the fastest there,
-    // or a slower one coming from a cut a sample ahead or behind.
+    // In the air a sample wants no feed of its own: the fastest there, but
+    // within the cutter's radius and a sample of a cut the slowest that cut
+    // wants, so that the tool slows before it meets material between two
+    // samples and gets back up only once clear of it.
     let flying = f.fastest.min(f.programmed * FASTEST);
+    let guard = plan.radius as f64 + reach;
     let mut feeds: Vec<Vec<f32>> = vec![vec![]; plan.moves.len()];
     let mut run: Vec<(usize, Option<f32>)> = vec![];
     let mut wanted = vec![];
@@ -902,8 +905,12 @@ fn refeed(plan: &Plan, load: &ToothLoad, f: Feeding) -> Refed {
         |run: &mut Vec<(usize, Option<f32>)>, wanted: &mut Vec<f32>, along: &mut Vec<f64>| {
             let low = slide(wanted, along, reach, false);
             let smoothed = slide(&low, along, reach, true);
-            for (&(i, air), feed) in run.iter().zip(smoothed) {
-                feeds[i].push(air.map_or(feed, |fastest| feed.min(fastest)));
+            let cuts: Vec<f32> = (run.iter().zip(wanted.iter()))
+                .map(|(&(_, air), &w)| if air.is_some() { f32::INFINITY } else { w })
+                .collect();
+            let near = slide(&cuts, along, guard, false);
+            for ((&(i, air), feed), near) in run.iter().zip(smoothed).zip(near) {
+                feeds[i].push(air.map_or(feed, |fastest| feed.min(fastest).min(near)));
             }
             run.clear();
             wanted.clear();
@@ -1388,6 +1395,75 @@ mod tests {
             .filter(|m| m.to[0] < m.from[0] && m.from[0] + m.to[0] < 2. * (60. - 3. * 5.))
             .collect();
         assert!(!returning.is_empty() && returning.iter().all(|m| m.feed == 1000.));
+    }
+    #[test]
+    fn the_tool_slows_from_the_air_feed_before_it_meets_material() {
+        // A Ø10 and a Ø3 slot into the stock's −X side from 1 to 20 mm out,
+        // starting at points that put the samples anywhere about the
+        // contact: measured again every 0.02 mm, nowhere the cutter touches
+        // material is it faster than a cut's own feed (`flying` only in the
+        // air), and air within the cutter's radius of the cut is not fed up.
+        for radius in [5., 1.5] {
+            for out in [1., 2.3, 6., 20.] {
+                for shift in [0., 0.07, 0.19, 0.31, 0.43] {
+                    let start = -50. - radius - out - shift;
+                    let mut s = sim(&[[start, 0., 36.], [0., 0., 36.]], CutterShape::Flat, &[]);
+                    s.plan.radius = radius;
+                    let load = load(&s, HELIX);
+                    let slot = load.at(0, 0.99).unwrap();
+                    let refed = refeed(&s.plan, &load, feeding(slot, 2000.));
+                    let cutting = (refed.moves.iter().zip(&refed.load.moves))
+                        .filter(|(_, f)| f.iter().any(|f| *f > 0.))
+                        .map(|(m, _)| m.feed)
+                        .fold(0., f32::max);
+                    let pieces = |m: &Move| (distance(m.from, m.to) / 0.02).ceil().max(1.) as usize;
+                    let fine: Vec<[f32; 3]> = (refed.moves.iter())
+                        .flat_map(|m| {
+                            let n = pieces(m);
+                            (1..=n).map(move |k| {
+                                std::array::from_fn(|i| {
+                                    m.from[i] + (m.to[i] - m.from[i]) * k as f32 / n as f32
+                                })
+                            })
+                        })
+                        .collect();
+                    let feeds: Vec<f32> = (refed.moves.iter())
+                        .flat_map(|m| std::iter::repeat_n(m.feed, pieces(m)))
+                        .collect();
+                    let mut dense = sim(&fine, CutterShape::Flat, &[]);
+                    dense.plan.radius = radius;
+                    for (m, &feed) in dense.plan.moves.iter_mut().zip(&feeds) {
+                        m.feed = feed;
+                    }
+                    for (k, f) in load_of(&dense).iter().enumerate() {
+                        assert!(
+                            *f <= 0. || feeds[k] <= cutting,
+                            "Ø{} {out} {shift}: F{} at X{}",
+                            2. * radius,
+                            feeds[k],
+                            fine[k][0]
+                        );
+                    }
+                    // Where the samples fall decides between the two.
+                    let step = sample_step(&s.plan);
+                    if out <= radius || out >= radius + 3. * step {
+                        assert_eq!(
+                            feeds[0] > cutting,
+                            out > radius,
+                            "Ø{} {out} {shift}: F{}",
+                            2. * radius,
+                            feeds[0]
+                        );
+                    }
+                }
+            }
+        }
+    }
+    /// The force on a tooth at each move of `sim`, one sample each.
+    fn load_of(sim: &Simulation) -> Vec<f32> {
+        (load(sim, HELIX).moves.iter())
+            .map(|m| m.iter().copied().fold(0., f32::max))
+            .collect()
     }
     #[test]
     fn a_short_fast_stretch_is_smoothed_away_and_a_short_slow_one_kept() {
