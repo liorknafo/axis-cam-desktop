@@ -1379,20 +1379,35 @@ mod tests {
     }
     #[test]
     fn moves_in_the_air_take_the_fastest_feed() {
-        // Above the stock throughout: the machine's most feed.
+        // Above the stock throughout: the machine's most feed, but within the
+        // cutter's radius and a sample (6 mm) of either end, where it may
+        // meet material no sample saw, its own.
         let above = sim(&[[-60., 0., 41.], [60., 0., 41.]], CutterShape::Flat, &[]);
-        let refed = refeed(&above.plan, &load(&above, HELIX), feeding(100., 1000.));
-        assert_eq!(refed.moves.len(), above.plan.moves.len());
-        assert!(refed.moves.iter().all(|m| m.feed == 1000.));
-        // On a machine with no most feed, `FASTEST` times the programmed.
-        let refed = refeed(
-            &above.plan,
-            &load(&above, HELIX),
-            feeding(100., f32::INFINITY),
+        let ends = |refed: &Refed, middle: f32| {
+            assert_eq!(piece_at(refed, [0., 0., 41.]).0, middle);
+            for m in &refed.moves {
+                let far = m.from[0].abs().max(m.to[0].abs());
+                assert!(
+                    m.feed == middle || (m.feed == 600. && far > 60. - 7.),
+                    "{m:?}"
+                );
+            }
+            assert_eq!(refed.moves[0].feed, 600.);
+            assert_eq!(refed.moves.last().unwrap().feed, 600.);
+        };
+        ends(
+            &refeed(&above.plan, &load(&above, HELIX), feeding(100., 1000.)),
+            1000.,
         );
-        assert!(refed.moves.iter().all(|m| m.feed == 600. * FASTEST));
-        // Back along the slot it cut, over nothing: slowed only within a
-        // cutter's reach of the slot's end, 1000 mm/min beyond.
+        // On a machine with no most feed, `FASTEST` times the programmed.
+        let load_above = load(&above, HELIX);
+        ends(
+            &refeed(&above.plan, &load_above, feeding(100., f32::INFINITY)),
+            600. * FASTEST,
+        );
+        // Back along the slot it cut, over nothing: slowed within a cutter's
+        // reach of the slot's end and of the end of the pass, 1000 mm/min
+        // between.
         let back = sim(
             &[[-60., 0., 36.], [60., 0., 36.], [-60., 0., 36.]],
             CutterShape::Flat,
@@ -1402,11 +1417,15 @@ mod tests {
         let refed = refeed(&back.plan, &load, feeding(load.peak / 2., 1000.));
         assert!(piece_at(&refed, [0., 0., 36.]).0 < 400.);
         let last = refed.moves.last().unwrap();
-        assert_eq!((last.to, last.feed), ([-60., 0., 36.], 1000.));
-        let returning: Vec<&Move> = (refed.moves.iter())
-            .filter(|m| m.to[0] < m.from[0] && m.from[0] + m.to[0] < 2. * (60. - 3. * 5.))
-            .collect();
-        assert!(!returning.is_empty() && returning.iter().all(|m| m.feed == 1000.));
+        assert_eq!((last.to, last.feed), ([-60., 0., 36.], 600.));
+        let returning = (refed.moves.iter())
+            .find(|m| m.to[0] < m.from[0] && m.from[0] >= 0. && m.to[0] <= 0.)
+            .unwrap();
+        assert_eq!(returning.feed, 1000.);
+        assert!(
+            returning.from[0] > 60. - 3. * 5. - 1. && returning.to[0] < -60. + 7.,
+            "{returning:?}"
+        );
     }
     #[test]
     fn the_tool_slows_from_the_air_feed_before_it_meets_material() {
