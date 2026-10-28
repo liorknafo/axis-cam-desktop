@@ -15,8 +15,9 @@ use clipper2::{EndType, FillRule, JoinType, Milli, Paths, difference, intersect,
 pub(crate) type Polygon = Vec<(f64, f64)>;
 pub(crate) type Region = Paths<Milli>;
 /// A loop to cut and, when the tool reaches it at depth from the loop
-/// before, the points it feeds through to its start (`step`).
-type Loop = (Polygon, Option<Vec<(f64, f64)>>);
+/// before, the points it feeds through to its start (`step`), and its ring
+/// (`usize::MAX` for a finishing repeat).
+type Loop = (Polygon, Option<Polygon>, usize);
 /// A zone's offset loops (outermost first), where its tool may step over at
 /// depth, its first cutting height, its target and, for what earlier cuts
 /// left of a zone, where that whole zone's tool centre may go.
@@ -158,6 +159,16 @@ fn step(
     reach: f64,
     allowed: &[Polygon],
 ) -> Option<(Vec<(f64, f64)>, Polygon)> {
+    step_at(from, to, reach, allowed, false)
+}
+/// `step`, optionally ending at the chosen start of `to`.
+fn step_at(
+    from: &[(f64, f64)],
+    to: &[(f64, f64)],
+    reach: f64,
+    allowed: &[Polygon],
+    fixed: bool,
+) -> Option<(Polygon, Polygon)> {
     let n = from.len();
     // Distance along `from` from its start to each vertex.
     let mut along = vec![0.];
@@ -170,12 +181,25 @@ fn step(
     // edge): each vertex with the nearest point of the other loop.
     let mut pairs = vec![];
     for (i, &p) in from.iter().enumerate() {
-        let (d, q, e) = nearest(to, p);
+        let (d, q, mut e) = nearest(to, p);
+        while (q.0 - to[(e + 1) % to.len()].0).hypot(q.1 - to[(e + 1) % to.len()].1) < 1e-8 {
+            e = (e + 1) % to.len();
+        }
         pairs.push((d, p, i, q, e));
     }
     for (j, &q) in to.iter().enumerate() {
         let (d, p, e) = nearest(from, q);
         pairs.push((d, p, e, q, j));
+    }
+    if fixed {
+        pairs.clear();
+        let (d, p, e) = nearest(from, to[0]);
+        pairs.push((d, p, e, to[0], 0));
+        pairs.extend(
+            from.iter()
+                .enumerate()
+                .map(|(i, &p)| ((p.0 - to[0].0).hypot(p.1 - to[0].1), p, i, to[0], 0)),
+        );
     }
     let mut ways: Vec<_> = pairs
         .into_iter()
@@ -311,16 +335,297 @@ fn ordered(rings: Vec<Vec<Polygon>>, finish: usize, reach: f64, allowed: &[Polyg
             }
         };
         done[i] = true;
-        out.push((path.clone(), points));
+        out.push((path.clone(), points, paths[i].0));
         if paths[i].0 == 0 {
             for _ in 0..finish {
-                out.push((path.clone(), Some(vec![])));
+                out.push((path.clone(), Some(vec![]), usize::MAX));
             }
         }
         last = Some((path, bounds[i]));
     }
     out
 }
+/// A closed entry contour, its open cutting path and the contour it ends on.
+struct Pass {
+    entry: Polygon,
+    path: Polygon,
+    way: Option<Polygon>,
+    last: Polygon,
+}
+/// A lap, including its return to the start.
+fn closed(path: &Polygon) -> Polygon {
+    path.iter().chain(path.first()).copied().collect()
+}
+/// Corresponding points round the end of successive laps, and their blend.
+type Tail = Vec<((f64, f64), f64)>;
+/// The end of `from` blended onto `to`, with both tangents held. Each lap
+/// uses the same blend at corresponding points, keeping the stepover.
+fn blend(
+    from: &Polygon,
+    to: &Polygon,
+    width: f64,
+    length: f64,
+    allowed: &[Polygon],
+    tail: Option<&Tail>,
+) -> Option<(Polygon, Polygon, Tail)> {
+    let lap = closed(from);
+    let mut ending = vec![];
+    if tail.is_none() {
+        let lengths: Vec<f64> = lap
+            .windows(2)
+            .map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
+            .collect();
+        let total: f64 = lengths.iter().sum();
+        if total < 0.00001 {
+            return None;
+        }
+        let length = length.min(total / 2.);
+        let mut travelled = 0.;
+        for (edge, &distance) in lengths.iter().enumerate() {
+            if distance < 1e-9 {
+                continue;
+            }
+            let first = ((total - length - travelled) / distance).clamp(0., 1.);
+            if first < 1. {
+                let count = ((1. - first) * distance / (width / 16.).min(0.1))
+                    .ceil()
+                    .max(1.) as usize;
+                let (a, b) = (lap[edge], lap[edge + 1]);
+                for k in 0..=count {
+                    let t = first + (1. - first) * k as f64 / count as f64;
+                    let u = ((travelled + t * distance - (total - length)) / length).clamp(0., 1.);
+                    ending.push(((a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1)), u));
+                }
+            }
+            travelled += distance;
+        }
+    }
+    let tail = tail.unwrap_or(&ending);
+    let (_, _, edge) = nearest(from, tail.first()?.0);
+    let mut path = from[..=edge].to_vec();
+    let mut projected = vec![];
+    let mut previous: Option<((f64, f64), usize)> = None;
+    let mut end = None;
+    for &(p, u) in tail {
+        let (d, q, mut e) = nearest(to, p);
+        while (q.0 - to[(e + 1) % to.len()].0).hypot(q.1 - to[(e + 1) % to.len()].1) < 1e-8 {
+            e = (e + 1) % to.len();
+        }
+        if d > width + 0.003 {
+            return None;
+        }
+        if let Some((old, old_edge)) = previous {
+            // A projection must go forward, never jump across a neck or
+            // wind round the other side of a concavity.
+            let mut advance = 0.;
+            let mut edge = old_edge;
+            let mut at = old;
+            while edge != e {
+                let next = to[(edge + 1) % to.len()];
+                advance += (next.0 - at.0).hypot(next.1 - at.1);
+                if advance > width * 2. {
+                    return None;
+                }
+                edge = (edge + 1) % to.len();
+                at = next;
+            }
+            let c = to[e];
+            let next = to[(e + 1) % to.len()];
+            if (q.0 - at.0) * (next.0 - c.0) + (q.1 - at.1) * (next.1 - c.1) < -1e-7 {
+                return None;
+            }
+            advance += (q.0 - at.0).hypot(q.1 - at.1);
+            if advance > width / 2. + 0.8 {
+                return None;
+            }
+        }
+        previous = Some((q, e));
+        let s = u * u * u * (10. + u * (-15. + 6. * u));
+        let point = (p.0 + s * (q.0 - p.0), p.1 + s * (q.1 - p.1));
+        let last = *path.last()?;
+        // A last blend ends on the exact wall contour. Exclude only the
+        // endpoints when testing crossings, so touching that contour is
+        // allowed but no chord can cut across a concave wall or an island.
+        let on = |p| allowed.iter().any(|path| nearest(path, p).0 < 1e-8);
+        let middle = ((last.0 + point.0) / 2., (last.1 + point.1) / 2.);
+        let inset = |t: f64| {
+            (
+                last.0 + t * (point.0 - last.0),
+                last.1 + t * (point.1 - last.1),
+            )
+        };
+        if !(inside(allowed, point) || on(point))
+            || !(inside(allowed, middle) || on(middle))
+            || ((last.0 - point.0).hypot(last.1 - point.1) > 1e-8
+                && crosses(allowed, inset(1e-7), inset(1. - 1e-7)))
+        {
+            return None;
+        }
+        path.push(point);
+        projected.push((q, u));
+        end = Some((q, e));
+    }
+    let (q, e) = end?;
+    Some((path, begun(to, q, e), projected))
+}
+/// The floor swept by open cutter paths, joined before comparing coverage.
+fn swept(paths: Vec<Polygon>, radius: f64) -> Result<Region, String> {
+    let paths: Region = paths.into();
+    union::<Milli>(
+        paths.inflate(radius, JoinType::Round, EndType::Round, 2.),
+        Vec::<Polygon>::new(),
+        FillRule::NonZero,
+    )
+    .map_err(|e| e.to_string())
+}
+/// One spiral per unbranched chain, in the order chosen by `ordered`.
+/// Branches keep their ordinary links. The last lap cuts its whole contour.
+fn spiralled(
+    loops: Vec<Loop>,
+    width: f64,
+    radius: f64,
+    allowed: &[Polygon],
+) -> Result<Vec<Pass>, String> {
+    let adjacent = |i: usize, j: usize| {
+        let (a, _, r) = &loops[i];
+        let (b, _, s) = &loops[j];
+        *r != usize::MAX
+            && *s != usize::MAX
+            && *r == *s + 1
+            && area(a) * area(b) > 0.
+            && if area(a).abs() < area(b).abs() {
+                inside(std::slice::from_ref(b), a[0])
+            } else {
+                inside(std::slice::from_ref(a), b[0])
+            }
+            && gap(a, b) <= width * 1.5
+    };
+    let next: Vec<Vec<usize>> = (0..loops.len())
+        .map(|i| (0..loops.len()).filter(|&j| adjacent(i, j)).collect())
+        .collect();
+    // The old swept floor, allowing 5 µm for integer offsets and cutter
+    // caps. Every accepted chain preserves it, including earlier spirals.
+    let safe: Vec<Polygon> = loops
+        .iter()
+        .filter(|l| l.2 == 0)
+        .map(|l| l.0.clone())
+        .collect();
+    let before = swept(
+        loops.iter().map(|l| closed(&l.0)).collect(),
+        (radius - 0.005).max(radius * 0.99),
+    )?;
+    let mut out: Vec<Pass> = vec![];
+    let mut i = 0;
+    while i < loops.len() {
+        crate::progress::step(i)?;
+        let mut stop = i + 1;
+        while stop < loops.len()
+            && next[stop - 1] == [stop]
+            && next.iter().filter(|n| n.contains(&stop)).count() == 1
+        {
+            stop += 1;
+        }
+        let (entry, way) = if let Some(previous) = out.last() {
+            if loops[i].2 == usize::MAX {
+                (previous.last.clone(), Some(vec![]))
+            } else if let Some((points, path)) =
+                step(&previous.last, &loops[i].0, width * 1.5, allowed)
+            {
+                (path, Some(points))
+            } else {
+                (loops[i].0.clone(), None)
+            }
+        } else {
+            (loops[i].0.clone(), None)
+        };
+        let mut chosen = None;
+        if stop > i + 1 {
+            let mut starts = vec![(entry.clone(), way.clone())];
+            // Try long sides as well as the routed start: a corner's nearest
+            // projection can jump to the other side of an offset contour.
+            let first = &loops[i].0;
+            let mut edges: Vec<_> = (0..first.len()).collect();
+            let length = |i: usize| {
+                let p = first[i];
+                let q = first[(i + 1) % first.len()];
+                (p.0 - q.0).hypot(p.1 - q.1)
+            };
+            edges.sort_by(|&a, &b| length(b).total_cmp(&length(a)));
+            for e in edges.into_iter().take(16) {
+                let a = first[e];
+                let b = first[(e + 1) % first.len()];
+                let seed = begun(first, ((a.0 + b.0) / 2., (a.1 + b.1) / 2.), e);
+                let route = out
+                    .last()
+                    .and_then(|p| step_at(&p.last, &seed, width * 1.5, allowed, true));
+                let candidate =
+                    route.map_or_else(|| (seed, None), |(points, path)| (path, Some(points)));
+                // Keep an existing at-depth entry when choosing a seam.
+                if way.is_none() || candidate.1.is_some() {
+                    starts.push(candidate);
+                }
+            }
+            'starts: for (entry, way) in starts {
+                for stretch in [4., 2., 1.] {
+                    let mut path = vec![];
+                    let mut last = entry.clone();
+                    let mut tail = None;
+                    for item in &loops[i + 1..stop] {
+                        if let Some((lap, outer, ending)) =
+                            blend(&last, &item.0, width, width * stretch, &safe, tail.as_ref())
+                        {
+                            path.extend(lap.into_iter().skip(usize::from(!path.is_empty())));
+                            last = outer;
+                            tail = Some(ending);
+                        } else {
+                            path.clear();
+                            break;
+                        }
+                    }
+                    if path.is_empty() {
+                        continue;
+                    }
+                    path.extend(closed(&last).into_iter().skip(1));
+                    if path.len() > crate::cam::CEILING {
+                        return Err(crate::cam::too_many("moves"));
+                    }
+                    // Include the earlier spirals and the pending rings:
+                    // stock inside this chain can already have been cut.
+                    let after = swept(
+                        out.iter()
+                            .map(|p| p.path.clone())
+                            .chain(std::iter::once(path.clone()))
+                            .chain(loops[stop..].iter().map(|l| closed(&l.0)))
+                            .collect(),
+                        radius,
+                    )?;
+                    let missing = difference::<Milli>(before.clone(), after, FillRule::NonZero)
+                        .map_err(|e| e.to_string())?;
+                    if !missing.contains_points() {
+                        chosen = Some(Pass {
+                            entry,
+                            path,
+                            way,
+                            last,
+                        });
+                        break 'starts;
+                    }
+                }
+            }
+        }
+        // A chain too tight to blend safely retains its proven contours.
+        let end = if chosen.is_some() { stop } else { i + 1 };
+        out.push(chosen.unwrap_or_else(|| Pass {
+            path: closed(&entry),
+            last: entry.clone(),
+            entry,
+            way,
+        }));
+        i = end;
+    }
+    Ok(out)
+}
+
 fn push(
     plan: &mut Plan,
     position: &mut [f32; 3],
@@ -2451,6 +2756,19 @@ fn finish_plan(setup: &Setup, op: &Operation, job: Job) -> Result<Plan, String> 
             }
         }
         let loops = ordered(rings, finish as usize, reach, &allowed);
+        let loops = if profile_only {
+            loops
+                .into_iter()
+                .map(|(entry, way, _)| Pass {
+                    path: closed(&entry),
+                    last: entry.clone(),
+                    entry,
+                    way,
+                })
+                .collect()
+        } else {
+            spiralled(loops, stepover as f64, radius as f64, &allowed)?
+        };
         // Every zone comes down where the highest begins: an opening's
         // column was cleared by this pocket's floor zone, which the export's
         // check of rapids cannot see.
@@ -2466,7 +2784,9 @@ fn finish_plan(setup: &Setup, op: &Operation, job: Job) -> Result<Plan, String> 
             } else {
                 (previous_z + ENTRY).min(approach)
             };
-            for (i, (path, way)) in loops.iter().enumerate() {
+            for (i, pass) in loops.iter().enumerate() {
+                let path = &pass.entry;
+                let way = &pass.way;
                 let start = [path[0].0 as f32, path[0].1 as f32];
                 if let Some(points) = way {
                     // To the next loop at depth: along the floor just cut, then
@@ -2621,7 +2941,7 @@ fn finish_plan(setup: &Setup, op: &Operation, job: Job) -> Result<Plan, String> 
                         }
                     }
                 }
-                for point in path.iter().skip(1).chain(std::iter::once(&path[0])) {
+                for point in pass.path.iter().skip(1) {
                     push(
                         &mut plan,
                         &mut position,
@@ -2955,6 +3275,177 @@ mod tests {
         }
         loops
     }
+    /// Offset rectangles, including the small last ring, as a simple floor.
+    fn spiral_rectangle() -> (Vec<Vec<Polygon>>, Vec<Polygon>) {
+        let wall = vec![(-10., -8.), (10., -8.), (10., 8.), (-10., 8.)];
+        let region: Region = vec![wall].into();
+        let rings = (0..)
+            .map(|i| {
+                Vec::<Polygon>::from(region.inflate(
+                    -0.8 * i as f64,
+                    JoinType::Round,
+                    EndType::Polygon,
+                    2.,
+                ))
+            })
+            .take_while(|p| !p.is_empty())
+            .collect();
+        (
+            rings,
+            vec![vec![(-11., -9.), (11., -9.), (11., 9.), (-11., 9.)]],
+        )
+    }
+    #[test]
+    fn corresponding_spiral_laps_never_exceed_the_stepover_round_an_island() {
+        let allowed = vec![vec![(-20., -20.), (20., -20.), (20., 20.), (-20., 20.)]];
+        for shrinking in [false, true] {
+            let circle = |r: f64| -> Polygon {
+                (0..256)
+                    .map(|i| {
+                        let angle = i as f64 * std::f64::consts::TAU / 256.
+                            * if shrinking { -1. } else { 1. };
+                        (r * angle.cos(), r * angle.sin())
+                    })
+                    .collect()
+            };
+            let radii: Vec<_> = (0..8)
+                .map(|i| {
+                    if shrinking {
+                        10. - i as f64 * 0.8
+                    } else {
+                        2. + i as f64 * 0.8
+                    }
+                })
+                .collect();
+            let mut from = circle(radii[0]);
+            let mut tail = None;
+            let mut previous: Option<Polygon> = None;
+            for &r in &radii[1..] {
+                let (path, last, ending) =
+                    blend(&from, &circle(r), 0.8, 1.6, &allowed, tail.as_ref())
+                        .unwrap_or_else(|| panic!("shrinking={shrinking} radius={r}"));
+                let bridge = path[path.len() - ending.len()..].to_vec();
+                if let Some(before) = previous {
+                    assert_eq!(before.len(), bridge.len());
+                    for (a, b) in before.iter().zip(&bridge) {
+                        assert!((a.0 - b.0).hypot(a.1 - b.1) <= 0.803);
+                    }
+                }
+                previous = Some(bridge);
+                from = last;
+                tail = Some(ending);
+            }
+        }
+    }
+    #[test]
+    fn a_rectangle_spirals_without_closing_or_stepping_between_laps() {
+        let (rings, allowed) = spiral_rectangle();
+        let wall = rings[0][0].clone();
+        let count = rings.len();
+        let passes = spiralled(ordered(rings, 0, 1.2, &allowed), 0.8, 1., &allowed).unwrap();
+        assert_eq!(passes.len(), 1, "{count} rings should be one spiral");
+        let pass = &passes[0];
+        assert!(pass.way.is_none());
+        assert_ne!(pass.path.first(), pass.path.last());
+        // Only the final wall lap closes. Every original wall vertex occurs,
+        // in order, between its start and its return to that start.
+        let wall_lap = closed(&pass.last);
+        assert!(pass.path.ends_with(&wall_lap[1..]));
+        for point in &wall {
+            assert!(pass.last.contains(point));
+        }
+        // A blend is sampled more finely than one stepover. Long moves are
+        // the straight sides of the existing offset contours, never a join.
+        for w in pass.path.windows(2) {
+            if (w[0].0 - w[1].0).abs() > 1e-8 && (w[0].1 - w[1].1).abs() > 1e-8 {
+                assert!((w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) <= 0.8);
+            }
+        }
+    }
+    #[test]
+    fn a_spiral_removes_the_ring_stock_and_keeps_the_wall_allowance() {
+        let (rings, allowed) = spiral_rectangle();
+        let before: Vec<_> = rings.iter().flatten().map(closed).collect();
+        let passes = spiralled(ordered(rings, 0, 1.2, &allowed), 0.8, 1., &allowed).unwrap();
+        let bounds = crate::mesh::Bounds {
+            min: [-12., -10., 0.],
+            max: [12., 10., 1.],
+        };
+        let blank = crate::simulation::StockGrid {
+            bounds,
+            nx: 480,
+            ny: 400,
+            dx: 0.05,
+            dy: 0.05,
+            heights: vec![1.; 480 * 400],
+        };
+        let cut = |paths: Vec<Polygon>| {
+            let mut stock = blank.clone();
+            for p in paths {
+                for w in p.windows(2) {
+                    stock.cut_shape(
+                        [w[0].0 as f32, w[0].1 as f32, 0.],
+                        [w[1].0 as f32, w[1].1 as f32, 0.],
+                        1.,
+                        crate::simulation::CutterShape::Flat,
+                    );
+                }
+            }
+            stock
+        };
+        let old = cut(before);
+        let new = cut(passes.into_iter().map(|p| p.path).collect());
+        assert_eq!(old.heights, new.heights);
+    }
+    #[test]
+    fn islands_and_separate_pockets_keep_separate_spiral_chains() {
+        let (mut rings, allowed) = spiral_rectangle();
+        // A second, disjoint pocket must have its own entry.
+        let second: Vec<_> = rings
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .map(|p| p.iter().map(|&(x, y)| (x + 50., y)).collect::<Polygon>())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for (a, b) in rings.iter_mut().zip(second) {
+            a.extend(b);
+        }
+        let mut allowed = allowed;
+        allowed.push(allowed[0].iter().map(|&(x, y)| (x + 50., y)).collect());
+        let passes = spiralled(ordered(rings, 1, 1.2, &allowed), 0.8, 1., &allowed).unwrap();
+        assert_eq!(passes.len(), 4, "two spirals and their finishing repeats");
+        assert_eq!(passes.iter().filter(|p| p.way.is_none()).count(), 2);
+        for pair in passes.chunks(2) {
+            assert_eq!(pair[1].path, closed(&pair[0].last));
+        }
+        // A central island has its own clockwise chain, separate from the
+        // counterclockwise wall chain. They meet only at a branch.
+        let region: Region = vec![
+            vec![(-12., -10.), (12., -10.), (12., 10.), (-12., 10.)],
+            vec![(-2., -2.), (-2., 2.), (2., 2.), (2., -2.)],
+        ]
+        .into();
+        let rings: Vec<Vec<Polygon>> = (0..)
+            .map(|i| {
+                Vec::from(region.inflate(-0.8 * i as f64, JoinType::Round, EndType::Polygon, 2.))
+            })
+            .take_while(|p: &Vec<Polygon>| !p.is_empty())
+            .collect();
+        let allowed: Vec<Polygon> = region
+            .inflate(0.01, JoinType::Round, EndType::Polygon, 2.)
+            .into();
+        let original = rings.iter().map(Vec::len).sum::<usize>();
+        let passes = spiralled(ordered(rings, 0, 1.2, &allowed), 0.8, 1., &allowed).unwrap();
+        assert!(passes.len() < original);
+        assert!(passes.iter().any(|p| area(&p.last) < 0.));
+        for pass in passes {
+            for w in pass.path.windows(2) {
+                assert!(!crosses(&allowed, w[0], w[1]));
+            }
+        }
+    }
     #[test]
     fn inside_contour_follows_walls_without_clearing_the_pocket_interior() {
         let (setup, mut op, tool, mesh) = fixture();
@@ -3036,8 +3527,29 @@ mod tests {
         assert!(paths.iter().any(|p| area(p) > 0.) && paths.iter().any(|p| area(p) < 0.));
         op.p.insert("pocket_milling".into(), "Conventional".into());
         let conventional = generate(&setup, &op, &tool, &mesh).unwrap();
-        for (a, b) in paths.iter().zip(loops(&conventional)) {
-            assert!((area(a) + area(&b)).abs() < 0.001);
+        // Spirals need not enclose equal signed areas when reversed: their
+        // seams can differ. Check the complete wall laps' travel instead.
+        let walls: Vec<Polygon> = job(&setup, &op, &tool, &mesh)
+            .unwrap()
+            .zones
+            .into_iter()
+            .flat_map(|z| Vec::<Polygon>::from(z.centres.at(0.).unwrap()))
+            .collect();
+        for wall in walls {
+            let travel = |plan: &Plan| -> f64 {
+                plan.moves
+                    .iter()
+                    .filter(|m| m.cutting_pass && m.from[2] == m.to[2])
+                    .filter(|m| {
+                        [m.from, m.to]
+                            .iter()
+                            .all(|p| nearest(&wall, (p[0] as f64, p[1] as f64)).0 < 0.002)
+                    })
+                    .map(|m| m.from[0] as f64 * m.to[1] as f64 - m.to[0] as f64 * m.from[1] as f64)
+                    .sum()
+            };
+            assert!(travel(&cw) * area(&wall) > 0.);
+            assert!(travel(&conventional) * area(&wall) < 0.);
         }
         op.p.insert("spindle_rotation".into(), "Counterclockwise (CCW)".into());
         let ccw = generate(&setup, &op, &tool, &mesh).unwrap();
@@ -3077,11 +3589,11 @@ mod tests {
         let loops = loops(&plan).len();
         let steps = links(&plan);
         // Each level ramps in where it can, then steps from ring to ring
-        // (and into the finish pass) without leaving the floor.
-        assert!(!steps.is_empty());
-        assert!(entries(&plan) + steps.len() >= loops, "{loops} loops");
+        // (and into the finish pass) without leaving the floor. A cutting
+        // run now holds a whole spiral, so count entries per level instead
+        // of comparing them with the number of closed contours.
         assert!(
-            entries(&plan) < loops / 2,
+            entries(&plan) <= plan.levels * 4,
             "{} entries, {loops} loops",
             entries(&plan)
         );
@@ -3253,7 +3765,7 @@ mod tests {
         let open = vec![square(-100., -100., 200.)];
         let order: Vec<Polygon> = ordered(rings, 1, 1.5, &open)
             .into_iter()
-            .map(|(p, _)| p)
+            .map(|(p, _, _)| p)
             .collect();
         // A loop the tool steps over to starts elsewhere: compare as sets.
         let at = |p: &Polygon| {
@@ -3731,7 +4243,7 @@ mod tests {
                 && run.iter().all(|p| p[2] - dz > 3. - 0.001)
         }));
         // Faster than each floor in an operation of its own, which clears
-        // the depth they share three times.
+        // the depth they share three times. Those separate floors spiral too.
         let alone: f32 = [3., 1., -1.]
             .iter()
             .map(|&z| {
@@ -3739,7 +4251,7 @@ mod tests {
                 generate(&setup, &op, &tool, &mesh).unwrap().duration
             })
             .sum();
-        assert!(plan.duration < alone * 0.85, "{} vs {alone}", plan.duration);
+        assert!(plan.duration < alone * 0.9, "{} vs {alone}", plan.duration);
         // And it leaves the same: the three floors' volume, less the round
         // cutter's corners.
         let mut sim = Simulation::new(plan);
@@ -4737,12 +5249,11 @@ mod tests {
         // It used to ramp into every ring at every level: over the limit.
         assert!(plan.moves.len() < 20_000, "{} moves", plan.moves.len());
         assert_eq!(plan.levels, 4);
-        let loops = loops(&plan).len();
-        // Entries only where a loop is the deepest of its spot (11 of 19
-        // loops a level), not one for every loop.
+        // At most the original 11 entries among 19 rings per level; a
+        // spiral now combines several rings into one cutting run.
         assert!(
-            entries(&plan) * 3 < loops * 2,
-            "{} entries, {loops} loops",
+            entries(&plan) <= plan.levels * 11,
+            "{} entries",
             entries(&plan)
         );
         // No feed move brings the cutter nearer the part than the radial
