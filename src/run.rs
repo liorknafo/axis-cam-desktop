@@ -2341,6 +2341,7 @@ pub fn cut_plan(
     let mut out = crate::simulation::Plan {
         moves: vec![],
         stops: vec![],
+        keep_air: vec![],
         ..plan.clone()
     };
     let mut new = vec![None; plan.moves.len()];
@@ -2352,6 +2353,7 @@ pub fn cut_plan(
         }
         let first = &plan.moves[step.moves.start];
         if let Some(last) = out.moves.last().filter(|_| gap).cloned() {
+            out.keep_air.push(false);
             out.moves.push(Move {
                 from: last.to,
                 to: first.from,
@@ -2367,6 +2369,8 @@ pub fn cut_plan(
         for i in step.moves.clone() {
             new[i] = Some(out.moves.len());
             out.moves.push(plan.moves[i].clone());
+            out.keep_air
+                .push(plan.keep_air.get(i).copied().unwrap_or(false));
         }
     }
     out.stops = (plan.stops.iter())

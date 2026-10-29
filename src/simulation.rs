@@ -174,6 +174,10 @@ pub struct Plan {
     /// Where the spindle stops partway through (`cam::boring`), in order.
     /// Empty for most plans.
     pub stops: Vec<Stop>,
+    /// Moves air trimming must keep: a support pass can cut a sliver
+    /// below its contact tolerance while setting up the next stepdown.
+    /// Empty means none.
+    pub keep_air: Vec<bool>,
 }
 /// A stop of the spindle partway through a plan: before move `at` the
 /// spindle and coolant stop and, with a `pause`, the program waits there,
@@ -574,6 +578,7 @@ fn generate_plan(
         holder_radius,
         neck: None,
         stops: vec![],
+        keep_air: vec![],
         display_scale: scale,
         duration: 0.,
         target,
@@ -964,6 +969,61 @@ impl Simulation {
             || self.initial_stock.removed_volume(),
             |v| v.removed_volume(),
         )
+    }
+    /// What this operation's moves have removed so far, mm³. A 3-axis
+    /// milling plan's is how far the top-down grid fell in each column, in
+    /// the material the operation started from (`initial_volume`, where an
+    /// earlier setup may have hollowed a column from below): exact in
+    /// depth, so a cut thinner than a voxel counts as it is made, where the
+    /// voxels' own count waits for a whole layer of them. Others, the
+    /// voxels' count.
+    pub fn removed_by_operation(&self) -> f32 {
+        let voxels = self.removed_volume() - self.inherited_volume();
+        let (Some(volume), Some(frame)) = (&self.initial_volume, self.frame) else {
+            return voxels;
+        };
+        if self.plan.is_lathe()
+            || self.plan.strategy == Strategy::Groove
+            || self.plan.moves.iter().any(|m| m.a.is_some())
+        {
+            return voxels;
+        }
+        let (grid, before) = (&self.stock, &self.initial_stock);
+        // Each column in fixed layers half the voxels' least side tall, each
+        // material or not as the volume holds at its middle: a fall counts
+        // the part of each layer it passes, so the count only grows as the
+        // column falls, and not at all through air.
+        let step = volume
+            .cell
+            .into_iter()
+            .fold(f32::INFINITY, f32::min)
+            .max(0.05)
+            / 2.;
+        let base = grid.bounds.min[2];
+        let mut depth = 0.;
+        for y in 0..grid.ny {
+            for x in 0..grid.nx {
+                let i = y * grid.nx + x;
+                let (low, high) = (grid.heights[i], before.heights[i]);
+                if low >= high {
+                    continue;
+                }
+                let (px, py) = (
+                    grid.bounds.min[0] + (x as f32 + 0.5) * grid.dx,
+                    grid.bounds.min[1] + (y as f32 + 0.5) * grid.dy,
+                );
+                let first = ((low - base) / step).floor() as i64;
+                let last = ((high - base) / step).ceil() as i64;
+                for k in first..last {
+                    let (bottom, top) = (base + k as f32 * step, base + (k + 1) as f32 * step);
+                    let passed = top.min(high) - bottom.max(low);
+                    if passed > 0. && volume.filled([px, py, bottom + step / 2.], frame) {
+                        depth += passed;
+                    }
+                }
+            }
+        }
+        depth * grid.dx * grid.dy
     }
     /// How many moves `seek(fraction)` replays: those from where it stands,
     /// or from the start when it goes back.
@@ -2186,6 +2246,91 @@ mod cumulative_tests {
             face.volume.as_ref().unwrap().occupied
         );
         assert_eq!(pocket.removed_volume(), pocket.inherited_volume());
+    }
+    #[test]
+    fn a_skim_thinner_than_a_voxel_counts_as_it_is_cut_and_air_does_not() {
+        // A 60 × 40 × 20 block (voxels 0.625 mm) skimmed 0.3 mm deep by a Ø10
+        // flat end mill from X −20 to 20: about 0.3 × 50 × 10 mm.
+        let stock = Bounds {
+            min: [-30., -20., 0.],
+            max: [30., 20., 20.],
+        };
+        let frame = crate::volume::Frame::identity();
+        let skim = |earlier: Option<([f32; 3], [f32; 3])>| {
+            let moves = [(Motion::Feed, [20., 0., 19.7], 600.)];
+            let mut plan = crate::post::fixture::plan([-20., 0., 19.7], &moves);
+            (plan.stock, plan.radius, plan.flute_length) = (stock, 5., 20.);
+            let mut volume = crate::volume::Volume::new(stock, frame);
+            if let Some((a, b)) = earlier {
+                volume.cut(a, b, 5., 20., CutterShape::Flat, frame, (0, 0));
+            }
+            let mut sim = Simulation::new(plan);
+            (sim.initial_volume, sim.volume, sim.frame) =
+                (Some(volume.clone()), Some(volume), Some(frame));
+            sim
+        };
+        let mut sim = skim(None);
+        let swept = 0.3 * (40. * 10. + std::f32::consts::PI * 25.);
+        // Halfway, at X 0: 20 mm of the slot and the cutter's disc.
+        sim.seek(0.5);
+        let half = sim.removed_by_operation();
+        let wanted = 0.3 * (20. * 10. + std::f32::consts::PI * 25.);
+        assert!((half / wanted - 1.).abs() < 0.1, "{half} vs {wanted}");
+        sim.seek(1.);
+        let whole = sim.removed_by_operation();
+        assert!((whole / swept - 1.).abs() < 0.1, "{whole} vs {swept}");
+        // The voxels' own count waits for a whole layer: 0.3 mm is under
+        // half a voxel, so none is cleared.
+        assert_eq!(sim.removed_volume() - sim.inherited_volume(), 0.);
+        // Where an earlier cut took the material away under the top, the
+        // skim through that air counts nothing there.
+        let mut hollow = skim(Some(([-40., 0., 10.], [40., 0., 10.])));
+        hollow.seek(1.);
+        assert!(
+            hollow.removed_by_operation() < 0.05 * swept,
+            "{}",
+            hollow.removed_by_operation()
+        );
+    }
+    #[test]
+    fn the_count_only_grows_through_a_cavity_under_a_roof() {
+        // A cavity Z10–16 an earlier cut left under a 4 mm roof (Z16–20),
+        // pierced from above to Z8 and followed along: the count never falls
+        // as the cutter goes on, and ends at the roof and the 2 mm under the
+        // cavity, not the cavity.
+        let stock = Bounds {
+            min: [-30., -20., 0.],
+            max: [30., 20., 20.],
+        };
+        let frame = crate::volume::Frame::identity();
+        let moves = [
+            (Motion::Feed, [-20., 0., 8.], 150.),
+            (Motion::Feed, [20., 0., 8.], 600.),
+        ];
+        let mut plan = crate::post::fixture::plan([-20., 0., 21.], &moves);
+        (plan.stock, plan.radius, plan.flute_length) = (stock, 5., 20.);
+        let mut volume = crate::volume::Volume::new(stock, frame);
+        volume.cut(
+            [-25., 0., 10.],
+            [25., 0., 10.],
+            7.,
+            6.,
+            CutterShape::Flat,
+            frame,
+            (0, 0),
+        );
+        let mut sim = Simulation::new(plan);
+        (sim.initial_volume, sim.volume, sim.frame) =
+            (Some(volume.clone()), Some(volume), Some(frame));
+        let mut was = 0.;
+        for k in 0..=200 {
+            sim.seek(k as f32 / 200.);
+            let now = sim.removed_by_operation();
+            assert!(now >= was - 1e-3, "{k}: {now} after {was}");
+            was = now;
+        }
+        let wanted = 6. * (40. * 10. + std::f32::consts::PI * 25.);
+        assert!((was / wanted - 1.).abs() < 0.1, "{was} vs {wanted}");
     }
     #[test]
     fn remaining_start_rebuilds_after_facing_edits_suppression_and_reorder() {

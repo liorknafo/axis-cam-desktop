@@ -10,9 +10,12 @@ use crate::{
 };
 use std::collections::HashMap;
 
-/// How far outside a face its samples are taken (mm): stock thinner than this
-/// against a face counts as cut, as a finishing allowance left on it would.
+/// The existing magenta threshold (mm), kept for completeness checks.
 const OFFSET: f32 = 0.5;
+/// Ignore residuals below 0.1 mm: cutter safety margins, tessellation/arc
+/// chords and fine finishing scallops. This still resolves the default
+/// 0.2 mm axial and 0.3 mm radial allowances (see fixture measurements below).
+const THIN_OFFSET: f32 = 0.1;
 /// The longest side a sampled piece of a face has (mm): longer faces are
 /// sampled in pieces.
 const PIECE: f32 = 5.;
@@ -20,9 +23,9 @@ const PIECE: f32 = 5.;
 /// 8 pieces a side is cut in at most. Longer edges are split first.
 const SPLIT: f32 = 8. * PIECE;
 /// How often a face is halved at most. That bounds a face to 2⁶ triangles of
-/// 64 samples, 4096 samples, and the background run to that many per face of
-/// the mesh; a triangle needing more splits (over about 300 mm across) is
-/// sampled in coarser pieces.
+/// 64 samples, 4096 sample positions (at most two stock queries each), and
+/// the background run to that many per face of the mesh. A triangle needing
+/// more splits (over about 300 mm across) is sampled in coarser pieces.
 const SPLITS: u32 = 6;
 /// The buckets of cuts along each axis of the stock.
 const BUCKETS: usize = 24;
@@ -45,12 +48,52 @@ pub struct Uncut {
     /// make up the whole face, so it is drawn piece by piece and magenta only
     /// where the stock is. Empty for every other face (or all of them).
     pub pieces: Vec<Vec<Piece>>,
+    /// Thin stock, sampled at `THIN_OFFSET` but not at `OFFSET`. Display only:
+    /// the existing faces, regions and share retain their magenta meaning.
+    pub thin: Coverage,
     /// Those faces, joined where they share an edge, largest first, of the
     /// area under stock. Those of regions under `SLIVER` are left out, here,
     /// in `faces` and in `share`.
     pub regions: Vec<Region>,
     /// The share of the part's surface still under stock, from 0 to 1.
     pub share: f32,
+}
+/// One disjoint category of stock-covered surface, with the same piece and
+/// region rules as the existing magenta category.
+#[derive(Debug, Clone, Default)]
+pub struct Coverage {
+    pub faces: Vec<bool>,
+    pub pieces: Vec<Vec<Piece>>,
+    pub regions: Vec<Region>,
+    pub share: f32,
+}
+pub static EMPTY: Coverage = Coverage {
+    faces: vec![],
+    pieces: vec![],
+    regions: vec![],
+    share: 0.,
+};
+impl Uncut {
+    pub fn any(&self) -> bool {
+        self.faces.iter().chain(&self.thin.faces).any(|f| *f)
+    }
+}
+type Tri = [[f32; 3]; 3];
+#[derive(Default)]
+struct Samples {
+    faces: Vec<bool>,
+    pieces: Vec<Vec<Piece>>,
+    found: HashMap<usize, (f32, Tri, Vec<Tri>)>,
+    covered: f32,
+}
+impl Samples {
+    fn new(n: usize) -> Self {
+        Self {
+            faces: vec![false; n],
+            pieces: vec![vec![]; n],
+            ..Self::default()
+        }
+    }
 }
 /// Faces still under stock that share edges.
 #[derive(Debug, Clone, PartialEq)]
@@ -90,13 +133,11 @@ pub fn uncut(stock: &Volume, setup1: &Setup, mesh: &Mesh) -> Uncut {
     let part = placement.bounds.scaled(1. / scale);
     let first = Frame::new(setup1, mesh);
     let cuts = Cuts::new(stock);
-    let mut faces = vec![false; mesh.faces.len()];
-    let mut pieces = vec![vec![]; mesh.faces.len()];
-    // Per face still under stock: the area of it that is, its points, and
-    // the triangles of it that are (mm, setup 1).
-    type Tri = [[f32; 3]; 3];
-    let mut found: HashMap<usize, (f32, Tri, Vec<Tri>)> = HashMap::new();
-    let (mut total, mut covered) = (0., 0.);
+    let mut layers = [
+        Samples::new(mesh.faces.len()),
+        Samples::new(mesh.faces.len()),
+    ];
+    let mut total = 0.;
     for (i, face) in mesh.faces.iter().enumerate() {
         let (raw, [a, b, c]) = match face.points[..] {
             [a, b, c] => (
@@ -123,7 +164,7 @@ pub fn uncut(stock: &Volume, setup1: &Setup, mesh: &Mesh) -> Uncut {
         // triangle under stock or cut all over is kept whole.
         let mut parts = vec![];
         split([a, b, c], 0, &mut parts);
-        let mut drawn: Vec<([[f32; 3]; 3], bool)> = vec![];
+        let mut drawn: [Vec<Piece>; 2] = [vec![], vec![]];
         for [a, b, c] in parts {
             let (u, v) = (sub(b, a), sub(c, a));
             let k = (longest(a, b, c) / PIECE).ceil().clamp(1., 8.) as usize;
@@ -145,39 +186,72 @@ pub fn uncut(stock: &Volume, setup1: &Setup, mesh: &Mesh) -> Uncut {
                         let Some(piece) = piece else { continue };
                         let centre = at(x + shift, y + shift);
                         let p: [f32; 3] = std::array::from_fn(|q| centre[q] + n[q] * OFFSET);
-                        cells.push((piece, cuts.left(moved(p, first, stock.frame))));
+                        let thick = cuts.left(moved(p, first, stock.frame));
+                        let thin = !thick
+                            && cuts.left(moved(
+                                std::array::from_fn(|q| centre[q] + n[q] * THIN_OFFSET),
+                                first,
+                                stock.frame,
+                            ));
+                        cells.push((piece, [thick, thin]));
                     }
                 }
             }
-            match cells.iter().filter(|(_, under)| *under).count() {
-                0 => drawn.push(([a, b, c], false)),
-                n if n == cells.len() => drawn.push(([a, b, c], true)),
-                _ => drawn.extend(cells),
+            let uniform = cells.iter().all(|(_, under)| *under == cells[0].1);
+            for (layer, drawn) in drawn.iter_mut().enumerate() {
+                if uniform {
+                    drawn.push(([a, b, c], cells[0].1[layer]));
+                } else {
+                    drawn.extend(cells.iter().map(|(t, under)| (*t, under[layer])));
+                }
             }
         }
         let area = twice / 2.;
-        let under: Vec<_> = (drawn.iter())
-            .filter(|(_, under)| *under)
-            .map(|(t, _)| *t)
-            .collect();
-        let left: f32 = (under.iter())
-            .map(|t| cross(sub(t[1], t[0]), sub(t[2], t[0])) / 2.)
-            .sum();
         total += area;
-        covered += left;
-        if under.is_empty() {
-            continue;
-        }
-        faces[i] = true;
-        if under.len() < drawn.len() {
-            pieces[i] = (drawn.into_iter())
-                .map(|(t, under)| (t.map(|q| carried(q, [a, b, c], raw)), under))
+        for (layer, drawn) in layers.iter_mut().zip(drawn) {
+            let under: Vec<_> = drawn
+                .iter()
+                .filter(|(_, under)| *under)
+                .map(|(t, _)| *t)
                 .collect();
-            found.insert(i, (left, [a, b, c], under));
-        } else {
-            found.insert(i, (area, [a, b, c], vec![[a, b, c]]));
+            if under.is_empty() {
+                continue;
+            }
+            let left: f32 = under
+                .iter()
+                .map(|t| cross(sub(t[1], t[0]), sub(t[2], t[0])) / 2.)
+                .sum();
+            layer.covered += left;
+            layer.faces[i] = true;
+            if under.len() < drawn.len() {
+                layer.pieces[i] = drawn
+                    .into_iter()
+                    .map(|(t, under)| (t.map(|q| carried(q, [a, b, c], raw)), under))
+                    .collect();
+                layer.found.insert(i, (left, [a, b, c], under));
+            } else {
+                layer.found.insert(i, (area, [a, b, c], vec![[a, b, c]]));
+            }
         }
     }
+    let [thick, thin] = layers.map(|layer| coverage(layer, part, total));
+    Uncut {
+        faces: thick.faces,
+        pieces: thick.pieces,
+        regions: thick.regions,
+        share: thick.share,
+        thin,
+    }
+}
+/// Join and filter each category independently, so a corner sliver cannot
+/// become a warning merely because it is thinner than the magenta threshold.
+fn coverage(samples: Samples, part: Bounds, total: f32) -> Coverage {
+    let Samples {
+        mut faces,
+        mut pieces,
+        found,
+        mut covered,
+    } = samples;
     // Faces under stock that share an edge make one region.
     let mut root: HashMap<usize, usize> = found.keys().map(|i| (*i, *i)).collect();
     fn top(root: &mut HashMap<usize, usize>, mut i: usize) -> usize {
@@ -265,7 +339,7 @@ pub fn uncut(stock: &Volume, setup1: &Setup, mesh: &Mesh) -> Uncut {
         });
     }
     regions.sort_by(|a, b| b.area.total_cmp(&a.area));
-    Uncut {
+    Coverage {
         faces,
         pieces,
         regions,
@@ -422,6 +496,243 @@ pub(crate) fn half_cut_face() -> (Mesh, Setup, [[f32; 3]; 3], Volume) {
 #[cfg(test)]
 mod tests {
     use crate::post::fixture;
+    fn floor_under(height: f32, cut_height: Option<f32>) -> super::Uncut {
+        let (mesh, setup, [a, _, _], mut stock) = super::half_cut_face();
+        stock.bounds.max[2] = a[2] + height;
+        let cuts = std::sync::Arc::make_mut(&mut stock.cuts);
+        cuts.clear();
+        if let Some(z) = cut_height {
+            cuts.push(crate::stock_surface::Cut {
+                a: [a[0], a[1], a[2] + z],
+                b: [a[0] + 100., a[1], a[2] + z],
+                radius: 100.,
+                flute: 20.,
+                shape: crate::simulation::CutterShape::Flat,
+                frame: stock.frame,
+                source: (0, 0),
+            });
+        }
+        super::uncut(&stock, &setup, &mesh)
+    }
+    #[test]
+    fn an_uncut_04_mm_recess_is_thin() {
+        let left = floor_under(0.4, None);
+        assert_eq!(left.faces, [false]);
+        assert_eq!(left.thin.faces, [true]);
+        assert_eq!((left.share, left.thin.share), (0., 1.));
+        assert!(left.regions.is_empty());
+        assert_eq!(left.thin.regions.len(), 1);
+        assert!(left.any());
+    }
+    #[test]
+    fn a_floor_with_02_mm_axial_stock_to_leave_is_thin() {
+        let left = floor_under(10., Some(0.2));
+        assert_eq!(left.faces, [false]);
+        assert_eq!(left.thin.faces, [true]);
+        assert_eq!((left.share, left.thin.share), (0., 1.));
+    }
+    #[test]
+    fn a_floor_cut_exactly_to_height_is_finished() {
+        let left = floor_under(10., Some(0.));
+        assert!(!left.any());
+        assert_eq!((left.share, left.thin.share), (0., 0.));
+        // A small numerical/machining residual is also finished.
+        assert!(!floor_under(10., Some(0.05)).any());
+    }
+    #[test]
+    fn more_than_05_mm_remains_magenta() {
+        let left = floor_under(10., Some(0.6));
+        assert_eq!(left.faces, [true]);
+        assert_eq!(left.thin.faces, [false]);
+        assert_eq!((left.share, left.thin.share), (1., 0.));
+    }
+    #[test]
+    fn finished_thin_and_magenta_pieces_share_one_face_without_overlap() {
+        let (mesh, setup, [a, _, c], mut stock) = super::half_cut_face();
+        let mut cut = stock.cuts[0].clone();
+        // Exact cut to X 45, then a cut leaving 0.2 mm to X 75.
+        cut.a = [a[0] + 45., a[1] - 40., a[2] + 0.2];
+        cut.b = [a[0] + 45., c[1] + 40., a[2] + 0.2];
+        std::sync::Arc::make_mut(&mut stock.cuts).push(cut);
+        let left = super::uncut(&stock, &setup, &mesh);
+        assert!(left.faces[0] && left.thin.faces[0]);
+        assert_eq!(left.pieces[0].len(), left.thin.pieces[0].len());
+        let mut areas = [0.; 3];
+        let placement = super::Placement::new(&mesh, Some(&setup));
+        for ((tri, thick), (thin_tri, thin)) in left.pieces[0].iter().zip(&left.thin.pieces[0]) {
+            assert_eq!(tri, thin_tri);
+            assert!(!(*thick && *thin));
+            let t = tri.map(|p| placement.transform(p).map(|v| v / mesh.display_scale()));
+            let x = t.iter().map(|p| p[0] - a[0]).sum::<f32>() / 3.;
+            assert_eq!((*thick, *thin), (x > 75., x > 45. && x <= 75.));
+            let area = super::cross(super::sub(t[1], t[0]), super::sub(t[2], t[0])) / 2.;
+            areas[if *thick {
+                0
+            } else if *thin {
+                1
+            } else {
+                2
+            }] += area;
+        }
+        assert!(areas.iter().all(|a| *a > 0.));
+        assert!((areas[0] / 1000. - left.share).abs() < 1e-4);
+        assert!((areas[1] / 1000. - left.thin.share).abs() < 1e-4);
+        assert!((areas.iter().sum::<f32>() - 1000.).abs() < 0.01);
+    }
+    /// Build the exact sweep history without spending time carving a grid.
+    fn swept_plan(plan: &crate::simulation::Plan, frame: super::Frame) -> super::Volume {
+        let mut stock = super::Volume::new(plan.stock, frame);
+        std::sync::Arc::make_mut(&mut stock.cuts).extend(
+            plan.moves
+                .iter()
+                .filter(|m| m.motion == crate::simulation::Motion::Feed)
+                .map(|m| crate::stock_surface::Cut {
+                    a: m.from,
+                    b: m.to,
+                    radius: plan.radius,
+                    flute: plan.flute_length,
+                    shape: plan.shape,
+                    frame,
+                    source: (0, 0),
+                }),
+        );
+        stock
+    }
+    /// Residual along a face normal to 1 µm. These finish fixtures have no
+    /// disconnected stock above the face, so the swept interval is monotone.
+    fn residual(cuts: &super::Cuts<'_>, p: [f32; 3], n: [f32; 3]) -> f32 {
+        let left = |d| cuts.left(std::array::from_fn(|k| p[k] + d * n[k]));
+        assert!(!left(0.5), "unfinished at {p:?}");
+        let (mut lo, mut hi) = (0., 0.5);
+        while hi - lo > 0.001 {
+            let mid = (lo + hi) / 2.;
+            if left(mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        hi
+    }
+    #[test]
+    fn uncut_threshold_exceeds_finished_fixture_residuals() {
+        use crate::{cam, model::Strategy};
+        // The existing pocket fixture: Ø2, zero allowances, its real 0.02 mm
+        // conservative margin, including offset-loop arc chords.
+        let (setup, op, tool, mesh) = crate::pocket::tests::fixture();
+        let plan = crate::pocket::generate(&setup, &op, &tool, &mesh).unwrap();
+        let stock = swept_plan(&plan, super::Frame::new(&setup, &mesh));
+        let cuts = super::Cuts::new(&stock);
+        let placement = super::Placement::new(&mesh, Some(&setup));
+        let z = placement.bounds.min[2] / mesh.display_scale() + 4.;
+        let mut pocket = 0f32;
+        for i in 0..101 {
+            let y = -7. + 14. * i as f32 / 100.;
+            pocket = pocket.max(residual(&cuts, [-10., y, z + 2.], [1., 0., 0.]));
+        }
+        eprintln!("Pocket wall maximum normal residual: {pocket:.4} mm");
+        assert!(pocket < super::THIN_OFFSET);
+        // The shipped block fixture uses a Ø10 cutter: a larger 0.05 mm
+        // Pocket margin, and the actual meshed pocket walls.
+        let (doc, mesh) = fixture::job();
+        let setup = &doc.setups[0];
+        let mut op = setup.operations[1].clone();
+        op.p.insert("allowance".into(), "0".into());
+        op.p.insert("axial_allowance".into(), "0".into());
+        let tool = doc.tools.iter().find(|t| t.id == op.tool).unwrap();
+        let plan = crate::pocket::generate(setup, &op, tool, &mesh).unwrap();
+        let stock = swept_plan(&plan, super::Frame::new(setup, &mesh));
+        let cuts = super::Cuts::new(&stock);
+        let placement = super::Placement::new(&mesh, Some(setup));
+        let mut most = 0f32;
+        let mut samples = 0;
+        for face in &mesh.faces {
+            let normal = mesh.surfaces[face.feature.unwrap()].normal;
+            if normal[2].abs() > 0.01 {
+                continue;
+            }
+            let p = std::array::from_fn(|k| {
+                face.points
+                    .iter()
+                    .map(|p| placement.transform(*p)[k] / mesh.display_scale())
+                    .sum::<f32>()
+                    / 3.
+            });
+            // Other operations, not this pocket, must finish the other walls.
+            if cuts.left(std::array::from_fn(|k| p[k] + 0.5 * normal[k])) {
+                continue;
+            }
+            most = most.max(residual(&cuts, p, normal));
+            samples += 1;
+        }
+        eprintln!("Ø10 block Pocket: {samples} wall samples, maximum normal residual {most:.4} mm");
+        assert!(samples > 0 && most < super::THIN_OFFSET);
+        // Existing ramp and tessellated R10 half-ball: Ø4 ball, fine 0.25 mm
+        // stepover and 0.01 mm tolerance, zero stock to leave.
+        for (name, mesh) in [
+            ("21 degree ramp", cam::tests::ramp().0),
+            ("R10 tessellated dome", cam::tests::half_ball_on_plate()),
+        ] {
+            let (setup, mut op, tool) = cam::tests::fixture(Strategy::Parallel);
+            op.p.insert("surface_stepover".into(), "0.25".into());
+            op.p.insert("tolerance".into(), "0.01".into());
+            let plan = cam::generate(&setup, &op, &tool, &mesh).unwrap();
+            let stock = swept_plan(&plan, super::Frame::new(&setup, &mesh));
+            let cuts = super::Cuts::new(&stock);
+            let placement = super::Placement::new(&mesh, Some(&setup));
+            let scale = mesh.display_scale();
+            let mut most = 0f32;
+            let mut samples = 0;
+            for face in &mesh.faces {
+                let t: [[f32; 3]; 3] =
+                    std::array::from_fn(|k| placement.transform(face.points[k]).map(|v| v / scale));
+                let (u, v) = (super::sub(t[1], t[0]), super::sub(t[2], t[0]));
+                let n = [
+                    u[1] * v[2] - u[2] * v[1],
+                    u[2] * v[0] - u[0] * v[2],
+                    u[0] * v[1] - u[1] * v[0],
+                ];
+                let length = super::cross(u, v);
+                let n = n.map(|x| x / length);
+                let centre: [f32; 3] =
+                    std::array::from_fn(|k| t.iter().map(|p| p[k]).sum::<f32>() / 3.);
+                if n[2] < 0.3
+                    || (name.contains("dome") && centre[2] < placement.bounds.min[2] / scale + 4.01)
+                {
+                    continue;
+                }
+                // Dense barycentric samples on finishable slopes, away from
+                // the concave plate/dome junction where an R2 ball leaves a fillet.
+                for i in 0..8 {
+                    for j in 0..8 - i {
+                        let p = std::array::from_fn(|k| {
+                            t[0][k]
+                                + (i as f32 + 1. / 3.) / 8. * u[k]
+                                + (j as f32 + 1. / 3.) / 8. * v[k]
+                        });
+                        most = most.max(residual(&cuts, p, n));
+                        samples += 1;
+                    }
+                }
+            }
+            eprintln!("{name}: {samples} samples, maximum normal residual {most:.4} mm");
+            assert!(samples > 0 && most < super::THIN_OFFSET, "{name}: {most}");
+            let left = super::uncut(&stock, &setup, &mesh);
+            for (i, face) in mesh.faces.iter().enumerate() {
+                let z = face
+                    .points
+                    .iter()
+                    .map(|p| placement.transform(*p)[2] / scale)
+                    .sum::<f32>()
+                    / 3.;
+                if mesh.surfaces[face.feature.unwrap()].normal[2] > 0.3
+                    && (!name.contains("dome") || z > placement.bounds.min[2] / scale + 4.01)
+                {
+                    assert!(!left.faces[i] && !left.thin.faces[i], "{name} face {i}");
+                }
+            }
+        }
+    }
     #[test]
     fn a_long_face_half_cut_is_under_stock_only_where_the_stock_is() {
         let (mesh, setup, [a, b, c], stock) = super::half_cut_face();

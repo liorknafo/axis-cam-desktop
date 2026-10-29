@@ -852,6 +852,21 @@ impl RestStock {
     pub fn top_over(&self, reach: &Reach, target: f32, original: f32) -> f32 {
         self.cap(reach.bounds, Some(reach), target, original)
     }
+    /// The heights the floors of earlier cuts over `near` stand at, between
+    /// `low` and `high`, lowest first: where the material they left may
+    /// step.
+    pub fn floors(&self, near: Bounds, low: f32, high: f32) -> Vec<f32> {
+        let mut floors: Vec<f32> = (self.cuts.iter())
+            .filter(|c| {
+                (0..2).all(|k| c.bounds.max[k] >= near.min[k] && c.bounds.min[k] <= near.max[k])
+            })
+            .map(|c| c.bounds.min[2])
+            .filter(|z| z.is_finite() && *z > low && *z < high)
+            .collect();
+        floors.sort_by(f32::total_cmp);
+        floors.dedup_by(|a, b| *a - *b < 0.001);
+        floors
+    }
     /// `top` within `region`, and within `reach` where there is one.
     fn cap(&self, mut region: Bounds, reach: Option<&Reach>, target: f32, original: f32) -> f32 {
         if self.cuts.is_empty()

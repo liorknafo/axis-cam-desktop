@@ -263,6 +263,7 @@ impl Builder {
                 holder_radius: positive("holder")? / 2.,
                 neck: None,
                 stops: vec![],
+                keep_air: vec![],
                 display_scale: stock.display_scale,
                 duration: 0.,
                 target: top,
@@ -3960,7 +3961,7 @@ pub(crate) mod tests {
         );
         mesh::normalize(t).unwrap()
     }
-    fn fixture(s: Strategy) -> (Setup, Operation, Tool) {
+    pub(crate) fn fixture(s: Strategy) -> (Setup, Operation, Tool) {
         let mut setup = Setup::new(Machine::new(3), "G54");
         setup.p.insert("stock_top".into(), "2".into());
         for k in ["stock_left", "stock_right", "stock_front", "stock_back"] {
@@ -4829,7 +4830,7 @@ pub(crate) mod tests {
     }
     /// A 30 × 16 mm wedge whose top slopes 21° down from 13.5 mm at X 0 to
     /// 2 mm at X 30, like the ramps under the TOTEM case.
-    fn ramp() -> (Mesh, impl Fn(f32) -> f32) {
+    pub(crate) fn ramp() -> (Mesh, impl Fn(f32) -> f32) {
         let rise = 21f32.to_radians().tan();
         let high = 2. + 30. * rise;
         let mut t = vec![];

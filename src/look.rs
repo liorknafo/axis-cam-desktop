@@ -360,6 +360,7 @@ impl View {
             live_volume: None,
             uncut: &[],
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -485,6 +486,7 @@ fn paint(scene: &Scene, args: &Args, view: &View) -> Picture {
         live_volume: None,
         uncut: &[],
         uncut_pieces: &[],
+        thin: &crate::uncut::EMPTY,
         show_uncut: true,
         section: Sectioning {
             cut: view.section.map(|(s, _)| s),

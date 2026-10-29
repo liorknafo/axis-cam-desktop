@@ -563,6 +563,7 @@ pub fn nominal(
         milling_direction: if cut.climb { "Climb" } else { "Conventional" },
         rings: vec![],
         stops: vec![],
+        keep_air: vec![],
     };
     let mut sim = Simulation::new(plan);
     (sim.initial_volume, sim.frame) = (Some(volume), Some(frame));
@@ -646,6 +647,7 @@ struct Refed {
     moves: Vec<Move>,
     /// Of each of the plan's moves, the index of its first piece.
     starts: Vec<usize>,
+    keep_air: Vec<bool>,
     duration: f32,
     load: std::sync::Arc<ToothLoad>,
     held: Held,
@@ -788,6 +790,7 @@ pub fn hold(
             .unwrap_or(refed.moves.len());
     }
     sim.plan.moves = refed.moves;
+    sim.plan.keep_air = refed.keep_air;
     sim.plan.duration = refed.duration;
     sim.tooth_load = Some(refed.load);
     sim.held = Some(refed.held);
@@ -876,8 +879,10 @@ struct Feeding {
 /// machine's most feed and `FASTEST` times the move's, and at least
 /// `SLOWEST` of it; rounded down
 /// to a whole power of `FEED_STEP` times the programmed feed. Where no
-/// tooth meets material the move's programmed feed is kept, or a slower
-/// one a sample from a cut. A feed faster than those round it for less
+/// tooth meets material there is no chip to keep: the machine's most feed,
+/// or `FASTEST` times the programmed one where it has none; within the
+/// cutter's radius and a sample of a cut, the slowest that cut wants there,
+/// and of the ends of a run of feeds, the move's own. A feed faster than those round it for less
 /// than two samples along the path (two thirds of the cutter's radius) is
 /// brought down to theirs: at a sample, never faster than wanted. Each cutting move is split
 /// where its feed changes, each piece taking its own; every move is timed
@@ -889,8 +894,14 @@ fn refeed(plan: &Plan, load: &ToothLoad, f: Feeding) -> Refed {
     let reach = sample_step(plan) as f64;
     // Each cutting move's feed at each of its samples, then smoothed over
     // each run of cutting moves the cutter goes along without a rapid.
-    // In the air a sample wants no feed of its own: the programmed one
-    // there, or a slower one coming from a cut a sample ahead or behind.
+    // In the air a sample wants no feed of its own: the fastest there, but
+    // within the cutter's radius and a sample of a cut the slowest that cut
+    // wants, so that the tool slows before it meets material between two
+    // samples and gets back up only once clear of it; and as near the ends
+    // of a run, where material no sample saw may lie past the last one, the
+    // move's own.
+    let flying = f.fastest.min(f.programmed * FASTEST);
+    let guard = plan.radius as f64 + reach;
     let mut feeds: Vec<Vec<f32>> = vec![vec![]; plan.moves.len()];
     let mut run: Vec<(usize, Option<f32>)> = vec![];
     let mut wanted = vec![];
@@ -900,8 +911,21 @@ fn refeed(plan: &Plan, load: &ToothLoad, f: Feeding) -> Refed {
         |run: &mut Vec<(usize, Option<f32>)>, wanted: &mut Vec<f32>, along: &mut Vec<f64>| {
             let low = slide(wanted, along, reach, false);
             let smoothed = slide(&low, along, reach, true);
-            for (&(i, air), feed) in run.iter().zip(smoothed) {
-                feeds[i].push(air.map_or(feed, |programmed| feed.min(programmed)));
+            let cuts: Vec<f32> = (run.iter().zip(wanted.iter()))
+                .map(|(&(_, air), &w)| if air.is_some() { f32::INFINITY } else { w })
+                .collect();
+            let near = slide(&cuts, along, guard, false);
+            let ends = |a: f64| {
+                along.first().is_some_and(|&f| a - f < guard)
+                    || along.last().is_some_and(|&l| l - a < guard)
+            };
+            for (k, ((&(i, air), feed), near)) in run.iter().zip(smoothed).zip(near).enumerate() {
+                let own = if ends(along[k]) {
+                    plan.moves[i].feed
+                } else {
+                    f32::INFINITY
+                };
+                feeds[i].push(air.map_or(feed, |fastest| feed.min(fastest).min(near).min(own)));
             }
             run.clear();
             wanted.clear();
@@ -936,7 +960,11 @@ fn refeed(plan: &Plan, load: &ToothLoad, f: Feeding) -> Refed {
                     .min(m.feed * FASTEST)
                     .max(m.feed * SLOWEST)
             };
-            run.push((i, (force <= 0.).then_some(m.feed)));
+            // A support pass (`Plan::keep_air`) may shave a sliver no
+            // sample measures: never fed up.
+            let support = plan.keep_air.get(i).copied().unwrap_or(false);
+            let air = if support { m.feed } else { flying };
+            run.push((i, (force <= 0.).then_some(air)));
             wanted.push(feed);
             along.push(travelled + (k as f64 + 0.5) * piece);
         }
@@ -1019,9 +1047,22 @@ fn refeed(plan: &Plan, load: &ToothLoad, f: Feeding) -> Refed {
         (held.slowest, held.fastest) = (f.programmed, f.programmed);
     }
     let peak = forces.iter().flatten().copied().fold(0., f32::max);
+    let keep_air = if plan.keep_air.is_empty() {
+        vec![]
+    } else {
+        starts
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &start)| {
+                let end = starts.get(i + 1).copied().unwrap_or(moves.len());
+                std::iter::repeat_n(plan.keep_air.get(i).copied().unwrap_or(false), end - start)
+            })
+            .collect()
+    };
     Refed {
         moves,
         starts,
+        keep_air,
         duration: time,
         load: std::sync::Arc::new(ToothLoad {
             moves: forces,
@@ -1357,28 +1398,185 @@ mod tests {
         assert!(refed.moves.iter().all(|m| m.feed >= 150.));
     }
     #[test]
-    fn moves_in_the_air_keep_the_programmed_feed() {
-        // Above the stock throughout: nothing changes.
+    fn moves_in_the_air_take_the_fastest_feed() {
+        // Above the stock throughout: the machine's most feed, but within the
+        // cutter's radius and a sample (6 mm) of either end, where it may
+        // meet material no sample saw, its own.
         let above = sim(&[[-60., 0., 41.], [60., 0., 41.]], CutterShape::Flat, &[]);
-        let refed = refeed(&above.plan, &load(&above, HELIX), feeding(100., 2000.));
-        assert_eq!(refed.moves.len(), above.plan.moves.len());
-        assert!(refed.moves.iter().all(|m| m.feed == 600.));
-        // Back along the slot it cut, over nothing: slowed only within a
-        // cutter's reach of the slot's end, 600 mm/min beyond.
+        let ends = |refed: &Refed, middle: f32| {
+            assert_eq!(piece_at(refed, [0., 0., 41.]).0, middle);
+            for m in &refed.moves {
+                let far = m.from[0].abs().max(m.to[0].abs());
+                assert!(
+                    m.feed == middle || (m.feed == 600. && far > 60. - 7.),
+                    "{m:?}"
+                );
+            }
+            assert_eq!(refed.moves[0].feed, 600.);
+            assert_eq!(refed.moves.last().unwrap().feed, 600.);
+        };
+        ends(
+            &refeed(&above.plan, &load(&above, HELIX), feeding(100., 1000.)),
+            1000.,
+        );
+        // On a machine with no most feed, `FASTEST` times the programmed.
+        let load_above = load(&above, HELIX);
+        ends(
+            &refeed(&above.plan, &load_above, feeding(100., f32::INFINITY)),
+            600. * FASTEST,
+        );
+        // A support pass (`Plan::keep_air`) keeps its own feed throughout.
+        let mut support = above.clone();
+        support.plan.keep_air = vec![true; support.plan.moves.len()];
+        let refed = refeed(&support.plan, &load_above, feeding(100., 1000.));
+        assert!(
+            refed.moves.iter().all(|m| m.feed == 600.),
+            "{:?}",
+            refed.moves
+        );
+        // Back along the slot it cut, over nothing: slowed within a cutter's
+        // reach of the slot's end and of the end of the pass, 1000 mm/min
+        // between.
         let back = sim(
             &[[-60., 0., 36.], [60., 0., 36.], [-60., 0., 36.]],
             CutterShape::Flat,
             &[],
         );
         let load = load(&back, HELIX);
-        let refed = refeed(&back.plan, &load, feeding(load.peak / 2., 2000.));
+        let refed = refeed(&back.plan, &load, feeding(load.peak / 2., 1000.));
         assert!(piece_at(&refed, [0., 0., 36.]).0 < 400.);
         let last = refed.moves.last().unwrap();
         assert_eq!((last.to, last.feed), ([-60., 0., 36.], 600.));
-        let returning: Vec<&Move> = (refed.moves.iter())
-            .filter(|m| m.to[0] < m.from[0] && m.from[0] + m.to[0] < 2. * (60. - 3. * 5.))
+        let returning = (refed.moves.iter())
+            .find(|m| m.to[0] < m.from[0] && m.from[0] >= 0. && m.to[0] <= 0.)
+            .unwrap();
+        assert_eq!(returning.feed, 1000.);
+        assert!(
+            returning.from[0] > 60. - 3. * 5. - 1. && returning.to[0] < -60. + 7.,
+            "{returning:?}"
+        );
+    }
+    #[test]
+    fn the_tool_slows_from_the_air_feed_before_it_meets_material() {
+        // A Ø10 and a Ø3 slot into the stock's −X side from 1 to 20 mm out,
+        // starting at points that put the samples anywhere about the
+        // contact: nowhere the cutter touches material is it faster than a
+        // cut's own feed (`flying` only in the air).
+        for radius in [5., 1.5] {
+            for out in [1., 2.3, 6., 20.] {
+                for shift in [0., 0.07, 0.19, 0.31, 0.43] {
+                    let start = -50. - radius - out - shift;
+                    let mut s = sim(&[[start, 0., 36.], [0., 0., 36.]], CutterShape::Flat, &[]);
+                    s.plan.radius = radius;
+                    let load = load(&s, HELIX);
+                    let slot = load.at(0, 0.99).unwrap();
+                    let refed = refeed(&s.plan, &load, feeding(slot, 2000.));
+                    let cutting = cut_feed(&refed);
+                    let touching = touching(&refed, radius);
+                    for &(feed, x) in &touching {
+                        assert!(
+                            feed <= cutting,
+                            "Ø{} {out} {shift}: F{feed} at X{x}",
+                            2. * radius
+                        );
+                    }
+                    // Fed up only clear of both the cut and the run's start,
+                    // where material no sample saw may lie; where the
+                    // samples fall decides in between.
+                    let step = sample_step(&s.plan);
+                    let fastest = (refed.moves.iter()).map(|m| m.feed).fold(0., f32::max);
+                    if out <= radius || out >= 2. * (radius + step) + step {
+                        assert_eq!(
+                            fastest > cutting,
+                            out > radius,
+                            "Ø{} {out} {shift}: F{fastest}",
+                            2. * radius
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn a_feed_that_ends_just_inside_the_stock_keeps_its_own_feed_there() {
+        // A feed from the air that stops just past where it meets the stock
+        // and retracts, too short in it for a sample to find the cut, or so
+        // that one does: it touches the material at no more than its
+        // programmed feed, or than a cut's own.
+        for radius in [5., 1.5] {
+            for out in [1., 3., 8.] {
+                for into in [0.05, 0.2, 0.4] {
+                    for shift in [0., 0.13, 0.29] {
+                        let start = -50. - radius - out - shift;
+                        let end = -50. - radius + into;
+                        let moves = [
+                            (Motion::Feed, [end, 0., 36.], 600.),
+                            (Motion::Rapid, [end, 0., 50.], 6000.),
+                        ];
+                        let mut plan = crate::post::fixture::plan([start, 0., 36.], &moves);
+                        (plan.stock, plan.radius, plan.flute_length) = (STOCK, radius, 20.);
+                        plan.strategy = Strategy::Pocket;
+                        let mut s = Simulation::new(plan);
+                        (s.initial_volume, s.frame) =
+                            (Some(Volume::new(STOCK, frame())), Some(frame()));
+                        let load = load(&s, HELIX);
+                        let refed = refeed(&s.plan, &load, feeding(100., 2000.));
+                        let touching = touching(&refed, radius);
+                        assert!(
+                            !touching.is_empty(),
+                            "Ø{} {out} {into}: no contact",
+                            2. * radius
+                        );
+                        let most = cut_feed(&refed).max(600.);
+                        for &(feed, x) in &touching {
+                            assert!(
+                                feed <= most,
+                                "Ø{} {out} {into} {shift}: F{feed} at X{x}",
+                                2. * radius
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    /// The fastest feed of `refed`'s pieces where a sample finds the cut.
+    fn cut_feed(refed: &Refed) -> f32 {
+        (refed.moves.iter().zip(&refed.load.moves))
+            .filter(|(_, f)| f.iter().any(|f| *f > 0.))
+            .map(|(m, _)| m.feed)
+            .fold(0., f32::max)
+    }
+    /// Where `refed`'s feeds, measured again every 0.02 mm, touch the
+    /// stock: the feed there and its X.
+    fn touching(refed: &Refed, radius: f32) -> Vec<(f32, f32)> {
+        let feeds: Vec<&Move> = (refed.moves.iter())
+            .filter(|m| m.motion == Motion::Feed)
             .collect();
-        assert!(!returning.is_empty() && returning.iter().all(|m| m.feed == 600.));
+        let pieces = |m: &Move| (distance(m.from, m.to) / 0.02).ceil().max(1.) as usize;
+        let mut fine = vec![feeds[0].from];
+        let mut rate = vec![];
+        for m in &feeds {
+            let n = pieces(m);
+            for k in 1..=n {
+                fine.push(std::array::from_fn(|i| {
+                    m.from[i] + (m.to[i] - m.from[i]) * k as f32 / n as f32
+                }));
+                rate.push(m.feed);
+            }
+        }
+        let mut dense = sim(&fine, CutterShape::Flat, &[]);
+        dense.plan.radius = radius;
+        (load_of(&dense).iter().enumerate())
+            .filter(|(_, f)| **f > 0.)
+            .map(|(k, _)| (rate[k], fine[k + 1][0]))
+            .collect()
+    }
+    /// The force on a tooth at each move of `sim`, one sample each.
+    fn load_of(sim: &Simulation) -> Vec<f32> {
+        (load(sim, HELIX).moves.iter())
+            .map(|m| m.iter().copied().fold(0., f32::max))
+            .collect()
     }
     #[test]
     fn a_short_fast_stretch_is_smoothed_away_and_a_short_slow_one_kept() {
@@ -1413,7 +1611,8 @@ mod tests {
     }
     #[test]
     fn splitting_stays_within_the_move_count_and_retimes_the_plan() {
-        let s = sim(&SLOT_THEN_SIDE, CutterShape::Flat, &[]);
+        let mut s = sim(&SLOT_THEN_SIDE, CutterShape::Flat, &[]);
+        s.plan.keep_air = (0..s.plan.moves.len()).map(|i| i % 2 == 0).collect();
         let load = load(&s, HELIX);
         let target = load.at(0, 0.5).unwrap() * 0.8;
         let refed = refeed(&s.plan, &load, feeding(target, 5000.));
@@ -1431,8 +1630,18 @@ mod tests {
         }
         assert!((refed.duration - time).abs() < 1e-3);
         // Each move's first piece starts where it did.
-        for (m, &start) in s.plan.moves.iter().zip(&refed.starts) {
+        for (i, (m, &start)) in s.plan.moves.iter().zip(&refed.starts).enumerate() {
             assert_eq!(refed.moves[start].from, m.from);
+            let end = refed
+                .starts
+                .get(i + 1)
+                .copied()
+                .unwrap_or(refed.moves.len());
+            assert!(
+                refed.keep_air[start..end]
+                    .iter()
+                    .all(|&keep| keep == s.plan.keep_air[i])
+            );
         }
         assert_eq!(refed.moves.last().unwrap().end, refed.duration);
         // As many pieces as the load has: one per move, at its slowest.

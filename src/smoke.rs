@@ -14272,7 +14272,7 @@ soft_max = 180.0
         a.left_stock.key ^= 1;
         assert_eq!(
             crate::ui::uncut_line(&a).unwrap(),
-            "Checking completeness again; the magenta faces are the last check's."
+            "Checking completeness again; the coloured faces are the last check's."
         );
         assert!(toggle(&a).is_some());
         assert!(legend(&a) > Some(without));
@@ -14304,6 +14304,46 @@ soft_max = 180.0
         let mut sample = app();
         sample.doc = Document::sample();
         assert!(crate::ui::uncut_toggle(&sample).is_none());
+    }
+    #[test]
+    fn thin_stock_alone_has_an_uncut_share_toggle_and_legend() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = leftover_app(&dir);
+        a.left_stock.key = a.left_key().unwrap();
+        a.left_stock.part = a.part_mesh().unwrap().fingerprint.clone();
+        a.left_stock.uncut = Some(Ok(std::sync::Arc::new(crate::uncut::Uncut {
+            thin: crate::uncut::Coverage {
+                faces: vec![true],
+                share: 0.25,
+                ..Default::default()
+            },
+            ..Default::default()
+        })));
+        let line = crate::ui::uncut_line(&a).unwrap();
+        assert!(
+            line.contains(
+                "Amber faces have 0.1–0.5 mm left: stock to leave or a shallow recess, 25%."
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("Every face"));
+        assert!(crate::ui::uncut_toggle(&a).is_some());
+        a.stock = false;
+        assert!(crate::ui::uncut_legend(&a).is_some());
+        a.left_stock.key ^= 1;
+        assert_eq!(
+            crate::ui::uncut_line(&a).unwrap(),
+            "Checking completeness again; the coloured faces are the last check's."
+        );
+        a.left_stock.key ^= 1;
+        a.show_uncut = false;
+        let line = crate::ui::uncut_line(&a).unwrap();
+        assert_eq!(
+            line,
+            "25% of the part's surface is still under stock after the whole job (25% with 0.1–0.5 mm left); Show uncut faces is off."
+        );
+        assert!(crate::ui::uncut_toggle(&a).is_some());
+        assert!(crate::ui::uncut_legend(&a).is_none());
     }
     /// Picking a face of a later setup's operation simulates the whole job
     /// again, but cannot change the stock that setup starts from: its box

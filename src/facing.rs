@@ -352,6 +352,7 @@ pub(crate) fn outline(f: Outline) -> Result<Plan, String> {
         holder_radius: f.holder_radius,
         neck: None,
         stops: vec![],
+        keep_air: vec![],
         display_scale: f.scale,
         duration: 0.,
         target: f.target,

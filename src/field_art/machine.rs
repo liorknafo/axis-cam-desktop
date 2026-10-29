@@ -560,7 +560,7 @@ fn hand_rapid(f: &mut Frame, time: f32, phase: f32) {
     if out || back {
         say(f, "HAND RAPID", 170., 20., GOLD, 9.);
         say(f, "1500 MM/MIN", 170., 31., CYAN, 14.);
-    } else if phase < 0.25 || phase >= 0.85 {
+    } else if !(0.25..0.85).contains(&phase) {
         say(f, "CUTTING FEED", 170., 20., TEXT, 9.);
         say(f, "120 MM/MIN", 170., 31., alpha(TEXT, 0.8), 14.);
     } else {

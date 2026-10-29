@@ -1879,21 +1879,27 @@ pub(crate) fn uncut_line(app: &App) -> Option<String> {
     app.left_key()?;
     Some(match shown_uncut(app) {
         None => "Completeness not checked yet.".into(),
-        Some((Ok(found), false)) if app.show_uncut && found.faces.iter().any(|f| *f) => {
-            "Checking completeness again; the magenta faces are the last check's.".into()
+        Some((Ok(found), false)) if app.show_uncut && found.any() => {
+            if found.thin.faces.iter().any(|f| *f) {
+                "Checking completeness again; the coloured faces are the last check's.".into()
+            } else {
+                "Checking completeness again; the magenta faces are the last check's.".into()
+            }
         }
         Some((_, false)) => "Checking completeness again…".into(),
         Some((Err(why), true)) => format!("Completeness not checked: {why}"),
-        Some((Ok(found), true)) if found.regions.is_empty() => {
+        Some((Ok(found), true)) if !found.any() => {
             "Every face of the part is cut by the job.".into()
         }
         Some((Ok(found), true)) if app.show_uncut => format!(
-            "Magenta faces are still under stock after the whole job: {:.0}% of the part's surface.",
-            found.share * 100.
+            "Magenta faces are still under stock after the whole job: {:.0}% of the part's surface. Amber faces have 0.1–0.5 mm left: stock to leave or a shallow recess, {:.0}%.",
+            found.share * 100.,
+            found.thin.share * 100.
         ),
         Some((Ok(found), true)) => format!(
-            "{:.0}% of the part's surface is still under stock after the whole job; Show uncut faces is off.",
-            found.share * 100.
+            "{:.0}% of the part's surface is still under stock after the whole job ({:.0}% with 0.1–0.5 mm left); Show uncut faces is off.",
+            (found.share + found.thin.share) * 100.,
+            found.thin.share * 100.
         ),
     })
 }
@@ -1906,7 +1912,7 @@ pub(crate) fn uncut_toggle(app: &App) -> Option<Element<'_, Message>> {
         .0
         .as_ref()
         .ok()
-        .filter(|found| found.faces.iter().any(|f| *f))?;
+        .filter(|found| found.any())?;
     Some(help::wrap(
         checkbox(app.show_uncut)
             .label("Show uncut faces")
@@ -1927,9 +1933,11 @@ pub(crate) fn uncut_toggle(app: &App) -> Option<Element<'_, Message>> {
 /// and magenta faces still under stock while those are shown. None with
 /// the stock hidden, no section and nothing magenta.
 pub(crate) fn uncut_legend(app: &App) -> Option<Element<'_, Message>> {
-    let magenta = app.show_uncut && uncut_toggle(app).is_some();
+    let found = shown_uncut(app).and_then(|(f, _)| f.as_ref().ok());
+    let magenta = app.show_uncut && found.is_some_and(|f| f.faces.iter().any(|f| *f));
+    let amber = app.show_uncut && found.is_some_and(|f| f.thin.faces.iter().any(|f| *f));
     let section = app.view_section().is_some();
-    if !app.stock && !magenta && !section {
+    if !app.stock && !magenta && !amber && !section {
         return None;
     }
     let key = |colour: Color, name: &'static str| {
@@ -1946,6 +1954,9 @@ pub(crate) fn uncut_legend(app: &App) -> Option<Element<'_, Message>> {
     }
     if magenta {
         legend = legend.push(key(Color::from_rgb8(214, 72, 166), "still under stock"));
+    }
+    if amber {
+        legend = legend.push(key(Color::from_rgb8(240, 158, 35), "0.1–0.5 mm left"));
     }
     Some(legend.into())
 }
@@ -2038,6 +2049,18 @@ fn uncut_block(app: &App) -> Option<Element<'_, Message>> {
         }
         _ => block = block.push(muted(uncut_line(app)?).size(12)),
     }
+    if let Some((Ok(found), _)) = shown
+        && found.thin.share > 0.
+        && !found.regions.is_empty()
+    {
+        block = block.push(
+            muted(format!(
+                "Amber: {:.0}% has 0.1–0.5 mm left.",
+                found.thin.share * 100.
+            ))
+            .size(12),
+        );
+    }
     Some(help::wrap(
         container(block).padding([4, 10]),
         Help::text(
@@ -2045,7 +2068,7 @@ fn uncut_block(app: &App) -> Option<Element<'_, Message>> {
             "The faces of the part that the stock left after every setup still covers: what the job has not machined yet. Until every enabled operation generates, completeness is not checked.",
         )
         .more(
-            "Each face is sampled 0.5 mm outside itself against the simulated cuts, so a thinner finishing allowance counts as cut. Positions are in setup 1's axes from the part's -X/-Y/bottom corner, in mm.",
+            "Each face is sampled 0.5 mm and 0.1 mm outside itself against the simulated cuts. Magenta means over 0.5 mm of stock remains; amber means 0.1–0.5 mm remains after the whole job. Smaller residuals count as cut to allow for cutter margins, mesh chords and fine finishing scallops. Positions are in setup 1's axes from the part's -X/-Y/bottom corner, in mm.",
         ),
         widget::tooltip::Position::Right,
     ))
@@ -2305,6 +2328,10 @@ pub(crate) fn scene_viewport(app: &App) -> Option<Viewport<'_>> {
             .and_then(|(found, _)| found.as_ref().ok())
             .map(|found| found.pieces.as_slice())
             .unwrap_or(&[]),
+        thin: shown_uncut(app)
+            .and_then(|(found, _)| found.as_ref().ok())
+            .map(|found| &found.thin)
+            .unwrap_or(&crate::uncut::EMPTY),
         show_uncut: app.show_uncut,
         section: viewport::Sectioning {
             cut: app.view_section(),
@@ -2495,6 +2522,18 @@ fn section_controls(app: &App) -> Option<Element<'_, Message>> {
             .into(),
     )
 }
+/// How far the simulation is, as the strip says it: to a tenth under 10%,
+/// rounded above, and 100% only at the end.
+fn percent(progress: f32) -> String {
+    let p = (progress * 100.).clamp(0., 100.);
+    if p < 9.95 {
+        format!("{p:.1}%")
+    } else if progress < 1. {
+        format!("{:.0}%", p.min(99.))
+    } else {
+        "100%".into()
+    }
+}
 /// The 3D view's toolbar, the simulation strip under it, and the strip's
 /// controls under that: Play and the timeline, the stats and Details, or
 /// what to do for a preview. The open details go above the controls, so
@@ -2673,7 +2712,7 @@ fn scene_panels(
             btn("Restart", Message::Scrub(0.), false),
             help::wrap(slider(0.0..=1.0, app.progress, Message::Scrub).on_release(Message::ScrubDone).step(0.001_f32).width(Fill), Help::text("Simulation progress", "Scrub forward or backward. Playback recomputes the remaining stock and cutter position at that time. Restart restores the stock left by all preceding enabled operations and setups."), widget::tooltip::Position::Top),
             // As wide as "100%", so the slider keeps its length.
-            muted(format!("{}%", (app.progress * 100.) as u32)).width(34).align_x(Alignment::End),
+            muted(percent(app.progress)).width(34).align_x(Alignment::End),
             help::wrap(pick_list(if app.active_simulation().is_some() { vec![1f32, 10., 30., 60., 120.] } else { vec![0.5f32, 1., 2., 4.] }, Some(app.speed), Message::Speed).text_size(12).style(choice_style).padding(5),crate::choice_help::selected("speed","Playback speed",&app.speed.to_string(),Target::Operation,&Fields::new()),widget::tooltip::Position::Top),
             muted("×")
         ].spacing(8).align_y(Alignment::Center));
@@ -2693,8 +2732,8 @@ fn scene_panels(
                     "{:.1} / {:.1} min · ≈{:.1} cm³ this operation · ≈{:.1} cm³ total removed",
                     sim.seconds / 60.,
                     sim.plan.duration / 60.,
-                    (sim.removed_volume() - sim.inherited_volume()) / 1000.,
-                    sim.removed_volume() / 1000.
+                    sim.removed_by_operation() / 1000.,
+                    (sim.inherited_volume() + sim.removed_by_operation()) / 1000.
                 ))
                 .size(12),
             };
@@ -2749,10 +2788,15 @@ fn scene_panels(
                     .color(WARN)
                 } else {
                     muted(format!(
-                        "Air taken out: {} stretch{} ({:.0} mm of feed) replaced by rapids, {:.1} min saved",
+                        "Air taken out: {} stretch{} ({:.0} mm of feed) replaced by rapids{}, {:.1} min saved",
                         air.stretches,
                         if air.stretches == 1 { "" } else { "es" },
                         air.air,
+                        match air.lowered {
+                            0 => String::new(),
+                            1 => ", 1 link lowered to just over the stock".into(),
+                            n => format!(", {n} links lowered to just over the stock"),
+                        },
                         air.saved / 60.
                     ))
                     .size(12)
@@ -13045,6 +13089,7 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             live_volume: None,
             uncut: &[],
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -14331,6 +14376,17 @@ mod tests {
     use crate::model::Strategy;
     use std::path::Path;
 
+    /// The simulation strip's progress, to a tenth under 10% (LIO-326).
+    #[test]
+    fn the_progress_is_rounded_and_full_only_at_the_end() {
+        use super::percent;
+        assert_eq!(percent(0.), "0.0%");
+        assert_eq!(percent(3.0 / 154.9), "1.9%");
+        assert_eq!(percent(0.0996), "10%");
+        assert_eq!(percent(0.887), "89%");
+        assert_eq!(percent(0.998), "99%");
+        assert_eq!(percent(1.), "100%");
+    }
     /// The Control page is short under 860 px of height and narrow under
     /// 1360 px of width (LIO-275).
     #[test]
