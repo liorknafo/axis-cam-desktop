@@ -1244,7 +1244,7 @@ pub struct App {
     pub import_error: Option<String>,
     pub stock: bool,
     /// "Show uncut faces": the part's faces the whole job leaves under stock
-    /// are drawn magenta (`uncut::Uncut::faces`), over the simulated stock too.
+    /// are drawn magenta or amber (`uncut::Uncut`), over the simulated stock too.
     pub show_uncut: bool,
     /// Whether the simulation strip shows its details (`ToggleSimDetails`).
     pub sim_details: bool,

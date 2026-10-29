@@ -280,6 +280,8 @@ pub struct Viewport<'a> {
     /// (`uncut::Uncut::pieces`): in `UNCUT` only those under stock. Empty
     /// when none is.
     pub uncut_pieces: &'a [Vec<crate::uncut::Piece>],
+    /// Disjoint thin-stock category, drawn amber with the same piece rules.
+    pub thin: &'a crate::uncut::Coverage,
     /// Whether those faces are drawn in `UNCUT` at all ("Show uncut faces").
     /// With a simulation and the stock shown the part itself is not drawn, so
     /// then just these faces are, after the stock and depth-tested against it.
@@ -1115,7 +1117,12 @@ impl Viewport<'_> {
             self.sample,
             self.simulation.map(|s| (s.id.as_str(), s.revision))
         );
-        let key = format!("{key}|{:?}", self.shown_a());
+        let key = format!(
+            "{key}|{:?}|{:?}|{}",
+            self.shown_a(),
+            self.thin.faces.first().map(std::ptr::from_ref),
+            self.thin.faces.len()
+        );
         format!(
             "{key}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{:?}",
             self.holding,
@@ -1254,17 +1261,41 @@ impl Viewport<'_> {
         // face whole.
         let placement = Placement::new(self.mesh, self.setup);
         let turned = self.turner();
-        let shapes = |fi: usize, face: &Face| -> Vec<(Vec<[f32; 3]>, bool)> {
-            let uncut = self.show_uncut && self.uncut.get(fi) == Some(&true);
-            match self.uncut_pieces.get(fi) {
-                Some(pieces) if uncut && !pieces.is_empty() => (pieces.iter())
-                    .map(|(t, under)| {
+        type CoveredShape = (Vec<[f32; 3]>, Option<[u8; 3]>);
+        let shapes = |fi: usize, face: &Face| -> Vec<CoveredShape> {
+            let thick = self.show_uncut && self.uncut.get(fi) == Some(&true);
+            let thin = self.show_uncut && self.thin.faces.get(fi) == Some(&true);
+            let thick_pieces = self.uncut_pieces.get(fi).filter(|p| thick && !p.is_empty());
+            let thin_pieces = self.thin.pieces.get(fi).filter(|p| thin && !p.is_empty());
+            // The classifier keeps the same subdivision in both masks.
+            // A category absent from this face has no pieces of its own.
+            match thick_pieces.or(thin_pieces) {
+                Some(pieces) => pieces
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (t, _))| {
                         let points: Vec<_> =
                             t.iter().map(|q| turned(placement.transform(*q))).collect();
-                        (cut.map_or(points.clone(), |cut| cut.clip(&points)), *under)
+                        let color = if thick && thick_pieces.is_none_or(|p| p[i].1) {
+                            Some(UNCUT)
+                        } else if thin && thin_pieces.is_none_or(|p| p[i].1) {
+                            Some(THIN)
+                        } else {
+                            None
+                        };
+                        (cut.map_or(points.clone(), |cut| cut.clip(&points)), color)
                     })
                     .collect(),
-                _ => vec![(face.points.clone(), uncut)],
+                None => vec![(
+                    face.points.clone(),
+                    if thick {
+                        Some(UNCUT)
+                    } else if thin {
+                        Some(THIN)
+                    } else {
+                        None
+                    },
+                )],
             }
         };
         // A selected face still under stock is striped in the selection's
@@ -1280,11 +1311,11 @@ impl Viewport<'_> {
                 && (face.feature == hovered || hovered_face.contains(&face.feature.unwrap()));
             let kept = !hover && face.feature.is_some_and(|f| marked.contains(&f));
             for (points, uncut) in shapes(fi, face) {
-                let striped = !hover && uncut && selected;
+                let striped = !hover && uncut.is_some() && selected;
                 let color = if hover {
                     [242, 190, 93, 255]
-                } else if uncut {
-                    uncut_color(light)
+                } else if let Some(color) = uncut {
+                    covered_color(color, light)
                 } else if selected {
                     SELECTED
                 } else {
@@ -1473,12 +1504,16 @@ impl Viewport<'_> {
                 }
             }
             for (fi, face) in faces.iter().enumerate() {
-                if !behind_stock || self.uncut.get(fi) != Some(&true) {
+                if !behind_stock
+                    || !self.show_uncut
+                    || (self.uncut.get(fi) != Some(&true) && self.thin.faces.get(fi) != Some(&true))
+                {
                     continue;
                 }
-                let color = uncut_color(face_light(&whole[fi]));
                 let striped = selected_by(face);
-                for (points, _) in shapes(fi, face).into_iter().filter(|(_, under)| *under) {
+                for (points, color) in shapes(fi, face) {
+                    let Some(color) = color else { continue };
+                    let color = covered_color(color, face_light(&whole[fi]));
                     let v = project(&points);
                     for i in 1..v.len().saturating_sub(1) {
                         raster_rows_with(
@@ -3014,6 +3049,7 @@ fn alpha_over(pixel: &mut [u8], color: [u8; 3], alpha: f32) {
 const SELECTED: [u8; 4] = [92, 168, 223, 255];
 /// The colour of the part's faces the whole job leaves under stock.
 const UNCUT: [u8; 3] = [214, 72, 166];
+const THIN: [u8; 3] = [240, 158, 35];
 /// How wide each stripe of `hatch` is, in logical pixels.
 const HATCH_STRIPE: f32 = 4.;
 /// The colour at pixel (x, y) of a selected face still under stock, whose
@@ -3029,10 +3065,10 @@ fn hatch(ratio: f32) -> impl Fn([u8; 4], u32, u32) -> [u8; 4] + Copy {
         }
     }
 }
-/// `UNCUT` as a face of brightness `light` is drawn.
-fn uncut_color(light: f32) -> [u8; 4] {
+/// A stock-coverage colour shaded with the part face.
+fn covered_color(color: [u8; 3], light: f32) -> [u8; 4] {
     let shade = |c: u8| (c as f32 * (light + 0.1).min(1.)) as u8;
-    [shade(UNCUT[0]), shade(UNCUT[1]), shade(UNCUT[2]), 255]
+    [shade(color[0]), shade(color[1]), shade(color[2]), 255]
 }
 /// How bright the part's `face` is drawn, from its normal and tone.
 fn face_light(face: &Face) -> f32 {
@@ -4047,6 +4083,7 @@ mod tests {
             live_volume: None,
             uncut: &[],
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -4076,6 +4113,7 @@ mod tests {
         let uncut = Viewport {
             uncut: &all,
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             ..bare
         };
         let (_, _, rgba) = uncut.pixels(&p, bounds, None);
@@ -4206,6 +4244,7 @@ mod tests {
                 start_stock: None,
                 uncut: &[],
                 uncut_pieces: &[],
+                thin: &crate::uncut::EMPTY,
                 show_uncut: true,
                 section: Sectioning {
                     cut: Some(Section::across(k, &mesh, Some(&setup), camera.toward())),
@@ -4286,6 +4325,7 @@ mod tests {
             live_volume: None,
             uncut: &[],
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             show_uncut: false,
             section: Default::default(),
             frame: None,
@@ -4376,6 +4416,7 @@ mod tests {
             live_volume: None,
             uncut: &all,
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -4404,6 +4445,7 @@ mod tests {
         let none = Viewport {
             uncut: &[],
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             show_uncut: true,
             section: Default::default(),
             ..off
@@ -4449,6 +4491,7 @@ mod tests {
             start_stock: None,
             uncut: &[],
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -4540,6 +4583,7 @@ mod tests {
             start_stock,
             uncut: &[],
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -4618,6 +4662,7 @@ mod tests {
             start_stock: None,
             uncut: &[],
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             show_uncut: false,
             section: Default::default(),
             frame: None,
@@ -4752,6 +4797,7 @@ mod tests {
             live_volume: None,
             uncut: &all,
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -4795,6 +4841,39 @@ mod tests {
             .filter(|w| w[0] != w[1])
             .count();
         assert!(turns >= 6, "{turns}");
+        let thin = crate::uncut::Coverage {
+            faces: all.clone(),
+            ..Default::default()
+        };
+        let amber_view = Viewport {
+            uncut: &[],
+            thin: &thin,
+            pin_holes: view.pin_holes.clone(),
+            hole_outlines: view.hole_outlines.clone(),
+            pin_aim: view.pin_aim.clone(),
+            holding: view.holding.clone(),
+            framed: view.framed.clone(),
+            ..view
+        };
+        let (plain_amber, _) = amber_view.render(&p, size, 1., None, &[]);
+        let (striped_amber, _) = amber_view.render(&p, size, 1., None, &features);
+        let amber = |rgba: &[u8]| {
+            rgba.chunks(4)
+                .filter(|px| px[0] > px[1].saturating_add(40) && px[1] > px[2].saturating_add(40))
+                .count()
+        };
+        assert!(amber(&plain_amber) > 0 && tinted(&plain_amber) == 0);
+        assert!(amber(&striped_amber) > 0 && tinted(&striped_amber) > 0);
+        assert_ne!(
+            view.raster_key(
+                Rectangle::new(Point::ORIGIN, iced::Size::new(300., 200.)),
+                None
+            ),
+            amber_view.raster_key(
+                Rectangle::new(Point::ORIGIN, iced::Size::new(300., 200.)),
+                None
+            )
+        );
         // Without the toggle the selection fills the face, as it did.
         let off = Viewport {
             show_uncut: false,
@@ -4839,6 +4918,7 @@ mod tests {
                 live_volume: None,
                 uncut,
                 uncut_pieces: &[],
+                thin: &crate::uncut::EMPTY,
                 show_uncut: true,
                 section: Default::default(),
                 frame: None,
@@ -4889,6 +4969,7 @@ mod tests {
             live_volume: None,
             uncut: &uncut.faces,
             uncut_pieces: &uncut.pieces,
+            thin: &crate::uncut::EMPTY,
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -4911,6 +4992,42 @@ mod tests {
         for x in [52., 60., 70., 85.] {
             assert!(magenta(x), "not magenta {x} mm along, under stock");
         }
+        // A second cut leaves 0.2 mm from X 45 to X 75 on this same face.
+        let mut stock = stock;
+        let mut cut = stock.cuts[0].clone();
+        cut.a[0] += 30.;
+        cut.b[0] += 30.;
+        cut.a[2] += 0.2;
+        cut.b[2] += 0.2;
+        std::sync::Arc::make_mut(&mut stock.cuts).push(cut);
+        let mixed = crate::uncut::uncut(&stock, &setup, &mesh);
+        let mixed_view = Viewport {
+            uncut: &mixed.faces,
+            uncut_pieces: &mixed.pieces,
+            thin: &mixed.thin,
+            ..view
+        };
+        let (rgba, _) = mixed_view.render(&p, size, 1., None, &[]);
+        let pixel = |x: f32| {
+            let at = p.p([a[0] + x, a[1] + 4., a[2]].map(|v| v * scale));
+            let i = (at.y as usize * size.0 as usize + at.x as usize) * 4;
+            &rgba[i..i + 4]
+        };
+        let amber =
+            |px: &[u8]| px[0] > px[1].saturating_add(40) && px[1] > px[2].saturating_add(40);
+        for x in [52., 60., 70.] {
+            assert!(amber(pixel(x)), "not amber at {x}: {:?}", pixel(x));
+        }
+        for x in [12., 30., 85.] {
+            assert!(!amber(pixel(x)), "amber at {x}");
+        }
+        assert!(pixel(85.)[2] > pixel(85.)[1].saturating_add(40));
+        let off = Viewport {
+            show_uncut: false,
+            ..mixed_view
+        };
+        let (rgba, _) = off.render(&p, size, 1., None, &[]);
+        assert!(!rgba.chunks(4).any(amber));
     }
     #[test]
     fn a_later_setups_known_box_is_drawn_as_its_stock_and_otherwise_none_is() {
@@ -4946,6 +5063,7 @@ mod tests {
             live_volume: None,
             uncut: &[],
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -5032,6 +5150,7 @@ mod tests {
             live_volume: None,
             uncut: &[],
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -5176,6 +5295,7 @@ mod tests {
             live_volume: None,
             uncut: &[],
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -5287,6 +5407,7 @@ mod tests {
             live_volume: None,
             uncut: &[],
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -5361,6 +5482,7 @@ mod tests {
             live_volume: None,
             uncut: &[],
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -5477,6 +5599,7 @@ mod tests {
             live_volume: None,
             uncut: &[],
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -5546,6 +5669,7 @@ mod tests {
             live_volume: None,
             uncut: &[],
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -5611,6 +5735,7 @@ mod tests {
             live_volume: None,
             uncut: &[],
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -5668,6 +5793,7 @@ mod tests {
             live_volume: None,
             uncut: &[],
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -5723,6 +5849,7 @@ mod tests {
             live_volume: None,
             uncut: &[],
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -5792,6 +5919,7 @@ mod tests {
             start_stock: None,
             uncut: &[],
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             show_uncut: true,
             section: Default::default(),
             frame: None,
@@ -5989,6 +6117,7 @@ mod tests {
             live_volume: None,
             uncut: &[],
             uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
             show_uncut: true,
             section: Default::default(),
             frame: None,

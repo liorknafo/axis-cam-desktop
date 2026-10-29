@@ -3548,14 +3548,14 @@ pub(crate) fn chamfered_hole() -> Vec<[[f32; 3]; 3]> {
     tris
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{mesh, model::Machine, simulation::Simulation};
     fn quad(tris: &mut Vec<[[f32; 3]; 3]>, x: f32, y: f32, xx: f32, yy: f32, z: f32) {
         tris.push([[x, y, z], [xx, y, z], [xx, yy, z]]);
         tris.push([[x, y, z], [xx, yy, z], [x, yy, z]]);
     }
-    fn fixture() -> (Setup, Operation, Tool, Mesh) {
+    pub(crate) fn fixture() -> (Setup, Operation, Tool, Mesh) {
         let mut tris = Vec::new();
         // Floor ring, central island, enclosing rim and lower model bound.
         for (x, y, xx, yy) in [
