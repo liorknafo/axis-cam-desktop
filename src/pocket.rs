@@ -2318,11 +2318,11 @@ fn remaining(
     .map_err(|e| e.to_string())
 }
 /// The floor of an earlier cut that the material of `centres`, cut from
-/// `top` down to `target`, was cleared to all but in places, and those
-/// places (`remaining` over it): the lowest floor where cutting them down
-/// to it, then all of it from there, takes fewer levels by area than all
-/// of it from `top`, so the levels under it are as even as they can be.
-/// None where no floor does.
+/// `top` down to `target`, was cleared to all but in places (`remaining`
+/// over it): the lowest floor where cutting those places down to it, then
+/// all of it from there, takes fewer levels by area than all of it from
+/// `top`, so the levels under it are as even as they can be. None where
+/// no floor does.
 fn stepped(
     centres: &Region,
     target: f32,
@@ -2330,7 +2330,7 @@ fn stepped(
     radius: f32,
     stepdown: f32,
     rest: &crate::rest::RestStock,
-) -> Result<Option<(f32, Region)>, String> {
+) -> Result<Option<f32>, String> {
     let full = centres.signed_area();
     let levels = |high: f32, low: f32| ((high - low - 0.0001) / stepdown).ceil().max(1.) as f64;
     let whole = full * levels(top, target);
@@ -2345,7 +2345,7 @@ fn stepped(
             break;
         }
         if area * levels(top, floor) + full * levels(floor, target) < whole - 0.01 {
-            lowest = Some((floor, taller));
+            lowest = Some(floor);
         }
     }
     Ok(lowest)
@@ -2954,33 +2954,25 @@ fn finish_plan(setup: &Setup, op: &Operation, job: Job) -> Result<Plan, String> 
     }
     // A piece whose material earlier cuts left taller only in places, as
     // where a slot runs out past a faced top to the stock round the part,
-    // is cut in two: those places down to the floor the rest was cleared
-    // to, then all of it from that floor, a whole stepdown at a time, and
-    // not from the tallest stock, which would leave its first level a skim.
-    // Where earlier cuts left nothing anywhere, it runs whole, as above.
+    // starts at the floor the rest was cleared to, a whole stepdown at a
+    // time from there, and not at the tallest stock, which would leave its
+    // first level a skim. Support passes along its own paths clear those
+    // places above it first (`support_clearings`), entering from the side
+    // already cleared. Where earlier cuts left nothing anywhere, it runs
+    // whole, as above.
     let mut bands = vec![];
+    let mut lowered = false;
     for (zone, room) in pieces {
         let centres = zone.centres.at(0.)?;
-        let cutting_top = start(&zone, &centres);
-        let split = match rest.filter(|_| !left.is_empty()) {
-            Some(rest) => stepped(&centres, zone.target, cutting_top, radius, stepdown, rest)?,
-            None => None,
-        };
-        let Some((floor, taller)) = split else {
-            bands.push((zone, room, cutting_top));
-            continue;
-        };
-        let outer = room.clone().unwrap_or_else(|| centres.into());
-        for piece in components(&taller) {
-            let piece = Zone {
-                centres: Centres::Region(piece),
-                target: floor,
-                ..zone
-            };
-            let top = start(&piece, &piece.centres.at(0.)?);
-            bands.push((piece, Some(outer.clone()), top));
+        let mut cutting_top = start(&zone, &centres);
+        if let Some(rest) = rest.filter(|_| !left.is_empty())
+            && let Some(floor) =
+                stepped(&centres, zone.target, cutting_top, radius, stepdown, rest)?
+        {
+            cutting_top = floor;
+            lowered = true;
         }
-        bands.push((zone, room, floor));
+        bands.push((zone, room, cutting_top));
     }
     let mut planned: Vec<Planned> = vec![];
     for (zone, room, cutting_top) in bands {
@@ -3054,7 +3046,8 @@ fn finish_plan(setup: &Setup, op: &Operation, job: Job) -> Result<Plan, String> 
             support: false,
         });
     }
-    if !profile_only && stack_clearings(&mut clearings, radius, stepdown)? {
+    let stacked = !profile_only && stack_clearings(&mut clearings, radius, stepdown)?;
+    if stacked || lowered {
         support_clearings(&mut clearings, rest, stock, radius, stepdown)?;
     }
     let mut segments = 0usize;
@@ -5627,25 +5620,32 @@ mod tests {
         let mut small = tool.clone();
         small.p.insert("diameter".into(), "2".into());
         let plan = generate(&setup, &op, &small, &mesh).unwrap();
-        let corner = |p: &[f32; 3]| {
-            [(-10., -8.), (10., -8.), (-10., 8.), (10., 8.)]
-                .iter()
-                .any(|c: &(f32, f32)| (p[0] - c.0).hypot(p[1] - c.1) < 4.)
-        };
-        let heights = |near: bool| {
-            let mut z: Vec<i32> = (cutting(&plan).iter())
-                .filter(|p| corner(p) == near)
-                .map(|p| ((p[2] - dz) * 100.).round() as i32)
-                .collect();
-            z.sort();
-            z.dedup();
-            z
-        };
-        // The corners from the top down to the floor the rest was cleared
-        // to; then all of it from there, a whole stepdown to Z 0.5 and on
-        // to Z 0, not from Z 6 with a first level at Z 2 that skims 0.5 mm.
-        assert_eq!(heights(false), [0, 50], "{:?}", heights(true));
-        assert!(heights(true).contains(&400) && heights(true).contains(&250));
+        // The cutting length at each height (hundredths of a mm).
+        let mut lengths: Vec<(i32, f32)> = vec![];
+        for m in plan
+            .moves
+            .iter()
+            .filter(|m| m.cutting_pass && m.from[2] == m.to[2])
+        {
+            let z = ((m.to[2] - dz) * 100.).round() as i32;
+            let l = (m.to[0] - m.from[0]).hypot(m.to[1] - m.from[1]);
+            match lengths.iter_mut().find(|e| e.0 == z) {
+                Some(e) => e.1 += l,
+                None => lengths.push((z, l)),
+            }
+        }
+        lengths.sort_by_key(|e| e.0);
+        let most = lengths.iter().map(|e| e.1).fold(0., f32::max);
+        let whole: Vec<i32> = (lengths.iter())
+            .filter(|e| e.1 > most / 2.)
+            .map(|e| e.0)
+            .collect();
+        // All of it from the floor the rest was cleared to, a whole
+        // stepdown to Z 0.5 and on to Z 0, not from Z 6 with a level at Z 2
+        // that skims 0.5 mm; the corners above it along its paths, a
+        // stepdown at a time.
+        assert_eq!(whole, [0, 50], "{lengths:?}");
+        assert!(lengths.iter().any(|e| e.0 == 250) && lengths.iter().any(|e| e.0 == 450));
     }
     #[test]
     fn an_outline_inside_another_leaves_no_edge_for_the_rings() {
