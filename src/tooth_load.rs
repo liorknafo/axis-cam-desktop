@@ -960,7 +960,11 @@ fn refeed(plan: &Plan, load: &ToothLoad, f: Feeding) -> Refed {
                     .min(m.feed * FASTEST)
                     .max(m.feed * SLOWEST)
             };
-            run.push((i, (force <= 0.).then_some(flying)));
+            // A support pass (`Plan::keep_air`) may shave a sliver no
+            // sample measures: never fed up.
+            let support = plan.keep_air.get(i).copied().unwrap_or(false);
+            let air = if support { m.feed } else { flying };
+            run.push((i, (force <= 0.).then_some(air)));
             wanted.push(feed);
             along.push(travelled + (k as f64 + 0.5) * piece);
         }
@@ -1420,6 +1424,15 @@ mod tests {
         ends(
             &refeed(&above.plan, &load_above, feeding(100., f32::INFINITY)),
             600. * FASTEST,
+        );
+        // A support pass (`Plan::keep_air`) keeps its own feed throughout.
+        let mut support = above.clone();
+        support.plan.keep_air = vec![true; support.plan.moves.len()];
+        let refed = refeed(&support.plan, &load_above, feeding(100., 1000.));
+        assert!(
+            refed.moves.iter().all(|m| m.feed == 600.),
+            "{:?}",
+            refed.moves
         );
         // Back along the slot it cut, over nothing: slowed within a cutter's
         // reach of the slot's end and of the end of the pass, 1000 mm/min
