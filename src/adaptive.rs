@@ -2556,7 +2556,9 @@ mod tests {
             .collect();
         assert_eq!(ramps.len(), 2);
         op.surfaces.as_mut().unwrap().ids = ramps;
-        op.p.insert("stepdown".into(), "1.5".into());
+        for k in ["stepdown", "slope_stepdown"] {
+            op.p.insert(k.into(), "1.5".into());
+        }
         let dz =
             stock::Placement::new(&mesh, Some(&setup)).bounds.min[2] / mesh.display_scale() + 4.;
         for strategy in [Strategy::Adaptive, Strategy::Pocket] {
@@ -2580,7 +2582,9 @@ mod tests {
     #[test]
     fn a_ramp_is_cleared_in_steps_never_into_it() {
         // A 30 × 12 mm part: level at Z 4 to X −5, a ramp 21.8° down to Z 0
-        // at X 5, level on from there. The ramp picked, Ø4, 1 mm stepdown.
+        // at X 5, level on from there. The ramp picked, Ø4, 1 mm stepdown,
+        // and a 6 mm stepdown with the 1 mm stepdown on slopes a new
+        // operation has: the steps stay 1 mm tall.
         let mut tris = vec![];
         quad(&mut tris, -15., -6., -5., 6., 4.);
         quad(&mut tris, 5., -6., 15., 6., 0.);
@@ -2593,9 +2597,8 @@ mod tests {
             .map(|(i, _)| i)
             .collect();
         assert_eq!(ramp.len(), 1);
-        assert!(crate::pocket::is_sloped(&setup, &mesh, ramp[0]));
+        assert!(crate::pocket::in_sloped_face(&setup, &mesh, ramp[0]));
         op.surfaces.as_mut().unwrap().ids = ramp;
-        op.p.insert("stepdown".into(), "1".into());
         assert_eq!(
             surface::issues(&op, &setup, Some(&mesh)),
             Vec::<String>::new()
@@ -2604,15 +2607,19 @@ mod tests {
         let dz = stock::Placement::new(&mesh, Some(&setup)).bounds.min[2] / scale + 4.;
         // The part's height at X.
         let height = |x: f32| (4. - 0.4 * (x + 5.)).clamp(0., 4.);
-        for strategy in [Strategy::Adaptive, Strategy::Pocket] {
+        for (strategy, stepdown) in [Strategy::Adaptive, Strategy::Pocket]
+            .into_iter()
+            .flat_map(|s| [(s, "1"), (s, "6")])
+        {
             let mut op = op.clone();
             op.strategy = strategy;
+            op.p.insert("stepdown".into(), stepdown.into());
             let plan = if strategy == Strategy::Adaptive {
                 generate(&setup, &op, &tool, &mesh)
             } else {
                 crate::pocket::generate(&setup, &op, &tool, &mesh)
             }
-            .unwrap_or_else(|e| panic!("{strategy:?}: {e}"));
+            .unwrap_or_else(|e| panic!("{strategy:?} at {stepdown}: {e}"));
             let r = plan.radius;
             // Never under the part anywhere under the cutter, which is
             // highest at the uphill end of the cutter's chord over it.
@@ -2626,7 +2633,7 @@ mod tests {
                     let half = (r * r - off * off).sqrt();
                     assert!(
                         p[2] - dz >= height(p[0] - half) - 0.001,
-                        "{strategy:?} {p:?} dz {dz} r {r}: {m:?}"
+                        "{strategy:?} at {stepdown} {p:?} dz {dz} r {r}: {m:?}"
                     );
                 }
             }
@@ -2637,6 +2644,185 @@ mod tests {
                     plan.moves.iter().any(|m| m.cutting_pass
                         && m.to[0] < 5. + 2. * r
                         && (m.to[2] - dz - z).abs() < 0.001),
+                    "{strategy:?} at {stepdown}: no cut at Z {z}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn a_step_dome_is_roughed_never_into_its_true_sphere() {
+        if crate::step::skip_without_helper() {
+            return;
+        }
+        // The R25 half ball of the STEP example on its 10 mm plate, its
+        // dome picked whole; Ø4, a 6 mm stepdown, no stock to leave. Its
+        // facets lie up to 0.07 mm inside the sphere, so a path clear of
+        // them alone cut the sphere 0.057 mm deep.
+        let mesh = mesh::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/half-ball-on-plate.step"),
+        )
+        .unwrap();
+        let mut setup = Setup::new(Machine::new(3), "G54");
+        setup
+            .p
+            .insert("stock_type".into(), "Relative size box".into());
+        for (k, _) in stock::OFFSETS {
+            setup.p.insert(k.into(), "0".into());
+        }
+        let tool = Tool::new("Flat 4", "Flat end mill", "4");
+        let placement = stock::Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        let points: Vec<[f32; 3]> = (mesh.faces.iter())
+            .flat_map(|f| {
+                f.points
+                    .iter()
+                    .map(|p| placement.transform(*p).map(|v| v / scale))
+            })
+            .collect();
+        let apex = *points.iter().max_by(|a, b| a[2].total_cmp(&b[2])).unwrap();
+        let centre = [apex[0], apex[1], apex[2] - 25.];
+        let id = (mesh.faces.iter())
+            .find(|f| {
+                f.points
+                    .iter()
+                    .any(|p| placement.transform(*p)[2] / scale > centre[2] + 20.)
+            })
+            .and_then(|f| f.feature)
+            .unwrap();
+        let dome = mesh.region_of(id);
+        let mut op = Operation::new(Strategy::Adaptive, tool.id.clone());
+        op.geometry.clear();
+        op.surfaces = Some(surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: dome,
+        });
+        for (k, v) in [
+            ("stepdown", "6"),
+            ("allowance", "0"),
+            ("axial_allowance", "0"),
+        ] {
+            op.p.insert(k.into(), v.into());
+        }
+        for strategy in [Strategy::Adaptive, Strategy::Pocket] {
+            let mut op = op.clone();
+            op.strategy = strategy;
+            let plan = if strategy == Strategy::Adaptive {
+                generate(&setup, &op, &tool, &mesh)
+            } else {
+                crate::pocket::generate(&setup, &op, &tool, &mesh)
+            }
+            .unwrap_or_else(|e| panic!("{strategy:?}: {e}"));
+            let r = plan.radius;
+            // The nearest the cutter (its flat bottom and all over it) comes
+            // to the sphere's centre, every 0.1 mm along each feed: never
+            // more than the 0.01 mm tolerance inside the sphere.
+            let mut nearest = f32::INFINITY;
+            for m in plan.moves.iter().filter(|m| m.motion == Motion::Feed) {
+                let n = ((m.end - m.start) / 0.1).ceil().max(1.) as usize;
+                for i in 0..=n {
+                    let p = m.at(m.start + (m.end - m.start) * i as f32 / n as f32);
+                    let across = ((p[0] - centre[0]).hypot(p[1] - centre[1]) - r).max(0.);
+                    let up = (p[2] - centre[2]).max(0.);
+                    nearest = nearest.min(across.hypot(up));
+                }
+            }
+            assert!(nearest >= 25. - 0.01, "{strategy:?}: {}", 25. - nearest);
+            assert!(plan.levels > 2, "{strategy:?}: {} levels", plan.levels);
+        }
+    }
+    #[test]
+    fn a_dome_is_roughed_in_steps_steep_foot_too_never_into_it() {
+        // A Ø20 half ball on a plate whose top is Z 4: its dome is one
+        // smooth face, sloped near the top and steeper than a wall at its
+        // foot. The dome picked by a click near its foot, Ø4, a 6 mm
+        // stepdown and no stock to leave.
+        let mesh = crate::cam::tests::half_ball_on_plate();
+        let mut setup = Setup::new(Machine::new(3), "G54");
+        setup
+            .p
+            .insert("stock_type".into(), "Relative size box".into());
+        for (k, _) in stock::OFFSETS {
+            setup.p.insert(k.into(), "0".into());
+        }
+        let tool = Tool::new("Flat 4", "Flat end mill", "4");
+        let placement = stock::Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        let b = placement.bounds;
+        let axis = [(b.min[0] + b.max[0]) / 2., (b.min[1] + b.max[1]) / 2.].map(|v| v / scale);
+        let foot = (0..mesh.surfaces.len())
+            .find(|&id| {
+                let c = placement
+                    .transform(mesh.surfaces[id].center)
+                    .map(|v| v / scale);
+                (c[0] - axis[0]).hypot(c[1] - axis[1]) > 9.5 && c[2] - b.min[2] / scale > 4.1
+            })
+            .unwrap();
+        assert!(crate::pocket::is_wall(&setup, &mesh, foot));
+        let dome = mesh.region_of(foot);
+        assert!(crate::pocket::in_sloped_face(&setup, &mesh, foot));
+        assert_eq!(
+            crate::pocket::sloped_faces(&setup, &mesh, dome.iter().copied()).len(),
+            dome.len()
+        );
+        let mut op = Operation::new(Strategy::Adaptive, tool.id.clone());
+        op.geometry.clear();
+        op.surfaces = Some(surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: dome,
+        });
+        for (k, v) in [
+            ("stepdown", "6"),
+            ("allowance", "0"),
+            ("axial_allowance", "0"),
+        ] {
+            op.p.insert(k.into(), v.into());
+        }
+        let bottom = b.min[2] / scale;
+        // The dome's height over the bottom at a distance off its axis.
+        let height = |d: f32| {
+            if d < 10. {
+                4. + (100. - d * d).sqrt()
+            } else {
+                4.
+            }
+        };
+        for strategy in [Strategy::Adaptive, Strategy::Pocket] {
+            let mut op = op.clone();
+            op.strategy = strategy;
+            setup.operations = vec![op.clone()];
+            assert_eq!(
+                surface::issues(&op, &setup, Some(&mesh)),
+                Vec::<String>::new(),
+                "{strategy:?}"
+            );
+            let plan = if strategy == Strategy::Adaptive {
+                generate(&setup, &op, &tool, &mesh)
+            } else {
+                crate::pocket::generate(&setup, &op, &tool, &mesh)
+            }
+            .unwrap_or_else(|e| panic!("{strategy:?}: {e}"));
+            let r = plan.radius;
+            // The flat bottom never under the dome: the dome is highest
+            // under it at its point nearest the axis. The facets are under
+            // the true sphere by up to 0.03 mm.
+            for m in plan.moves.iter().filter(|m| m.motion == Motion::Feed) {
+                for i in 0..=10 {
+                    let p = m.at(m.start + (m.end - m.start) * i as f32 / 10.);
+                    let d = ((p[0] - axis[0]).hypot(p[1] - axis[1]) - r).max(0.);
+                    assert!(
+                        p[2] - bottom >= height(d) - 0.03,
+                        "{strategy:?} {p:?} at {d} off the axis: {m:?}"
+                    );
+                }
+            }
+            // A step at each millimetre from under the top down to the
+            // plate, round the dome.
+            for z in 4..14 {
+                assert!(
+                    plan.moves.iter().any(|m| m.cutting_pass
+                        && (m.to[2] - bottom - z as f32).abs() < 0.001
+                        && (m.to[0] - axis[0]).hypot(m.to[1] - axis[1]) < 10. + 2. * r),
                     "{strategy:?}: no cut at Z {z}"
                 );
             }

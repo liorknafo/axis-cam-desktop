@@ -1243,7 +1243,7 @@ impl Viewport<'_> {
                 .is_some_and(|o| matches!(o.strategy, Strategy::Pocket | Strategy::Adaptive))
                 && self
                     .setup
-                    .is_some_and(|s| crate::pocket::is_sloped(s, self.mesh, h))
+                    .is_some_and(|s| crate::pocket::in_sloped_face(s, self.mesh, h))
         };
         let hovered_face: std::collections::HashSet<usize> = match hovered {
             Some(h)
