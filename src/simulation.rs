@@ -989,13 +989,17 @@ impl Simulation {
             return voxels;
         }
         let (grid, before) = (&self.stock, &self.initial_stock);
-        // Each fall in pieces at most half the voxels' least side.
+        // Each column in fixed layers half the voxels' least side tall, each
+        // material or not as the volume holds at its middle: a fall counts
+        // the part of each layer it passes, so the count only grows as the
+        // column falls, and not at all through air.
         let step = volume
             .cell
             .into_iter()
             .fold(f32::INFINITY, f32::min)
             .max(0.05)
             / 2.;
+        let base = grid.bounds.min[2];
         let mut depth = 0.;
         for y in 0..grid.ny {
             for x in 0..grid.nx {
@@ -1008,12 +1012,15 @@ impl Simulation {
                     grid.bounds.min[0] + (x as f32 + 0.5) * grid.dx,
                     grid.bounds.min[1] + (y as f32 + 0.5) * grid.dy,
                 );
-                let n = ((high - low) / step).ceil().max(1.);
-                let piece = (high - low) / n;
-                depth += (0..n as usize)
-                    .filter(|&k| volume.filled([px, py, low + (k as f32 + 0.5) * piece], frame))
-                    .count() as f32
-                    * piece;
+                let first = ((low - base) / step).floor() as i64;
+                let last = ((high - base) / step).ceil() as i64;
+                for k in first..last {
+                    let (bottom, top) = (base + k as f32 * step, base + (k + 1) as f32 * step);
+                    let passed = top.min(high) - bottom.max(low);
+                    if passed > 0. && volume.filled([px, py, bottom + step / 2.], frame) {
+                        depth += passed;
+                    }
+                }
             }
         }
         depth * grid.dx * grid.dy
@@ -2284,6 +2291,46 @@ mod cumulative_tests {
             "{}",
             hollow.removed_by_operation()
         );
+    }
+    #[test]
+    fn the_count_only_grows_through_a_cavity_under_a_roof() {
+        // A cavity Z10–16 an earlier cut left under a 4 mm roof (Z16–20),
+        // pierced from above to Z8 and followed along: the count never falls
+        // as the cutter goes on, and ends at the roof and the 2 mm under the
+        // cavity, not the cavity.
+        let stock = Bounds {
+            min: [-30., -20., 0.],
+            max: [30., 20., 20.],
+        };
+        let frame = crate::volume::Frame::identity();
+        let moves = [
+            (Motion::Feed, [-20., 0., 8.], 150.),
+            (Motion::Feed, [20., 0., 8.], 600.),
+        ];
+        let mut plan = crate::post::fixture::plan([-20., 0., 21.], &moves);
+        (plan.stock, plan.radius, plan.flute_length) = (stock, 5., 20.);
+        let mut volume = crate::volume::Volume::new(stock, frame);
+        volume.cut(
+            [-25., 0., 10.],
+            [25., 0., 10.],
+            7.,
+            6.,
+            CutterShape::Flat,
+            frame,
+            (0, 0),
+        );
+        let mut sim = Simulation::new(plan);
+        (sim.initial_volume, sim.volume, sim.frame) =
+            (Some(volume.clone()), Some(volume), Some(frame));
+        let mut was = 0.;
+        for k in 0..=200 {
+            sim.seek(k as f32 / 200.);
+            let now = sim.removed_by_operation();
+            assert!(now >= was - 1e-3, "{k}: {now} after {was}");
+            was = now;
+        }
+        let wanted = 6. * (40. * 10. + std::f32::consts::PI * 25.);
+        assert!((was / wanted - 1.).abs() < 0.1, "{was} vs {wanted}");
     }
     #[test]
     fn remaining_start_rebuilds_after_facing_edits_suppression_and_reorder() {
