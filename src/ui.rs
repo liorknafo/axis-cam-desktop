@@ -2705,8 +2705,8 @@ fn scene_panels(
                     "{:.1} / {:.1} min · ≈{:.1} cm³ this operation · ≈{:.1} cm³ total removed",
                     sim.seconds / 60.,
                     sim.plan.duration / 60.,
-                    (sim.removed_volume() - sim.inherited_volume()) / 1000.,
-                    sim.removed_volume() / 1000.
+                    sim.removed_by_operation() / 1000.,
+                    (sim.inherited_volume() + sim.removed_by_operation()) / 1000.
                 ))
                 .size(12),
             };
