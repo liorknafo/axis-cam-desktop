@@ -2317,6 +2317,39 @@ fn remaining(
     .map(|r| r.simplify(0.001, false))
     .map_err(|e| e.to_string())
 }
+/// The floor of an earlier cut that the material of `centres`, cut from
+/// `top` down to `target`, was cleared to all but in places, and those
+/// places (`remaining` over it): the lowest floor where cutting them down
+/// to it, then all of it from there, takes fewer levels by area than all
+/// of it from `top`, so the levels under it are as even as they can be.
+/// None where no floor does.
+fn stepped(
+    centres: &Region,
+    target: f32,
+    top: f32,
+    radius: f32,
+    stepdown: f32,
+    rest: &crate::rest::RestStock,
+) -> Result<Option<(f32, Region)>, String> {
+    let full = centres.signed_area();
+    let levels = |high: f32, low: f32| ((high - low - 0.0001) / stepdown).ceil().max(1.) as f64;
+    let whole = full * levels(top, target);
+    let mut lowest = None;
+    let floors = rest.floors(envelope(centres, radius), target + 0.001, top - 0.001);
+    // Highest first: a lower floor leaves at least as much over it, and
+    // once that is all of it no lower floor splits it.
+    for floor in floors.into_iter().rev().take(8) {
+        let taller = remaining(centres, radius, rest, floor, top)?;
+        let area = taller.signed_area();
+        if area >= full * 0.999 - 0.01 {
+            break;
+        }
+        if area * levels(top, floor) + full * levels(floor, target) < whole - 0.01 {
+            lowest = Some((floor, taller));
+        }
+    }
+    Ok(lowest)
+}
 
 /// Where a cutter `inset` from the part may go round inside `open`, a
 /// hole's opening too narrow for it, as `setup` places the part, and how
@@ -2919,9 +2952,38 @@ fn finish_plan(setup: &Setup, op: &Operation, job: Job) -> Result<Plan, String> 
             _ => pieces.push((zone, None)),
         }
     }
-    let mut planned: Vec<Planned> = vec![];
+    // A piece whose material earlier cuts left taller only in places, as
+    // where a slot runs out past a faced top to the stock round the part,
+    // is cut in two: those places down to the floor the rest was cleared
+    // to, then all of it from that floor, a whole stepdown at a time, and
+    // not from the tallest stock, which would leave its first level a skim.
+    // Where earlier cuts left nothing anywhere, it runs whole, as above.
+    let mut bands = vec![];
     for (zone, room) in pieces {
-        let cutting_top = start(&zone, &zone.centres.at(0.)?);
+        let centres = zone.centres.at(0.)?;
+        let cutting_top = start(&zone, &centres);
+        let split = match rest.filter(|_| !left.is_empty()) {
+            Some(rest) => stepped(&centres, zone.target, cutting_top, radius, stepdown, rest)?,
+            None => None,
+        };
+        let Some((floor, taller)) = split else {
+            bands.push((zone, room, cutting_top));
+            continue;
+        };
+        let outer = room.clone().unwrap_or_else(|| centres.into());
+        for piece in components(&taller) {
+            let piece = Zone {
+                centres: Centres::Region(piece),
+                target: floor,
+                ..zone
+            };
+            let top = start(&piece, &piece.centres.at(0.)?);
+            bands.push((piece, Some(outer.clone()), top));
+        }
+        bands.push((zone, room, floor));
+    }
+    let mut planned: Vec<Planned> = vec![];
+    for (zone, room, cutting_top) in bands {
         let mut rings: Vec<Vec<Polygon>> = Vec::new();
         // Inward a stepover at a time until nothing is left; their points
         // count against the ceiling as their moves will.
@@ -5532,6 +5594,58 @@ mod tests {
             .moves
             .len()
         );
+    }
+    #[test]
+    fn a_pocket_cleared_lower_but_in_its_corners_steps_down_from_the_lower_floor() {
+        // A 20 × 16 mm pocket in a rim up to Z 6, cleared to Z 2.5 by a Ø6
+        // cutter but in its R3 corners, which stay up to Z 6.
+        let mut tris = vec![];
+        quad(&mut tris, -10., -8., 10., 8., 0.);
+        for (x, y, xx, yy) in [
+            (-15., -12., 15., -8.),
+            (-15., 8., 15., 12.),
+            (-15., -8., -10., 8.),
+            (10., -8., 15., 8.),
+        ] {
+            quad(&mut tris, x, y, xx, yy, 6.);
+        }
+        quad(&mut tris, -15., -12., 15., 12., -4.);
+        let (mut setup, mut op, tool, mesh, dz) = part(tris, &[0.], 6.);
+        op.p.insert("stepdown".into(), "2".into());
+        let mut earlier = op.clone();
+        earlier.p.insert("bottom".into(), "2.5".into());
+        let frame = crate::volume::Frame::new(&setup, &mesh);
+        let mut sim = Simulation::new(generate(&setup, &earlier, &tool, &mesh).unwrap());
+        sim.volume = Some(crate::volume::Volume::new(sim.plan.stock, frame));
+        sim.initial_volume = sim.volume.clone();
+        sim.frame = Some(frame);
+        sim.seek(1.);
+        setup.preview_remaining = Some(std::sync::Arc::new(crate::rest::RestStock::new(
+            sim.volume.as_ref().unwrap(),
+            frame,
+        )));
+        let mut small = tool.clone();
+        small.p.insert("diameter".into(), "2".into());
+        let plan = generate(&setup, &op, &small, &mesh).unwrap();
+        let corner = |p: &[f32; 3]| {
+            [(-10., -8.), (10., -8.), (-10., 8.), (10., 8.)]
+                .iter()
+                .any(|c: &(f32, f32)| (p[0] - c.0).hypot(p[1] - c.1) < 4.)
+        };
+        let heights = |near: bool| {
+            let mut z: Vec<i32> = (cutting(&plan).iter())
+                .filter(|p| corner(p) == near)
+                .map(|p| ((p[2] - dz) * 100.).round() as i32)
+                .collect();
+            z.sort();
+            z.dedup();
+            z
+        };
+        // The corners from the top down to the floor the rest was cleared
+        // to; then all of it from there, a whole stepdown to Z 0.5 and on
+        // to Z 0, not from Z 6 with a first level at Z 2 that skims 0.5 mm.
+        assert_eq!(heights(false), [0, 50], "{:?}", heights(true));
+        assert!(heights(true).contains(&400) && heights(true).contains(&250));
     }
     #[test]
     fn an_outline_inside_another_leaves_no_edge_for_the_rings() {
