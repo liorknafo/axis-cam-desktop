@@ -263,6 +263,7 @@ impl Builder {
                 holder_radius: positive("holder")? / 2.,
                 neck: None,
                 stops: vec![],
+                keep_air: vec![],
                 display_scale: stock.display_scale,
                 duration: 0.,
                 target: top,

@@ -523,6 +523,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
         holder_radius: radius.max(0.05),
         neck: None,
         stops: vec![],
+        keep_air: vec![],
         display_scale: resolved.display_scale,
         duration: cut.duration,
         target,

@@ -174,6 +174,10 @@ pub struct Plan {
     /// Where the spindle stops partway through (`cam::boring`), in order.
     /// Empty for most plans.
     pub stops: Vec<Stop>,
+    /// Moves air trimming must keep: a support pass can cut a sliver
+    /// below its contact tolerance while setting up the next stepdown.
+    /// Empty means none.
+    pub keep_air: Vec<bool>,
 }
 /// A stop of the spindle partway through a plan: before move `at` the
 /// spindle and coolant stop and, with a `pause`, the program waits there,
@@ -574,6 +578,7 @@ fn generate_plan(
         holder_radius,
         neck: None,
         stops: vec![],
+        keep_air: vec![],
         display_scale: scale,
         duration: 0.,
         target,

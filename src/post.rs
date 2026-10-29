@@ -3993,6 +3993,7 @@ pub(crate) mod fixture {
             holder_radius: 16.,
             neck: None,
             stops: vec![],
+            keep_air: vec![],
             display_scale: 1.,
             duration: 0.,
             target: 9.,

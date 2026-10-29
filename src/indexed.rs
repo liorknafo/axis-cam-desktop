@@ -1306,6 +1306,7 @@ pub fn generate(
     let rig = rig.filter(|_| swing.machine_z <= 0.);
     let mut plan = parts[0].1.clone();
     plan.moves.clear();
+    plan.keep_air.clear();
     plan.duration = 0.;
     let (mut a_now, mut at): (f32, Option<[f32; 3]>) = (start.a, None);
     for (k, (a, part)) in parts.iter().enumerate() {
@@ -1347,8 +1348,11 @@ pub fn generate(
             entry.push(&mut plan, Some(a_now), Some(*a));
             moves = &moves[entry.first..];
         }
-        for m in moves {
+        let first = part.moves.len() - moves.len();
+        for (i, m) in moves.iter().enumerate() {
             push(&mut plan, m.clone());
+            *plan.keep_air.last_mut().unwrap() =
+                part.keep_air.get(first + i).copied().unwrap_or(false);
         }
         at = plan.moves.last().map(|m| m.to);
         a_now = *a;
@@ -1385,10 +1389,13 @@ pub fn enter_held(
     let entry = Entry::new(&plan.moves, None, swing.z - swing.machine_z.max(0.));
     let mut entered = plan.clone();
     entered.moves.clear();
+    entered.keep_air.clear();
     entered.duration = 0.;
     entry.push(&mut entered, None, None);
-    for m in &plan.moves[entry.first..] {
+    for (i, m) in plan.moves[entry.first..].iter().enumerate() {
         push(&mut entered, m.clone());
+        *entered.keep_air.last_mut().unwrap() =
+            plan.keep_air.get(entry.first + i).copied().unwrap_or(false);
     }
     Ok(entered)
 }
@@ -1450,6 +1457,7 @@ impl Entry {
 }
 /// `m` onto the end of `plan`, timed from where it ends.
 fn push(plan: &mut crate::simulation::Plan, m: crate::simulation::Move) {
+    plan.keep_air.push(false);
     let seconds = m.end - m.start;
     plan.moves.push(crate::simulation::Move {
         start: plan.duration,

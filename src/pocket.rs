@@ -35,6 +35,8 @@ pub(crate) const ENTRY: f32 = 0.5;
 const RAMP_LAPS: f32 = 10.;
 /// `RAMP_LAPS` in what earlier cuts left.
 const REST_RAMP_LAPS: f32 = 2.;
+/// The slack inside a known sweep, mm, before another path can skip it.
+const SWEEP_SLACK: f64 = 0.01;
 pub(crate) fn area(p: &Polygon) -> f64 {
     p.iter()
         .zip(p.iter().cycle().skip(1))
@@ -346,11 +348,254 @@ fn ordered(rings: Vec<Vec<Polygon>>, finish: usize, reach: f64, allowed: &[Polyg
     out
 }
 /// A closed entry contour, its open cutting path and the contour it ends on.
+#[derive(Clone)]
 struct Pass {
     entry: Polygon,
     path: Polygon,
     way: Option<Polygon>,
     last: Polygon,
+    rate: f32,
+}
+impl Pass {
+    /// An entry back along the first edge, within this path's own sweep.
+    fn along(path: Polygon, rate: f32) -> Self {
+        Self {
+            entry: path[..2].to_vec(),
+            last: path.clone(),
+            path,
+            way: None,
+            rate,
+        }
+    }
+}
+/// The paths cut at depth, including the steps between passes.
+fn flat_paths(passes: &[Pass]) -> Vec<Polygon> {
+    let mut paths = vec![];
+    let mut previous = None;
+    for pass in passes {
+        if let Some(way) = &pass.way {
+            let path: Polygon = previous.into_iter().chain(way.iter().copied()).collect();
+            if path.len() > 1 {
+                paths.push(path);
+            }
+        }
+        paths.push(pass.path.clone());
+        previous = pass.path.last().copied();
+    }
+    paths
+}
+/// The portions of a path whose whole cutter footprint is not covered.
+fn fragments(path: &Polygon, safe: &[Polygon]) -> Vec<Polygon> {
+    let mut paths = vec![];
+    let mut kept = vec![];
+    let finish = |kept: &mut Polygon, paths: &mut Vec<Polygon>| {
+        if kept.len() > 1 {
+            paths.push(std::mem::take(kept));
+        }
+        kept.clear();
+    };
+    for edge in path.windows(2) {
+        if inside(safe, edge[0]) && inside(safe, edge[1]) && !crosses(safe, edge[0], edge[1]) {
+            finish(&mut kept, &mut paths);
+        } else {
+            if kept.is_empty() {
+                kept.push(edge[0]);
+            }
+            kept.push(edge[1]);
+        }
+    }
+    finish(&mut kept, &mut paths);
+    paths
+}
+/// A pocket's paths between two cutting heights.
+struct Clearing {
+    passes: Vec<Pass>,
+    top: f32,
+    target: f32,
+    room: Option<Vec<Polygon>>,
+    support: bool,
+}
+/// Leave only paths whose full cutter sweep is not covered below.
+fn uncovered(passes: Vec<Pass>, covered: &Region) -> Vec<Pass> {
+    let room: Vec<Polygon> = covered.clone().into();
+    let gone = |a, b| inside(&room, a) && inside(&room, b) && !crosses(&room, a, b);
+    let mut out = vec![];
+    let mut previous = None;
+    let mut linked = true;
+    for mut pass in passes {
+        let way: Polygon = previous
+            .into_iter()
+            .chain(pass.way.iter().flatten().copied())
+            .collect();
+        previous = pass.path.last().copied();
+        if !pass
+            .path
+            .windows(2)
+            .chain(way.windows(2))
+            .any(|e| gone(e[0], e[1]))
+        {
+            if !linked && pass.way.is_some() {
+                if way.len() > 1 {
+                    out.push(Pass::along(way, 0.25));
+                    pass.way = Some(vec![]);
+                } else {
+                    pass.way = None;
+                }
+            }
+            out.push(pass);
+            linked = true;
+            continue;
+        }
+        linked = false;
+        // An entry can sweep just past the spiral seam. Keep that ramp
+        // unless the deeper paths cover its whole cutter footprint too.
+        let entry = closed(&pass.entry);
+        if pass.way.is_none() && !entry.windows(2).all(|e| gone(e[0], e[1])) {
+            out.push(Pass {
+                path: vec![pass.entry[0]],
+                last: pass.entry.clone(),
+                entry: pass.entry,
+                way: None,
+                rate: pass.rate,
+            });
+        }
+        for (path, rate) in [(way, 0.25), (pass.path, pass.rate)] {
+            out.extend(
+                fragments(&path, &room)
+                    .into_iter()
+                    .map(|p| Pass::along(p, rate)),
+            );
+        }
+    }
+    out
+}
+/// Thin bands share one stepdown over the area cleared by later bands.
+/// The upper floors keep every path not proven to be covered below.
+fn stack_clearings(
+    clearings: &mut Vec<Clearing>,
+    radius: f32,
+    stepdown: f32,
+) -> Result<bool, String> {
+    let mut stacked = false;
+    let mut end = clearings.len();
+    while end > 0 {
+        let low = clearings[end - 1].target;
+        let mut start = end;
+        let mut high = low;
+        while start > 0 {
+            let c = &clearings[start - 1];
+            if c.room.is_some()
+                || c.target < low - 0.001
+                || c.target > high + 0.001
+                || c.top - low > stepdown + 0.0001
+            {
+                break;
+            }
+            high = high.max(c.top);
+            start -= 1;
+        }
+        if end > start + 1
+            && clearings[start..end]
+                .iter()
+                .any(|c| (c.target - low).abs() > 0.001)
+        {
+            stacked = true;
+            let mut below = Region::new(vec![]);
+            for c in clearings[start..end].iter_mut().rev() {
+                let paths = flat_paths(&c.passes);
+                let full = swept(paths, (radius as f64 - SWEEP_SLACK).max(0.))?;
+                if below.contains_points() {
+                    let covered = below.inflate(
+                        -(radius as f64 + SWEEP_SLACK),
+                        JoinType::Round,
+                        EndType::Polygon,
+                        2.,
+                    );
+                    c.passes = uncovered(std::mem::take(&mut c.passes), &covered);
+                }
+                below =
+                    union::<Milli>(below, full, FillRule::NonZero).map_err(|e| e.to_string())?;
+                c.top = high;
+            }
+        }
+        end = start.min(end - 1);
+    }
+    clearings.retain(|c| !c.passes.is_empty());
+    Ok(stacked)
+}
+/// Clear boundary stock before it can meet more than one stepdown.
+fn support_clearings(
+    clearings: &mut Vec<Clearing>,
+    rest: Option<&crate::rest::RestStock>,
+    bounds: crate::mesh::Bounds,
+    radius: f32,
+    stepdown: f32,
+) -> Result<(), String> {
+    let mut known: Vec<(f32, Region, usize)> = vec![];
+    let mut out: Vec<Clearing> = vec![];
+    for c in std::mem::take(clearings) {
+        let paths = flat_paths(&c.passes);
+        let first = (c.top - stepdown).max(c.target);
+        if ((bounds.max[2] - first) / stepdown).ceil() > crate::cam::CEILING as f32 {
+            return Err(crate::cam::too_many("moves"));
+        }
+        let mut heights = vec![];
+        let mut h = first + stepdown;
+        while h < bounds.max[2] - 0.001 {
+            heights.push(h);
+            h += stepdown;
+        }
+        // Later levels follow the same paths: only the first can meet
+        // stock a different pocket's boundary left taller than its top.
+        for h in heights.into_iter().rev() {
+            let mut cleared = match rest {
+                Some(rest) => region(rest.cleared(bounds, h, bounds.max[2]))?,
+                None => Region::new(vec![]),
+            };
+            for (_, r, i) in known.iter().filter(|(z, _, _)| *z <= h + 0.0001) {
+                // This proof depends on those earlier paths being kept,
+                // including slivers below air trimming's contact threshold.
+                out[*i].support = true;
+                cleared = union::<Milli>(cleared, r.clone(), FillRule::NonZero)
+                    .map_err(|e| e.to_string())?;
+            }
+            let safe: Vec<Polygon> = cleared
+                .inflate(
+                    -(radius as f64 + SWEEP_SLACK),
+                    JoinType::Round,
+                    EndType::Polygon,
+                    2.,
+                )
+                .into();
+            let passes: Vec<Pass> = paths
+                .iter()
+                .flat_map(|path| fragments(path, &safe))
+                .map(|path| Pass::along(path, 1.))
+                .collect();
+            if !passes.is_empty() {
+                known.push((
+                    h,
+                    swept(flat_paths(&passes), (radius as f64 - SWEEP_SLACK).max(0.))?,
+                    out.len(),
+                ));
+                out.push(Clearing {
+                    passes,
+                    top: (h + stepdown).min(bounds.max[2]),
+                    target: h,
+                    room: None,
+                    support: true,
+                });
+            }
+        }
+        known.push((
+            c.target,
+            swept(paths, (radius as f64 - SWEEP_SLACK).max(0.))?,
+            out.len(),
+        ));
+        out.push(c);
+    }
+    *clearings = out;
+    Ok(())
 }
 /// A lap, including its return to the start.
 fn closed(path: &Polygon) -> Polygon {
@@ -607,6 +852,7 @@ fn spiralled(
                             path,
                             way,
                             last,
+                            rate: 1.,
                         });
                         break 'starts;
                     }
@@ -620,6 +866,7 @@ fn spiralled(
             last: entry.clone(),
             entry,
             way,
+            rate: 1.,
         }));
         i = end;
     }
@@ -2702,23 +2949,73 @@ fn finish_plan(setup: &Setup, op: &Operation, job: Job) -> Result<Plan, String> 
     if planned.is_empty() {
         return Err("No finite pocket motion could be generated.".into());
     }
+    let points = planned
+        .iter()
+        .fold(0usize, |sum, (rings, _, high, low, _)| {
+            let levels = ((high - low - 0.0001) / stepdown).ceil().max(1.) as usize;
+            let points: usize = rings.iter().flatten().map(|p| p.len() + 5).sum();
+            sum.saturating_add(points.saturating_mul(levels))
+        });
+    if points > crate::cam::CEILING {
+        return Err(crate::cam::too_many("moves"));
+    }
+    let mut clearings = vec![];
+    let reach = stepover as f64 * 1.5;
+    let clockwise = facing_setting(&op.p, "spindle_rotation") == "Clockwise (CW)";
+    let climb = pocket_setting(&op.p, "pocket_milling") == "Climb";
+    for (mut rings, allowed, cutting_top, target, room) in planned {
+        if clockwise != climb {
+            for p in rings.iter_mut().flatten() {
+                p[1..].reverse();
+            }
+        }
+        let loops = ordered(rings, finish as usize, reach, &allowed);
+        let passes = if profile_only {
+            loops
+                .into_iter()
+                .map(|(entry, way, _)| Pass {
+                    path: closed(&entry),
+                    last: entry.clone(),
+                    entry,
+                    way,
+                    rate: 1.,
+                })
+                .collect()
+        } else {
+            spiralled(loops, stepover as f64, radius as f64, &allowed)?
+        };
+        clearings.push(Clearing {
+            passes,
+            top: cutting_top,
+            target,
+            room,
+            support: false,
+        });
+    }
+    if !profile_only && stack_clearings(&mut clearings, radius, stepdown)? {
+        support_clearings(&mut clearings, rest, stock, radius, stepdown)?;
+    }
     let mut segments = 0usize;
     let mut total_levels = 0usize;
-    for (rings, _, cutting_top, target, _) in &planned {
-        let levels = ((cutting_top - target - 0.0001) / stepdown).ceil().max(1.) as usize;
+    for clearing in &clearings {
+        let levels = ((clearing.top - clearing.target - 0.0001) / stepdown)
+            .ceil()
+            .max(1.) as usize;
         total_levels += levels;
-        let loops: usize = rings.iter().flatten().map(|p| p.len() + 5).sum();
-        segments = segments.saturating_add(loops.saturating_mul(levels));
+        let points: usize = clearing
+            .passes
+            .iter()
+            .map(|p| p.path.len() + p.entry.len() + 5)
+            .sum();
+        segments = segments.saturating_add(points.saturating_mul(levels));
     }
     if segments > crate::cam::CEILING {
         return Err(crate::cam::too_many("moves"));
     }
     crate::progress::expect(segments);
-    let clockwise = facing_setting(&op.p, "spindle_rotation") == "Clockwise (CW)";
-    let climb = pocket_setting(&op.p, "pocket_milling") == "Climb";
-    let highest = planned
+    let highest = clearings
         .iter()
-        .map(|p| p.2)
+        .map(|p| p.top)
         .fold(f32::NEG_INFINITY, f32::max);
     let mut plan = Plan {
         shape: crate::simulation::CutterShape::Flat,
@@ -2733,42 +3030,31 @@ fn finish_plan(setup: &Setup, op: &Operation, job: Job) -> Result<Plan, String> 
         holder_radius,
         neck: None,
         stops: vec![],
+        keep_air: vec![],
         display_scale: scale,
         duration: 0.,
-        target: planned.iter().map(|p| p.3).fold(f32::INFINITY, f32::min),
+        target: clearings
+            .iter()
+            .map(|p| p.target)
+            .fold(f32::INFINITY, f32::min),
         levels: total_levels,
         rest_top: (highest < top - 0.0001).then_some(highest),
         spindle_clockwise: clockwise,
         milling_direction: if climb { "Climb" } else { "Conventional" },
         rings: vec![],
     };
-    let first = planned[0].0[0][0][0];
+    let first = clearings[0].passes[0].entry[0];
     let mut position = [first.0 as f32, first.1 as f32, clearance];
-    let reach = stepover as f64 * 1.5;
-    for (mut rings, allowed, cutting_top, target, room) in planned {
+    for Clearing {
+        passes: loops,
+        top: cutting_top,
+        target,
+        room,
+        support,
+    } in clearings
+    {
         let trimmed = room.is_some();
-        // Clipper outer boundaries are CCW and islands CW (free area on left).
-        // CW climb keeps remaining material on the right of cutter travel.
-        if clockwise != climb {
-            // Each loop keeps its start, so both directions cut in one order.
-            for p in rings.iter_mut().flatten() {
-                p[1..].reverse();
-            }
-        }
-        let loops = ordered(rings, finish as usize, reach, &allowed);
-        let loops = if profile_only {
-            loops
-                .into_iter()
-                .map(|(entry, way, _)| Pass {
-                    path: closed(&entry),
-                    last: entry.clone(),
-                    entry,
-                    way,
-                })
-                .collect()
-        } else {
-            spiralled(loops, stepover as f64, radius as f64, &allowed)?
-        };
+        let first_move = plan.moves.len();
         // Every zone comes down where the highest begins: an opening's
         // column was cleared by this pocket's floor zone, which the export's
         // check of rapids cannot see.
@@ -2947,13 +3233,22 @@ fn finish_plan(setup: &Setup, op: &Operation, job: Job) -> Result<Plan, String> 
                         &mut position,
                         [point.0 as f32, point.1 as f32, z],
                         Motion::Feed,
-                        feed,
+                        feed * pass.rate,
                         true,
                     )?;
                 }
             }
             let above = [position[0], position[1], clearance];
             push(&mut plan, &mut position, above, Motion::Rapid, 6000., false)?;
+        }
+        if support {
+            plan.keep_air.resize(plan.moves.len(), false);
+            for (keep, m) in plan.keep_air[first_move..]
+                .iter_mut()
+                .zip(&plan.moves[first_move..])
+            {
+                *keep = m.motion == Motion::Feed && m.from[2] == m.to[2];
+            }
         }
     }
     if plan.moves.is_empty() || !plan.duration.is_finite() {
@@ -4190,6 +4485,127 @@ mod tests {
         // Clear of the wall, and of the ledge below its height.
         assert!(points.iter().all(|p| clear(p, (-15., -10., -5., 10.), 1.)
             && (p[2] >= 3. - 0.001 || clear(p, (-15., -10., -3., 10.), 1.))));
+    }
+    #[test]
+    fn thin_terraces_do_not_clear_the_deep_floor_at_every_height() {
+        let mut tris = vec![];
+        // Three nested ledges 0.3 mm apart over a deeper square pocket.
+        for (outer, inner, z) in [(15., 12., 6.), (12., 9., 3.), (9., 6., 2.7), (6., 4., 2.4)] {
+            for (x, y, xx, yy) in [
+                (-outer, -outer, outer, -inner),
+                (-outer, inner, outer, outer),
+                (-outer, -inner, -inner, inner),
+                (inner, -inner, outer, inner),
+            ] {
+                quad(&mut tris, x, y, xx, yy, z);
+            }
+        }
+        quad(&mut tris, -4., -4., 4., 4., 0.);
+        quad(&mut tris, -15., -15., 15., 15., -4.);
+        let (setup, mut op, tool, mesh, dz) = part(tris, &[3., 2.7, 2.4, 0.], 2.);
+        for (key, value) in [
+            ("stepdown", "4"),
+            ("allowance", "0.2"),
+            ("axial_allowance", "0.1"),
+        ] {
+            op.p.insert(key.into(), value.into());
+        }
+        for entry in ["Plunge", "Profile ramp"] {
+            op.p.insert("pocket_entry".into(), entry.into());
+            op.p.insert("ramp_angle".into(), "2".into());
+            op.p.insert("finish_passes".into(), "1".into());
+            // A zone alone has no later band to defer to: the old clearing.
+            let count = job(&setup, &op, &tool, &mesh).unwrap().zones.len();
+            let before: Vec<Plan> = (0..count)
+                .map(|i| {
+                    let mut one = job(&setup, &op, &tool, &mesh).unwrap();
+                    one.zones = vec![one.zones.swap_remove(i)];
+                    finish_plan(&setup, &op, one).unwrap()
+                })
+                .collect();
+            let after = generate(&setup, &op, &tool, &mesh).unwrap();
+            let grid = |plans: &[Plan]| {
+                let bounds = after.stock;
+                let size = bounds.dimensions();
+                let nx = (size[0] / 0.1).ceil() as usize;
+                let ny = (size[1] / 0.1).ceil() as usize;
+                let mut grid = crate::simulation::StockGrid {
+                    bounds,
+                    nx,
+                    ny,
+                    dx: size[0] / nx as f32,
+                    dy: size[1] / ny as f32,
+                    heights: vec![bounds.max[2]; nx * ny],
+                };
+                let mut deepest = 0_f32;
+                for plan in plans {
+                    for m in plan.moves.iter().filter(|m| m.motion == Motion::Feed) {
+                        let range = |k: usize, count: usize, cell: f32| {
+                            let lo = ((m.from[k].min(m.to[k]) - plan.radius - bounds.min[k]) / cell)
+                                .floor()
+                                .clamp(0., count as f32)
+                                as usize;
+                            let hi = ((m.from[k].max(m.to[k]) + plan.radius - bounds.min[k]) / cell)
+                                .ceil()
+                                .clamp(0., count as f32)
+                                as usize;
+                            lo..hi
+                        };
+                        let xs = range(0, nx, grid.dx);
+                        let ys = range(1, ny, grid.dy);
+                        let before: Vec<(usize, f32)> = ys
+                            .flat_map(|y| xs.clone().map(move |x| y * nx + x))
+                            .map(|i| (i, grid.heights[i]))
+                            .collect();
+                        grid.cut_shape(m.from, m.to, plan.radius, plan.shape);
+                        for (i, height) in before {
+                            deepest = deepest.max(height - grid.heights[i]);
+                        }
+                    }
+                }
+                (grid, deepest)
+            };
+            let (old, _) = grid(&before);
+            let (new, deepest) = grid(std::slice::from_ref(&after));
+            assert!(deepest <= 4.001, "{entry}: {deepest} mm engagement");
+            for (a, b) in old.heights.iter().zip(&new.heights) {
+                assert!((a - b).abs() < 0.001, "stock {a} vs {b}");
+            }
+            for (x, z) in [(10.5, 3.1), (7.5, 2.8), (5., 2.5), (0., 0.1)] {
+                let ix = ((x - new.bounds.min[0]) / new.dx) as usize;
+                let iy = ((0. - new.bounds.min[1]) / new.dy) as usize;
+                let height = new.heights[iy * new.nx + ix] - dz;
+                assert!((height - z).abs() < 0.001, "X{x}: {height} vs {z}");
+            }
+            let core_levels = |plans: &[Plan]| {
+                let mut heights: Vec<f32> = plans
+                    .iter()
+                    .flat_map(|p| &p.moves)
+                    .filter(|m| {
+                        m.cutting_pass
+                            && m.from[2] == m.to[2]
+                            && nearest(
+                                &[
+                                    (m.from[0] as f64, m.from[1] as f64),
+                                    (m.to[0] as f64, m.to[1] as f64),
+                                ],
+                                (0., 0.),
+                            )
+                            .0 < after.radius as f64
+                    })
+                    .map(|m| m.to[2])
+                    .collect();
+                heights.sort_by(f32::total_cmp);
+                heights.dedup_by(|a, b| (*a - *b).abs() < 0.001);
+                heights
+            };
+            let old_levels = core_levels(&before);
+            let new_levels = core_levels(std::slice::from_ref(&after));
+            assert!(
+                new_levels.len() < old_levels.len(),
+                "{old_levels:?} vs {new_levels:?}"
+            );
+        }
     }
     #[test]
     fn floors_side_by_side_are_cleared_together_down_to_each_height() {

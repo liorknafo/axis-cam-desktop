@@ -364,7 +364,11 @@ fn cutting(
         }
     }
     let cuts = found.into_iter().map(|s| [s - lag - pad, s + pad]);
-    Ok(Some(merged(cuts.chain(again), total)))
+    let required = feeds
+        .iter()
+        .filter(|f| plan.keep_air.get(f.index).copied().unwrap_or(false))
+        .map(|f| [f.at, f.at + f.length]);
+    Ok(Some(merged(cuts.chain(again).chain(required), total)))
 }
 
 /// `stretches` (mm of feed) sorted, the overlapping joined, within the
@@ -804,6 +808,7 @@ fn relink(
     }
     // Whole moves again where a move's pieces were all kept, and timed.
     let mut moves_out: Vec<Move> = vec![];
+    let mut keep_air = vec![];
     // The move and fraction the last one kept ends at.
     let mut ends: Option<(usize, f32)> = None;
     let mut clock = 0.;
@@ -823,6 +828,7 @@ fn relink(
             continue;
         }
         let original = piece.map(|p| &moves[p.index]);
+        keep_air.push(piece.is_some_and(|p| plan.keep_air.get(p.index).copied().unwrap_or(false)));
         moves_out.push(Move {
             from,
             to,
@@ -839,6 +845,7 @@ fn relink(
     let mut plan = plan;
     trimmed.saved = plan.duration - clock;
     plan.moves = moves_out;
+    plan.keep_air = keep_air;
     plan.duration = clock;
     (plan, Some(trimmed))
 }
@@ -907,6 +914,39 @@ mod tests {
         assert!((plan.moves.last().unwrap().end - plan.duration).abs() < 1e-3);
     }
 
+    #[test]
+    fn support_moves_survive_air_trimming_and_its_move_indices() {
+        let volume = stock(&[
+            ([-60., 0., 30.], [60., 0., 30.]),
+            ([-60., 20., 30.], [60., 20., 30.]),
+        ]);
+        let mut original = plan(&[
+            [-100., 0., 30.],
+            [100., 0., 30.],
+            [100., 20., 30.],
+            [-100., 20., 30.],
+        ]);
+        original.keep_air = vec![false; original.moves.len()];
+        original.keep_air[2] = true;
+        let middle = |plan: &Plan, y: f32| {
+            plan.moves.iter().any(|m| {
+                m.motion == Motion::Feed
+                    && m.from[1] == y
+                    && m.to[1] == y
+                    && m.from[0].min(m.to[0]) < -20.
+                    && m.from[0].max(m.to[0]) > 20.
+            })
+        };
+        let (kept, air) = trimmed(original, &volume);
+        assert!(air.is_some());
+        assert!(middle(&kept, 0.));
+        assert!(!middle(&kept, 20.));
+        assert!(kept.keep_air.iter().any(|&keep| keep));
+        continuous(&kept);
+        let (again, _) = trimmed(kept, &volume);
+        assert!(middle(&again, 0.));
+        continuous(&again);
+    }
     #[test]
     fn a_pass_through_a_cleared_slot_rises_over_it() {
         // A slot cleared along X from -60 to 60 at Z30, and a pass along it

@@ -1248,6 +1248,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
             holder_radius: job.holder_radius,
             neck: None,
             stops: vec![],
+            keep_air: vec![],
             display_scale: job.scale,
             duration: 0.,
             target: zones

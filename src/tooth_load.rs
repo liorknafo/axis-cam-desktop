@@ -563,6 +563,7 @@ pub fn nominal(
         milling_direction: if cut.climb { "Climb" } else { "Conventional" },
         rings: vec![],
         stops: vec![],
+        keep_air: vec![],
     };
     let mut sim = Simulation::new(plan);
     (sim.initial_volume, sim.frame) = (Some(volume), Some(frame));
@@ -646,6 +647,7 @@ struct Refed {
     moves: Vec<Move>,
     /// Of each of the plan's moves, the index of its first piece.
     starts: Vec<usize>,
+    keep_air: Vec<bool>,
     duration: f32,
     load: std::sync::Arc<ToothLoad>,
     held: Held,
@@ -788,6 +790,7 @@ pub fn hold(
             .unwrap_or(refed.moves.len());
     }
     sim.plan.moves = refed.moves;
+    sim.plan.keep_air = refed.keep_air;
     sim.plan.duration = refed.duration;
     sim.tooth_load = Some(refed.load);
     sim.held = Some(refed.held);
@@ -1040,9 +1043,22 @@ fn refeed(plan: &Plan, load: &ToothLoad, f: Feeding) -> Refed {
         (held.slowest, held.fastest) = (f.programmed, f.programmed);
     }
     let peak = forces.iter().flatten().copied().fold(0., f32::max);
+    let keep_air = if plan.keep_air.is_empty() {
+        vec![]
+    } else {
+        starts
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &start)| {
+                let end = starts.get(i + 1).copied().unwrap_or(moves.len());
+                std::iter::repeat_n(plan.keep_air.get(i).copied().unwrap_or(false), end - start)
+            })
+            .collect()
+    };
     Refed {
         moves,
         starts,
+        keep_air,
         duration: time,
         load: std::sync::Arc::new(ToothLoad {
             moves: forces,
@@ -1582,7 +1598,8 @@ mod tests {
     }
     #[test]
     fn splitting_stays_within_the_move_count_and_retimes_the_plan() {
-        let s = sim(&SLOT_THEN_SIDE, CutterShape::Flat, &[]);
+        let mut s = sim(&SLOT_THEN_SIDE, CutterShape::Flat, &[]);
+        s.plan.keep_air = (0..s.plan.moves.len()).map(|i| i % 2 == 0).collect();
         let load = load(&s, HELIX);
         let target = load.at(0, 0.5).unwrap() * 0.8;
         let refed = refeed(&s.plan, &load, feeding(target, 5000.));
@@ -1600,8 +1617,18 @@ mod tests {
         }
         assert!((refed.duration - time).abs() < 1e-3);
         // Each move's first piece starts where it did.
-        for (m, &start) in s.plan.moves.iter().zip(&refed.starts) {
+        for (i, (m, &start)) in s.plan.moves.iter().zip(&refed.starts).enumerate() {
             assert_eq!(refed.moves[start].from, m.from);
+            let end = refed
+                .starts
+                .get(i + 1)
+                .copied()
+                .unwrap_or(refed.moves.len());
+            assert!(
+                refed.keep_air[start..end]
+                    .iter()
+                    .all(|&keep| keep == s.plan.keep_air[i])
+            );
         }
         assert_eq!(refed.moves.last().unwrap().end, refed.duration);
         // As many pieces as the load has: one per move, at its slowest.
