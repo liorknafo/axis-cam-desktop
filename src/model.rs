@@ -1373,6 +1373,10 @@ pub const TOOTH_FORCE_ISSUE: &str =
 /// The height above the stock top at which a new operation's tool travels
 /// between cuts, mm (the "clearance" `Operation::new` starts with).
 pub const CLEARANCE: f32 = 15.;
+/// How tall the steps a Pocket or an Adaptive clearing leaves on a sloped
+/// face may be, mm (`pocket::slope_stepdown`), for a new operation and one
+/// saved before it had the field: a finishing pass takes no more.
+pub const SLOPE_STEPDOWN: &str = "1";
 impl Operation {
     pub fn new(s: Strategy, tool: String) -> Self {
         let mut p = fields(&[
@@ -1392,6 +1396,7 @@ impl Operation {
             ("top", "0"),
             ("bottom", "0"),
             ("stepdown", "2"),
+            ("slope_stepdown", SLOPE_STEPDOWN),
             ("stepover", "40"),
             ("allowance", "0.3"),
             ("axial_allowance", "0.2"),
@@ -2264,6 +2269,12 @@ impl Operation {
                     | Strategy::Waterline
             ) {
                 positive(&self.p, "stepdown", &mut e)
+            }
+            // Blank in an operation saved before it was: the default.
+            if matches!(s, Strategy::Adaptive | Strategy::Pocket)
+                && !get(&self.p, "slope_stepdown").trim().is_empty()
+            {
+                positive(&self.p, "slope_stepdown", &mut e)
             }
             if matches!(s, Strategy::Face | Strategy::Indexed) {
                 bounded(&self.p, "stepover", 0.01, 100., &mut e)
@@ -3888,7 +3899,7 @@ fn label(k: &str) -> String {
 pub const BOX_FIELDS: [&str; 6] = ["x_min", "x_max", "y_min", "y_max", "z_top", "z_bottom"];
 /// The operation editor's text fields, by key: the ones a check's message
 /// names by its `label`.
-const OPERATION_FIELDS: [&str; 74] = [
+const OPERATION_FIELDS: [&str; 75] = [
     "name",
     "hole_min",
     "x_min",
@@ -3924,6 +3935,7 @@ const OPERATION_FIELDS: [&str; 74] = [
     "slope_min",
     "slope_max",
     "stepdown",
+    "slope_stepdown",
     "tolerance",
     "allowance",
     "axial_allowance",

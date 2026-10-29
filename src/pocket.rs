@@ -52,6 +52,20 @@ fn region(triangles: Vec<Polygon>) -> Result<Region, String> {
 fn number(op: &Operation, key: &str) -> Result<f32, String> {
     num(&op.p, key).ok_or_else(|| format!("Enter a finite {} value.", key.replace('_', " ")))
 }
+/// How tall the steps a sloped face is left in may be (`slope_floors`): an
+/// operation's slope stepdown, but no more than its `stepdown`. Blank in an
+/// operation saved before it had one: `model::SLOPE_STEPDOWN`.
+pub fn slope_stepdown(op: &Operation, stepdown: f32) -> Result<f32, String> {
+    let typed = get(&op.p, "slope_stepdown");
+    let step = if typed.trim().is_empty() {
+        crate::model::SLOPE_STEPDOWN.parse().unwrap()
+    } else {
+        num(&op.p, "slope_stepdown")
+            .filter(|v| *v > 0.)
+            .ok_or("Enter a positive stepdown on slopes.")?
+    };
+    Ok(step.min(stepdown))
+}
 fn positive(tool: &Tool, key: &str) -> Result<f32, String> {
     num(&tool.p, key)
         .filter(|v| *v > 0.)
@@ -1339,24 +1353,70 @@ pub fn is_wall(setup: &Setup, mesh: &Mesh, id: usize) -> bool {
         .get(id)
         .is_some_and(|s| crate::mesh::rotation(s.normal, angles)[2].abs() < WALL)
 }
-/// Whether mesh surface `id` is sloped, as `setup` turns the part: facing
-/// up, but neither level nor a wall (a ramp, a fillet, a dome). A Pocket or
-/// an Adaptive clearing clears the stock over it in steps (`slope_floors`).
-pub fn is_sloped(setup: &Setup, mesh: &Mesh, id: usize) -> bool {
+/// The surfaces among `ids` a Pocket or an Adaptive clearing clears the
+/// stock over in steps (`slope_floors`), as `setup` turns the part: the
+/// sloped ones, facing up but neither level nor a wall (a ramp, a fillet, a
+/// dome), and the rest of a smooth face they are in that faces up, so a
+/// dome or a fillet is one sloped face, its steep foot and its crown too. A level surface stays a floor of its own where its smooth
+/// face is mostly level (a floor one smooth face with the fillet round it).
+pub fn sloped_faces(
+    setup: &Setup,
+    mesh: &Mesh,
+    ids: impl IntoIterator<Item = usize>,
+) -> std::collections::HashSet<usize> {
     let angles = crate::stock::Placement::new(mesh, Some(setup)).rotation();
-    mesh.surfaces.get(id).is_some_and(|s| {
-        let up = crate::mesh::rotation(s.normal, angles)[2];
-        (WALL..LEVEL).contains(&up)
-    })
+    let up = |id: usize| crate::mesh::rotation(mesh.surfaces[id].normal, angles)[2];
+    // Per smooth face: whether any of it slopes, and whether it is mostly
+    // level, by area.
+    let mut faces: std::collections::HashMap<usize, (bool, bool)> = Default::default();
+    let mut face = |id: usize| {
+        let Some(&region) = mesh.regions.get(id) else {
+            return (false, false);
+        };
+        *faces.entry(region).or_insert_with(|| {
+            let (mut sloped, mut level, mut rest) = (false, 0., 0.);
+            for (i, _) in (mesh.regions.iter().enumerate()).filter(|(_, r)| **r == region) {
+                let u = up(i);
+                sloped |= (WALL..LEVEL).contains(&u);
+                if u >= LEVEL {
+                    level += mesh.surfaces[i].area;
+                } else {
+                    rest += mesh.surfaces[i].area;
+                }
+            }
+            (sloped, level > rest)
+        })
+    };
+    (ids.into_iter())
+        .filter(|&id| id < mesh.surfaces.len())
+        .filter(|&id| {
+            let u = up(id);
+            if (WALL..LEVEL).contains(&u) {
+                return true;
+            }
+            // Facing up at all: a wall of the face, not an overhang.
+            let (sloped, level) = face(id);
+            sloped && u > -0.001 && !(u >= LEVEL && level)
+        })
+        .collect()
+}
+/// Whether surface `id` is one a Pocket or an Adaptive clearing clears the
+/// stock over in steps (`sloped_faces`).
+pub fn in_sloped_face(setup: &Setup, mesh: &Mesh, id: usize) -> bool {
+    !sloped_faces(setup, mesh, [id]).is_empty()
 }
 /// The z of a level face's unit normal, at least: within 0.5° of facing
 /// straight up or down.
 pub const LEVEL: f32 = 0.999_961_9;
+/// How far inside a curved face its facets may lie, mm: the STEP helper
+/// meshes to 0.05 mm (`native/step_preview.cpp`), and a Ø50 sphere's
+/// facets come up to 0.072 mm inside it between their corners.
+pub const FACETED: f32 = 0.1;
 /// The selected sloped faces `ids`, one group that touches, as `setup`
 /// places the part (mm): their outline seen from above, and the heights of
-/// the floors they are cleared as: their lowest point, and over it, to
-/// under their highest, those whose targets (`offset` over them) are a
-/// whole number of stepdowns under the cutting top (`top`). The floors are
+/// the floors they are cleared as: their lowest point, and over it, to the
+/// first at or over their highest, those whose targets (`offset` over them)
+/// are a whole number of stepdowns under the cutting top (`top`). The floors are
 /// at most `stepdown` apart, and the floors of every sloped face are at the
 /// same heights, so `banded` makes no thin bands between one face's and
 /// another's, each cut as a level of its own.
@@ -1391,7 +1451,7 @@ fn slope_floors(
     if loops.is_empty() {
         return Err("The selected sloped face has no usable XY area.".into());
     }
-    let mut planes = vec![low];
+    let (mut planes, mut over) = (vec![low], None);
     for k in 1.. {
         let plane = top - k as f32 * stepdown - offset;
         if plane <= low + 0.001 {
@@ -1399,8 +1459,13 @@ fn slope_floors(
         }
         if plane < high - 0.0001 {
             planes.push(plane);
+        } else {
+            over = Some(plane);
         }
     }
+    // And the lowest at or over their top, which clears the stock over all
+    // of them, so their top is left in a step no taller than the rest.
+    planes.extend(over);
     Ok((outline(&region(loops)?), planes))
 }
 /// Where triangle `p` crosses the height `z`: the points on its two edges
@@ -2532,14 +2597,17 @@ fn floor_job(
     let stock = stock::resolve(setup, Some(mesh))?;
     let placement = Placement::new(mesh, Some(setup));
     let scale = stock.display_scale;
-    let ids: std::collections::HashSet<_> = selection.ids.iter().copied().collect();
-    // The selected walls pick holes, each cut down its outline.
-    let picked = holes(setup, &ids, mesh)?;
-    // The selected sloped faces (a ramp, a fillet, a dome) are cleared as
-    // floors a stepdown apart (`slope_floors`).
+    let mut ids: std::collections::HashSet<_> = selection.ids.iter().copied().collect();
+    // The selected sloped faces (a ramp, a fillet, a dome, steep at its
+    // foot too) are cleared as floors a slope stepdown apart
+    // (`slope_floors`).
+    let steps = sloped_faces(setup, mesh, ids.iter().copied());
     let sloped: Vec<usize> = (selection.ids.iter().copied())
-        .filter(|&id| is_sloped(setup, mesh, id))
+        .filter(|id| steps.contains(id))
         .collect();
+    // The other selected walls pick holes, each cut down its outline.
+    ids.retain(|id| !steps.contains(id));
+    let picked = holes(setup, &ids, mesh)?;
     // The selected faces by height, highest first: each floor is cleared to
     // its own height, as one pocket.
     let mut heights: Vec<(f32, usize)> = ids
@@ -2767,21 +2835,35 @@ fn floor_job(
     // Each group of touching sloped faces, as floors from its lowest point
     // up: each clears the stock over the faces down to its height, clear of
     // the part above it, so the faces are left in steps no taller than the
-    // stepdown, for a finishing pass. A floor too narrow for this tool is
-    // left, as a corner is.
+    // slope stepdown, for a finishing pass. A floor too narrow for this
+    // tool is left, as a corner is.
+    let slope_step = slope_stepdown(op, stepdown)?;
     for group in surface::connected(mesh, &sloped) {
-        let (area, planes) = slope_floors(setup, mesh, &group, top, stepdown, bottom + axial)?;
+        let (area, planes) = slope_floors(setup, mesh, &group, top, slope_step, bottom + axial)?;
         // Grown by the keep-out, so the tool reaches the slope's foot from
         // past it, where the lowest floor stands.
         let area = area.inflate(inset, JoinType::Round, EndType::Polygon, 2.);
+        // A curved face's facets lie up to `FACETED` inside the face itself:
+        // the floors keep clear of what is above `FACETED` under them, and
+        // that much further from it, so the face itself is never cut.
+        let curved = (group.iter()).any(|&i| {
+            let (a, b) = (mesh.surfaces[i].normal, mesh.surfaces[group[0]].normal);
+            a[0] * b[0] + a[1] * b[1] + a[2] * b[2] < LEVEL
+        });
+        let faceted = if curved { FACETED } else { 0. };
+        let low = planes[0];
         for plane in planes {
             let target = plane + bottom + axial;
             if target >= top - 0.0001 {
                 continue;
             }
             // The part from 1 µm over the plane, not `part_above`'s 10: up a
-            // slope 10 µm of height is more than the margin across it.
-            let above = part_above(setup, mesh, plane - 0.009)?;
+            // slope 10 µm of height is more than the margin across it. The
+            // facets of a curved face are none under its foot.
+            let mut above = part_above(setup, mesh, (plane - faceted).max(low) - 0.009)?;
+            if curved {
+                above = above.inflate(faceted as f64, JoinType::Round, EndType::Polygon, 2.);
+            }
             let centres = Centres::Floor {
                 area: area.clone(),
                 above: above.clone(),
@@ -4263,7 +4345,7 @@ pub(crate) mod tests {
         // (`slope_floors`), not refused.
         op.surfaces.as_mut().unwrap().mesh_fingerprint = mesh.fingerprint.clone();
         setup.p.insert("rx".into(), "10".into());
-        assert!(is_sloped(
+        assert!(in_sloped_face(
             &setup,
             &mesh,
             op.surfaces.as_ref().unwrap().ids[0]

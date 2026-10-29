@@ -284,6 +284,14 @@ pub fn issues(operation: &Operation, setup: &Setup, mesh: Option<&Mesh>) -> Vec<
     // at an angle (`indexed`).
     let angles = crate::stock::Placement::new(mesh, Some(setup)).rotation();
     let picks_holes = crate::picks_holes(operation);
+    let steps = if matches!(
+        operation.strategy,
+        crate::model::Strategy::Pocket | crate::model::Strategy::Adaptive
+    ) {
+        crate::pocket::sloped_faces(setup, mesh, selection.ids.iter().copied())
+    } else {
+        Default::default()
+    };
     let mut result = Vec::new();
     let mut heights = Vec::new();
     for &id in &selection.ids {
@@ -307,17 +315,13 @@ pub fn issues(operation: &Operation, setup: &Setup, mesh: Option<&Mesh>) -> Vec<
         if operation.strategy == crate::model::Strategy::Chamfer {
             continue;
         }
-        // A Pocket, an inside Contour or a Drill picks a hole by its walls.
-        if picks_holes && up < crate::pocket::WALL {
+        // A Pocket or an Adaptive clearing clears the stock over a sloped
+        // face in steps (`pocket::slope_floors`), all of a dome or a fillet.
+        if steps.contains(&id) {
             continue;
         }
-        // A Pocket or an Adaptive clearing clears the stock over a sloped
-        // face in steps (`pocket::slope_floors`).
-        if matches!(
-            operation.strategy,
-            crate::model::Strategy::Pocket | crate::model::Strategy::Adaptive
-        ) && crate::pocket::is_sloped(setup, mesh, id)
-        {
+        // A Pocket, an inside Contour or a Drill picks a hole by its walls.
+        if picks_holes && up < crate::pocket::WALL {
             continue;
         }
         if up < crate::pocket::LEVEL {

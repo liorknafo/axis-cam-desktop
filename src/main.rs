@@ -5091,22 +5091,25 @@ impl App {
                         .is_some_and(|o| o.strategy == Strategy::Groove)
                         && wall
                         && pocket::hole_walls(&setup, mesh, n).is_err());
-                // A Pocket takes a sloped face no hole lies past as a face
+                // A Pocket takes a sloped face no hole lies past, and the
+                // steep foot of one that picks no hole (a dome's), as a face
                 // to clear the stock over in steps (`pocket::slope_floors`).
-                let near = (picks_holes && sloped)
-                    .then(|| pocket::hole_near(&setup, mesh, n))
-                    .flatten();
                 let pocket_op = self
                     .operation()
                     .is_some_and(|o| o.strategy == Strategy::Pocket);
-                if picks_holes && (wall || (sloped && (near.is_some() || !pocket_op))) {
+                let slope_face = pocket_op && pocket::in_sloped_face(&setup, mesh, n);
+                let near = (picks_holes && (sloped || slope_face))
+                    .then(|| pocket::hole_near(&setup, mesh, n))
+                    .flatten();
+                let walls = (picks_holes && wall).then(|| pocket::hole_walls(&setup, mesh, n));
+                let steps =
+                    slope_face && !matches!(near, Some(Ok(_))) && !matches!(walls, Some(Ok(_)));
+                if picks_holes && !steps && (wall || (sloped && (near.is_some() || !pocket_op))) {
                     // What a click here picks: the wall's hole, or the hole
                     // past a sloping face (a cone, a chamfer, a fillet) or past
                     // the one a wall's outline crosses (a screw hole's lip).
-                    let found = match wall.then(|| pocket::hole_walls(&setup, mesh, n)) {
-                        Some(Err(e)) if e == pocket::LEANING => {
-                            pocket::hole_near(&setup, mesh, n).unwrap_or(Err(e))
-                        }
+                    let found = match walls {
+                        Some(Err(e)) if e == pocket::LEANING => near.unwrap_or(Err(e)),
                         Some(found) => found,
                         None => match near {
                             Some(Ok(walls)) => Ok(walls),
@@ -5238,11 +5241,11 @@ impl App {
                 // Parallel and Waterline finishing take a whole face, curved or
                 // flat: every surface of the smooth face clicked, added or
                 // removed together. So does a Pocket or an Adaptive clearing
-                // a sloped face is clicked in (`pocket::is_sloped`).
+                // a sloped face is clicked in (`pocket::sloped_faces`).
                 let steps = self
                     .operation()
                     .is_some_and(|o| matches!(o.strategy, Strategy::Pocket | Strategy::Adaptive))
-                    && pocket::is_sloped(&setup, mesh, n);
+                    && pocket::in_sloped_face(&setup, mesh, n);
                 let face = if steps || self.operation().is_some_and(picks_faces) {
                     mesh.region_of(n)
                 } else {
