@@ -606,13 +606,17 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
                 cutting_top - target.max(b.plan.stock.min[2])
             ));
         }
-        Some(Tabs {
-            count: count as usize,
-            width,
-            // The tool's centre rises over the tab and its own diameter.
-            lift: width + 2. * b.plan.radius,
-            top: tab_top,
-        })
+        Some((
+            Tabs {
+                count: count as usize,
+                width,
+                // The tool's centre rises over the tab and its own diameter.
+                lift: width + 2. * b.plan.radius,
+                // Past the part: stock to leave, the cut's width and the wall.
+                margin: 2. * b.plan.radius + radial + (b.plan.radius * 0.01).max(0.02) + WALL,
+            },
+            height,
+        ))
     } else {
         None
     };
@@ -638,16 +642,64 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
             points
         })
         .collect();
-    let mut spans: Vec<Vec<(f32, f32)>> = vec![];
-    if let Some(tabs) = &tabs {
+    let mut spans: Vec<Vec<(f32, f32, f32)>> = vec![];
+    if let Some((tabs, height)) = &tabs {
         let stock = b.plan.stock;
-        let through = target <= stock.min[2] + 0.001;
-        // Past the cut's outer edge, where the tabs join the stock.
-        let edge = 2. * b.plan.radius + radial + (b.plan.radius * 0.01).max(0.02);
         // From the tool's centre: its radius, then a 2 mm wall of stock,
         // enough to stay standing in the vise or under the clamps.
         let reach = b.plan.radius + WALL;
-        let (mut loose, mut all) = (0, 0);
+        // A tab is the material left across the cut, from the part's wall
+        // through the cut to `reach` past the tool's centre, `height` thick:
+        // only stock no earlier operation has cut away. Its height is
+        // measured up from the lowest such material there, where the cut
+        // leaves the stock unless earlier cuts took it away lower down.
+        let bottom = target.max(stock.min[2]);
+        let mut near = Bounds {
+            min: [f32::INFINITY, f32::INFINITY, bottom],
+            max: [f32::NEG_INFINITY, f32::NEG_INFINITY, cutting_top],
+        };
+        let around = reach.max(offset as f32 + TAB_INWARD) + 1.;
+        for p in loops.iter().flatten() {
+            for (k, &v) in p.iter().enumerate() {
+                near.min[k] = near.min[k].min(v - around);
+                near.max[k] = near.max[k].max(v + around);
+            }
+        }
+        let rest = setup.preview_remaining.as_deref();
+        let removed = rest.map(|rest| rest.removed_in(near));
+        // The stock's own shape as it began: earlier setups' (`rest`), or
+        // this one's box or round bar.
+        let bar = crate::stock::is_round(setup).then(|| crate::stock::bar(stock));
+        let bar_x = crate::stock::round(setup, stock);
+        let begun = |q: [f32; 3]| match rest {
+            Some(rest) => rest.in_stock(q),
+            None => {
+                bar.is_none_or(|(c, r)| (q[0] - c[0]).hypot(q[1] - c[1]) < r)
+                    && bar_x.is_none_or(|bar| bar.contains(q))
+            }
+        };
+        let solid = |q: [f32; 2], z: f32| {
+            (0..2).all(|k| stock.min[k] < q[k] && q[k] < stock.max[k])
+                && begun([q[0], q[1], z])
+                && removed.as_ref().is_none_or(|r| !r.at([q[0], q[1], z]))
+        };
+        // `from`..`to` in steps of at most `step`, both ends included.
+        let spaced = |from: f32, to: f32, step: f32| -> Vec<f32> {
+            let n = ((to - from) / step).ceil().max(1.) as usize;
+            (0..=n)
+                .map(|i| from + (to - from) * i as f32 / n as f32)
+                .collect()
+        };
+        // Through the tab's thickness, from just above its bottom to just
+        // under its top.
+        let inset = (0.01f32).min(height / 4.);
+        // Across the cut, from the tool's centre: from the part's outline,
+        // the stock to leave included, out to `reach`.
+        let wall = offset as f32;
+        let across = (-wall + 0.005, reach);
+        // The part, for where its wall is at each height: at the outline,
+        // or set back from it, by `TAB_INWARD` at most.
+        let index = crate::analysis::Index::new(&g);
         for points in &loops {
             let outline = Outline::new(points);
             if tabs.count as f32 * tabs.lift >= outline.length() {
@@ -665,31 +717,94 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
                 .map(|w| w[0][0] * w[1][1] - w[1][0] * w[0][1])
                 .sum::<f32>()
                 > 0.;
-            let placed = outline.spans(tabs)?;
-            for &(start, end) in &placed {
-                let (c, d) = outline.at((start + end) / 2.);
-                let out = if anticlockwise {
-                    [d[1], -d[0]]
-                } else {
-                    [-d[1], d[0]]
+            // The top of a tab centred `c` along the path, joining the part
+            // to stock beside the cut across its width (its middle and both
+            // sides): over the lowest `height` of solid stock there under
+            // the cut's start. None where there is none.
+            let holds = |c: f32| {
+                // Where the tab's middle and sides cross the cut: from the
+                // part's wall out, and the way out.
+                let lines: Vec<([f32; 2], [f32; 2])> = [-tabs.width / 2., 0., tabs.width / 2.]
+                    .iter()
+                    .map(|&o| {
+                        let (p, d) = outline.at(c + o);
+                        let out = if anticlockwise {
+                            [d[1], -d[0]]
+                        } else {
+                            [-d[1], d[0]]
+                        };
+                        (p, out)
+                    })
+                    .collect();
+                // Tried half a millimetre apart, or closer than the
+                // narrowest earlier cut near the tab is wide (`narrowest`),
+                // so none passes between the points tried unseen.
+                let narrowest = (removed.as_ref())
+                    .map(|r| {
+                        (lines.iter())
+                            .flat_map(|&(p, out)| {
+                                spaced(-wall - TAB_INWARD, across.1, 0.5).into_iter().map(
+                                    move |t| {
+                                        r.narrowest([p[0] + out[0] * t, p[1] + out[1] * t, bottom])
+                                    },
+                                )
+                            })
+                            .fold(f32::INFINITY, f32::min)
+                    })
+                    .unwrap_or(f32::INFINITY);
+                let step = narrowest.clamp(0.01, 0.5);
+                let at =
+                    |(p, out): ([f32; 2], [f32; 2]), t: f32| [p[0] + out[0] * t, p[1] + out[1] * t];
+                // From the outline out across the cut.
+                let points: Vec<[f32; 2]> = (lines.iter())
+                    .flat_map(|&line| {
+                        (spaced(across.0, across.1, step).into_iter()).map(move |t| at(line, t))
+                    })
+                    .collect();
+                // From the outline in, each with where the part is solid
+                // over it.
+                let inward: Vec<Vec<_>> = (lines.iter())
+                    .map(|&line| {
+                        (spaced(0.005, TAB_INWARD, step).into_iter())
+                            .map(|t| {
+                                let q = at(line, -wall - t);
+                                (q, crate::analysis::solid(&index, q, g.bounds.max[2]))
+                            })
+                            .collect()
+                    })
+                    .collect();
+                // Whether the material at `z` reaches the part from the
+                // outline in, uncut, before `TAB_INWARD`.
+                let joined = |z: f32| {
+                    inward.iter().all(|line| {
+                        line.iter()
+                            .find_map(|(q, part)| {
+                                if part.iter().any(|&(a, b)| a < z && z < b) {
+                                    Some(true)
+                                } else if solid(*q, z) {
+                                    None
+                                } else {
+                                    Some(false)
+                                }
+                            })
+                            .unwrap_or(false)
+                    })
                 };
-                let q = [c[0] + out[0] * reach, c[1] + out[1] * reach];
-                all += 1;
-                loose += usize::from(
-                    !(stock.min[0] < q[0]
-                        && q[0] < stock.max[0]
-                        && stock.min[1] < q[1]
-                        && q[1] < stock.max[1]),
-                );
-            }
-            spans.push(placed);
-        }
-        if through && loose > 0 {
-            return Err(format!(
-                "{loose} of {all} tabs join the part to no stock: the cut runs past the stock's edge there, so the part still comes loose. Leave at least {:.1} mm of stock beside the part (stock to leave, the tool's diameter and a {WALL} mm wall), or use a narrower tool.",
-                // Rounded up, so that the margin it names is enough.
-                ((edge + WALL) * 10.).ceil() / 10.
-            ));
+                let through = spaced(inset, height - inset, step.min(TAB_RISE));
+                // The lowest start, from `bottom` up in `TAB_RISE` steps,
+                // with solid stock through the tab's thickness above it,
+                // joined to the part.
+                (0..)
+                    .map(|j| bottom + j as f32 * TAB_RISE)
+                    .take_while(|&start| start + height < cutting_top)
+                    .find(|&start| {
+                        (through.iter()).all(|&t| {
+                            points.iter().all(|&q| solid(q, start + t)) && joined(start + t)
+                        })
+                    })
+                    .map(|start| start + height)
+            };
+            spans.push(outline.spans(tabs, holds)?);
         }
     }
     crate::progress::expect(levels);
@@ -697,8 +812,8 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
         crate::progress::report(level)?;
         let z = (cutting_top - level as f32 * down).max(target);
         for (i, points) in loops.iter().enumerate() {
-            let points = match &tabs {
-                Some(tabs) if z < tabs.top => tabbed(points, z, tabs, &spans[i]),
+            let points = match spans.get(i) {
+                Some(spans) if spans.iter().any(|s| z < s.2) => tabbed(points, z, spans),
                 _ => points.iter().map(|p| [p[0], p[1], z]).collect(),
             };
             for _ in 0..=if level == levels { finish as usize } else { 0 } {
@@ -982,14 +1097,16 @@ const WALL: f32 = 2.;
 /// and still be cut, mm: a round hole's chords lie inside its circle.
 const HOLE_MIN_SLACK: f32 = 0.05;
 /// An outside Contour's holding tabs: `count` on each outline, evenly
-/// spaced, over each of which the tool's centre rises to `top` along
+/// spaced, over each of which the tool's centre rises to the tab's top along
 /// `lift` mm of its path.
 struct Tabs {
     count: usize,
     /// Each tab's own width, at its narrowest.
     width: f32,
     lift: f32,
-    top: f32,
+    /// The stock a tab needs beside the part to join it to, mm: stock to
+    /// leave, the cut's width and a `WALL`.
+    margin: f32,
 }
 /// How far a tab's stretch of the path may turn, over the tab and its
 /// margins: a straight side does not, an arc of radius R does by its length
@@ -1001,6 +1118,11 @@ const TAB_MARGIN: f32 = 1.;
 const TAB_GAP: f32 = 1.;
 /// The step along the path at which tab centres are tried, mm.
 const TAB_STEP: f32 = 0.25;
+/// The step up through the stock at which a tab's material is tried, mm.
+const TAB_RISE: f32 = 0.25;
+/// How far in from the outline a tab's material is followed to the part's
+/// wall, at a height where the wall is set back from it, mm.
+const TAB_INWARD: f32 = 5.;
 /// A closed tool path (its last point its first) and how far along it
 /// each of its points is, mm.
 struct Outline<'a> {
@@ -1043,9 +1165,15 @@ impl<'a> Outline<'a> {
     /// straight side, or an arc of a large enough radius; never a corner, a
     /// short segment between corners or a tight arc), as near as such
     /// stretches allow to centres spaced evenly half a spacing from the
-    /// start, `TAB_GAP` apart at least, none spanning the start. Refused
-    /// when fewer fit than asked.
-    fn spans(&self, tabs: &Tabs) -> Result<Vec<(f32, f32)>, String> {
+    /// start, `TAB_GAP` apart at least, none spanning the start, and only
+    /// where `holds` a tab centred there: it has stock beside the cut to
+    /// join the part to, and is given the tab's top there. Each as its
+    /// start, end and top. Refused when fewer fit than asked.
+    fn spans(
+        &self,
+        tabs: &Tabs,
+        holds: impl Fn(f32) -> Option<f32>,
+    ) -> Result<Vec<(f32, f32, f32)>, String> {
         let length = self.length();
         let half = tabs.lift / 2. + TAB_MARGIN;
         let turned = self.turned();
@@ -1060,19 +1188,47 @@ impl<'a> Outline<'a> {
             }
         };
         let steps = ((length - 2. * half) / TAB_STEP).floor().max(-1.) as i64;
-        let fits: Vec<f32> = (0..=steps)
+        let shaped: Vec<f32> = (0..=steps)
             .map(|k| half + k as f32 * TAB_STEP)
             .filter(|&c| turning(c - half, c + half) <= TAB_TURN)
             .collect();
+        // Each of `shaped`'s tab top where it holds, asked only as it is
+        // tried.
+        let mut held: Vec<Option<Option<f32>>> = vec![None; shaped.len()];
+        // Whether some place was passed over for holding nothing.
+        let mut unheld = false;
         let spacing = length / tabs.count as f32;
-        let mut centres: Vec<f32> = vec![];
+        let mut centres: Vec<(f32, f32)> = vec![];
         for i in 0..tabs.count {
             let ideal = (i as f32 + 0.5) * spacing;
-            let best = (fits.iter().copied())
-                .filter(|c| centres.iter().all(|o| (c - o).abs() >= tabs.lift + TAB_GAP))
-                .min_by(|a, b| (a - ideal).abs().total_cmp(&(b - ideal).abs()));
+            let mut order: Vec<usize> = (0..shaped.len())
+                .filter(|&j| {
+                    (centres.iter()).all(|o| (shaped[j] - o.0).abs() >= tabs.lift + TAB_GAP)
+                })
+                .collect();
+            order.sort_by(|&a, &b| {
+                (shaped[a] - ideal)
+                    .abs()
+                    .total_cmp(&(shaped[b] - ideal).abs())
+            });
+            let best = order.into_iter().find_map(|j| {
+                let top = *held[j].get_or_insert_with(|| holds(shaped[j]));
+                unheld |= top.is_none();
+                top.map(|top| (shaped[j], top))
+            });
             match best {
                 Some(c) => centres.push(c),
+                None if unheld => {
+                    return Err(format!(
+                        "Only {} of {} tabs {:.2} mm wide fit on a {:.2} mm outline where stock is left beside the cut to join the part to, as thick as the tabs and under the cut's start: elsewhere the cut runs past the stock's edge or through material already cut away, and a tab there holds nothing. Use fewer, narrower or thinner tabs, or leave at least {:.1} mm of stock beside the part (stock to leave, the tool's diameter and a {WALL} mm wall).",
+                        centres.len(),
+                        tabs.count,
+                        tabs.width,
+                        length,
+                        // Rounded up, so that the margin it names is enough.
+                        (tabs.margin * 10.).ceil() / 10.
+                    ));
+                }
                 None => {
                     return Err(format!(
                         "Only {} of {} tabs {:.2} mm wide fit on the straight sides and gentle curves of a {:.2} mm outline: a tab needs {:.2} mm of it turning by {:.0}° at most, away from corners and short segments. Use fewer or narrower tabs.",
@@ -1086,10 +1242,10 @@ impl<'a> Outline<'a> {
                 }
             }
         }
-        centres.sort_by(f32::total_cmp);
+        centres.sort_by(|a, b| a.0.total_cmp(&b.0));
         Ok(centres
             .into_iter()
-            .map(|c| (c - tabs.lift / 2., c + tabs.lift / 2.))
+            .map(|(c, top)| (c - tabs.lift / 2., c + tabs.lift / 2., top))
             .collect())
     }
     /// The point `s` mm along the path, and the way the path runs there
@@ -1109,31 +1265,31 @@ impl<'a> Outline<'a> {
     }
 }
 /// The closed path `points` (its last point its first) at height `z`,
-/// rising straight up to the tabs' top at the start of each tab
-/// (`Outline::spans`) and dropping straight back down at its end.
-fn tabbed(points: &[[f32; 2]], z: f32, tabs: &Tabs, spans: &[(f32, f32)]) -> Vec<[f32; 3]> {
+/// rising straight up to its tab's top at the start of each tab above `z`
+/// (`Outline::spans`: its start, end and top) and dropping straight back
+/// down at its end.
+fn tabbed(points: &[[f32; 2]], z: f32, spans: &[(f32, f32, f32)]) -> Vec<[f32; 3]> {
     let outline = Outline::new(points);
     let along = &outline.along;
-    // Along the path: each vertex (None), each tab's start (Some(true))
-    // and its end (Some(false)).
-    let mut events: Vec<(f32, Option<bool>, usize)> = along
+    // Along the path: each vertex (None), each tab's start (Some(top)) and
+    // its end (Some(z)), with the height the path goes on at.
+    let mut events: Vec<(f32, Option<f32>, usize)> = along
         .iter()
         .enumerate()
         .map(|(i, &s)| (s, None, i))
         .collect();
-    for &(start, end) in spans {
-        events.extend([(start, Some(true), 0), (end, Some(false), 0)]);
+    for &(start, end, top) in spans.iter().filter(|s| z < s.2) {
+        events.extend([(start, Some(top), 0), (end, Some(z), 0)]);
     }
     events.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let (mut out, mut up) = (vec![], false);
+    let (mut out, mut at) = (vec![], z);
     for (s, edge, i) in events {
         match edge {
-            None => out.push([points[i][0], points[i][1], if up { tabs.top } else { z }]),
-            Some(rise) => {
+            None => out.push([points[i][0], points[i][1], at]),
+            Some(to) => {
                 let ([x, y], _) = outline.at(s);
-                let (from, to) = if rise { (z, tabs.top) } else { (tabs.top, z) };
-                out.extend([[x, y, from], [x, y, to]]);
-                up = rise;
+                out.extend([[x, y, at], [x, y, to]]);
+                at = to;
             }
         }
     }
@@ -4196,17 +4352,17 @@ pub(crate) mod tests {
             count,
             width,
             lift: width + 4.,
-            top: 1.,
+            margin: 6.,
         };
         // A 100 × 40 rectangle, its sides split into 1 mm segments: 4 tabs
         // 6 mm wide, each wholly on one side, clear of the corners by the
         // margin, 1 mm apart at least, near the even spacing of 70 mm.
         let points = path(&[[0., 0.], [100., 0.], [100., 40.], [0., 40.]], 1.);
         let outline = Outline::new(&points);
-        let spans = outline.spans(&tabs(4, 6.)).unwrap();
+        let spans = outline.spans(&tabs(4, 6.), |_| Some(1.)).unwrap();
         assert_eq!(spans.len(), 4);
         let corners = [0., 100., 140., 240., 280.];
-        for (i, &(a, b)) in spans.iter().enumerate() {
+        for (i, &(a, b, _)) in spans.iter().enumerate() {
             assert!((b - a - 10.).abs() < 1e-4);
             assert!(
                 corners
@@ -4242,7 +4398,7 @@ pub(crate) mod tests {
         let outline = Outline::new(&notched);
         let at = |q: [f32; 2]| outline.along[notched.iter().position(|p| *p == q).unwrap()];
         let notch = (at([30., 0.]), at([36., 0.]));
-        for (a, b) in outline.spans(&tabs(4, 6.)).unwrap() {
+        for (a, b, _) in outline.spans(&tabs(4, 6.), |_| Some(1.)).unwrap() {
             assert!(
                 b + TAB_MARGIN <= notch.0 + 1e-3 || a - TAB_MARGIN >= notch.1 - 1e-3,
                 "{a}..{b}"
@@ -4250,16 +4406,43 @@ pub(crate) mod tests {
         }
         // A Ø10 circle turns too much under any tab; a Ø400 one barely.
         let small = circle(5., 72);
-        let error = Outline::new(&small).spans(&tabs(2, 3.)).unwrap_err();
+        let error = Outline::new(&small)
+            .spans(&tabs(2, 3.), |_| Some(1.))
+            .unwrap_err();
         assert!(
             error.starts_with("Only 0 of 2 tabs 3.00 mm wide fit"),
             "{error}"
         );
         let large = circle(200., 720);
-        assert_eq!(Outline::new(&large).spans(&tabs(6, 6.)).unwrap().len(), 6);
+        assert_eq!(
+            Outline::new(&large)
+                .spans(&tabs(6, 6.), |_| Some(1.))
+                .unwrap()
+                .len(),
+            6
+        );
         // More tabs than the sides hold are refused with how many fit.
-        let error = Outline::new(&points).spans(&tabs(30, 6.)).unwrap_err();
+        let error = Outline::new(&points)
+            .spans(&tabs(30, 6.), |_| Some(1.))
+            .unwrap_err();
         assert!(error.starts_with("Only "), "{error}");
+        // With no stock beside the bottom side (0..100 along the path), all
+        // 4 go on the other three, still spread round them.
+        let rectangle = Outline::new(&points);
+        let spans = rectangle
+            .spans(&tabs(4, 6.), |c| (!(0. ..=100.).contains(&c)).then_some(1.))
+            .unwrap();
+        assert_eq!(spans.len(), 4);
+        assert!(spans.iter().all(|&(a, _, _)| a > 100.), "{spans:?}");
+        assert!(spans[3].0 - spans[0].0 > 100., "{spans:?}");
+        // With stock beside none of it, none: refused, naming the stock to
+        // leave.
+        let error = rectangle.spans(&tabs(4, 6.), |_| None).unwrap_err();
+        assert!(
+            error.starts_with("Only 0 of 4 tabs 6.00 mm wide fit on a 280.00 mm outline where stock is left beside the cut")
+                && error.contains("at least 6.0 mm"),
+            "{error}"
+        );
     }
     #[test]
     fn contour_tabs_keep_the_part_joined_to_the_stock_around_it() {
@@ -4353,22 +4536,359 @@ pub(crate) mod tests {
         assert!(error.starts_with("Tab height must be less than"), "{error}");
         op.p.insert("tab_height".into(), "0".into());
         assert!(generate(&setup, &op, &tool, &mesh).is_err());
-        // With 3 mm of stock beside the part the Ø4 cut runs past its edge:
-        // the tabs would join the part to nothing.
+        // Where the tabs rise, (x, y).
+        let tabs_at = |plan: &Plan| -> Vec<[f32; 2]> {
+            (plan.moves.iter())
+                .filter(|m| m.cutting_pass && m.from[0] == m.to[0] && m.from[1] == m.to[1])
+                .filter(|m| m.to[2] > m.from[2])
+                .map(|m| [m.to[0], m.to[1]])
+                .collect()
+        };
+        // With 3 mm of stock on the left the Ø4 cut runs past its edge there:
+        // a tab on that side would join the part to nothing, so all 4 go on
+        // the other three.
         op.p.insert("tab_height".into(), "1.5".into());
-        for k in ["stock_left", "stock_right", "stock_front", "stock_back"] {
+        op.p.insert("tab_width".into(), "3".into());
+        setup.p.insert("stock_left".into(), "3".into());
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        let at = tabs_at(&plan);
+        assert_eq!(at.len(), 8);
+        // The left side's path runs at x = −12.02.
+        assert!(at.iter().all(|p| p[0] > -12.), "{at:?}");
+        // With 3 mm all round, nowhere: refused, naming the stock to leave.
+        for k in ["stock_right", "stock_front", "stock_back"] {
             setup.p.insert(k.into(), "3".into());
         }
         let error = generate(&setup, &op, &tool, &mesh).unwrap_err();
         assert!(
-            error.starts_with("4 of 4 tabs join the part to no stock")
+            error.starts_with("Only 0 of 4 tabs 3.00 mm wide fit on a ")
+                && error.contains("where stock is left beside the cut")
                 && error.contains("at least 6.1 mm"),
             "{error}"
         );
-        // A cut that stops above the stock's bottom leaves the part joined
-        // by its skin: the tabs only thicken it.
+        // So too when the cut stops above the stock's bottom: its skin holds
+        // the part, and a tab with nothing beside it would only be a bump.
         setup.p.insert("stock_bottom".into(), "2".into());
-        assert!(generate(&setup, &op, &tool, &mesh).is_ok());
+        assert!(generate(&setup, &op, &tool, &mesh).is_err());
+        // With 8 mm all round but a Ø3 slot already cut through along the
+        // front, where the tabs would be, the stock past it standing, the
+        // tabs go on the other three sides.
+        setup.p.insert("stock_bottom".into(), "0".into());
+        for k in ["stock_left", "stock_right", "stock_front", "stock_back"] {
+            setup.p.insert(k.into(), "8".into());
+        }
+        let full = generate(&setup, &op, &tool, &mesh).unwrap();
+        // The front side's path runs at y = −10.02.
+        assert!(
+            tabs_at(&full).iter().any(|p| p[1] < -10.),
+            "a tab on the front"
+        );
+        let frame = crate::volume::Frame::new(&setup, &mesh);
+        let mut volume = crate::volume::Volume::new(full.stock, frame);
+        volume.cut(
+            [-30., -10.02, 0.],
+            [30., -10.02, 0.],
+            1.5,
+            80.,
+            CutterShape::Flat,
+            frame,
+            (0, 0),
+        );
+        setup.preview_remaining = Some(std::sync::Arc::new(crate::rest::RestStock::new(
+            &volume, frame,
+        )));
+        let at = tabs_at(&generate(&setup, &op, &tool, &mesh).unwrap());
+        assert_eq!(at.len(), 8);
+        assert!(at.iter().all(|p| p[1] > -10.), "{at:?}");
+        // With the bottom 3 mm all round the part already cut away, from
+        // the part's wall out past the cut, the tabs are its 1.5 mm just
+        // above that: the material there.
+        let mut volume = crate::volume::Volume::new(full.stock, frame);
+        let ring = [
+            [-13., -11.],
+            [13., -11.],
+            [13., 11.],
+            [-13., 11.],
+            [-13., -11.],
+        ];
+        for w in ring.windows(2) {
+            volume.cut(
+                [w[0][0], w[0][1], 0.],
+                [w[1][0], w[1][1], 0.],
+                4.,
+                3.,
+                CutterShape::Flat,
+                frame,
+                (0, 0),
+            );
+        }
+        setup.preview_remaining = Some(std::sync::Arc::new(crate::rest::RestStock::new(
+            &volume, frame,
+        )));
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        let rises: Vec<&Move> = (plan.moves.iter())
+            .filter(|m| m.cutting_pass && m.from[0] == m.to[0] && m.from[1] == m.to[1])
+            .filter(|m| m.to[2] > m.from[2])
+            .collect();
+        // 4 tabs on each pass under their top.
+        assert!(
+            !rises.is_empty() && rises.len().is_multiple_of(4),
+            "{}",
+            rises.len()
+        );
+        for m in &rises {
+            assert!((3. ..=3.25 + 0.001).contains(&(m.to[2] - 1.5)), "{m:?}");
+        }
+    }
+    #[test]
+    fn contour_tabs_go_only_in_a_round_bars_material_and_thin_ones_in_their_own() {
+        let mesh = block();
+        let (mut setup, mut op, tool) = fixture(Strategy::Contour);
+        for (k, v) in [
+            ("tabs", "Yes"),
+            ("tab_count", "4"),
+            ("tab_width", "3"),
+            ("tab_height", "1.5"),
+        ] {
+            op.p.insert(k.into(), v.into());
+        }
+        // The 20 × 16 block turned 45° in a Ø26 bar standing along Z: its
+        // corners 12.81 mm out, the Ø4 cut runs past the bar's side
+        // everywhere a tab could go, so none would hold.
+        for (k, v) in [
+            ("stock_type", "Round bar"),
+            ("stock_diameter", "26"),
+            ("stock_length", "10"),
+            ("rz", "45"),
+        ] {
+            setup.p.insert(k.into(), v.into());
+        }
+        let error = generate(&setup, &op, &tool, &mesh).unwrap_err();
+        assert!(
+            error.starts_with("Only 0 of 4 tabs")
+                && error.contains("where stock is left beside the cut"),
+            "{error}"
+        );
+        // In a Ø40 bar each is in the bar, 2 mm of it at least past the cut.
+        setup.p.insert("stock_diameter".into(), "40".into());
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        let rises: Vec<&Move> = (plan.moves.iter())
+            .filter(|m| m.cutting_pass && m.from[0] == m.to[0] && m.from[1] == m.to[1])
+            .filter(|m| m.to[2] > m.from[2])
+            .collect();
+        assert!(!rises.is_empty() && rises.len().is_multiple_of(4));
+        let (centre, radius) = crate::stock::bar(plan.stock);
+        for m in &rises {
+            let out = (m.to[0] - centre[0]).hypot(m.to[1] - centre[1]);
+            assert!(out + 2. + WALL <= radius, "{m:?}");
+        }
+        // A 0.1 mm tab over stock already cut away 0.11 mm up from the
+        // bottom all round goes on the material above that, not in it.
+        let (mut setup, mut op, tool) = fixture(Strategy::Contour);
+        for k in ["stock_left", "stock_right", "stock_front", "stock_back"] {
+            setup.p.insert(k.into(), "8".into());
+        }
+        for (k, v) in [
+            ("tabs", "Yes"),
+            ("tab_count", "4"),
+            ("tab_width", "3"),
+            ("tab_height", "0.1"),
+        ] {
+            op.p.insert(k.into(), v.into());
+        }
+        let full = generate(&setup, &op, &tool, &mesh).unwrap();
+        let frame = crate::volume::Frame::new(&setup, &mesh);
+        let mut volume = crate::volume::Volume::new(full.stock, frame);
+        let ring = [
+            [-13., -11.],
+            [13., -11.],
+            [13., 11.],
+            [-13., 11.],
+            [-13., -11.],
+        ];
+        for w in ring.windows(2) {
+            volume.cut(
+                [w[0][0], w[0][1], 0.],
+                [w[1][0], w[1][1], 0.],
+                4.,
+                full.target + 0.11,
+                CutterShape::Flat,
+                frame,
+                (0, 0),
+            );
+        }
+        setup.preview_remaining = Some(std::sync::Arc::new(crate::rest::RestStock::new(
+            &volume, frame,
+        )));
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        let tops: Vec<f32> = (plan.moves.iter())
+            .filter(|m| m.cutting_pass && m.from[0] == m.to[0] && m.from[1] == m.to[1])
+            .filter(|m| m.to[2] > m.from[2])
+            .map(|m| m.to[2])
+            .collect();
+        assert!(!tops.is_empty());
+        for top in tops {
+            assert!(top - 0.1 >= full.target + 0.11, "{top}");
+        }
+        // A 0.4 mm slot cut from underneath along the front, through the
+        // tabs' thickness, 0.4 mm past the cut: narrower than half a
+        // millimetre, it still severs any tab there, so they go elsewhere.
+        op.p.insert("tab_height".into(), "1.5".into());
+        let mut flipped = setup.clone();
+        flipped.p.insert("rx".into(), "180".into());
+        let flipped = crate::volume::Frame::new(&flipped, &mesh);
+        let mut volume = crate::volume::Volume::new(full.stock, frame);
+        let (y, top) = (-10.395, full.target + 1.6);
+        volume.cut(
+            frame.transfer([-20., y, top], flipped),
+            frame.transfer([20., y, top], flipped),
+            0.2,
+            top,
+            CutterShape::Flat,
+            flipped,
+            (0, 0),
+        );
+        setup.preview_remaining = Some(std::sync::Arc::new(crate::rest::RestStock::new(
+            &volume, frame,
+        )));
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        let rises: Vec<&Move> = (plan.moves.iter())
+            .filter(|m| m.cutting_pass && m.from[0] == m.to[0] && m.from[1] == m.to[1])
+            .filter(|m| m.to[2] > m.from[2])
+            .collect();
+        assert!(!rises.is_empty());
+        for m in rises {
+            // On the front only above the slot.
+            assert!(m.to[1] > -10. || m.to[2] - 1.5 >= top, "{m:?}");
+        }
+        // So too a 0.4 mm slot right against the part's front wall, with a
+        // Ø10 cutter: the tab must reach the wall itself.
+        let (mut setup, op, mut tool) = (setup, op, tool);
+        for k in ["stock_left", "stock_right", "stock_front", "stock_back"] {
+            setup.p.insert(k.into(), "16".into());
+        }
+        setup.preview_remaining = None;
+        tool.p.insert("diameter".into(), "10".into());
+        let full = generate(&setup, &op, &tool, &mesh).unwrap();
+        let frame = crate::volume::Frame::new(&setup, &mesh);
+        let mut volume = crate::volume::Volume::new(full.stock, frame);
+        let (y, top) = (-8.25, full.target + 1.6);
+        volume.cut(
+            frame.transfer([-20., y, top], flipped),
+            frame.transfer([20., y, top], flipped),
+            0.2,
+            top,
+            CutterShape::Flat,
+            flipped,
+            (0, 0),
+        );
+        setup.preview_remaining = Some(std::sync::Arc::new(crate::rest::RestStock::new(
+            &volume, frame,
+        )));
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        let rises: Vec<&Move> = (plan.moves.iter())
+            .filter(|m| m.cutting_pass && m.from[0] == m.to[0] && m.from[1] == m.to[1])
+            .filter(|m| m.to[2] > m.from[2])
+            .collect();
+        assert!(!rises.is_empty());
+        for m in rises {
+            assert!(m.to[1] > -10. || m.to[2] - 1.5 >= top, "{m:?}");
+        }
+    }
+    #[test]
+    fn a_tab_follows_its_material_in_to_a_wall_set_back_under_the_outline() {
+        // The block, 2 mm narrower all round for its bottom 3 mm: at the
+        // tabs' height its wall is 2 mm in from the outline.
+        let mut t = vec![];
+        for (lo, hi) in [
+            ([2., 2., 0.], [18., 14., 3.]),
+            ([0., 0., 3.], [20., 16., 8.]),
+        ] {
+            let [x0, y0, z0]: [f32; 3] = lo;
+            let [x1, y1, z1]: [f32; 3] = hi;
+            quad(
+                &mut t,
+                [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]],
+            );
+            quad(
+                &mut t,
+                [[x0, y0, z0], [x0, y1, z0], [x1, y1, z0], [x1, y0, z0]],
+            );
+            quad(
+                &mut t,
+                [[x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]],
+            );
+            quad(
+                &mut t,
+                [[x1, y1, z0], [x0, y1, z0], [x0, y1, z1], [x1, y1, z1]],
+            );
+            quad(
+                &mut t,
+                [[x0, y1, z0], [x0, y0, z0], [x0, y0, z1], [x0, y1, z1]],
+            );
+            quad(
+                &mut t,
+                [[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]],
+            );
+        }
+        let mesh = mesh::normalize(t).unwrap();
+        let (mut setup, mut op, tool) = fixture(Strategy::Contour);
+        for k in ["stock_left", "stock_right", "stock_front", "stock_back"] {
+            setup.p.insert(k.into(), "8".into());
+        }
+        for (k, v) in [
+            ("tabs", "Yes"),
+            ("tab_count", "4"),
+            ("tab_width", "3"),
+            ("tab_height", "1.5"),
+        ] {
+            op.p.insert(k.into(), v.into());
+        }
+        let tops = |plan: &Plan| -> Vec<[f32; 3]> {
+            (plan.moves.iter())
+                .filter(|m| m.cutting_pass && m.from[0] == m.to[0] && m.from[1] == m.to[1])
+                .filter(|m| m.to[2] > m.from[2])
+                .map(|m| m.to)
+                .collect()
+        };
+        // Joined to it by the stock under the overhang: at the bottom.
+        let full = generate(&setup, &op, &tool, &mesh).unwrap();
+        // Where the cut leaves the stock: the model's bottom.
+        let floor = full.target.max(full.stock.min[2]);
+        let at = tops(&full);
+        assert!(
+            !at.is_empty() && at.iter().all(|p| (p[2] - floor - 1.5).abs() < 0.001),
+            "{at:?}"
+        );
+        // With a 0.8 mm slot already cut up 2 mm from underneath along the
+        // front, in that stock 1 mm in from the outline, a tab there is cut
+        // off from the part below 2 mm: the front tabs go on above it.
+        let frame = crate::volume::Frame::new(&setup, &mesh);
+        let mut flipped = setup.clone();
+        flipped.p.insert("rx".into(), "180".into());
+        let flipped = crate::volume::Frame::new(&flipped, &mesh);
+        let mut volume = crate::volume::Volume::new(full.stock, frame);
+        volume.cut(
+            frame.transfer([-20., -7., floor + 2.], flipped),
+            frame.transfer([20., -7., floor + 2.], flipped),
+            0.4,
+            floor + 2. - full.stock.min[2],
+            CutterShape::Flat,
+            flipped,
+            (0, 0),
+        );
+        setup.preview_remaining = Some(std::sync::Arc::new(crate::rest::RestStock::new(
+            &volume, frame,
+        )));
+        let at = tops(&generate(&setup, &op, &tool, &mesh).unwrap());
+        assert!(at.iter().any(|p| p[1] < -8.), "a tab on the front: {at:?}");
+        for p in &at {
+            if p[1] < -8. {
+                assert!(p[2] - 1.5 >= floor + 2. - 0.001, "{p:?}");
+            } else {
+                assert!((p[2] - floor - 1.5).abs() < 0.001, "{p:?}");
+            }
+        }
     }
     #[test]
     fn waterline_obeys_z_levels_and_preserves_model() {
