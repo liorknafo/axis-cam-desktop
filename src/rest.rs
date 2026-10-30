@@ -49,6 +49,10 @@ pub struct RestStock {
     coaxial: Coaxial,
     /// Every earlier cut, of any shape, in its own frame (`bored`).
     all: std::sync::Arc<Vec<Cut>>,
+    /// The stock began as a round bar standing in `bounds` (`Volume::round`).
+    round: bool,
+    /// The stock began as this round bar along X (`Volume::bar_x`).
+    bar_x: Option<crate::stock::Round>,
 }
 fn corners(b: Bounds) -> [[f32; 3]; 8] {
     std::array::from_fn(|mask| {
@@ -528,6 +532,42 @@ fn removes(cut: &Cut, b: &Bounds, current: Frame, p: [f32; 3]) -> bool {
         )
     }
 }
+/// The cell of `RemovedIn`'s grid, mm.
+const REMOVED_CELL: f32 = 2.;
+/// Earlier cuts over an area, by cell (`RestStock::removed_in`).
+pub struct RemovedIn<'a> {
+    cuts: Vec<(&'a Cut, Bounds)>,
+    cells: Vec<Vec<usize>>,
+    /// The radius of the narrowest cut in each cell.
+    narrowest: Vec<f32>,
+    near: Bounds,
+    n: [usize; 2],
+    current: Frame,
+}
+impl RemovedIn<'_> {
+    /// Whether an earlier cut can have removed material at `p`, in the
+    /// current frame, as `Removed::at` tells it: only for a point inside
+    /// the area, as the cuts outside it are not kept.
+    pub fn at(&self, p: [f32; 3]) -> bool {
+        debug_assert!((0..3).all(|k| self.near.min[k] <= p[k] && p[k] <= self.near.max[k]));
+        self.cells[self.cell(p)].iter().any(|&i| {
+            let (cut, b) = &self.cuts[i];
+            removes(cut, b, self.current, p)
+        })
+    }
+    /// The radius of the narrowest earlier cut that can reach `p`'s cell,
+    /// mm (infinite for none): a slot it cut is at least twice as wide, so
+    /// points that close together cannot all miss it.
+    pub fn narrowest(&self, p: [f32; 3]) -> f32 {
+        self.narrowest[self.cell(p)]
+    }
+    fn cell(&self, p: [f32; 3]) -> usize {
+        let at = |k: usize| {
+            (((p[k] - self.near.min[k]) / REMOVED_CELL).floor().max(0.) as usize).min(self.n[k] - 1)
+        };
+        at(1) * self.n[0] + at(0)
+    }
+}
 /// `Removed::by` over some of a volume's cuts, in the order they were made:
 /// the operation whose cut first removed material at a point.
 pub struct FirstCut<'a> {
@@ -649,7 +689,21 @@ impl RestStock {
             removal: removal_boxes(volume, current),
             coaxial: coaxial(volume, current),
             all: volume.cuts.clone(),
+            round: volume.round,
+            bar_x: volume.bar_x,
         }
+    }
+    /// Whether `p` (current frame) lies in the stock as it began: its box,
+    /// or the round bar in it.
+    pub fn in_stock(&self, p: [f32; 3]) -> bool {
+        let q = transfer(p, self.current, self.reference);
+        let b = self.bounds;
+        (0..3).all(|k| b.min[k] <= q[k] && q[k] <= b.max[k])
+            && (!self.round || {
+                let (centre, radius) = crate::stock::bar(b);
+                (q[0] - centre[0]).hypot(q[1] - centre[1]) <= radius
+            })
+            && self.bar_x.is_none_or(|bar| bar.contains(q))
     }
     /// Whether earlier cuts have emptied the upright cylinder of `radius`
     /// round `centre` from `bottom` up to `top` (current frame, mm): a hole
@@ -696,6 +750,44 @@ impl RestStock {
                     })
             })
         })
+    }
+    /// `Removed::at` for many points in `near` (current frame): the earlier
+    /// cuts, of any cutter shape, whose removal boxes reach it, by cell of a
+    /// grid over its XY.
+    pub fn removed_in(&self, near: Bounds) -> RemovedIn<'_> {
+        let cuts: Vec<(&Cut, Bounds)> = (self.all.iter())
+            .map(|c| (c, removal_box(c, self.current)))
+            .filter(|(_, b)| (0..3).all(|k| b.min[k] <= near.max[k] && b.max[k] >= near.min[k]))
+            .collect();
+        let cell = REMOVED_CELL;
+        let n = [0, 1].map(|k| (((near.max[k] - near.min[k]) / cell).ceil() as usize).max(1));
+        let at =
+            |v: f32, k: usize| (((v - near.min[k]) / cell).floor().max(0.) as usize).min(n[k] - 1);
+        let mut cells = vec![vec![]; n[0] * n[1]];
+        let mut narrowest = vec![f32::INFINITY; n[0] * n[1]];
+        for (i, (cut, b)) in cuts.iter().enumerate() {
+            // A lathe's ring (`a` = [z0, r0, 0], `b` = [z1, r1, 0]): half
+            // its narrower side.
+            let radius = if cut.shape == CutterShape::Revolve {
+                (cut.b[0] - cut.a[0]).abs().min((cut.b[1] - cut.a[1]).abs()) / 2.
+            } else {
+                cut.radius
+            };
+            for y in at(b.min[1], 1)..=at(b.max[1], 1) {
+                for x in at(b.min[0], 0)..=at(b.max[0], 0) {
+                    cells[y * n[0] + x].push(i);
+                    narrowest[y * n[0] + x] = narrowest[y * n[0] + x].min(radius);
+                }
+            }
+        }
+        RemovedIn {
+            cuts,
+            cells,
+            narrowest,
+            near,
+            n,
+            current: self.current,
+        }
     }
     /// What earlier lathe cuts left about the current frame's Z axis.
     pub fn coaxial(&self) -> &Coaxial {

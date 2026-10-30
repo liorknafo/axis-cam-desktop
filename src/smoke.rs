@@ -7840,7 +7840,11 @@ flood = { pin = 8 }
             assert!(ok, "{message}");
             // The work offset is set, then the tip moves back: a job of its
             // own, ended once its outcome is in.
-            let seq = conn(a).snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
+            let seq = conn(a)
+                .snapshot
+                .program_outcome
+                .as_ref()
+                .map_or(0, |o| o.seq);
             tick_until(a, 5.0, "back where it started", |s| {
                 s.state == Some(State::Idle)
                     && s.program_outcome.as_ref().is_some_and(|o| o.seq > seq)
@@ -17253,7 +17257,8 @@ soft_max = 180.0
         let _ = a.update(Message::Generate);
         assert!(a.active_simulation().is_none());
         assert!(
-            a.status.contains("4 of 4 tabs join the part to no stock")
+            a.status.contains("Only 0 of 4 tabs")
+                && a.status.contains("where stock is left beside the cut")
                 && a.status.contains("at least 12.4 mm"),
             "{}",
             a.status

@@ -2456,7 +2456,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (_, "tab_count") => (
             "How many tabs an outside Contour leaves on each outline it goes around, placed automatically: as near to evenly spaced as the outline allows, each on a straight side or a gentle curve, never on a corner, a short segment or a tight arc. Two or three hold a small part; use more on a long or thin one, so it cannot bend into the cutter.",
-            "",
+            "Tabs go only where stock is left across the cut to join the part to, as thick as a tab: not where the cut runs past the stock's edge, nor where earlier operations left no such material. A tab sits on the lowest material left there. Where too few places are left for the tabs asked, the contour is refused with the stock to leave beside the part.",
             Some(Operation(Strategy::Contour)),
         ),
         (_, "tab_width") => (
@@ -2465,8 +2465,8 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Operation(Strategy::Contour)),
         ),
         (_, "tab_height") => (
-            "How thick each tab is, in mm: over the tabs the cut stops this far above the stock's bottom, or above the contour's bottom where that is higher. It must be less than the depth the contour cuts.",
-            "A tab holds only where stock is left beyond the cut, so leave more stock beside the part than the stock to leave, the tool's diameter and a 2 mm wall. Levels above the tabs' top go round in full. Below it the tool rises straight up at each tab's start and plunges back down at its end at a quarter of the cutting feed, as it does entering the cut. Cut or file the tabs off after the part is unclamped.",
+            "How thick each tab is, in mm: over the tabs the cut stops this far above the stock's bottom, or above the contour's bottom where that is higher, or above the lowest material left there where an earlier operation cut it away from under the tab. It must be less than the depth the contour cuts.",
+            "A tab holds only where stock is left beyond the cut, so tabs go only where more stock is left beside the part than the stock to leave, the tool's diameter and a 2 mm wall. Levels above the tabs' top go round in full. Below it the tool rises straight up at each tab's start and plunges back down at its end at a quarter of the cutting feed, as it does entering the cut. Cut or file the tabs off after the part is unclamped.",
             Some(Operation(Strategy::Contour)),
         ),
         (_, "hole_min") => (
