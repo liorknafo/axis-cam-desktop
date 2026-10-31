@@ -5406,6 +5406,10 @@ flood = { pin = 8 }
         run_until(&mut a, 60., "the first tool run", |r| r.running.is_none());
         tick_until(&mut a, 5.0, "Idle", |s| s.state == Some(State::Idle));
         assert!(run_of(&a).done[0], "{:?}", run_of(&a).outcome);
+        // Stopped, the stock that waited is meshed, and until its surface
+        // comes the live grid of every cut is drawn, not an older surface.
+        assert!(!a.locked() && a.run_mesh_waits.is_some());
+        assert!(a.run_stock().is_none() && a.live_stock().is_some());
         // What the tick does in the background once the machine stops,
         // in line here: the run's stock meshed, on the CPU too, though it
         // waited while the machine moved.
@@ -5413,6 +5417,7 @@ flood = { pin = 8 }
         // The tick's job, which tests do not run, gives way.
         a.run_mesh_job = None;
         let _ = a.refresh_run_mesh();
+        assert!(a.run_mesh_waits.is_none() && a.run_stock().is_some());
         a.show_uncut = false;
         let size = (480, 360);
         let machine = crate::ui::scene_viewport(&a).unwrap();

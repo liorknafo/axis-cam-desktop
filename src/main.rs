@@ -1347,7 +1347,7 @@ pub struct App {
     run_mesh_started: Option<Instant>,
     /// The carve (`run::Carving::serial`) that could not be meshed on the
     /// GPU while this computer's driver moved the machine: it is meshed
-    /// once the machine stops.
+    /// once the machine stops, and its live grid drawn until it is.
     run_mesh_waits: Option<u64>,
     pub progress: f32,
     pub speed: f32,
@@ -3287,7 +3287,7 @@ impl App {
         let c = r.carving.as_ref()?;
         let current = c.surface.as_ref().is_some_and(|s| s.0 == c.version);
         let failed = (self.run_mesh_failed).is_some_and(|k| (k.0, k.1) == (c.serial, c.version));
-        if !current && (self.run_mesh_waits(c.serial) || failed) {
+        if !current && (self.run_mesh_waits == Some(c.serial) || failed) {
             return None;
         }
         r.carved_surface()
@@ -3300,7 +3300,8 @@ impl App {
     }
     /// The stock of carve `serial` waits for the machine to stop to be
     /// meshed: there is no GPU to mesh it on while this computer's driver
-    /// moves the machine, or the GPU failed to.
+    /// moves the machine, or the GPU failed to. Until a surface of it comes
+    /// (`run_mesh_waits`), after the stop too, the live grid is drawn.
     fn run_mesh_waits(&self, serial: u64) -> bool {
         self.driving_here() && self.run_mesh_waits == Some(serial)
     }
@@ -7368,6 +7369,9 @@ impl App {
                 match (result, carving) {
                     (Ok(Some(surface)), Some(carving)) => {
                         carving.surface = Some((key.1, key.2, surface));
+                        if self.run_mesh_waits == Some(key.0) {
+                            self.run_mesh_waits = None;
+                        }
                     }
                     (Ok(None), _) => self.run_mesh_waits = Some(key.0),
                     (Ok(_), None) => {}
