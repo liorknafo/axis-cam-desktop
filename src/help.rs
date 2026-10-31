@@ -1527,11 +1527,7 @@ pub fn command(m: &Message, label: String) -> Help {
         Guide(a) => guide_help(a),
         ControlSetup(false) => ("Jog, zero and run the machine.", ""),
         ControlView(crate::ui::JobView::Stock) => (
-            "Show the setup's stock in 3D as it is cut: the machine's tool is red while a tool run cuts.",
-            "",
-        ),
-        ControlView(crate::ui::JobView::Machine) => (
-            "Show the machine's travel, the tool tip in it and the work zero.",
+            "Show the setup's stock in 3D as it is cut: the machine's tool is red while a tool run cuts. The machine itself is in the Machine tab.",
             "",
         ),
         ControlView(crate::ui::JobView::Top) => ("Look at the setup's stock from above.", ""),
@@ -4911,7 +4907,6 @@ mod tests {
             ControlSetup(false),
             ControlSetup(true),
             ControlView(crate::ui::JobView::Stock),
-            ControlView(crate::ui::JobView::Machine),
             ControlView(crate::ui::JobView::Top),
             Setup(crate::setup::Msg::Save),
             Setup(crate::setup::Msg::UseCalibration),
