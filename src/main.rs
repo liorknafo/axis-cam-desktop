@@ -7203,16 +7203,18 @@ impl App {
                         .strip_prefix("Connecting to ")
                         .map(|name| name.trim_end_matches('…'));
                     let name = connecting.or_else(|| {
-                        Some(
-                            self.status
-                                .strip_prefix("Connected to ")?
-                                .rsplit_once(": ")?
-                                .0,
-                        )
+                        let rest = (self.status.strip_prefix("Connected to "))
+                            .or_else(|| self.status.strip_prefix(NO_LINK))?;
+                        Some(rest.rsplit_once(": ")?.0)
                     });
                     if let (Some(name), Some(state)) = (name, &c.snapshot.state) {
                         use uc100::controller::State;
                         self.status = match state {
+                            // The Pi's state as last known, never "Connected".
+                            s if c.pi_down() => format!(
+                                "{NO_LINK}{name}: last known {}; the machine carries on.",
+                                s.label()
+                            ),
                             State::Disconnected if connecting.is_some() => format!(
                                 "Could not connect to {name}; see the log in the Control page's Machine tab."
                             ),
@@ -8490,6 +8492,9 @@ fn main() -> iced::Result {
         .default_font(iced::Font::with_name("Helvetica Neue"))
         .run()
 }
+
+/// The status line's start while the link to the Pi is not answering.
+const NO_LINK: &str = "No link to the Pi of ";
 
 /// How this computer names itself to a Pi it pairs with: the Mac's name
 /// ("Lior's MacBook Pro"), else its host name.

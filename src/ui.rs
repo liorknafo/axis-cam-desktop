@@ -7962,19 +7962,48 @@ fn control(app: &App) -> Element<'_, Message> {
         .into();
     };
     let fit = Fit::of(app);
-    column![
-        run_bar(app, c),
-        row![
-            hands(c, fit),
-            centre(app, c),
-            container(program(app, c)).width(fit.program()).height(Fill)
-        ]
-        .spacing(fit.gap())
-        .padding(fit.gap())
+    let mut page = Column::new();
+    if let Some(banner) = pi_lost(c) {
+        page = page.push(banner);
+    }
+    page.push(run_bar(app, c))
+        .push(
+            row![
+                hands(c, fit),
+                centre(app, c),
+                container(program(app, c)).width(fit.program()).height(Fill)
+            ]
+            .spacing(fit.gap())
+            .padding(fit.gap())
+            .height(Fill),
+        )
         .height(Fill)
-    ]
-    .height(Fill)
-    .into()
+        .into()
+}
+
+/// What the Control page says over every tab while the link to the Pi is
+/// not answering.
+pub(crate) const PI_LOST: &str = "No link to the Pi. Everything shown is its last known state. The machine carries on without this computer: a tool run goes on to its end, a jog stops by itself. Hold, Stop and E-stop cannot reach it from here until the link is back: use the machine's own E-stop. Reconnecting…";
+
+/// The banner over the Control page while the link to the Pi is down, or
+/// the Pi refuses this computer.
+fn pi_lost(c: &crate::control::Connection) -> Option<Element<'_, Message>> {
+    let link = c.link.as_ref()?;
+    let said = match &link.state {
+        uc100_remote::LinkState::Refused(why) => format!("The Pi refused this computer: {why}"),
+        _ if !link.live => PI_LOST.to_string(),
+        _ => return None,
+    };
+    Some(
+        container(bold(said, 14).color(Color::WHITE))
+            .padding([10, 14])
+            .width(Fill)
+            .style(|_| container::Style {
+                background: Some(WARN.into()),
+                ..Default::default()
+            })
+            .into(),
+    )
 }
 
 /// The green Cycle Start button, greyed out without a message.

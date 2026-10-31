@@ -2851,6 +2851,104 @@ flood = { pin = 8 }
         pi_until(&server, 10.0, "stopped on the Pi", |s| s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| !o.ok));
     }
 
+    /// A relay between this computer and the Pi that the test can cut: while
+    /// cut, nothing crosses either way, as when Wi-Fi drops.
+    struct Relay {
+        addr: std::net::SocketAddr,
+        cut: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Relay {
+        fn to(server: std::net::SocketAddr) -> Relay {
+            use std::sync::atomic::Ordering;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let cut = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = cut.clone();
+            std::thread::spawn(move || {
+                for client in listener.incoming().flatten() {
+                    let Ok(upstream) = std::net::TcpStream::connect(server) else { continue };
+                    for (mut from, mut to) in [
+                        (client.try_clone().unwrap(), upstream.try_clone().unwrap()),
+                        (upstream, client),
+                    ] {
+                        let flag = flag.clone();
+                        std::thread::spawn(move || {
+                            let mut buf = [0u8; 16384];
+                            loop {
+                                while flag.load(Ordering::SeqCst) {
+                                    std::thread::sleep(std::time::Duration::from_millis(5));
+                                }
+                                let n = match std::io::Read::read(&mut from, &mut buf) {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => n,
+                                };
+                                // Cut while reading: what was read is lost.
+                                if flag.load(Ordering::SeqCst) {
+                                    continue;
+                                }
+                                if std::io::Write::write_all(&mut to, &buf[..n]).is_err() {
+                                    break;
+                                }
+                            }
+                            let _ = to.shutdown(std::net::Shutdown::Both);
+                        });
+                    }
+                }
+            });
+            Relay { addr, cut }
+        }
+
+        fn set_cut(&self, on: bool) {
+            self.cut.store(on, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The link to the Pi drops while a tool run cuts: every tab says so
+    /// over the page, the status line says it is the last known state, never
+    /// "Connected", and the Pi finishes the tool run. With the link back the
+    /// banner goes and the run takes the outcome.
+    #[test]
+    fn a_lost_link_to_the_pi_is_said_over_every_tab_while_the_pi_carries_on() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        let relay = Relay::to(server.addr());
+        let _ = a.update(Message::PiAddress(relay.addr.to_string()));
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5.0, "running on the Pi", |s| s.state == Some(State::Run));
+        relay.set_cut(true);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !conn(&a).pi_down() {
+            let _ = a.update(Message::Tick);
+            assert!(std::time::Instant::now() < end, "the lost link never showed");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = a.update(Message::Tick);
+        for tab in [crate::ui::ControlTab::Job, crate::ui::ControlTab::Machine] {
+            let _ = a.update(Message::ControlTab(tab));
+            shows(&a, &[crate::ui::PI_LOST]);
+        }
+        assert!(a.status.starts_with("No link to the Pi of"), "{}", a.status);
+        assert!(!a.status.contains("Connected"), "{}", a.status);
+        // The Pi carries on to the end of the tool run.
+        pi_until(&server, 60.0, "the tool run's end", |s| {
+            s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| o.ok)
+        });
+        let _ = a.update(Message::Tick);
+        assert!(conn(&a).pi_down() && a.status.starts_with("No link"), "{}", a.status);
+        relay.set_cut(false);
+        run_until(&mut a, 20.0, "tool run 1 done, the link back", |r| r.done[0]);
+        let _ = a.update(Message::Tick);
+        assert!(!conn(&a).pi_down());
+        lacks(&a, &[crate::ui::PI_LOST]);
+        assert!(a.status.starts_with("Connected to"), "{}", a.status);
+    }
+
     /// Stop after step on the Pi: armed while the Drill drills, then this
     /// computer disconnects at once. The Pi stops after a hole by itself,
     /// over the stock; connected again, the run says which hole.
