@@ -5317,11 +5317,13 @@ flood = { pin = 8 }
     /// The MACHINE page draws the stock a tool run cut as MANUFACTURE draws
     /// what the same operations leave: its surface meshed at the
     /// simulation's detail, not the run's top-down grid of columns, whose
-    /// walls step a cell at a time. While the machine moves it is meshed
-    /// only on the Pi, the last surface drawn until the next is; on this
-    /// computer's driver the mesher waits for the machine to stop (#167),
-    /// and the live grid shows what the tool cuts meanwhile. An operation's
-    /// preview left from MANUFACTURE does not hide it.
+    /// walls step a cell at a time. While this computer's driver moves the
+    /// machine it is meshed on the GPU only, on the mesher's own thread, the
+    /// last surface drawn until the next is; without a GPU the mesher waits
+    /// for the machine to stop (#167), and the live grid shows what the
+    /// tool cuts meanwhile. A sample that finds the tool where it was cuts
+    /// nothing, so a held machine's stock is not meshed again. An
+    /// operation's preview left from MANUFACTURE does not hide it.
     #[test]
     fn the_machine_page_draws_the_stock_a_run_cut_as_planning_does() {
         use crate::run::Action as R;
@@ -5337,45 +5339,61 @@ flood = { pin = 8 }
         run_until(&mut a, 60., "the first cuts", |r| {
             r.carving.as_ref().is_some_and(|c| c.version > 0)
         });
-        let on_pi = |a: &mut App, pi: bool| {
-            a.control.as_mut().unwrap().pi = pi.then(|| "pi".to_string());
-        };
-        // On the simulator, as on USB: nothing is meshed while it moves.
-        assert!(a.locked());
-        let task = a.refresh_run_mesh();
-        assert!(iced_runtime::task::into_stream(task).is_none());
-        assert!(a.run_mesh_job.is_none() && a.run_stock().is_none());
-        // On the Pi it is, in the background (here in line).
-        on_pi(&mut a, true);
-        let task = a.refresh_run_mesh();
-        assert!(iced_runtime::task::into_stream(task).is_some());
+        // The tick's job, which tests do not run to its end, gives way.
         a.run_mesh_job = None;
-        a.smoke_dir = Some(dir.path().to_path_buf());
-        let _ = a.refresh_run_mesh();
-        a.smoke_dir = None;
-        on_pi(&mut a, false);
-        let meshed = version(&a);
-        assert_eq!(
-            run_of(&a)
-                .carving
-                .as_ref()
-                .unwrap()
-                .surface
-                .as_ref()
-                .unwrap()
-                .0,
-            meshed
-        );
-        run_until(&mut a, 60., "more cuts", |r| {
-            r.carving.as_ref().is_some_and(|c| c.version > meshed)
-        });
         assert!(a.locked());
-        // Once the tool has cut on, an older surface is drawn only on the
-        // Pi, whose next one comes; here the live grid shows the cuts.
-        assert!(a.run_stock().is_none() && a.live_stock().is_some());
-        on_pi(&mut a, true);
-        assert!(a.run_stock().is_some());
-        on_pi(&mut a, false);
+        if crate::gpu_mesh::shared().is_some() {
+            // Meshed while the machine moves, by the mesher's thread.
+            let meshed = version(&a);
+            let message = first_message(a.refresh_run_mesh());
+            assert!(matches!(message, Message::RunMeshed { .. }));
+            let _ = a.update(message);
+            let surface = |a: &App| {
+                let c = run_of(a).carving.as_ref().unwrap();
+                c.surface.as_ref().map(|s| s.0)
+            };
+            assert_eq!(surface(&a), Some(meshed));
+            run_until(&mut a, 60., "more cuts", |r| {
+                r.carving.as_ref().is_some_and(|c| c.version > meshed)
+            });
+            // The last surface is drawn while the next is meshed.
+            assert!(a.locked() && a.run_stock().is_some());
+        }
+        // Without a GPU it waits for the machine to stop; an older surface
+        // would hide the cuts since, which the live grid shows.
+        a.run_mesh_job = None;
+        a.run_mesh_waits = Some(run_of(&a).carving.as_ref().unwrap().serial);
+        assert!(iced_runtime::task::into_stream(a.refresh_run_mesh()).is_none());
+        assert!(a.run_mesh_job.is_none() && a.live_stock().is_some());
+        let stale = (run_of(&a).carving.as_ref())
+            .is_some_and(|c| c.surface.as_ref().is_none_or(|s| s.0 != c.version));
+        assert!(!stale || a.run_stock().is_none());
+        // Not again within `RUN_MESH_EVERY` of the last job while it moves.
+        let waits = a.run_mesh_waits.take();
+        a.run_mesh_started = Some(std::time::Instant::now());
+        assert!(iced_runtime::task::into_stream(a.refresh_run_mesh()).is_none());
+        a.run_mesh_waits = waits;
+        // On the Pi this computer's processor is free: it is meshed anyway,
+        // at once, on the CPU too.
+        a.control.as_mut().unwrap().pi = Some("pi".into());
+        assert!(iced_runtime::task::into_stream(a.refresh_run_mesh()).is_some());
+        a.control.as_mut().unwrap().pi = None;
+        (a.run_mesh_job, a.run_mesh_waits) = (None, None);
+        // A sample that finds the tool where the last one did cuts nothing.
+        let sample = conn(&a).snapshot.clone();
+        let cuts = |a: &App| {
+            let c = run_of(a).carving.as_ref().unwrap();
+            (c.version, c.volume.as_ref().unwrap().cuts.len())
+        };
+        let carve = |a: &mut App| {
+            let run = a.control.as_mut().unwrap().run.as_mut().unwrap();
+            run.carve(&sample);
+        };
+        carve(&mut a);
+        let once = cuts(&a);
+        carve(&mut a);
+        carve(&mut a);
+        assert_eq!(cuts(&a), once);
         run_until(&mut a, 60., "the first tool run", |r| r.running.is_none());
         tick_until(&mut a, 5.0, "Idle", |s| s.state == Some(State::Idle));
         assert!(run_of(&a).done[0], "{:?}", run_of(&a).outcome);
@@ -6530,45 +6548,13 @@ flood = { pin = 8 }
     fn render_a_saved_projects_run_stock() {
         use crate::run::Action as R;
         use uc100::controller::State;
-        let project = std::path::PathBuf::from(std::env::var("AXIS_PROJECT").unwrap_or(format!(
-            "{}/Library/Application Support/AXIS CAM Studio/workspace.json",
-            std::env::var("HOME").unwrap()
-        )));
         let out = std::path::PathBuf::from(
             std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/run-stock-project".into()),
         );
         std::fs::create_dir_all(&out).unwrap();
         let size = iced::Size::new(1440., 900.);
         let dir = tempfile::tempdir().unwrap();
-        let mut a = run_app_of(dir.path(), FAST, &[0]);
-        let m = a.doc.machines[0].clone();
-        let (mut doc, _) = crate::storage::load_reporting(&project).unwrap();
-        let mesh = crate::mesh::load(&doc.file.as_ref().unwrap().path).unwrap();
-        // The project's own machine, which its tools are on, driven by the
-        // simulated controller.
-        let simulated = |machine: &mut Machine| {
-            for k in [
-                "uc100_profile",
-                "uc100_connection",
-                "x",
-                "y",
-                "z",
-                "feed",
-                "post_dwell",
-            ] {
-                machine.p.insert(k.into(), m.p[k].clone());
-            }
-        };
-        doc.machines.iter_mut().for_each(simulated);
-        for setup in &mut doc.setups {
-            simulated(&mut setup.machine);
-            for op in &mut setup.operations {
-                op.p.insert("feed".into(), "30000".into());
-            }
-        }
-        doc.active = doc.setups[0].id.clone();
-        a.replace_document(doc, None);
-        let _ = a.update(Message::ModelRestored(Ok(mesh)));
+        let mut a = saved_project_on_the_simulator(dir.path());
         // The operations of the first tool run: those with the first's tool.
         let tool = a.doc.setups[0].operations[0].tool.clone();
         let last = (a.doc.setups[0].operations.iter())
@@ -6629,19 +6615,147 @@ flood = { pin = 8 }
         shot(&mut a, "3-machine-done");
     }
 
+    /// Runs a saved project's first tool run (`saved_project_on_the_simulator`)
+    /// on the simulated UC100 as the window would: a tick every 33 ms, the
+    /// run's stock meshed in the background as the tick asks
+    /// (`App::refresh_run_mesh`, its job's answer taken as it comes) and the
+    /// Job view drawn at 1500 × 960 each tick. With `AXIS_MESH=0` nothing is
+    /// meshed: the live grid is drawn, as before the run's stock had a
+    /// surface. Prints the driver's motion buffer at its lowest and its
+    /// longest status gap (the driver's log), the meshes made and how long
+    /// a tick and its drawing took. Not a check: run it with --ignored.
+    #[test]
+    #[ignore]
+    fn measure_a_saved_projects_run_with_its_stock_meshed() {
+        use crate::run::Action as R;
+        use futures_util::StreamExt;
+        use uc100::controller::State;
+        let mesh = std::env::var("AXIS_MESH").as_deref() != Ok("0");
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = saved_project_on_the_simulator(dir.path());
+        a.page = Page::Control;
+        zeroed(&mut a);
+        check_run_pictured(&mut a, dir.path(), 0);
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Job));
+        let _ = a.update(Message::ControlView(crate::ui::JobView::Stock));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        // The window's runtime: the tasks the ticks start, run on a thread
+        // of their own, their messages sent back.
+        let (tasks, mut started) = tokio::sync::mpsc::unbounded_channel::<
+            iced_runtime::futures::BoxStream<iced_runtime::Action<Message>>,
+        >();
+        let (answer, answers) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                while let Some(mut stream) = started.recv().await {
+                    let answer = answer.clone();
+                    tokio::spawn(async move {
+                        while let Some(action) = stream.next().await {
+                            if let iced_runtime::Action::Output(message) = action {
+                                let _ = answer.send(message);
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        let (mut meshes, mut ticks) = (0, vec![]);
+        // A job started by a tick before this runtime, whose answer no one
+        // takes, gives way.
+        a.run_mesh_job = None;
+        let mut deadline = Deadline::new(1200.);
+        while run_of(&a).running.is_some() {
+            let begun = std::time::Instant::now();
+            if !mesh {
+                a.run_mesh_waits = run_of(&a).carving.as_ref().map(|c| c.serial);
+            }
+            for message in answers.try_iter() {
+                meshes += usize::from(matches!(message, Message::RunMeshed { .. }));
+                let _ = a.update(message);
+            }
+            if let Some(stream) = iced_runtime::task::into_stream(a.update(Message::Tick)) {
+                let _ = tasks.send(stream);
+            }
+            let view = crate::ui::scene_viewport(&a).unwrap();
+            let p = crate::viewport::Projector::fit(a.camera, (1000., 640.), view.scene_bounds());
+            let _ = view.render(&p, (1500, 960), 1.5, None, &[]);
+            let took = begun.elapsed();
+            ticks.push(took);
+            assert!(deadline.within(&conn(&a).snapshot));
+            std::thread::sleep(std::time::Duration::from_millis(33).saturating_sub(took));
+        }
+        ticks.sort();
+        let at = |q: f64| ticks[((ticks.len() - 1) as f64 * q) as usize].as_secs_f64() * 1000.;
+        let s = &conn(&a).snapshot;
+        for line in s
+            .log
+            .iter()
+            .filter(|l| l.contains("Motion buffer") || l.contains("priority"))
+        {
+            eprintln!("driver: {line}");
+        }
+        eprintln!(
+            "mesh {mesh}: {meshes} meshes, {} ticks, tick and drawing median {:.1} ms, 95 % {:.1} ms, longest {:.1} ms; outcome {:?}",
+            ticks.len(),
+            at(0.5),
+            at(0.95),
+            at(1.),
+            run_of(&a).outcome
+        );
+    }
+
+    /// `$AXIS_PROJECT` (default the app's workspace), read and not saved,
+    /// its model loaded from where it says, on a simulated UC100: its own
+    /// machine, which its tools are on, driven by the simulated controller,
+    /// its feeds raised so a tool run takes minutes.
+    fn saved_project_on_the_simulator(dir: &std::path::Path) -> App {
+        let project = std::path::PathBuf::from(std::env::var("AXIS_PROJECT").unwrap_or(format!(
+            "{}/Library/Application Support/AXIS CAM Studio/workspace.json",
+            std::env::var("HOME").unwrap()
+        )));
+        let mut a = run_app_of(dir, FAST, &[0]);
+        let m = a.doc.machines[0].clone();
+        let (mut doc, _) = crate::storage::load_reporting(&project).unwrap();
+        let mesh = crate::mesh::load(&doc.file.as_ref().unwrap().path).unwrap();
+        // The project's own machine, which its tools are on, driven by the
+        // simulated controller.
+        let simulated = |machine: &mut Machine| {
+            for k in [
+                "uc100_profile",
+                "uc100_connection",
+                "x",
+                "y",
+                "z",
+                "feed",
+                "post_dwell",
+            ] {
+                machine.p.insert(k.into(), m.p[k].clone());
+            }
+        };
+        doc.machines.iter_mut().for_each(simulated);
+        for setup in &mut doc.setups {
+            simulated(&mut setup.machine);
+            for op in &mut setup.operations {
+                op.p.insert("feed".into(), "30000".into());
+            }
+        }
+        doc.active = doc.setups[0].id.clone();
+        a.replace_document(doc, None);
+        let _ = a.update(Message::ModelRestored(Ok(mesh)));
+        a
+    }
+
     /// Meshes the stock a run has carved, here rather than in the
-    /// background, as `App::refresh_run_mesh` does once the machine stops,
-    /// and on the Pi while it moves: the connection is taken for one on the
-    /// Pi meanwhile.
+    /// background, as `App::refresh_run_mesh` does.
     fn mesh_the_run(a: &mut App) {
-        let pi = conn(a).pi.clone();
-        let c = a.control.as_mut().unwrap();
-        c.pi.get_or_insert_with(|| "render".into());
         a.smoke_dir = Some(std::env::temp_dir());
         a.run_mesh_job = None;
         let _ = a.refresh_run_mesh();
         a.smoke_dir = None;
-        a.control.as_mut().unwrap().pi = pi;
         let c = run_of(a).carving.as_ref().unwrap();
         eprintln!(
             "run stock: {} cuts, {:?}",
@@ -6650,6 +6764,22 @@ flood = { pin = 8 }
                 .as_ref()
                 .map(|s| (s.1, s.2.triangles.len(), s.2.cell_mm, s.2.milliseconds))
         );
+    }
+
+    /// The first message `task` gives, waited for.
+    fn first_message(task: Task<Message>) -> Message {
+        use futures_util::StreamExt;
+        let mut stream = iced_runtime::task::into_stream(task).expect("a task");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        loop {
+            match runtime.block_on(stream.next()) {
+                Some(iced_runtime::Action::Output(message)) => return message,
+                Some(_) => {}
+                None => panic!("the task ended without a message"),
+            }
+        }
     }
 
     /// Meshes the stock as `a`'s simulation has it cut, here rather than in

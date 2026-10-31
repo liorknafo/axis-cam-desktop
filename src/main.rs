@@ -490,7 +490,7 @@ pub enum Message {
     /// not be meshed.
     RunMeshed {
         key: RunMeshKey,
-        result: Result<std::sync::Arc<stock_surface::SurfaceMesh>, String>,
+        result: RunMeshed,
     },
     Tick,
     Plan,
@@ -685,6 +685,15 @@ const START_MESHES: usize = 8;
 /// What the stock a run carved is meshed for: the carve
 /// (`run::Carving::serial`), its version and the detail.
 type RunMeshKey = (u64, u64, stock_surface::Detail);
+/// How often the stock a run carves is meshed while this computer's driver
+/// moves the machine: four pictures a second keep up with the tool, and
+/// leave the processor to the driver and the window's drawing between
+/// them. On the Pi it is meshed again as soon as the last is done.
+const RUN_MESH_EVERY: Duration = Duration::from_millis(250);
+/// The surface of the stock a run carved, None when it waits for the
+/// machine to stop (no GPU to mesh it on meanwhile), or why it could not be
+/// meshed.
+type RunMeshed = Result<Option<std::sync::Arc<stock_surface::SurfaceMesh>>, String>;
 /// A heading and the lines of the box the inspector shows.
 pub type HoldingNote = Option<(String, Vec<String>)>;
 /// What the status of a generated preview ends with on a CNC machine, and on
@@ -907,6 +916,18 @@ fn holding_fingerprint(doc: &Document, left: u64) -> Option<u64> {
     serde_json::to_writer(&mut out, &doc.workholding).ok()?;
     serde_json::to_writer(&mut out, &doc.selected_material()).ok()?;
     Some(hasher.finish())
+}
+/// Gives the calling thread the ordinary priority, below the driver's
+/// motion thread, which raises its own (user-interactive on macOS,
+/// real-time on Linux, time-critical on Windows), whatever the thread that
+/// started it had: a background job's (`App::refresh_run_mesh`). Lower ones
+/// get nothing while the window's drawing keeps every core busy.
+fn below_the_driver() {
+    // SAFETY: a plain libc call on the current thread.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_DEFAULT, 0);
+    }
 }
 /// The box each setup of `doc` starts from when the earlier ones are
 /// simulated on `mesh` (`simulation::sequence_walk`, as the simulation itself
@@ -1321,6 +1342,13 @@ pub struct App {
     /// of the last that could not be.
     run_mesh_job: Option<RunMeshKey>,
     run_mesh_failed: Option<RunMeshKey>,
+    /// When the last of those jobs started: while this computer's driver
+    /// moves the machine the next waits `RUN_MESH_EVERY` after it.
+    run_mesh_started: Option<Instant>,
+    /// The carve (`run::Carving::serial`) that could not be meshed on the
+    /// GPU while this computer's driver moved the machine: it is meshed
+    /// once the machine stops.
+    run_mesh_waits: Option<u64>,
     pub progress: f32,
     pub speed: f32,
     pub last_tick: Instant,
@@ -1979,6 +2007,8 @@ impl App {
             start_mesh_failed: None,
             run_mesh_job: None,
             run_mesh_failed: None,
+            run_mesh_started: None,
+            run_mesh_waits: None,
             progress: 0.,
             speed: 1.,
             last_tick: Instant::now(),
@@ -3256,30 +3286,36 @@ impl App {
         }
         let c = r.carving.as_ref()?;
         let current = c.surface.as_ref().is_some_and(|s| s.0 == c.version);
-        if !current && !self.run_meshes() {
+        if !current && self.run_mesh_waits(c.serial) {
             return None;
         }
         r.carved_surface()
     }
-    /// The stock a run carves may be meshed now (`refresh_run_mesh`): the
-    /// machine stands still, or the Pi feeds it. While this computer's
-    /// driver feeds a moving machine (USB, the simulator) nothing competes
-    /// with it for the processor (#167).
-    fn run_meshes(&self) -> bool {
-        !self.locked() || self.control.as_ref().is_some_and(|c| c.pi.is_some())
+    /// This computer's driver moves the machine (USB, the simulator): the
+    /// run's stock is meshed on the GPU only, so that the CPU's cores stay
+    /// the driver's (#167).
+    fn driving_here(&self) -> bool {
+        self.locked() && self.control.as_ref().is_some_and(|c| c.pi.is_none())
     }
-    /// Meshes the stock the run has carved (`run::Carving::volume`) off the
-    /// window's thread, at the simulation's detail, when its last surface
-    /// is of an earlier cut or detail (in line in the smoke run): one job at
-    /// a time, each version once, the last surface drawn meanwhile. While
-    /// the machine moves, only on the Pi: on USB and the simulator this
-    /// computer's driver feeds the machine, and the mesher waits for it to
+    /// The stock of carve `serial` waits for the machine to stop to be
+    /// meshed: there is no GPU to mesh it on while this computer's driver
+    /// moves the machine.
+    fn run_mesh_waits(&self, serial: u64) -> bool {
+        self.driving_here() && self.run_mesh_waits == Some(serial)
+    }
+    /// Meshes the stock the run has carved (`run::Carving::volume`) at the
+    /// simulation's detail when its last surface is of an earlier cut or
+    /// detail (in line in the smoke run): one job at a time, each version
+    /// once, the last surface drawn meanwhile. The job runs on a thread of
+    /// its own below the driver's motion thread (`below_the_driver`), and
+    /// while this computer's driver moves the
+    /// machine only on the GPU: without one it waits for the machine to
     /// stop, as the check does (#167).
     pub(crate) fn refresh_run_mesh(&mut self) -> Task<Message> {
-        if self.run_mesh_job.is_some() {
-            return Task::none();
-        }
-        if !self.run_meshes() {
+        let gpu_only = self.driving_here();
+        if self.run_mesh_job.is_some()
+            || gpu_only && (self.run_mesh_started).is_some_and(|t| t.elapsed() < RUN_MESH_EVERY)
+        {
             return Task::none();
         }
         let Some(c) = self.control.as_ref() else {
@@ -3297,11 +3333,19 @@ impl App {
             .as_ref()
             .is_some_and(|s| (s.0, s.1) == (key.1, key.2))
             || self.run_mesh_failed == Some(key)
+            || self.run_mesh_waits(key.0)
         {
             return Task::none();
         }
         let snapshot = stock_surface::Snapshot::of(volume, key.2);
-        let build = move || snapshot.build().map(std::sync::Arc::new);
+        let build = move || -> RunMeshed {
+            let mesh = if gpu_only {
+                snapshot.build_on_gpu().transpose()?
+            } else {
+                Some(snapshot.build()?)
+            };
+            Ok(mesh.map(std::sync::Arc::new))
+        };
         if self.smoke_dir.is_some() {
             return self.update(Message::RunMeshed {
                 key,
@@ -3309,11 +3353,25 @@ impl App {
             });
         }
         self.run_mesh_job = Some(key);
+        self.run_mesh_started = Some(Instant::now());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let spawned = std::thread::Builder::new()
+            .name("run stock mesher".into())
+            .spawn(move || {
+                below_the_driver();
+                let _ = tx.send(build());
+            });
+        if let Err(e) = spawned {
+            return self.update(Message::RunMeshed {
+                key,
+                result: Err(format!("Stock mesher failed: {e}")),
+            });
+        }
         Task::perform(
             async move {
-                let result = tokio::task::spawn_blocking(build)
+                let result = rx
                     .await
-                    .unwrap_or_else(|e| Err(format!("Stock mesher failed: {e}")));
+                    .unwrap_or_else(|_| Err("Stock mesher failed.".into()));
                 (key, result)
             },
             |(key, result)| Message::RunMeshed { key, result },
@@ -7298,9 +7356,10 @@ impl App {
                     .and_then(|c| c.run.as_mut()?.carving.as_mut())
                     .filter(|c| c.serial == key.0);
                 match (result, carving) {
-                    (Ok(surface), Some(carving)) => {
+                    (Ok(Some(surface)), Some(carving)) => {
                         carving.surface = Some((key.1, key.2, surface));
                     }
+                    (Ok(None), _) => self.run_mesh_waits = Some(key.0),
                     (Ok(_), None) => {}
                     (Err(e), _) => {
                         self.status = e;

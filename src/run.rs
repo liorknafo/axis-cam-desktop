@@ -413,6 +413,11 @@ pub struct Carving {
     /// The block of the running blocks at the last sample: None between
     /// tool runs, so that a jog then does not cut.
     last: Option<usize>,
+    /// Where the last sample's cut ended: its block, the point on its move
+    /// it was cut up to and the tool's tip. A sample that finds the tool
+    /// there again (held, paused, a snapshot repeated) cuts nothing, and
+    /// one further along the same move cuts only the rest of it.
+    reached: Option<(usize, [f32; 3], [f32; 3])>,
     /// Counts the cuts, for the 3D view's redraw.
     pub version: u64,
 }
@@ -480,7 +485,7 @@ impl Run {
     pub fn carve(&mut self, s: &uc100::controller::Snapshot) {
         let Some(live) = self.live(s) else {
             if let Some(c) = &mut self.carving {
-                c.last = None;
+                (c.last, c.reached) = (None, None);
             }
             return;
         };
@@ -556,6 +561,7 @@ impl Run {
             turns: b.turns.clone(),
             surface: None,
             last: None,
+            reached: None,
             version: 0,
         });
         true
@@ -591,7 +597,17 @@ impl Run {
             _ => None,
         };
         let now = to.map_or(blocks.len(), |(b, _)| b);
+        // Cut on the same move as the last sample: from where that cut ended.
+        let reached = (self.carving.as_ref())
+            .and_then(|c| c.reached)
+            .filter(|r| from == Some(now) && r.0 == now);
+        if let (Some((_, tip)), Some((_, _, was))) = (to, reached)
+            && tip == was
+        {
+            return;
+        }
         let mut sweeps: Vec<_> = (from.unwrap_or(0)..now).filter_map(ends).collect();
+        let mut end = None;
         if let (Some((_, tip)), Some((op, a, b, angle))) = (to, ends(now)) {
             // The tip's place on the move: the share of it done.
             let d: [f32; 3] = std::array::from_fn(|k| b[k] - a[k]);
@@ -601,8 +617,10 @@ impl Run {
             } else {
                 ((0..3).map(|k| (tip[k] - a[k]) * d[k]).sum::<f32>() / length).clamp(0., 1.)
             };
-            sweeps.push((op, a, std::array::from_fn(|k| a[k] + t * d[k]), angle));
+            let on: [f32; 3] = std::array::from_fn(|k| a[k] + t * d[k]);
+            sweeps.push((op, reached.map_or(a, |r| r.1), on, angle));
             sweeps.push((op, tip, tip, angle));
+            end = Some((now, on, tip));
         }
         let cutter = |op: usize| {
             let before = (self.before.iter()).find(|b| Some(b.op) == p.indexes.get(op).copied());
@@ -619,6 +637,7 @@ impl Run {
             })
             .collect();
         if let Some(c) = &mut self.carving {
+            c.reached = end;
             for (a, b, (radius, shape, flute), angle, source) in sweeps {
                 if let Some(volume) = &mut c.volume {
                     let frame = if c.turning {

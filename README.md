@@ -674,13 +674,17 @@ the same places, greyed when they cannot be used. Under it three columns:
   done), never on a tick and never while a text field has the focus.
   The stock a run has cut is drawn as the MANUFACTURE simulation draws its
   stock: the surface of every cut so far, meshed at the simulation's
-  **Draft / Standard / Fine** detail by the same mesher, in the background,
-  each cut state once, the last surface shown until the next is ready. On
-  the Pi it follows the tool while the machine moves. On USB and the
-  simulator this computer's driver feeds the machine, so nothing is meshed
-  while it moves (#167): the stock is drawn coarser then, from a grid of
-  at most 96 cells a side, and smooth again as soon as the machine stops.
-  An operation's preview left open in MANUFACTURE does not hide the run's
+  **Draft / Standard / Fine** detail by the same mesher, in the background
+  on a thread of its own below the driver's motion thread, each cut state
+  once, the last surface shown until the next is ready; it follows the
+  tool while the machine moves. On the Pi this computer's processor is
+  free and it is meshed again as soon as the last is done. While this
+  computer's driver moves the machine (USB, the simulator) it is meshed
+  on the GPU only and at most four times a second, so that the processor
+  stays the driver's (#167); a computer without a usable GPU draws the
+  run's stock coarser while the machine moves, from a grid of at most 96
+  cells a side, and smooth again once it stops. A held or paused machine's stock is not meshed again. An
+  operation's preview left open in MANUFACTURE does not hide the run's
   stock.
 - **Right, Operations**: the setup's operations in the order they are cut,
   grouped by tool run, one row each with its state, name, time and **Start
