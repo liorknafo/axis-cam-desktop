@@ -98,13 +98,13 @@ struct RasterTile {
     image_bounds: Rectangle,
     clip_bounds: Rectangle,
 }
-struct RasterFrame {
+pub(crate) struct RasterFrame {
     width: u32,
     height: u32,
     tiles: Vec<RasterTile>,
 }
 impl RasterFrame {
-    fn from_rgba(width: u32, height: u32, pixels: &[u8]) -> Self {
+    pub(crate) fn from_rgba(width: u32, height: u32, pixels: &[u8]) -> Self {
         let mut tiles = Vec::new();
         for y in (0..height).step_by(TILE_SIDE as usize) {
             for x in (0..width).step_by(TILE_SIDE as usize) {
@@ -146,7 +146,7 @@ impl RasterFrame {
             tiles,
         }
     }
-    fn draw(&self, frame: &mut Frame, size: iced::Size) {
+    pub(crate) fn draw(&self, frame: &mut Frame, size: iced::Size) {
         let map = |r: Rectangle| Rectangle {
             x: r.x * size.width / self.width as f32,
             y: r.y * size.height / self.height as f32,

@@ -8274,6 +8274,48 @@ flood = { pin = 8 }
             render_element(element, iced::Size::new(900., 640.), &out.join(name));
         }
     }
+    /// LIO-342: the MACHINE page itself, connected to a simulated UC100
+    /// with the Machine view up, before and after the machine's travel and
+    /// clearances are changed and saved in the library, with the time the
+    /// model takes to draw.
+    #[test]
+    #[ignore]
+    fn render_the_machine_page_before_and_after_a_travel_change() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/machine-page-renders".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), LIMITED);
+        idle(&mut a);
+        a.page = Page::Control;
+        a.control_tab = crate::ui::ControlTab::Machine;
+        let size = iced::Size::new(1600., 1000.);
+        let time = |a: &App| {
+            let view = crate::ui::machine_model(a, conn(a));
+            let element: iced::Element<'_, Message> = iced::widget::canvas(view)
+                .width(iced::Fill)
+                .height(iced::Fill)
+                .into();
+            let start = std::time::Instant::now();
+            render_element(element, iced::Size::new(900., 640.), &out.join("model.png"));
+            start.elapsed()
+        };
+        render_png(&a, size, &out.join("1-before.png"));
+        eprintln!("model drawn in {:?}", time(&a));
+        a.machine_draft = a.doc.machines[0].clone();
+        for (k, v) in [
+            ("x", "600"),
+            ("y", "400"),
+            ("z", "100"),
+            ("gantry_height", "180"),
+        ] {
+            a.machine_draft.p.insert(k.into(), v.into());
+        }
+        let _ = a.update(Message::SaveMachine);
+        a.page = Page::Control;
+        render_png(&a, size, &out.join("2-after.png"));
+    }
     /// LIO-342: the machine view on the library CNC4030, plain and with its
     /// rotary unit, and on a bigger machine: 600 × 400 × 100 mm of travel,
     /// the nose 220 mm over the table, the gantry 180 mm high, 700 wide.
@@ -10163,7 +10205,7 @@ flood = { pin = 8 }
             assert!(
                 lines.contains(&(
                     Caption::Assumed,
-                    "Dashed box: assumed travel, travel not configured in the profile"
+                    "Dashed box: assumed travel, travel not configured in the profile".into()
                 )),
                 "{lines:?}"
             );
@@ -10178,13 +10220,31 @@ flood = { pin = 8 }
         assert_eq!(real.envelope, [[0., 0., -55.], [390., 280., 0.]]);
         assert!(
             real.captions()
-                .contains(&(Caption::Travel, "Box: where the tool tip can travel"))
+                .contains(&(Caption::Travel, "Box: where the tool tip can travel".into()))
         );
         assert!(
             view(&limited, false)
                 .captions()
                 .iter()
                 .all(|(k, _)| *k != Caption::Assumed)
+        );
+        // Soft limits that span other than the machine's travel are said
+        // (LIO-342): the model is drawn to the travel, the box to the limits.
+        assert!(real.captions().iter().all(|(k, _)| *k != Caption::Mismatch));
+        let larger = MachineView {
+            figures: crate::machine_view::Figures {
+                travel: [600., 280., 55.],
+                ..figures
+            },
+            ..view(&limited, true)
+        };
+        assert!(
+            larger.captions().contains(&(
+                Caption::Mismatch,
+                "The profile's soft limits span 390 × 280 × 55 mm, the machine's travel is 600 × 280 × 55 mm".into()
+            )),
+            "{:?}",
+            larger.captions()
         );
     }
 

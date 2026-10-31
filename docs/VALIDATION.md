@@ -1639,3 +1639,28 @@ A chamfer mill was taken only by Drilling, to countersink. The power feed's clut
 - **Tests.** `smoke::tests::the_machine_in_3d_is_its_own_tab_and_the_job_tab_says_so`: the tabs start Job, Machine, Work zero; the Job tab before a setup shows `NO_JOB` and no 3D / Top; the Machine tab shows Disconnect, Machine zero and Log. `back_in_machine_the_job_tab_shows_the_setup_picked_to_run`: setup 1 picked to run, setup 2 opened in MANUFACTURE, back in MACHINE the active setup is setup 1 and the Job tab does not show `NO_JOB`. `the_connected_machine_is_not_removed_and_disconnect_stays_on_the_control_page`, `the_jog_pad_stays_put_while_the_machine_jogs_and_the_page_does_not_scroll`, `the_keys_jog_only_with_the_pad_on_screen_and_the_stops_say_what_they_stop`, `toolbar_glyphs_meet_contrast_on_their_tiles`, `work_zero_says_move_there_waits_for_machine_zero_and_offers_it` and the `help::` tests (with LF sources) pass.
 - **Renders** (`render_the_control_page`): the Machine tab at 1440 × 900, 1440 × 790 and 1120 × 690, and the Job tab before and after a setup is picked, inspected: nothing cut off or overlapping.
 - Not run: the full suite.
+
+## MACHINE's machine model, rendered like the Work page's view (LIO-342, second round, 31 October 2026)
+
+- **What was seen.** After the first round the owner found it not acceptable: it still looked like boxes, and the travel still did not seem applied. The model was still flat polygons sorted far to near and filled one colour each. On the MACHINE page itself (a simulated UC100 on the LIMITED profile, `render_the_machine_page_before_and_after_a_travel_change`) a change of the library's travel left two things as they were. The box, which is the profile's soft limits (390 × 280 × 55 mm) and not the travel, stayed put, with nothing to say they disagreed. And the Z travel was drawn nowhere: 600 × 400 × 300 and 600 × 400 × 100 mm looked the same. Before machine zero the 50 % amber tint turned all the aluminium brown.
+- **What changed.** `machine_view` has its own small renderer. The model is triangles with a normal at each corner: rounded boxes (each face cut on a grid that crowds to its edges, every point moved onto the rounded box), smooth or faceted cylinders, and prisms for the side plates and the rotary unit's solids. They are drawn through a depth buffer at 2 × 2 samples a pixel. Triangles turned away are left out, and the rows are shared among the cores. Each sample is lit by a key light, a fill light and the room, with a highlight sharper and brighter on polished metal. Samples are darkened where solids meet, at the frame's edge and where the surface turns sharply, then averaged down. The picture is kept in the canvas state until what it is drawn from changes. The travel box goes into the same buffer, faint and dashed behind the machine. The parts:
+  - an aluminium frame on rubber feet, and a T-slot table of slats on a floor;
+  - chrome Y rods on supports with a stepper at each back end;
+  - the blue side plates, wider at the foot, on bearing blocks;
+  - the beam with two X rods and a ball screw, and the X stepper on the right plate;
+  - the X carriage and the Z column, which spans the Z travel, with its stepper on top;
+  - the Z slide, the spindle's clamp, and the spindle (nose, chrome body, black cap and plug);
+  - a hex collet nut, and the tool with a carbide tip;
+  - a vise with jaws and a handle under the simulator's block;
+  - a gradient floor and a soft shadow.
+
+  An amber line says when the profile's soft limits span other than the machine's travel (`Caption::Mismatch`). The amber of an unset position is a 30 % tinge.
+- **Measured.** `machine_view::tests::time_a_frame` (release, 900 × 640): 12,004 triangles, built in 0.9 ms, fitted and built in 2.6 ms, drawn in 25 ms. The page render test before and after the change: the beam higher, the table and the base the new size, the Z column shorter, the mismatch line naming both. Orbits from the front, left, behind, low, the side and above (temporary starting-orbit override): no face drawn over a nearer one, and no holes where triangles are left out.
+- **Tests.** In `machine_view::tests`:
+  - `a_rounded_box_is_closed_and_its_normals_point_out`;
+  - `the_renderer_draws_the_nearest_surface_lit_and_outlined` (a near box over a far one, its outline darker, a line fainter behind it);
+  - `the_model_is_drawn_to_the_machines_travel_and_clearances`, now also with the Z column reaching the bottom of a 200 mm Z travel;
+  - the position and rotary tests, on the triangles.
+
+  `a_profile_with_no_soft_limits_gets_the_same_amber_warning_and_an_assumed_box` also checks the mismatch line.
+- Not validated: on the real machine's screen (the page was rendered headless through the app's own view). Not changed: the gantry still moves in Y over a fixed table.
