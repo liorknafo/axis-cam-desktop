@@ -2805,6 +2805,15 @@ impl Connection {
         self.link.as_ref().is_some_and(|l| !l.live)
     }
 
+    /// The machine runs a probe move, which Feed hold does not pause (the
+    /// driver only logs it); Stop aborts it. Its program is the driver's
+    /// "Probe", or a move with the probe flag on.
+    pub fn probe_moving(&self) -> bool {
+        let s = &self.snapshot;
+        s.state == Some(State::Run)
+            && (s.program_name.as_deref() == Some("Probe") || s.status.is_some_and(|st| st.probing()))
+    }
+
     /// This computer may command the machine: always over USB and on the
     /// simulator; on the Pi, in control with the link answering.
     pub fn in_control(&self) -> bool {
@@ -3278,7 +3287,9 @@ impl Connection {
         // (E-stop, Hold and Stop only).
         let state = self.snapshot.state.clone();
         match action {
-            R::Hold if state == Some(State::Run) => return self.send(Command::FeedHold),
+            R::Hold if state == Some(State::Run) && !self.probe_moving() => {
+                return self.send(Command::FeedHold);
+            }
             R::Resume if matches!(state, Some(State::Hold | State::Paused(_))) && self.in_control() => {
                 return self.send(Command::Resume);
             }

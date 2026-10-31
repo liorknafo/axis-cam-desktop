@@ -2734,12 +2734,20 @@ flood = { pin = 8 }
     /// Pi does its UC100, and `run_app`'s machine connecting to it across
     /// the network, this computer paired with it.
     fn pi_app(dir: &std::path::Path) -> (App, uc100_remote::Server) {
+        let mut a = run_app(dir);
+        let server = to_pi(&mut a, dir);
+        (a, server)
+    }
+
+    /// Moves the machine of an app made by `profile_app` (its profile in
+    /// `dir`) onto a uc100-server on 127.0.0.1 running the simulator, this
+    /// computer paired with it.
+    fn to_pi(a: &mut App, dir: &std::path::Path) -> uc100_remote::Server {
         let server = uc100_remote::Server::start(uc100_remote::ServerOptions {
             data: dir.join("pi"),
             listen: "127.0.0.1:0".parse().unwrap(),
         })
         .unwrap();
-        let mut a = run_app(dir);
         // The Pi runs its simulator: the profile asks it to.
         let profile = dir.join("uc100.toml");
         let text = std::fs::read_to_string(&profile).unwrap();
@@ -2750,7 +2758,7 @@ flood = { pin = 8 }
         let token = uc100_remote::RemoteController::pair(&server.addr().to_string(), &code, "Test Mac");
         let _ = a.update(Message::PiPaired(token.map(|t| t.to_string())));
         assert!(a.status.starts_with("Paired"), "{}", a.status);
-        (a, server)
+        server
     }
 
     /// The Pi's own snapshot: what its controller does, whatever this
@@ -7768,6 +7776,45 @@ flood = { pin = 8 }
 
     fn blocked(a: &App) -> String {
         conn(a).probe_blocked().unwrap_or_default()
+    }
+
+    /// While a probe moves, Hold (which cannot pause it: the driver only
+    /// logs it) is off, the run bar says Stop now aborts it, Space says so
+    /// too, and Stop now aborts it, work Z unchanged: over USB and on the Pi.
+    #[test]
+    fn hold_is_off_while_a_probe_moves_and_stop_aborts_it() {
+        use crate::control::Action;
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        for on_pi in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut a = profile_app(dir.path(), &probe_profile());
+            plate(&mut a, "1000");
+            let _server = on_pi.then(|| to_pi(&mut a, dir.path()));
+            a.page = Page::Control;
+            idle(&mut a);
+            let _ = a.update(Message::Machine(Action::MachineZero(None)));
+            tick_until(&mut a, 3.0, "machine zero", |s| s.referenced[..3].iter().all(|r| *r));
+            mdi(&mut a, "G0 X195 Y140 Z-10");
+            let _ = a.update(Message::Machine(Action::ProbeZ));
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !conn(&a).probe_moving() {
+                let _ = a.update(Message::Tick);
+                assert!(std::time::Instant::now() < end, "never probing (Pi: {on_pi}): {:?}", conn(&a).snapshot.state);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let _ = a.update(Message::Resized(iced::Size::new(1440., 900.)));
+            let clicks = crate::ui::probe::clicks(crate::ui::run_bar(&a, conn(&a)), iced::Size::new(1440., 200.));
+            assert!(!clicks.iter().any(|m| matches!(m, Message::Run(R::Hold))), "Hold offered (Pi: {on_pi})");
+            assert!(clicks.iter().any(|m| matches!(m, Message::Run(R::Stop))), "Stop not offered (Pi: {on_pi})");
+            shows(&a, &[crate::ui::PROBE_HOLD]);
+            let _ = a.update(Message::HoldKey);
+            assert_eq!(a.status, crate::ui::PROBE_HOLD);
+            let _ = a.update(Message::Run(R::Stop));
+            tick_until(&mut a, 5.0, "the probe aborted", |s| s.state == Some(State::Idle));
+            assert!(conn(&a).snapshot.work_offset[2].abs() < 1e-9, "Pi: {on_pi}");
+            assert!(conn(&a).snapshot.machine_pos[2] > -30., "the probe ran to its end");
+        }
     }
 
     #[test]

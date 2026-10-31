@@ -8155,6 +8155,9 @@ pub(crate) fn run_line(
 /// back), the setup's progress and time left, and Cycle Start, Hold,
 /// Resume and Stop now, always in the same places, greyed when they cannot
 /// be used (LIO-274).
+/// Why Hold is off while a probe moves.
+pub(crate) const PROBE_HOLD: &str = "Probing: Hold cannot pause a probe move. Stop now aborts it.";
+
 pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Message> {
     use crate::run::Action as R;
     use uc100::controller::State;
@@ -8221,6 +8224,11 @@ pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
             widget::tooltip::Position::Bottom,
         )
     };
+    let line: Element<_> = if c.probe_moving() {
+        text(PROBE_HOLD).size(13).color(WARN).wrapping(Wrapping::None).into()
+    } else {
+        line
+    };
     let (done, times) = match c.run.as_ref().and_then(|r| run_times(r, s)) {
         Some((done, short, long)) => (
             done,
@@ -8251,7 +8259,10 @@ pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
     let big = |label: &str, m: Option<Message>| act_with(label.to_string(), m, false, None, pad);
     // Hold, Resume and Stop act on the machine, a tool run followed or not
     // (after reconnecting to a Pi that runs one); a watcher holds and stops.
-    let hold = msg(state == Some(&State::Run) && !c.pi_down(), R::Hold);
+    let hold = msg(
+        state == Some(&State::Run) && !c.pi_down() && !c.probe_moving(),
+        R::Hold,
+    );
     let resume = msg(
         matches!(state, Some(State::Hold | State::Paused(_))) && c.in_control(),
         R::Resume,

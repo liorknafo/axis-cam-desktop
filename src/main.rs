@@ -6193,6 +6193,7 @@ impl App {
                 use uc100::controller::{Command, State};
                 if let Some(c) = &self.control {
                     match c.snapshot.state {
+                        Some(State::Run) if c.probe_moving() => self.status = ui::PROBE_HOLD.into(),
                         Some(State::Run) => c.send(Command::FeedHold),
                         Some(State::Hold) if self.jog_pad_shown() => c.send(Command::Resume),
                         _ => {}
