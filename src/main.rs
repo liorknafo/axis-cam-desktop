@@ -2955,6 +2955,7 @@ impl App {
         let reconnect = here.is_some();
         match d.save() {
             Err(e) => d.note = Some(e),
+            // Connecting takes the travel from the profile.
             Ok(_) if reconnect => {
                 d.note = Some(
                     "Saved, and the machine was reconnected with it: Reset, then set the machine position again.".into(),
@@ -2962,7 +2963,17 @@ impl App {
                 self.disconnect_machine();
                 return self.update(Message::Connect);
             }
-            Ok(_) => d.note = Some("Saved.".into()),
+            Ok(cfg) => {
+                let synced = control::travel_from_profile(&mut self.doc, id, &cfg);
+                d.note = Some(if synced {
+                    "Saved. The machine's X, Y and Z travel now follow these soft limits.".into()
+                } else {
+                    "Saved.".into()
+                });
+                if synced {
+                    self.touch();
+                }
+            }
         }
         Task::none()
     }
@@ -6259,6 +6270,10 @@ impl App {
                             c.resume_pi_run(kept);
                         }
                         self.status = format!("Connecting to {}…", m.name());
+                        if control::travel_from_profile(&mut self.doc, &m.id, &c.config) {
+                            self.touch();
+                            self.status += " Its X, Y and Z travel now follow the soft limits in its UC100 profile.";
+                        }
                         self.control = Some(c);
                         if let Some(si) = self.run_on_connect.take().and_then(|id| {
                             (self.doc.setups.iter())

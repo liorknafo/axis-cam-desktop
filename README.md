@@ -1015,8 +1015,10 @@ Once the machine is Idle, the Control page has everything needed before a job:
   captioned "travel not configured", whether or not the position is set.
   The shipped Jingyan's figures are **assumed** from a similar machine's
   spec sheet, as are the JY5800 profile's soft limits (travel 390 × 280 ×
-  55 mm): measure the machine and correct both (the machine library, the
-  driver profile).
+  55 mm): measure the machine and correct the soft limits in Controller
+  configuration. They are given once (LIO-344): saving the profile, and
+  connecting to the machine, make its X, Y and Z travel in the machine
+  library and in each setup's copy the soft limits' spans, marked Measured.
 
 **Controller configuration** (beside **Control** in the MACHINE toolbar) does
 the commissioning work that needed the driver's egui app or a text editor:
