@@ -986,26 +986,37 @@ Once the machine is Idle, the Control page has everything needed before a job:
 - **Overrides.** Feed override 10–200 %; **Override limit switches** when the
   profile has any.
 - **MDI.** One G-code line, sent with Enter or **Send**.
-- **The machine.** A model of a gantry router shaped like the CNC4030 (base,
-  rails, T-slot table, gantry side plates and beam, carriage, Z plate,
-  clamped spindle, stepper motors) moves with the live position, with the
-  tool-tip travel box from the soft limits, the simulator's block standing on
-  a vise's body, and a green ring at the active work zero once the machine
-  position is set; drag to turn it. It is amber until the machine position is
-  set. It is drawn to the connected machine's figures in the machine library
-  (Travel & spindle): the table reaches 70 mm past the X travel and 20 mm
-  past the Y travel each side, the spindle nose stands **Spindle nose to
-  table at Z top** over it, the beam **Gantry clearance height**, and the
-  side plates stand beside the table, **Gantry clearance width** apart when
-  that is wider. A change shows as soon as the machine is saved. The
-  Jingyan's numbers stand in for any figure the machine does not give. The
-  footer names the travel. When the profile lacks soft limits on X, Y or Z,
-  the box is the machine's travel from machine zero instead, drawn dashed and
-  captioned "travel not configured", whether or not the position is set. The
-  shipped Jingyan's figures are **assumed** from a similar machine's spec
-  sheet, as are the JY5800 profile's soft limits (travel 390 × 280 × 55 mm):
-  measure the machine and correct both (the machine library, the driver
-  profile).
+- **The machine.** A model of a gantry router shaped like the CNC4030 moves
+  with the live position: an aluminium frame on rubber feet, a T-slot table,
+  chrome Y rails, the gantry's blue side plates on bearing blocks, the beam
+  with its X rods and ball screw, the X carriage and Z column, the clamped
+  spindle with its hex collet nut and tool, and NEMA 23 steppers on X, Y
+  and Z. It is drawn as the Work page's view draws a part: through a depth
+  buffer at twice the view's resolution, lit per pixel with highlights on
+  the metal, outlined where parts meet, about 30 ms a frame in a release
+  build, and drawn again only when something it shows changes. With it are
+  the tool-tip travel box from the soft limits (faint and dashed where the
+  machine hides it), the simulator's block standing in a vise, and a green
+  ring at the active work zero once the machine position is set; drag to
+  turn it. Until the machine position is set the moving parts take an
+  amber tinge. It is drawn to the connected machine's figures in the
+  machine library (Travel & spindle): the table reaches 70 mm past the X
+  travel and 20 mm past the Y travel each side, the base and rails run the
+  Y travel, the Z column spans the Z travel, the spindle nose stands
+  **Spindle nose to table at Z top** over the table, the beam **Gantry
+  clearance height**, and the side plates stand beside the table, **Gantry
+  clearance width** apart when that is wider. A change shows as soon as the
+  machine is saved; the Jingyan's numbers stand in for any figure the
+  machine does not give, and the footer names the travel. The box is the
+  profile's soft limits, which the profile form edits (Controller
+  configuration): when they span other than the machine's travel, an amber
+  line says both. When the profile lacks soft limits on X, Y or Z, the box
+  is the machine's travel from machine zero instead, drawn dashed and
+  captioned "travel not configured", whether or not the position is set.
+  The shipped Jingyan's figures are **assumed** from a similar machine's
+  spec sheet, as are the JY5800 profile's soft limits (travel 390 × 280 ×
+  55 mm): measure the machine and correct both (the machine library, the
+  driver profile).
 
 **Controller configuration** (beside **Control** in the MACHINE toolbar) does
 the commissioning work that needed the driver's egui app or a text editor:
