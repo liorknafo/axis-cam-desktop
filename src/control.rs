@@ -195,6 +195,46 @@ pub fn profile(m: &Machine) -> Result<MachineConfig, String> {
     MachineConfig::load(Path::new(path)).map_err(|e| e.to_string())
 }
 
+/// A UC100 machine's X, Y and Z travel are its profile's soft limits, given
+/// once (LIO-344): their spans go into machine `id` in the library and in
+/// each setup's copy, which a run checks against them, marked Measured where
+/// they change. An axis without both limits keeps its travel. Whether any
+/// changed.
+pub fn travel_from_profile(
+    doc: &mut crate::model::Document,
+    id: &str,
+    cfg: &MachineConfig,
+) -> bool {
+    let mut changed = false;
+    let setups = doc.setups.iter_mut().map(|s| &mut s.machine);
+    for m in doc.machines.iter_mut().chain(setups) {
+        if m.id != id || get(&m.p, "controller") != "UC100" {
+            continue;
+        }
+        for (k, key) in ["x", "y", "z"].into_iter().enumerate() {
+            let Some(span) = cfg
+                .axes
+                .get(k)
+                .and_then(|a| Some(a.soft_max? - a.soft_min?))
+            else {
+                continue;
+            };
+            if (crate::post_check::machine_mm(m, key) as f64 - span).abs() <= 0.01 {
+                continue;
+            }
+            let v = if get(&m.p, "units") == "inch" {
+                span / 25.4
+            } else {
+                span
+            };
+            m.p.insert(key.into(), v.to_string());
+            m.p.insert(format!("{key}_source"), crate::envelope::MEASURED.into());
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// The spindle cap of each profile file read so far, by path and the file's
 /// modification time: a view asks for it on every redraw, and the file is
 /// read and parsed again only when it has changed.
@@ -7359,6 +7399,42 @@ spindle_max_rpm = 24000
         m.p.insert("uc100_profile".into(), profile.into());
         m.p.insert("uc100_connection".into(), connection.into());
         m
+    }
+
+    /// LIO-344: soft limits typed in the profile become the travel of the
+    /// library machine and its setup copy, so Cycle Start never asks for them
+    /// twice; the same limits again change nothing.
+    #[test]
+    fn the_profiles_soft_limits_are_the_machines_travel() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = owners_machine(dir.path()).unwrap();
+        let text = include_str!("../assets/jy5800.toml")
+            .replace("soft_max = 390.0", "soft_max = 305.0")
+            .replace("soft_max = 280.0", "soft_max = 405.0")
+            .replace("soft_min = -55.0", "soft_min = -100.0");
+        let cfg = MachineConfig::from_toml(&text).unwrap();
+        let mut other = Machine::new(3);
+        other.p.insert("x".into(), "390".into());
+        let mut doc = crate::model::Document {
+            machines: vec![m.clone(), other],
+            setups: vec![crate::model::Setup::new(m.clone(), "G54")],
+            ..Default::default()
+        };
+        assert!(travel_from_profile(&mut doc, &m.id, &cfg));
+        for machine in [&doc.machines[0], &doc.setups[0].machine] {
+            for (key, v) in [("x", "305"), ("y", "405"), ("z", "100")] {
+                assert_eq!(get(&machine.p, key), v);
+                assert_eq!(get(&machine.p, &format!("{key}_source")), "Measured");
+            }
+        }
+        assert_eq!(get(&doc.machines[1].p, "x"), "390");
+        assert!(!travel_from_profile(&mut doc, &m.id, &cfg));
+        // In inches the span is written in inches.
+        doc.machines[0].p.insert("units".into(), "inch".into());
+        doc.machines[0].p.insert("x".into(), "1".into());
+        assert!(travel_from_profile(&mut doc, &m.id, &cfg));
+        let x = crate::post_check::machine_mm(&doc.machines[0], "x");
+        assert!((x - 305.).abs() < 0.01, "{x}");
     }
 
     #[test]
