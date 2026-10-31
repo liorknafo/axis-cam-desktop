@@ -2751,11 +2751,20 @@ flood = { pin = 8 }
         // The Pi runs its simulator: the profile asks it to.
         let profile = dir.join("uc100.toml");
         let text = std::fs::read_to_string(&profile).unwrap();
-        std::fs::write(&profile, text.replacen("[controller]", "[controller]\nsimulated = true", 1)).unwrap();
+        std::fs::write(
+            &profile,
+            text.replacen("[controller]", "[controller]\nsimulated = true", 1),
+        )
+        .unwrap();
         let _ = a.update(Message::MachineConnection(crate::control::PI));
         let _ = a.update(Message::PiAddress(server.addr().to_string()));
-        let code = uc100_remote::data::Data { dir: dir.join("pi") }.new_code().unwrap();
-        let token = uc100_remote::RemoteController::pair(&server.addr().to_string(), &code, "Test Mac");
+        let code = uc100_remote::data::Data {
+            dir: dir.join("pi"),
+        }
+        .new_code()
+        .unwrap();
+        let token =
+            uc100_remote::RemoteController::pair(&server.addr().to_string(), &code, "Test Mac");
         let _ = a.update(Message::PiPaired(token.map(|t| t.to_string())));
         assert!(a.status.starts_with("Paired"), "{}", a.status);
         server
@@ -2763,7 +2772,12 @@ flood = { pin = 8 }
 
     /// The Pi's own snapshot: what its controller does, whatever this
     /// computer is connected to.
-    fn pi_until(server: &uc100_remote::Server, secs: f64, what: &str, ok: impl Fn(&uc100::controller::Snapshot) -> bool) {
+    fn pi_until(
+        server: &uc100_remote::Server,
+        secs: f64,
+        what: &str,
+        ok: impl Fn(&uc100::controller::Snapshot) -> bool,
+    ) {
         let end = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
         loop {
             if let Some(s) = server.snapshot()
@@ -2771,7 +2785,11 @@ flood = { pin = 8 }
             {
                 return;
             }
-            assert!(std::time::Instant::now() < end, "timed out waiting on the Pi for {what}: {:?}", server.snapshot().map(|s| s.state));
+            assert!(
+                std::time::Instant::now() < end,
+                "timed out waiting on the Pi for {what}: {:?}",
+                server.snapshot().map(|s| s.state)
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
@@ -2792,13 +2810,20 @@ flood = { pin = 8 }
         answer_skips(&mut a, 0);
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
         let _ = a.update(Message::Run(R::CycleStart));
-        tick_until(&mut a, 5.0, "the tool run running on the Pi", |s| s.state == Some(State::Run));
+        tick_until(&mut a, 5.0, "the tool run running on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
         let _ = a.update(Message::Disconnect);
         assert!(a.control.is_none() && a.pi_run.is_some(), "{}", a.status);
         // The Pi carries on: still running a moment later, then done.
         std::thread::sleep(std::time::Duration::from_millis(300));
         let s = server.snapshot().unwrap();
-        assert_eq!(s.state, Some(State::Run), "{:?}", s.log.iter().rev().take(5).collect::<Vec<_>>());
+        assert_eq!(
+            s.state,
+            Some(State::Run),
+            "{:?}",
+            s.log.iter().rev().take(5).collect::<Vec<_>>()
+        );
         pi_until(&server, 60.0, "the tool run's end", |s| {
             s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| o.ok)
         });
@@ -2810,7 +2835,10 @@ flood = { pin = 8 }
         // enabled and referenced.
         let s = server.snapshot().unwrap();
         assert_eq!(s.state, Some(State::Idle));
-        assert!(s.referenced[..3].iter().all(|r| *r), "an E-stop cleared the references");
+        assert!(
+            s.referenced[..3].iter().all(|r| *r),
+            "an E-stop cleared the references"
+        );
     }
 
     /// AXIS CAM closed and opened again while a tool run cuts on the Pi: it
@@ -2826,15 +2854,22 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::Setup(0)));
         answer_skips(&mut a, 0);
         let _ = a.update(Message::Run(R::CycleStart));
-        tick_until(&mut a, 5.0, "running on the Pi", |s| s.state == Some(State::Run));
+        tick_until(&mut a, 5.0, "running on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
         let _ = a.update(Message::Disconnect);
         // As after a restart: the run is gone from this computer.
         a.pi_run = None;
         let _ = a.update(Message::Connect);
-        tick_until(&mut a, 5.0, "the Pi running, seen again", |s| s.state == Some(State::Run));
+        tick_until(&mut a, 5.0, "the Pi running, seen again", |s| {
+            s.state == Some(State::Run)
+        });
         assert!(conn(&a).run.is_none());
         let _ = a.update(Message::Resized(iced::Size::new(1440., 900.)));
-        let clicks = crate::ui::probe::clicks(crate::ui::run_bar(&a, conn(&a)), iced::Size::new(1440., 200.));
+        let clicks = crate::ui::probe::clicks(
+            crate::ui::run_bar(&a, conn(&a)),
+            iced::Size::new(1440., 200.),
+        );
         for want in [R::Hold, R::Stop] {
             assert!(
                 clicks.iter().any(|m| matches!(m, Message::Run(r) if std::mem::discriminant(r) == std::mem::discriminant(&want))),
@@ -2842,13 +2877,19 @@ flood = { pin = 8 }
             );
         }
         let _ = a.update(Message::Run(R::Hold));
-        pi_until(&server, 10.0, "Hold on the Pi", |s| s.state == Some(State::Hold));
+        pi_until(&server, 10.0, "Hold on the Pi", |s| {
+            s.state == Some(State::Hold)
+        });
         tick_until(&mut a, 5.0, "Hold seen", |s| s.state == Some(State::Hold));
         let _ = a.update(Message::Run(R::Resume));
-        pi_until(&server, 10.0, "running again", |s| s.state == Some(State::Run));
+        pi_until(&server, 10.0, "running again", |s| {
+            s.state == Some(State::Run)
+        });
         tick_until(&mut a, 5.0, "Run seen", |s| s.state == Some(State::Run));
         let _ = a.update(Message::Run(R::Stop));
-        pi_until(&server, 10.0, "stopped on the Pi", |s| s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| !o.ok));
+        pi_until(&server, 10.0, "stopped on the Pi", |s| {
+            s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| !o.ok)
+        });
     }
 
     /// A relay between this computer and the Pi that the test can cut: while
@@ -2867,7 +2908,9 @@ flood = { pin = 8 }
             let flag = cut.clone();
             std::thread::spawn(move || {
                 for client in listener.incoming().flatten() {
-                    let Ok(upstream) = std::net::TcpStream::connect(server) else { continue };
+                    let Ok(upstream) = std::net::TcpStream::connect(server) else {
+                        continue;
+                    };
                     for (mut from, mut to) in [
                         (client.try_clone().unwrap(), upstream.try_clone().unwrap()),
                         (upstream, client),
@@ -2920,12 +2963,17 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::Setup(0)));
         answer_skips(&mut a, 0);
         let _ = a.update(Message::Run(R::CycleStart));
-        tick_until(&mut a, 5.0, "running on the Pi", |s| s.state == Some(State::Run));
+        tick_until(&mut a, 5.0, "running on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
         relay.set_cut(true);
         let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !conn(&a).pi_down() {
             let _ = a.update(Message::Tick);
-            assert!(std::time::Instant::now() < end, "the lost link never showed");
+            assert!(
+                std::time::Instant::now() < end,
+                "the lost link never showed"
+            );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let _ = a.update(Message::Tick);
@@ -2940,9 +2988,15 @@ flood = { pin = 8 }
             s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| o.ok)
         });
         let _ = a.update(Message::Tick);
-        assert!(conn(&a).pi_down() && a.status.starts_with("No link"), "{}", a.status);
+        assert!(
+            conn(&a).pi_down() && a.status.starts_with("No link"),
+            "{}",
+            a.status
+        );
         relay.set_cut(false);
-        run_until(&mut a, 20.0, "tool run 1 done, the link back", |r| r.done[0]);
+        run_until(&mut a, 20.0, "tool run 1 done, the link back", |r| {
+            r.done[0]
+        });
         let _ = a.update(Message::Tick);
         assert!(!conn(&a).pi_down());
         lacks(&a, &[crate::ui::PI_LOST]);
@@ -2965,11 +3019,17 @@ flood = { pin = 8 }
         let mut deadline = Deadline::new(5.);
         loop {
             let _ = a.update(Message::Tick);
-            let armed = conn(&a).link.as_ref().is_some_and(|l| matches!(l.stop_after, uc100_remote::wire::StopAfter::Armed { .. }));
+            let armed = conn(&a).link.as_ref().is_some_and(|l| {
+                matches!(l.stop_after, uc100_remote::wire::StopAfter::Armed { .. })
+            });
             if armed {
                 break;
             }
-            assert!(deadline.within(&conn(&a).snapshot), "never armed: {:?}", conn(&a).pi_note);
+            assert!(
+                deadline.within(&conn(&a).snapshot),
+                "never armed: {:?}",
+                conn(&a).pi_note
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let _ = a.update(Message::Disconnect);
@@ -2977,13 +3037,24 @@ flood = { pin = 8 }
             s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| !o.ok)
         });
         let s = server.snapshot().unwrap();
-        assert!(s.work_pos[2] > 0.5, "the Pi stopped at work Z {}, in the stock", s.work_pos[2]);
-        assert!(s.log.iter().any(|l| l.contains("stopped")), "{:?}", s.log.iter().rev().take(6).collect::<Vec<_>>());
+        assert!(
+            s.work_pos[2] > 0.5,
+            "the Pi stopped at work Z {}, in the stock",
+            s.work_pos[2]
+        );
+        assert!(
+            s.log.iter().any(|l| l.contains("stopped")),
+            "{:?}",
+            s.log.iter().rev().take(6).collect::<Vec<_>>()
+        );
         // Connected again: stopped after a hole, not done.
         let _ = a.update(Message::Connect);
         run_until(&mut a, 10.0, "the outcome", |r| r.running.is_none());
         let (ok, message) = run_of(&a).outcome.clone().unwrap();
-        assert!(!ok && message.starts_with("Stopped after hole"), "{message}");
+        assert!(
+            !ok && message.starts_with("Stopped after hole"),
+            "{message}"
+        );
         assert!(!run_of(&a).done[1]);
         assert!(drill.steps.len() > 1);
     }
@@ -3005,7 +3076,9 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::CycleStart));
         assert!(run_of(&a).running.is_some());
         let started = std::time::Instant::now();
-        run_until(&mut a, 10.0, "the lost tool run put back", |r| r.running.is_none());
+        run_until(&mut a, 10.0, "the lost tool run put back", |r| {
+            r.running.is_none()
+        });
         assert!(started.elapsed() >= std::time::Duration::from_secs(3));
         let (ok, message) = run_of(&a).outcome.clone().unwrap();
         assert!(!ok && message.contains("did not reach the Pi"), "{message}");
@@ -3033,11 +3106,21 @@ flood = { pin = 8 }
                 std::time::Instant::now() < end,
                 "not every axis declared: {:?} {:?}",
                 conn(&a).snapshot.referenced,
-                conn(&a).snapshot.log.iter().rev().take(5).collect::<Vec<_>>()
+                conn(&a)
+                    .snapshot
+                    .log
+                    .iter()
+                    .rev()
+                    .take(5)
+                    .collect::<Vec<_>>()
             );
         }
         let s = &conn(&a).snapshot;
-        assert!(s.machine_pos[..3].iter().all(|v| v.abs() < 1e-9), "{:?}", s.machine_pos);
+        assert!(
+            s.machine_pos[..3].iter().all(|v| v.abs() < 1e-9),
+            "{:?}",
+            s.machine_pos
+        );
     }
 
     /// Another paired computer controls the Pi's machine: this one watches,
@@ -3048,13 +3131,23 @@ flood = { pin = 8 }
         use crate::run::Action as R;
         let dir = tempfile::tempdir().unwrap();
         let (mut a, server) = pi_app(dir.path());
-        let code = uc100_remote::data::Data { dir: dir.path().join("pi") }.new_code().unwrap();
-        let other_token = uc100_remote::RemoteController::pair(&server.addr().to_string(), &code, "Workshop PC").unwrap();
+        let code = uc100_remote::data::Data {
+            dir: dir.path().join("pi"),
+        }
+        .new_code()
+        .unwrap();
+        let other_token =
+            uc100_remote::RemoteController::pair(&server.addr().to_string(), &code, "Workshop PC")
+                .unwrap();
         let cfg = conn_profile(dir.path());
-        let other = uc100_remote::RemoteController::start(cfg, &server.addr().to_string(), other_token);
+        let other =
+            uc100_remote::RemoteController::start(cfg, &server.addr().to_string(), other_token);
         let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while other.link().state != uc100_remote::LinkState::Controlling {
-            assert!(std::time::Instant::now() < end, "the other computer never got control");
+            assert!(
+                std::time::Instant::now() < end,
+                "the other computer never got control"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let _ = a.update(Message::Connect);
@@ -3069,17 +3162,33 @@ flood = { pin = 8 }
         // Nothing manual reaches the Pi, and the feed shown is the Pi's.
         let _ = a.update(Message::Machine(crate::control::Action::MachineZero(None)));
         let _ = a.update(Message::Machine(crate::control::Action::FeedOverride(50.)));
-        assert!(conn(&a).pi_note.as_ref().is_some_and(|n| n.contains("Take control")), "{:?}", conn(&a).pi_note);
+        assert!(
+            conn(&a)
+                .pi_note
+                .as_ref()
+                .is_some_and(|n| n.contains("Take control")),
+            "{:?}",
+            conn(&a).pi_note
+        );
         for _ in 0..20 {
             let _ = a.update(Message::Tick);
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let s = server.snapshot().unwrap();
-        assert!(!s.referenced[0] && s.feed_override == 1.0, "{:?} {}", s.referenced, s.feed_override);
+        assert!(
+            !s.referenced[0] && s.feed_override == 1.0,
+            "{:?} {}",
+            s.referenced,
+            s.feed_override
+        );
         assert_eq!(conn(&a).feed_override, 100.);
         let _ = a.update(Message::Run(R::Setup(0)));
         answer_skips(&mut a, 0);
-        assert!(problems(&a).iter().any(|p| p.contains("Take control")), "{:?}", problems(&a));
+        assert!(
+            problems(&a).iter().any(|p| p.contains("Take control")),
+            "{:?}",
+            problems(&a)
+        );
         other.release_control();
         // As the page shows it: nobody controls, then Take control.
         let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -3088,14 +3197,25 @@ flood = { pin = 8 }
             Some(uc100_remote::LinkState::Watching { holder: None })
         ) {
             let _ = a.update(Message::Tick);
-            assert!(std::time::Instant::now() < end, "the other never let go: {:?}", conn(&a).link.as_ref().map(|l| &l.state));
+            assert!(
+                std::time::Instant::now() < end,
+                "the other never let go: {:?}",
+                conn(&a).link.as_ref().map(|l| &l.state)
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let _ = a.update(Message::PiTakeControl);
         let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !matches!(conn(&a).link.as_ref().map(|l| &l.state), Some(uc100_remote::LinkState::Controlling)) {
+        while !matches!(
+            conn(&a).link.as_ref().map(|l| &l.state),
+            Some(uc100_remote::LinkState::Controlling)
+        ) {
             let _ = a.update(Message::Tick);
-            assert!(std::time::Instant::now() < end, "never took control: {:?}", conn(&a).link.as_ref().map(|l| &l.state));
+            assert!(
+                std::time::Instant::now() < end,
+                "never took control: {:?}",
+                conn(&a).link.as_ref().map(|l| &l.state)
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         other.shutdown();
@@ -3124,7 +3244,10 @@ flood = { pin = 8 }
         let token: uc100_remote::Token = format!("7:{}", "ab".repeat(32)).parse().unwrap();
         let _ = a.update(Message::PiPaired(Ok(token.to_string())));
         assert_eq!(tokens.paired(), Ok(true));
-        assert_eq!(tokens.load().unwrap().unwrap().to_string(), token.to_string());
+        assert_eq!(
+            tokens.load().unwrap().unwrap().to_string(),
+            token.to_string()
+        );
         let _ = a.view();
         let _ = a.update(Message::PiPaired(Err("wrong code".into())));
         assert!(a.status.contains("wrong code"));
@@ -3468,19 +3591,26 @@ flood = { pin = 8 }
             a.control.as_mut().unwrap().snapshot.state = Some(state.clone());
             let messages = clicks(&a);
             assert!(
-                !messages.iter().any(|m| matches!(m, Message::Run(R::Skip(..) | R::More(Some(_))))),
+                !messages
+                    .iter()
+                    .any(|m| matches!(m, Message::Run(R::Skip(..) | R::More(Some(_))))),
                 "a skip offered before Idle, {state:?}: {messages:?}"
             );
             assert!(!skip(&mut a, 3, None));
             assert_eq!(run_of(&a).skips, [(1, Cut), (3, Left)]);
         }
         a.control.as_mut().unwrap().snapshot.state = observed;
-        tick_until(&mut a, 5.0, "Idle after tool run 1", |s| s.state == Some(State::Idle));
+        tick_until(&mut a, 5.0, "Idle after tool run 1", |s| {
+            s.state == Some(State::Idle)
+        });
         let message = (clicks(&a).into_iter())
             .find(|m| matches!(m, Message::Run(R::Skip(3, None))))
             .expect("Don't skip offered for the Drill once Idle");
         let _ = a.update(message);
-        assert!(run_of(&a).programs.is_none(), "the click checks the setup again");
+        assert!(
+            run_of(&a).programs.is_none(),
+            "the click checks the setup again"
+        );
         answer_skips(&mut a, 0);
         assert_eq!(sent(&a), [vec![0, 2], vec![3]]);
     }
@@ -5184,6 +5314,157 @@ flood = { pin = 8 }
         render_png(&a, size, &out.join("3-drilling-chosen-surface-unknown.png"));
     }
 
+    /// The MACHINE page draws the stock a tool run cut as MANUFACTURE draws
+    /// what the same operations leave: its surface meshed at the
+    /// simulation's detail, not the run's top-down grid of columns, whose
+    /// walls step a cell at a time. While this computer's driver moves the
+    /// machine it is meshed on the GPU only, on the mesher's own thread, the
+    /// last surface drawn until the next is; without a GPU the mesher waits
+    /// for the machine to stop (#167), and the live grid shows what the
+    /// tool cuts meanwhile. A sample that finds the tool where it was cuts
+    /// nothing, so a held machine's stock is not meshed again. An
+    /// operation's preview left from MANUFACTURE does not hide it.
+    #[test]
+    fn the_machine_page_draws_the_stock_a_run_cut_as_planning_does() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        // The Face, the Pocket and the Contour, one tool run; the Drill.
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        check_run_pictured(&mut a, dir.path(), 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        let version = |a: &App| run_of(a).carving.as_ref().map_or(0, |c| c.version);
+        run_until(&mut a, 60., "the first cuts", |r| {
+            r.carving.as_ref().is_some_and(|c| c.version > 0)
+        });
+        // The tick's job, which tests do not run to its end, gives way.
+        a.run_mesh_job = None;
+        assert!(a.locked());
+        if crate::gpu_mesh::shared().is_some() {
+            // Meshed while the machine moves, by the mesher's thread.
+            let meshed = version(&a);
+            let message = first_message(a.refresh_run_mesh());
+            assert!(matches!(message, Message::RunMeshed { .. }));
+            let _ = a.update(message);
+            let surface = |a: &App| {
+                let c = run_of(a).carving.as_ref().unwrap();
+                c.surface.as_ref().map(|s| s.0)
+            };
+            assert_eq!(surface(&a), Some(meshed));
+            run_until(&mut a, 60., "more cuts", |r| {
+                r.carving.as_ref().is_some_and(|c| c.version > meshed)
+            });
+            // The last surface is drawn while the next is meshed.
+            assert!(a.locked() && a.run_stock().is_some());
+        }
+        // Without a GPU, or when it fails, it waits for the machine to stop;
+        // an older surface would hide the cuts since, which the live grid
+        // shows.
+        let key = |a: &App| {
+            let c = run_of(a).carving.as_ref().unwrap();
+            (c.serial, c.version, a.stock_detail)
+        };
+        a.run_mesh_job = Some(key(&a));
+        let _ = a.update(Message::RunMeshed {
+            key: key(&a),
+            result: Ok(None),
+        });
+        assert!(a.run_mesh_job.is_none() && a.run_mesh_failed.is_none());
+        assert!(iced_runtime::task::into_stream(a.refresh_run_mesh()).is_none());
+        assert!(a.run_mesh_job.is_none() && a.live_stock().is_some());
+        let stale = (run_of(&a).carving.as_ref())
+            .is_some_and(|c| c.surface.as_ref().is_none_or(|s| s.0 != c.version));
+        assert!(!stale || a.run_stock().is_none());
+        // Not again within `RUN_MESH_EVERY` of the last job while it moves.
+        let waits = a.run_mesh_waits.take();
+        a.run_mesh_started = Some(std::time::Instant::now());
+        assert!(iced_runtime::task::into_stream(a.refresh_run_mesh()).is_none());
+        a.run_mesh_waits = waits;
+        // On the Pi this computer's processor is free: it is meshed anyway,
+        // at once, on the CPU too.
+        a.control.as_mut().unwrap().pi = Some("pi".into());
+        assert!(iced_runtime::task::into_stream(a.refresh_run_mesh()).is_some());
+        a.control.as_mut().unwrap().pi = None;
+        a.run_mesh_job = None;
+        // A sample that finds the tool where the last one did cuts nothing.
+        let sample = conn(&a).snapshot.clone();
+        let cuts = |a: &App| {
+            let c = run_of(a).carving.as_ref().unwrap();
+            (c.version, c.volume.as_ref().unwrap().cuts.len())
+        };
+        let carve = |a: &mut App| {
+            let run = a.control.as_mut().unwrap().run.as_mut().unwrap();
+            run.carve(&sample);
+        };
+        carve(&mut a);
+        let once = cuts(&a);
+        carve(&mut a);
+        carve(&mut a);
+        assert_eq!(cuts(&a), once);
+        run_until(&mut a, 60., "the first tool run", |r| r.running.is_none());
+        tick_until(&mut a, 5.0, "Idle", |s| s.state == Some(State::Idle));
+        assert!(run_of(&a).done[0], "{:?}", run_of(&a).outcome);
+        // Stopped, the stock that waited is meshed, and until its surface
+        // comes the live grid of every cut is drawn, not an older surface.
+        assert!(!a.locked() && a.run_mesh_waits.is_some());
+        assert!(a.run_stock().is_none() && a.live_stock().is_some());
+        // What the tick does in the background once the machine stops,
+        // in line here: the run's stock meshed, on the CPU too, though it
+        // waited while the machine moved.
+        a.smoke_dir = Some(dir.path().to_path_buf());
+        // The tick's job, which tests do not run, gives way.
+        a.run_mesh_job = None;
+        let _ = a.refresh_run_mesh();
+        assert!(a.run_mesh_waits.is_none() && a.run_stock().is_some());
+        a.show_uncut = false;
+        let size = (480, 360);
+        let machine = crate::ui::scene_viewport(&a).unwrap();
+        let p = crate::viewport::Projector::fit(
+            a.camera,
+            (size.0 as f32, size.1 as f32),
+            machine.scene_bounds(),
+        );
+        let depths = |v: &crate::viewport::Viewport| v.render(&p, size, 1., None, &[]).1;
+        let cut = depths(&machine);
+        // Planning: the stock the Drill starts from, the tool run's three
+        // operations cut, meshed in line.
+        a.page = Page::Work;
+        let _ = a.refresh_left_stock();
+        let _ = a.update(Message::SelectOp(3));
+        let _ = a.refresh_start_mesh();
+        let planned = crate::ui::scene_viewport(&a).unwrap();
+        assert!(planned.start_stock.is_some() && planned.simulation.is_none());
+        let planned = depths(&planned);
+        // Where either draws the stock, both do, as near as the meshes' cells.
+        let drawn = planned.iter().filter(|d| d.is_finite()).count();
+        // A pixel only one of them draws is infinitely far apart.
+        let apart = (cut.iter().zip(&planned))
+            .filter(|(m, s)| m.is_finite() || s.is_finite())
+            .filter(|(m, s)| (*m - *s).abs() >= 0.5)
+            .count();
+        assert!(drawn > 20_000, "{drawn}");
+        assert!(apart * 200 < drawn, "{apart} of {drawn} pixels apart");
+        // A preview generated in MANUFACTURE: MACHINE still draws the run's.
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Generate);
+        assert!(a.active_simulation().is_some(), "{}", a.status);
+        a.page = Page::Control;
+        let view = crate::ui::scene_viewport(&a).unwrap();
+        assert!(view.simulation.is_none() && view.run_stock.is_some());
+        assert_eq!(depths(&view), cut);
+        // A mesh of the latest cuts that fails leaves the live grid, not an
+        // older surface.
+        let carving = a.control.as_mut().unwrap().run.as_mut().unwrap();
+        carving.carving.as_mut().unwrap().version += 1;
+        let _ = a.update(Message::RunMeshed {
+            key: key(&a),
+            result: Err("failed".into()),
+        });
+        assert!(a.run_stock().is_none() && a.live_stock().is_some());
+    }
+
     /// The driver refuses a job sent while it is not idle for it: for a few
     /// milliseconds after a work or machine zero it re-anchors its position,
     /// while the app's snapshot still says Idle. Such a Cycle Start ran
@@ -6272,6 +6553,255 @@ flood = { pin = 8 }
                     iced::Size::new(1440., 1700.),
                     &out.join(format!("6-after-operation-{}.png", i + 1)),
                 );
+            }
+        }
+    }
+
+    /// Renders a saved project's first setup as MANUFACTURE simulates its
+    /// first tool run and as MACHINE shows it cut on a simulated UC100, the
+    /// same camera on both, to PNGs in `$AXIS_RENDER_DIR` (default
+    /// /tmp/run-stock-project): "1-planning" after the tool run's last
+    /// operation, "2-machine-cutting" partway and "3-machine-done" once it
+    /// ended, each also zoomed in ("-zoom"). The project is `$AXIS_PROJECT`
+    /// (default the app's workspace), read and not saved, its model loaded
+    /// from where it says; its machine is replaced by a simulated one, its
+    /// feeds raised so the run takes seconds. Not a check: run it with
+    /// --ignored.
+    #[test]
+    #[ignore]
+    fn render_a_saved_projects_run_stock() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/run-stock-project".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let size = iced::Size::new(1440., 900.);
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = saved_project_on_the_simulator(dir.path());
+        // The operations of the first tool run: those with the first's tool.
+        let tool = a.doc.setups[0].operations[0].tool.clone();
+        let last = (a.doc.setups[0].operations.iter())
+            .take_while(|o| o.tool == tool)
+            .count()
+            - 1;
+        let shot = |a: &mut App, name: &str| {
+            let _ = a.update(Message::Camera("ISO"));
+            render_png(a, size, &out.join(format!("{name}.png")));
+            a.camera.zoom *= 2.5;
+            render_png(a, size, &out.join(format!("{name}-zoom.png")));
+        };
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(last));
+        let _ = a.update(Message::Generate);
+        assert!(a.simulation.is_some(), "{}", a.status);
+        // The stock alone, as MACHINE draws it.
+        a.paths = false;
+        let _ = a.update(Message::Scrub(1.));
+        let _ = a.update(Message::ScrubDone);
+        mesh_the_stock(&mut a);
+        eprintln!("planning detail {}", a.stock_detail);
+        shot(&mut a, "1-planning");
+        // MACHINE with no preview left from MANUFACTURE.
+        a.simulation = None;
+        a.page = Page::Control;
+        zeroed(&mut a);
+        check_run_pictured(&mut a, dir.path(), 0);
+        // The Operations list's hover pictures of the stock each leaves.
+        for (oi, picture) in &run_of(&a).pictures {
+            if let iced::widget::image::Handle::Rgba {
+                width,
+                height,
+                pixels,
+                ..
+            } = picture
+            {
+                let file = std::fs::File::create(out.join(format!("0-op-{}.png", oi + 1))).unwrap();
+                let mut e = png::Encoder::new(file, *width, *height);
+                e.set_color(png::ColorType::Rgba);
+                e.write_header().unwrap().write_image_data(pixels).unwrap();
+            }
+        }
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Job));
+        let _ = a.update(Message::ControlView(crate::ui::JobView::Stock));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        let started = std::time::Instant::now();
+        run_until(&mut a, 600., "halfway", |r| {
+            r.carving.as_ref().is_some_and(|c| c.version > 0)
+                && started.elapsed() > std::time::Duration::from_secs(45)
+        });
+        mesh_the_run(&mut a);
+        shot(&mut a, "2-machine-cutting");
+        run_until(&mut a, 1200., "the tool run", |r| r.running.is_none());
+        tick_until(&mut a, 5.0, "Idle", |s| s.state == Some(State::Idle));
+        mesh_the_run(&mut a);
+        shot(&mut a, "3-machine-done");
+    }
+
+    /// Runs a saved project's first tool run (`saved_project_on_the_simulator`)
+    /// on the simulated UC100 as the window would: a tick every 33 ms, the
+    /// run's stock meshed in the background as the tick asks
+    /// (`App::refresh_run_mesh`, its job's answer taken as it comes) and the
+    /// Job view drawn at 1500 × 960 each tick. With `AXIS_MESH=0` nothing is
+    /// meshed: the live grid is drawn, as before the run's stock had a
+    /// surface. Prints the driver's motion buffer at its lowest and its
+    /// longest status gap (the driver's log), the meshes made and how long
+    /// a tick and its drawing took. Not a check: run it with --ignored.
+    #[test]
+    #[ignore]
+    fn measure_a_saved_projects_run_with_its_stock_meshed() {
+        use crate::run::Action as R;
+        use futures_util::StreamExt;
+        use uc100::controller::State;
+        let mesh = std::env::var("AXIS_MESH").as_deref() != Ok("0");
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = saved_project_on_the_simulator(dir.path());
+        a.page = Page::Control;
+        zeroed(&mut a);
+        check_run_pictured(&mut a, dir.path(), 0);
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Job));
+        let _ = a.update(Message::ControlView(crate::ui::JobView::Stock));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        // The window's runtime: the tasks the ticks start, run on a thread
+        // of their own, their messages sent back.
+        let (tasks, mut started) = tokio::sync::mpsc::unbounded_channel::<
+            iced_runtime::futures::BoxStream<iced_runtime::Action<Message>>,
+        >();
+        let (answer, answers) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                while let Some(mut stream) = started.recv().await {
+                    let answer = answer.clone();
+                    tokio::spawn(async move {
+                        while let Some(action) = stream.next().await {
+                            if let iced_runtime::Action::Output(message) = action {
+                                let _ = answer.send(message);
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        let (mut meshes, mut ticks) = (0, vec![]);
+        // A job started by a tick before this runtime, whose answer no one
+        // takes, gives way.
+        a.run_mesh_job = None;
+        let mut deadline = Deadline::new(1200.);
+        while run_of(&a).running.is_some() {
+            let begun = std::time::Instant::now();
+            if !mesh {
+                a.run_mesh_waits = run_of(&a).carving.as_ref().map(|c| c.serial);
+            }
+            for message in answers.try_iter() {
+                meshes += usize::from(matches!(message, Message::RunMeshed { .. }));
+                let _ = a.update(message);
+            }
+            if let Some(stream) = iced_runtime::task::into_stream(a.update(Message::Tick)) {
+                let _ = tasks.send(stream);
+            }
+            let view = crate::ui::scene_viewport(&a).unwrap();
+            let p = crate::viewport::Projector::fit(a.camera, (1000., 640.), view.scene_bounds());
+            let _ = view.render(&p, (1500, 960), 1.5, None, &[]);
+            let took = begun.elapsed();
+            ticks.push(took);
+            assert!(deadline.within(&conn(&a).snapshot));
+            std::thread::sleep(std::time::Duration::from_millis(33).saturating_sub(took));
+        }
+        ticks.sort();
+        let at = |q: f64| ticks[((ticks.len() - 1) as f64 * q) as usize].as_secs_f64() * 1000.;
+        let s = &conn(&a).snapshot;
+        for line in s
+            .log
+            .iter()
+            .filter(|l| l.contains("Motion buffer") || l.contains("priority"))
+        {
+            eprintln!("driver: {line}");
+        }
+        eprintln!(
+            "mesh {mesh}: {meshes} meshes, {} ticks, tick and drawing median {:.1} ms, 95 % {:.1} ms, longest {:.1} ms; outcome {:?}",
+            ticks.len(),
+            at(0.5),
+            at(0.95),
+            at(1.),
+            run_of(&a).outcome
+        );
+    }
+
+    /// `$AXIS_PROJECT` (default the app's workspace), read and not saved,
+    /// its model loaded from where it says, on a simulated UC100: its own
+    /// machine, which its tools are on, driven by the simulated controller,
+    /// its feeds raised so a tool run takes minutes.
+    fn saved_project_on_the_simulator(dir: &std::path::Path) -> App {
+        let project = std::path::PathBuf::from(std::env::var("AXIS_PROJECT").unwrap_or(format!(
+            "{}/Library/Application Support/AXIS CAM Studio/workspace.json",
+            std::env::var("HOME").unwrap()
+        )));
+        let mut a = run_app_of(dir, FAST, &[0]);
+        let m = a.doc.machines[0].clone();
+        let (mut doc, _) = crate::storage::load_reporting(&project).unwrap();
+        let mesh = crate::mesh::load(&doc.file.as_ref().unwrap().path).unwrap();
+        // The project's own machine, which its tools are on, driven by the
+        // simulated controller.
+        let simulated = |machine: &mut Machine| {
+            for k in [
+                "uc100_profile",
+                "uc100_connection",
+                "x",
+                "y",
+                "z",
+                "feed",
+                "post_dwell",
+            ] {
+                machine.p.insert(k.into(), m.p[k].clone());
+            }
+        };
+        doc.machines.iter_mut().for_each(simulated);
+        for setup in &mut doc.setups {
+            simulated(&mut setup.machine);
+            for op in &mut setup.operations {
+                op.p.insert("feed".into(), "30000".into());
+            }
+        }
+        doc.active = doc.setups[0].id.clone();
+        a.replace_document(doc, None);
+        let _ = a.update(Message::ModelRestored(Ok(mesh)));
+        a
+    }
+
+    /// Meshes the stock a run has carved, here rather than in the
+    /// background, as `App::refresh_run_mesh` does.
+    fn mesh_the_run(a: &mut App) {
+        a.smoke_dir = Some(std::env::temp_dir());
+        a.run_mesh_job = None;
+        let _ = a.refresh_run_mesh();
+        a.smoke_dir = None;
+        let c = run_of(a).carving.as_ref().unwrap();
+        eprintln!(
+            "run stock: {} cuts, {:?}",
+            c.volume.as_ref().map_or(0, |v| v.cuts.len()),
+            c.surface
+                .as_ref()
+                .map(|s| (s.1, s.2.triangles.len(), s.2.cell_mm, s.2.milliseconds))
+        );
+    }
+
+    /// The first message `task` gives, waited for.
+    fn first_message(task: Task<Message>) -> Message {
+        use futures_util::StreamExt;
+        let mut stream = iced_runtime::task::into_stream(task).expect("a task");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        loop {
+            match runtime.block_on(stream.next()) {
+                Some(iced_runtime::Action::Output(message)) => return message,
+                Some(_) => {}
+                None => panic!("the task ended without a message"),
             }
         }
     }
@@ -7902,26 +8432,46 @@ flood = { pin = 8 }
             a.page = Page::Control;
             idle(&mut a);
             let _ = a.update(Message::Machine(Action::MachineZero(None)));
-            tick_until(&mut a, 3.0, "machine zero", |s| s.referenced[..3].iter().all(|r| *r));
+            tick_until(&mut a, 3.0, "machine zero", |s| {
+                s.referenced[..3].iter().all(|r| *r)
+            });
             mdi(&mut a, "G0 X195 Y140 Z-10");
             let _ = a.update(Message::Machine(Action::ProbeZ));
             let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while !conn(&a).probe_moving() {
                 let _ = a.update(Message::Tick);
-                assert!(std::time::Instant::now() < end, "never probing (Pi: {on_pi}): {:?}", conn(&a).snapshot.state);
+                assert!(
+                    std::time::Instant::now() < end,
+                    "never probing (Pi: {on_pi}): {:?}",
+                    conn(&a).snapshot.state
+                );
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             let _ = a.update(Message::Resized(iced::Size::new(1440., 900.)));
-            let clicks = crate::ui::probe::clicks(crate::ui::run_bar(&a, conn(&a)), iced::Size::new(1440., 200.));
-            assert!(!clicks.iter().any(|m| matches!(m, Message::Run(R::Hold))), "Hold offered (Pi: {on_pi})");
-            assert!(clicks.iter().any(|m| matches!(m, Message::Run(R::Stop))), "Stop not offered (Pi: {on_pi})");
+            let clicks = crate::ui::probe::clicks(
+                crate::ui::run_bar(&a, conn(&a)),
+                iced::Size::new(1440., 200.),
+            );
+            assert!(
+                !clicks.iter().any(|m| matches!(m, Message::Run(R::Hold))),
+                "Hold offered (Pi: {on_pi})"
+            );
+            assert!(
+                clicks.iter().any(|m| matches!(m, Message::Run(R::Stop))),
+                "Stop not offered (Pi: {on_pi})"
+            );
             shows(&a, &[crate::ui::PROBE_HOLD]);
             let _ = a.update(Message::HoldKey);
             assert_eq!(a.status, crate::ui::PROBE_HOLD);
             let _ = a.update(Message::Run(R::Stop));
-            tick_until(&mut a, 5.0, "the probe aborted", |s| s.state == Some(State::Idle));
+            tick_until(&mut a, 5.0, "the probe aborted", |s| {
+                s.state == Some(State::Idle)
+            });
             assert!(conn(&a).snapshot.work_offset[2].abs() < 1e-9, "Pi: {on_pi}");
-            assert!(conn(&a).snapshot.machine_pos[2] > -30., "the probe ran to its end");
+            assert!(
+                conn(&a).snapshot.machine_pos[2] > -30.,
+                "the probe ran to its end"
+            );
         }
     }
 
@@ -11104,8 +11654,14 @@ soft_max = 180.0
         // offered, nothing connected until this computer is paired.
         let _ = a.update(Message::MachineConnection(crate::control::PI));
         assert!(a.control.is_none());
-        assert_eq!(crate::control::pi(&a.doc.machines[0]), Some(crate::control::PI_DEFAULT));
-        assert_eq!(crate::control::pi(&a.machine_draft), Some(crate::control::PI_DEFAULT));
+        assert_eq!(
+            crate::control::pi(&a.doc.machines[0]),
+            Some(crate::control::PI_DEFAULT)
+        );
+        assert_eq!(
+            crate::control::pi(&a.machine_draft),
+            Some(crate::control::PI_DEFAULT)
+        );
         assert!(a.status.contains("sudo uc100-server pair"), "{}", a.status);
         shows(&a, &["Pi (network)", "Pi address", "Code"]);
         lacks(&a, &["Connect"]);

@@ -2293,11 +2293,15 @@ const SECTION_LINE: f32 = 40.;
 /// The 3D view `scene` shows. None without a part to show.
 pub(crate) fn scene_viewport(app: &App) -> Option<Viewport<'_>> {
     let s = app.doc.active_setup();
+    // On the Control page the stock a run of the setup carved is drawn, not
+    // an operation's preview left from MANUFACTURE.
+    let carved =
+        app.live_stock().is_some() || app.live_volume().is_some() || app.run_stock().is_some();
     Some(Viewport {
         setup: s,
         mesh: app.part_mesh()?,
         operation: app.operation(),
-        simulation: app.active_simulation(),
+        simulation: app.active_simulation().filter(|_| !carved),
         sample: app.is_sample(),
         camera: app.camera,
         picking: app.picking || app.picking_pin_holes(),
@@ -2320,6 +2324,7 @@ pub(crate) fn scene_viewport(app: &App) -> Option<Viewport<'_>> {
         live_stock: app.live_stock(),
         start_stock: app.start_stock(),
         live_volume: app.live_volume(),
+        run_stock: app.run_stock(),
         uncut: shown_uncut(app)
             .and_then(|(found, _)| found.as_ref().ok())
             .map(|found| found.faces.as_slice())
@@ -7756,8 +7761,16 @@ fn connect_controls(app: &App) -> Column<'_, Message> {
         col = col.push(
             row![
                 muted("Connection"),
-                btn("Real (USB)", Message::MachineConnection("USB"), now == "USB"),
-                btn("Simulated", Message::MachineConnection("Simulated"), now == "Simulated"),
+                btn(
+                    "Real (USB)",
+                    Message::MachineConnection("USB"),
+                    now == "USB"
+                ),
+                btn(
+                    "Simulated",
+                    Message::MachineConnection("Simulated"),
+                    now == "Simulated"
+                ),
                 btn(
                     crate::control::PI,
                     Message::MachineConnection(crate::control::PI),
@@ -7777,7 +7790,13 @@ fn connect_controls(app: &App) -> Column<'_, Message> {
         }
         let mut paired = true;
         if let Some(address) = pi {
-            col = col.push(pi_pairing(app, m, address, connected.is_none(), &mut paired));
+            col = col.push(pi_pairing(
+                app,
+                m,
+                address,
+                connected.is_none(),
+                &mut paired,
+            ));
         }
         if let Some(c) = connected.filter(|c| c.pi.is_some()) {
             col = col.push(pi_link(c));
@@ -7854,7 +7873,11 @@ fn pi_pairing<'a>(
             } else {
                 muted("").into()
             };
-            col = col.push(row![muted("Code"), code, pair].spacing(6).align_y(Alignment::Center));
+            col = col.push(
+                row![muted("Code"), code, pair]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+            );
         }
     }
     col.into()
@@ -7870,11 +7893,15 @@ fn pi_link(c: &crate::control::Connection) -> Element<'_, Message> {
     };
     col = match &link.state {
         L::Connecting => col.push(muted("Connecting to the Pi…")),
-        L::Refused(why) => col.push(warnings(vec![format!("The Pi refused this computer: {why}")])),
+        L::Refused(why) => col.push(warnings(vec![format!(
+            "The Pi refused this computer: {why}"
+        )])),
         L::Watching { holder } => col.push(
             row![
                 muted(match holder {
-                    Some(who) => format!("Watching: {who} controls the machine. You may E-stop, hold and stop."),
+                    Some(who) => format!(
+                        "Watching: {who} controls the machine. You may E-stop, hold and stop."
+                    ),
                     None => "Watching: nobody controls the machine.".into(),
                 }),
                 secondary("Take control", Message::PiTakeControl),
@@ -8254,7 +8281,11 @@ pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
         )
     };
     let line: Element<_> = if c.probe_moving() {
-        text(PROBE_HOLD).size(13).color(WARN).wrapping(Wrapping::None).into()
+        text(PROBE_HOLD)
+            .size(13)
+            .color(WARN)
+            .wrapping(Wrapping::None)
+            .into()
     } else {
         line
     };
@@ -8967,7 +8998,11 @@ fn spindle_card(
             .width(48),
         help::wrap(
             slider(10.0..=200.0, c.feed_override, move |v| {
-                Message::Machine(Action::FeedOverride(if c.in_control() { v } else { c.feed_override }))
+                Message::Machine(Action::FeedOverride(if c.in_control() {
+                    v
+                } else {
+                    c.feed_override
+                }))
             })
             .step(5.0_f32),
             help::command(
@@ -8978,7 +9013,8 @@ fn spindle_card(
         ),
         small(
             "100 %",
-            c.in_control().then_some(Message::Machine(Action::FeedOverride(100.))),
+            c.in_control()
+                .then_some(Message::Machine(Action::FeedOverride(100.))),
             false
         ),
     ]
@@ -13255,6 +13291,7 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             live_stock: None,
             start_stock: None,
             live_volume: None,
+            run_stock: None,
             uncut: &[],
             uncut_pieces: &[],
             thin: &crate::uncut::EMPTY,

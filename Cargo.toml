@@ -36,6 +36,8 @@ pollster = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7.0"
+# The run's stock mesher sets its thread's QoS (`below_the_driver`).
+libc = "0.2"
 
 [profile.release]
 opt-level = 2

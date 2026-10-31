@@ -373,11 +373,13 @@ pub struct OpStock {
     pub stock: StockGrid,
     pub shape: CutterShape,
     /// The stock as the simulation holds it (`Simulation::initial_volume`),
-    /// its cutter's flute length, and the frame the part is posed in at each
-    /// A angle (`Simulation::turns`, empty for a 3-axis setup): an indexed
-    /// setup's live carve cuts this, at each move's angle.
+    /// its cutter's flute length, the frame its moves are in
+    /// (`Simulation::frame`) and the frame the part is posed in at each A
+    /// angle (`Simulation::turns`, empty for a 3-axis setup): the live carve
+    /// cuts this, at each move's angle, and the 3D view draws its surface.
     pub volume: Option<crate::volume::Volume>,
     pub flute: f32,
+    pub frame: Option<crate::volume::Frame>,
     pub turns: Vec<(f32, crate::volume::Frame)>,
 }
 
@@ -386,15 +388,36 @@ pub struct OpStock {
 /// the move it is on up to the tool's tip, and the tool where it is.
 #[derive(Debug, Clone)]
 pub struct Carving {
+    /// Which carve this is, for its surface (`RunMeshKey`): none other has
+    /// the same, while each starts its versions from 0.
+    pub serial: u64,
     pub stock: StockGrid,
-    /// For a tool run that turns A, the stock as a volume, cut at each
-    /// move's A in the frame the part is posed in there; the top-view
-    /// `stock` is then not cut, being the first angle's.
+    /// The stock as a volume, with every cut made in it, cut at each move's
+    /// A in the frame the part is posed in there (in `frame` without A):
+    /// what its surface is meshed from (`surface`). None where the check
+    /// had none. For a tool run that turns A, the top-view `stock` is not
+    /// cut, being the first angle's.
     pub volume: Option<crate::volume::Volume>,
+    /// The tool run turns A.
+    turning: bool,
+    frame: Option<crate::volume::Frame>,
     turns: Vec<(f32, crate::volume::Frame)>,
+    /// The surface of `volume` as last meshed (`App::refresh_run_mesh`),
+    /// with the version and detail it was meshed at: drawn until the next
+    /// is meshed, as the simulation's is.
+    pub surface: Option<(
+        u64,
+        crate::stock_surface::Detail,
+        Arc<crate::stock_surface::SurfaceMesh>,
+    )>,
     /// The block of the running blocks at the last sample: None between
     /// tool runs, so that a jog then does not cut.
     last: Option<usize>,
+    /// Where the last sample's cut ended: its block, the point on its move
+    /// it was cut up to and the tool's tip. A sample that finds the tool
+    /// there again (held, paused, a snapshot repeated) cuts nothing, and
+    /// one further along the same move cuts only the rest of it.
+    reached: Option<(usize, [f32; 3], [f32; 3])>,
     /// Counts the cuts, for the 3D view's redraw.
     pub version: u64,
 }
@@ -462,7 +485,7 @@ impl Run {
     pub fn carve(&mut self, s: &uc100::controller::Snapshot) {
         let Some(live) = self.live(s) else {
             if let Some(c) = &mut self.carving {
-                c.last = None;
+                (c.last, c.reached) = (None, None);
             }
             return;
         };
@@ -528,11 +551,17 @@ impl Run {
         if turning && (b.volume.is_none() || b.turns.is_empty()) {
             return false;
         }
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         self.carving = Some(Carving {
+            serial: SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             stock: b.stock.clone(),
-            volume: b.volume.clone().filter(|_| turning),
+            volume: b.volume.clone().filter(|_| turning || b.frame.is_some()),
+            turning,
+            frame: b.frame,
             turns: b.turns.clone(),
+            surface: None,
             last: None,
+            reached: None,
             version: 0,
         });
         true
@@ -568,7 +597,17 @@ impl Run {
             _ => None,
         };
         let now = to.map_or(blocks.len(), |(b, _)| b);
+        // Cut on the same move as the last sample: from where that cut ended.
+        let reached = (self.carving.as_ref())
+            .and_then(|c| c.reached)
+            .filter(|r| from == Some(now) && r.0 == now);
+        if let (Some((_, tip)), Some((_, _, was))) = (to, reached)
+            && tip == was
+        {
+            return;
+        }
         let mut sweeps: Vec<_> = (from.unwrap_or(0)..now).filter_map(ends).collect();
+        let mut end = None;
         if let (Some((_, tip)), Some((op, a, b, angle))) = (to, ends(now)) {
             // The tip's place on the move: the share of it done.
             let d: [f32; 3] = std::array::from_fn(|k| b[k] - a[k]);
@@ -578,8 +617,10 @@ impl Run {
             } else {
                 ((0..3).map(|k| (tip[k] - a[k]) * d[k]).sum::<f32>() / length).clamp(0., 1.)
             };
-            sweeps.push((op, a, std::array::from_fn(|k| a[k] + t * d[k]), angle));
+            let on: [f32; 3] = std::array::from_fn(|k| a[k] + t * d[k]);
+            sweeps.push((op, reached.map_or(a, |r| r.1), on, angle));
             sweeps.push((op, tip, tip, angle));
+            end = Some((now, on, tip));
         }
         let cutter = |op: usize| {
             let before = (self.before.iter()).find(|b| Some(b.op) == p.indexes.get(op).copied());
@@ -596,16 +637,21 @@ impl Run {
             })
             .collect();
         if let Some(c) = &mut self.carving {
+            c.reached = end;
             for (a, b, (radius, shape, flute), angle, source) in sweeps {
-                match &mut c.volume {
-                    Some(volume) => {
-                        let frame = (c.turns.iter())
+                if let Some(volume) = &mut c.volume {
+                    let frame = if c.turning {
+                        (c.turns.iter())
                             .find(|t| angle.is_some_and(|x| (x - t.0).abs() < 1e-4))
-                            .map(|t| t.1);
-                        let Some(frame) = frame else { continue };
-                        volume.cut(a, b, radius, flute, shape, frame, source);
-                    }
-                    None => c.stock.cut_shape(a, b, radius, shape),
+                            .map(|t| t.1)
+                    } else {
+                        c.frame
+                    };
+                    let Some(frame) = frame else { continue };
+                    volume.cut(a, b, radius, flute, shape, frame, source);
+                }
+                if !c.turning {
+                    c.stock.cut_shape(a, b, radius, shape);
                 }
                 c.version += 1;
             }
@@ -615,14 +661,22 @@ impl Run {
     /// The stock as this run's tool runs have cut it, once one has moved
     /// (`carve`), with its version.
     pub fn stock(&self) -> Option<(&StockGrid, u64)> {
-        let c = self.carving.as_ref().filter(|c| c.volume.is_none())?;
+        let c = self.carving.as_ref().filter(|c| !c.turning)?;
         Some((&c.stock, c.version))
     }
     /// The stock as this run's tool runs that turn A have cut it, as a
     /// volume (`Carving::volume`), with its version.
     pub fn carved_volume(&self) -> Option<(&crate::volume::Volume, u64)> {
-        let c = self.carving.as_ref()?;
+        let c = self.carving.as_ref().filter(|c| c.turning)?;
         Some((c.volume.as_ref()?, c.version))
+    }
+    /// The stock as this run's tool runs have cut it, as a volume, and the
+    /// surface it was last meshed to (`Carving::surface`), once it has been.
+    pub fn carved_surface(
+        &self,
+    ) -> Option<(&crate::volume::Volume, &crate::stock_surface::SurfaceMesh)> {
+        let c = self.carving.as_ref()?;
+        Some((c.volume.as_ref()?, c.surface.as_ref()?.2.as_ref()))
     }
 
     /// A tool run has started: X/Y work zero is kept from then on.
@@ -2615,6 +2669,7 @@ fn simulated_with(doc: &Document, mesh: &Mesh, si: usize) -> (Sims, Left) {
                 shape: sim.plan.shape,
                 volume: sim.initial_volume.clone(),
                 flute: sim.plan.flute_length,
+                frame: sim.frame,
                 turns: sim.turns.clone(),
             })
         })

@@ -315,17 +315,22 @@ impl Snapshot {
     /// The surface, meshed on the GPU when there is one (`gpu_mesh`), else
     /// by fidget's octree on the CPU (`build_cpu`).
     pub fn build(&self) -> Result<SurfaceMesh, String> {
-        // The GPU's field has the bar along Z (`round`), not a rotary
-        // setup's bar along X (`bar_x`): that one is meshed on the CPU.
-        if self.bar_x.is_none()
-            && let Some(gpu) = crate::gpu_mesh::shared()
-        {
-            match gpu.mesh(self) {
-                Ok(mesh) => return Ok(mesh),
-                Err(e) => eprintln!("GPU stock mesher: {e}; meshing on the CPU."),
-            }
+        match self.build_on_gpu() {
+            Some(Ok(mesh)) => return Ok(mesh),
+            Some(Err(e)) => eprintln!("GPU stock mesher: {e}; meshing on the CPU."),
+            None => {}
         }
         self.build_cpu()
+    }
+    /// The surface meshed on the GPU (`gpu_mesh`), which keeps the CPU's
+    /// cores free: None without a GPU, and for a rotary setup's bar along X
+    /// (`bar_x`), which the GPU's field does not have (it has the bar along
+    /// Z, `round`).
+    pub fn build_on_gpu(&self) -> Option<Result<SurfaceMesh, String>> {
+        if self.bar_x.is_some() {
+            return None;
+        }
+        Some(crate::gpu_mesh::shared()?.mesh(self))
     }
     /// The surface meshed by fidget's adaptive octree on the CPU.
     pub fn build_cpu(&self) -> Result<SurfaceMesh, String> {

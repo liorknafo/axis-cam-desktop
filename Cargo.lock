@@ -511,6 +511,7 @@ dependencies = [
  "iced_runtime",
  "iced_tiny_skia",
  "jsonwebtoken",
+ "libc",
  "png 0.17.16",
  "pollster",
  "reqwest",
