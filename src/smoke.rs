@@ -3028,13 +3028,59 @@ flood = { pin = 8 }
         assert!(run_of(&a).tool_change().is_none());
         assert!(problems(&a).iter().any(|p| p.contains("Every tool run")));
         // What was cut stays cut: the Drill taken back is next, and the
-        // Pocket stays skipped.
+        // Pocket stays skipped. A skip is taken once the machine is Idle,
+        // which it is a tick after the tool run's outcome.
+        tick_until(&mut a, 5.0, "Idle after tool run 1", |s| {
+            s.state == Some(uc100::controller::State::Idle)
+        });
         assert!(skip(&mut a, 3, None));
         assert_eq!(sent(&a), [vec![0, 2], vec![3]]);
         assert_eq!(
             (run_of(&a).done.clone(), run_of(&a).next),
             (vec![true, false], 1)
         );
+    }
+
+    /// The skips are offered only once the machine is Idle after a tool run:
+    /// in the driver's tick between the outcome and Idle (Run, or Stopping
+    /// for a stop) the Operations list emits no skip or skip menu and a skip
+    /// sent anyway is refused; Idle, Don't skip is there and taken.
+    #[test]
+    fn skips_are_offered_once_the_machine_is_idle_after_a_tool_run() {
+        use crate::run::{Action as R, Skip::*};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(skip(&mut a, 1, Some(Cut)) && skip(&mut a, 3, Some(Left)));
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(&mut a, 30.0, "tool run 1", |r| r.done[0]);
+        let _ = a.update(Message::Resized(iced::Size::new(1440., 900.)));
+        let clicks = |a: &App| {
+            crate::ui::probe::clicks(crate::ui::program(a, conn(a)), iced::Size::new(440., 900.))
+        };
+        let observed = conn(&a).snapshot.state.clone();
+        for state in [State::Run, State::Stopping] {
+            a.control.as_mut().unwrap().snapshot.state = Some(state.clone());
+            let messages = clicks(&a);
+            assert!(
+                !messages.iter().any(|m| matches!(m, Message::Run(R::Skip(..) | R::More(Some(_))))),
+                "a skip offered before Idle, {state:?}: {messages:?}"
+            );
+            assert!(!skip(&mut a, 3, None));
+            assert_eq!(run_of(&a).skips, [(1, Cut), (3, Left)]);
+        }
+        a.control.as_mut().unwrap().snapshot.state = observed;
+        tick_until(&mut a, 5.0, "Idle after tool run 1", |s| s.state == Some(State::Idle));
+        let message = (clicks(&a).into_iter())
+            .find(|m| matches!(m, Message::Run(R::Skip(3, None))))
+            .expect("Don't skip offered for the Drill once Idle");
+        let _ = a.update(message);
+        assert!(run_of(&a).programs.is_none(), "the click checks the setup again");
+        answer_skips(&mut a, 0);
+        assert_eq!(sent(&a), [vec![0, 2], vec![3]]);
     }
 
     /// The Tool runs panel shows each operation with a picture of the stock
