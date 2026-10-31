@@ -2872,6 +2872,30 @@ flood = { pin = 8 }
         run_until(&mut a, 60.0, "tool run 1", |r| r.done[0]);
     }
 
+    /// Machine zero on the Pi declares X, Y and Z one after another, each
+    /// once the driver has logged the one before: ticked with no pause, as
+    /// when the network bunches them, the driver would drop all but the
+    /// first.
+    #[test]
+    fn machine_zero_on_the_pi_declares_every_axis_when_ticked_without_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, _server) = pi_app(dir.path());
+        idle(&mut a);
+        let _ = a.update(Message::Machine(crate::control::Action::MachineZero(None)));
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !conn(&a).snapshot.referenced[..3].iter().all(|r| *r) {
+            let _ = a.update(Message::Tick);
+            assert!(
+                std::time::Instant::now() < end,
+                "not every axis declared: {:?} {:?}",
+                conn(&a).snapshot.referenced,
+                conn(&a).snapshot.log.iter().rev().take(5).collect::<Vec<_>>()
+            );
+        }
+        let s = &conn(&a).snapshot;
+        assert!(s.machine_pos[..3].iter().all(|v| v.abs() < 1e-9), "{:?}", s.machine_pos);
+    }
+
     /// Another paired computer controls the Pi's machine: this one watches,
     /// may not start a tool run, and takes control once the other gives it
     /// up.

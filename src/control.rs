@@ -2321,6 +2321,11 @@ pub struct Connection {
     /// Machine positions still to declare (axis, value), sent one per tick:
     /// the driver drops a second `SetMachine` until it has re-read the position.
     declare: VecDeque<(usize, f64)>,
+    /// On the Pi, the declaration sent and not yet in the driver's log: the
+    /// axis, its value, the log count and time it was sent, and whether it
+    /// was sent again. Two that reach the Pi together (the network bunches
+    /// them) would see the driver drop the second, so the next waits.
+    declaring: Option<(usize, f64, u64, Instant, bool)>,
     held: Option<Held>,
     pub jog_step: Option<f64>,
     /// A's step in degrees (`Action::JogAngle`).
@@ -2513,6 +2518,7 @@ impl Connection {
             stop_sent: None,
             snapshot: Snapshot::default(),
             declare: VecDeque::new(),
+            declaring: None,
             held: None,
             jog_step: None,
             jog_angle: None,
@@ -2893,7 +2899,12 @@ impl Connection {
         // Any state but Idle (E-stop, a move) drops what is left, so nothing
         // is declared later by surprise.
         if self.idle() {
-            if let Some((axis, value)) = self.declare.pop_front() {
+            if !self.declaring_on_pi()
+                && let Some((axis, value)) = self.declare.pop_front()
+            {
+                if self.pi.is_some() {
+                    self.declaring = Some((axis, value, self.snapshot.log_seq, Instant::now(), false));
+                }
                 self.send(Command::SetMachine { axis, value });
                 // The pins stay put on the table: in the new machine
                 // coordinates they are where the axis moved from.
@@ -2911,6 +2922,7 @@ impl Connection {
             }
         } else {
             self.declare.clear();
+            self.declaring = None;
             if self.referencing.take().is_some() {
                 self.pin_said = Some((
                     false,
@@ -5030,6 +5042,34 @@ impl Connection {
             run.stopped = Some(st);
             self.keep_journal();
         }
+    }
+
+    /// On the Pi, whether a declaration sent is still awaited: until the
+    /// driver logs it, the next is held; one not logged within a second is
+    /// sent once more, then given up.
+    fn declaring_on_pi(&mut self) -> bool {
+        let Some((axis, value, seq, at, again)) = self.declaring else {
+            return false;
+        };
+        let s = &self.snapshot;
+        let said = format!("{} declared at machine", AXIS_NAMES[axis]);
+        let fresh = s.log_seq.saturating_sub(seq) as usize;
+        if s.log.iter().rev().take(fresh).any(|l| l.starts_with(&said)) {
+            self.declaring = None;
+            return false;
+        }
+        if at.elapsed() < Duration::from_secs(1) {
+            return true;
+        }
+        if again {
+            self.declaring = None;
+            self.declare.clear();
+            self.pi_note = Some(format!("{} was not declared on the Pi: set machine zero again.", AXIS_NAMES[axis]));
+            return true;
+        }
+        self.send(Command::SetMachine { axis, value });
+        self.declaring = Some((axis, value, seq, Instant::now(), true));
+        true
     }
 
     /// A tool run sent to the Pi that shows neither running nor a new
