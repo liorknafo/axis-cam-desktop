@@ -100,9 +100,9 @@ impl PiTokens {
             read_token_file(&self.file)?
         };
         text.map(|t| {
-            t.trim()
-                .parse()
-                .map_err(|e| format!("The kept pairing with the Pi is unreadable ({e}): pair again."))
+            t.trim().parse().map_err(|e| {
+                format!("The kept pairing with the Pi is unreadable ({e}): pair again.")
+            })
         })
         .transpose()
     }
@@ -125,8 +125,11 @@ impl PiTokens {
         options.write(true).create(true).truncate(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        std::io::Write::write_all(&mut options.open(&self.file).map_err(|e| e.to_string())?, text.as_bytes())
-            .map_err(|e| e.to_string())
+        std::io::Write::write_all(
+            &mut options.open(&self.file).map_err(|e| e.to_string())?,
+            text.as_bytes(),
+        )
+        .map_err(|e| e.to_string())
     }
 
     /// Forgets the pairing on this computer (the Pi keeps it until
@@ -168,7 +171,10 @@ impl PiTokens {
     }
 
     fn changed(&self) {
-        PAIRED.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.file);
+        PAIRED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.file);
     }
 }
 
@@ -2465,7 +2471,13 @@ impl Connection {
         pad_state(&file);
         let controller = Controller::start(cfg.clone(), Some(file));
         let nap = uc100::macos::prevent_app_nap("AXIS CAM machine control");
-        Ok(Self::with(m, cfg, Driver::Local(controller), Some(nap), journal))
+        Ok(Self::with(
+            m,
+            cfg,
+            Driver::Local(controller),
+            Some(nap),
+            journal,
+        ))
     }
 
     /// Connects to the UC100 uc100-server runs on the Pi of `m` (`pi`), as
@@ -2473,7 +2485,11 @@ impl Connection {
     /// (the Pi applies it only while the machine is stopped). The Pi keeps
     /// the driver's saved offsets and position; this computer keeps the run
     /// journal.
-    pub fn open_pi(m: &Machine, state_dir: &Path, token: uc100_remote::Token) -> Result<Self, String> {
+    pub fn open_pi(
+        m: &Machine,
+        state_dir: &Path,
+        token: uc100_remote::Token,
+    ) -> Result<Self, String> {
         let address = pi(m).ok_or("This machine does not connect to a Pi.")?;
         // As the file says: a machine's profile leaves `simulated` out, so
         // the Pi drives its UC100; a test's asks the Pi for its simulator.
@@ -2811,7 +2827,8 @@ impl Connection {
     pub fn probe_moving(&self) -> bool {
         let s = &self.snapshot;
         s.state == Some(State::Run)
-            && (s.program_name.as_deref() == Some("Probe") || s.status.is_some_and(|st| st.probing()))
+            && (s.program_name.as_deref() == Some("Probe")
+                || s.status.is_some_and(|st| st.probing()))
     }
 
     /// This computer may command the machine: always over USB and on the
@@ -2927,7 +2944,8 @@ impl Connection {
                 && let Some((axis, value)) = self.declare.pop_front()
             {
                 if self.pi.is_some() {
-                    self.declaring = Some((axis, value, self.snapshot.log_seq, Instant::now(), false));
+                    self.declaring =
+                        Some((axis, value, self.snapshot.log_seq, Instant::now(), false));
                 }
                 self.send(Command::SetMachine { axis, value });
                 // The pins stay put on the table: in the new machine
@@ -3290,7 +3308,9 @@ impl Connection {
             R::Hold if state == Some(State::Run) && !self.probe_moving() => {
                 return self.send(Command::FeedHold);
             }
-            R::Resume if matches!(state, Some(State::Hold | State::Paused(_))) && self.in_control() => {
+            R::Resume
+                if matches!(state, Some(State::Hold | State::Paused(_))) && self.in_control() =>
+            {
                 return self.send(Command::Resume);
             }
             R::Stop if crate::run::busy(state.as_ref()) => return self.send(Command::Stop),
@@ -3324,7 +3344,9 @@ impl Connection {
                         let want = !run.stop_after;
                         let ranges = if want { run.stop_ranges() } else { vec![] };
                         if want && ranges.is_empty() {
-                            self.pi_note = Some("Stop after step: no step of this tool run ends ahead.".into());
+                            self.pi_note = Some(
+                                "Stop after step: no step of this tool run ends ahead.".into(),
+                            );
                         } else if remote.stop_after(ranges) {
                             run.stop_after = want;
                             self.stop_sent = Some(Instant::now());
@@ -3339,8 +3361,13 @@ impl Connection {
                         _ => None,
                     };
                     if !self.try_send(job) {
-                        let why = self.pi_note.clone().unwrap_or_else(|| "the link to the Pi is down".into());
-                        run.not_started(format!("The tool run was not sent ({why}). Nothing moved."));
+                        let why = self
+                            .pi_note
+                            .clone()
+                            .unwrap_or_else(|| "the link to the Pi is down".into());
+                        run.not_started(format!(
+                            "The tool run was not sent ({why}). Nothing moved."
+                        ));
                     } else if self.pi.is_some() {
                         let seq = self.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
                         (self.job_sent, self.job_name) = (Some((Instant::now(), seq)), name);
@@ -5124,7 +5151,10 @@ impl Connection {
         if again {
             self.declaring = None;
             self.declare.clear();
-            self.pi_note = Some(format!("{} was not declared on the Pi: set machine zero again.", AXIS_NAMES[axis]));
+            self.pi_note = Some(format!(
+                "{} was not declared on the Pi: set machine zero again.",
+                AXIS_NAMES[axis]
+            ));
             return true;
         }
         self.send(Command::SetMachine { axis, value });
@@ -5167,12 +5197,17 @@ impl Connection {
             return;
         }
         match &link.stop_after {
-            StopAfter::Fired { line, program } if program.is_some() && *program == self.job_name => {
+            StopAfter::Fired { line, program }
+                if program.is_some() && *program == self.job_name =>
+            {
                 run.stop_after = true;
                 run.stopped_on_pi(*line);
             }
             StopAfter::Armed { .. } => run.stop_after = true,
-            _ if self.stop_sent.is_none_or(|t| t.elapsed() > Duration::from_millis(1500)) => {
+            _ if self
+                .stop_sent
+                .is_none_or(|t| t.elapsed() > Duration::from_millis(1500)) =>
+            {
                 run.stop_after = false;
             }
             _ => {}

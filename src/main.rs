@@ -5991,7 +5991,11 @@ impl App {
                 let Some(m) = self.control_target() else {
                     return Task::none();
                 };
-                if self.control.as_ref().is_some_and(|c| c.machine_id == m.id && c.pi.is_some()) {
+                if self
+                    .control
+                    .as_ref()
+                    .is_some_and(|c| c.machine_id == m.id && c.pi.is_some())
+                {
                     self.disconnect_machine();
                 }
                 let Some(m) = self.control_target() else {

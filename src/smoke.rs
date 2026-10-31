@@ -2751,11 +2751,20 @@ flood = { pin = 8 }
         // The Pi runs its simulator: the profile asks it to.
         let profile = dir.join("uc100.toml");
         let text = std::fs::read_to_string(&profile).unwrap();
-        std::fs::write(&profile, text.replacen("[controller]", "[controller]\nsimulated = true", 1)).unwrap();
+        std::fs::write(
+            &profile,
+            text.replacen("[controller]", "[controller]\nsimulated = true", 1),
+        )
+        .unwrap();
         let _ = a.update(Message::MachineConnection(crate::control::PI));
         let _ = a.update(Message::PiAddress(server.addr().to_string()));
-        let code = uc100_remote::data::Data { dir: dir.join("pi") }.new_code().unwrap();
-        let token = uc100_remote::RemoteController::pair(&server.addr().to_string(), &code, "Test Mac");
+        let code = uc100_remote::data::Data {
+            dir: dir.join("pi"),
+        }
+        .new_code()
+        .unwrap();
+        let token =
+            uc100_remote::RemoteController::pair(&server.addr().to_string(), &code, "Test Mac");
         let _ = a.update(Message::PiPaired(token.map(|t| t.to_string())));
         assert!(a.status.starts_with("Paired"), "{}", a.status);
         server
@@ -2763,7 +2772,12 @@ flood = { pin = 8 }
 
     /// The Pi's own snapshot: what its controller does, whatever this
     /// computer is connected to.
-    fn pi_until(server: &uc100_remote::Server, secs: f64, what: &str, ok: impl Fn(&uc100::controller::Snapshot) -> bool) {
+    fn pi_until(
+        server: &uc100_remote::Server,
+        secs: f64,
+        what: &str,
+        ok: impl Fn(&uc100::controller::Snapshot) -> bool,
+    ) {
         let end = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
         loop {
             if let Some(s) = server.snapshot()
@@ -2771,7 +2785,11 @@ flood = { pin = 8 }
             {
                 return;
             }
-            assert!(std::time::Instant::now() < end, "timed out waiting on the Pi for {what}: {:?}", server.snapshot().map(|s| s.state));
+            assert!(
+                std::time::Instant::now() < end,
+                "timed out waiting on the Pi for {what}: {:?}",
+                server.snapshot().map(|s| s.state)
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
@@ -2792,13 +2810,20 @@ flood = { pin = 8 }
         answer_skips(&mut a, 0);
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
         let _ = a.update(Message::Run(R::CycleStart));
-        tick_until(&mut a, 5.0, "the tool run running on the Pi", |s| s.state == Some(State::Run));
+        tick_until(&mut a, 5.0, "the tool run running on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
         let _ = a.update(Message::Disconnect);
         assert!(a.control.is_none() && a.pi_run.is_some(), "{}", a.status);
         // The Pi carries on: still running a moment later, then done.
         std::thread::sleep(std::time::Duration::from_millis(300));
         let s = server.snapshot().unwrap();
-        assert_eq!(s.state, Some(State::Run), "{:?}", s.log.iter().rev().take(5).collect::<Vec<_>>());
+        assert_eq!(
+            s.state,
+            Some(State::Run),
+            "{:?}",
+            s.log.iter().rev().take(5).collect::<Vec<_>>()
+        );
         pi_until(&server, 60.0, "the tool run's end", |s| {
             s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| o.ok)
         });
@@ -2810,7 +2835,10 @@ flood = { pin = 8 }
         // enabled and referenced.
         let s = server.snapshot().unwrap();
         assert_eq!(s.state, Some(State::Idle));
-        assert!(s.referenced[..3].iter().all(|r| *r), "an E-stop cleared the references");
+        assert!(
+            s.referenced[..3].iter().all(|r| *r),
+            "an E-stop cleared the references"
+        );
     }
 
     /// AXIS CAM closed and opened again while a tool run cuts on the Pi: it
@@ -2826,15 +2854,22 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::Setup(0)));
         answer_skips(&mut a, 0);
         let _ = a.update(Message::Run(R::CycleStart));
-        tick_until(&mut a, 5.0, "running on the Pi", |s| s.state == Some(State::Run));
+        tick_until(&mut a, 5.0, "running on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
         let _ = a.update(Message::Disconnect);
         // As after a restart: the run is gone from this computer.
         a.pi_run = None;
         let _ = a.update(Message::Connect);
-        tick_until(&mut a, 5.0, "the Pi running, seen again", |s| s.state == Some(State::Run));
+        tick_until(&mut a, 5.0, "the Pi running, seen again", |s| {
+            s.state == Some(State::Run)
+        });
         assert!(conn(&a).run.is_none());
         let _ = a.update(Message::Resized(iced::Size::new(1440., 900.)));
-        let clicks = crate::ui::probe::clicks(crate::ui::run_bar(&a, conn(&a)), iced::Size::new(1440., 200.));
+        let clicks = crate::ui::probe::clicks(
+            crate::ui::run_bar(&a, conn(&a)),
+            iced::Size::new(1440., 200.),
+        );
         for want in [R::Hold, R::Stop] {
             assert!(
                 clicks.iter().any(|m| matches!(m, Message::Run(r) if std::mem::discriminant(r) == std::mem::discriminant(&want))),
@@ -2842,13 +2877,19 @@ flood = { pin = 8 }
             );
         }
         let _ = a.update(Message::Run(R::Hold));
-        pi_until(&server, 10.0, "Hold on the Pi", |s| s.state == Some(State::Hold));
+        pi_until(&server, 10.0, "Hold on the Pi", |s| {
+            s.state == Some(State::Hold)
+        });
         tick_until(&mut a, 5.0, "Hold seen", |s| s.state == Some(State::Hold));
         let _ = a.update(Message::Run(R::Resume));
-        pi_until(&server, 10.0, "running again", |s| s.state == Some(State::Run));
+        pi_until(&server, 10.0, "running again", |s| {
+            s.state == Some(State::Run)
+        });
         tick_until(&mut a, 5.0, "Run seen", |s| s.state == Some(State::Run));
         let _ = a.update(Message::Run(R::Stop));
-        pi_until(&server, 10.0, "stopped on the Pi", |s| s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| !o.ok));
+        pi_until(&server, 10.0, "stopped on the Pi", |s| {
+            s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| !o.ok)
+        });
     }
 
     /// A relay between this computer and the Pi that the test can cut: while
@@ -2867,7 +2908,9 @@ flood = { pin = 8 }
             let flag = cut.clone();
             std::thread::spawn(move || {
                 for client in listener.incoming().flatten() {
-                    let Ok(upstream) = std::net::TcpStream::connect(server) else { continue };
+                    let Ok(upstream) = std::net::TcpStream::connect(server) else {
+                        continue;
+                    };
                     for (mut from, mut to) in [
                         (client.try_clone().unwrap(), upstream.try_clone().unwrap()),
                         (upstream, client),
@@ -2920,12 +2963,17 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::Setup(0)));
         answer_skips(&mut a, 0);
         let _ = a.update(Message::Run(R::CycleStart));
-        tick_until(&mut a, 5.0, "running on the Pi", |s| s.state == Some(State::Run));
+        tick_until(&mut a, 5.0, "running on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
         relay.set_cut(true);
         let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !conn(&a).pi_down() {
             let _ = a.update(Message::Tick);
-            assert!(std::time::Instant::now() < end, "the lost link never showed");
+            assert!(
+                std::time::Instant::now() < end,
+                "the lost link never showed"
+            );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let _ = a.update(Message::Tick);
@@ -2940,9 +2988,15 @@ flood = { pin = 8 }
             s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| o.ok)
         });
         let _ = a.update(Message::Tick);
-        assert!(conn(&a).pi_down() && a.status.starts_with("No link"), "{}", a.status);
+        assert!(
+            conn(&a).pi_down() && a.status.starts_with("No link"),
+            "{}",
+            a.status
+        );
         relay.set_cut(false);
-        run_until(&mut a, 20.0, "tool run 1 done, the link back", |r| r.done[0]);
+        run_until(&mut a, 20.0, "tool run 1 done, the link back", |r| {
+            r.done[0]
+        });
         let _ = a.update(Message::Tick);
         assert!(!conn(&a).pi_down());
         lacks(&a, &[crate::ui::PI_LOST]);
@@ -2965,11 +3019,17 @@ flood = { pin = 8 }
         let mut deadline = Deadline::new(5.);
         loop {
             let _ = a.update(Message::Tick);
-            let armed = conn(&a).link.as_ref().is_some_and(|l| matches!(l.stop_after, uc100_remote::wire::StopAfter::Armed { .. }));
+            let armed = conn(&a).link.as_ref().is_some_and(|l| {
+                matches!(l.stop_after, uc100_remote::wire::StopAfter::Armed { .. })
+            });
             if armed {
                 break;
             }
-            assert!(deadline.within(&conn(&a).snapshot), "never armed: {:?}", conn(&a).pi_note);
+            assert!(
+                deadline.within(&conn(&a).snapshot),
+                "never armed: {:?}",
+                conn(&a).pi_note
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let _ = a.update(Message::Disconnect);
@@ -2977,13 +3037,24 @@ flood = { pin = 8 }
             s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| !o.ok)
         });
         let s = server.snapshot().unwrap();
-        assert!(s.work_pos[2] > 0.5, "the Pi stopped at work Z {}, in the stock", s.work_pos[2]);
-        assert!(s.log.iter().any(|l| l.contains("stopped")), "{:?}", s.log.iter().rev().take(6).collect::<Vec<_>>());
+        assert!(
+            s.work_pos[2] > 0.5,
+            "the Pi stopped at work Z {}, in the stock",
+            s.work_pos[2]
+        );
+        assert!(
+            s.log.iter().any(|l| l.contains("stopped")),
+            "{:?}",
+            s.log.iter().rev().take(6).collect::<Vec<_>>()
+        );
         // Connected again: stopped after a hole, not done.
         let _ = a.update(Message::Connect);
         run_until(&mut a, 10.0, "the outcome", |r| r.running.is_none());
         let (ok, message) = run_of(&a).outcome.clone().unwrap();
-        assert!(!ok && message.starts_with("Stopped after hole"), "{message}");
+        assert!(
+            !ok && message.starts_with("Stopped after hole"),
+            "{message}"
+        );
         assert!(!run_of(&a).done[1]);
         assert!(drill.steps.len() > 1);
     }
@@ -3005,7 +3076,9 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::CycleStart));
         assert!(run_of(&a).running.is_some());
         let started = std::time::Instant::now();
-        run_until(&mut a, 10.0, "the lost tool run put back", |r| r.running.is_none());
+        run_until(&mut a, 10.0, "the lost tool run put back", |r| {
+            r.running.is_none()
+        });
         assert!(started.elapsed() >= std::time::Duration::from_secs(3));
         let (ok, message) = run_of(&a).outcome.clone().unwrap();
         assert!(!ok && message.contains("did not reach the Pi"), "{message}");
@@ -3033,11 +3106,21 @@ flood = { pin = 8 }
                 std::time::Instant::now() < end,
                 "not every axis declared: {:?} {:?}",
                 conn(&a).snapshot.referenced,
-                conn(&a).snapshot.log.iter().rev().take(5).collect::<Vec<_>>()
+                conn(&a)
+                    .snapshot
+                    .log
+                    .iter()
+                    .rev()
+                    .take(5)
+                    .collect::<Vec<_>>()
             );
         }
         let s = &conn(&a).snapshot;
-        assert!(s.machine_pos[..3].iter().all(|v| v.abs() < 1e-9), "{:?}", s.machine_pos);
+        assert!(
+            s.machine_pos[..3].iter().all(|v| v.abs() < 1e-9),
+            "{:?}",
+            s.machine_pos
+        );
     }
 
     /// Another paired computer controls the Pi's machine: this one watches,
@@ -3048,13 +3131,23 @@ flood = { pin = 8 }
         use crate::run::Action as R;
         let dir = tempfile::tempdir().unwrap();
         let (mut a, server) = pi_app(dir.path());
-        let code = uc100_remote::data::Data { dir: dir.path().join("pi") }.new_code().unwrap();
-        let other_token = uc100_remote::RemoteController::pair(&server.addr().to_string(), &code, "Workshop PC").unwrap();
+        let code = uc100_remote::data::Data {
+            dir: dir.path().join("pi"),
+        }
+        .new_code()
+        .unwrap();
+        let other_token =
+            uc100_remote::RemoteController::pair(&server.addr().to_string(), &code, "Workshop PC")
+                .unwrap();
         let cfg = conn_profile(dir.path());
-        let other = uc100_remote::RemoteController::start(cfg, &server.addr().to_string(), other_token);
+        let other =
+            uc100_remote::RemoteController::start(cfg, &server.addr().to_string(), other_token);
         let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while other.link().state != uc100_remote::LinkState::Controlling {
-            assert!(std::time::Instant::now() < end, "the other computer never got control");
+            assert!(
+                std::time::Instant::now() < end,
+                "the other computer never got control"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let _ = a.update(Message::Connect);
@@ -3069,17 +3162,33 @@ flood = { pin = 8 }
         // Nothing manual reaches the Pi, and the feed shown is the Pi's.
         let _ = a.update(Message::Machine(crate::control::Action::MachineZero(None)));
         let _ = a.update(Message::Machine(crate::control::Action::FeedOverride(50.)));
-        assert!(conn(&a).pi_note.as_ref().is_some_and(|n| n.contains("Take control")), "{:?}", conn(&a).pi_note);
+        assert!(
+            conn(&a)
+                .pi_note
+                .as_ref()
+                .is_some_and(|n| n.contains("Take control")),
+            "{:?}",
+            conn(&a).pi_note
+        );
         for _ in 0..20 {
             let _ = a.update(Message::Tick);
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let s = server.snapshot().unwrap();
-        assert!(!s.referenced[0] && s.feed_override == 1.0, "{:?} {}", s.referenced, s.feed_override);
+        assert!(
+            !s.referenced[0] && s.feed_override == 1.0,
+            "{:?} {}",
+            s.referenced,
+            s.feed_override
+        );
         assert_eq!(conn(&a).feed_override, 100.);
         let _ = a.update(Message::Run(R::Setup(0)));
         answer_skips(&mut a, 0);
-        assert!(problems(&a).iter().any(|p| p.contains("Take control")), "{:?}", problems(&a));
+        assert!(
+            problems(&a).iter().any(|p| p.contains("Take control")),
+            "{:?}",
+            problems(&a)
+        );
         other.release_control();
         // As the page shows it: nobody controls, then Take control.
         let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -3088,14 +3197,25 @@ flood = { pin = 8 }
             Some(uc100_remote::LinkState::Watching { holder: None })
         ) {
             let _ = a.update(Message::Tick);
-            assert!(std::time::Instant::now() < end, "the other never let go: {:?}", conn(&a).link.as_ref().map(|l| &l.state));
+            assert!(
+                std::time::Instant::now() < end,
+                "the other never let go: {:?}",
+                conn(&a).link.as_ref().map(|l| &l.state)
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let _ = a.update(Message::PiTakeControl);
         let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !matches!(conn(&a).link.as_ref().map(|l| &l.state), Some(uc100_remote::LinkState::Controlling)) {
+        while !matches!(
+            conn(&a).link.as_ref().map(|l| &l.state),
+            Some(uc100_remote::LinkState::Controlling)
+        ) {
             let _ = a.update(Message::Tick);
-            assert!(std::time::Instant::now() < end, "never took control: {:?}", conn(&a).link.as_ref().map(|l| &l.state));
+            assert!(
+                std::time::Instant::now() < end,
+                "never took control: {:?}",
+                conn(&a).link.as_ref().map(|l| &l.state)
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         other.shutdown();
@@ -3124,7 +3244,10 @@ flood = { pin = 8 }
         let token: uc100_remote::Token = format!("7:{}", "ab".repeat(32)).parse().unwrap();
         let _ = a.update(Message::PiPaired(Ok(token.to_string())));
         assert_eq!(tokens.paired(), Ok(true));
-        assert_eq!(tokens.load().unwrap().unwrap().to_string(), token.to_string());
+        assert_eq!(
+            tokens.load().unwrap().unwrap().to_string(),
+            token.to_string()
+        );
         let _ = a.view();
         let _ = a.update(Message::PiPaired(Err("wrong code".into())));
         assert!(a.status.contains("wrong code"));
@@ -3468,19 +3591,26 @@ flood = { pin = 8 }
             a.control.as_mut().unwrap().snapshot.state = Some(state.clone());
             let messages = clicks(&a);
             assert!(
-                !messages.iter().any(|m| matches!(m, Message::Run(R::Skip(..) | R::More(Some(_))))),
+                !messages
+                    .iter()
+                    .any(|m| matches!(m, Message::Run(R::Skip(..) | R::More(Some(_))))),
                 "a skip offered before Idle, {state:?}: {messages:?}"
             );
             assert!(!skip(&mut a, 3, None));
             assert_eq!(run_of(&a).skips, [(1, Cut), (3, Left)]);
         }
         a.control.as_mut().unwrap().snapshot.state = observed;
-        tick_until(&mut a, 5.0, "Idle after tool run 1", |s| s.state == Some(State::Idle));
+        tick_until(&mut a, 5.0, "Idle after tool run 1", |s| {
+            s.state == Some(State::Idle)
+        });
         let message = (clicks(&a).into_iter())
             .find(|m| matches!(m, Message::Run(R::Skip(3, None))))
             .expect("Don't skip offered for the Drill once Idle");
         let _ = a.update(message);
-        assert!(run_of(&a).programs.is_none(), "the click checks the setup again");
+        assert!(
+            run_of(&a).programs.is_none(),
+            "the click checks the setup again"
+        );
         answer_skips(&mut a, 0);
         assert_eq!(sent(&a), [vec![0, 2], vec![3]]);
     }
@@ -7902,26 +8032,46 @@ flood = { pin = 8 }
             a.page = Page::Control;
             idle(&mut a);
             let _ = a.update(Message::Machine(Action::MachineZero(None)));
-            tick_until(&mut a, 3.0, "machine zero", |s| s.referenced[..3].iter().all(|r| *r));
+            tick_until(&mut a, 3.0, "machine zero", |s| {
+                s.referenced[..3].iter().all(|r| *r)
+            });
             mdi(&mut a, "G0 X195 Y140 Z-10");
             let _ = a.update(Message::Machine(Action::ProbeZ));
             let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while !conn(&a).probe_moving() {
                 let _ = a.update(Message::Tick);
-                assert!(std::time::Instant::now() < end, "never probing (Pi: {on_pi}): {:?}", conn(&a).snapshot.state);
+                assert!(
+                    std::time::Instant::now() < end,
+                    "never probing (Pi: {on_pi}): {:?}",
+                    conn(&a).snapshot.state
+                );
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             let _ = a.update(Message::Resized(iced::Size::new(1440., 900.)));
-            let clicks = crate::ui::probe::clicks(crate::ui::run_bar(&a, conn(&a)), iced::Size::new(1440., 200.));
-            assert!(!clicks.iter().any(|m| matches!(m, Message::Run(R::Hold))), "Hold offered (Pi: {on_pi})");
-            assert!(clicks.iter().any(|m| matches!(m, Message::Run(R::Stop))), "Stop not offered (Pi: {on_pi})");
+            let clicks = crate::ui::probe::clicks(
+                crate::ui::run_bar(&a, conn(&a)),
+                iced::Size::new(1440., 200.),
+            );
+            assert!(
+                !clicks.iter().any(|m| matches!(m, Message::Run(R::Hold))),
+                "Hold offered (Pi: {on_pi})"
+            );
+            assert!(
+                clicks.iter().any(|m| matches!(m, Message::Run(R::Stop))),
+                "Stop not offered (Pi: {on_pi})"
+            );
             shows(&a, &[crate::ui::PROBE_HOLD]);
             let _ = a.update(Message::HoldKey);
             assert_eq!(a.status, crate::ui::PROBE_HOLD);
             let _ = a.update(Message::Run(R::Stop));
-            tick_until(&mut a, 5.0, "the probe aborted", |s| s.state == Some(State::Idle));
+            tick_until(&mut a, 5.0, "the probe aborted", |s| {
+                s.state == Some(State::Idle)
+            });
             assert!(conn(&a).snapshot.work_offset[2].abs() < 1e-9, "Pi: {on_pi}");
-            assert!(conn(&a).snapshot.machine_pos[2] > -30., "the probe ran to its end");
+            assert!(
+                conn(&a).snapshot.machine_pos[2] > -30.,
+                "the probe ran to its end"
+            );
         }
     }
 
@@ -11104,8 +11254,14 @@ soft_max = 180.0
         // offered, nothing connected until this computer is paired.
         let _ = a.update(Message::MachineConnection(crate::control::PI));
         assert!(a.control.is_none());
-        assert_eq!(crate::control::pi(&a.doc.machines[0]), Some(crate::control::PI_DEFAULT));
-        assert_eq!(crate::control::pi(&a.machine_draft), Some(crate::control::PI_DEFAULT));
+        assert_eq!(
+            crate::control::pi(&a.doc.machines[0]),
+            Some(crate::control::PI_DEFAULT)
+        );
+        assert_eq!(
+            crate::control::pi(&a.machine_draft),
+            Some(crate::control::PI_DEFAULT)
+        );
         assert!(a.status.contains("sudo uc100-server pair"), "{}", a.status);
         shows(&a, &["Pi (network)", "Pi address", "Code"]);
         lacks(&a, &["Connect"]);

@@ -7756,8 +7756,16 @@ fn connect_controls(app: &App) -> Column<'_, Message> {
         col = col.push(
             row![
                 muted("Connection"),
-                btn("Real (USB)", Message::MachineConnection("USB"), now == "USB"),
-                btn("Simulated", Message::MachineConnection("Simulated"), now == "Simulated"),
+                btn(
+                    "Real (USB)",
+                    Message::MachineConnection("USB"),
+                    now == "USB"
+                ),
+                btn(
+                    "Simulated",
+                    Message::MachineConnection("Simulated"),
+                    now == "Simulated"
+                ),
                 btn(
                     crate::control::PI,
                     Message::MachineConnection(crate::control::PI),
@@ -7777,7 +7785,13 @@ fn connect_controls(app: &App) -> Column<'_, Message> {
         }
         let mut paired = true;
         if let Some(address) = pi {
-            col = col.push(pi_pairing(app, m, address, connected.is_none(), &mut paired));
+            col = col.push(pi_pairing(
+                app,
+                m,
+                address,
+                connected.is_none(),
+                &mut paired,
+            ));
         }
         if let Some(c) = connected.filter(|c| c.pi.is_some()) {
             col = col.push(pi_link(c));
@@ -7854,7 +7868,11 @@ fn pi_pairing<'a>(
             } else {
                 muted("").into()
             };
-            col = col.push(row![muted("Code"), code, pair].spacing(6).align_y(Alignment::Center));
+            col = col.push(
+                row![muted("Code"), code, pair]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+            );
         }
     }
     col.into()
@@ -7870,11 +7888,15 @@ fn pi_link(c: &crate::control::Connection) -> Element<'_, Message> {
     };
     col = match &link.state {
         L::Connecting => col.push(muted("Connecting to the Pi…")),
-        L::Refused(why) => col.push(warnings(vec![format!("The Pi refused this computer: {why}")])),
+        L::Refused(why) => col.push(warnings(vec![format!(
+            "The Pi refused this computer: {why}"
+        )])),
         L::Watching { holder } => col.push(
             row![
                 muted(match holder {
-                    Some(who) => format!("Watching: {who} controls the machine. You may E-stop, hold and stop."),
+                    Some(who) => format!(
+                        "Watching: {who} controls the machine. You may E-stop, hold and stop."
+                    ),
                     None => "Watching: nobody controls the machine.".into(),
                 }),
                 secondary("Take control", Message::PiTakeControl),
@@ -8254,7 +8276,11 @@ pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
         )
     };
     let line: Element<_> = if c.probe_moving() {
-        text(PROBE_HOLD).size(13).color(WARN).wrapping(Wrapping::None).into()
+        text(PROBE_HOLD)
+            .size(13)
+            .color(WARN)
+            .wrapping(Wrapping::None)
+            .into()
     } else {
         line
     };
@@ -8967,7 +8993,11 @@ fn spindle_card(
             .width(48),
         help::wrap(
             slider(10.0..=200.0, c.feed_override, move |v| {
-                Message::Machine(Action::FeedOverride(if c.in_control() { v } else { c.feed_override }))
+                Message::Machine(Action::FeedOverride(if c.in_control() {
+                    v
+                } else {
+                    c.feed_override
+                }))
             })
             .step(5.0_f32),
             help::command(
@@ -8978,7 +9008,8 @@ fn spindle_card(
         ),
         small(
             "100 %",
-            c.in_control().then_some(Message::Machine(Action::FeedOverride(100.))),
+            c.in_control()
+                .then_some(Message::Machine(Action::FeedOverride(100.))),
             false
         ),
     ]
