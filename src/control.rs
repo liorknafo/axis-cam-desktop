@@ -3811,19 +3811,18 @@ impl Connection {
         }
     }
 
-    /// Why no Go can move `axes` now, whatever the targets: the machine
-    /// must be Idle, and each axis it moves, and every axis with a soft
-    /// limit, must have a machine position.
-    pub fn go_ready(&self, axes: &[usize]) -> Result<(), String> {
+    /// Why `go` cannot move now, whatever the targets: the machine must be
+    /// Idle. X, Y and Z need no machine position (LIO-340): without one the
+    /// soft limits are off for the Go, as for Cycle Start. A needs one, as
+    /// to jog it, and so does Z top, whose target is Z's soft maximum.
+    pub fn go_ready(&self, go: Go) -> Result<(), String> {
         if !self.idle() {
             return Err("The machine is not Idle.".into());
         }
-        let mut unset = self.unset_limited_axes();
-        unset.extend(
-            (axes.iter().copied()).filter(|&a| self.axis(a) && !self.snapshot.referenced[a]),
-        );
-        unset.sort_unstable();
-        unset.dedup();
+        let unset: Vec<usize> = (self.go_axes(go).into_iter())
+            .filter(|&a| self.axis(a) && !self.snapshot.referenced[a])
+            .filter(|&a| rotary(a) || go == Go::ZTop)
+            .collect();
         if !unset.is_empty() {
             let names: Vec<&str> = unset.iter().map(|&a| AXIS_NAMES[a]).collect();
             return Err(format!(
@@ -3842,7 +3841,7 @@ impl Connection {
 
     /// Why Go to X0 Y0 cannot move now, whatever the tool's height.
     pub fn to_work_xy(&self) -> Result<(), String> {
-        self.go_ready(&self.go_axes(Go::WorkXY0))
+        self.go_ready(Go::WorkXY0)
     }
 
     /// The work Z of the stock top of the setup picked in the run bar, as
@@ -3864,7 +3863,7 @@ impl Connection {
         {
             return Err(format!("This machine has no {}.", AXIS_NAMES[a]));
         }
-        self.go_ready(&self.go_axes(go))?;
+        self.go_ready(go)?;
         let s = &self.snapshot;
         let (now, work) = (s.machine_pos, s.work_pos);
         let mut to: [Option<f64>; 6] = [None; 6];
@@ -3928,8 +3927,9 @@ impl Connection {
                 vec![up, over, down]
             }
         };
+        // An axis without a machine position has no soft limits to check.
         for p in &points {
-            for a in (0..6).filter(|&a| (p[a] - now[a]).abs() > 1e-9) {
+            for a in (0..6).filter(|&a| s.referenced[a] && (p[a] - now[a]).abs() > 1e-9) {
                 let Some(x) = self.config.axes.get(a) else {
                     continue;
                 };
@@ -4067,9 +4067,13 @@ impl Connection {
     }
 
     /// `p` held inside the soft limits of X, Y and Z, which the driver
-    /// refuses a move past.
+    /// refuses a move past. An axis without a machine position is left be:
+    /// its limits are off and its position says nothing of its travel.
     fn inside(&self, mut p: Vec6) -> Vec6 {
         for (a, v) in p.iter_mut().enumerate().take(3) {
+            if !self.snapshot.referenced[a] {
+                continue;
+            }
             if let Some(x) = self.config.axes.get(a) {
                 if let Some(lo) = x.soft_min {
                     *v = v.max(lo);

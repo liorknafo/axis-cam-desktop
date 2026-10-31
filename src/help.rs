@@ -1645,19 +1645,19 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
             "",
         ),
         GoTo(crate::control::Go::Axis(_)) => (
-            "Rapid this axis alone to its target. X, Y or A alone is refused while the tool is under the stock top of the setup picked: raise Z first, or Go with Z up first. Every target is checked against the soft limits before anything moves.",
+            "Rapid this axis alone to its target. X, Y or A alone is refused while the tool is under the stock top of the setup picked: raise Z first, or Go with Z up first. Every target is checked against the soft limits of an axis with a machine position before anything moves.",
             "",
         ),
         GoTo(crate::control::Go::All) => (
-            "Rapid to every target typed, Z up first: Z rises to the highest of where it is, its target and the stock top of the setup picked, then X, Y (and A) move, then Z goes down to its target. Axes left empty stay. Every point is checked against the soft limits before anything moves.",
+            "Rapid to every target typed, Z up first: Z rises to the highest of where it is, its target and the stock top of the setup picked, then X, Y (and A) move, then Z goes down to its target. Axes left empty stay. Every point is checked against the soft limits of an axis with a machine position before anything moves.",
             "",
         ),
         GoTo(crate::control::Go::WorkXY0) => (
-            "Rapid X and Y to work X0 Y0, Z up first: under the stock top of the setup picked, Z rises to it first and stays there. Otherwise Z stays where it is. Soft limits apply.",
+            "Rapid X and Y to work X0 Y0, Z up first: under the stock top of the setup picked, Z rises to it first and stays there. Otherwise Z stays where it is. Soft limits apply once X, Y and Z have a machine position.",
             "",
         ),
         GoTo(crate::control::Go::ZTop) => (
-            "Rapid Z alone to the top of its travel, its soft maximum in the profile. X, Y and A stay where they are.",
+            "Rapid Z alone to the top of its travel, its soft maximum in the profile, so it needs machine Z set. X, Y and A stay where they are.",
             "",
         ),
         ProbeFrom(_) => (
