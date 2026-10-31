@@ -691,8 +691,8 @@ type RunMeshKey = (u64, u64, stock_surface::Detail);
 /// them. On the Pi it is meshed again as soon as the last is done.
 const RUN_MESH_EVERY: Duration = Duration::from_millis(250);
 /// The surface of the stock a run carved, None when it waits for the
-/// machine to stop (no GPU to mesh it on meanwhile), or why it could not be
-/// meshed.
+/// machine to stop (no GPU to mesh it on meanwhile, or the GPU failed), or
+/// why it could not be meshed.
 type RunMeshed = Result<Option<std::sync::Arc<stock_surface::SurfaceMesh>>, String>;
 /// A heading and the lines of the box the inspector shows.
 pub type HoldingNote = Option<(String, Vec<String>)>;
@@ -3286,7 +3286,8 @@ impl App {
         }
         let c = r.carving.as_ref()?;
         let current = c.surface.as_ref().is_some_and(|s| s.0 == c.version);
-        if !current && self.run_mesh_waits(c.serial) {
+        let failed = (self.run_mesh_failed).is_some_and(|k| (k.0, k.1) == (c.serial, c.version));
+        if !current && (self.run_mesh_waits(c.serial) || failed) {
             return None;
         }
         r.carved_surface()
@@ -3299,7 +3300,7 @@ impl App {
     }
     /// The stock of carve `serial` waits for the machine to stop to be
     /// meshed: there is no GPU to mesh it on while this computer's driver
-    /// moves the machine.
+    /// moves the machine, or the GPU failed to.
     fn run_mesh_waits(&self, serial: u64) -> bool {
         self.driving_here() && self.run_mesh_waits == Some(serial)
     }
@@ -3340,7 +3341,16 @@ impl App {
         let snapshot = stock_surface::Snapshot::of(volume, key.2);
         let build = move || -> RunMeshed {
             let mesh = if gpu_only {
-                snapshot.build_on_gpu().transpose()?
+                // A GPU that fails waits, as none does, for the CPU once
+                // the machine stops.
+                match snapshot.build_on_gpu() {
+                    Some(Ok(mesh)) => Some(mesh),
+                    Some(Err(e)) => {
+                        eprintln!("GPU stock mesher: {e}; meshed once the machine stops.");
+                        None
+                    }
+                    None => None,
+                }
             } else {
                 Some(snapshot.build()?)
             };

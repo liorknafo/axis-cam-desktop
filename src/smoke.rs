@@ -5359,10 +5359,19 @@ flood = { pin = 8 }
             // The last surface is drawn while the next is meshed.
             assert!(a.locked() && a.run_stock().is_some());
         }
-        // Without a GPU it waits for the machine to stop; an older surface
-        // would hide the cuts since, which the live grid shows.
-        a.run_mesh_job = None;
-        a.run_mesh_waits = Some(run_of(&a).carving.as_ref().unwrap().serial);
+        // Without a GPU, or when it fails, it waits for the machine to stop;
+        // an older surface would hide the cuts since, which the live grid
+        // shows.
+        let key = |a: &App| {
+            let c = run_of(a).carving.as_ref().unwrap();
+            (c.serial, c.version, a.stock_detail)
+        };
+        a.run_mesh_job = Some(key(&a));
+        let _ = a.update(Message::RunMeshed {
+            key: key(&a),
+            result: Ok(None),
+        });
+        assert!(a.run_mesh_job.is_none() && a.run_mesh_failed.is_none());
         assert!(iced_runtime::task::into_stream(a.refresh_run_mesh()).is_none());
         assert!(a.run_mesh_job.is_none() && a.live_stock().is_some());
         let stale = (run_of(&a).carving.as_ref())
@@ -5378,7 +5387,7 @@ flood = { pin = 8 }
         a.control.as_mut().unwrap().pi = Some("pi".into());
         assert!(iced_runtime::task::into_stream(a.refresh_run_mesh()).is_some());
         a.control.as_mut().unwrap().pi = None;
-        (a.run_mesh_job, a.run_mesh_waits) = (None, None);
+        a.run_mesh_job = None;
         // A sample that finds the tool where the last one did cuts nothing.
         let sample = conn(&a).snapshot.clone();
         let cuts = |a: &App| {
@@ -5398,7 +5407,8 @@ flood = { pin = 8 }
         tick_until(&mut a, 5.0, "Idle", |s| s.state == Some(State::Idle));
         assert!(run_of(&a).done[0], "{:?}", run_of(&a).outcome);
         // What the tick does in the background once the machine stops,
-        // in line here: the run's stock meshed.
+        // in line here: the run's stock meshed, on the CPU too, though it
+        // waited while the machine moved.
         a.smoke_dir = Some(dir.path().to_path_buf());
         // The tick's job, which tests do not run, gives way.
         a.run_mesh_job = None;
@@ -5439,6 +5449,15 @@ flood = { pin = 8 }
         let view = crate::ui::scene_viewport(&a).unwrap();
         assert!(view.simulation.is_none() && view.run_stock.is_some());
         assert_eq!(depths(&view), cut);
+        // A mesh of the latest cuts that fails leaves the live grid, not an
+        // older surface.
+        let carving = a.control.as_mut().unwrap().run.as_mut().unwrap();
+        carving.carving.as_mut().unwrap().version += 1;
+        let _ = a.update(Message::RunMeshed {
+            key: key(&a),
+            result: Err("failed".into()),
+        });
+        assert!(a.run_stock().is_none() && a.live_stock().is_some());
     }
 
     /// The driver refuses a job sent while it is not idle for it: for a few

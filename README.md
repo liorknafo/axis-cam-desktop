@@ -681,9 +681,10 @@ the same places, greyed when they cannot be used. Under it three columns:
   free and it is meshed again as soon as the last is done. While this
   computer's driver moves the machine (USB, the simulator) it is meshed
   on the GPU only and at most four times a second, so that the processor
-  stays the driver's (#167); a computer without a usable GPU draws the
-  run's stock coarser while the machine moves, from a grid of at most 96
-  cells a side, and smooth again once it stops. A held or paused machine's stock is not meshed again. An
+  stays the driver's (#167); a computer without a usable GPU, or whose
+  GPU fails to mesh it, draws the run's stock coarser while the machine
+  moves, from a grid of at most 96 cells a side, and smooth again once it
+  stops. A held or paused machine's stock is not meshed again. An
   operation's preview left open in MANUFACTURE does not hide the run's
   stock.
 - **Right, Operations**: the setup's operations in the order they are cut,
