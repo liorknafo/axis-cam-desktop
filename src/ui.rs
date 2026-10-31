@@ -7745,26 +7745,41 @@ fn connect_controls(app: &App) -> Column<'_, Message> {
         col = col.push(secondary(steps, Message::ShowGuide));
     }
     if let Some(m) = target {
-        let sim = crate::control::simulated(m);
+        let now = crate::control::connection_label(m);
+        let pi = crate::control::pi(m);
         col = col.push(
             row![
                 muted("Connection"),
-                btn("Real (USB)", Message::MachineConnection(false), !sim),
-                btn("Simulated", Message::MachineConnection(true), sim),
+                btn("Real (USB)", Message::MachineConnection("USB"), now == "USB"),
+                btn("Simulated", Message::MachineConnection("Simulated"), now == "Simulated"),
+                btn(
+                    crate::control::PI,
+                    Message::MachineConnection(crate::control::PI),
+                    pi.is_some()
+                ),
             ]
             .spacing(6)
             .align_y(Alignment::Center),
         );
-        if app.control.as_ref().is_some_and(|c| c.machine_id == m.id) {
-            col = col.push(muted(if sim {
-                "Real (USB) disconnects the simulator and connects to the machine itself."
-            } else {
-                "Simulated disconnects the machine (it is left in E-stop) and connects to the simulator."
+        let connected = app.control.as_ref().filter(|c| c.machine_id == m.id);
+        if connected.is_some() {
+            col = col.push(muted(match now {
+                "Simulated" => "Real (USB) disconnects the simulator and connects to the machine itself.",
+                "USB" => "Simulated disconnects the machine (it is left in E-stop) and connects to the simulator.",
+                _ => "Another connection closes the link to the Pi (a running tool run goes on there) and connects that way.",
             }));
+        }
+        let mut paired = true;
+        if let Some(address) = pi {
+            col = col.push(pi_pairing(app, m, address, connected.is_none(), &mut paired));
+        }
+        if let Some(c) = connected.filter(|c| c.pi.is_some()) {
+            col = col.push(pi_link(c));
         }
         // The profile is read only while disconnected, not on every 33 ms tick.
         col = match &app.control {
             Some(_) => col.push(secondary("Disconnect", Message::Disconnect)),
+            None if !paired => col,
             None => match crate::control::profile(m) {
                 Ok(_) => col.push(primary("Connect", Message::Connect)),
                 Err(e) => col.push(warnings(vec![e])),
@@ -7777,6 +7792,106 @@ fn connect_controls(app: &App) -> Column<'_, Message> {
     }
     col
 }
+/// The Pi a machine connects to across the network: its address (editable
+/// while disconnected) and this computer's pairing with it, or the code
+/// field and Pair. `paired` is set false when it is not paired.
+fn pi_pairing<'a>(
+    app: &'a App,
+    m: &'a crate::model::Machine,
+    address: &'a str,
+    editable: bool,
+    paired: &mut bool,
+) -> Element<'a, Message> {
+    let mut col = column![].spacing(6);
+    let place = if editable {
+        row![
+            muted("Pi address"),
+            text_input(crate::control::PI_DEFAULT, address)
+                .on_input(Message::PiAddress)
+                .width(Length::Fixed(200.))
+                .padding([5, 8])
+                .size(13),
+        ]
+    } else {
+        row![muted("Pi address"), text(address).size(13)]
+    };
+    col = col.push(place.spacing(6).align_y(Alignment::Center));
+    match crate::control::PiTokens::of(&app.state_path, &m.id).paired() {
+        Ok(true) => {
+            col = col.push(
+                row![
+                    muted("This computer is paired with the Pi."),
+                    secondary("Forget", Message::PiForget),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+        }
+        found => {
+            *paired = false;
+            if let Err(e) = found {
+                col = col.push(warnings(vec![e]));
+            }
+            col = col.push(muted(
+                "Pair this computer once: on the Pi run `sudo uc100-server pair`, then type the 6-digit code it shows.",
+            ));
+            let code = text_input("123456", &app.pi_code)
+                .on_input(Message::PiCode)
+                .on_submit(Message::PiPair)
+                .width(Length::Fixed(100.))
+                .padding([5, 8])
+                .size(13);
+            let pair: Element<'a, Message> = if app.pi_pairing {
+                muted("Pairing…").into()
+            } else if app.pi_code.len() == 6 {
+                primary("Pair", Message::PiPair).into()
+            } else {
+                muted("").into()
+            };
+            col = col.push(row![muted("Code"), code, pair].spacing(6).align_y(Alignment::Center));
+        }
+    }
+    col.into()
+}
+
+/// The link to the Pi: connecting, refused (why), watching (who controls,
+/// and Take control) or in control; whether it answers; its newest note.
+fn pi_link(c: &crate::control::Connection) -> Element<'_, Message> {
+    use uc100_remote::LinkState as L;
+    let mut col = column![].spacing(6);
+    let Some(link) = &c.link else {
+        return col.push(muted("Connecting to the Pi…")).into();
+    };
+    col = match &link.state {
+        L::Connecting => col.push(muted("Connecting to the Pi…")),
+        L::Refused(why) => col.push(warnings(vec![format!("The Pi refused this computer: {why}")])),
+        L::Watching { holder } => col.push(
+            row![
+                muted(match holder {
+                    Some(who) => format!("Watching: {who} controls the machine. You may E-stop, hold and stop."),
+                    None => "Watching: nobody controls the machine.".into(),
+                }),
+                secondary("Take control", Message::PiTakeControl),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        ),
+        L::Controlling => col.push(muted(match &link.name {
+            Some(name) => format!("In control, as {name}."),
+            None => "In control.".into(),
+        })),
+    };
+    if matches!(link.state, L::Watching { .. } | L::Controlling) && !link.live {
+        col = col.push(warnings(vec![
+            "The link to the Pi is not answering: what you see is its last state, and the machine carries on. Reconnecting…".into(),
+        ]));
+    }
+    if let Some(note) = &c.pi_note {
+        col = col.push(muted(format!("Pi: {note}")).size(12));
+    }
+    col.into()
+}
+
 /// The driver's log, the last 40 lines, newest at the bottom.
 // ponytail: the last 40 lines; keep more if someone needs older ones.
 fn machine_log(c: &crate::control::Connection) -> Element<'_, Message> {

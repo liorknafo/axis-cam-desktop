@@ -11,19 +11,173 @@ use uc100::diagnostics::{INPUT_PINS, InputTracker};
 use uc100::gcode::{Action as Do, Located, Spindle};
 use uc100::protocol::Status;
 
+/// The Connection value of a UC100 run by uc100-server on a Raspberry Pi
+/// across the network (`pi`).
+pub const PI: &str = "Pi (network)";
+/// The Pi's address when the machine names none (port 7110).
+pub const PI_DEFAULT: &str = "uc100.local";
+
 /// Whether a UC100 machine connects to the simulator. Unset means the
 /// simulator, except on macOS, where the real machine is connected.
 pub fn simulated(m: &Machine) -> bool {
     match get(&m.p, "uc100_connection") {
         "USB" => false,
         "Simulated" => true,
+        PI => false,
         _ => !cfg!(target_os = "macos"),
     }
 }
 
+/// The Pi a UC100 machine connects to across the network ("uc100.local",
+/// "host:port"), or None when it connects over USB or to the simulator.
+pub fn pi(m: &Machine) -> Option<&str> {
+    (get(&m.p, "uc100_connection") == PI).then(|| match get(&m.p, "uc100_pi").trim() {
+        "" => PI_DEFAULT,
+        address => address,
+    })
+}
+
 /// The Connection value shown for a machine, with the default applied.
 pub fn connection_label(m: &Machine) -> &'static str {
-    if simulated(m) { "Simulated" } else { "USB" }
+    if pi(m).is_some() {
+        PI
+    } else if simulated(m) {
+        "Simulated"
+    } else {
+        "USB"
+    }
+}
+
+/// Where this computer keeps the token it was paired with the Pi of
+/// machine `machine_id` (`uc100_remote::Token`): a credential that drives
+/// the machine, so never in the project. On macOS the Keychain, as the
+/// item "AXIS CAM Studio" / `uc100-pi-<id>`; a 0600 file beside an isolated
+/// (test or smoke) workspace `state_path`, and on other platforms.
+pub struct PiTokens {
+    file: std::path::PathBuf,
+    /// The Keychain item's account, `uc100-pi-<machine id>`.
+    #[cfg(target_os = "macos")]
+    account: String,
+    #[cfg(target_os = "macos")]
+    keychain: bool,
+}
+
+impl PiTokens {
+    #[cfg(target_os = "macos")]
+    const SERVICE: &str = "AXIS CAM Studio";
+    /// errSecItemNotFound
+    #[cfg(target_os = "macos")]
+    const NOT_FOUND: i32 = -25300;
+
+    pub fn of(state_path: &Path, machine_id: &str) -> Self {
+        let dir = state_path.parent().unwrap_or(Path::new("."));
+        PiTokens {
+            file: dir.join("uc100").join(format!("{machine_id}-pi.token")),
+            #[cfg(target_os = "macos")]
+            account: format!("uc100-pi-{machine_id}"),
+            #[cfg(target_os = "macos")]
+            keychain: state_path == crate::storage::state_path(),
+        }
+    }
+
+    /// The token kept, if this computer is paired.
+    pub fn load(&self) -> Result<Option<uc100_remote::Token>, String> {
+        let text = {
+            #[cfg(target_os = "macos")]
+            if self.keychain {
+                match security_framework::passwords::get_generic_password(
+                    Self::SERVICE,
+                    &self.account,
+                ) {
+                    Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+                    Err(e) if e.code() == Self::NOT_FOUND => None,
+                    Err(e) => return Err(format!("Keychain: {e}")),
+                }
+            } else {
+                read_token_file(&self.file)?
+            }
+            #[cfg(not(target_os = "macos"))]
+            read_token_file(&self.file)?
+        };
+        text.map(|t| {
+            t.trim()
+                .parse()
+                .map_err(|e| format!("The kept pairing with the Pi is unreadable ({e}): pair again."))
+        })
+        .transpose()
+    }
+
+    pub fn save(&self, token: &uc100_remote::Token) -> Result<(), String> {
+        self.changed();
+        let text = token.to_string();
+        #[cfg(target_os = "macos")]
+        if self.keychain {
+            return security_framework::passwords::set_generic_password(
+                Self::SERVICE,
+                &self.account,
+                text.as_bytes(),
+            )
+            .map_err(|e| format!("Keychain: {e}"));
+        }
+        let dir = self.file.parent().ok_or("Missing parent directory")?;
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        std::io::Write::write_all(&mut options.open(&self.file).map_err(|e| e.to_string())?, text.as_bytes())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Forgets the pairing on this computer (the Pi keeps it until
+    /// `uc100-server forget`).
+    pub fn forget(&self) -> Result<(), String> {
+        self.changed();
+        #[cfg(target_os = "macos")]
+        if self.keychain {
+            return match security_framework::passwords::delete_generic_password(
+                Self::SERVICE,
+                &self.account,
+            ) {
+                Err(e) if e.code() != Self::NOT_FOUND => Err(format!("Keychain: {e}")),
+                _ => Ok(()),
+            };
+        }
+        match std::fs::remove_file(&self.file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Whether each kept pairing was found, by token file path (which names the
+/// Keychain item too): the Control page asks on every redraw, and the
+/// Keychain is read again only after a save or forget.
+static PAIRED: std::sync::Mutex<BTreeMap<std::path::PathBuf, Result<bool, String>>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+impl PiTokens {
+    /// Whether this computer is paired with the Pi (`load` found a token),
+    /// read once per save or forget (`PAIRED`).
+    pub fn paired(&self) -> Result<bool, String> {
+        let mut known = PAIRED.lock().unwrap_or_else(|e| e.into_inner());
+        known
+            .entry(self.file.clone())
+            .or_insert_with(|| self.load().map(|t| t.is_some()))
+            .clone()
+    }
+
+    fn changed(&self) {
+        PAIRED.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.file);
+    }
+}
+
+fn read_token_file(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Loads a machine's UC100 profile and checks it with the driver.
@@ -2094,11 +2248,72 @@ struct Held {
     log_seq: u64,
 }
 
+/// The driver's controller: in AXIS CAM (USB or the simulator), or run by
+/// uc100-server on a Raspberry Pi across the network.
+enum Driver {
+    Local(Controller),
+    Remote(uc100_remote::RemoteController),
+}
+
+impl Driver {
+    /// Whether `command` went; a local one always does. One the link to the
+    /// Pi cannot take now is dropped, never sent later, with a note.
+    fn send(&self, command: Command) -> bool {
+        match self {
+            Driver::Local(c) => {
+                c.send(command);
+                true
+            }
+            Driver::Remote(r) => r.send(command),
+        }
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        match self {
+            Driver::Local(c) => c.snapshot(),
+            Driver::Remote(r) => r.snapshot(),
+        }
+    }
+}
+
+/// A tool run left running on the Pi when the link was closed
+/// (`Connection::take_pi_run`).
+pub struct PiRun {
+    machine_id: String,
+    run: crate::run::Run,
+    job_name: Option<String>,
+}
+
+/// How long a tool run sent to the Pi may show neither running nor a new
+/// outcome, the link live, before it is taken as lost on the way.
+const JOB_REACH: Duration = Duration::from_secs(3);
+
 /// A running driver controller for one machine.
 pub struct Connection {
-    controller: Controller,
+    driver: Driver,
     pub machine_id: String,
     pub simulated: bool,
+    /// The Pi's address, on a connection across the network (`pi`).
+    pub pi: Option<String>,
+    /// The link to the Pi at the last tick (None on USB and the simulator).
+    pub link: Option<uc100_remote::Link>,
+    /// The newest of the link's notes, for the status line, and the count
+    /// of notes seen.
+    pub pi_note: Option<String>,
+    notes_seen: u64,
+    /// A tool run sent to the Pi that has not yet shown running or ended:
+    /// when it was sent, and the outcome count then.
+    job_sent: Option<(Instant, u64)>,
+    /// The name of the last tool run sent, which the Pi's Stop after step
+    /// names when it fires.
+    job_name: Option<String>,
+    /// Tests: the next tool run handed to the link is lost on the way, as
+    /// when the link fails while it crosses.
+    #[cfg(test)]
+    pub lose_next_job: bool,
+    /// When Stop after step was last armed or disarmed on the Pi: until the
+    /// Pi has answered, the run keeps the choice rather than the Pi's.
+    stop_sent: Option<Instant>,
     /// The profile the controller was started with; the snapshot has no config.
     pub config: MachineConfig,
     /// The driver's state at the last tick.
@@ -2208,8 +2423,8 @@ pub struct Connection {
     /// After a Stop after step: the machine Z to lift the tool to once Idle.
     z_up: Option<f64>,
     /// Keeps macOS from throttling AXIS CAM in the background, which would
-    /// starve the controller's motion buffer.
-    _nap: uc100::macos::ActivityToken,
+    /// starve the controller's motion buffer; the Pi feeds its own.
+    _nap: Option<uc100::macos::ActivityToken>,
 }
 
 /// Why a probe whose program ended with the machine in `state`, not Idle
@@ -2244,6 +2459,35 @@ impl Connection {
         let journal = state_dir.join(format!("{}{suffix}-journal.json", m.id));
         pad_state(&file);
         let controller = Controller::start(cfg.clone(), Some(file));
+        let nap = uc100::macos::prevent_app_nap("AXIS CAM machine control");
+        Ok(Self::with(m, cfg, Driver::Local(controller), Some(nap), journal))
+    }
+
+    /// Connects to the UC100 uc100-server runs on the Pi of `m` (`pi`), as
+    /// the computer paired with `token`, and sends it the machine's profile
+    /// (the Pi applies it only while the machine is stopped). The Pi keeps
+    /// the driver's saved offsets and position; this computer keeps the run
+    /// journal.
+    pub fn open_pi(m: &Machine, state_dir: &Path, token: uc100_remote::Token) -> Result<Self, String> {
+        let address = pi(m).ok_or("This machine does not connect to a Pi.")?;
+        // As the file says: a machine's profile leaves `simulated` out, so
+        // the Pi drives its UC100; a test's asks the Pi for its simulator.
+        let cfg = profile(m)?;
+        let journal = state_dir.join(format!("{}-pi-journal.json", m.id));
+        let remote = uc100_remote::RemoteController::start(cfg.clone(), address, token);
+        let mut c = Self::with(m, cfg, Driver::Remote(remote), None, journal);
+        c.pi = Some(address.to_owned());
+        Ok(c)
+    }
+
+    fn with(
+        m: &Machine,
+        cfg: MachineConfig,
+        driver: Driver,
+        nap: Option<uc100::macos::ActivityToken>,
+        journal: std::path::PathBuf,
+    ) -> Self {
+        let simulated = cfg.controller.simulated;
         let block = sim_block(&cfg, None).filter(|_| simulated);
         let pins = pins_settings(&m.p);
         let sim_pins = match (&pins, block) {
@@ -2253,11 +2497,20 @@ impl Connection {
             _ => None,
         };
         let mut c = Self {
-            _nap: uc100::macos::prevent_app_nap("AXIS CAM machine control"),
-            controller,
+            _nap: nap,
+            driver,
             config: cfg,
             machine_id: m.id.clone(),
             simulated,
+            pi: None,
+            link: None,
+            pi_note: None,
+            notes_seen: 0,
+            job_sent: None,
+            job_name: None,
+            #[cfg(test)]
+            lose_next_job: false,
+            stop_sent: None,
             snapshot: Snapshot::default(),
             declare: VecDeque::new(),
             held: None,
@@ -2313,7 +2566,7 @@ impl Connection {
             z_up: None,
         };
         c.send_sim_blocks();
-        Ok(c)
+        c
     }
 
     /// Simulated: the blocks the probe touches. The stock's block, unless
@@ -2525,23 +2778,72 @@ impl Connection {
     }
 
     pub fn send(&self, command: Command) {
-        self.controller.send(command)
+        self.driver.send(command);
+    }
+
+    /// Sends `command` and says whether it went: across the network one the
+    /// link cannot take now (down, or another computer in control) is
+    /// dropped, with a note in `pi_note`.
+    pub fn try_send(&mut self, command: Command) -> bool {
+        #[cfg(test)]
+        if matches!(command, Command::Job { .. }) && std::mem::take(&mut self.lose_next_job) {
+            return true;
+        }
+        self.driver.send(command)
+    }
+
+    /// The link to the Pi is not answering: the snapshot is the last one
+    /// received, nothing can be sent, and the machine carries on. False on
+    /// USB and the simulator.
+    pub fn pi_down(&self) -> bool {
+        self.link.as_ref().is_some_and(|l| !l.live)
+    }
+
+    /// Another computer controls the Pi's machine: this one watches, and
+    /// may only E-stop, hold and stop.
+    pub fn watching(&self) -> bool {
+        matches!(
+            self.link.as_ref().map(|l| &l.state),
+            Some(uc100_remote::LinkState::Watching { .. })
+        )
+    }
+
+    /// Asks the Pi for control of the machine (granted when no other
+    /// computer has it).
+    pub fn take_control(&self) {
+        if let Driver::Remote(r) = &self.driver {
+            r.take_control();
+        }
     }
 
     pub fn refresh(&mut self) {
-        self.snapshot = self.controller.snapshot();
+        self.snapshot = self.driver.snapshot();
+        if let Driver::Remote(r) = &self.driver {
+            let link = r.link();
+            let new = link.note_seq.saturating_sub(self.notes_seen) as usize;
+            if new > 0 {
+                self.pi_note = link.notes.iter().rev().take(new).next().cloned();
+                self.notes_seen = link.note_seq;
+            }
+            self.link = Some(link);
+        }
         self.observe();
     }
 
     /// Acts on the snapshot `refresh` read.
     fn observe(&mut self) {
         let mut stop = false;
+        self.watch_job();
+        // Before the outcome: a stop the Pi made after a step is that step's.
+        self.follow_stop_after();
+        let remote = self.pi.is_some();
         if let Some(run) = &mut self.run {
             run.refresh(self.snapshot.program_outcome.as_ref());
             run.carve(&self.snapshot);
             run.track(&self.snapshot);
-            // Stop after step: the driver's Stop as the step ends.
-            stop = run.stop_due(&self.snapshot);
+            // Stop after step: the driver's Stop as the step ends. On the
+            // Pi, the Pi sends it (`follow_stop_after`).
+            stop = !remote && run.stop_due(&self.snapshot);
         }
         if stop {
             self.send(Command::Stop);
@@ -2645,7 +2947,7 @@ impl Connection {
                 let same = h.log_seq == self.snapshot.log_seq && h.sent.elapsed() <= JOG_KEEPALIVE;
                 if same && h.sent.elapsed() >= JOG_RESEND {
                     h.sent = Instant::now();
-                    self.controller.send(Command::JogStart {
+                    self.driver.send(Command::JogStart {
                         axis: h.axis,
                         negative: h.negative,
                         speed: self.jog_speed as f64 / 100.,
@@ -2938,11 +3240,34 @@ impl Connection {
             R::StopAfterStep
                 if run.running.is_some() && matches!(state, Some(State::Run | State::Hold)) =>
             {
-                run.stop_after = !run.stop_after
+                match &self.driver {
+                    Driver::Local(_) => run.stop_after = !run.stop_after,
+                    // The Pi decides: it is sent the lines where a step ends.
+                    Driver::Remote(remote) => {
+                        let want = !run.stop_after;
+                        let ranges = if want { run.stop_ranges() } else { vec![] };
+                        if want && ranges.is_empty() {
+                            self.pi_note = Some("Stop after step: no step of this tool run ends ahead.".into());
+                        } else if remote.stop_after(ranges) {
+                            run.stop_after = want;
+                            self.stop_sent = Some(Instant::now());
+                        }
+                    }
+                }
             }
             R::CycleStart => {
                 if let Some(job) = run.cycle_start(self, doc) {
-                    self.send(job);
+                    let name = match &job {
+                        Command::Job { name, .. } => Some(name.clone()),
+                        _ => None,
+                    };
+                    if !self.try_send(job) {
+                        let why = self.pi_note.clone().unwrap_or_else(|| "the link to the Pi is down".into());
+                        run.not_started(format!("The tool run was not sent ({why}). Nothing moved."));
+                    } else if self.pi.is_some() {
+                        let seq = self.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
+                        (self.job_sent, self.job_name) = (Some((Instant::now(), seq)), name);
+                    }
                 }
             }
             R::Hold if state == Some(State::Run) => self.send(Command::FeedHold),
@@ -4613,6 +4938,8 @@ impl Connection {
     /// Jog, work zero, MDI and the spindle are allowed: Idle, or paused in a program.
     pub fn manual(&self) -> bool {
         matches!(self.snapshot.state, Some(State::Idle | State::Paused(_)))
+            && !self.pi_down()
+            && !self.watching()
             && self.edges.is_none()
             && self.routine.is_none()
             && self.turning.is_none()
@@ -4693,6 +5020,10 @@ impl Connection {
     /// Keeps where a running tool run is in the journal before the
     /// connection ends (`why`): the step it is in counts as not done.
     pub fn leaving(&mut self, why: &str) {
+        // On the Pi the tool run carries on without this computer.
+        if self.pi.is_some() {
+            return;
+        }
         if let Some(st) = self.run.as_ref().and_then(|r| r.stopped_in(why))
             && let Some(run) = &mut self.run
         {
@@ -4701,10 +5032,84 @@ impl Connection {
         }
     }
 
+    /// A tool run sent to the Pi that shows neither running nor a new
+    /// outcome for `JOB_REACH`, the link live, was lost on the way (the link
+    /// failed while it crossed): it is put back, nothing having moved.
+    fn watch_job(&mut self) {
+        let Some((at, seq)) = self.job_sent else {
+            return;
+        };
+        let s = &self.snapshot;
+        let reached = crate::run::busy(s.state.as_ref())
+            || s.program_outcome.as_ref().is_some_and(|o| o.seq > seq);
+        let running = self.run.as_ref().is_some_and(|r| r.running.is_some());
+        if reached || !running {
+            self.job_sent = None;
+        } else if !self.pi_down() && at.elapsed() > JOB_REACH {
+            self.job_sent = None;
+            if let Some(run) = &mut self.run {
+                run.not_started(
+                    "The tool run did not reach the Pi: the link failed while it was being sent. Nothing moved; press Cycle Start again.".into(),
+                );
+            }
+        }
+    }
+
+    /// Stop after step on the Pi: the run shows what the Pi holds (armed,
+    /// or not) once the Pi has answered the last change, and a stop the Pi
+    /// made at a step's end is taken as that step's.
+    fn follow_stop_after(&mut self) {
+        use uc100_remote::wire::StopAfter;
+        let (Some(link), Some(run)) = (&self.link, &mut self.run) else {
+            return;
+        };
+        if run.running.is_none() || !link.live {
+            return;
+        }
+        match &link.stop_after {
+            StopAfter::Fired { line, program } if program.is_some() && *program == self.job_name => {
+                run.stop_after = true;
+                run.stopped_on_pi(*line);
+            }
+            StopAfter::Armed { .. } => run.stop_after = true,
+            _ if self.stop_sent.is_none_or(|t| t.elapsed() > Duration::from_millis(1500)) => {
+                run.stop_after = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// Closing the link to the Pi while a tool run runs there: the run, to
+    /// follow it again when this computer connects back (`resume_pi_run`).
+    pub fn take_pi_run(&mut self) -> Option<PiRun> {
+        let running = self.run.as_ref().is_some_and(|r| r.running.is_some());
+        (self.pi.is_some() && running).then(|| PiRun {
+            machine_id: self.machine_id.clone(),
+            run: self.run.take().expect("running"),
+            job_name: self.job_name.take(),
+        })
+    }
+
+    /// Follows again the tool run `take_pi_run` kept, connected back to the
+    /// same machine's Pi: its outcome, if it ended meanwhile, comes with the
+    /// Pi's snapshot.
+    pub fn resume_pi_run(&mut self, kept: PiRun) {
+        if self.pi.is_some() && kept.machine_id == self.machine_id {
+            (self.run, self.job_name) = (Some(kept.run), kept.job_name);
+        }
+    }
+
+    /// Ends the connection. The local controller disconnects the UC100
+    /// (left in E-stop); the link to the Pi just closes, never sending
+    /// Disconnect: the Pi keeps the UC100 and a running tool run goes on.
     pub fn close(self) {
-        let Connection { controller, .. } = self;
-        controller.send(Command::Disconnect);
-        controller.shutdown();
+        match self.driver {
+            Driver::Local(controller) => {
+                controller.send(Command::Disconnect);
+                controller.shutdown();
+            }
+            Driver::Remote(remote) => remote.shutdown(),
+        }
     }
 }
 
@@ -7708,7 +8113,7 @@ probe = { pin = 13, active_low = true }
         let raw = |c: &Connection, what: &str, ok: &dyn Fn(&Snapshot) -> bool| {
             let cap = Instant::now() + Duration::from_secs(60);
             loop {
-                let s = c.controller.snapshot();
+                let s = c.driver.snapshot();
                 if ok(&s) {
                     return s;
                 }

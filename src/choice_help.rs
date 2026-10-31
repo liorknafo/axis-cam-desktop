@@ -796,6 +796,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             )),
             "controller" if value == "UC100" => plain("AXIS CAM drives this machine itself through the UC100 driver: connect, reset and E-stop it on the Control page. G-code export is not offered for it.".to_string()),
             "uc100_connection" if value == "Simulated" => plain("Connect to a simulated UC100 inside AXIS CAM: the driver's controller, planner and checks run, but no hardware is opened and nothing moves. Its saved offsets and position are kept apart from the real machine's.".to_string()),
+            "uc100_connection" if value == crate::control::PI => plain("Connect to the UC100 on a Raspberry Pi running uc100-server, across the network. The Pi drives the machine: a tool run goes on if this computer sleeps, closes or loses Wi-Fi, and the Pi decides Stop after step. Pair once with the code `sudo uc100-server pair` shows. The Pi keeps the offsets.".to_string()),
             "uc100_connection" => plain("Connect to the real UC100 over USB (macOS). The machine starts in E-stop; press Reset on the Control page to enable it.".to_string()),
             "controller" if value == "LinuxCNC" => plain("LinuxCNC has a 3-axis postprocessor, which also indexes A on a machine with A around X (G0 A alone, never during a move). Export checks every setup and replays each program against the simulated moves before writing it.".to_string()),
             "controller" => plain(format!(

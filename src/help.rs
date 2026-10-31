@@ -4705,7 +4705,7 @@ mod tests {
                     "Custom",
                 ],
             ),
-            ("uc100_connection", vec!["USB", "Simulated"]),
+            ("uc100_connection", vec!["USB", "Simulated", crate::control::PI]),
             (
                 "arrangement",
                 vec![

@@ -2730,6 +2730,219 @@ flood = { pin = 8 }
         run_of(a).op_steps(1).expect("the Drill's holes").clone()
     }
 
+    /// A uc100-server on 127.0.0.1 running the driver's simulator, as the
+    /// Pi does its UC100, and `run_app`'s machine connecting to it across
+    /// the network, this computer paired with it.
+    fn pi_app(dir: &std::path::Path) -> (App, uc100_remote::Server) {
+        let server = uc100_remote::Server::start(uc100_remote::ServerOptions {
+            data: dir.join("pi"),
+            listen: "127.0.0.1:0".parse().unwrap(),
+        })
+        .unwrap();
+        let mut a = run_app(dir);
+        // The Pi runs its simulator: the profile asks it to.
+        let profile = dir.join("uc100.toml");
+        let text = std::fs::read_to_string(&profile).unwrap();
+        std::fs::write(&profile, text.replacen("[controller]", "[controller]\nsimulated = true", 1)).unwrap();
+        let _ = a.update(Message::MachineConnection(crate::control::PI));
+        let _ = a.update(Message::PiAddress(server.addr().to_string()));
+        let code = uc100_remote::data::Data { dir: dir.join("pi") }.new_code().unwrap();
+        let token = uc100_remote::RemoteController::pair(&server.addr().to_string(), &code, "Test Mac");
+        let _ = a.update(Message::PiPaired(token.map(|t| t.to_string())));
+        assert!(a.status.starts_with("Paired"), "{}", a.status);
+        (a, server)
+    }
+
+    /// The Pi's own snapshot: what its controller does, whatever this
+    /// computer is connected to.
+    fn pi_until(server: &uc100_remote::Server, secs: f64, what: &str, ok: impl Fn(&uc100::controller::Snapshot) -> bool) {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
+        loop {
+            if let Some(s) = server.snapshot()
+                && ok(&s)
+            {
+                return;
+            }
+            assert!(std::time::Instant::now() < end, "timed out waiting on the Pi for {what}: {:?}", server.snapshot().map(|s| s.state));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The owner's case: a tool run sent to the Pi goes on and finishes while
+    /// this computer is disconnected, and closing the link does not
+    /// disconnect the Pi's UC100 (no E-stop, no Disconnect). Connected again,
+    /// the run follows it and takes the tool run as done.
+    #[test]
+    fn a_tool_run_on_the_pi_finishes_with_this_computer_disconnected() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        assert!(conn(&a).pi.is_some());
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5.0, "the tool run running on the Pi", |s| s.state == Some(State::Run));
+        let _ = a.update(Message::Disconnect);
+        assert!(a.control.is_none() && a.pi_run.is_some(), "{}", a.status);
+        // The Pi carries on: still running a moment later, then done.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let s = server.snapshot().unwrap();
+        assert_eq!(s.state, Some(State::Run), "{:?}", s.log.iter().rev().take(5).collect::<Vec<_>>());
+        pi_until(&server, 60.0, "the tool run's end", |s| {
+            s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| o.ok)
+        });
+        // Connected again: the run takes the outcome the Pi kept.
+        let _ = a.update(Message::Connect);
+        run_until(&mut a, 10.0, "tool run 1 done", |r| r.done[0]);
+        assert!(run_of(&a).outcome.as_ref().unwrap().0);
+        // Closing never disconnected the UC100: the Pi's machine is still
+        // enabled and referenced.
+        let s = server.snapshot().unwrap();
+        assert_eq!(s.state, Some(State::Idle));
+        assert!(s.referenced[..3].iter().all(|r| *r), "an E-stop cleared the references");
+    }
+
+    /// Stop after step on the Pi: armed while the Drill drills, then this
+    /// computer disconnects at once. The Pi stops after a hole by itself,
+    /// over the stock; connected again, the run says which hole.
+    #[test]
+    fn the_pi_stops_after_a_step_with_this_computer_gone() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        let drill = drilling(&mut a);
+        let _ = a.update(Message::Run(R::StopAfterStep));
+        assert!(run_of(&a).stop_after, "{:?}", conn(&a).pi_note);
+        // Wait for the Pi to hold it armed, then leave.
+        let mut deadline = Deadline::new(5.);
+        loop {
+            let _ = a.update(Message::Tick);
+            let armed = conn(&a).link.as_ref().is_some_and(|l| matches!(l.stop_after, uc100_remote::wire::StopAfter::Armed { .. }));
+            if armed {
+                break;
+            }
+            assert!(deadline.within(&conn(&a).snapshot), "never armed: {:?}", conn(&a).pi_note);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = a.update(Message::Disconnect);
+        pi_until(&server, 60.0, "the Pi's stop", |s| {
+            s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| !o.ok)
+        });
+        let s = server.snapshot().unwrap();
+        assert!(s.work_pos[2] > 0.5, "the Pi stopped at work Z {}, in the stock", s.work_pos[2]);
+        assert!(s.log.iter().any(|l| l.contains("stopped")), "{:?}", s.log.iter().rev().take(6).collect::<Vec<_>>());
+        // Connected again: stopped after a hole, not done.
+        let _ = a.update(Message::Connect);
+        run_until(&mut a, 10.0, "the outcome", |r| r.running.is_none());
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(!ok && message.starts_with("Stopped after hole"), "{message}");
+        assert!(!run_of(&a).done[1]);
+        assert!(drill.steps.len() > 1);
+    }
+
+    /// A tool run lost on the way to the Pi (the link failed as it
+    /// crossed): it never runs and no outcome comes, so after a few seconds
+    /// with the link live it is put back, nothing having moved, and Cycle
+    /// Start can send it again.
+    #[test]
+    fn a_tool_run_lost_on_the_way_to_the_pi_is_put_back() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, _server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        a.control.as_mut().unwrap().lose_next_job = true;
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(run_of(&a).running.is_some());
+        let started = std::time::Instant::now();
+        run_until(&mut a, 10.0, "the lost tool run put back", |r| r.running.is_none());
+        assert!(started.elapsed() >= std::time::Duration::from_secs(3));
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(!ok && message.contains("did not reach the Pi"), "{message}");
+        assert_eq!(conn(&a).snapshot.state, Some(State::Idle));
+        assert!(!run_of(&a).done[0]);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(&mut a, 60.0, "tool run 1", |r| r.done[0]);
+    }
+
+    /// Another paired computer controls the Pi's machine: this one watches,
+    /// may not start a tool run, and takes control once the other gives it
+    /// up.
+    #[test]
+    fn a_computer_watching_the_pi_takes_control_when_it_is_free() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        let code = uc100_remote::data::Data { dir: dir.path().join("pi") }.new_code().unwrap();
+        let other_token = uc100_remote::RemoteController::pair(&server.addr().to_string(), &code, "Workshop PC").unwrap();
+        let cfg = conn_profile(dir.path());
+        let other = uc100_remote::RemoteController::start(cfg, &server.addr().to_string(), other_token);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while other.link().state != uc100_remote::LinkState::Controlling {
+            assert!(std::time::Instant::now() < end, "the other computer never got control");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = a.update(Message::Connect);
+        let mut deadline = Deadline::new(5.);
+        while !conn(&a).watching() {
+            let _ = a.update(Message::Tick);
+            assert!(deadline.within(&conn(&a).snapshot) || conn(&a).snapshot.status.is_none());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = a.view();
+        assert!(!conn(&a).manual());
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(problems(&a).iter().any(|p| p.contains("Take control")), "{:?}", problems(&a));
+        other.release_control();
+        let _ = a.update(Message::PiTakeControl);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !matches!(conn(&a).link.as_ref().map(|l| &l.state), Some(uc100_remote::LinkState::Controlling)) {
+            let _ = a.update(Message::Tick);
+            assert!(std::time::Instant::now() < end, "never took control: {:?}", conn(&a).link.as_ref().map(|l| &l.state));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        other.shutdown();
+    }
+
+    /// The profile `pi_app` wrote, as the other computer sends it.
+    fn conn_profile(dir: &std::path::Path) -> uc100::config::MachineConfig {
+        uc100::config::MachineConfig::load(&dir.join("uc100.toml")).unwrap()
+    }
+
+    /// Not paired, Connect says how to pair and connects nothing; the
+    /// pairing is kept on this computer (a file beside a test workspace)
+    /// and Forget removes it.
+    #[test]
+    fn connecting_to_the_pi_needs_a_pairing_this_computer_keeps() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        let _ = a.update(Message::MachineConnection(crate::control::PI));
+        let _ = a.update(Message::Connect);
+        assert!(a.control.is_none());
+        assert!(a.status.contains("sudo uc100-server pair"), "{}", a.status);
+        let _ = a.view();
+        let id = a.control_target().unwrap().id.clone();
+        let tokens = crate::control::PiTokens::of(&a.state_path, &id);
+        assert_eq!(tokens.paired(), Ok(false));
+        let token: uc100_remote::Token = format!("7:{}", "ab".repeat(32)).parse().unwrap();
+        let _ = a.update(Message::PiPaired(Ok(token.to_string())));
+        assert_eq!(tokens.paired(), Ok(true));
+        assert_eq!(tokens.load().unwrap().unwrap().to_string(), token.to_string());
+        let _ = a.view();
+        let _ = a.update(Message::PiPaired(Err("wrong code".into())));
+        assert!(a.status.contains("wrong code"));
+        let _ = a.update(Message::PiForget);
+        assert_eq!(tokens.paired(), Ok(false));
+    }
+
     /// Stop after step (LIO-275) armed while the Drill drills: the tool run
     /// stops once a hole is done, the tool over the stock, never in a hole;
     /// then Z goes up to the clearance plane and the spindle is off; where it
@@ -10640,18 +10853,18 @@ soft_max = 180.0
         a.page = Page::Control;
         a.machine_draft = a.doc.machines[0].clone();
         shows(&a, &["Real (USB)", "Simulated"]);
-        let _ = a.update(Message::MachineConnection(false));
+        let _ = a.update(Message::MachineConnection("USB"));
         assert!(!crate::control::simulated(&a.doc.machines[0]));
         assert!(!crate::control::simulated(&a.machine_draft));
         assert_eq!(a.doc.machines[0].version, 1, "not a planning change");
         assert!(a.control.is_none(), "choosing does not connect");
-        let _ = a.update(Message::MachineConnection(true));
+        let _ = a.update(Message::MachineConnection("Simulated"));
         assert!(crate::control::simulated(&a.doc.machines[0]));
         let _ = a.update(Message::Connect);
         assert!(conn(&a).simulated);
         // The way it is connected already keeps the connection.
         a.control.as_mut().unwrap().mdi = "G0 X1".into();
-        let _ = a.update(Message::MachineConnection(true));
+        let _ = a.update(Message::MachineConnection("Simulated"));
         assert_eq!(conn(&a).mdi, "G0 X1");
         // Connected, the switch is in the Machine tab.
         let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Machine));
@@ -10659,6 +10872,15 @@ soft_max = 180.0
             &a,
             &["Real (USB) disconnects the simulator and connects to the machine itself."],
         );
+        // Pi (network): the simulator disconnected, its address and pairing
+        // offered, nothing connected until this computer is paired.
+        let _ = a.update(Message::MachineConnection(crate::control::PI));
+        assert!(a.control.is_none());
+        assert_eq!(crate::control::pi(&a.doc.machines[0]), Some(crate::control::PI_DEFAULT));
+        assert_eq!(crate::control::pi(&a.machine_draft), Some(crate::control::PI_DEFAULT));
+        assert!(a.status.contains("sudo uc100-server pair"), "{}", a.status);
+        shows(&a, &["Pi (network)", "Pi address", "Code"]);
+        lacks(&a, &["Connect"]);
     }
 
     #[test]
