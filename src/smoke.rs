@@ -2805,6 +2805,44 @@ flood = { pin = 8 }
         assert!(s.referenced[..3].iter().all(|r| *r), "an E-stop cleared the references");
     }
 
+    /// AXIS CAM closed and opened again while a tool run cuts on the Pi: it
+    /// follows nothing, but the run bar's Hold, Resume and Stop now act on
+    /// the Pi's machine.
+    #[test]
+    fn hold_and_stop_work_on_a_pi_tool_run_this_computer_did_not_follow() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5.0, "running on the Pi", |s| s.state == Some(State::Run));
+        let _ = a.update(Message::Disconnect);
+        // As after a restart: the run is gone from this computer.
+        a.pi_run = None;
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 5.0, "the Pi running, seen again", |s| s.state == Some(State::Run));
+        assert!(conn(&a).run.is_none());
+        let _ = a.update(Message::Resized(iced::Size::new(1440., 900.)));
+        let clicks = crate::ui::probe::clicks(crate::ui::run_bar(&a, conn(&a)), iced::Size::new(1440., 200.));
+        for want in [R::Hold, R::Stop] {
+            assert!(
+                clicks.iter().any(|m| matches!(m, Message::Run(r) if std::mem::discriminant(r) == std::mem::discriminant(&want))),
+                "{want:?} not offered: {clicks:?}"
+            );
+        }
+        let _ = a.update(Message::Run(R::Hold));
+        pi_until(&server, 10.0, "Hold on the Pi", |s| s.state == Some(State::Hold));
+        tick_until(&mut a, 5.0, "Hold seen", |s| s.state == Some(State::Hold));
+        let _ = a.update(Message::Run(R::Resume));
+        pi_until(&server, 10.0, "running again", |s| s.state == Some(State::Run));
+        tick_until(&mut a, 5.0, "Run seen", |s| s.state == Some(State::Run));
+        let _ = a.update(Message::Run(R::Stop));
+        pi_until(&server, 10.0, "stopped on the Pi", |s| s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| !o.ok));
+    }
+
     /// Stop after step on the Pi: armed while the Drill drills, then this
     /// computer disconnects at once. The Pi stops after a hole by itself,
     /// over the stock; connected again, the run says which hole.
@@ -2921,7 +2959,18 @@ flood = { pin = 8 }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let _ = a.view();
-        assert!(!conn(&a).manual());
+        assert!(!conn(&a).manual() && !conn(&a).idle());
+        // Nothing manual reaches the Pi, and the feed shown is the Pi's.
+        let _ = a.update(Message::Machine(crate::control::Action::MachineZero(None)));
+        let _ = a.update(Message::Machine(crate::control::Action::FeedOverride(50.)));
+        assert!(conn(&a).pi_note.as_ref().is_some_and(|n| n.contains("Take control")), "{:?}", conn(&a).pi_note);
+        for _ in 0..20 {
+            let _ = a.update(Message::Tick);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let s = server.snapshot().unwrap();
+        assert!(!s.referenced[0] && s.feed_override == 1.0, "{:?} {}", s.referenced, s.feed_override);
+        assert_eq!(conn(&a).feed_override, 100.);
         let _ = a.update(Message::Run(R::Setup(0)));
         answer_skips(&mut a, 0);
         assert!(problems(&a).iter().any(|p| p.contains("Take control")), "{:?}", problems(&a));

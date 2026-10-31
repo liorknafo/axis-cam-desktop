@@ -7718,10 +7718,16 @@ fn connect_controls(app: &App) -> Column<'_, Message> {
             container(
                 column![
                     bold(format!("Switch to {}?", to.name()), 14),
-                    muted(format!(
-                        "This disconnects from {from} (it is left in E-stop) and connects to {}.",
-                        to.name()
-                    ))
+                    muted(match c.pi {
+                        Some(_) => format!(
+                            "This closes the link to the Pi of {from} (a tool run there goes on; Hold and Stop it from here once connected back) and connects to {}.",
+                            to.name()
+                        ),
+                        None => format!(
+                            "This disconnects from {from} (it is left in E-stop) and connects to {}.",
+                            to.name()
+                        ),
+                    })
                     .size(13),
                     row![
                         primary("Disconnect and switch", Message::SwitchMachine(true)),
@@ -8243,9 +8249,11 @@ pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
     });
     let pad = if fit.short { [8, 10] } else { [11, 14] };
     let big = |label: &str, m: Option<Message>| act_with(label.to_string(), m, false, None, pad);
-    let hold = msg(run.is_some() && state == Some(&State::Run), R::Hold);
+    // Hold, Resume and Stop act on the machine, a tool run followed or not
+    // (after reconnecting to a Pi that runs one); a watcher holds and stops.
+    let hold = msg(state == Some(&State::Run) && !c.pi_down(), R::Hold);
     let resume = msg(
-        run.is_some() && matches!(state, Some(State::Hold | State::Paused(_))),
+        matches!(state, Some(State::Hold | State::Paused(_))) && c.in_control(),
         R::Resume,
     );
     let mut buttons = row![cycle_start(
@@ -8292,7 +8300,7 @@ pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
         .push(after)
         .push(big(
             "Stop now",
-            msg(run.is_some() && crate::run::busy(state), R::Stop),
+            msg(crate::run::busy(state) && !c.pi_down(), R::Stop),
         ));
     container(
         row![picker, what, buttons]
@@ -8918,9 +8926,9 @@ fn spindle_card(
             .font(Font::MONOSPACE)
             .width(48),
         help::wrap(
-            slider(10.0..=200.0, c.feed_override, |v| Message::Machine(
-                Action::FeedOverride(v)
-            ))
+            slider(10.0..=200.0, c.feed_override, move |v| {
+                Message::Machine(Action::FeedOverride(if c.in_control() { v } else { c.feed_override }))
+            })
             .step(5.0_f32),
             help::command(
                 &Message::Machine(Action::FeedOverride(100.)),
@@ -8930,7 +8938,7 @@ fn spindle_card(
         ),
         small(
             "100 %",
-            Some(Message::Machine(Action::FeedOverride(100.))),
+            c.in_control().then_some(Message::Machine(Action::FeedOverride(100.))),
             false
         ),
     ]

@@ -2805,6 +2805,12 @@ impl Connection {
         self.link.as_ref().is_some_and(|l| !l.live)
     }
 
+    /// This computer may command the machine: always over USB and on the
+    /// simulator; on the Pi, in control with the link answering.
+    pub fn in_control(&self) -> bool {
+        !self.pi_down() && !self.watching()
+    }
+
     /// Another computer controls the Pi's machine: this one watches, and
     /// may only E-stop, hold and stop.
     pub fn watching(&self) -> bool {
@@ -2832,6 +2838,11 @@ impl Connection {
                 self.notes_seen = link.note_seq;
             }
             self.link = Some(link);
+            // The Pi's feed override, whatever this computer asked (none
+            // before its first snapshot).
+            if self.snapshot.feed_override > 0. {
+                self.feed_override = (self.snapshot.feed_override * 100.) as f32;
+            }
         }
         self.observe();
     }
@@ -2885,7 +2896,11 @@ impl Connection {
         self.edges_step();
         self.routine_step();
         self.turning_step();
-        // Stopped after a step: Z up to the clearance plane, once Idle.
+        // Stopped after a step: Z up to the clearance plane, once Idle; on
+        // the Pi only while in control then, never later by surprise.
+        if !self.in_control() {
+            self.z_up = None;
+        }
         if self.idle()
             && let Some(z) = self.z_up.take()
         {
@@ -2975,6 +2990,33 @@ impl Connection {
 
     /// Does what the page asks, if the machine can; otherwise nothing.
     pub fn act(&mut self, action: Action) {
+        // On the Pi, only the computer in control commands the machine;
+        // fields, selections and E-stop (MachineEStop) stay.
+        let local_only = matches!(
+            action,
+            Action::JogStep(_)
+                | Action::JogAngle(_)
+                | Action::JogSpeed(_)
+                | Action::JogRelease
+                | Action::WorkText(..)
+                | Action::MoveTo(_)
+                | Action::TargetText(..)
+                | Action::Rpm(_)
+                | Action::MdiText(_)
+                | Action::CalAxis(_)
+                | Action::CalDistance(_)
+                | Action::CalMeasured(_)
+                | Action::BarText(_)
+                | Action::SpacingText(_)
+        );
+        if !local_only && !self.in_control() {
+            self.pi_note = Some(if self.pi_down() {
+                "Not sent: the link to the Pi is not answering.".into()
+            } else {
+                "Not sent: another computer controls the machine. Take control first.".into()
+            });
+            return;
+        }
         match action {
             Action::Home if self.idle() && self.home_switches() => self.send(Command::Home(vec![])),
             Action::MachineZero(axis) if self.idle() => {
@@ -3231,10 +3273,22 @@ impl Connection {
             }
             return;
         }
+        // Hold, Resume and Stop act on the machine, followed or not: after
+        // reconnecting to a Pi that runs a tool run, and for a watcher
+        // (E-stop, Hold and Stop only).
+        let state = self.snapshot.state.clone();
+        match action {
+            R::Hold if state == Some(State::Run) => return self.send(Command::FeedHold),
+            R::Resume if matches!(state, Some(State::Hold | State::Paused(_))) && self.in_control() => {
+                return self.send(Command::Resume);
+            }
+            R::Stop if crate::run::busy(state.as_ref()) => return self.send(Command::Stop),
+            R::Hold | R::Resume | R::Stop => return,
+            _ => {}
+        }
         let Some(mut run) = self.run.take() else {
             return;
         };
-        let state = self.snapshot.state.clone();
         match action {
             // A probe under way sets the work zero for the start it began with.
             R::Next(i) if i < run.done.len() && !self.probing() => run.start_at(i, 0),
@@ -3282,11 +3336,6 @@ impl Connection {
                     }
                 }
             }
-            R::Hold if state == Some(State::Run) => self.send(Command::FeedHold),
-            R::Resume if matches!(state, Some(State::Hold | State::Paused(_))) => {
-                self.send(Command::Resume)
-            }
-            R::Stop if crate::run::busy(state.as_ref()) => self.send(Command::Stop),
             R::RecordReference if self.manual() => {
                 run.record_reference(self, self.snapshot.work_pos[2])
             }
@@ -4942,6 +4991,7 @@ impl Connection {
     /// Idle, and no probing routine is between two of its moves.
     pub fn idle(&self) -> bool {
         self.snapshot.state == Some(State::Idle)
+            && self.in_control()
             && self.edges.is_none()
             && self.routine.is_none()
             && self.turning.is_none()
@@ -4950,8 +5000,7 @@ impl Connection {
     /// Jog, work zero, MDI and the spindle are allowed: Idle, or paused in a program.
     pub fn manual(&self) -> bool {
         matches!(self.snapshot.state, Some(State::Idle | State::Paused(_)))
-            && !self.pi_down()
-            && !self.watching()
+            && self.in_control()
             && self.edges.is_none()
             && self.routine.is_none()
             && self.turning.is_none()
