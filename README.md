@@ -840,8 +840,8 @@ Once the machine is Idle, the Control page has everything needed before a job:
   Enter in the field sets it too. **Zero all**; **Go to X0 Y0** rapids X and
   Y to the work zero, Z up first: with the tool under the stock top of the
   setup picked in the run bar, Z rises to that top first and stays there;
-  otherwise Z stays where it is (it needs X, Y and Z referenced and the
-  machine Idle). **G54–G59** pick the coordinate system
+  otherwise Z stays where it is (it needs the machine Idle; without a
+  machine position the soft limits are off for it). **G54–G59** pick the coordinate system
   (while Idle). Setting Z by any of them counts as touching Z off for the
   tool run.
 - **Move to.** **Move to…** on the Position card puts a target field and
@@ -853,14 +853,15 @@ Once the machine is Idle, the Control page has everything needed before a job:
   stock top of the setup picked, then X and Y (and A) move, then Z goes down
   to its target; an axis left empty stays where it is. **X0 Y0** and **Z
   top** (the top of Z's travel, its soft maximum) beside it are one-click
-  presets. Every point of a Go is checked against the soft limits before
-  anything moves. With the tool under the stock top of the setup picked,
+  presets. Every point of a Go is checked against the soft limits of each
+  axis with a machine position before anything moves. With the tool under the stock top of the setup picked,
   **Go X**, **Go Y** and **Go A** alone are refused (raise Z first, or use
   the Go of every axis). A refusal says why in the status line and nothing
   moves. Enter in a target field keeps the value and never moves the
   machine: only a click on a Go does. The Gos are greyed, with why on hover,
-  unless the machine is Idle and every axis with a soft limit, and each axis
-  the Go moves, has a machine position.
+  unless the machine is Idle. Before machine zero X, Y and Z Go with the
+  soft limits off, as Cycle Start runs then; A and **Z top** wait for a
+  machine position.
 - **Probe Z.** With a touch plate: set its **thickness** (measure it), the
   **probe feed**, the **maximum probe distance** and the **retract** in the
   Machine library, on the machine's UC100 step. Put the plate on the stock top

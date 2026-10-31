@@ -8493,7 +8493,7 @@ fn position_card(c: &crate::control::Connection, fit: Fit) -> Element<'_, Messag
     // move; a target that cannot be gone to is refused on the click, in
     // the status line (`Connection::go_to`).
     let go_button = |label: String, go: Go, width: Option<Length>| {
-        let ready = c.go_ready(&c.go_axes(go)).and_then(|()| match go {
+        let ready = c.go_ready(go).and_then(|()| match go {
             Go::Axis(a) if c.targets[a].trim().is_empty() => {
                 Err(format!("Type the work {} to go to first.", AXES[a]))
             }

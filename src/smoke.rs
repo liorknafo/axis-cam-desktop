@@ -9160,7 +9160,7 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::CycleStart));
         tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
         assert_eq!(
-            conn(&a).go_ready(&[0]),
+            conn(&a).go_ready(Go::Axis(0)),
             Err("The machine is not Idle.".to_string())
         );
         let _ = a.update(Message::Machine(Action::GoTo(Go::Axis(0))));
@@ -9192,6 +9192,36 @@ flood = { pin = 8 }
         assert_eq!(conn(&a).snapshot.machine_pos, held);
         let _ = a.update(Message::Run(R::Stop));
         run_until(&mut a, 5.0, "the stop", |r| r.running.is_none());
+    }
+
+    /// Before machine zero (LIO-340) X, Y and Z Go with their soft limits
+    /// off, as Cycle Start runs: a target past them is not refused nor cut
+    /// short. Z top, whose target is the soft maximum, waits for machine Z.
+    #[test]
+    fn move_to_goes_before_machine_zero_with_the_soft_limits_off() {
+        use crate::control::{Action, Go};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        idle(&mut a);
+        assert!(!conn(&a).snapshot.referenced[..3].iter().any(|r| *r));
+        let _ = a.update(Message::Machine(Action::MoveTo(true)));
+        // Machine X −50 is past X's soft minimum of 0.
+        let to = [-50., 20., -5.];
+        for (axis, v) in to.iter().enumerate() {
+            let _ = a.update(Message::Machine(Action::TargetText(axis, v.to_string())));
+        }
+        let offered = go_clicks(&a);
+        for g in [Go::Axis(0), Go::All, Go::WorkXY0] {
+            assert!(offered.contains(&g), "{g:?} not offered: {offered:?}");
+        }
+        assert!(!offered.contains(&Go::ZTop), "{offered:?}");
+        assert!(conn(&a).go_ready(Go::ZTop).unwrap_err().contains("Z needs"));
+        let _ = a.update(Message::Machine(Action::GoTo(Go::All)));
+        assert!(a.status.is_empty(), "{}", a.status);
+        tick_until(&mut a, 5.0, "at the targets", |s| {
+            s.state == Some(State::Idle) && (0..3).all(|i| (s.work_pos[i] - to[i]).abs() < 1e-3)
+        });
     }
 
     /// Picking another setup in the Run strip while a probe is under way
