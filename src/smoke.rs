@@ -9224,6 +9224,55 @@ flood = { pin = 8 }
         });
     }
 
+    /// Before machine zero (LIO-341) the Work zero tab says why Move there
+    /// waits and offers Set machine zero here beside it; once pressed, the
+    /// note is gone and Move there goes.
+    #[test]
+    fn work_zero_says_move_there_waits_for_machine_zero_and_offers_it() {
+        use crate::control::Action;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        idle(&mut a);
+        check_run(&mut a, 0);
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        let waits = |a: &App| {
+            page_texts(a)
+                .iter()
+                .any(|t| t.starts_with("Move there waits for machine zero"))
+        };
+        let clicks = |a: &App| {
+            let area = iced::Rectangle::new(iced::Point::ORIGIN, WINDOW);
+            crate::ui::probe::clicks_in(a.view(), WINDOW, area, 5.)
+        };
+        assert!(waits(&a), "{:?}", page_texts(&a));
+        let zero = clicks(&a)
+            .into_iter()
+            .find(|m| matches!(m, Message::Machine(Action::MachineZero(None))));
+        let moves =
+            |a: &App| (clicks(a).iter()).any(|m| matches!(m, Message::Machine(Action::ToSimZero)));
+        assert!(!moves(&a));
+        let _ = a.update(zero.expect("Set machine zero here on the Work zero tab"));
+        // ponytail: pressed again while an axis stays unset (LIO-163).
+        for _ in 0..5 {
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while !conn(&a).unset_limited_axes().is_empty() && std::time::Instant::now() < end {
+                let _ = a.update(Message::Tick);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if conn(&a).unset_limited_axes().is_empty() {
+                break;
+            }
+            let _ = a.update(Message::Machine(Action::MachineZero(None)));
+        }
+        assert!(
+            conn(&a).unset_limited_axes().is_empty(),
+            "{:?}",
+            conn(&a).snapshot.log
+        );
+        assert!(!waits(&a), "{:?}", page_texts(&a));
+        assert!(moves(&a));
+    }
+
     /// Picking another setup in the Run strip while a probe is under way
     /// is refused, in the handler and on the buttons (`setup_locked`): the
     /// probe sets the work zero of the setup it started with, on that
