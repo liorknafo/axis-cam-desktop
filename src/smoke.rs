@@ -3081,6 +3081,16 @@ flood = { pin = 8 }
         answer_skips(&mut a, 0);
         assert!(problems(&a).iter().any(|p| p.contains("Take control")), "{:?}", problems(&a));
         other.release_control();
+        // As the page shows it: nobody controls, then Take control.
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !matches!(
+            conn(&a).link.as_ref().map(|l| &l.state),
+            Some(uc100_remote::LinkState::Watching { holder: None })
+        ) {
+            let _ = a.update(Message::Tick);
+            assert!(std::time::Instant::now() < end, "the other never let go: {:?}", conn(&a).link.as_ref().map(|l| &l.state));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let _ = a.update(Message::PiTakeControl);
         let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !matches!(conn(&a).link.as_ref().map(|l| &l.state), Some(uc100_remote::LinkState::Controlling)) {
