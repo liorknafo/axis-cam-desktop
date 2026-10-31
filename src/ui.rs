@@ -9231,13 +9231,21 @@ fn job_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, M
     col.into()
 }
 /// The machine's travel and the tool in it, for the Job tab.
-fn machine_model<'a>(
+pub(crate) fn machine_model<'a>(
     app: &'a App,
     c: &'a crate::control::Connection,
 ) -> crate::machine_view::MachineView {
     let s = &c.snapshot;
-    let (envelope, assumed) = crate::machine_view::MachineView::envelope(&c.config);
+    // The library's machine, as saved: the model follows its travel and
+    // clearances as soon as they are changed (LIO-342).
+    let machine = app.doc.machines.iter().find(|m| m.id == c.machine_id);
+    let figures = machine.map_or(
+        crate::machine_view::Figures::JINGYAN,
+        crate::machine_view::Figures::of,
+    );
+    let (envelope, assumed) = crate::machine_view::MachineView::envelope(&c.config, figures.travel);
     crate::machine_view::MachineView {
+        figures,
         pos: [
             s.machine_pos[0] as f32,
             s.machine_pos[1] as f32,
@@ -9251,9 +9259,7 @@ fn machine_model<'a>(
             .map(|(lo, hi)| [lo.map(|v| v as f32), hi.map(|v| v as f32)]),
         zero: std::array::from_fn(|k| s.work_offset[k] as f32),
         rotary: c.rotary.as_ref().filter(|_| c.axis(3)).map(|r| {
-            let sign = (app.doc.machines.iter())
-                .find(|m| m.id == c.machine_id)
-                .map_or(1., crate::indexed::sign);
+            let sign = machine.map_or(1., crate::indexed::sign);
             crate::chuck::Rig::on_machine(r.unit, sign)
         }),
         a: s.machine_pos[3] as f32,

@@ -983,15 +983,26 @@ Once the machine is Idle, the Control page has everything needed before a job:
 - **Overrides.** Feed override 10–200 %; **Override limit switches** when the
   profile has any.
 - **MDI.** One G-code line, sent with Enter or **Send**.
-- **The machine.** A model of the CNC4030 (gantry, carriage, spindle, T-slot
-  table) moves with the live position, with the tool-tip travel box from the
-  soft limits, the simulator's block, and a green ring at the active work
-  zero once the machine position is set; drag to turn it. It is amber until
-  the machine position is set. When the profile lacks soft limits on X, Y or
-  Z, the box is the assumed travel instead, drawn dashed and captioned
-  "travel not configured", whether or not the position is set. Its dimensions are **assumed** from a similar machine's spec sheet,
-  as are the JY5800 profile's soft limits (travel 390 × 280 × 55 mm): measure
-  the machine and correct both (`src/machine_view.rs`, the driver profile).
+- **The machine.** A model of a gantry router shaped like the CNC4030 (base,
+  rails, T-slot table, gantry side plates and beam, carriage, Z plate,
+  clamped spindle, stepper motors) moves with the live position, with the
+  tool-tip travel box from the soft limits, the simulator's block standing on
+  a vise's body, and a green ring at the active work zero once the machine
+  position is set; drag to turn it. It is amber until the machine position is
+  set. It is drawn to the connected machine's figures in the machine library
+  (Travel & spindle): the table reaches 70 mm past the X travel and 20 mm
+  past the Y travel each side, the spindle nose stands **Spindle nose to
+  table at Z top** over it, the beam **Gantry clearance height**, and the
+  side plates stand beside the table, **Gantry clearance width** apart when
+  that is wider. A change shows as soon as the machine is saved. The
+  Jingyan's numbers stand in for any figure the machine does not give. The
+  footer names the travel. When the profile lacks soft limits on X, Y or Z,
+  the box is the machine's travel from machine zero instead, drawn dashed and
+  captioned "travel not configured", whether or not the position is set. The
+  shipped Jingyan's figures are **assumed** from a similar machine's spec
+  sheet, as are the JY5800 profile's soft limits (travel 390 × 280 × 55 mm):
+  measure the machine and correct both (the machine library, the driver
+  profile).
 
 **Controller configuration** (beside **Control** in the MACHINE toolbar) does
 the commissioning work that needed the driver's egui app or a text editor:

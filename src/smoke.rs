@@ -8105,6 +8105,7 @@ flood = { pin = 8 }
             (30., "4-machine-rotary-a30.png"),
         ] {
             let view = crate::machine_view::MachineView {
+                figures: crate::machine_view::Figures::JINGYAN,
                 pos: [150., 120., -10.],
                 known: true,
                 envelope: [[0., 0., -55.], [390., 280., 0.]],
@@ -8215,6 +8216,7 @@ flood = { pin = 8 }
             (90., "4-machine-a90.png"),
         ] {
             let view = crate::machine_view::MachineView {
+                figures: crate::machine_view::Figures::JINGYAN,
                 pos,
                 known: true,
                 envelope: [[0., 0., -55.], [390., 280., 0.]],
@@ -8223,6 +8225,49 @@ flood = { pin = 8 }
                 zero: machine_zero,
                 rotary: Some(rig.clone()),
                 a: angle,
+            };
+            let element: iced::Element<'_, Message> = iced::widget::canvas(view)
+                .width(iced::Fill)
+                .height(iced::Fill)
+                .into();
+            render_element(element, iced::Size::new(900., 640.), &out.join(name));
+        }
+    }
+    /// LIO-342: the machine view on the library CNC4030, plain and with its
+    /// rotary unit, and on a bigger machine: 600 × 400 × 100 mm of travel,
+    /// the nose 220 mm over the table, the gantry 180 mm high, 700 wide.
+    #[test]
+    #[ignore]
+    fn render_the_machine_view() {
+        use crate::machine_view::Figures;
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/machine-view-renders".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let mut m = Machine::new(4);
+        m.fill_rotary_defaults();
+        let rig = crate::chuck::Rig::on_machine(m.rotary_unit().unwrap(), 1.);
+        let big = Figures {
+            travel: [600., 400., 100.],
+            nose_to_table: 220.,
+            gantry: [180., 700.],
+        };
+        for (figures, rotary, name) in [
+            (Figures::JINGYAN, None, "plain.png"),
+            (Figures::JINGYAN, Some(rig), "rotary.png"),
+            (big, None, "bigger.png"),
+        ] {
+            let [x, y, z] = figures.travel;
+            let view = crate::machine_view::MachineView {
+                figures,
+                pos: [150., 120., -10.],
+                known: true,
+                envelope: [[0., 0., -z], [x, y, 0.]],
+                assumed: false,
+                block: Some([[100., 80., -50.], [220., 170., -30.]]),
+                zero: [100., 80., -30.],
+                rotary,
+                a: 30.,
             };
             let element: iced::Element<'_, Message> = iced::widget::canvas(view)
                 .width(iced::Fill)
@@ -9913,6 +9958,42 @@ flood = { pin = 8 }
         }
     }
 
+    /// LIO-342: the Control page's model is drawn to the connected
+    /// machine's travel and clearances in the library, and follows them as
+    /// soon as the machine is saved; with no soft limits its box is that
+    /// travel.
+    #[test]
+    fn the_machine_model_follows_the_library_machines_travel() {
+        use crate::machine_view::Figures;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), UNLIMITED);
+        idle(&mut a);
+        let model = |a: &App| crate::ui::machine_model(a, conn(a));
+        let before = model(&a);
+        assert_eq!(before.figures, Figures::of(&a.doc.machines[0]));
+        assert_eq!(before.figures.travel, [600., 400., 300.]);
+        assert!(before.assumed);
+        assert_eq!(before.envelope, [[0., 0., -300.], [600., 400., 0.]]);
+        // The operator corrects the travel and the clearances and saves.
+        a.machine_draft = a.doc.machines[0].clone();
+        for (k, v) in [
+            ("x", "420"),
+            ("y", "310"),
+            ("z", "80"),
+            ("nose_to_table", "200"),
+            ("gantry_height", "140"),
+        ] {
+            a.machine_draft.p.insert(k.into(), v.into());
+        }
+        let _ = a.update(Message::SaveMachine);
+        assert_eq!(a.status.split(' ').next(), Some("Machine"), "{}", a.status);
+        let after = model(&a);
+        assert_eq!(after.figures.travel, [420., 310., 80.]);
+        assert_eq!(after.figures.nose_to_table, 200.);
+        assert_eq!(after.figures.gantry[0], 140.);
+        assert_eq!(after.envelope, [[0., 0., -80.], [420., 310., 0.]]);
+    }
+
     #[test]
     fn a_profile_with_no_soft_limits_gets_the_same_amber_warning_and_an_assumed_box() {
         use crate::machine_view::{Caption, MachineView};
@@ -9922,9 +10003,11 @@ flood = { pin = 8 }
             let a = profile_app(dir.path(), text);
             crate::control::profile(&a.doc.machines[0]).unwrap()
         };
+        let figures = crate::machine_view::Figures::JINGYAN;
         let view = |c: &uc100::config::MachineConfig, known: bool| {
-            let (envelope, assumed) = MachineView::envelope(c);
+            let (envelope, assumed) = MachineView::envelope(c, figures.travel);
             MachineView {
+                figures,
                 pos: [0.; 3],
                 known,
                 envelope,
@@ -9974,7 +10057,13 @@ flood = { pin = 8 }
             some.soft_limits_configured(),
             "the driver's any-axis meaning"
         );
-        assert!(MachineView::envelope(&some).1, "the assumed travel");
+        assert!(
+            MachineView::envelope(&some, figures.travel).1,
+            "the assumed travel"
+        );
+        // The assumed box is the machine library's travel (LIO-342).
+        let (envelope, _) = MachineView::envelope(&none, [600., 400., 90.]);
+        assert_eq!(envelope, [[0., 0., -90.], [600., 400., 0.]]);
         let other = tempfile::tempdir().unwrap();
         let mut a = profile_app(other.path(), &partial);
         idle(&mut a);

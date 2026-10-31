@@ -1,31 +1,69 @@
-//! The machine on the Control page: a flat-shaded model of the Jingyan
-//! CNC4030 that moves with the controller's machine position. Its own small
-//! canvas, drawn from scratch each frame (under 200 polygons), not the Work
-//! page's viewport.
+//! The machine on the Control page: a flat-shaded model of a gantry router
+//! shaped like the Jingyan CNC4030, drawn to the machine library's travel and
+//! clearances, that moves with the controller's machine position. Its own
+//! small canvas, drawn from scratch each frame (a few hundred polygons), not
+//! the Work page's viewport.
 use crate::Message;
 use iced::{Color, Point, Rectangle, Renderer, Size, Theme, mouse, widget::canvas};
 
-// ASSUMED (LIO-47) from a similar 800 W CNC4030's spec sheet, NOT measured on
-// the machine: measure it and correct these; nothing else here holds machine
-// dimensions. World coordinates are the tool tip's machine coordinates in mm:
-// machine zero is X at the left end, Y at the front end, Z at the top.
-/// Travel X × Y × Z (Z −55…0).
-pub const TRAVEL: [f32; 3] = [390., 280., 55.];
-/// The T-slot table, X × Y; the travel is centred on it.
-const TABLE: [f32; 2] = [530., 320.];
-/// Table top to the underside of the gantry beam.
-const BEAM_CLEARANCE: f32 = 70.;
-/// Table top to the tool tip at Z top, with the nominal tool.
-const TIP_HEIGHT: f32 = 60.;
+// World coordinates are the tool tip's machine coordinates in mm: machine
+// zero is X at the left end, Y at the front end, Z at the top. The sizes
+// below are the parts the machine library does not give (LIO-47, ASSUMED
+// from a similar 800 W CNC4030); `Figures` holds the ones it does.
+/// How far the T-slot table reaches past the X and the Y travel, each side.
+const TABLE_OVER: [f32; 2] = [70., 20.];
 /// Spindle body diameter and length, without a rotary unit (with one, its
 /// machine's spindle nose, `model::NOSE_DEFAULT` assumed).
 const SPINDLE: [f32; 2] = [65., 185.];
 /// Nominal tool: diameter and length below the collet nut.
 const TOOL: [f32; 2] = [6., 30.];
+/// The collet nut's length.
+const NUT: f32 = 14.;
+/// A stepper motor's square, and its length.
+const MOTOR: [f32; 2] = [57., 60.];
+
+/// The machine's figures the model is drawn to, mm: the X, Y and Z travel,
+/// the spindle nose over the table at Z top, and the gantry's clearance
+/// height and width (`envelope::FIGURES`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Figures {
+    pub travel: [f32; 3],
+    pub nose_to_table: f32,
+    pub gantry: [f32; 2],
+}
+
+impl Figures {
+    /// The shipped Jingyan CNC4030's, ASSUMED (`envelope::jingyan`).
+    pub const JINGYAN: Figures = Figures {
+        travel: [390., 280., 55.],
+        nose_to_table: 160.,
+        gantry: [120., 390.],
+    };
+
+    /// Machine `m`'s figures, the Jingyan's for any it does not give.
+    pub fn of(m: &crate::model::Machine) -> Self {
+        let j = Self::JINGYAN;
+        let f = |key, or| crate::envelope::clearance(m, key).map_or(or, |c| c.0);
+        Figures {
+            travel: [
+                f("x", j.travel[0]),
+                f("y", j.travel[1]),
+                f("z", j.travel[2]),
+            ],
+            nose_to_table: f("nose_to_table", j.nose_to_table),
+            gantry: [
+                f("gantry_height", j.gantry[0]),
+                f("gantry_width", j.gantry[1]),
+            ],
+        }
+    }
+}
 
 /// The model for one frame: where the tool tip is, whether the machine
 /// position is set, and the box the tool tip may travel in.
 pub struct MachineView {
+    /// The machine's sizes.
+    pub figures: Figures,
     pub pos: [f32; 3],
     pub known: bool,
     /// The tool-tip travel box: the profile's soft limits when X, Y and Z
@@ -61,16 +99,19 @@ pub enum Caption {
 }
 
 impl MachineView {
-    /// The travel box from the profile's soft limits, or the assumed travel,
-    /// and whether it is the assumed one.
-    pub fn envelope(config: &uc100::config::MachineConfig) -> ([[f32; 3]; 2], bool) {
+    /// The travel box from the profile's soft limits, or the machine's
+    /// `travel` (X, Y, Z) from machine zero, and whether it is the latter.
+    pub fn envelope(
+        config: &uc100::config::MachineConfig,
+        travel: [f32; 3],
+    ) -> ([[f32; 3]; 2], bool) {
         let limit = |a: usize| {
             let x = config.axes.get(a)?;
             Some((x.soft_min? as f32, x.soft_max? as f32))
         };
         match (limit(0), limit(1), limit(2)) {
             (Some(x), Some(y), Some(z)) => ([[x.0, y.0, z.0], [x.1, y.1, z.1]], false),
-            _ => ([[0., 0., -TRAVEL[2]], [TRAVEL[0], TRAVEL[1], 0.]], true),
+            _ => ([[0., 0., -travel[2]], [travel[0], travel[1], 0.]], true),
         }
     }
 
@@ -103,17 +144,20 @@ impl MachineView {
     }
 }
 
-/// One flat polygon. Layer 0 is the base and table, drawn first: with the
-/// view always from above, everything else stands on them. Layer 1 is the
-/// table's slots, layer 2 the rest, each sorted far to near.
+/// One flat polygon. Layer 0 is the base, drawn first, then layer 1, the
+/// table and the rails on it: with the view always from above, everything
+/// else stands on them. Layer 2 is the table's slots, layer 3 the rest,
+/// each sorted far to near.
 struct Face {
     pts: Vec<[f32; 3]>,
     normal: [f32; 3],
     color: Color,
     layer: u8,
-    /// Which part it belongs to, for the tests.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Which part it belongs to.
     part: &'static str,
+    /// Its edges are drawn: not between a cylinder's sides or the beam's
+    /// pieces, which would show as seams.
+    outline: bool,
 }
 
 fn boxed(
@@ -145,11 +189,12 @@ fn boxed(
             color,
             layer,
             part,
+            outline: true,
         });
     }
 }
 
-/// An upright cylinder of 16 sides.
+/// An upright cylinder of 24 sides.
 fn cylinder(
     faces: &mut Vec<Face>,
     at: [f32; 2],
@@ -158,7 +203,7 @@ fn cylinder(
     color: Color,
     part: &'static str,
 ) {
-    const N: usize = 16;
+    const N: usize = 24;
     let ring = |i: usize, z: f32| {
         let a = i as f32 * std::f32::consts::TAU / N as f32;
         [at[0] + radius * a.cos(), at[1] + radius * a.sin(), z]
@@ -174,8 +219,9 @@ fn cylinder(
             ],
             normal: [a.cos(), a.sin(), 0.],
             color,
-            layer: 2,
+            layer: 3,
             part,
+            outline: false,
         });
     }
     for (z, normal) in [(z[0], [0., 0., -1.]), (z[1], [0., 0., 1.])] {
@@ -183,23 +229,38 @@ fn cylinder(
             pts: (0..N).map(|i| ring(i, z)).collect(),
             normal,
             color,
-            layer: 2,
+            layer: 3,
             part,
+            outline: true,
         });
     }
 }
 
-/// The machine with its tool tip at `pos` (machine X, Y, Z).
+/// The Jingyan with its tool tip at `pos` (machine X, Y, Z).
 #[cfg(test)]
 fn faces(pos: [f32; 3], known: bool) -> Vec<Face> {
-    machine(pos, known, None, 0.)
+    machine(&Figures::JINGYAN, pos, known, None, 0.)
 }
 
-/// The machine with its tool tip at `pos`, and the rotary unit `rotary`
-/// with its chuck at A `a` (degrees). With the unit the table's top is the
-/// unit's (its centre height under the centreline) and the gantry's beam
-/// clears its chuck.
-fn machine(pos: [f32; 3], known: bool, rotary: Option<&crate::chuck::Rig>, a: f32) -> Vec<Face> {
+/// The table's top in machine Z: the nominal tool's tip at Z top stands the
+/// spindle nose's height, less the tool and its nut, over it; with the
+/// rotary unit, the unit's centre height under its centreline.
+fn table_top(fig: &Figures, rotary: Option<&crate::chuck::Rig>) -> f32 {
+    rotary.map_or(TOOL[1] + NUT - fig.nose_to_table, |r| r.table)
+}
+
+/// The machine of figures `fig` with its tool tip at `pos`, and the rotary
+/// unit `rotary` with its chuck at A `a` (degrees). The gantry runs in Y on
+/// rails beside the table, its beam the gantry clearance over the table
+/// (over the unit's chuck, with one), its side plates the clearance width
+/// apart but never on the table.
+fn machine(
+    fig: &Figures,
+    pos: [f32; 3],
+    known: bool,
+    rotary: Option<&crate::chuck::Rig>,
+    a: f32,
+) -> Vec<Face> {
     let rgb = |r, g, b| Color::from_rgb8(r, g, b);
     // The moving parts turn amber until the machine position is set.
     let moving = |c: Color| {
@@ -214,42 +275,54 @@ fn machine(pos: [f32; 3], known: bool, rotary: Option<&crate::chuck::Rig>, a: f3
         }
     };
     let [x, y, z] = pos;
-    let table_top = rotary.map_or(-TIP_HEIGHT, |r| r.table);
-    let clearance = rotary.map_or(BEAM_CLEARANCE, |r| {
-        BEAM_CLEARANCE.max(r.unit.centre_height + r.unit.chuck_diameter / 2. + 10.)
+    let travel = fig.travel;
+    let table_top = table_top(fig, rotary);
+    let clearance = rotary.map_or(fig.gantry[0], |r| {
+        fig.gantry[0].max(r.unit.centre_height + r.unit.chuck_diameter / 2. + 10.)
     });
-    let tx = [(TRAVEL[0] - TABLE[0]) / 2., (TRAVEL[0] + TABLE[0]) / 2.];
-    let ty = [(TRAVEL[1] - TABLE[1]) / 2., (TRAVEL[1] + TABLE[1]) / 2.];
+    let tx = [-TABLE_OVER[0], travel[0] + TABLE_OVER[0]];
+    let ty = [-TABLE_OVER[1], travel[1] + TABLE_OVER[1]];
     // On a machine with A, the spindle its rotary checks take (LIO-204).
     let spindle = rotary.map_or(SPINDLE, |rig| {
         [rig.unit.nose_diameter, rig.unit.nose_length]
     });
     let r = spindle[0] / 2.;
-    let nose = z + TOOL[1] + 14.;
+    let nose = z + TOOL[1] + NUT;
     // The gantry: spindle in front (toward the operator, −Y), then the Z
     // plate, the X carriage and the beam behind it.
     let beam = [table_top + clearance, table_top + clearance + 80.];
     let beam_y = [y + r + 30., y + r + 90.];
-    let side = [tx[0] - 40., tx[1] + 40.];
-    // The base and rails reach behind the beam at the back of Y.
-    let back = TRAVEL[1] + r + 110.;
+    let half = fig.gantry[1].max(tx[1] - tx[0] + 30.) / 2.;
+    let open = [travel[0] / 2. - half, travel[0] / 2. + half];
+    let plates = [[open[0] - 20., open[0]], [open[1], open[1] + 20.]];
+    // The base and rails reach behind the gantry at the back of Y.
+    let back = travel[1] + r + 130.;
     let mut f = Vec::new();
     boxed(
         &mut f,
-        [side[0], ty[0] - 30., table_top - 80.],
-        [side[1], back, table_top - 20.],
-        rgb(72, 80, 90),
+        [open[0] - 40., ty[0] - 30., table_top - 60.],
+        [open[1] + 40., back, table_top - 20.],
+        rgb(62, 68, 76),
         0,
         "base",
     );
-    for x0 in [side[0], tx[1] + 15.] {
+    for [x0, x1] in plates {
         boxed(
             &mut f,
-            [x0, ty[0] - 30., table_top - 20.],
-            [x0 + 25., back, table_top],
-            rgb(96, 104, 114),
-            0,
+            [x0 - 5., ty[0] - 30., table_top - 20.],
+            [x1 + 5., back, table_top],
+            rgb(150, 158, 168),
+            1,
             "rails",
+        );
+        // The Y motor at the rail's back end, under its top.
+        boxed(
+            &mut f,
+            [(x0 + x1 - MOTOR[0]) / 2., back, table_top - MOTOR[0]],
+            [(x0 + x1 + MOTOR[0]) / 2., back + MOTOR[1], table_top],
+            rgb(44, 47, 52),
+            0,
+            "motor",
         );
     }
     boxed(
@@ -257,12 +330,13 @@ fn machine(pos: [f32; 3], known: bool, rotary: Option<&crate::chuck::Rig>, a: f3
         [tx[0], ty[0], table_top - 20.],
         [tx[1], ty[1], table_top],
         rgb(184, 191, 199),
-        0,
+        1,
         "table",
     );
-    // T-slots along Y.
-    for i in 1..6 {
-        let sx = tx[0] + TABLE[0] * i as f32 / 6.;
+    // T-slots along Y, about every 85 mm.
+    let slots = ((tx[1] - tx[0]) / 85.).round().max(2.) as usize;
+    for i in 1..slots {
+        let sx = tx[0] + (tx[1] - tx[0]) * i as f32 / slots as f32;
         f.push(Face {
             pts: vec![
                 [sx - 4., ty[0], table_top],
@@ -272,65 +346,110 @@ fn machine(pos: [f32; 3], known: bool, rotary: Option<&crate::chuck::Rig>, a: f3
             ],
             normal: [0., 0., 1.],
             color: rgb(120, 128, 138),
-            layer: 1,
+            layer: 2,
             part: "table",
+            outline: true,
         });
     }
-    let gantry = moving(rgb(64, 110, 160));
-    for x0 in [side[0], side[1] - 25.] {
+    let gantry = moving(rgb(52, 104, 158));
+    for [x0, x1] in plates {
         boxed(
             &mut f,
-            [x0, beam_y[0] - 10., table_top],
-            [x0 + 25., beam_y[1] + 10., beam[1]],
+            [x0, beam_y[0] - 30., table_top],
+            [x1, beam_y[1] + 30., beam[1]],
             gantry,
-            2,
+            3,
             "gantry",
         );
     }
     // The beam in short pieces, so that far-to-near sorting of faces holds
     // next to the carriage.
     let pieces = 8;
-    let w = (side[1] - side[0] - 50.) / pieces as f32;
+    let w = (plates[1][1] - plates[0][0]) / pieces as f32;
     for i in 0..pieces {
-        let x0 = side[0] + 25. + w * i as f32;
+        let x0 = plates[0][0] + w * i as f32;
         boxed(
             &mut f,
             [x0, beam_y[0], beam[0]],
             [x0 + w, beam_y[1], beam[1]],
             gantry,
-            2,
+            3,
             "beam",
         );
     }
+    for face in f.iter_mut().filter(|f| f.part == "beam") {
+        face.outline = false;
+    }
+    // The X motor at the beam's right end.
+    let (beam_mid, beam_mid_y) = ((beam[0] + beam[1]) / 2., (beam_y[0] + beam_y[1]) / 2.);
+    boxed(
+        &mut f,
+        [
+            plates[1][1],
+            beam_mid_y - MOTOR[0] / 2.,
+            beam_mid - MOTOR[0] / 2.,
+        ],
+        [
+            plates[1][1] + MOTOR[1],
+            beam_mid_y + MOTOR[0] / 2.,
+            beam_mid + MOTOR[0] / 2.,
+        ],
+        moving(rgb(44, 47, 52)),
+        3,
+        "motor",
+    );
     boxed(
         &mut f,
         [x - 65., y + r + 15., beam[0] - 25.],
         [x + 65., y + r + 30., beam[1] + 10.],
         moving(rgb(88, 98, 110)),
-        2,
+        3,
         "carriage",
     );
+    let plate_top = nose + spindle[1] + 15.;
     boxed(
         &mut f,
         [x - 50., y + r, nose + 25.],
-        [x + 50., y + r + 15., nose + spindle[1] + 15.],
+        [x + 50., y + r + 15., plate_top],
         moving(rgb(110, 122, 136)),
-        2,
+        3,
         "z plate",
     );
-    cylinder(
+    // The Z motor on its bracket over the spindle.
+    boxed(
         &mut f,
-        [x, y],
-        r,
-        [nose, nose + spindle[1]],
-        moving(rgb(206, 210, 216)),
-        "spindle",
+        [x - MOTOR[0] / 2., y + r + 15. - MOTOR[0], plate_top],
+        [x + MOTOR[0] / 2., y + r + 15., plate_top + MOTOR[1]],
+        moving(rgb(44, 47, 52)),
+        3,
+        "motor",
     );
+    // The spindle, held to the Z plate by its clamp; the clamp hides the
+    // part of it inside.
+    let clamp = [nose + spindle[1] * 0.45, nose + spindle[1] * 0.8];
+    boxed(
+        &mut f,
+        [x - r - 10., y - r - 10., clamp[0]],
+        [x + r + 10., y + r, clamp[1]],
+        moving(rgb(70, 78, 88)),
+        3,
+        "clamp",
+    );
+    for span in [[nose, clamp[0]], [clamp[1], nose + spindle[1]]] {
+        cylinder(
+            &mut f,
+            [x, y],
+            r,
+            span,
+            moving(rgb(214, 218, 224)),
+            "spindle",
+        );
+    }
     cylinder(
         &mut f,
         [x, y],
         14.,
-        [nose - 14., nose],
+        [nose - NUT, nose],
         moving(rgb(150, 154, 160)),
         "nut",
     );
@@ -389,8 +508,9 @@ fn rotary_faces(f: &mut Vec<Face>, rig: &crate::chuck::Rig, a: f32) {
                 pts,
                 normal,
                 color,
-                layer: 2,
+                layer: 3,
                 part,
+                outline: true,
             });
         };
         for i in 0..n {
@@ -435,8 +555,9 @@ impl View {
     }
 }
 
-/// The faces that face the eye, shaded, back to front.
-fn painted(faces: &[Face], view: &View) -> Vec<(Vec<[f32; 2]>, Color)> {
+/// The faces that face the eye, shaded, back to front, and whether each
+/// has its edges drawn.
+fn painted(faces: &[Face], view: &View) -> Vec<(Vec<[f32; 2]>, Color, bool)> {
     let light = {
         let l = [-0.35, -0.55, 0.76];
         let n = dot(l, l).sqrt();
@@ -461,7 +582,11 @@ fn painted(faces: &[Face], view: &View) -> Vec<(Vec<[f32; 2]>, Color)> {
                 b: f.color.b * shade,
                 a: f.color.a,
             };
-            (f.pts.iter().map(|&p| view.flat(p)).collect(), color)
+            (
+                f.pts.iter().map(|&p| view.flat(p)).collect(),
+                color,
+                f.outline,
+            )
         })
         .collect()
 }
@@ -529,12 +654,22 @@ impl canvas::Program<Message> for MachineView {
             Color::from_rgb8(239, 243, 247),
         );
         let view = View::new(state.yaw, state.pitch);
-        // Fit a fixed box round the whole machine, so the scale holds still
-        // while it moves.
-        let table_top = self.rotary.as_ref().map_or(-TIP_HEIGHT, |r| r.table);
-        let (lo, hi) = (
-            [-120., -60., table_top - 80.],
-            [TRAVEL[0] + 120., TRAVEL[1] + 160., 260.],
+        // Fit the box round the whole machine at both ends of its X and Y
+        // travel, so the scale holds still while it moves.
+        let rotary = self.rotary.as_ref();
+        let [tx, ty, _] = self.figures.travel;
+        let ends = [[0., 0., 0.], [tx, ty, 0.]];
+        let all = ends
+            .iter()
+            .flat_map(|&p| machine(&self.figures, p, true, rotary, 0.));
+        let (lo, hi) = all.flat_map(|f| f.pts).chain(self.envelope).fold(
+            ([f32::MAX; 3], [f32::MIN; 3]),
+            |(lo, hi), p| {
+                (
+                    std::array::from_fn(|k| lo[k].min(p[k])),
+                    std::array::from_fn(|k| hi[k].max(p[k])),
+                )
+            },
         );
         let corners: Vec<[f32; 2]> = (0..8)
             .map(|i| {
@@ -554,11 +689,23 @@ impl canvas::Program<Message> for MachineView {
             (bounds.height - size.height * scale) / 2. - min(1) * scale,
         );
         let screen = |p: [f32; 2]| Point::new(origin.x + p[0] * scale, origin.y + p[1] * scale);
-        let mut f = machine(self.pos, self.known, self.rotary.as_ref(), self.a);
+        let mut f = machine(&self.figures, self.pos, self.known, rotary, self.a);
         if let Some([lo, hi]) = self.block {
-            boxed(&mut f, lo, hi, Color::from_rgb8(214, 184, 132), 2, "stock");
+            boxed(&mut f, lo, hi, Color::from_rgb8(214, 184, 132), 3, "stock");
+            // A block over the table stands on a vise's body, not in the air.
+            let table = table_top(&self.figures, rotary);
+            if rotary.is_none() && lo[2] > table + 1. {
+                boxed(
+                    &mut f,
+                    [lo[0], lo[1] - 15., table],
+                    [hi[0], hi[1] + 15., lo[2]],
+                    Color::from_rgb8(96, 108, 122),
+                    3,
+                    "vise",
+                );
+            }
         }
-        for (pts, color) in painted(&f, &view) {
+        for (pts, color, outline) in painted(&f, &view) {
             let path = canvas::Path::new(|b| {
                 b.move_to(screen(pts[0]));
                 for &p in &pts[1..] {
@@ -567,14 +714,18 @@ impl canvas::Program<Message> for MachineView {
                 b.close();
             });
             frame.fill(&path, color);
+            // Without its edges, a face is stroked in its own colour, which
+            // closes the anti-aliased seams to its neighbours.
+            let edge = match outline {
+                true => Color {
+                    a: 0.25 * color.a,
+                    ..Color::BLACK
+                },
+                false => color,
+            };
             frame.stroke(
                 &path,
-                canvas::Stroke::default()
-                    .with_color(Color {
-                        a: 0.25 * color.a,
-                        ..Color::BLACK
-                    })
-                    .with_width(0.5),
+                canvas::Stroke::default().with_color(edge).with_width(0.5),
             );
         }
         // The tool tip's travel, and the tool tip.
@@ -653,12 +804,14 @@ impl canvas::Program<Message> for MachineView {
                 ..Default::default()
             });
         }
+        let [x, y, z] = self.figures.travel.map(crate::envelope::mm);
+        let size = format!("Travel {x} × {y} × {z} mm from the machine library");
         let foot = match &self.rotary {
             Some(_) => format!(
-                "CNC4030, assumed dimensions · rotary unit as the machine library places it, A {}° · drag to turn",
+                "{size} · rotary unit as the library places it, A {}° · drag to turn",
                 crate::indexed::degrees(self.a)
             ),
-            None => "CNC4030, assumed dimensions · drag to turn".into(),
+            None => format!("{size} · drag to turn"),
         };
         frame.fill_text(canvas::Text {
             content: crate::ui::ellipsize(&foot, fits(5.7)),
@@ -705,7 +858,9 @@ mod tests {
         let table = |f: &[Face]| part(f, "table").collect::<Vec<_>>();
         assert_eq!(table(&home), table(&moved));
         // At the bottom of Z the tool stays above the table.
-        assert!(lowest(&faces([0., 0., -TRAVEL[2]], true), "tool", 2) > -TIP_HEIGHT);
+        let j = Figures::JINGYAN;
+        let bottom = faces([0., 0., -j.travel[2]], true);
+        assert!(lowest(&bottom, "tool", 2) > table_top(&j, None));
         // Until the position is set, the moving parts change colour.
         let unset = faces([0., 0., 0.], false);
         let colour = |f: &[Face], name: &str| f.iter().find(|f| f.part == name).unwrap().color;
@@ -719,7 +874,7 @@ mod tests {
         m.fill_rotary_defaults();
         let unit = m.rotary_unit().unwrap();
         let rig = crate::chuck::Rig::on_machine(unit, 1.);
-        let at = |a: f32| machine([100., 50., 0.], true, Some(&rig), a);
+        let at = |a: f32| machine(&Figures::JINGYAN, [100., 50., 0.], true, Some(&rig), a);
         let zero = at(0.);
         let highest =
             |f: &[Face], name: &str, k: usize| part(f, name).map(|p| p[k]).fold(f32::MIN, f32::max);
@@ -758,7 +913,97 @@ mod tests {
         // Without a rotary unit the machine is the one it was.
         let plain = faces([100., 50., 0.], true);
         assert!(part(&plain, "jaw").next().is_none());
-        assert_eq!(highest(&plain, "table", 2), -TIP_HEIGHT);
+        assert_eq!(
+            highest(&plain, "table", 2),
+            table_top(&Figures::JINGYAN, None)
+        );
+    }
+
+    #[test]
+    fn the_model_is_drawn_to_the_machines_travel_and_clearances() {
+        let highest =
+            |f: &[Face], name: &str, k: usize| part(f, name).map(|p| p[k]).fold(f32::MIN, f32::max);
+        let j = Figures::JINGYAN;
+        let at = |fig: &Figures| machine(fig, [0., 0., 0.], true, None, 0.);
+        let shipped = at(&j);
+        // The table reaches past the X and Y travel by the same margins.
+        let wide = Figures {
+            travel: [600., 400., 55.],
+            ..j
+        };
+        let grown = at(&wide);
+        let span = |f: &[Face], k: usize| highest(f, "table", k) - lowest(f, "table", k);
+        assert_eq!(span(&grown, 0) - span(&shipped, 0), 210.);
+        assert_eq!(span(&grown, 1) - span(&shipped, 1), 120.);
+        // The base and rails reach behind the gantry at the far end of Y.
+        assert_eq!(
+            highest(&grown, "rails", 1) - highest(&shipped, "rails", 1),
+            120.
+        );
+        // The spindle nose stands its height over the table at Z top, and
+        // the beam the gantry clearance.
+        let nose = lowest(&shipped, "nut", 2) + NUT;
+        assert_eq!(nose - highest(&shipped, "table", 2), j.nose_to_table);
+        assert_eq!(
+            lowest(&shipped, "beam", 2) - highest(&shipped, "table", 2),
+            j.gantry[0]
+        );
+        let tall = at(&Figures {
+            nose_to_table: 220.,
+            gantry: [180., j.gantry[1]],
+            ..j
+        });
+        assert_eq!(
+            highest(&tall, "table", 2),
+            highest(&shipped, "table", 2) - 60.
+        );
+        assert_eq!(lowest(&tall, "beam", 2) - highest(&tall, "table", 2), 180.);
+        // The side plates stand beside the table, the clearance width apart
+        // when that is wider.
+        let inside = |f: &[Face]| {
+            let plates: Vec<f32> = part(f, "gantry").map(|p| p[0]).collect();
+            let mid = j.travel[0] / 2.;
+            let left = plates
+                .iter()
+                .copied()
+                .filter(|&v| v < mid)
+                .fold(f32::MIN, f32::max);
+            let right = plates
+                .iter()
+                .copied()
+                .filter(|&v| v > mid)
+                .fold(f32::MAX, f32::min);
+            (left, right)
+        };
+        let (left, right) = inside(&shipped);
+        assert!(left < lowest(&shipped, "table", 0) && right > highest(&shipped, "table", 0));
+        let (left, right) = inside(&at(&Figures {
+            gantry: [j.gantry[0], 800.],
+            ..j
+        }));
+        assert_eq!(right - left, 800.);
+        // The figures come from the machine library, in inches too, and
+        // the Jingyan's stand in for those it does not give.
+        let mut m = crate::model::Machine::new(3);
+        for (k, v) in [
+            ("x", "500"),
+            ("y", "350"),
+            ("z", "90"),
+            ("gantry_height", "150"),
+        ] {
+            m.p.insert(k.into(), v.into());
+        }
+        m.p.insert("nose_to_table".into(), "".into());
+        m.p.insert("gantry_width".into(), "".into());
+        let fig = Figures::of(&m);
+        assert_eq!(fig.travel, [500., 350., 90.]);
+        assert_eq!(fig.gantry, [150., j.gantry[1]]);
+        assert_eq!(fig.nose_to_table, j.nose_to_table);
+        m.p.insert("units".into(), "inch".into());
+        assert_eq!(
+            Figures::of(&m).travel,
+            [500. * 25.4, 350. * 25.4, 90. * 25.4]
+        );
     }
 
     #[test]
@@ -773,8 +1018,8 @@ mod tests {
         // Three faces of each box face the eye: front, top and one side.
         assert_eq!(drawn.len(), 6);
         let blue = |c: Color| c.b > c.r;
-        assert!(drawn[..3].iter().all(|(_, c)| blue(*c)));
-        assert!(drawn[3..].iter().all(|(_, c)| !blue(*c)));
+        assert!(drawn[..3].iter().all(|(_, c, _)| blue(*c)));
+        assert!(drawn[3..].iter().all(|(_, c, _)| !blue(*c)));
         // The table layer comes first even when it is nearer.
         boxed(
             &mut f,
@@ -786,6 +1031,6 @@ mod tests {
         );
         let drawn = painted(&f, &View::new(o.yaw, o.pitch));
         assert_eq!(drawn[0].1.g, drawn[0].1.r);
-        assert!(drawn[..3].iter().all(|(_, c)| c.r == c.g && c.g == c.b));
+        assert!(drawn[..3].iter().all(|(_, c, _)| c.r == c.g && c.g == c.b));
     }
 }

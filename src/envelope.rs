@@ -111,7 +111,7 @@ fn flag(source: Source) -> &'static str {
 
 /// A clearance of machine `m` in mm, with where it comes from: None when it
 /// gives none or not a positive number.
-fn clearance(m: &Machine, key: &str) -> Option<(f32, Source)> {
+pub fn clearance(m: &Machine, key: &str) -> Option<(f32, Source)> {
     let inch = if get(&m.p, "units") == "inch" {
         25.4
     } else {
@@ -228,7 +228,7 @@ pub fn adopt(doc: &mut Document) -> Option<String> {
 }
 
 /// `v` mm for a message: up to two decimals, without trailing zeros.
-fn mm(v: f32) -> String {
+pub fn mm(v: f32) -> String {
     match format!("{v:.2}")
         .trim_end_matches('0')
         .trim_end_matches('.')
