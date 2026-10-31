@@ -3028,7 +3028,11 @@ flood = { pin = 8 }
         assert!(run_of(&a).tool_change().is_none());
         assert!(problems(&a).iter().any(|p| p.contains("Every tool run")));
         // What was cut stays cut: the Drill taken back is next, and the
-        // Pocket stays skipped.
+        // Pocket stays skipped. A skip is taken once the machine is Idle,
+        // which it is a tick after the tool run's outcome.
+        tick_until(&mut a, 5.0, "Idle after tool run 1", |s| {
+            s.state == Some(uc100::controller::State::Idle)
+        });
         assert!(skip(&mut a, 3, None));
         assert_eq!(sent(&a), [vec![0, 2], vec![3]]);
         assert_eq!(
