@@ -8289,7 +8289,7 @@ flood = { pin = 8 }
         let mut a = profile_app(dir.path(), LIMITED);
         idle(&mut a);
         a.page = Page::Control;
-        a.control_view = crate::ui::JobView::Machine;
+        a.control_tab = crate::ui::ControlTab::Machine;
         let size = iced::Size::new(1600., 1000.);
         let time = |a: &App| {
             let view = crate::ui::machine_model(a, conn(a));
