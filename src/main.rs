@@ -345,7 +345,7 @@ pub enum Message {
     /// The machine's phase changed to one that shows this tab, and whether
     /// a text field had the focus then: the tab is not switched under it.
     ControlPhaseTab(ui::ControlTab, bool),
-    /// What the Control page's Job tab shows: the stock, the machine, from above.
+    /// How the Control page's Job tab shows the stock: in 3D or from above.
     ControlView(ui::JobView),
     Setup(setup::Msg),
     /// A jog key went down and no widget took it (axis, negative, repeat).
@@ -4851,6 +4851,19 @@ impl App {
                 self.pinned_help = None;
                 if p == Page::Control && self.page != Page::Control {
                     self.cam_page = self.page;
+                    // The setup picked to run is the one the 3D views show:
+                    // another opened in MANUFACTURE since is left there, or
+                    // the Job tab would ask for a setup the run bar has
+                    // (LIO-343).
+                    let run = (self.control.as_ref()).and_then(|c| c.run.as_ref());
+                    if let Some(id) = run.map(|r| r.setup_id.clone()).filter(|id| {
+                        *id != self.doc.active && self.doc.setups.iter().any(|s| s.id == *id)
+                    }) {
+                        self.doc.active = id;
+                        self.stop_selection();
+                        self.dirty = true;
+                        self.last_edit = Instant::now();
+                    }
                 }
                 self.page = p;
                 self.picking = false;
@@ -6200,7 +6213,6 @@ impl App {
                 match view {
                     ui::JobView::Stock => return self.update(Message::Camera("ISO")),
                     ui::JobView::Top => return self.update(Message::Camera("TOP")),
-                    ui::JobView::Machine => {}
                 }
             }
             Message::Setup(setup::Msg::Edit(e)) => {

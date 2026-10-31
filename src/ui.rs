@@ -1055,25 +1055,10 @@ pub fn view(app: &App) -> Element<'_, Message> {
             include_bytes!("../assets/tb-support.svg"),
         ),
     ];
-    top_row = if manufacture {
-        top_row.extend(pages.map(|(page, label, icon)| {
-            tool_btn(icon, label, Message::Page(page), app.page == page).into()
-        }))
-    } else {
-        top_row
-            .push(tool_btn(
-                include_bytes!("../assets/tb-control.svg"),
-                "Control",
-                Message::ControlSetup(false),
-                !app.machine_setup,
-            ))
-            .push(tool_btn(
-                include_bytes!("../assets/tb-setup.svg"),
-                "Controller configuration",
-                Message::ControlSetup(true),
-                app.machine_setup,
-            ))
-    };
+    // The bar is MANUFACTURE's alone: MACHINE has `machine_bar`.
+    top_row = top_row.extend(pages.map(|(page, label, icon)| {
+        tool_btn(icon, label, Message::Page(page), app.page == page).into()
+    }));
     top_row = top_row.push(space().width(Fill));
     if app.control.is_some() {
         top_row = top_row.push(estop());
@@ -7324,7 +7309,7 @@ pub(crate) fn limits_off_warning(
 /// right whichever is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlTab {
-    /// The 3D view of the job or of the machine.
+    /// The setup's stock in 3D as it is cut.
     Job,
     /// The manual tool change between tool runs, while one is due.
     ToolChange,
@@ -7335,7 +7320,8 @@ pub enum ControlTab {
     /// Rotary A's calibration, on a machine with the rotary unit.
     Rotary,
     Mdi,
-    /// The connection, the machine zero, the soft limits and the log.
+    /// The machine in 3D, its connection, the machine zero, the soft limits
+    /// and the log.
     Machine,
 }
 impl ControlTab {
@@ -7373,12 +7359,10 @@ pub(crate) fn phase(c: Option<&crate::control::Connection>) -> Phase {
         _ => Phase::Idle,
     }
 }
-/// What the Job tab's view shows: the setup's stock in 3D, the machine's
-/// travel with the tool in it, or the stock from above.
+/// What the Job tab's view shows: the setup's stock in 3D or from above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobView {
     Stock,
-    Machine,
     Top,
 }
 /// How the Control page fits the window (LIO-275), from the window's size,
@@ -9075,7 +9059,8 @@ fn control_tab<'a>(tab: ControlTab, shown: bool, alert: bool, fit: Fit) -> Eleme
     .into()
 }
 /// The tabs the centre offers now: Tool change while one is due, Rotary A
-/// on a machine with the rotary unit.
+/// on a machine with the rotary unit. Machine is second, the two 3D views
+/// side by side, and its machine zero before the work zero (LIO-343).
 pub(crate) fn control_tabs(c: &crate::control::Connection) -> Vec<ControlTab> {
     let mut tabs = vec![ControlTab::Job];
     match phase(Some(c)) {
@@ -9083,11 +9068,11 @@ pub(crate) fn control_tabs(c: &crate::control::Connection) -> Vec<ControlTab> {
         Phase::Start => tabs.push(ControlTab::Start),
         _ => {}
     }
-    tabs.extend([ControlTab::WorkZero, ControlTab::Probe]);
+    tabs.extend([ControlTab::Machine, ControlTab::WorkZero, ControlTab::Probe]);
     if c.rotary.is_some() && c.axis(3) {
         tabs.push(ControlTab::Rotary);
     }
-    tabs.extend([ControlTab::Mdi, ControlTab::Machine]);
+    tabs.push(ControlTab::Mdi);
     tabs
 }
 /// The centre of the Control page: one task at a time in its tabs.
@@ -9105,8 +9090,8 @@ fn centre<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Me
         bar = bar.push(control_tab(t, t == shown, alert, fit));
     }
     // Narrow, the view switcher leaves the tabs their room: it is in the
-    // Job tab's foot.
-    if shown == ControlTab::Job && !fit.narrow {
+    // Job tab's foot. Before a setup is picked it has nothing to turn.
+    if shown == ControlTab::Job && !fit.narrow && c.run.is_some() {
         bar = bar
             .push(space().width(Fill))
             .push(job_views(app))
@@ -9151,16 +9136,10 @@ fn tab_scroll<'a>(body: Column<'a, Message>) -> Element<'a, Message> {
     .into()
 }
 
-/// The Job tab: the one 3D view, of the setup's stock as it is cut (the
-/// machine's tool red), or of the machine's travel with the tool in it.
-/// The Job tab's view switcher: the stock, the machine, the stock from above.
+/// The Job tab's view switcher: the stock in 3D or from above.
 fn job_views(app: &App) -> Element<'_, Message> {
     let mut views = row![].spacing(2);
-    for (view, label) in [
-        (JobView::Stock, "Stock"),
-        (JobView::Machine, "Machine"),
-        (JobView::Top, "Top"),
-    ] {
+    for (view, label) in [(JobView::Stock, "3D"), (JobView::Top, "Top")] {
         views = views.push(small(
             label,
             Some(Message::ControlView(view)),
@@ -9177,9 +9156,8 @@ fn job_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, M
             .get(r.setup)
             .is_some_and(|x| x.id == app.doc.active)
     });
-    let stock = (app.control_view != JobView::Machine && picked.is_some())
-        .then(|| scene(app, None))
-        .flatten();
+    // The Job tab: the setup's stock as it is cut (the machine's tool red).
+    let stock = picked.is_some().then(|| scene(app, None)).flatten();
     let mut col = column![].spacing(6).height(Fill);
     // The line under the view, how to turn it: short, a hover card on the
     // switcher's left; narrow, the switcher is on its right.
@@ -9215,22 +9193,21 @@ fn job_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, M
             }
         }
         None => {
-            col = col
-                .push(container(canvas(machine_model(app, c)).width(Fill).height(Fill)).height(Fill))
-                .extend(foot(
-                    "Machine",
-                    if picked.is_none() && app.control_view != JobView::Machine {
-                        "The machine's travel, the tool in it: pick a setup in the run bar to see its stock."
-                    } else {
-                        "The box is where the tool tip can travel; the red dot is the tool tip, the green ring the work zero. Drag to turn."
-                    }
-                    .into(),
-                ));
+            col = col.push(
+                container(muted(if picked.is_none() {
+                    NO_JOB
+                } else {
+                    "The setup's stock cannot be drawn: its part is not loaded."
+                }))
+                .center(Fill),
+            );
         }
     }
     col.into()
 }
-/// The machine's travel and the tool in it, for the Job tab.
+/// The Job tab before a setup is picked to run.
+pub(crate) const NO_JOB: &str = "Pick a setup in the run bar to see its stock here. The machine itself, its travel and the tool in it, is in the Machine tab.";
+/// The machine's travel and the tool in it, for the Machine tab.
 pub(crate) fn machine_model<'a>(
     app: &'a App,
     c: &'a crate::control::Connection,
@@ -10110,7 +10087,8 @@ fn mdi_tab(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
 }
 
 /// The Machine tab: the machine and its connection, the firmware, the soft
-/// limits, the machine zero and the fixture pins, beside the log.
+/// limits, the machine zero and the fixture pins, beside the machine in 3D
+/// and the log.
 fn machine_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Message> {
     use crate::control::Action;
     let s = &c.snapshot;
@@ -10192,16 +10170,31 @@ fn machine_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'
         );
         col = col.push(muted("To drive off a limit switch that tripped. It turns itself off a second after no switch is active."));
     }
-    // Narrow, the log is the MDI tab's alone.
+    // The machine itself, in 3D, beside what sets it up (LIO-343): it was
+    // a view of the Job tab's, where the owner did not look for it.
+    // The model draws its own legend.
+    let model = canvas(machine_model(app, c)).width(Fill).height(Fill);
+    // Narrow, the model is over the controls and the log is the MDI tab's
+    // alone.
     if Fit::of(app).narrow {
-        return tab_scroll(col);
+        return column![
+            container(model).height(Length::FillPortion(1)),
+            container(tab_scroll(col)).height(Length::FillPortion(1))
+        ]
+        .spacing(10)
+        .height(Fill)
+        .into();
     }
     row![
         tab_scroll(col),
-        column![bold("Log", 13), machine_log(c)]
-            .spacing(8)
-            .width(Fill)
-            .height(Fill)
+        column![
+            container(model).height(Length::FillPortion(3)),
+            bold("Log", 13),
+            container(machine_log(c)).height(Length::FillPortion(2))
+        ]
+        .spacing(8)
+        .width(Fill)
+        .height(Fill)
     ]
     .spacing(14)
     .height(Fill)
@@ -14978,13 +14971,6 @@ mod tests {
             }
         }
         assert!(checked >= 9, "only {checked} glyph colours were read");
-    }
-
-    #[test]
-    fn the_control_tile_is_a_panel_not_a_play_triangle() {
-        let svg = include_str!("../assets/tb-control.svg");
-        assert!(svg.matches("<circle").count() >= 2, "a dial and a button");
-        assert!(!svg.contains("l13-8"), "the play triangle is gone");
     }
 
     #[test]

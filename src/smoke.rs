@@ -1283,13 +1283,13 @@ impl App {
                 );
                 vec![
                     Message::Tick,
-                    Message::ControlView(crate::ui::JobView::Machine),
+                    Message::ControlTab(crate::ui::ControlTab::Machine),
                 ]
             }
             121 => {
                 // The setup picked in the run bar, checked here (the smoke
                 // run leaves the tasks its steps return alone).
-                let _ = self.update(Message::ControlView(crate::ui::JobView::Stock));
+                let _ = self.update(Message::ControlTab(crate::ui::ControlTab::Job));
                 let _ = self.update(Message::Run(crate::run::Action::Setup(0)));
                 let epoch = self
                     .control
@@ -2085,6 +2085,50 @@ mist = { pin = 9 }
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    /// The machine in 3D is the Machine tab's, second after the Job, not a
+    /// view inside the Job tab (LIO-343); before a setup is picked the Job
+    /// tab says where it went.
+    #[test]
+    fn the_machine_in_3d_is_its_own_tab_and_the_job_tab_says_so() {
+        use crate::ui::ControlTab as T;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        a.page = Page::Control;
+        let _ = a.update(Message::Connect);
+        assert_eq!(
+            crate::ui::control_tabs(conn(&a))[..3],
+            [T::Job, T::Machine, T::WorkZero]
+        );
+        // Nothing picked: no stock to turn, and where the machine went.
+        let _ = a.update(Message::ControlTab(T::Job));
+        shows(&a, &[crate::ui::NO_JOB]);
+        lacks(&a, &["3D", "Top"]);
+        let _ = a.update(Message::ControlTab(T::Machine));
+        shows(&a, &["Disconnect", "Machine zero", "Log"]);
+    }
+
+    /// A setup opened in MANUFACTURE while another is picked to run: back
+    /// in MACHINE the 3D views show the one picked again, and the Job tab
+    /// does not ask for a setup the run bar has (LIO-343).
+    #[test]
+    fn back_in_machine_the_job_tab_shows_the_setup_picked_to_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        a.page = Page::Control;
+        idle(&mut a);
+        let mut other = a.doc.setups[0].clone();
+        other.id = "other".into();
+        a.doc.setups.push(other);
+        let _ = a.update(Message::Run(crate::run::Action::Setup(0)));
+        let picked = a.doc.setups[0].id.clone();
+        let _ = a.update(Message::SelectSetup(1));
+        assert_eq!((a.page, a.doc.active.as_str()), (Page::Work, "other"));
+        let _ = a.update(Message::Page(Page::Control));
+        assert_eq!(a.doc.active, picked);
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Job));
+        lacks(&a, &[crate::ui::NO_JOB]);
     }
 
     #[test]
@@ -4036,10 +4080,7 @@ flood = { pin = 8 }
             let _ = a.update(Message::ControlTab(tab));
             shot(&mut a, &format!("04-tab-{name}"));
         }
-        let _ = a.update(Message::ControlView(crate::ui::JobView::Machine));
         let _ = a.update(Message::ControlTab(T::Job));
-        shot(&mut a, "04-tab-job-machine");
-        let _ = a.update(Message::ControlView(crate::ui::JobView::Stock));
         // The Contour skipped as cut, the Drill with its material left (its
         // tool run with it), and the Face's skips open: the Pocket cuts
         // beneath it, so its material cannot be left.

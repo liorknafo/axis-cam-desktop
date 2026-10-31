@@ -172,7 +172,7 @@ pub const CHECK_WAITS: &str = "The setup is checked once the machine stops and t
 /// A setup being run on the connected machine, tool run by tool run.
 pub struct Run {
     pub setup: usize,
-    setup_id: String,
+    pub(crate) setup_id: String,
     pub name: String,
     /// Its checked programs, or why it cannot run; None while checking.
     pub programs: Option<Arc<Result<Vec<Checked>, Vec<String>>>>,
