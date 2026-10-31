@@ -316,9 +316,22 @@ pub enum Message {
     SwitchMachine(bool),
     /// Back to the manual mill's steps from the CNC's Control page.
     ShowGuide,
-    /// The Control page's Real | Simulated switch for its machine (true:
-    /// simulated). Connected the other way, it reconnects.
-    MachineConnection(bool),
+    /// The Control page's Real (USB) | Simulated | Pi (network) switch for
+    /// its machine (the `uc100_connection` value). Connected another way,
+    /// it reconnects.
+    MachineConnection(&'static str),
+    /// The address of the Pi the machine connects to across the network.
+    PiAddress(String),
+    /// The pairing code typed, as `sudo uc100-server pair` shows it on the Pi.
+    PiCode(String),
+    /// Pairs this computer with the Pi using the code typed.
+    PiPair,
+    /// The Pi answered the pairing: the token to keep, or why not.
+    PiPaired(Result<String, String>),
+    /// Forgets this computer's pairing with the machine's Pi.
+    PiForget,
+    /// Asks the Pi for control of the machine another computer had.
+    PiTakeControl,
     Connect,
     Disconnect,
     MachineReset,
@@ -1319,6 +1332,13 @@ pub struct App {
     /// The machine (id) picked on the Control page while another is
     /// connected: the page asks whether to disconnect and switch to it.
     pub switch_machine: Option<String>,
+    /// The pairing code being typed for the machine's Pi, and whether the
+    /// Pi is being asked.
+    pub pi_code: String,
+    pub pi_pairing: bool,
+    /// A tool run left running on the Pi when this computer disconnected,
+    /// followed again on connecting back.
+    pub pi_run: Option<control::PiRun>,
     /// The manual-mill setup (id) whose Control page shows the CNC instead of
     /// its steps, after a CNC machine was picked there. Making another setup
     /// active shows the steps again.
@@ -1822,6 +1842,9 @@ impl App {
             profile_draft: None,
             control_machine: None,
             switch_machine: None,
+            pi_code: String::new(),
+            pi_pairing: false,
+            pi_run: None,
             cnc_over_guide: None,
             run_on_connect: None,
             jog_key: None,
@@ -2901,8 +2924,13 @@ impl App {
         self.switch_machine = None;
         if let Some(mut c) = self.control.take() {
             c.leaving("disconnected while it ran");
+            self.pi_run = c.take_pi_run();
+            self.status = match (&c.pi, &self.pi_run) {
+                (Some(_), Some(_)) => "Disconnected from the Pi. The tool run goes on there; connect again to follow it.".into(),
+                (Some(_), None) => "Disconnected from the Pi.".into(),
+                _ => "Disconnected from the machine.".into(),
+            };
             c.close();
-            self.status = "Disconnected from the machine.".into();
         }
     }
     /// Saves the workspace, then carries out `close_decision`: closes the
@@ -5874,11 +5902,10 @@ impl App {
                 }
             }
             Message::ShowGuide => self.cnc_over_guide = None,
-            Message::MachineConnection(sim) => {
+            Message::MachineConnection(value) => {
                 let Some(id) = self.control_target().map(|m| m.id.clone()) else {
                     return Task::none();
                 };
-                let value = if sim { "Simulated" } else { "USB" };
                 // Not a planning setting: the setups' snapshots keep their
                 // version. A machine being edited takes the choice too.
                 for m in (self.doc.machines.iter_mut())
@@ -5890,12 +5917,94 @@ impl App {
                 self.dirty = true;
                 self.project_dirty = true;
                 self.last_edit = Instant::now();
+                let now = |c: &control::Connection| match (&c.pi, c.simulated) {
+                    (Some(_), _) => control::PI,
+                    (None, true) => "Simulated",
+                    (None, false) => "USB",
+                };
                 if let Some(c) = &self.control
                     && c.machine_id == id
-                    && c.simulated != sim
+                    && now(c) != value
                 {
                     self.disconnect_machine();
                     return self.update(Message::Connect);
+                }
+            }
+            Message::PiAddress(address) => {
+                let Some(id) = self.control_target().map(|m| m.id.clone()) else {
+                    return Task::none();
+                };
+                for m in (self.doc.machines.iter_mut())
+                    .chain(std::iter::once(&mut self.machine_draft))
+                    .filter(|m| m.id == id)
+                {
+                    m.p.insert("uc100_pi".into(), address.trim().to_owned());
+                }
+                self.dirty = true;
+                self.project_dirty = true;
+                self.last_edit = Instant::now();
+            }
+            Message::PiCode(code) => {
+                self.pi_code = code.chars().filter(char::is_ascii_digit).take(6).collect();
+            }
+            Message::PiPair => {
+                let Some(m) = self.control_target() else {
+                    return Task::none();
+                };
+                let Some(address) = control::pi(m).map(str::to_owned) else {
+                    return Task::none();
+                };
+                if self.pi_pairing || self.pi_code.len() != 6 {
+                    return Task::none();
+                }
+                self.pi_pairing = true;
+                let code = std::mem::take(&mut self.pi_code);
+                let name = computer_name();
+                self.status = format!("Pairing with {address}…");
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            uc100_remote::RemoteController::pair(&address, &code, &name)
+                                .map(|t| t.to_string())
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()))
+                    },
+                    Message::PiPaired,
+                );
+            }
+            Message::PiPaired(answer) => {
+                self.pi_pairing = false;
+                let Some(m) = self.control_target() else {
+                    return Task::none();
+                };
+                let tokens = control::PiTokens::of(&self.state_path, &m.id);
+                self.status = match answer.and_then(|t| t.parse()) {
+                    Ok(token) => match tokens.save(&token) {
+                        Ok(()) => format!("Paired with the Pi of {}. Connect to use it.", m.name()),
+                        Err(e) => format!("Paired, but the pairing could not be kept: {e}"),
+                    },
+                    Err(why) => format!("Pairing refused: {why}"),
+                };
+            }
+            Message::PiForget => {
+                let Some(m) = self.control_target() else {
+                    return Task::none();
+                };
+                if self.control.as_ref().is_some_and(|c| c.machine_id == m.id && c.pi.is_some()) {
+                    self.disconnect_machine();
+                }
+                let Some(m) = self.control_target() else {
+                    return Task::none();
+                };
+                self.status = match control::PiTokens::of(&self.state_path, &m.id).forget() {
+                    Ok(()) => "This computer is no longer paired with the Pi. On the Pi, `sudo uc100-server forget` removes it there too.".into(),
+                    Err(e) => format!("Could not forget the pairing: {e}"),
+                };
+            }
+            Message::PiTakeControl => {
+                if let Some(c) = &self.control {
+                    c.take_control();
                 }
             }
             Message::ControlSetup(on) => {
@@ -5952,8 +6061,21 @@ impl App {
                     return Task::none();
                 };
                 let dir = self.state_path.parent().unwrap().join("uc100");
-                match control::Connection::open(&m, &dir) {
-                    Ok(c) => {
+                let opened = match control::pi(&m) {
+                    None => control::Connection::open(&m, &dir),
+                    Some(address) => match control::PiTokens::of(&self.state_path, &m.id).load() {
+                        Ok(Some(token)) => control::Connection::open_pi(&m, &dir, token),
+                        Ok(None) => Err(format!(
+                            "pair this computer with the Pi at {address} first: run `sudo uc100-server pair` on the Pi and type the code it shows."
+                        )),
+                        Err(e) => Err(e),
+                    },
+                };
+                match opened {
+                    Ok(mut c) => {
+                        if let Some(kept) = self.pi_run.take() {
+                            c.resume_pi_run(kept);
+                        }
                         self.status = format!("Connecting to {}…", m.name());
                         self.control = Some(c);
                         if let Some(si) = self.run_on_connect.take().and_then(|id| {
@@ -6071,6 +6193,7 @@ impl App {
                 use uc100::controller::{Command, State};
                 if let Some(c) = &self.control {
                     match c.snapshot.state {
+                        Some(State::Run) if c.probe_moving() => self.status = ui::PROBE_HOLD.into(),
                         Some(State::Run) => c.send(Command::FeedHold),
                         Some(State::Hold) if self.jog_pad_shown() => c.send(Command::Resume),
                         _ => {}
@@ -7080,16 +7203,18 @@ impl App {
                         .strip_prefix("Connecting to ")
                         .map(|name| name.trim_end_matches('…'));
                     let name = connecting.or_else(|| {
-                        Some(
-                            self.status
-                                .strip_prefix("Connected to ")?
-                                .rsplit_once(": ")?
-                                .0,
-                        )
+                        let rest = (self.status.strip_prefix("Connected to "))
+                            .or_else(|| self.status.strip_prefix(NO_LINK))?;
+                        Some(rest.rsplit_once(": ")?.0)
                     });
                     if let (Some(name), Some(state)) = (name, &c.snapshot.state) {
                         use uc100::controller::State;
                         self.status = match state {
+                            // The Pi's state as last known, never "Connected".
+                            s if c.pi_down() => format!(
+                                "{NO_LINK}{name}: last known {}; the machine carries on.",
+                                s.label()
+                            ),
                             State::Disconnected if connecting.is_some() => format!(
                                 "Could not connect to {name}; see the log in the Control page's Machine tab."
                             ),
@@ -8366,4 +8491,25 @@ fn main() -> iced::Result {
         .antialiasing(true)
         .default_font(iced::Font::with_name("Helvetica Neue"))
         .run()
+}
+
+/// The status line's start while the link to the Pi is not answering.
+const NO_LINK: &str = "No link to the Pi of ";
+
+/// How this computer names itself to a Pi it pairs with: the Mac's name
+/// ("Lior's MacBook Pro"), else its host name.
+fn computer_name() -> String {
+    let run = |cmd: &str, args: &[&str]| {
+        std::process::Command::new(cmd)
+            .args(args)
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .filter(|n| !n.is_empty())
+    };
+    #[cfg(target_os = "macos")]
+    if let Some(name) = run("scutil", &["--get", "ComputerName"]) {
+        return name;
+    }
+    run("hostname", &[]).unwrap_or_else(|| "AXIS CAM".into())
 }

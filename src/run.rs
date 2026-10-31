@@ -956,15 +956,66 @@ impl Run {
         let Some((_, _, block)) = self.progress(s.current_line) else {
             return false;
         };
-        let (Some(r), Some(blocks)) = (self.running.as_ref(), self.running_blocks()) else {
+        let Some(step) = self.step_end(block) else {
             return false;
         };
-        let Some(mark) = r.marks.get(block).copied().flatten() else {
-            return false;
+        self.stopping = Some(step);
+        true
+    }
+
+    /// Stop after step on the Pi (`uc100_remote`): the running tool run's
+    /// job lines where `stop_due` would stop it, runs of lines next to each
+    /// other as one range. The Pi stops the first time it sees one, with or
+    /// without this computer.
+    pub fn stop_ranges(&self) -> Vec<std::ops::RangeInclusive<u32>> {
+        let n = self.running_blocks().map_or(0, |b| b.len());
+        let mut out: Vec<std::ops::RangeInclusive<u32>> = vec![];
+        for block in (0..n).filter(|&b| self.step_end(b).is_some()) {
+            // Job line n is block n - 1 (`progress`).
+            let line = block as u32 + 1;
+            match out.last_mut() {
+                Some(r) if *r.end() + 1 == line => *r = *r.start()..=line,
+                _ => out.push(line..=line),
+            }
+        }
+        out
+    }
+
+    /// The Pi stopped the running tool run after a step, at job line
+    /// `line`: the step it ends, for when its outcome comes.
+    pub fn stopped_on_pi(&mut self, line: u32) {
+        if self.stopping.is_none()
+            && let Some((_, _, block)) = self.progress(Some(line))
+        {
+            self.stopping = self.step_end(block);
+        }
+    }
+
+    /// The tool run just started never reached the machine (`why`): it is
+    /// put back as it was, as one the driver refused (`NOT_STARTED`).
+    pub fn not_started(&mut self, why: String) {
+        let Some(r) = self.running.take() else {
+            return;
         };
-        let Some(p) = self.checked().and_then(|c| c.get(r.index)) else {
-            return false;
-        };
+        let Before {
+            xy,
+            zero,
+            last,
+            touched,
+        } = r.before;
+        (self.xy, self.zero, self.last, self.touched) = (xy, zero, last, touched);
+        (self.stopping, self.stop_after) = (None, false);
+        self.outcome = Some((false, why));
+    }
+
+    /// The step (operation index in the setup, step) Stop after step stops
+    /// after when the driver's line is on block `block` of the running tool
+    /// run, if it stops there.
+    fn step_end(&self, block: usize) -> Option<(usize, usize)> {
+        let r = self.running.as_ref()?;
+        let blocks = self.running_blocks()?;
+        let mark = r.marks.get(block).copied().flatten()?;
+        let p = self.checked().and_then(|c| c.get(r.index))?;
         // The end of an operation is a step's end too (LIO-311): on the way
         // into the next operation sent, before its first feed, the one before
         // it, risen to its clearance after its last feed, did its last step.
@@ -996,9 +1047,7 @@ impl Run {
                 Some((oi, (0..n).rev().find(|s| !cut.contains(s))?, true))
             }),
         };
-        let Some((op, step, _)) = step else {
-            return false;
-        };
+        let (op, step, _) = step?;
         // The driver's line is where its planner is, which the stop slows
         // down from: at the clearance, up there or on its way down into the
         // next step, in the air over the stock. A rise to it is not yet there.
@@ -1010,11 +1059,7 @@ impl Run {
             Block::Descend { .. } => false,
             _ => true,
         };
-        if !there {
-            return false;
-        }
-        self.stopping = Some((op, step));
-        true
+        there.then_some((op, step))
     }
 
     /// Why Cycle Start cannot start the next tool run now; empty when it can.
@@ -1030,6 +1075,12 @@ impl Run {
         };
         if self.running.is_some() {
             return vec!["A tool run is running.".into()];
+        }
+        if c.pi_down() {
+            return vec!["The link to the Pi is not answering: wait for it to reconnect.".into()];
+        }
+        if c.watching() {
+            return vec!["Another computer controls the machine: Take control first.".into()];
         }
         let Some(p) = programs.get(self.next) else {
             return vec!["Every tool run of this setup has run. Pick one to run it again.".into()];

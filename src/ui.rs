@@ -7718,10 +7718,16 @@ fn connect_controls(app: &App) -> Column<'_, Message> {
             container(
                 column![
                     bold(format!("Switch to {}?", to.name()), 14),
-                    muted(format!(
-                        "This disconnects from {from} (it is left in E-stop) and connects to {}.",
-                        to.name()
-                    ))
+                    muted(match c.pi {
+                        Some(_) => format!(
+                            "This closes the link to the Pi of {from} (a tool run there goes on; Hold and Stop it from here once connected back) and connects to {}.",
+                            to.name()
+                        ),
+                        None => format!(
+                            "This disconnects from {from} (it is left in E-stop) and connects to {}.",
+                            to.name()
+                        ),
+                    })
                     .size(13),
                     row![
                         primary("Disconnect and switch", Message::SwitchMachine(true)),
@@ -7745,26 +7751,41 @@ fn connect_controls(app: &App) -> Column<'_, Message> {
         col = col.push(secondary(steps, Message::ShowGuide));
     }
     if let Some(m) = target {
-        let sim = crate::control::simulated(m);
+        let now = crate::control::connection_label(m);
+        let pi = crate::control::pi(m);
         col = col.push(
             row![
                 muted("Connection"),
-                btn("Real (USB)", Message::MachineConnection(false), !sim),
-                btn("Simulated", Message::MachineConnection(true), sim),
+                btn("Real (USB)", Message::MachineConnection("USB"), now == "USB"),
+                btn("Simulated", Message::MachineConnection("Simulated"), now == "Simulated"),
+                btn(
+                    crate::control::PI,
+                    Message::MachineConnection(crate::control::PI),
+                    pi.is_some()
+                ),
             ]
             .spacing(6)
             .align_y(Alignment::Center),
         );
-        if app.control.as_ref().is_some_and(|c| c.machine_id == m.id) {
-            col = col.push(muted(if sim {
-                "Real (USB) disconnects the simulator and connects to the machine itself."
-            } else {
-                "Simulated disconnects the machine (it is left in E-stop) and connects to the simulator."
+        let connected = app.control.as_ref().filter(|c| c.machine_id == m.id);
+        if connected.is_some() {
+            col = col.push(muted(match now {
+                "Simulated" => "Real (USB) disconnects the simulator and connects to the machine itself.",
+                "USB" => "Simulated disconnects the machine (it is left in E-stop) and connects to the simulator.",
+                _ => "Another connection closes the link to the Pi (a running tool run goes on there) and connects that way.",
             }));
+        }
+        let mut paired = true;
+        if let Some(address) = pi {
+            col = col.push(pi_pairing(app, m, address, connected.is_none(), &mut paired));
+        }
+        if let Some(c) = connected.filter(|c| c.pi.is_some()) {
+            col = col.push(pi_link(c));
         }
         // The profile is read only while disconnected, not on every 33 ms tick.
         col = match &app.control {
             Some(_) => col.push(secondary("Disconnect", Message::Disconnect)),
+            None if !paired => col,
             None => match crate::control::profile(m) {
                 Ok(_) => col.push(primary("Connect", Message::Connect)),
                 Err(e) => col.push(warnings(vec![e])),
@@ -7777,6 +7798,106 @@ fn connect_controls(app: &App) -> Column<'_, Message> {
     }
     col
 }
+/// The Pi a machine connects to across the network: its address (editable
+/// while disconnected) and this computer's pairing with it, or the code
+/// field and Pair. `paired` is set false when it is not paired.
+fn pi_pairing<'a>(
+    app: &'a App,
+    m: &'a crate::model::Machine,
+    address: &'a str,
+    editable: bool,
+    paired: &mut bool,
+) -> Element<'a, Message> {
+    let mut col = column![].spacing(6);
+    let place = if editable {
+        row![
+            muted("Pi address"),
+            text_input(crate::control::PI_DEFAULT, address)
+                .on_input(Message::PiAddress)
+                .width(Length::Fixed(200.))
+                .padding([5, 8])
+                .size(13),
+        ]
+    } else {
+        row![muted("Pi address"), text(address).size(13)]
+    };
+    col = col.push(place.spacing(6).align_y(Alignment::Center));
+    match crate::control::PiTokens::of(&app.state_path, &m.id).paired() {
+        Ok(true) => {
+            col = col.push(
+                row![
+                    muted("This computer is paired with the Pi."),
+                    secondary("Forget", Message::PiForget),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+        }
+        found => {
+            *paired = false;
+            if let Err(e) = found {
+                col = col.push(warnings(vec![e]));
+            }
+            col = col.push(muted(
+                "Pair this computer once: on the Pi run `sudo uc100-server pair`, then type the 6-digit code it shows.",
+            ));
+            let code = text_input("123456", &app.pi_code)
+                .on_input(Message::PiCode)
+                .on_submit(Message::PiPair)
+                .width(Length::Fixed(100.))
+                .padding([5, 8])
+                .size(13);
+            let pair: Element<'a, Message> = if app.pi_pairing {
+                muted("Pairing…").into()
+            } else if app.pi_code.len() == 6 {
+                primary("Pair", Message::PiPair).into()
+            } else {
+                muted("").into()
+            };
+            col = col.push(row![muted("Code"), code, pair].spacing(6).align_y(Alignment::Center));
+        }
+    }
+    col.into()
+}
+
+/// The link to the Pi: connecting, refused (why), watching (who controls,
+/// and Take control) or in control; whether it answers; its newest note.
+fn pi_link(c: &crate::control::Connection) -> Element<'_, Message> {
+    use uc100_remote::LinkState as L;
+    let mut col = column![].spacing(6);
+    let Some(link) = &c.link else {
+        return col.push(muted("Connecting to the Pi…")).into();
+    };
+    col = match &link.state {
+        L::Connecting => col.push(muted("Connecting to the Pi…")),
+        L::Refused(why) => col.push(warnings(vec![format!("The Pi refused this computer: {why}")])),
+        L::Watching { holder } => col.push(
+            row![
+                muted(match holder {
+                    Some(who) => format!("Watching: {who} controls the machine. You may E-stop, hold and stop."),
+                    None => "Watching: nobody controls the machine.".into(),
+                }),
+                secondary("Take control", Message::PiTakeControl),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        ),
+        L::Controlling => col.push(muted(match &link.name {
+            Some(name) => format!("In control, as {name}."),
+            None => "In control.".into(),
+        })),
+    };
+    if matches!(link.state, L::Watching { .. } | L::Controlling) && !link.live {
+        col = col.push(warnings(vec![
+            "The link to the Pi is not answering: what you see is its last state, and the machine carries on. Reconnecting…".into(),
+        ]));
+    }
+    if let Some(note) = &c.pi_note {
+        col = col.push(muted(format!("Pi: {note}")).size(12));
+    }
+    col.into()
+}
+
 /// The driver's log, the last 40 lines, newest at the bottom.
 // ponytail: the last 40 lines; keep more if someone needs older ones.
 fn machine_log(c: &crate::control::Connection) -> Element<'_, Message> {
@@ -7841,19 +7962,48 @@ fn control(app: &App) -> Element<'_, Message> {
         .into();
     };
     let fit = Fit::of(app);
-    column![
-        run_bar(app, c),
-        row![
-            hands(c, fit),
-            centre(app, c),
-            container(program(app, c)).width(fit.program()).height(Fill)
-        ]
-        .spacing(fit.gap())
-        .padding(fit.gap())
+    let mut page = Column::new();
+    if let Some(banner) = pi_lost(c) {
+        page = page.push(banner);
+    }
+    page.push(run_bar(app, c))
+        .push(
+            row![
+                hands(c, fit),
+                centre(app, c),
+                container(program(app, c)).width(fit.program()).height(Fill)
+            ]
+            .spacing(fit.gap())
+            .padding(fit.gap())
+            .height(Fill),
+        )
         .height(Fill)
-    ]
-    .height(Fill)
-    .into()
+        .into()
+}
+
+/// What the Control page says over every tab while the link to the Pi is
+/// not answering.
+pub(crate) const PI_LOST: &str = "No link to the Pi. Everything shown is its last known state. The machine carries on without this computer: a tool run goes on to its end, a jog stops by itself. Hold, Stop and E-stop cannot reach it from here until the link is back: use the machine's own E-stop. Reconnecting…";
+
+/// The banner over the Control page while the link to the Pi is down, or
+/// the Pi refuses this computer.
+fn pi_lost(c: &crate::control::Connection) -> Option<Element<'_, Message>> {
+    let link = c.link.as_ref()?;
+    let said = match &link.state {
+        uc100_remote::LinkState::Refused(why) => format!("The Pi refused this computer: {why}"),
+        _ if !link.live => PI_LOST.to_string(),
+        _ => return None,
+    };
+    Some(
+        container(bold(said, 14).color(Color::WHITE))
+            .padding([10, 14])
+            .width(Fill)
+            .style(|_| container::Style {
+                background: Some(WARN.into()),
+                ..Default::default()
+            })
+            .into(),
+    )
 }
 
 /// The green Cycle Start button, greyed out without a message.
@@ -8034,6 +8184,9 @@ pub(crate) fn run_line(
 /// back), the setup's progress and time left, and Cycle Start, Hold,
 /// Resume and Stop now, always in the same places, greyed when they cannot
 /// be used (LIO-274).
+/// Why Hold is off while a probe moves.
+pub(crate) const PROBE_HOLD: &str = "Probing: Hold cannot pause a probe move. Stop now aborts it.";
+
 pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Message> {
     use crate::run::Action as R;
     use uc100::controller::State;
@@ -8100,6 +8253,11 @@ pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
             widget::tooltip::Position::Bottom,
         )
     };
+    let line: Element<_> = if c.probe_moving() {
+        text(PROBE_HOLD).size(13).color(WARN).wrapping(Wrapping::None).into()
+    } else {
+        line
+    };
     let (done, times) = match c.run.as_ref().and_then(|r| run_times(r, s)) {
         Some((done, short, long)) => (
             done,
@@ -8128,9 +8286,14 @@ pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
     });
     let pad = if fit.short { [8, 10] } else { [11, 14] };
     let big = |label: &str, m: Option<Message>| act_with(label.to_string(), m, false, None, pad);
-    let hold = msg(run.is_some() && state == Some(&State::Run), R::Hold);
+    // Hold, Resume and Stop act on the machine, a tool run followed or not
+    // (after reconnecting to a Pi that runs one); a watcher holds and stops.
+    let hold = msg(
+        state == Some(&State::Run) && !c.pi_down() && !c.probe_moving(),
+        R::Hold,
+    );
     let resume = msg(
-        run.is_some() && matches!(state, Some(State::Hold | State::Paused(_))),
+        matches!(state, Some(State::Hold | State::Paused(_))) && c.in_control(),
         R::Resume,
     );
     let mut buttons = row![cycle_start(
@@ -8177,7 +8340,7 @@ pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
         .push(after)
         .push(big(
             "Stop now",
-            msg(run.is_some() && crate::run::busy(state), R::Stop),
+            msg(crate::run::busy(state) && !c.pi_down(), R::Stop),
         ));
     container(
         row![picker, what, buttons]
@@ -8803,9 +8966,9 @@ fn spindle_card(
             .font(Font::MONOSPACE)
             .width(48),
         help::wrap(
-            slider(10.0..=200.0, c.feed_override, |v| Message::Machine(
-                Action::FeedOverride(v)
-            ))
+            slider(10.0..=200.0, c.feed_override, move |v| {
+                Message::Machine(Action::FeedOverride(if c.in_control() { v } else { c.feed_override }))
+            })
             .step(5.0_f32),
             help::command(
                 &Message::Machine(Action::FeedOverride(100.)),
@@ -8815,7 +8978,7 @@ fn spindle_card(
         ),
         small(
             "100 %",
-            Some(Message::Machine(Action::FeedOverride(100.))),
+            c.in_control().then_some(Message::Machine(Action::FeedOverride(100.))),
             false
         ),
     ]
