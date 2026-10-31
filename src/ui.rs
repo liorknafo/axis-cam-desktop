@@ -9796,8 +9796,11 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
         // is out of date, and say so (#39).
         let checked = c.run_program();
         let mut buttons = row![].spacing(6).align_y(Alignment::Center);
+        // Move there rises to Z's soft maximum, so it waits for machine
+        // zero: it says so and offers it here (LIO-341).
+        let unplaced = c.sim_zero().is_some() && !c.unset_limited_axes().is_empty();
         if c.sim_zero().is_some() {
-            let ready = checked.is_ok() && c.idle() && c.unset_limited_axes().is_empty();
+            let ready = checked.is_ok() && c.idle() && !unplaced;
             buttons = buttons.push(small(
                 "Move there",
                 ready.then_some(Message::Machine(Action::ToSimZero)),
@@ -9845,6 +9848,20 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
         let mut list = column![bold("Work zero on the stock", 13)].spacing(4);
         for line in steps {
             list = list.push(text(line).size(12));
+        }
+        if unplaced {
+            list = list.push(
+                row![
+                    small(
+                        "Set machine zero here",
+                        idle(Action::MachineZero(None)),
+                        false
+                    ),
+                    hint("Work zero", MOVE_THERE_WAITS, fit.chars(60)),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            );
         }
         col = col.push(rule::horizontal(1)).push(list).push(buttons);
     } else if run.checked().is_some() {
@@ -11671,6 +11688,7 @@ fn rotary_tab<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>
     Some(tab_scroll(col))
 }
 const HOME_NOTE: &str = "Home references every axis on its switch. Every E-stop clears the machine position: home again after one.";
+const MOVE_THERE_WAITS: &str = "Move there waits for machine zero: it rises to the top of Z first. Set it here, with X at its left end, Y at its front end and Z at the top (where the simulator starts), or in the Machine tab.";
 const MACHINE_ZERO_NOTE: &str = "Every E-stop clears the machine position: set it again after one. Without home switches, jog X to its left end, Y to its front end (gantry toward you) and Z to the top, then Set machine zero here. Keep the last position takes the position AXIS CAM saved at the last disconnect: only if nothing moved the machine since.";
 /// The note under a library editor's fields when its draft is not what the
 /// library holds: `saved` is the entry with the draft's id, if there is one.
