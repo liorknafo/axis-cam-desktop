@@ -485,6 +485,13 @@ pub enum Message {
         volume: std::sync::Arc<volume::Volume>,
         result: Result<std::sync::Arc<stock_surface::SurfaceMesh>, String>,
     },
+    /// The stock a run carved, meshed off the window's thread
+    /// (`App::refresh_run_mesh`): its key and the surface, or why it could
+    /// not be meshed.
+    RunMeshed {
+        key: RunMeshKey,
+        result: Result<std::sync::Arc<stock_surface::SurfaceMesh>, String>,
+    },
     Tick,
     Plan,
     /// The text of the planner chat's box changes.
@@ -675,6 +682,9 @@ type StockMeshKey = (String, u64, u64, stock_surface::Detail);
 type StartKey = (u64, usize, usize, stock_surface::Detail);
 /// How many of those the app keeps meshed (`App::start_mesh`).
 const START_MESHES: usize = 8;
+/// What the stock a run carved is meshed for: the carve
+/// (`run::Carving::serial`), its version and the detail.
+type RunMeshKey = (u64, u64, stock_surface::Detail);
 /// A heading and the lines of the box the inspector shows.
 pub type HoldingNote = Option<(String, Vec<String>)>;
 /// What the status of a generated preview ends with on a CNC machine, and on
@@ -1307,6 +1317,10 @@ pub struct App {
     /// The key of the one being meshed, and of the last that could not be.
     start_mesh_job: Option<StartKey>,
     start_mesh_failed: Option<StartKey>,
+    /// The key of the run's stock being meshed (`refresh_run_mesh`), and
+    /// of the last that could not be.
+    run_mesh_job: Option<RunMeshKey>,
+    run_mesh_failed: Option<RunMeshKey>,
     pub progress: f32,
     pub speed: f32,
     pub last_tick: Instant,
@@ -1571,6 +1585,7 @@ fn while_locked(m: &Message) -> bool {
             | PlanViewport(_)
             | Speed(_)
             | StockMeshed { .. }
+            | RunMeshed { .. }
             | Tick
             | PlanProgress(..)
             | PlanFinished(..)
@@ -1962,6 +1977,8 @@ impl App {
             start_mesh: vec![],
             start_mesh_job: None,
             start_mesh_failed: None,
+            run_mesh_job: None,
+            run_mesh_failed: None,
             progress: 0.,
             speed: 1.,
             last_tick: Instant::now(),
@@ -3220,6 +3237,86 @@ impl App {
                 volume,
                 result,
             },
+        )
+    }
+    /// The stock the run of the active setup has carved and its surface,
+    /// once meshed (`refresh_run_mesh`), for the Control page's 3D view:
+    /// drawn as the simulation's stock is, instead of `live_stock` and
+    /// `live_volume`. While the mesher waits for the machine to stop, only
+    /// a surface of every cut so far: an older one would hide what the tool
+    /// cuts now, which the live stock shows.
+    pub fn run_stock(&self) -> Option<(&volume::Volume, &stock_surface::SurfaceMesh)> {
+        if self.page != Page::Control {
+            return None;
+        }
+        let r = self.control.as_ref()?.run.as_ref()?;
+        let setup = self.doc.setups.get(r.setup)?;
+        if setup.id != self.doc.active {
+            return None;
+        }
+        let c = r.carving.as_ref()?;
+        let current = c.surface.as_ref().is_some_and(|s| s.0 == c.version);
+        if !current && !self.run_meshes() {
+            return None;
+        }
+        r.carved_surface()
+    }
+    /// The stock a run carves may be meshed now (`refresh_run_mesh`): the
+    /// machine stands still, or the Pi feeds it. While this computer's
+    /// driver feeds a moving machine (USB, the simulator) nothing competes
+    /// with it for the processor (#167).
+    fn run_meshes(&self) -> bool {
+        !self.locked() || self.control.as_ref().is_some_and(|c| c.pi.is_some())
+    }
+    /// Meshes the stock the run has carved (`run::Carving::volume`) off the
+    /// window's thread, at the simulation's detail, when its last surface
+    /// is of an earlier cut or detail (in line in the smoke run): one job at
+    /// a time, each version once, the last surface drawn meanwhile. While
+    /// the machine moves, only on the Pi: on USB and the simulator this
+    /// computer's driver feeds the machine, and the mesher waits for it to
+    /// stop, as the check does (#167).
+    pub(crate) fn refresh_run_mesh(&mut self) -> Task<Message> {
+        if self.run_mesh_job.is_some() {
+            return Task::none();
+        }
+        if !self.run_meshes() {
+            return Task::none();
+        }
+        let Some(c) = self.control.as_ref() else {
+            return Task::none();
+        };
+        let Some(carving) = c.run.as_ref().and_then(|r| r.carving.as_ref()) else {
+            return Task::none();
+        };
+        let Some(volume) = &carving.volume else {
+            return Task::none();
+        };
+        let key = (carving.serial, carving.version, self.stock_detail);
+        if carving
+            .surface
+            .as_ref()
+            .is_some_and(|s| (s.0, s.1) == (key.1, key.2))
+            || self.run_mesh_failed == Some(key)
+        {
+            return Task::none();
+        }
+        let snapshot = stock_surface::Snapshot::of(volume, key.2);
+        let build = move || snapshot.build().map(std::sync::Arc::new);
+        if self.smoke_dir.is_some() {
+            return self.update(Message::RunMeshed {
+                key,
+                result: build(),
+            });
+        }
+        self.run_mesh_job = Some(key);
+        Task::perform(
+            async move {
+                let result = tokio::task::spawn_blocking(build)
+                    .await
+                    .unwrap_or_else(|e| Err(format!("Stock mesher failed: {e}")));
+                (key, result)
+            },
+            |(key, result)| Message::RunMeshed { key, result },
         )
     }
     /// Checks the setup being run, in the background: simulates the job up to
@@ -7193,6 +7290,24 @@ impl App {
                     }
                 }
             }
+            Message::RunMeshed { key, result } => {
+                if self.run_mesh_job == Some(key) {
+                    self.run_mesh_job = None;
+                }
+                let carving = (self.control.as_mut())
+                    .and_then(|c| c.run.as_mut()?.carving.as_mut())
+                    .filter(|c| c.serial == key.0);
+                match (result, carving) {
+                    (Ok(surface), Some(carving)) => {
+                        carving.surface = Some((key.1, key.2, surface));
+                    }
+                    (Ok(_), None) => {}
+                    (Err(e), _) => {
+                        self.status = e;
+                        self.run_mesh_failed = Some(key);
+                    }
+                }
+            }
             Message::HelpHover(on) => self.help_animating = on,
             Message::HelpMore(expanded) => self.pinned_expanded = expanded,
             Message::HelpPause(paused) => self.pinned_paused = paused,
@@ -7316,6 +7431,7 @@ impl App {
                     self.picture_run(),
                     self.refresh_stock_surface(),
                     self.refresh_start_mesh(),
+                    self.refresh_run_mesh(),
                     self.refresh_post(),
                     left,
                     recheck,

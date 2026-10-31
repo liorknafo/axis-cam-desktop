@@ -272,6 +272,14 @@ pub struct Viewport<'a> {
     /// (`run::Run::carved_volume`) with its version: drawn, turned to the
     /// machine's A, instead of the setup's stock when no simulation is shown.
     pub live_volume: Option<(&'a crate::volume::Volume, u64)>,
+    /// The stock a run of this setup has carved, as a volume, and its
+    /// surface as last meshed (`App::run_stock`): drawn, turned to the
+    /// machine's A, as the simulation draws its stock, instead of
+    /// `live_stock` and `live_volume` when no simulation is shown.
+    pub run_stock: Option<(
+        &'a crate::volume::Volume,
+        &'a crate::stock_surface::SurfaceMesh,
+    )>,
     /// Per face of the part (`Mesh::faces`): whether the whole job still
     /// leaves it under stock (`uncut::Uncut::faces`); those are drawn in
     /// `UNCUT`. Empty when that is not known.
@@ -1124,7 +1132,7 @@ impl Viewport<'_> {
             self.thin.faces.len()
         );
         format!(
-            "{key}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{:?}",
+            "{key}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{:?}",
             self.holding,
             self.framed,
             self.frame,
@@ -1134,6 +1142,8 @@ impl Viewport<'_> {
             self.start_stock
                 .map(|(_, surface)| std::ptr::from_ref(surface)),
             self.live_volume.map(|(g, v)| (std::ptr::from_ref(g), v)),
+            self.run_stock
+                .map(|(_, surface)| std::ptr::from_ref(surface)),
             self.uncut.first().map(std::ptr::from_ref),
             self.uncut.len(),
             self.show_uncut,
@@ -1186,6 +1196,7 @@ impl Viewport<'_> {
             && self.show_stock
             && (self.live_stock.is_some()
                 || self.live_volume.is_some()
+                || self.run_stock.is_some()
                 || (start.is_some() && !self.picking));
         let behind_stock = (self.simulation.is_some() && self.show_stock) || carved;
         let cut = self.cut();
@@ -1394,11 +1405,28 @@ impl Viewport<'_> {
             );
         }
         if self.simulation.is_some() || carved {
-            let outline = match (self.simulation, self.live_stock) {
-                (Some(simulation), _) => {
+            let run_stock = self.run_stock.zip(self.setup);
+            let outline = match (self.simulation, run_stock, self.live_stock) {
+                (Some(simulation), ..) => {
                     self.raster_simulation(simulation, p, &mut rgba, &mut depths, w, h, ratio)
                 }
-                (None, Some((grid, _))) => {
+                (None, Some(((volume, surface), setup)), _) => {
+                    // As the simulation draws its stock: the run's carved
+                    // stock, meshed, seen in the setup's frame turned to
+                    // the machine's A.
+                    let frame = crate::volume::Frame::new(setup, self.mesh);
+                    let current = match self.extra_turn() {
+                        Some((axis, turn)) => frame.turned(axis, turn),
+                        None => frame,
+                    };
+                    let (triangles, colors, outline) =
+                        self.carved(volume, surface, current, p, ratio);
+                    raster_triangles(&mut rgba, &mut depths, w, h, triangles.len(), |i| {
+                        (triangles[i], colors[i])
+                    });
+                    outline
+                }
+                (None, None, Some((grid, _))) => {
                     let scale = self.mesh.display_scale();
                     let mut outline = vec![];
                     let mut face = |points: &[[f32; 3]], color: [u8; 4]| {
@@ -1426,7 +1454,7 @@ impl Viewport<'_> {
                     grid_faces(grid, &mut face);
                     outline
                 }
-                (None, None) => {
+                (None, None, None) => {
                     if let (Some((volume, _)), Some(setup)) = (self.live_volume, self.setup) {
                         // A run that turns A: the stock it carved, seen in the
                         // setup's frame turned to the machine's A.
@@ -4081,6 +4109,7 @@ mod tests {
             live_stock: None,
             start_stock: None,
             live_volume: None,
+            run_stock: None,
             uncut: &[],
             uncut_pieces: &[],
             thin: &crate::uncut::EMPTY,
@@ -4241,6 +4270,7 @@ mod tests {
                 live_stock: None,
                 a: None,
                 live_volume: None,
+                run_stock: None,
                 start_stock: None,
                 uncut: &[],
                 uncut_pieces: &[],
@@ -4323,6 +4353,7 @@ mod tests {
             live_stock: None,
             start_stock: None,
             live_volume: None,
+            run_stock: None,
             uncut: &[],
             uncut_pieces: &[],
             thin: &crate::uncut::EMPTY,
@@ -4414,6 +4445,7 @@ mod tests {
             live_stock: None,
             start_stock: None,
             live_volume: None,
+            run_stock: None,
             uncut: &all,
             uncut_pieces: &[],
             thin: &crate::uncut::EMPTY,
@@ -4488,6 +4520,7 @@ mod tests {
             live_stock: None,
             a: None,
             live_volume: None,
+            run_stock: None,
             start_stock: None,
             uncut: &[],
             uncut_pieces: &[],
@@ -4580,6 +4613,7 @@ mod tests {
             live_stock: None,
             a: None,
             live_volume: None,
+            run_stock: None,
             start_stock,
             uncut: &[],
             uncut_pieces: &[],
@@ -4659,6 +4693,7 @@ mod tests {
             live_stock: None,
             a: None,
             live_volume: None,
+            run_stock: None,
             start_stock: None,
             uncut: &[],
             uncut_pieces: &[],
@@ -4795,6 +4830,7 @@ mod tests {
             live_stock: None,
             start_stock: None,
             live_volume: None,
+            run_stock: None,
             uncut: &all,
             uncut_pieces: &[],
             thin: &crate::uncut::EMPTY,
@@ -4916,6 +4952,7 @@ mod tests {
                 live_stock: None,
                 start_stock: None,
                 live_volume: None,
+                run_stock: None,
                 uncut,
                 uncut_pieces: &[],
                 thin: &crate::uncut::EMPTY,
@@ -4967,6 +5004,7 @@ mod tests {
             live_stock: None,
             start_stock: None,
             live_volume: None,
+            run_stock: None,
             uncut: &uncut.faces,
             uncut_pieces: &uncut.pieces,
             thin: &crate::uncut::EMPTY,
@@ -5061,6 +5099,7 @@ mod tests {
             live_stock: None,
             start_stock: None,
             live_volume: None,
+            run_stock: None,
             uncut: &[],
             uncut_pieces: &[],
             thin: &crate::uncut::EMPTY,
@@ -5148,6 +5187,7 @@ mod tests {
             live_stock: None,
             start_stock: None,
             live_volume: None,
+            run_stock: None,
             uncut: &[],
             uncut_pieces: &[],
             thin: &crate::uncut::EMPTY,
@@ -5293,6 +5333,7 @@ mod tests {
             live_stock: None,
             start_stock: None,
             live_volume: None,
+            run_stock: None,
             uncut: &[],
             uncut_pieces: &[],
             thin: &crate::uncut::EMPTY,
@@ -5405,6 +5446,7 @@ mod tests {
             live_stock: None,
             start_stock: None,
             live_volume: None,
+            run_stock: None,
             uncut: &[],
             uncut_pieces: &[],
             thin: &crate::uncut::EMPTY,
@@ -5480,6 +5522,7 @@ mod tests {
             live_stock: None,
             start_stock: None,
             live_volume: None,
+            run_stock: None,
             uncut: &[],
             uncut_pieces: &[],
             thin: &crate::uncut::EMPTY,
@@ -5597,6 +5640,7 @@ mod tests {
             live_stock: None,
             start_stock: None,
             live_volume: None,
+            run_stock: None,
             uncut: &[],
             uncut_pieces: &[],
             thin: &crate::uncut::EMPTY,
@@ -5667,6 +5711,7 @@ mod tests {
             live_stock: None,
             start_stock: None,
             live_volume: None,
+            run_stock: None,
             uncut: &[],
             uncut_pieces: &[],
             thin: &crate::uncut::EMPTY,
@@ -5733,6 +5778,7 @@ mod tests {
             live_stock: None,
             start_stock: None,
             live_volume: None,
+            run_stock: None,
             uncut: &[],
             uncut_pieces: &[],
             thin: &crate::uncut::EMPTY,
@@ -5791,6 +5837,7 @@ mod tests {
             live_stock: None,
             start_stock: None,
             live_volume: None,
+            run_stock: None,
             uncut: &[],
             uncut_pieces: &[],
             thin: &crate::uncut::EMPTY,
@@ -5847,6 +5894,7 @@ mod tests {
             live_stock: None,
             start_stock: None,
             live_volume: None,
+            run_stock: None,
             uncut: &[],
             uncut_pieces: &[],
             thin: &crate::uncut::EMPTY,
@@ -5916,6 +5964,7 @@ mod tests {
             live_stock: None,
             a: None,
             live_volume: None,
+            run_stock: None,
             start_stock: None,
             uncut: &[],
             uncut_pieces: &[],
@@ -6115,6 +6164,7 @@ mod tests {
             live_stock: None,
             start_stock: None,
             live_volume: None,
+            run_stock: None,
             uncut: &[],
             uncut_pieces: &[],
             thin: &crate::uncut::EMPTY,

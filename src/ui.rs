@@ -2293,11 +2293,15 @@ const SECTION_LINE: f32 = 40.;
 /// The 3D view `scene` shows. None without a part to show.
 pub(crate) fn scene_viewport(app: &App) -> Option<Viewport<'_>> {
     let s = app.doc.active_setup();
+    // On the Control page the stock a run of the setup carved is drawn, not
+    // an operation's preview left from MANUFACTURE.
+    let carved =
+        app.live_stock().is_some() || app.live_volume().is_some() || app.run_stock().is_some();
     Some(Viewport {
         setup: s,
         mesh: app.part_mesh()?,
         operation: app.operation(),
-        simulation: app.active_simulation(),
+        simulation: app.active_simulation().filter(|_| !carved),
         sample: app.is_sample(),
         camera: app.camera,
         picking: app.picking || app.picking_pin_holes(),
@@ -2320,6 +2324,7 @@ pub(crate) fn scene_viewport(app: &App) -> Option<Viewport<'_>> {
         live_stock: app.live_stock(),
         start_stock: app.start_stock(),
         live_volume: app.live_volume(),
+        run_stock: app.run_stock(),
         uncut: shown_uncut(app)
             .and_then(|(found, _)| found.as_ref().ok())
             .map(|found| found.faces.as_slice())
@@ -13286,6 +13291,7 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             live_stock: None,
             start_stock: None,
             live_volume: None,
+            run_stock: None,
             uncut: &[],
             uncut_pieces: &[],
             thin: &crate::uncut::EMPTY,

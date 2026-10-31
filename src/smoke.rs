@@ -5314,6 +5314,115 @@ flood = { pin = 8 }
         render_png(&a, size, &out.join("3-drilling-chosen-surface-unknown.png"));
     }
 
+    /// The MACHINE page draws the stock a tool run cut as MANUFACTURE draws
+    /// what the same operations leave: its surface meshed at the
+    /// simulation's detail, not the run's top-down grid of columns, whose
+    /// walls step a cell at a time. While the machine moves it is meshed
+    /// only on the Pi, the last surface drawn until the next is; on this
+    /// computer's driver the mesher waits for the machine to stop (#167),
+    /// and the live grid shows what the tool cuts meanwhile. An operation's
+    /// preview left from MANUFACTURE does not hide it.
+    #[test]
+    fn the_machine_page_draws_the_stock_a_run_cut_as_planning_does() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        // The Face, the Pocket and the Contour, one tool run; the Drill.
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        check_run_pictured(&mut a, dir.path(), 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        let version = |a: &App| run_of(a).carving.as_ref().map_or(0, |c| c.version);
+        run_until(&mut a, 60., "the first cuts", |r| {
+            r.carving.as_ref().is_some_and(|c| c.version > 0)
+        });
+        let on_pi = |a: &mut App, pi: bool| {
+            a.control.as_mut().unwrap().pi = pi.then(|| "pi".to_string());
+        };
+        // On the simulator, as on USB: nothing is meshed while it moves.
+        assert!(a.locked());
+        let task = a.refresh_run_mesh();
+        assert!(iced_runtime::task::into_stream(task).is_none());
+        assert!(a.run_mesh_job.is_none() && a.run_stock().is_none());
+        // On the Pi it is, in the background (here in line).
+        on_pi(&mut a, true);
+        let task = a.refresh_run_mesh();
+        assert!(iced_runtime::task::into_stream(task).is_some());
+        a.run_mesh_job = None;
+        a.smoke_dir = Some(dir.path().to_path_buf());
+        let _ = a.refresh_run_mesh();
+        a.smoke_dir = None;
+        on_pi(&mut a, false);
+        let meshed = version(&a);
+        assert_eq!(
+            run_of(&a)
+                .carving
+                .as_ref()
+                .unwrap()
+                .surface
+                .as_ref()
+                .unwrap()
+                .0,
+            meshed
+        );
+        run_until(&mut a, 60., "more cuts", |r| {
+            r.carving.as_ref().is_some_and(|c| c.version > meshed)
+        });
+        assert!(a.locked());
+        // Once the tool has cut on, an older surface is drawn only on the
+        // Pi, whose next one comes; here the live grid shows the cuts.
+        assert!(a.run_stock().is_none() && a.live_stock().is_some());
+        on_pi(&mut a, true);
+        assert!(a.run_stock().is_some());
+        on_pi(&mut a, false);
+        run_until(&mut a, 60., "the first tool run", |r| r.running.is_none());
+        tick_until(&mut a, 5.0, "Idle", |s| s.state == Some(State::Idle));
+        assert!(run_of(&a).done[0], "{:?}", run_of(&a).outcome);
+        // What the tick does in the background once the machine stops,
+        // in line here: the run's stock meshed.
+        a.smoke_dir = Some(dir.path().to_path_buf());
+        // The tick's job, which tests do not run, gives way.
+        a.run_mesh_job = None;
+        let _ = a.refresh_run_mesh();
+        a.show_uncut = false;
+        let size = (480, 360);
+        let machine = crate::ui::scene_viewport(&a).unwrap();
+        let p = crate::viewport::Projector::fit(
+            a.camera,
+            (size.0 as f32, size.1 as f32),
+            machine.scene_bounds(),
+        );
+        let depths = |v: &crate::viewport::Viewport| v.render(&p, size, 1., None, &[]).1;
+        let cut = depths(&machine);
+        // Planning: the stock the Drill starts from, the tool run's three
+        // operations cut, meshed in line.
+        a.page = Page::Work;
+        let _ = a.refresh_left_stock();
+        let _ = a.update(Message::SelectOp(3));
+        let _ = a.refresh_start_mesh();
+        let planned = crate::ui::scene_viewport(&a).unwrap();
+        assert!(planned.start_stock.is_some() && planned.simulation.is_none());
+        let planned = depths(&planned);
+        // Where either draws the stock, both do, as near as the meshes' cells.
+        let drawn = planned.iter().filter(|d| d.is_finite()).count();
+        // A pixel only one of them draws is infinitely far apart.
+        let apart = (cut.iter().zip(&planned))
+            .filter(|(m, s)| m.is_finite() || s.is_finite())
+            .filter(|(m, s)| (*m - *s).abs() >= 0.5)
+            .count();
+        assert!(drawn > 20_000, "{drawn}");
+        assert!(apart * 200 < drawn, "{apart} of {drawn} pixels apart");
+        // A preview generated in MANUFACTURE: MACHINE still draws the run's.
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Generate);
+        assert!(a.active_simulation().is_some(), "{}", a.status);
+        a.page = Page::Control;
+        let view = crate::ui::scene_viewport(&a).unwrap();
+        assert!(view.simulation.is_none() && view.run_stock.is_some());
+        assert_eq!(depths(&view), cut);
+    }
+
     /// The driver refuses a job sent while it is not idle for it: for a few
     /// milliseconds after a work or machine zero it re-anchors its position,
     /// while the app's snapshot still says Idle. Such a Cycle Start ran
@@ -6404,6 +6513,143 @@ flood = { pin = 8 }
                 );
             }
         }
+    }
+
+    /// Renders a saved project's first setup as MANUFACTURE simulates its
+    /// first tool run and as MACHINE shows it cut on a simulated UC100, the
+    /// same camera on both, to PNGs in `$AXIS_RENDER_DIR` (default
+    /// /tmp/run-stock-project): "1-planning" after the tool run's last
+    /// operation, "2-machine-cutting" partway and "3-machine-done" once it
+    /// ended, each also zoomed in ("-zoom"). The project is `$AXIS_PROJECT`
+    /// (default the app's workspace), read and not saved, its model loaded
+    /// from where it says; its machine is replaced by a simulated one, its
+    /// feeds raised so the run takes seconds. Not a check: run it with
+    /// --ignored.
+    #[test]
+    #[ignore]
+    fn render_a_saved_projects_run_stock() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let project = std::path::PathBuf::from(std::env::var("AXIS_PROJECT").unwrap_or(format!(
+            "{}/Library/Application Support/AXIS CAM Studio/workspace.json",
+            std::env::var("HOME").unwrap()
+        )));
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/run-stock-project".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let size = iced::Size::new(1440., 900.);
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), FAST, &[0]);
+        let m = a.doc.machines[0].clone();
+        let (mut doc, _) = crate::storage::load_reporting(&project).unwrap();
+        let mesh = crate::mesh::load(&doc.file.as_ref().unwrap().path).unwrap();
+        // The project's own machine, which its tools are on, driven by the
+        // simulated controller.
+        let simulated = |machine: &mut Machine| {
+            for k in [
+                "uc100_profile",
+                "uc100_connection",
+                "x",
+                "y",
+                "z",
+                "feed",
+                "post_dwell",
+            ] {
+                machine.p.insert(k.into(), m.p[k].clone());
+            }
+        };
+        doc.machines.iter_mut().for_each(simulated);
+        for setup in &mut doc.setups {
+            simulated(&mut setup.machine);
+            for op in &mut setup.operations {
+                op.p.insert("feed".into(), "30000".into());
+            }
+        }
+        doc.active = doc.setups[0].id.clone();
+        a.replace_document(doc, None);
+        let _ = a.update(Message::ModelRestored(Ok(mesh)));
+        // The operations of the first tool run: those with the first's tool.
+        let tool = a.doc.setups[0].operations[0].tool.clone();
+        let last = (a.doc.setups[0].operations.iter())
+            .take_while(|o| o.tool == tool)
+            .count()
+            - 1;
+        let shot = |a: &mut App, name: &str| {
+            let _ = a.update(Message::Camera("ISO"));
+            render_png(a, size, &out.join(format!("{name}.png")));
+            a.camera.zoom *= 2.5;
+            render_png(a, size, &out.join(format!("{name}-zoom.png")));
+        };
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(last));
+        let _ = a.update(Message::Generate);
+        assert!(a.simulation.is_some(), "{}", a.status);
+        // The stock alone, as MACHINE draws it.
+        a.paths = false;
+        let _ = a.update(Message::Scrub(1.));
+        let _ = a.update(Message::ScrubDone);
+        mesh_the_stock(&mut a);
+        eprintln!("planning detail {}", a.stock_detail);
+        shot(&mut a, "1-planning");
+        // MACHINE with no preview left from MANUFACTURE.
+        a.simulation = None;
+        a.page = Page::Control;
+        zeroed(&mut a);
+        check_run_pictured(&mut a, dir.path(), 0);
+        // The Operations list's hover pictures of the stock each leaves.
+        for (oi, picture) in &run_of(&a).pictures {
+            if let iced::widget::image::Handle::Rgba {
+                width,
+                height,
+                pixels,
+                ..
+            } = picture
+            {
+                let file = std::fs::File::create(out.join(format!("0-op-{}.png", oi + 1))).unwrap();
+                let mut e = png::Encoder::new(file, *width, *height);
+                e.set_color(png::ColorType::Rgba);
+                e.write_header().unwrap().write_image_data(pixels).unwrap();
+            }
+        }
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Job));
+        let _ = a.update(Message::ControlView(crate::ui::JobView::Stock));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        let started = std::time::Instant::now();
+        run_until(&mut a, 600., "halfway", |r| {
+            r.carving.as_ref().is_some_and(|c| c.version > 0)
+                && started.elapsed() > std::time::Duration::from_secs(45)
+        });
+        mesh_the_run(&mut a);
+        shot(&mut a, "2-machine-cutting");
+        run_until(&mut a, 1200., "the tool run", |r| r.running.is_none());
+        tick_until(&mut a, 5.0, "Idle", |s| s.state == Some(State::Idle));
+        mesh_the_run(&mut a);
+        shot(&mut a, "3-machine-done");
+    }
+
+    /// Meshes the stock a run has carved, here rather than in the
+    /// background, as `App::refresh_run_mesh` does once the machine stops,
+    /// and on the Pi while it moves: the connection is taken for one on the
+    /// Pi meanwhile.
+    fn mesh_the_run(a: &mut App) {
+        let pi = conn(a).pi.clone();
+        let c = a.control.as_mut().unwrap();
+        c.pi.get_or_insert_with(|| "render".into());
+        a.smoke_dir = Some(std::env::temp_dir());
+        a.run_mesh_job = None;
+        let _ = a.refresh_run_mesh();
+        a.smoke_dir = None;
+        a.control.as_mut().unwrap().pi = pi;
+        let c = run_of(a).carving.as_ref().unwrap();
+        eprintln!(
+            "run stock: {} cuts, {:?}",
+            c.volume.as_ref().map_or(0, |v| v.cuts.len()),
+            c.surface
+                .as_ref()
+                .map(|s| (s.1, s.2.triangles.len(), s.2.cell_mm, s.2.milliseconds))
+        );
     }
 
     /// Meshes the stock as `a`'s simulation has it cut, here rather than in

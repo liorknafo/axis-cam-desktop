@@ -672,6 +672,16 @@ the same places, greyed when they cannot be used. Under it three columns:
   numbered checklist with its buttons. The tab changes by itself only when
   the phase does (a tool change comes up, a tool run starts, the change is
   done), never on a tick and never while a text field has the focus.
+  The stock a run has cut is drawn as the MANUFACTURE simulation draws its
+  stock: the surface of every cut so far, meshed at the simulation's
+  **Draft / Standard / Fine** detail by the same mesher, in the background,
+  each cut state once, the last surface shown until the next is ready. On
+  the Pi it follows the tool while the machine moves. On USB and the
+  simulator this computer's driver feeds the machine, so nothing is meshed
+  while it moves (#167): the stock is drawn coarser then, from a grid of
+  at most 96 cells a side, and smooth again as soon as the machine stops.
+  An operation's preview left open in MANUFACTURE does not hide the run's
+  stock.
 - **Right, Operations**: the setup's operations in the order they are cut,
   grouped by tool run, one row each with its state, name, time and **Start
   here**; the one being cut shows how far it is. The picture of the stock it
