@@ -198,6 +198,14 @@ impl Plan {
     pub fn is_lathe(&self) -> bool {
         self.shape == CutterShape::Revolve
     }
+    /// The slowest and the fastest feed (mm/min) of the plan's feed moves;
+    /// None without one.
+    pub fn feed_range(&self) -> Option<(f32, f32)> {
+        (self.moves.iter())
+            .filter(|m| m.motion == Motion::Feed && m.feed > 0.)
+            .map(|m| (m.feed, m.feed))
+            .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+    }
 }
 /// A lathe cut: the ring of the plan's setup frame between `z[0]` and `z[1]`
 /// along its Z axis and between the radii `r[0]` and `r[1]` from it (mm),

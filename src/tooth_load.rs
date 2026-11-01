@@ -1097,14 +1097,10 @@ fn slide(values: &[f32], along: &[f64], reach: f64, most: bool) -> Vec<f32> {
     }
     out
 }
-/// The colour a path is drawn in where one tooth takes `force` of the
-/// operation's `peak`: blue light, through violet, to red at the peak; grey
-/// where it cuts nothing.
-pub fn colour(force: f32, peak: f32) -> [u8; 4] {
-    if force <= 0. || peak <= 0. {
-        return [150, 150, 150, 255];
-    }
-    let t = (force / peak).clamp(0., 1.);
+/// The colour a path is drawn in at `t` of its scale (0 to 1): blue, through
+/// violet, to red at 1.
+pub fn colour(t: f32) -> [u8; 4] {
+    let t = t.clamp(0., 1.);
     let stops = [[34., 114., 176.], [140., 70., 170.], [214., 39., 40.]];
     let (a, b, u) = if t < 0.5 {
         (stops[0], stops[1], t * 2.)
@@ -1941,8 +1937,9 @@ mod tests {
     }
     #[test]
     fn colours_run_from_blue_to_red() {
-        assert_eq!(colour(0., 10.), [150, 150, 150, 255]);
-        assert_eq!(colour(1e-6, 10.)[0..3], [34, 114, 176]);
-        assert_eq!(colour(10., 10.)[0..3], [214, 39, 40]);
+        assert_eq!(colour(0.)[0..3], [34, 114, 176]);
+        assert_eq!(colour(0.5)[0..3], [140, 70, 170]);
+        assert_eq!(colour(1.)[0..3], [214, 39, 40]);
+        assert_eq!(colour(2.), colour(1.));
     }
 }
