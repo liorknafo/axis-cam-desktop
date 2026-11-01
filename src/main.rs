@@ -2100,6 +2100,16 @@ impl App {
             self.save_settings();
         }
     }
+    /// While a UC100 machine is connected, its X, Y and Z travel in the
+    /// library and in each setup's copy are its profile's soft limits
+    /// (`control::travel_from_profile`), in a project opened or setups put
+    /// back since Connect too (LIO-344). Whether any changed.
+    fn travel_from_connected(&mut self) -> bool {
+        let Some(c) = &self.control else {
+            return false;
+        };
+        control::travel_from_profile(&mut self.doc, &c.machine_id, &c.config)
+    }
     fn replace_document(&mut self, doc: Document, path: Option<PathBuf>) {
         // What is being generated is the old project's.
         self.cancel_generation();
@@ -2120,6 +2130,7 @@ impl App {
         if !self.is_sample() {
             self.doc.sync_stock_sources();
         }
+        self.travel_from_connected();
         // What was worked out for the old project is not even a last result
         // of this one (`stale_ready`, `ui::stock_picture`).
         self.ready = run::Ready::default();
@@ -7698,6 +7709,7 @@ impl App {
                 // since the preview comes back, as Undo does it.
                 let restored = self.doc.restore_holders(&job, &job.setups);
                 self.doc.setups = job.setups;
+                self.travel_from_connected();
                 self.doc.active = job.active;
                 self.stop_selection();
                 self.page = Page::Work;
@@ -7768,6 +7780,7 @@ impl App {
                 status += &self.doc.restore_holders(&before, &before.setups);
                 self.doc.setups = before.setups;
                 self.doc.active = before.active;
+                self.travel_from_connected();
                 self.stop_selection();
                 self.touch();
                 self.status = status;
