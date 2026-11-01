@@ -1018,7 +1018,8 @@ Once the machine is Idle, the Control page has everything needed before a job:
   55 mm): measure the machine and correct the soft limits in Controller
   configuration. They are given once (LIO-344): saving the profile, and
   connecting to the machine, make its X, Y and Z travel in the machine
-  library and in each setup's copy the soft limits' spans, marked Measured.
+  library and in each setup's copy the soft limits' spans, marked Measured;
+  so does opening a project, or putting setups back, while it is connected.
 
 **Controller configuration** (beside **Control** in the MACHINE toolbar) does
 the commissioning work that needed the driver's egui app or a text editor:

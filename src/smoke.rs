@@ -9352,6 +9352,118 @@ flood = { pin = 8 }
         });
     }
 
+    /// The owner's profile, X 0..305, Y 0..405 and Z -100..0 (Z's top at
+    /// machine 0, down negative), with a job opened after Connect whose
+    /// machine still says X 390, Y 280, Z 55 (LIO-344): the job is given the
+    /// profile's travel. A work zero 7.4 mm under Z's top puts the 15 mm
+    /// clearance over it 7.6 mm over the top, which Cycle Start refuses;
+    /// Move there and Zero all put it on the simulator's block top, at
+    /// machine Z -50, and the job starts. Undo plan puts back setups from
+    /// before Connect, which are given it too.
+    #[test]
+    fn a_job_opened_after_connect_takes_the_profile_travel_and_runs_on_z_below_zero() {
+        use crate::control::Action;
+        use crate::post_check::machine_mm;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let profile = FAST
+            .replace("soft_max = 390.0", "soft_max = 305.0")
+            .replace("soft_max = 280.0", "soft_max = 405.0")
+            .replace("soft_min = -80.0", "soft_min = -100.0");
+        let mut a = run_app_on(dir.path(), &profile);
+        let mut job = a.doc.clone();
+        let setups = job.setups.iter_mut().map(|s| &mut s.machine);
+        for m in job.machines.iter_mut().chain(setups) {
+            for (k, v) in [("x", "390"), ("y", "280"), ("z", "55")] {
+                m.p.insert(k.into(), v.into());
+            }
+        }
+        let mesh = a.imported_mesh.clone();
+        idle(&mut a);
+        a.replace_document(job.clone(), None);
+        a.imported_mesh = mesh;
+        a.page = Page::Control;
+        let travel = |a: &App| {
+            let setups = a.doc.setups.iter().map(|s| &s.machine);
+            (a.doc.machines.iter().chain(setups))
+                .map(|m| ["x", "y", "z"].map(|k| machine_mm(m, k)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(travel(&a), vec![[305., 405., 100.]; 2]);
+        let _ = a.update(Message::Machine(Action::MachineZero(None)));
+        tick_until(&mut a, 3.0, "machine zero", |s| {
+            s.referenced[..3].iter().all(|r| *r)
+        });
+        // Work X15 Y20 at machine 0, and work Z 7.4 at Z's top.
+        mdi(&mut a, "G10 L2 P1 X15 Y20 Z-7.4");
+        check_run(&mut a, 0);
+        let said = problems(&a);
+        assert_eq!(said.len(), 3, "{said:#?}");
+        assert!(
+            said[2].starts_with("At this work zero the tool would reach machine Z -11.400 to 7.600, outside the soft limits -100.000 to 0.000."),
+            "{said:#?}"
+        );
+        let zero = conn(&a).sim_zero().unwrap();
+        assert_eq!(zero[2], -50.);
+        let _ = a.update(Message::Machine(Action::ToSimZero));
+        tick_until(&mut a, 10.0, "the move onto the block", |s| {
+            s.state == Some(State::Idle)
+                && (0..3).all(|k| (s.machine_pos[k] - zero[k]).abs() < 0.06)
+        });
+        let _ = a.update(Message::Machine(Action::WorkZero(None)));
+        tick_until(&mut a, 2.0, "work zero", |s| {
+            s.work_pos[..3].iter().all(|v| v.abs() < 1e-6)
+        });
+        assert_eq!(conn(&a).snapshot.work_offset[2], -50.);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(crate::run::Action::CycleStart));
+        assert!(run_of(&a).running.is_some());
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+        a.undo = Some(job);
+        let _ = a.update(Message::UndoPlan);
+        assert_eq!(travel(&a), vec![[305., 405., 100.]; 2]);
+    }
+
+    /// The machine editor left open across Connect is given the profile's
+    /// travel too, so Save and Assign to current setup keep it (LIO-344);
+    /// travel typed while it is connected is saved as the profile's.
+    #[test]
+    fn a_machine_edited_across_connect_keeps_the_profile_travel() {
+        use crate::post_check::machine_mm;
+        let dir = tempfile::tempdir().unwrap();
+        let profile = FAST
+            .replace("soft_max = 390.0", "soft_max = 305.0")
+            .replace("soft_max = 280.0", "soft_max = 405.0")
+            .replace("soft_min = -80.0", "soft_min = -100.0");
+        let mut a = run_app_on(dir.path(), &profile);
+        let setups = a.doc.setups.iter_mut().map(|s| &mut s.machine);
+        for m in a.doc.machines.iter_mut().chain(setups) {
+            for (k, v) in [("x", "390"), ("y", "280"), ("z", "55")] {
+                m.p.insert(k.into(), v.into());
+            }
+        }
+        let id = a.doc.machines[0].id.clone();
+        let _ = a.update(Message::EditMachine(id.clone()));
+        let _ = a.update(Message::Edit(Target::Machine, "name", "JY5800 B".into()));
+        idle(&mut a);
+        let travel = |m: &Machine| ["x", "y", "z"].map(|k| machine_mm(m, k));
+        assert_eq!(travel(&a.machine_draft), [305., 405., 100.]);
+        let _ = a.update(Message::SaveMachine);
+        let _ = a.update(Message::AssignMachine(id.clone()));
+        let m = &a.doc.setups[0].machine;
+        assert_eq!(
+            (m.name(), travel(m)),
+            ("JY5800 B".into(), [305., 405., 100.])
+        );
+        let _ = a.update(Message::EditMachine(id));
+        let _ = a.update(Message::Edit(Target::Machine, "z", "55".into()));
+        let _ = a.update(Message::SaveMachine);
+        assert_eq!(travel(&a.doc.machines[0]), [305., 405., 100.]);
+        assert!(a.status.starts_with("Machine profile saved, its X, Y and Z travel kept at its UC100 profile's soft limits"), "{}", a.status);
+    }
+
     /// Before machine zero (LIO-341) the Work zero tab says why Move there
     /// waits and offers Set machine zero here beside it; once pressed, the
     /// note is gone and Move there goes.
@@ -11627,7 +11739,12 @@ soft_max = 180.0
         assert_eq!(draft(&a).number("axes.x.soft_max"), "380");
         let _ = a.view();
         let _ = a.update(Message::Setup(Msg::Save));
-        assert_eq!(draft(&a).note.as_deref(), Some("Saved."));
+        // The machine's travel follows the soft limits saved (LIO-344).
+        assert_eq!(
+            draft(&a).note.as_deref(),
+            Some("Saved. The machine's X, Y and Z travel now follow these soft limits.")
+        );
+        assert_eq!(crate::post_check::machine_mm(&a.doc.machines[0], "x"), 380.);
         let cfg = crate::control::profile(&a.doc.machines[0]).unwrap();
         assert_eq!(cfg.axes.x.unwrap().soft_max, Some(380.));
         assert_eq!(cfg.inputs.estop.unwrap().pin, 10);

@@ -2100,6 +2100,24 @@ impl App {
             self.save_settings();
         }
     }
+    /// While a UC100 machine is connected, its X, Y and Z travel in the
+    /// library, in each setup's copy and in the machine editor are its
+    /// profile's soft limits (`travel_from`), in a project opened or setups
+    /// put back since Connect too (LIO-344). Whether any changed.
+    fn travel_from_connected(&mut self) -> bool {
+        let Some(c) = &self.control else {
+            return false;
+        };
+        let (id, cfg) = (c.machine_id.clone(), c.config.clone());
+        self.travel_from(&id, &cfg)
+    }
+    /// Machine `id`'s X, Y and Z travel, in the library, each setup's copy
+    /// and the machine editor, made profile `cfg`'s soft limit spans
+    /// (`control::travel_from_profile`). Whether any changed.
+    fn travel_from(&mut self, id: &str, cfg: &uc100::config::MachineConfig) -> bool {
+        let draft = control::travel_into(&mut self.machine_draft, id, cfg);
+        control::travel_from_profile(&mut self.doc, id, cfg) | draft
+    }
     fn replace_document(&mut self, doc: Document, path: Option<PathBuf>) {
         // What is being generated is the old project's.
         self.cancel_generation();
@@ -2120,6 +2138,7 @@ impl App {
         if !self.is_sample() {
             self.doc.sync_stock_sources();
         }
+        self.travel_from_connected();
         // What was worked out for the old project is not even a last result
         // of this one (`stale_ready`, `ui::stock_picture`).
         self.ready = run::Ready::default();
@@ -2964,7 +2983,11 @@ impl App {
                 return self.update(Message::Connect);
             }
             Ok(cfg) => {
-                let synced = control::travel_from_profile(&mut self.doc, id, &cfg);
+                let id = id.clone();
+                let synced = self.travel_from(&id, &cfg);
+                let Some((_, Ok(d))) = &mut self.profile_draft else {
+                    return Task::none();
+                };
                 d.note = Some(if synced {
                     "Saved. The machine's X, Y and Z travel now follow these soft limits.".into()
                 } else {
@@ -6270,11 +6293,11 @@ impl App {
                             c.resume_pi_run(kept);
                         }
                         self.status = format!("Connecting to {}…", m.name());
-                        if control::travel_from_profile(&mut self.doc, &m.id, &c.config) {
+                        self.control = Some(c);
+                        if self.travel_from_connected() {
                             self.touch();
                             self.status += " Its X, Y and Z travel now follow the soft limits in its UC100 profile.";
                         }
-                        self.control = Some(c);
                         if let Some(si) = self.run_on_connect.take().and_then(|id| {
                             (self.doc.setups.iter())
                                 .position(|s| s.id == id && s.machine.id == m.id)
@@ -6569,10 +6592,13 @@ impl App {
                         m.p.remove(control::CENTRE_MARK);
                         m.p.remove(model::CENTRE_REF);
                     }
+                    let mut synced = false;
                     if let Some(c) = self.control.as_mut().filter(|c| c.machine_id == m.id) {
                         c.probe = control::probe_settings(&m.p);
                         c.pins = control::pins_settings(&m.p);
                         c.rotary = control::Rotary::of(&m);
+                        // Its travel is the connected profile's (LIO-344).
+                        synced = control::travel_into(&mut m, &c.machine_id, &c.config);
                     }
                     if let Some(i) = self.doc.machines.iter().position(|x| x.id == m.id) {
                         m.version += 1;
@@ -6582,7 +6608,13 @@ impl App {
                     }
                     self.page = Page::Machines;
                     self.touch();
-                    self.status="Machine profile saved. Use Assign to current setup to update an existing setup snapshot.".into();
+                    // Said first: the status line is cut short to fit.
+                    self.status = if synced {
+                        "Machine profile saved, its X, Y and Z travel kept at its UC100 profile's soft limits: change them in Controller configuration. Use Assign to current setup to update an existing setup snapshot."
+                    } else {
+                        "Machine profile saved. Use Assign to current setup to update an existing setup snapshot."
+                    }
+                    .into();
                     return self.resume();
                 } else {
                     self.status = errors.join(" ");
@@ -7698,6 +7730,7 @@ impl App {
                 // since the preview comes back, as Undo does it.
                 let restored = self.doc.restore_holders(&job, &job.setups);
                 self.doc.setups = job.setups;
+                self.travel_from_connected();
                 self.doc.active = job.active;
                 self.stop_selection();
                 self.page = Page::Work;
@@ -7768,6 +7801,7 @@ impl App {
                 status += &self.doc.restore_holders(&before, &before.setups);
                 self.doc.setups = before.setups;
                 self.doc.active = before.active;
+                self.travel_from_connected();
                 self.stop_selection();
                 self.touch();
                 self.status = status;
