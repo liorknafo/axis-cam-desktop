@@ -1419,11 +1419,17 @@ impl Viewport<'_> {
                         Some((axis, turn)) => frame.turned(axis, turn),
                         None => frame,
                     };
-                    let (triangles, colors, outline) =
+                    let (triangles, colors, outline, (tool, marks)) =
                         self.carved(volume, surface, current, p, ratio);
-                    raster_triangles(&mut rgba, &mut depths, w, h, triangles.len(), |i| {
-                        (triangles[i], colors[i])
-                    });
+                    raster_painted(
+                        &mut rgba,
+                        &mut depths,
+                        w,
+                        h,
+                        triangles.len(),
+                        |i| (triangles[i], colors[i]),
+                        tool_marked(&tool, &marks, p, ratio, self.mesh.display_scale()),
+                    );
                     outline
                 }
                 (None, None, Some((grid, _))) => {
@@ -1491,11 +1497,17 @@ impl Viewport<'_> {
                         outline
                     } else if let (Some((volume, surface)), Some(setup)) = (start, self.setup) {
                         let current = crate::volume::Frame::new(setup, self.mesh);
-                        let (triangles, colors, outline) =
+                        let (triangles, colors, outline, (tool, marks)) =
                             self.carved(volume, surface, current, p, ratio);
-                        raster_triangles(&mut rgba, &mut depths, w, h, triangles.len(), |i| {
-                            (triangles[i], colors[i])
-                        });
+                        raster_painted(
+                            &mut rgba,
+                            &mut depths,
+                            w,
+                            h,
+                            triangles.len(),
+                            |i| (triangles[i], colors[i]),
+                            tool_marked(&tool, &marks, p, ratio, self.mesh.display_scale()),
+                        );
                         outline
                     } else {
                         vec![]
@@ -1550,7 +1562,7 @@ impl Viewport<'_> {
                             w,
                             0..h,
                             [v[0], v[i], v[i + 1]],
-                            |x, y| {
+                            |x, y, _| {
                                 if striped { hatch(color, x, y) } else { color }
                             },
                         );
@@ -1561,7 +1573,7 @@ impl Viewport<'_> {
             && let (Some((volume, surface)), Some(setup)) = (start, self.setup)
         {
             let current = crate::volume::Frame::new(setup, self.mesh);
-            let (triangles, colors, _) = self.carved(volume, surface, current, p, ratio);
+            let (triangles, colors, ..) = self.carved(volume, surface, current, p, ratio);
             raster_ghost(&mut rgba, &depths, (w, h), &triangles, &colors);
         } else if self.show_stock
             && let Some(setup) = self.setup
@@ -1772,7 +1784,8 @@ impl Viewport<'_> {
     /// The triangles of `surface`, what is left of the stock `volume`, moved
     /// to the setup's frame `current` and projected (each vertex once), and
     /// the colour of each (once), as the view draws them; less what the
-    /// section cuts away, with where it crosses them (display units).
+    /// section cuts away, with where it crosses them (display units); and
+    /// the tool marks on them (`tool_marked`).
     fn carved(
         &self,
         volume: &crate::volume::Volume,
@@ -1780,8 +1793,9 @@ impl Viewport<'_> {
         current: crate::volume::Frame,
         p: &Projector,
         ratio: f32,
-    ) -> (Vec<Corners>, Vec<[u8; 4]>, Vec<Segment>) {
+    ) -> Carved {
         let scale = self.mesh.display_scale();
+        let tool = tool_marks(volume, surface, current);
         let project = |v: [f32; 3]| {
             let pt = p.p(v);
             (Point::new(pt.x * ratio, pt.y * ratio), p.depth(v))
@@ -1798,15 +1812,17 @@ impl Viewport<'_> {
             let triangles = (surface.triangles.iter())
                 .map(|t| t.map(|v| corners[v].1))
                 .collect();
-            return (triangles, colors, vec![]);
+            let marks = tool.triangles.clone();
+            return (triangles, colors, vec![], (tool, marks));
         };
-        let (mut triangles, mut kept, mut outline) = (vec![], vec![], vec![]);
-        for (t, color) in surface.triangles.iter().zip(colors) {
+        let (mut triangles, mut kept, mut outline, mut marks) = (vec![], vec![], vec![], vec![]);
+        for ((t, color), mark) in surface.triangles.iter().zip(colors).zip(&tool.triangles) {
             let points = t.map(|i| corners[i].0.map(|n| n * scale));
             match points.iter().filter(|v| cut.distance(**v) > 0.).count() {
                 0 => {
                     triangles.push(t.map(|v| corners[v].1));
                     kept.push(color);
+                    marks.push(*mark);
                 }
                 3 => {}
                 _ => {
@@ -1814,12 +1830,13 @@ impl Viewport<'_> {
                     for i in 1..left.len().saturating_sub(1) {
                         triangles.push([left[0], left[i], left[i + 1]]);
                         kept.push(color);
+                        marks.push(*mark);
                     }
                     outline.extend(cut.crossing(&points));
                 }
             }
         }
-        (triangles, kept, outline)
+        (triangles, kept, outline, (tool, marks))
     }
     /// The simulation `sim` drawn: its stock, less what the section cuts
     /// away, the tool and the paths. Returns where the section crosses the
@@ -1852,10 +1869,17 @@ impl Viewport<'_> {
             && let (Some(volume), Some(current)) = (&sim.volume, current)
             && let Some(surface) = &sim.stock_surface
         {
-            let (triangles, colors, crossings) = self.carved(volume, surface, current, p, ratio);
-            raster_triangles(rgba, depths, w, h, triangles.len(), |i| {
-                (triangles[i], colors[i])
-            });
+            let (triangles, colors, crossings, (tool, marks)) =
+                self.carved(volume, surface, current, p, ratio);
+            raster_painted(
+                rgba,
+                depths,
+                w,
+                h,
+                triangles.len(),
+                |i| (triangles[i], colors[i]),
+                tool_marked(&tool, &marks, p, ratio, self.mesh.display_scale()),
+            );
             outline = crossings;
         }
         if self.show_stock && sim.volume.is_none() {
@@ -2987,23 +3011,7 @@ fn stock_color(
     newest: Option<&(u32, crate::volume::History)>,
 ) -> [u8; 4] {
     let source = triangle.map(|i| surface.vertices[i]);
-    let outer = (0..3).any(|k| {
-        source
-            .iter()
-            .all(|p| (p[k] - volume.bounds.min[k]).abs() < 0.01)
-            || source
-                .iter()
-                .all(|p| (p[k] - volume.bounds.max[k]).abs() < 0.01)
-    }) || volume.round && on_bar(volume.bounds, &source, surface.cell_mm)
-        || volume.bar_x.is_some_and(|bar| {
-            // A bar along X's own surface is the block's too: its points lie
-            // within half a cell of the meshing of it.
-            source.iter().all(|p| {
-                let r = (p[1] - bar.axis[0]).hypot(p[2] - bar.axis[1]);
-                (r - bar.radius).abs() <= surface.cell_mm / 2.
-            })
-        });
-    if outer {
+    if on_block(volume, surface, &source) {
         shade(&points, BLOCK)
     } else if newest
         .is_some_and(|(from, history)| newly_cut(history, *from, &source, surface.cell_mm))
@@ -3011,6 +3019,196 @@ fn stock_color(
         shade_cut(&points, NEW_CUT, span)
     } else {
         shade_cut(&points, CUT, span)
+    }
+}
+/// Whether the triangle `source` of `surface` (`volume`'s frame) lies on the
+/// stock's own faces: its box's, or its bar's.
+fn on_block(
+    volume: &crate::volume::Volume,
+    surface: &crate::stock_surface::SurfaceMesh,
+    source: &[[f32; 3]; 3],
+) -> bool {
+    (0..3).any(|k| {
+        source
+            .iter()
+            .all(|p| (p[k] - volume.bounds.min[k]).abs() < 0.01)
+            || source
+                .iter()
+                .all(|p| (p[k] - volume.bounds.max[k]).abs() < 0.01)
+    }) || volume.round && on_bar(volume.bounds, source, surface.cell_mm)
+        || volume.bar_x.is_some_and(|bar| {
+            // A bar along X's own surface is the block's too: its points lie
+            // within half a cell of the meshing of it.
+            source.iter().all(|p| {
+                let r = (p[1] - bar.axis[0]).hypot(p[2] - bar.axis[1]);
+                (r - bar.radius).abs() <= surface.cell_mm / 2.
+            })
+        })
+}
+/// The marks a cutter's move leaves on the faces it cuts, in the frame the
+/// stock is seen in (mm), from the move's start `origin` along `along`
+/// (across it, `across`) every `pitch`: on a floor, the arcs of its end of
+/// `radius`; on a wall, its flutes' lines across the move. A lathe's cut
+/// leaves rings round its axis, `along`.
+#[derive(Clone, Copy, Debug)]
+struct CutMarks {
+    origin: [f32; 3],
+    along: [f32; 3],
+    across: [f32; 3],
+    radius: f32,
+    pitch: f32,
+}
+/// How far apart a turned face's rings are, mm.
+const TURNED_PITCH: f32 = 0.5;
+/// How much lighter the ridge before each tool mark is than the mark's
+/// groove.
+const MARK_DEPTH: f32 = 0.14;
+impl CutMarks {
+    /// The marks `cut` leaves, seen in `current`; None for a plunge's, a
+    /// drill's or a thread mill's, whose faces show their own shape.
+    fn of(cut: &crate::stock_surface::Cut, current: crate::volume::Frame) -> Option<Self> {
+        use crate::simulation::CutterShape;
+        let to = |v: [f32; 3]| cut.frame.transfer_vector(v, current);
+        if cut.shape == CutterShape::Revolve {
+            return Some(Self {
+                origin: cut.frame.transfer([0.; 3], current),
+                along: to([0., 0., 1.]),
+                across: [0.; 3],
+                radius: 0.,
+                pitch: TURNED_PITCH,
+            });
+        }
+        let d = [cut.b[0] - cut.a[0], cut.b[1] - cut.a[1]];
+        let l = d[0].hypot(d[1]);
+        if matches!(cut.shape, CutterShape::Drill | CutterShape::Thread { .. }) || l < 0.01 {
+            return None;
+        }
+        // ponytail: a third of the radius, far coarser than a real feed per
+        // tooth so it reads on screen; the operation's feed if it should.
+        Some(Self {
+            origin: cut.frame.transfer(cut.a, current),
+            along: to([d[0] / l, d[1] / l, 0.]),
+            across: to([-d[1] / l, d[0] / l, 0.]),
+            radius: cut.radius,
+            pitch: (cut.radius / 3.).clamp(0.3, 2.),
+        })
+    }
+    /// How light the marks leave the point `q`, about 1: arcs on a `floor`,
+    /// else lines. `pixels` is how many pixels a mm spans: marks finer than
+    /// a few pixels fade out rather than shimmer.
+    fn light(&self, q: [f32; 3], floor: bool, pixels: f32) -> f32 {
+        let fade = ((self.pitch * pixels - 3.) / 3.).clamp(0., 1.);
+        if fade == 0. {
+            return 1.;
+        }
+        let v: [f32; 3] = std::array::from_fn(|k| q[k] - self.origin[k]);
+        let dot = |a: [f32; 3]| v[0] * a[0] + v[1] * a[1] + v[2] * a[2];
+        let mut t = dot(self.along);
+        if floor {
+            // Where the end's leading edge passed over q: the arc through it.
+            let d = dot(self.across);
+            t -= (self.radius * self.radius - d * d).max(0.).sqrt();
+        }
+        let f = (t / self.pitch).rem_euclid(1.);
+        1. + fade * MARK_DEPTH * (f - 0.5)
+    }
+}
+/// No cut's marks on a triangle (`ToolMarks::triangles`).
+const UNMARKED: u32 = u32::MAX;
+/// A triangle's mark is a floor's (`CutMarks::light`).
+const FLOOR: u32 = 1 << 31;
+/// The marks on the stock's surface: each cut's (`CutMarks::of`) by its number,
+/// and each triangle's, the number of the cut that left its face (or
+/// `UNMARKED`), `FLOOR` added on a face across that cut's axis.
+struct ToolMarks {
+    cuts: Vec<Option<CutMarks>>,
+    triangles: Vec<u32>,
+}
+/// The marks last worked out (`tool_marks`), by the surface, the number of
+/// cuts and the frame they are seen in.
+type MarksKey = (usize, usize, usize, crate::volume::Frame);
+static MARKS: std::sync::Mutex<Option<(MarksKey, std::sync::Arc<ToolMarks>)>> =
+    std::sync::Mutex::new(None);
+/// The tool marks on `surface`, the stock of `volume`, seen in `current`.
+/// A face's are those of the latest cut that swept the air just beside it.
+/// Kept for the surface last asked for, so orbiting does not work them out
+/// again.
+fn tool_marks(
+    volume: &crate::volume::Volume,
+    surface: &crate::stock_surface::SurfaceMesh,
+    current: crate::volume::Frame,
+) -> std::sync::Arc<ToolMarks> {
+    let key = (
+        surface.vertices.as_ptr() as usize,
+        surface.triangles.len(),
+        volume.cuts.len(),
+        current,
+    );
+    if let Some((k, marks)) = &*MARKS.lock().unwrap()
+        && *k == key
+    {
+        return marks.clone();
+    }
+    let extent = volume.bounds.dimensions().into_iter().fold(0., f32::max);
+    let mut history =
+        crate::volume::History::new(volume.frame, volume.bounds, (extent / 100.).max(0.1));
+    for cut in volume.cuts.iter() {
+        history.add(cut.clone());
+    }
+    let cell = surface.cell_mm;
+    let triangles = on_every_core(&surface.triangles, |triangle| {
+        let source = triangle.map(|i| surface.vertices[i]);
+        if on_block(volume, surface, &source) {
+            return UNMARKED;
+        }
+        let n = normal(&source);
+        let middle: [f32; 3] =
+            std::array::from_fn(|k| source.iter().map(|p| p[k]).sum::<f32>() / 3.);
+        [1., -1.]
+            .into_iter()
+            .find_map(|side: f32| {
+                let q = std::array::from_fn(|k| middle[k] + side * cell / 4. * n[k]);
+                history.latest(q, u32::MAX)
+            })
+            .map_or(UNMARKED, |(id, cut)| {
+                let up = cut.frame.transfer_vector([0., 0., 1.], volume.frame);
+                let across = (n[0] * up[0] + n[1] * up[1] + n[2] * up[2]).abs() > 0.7;
+                id | if across { FLOOR } else { 0 }
+            })
+    });
+    let marks = std::sync::Arc::new(ToolMarks {
+        cuts: volume
+            .cuts
+            .iter()
+            .map(|c| CutMarks::of(c, current))
+            .collect(),
+        triangles,
+    });
+    *MARKS.lock().unwrap() = Some((key, marks.clone()));
+    marks
+}
+/// `color`, of triangle i of the stock drawn with `marks` (by triangle,
+/// `ToolMarks::triangles`), at pixel (x, y) and depth z of a frame `ratio`
+/// times `p`'s, seen at `scale` display units a mm: with its tool marks.
+fn tool_marked(
+    tool: &ToolMarks,
+    marks: &[u32],
+    p: &Projector,
+    ratio: f32,
+    scale: f32,
+) -> impl Fn(usize, [u8; 4], u32, u32, f32) -> [u8; 4] + Sync {
+    let pixels = p.scale * ratio * scale;
+    move |i, color, x, y, z| {
+        let m = marks[i];
+        let Some(Some(cut)) = (m != UNMARKED).then(|| tool.cuts[(m & !FLOOR) as usize]) else {
+            return color;
+        };
+        let at = Point::new((x as f32 + 0.5) / ratio, (y as f32 + 0.5) / ratio);
+        let q = p.at_depth(at, z).map(|v| v / scale);
+        let light = cut.light(q, m & FLOOR != 0, pixels);
+        let [r, g, b, a] = color;
+        let [r, g, b] = [r, g, b].map(|c| (c as f32 * light).clamp(0., 255.) as u8);
+        [r, g, b, a]
     }
 }
 /// Whether the cuts of `history` from `from` on, and none before it, swept
@@ -3617,6 +3815,14 @@ fn raster_triangle(
 }
 /// A triangle's corners projected to the frame: their pixels and depths.
 type Corners = [(Point, f32); 3];
+/// The stock as `Viewport::carved` draws it: its triangles projected, their
+/// colours, where the section crosses it, and the tool marks on them.
+type Carved = (
+    Vec<Corners>,
+    Vec<[u8; 4]>,
+    Vec<Segment>,
+    (std::sync::Arc<ToolMarks>, Vec<u32>),
+);
 /// A triangle projected to the frame, and its colour.
 type Projected = (Corners, [u8; 4]);
 /// `triangles` drawn as `raster_triangle` draws each in turn, on every core:
@@ -3630,18 +3836,41 @@ fn raster_triangles(
     count: usize,
     triangle: impl Fn(usize) -> Projected + Sync,
 ) {
+    raster_painted(
+        pixels,
+        depths,
+        w,
+        h,
+        count,
+        triangle,
+        |_, color, _, _, _| color,
+    );
+}
+/// `raster_triangles` with each pixel (x, y) at depth z of triangle i in
+/// `paint(i, its colour, x, y, z)`.
+fn raster_painted(
+    pixels: &mut [u8],
+    depths: &mut [f32],
+    w: u32,
+    h: u32,
+    count: usize,
+    triangle: impl Fn(usize) -> Projected + Sync,
+    paint: impl Fn(usize, [u8; 4], u32, u32, f32) -> [u8; 4] + Sync,
+) {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()) as u32;
     if threads == 1 || count < 4096 || w == 0 {
         for i in 0..count {
             let (vertices, color) = triangle(i);
-            raster_triangle(pixels, depths, w, h, vertices, color);
+            raster_rows_with(pixels, depths, w, 0..h, vertices, |x, y, z| {
+                paint(i, color, x, y, z)
+            });
         }
         return;
     }
     let band = h.div_ceil(threads).max(1);
     let bands = h.div_ceil(band) as usize;
     let length = count.div_ceil(threads as usize);
-    let triangle = &triangle;
+    let (triangle, paint) = (&triangle, &paint);
     // The triangles reaching each band, sorted out a part of the list a core.
     let parts: Vec<Vec<Vec<u32>>> = std::thread::scope(|scope| {
         let sorting: Vec<_> = (0..count)
@@ -3678,8 +3907,10 @@ fn raster_triangles(
             let parts = &parts;
             scope.spawn(move || {
                 for i in parts.iter().flat_map(|reaching| &reaching[b]) {
-                    let (vertices, color) = triangle(*i as usize);
-                    raster_rows(pixels, depths, w, rows.clone(), vertices, color);
+                    let (i, (vertices, color)) = (*i as usize, triangle(*i as usize));
+                    raster_rows_with(pixels, depths, w, rows.clone(), vertices, |x, y, z| {
+                        paint(i, color, x, y, z)
+                    });
                 }
             });
         }
@@ -3695,16 +3926,16 @@ fn raster_rows(
     vertices: [(Point, f32); 3],
     color: [u8; 4],
 ) {
-    raster_rows_with(pixels, depths, w, rows, vertices, |_, _| color);
+    raster_rows_with(pixels, depths, w, rows, vertices, |_, _, _| color);
 }
-/// `raster_rows` with the colour of each pixel (x, y) its own.
+/// `raster_rows` with the colour of each pixel (x, y) at depth z its own.
 fn raster_rows_with(
     pixels: &mut [u8],
     depths: &mut [f32],
     w: u32,
     rows: std::ops::Range<u32>,
     vertices: [(Point, f32); 3],
-    color: impl Fn(u32, u32) -> [u8; 4],
+    color: impl Fn(u32, u32, f32) -> [u8; 4],
 ) {
     let minx = vertices
         .iter()
@@ -3737,7 +3968,7 @@ fn raster_rows_with(
                 && z >= depths[index]
             {
                 depths[index] = z;
-                pixels[index * 4..index * 4 + 4].copy_from_slice(&color(x, y));
+                pixels[index * 4..index * 4 + 4].copy_from_slice(&color(x, y, z));
             }
         }
     }
@@ -4222,6 +4453,59 @@ mod tests {
                 .unwrap()
         };
         assert!(floor(6.) + 40 < floor(13.), "{} {}", floor(6.), floor(13.));
+    }
+    #[test]
+    fn a_cut_face_carries_the_marks_of_the_cut_that_left_it() {
+        use crate::simulation::CutterShape;
+        let mesh =
+            crate::mesh::normalize(vec![[[0., 0., 0.], [20., 0., 0.], [0., 20., 10.]]]).unwrap();
+        let frame = crate::volume::Frame::new(
+            &crate::model::Setup::new(crate::model::Machine::new(3), "G54"),
+            &mesh,
+        );
+        let bounds = crate::mesh::Bounds {
+            min: [-30., -20., 0.],
+            max: [30., 20., 15.],
+        };
+        let mut v = crate::volume::Volume::new(bounds, frame);
+        // A slot along X to Z 6.
+        v.cut(
+            [-40., 0., 6.],
+            [40., 0., 6.],
+            5.,
+            20.,
+            CutterShape::Flat,
+            frame,
+            (0, 0),
+        );
+        let surface = crate::stock_surface::Snapshot::of(&v, crate::stock_surface::Detail::Draft)
+            .build()
+            .unwrap();
+        let tool = tool_marks(&v, &surface, frame);
+        let (mut floors, mut walls) = (0, 0);
+        for (t, &m) in surface.triangles.iter().zip(&tool.triangles) {
+            let p = t.map(|i| surface.vertices[i]);
+            let on = |k: usize, at: f32| p.iter().all(|q| (q[k] - at).abs() < 0.01);
+            if on(2, 6.) {
+                assert_eq!(m, FLOOR, "{p:?}");
+                floors += 1;
+            } else if on(1, 5.) || on(1, -5.) {
+                assert_eq!(m, 0, "{p:?}");
+                walls += 1;
+            } else if on(2, 15.) || on(2, 0.) {
+                assert_eq!(m, UNMARKED, "{p:?}");
+            }
+        }
+        assert!(floors > 4 && walls > 4, "{floors} floors {walls} walls");
+        // Arcs on the floor, a mark every pitch along the move; none too
+        // fine to see.
+        let marks = tool.cuts[0].unwrap();
+        let light = |x: f32, y: f32, pixels| marks.light([x, y, 6.], true, pixels);
+        let at = light(0.5, 0., 20.);
+        assert!((at - light(0.7, 0., 20.)).abs() > 0.01);
+        assert!((at - light(0.5 + marks.pitch, 0., 20.)).abs() < 1e-3);
+        assert!((at - light(0.5, 2., 20.)).abs() > 0.01);
+        assert_eq!(light(0.5, 0., 1.), 1.);
     }
     #[test]
     fn the_viewport_draws_the_same_pixels_after_the_split() {
