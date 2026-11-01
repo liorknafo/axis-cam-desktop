@@ -2822,18 +2822,23 @@ fn scene_panels(
                     .size(12),
                 );
             }
-            if let Some(load) = &sim.tooth_load {
+            if let Some((slowest, fastest)) = sim.plan.feed_range().filter(|(s, f)| f > s) {
                 playback = playback.push(
-                    muted(if load.peak > 0. {
-                        format!(
-                            "Path coloured by the force on one tooth: blue light, red {:.0} N, this operation's most · grey cuts nothing",
-                            load.peak
-                        )
-                    } else {
-                        "Path grey: no tooth of this operation meets material".into()
-                    })
+                    muted(format!(
+                        "Path coloured by feed: blue {slowest:.0} mm/min, red {fastest:.0} mm/min{}",
+                        sim.tooth_load
+                            .as_ref()
+                            .filter(|l| l.peak > 0.)
+                            .map_or(String::new(), |l| format!(
+                                " · most force on one tooth {:.0} N",
+                                l.peak
+                            ))
+                    ))
                     .size(12),
                 );
+            } else if let Some(load) = sim.tooth_load.as_ref().filter(|l| l.peak > 0.) {
+                playback = playback
+                    .push(muted(format!("Most force on one tooth {:.0} N", load.peak)).size(12));
             }
             // A slow update is said in place of the details, on their one
             // line: the strip keeps its height while Play meshes each frame.

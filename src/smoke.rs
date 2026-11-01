@@ -7740,7 +7740,11 @@ flood = { pin = 8 }
             for (i, m) in feeds().filter(|(_, m)| (m.to[2] - z).abs() < 0.01) {
                 let pieces = &load.moves[i];
                 for (k, force) in pieces.iter().enumerate() {
-                    let colour = crate::tooth_load::colour(*force, peak);
+                    let colour = if *force > 0. && peak > 0. {
+                        crate::tooth_load::colour(force / peak)
+                    } else {
+                        [150, 150, 150, 255]
+                    };
                     for s in 0..=20 {
                         let t = (k as f32 + s as f32 / 20.) / pieces.len() as f32;
                         let x = ((m.from[0] + (m.to[0] - m.from[0]) * t - lo[0]) * scale) as usize;

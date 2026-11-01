@@ -2010,6 +2010,9 @@ impl Viewport<'_> {
                 .iter()
                 .take(sim.current + 1)
                 .rposition(|m| m.cutting_pass && m.start <= sim.seconds);
+            // ponytail: scanned each draw, O(moves); keep it on the Plan if a
+            // million-move path ever draws slowly.
+            let feeds = sim.plan.feed_range();
             // The pieces to draw, drawn from the farthest to the nearest:
             // the lines do not hide each other by depth.
             let mut lines = vec![];
@@ -2025,10 +2028,10 @@ impl Viewport<'_> {
                             && (movement.from[2] - pos[2]).abs() < 0.001));
                 // This level's cuts alone while the run goes on: the levels
                 // above, cut already, would hide the stock they cut. When it
-                // has ended with the load on each tooth, every cut stays
-                // drawn in its colour, to be looked over.
+                // has ended, every cut stays drawn in its feed's colour, to
+                // be looked over.
                 if feed
-                    && (sim.tooth_load.is_none() || sim.seconds < sim.plan.duration)
+                    && sim.seconds < sim.plan.duration
                     && !pocket_layer
                     && Some(index) != last_cut
                     && index != sim.current
@@ -2038,11 +2041,8 @@ impl Viewport<'_> {
                 if !feed && sim.seconds >= movement.end {
                     continue;
                 }
-                // A feed move in the colour of the load on each tooth along
-                // it (`tooth_load::colour`), piece by piece as it was
-                // measured, up to where the cutter is.
-                let load = sim.tooth_load.as_ref().filter(|_| feed);
-                let pieces = load.map_or(1, |l| l.moves[index].len().max(1));
+                // A feed move in the colour of its feed on the operation's
+                // range (`tooth_load::colour`), up to where the cutter is.
                 let span = movement.end - movement.start;
                 let now = if span > 0. {
                     ((sim.seconds - movement.start) / span).clamp(0., 1.)
@@ -2054,28 +2054,20 @@ impl Viewport<'_> {
                         (movement.from[k] + (movement.to[k] - movement.from[k]) * t) * scale
                     })
                 };
-                for piece in 0..pieces {
-                    let t0 = piece as f32 / pieces as f32;
-                    if t0 >= now && piece > 0 {
-                        break;
+                let Some((from, to)) = (match cut {
+                    Some(cut) => cut.clip_segment(at(0.), at(now)),
+                    None => Some((at(0.), at(now))),
+                }) else {
+                    continue;
+                };
+                let colour = match feeds {
+                    _ if !feed => [226, 149, 38, 255],
+                    Some((slowest, fastest)) if fastest > slowest => {
+                        crate::tooth_load::colour((movement.feed - slowest) / (fastest - slowest))
                     }
-                    let t1 = ((piece + 1) as f32 / pieces as f32).min(now);
-                    let Some((from, to)) = (match cut {
-                        Some(cut) => cut.clip_segment(at(t0), at(t1)),
-                        None => Some((at(t0), at(t1))),
-                    }) else {
-                        continue;
-                    };
-                    let colour = match load {
-                        Some(l) => crate::tooth_load::colour(
-                            l.moves[index].get(piece).copied().unwrap_or(0.),
-                            l.peak,
-                        ),
-                        None if feed => [34, 114, 176, 255],
-                        None => [226, 149, 38, 255],
-                    };
-                    lines.push((shown(from), shown(to), colour));
-                }
+                    _ => [34, 114, 176, 255],
+                };
+                lines.push((shown(from), shown(to), colour));
             }
             lines.sort_by(|p, q| (p.0.1 + p.1.1).total_cmp(&(q.0.1 + q.1.1)));
             for (a, b, colour) in lines {
