@@ -4489,6 +4489,36 @@ flood = { pin = 8 }
         let plan = &a.active_simulation().unwrap().plan;
         eprintln!("target {} part top {top}", plan.target);
     }
+    /// Renders the fixture job's first setup's stock after its last operation
+    /// to `$AXIS_RENDER_DIR` (default /tmp/cut-depths): its floors, each the
+    /// darker the deeper it lies (LIO-346). Not a check: run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_the_cut_floors_by_depth() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/cut-depths".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let (doc, mesh) = crate::post::fixture::job();
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.page = Page::Work;
+        let last = a.doc.setups[0].operations.len() - 1;
+        let _ = a.update(Message::SelectOp(last));
+        let _ = a.update(Message::Generate);
+        assert!(a.simulation.is_some(), "{}", a.status);
+        a.paths = false;
+        let _ = a.update(Message::Scrub(1.));
+        let _ = a.update(Message::ScrubDone);
+        mesh_the_stock(&mut a);
+        let size = iced::Size::new(1600., 1000.);
+        let _ = a.update(Message::Camera("ISO"));
+        render_png(&a, size, &out.join("1-iso.png"));
+        a.camera.zoom *= 2.;
+        render_png(&a, size, &out.join("2-iso-zoom.png"));
+    }
     /// Renders the owner's 3-tooth thread mill milling the M6 holes to
     /// `$AXIS_RENDER_DIR` (default /tmp/threading): the cutter over the part
     /// between holes, and the threads it leaves at Ultra detail, at the
