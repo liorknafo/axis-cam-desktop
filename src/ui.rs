@@ -1802,7 +1802,7 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
                     }),
                     Help::text(
                         "Stock after this setup",
-                        "The stock as this setup's operations leave it, in its jaws or clamps, seen as its 3D view first shows it. Cut faces are green. Click it to see that stock in the 3D view.",
+                        "The stock as this setup's operations leave it, in its jaws or clamps, seen as its 3D view first shows it. What this setup cut is blue, what earlier setups cut green. Click it to see that stock in the 3D view.",
                     ),
                     widget::tooltip::Position::Right,
                 ));
@@ -2061,8 +2061,9 @@ fn uncut_block(app: &App) -> Option<Element<'_, Message>> {
 /// The picture of setup `si`'s stock in its jaws or clamps, for the browser.
 /// As it starts (`end` false): what the earlier setups left it
 /// (`LeftStock::before`), else its box (`App::known_stock`). As its
-/// operations leave it (`end`): `LeftStock::after`; None until that is worked
-/// out and when nothing was cut by then. While the job is worked out again,
+/// operations leave it (`end`): `LeftStock::after`, what its operations cut
+/// in their own colour (`viewport::stock_triangles`); None until that is
+/// worked out and when nothing was cut by then. While the job is worked out again,
 /// from the stock last worked out.
 pub(crate) fn stock_picture(app: &App, si: usize, end: bool) -> Option<widget::image::Handle> {
     use std::hash::{Hash, Hasher};
@@ -2117,7 +2118,11 @@ pub(crate) fn stock_picture(app: &App, si: usize, end: bool) -> Option<widget::i
     let mut triangles = match cut {
         Some((v, surface)) => {
             let frame = crate::volume::Frame::new(setup, app.part_mesh()?);
-            crate::viewport::stock_triangles(&v, &surface, frame).collect()
+            // As its operations leave it: what they cut in their own colour.
+            let since = (v.cuts.iter())
+                .position(|c| c.source.0 == si as u16)
+                .filter(|_| end);
+            crate::viewport::stock_triangles(&v, &surface, frame, since).collect()
         }
         None => crate::viewport::box_triangles(stock, crate::viewport::BLOCK),
     };

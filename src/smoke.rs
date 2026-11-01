@@ -3693,6 +3693,13 @@ flood = { pin = 8 }
         let drawn = run_of(&a).pictures.clone();
         let pictures = move |_: &App| drawn.clone();
         let pixels: Vec<_> = (0..4).map(pixels).collect();
+        // Each shows what its own operation cut in blue.
+        for (k, p) in pixels.iter().enumerate() {
+            let blue = (p.chunks(4))
+                .filter(|px| px[3] > 0 && px[2] > px[1].saturating_add(30))
+                .count();
+            assert!(blue > 100, "operation {k}: {blue} blue");
+        }
         for k in 1..4 {
             assert_ne!(pixels[k - 1], pixels[k], "operation {k}");
         }
@@ -15624,6 +15631,28 @@ soft_max = 180.0
             let (green, grey) = end(si, &a).unwrap();
             assert!(green > 1000 && grey > 100, "{si}: {green} {grey}");
         }
+        // What a setup's own operations cut is blue (green above counts
+        // it too); only what earlier setups cut is green: setup 1's band,
+        // in sight under setup 2's jaws, in what setup 2 leaves.
+        let hues = |si, a: &App| {
+            let Some(iced::widget::image::Handle::Rgba { pixels, .. }) =
+                crate::ui::stock_picture(a, si, true)
+            else {
+                unreachable!()
+            };
+            let drawn = || pixels.chunks(4).filter(|px| px[3] > 0);
+            let blue = drawn()
+                .filter(|px| px[2] > px[1].saturating_add(30))
+                .count();
+            let green = drawn()
+                .filter(|px| px[1] > px[0].saturating_add(30) && px[1] > px[2].saturating_add(10))
+                .count();
+            (blue, green)
+        };
+        let (blue, green) = hues(0, &a);
+        assert!(blue > 1000 && green == 0, "{blue} blue {green} green");
+        let (blue, green) = hues(1, &a);
+        assert!(blue > 1000 && green > 20, "{blue} blue {green} green");
         assert!(std::sync::Arc::ptr_eq(
             a.left_stock.after[0].as_ref().unwrap(),
             a.left_stock.before[1].as_ref().unwrap()
