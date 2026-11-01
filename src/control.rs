@@ -197,40 +197,48 @@ pub fn profile(m: &Machine) -> Result<MachineConfig, String> {
 
 /// A UC100 machine's X, Y and Z travel are its profile's soft limits, given
 /// once (LIO-344): their spans go into machine `id` in the library and in
-/// each setup's copy, which a run checks against them, marked Measured where
-/// they change. An axis without both limits keeps its travel. Whether any
-/// changed.
+/// each setup's copy, which a run checks against them (`travel_into`).
+/// Whether any changed.
 pub fn travel_from_profile(
     doc: &mut crate::model::Document,
     id: &str,
     cfg: &MachineConfig,
 ) -> bool {
-    let mut changed = false;
     let setups = doc.setups.iter_mut().map(|s| &mut s.machine);
+    let mut changed = false;
     for m in doc.machines.iter_mut().chain(setups) {
-        if m.id != id || get(&m.p, "controller") != "UC100" {
+        changed |= travel_into(m, id, cfg);
+    }
+    changed
+}
+
+/// Machine `m`, when it is the UC100 machine `id`, given its profile's soft
+/// limit spans as X, Y and Z travel, marked Measured where they change. An
+/// axis without both limits keeps its travel. Whether any changed.
+pub fn travel_into(m: &mut Machine, id: &str, cfg: &MachineConfig) -> bool {
+    if m.id != id || get(&m.p, "controller") != "UC100" {
+        return false;
+    }
+    let mut changed = false;
+    for (k, key) in ["x", "y", "z"].into_iter().enumerate() {
+        let Some(span) = cfg
+            .axes
+            .get(k)
+            .and_then(|a| Some(a.soft_max? - a.soft_min?))
+        else {
+            continue;
+        };
+        if (crate::post_check::machine_mm(m, key) as f64 - span).abs() <= 0.01 {
             continue;
         }
-        for (k, key) in ["x", "y", "z"].into_iter().enumerate() {
-            let Some(span) = cfg
-                .axes
-                .get(k)
-                .and_then(|a| Some(a.soft_max? - a.soft_min?))
-            else {
-                continue;
-            };
-            if (crate::post_check::machine_mm(m, key) as f64 - span).abs() <= 0.01 {
-                continue;
-            }
-            let v = if get(&m.p, "units") == "inch" {
-                span / 25.4
-            } else {
-                span
-            };
-            m.p.insert(key.into(), v.to_string());
-            m.p.insert(format!("{key}_source"), crate::envelope::MEASURED.into());
-            changed = true;
-        }
+        let v = if get(&m.p, "units") == "inch" {
+            span / 25.4
+        } else {
+            span
+        };
+        m.p.insert(key.into(), v.to_string());
+        m.p.insert(format!("{key}_source"), crate::envelope::MEASURED.into());
+        changed = true;
     }
     changed
 }
