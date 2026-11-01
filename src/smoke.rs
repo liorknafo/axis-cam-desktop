@@ -3693,10 +3693,11 @@ flood = { pin = 8 }
         let drawn = run_of(&a).pictures.clone();
         let pictures = move |_: &App| drawn.clone();
         let pixels: Vec<_> = (0..4).map(pixels).collect();
-        // Each shows what its own operation cut in blue.
+        // Each shows what its own operation cut in blue: bluer than green by
+        // a fifth however dark its depth draws it (`viewport::shade_cut`).
         for (k, p) in pixels.iter().enumerate() {
             let blue = (p.chunks(4))
-                .filter(|px| px[3] > 0 && px[2] > px[1].saturating_add(30))
+                .filter(|px| px[3] > 0 && f32::from(px[2]) > 1.2 * f32::from(px[1]))
                 .count();
             assert!(blue > 100, "operation {k}: {blue} blue");
         }
