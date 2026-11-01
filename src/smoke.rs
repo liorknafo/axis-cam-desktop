@@ -7467,6 +7467,59 @@ flood = { pin = 8 }
         shows(&a, &[said.as_str()]);
     }
     #[test]
+    fn holding_the_force_on_the_cutter_has_its_own_field_and_the_simulation_says_it() {
+        use crate::tooth_load::{FEED_FOLLOWS, Hold};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), FAST, &[0, 1]);
+        a.sim_details = true;
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.update(Message::Tab("Tool".into()));
+        let _ = a.update(Message::Edit(
+            Target::Operation,
+            "feed_follows",
+            FEED_FOLLOWS[2].into(),
+        ));
+        lacks(&a, &["Force per tooth to hold · N"]);
+        let texts = page_texts(&a);
+        let field = (texts.iter())
+            .position(|t| t == "Force on the cutter to hold · N")
+            .unwrap_or_else(|| panic!("{texts:?}"));
+        assert!(
+            texts[field + 1..].iter().any(|t| t
+                .starts_with("Automatic: the steady force on the whole cutter")
+                && t.contains("5.0 mm wide")),
+            "{texts:?}"
+        );
+        // A per-tooth force typed before is not this one's.
+        let _ = a.update(Message::Edit(Target::Operation, "tooth_force", "-3".into()));
+        lacks(&a, &[crate::model::TOOTH_FORCE_ISSUE]);
+        let _ = a.update(Message::Edit(Target::Operation, "cutter_force", "0".into()));
+        let texts = page_texts(&a);
+        let field = (texts.iter())
+            .position(|t| t == "Force on the cutter to hold · N")
+            .unwrap();
+        assert_eq!(
+            (texts[field + 1].as_str(), texts[field + 2].as_str()),
+            ("Error", crate::model::CUTTER_FORCE_ISSUE)
+        );
+        let _ = a.update(Message::Edit(Target::Operation, "cutter_force", "".into()));
+        let _ = a.update(Message::Generate);
+        let sim = a.active_simulation().expect("a simulation");
+        let held = sim.held.expect("held");
+        assert_eq!(held.hold, Hold::Cutter);
+        assert!(held.slowest < held.fastest, "{held:?}");
+        let load = sim.tooth_load.as_ref().expect("its load");
+        let said = format!(
+            "Feed {:.0}–{:.0} mm/min to hold {:.0} N on the cutter",
+            held.slowest, held.fastest, held.target
+        );
+        let legend = format!(", on the cutter {:.0} N", load.cutter_peak);
+        let texts = page_texts(&a);
+        assert!(texts.contains(&said), "{texts:?}");
+        assert!(texts.iter().any(|t| t.ends_with(&legend)), "{texts:?}");
+    }
+    #[test]
     fn a_waterline_and_a_parallel_offer_the_held_feed_with_their_automatic_force() {
         use crate::tooth_load::FEED_FOLLOWS;
         let dir = tempfile::tempdir().unwrap();

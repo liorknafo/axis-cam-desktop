@@ -1370,6 +1370,9 @@ pub fn post_setting_issues(p: &Fields) -> Vec<String> {
 /// (`tooth_load::target`).
 pub const TOOTH_FORCE_ISSUE: &str =
     "Force per tooth to hold must be a number above zero, or empty for the nominal cut's.";
+/// The message for a force on the cutter to hold that is not a force.
+pub const CUTTER_FORCE_ISSUE: &str =
+    "Force on the cutter to hold must be a number above zero, or empty for the nominal cut's.";
 /// The height above the stock top at which a new operation's tool travels
 /// between cuts, mm (the "clearance" `Operation::new` starts with).
 pub const CLEARANCE: f32 = 15.;
@@ -1388,6 +1391,7 @@ impl Operation {
             // the feeds typed in.
             ("feed_follows", crate::tooth_load::FEED_FOLLOWS[0]),
             ("tooth_force", ""),
+            ("cutter_force", ""),
             ("coolant", "Flood"),
             ("boundary", "Selected geometry"),
             ("containment", "Tool inside boundary"),
@@ -2137,11 +2141,17 @@ impl Operation {
             }
         }
         // Empty: the force at the cutting feed on the nominal cut.
-        if crate::tooth_load::follows(self, m)
-            && !get(&self.p, "tooth_force").trim().is_empty()
-            && !num(&self.p, "tooth_force").is_some_and(|f| f > 0.)
+        if let Some(hold) = crate::tooth_load::follows(self, m)
+            && !get(&self.p, hold.key()).trim().is_empty()
+            && !num(&self.p, hold.key()).is_some_and(|f| f > 0.)
         {
-            e.push(TOOTH_FORCE_ISSUE.into())
+            e.push(
+                match hold {
+                    crate::tooth_load::Hold::Tooth => TOOTH_FORCE_ISSUE,
+                    crate::tooth_load::Hold::Cutter => CUTTER_FORCE_ISSUE,
+                }
+                .into(),
+            )
         }
         if manual::is_hand(m)
             && num(&self.p, "rpm").is_some_and(|rpm| rpm > 0. && !manual::on_gear(m, rpm))
@@ -3996,6 +4006,9 @@ pub fn issue_field(issue: &str) -> Option<&'static str> {
     }
     if m.starts_with("force per tooth ") {
         return Some("tooth_force");
+    }
+    if m.starts_with("force on the cutter ") {
+        return Some("cutter_force");
     }
     if m.starts_with("finishing passes ") {
         return Some("finish_passes");
