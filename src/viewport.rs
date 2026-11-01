@@ -2892,7 +2892,8 @@ fn cut_span(
 /// The faces between the voxels of `volume` that hold material and those
 /// that do not (or the outside), as quads in the frame `current` (mm), each
 /// with the colour the view gives stock: the block's own colour where the
-/// side beyond it never held material, the cut colour where it was cut.
+/// side beyond it never held material, the cut colour where it was cut,
+/// shaded by depth as `shade_cut` shades the meshed stock's.
 pub(crate) fn voxel_faces(
     volume: &crate::volume::Volume,
     current: crate::volume::Frame,
@@ -2937,15 +2938,31 @@ pub(crate) fn voxel_faces(
                             q[v] += dv;
                             corner(q)
                         };
-                        let quad = [at(0, 0), at(1, 0), at(1, 1), at(0, 1)];
-                        let base = if stock(beyond) { CUT } else { BLOCK };
-                        out.push((quad, shade(&quad, base)));
+                        // Counterclockwise seen from outside, as `shade_cut` takes it.
+                        let mut quad = [at(0, 0), at(1, 0), at(1, 1), at(0, 1)];
+                        if side == 0 {
+                            quad.reverse();
+                        }
+                        out.push((quad, stock(beyond)));
                     }
                 }
             }
         }
     }
-    out
+    // From the stock's top to its lowest cut face, as `cut_span` has it.
+    let top = box_vertices(volume.bounds)
+        .map(|p| volume.frame.transfer(p, current)[2])
+        .into_iter()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let bottom = (out.iter().filter(|(_, cut)| *cut))
+        .flat_map(|(quad, _)| quad.map(|p| p[2]))
+        .fold(top, f32::min);
+    (out.into_iter())
+        .map(|(quad, cut)| match cut {
+            true => (quad, shade_cut(&quad, CUT, [top, bottom])),
+            false => (quad, shade(&quad, BLOCK)),
+        })
+        .collect()
 }
 /// The triangles of `surface`, the simulated stock of `volume`, in the frame
 /// `current` (mm), each with the colour the view gives it. With `since`, the
@@ -4222,6 +4239,22 @@ mod tests {
                 .unwrap()
         };
         assert!(floor(6.) + 40 < floor(13.), "{} {}", floor(6.), floor(13.));
+        // So is the voxel stock a live run that turns A draws.
+        let voxel_floor = |z: f32| {
+            (voxel_faces(&v, frame).into_iter())
+                .find(|(p, _)| {
+                    normal(p)[2] > 0.99
+                        && p.iter().all(|p| (p[2] - z).abs() < 1. && p[0].abs() < 3.)
+                })
+                .map(|(_, c)| c[1])
+                .unwrap()
+        };
+        assert!(
+            voxel_floor(6.) + 40 < voxel_floor(13.),
+            "{} {}",
+            voxel_floor(6.),
+            voxel_floor(13.)
+        );
     }
     #[test]
     fn the_viewport_draws_the_same_pixels_after_the_split() {
