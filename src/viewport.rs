@@ -1790,8 +1790,9 @@ impl Viewport<'_> {
             let q = volume.frame.transfer(v, current);
             (q, project(q.map(|n| n * scale)))
         });
+        let span = cut_span(volume, surface, current);
         let colors = on_every_core(&surface.triangles, |t| {
-            stock_color(volume, surface, t, t.map(|i| corners[i].0), None)
+            stock_color(volume, surface, t, t.map(|i| corners[i].0), span, None)
         });
         let Some(cut) = self.cut() else {
             let triangles = (surface.triangles.iter())
@@ -2857,12 +2858,36 @@ fn shade(points: &[[f32; 3]], base: [f32; 3]) -> [u8; 4] {
 /// `shade` for a cut face of the stock, whose corners run counterclockwise
 /// seen from outside it: lit by whether it faces up or down, so the faces
 /// under an overhang, a thread's lower flanks, are in shade and its teeth
-/// read; a floor and a wall shade as `shade` has them.
-fn shade_cut(points: &[[f32; 3]], base: [f32; 3]) -> [u8; 4] {
+/// read; a floor and a wall shade as `shade` has them. Darker the lower it
+/// lies in `span` (`cut_span`), so floors at different depths read apart.
+fn shade_cut(points: &[[f32; 3]], base: [f32; 3], span: [f32; 2]) -> [u8; 4] {
     let n = normal(points);
-    let light = 0.6 + 0.28 * n[2] + 0.12 * n[0].abs();
+    let z = points.iter().map(|p| p[2]).sum::<f32>() / points.len() as f32;
+    let deep = ((span[0] - z) / (span[0] - span[1]).max(0.01)).clamp(0., 1.);
+    let light = (0.6 + 0.28 * n[2] + 0.12 * n[0].abs()) * (1. - DEPTH_SHADE * deep);
     let [r, g, b] = base.map(|c| (c * light) as u8);
     [r, g, b, 255]
+}
+/// How much darker `shade_cut` draws the deepest cut than one at the top.
+const DEPTH_SHADE: f32 = 0.45;
+/// The Z, in the frame `current`, of the top of `volume`'s stock and of the
+/// lowest point of `surface` inside its box: from the stock's top to its
+/// deepest cut, the span `shade_cut` darkens cut faces over.
+fn cut_span(
+    volume: &crate::volume::Volume,
+    surface: &crate::stock_surface::SurfaceMesh,
+    current: crate::volume::Frame,
+) -> [f32; 2] {
+    let (min, max) = (volume.bounds.min, volume.bounds.max);
+    let top = box_vertices(volume.bounds)
+        .map(|p| volume.frame.transfer(p, current)[2])
+        .into_iter()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let inside = |p: &&[f32; 3]| (0..3).all(|k| p[k] > min[k] + 0.01 && p[k] < max[k] - 0.01);
+    let bottom = (surface.vertices.iter().filter(inside))
+        .map(|p| volume.frame.transfer(*p, current)[2])
+        .fold(top, f32::min);
+    [top, bottom]
 }
 /// The faces between the voxels of `volume` that hold material and those
 /// that do not (or the outside), as quads in the frame `current` (mm), each
@@ -2941,21 +2966,24 @@ pub(crate) fn stock_triangles<'a>(
         }
         (from as u32, history)
     });
+    let span = cut_span(volume, surface, current);
     surface.triangles.iter().map(move |triangle| {
         let points = triangle.map(|i| volume.frame.transfer(surface.vertices[i], current));
-        let color = stock_color(volume, surface, triangle, points, newest.as_ref());
+        let color = stock_color(volume, surface, triangle, points, span, newest.as_ref());
         (points, color)
     })
 }
 /// The colour the view gives `triangle` of `surface`, whose corners are
 /// `points` in the frame it is seen in: the block's where it lies on the
-/// stock's own faces, else the cut's, shaded; `NEW_CUT` where the cuts of
-/// `newest` from its first on took it away (`newly_cut`).
+/// stock's own faces, else the cut's, shaded by its depth in `span`
+/// (`cut_span`); `NEW_CUT` where the cuts of `newest` from its first on took
+/// it away (`newly_cut`).
 fn stock_color(
     volume: &crate::volume::Volume,
     surface: &crate::stock_surface::SurfaceMesh,
     triangle: &[usize; 3],
     points: [[f32; 3]; 3],
+    span: [f32; 2],
     newest: Option<&(u32, crate::volume::History)>,
 ) -> [u8; 4] {
     let source = triangle.map(|i| surface.vertices[i]);
@@ -2980,9 +3008,9 @@ fn stock_color(
     } else if newest
         .is_some_and(|(from, history)| newly_cut(history, *from, &source, surface.cell_mm))
     {
-        shade_cut(&points, NEW_CUT)
+        shade_cut(&points, NEW_CUT, span)
     } else {
-        shade_cut(&points, CUT)
+        shade_cut(&points, CUT, span)
     }
 }
 /// Whether the cuts of `history` from `from` on, and none before it, swept
@@ -4097,6 +4125,7 @@ mod tests {
             .build()
             .unwrap();
         let (mut block, mut cut) = (0, 0);
+        let span = cut_span(&v, &surface, frame);
         for (points, color) in stock_triangles(&v, &surface, frame, None) {
             let radii = points.map(|p| p[0].hypot(p[1]));
             let z = points.map(|p| p[2]);
@@ -4117,7 +4146,7 @@ mod tests {
                     && !radii.iter().all(|r| (r - 25.).abs() < 0.05)
             {
                 // The turned diameter and its shoulder.
-                assert_eq!(color, shade_cut(&points, CUT), "{points:?}");
+                assert_eq!(color, shade_cut(&points, CUT, span), "{points:?}");
                 cut += 1;
             }
         }
@@ -4164,21 +4193,35 @@ mod tests {
             .unwrap();
         let since = v.cuts.iter().position(|c| c.source == (0, 1));
         let (mut slot, mut faced) = (0, 0);
+        let span = cut_span(&v, &surface, frame);
+        assert!(
+            (span[0] - 15.).abs() < 0.01 && (span[1] - 6.).abs() < 0.1,
+            "{span:?}"
+        );
         for (points, color) in stock_triangles(&v, &surface, frame, since) {
             let on = |z: f32| points.iter().all(|p| (p[2] - z).abs() < 0.01);
             if on(6.) && points.iter().all(|p| p[0].abs() < 6. && p[1].abs() < 3.) {
-                assert_eq!(color, shade_cut(&points, NEW_CUT), "{points:?}");
+                assert_eq!(color, shade_cut(&points, NEW_CUT, span), "{points:?}");
                 slot += 1;
             } else if on(13.) && points.iter().all(|p| p[0].abs() > 15.) {
-                assert_eq!(color, shade_cut(&points, CUT), "{points:?}");
+                assert_eq!(color, shade_cut(&points, CUT, span), "{points:?}");
                 faced += 1;
             }
         }
         assert!(slot > 4 && faced > 20, "{slot} slot, {faced} faced");
         // Without one, every cut face is the cut's.
         assert!(
-            stock_triangles(&v, &surface, frame, None).all(|(p, c)| c != shade_cut(&p, NEW_CUT))
+            stock_triangles(&v, &surface, frame, None)
+                .all(|(p, c)| c != shade_cut(&p, NEW_CUT, span))
         );
+        // The slot's floor is drawn darker than the facing's, both cut.
+        let floor = |z: f32| {
+            stock_triangles(&v, &surface, frame, None)
+                .find(|(p, _)| p.iter().all(|p| (p[2] - z).abs() < 0.01 && p[0].abs() < 3.))
+                .map(|(_, c)| c[1])
+                .unwrap()
+        };
+        assert!(floor(6.) + 40 < floor(13.), "{} {}", floor(6.), floor(13.));
     }
     #[test]
     fn the_viewport_draws_the_same_pixels_after_the_split() {
