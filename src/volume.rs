@@ -725,11 +725,20 @@ impl History {
     /// Whether a cut kept before cut `before` swept the point `p` of the
     /// frame: the latest cuts first, the likeliest to have.
     pub(crate) fn swept(&self, p: [f32; 3], before: u32) -> bool {
+        self.latest(p, before).is_some()
+    }
+    /// The latest cut kept before cut `before` that swept the point `p` of
+    /// the frame, and its number.
+    pub(crate) fn latest(
+        &self,
+        p: [f32; 3],
+        before: u32,
+    ) -> Option<(u32, &crate::stock_surface::Cut)> {
         let bucket = &self.buckets[self.bucket(p[1], 1) * self.n[0] + self.bucket(p[0], 0)];
         let earlier = &bucket[..bucket.partition_point(|(id, _)| *id < before)];
-        earlier.iter().rev().any(|(id, b)| {
+        earlier.iter().rev().find_map(|(id, b)| {
             if (0..3).any(|k| p[k] < b.min[k] || p[k] > b.max[k]) {
-                return false;
+                return None;
             }
             let c = &self.cuts[*id as usize];
             let q = if c.frame == self.frame {
@@ -737,7 +746,7 @@ impl History {
             } else {
                 self.frame.transfer(p, c.frame)
             };
-            swept(q, c.a, c.b, c.radius, c.flute, c.shape)
+            swept(q, c.a, c.b, c.radius, c.flute, c.shape).then_some((*id, c))
         })
     }
 }

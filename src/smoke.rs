@@ -4518,6 +4518,8 @@ flood = { pin = 8 }
         render_png(&a, size, &out.join("1-iso.png"));
         a.camera.zoom *= 2.;
         render_png(&a, size, &out.join("2-iso-zoom.png"));
+        a.camera.zoom *= 3.;
+        render_png(&a, size, &out.join("3-iso-close.png"));
     }
     /// Renders the owner's 3-tooth thread mill milling the M6 holes to
     /// `$AXIS_RENDER_DIR` (default /tmp/threading): the cutter over the part
