@@ -1019,7 +1019,7 @@ mod tests {
     }
     fn write_png(path: &std::path::Path, volume: &crate::volume::Volume, mesh: &SurfaceMesh) {
         let triangles: Vec<_> =
-            crate::viewport::stock_triangles(volume, mesh, volume.frame).collect();
+            crate::viewport::stock_triangles(volume, mesh, volume.frame, None).collect();
         let Some(iced::widget::image::Handle::Rgba {
             width,
             height,
@@ -1096,7 +1096,8 @@ mod tests {
                 // What the 3D view pays a frame for each, at a window's size.
                 let draw = |surface: &SurfaceMesh| {
                     let triangles: Vec<_> =
-                        crate::viewport::stock_triangles(volume, surface, volume.frame).collect();
+                        crate::viewport::stock_triangles(volume, surface, volume.frame, None)
+                            .collect();
                     let started = std::time::Instant::now();
                     crate::viewport::stock_picture(&triangles, (1600, 1000));
                     started.elapsed().as_secs_f64() * 1e3

@@ -178,7 +178,7 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
         let surface =
             crate::stock_surface::Snapshot::of(v, crate::stock_surface::Detail::Draft).build();
         let mut triangles: Vec<_> = match &surface {
-            Ok(s) => viewport::stock_triangles(v, s, frame).collect(),
+            Ok(s) => viewport::stock_triangles(v, s, frame, None).collect(),
             Err(_) => viewport::box_triangles(box_.translated(zero), viewport::BLOCK),
         };
         triangles.extend(held.iter().copied());

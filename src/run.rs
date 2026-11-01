@@ -2714,9 +2714,12 @@ const PICTURING_THREADS: usize = 4;
 /// Pictures of the stock each operation leaves (`left`), by its index in
 /// the setup: meshed at Draft detail and seen in the setup's `frame` with the
 /// boxes `jaws` (its jaws, clamps or pins, in its frame in mm) as the 3D view
-/// first shows the setup, `viewport::OP_PICTURE` px.
+/// first shows the setup, `viewport::OP_PICTURE` px. What each operation
+/// cut is in its own colour (`viewport::stock_triangles`); `si` is the
+/// setup's index in the document.
 pub fn op_pictures(
     left: &Left,
+    si: usize,
     frame: crate::volume::Frame,
     jaws: &[crate::mesh::Bounds],
 ) -> Vec<(usize, iced::widget::image::Handle)> {
@@ -2724,13 +2727,14 @@ pub fn op_pictures(
         .iter()
         .flat_map(|b| crate::viewport::box_triangles(*b, crate::viewport::JAWS))
         .collect();
-    let picture = |volume: &crate::volume::Volume| {
+    let picture = |oi: usize, volume: &crate::volume::Volume| {
         let surface =
             crate::stock_surface::Snapshot::of(volume, crate::stock_surface::Detail::Draft)
                 .build()
                 .ok()?;
+        let since = (volume.cuts.iter()).position(|c| c.source == (si as u16, oi as u16));
         let mut triangles: Vec<_> =
-            crate::viewport::stock_triangles(volume, &surface, frame).collect();
+            crate::viewport::stock_triangles(volume, &surface, frame, since).collect();
         triangles.extend(holding.iter().cloned());
         crate::viewport::stock_picture(&triangles, crate::viewport::OP_PICTURE)
     };
@@ -2748,7 +2752,7 @@ pub fn op_pictures(
         std::thread::scope(|scope| {
             let drawn: Vec<_> = chunk
                 .iter()
-                .map(|(oi, volume)| (*oi, scope.spawn(|| picture(volume))))
+                .map(|(oi, volume)| (*oi, scope.spawn(|| picture(*oi, volume))))
                 .collect();
             for (oi, h) in drawn {
                 if let Ok(Some(p)) = h.join() {

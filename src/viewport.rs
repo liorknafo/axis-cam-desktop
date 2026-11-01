@@ -1791,7 +1791,7 @@ impl Viewport<'_> {
             (q, project(q.map(|n| n * scale)))
         });
         let colors = on_every_core(&surface.triangles, |t| {
-            stock_color(volume, surface, t, t.map(|i| corners[i].0))
+            stock_color(volume, surface, t, t.map(|i| corners[i].0), None)
         });
         let Some(cut) = self.cut() else {
             let triangles = (surface.triangles.iter())
@@ -2838,6 +2838,9 @@ fn line(frame: &mut Frame, points: &[Point], c: Color, w: f32) {
 pub(crate) const BLOCK: [f32; 3] = [219., 183., 113.];
 /// The colour of the faces of simulated stock that were cut.
 const CUT: [f32; 3] = [103., 181., 151.];
+/// The colour of the faces a still picture's own operation or setup cut
+/// (`stock_triangles`): the tint of an operation's surfaces (`SELECTED`).
+const NEW_CUT: [f32; 3] = [92., 168., 223.];
 /// The colour of jaws and clamps in still pictures.
 pub(crate) const JAWS: [f32; 3] = [176., 176., 176.];
 /// `base` shaded as the view shades a face of simulated stock: by its normal.
@@ -2855,10 +2858,10 @@ fn shade(points: &[[f32; 3]], base: [f32; 3]) -> [u8; 4] {
 /// seen from outside it: lit by whether it faces up or down, so the faces
 /// under an overhang, a thread's lower flanks, are in shade and its teeth
 /// read; a floor and a wall shade as `shade` has them.
-fn shade_cut(points: &[[f32; 3]]) -> [u8; 4] {
+fn shade_cut(points: &[[f32; 3]], base: [f32; 3]) -> [u8; 4] {
     let n = normal(points);
     let light = 0.6 + 0.28 * n[2] + 0.12 * n[0].abs();
-    let [r, g, b] = CUT.map(|c| (c * light) as u8);
+    let [r, g, b] = base.map(|c| (c * light) as u8);
     [r, g, b, 255]
 }
 /// The faces between the voxels of `volume` that hold material and those
@@ -2920,25 +2923,40 @@ pub(crate) fn voxel_faces(
     out
 }
 /// The triangles of `surface`, the simulated stock of `volume`, in the frame
-/// `current` (mm), each with the colour the view gives it.
+/// `current` (mm), each with the colour the view gives it. With `since`, the
+/// index in `volume.cuts` of the first cut of the operation or setup a still
+/// picture is of, what those cuts took away is in `NEW_CUT`.
 pub(crate) fn stock_triangles<'a>(
     volume: &'a crate::volume::Volume,
     surface: &'a crate::stock_surface::SurfaceMesh,
     current: crate::volume::Frame,
+    since: Option<usize>,
 ) -> impl Iterator<Item = ([[f32; 3]; 3], [u8; 4])> + 'a {
+    let newest = since.map(|from| {
+        let extent = volume.bounds.dimensions().into_iter().fold(0., f32::max);
+        let mut history =
+            crate::volume::History::new(volume.frame, volume.bounds, (extent / 100.).max(0.1));
+        for cut in volume.cuts.iter() {
+            history.add(cut.clone());
+        }
+        (from as u32, history)
+    });
     surface.triangles.iter().map(move |triangle| {
         let points = triangle.map(|i| volume.frame.transfer(surface.vertices[i], current));
-        (points, stock_color(volume, surface, triangle, points))
+        let color = stock_color(volume, surface, triangle, points, newest.as_ref());
+        (points, color)
     })
 }
 /// The colour the view gives `triangle` of `surface`, whose corners are
 /// `points` in the frame it is seen in: the block's where it lies on the
-/// stock's own faces, else the cut's, shaded.
+/// stock's own faces, else the cut's, shaded; `NEW_CUT` where the cuts of
+/// `newest` from its first on took it away (`newly_cut`).
 fn stock_color(
     volume: &crate::volume::Volume,
     surface: &crate::stock_surface::SurfaceMesh,
     triangle: &[usize; 3],
     points: [[f32; 3]; 3],
+    newest: Option<&(u32, crate::volume::History)>,
 ) -> [u8; 4] {
     let source = triangle.map(|i| surface.vertices[i]);
     let outer = (0..3).any(|k| {
@@ -2959,9 +2977,32 @@ fn stock_color(
         });
     if outer {
         shade(&points, BLOCK)
+    } else if newest
+        .is_some_and(|(from, history)| newly_cut(history, *from, &source, surface.cell_mm))
+    {
+        shade_cut(&points, NEW_CUT)
     } else {
-        shade_cut(&points)
+        shade_cut(&points, CUT)
     }
+}
+/// Whether the cuts of `history` from `from` on, and none before it, swept
+/// the air beside the face `source` of stock meshed at `cell` mm: what
+/// those cuts took away. Tried a quarter cell off the face's middle on each
+/// side: the mesh lies within hundredths of a cell of the true surface, and
+/// no cut swept the stock's side. ponytail: a finish pass leaving under a
+/// quarter cell reads as cut before; a finer offset if that shows.
+fn newly_cut(
+    history: &crate::volume::History,
+    from: u32,
+    source: &[[f32; 3]; 3],
+    cell: f32,
+) -> bool {
+    let n = normal(source);
+    let middle: [f32; 3] = std::array::from_fn(|k| source.iter().map(|p| p[k]).sum::<f32>() / 3.);
+    [1., -1.].into_iter().any(|side: f32| {
+        let q = std::array::from_fn(|k| middle[k] + side * cell / 4. * n[k]);
+        history.swept(q, u32::MAX) && !history.swept(q, from)
+    })
 }
 /// `f` of each of `items`, in order, worked out on every core.
 fn on_every_core<T: Sync, U: Send>(items: &[T], f: impl Fn(&T) -> U + Sync) -> Vec<U> {
@@ -4016,7 +4057,7 @@ mod tests {
                 .unwrap();
         let (w, h) = (900, 700);
         let p = Projector::filling(Camera::default(), (w as f32, h as f32), &[bounds], 0.9);
-        let triangles: Vec<_> = stock_triangles(&v, &surface, frame)
+        let triangles: Vec<_> = stock_triangles(&v, &surface, frame, None)
             .map(|(t, color)| (t.map(|q| (p.p(q), p.depth(q))), color))
             .collect();
         assert!(triangles.len() > 4096, "{} triangles", triangles.len());
@@ -4056,7 +4097,7 @@ mod tests {
             .build()
             .unwrap();
         let (mut block, mut cut) = (0, 0);
-        for (points, color) in stock_triangles(&v, &surface, frame) {
+        for (points, color) in stock_triangles(&v, &surface, frame, None) {
             let radii = points.map(|p| p[0].hypot(p[1]));
             let z = points.map(|p| p[2]);
             if radii.iter().all(|r| (r - 25.).abs() < 0.05) && z.iter().all(|z| *z < 49.) {
@@ -4076,11 +4117,68 @@ mod tests {
                     && !radii.iter().all(|r| (r - 25.).abs() < 0.05)
             {
                 // The turned diameter and its shoulder.
-                assert_eq!(color, shade_cut(&points), "{points:?}");
+                assert_eq!(color, shade_cut(&points, CUT), "{points:?}");
                 cut += 1;
             }
         }
         assert!(block > 50 && cut > 50, "{block} block, {cut} cut");
+    }
+    #[test]
+    fn a_pictures_own_cut_is_in_its_colour_and_earlier_cuts_in_the_cuts() {
+        use crate::simulation::CutterShape;
+        let mesh =
+            crate::mesh::normalize(vec![[[0., 0., 0.], [20., 0., 0.], [0., 20., 10.]]]).unwrap();
+        let frame = crate::volume::Frame::new(
+            &crate::model::Setup::new(crate::model::Machine::new(3), "G54"),
+            &mesh,
+        );
+        let bounds = crate::mesh::Bounds {
+            min: [-30., -20., 0.],
+            max: [30., 20., 15.],
+        };
+        let mut v = crate::volume::Volume::new(bounds, frame);
+        // A facing to Z 13, then a slot to Z 6 in its middle.
+        for i in 0..6 {
+            let y = -20. + i as f32 * 8.;
+            v.cut(
+                [-36., y, 13.],
+                [36., y, 13.],
+                6.,
+                20.,
+                CutterShape::Flat,
+                frame,
+                (0, 0),
+            );
+        }
+        v.cut(
+            [-4., 0., 6.],
+            [4., 0., 6.],
+            5.,
+            20.,
+            CutterShape::Flat,
+            frame,
+            (0, 1),
+        );
+        let surface = crate::stock_surface::Snapshot::of(&v, crate::stock_surface::Detail::Draft)
+            .build()
+            .unwrap();
+        let since = v.cuts.iter().position(|c| c.source == (0, 1));
+        let (mut slot, mut faced) = (0, 0);
+        for (points, color) in stock_triangles(&v, &surface, frame, since) {
+            let on = |z: f32| points.iter().all(|p| (p[2] - z).abs() < 0.01);
+            if on(6.) && points.iter().all(|p| p[0].abs() < 6. && p[1].abs() < 3.) {
+                assert_eq!(color, shade_cut(&points, NEW_CUT), "{points:?}");
+                slot += 1;
+            } else if on(13.) && points.iter().all(|p| p[0].abs() > 15.) {
+                assert_eq!(color, shade_cut(&points, CUT), "{points:?}");
+                faced += 1;
+            }
+        }
+        assert!(slot > 4 && faced > 20, "{slot} slot, {faced} faced");
+        // Without one, every cut face is the cut's.
+        assert!(
+            stock_triangles(&v, &surface, frame, None).all(|(p, c)| c != shade_cut(&p, NEW_CUT))
+        );
     }
     #[test]
     fn the_viewport_draws_the_same_pixels_after_the_split() {

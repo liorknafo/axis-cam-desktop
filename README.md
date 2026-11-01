@@ -127,7 +127,7 @@ The contextual approach references Autodesk's [Fusion Face parameter reference](
 
 The first setup defines the blank. Every later operation starts with all earlier enabled cuts, in browser order. Later setups reposition that same material: their old nominal stock dimensions do not refill cavities. Editing, suppressing, reordering or removing operations/setups invalidates previews, and generation rebuilds the applicable history. Reordering setups makes the new first setup responsible for the initial blank. An upstream failure prevents dependent previews from presenting misleading fresh stock.
 
-Each setup in the browser has a small picture of the stock as that setup starts: its block for the first setup, and what the earlier setups left for a later one. The active setup's operation list ends with **Stock after this setup**, a picture of the stock as its operations leave it. Both pictures show the stock in the setup's vise jaws or clamps, seen the way the setup's 3D view first shows it, with the original block's faces in tan and cut faces in green.
+Each setup in the browser has a small picture of the stock as that setup starts: its block for the first setup, and what the earlier setups left for a later one. The active setup's operation list ends with **Stock after this setup**, a picture of the stock as its operations leave it. Both pictures show the stock in the setup's vise jaws or clamps, seen the way the setup's 3D view first shows it, with the original block's faces in tan and cut faces in green. In **Stock after this setup**, what that setup's own operations cut is blue and only what earlier setups cut stays green.
 
 The pictures are worked out in the background whenever the job changes in the MANUFACTURE workspace, using the run that works out the stock the vise checks use. That run simulates the whole job, and each stock is meshed once at Draft detail. Until it is ready, and after an operation that fails, a setup shows its original block and no picture after its operations. Nothing is worked out on the MACHINE workspace's Control page, so Cycle Start never waits for it.
 
@@ -692,7 +692,8 @@ the same places, greyed when they cannot be used. Under it three columns:
 - **Right, Operations**: the setup's operations in the order they are cut,
   grouped by tool run, one row each with its state, name, time and **Start
   here**; the one being cut shows how far it is. The picture of the stock it
-  leaves is on hover. Under the list: what holds Cycle Start back in full,
+  leaves is on hover: what that operation cut is blue, what earlier ones cut
+  green. Under the list: what holds Cycle Start back in full,
   **Set coolant to Off**, the soft-limit warnings, **Check again** and how
   the last tool run ended.
 
@@ -1176,7 +1177,8 @@ bar, at once when that machine is connected, or when you press
    tool changes between tool runs and holds are not counted.
 
    Each tool run in the Operations list shows its operations as rows, each
-   with where it stands and, on hover, a picture of the stock it leaves.
+   with where it stands and, on hover, a picture of the stock it leaves,
+   with what that operation cut in blue and what earlier ones cut in green.
    **Start here** on a row makes Cycle Start begin with that operation, in any tool run,
    for operations already cut in an earlier session or before a Stop or
    E-stop (LIO-177): the operations before it say "Skipped: taken as cut"

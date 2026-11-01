@@ -3511,7 +3511,7 @@ impl App {
             return Task::none();
         };
         self.picture_job = Some(epoch);
-        let work = move || run::op_pictures(&left, frame, &jaws);
+        let work = move || run::op_pictures(&left, si, frame, &jaws);
         if self.smoke_dir.is_some() {
             return self.update(Message::RunPictures(epoch, work()));
         }
