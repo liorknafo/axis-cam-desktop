@@ -6608,10 +6608,13 @@ impl App {
                     }
                     self.page = Page::Machines;
                     self.touch();
-                    self.status="Machine profile saved. Use Assign to current setup to update an existing setup snapshot.".into();
-                    if synced {
-                        self.status += " Its X, Y and Z travel stay the soft limits in its UC100 profile: change them in Controller configuration.";
+                    // Said first: the status line is cut short to fit.
+                    self.status = if synced {
+                        "Machine profile saved, its X, Y and Z travel kept at its UC100 profile's soft limits: change them in Controller configuration. Use Assign to current setup to update an existing setup snapshot."
+                    } else {
+                        "Machine profile saved. Use Assign to current setup to update an existing setup snapshot."
                     }
+                    .into();
                     return self.resume();
                 } else {
                     self.status = errors.join(" ");

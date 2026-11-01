@@ -9461,7 +9461,7 @@ flood = { pin = 8 }
         let _ = a.update(Message::Edit(Target::Machine, "z", "55".into()));
         let _ = a.update(Message::SaveMachine);
         assert_eq!(travel(&a.doc.machines[0]), [305., 405., 100.]);
-        assert!(a.status.contains("soft limits"), "{}", a.status);
+        assert!(a.status.starts_with("Machine profile saved, its X, Y and Z travel kept at its UC100 profile's soft limits"), "{}", a.status);
     }
 
     /// Before machine zero (LIO-341) the Work zero tab says why Move there
