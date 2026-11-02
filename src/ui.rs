@@ -2839,8 +2839,10 @@ fn scene_panels(
                     .size(12),
                 );
             } else if let Some(load) = sim.tooth_load.as_ref().filter(|l| l.peak > 0.) {
+                // `most_force`'s, without the scale it follows.
+                let most = most_force(load, sim.held.as_ref());
                 playback = playback
-                    .push(muted(format!("Most force on one tooth {:.0} N", load.peak)).size(12));
+                    .push(muted(format!("Most{}", most.trim_start_matches(" · most"))).size(12));
             }
             // A slow update is said in place of the details, on their one
             // line: the strip keeps its height while Play meshes each frame.
