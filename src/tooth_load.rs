@@ -11,9 +11,14 @@
 //! chip thinning of a light cut, a ramp's and a plunge's alike), its force
 //! kc1.1 × h^(1−mc) × its width (`forces::KC`). One tooth's force is the
 //! sum over the elements it has in the cut at one spindle angle, its flute
-//! wound up a `HELIX` helix, and the load the most over a turn. A simple
-//! model: the engagement is exact, kc, the helix and the straight chip
-//! are assumed. Milling only: drills, taps, thread mills and the lathe
+//! wound up a `HELIX` helix, and the load the most over a turn. The force
+//! on the whole cutter is the steady push that bends it: its teeth's
+//! forces over a turn summed as vectors and averaged. A full-width cut,
+//! its teeth in the material over half a turn, pushes about twice as hard
+//! as a 40% side cut though each tooth's peak is about the same. A simple
+//! model: the
+//! engagement is exact, kc, the helix and the straight chip are assumed,
+//! and only the tangential force (no radial one). Milling only: drills, taps, thread mills and the lathe
 //! have none (`of`).
 use crate::material::Material;
 use crate::mesh::Bounds;
@@ -48,8 +53,51 @@ pub struct ToothLoad {
     pub facing: Vec<Vec<f32>>,
     /// The most of them, N.
     pub peak: f32,
+    /// Of each of those pieces, the force on the whole cutter (N): the
+    /// tangential forces on all its teeth over a turn, summed as vectors
+    /// and averaged, the steady push that bends it.
+    pub cutter: Vec<Vec<f32>>,
+    /// The most of them, N.
+    pub cutter_peak: f32,
+}
+/// What a feed changed along the path holds (`FEED_FOLLOWS`): the force
+/// on one tooth, or on the whole cutter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hold {
+    Tooth,
+    Cutter,
+}
+impl Hold {
+    /// The field its force to hold is typed in.
+    pub fn key(self) -> &'static str {
+        match self {
+            Hold::Tooth => "tooth_force",
+            Hold::Cutter => "cutter_force",
+        }
+    }
+    /// What it holds, after a force: "N per tooth".
+    pub fn on(self) -> &'static str {
+        match self {
+            Hold::Tooth => "per tooth",
+            Hold::Cutter => "on the cutter",
+        }
+    }
 }
 impl ToothLoad {
+    /// The force along each move's pieces that `hold` holds.
+    pub fn of(&self, hold: Hold) -> &[Vec<f32>] {
+        match hold {
+            Hold::Tooth => &self.moves,
+            Hold::Cutter => &self.cutter,
+        }
+    }
+    /// The most of them.
+    pub fn peak_of(&self, hold: Hold) -> f32 {
+        match hold {
+            Hold::Tooth => self.peak,
+            Hold::Cutter => self.cutter_peak,
+        }
+    }
     /// The force on one tooth over the piece of move `index` that
     /// fraction `t` of it lies in; None for a move that cuts nothing.
     pub fn at(&self, index: usize, t: f32) -> Option<f32> {
@@ -274,11 +322,12 @@ pub fn measure(
         })
         .collect();
     let step = sample_step(plan);
-    // The force on one tooth midway along each piece of move `index`, and
-    // how thin the chip is there (`ToothLoad::facing`).
-    let measure_move = |index: usize| -> (Vec<f32>, Vec<f32>) {
+    // The force on one tooth midway along each piece of move `index`, how
+    // thin the chip is there (`ToothLoad::facing`), and the force on the
+    // whole cutter.
+    let measure_move = |index: usize| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let (m, Some(before)) = (&plan.moves[index], numbers[index]) else {
-            return (vec![], vec![]);
+            return (vec![], vec![], vec![]);
         };
         let f = in_frame(m);
         let top = plan.stock.max[2].max(stocks[f].max[2]);
@@ -290,11 +339,16 @@ pub fn measure(
             |t: f32| -> [f32; 3] { std::array::from_fn(|k| m.from[k] + (m.to[k] - m.from[k]) * t) };
         let mut loads = Vec::with_capacity(pieces);
         let mut facings = Vec::with_capacity(pieces);
+        let mut cutters = Vec::with_capacity(pieces);
         for i in 0..pieces {
             // Midway along it, where the cutter goes on along the move: at its
             // end it may turn away from what lies ahead.
             let here = at((i as f32 + 0.5) / pieces as f32);
             let mut tooth = [0_f32; ANGLES];
+            // The same forces as vectors, along the edge's cutting speed
+            // (round the axis, whichever way the spindle turns: the size of
+            // their sum is the same), summed over the turn.
+            let mut push = [0_f32; 2];
             let mut most = 0_f32;
             for (e, &behind) in edge.iter().zip(&behind) {
                 if here[2] + e.z > top {
@@ -315,21 +369,26 @@ pub fn measure(
                         most = most.max(facing);
                         // The tooth whose flute's lowest point is `behind`
                         // angles back from here.
-                        tooth[(j + ANGLES - behind) % ANGLES] +=
-                            kc * (chip * facing).powf(1. - mc) * e.width;
+                        let force = kc * (chip * facing).powf(1. - mc) * e.width;
+                        tooth[(j + ANGLES - behind) % ANGLES] += force;
+                        push[0] -= force * s;
+                        push[1] += force * c;
                     }
                 }
             }
             loads.push(tooth.into_iter().fold(0., f32::max));
             facings.push(most);
+            // Each of the teeth passes every sampled angle once a turn.
+            cutters.push(push[0].hypot(push[1]) * flutes / ANGLES as f32);
         }
-        (loads, facings)
+        (loads, facings, cutters)
     };
     // The moves dealt round the cores in turn.
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
     let progress = crate::progress::current();
     let mut moves = vec![vec![]; plan.moves.len()];
     let mut facing = vec![vec![]; plan.moves.len()];
+    let mut cutter = vec![vec![]; plan.moves.len()];
     let dealt = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|w| {
@@ -352,7 +411,7 @@ pub fn measure(
             .map(|h| h.join().ok().flatten())
             .collect::<Vec<_>>()
     });
-    for (index, (loads, facings)) in dealt
+    for (index, (loads, facings, cutters)) in dealt
         .into_iter()
         .collect::<Option<Vec<_>>>()?
         .into_iter()
@@ -360,12 +419,16 @@ pub fn measure(
     {
         moves[index] = loads;
         facing[index] = facings;
+        cutter[index] = cutters;
     }
     let peak = moves.iter().flatten().copied().fold(0., f32::max);
+    let cutter_peak = cutter.iter().flatten().copied().fold(0., f32::max);
     Some(ToothLoad {
         moves,
         facing,
         peak,
+        cutter,
+        cutter_peak,
     })
 }
 /// How far apart along a plan's cutting moves `measure` samples the load:
@@ -383,12 +446,32 @@ fn distance(a: [f32; 3], b: [f32; 3]) -> f32 {
 }
 /// The choice of what an operation's feed follows (`feed_follows`): the
 /// programmed feed throughout, or a feed changed along the path so the
-/// force on one tooth stays at a target (`hold`). An operation without
-/// the setting (one saved before it) keeps its programmed feed.
-pub const FEED_FOLLOWS: [&str; 2] = ["Programmed feed", "Hold the force per tooth"];
-/// Whether `op`'s feed follows the force on its teeth (`FEED_FOLLOWS`).
-pub fn follows(op: &Operation, machine: &Machine) -> bool {
-    offered(op.strategy, machine) && get(&op.p, "feed_follows") == FEED_FOLLOWS[1]
+/// force on one tooth, or on the whole cutter, stays at a target (`hold`).
+/// An operation without the setting (one saved before it) keeps its
+/// programmed feed.
+pub const FEED_FOLLOWS: [&str; 3] = [
+    "Programmed feed",
+    "Hold the force per tooth",
+    "Hold the force on the cutter",
+];
+/// What `op`'s feed holds (`FEED_FOLLOWS`); None for its programmed feed.
+pub fn follows(op: &Operation, machine: &Machine) -> Option<Hold> {
+    if !offered(op.strategy, machine) {
+        return None;
+    }
+    match get(&op.p, "feed_follows") {
+        f if f == FEED_FOLLOWS[1] => Some(Hold::Tooth),
+        f if f == FEED_FOLLOWS[2] => Some(Hold::Cutter),
+        _ => None,
+    }
+}
+/// The choice in `FEED_FOLLOWS` for `hold`.
+pub fn choice(hold: Option<Hold>) -> &'static str {
+    match hold {
+        None => FEED_FOLLOWS[0],
+        Some(Hold::Tooth) => FEED_FOLLOWS[1],
+        Some(Hold::Cutter) => FEED_FOLLOWS[2],
+    }
 }
 /// The strategies whose feed can follow the force on a tooth: every one a
 /// CNC mill cuts with a milling cutter's side and end, whose load `measure`
@@ -484,25 +567,31 @@ pub fn nominal_cut(op: &Operation, tool: &Tool, level: Option<f32>) -> Option<No
             .min(level.unwrap_or(f32::INFINITY)),
     })
 }
-/// The force on one tooth (N) at `feed` mm/min and `rpm` with `flutes`, in
-/// `material`, along `cut` once the cutter is fully in it: what `measure`
-/// works out there. Worked out once for each set of numbers.
+/// The force (N) that `hold` holds, on one tooth or on the whole cutter, at
+/// `feed` mm/min and `rpm` with `flutes`, in `material`, along `cut` once
+/// the cutter is fully in it: what `measure` works out there. Worked out
+/// once for each set of numbers.
 pub fn nominal(
     cut: &NominalCut,
     flutes: f32,
     rpm: f32,
     feed: f32,
     material: Option<&Material>,
+    hold: Hold,
 ) -> Option<f32> {
     use std::hash::{Hash, Hasher};
-    static KNOWN: std::sync::Mutex<Vec<(u64, f32)>> = std::sync::Mutex::new(vec![]);
+    static KNOWN: std::sync::Mutex<Vec<(u64, [f32; 2])>> = std::sync::Mutex::new(vec![]);
+    let pick = |forces: [f32; 2]| match hold {
+        Hold::Tooth => forces[0],
+        Hold::Cutter => forces[1],
+    };
     let (kc, mc) = crate::forces::kc(material);
     let mut h = std::collections::hash_map::DefaultHasher::new();
     format!("{cut:?}").hash(&mut h);
     [flutes, rpm, feed, kc, mc].map(f32::to_bits).hash(&mut h);
     let key = h.finish();
     if let Some(known) = KNOWN.lock().ok()?.iter().find(|k| k.0 == key) {
-        return Some(known.1);
+        return Some(pick(known.1));
     }
     let r = cut.radius;
     let frame = Frame::identity();
@@ -569,36 +658,39 @@ pub fn nominal(
     (sim.initial_volume, sim.frame) = (Some(volume), Some(frame));
     let load = measure(&sim, flutes, rpm, material, HELIX)?;
     // The middle fifth of the cut, well past where the cutter entered.
-    let samples = &load.moves[1];
-    let n = samples.len();
-    let middle = &samples[n * 2 / 5..(n * 3 / 5).max(n * 2 / 5 + 1)];
-    let force = middle.iter().sum::<f32>() / middle.len() as f32;
+    let middle = |samples: &[f32]| {
+        let n = samples.len();
+        let middle = &samples[n * 2 / 5..(n * 3 / 5).max(n * 2 / 5 + 1)];
+        middle.iter().sum::<f32>() / middle.len() as f32
+    };
+    let forces = [middle(&load.moves[1]), middle(&load.cutter[1])];
     let mut known = KNOWN.lock().ok()?;
     if known.len() >= 32 {
         known.remove(0);
     }
-    known.push((key, force));
-    Some(force)
+    known.push((key, forces));
+    Some(pick(forces))
 }
-/// The force on one tooth `op`'s feed holds (`follows`), N: the one typed
-/// in, else the one at its programmed feed on its nominal cut
-/// (`nominal_cut`, its levels `level` deep where that is known), or, for a
-/// strategy without one (`from_the_path`), the one along most of its path
-/// as programmed (`typical`, once `path` is measured); with whether it is
-/// that automatic one.
+/// The force `op`'s feed holds, `hold`'s, on one tooth or on the whole
+/// cutter (`follows`), N: the one typed in, else the one at its programmed
+/// feed on its nominal cut (`nominal_cut`, its levels `level` deep where
+/// that is known), or, for a strategy without one (`from_the_path`), the
+/// one along most of its path as programmed (`typical`, once `path` is
+/// measured); with whether it is that automatic one.
 pub fn target(
     op: &Operation,
+    hold: Hold,
     tool: &Tool,
     material: Option<&Material>,
     level: Option<f32>,
     path: Option<(&Plan, &ToothLoad)>,
 ) -> Option<(f32, bool)> {
-    if let Some(typed) = num(&op.p, "tooth_force").filter(|f| *f > 0.) {
+    if let Some(typed) = num(&op.p, hold.key()).filter(|f| *f > 0.) {
         return Some((typed, false));
     }
     if from_the_path(op.strategy) {
         let (plan, load) = path?;
-        return typical(plan, load).map(|force| (force, true));
+        return typical(plan, load.of(hold)).map(|force| (force, true));
     }
     let positive = |p, key| num(p, key).filter(|v| *v > 0.);
     let force = nominal(
@@ -607,14 +699,15 @@ pub fn target(
         positive(&op.p, "rpm")?,
         positive(&op.p, "feed")?,
         material,
+        hold,
     )?;
     (force > 0.).then_some((force, true))
 }
-/// The force on one tooth along most of `plan`'s path where a tooth meets
-/// material (`load`): the median over the length cut, N. None where no
-/// tooth does.
-fn typical(plan: &Plan, load: &ToothLoad) -> Option<f32> {
-    let mut cut: Vec<(f32, f32)> = (plan.moves.iter().zip(&load.moves))
+/// The force along most of `plan`'s path where a tooth meets material
+/// (`load`, of each move's pieces): the median over the length cut, N.
+/// None where no tooth does.
+fn typical(plan: &Plan, load: &[Vec<f32>]) -> Option<f32> {
+    let mut cut: Vec<(f32, f32)> = (plan.moves.iter().zip(load))
         .flat_map(|(m, forces)| {
             let piece = distance(m.from, m.to) / forces.len().max(1) as f32;
             (forces.iter().filter(|f| **f > 0.)).map(move |&f| (f, piece))
@@ -631,11 +724,12 @@ fn typical(plan: &Plan, load: &ToothLoad) -> Option<f32> {
         .map(|c| c.0)
 }
 
-/// What holding the force on a tooth made of an operation's feeds
-/// (`hold`): the force held, N, and the slowest and the fastest feed
-/// (mm/min) the moves that cut take.
+/// What holding the force on a tooth or on the cutter made of an
+/// operation's feeds (`hold`): which it held, the force held, N, and the
+/// slowest and the fastest feed (mm/min) the moves that cut take.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Held {
+    pub hold: Hold,
     pub target: f32,
     pub slowest: f32,
     pub fastest: f32,
@@ -653,8 +747,9 @@ struct Refed {
     held: Held,
 }
 
-/// Changes the feed along `sim`'s moves so the force on one tooth stays at
-/// `op`'s target (`target`), when its feed follows it (`follows`): splits
+/// Changes the feed along `sim`'s moves so the force on one tooth, or on
+/// the whole cutter, stays at `op`'s target (`target`), when its feed
+/// follows it (`follows`): splits
 /// the cutting moves where the feed wanted changes (`refeed`), re-times the
 /// plan, and keeps the load along the new moves (`Simulation::tooth_load`)
 /// and what was held (`Simulation::held`). The load is measured once for
@@ -671,9 +766,9 @@ pub fn hold(
     use std::hash::{Hash, Hasher};
     static KNOWN: std::sync::Mutex<Vec<(u64, std::sync::Arc<ToothLoad>)>> =
         std::sync::Mutex::new(vec![]);
-    if !follows(op, machine) {
+    let Some(holding) = follows(op, machine) else {
         return Ok(());
-    }
+    };
     let positive = |p, key| num(p, key).filter(|v| *v > 0.);
     let Some(tool) = doc.tools.iter().find(|t| t.id == op.tool) else {
         return Ok(());
@@ -684,7 +779,7 @@ pub fn hold(
         positive(&tool.p, "flutes"),
         positive(&op.p, "rpm"),
         positive(&op.p, "feed"),
-        from_the_path(op.strategy) || target(op, tool, material, None, None).is_some(),
+        from_the_path(op.strategy) || target(op, holding, tool, material, None, None).is_some(),
     ) else {
         return Ok(());
     };
@@ -758,6 +853,7 @@ pub fn hold(
     // The nominal cut as deep as the levels that cut are, or the path's.
     let Some((target, _)) = target(
         op,
+        holding,
         tool,
         material,
         level_depth(&sim.plan, &load, |a| {
@@ -774,6 +870,7 @@ pub fn hold(
         &sim.plan,
         &load,
         Feeding {
+            hold: holding,
             target,
             mc,
             programmed: feed,
@@ -854,12 +951,16 @@ fn shape_key(shape: CutterShape) -> [u16; 4] {
         } => [5, pitch, teeth.into(), angle.into()],
     }
 }
-/// What `refeed` holds the force on a tooth at and between.
+/// What `refeed` holds the force on a tooth or on the cutter at and
+/// between.
 #[derive(Debug, Clone, Copy)]
 struct Feeding {
-    /// The force on one tooth to hold, N.
+    /// Which force it holds.
+    hold: Hold,
+    /// The force to hold, N.
     target: f32,
-    /// The material's mc: a tooth's force goes as the feed to 1 − mc.
+    /// The material's mc: a tooth's force, and so the cutter's, goes as the
+    /// feed to 1 − mc.
     mc: f32,
     /// The operation's programmed feed, mm/min, which the feeds are a
     /// whole power of `FEED_STEP` times.
@@ -869,8 +970,9 @@ struct Feeding {
     /// The most moves the plan may have.
     most: usize,
 }
-/// `plan`'s moves fed so the force on one tooth `load` measured along them
-/// stays at `f.target`. At each sample the force goes as the feed to the
+/// `plan`'s moves fed so the force `load` measured along them, `f.hold`'s
+/// (on one tooth or on the cutter), stays at `f.target`. At each sample the
+/// force goes as the feed to the
 /// 1 − mc, the engagement staying as it is, so the feed wanted there is the
 /// move's times (target ÷ force)^(1/(1 − mc)): no more than gives
 /// `THICKEST` times the move's programmed chip at the thickest chip there
@@ -931,8 +1033,9 @@ fn refeed(plan: &Plan, load: &ToothLoad, f: Feeding) -> Refed {
             wanted.clear();
             along.clear();
         };
+    let held_load = load.of(f.hold);
     for (i, m) in plan.moves.iter().enumerate() {
-        let forces = &load.moves[i];
+        let forces = &held_load[i];
         if forces.is_empty() {
             if m.motion != Motion::Feed || distance(m.from, m.to) > 0. {
                 smooth(&mut run, &mut wanted, &mut along);
@@ -943,10 +1046,13 @@ fn refeed(plan: &Plan, load: &ToothLoad, f: Feeding) -> Refed {
         let piece = (distance(m.from, m.to) / n as f32) as f64;
         let down = m.to[2] < m.from[2] - 1e-4;
         for (k, &force) in forces.iter().enumerate() {
-            let feed = if force <= 0. {
+            // In the air where no tooth meets material: the cutter's force
+            // may all but cancel where its teeth do (a straight plunge's).
+            let cuts = load.moves[i][k] > 0.;
+            let feed = if !cuts {
                 f32::INFINITY
             } else {
-                let mut w = m.feed * (f.target / force).powf(1. / (1. - f.mc));
+                let mut w = m.feed * (f.target / force.max(1e-6)).powf(1. / (1. - f.mc));
                 let facing = load.facing[i][k];
                 if facing > 0. {
                     w = w.min(THICKEST * m.feed / facing);
@@ -964,7 +1070,7 @@ fn refeed(plan: &Plan, load: &ToothLoad, f: Feeding) -> Refed {
             // sample measures: never fed up.
             let support = plan.keep_air.get(i).copied().unwrap_or(false);
             let air = if support { m.feed } else { flying };
-            run.push((i, (force <= 0.).then_some(air)));
+            run.push((i, (!cuts).then_some(air)));
             wanted.push(feed);
             along.push(travelled + (k as f64 + 0.5) * piece);
         }
@@ -996,8 +1102,10 @@ fn refeed(plan: &Plan, load: &ToothLoad, f: Feeding) -> Refed {
     let mut starts = Vec::with_capacity(plan.moves.len());
     let mut forces = vec![];
     let mut facing = vec![];
+    let mut cutter = vec![];
     let mut time = 0.;
     let mut held = Held {
+        hold: f.hold,
         target: f.target,
         slowest: f32::INFINITY,
         fastest: 0.,
@@ -1014,6 +1122,7 @@ fn refeed(plan: &Plan, load: &ToothLoad, f: Feeding) -> Refed {
             time += seconds;
             forces.push(load.moves[i].clone());
             facing.push(load.facing[i].clone());
+            cutter.push(load.cutter[i].clone());
             continue;
         }
         let n = load.moves[i].len() as f32;
@@ -1034,19 +1143,23 @@ fn refeed(plan: &Plan, load: &ToothLoad, f: Feeding) -> Refed {
             time += seconds;
             // A tooth's force goes as the feed to 1 − mc.
             let scale = (feed / m.feed).powf(1. - f.mc);
-            let piece: Vec<f32> = load.moves[i][a..b].iter().map(|f| f * scale).collect();
+            let scaled =
+                |of: &[Vec<f32>]| -> Vec<f32> { of[i][a..b].iter().map(|f| f * scale).collect() };
+            let piece = scaled(&load.moves);
             if piece.iter().any(|f| *f > 0.) {
                 held.slowest = held.slowest.min(feed);
                 held.fastest = held.fastest.max(feed);
             }
             forces.push(piece);
             facing.push(load.facing[i][a..b].to_vec());
+            cutter.push(scaled(&load.cutter));
         }
     }
     if held.fastest == 0. {
         (held.slowest, held.fastest) = (f.programmed, f.programmed);
     }
     let peak = forces.iter().flatten().copied().fold(0., f32::max);
+    let cutter_peak = cutter.iter().flatten().copied().fold(0., f32::max);
     let keep_air = if plan.keep_air.is_empty() {
         vec![]
     } else {
@@ -1068,6 +1181,8 @@ fn refeed(plan: &Plan, load: &ToothLoad, f: Feeding) -> Refed {
             moves: forces,
             facing,
             peak,
+            cutter,
+            cutter_peak,
         }),
         held,
     }
@@ -1310,6 +1425,7 @@ mod tests {
     /// Holding `target` N at 600 mm/min programmed, at most `fastest`.
     fn feeding(target: f32, fastest: f32) -> Feeding {
         Feeding {
+            hold: Hold::Tooth,
             target,
             mc: KC.1,
             programmed: 600.,
@@ -1376,6 +1492,130 @@ mod tests {
         );
         assert_eq!(refed.held.target, target);
         assert!(refed.held.slowest <= 600. && refed.held.fastest >= feed);
+    }
+    /// A Ø10 slot 4 mm deep along Y 0, then back 4 mm (40% of the
+    /// diameter) into its wall at Y 5.
+    const SLOT_THEN_40: [[f32; 3]; 4] = [
+        [-60., 0., 36.],
+        [60., 0., 36.],
+        [60., 4., 36.],
+        [-60., 4., 36.],
+    ];
+    /// The mean of the middle third of move `i`'s pieces of `of`.
+    fn middle_of(of: &[Vec<f32>], i: usize) -> f32 {
+        let p = &of[i];
+        let m = &p[p.len() / 3..2 * p.len() / 3];
+        m.iter().sum::<f32>() / m.len() as f32
+    }
+    #[test]
+    fn the_cutter_is_pushed_twice_as_hard_in_a_slot_as_in_a_40_percent_side_cut() {
+        // Straight flutes, 3 of them at 6000 rpm: a 1/30 mm feed per tooth.
+        // An edge at angle θ from the feed takes kc1.1 × (fz cos θ)^0.75
+        // along its cutting speed (−sin θ, cos θ); a turn's teeth summed as
+        // vectors and averaged are 3/2π of its integral over the material:
+        // over the slot's −90°..90° ∫cos^1.75 θ = 1.6526 along Y, over the
+        // side cut's, where sin θ > 0.2, (−0.5514, 0.6285): 0.836.
+        let s = sim(&SLOT_THEN_40, CutterShape::Flat, &[]);
+        let load = measure(&s, 3., 6000., None, 0.).unwrap();
+        let k = KC.0 * (600_f32 / 18000.).powf(1. - KC.1) * 4.;
+        let slot = middle_of(&load.cutter, 0);
+        let expected = 3. / TAU * 1.6526 * k;
+        assert!((slot / expected - 1.).abs() < 0.03, "{slot} vs {expected}");
+        let side = middle_of(&load.cutter, 2);
+        let expected = 3. / TAU * 0.836 * k;
+        assert!((side / expected - 1.).abs() < 0.04, "{side} vs {expected}");
+        // About twice the push, where one tooth's peak is within a few
+        // percent: the side cut's tooth enters at 11.5°, its chip 0.98 fz.
+        let tooth = middle_of(&load.moves, 0) / middle_of(&load.moves, 2);
+        assert!((tooth - 1.).abs() < 0.04, "{tooth}");
+        assert!((slot / side - 1.98).abs() < 0.08, "{}", slot / side);
+        assert_eq!(
+            load.cutter_peak,
+            load.cutter.iter().flatten().copied().fold(0., f32::max)
+        );
+        // With a helix too.
+        let wound = measure(&s, 3., 6000., None, HELIX).unwrap();
+        let ratio = middle_of(&wound.cutter, 0) / middle_of(&wound.cutter, 2);
+        assert!((ratio - 1.98).abs() < 0.12, "{ratio}");
+    }
+    #[test]
+    fn holding_the_cutters_force_feeds_a_slot_slower_than_a_side_cut() {
+        let s = sim(&SLOT_THEN_40, CutterShape::Flat, &[]);
+        let load = measure(&s, 3., 6000., None, HELIX).unwrap();
+        // The target each hold takes: the side cut's at 600 mm/min.
+        let feed_of = |hold: Hold| {
+            let target = middle_of(load.of(hold), 2);
+            let refed = refeed(
+                &s.plan,
+                &load,
+                Feeding {
+                    hold,
+                    ..feeding(target, f32::INFINITY)
+                },
+            );
+            assert_eq!(refed.held.hold, hold);
+            [[0., 0., 36.], [0., 4., 36.]].map(|p| piece_at(&refed, p).0)
+        };
+        // Per tooth, the slot is fed nearly as fast as the side cut: within
+        // two steps of it (the helix has a little more of a slot's flute at
+        // its thickest chip).
+        let [slot, side] = feed_of(Hold::Tooth);
+        let per_tooth = slot / side;
+        assert!(per_tooth >= 0.8 && slot <= side, "{slot} vs {side}");
+        // On the cutter, at (1 ÷ 1.98)^(1 / 0.75), 40% of the side cut's.
+        let [slot, side] = feed_of(Hold::Cutter);
+        assert!((600. / FEED_STEP..=600.).contains(&side), "{side}");
+        let want = side * (1_f32 / 1.98).powf(1. / (1. - KC.1));
+        assert!(
+            slot <= want * 1.06 && slot > want / FEED_STEP / 1.06,
+            "{slot} vs {want}"
+        );
+        assert!(slot / side < 0.6 * per_tooth, "{slot} {side} {per_tooth}");
+        // The force on the cutter held there, the tooth's scaled with it.
+        let refed = refeed(
+            &s.plan,
+            &load,
+            Feeding {
+                hold: Hold::Cutter,
+                ..feeding(middle_of(&load.cutter, 2), f32::INFINITY)
+            },
+        );
+        let i = (refed.moves.iter())
+            .position(|m| m.from[1] == 0. && m.from[0] <= 0. && m.to[0] >= 0.)
+            .unwrap();
+        let scale = (refed.moves[i].feed / 600.).powf(1. - KC.1);
+        assert!(refed.load.cutter[i].iter().all(|f| *f > 0.));
+        assert!(refed.load.cutter_peak > 0. && refed.load.peak > 0.);
+        let first = (refed.load.moves[i][0], refed.load.cutter[i][0]);
+        let at = refed.moves[i].from;
+        let k = ((at[0] - s.plan.moves[0].from[0])
+            / distance(s.plan.moves[0].from, s.plan.moves[0].to)
+            * load.moves[0].len() as f32)
+            .round() as usize;
+        assert!((first.0 / (load.moves[0][k] * scale) - 1.).abs() < 1e-3);
+        assert!((first.1 / (load.cutter[0][k] * scale) - 1.).abs() < 1e-3);
+    }
+    #[test]
+    fn a_plunge_held_on_the_cutter_is_not_taken_for_air() {
+        // Straight down into the stock: the teeth's pushes all but cancel,
+        // but they cut, so the plunge keeps its own feed, never the air's.
+        let s = sim(&[[0., 0., 45.], [0., 0., 30.]], CutterShape::Flat, &[]);
+        let load = measure(&s, 3., 6000., None, HELIX).unwrap();
+        let cutting = load.moves[0].iter().filter(|f| **f > 0.).count();
+        assert!(cutting > 0);
+        let refed = refeed(
+            &s.plan,
+            &load,
+            Feeding {
+                hold: Hold::Cutter,
+                ..feeding(1., 6000.)
+            },
+        );
+        for (m, f) in refed.moves.iter().zip(&refed.load.moves) {
+            if f.iter().any(|f| *f > 0.) {
+                assert!(m.feed <= 600., "{} at {:?}", m.feed, m.from);
+            }
+        }
     }
     #[test]
     fn a_held_feed_stays_between_the_machines_most_and_a_quarter_of_the_programmed() {
@@ -1587,6 +1827,8 @@ mod tests {
             ],
             facing: vec![vec![1.; 30]],
             peak: 100_f32.max(force),
+            cutter: vec![vec![0.; 30]],
+            cutter_peak: 0.,
         };
         // Lighter there, wanting a faster feed for 0.5 mm: kept at 600.
         let refed = refeed(&plan, &with(25.), feeding(100., f32::INFINITY));
@@ -1707,7 +1949,7 @@ mod tests {
             width,
             depth: 4.,
         };
-        let nominal = |width| nominal(&cut(width), 2., 6000., 600., None).unwrap();
+        let nominal = |width| nominal(&cut(width), 2., 6000., 600., None, Hold::Tooth).unwrap();
         let slot = middle(
             &sim(&[[-60., 0., 36.], [60., 0., 36.]], CutterShape::Flat, &[]),
             HELIX,
@@ -1837,15 +2079,17 @@ mod tests {
             moves: vec![vec![100., 100.], second],
             facing: vec![vec![1.; 2], vec![1.; 3]],
             peak: 300.,
+            cutter: vec![vec![0.; 2], vec![0.; 3]],
+            cutter_peak: 0.,
         };
-        assert_eq!(typical(&plan, &load(vec![0., 20., 300.])), Some(100.));
+        assert_eq!(typical(&plan, &load(vec![0., 20., 300.]).moves), Some(100.));
         // By length, not by sample: 10 mm at 100 N, 20 mm at 20 N.
-        assert_eq!(typical(&plan, &load(vec![0., 20., 20.])), Some(20.));
+        assert_eq!(typical(&plan, &load(vec![0., 20., 20.]).moves), Some(20.));
         let air = ToothLoad {
             moves: vec![vec![0.; 2], vec![0.; 3]],
             ..load(vec![])
         };
-        assert_eq!(typical(&plan, &air), None);
+        assert_eq!(typical(&plan, &air.moves), None);
     }
     #[test]
     fn a_held_waterline_holds_a_full_slots_force_and_a_parallel_its_paths() {
@@ -1876,14 +2120,14 @@ mod tests {
         // The Parallel's target: the force along most of its path as
         // programmed.
         let parallel = of(&programmed[1], &doc).unwrap();
-        let want = typical(&programmed[1].plan, &parallel).unwrap();
+        let want = typical(&programmed[1].plan, &parallel.moves).unwrap();
         assert_eq!(held[1].held.unwrap().target, want);
         // The Waterline's: a full slot as deep as its levels, at most its
         // 3 mm stepdown.
         let slot = nominal_cut(&ops[5], tool(&ops[5]), None).unwrap();
         assert_eq!((slot.width, slot.depth), (None, 3.));
         let material = doc.selected_material();
-        let (full, _) = target(&ops[5], tool(&ops[5]), material, None, None).unwrap();
+        let (full, _) = target(&ops[5], Hold::Tooth, tool(&ops[5]), material, None, None).unwrap();
         let target = held[2].held.unwrap().target;
         assert!(target > 0. && target <= full * 1.001, "{target} vs {full}");
     }
@@ -1932,7 +2176,7 @@ mod tests {
         // The target: the Facing's nominal cut, no deeper than its stepdown.
         let tool = &doc.tools[0];
         let op = &doc.setups[1].operations[0];
-        let (full, _) = target(op, tool, doc.selected_material(), None, None).unwrap();
+        let (full, _) = target(op, Hold::Tooth, tool, doc.selected_material(), None, None).unwrap();
         assert!(h.target <= full * 1.001, "{} vs {full}", h.target);
     }
     #[test]

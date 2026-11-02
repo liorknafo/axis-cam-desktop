@@ -2410,6 +2410,11 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "The nominal cut is the stepover (a Contour or Waterline: a full slot) as deep as the levels cut, at most the stepdown; the path's force is the median, by length, where a tooth cuts. Worked out from the project material's kc1.1 and mc (steel without one) and the tool's flutes, for a 30° helix. The SIMULATION panel says the feeds it took.",
             Some(Tool),
         ),
+        (_, "cutter_force") => (
+            "The force on the whole cutter, in N, that the feed is changed along the path to hold: the steady push of all its teeth, which bends it. Empty: the force at the cutting feed on the operation's nominal cut, shown under the field (a Parallel, Chamfer or Groove: along most of its path). A larger force feeds faster everywhere.",
+            "The tangential forces on every tooth over a turn, summed as vectors and averaged (no radial force). The nominal cut is the stepover (a Contour or Waterline: a full slot) as deep as the levels cut, at most the stepdown; the path's force is the median, by length, where a tooth cuts. Worked out from the project material's kc1.1 and mc (steel without one) and the tool's flutes, for a 30° helix. The SIMULATION panel says the feeds it took.",
+            Some(Tool),
+        ),
         (_, "coolant") => (
             "Coolant for this operation. LinuxCNC export writes M8 for Flood, M7 for Mist, the machine's Air output for Air (refused when it has none) and nothing for Off, then M9 when the coolant changes, at a tool change and at the end of the program. The preview does not simulate coolant.",
             "",

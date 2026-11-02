@@ -650,7 +650,7 @@ pub(crate) fn issue_tab(issue: &str) -> Option<&'static str> {
                 None
             };
         }
-        Some("rpm" | "feed" | "tooth_force") => "Tool",
+        Some("rpm" | "feed" | "tooth_force" | "cutter_force") => "Tool",
         Some("hole_diameter" | "silhouette_extend") => "Geometry",
         Some("x_min" | "x_max" | "y_min" | "y_max" | "z_top" | "z_bottom") => "Box",
         Some(
@@ -2810,13 +2810,18 @@ fn scene_panels(
                 playback = playback.push(
                     muted(if held.slowest < held.fastest {
                         format!(
-                            "Feed {:.0}–{:.0} mm/min to hold {:.0} N per tooth",
-                            held.slowest, held.fastest, held.target
+                            "Feed {:.0}–{:.0} mm/min to hold {:.0} N {}",
+                            held.slowest,
+                            held.fastest,
+                            held.target,
+                            held.hold.on()
                         )
                     } else {
                         format!(
-                            "Feed {:.0} mm/min holds {:.0} N per tooth or less",
-                            held.fastest, held.target
+                            "Feed {:.0} mm/min holds {:.0} N {} or less",
+                            held.fastest,
+                            held.target,
+                            held.hold.on()
                         )
                     })
                     .size(12),
@@ -2829,16 +2834,15 @@ fn scene_panels(
                         sim.tooth_load
                             .as_ref()
                             .filter(|l| l.peak > 0.)
-                            .map_or(String::new(), |l| format!(
-                                " · most force on one tooth {:.0} N",
-                                l.peak
-                            ))
+                            .map_or(String::new(), |l| most_force(l, sim.held.as_ref()))
                     ))
                     .size(12),
                 );
             } else if let Some(load) = sim.tooth_load.as_ref().filter(|l| l.peak > 0.) {
+                // `most_force`'s, without the scale it follows.
+                let most = most_force(load, sim.held.as_ref());
                 playback = playback
-                    .push(muted(format!("Most force on one tooth {:.0} N", load.peak)).size(12));
+                    .push(muted(format!("Most{}", most.trim_start_matches(" · most"))).size(12));
             }
             // A slow update is said in place of the details, on their one
             // line: the strip keeps its height while Play meshes each frame.
@@ -2885,6 +2889,22 @@ pub(crate) const STOCK_NOTICE_AFTER: std::time::Duration = std::time::Duration::
 /// that slow updates one after another keep it: for how long it has been
 /// working, and what is drawn meanwhile. The time comes first, so that a
 /// narrow strip cuts off the words rather than it.
+/// The legend's most force along a measured path (`load`): on one tooth,
+/// and on the whole cutter where its feed held that (`held`).
+fn most_force(
+    load: &crate::tooth_load::ToothLoad,
+    held: Option<&crate::tooth_load::Held>,
+) -> String {
+    let cutter = held.filter(|h| h.hold == crate::tooth_load::Hold::Cutter);
+    format!(
+        " · most force on one tooth {:.0} N{}",
+        load.peak,
+        cutter.map_or(String::new(), |_| format!(
+            ", on the cutter {:.0} N",
+            load.cutter_peak
+        ))
+    )
+}
 pub(crate) fn stock_surface_notice(app: &App) -> Option<String> {
     let elapsed = app.stock_mesh_elapsed()?;
     if elapsed < STOCK_NOTICE_AFTER && !app.stock_mesh_slow() {
@@ -3089,24 +3109,31 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 let follows = crate::tooth_load::follows(o, machine);
                 c = c.push(choice_value(
                     p,
-                    crate::tooth_load::FEED_FOLLOWS[follows as usize],
+                    crate::tooth_load::choice(follows),
                     "feed_follows",
                     "Feed along the path",
                     &crate::tooth_load::FEED_FOLLOWS,
                     t,
                 ));
-                if follows {
-                    c = c.push(checks.hinted(
-                        p,
-                        "tooth_force",
-                        "Force per tooth to hold · N",
-                        "Automatic",
-                    ));
+                if let Some(hold) = follows {
+                    use crate::tooth_load::Hold;
+                    let (label, whose) = match hold {
+                        Hold::Tooth => ("Force per tooth to hold · N", "one tooth's force"),
+                        Hold::Cutter => (
+                            "Force on the cutter to hold · N",
+                            "the steady force on the whole cutter, all its teeth over a turn,",
+                        ),
+                    };
+                    c = c.push(checks.hinted(p, hold.key(), label, "Automatic"));
                     let tool = app.doc.tools.iter().find(|tool| tool.id == o.tool);
                     let automatic = tool.and_then(|tool| {
                         // No nominal cut: the force along the path, once measured.
                         if crate::tooth_load::from_the_path(o.strategy) {
-                            return Some("Automatic: the force one tooth takes along most of the path at the cutting feed, measured when the operation is generated. The simulation says the force held.".into());
+                            let takes = match hold {
+                                Hold::Tooth => "the force one tooth takes",
+                                Hold::Cutter => "the force on the whole cutter",
+                            };
+                            return Some(format!("Automatic: {takes} along most of the path at the cutting feed, measured when the operation is generated. The simulation says the force held."));
                         }
                         let cut = crate::tooth_load::nominal_cut(o, tool, None)?;
                         let force = crate::tooth_load::nominal(
@@ -3115,9 +3142,10 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                             num(&o.p, "rpm")?,
                             num(&o.p, "feed")?,
                             app.doc.selected_material(),
+                            hold,
                         )?;
                         Some(format!(
-                            "Automatic: one tooth's force at the cutting feed on the nominal cut, {} as deep as a level: {force:.0} N at the full {:.1} mm stepdown. The simulation says the force held.",
+                            "Automatic: {whose} at the cutting feed on the nominal cut, {} as deep as a level: {force:.0} N at the full {:.1} mm stepdown. The simulation says the force held.",
                             cut.width
                                 .map_or("a full slot".into(), |w| format!("{w:.1} mm wide")),
                             cut.depth
