@@ -14,9 +14,10 @@
 //! `pad` of path either side. A level move that repeats one the operation
 //! already made where that one cut, a finishing pass taken again (Pocket's
 //! and Contour's finishing passes), is kept whatever it cuts. A Pocket
-//! support pass (`Plan::keep_air`) is air like any other where nothing is
-//! found: what it would shave is under `DEPTH`, so the level after it still
-//! takes no more than a stepdown and `DEPTH`.
+//! support pass (`Plan::keep_air`) cuts where material reaches only
+//! `SUPPORT_DEPTH` into it: `DEPTH` is a depth into the cutter's side, and a
+//! strip that thin can still stand a whole stepdown tall, which the level
+//! after the pass would meet as well as its own.
 use crate::holding::HoldBox;
 use crate::mesh::Bounds;
 use crate::model::{Operation, Setup, Strategy, num};
@@ -27,6 +28,10 @@ use crate::volume::{Frame, History, Volume, swept};
 /// How far into the cutter material must reach for the cutter to cut it,
 /// mm: a thinner sliver, the chords of two passes over one curve, is air.
 pub const DEPTH: f32 = 0.02;
+/// How far into a Pocket support pass material must reach for the pass to
+/// cut it, mm: what it touches, so that the level after it meets no more
+/// than a stepdown but in a strip thinner than this.
+pub const SUPPORT_DEPTH: f32 = 0.001;
 /// The rapid rate plans are timed at, mm/min (`cam::Builder`).
 const RAPID: f32 = 6000.;
 /// The most cutter positions a path is tested at: a longer one is tested
@@ -267,8 +272,9 @@ impl<'a> Detector<'a> {
         let m = &self.plan.moves[self.feeds[k].index];
         lerp(m.from, m.to, t)
     }
-    /// A point of material `DEPTH` inside the cutter `s` mm along the path
-    /// that was there `lag` before: None where it cuts nothing.
+    /// A point of material `DEPTH` (`SUPPORT_DEPTH` on a support pass)
+    /// inside the cutter `s` mm along the path that was there `lag` before:
+    /// None where it cuts nothing.
     fn found(&self, s: f32) -> Option<[f32; 3]> {
         let (radius, flute, shape) = (self.plan.radius, self.plan.flute_length, self.plan.shape);
         let (k, t) = self.locate(s);
@@ -297,7 +303,9 @@ impl<'a> Detector<'a> {
                 && !partial.is_some_and(|(a, b)| swept(p, a, b, radius, flute, shape))
                 && !self.history.swept(p, before)
         };
-        surface(here, v, radius, flute, shape, top).find(solid)
+        let support = self.plan.keep_air.get(self.feeds[k].index) == Some(&true);
+        let depth = if support { SUPPORT_DEPTH } else { DEPTH };
+        surface(here, v, radius, flute, shape, top, depth).find(solid)
     }
 }
 
@@ -393,7 +401,7 @@ fn merged(stretches: impl IntoIterator<Item = [f32; 2]>, total: f32) -> Vec<[f32
 }
 
 /// The points of a cutter of `shape`, `radius` and `flute` with its tip at
-/// `tip`, moving along `v`, where material `DEPTH` inside its surface is:
+/// `tip`, moving along `v`, where material `depth` inside its surface is:
 /// round its end and up its side to `top`, every 10° round from the way it
 /// moves (so straight across it too), and up its side every `RISE`.
 fn surface(
@@ -403,6 +411,7 @@ fn surface(
     flute: f32,
     shape: CutterShape,
     top: f32,
+    depth: f32,
 ) -> impl Iterator<Item = [f32; 3]> {
     let h = v[0].hypot(v[1]);
     let (u, n) = if h > 1e-6 {
@@ -416,7 +425,7 @@ fn surface(
             [u[0] * c + n[0] * s, u[1] * c + n[1] * s]
         })
     };
-    let rho = radius - DEPTH;
+    let rho = radius - depth;
     let ring = move |r: f32, z: f32, every: usize| {
         round(every).map(move |d| [tip[0] + r * d[0], tip[1] + r * d[1], z])
     };
@@ -424,7 +433,7 @@ fn surface(
     let end: Vec<[f32; 3]> = match shape {
         CutterShape::Ball => {
             let centre = tip[2] + radius;
-            std::iter::once([tip[0], tip[1], tip[2] + DEPTH])
+            std::iter::once([tip[0], tip[1], tip[2] + depth])
                 .chain((1..=9).flat_map(move |i| {
                     let (s, c) = (i as f32 * 10_f32.to_radians()).sin_cos();
                     ring(rho * s, centre - rho * c, if i <= 3 { 12 } else { 36 })
@@ -432,7 +441,7 @@ fn surface(
                 .collect()
         }
         _ => {
-            let z = tip[2] + DEPTH;
+            let z = tip[2] + depth;
             std::iter::once([tip[0], tip[1], z])
                 .chain(ring(rho / 3., z, 12))
                 .chain(ring(rho * 2. / 3., z, 12))
@@ -443,9 +452,9 @@ fn surface(
     let from = tip[2]
         + match shape {
             CutterShape::Ball => radius,
-            _ => DEPTH,
+            _ => depth,
         };
-    let to = (tip[2] + flute - DEPTH).min(top);
+    let to = (tip[2] + flute - depth).min(top);
     let rises = if to > from {
         ((to - from) / RISE).ceil() as usize
     } else {
@@ -953,11 +962,67 @@ mod tests {
         // The flag stays on the support pass's ends and on nothing else.
         assert_eq!(kept.keep_air.len(), kept.moves.len());
         for (m, &keep) in kept.moves.iter().zip(&kept.keep_air) {
-            let support = m.motion == Motion::Feed && m.from[1] == 0. && m.to[1] == 0. && m.from[2] == 30.;
+            let support =
+                m.motion == Motion::Feed && m.from[1] == 0. && m.to[1] == 0. && m.from[2] == 30.;
             assert_eq!(keep, support, "{m:?}");
         }
         assert!(kept.keep_air.iter().filter(|&&keep| keep).count() == 2);
         continuous(&kept);
+    }
+    #[test]
+    fn a_support_pass_shaving_a_strip_thinner_than_depth_is_kept() {
+        // A Ø3 pass along Y-0.015 at Z36 leaves a strip 0.015 mm thick and
+        // 4 mm tall beside a support pass along Y0 at Z36: under `DEPTH`,
+        // but the Z32 level after it would meet it 8 mm tall (found by the
+        // acceptance review of LIO-352). A plain pass there is still air.
+        let mut volume = Volume::new(STOCK, frame());
+        let flat = CutterShape::Flat;
+        volume.cut(
+            [-100., -0.015, 36.],
+            [100., -0.015, 36.],
+            1.5,
+            25.,
+            flat,
+            frame(),
+            (0, 0),
+        );
+        let strip = [0., 1.49, 38.];
+        assert!(
+            !volume
+                .cuts
+                .iter()
+                .any(|c| swept(strip, c.a, c.b, c.radius, c.flute, c.shape))
+        );
+        let mut original = plan(&[
+            [-80., 0., 36.],
+            [80., 0., 36.],
+            [80., 0., 32.],
+            [-80., 0., 32.],
+        ]);
+        original.radius = 1.5;
+        let shaves = |plan: &Plan| {
+            plan.moves.iter().any(|m| {
+                m.motion == Motion::Feed
+                    && m.from[2] == 36.
+                    && m.to[2] == 36.
+                    && swept(
+                        strip,
+                        m.from,
+                        m.to,
+                        plan.radius,
+                        plan.flute_length,
+                        plan.shape,
+                    )
+            })
+        };
+        assert!(shaves(&original));
+        let (plain, _) = trimmed(original.clone(), &volume);
+        assert!(!shaves(&plain));
+        original.keep_air = vec![false; original.moves.len()];
+        original.keep_air[2] = true;
+        let (support, _) = trimmed(original, &volume);
+        assert!(shaves(&support));
+        continuous(&support);
     }
     #[test]
     fn a_ramp_made_again_over_air_is_air() {
@@ -1283,4 +1348,3 @@ mod tests {
         }
     }
 }
-

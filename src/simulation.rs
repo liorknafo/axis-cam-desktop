@@ -177,8 +177,8 @@ pub struct Plan {
     /// Pocket's support passes, which clear the stock over a band before
     /// its first stepdown: the force hold never feeds one up where its
     /// voxels find nothing, as it may shave a sliver thinner than they
-    /// are. Air trimming, which measures exactly, takes one out like any
-    /// other move where it cuts nothing. Empty means none.
+    /// are. Air trimming, which measures exactly, takes one out only where
+    /// it touches nothing (`air::SUPPORT_DEPTH`). Empty means none.
     pub keep_air: Vec<bool>,
 }
 /// A stop of the spindle partway through a plan: before move `at` the
