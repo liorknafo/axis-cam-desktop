@@ -921,15 +921,12 @@ pub fn project_note(app: &App) -> String {
     }
 }
 /// In place of a page that could not be drawn (`fault`): what went wrong,
-/// the field typed in last put back as it was, and Home, which draws
-/// without the page.
+/// undoing the last edit typed in a field, and Home, which draws without
+/// the page.
 pub fn fault_page(app: &App, fault: String) -> Element<'_, Message> {
     let mut actions = row![].spacing(8);
-    if app.typed_last.as_ref().is_some_and(|e| app.can_put_back(e)) {
-        actions = actions.push(primary(
-            "Put back the field typed in last",
-            Message::PutBackEdit,
-        ));
+    if app.can_put_back() {
+        actions = actions.push(primary("Undo the last edit", Message::PutBackEdit));
     }
     actions = actions.push(secondary("Home", Message::Page(Page::Home)));
     let body = column![
@@ -937,7 +934,7 @@ pub fn fault_page(app: &App, fault: String) -> Element<'_, Message> {
         text(format!("Something went wrong: {fault}"))
             .size(13)
             .color(ERROR[1]),
-        muted("The app is still running and the project is as it was. The value typed last may be one this page cannot take: put that field back as it was, or go Home."),
+        muted("The app is still running and the project is as it was. The last value typed may be one this page cannot take: undo that edit, or go Home."),
         actions,
     ]
     .spacing(12)

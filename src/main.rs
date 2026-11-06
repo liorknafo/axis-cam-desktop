@@ -99,14 +99,34 @@ pub enum Target {
     Material,
     Holder,
 }
-/// A field typed in (`App::typed_last`): which, whose (`App::edited`), and
-/// what it held before the typing.
-#[derive(Debug, Clone, PartialEq)]
+/// The last edit typed in a field (`App::typed_last`): what it changed as
+/// it was before, and as the edit left it, saved as a project saves it.
+#[derive(Debug, Clone)]
 pub struct LastEdit {
-    pub target: Target,
-    pub key: &'static str,
-    pub owner: String,
-    pub before: String,
+    pub before: Edited,
+    pub after: String,
+}
+/// What an edit changes: the project for an operation or a setup (a setup's
+/// edit may turn or hold the others), else the editor's draft.
+#[derive(Debug, Clone)]
+pub enum Edited {
+    Project(Box<Document>),
+    Machine(Box<Machine>),
+    Tool(Tool),
+    Material(material::Material),
+    Holder(holding::Holder),
+}
+impl Edited {
+    fn saved(&self) -> String {
+        match self {
+            Self::Project(d) => serde_json::to_string(d),
+            Self::Machine(m) => serde_json::to_string(m),
+            Self::Tool(t) => serde_json::to_string(t),
+            Self::Material(m) => serde_json::to_string(m),
+            Self::Holder(h) => serde_json::to_string(h),
+        }
+        .unwrap_or_default()
+    }
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum Account {
@@ -233,8 +253,8 @@ pub enum Message {
     SetupStep(&'static str),
     Tab(String),
     Edit(Target, &'static str, String),
-    /// Puts back the field typed in last as it was before the typing, from
-    /// the page that could not be drawn (`LastEdit`).
+    /// Undoes the last edit typed in a field, from the page that could not
+    /// be drawn (`LastEdit`).
     PutBackEdit,
     Title(String),
     AddOp(Strategy),
@@ -1158,8 +1178,8 @@ pub struct App {
     /// The setup editor's step shown (`ui::SETUP_STEPS`).
     pub setup_step: &'static str,
     pub status: String,
-    /// The field typed in last, as it was before the typing: the page that
-    /// could not be drawn puts it back (`fault`).
+    /// The last edit typed in a field: the page that could not be drawn
+    /// undoes it (`fault`).
     pub typed_last: Option<LastEdit>,
     /// The page the status line was last set on: on another page it is an
     /// earlier event's, and the footer shows it as such.
@@ -4754,49 +4774,37 @@ impl App {
             _ => return None,
         })
     }
-    /// The id and the fields of what an edit of `target` changes: the
-    /// selected operation, the active setup, or the draft in its editor.
-    fn edited(&self, target: Target) -> Option<(&str, &Fields)> {
-        Some(match target {
-            Target::Operation => self.operation().map(|o| (o.id.as_str(), &o.p))?,
-            Target::Setup => (self.doc.setups.iter())
-                .find(|s| s.id == self.doc.active)
-                .map(|s| (s.id.as_str(), &s.p))?,
-            Target::Machine => (self.machine_draft.id.as_str(), &self.machine_draft.p),
-            Target::Tool => (self.tool_draft.id.as_str(), &self.tool_draft.p),
-            Target::Material => (self.material_draft.id.as_str(), &self.material_draft.p),
-            Target::Holder => (self.holder_draft.id.as_str(), &self.holder_draft.p),
-        })
-    }
-    /// Keeps field `key` of `target` as it was before it is typed in, once
-    /// for each run of typing in the same field.
-    fn note_edit(&mut self, target: Target, key: &'static str) {
-        let Some((owner, fields)) = self.edited(target) else {
-            self.typed_last = None;
-            return;
-        };
-        let same = |e: &LastEdit| e.target == target && e.key == key && e.owner == owner;
-        if !self.typed_last.as_ref().is_some_and(same) {
-            self.typed_last = Some(LastEdit {
-                target,
-                key,
-                owner: owner.to_string(),
-                before: get(fields, key).to_string(),
-            });
+    /// What an edit of `target` changes, as it is now.
+    fn edited(&self, target: Target) -> Edited {
+        match target {
+            Target::Operation | Target::Setup => Edited::Project(Box::new(self.doc.clone())),
+            Target::Machine => Edited::Machine(Box::new(self.machine_draft.clone())),
+            Target::Tool => Edited::Tool(self.tool_draft.clone()),
+            Target::Material => Edited::Material(self.material_draft.clone()),
+            Target::Holder => Edited::Holder(self.holder_draft.clone()),
         }
     }
-    /// Whether `edit`'s field is still the one edited: the same operation,
-    /// setup or draft, in the same project.
-    pub fn can_put_back(&self, edit: &LastEdit) -> bool {
-        self.edited(edit.target)
-            .is_some_and(|(owner, _)| owner == edit.owner)
+    /// Whether the last edit can be undone: what it changed is still as it
+    /// left it, so undoing it takes back that edit and nothing since.
+    pub fn can_put_back(&self) -> bool {
+        self.typed_last.as_ref().is_some_and(|e| {
+            let target = match e.before {
+                Edited::Project(_) => Target::Operation,
+                Edited::Machine(_) => Target::Machine,
+                Edited::Tool(_) => Target::Tool,
+                Edited::Material(_) => Target::Material,
+                Edited::Holder(_) => Target::Holder,
+            };
+            self.edited(target).saved() == e.after
+        })
     }
     fn update(&mut self, message: Message) -> Task<Message> {
         let before = self.status.clone();
         let (selected, page) = (self.selected, self.page);
-        if let Message::Edit(target, key, _) = message {
-            self.note_edit(target, key);
-        }
+        let edit = match message {
+            Message::Edit(target, ..) => Some((target, self.edited(target))),
+            _ => None,
+        };
         let task = match fault::guard(|| self.handle(message)) {
             Ok(task) => task,
             Err(fault) => {
@@ -4804,6 +4812,10 @@ impl App {
                 Task::none()
             }
         };
+        if let Some((target, before)) = edit {
+            let after = self.edited(target).saved();
+            self.typed_last = Some(LastEdit { before, after });
+        }
         // Batched only when it starts one: a batch is never an empty task.
         let task = match self.refresh_part_holes() {
             Some(holes) => Task::batch([task, holes]),
@@ -7804,10 +7816,19 @@ impl App {
                 );
             }
             Message::PutBackEdit => {
-                if let Some(edit) = self.typed_last.take().filter(|e| self.can_put_back(e)) {
-                    let task = self.handle(Message::Edit(edit.target, edit.key, edit.before));
-                    self.status = "The field typed in last was put back as it was.".into();
-                    return task;
+                if self.can_put_back() {
+                    match self.typed_last.take().map(|e| e.before) {
+                        Some(Edited::Project(doc)) => {
+                            self.doc = *doc;
+                            self.touch();
+                        }
+                        Some(Edited::Machine(m)) => self.machine_draft = *m,
+                        Some(Edited::Tool(t)) => self.tool_draft = t,
+                        Some(Edited::Material(m)) => self.material_draft = m,
+                        Some(Edited::Holder(h)) => self.holder_draft = h,
+                        None => {}
+                    }
+                    self.status = "The last edit was undone.".into();
                 }
             }
             Message::UndoPlan => {

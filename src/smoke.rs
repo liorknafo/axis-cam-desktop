@@ -7436,19 +7436,20 @@ flood = { pin = 8 }
         }
     }
     /// The page drawn in place of one that panicked says what went wrong
-    /// and puts back the field typed in last as it was before the typing:
-    /// that field only, of that operation, setup or editor draft, and not
-    /// once another is edited or another project is open.
+    /// and undoes the last edit typed in a field: all it changed (a
+    /// machine's kind, a turn's kind, the axes bring other settings), and
+    /// only while nothing changed since, so it never takes back a save, a
+    /// later change or another project.
     #[test]
-    fn the_page_that_could_not_be_drawn_puts_back_the_field_typed_in_last() {
-        const PUT_BACK: &str = "Put back the field typed in last";
+    fn the_page_that_could_not_be_drawn_undoes_the_last_edit() {
+        const UNDO: &str = "Undo the last edit";
         let page_texts = |a: &App| {
             crate::ui::probe::texts(
                 crate::ui::fault_page(a, "boom (src/x.rs:1:2)".into()),
                 WINDOW,
             )
         };
-        let offers = |a: &App| page_texts(a).iter().any(|t| t == PUT_BACK);
+        let offers = |a: &App| page_texts(a).iter().any(|t| t == UNDO);
         let mut a = app();
         assert!(!offers(&a));
         let texts = page_texts(&a);
@@ -7459,9 +7460,7 @@ flood = { pin = 8 }
         ] {
             assert!(texts.iter().any(|t| t == want), "{want}: {texts:?}");
         }
-        // Typed key by key: the feed as it was before the typing comes back,
-        // and the other fields typed in before are kept.
-        let feed = get(&a.operation().unwrap().p, "feed").to_string();
+        // The last keystroke only; what was typed before it stays.
         let _ = a.update(Message::Edit(Target::Operation, "rpm", "9000".into()));
         for typed in ["", "0"] {
             let _ = a.update(Message::Edit(Target::Operation, "feed", typed.into()));
@@ -7471,22 +7470,31 @@ flood = { pin = 8 }
         assert!(clicks.iter().any(|m| matches!(m, Message::PutBackEdit)));
         let _ = a.update(Message::PutBackEdit);
         let p = &a.operation().unwrap().p;
-        assert_eq!((get(p, "feed"), get(p, "rpm")), (feed.as_str(), "9000"));
+        assert_eq!((get(p, "feed"), get(p, "rpm")), ("", "9000"));
         assert!(!offers(&a));
-        // The tool, machine, material and holder editors' drafts.
+        // A machine's kind and axes bring other settings; undone with it.
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "CNC".into()));
+        let cnc = a.machine_draft.clone();
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "Manual".into()));
+        assert_ne!(a.machine_draft.p, cnc.p);
+        let _ = a.update(Message::PutBackEdit);
+        assert_eq!(a.machine_draft.p, cnc.p);
+        let _ = a.update(Message::Edit(Target::Machine, "axes", "5".into()));
+        let five = a.machine_draft.p.clone();
+        let _ = a.update(Message::Edit(Target::Machine, "axes", "3".into()));
+        let _ = a.update(Message::PutBackEdit);
+        assert_eq!(a.machine_draft.p, five);
+        // The tool, material and holder editors' drafts.
         a.tool_draft.p.insert("flutes".into(), "3".into());
-        a.machine_draft.p.insert("feed".into(), "5000".into());
         a.material_draft.p.insert("vc_min".into(), "150".into());
         a.holder_draft.p.insert("jaw_width".into(), "100".into());
         for (target, key, was) in [
             (Target::Tool, "flutes", "3"),
-            (Target::Machine, "feed", "5000"),
             (Target::Material, "vc_min", "150"),
             (Target::Holder, "jaw_width", "100"),
         ] {
             let draft = |a: &App| match target {
                 Target::Tool => get(&a.tool_draft.p, key).to_string(),
-                Target::Machine => get(&a.machine_draft.p, key).to_string(),
                 Target::Material => get(&a.material_draft.p, key).to_string(),
                 _ => get(&a.holder_draft.p, key).to_string(),
             };
@@ -7496,13 +7504,22 @@ flood = { pin = 8 }
             let _ = a.update(Message::PutBackEdit);
             assert_eq!(draft(&a), was, "{target:?}.{key}");
         }
-        // Another operation selected: its feed is not the one typed in.
-        let _ = a.update(Message::Edit(Target::Operation, "feed", "0".into()));
-        let _ = a.update(Message::SelectOp(1));
-        assert!(!offers(&a));
+        // Saved and opened again: the edit after takes back to what was saved.
+        let id = a.doc.tools[0].id.clone();
+        let _ = a.update(Message::EditTool(id.clone()));
+        let _ = a.update(Message::Edit(Target::Tool, "flutes", "7".into()));
+        let _ = a.update(Message::SaveTool);
+        let _ = a.update(Message::EditTool(id));
+        let _ = a.update(Message::Edit(Target::Tool, "flutes", "0".into()));
         let _ = a.update(Message::PutBackEdit);
-        let _ = a.update(Message::SelectOp(0));
-        assert_eq!(get(&a.operation().unwrap().p, "feed"), "0");
+        assert_eq!(get(&a.tool_draft.p, "flutes"), "7");
+        // Anything changed since the edit: nothing to undo.
+        let _ = a.update(Message::Edit(Target::Operation, "feed", "0".into()));
+        let _ = a.update(Message::AddOp(Strategy::Face));
+        assert!(!offers(&a));
+        let before = a.doc.setups[0].operations.len();
+        let _ = a.update(Message::PutBackEdit);
+        assert_eq!(a.doc.setups[0].operations.len(), before);
         // Another project open: nothing of the first is put into it.
         let _ = a.update(Message::Edit(Target::Operation, "feed", "1".into()));
         let other = Document::sample();
@@ -7510,13 +7527,25 @@ flood = { pin = 8 }
         a.replace_document(other, None);
         a.selected = Some(0);
         assert!(!offers(&a));
-        let before = a.doc.clone();
+        let before = serde_json::to_string(&a.doc).unwrap();
         let _ = a.update(Message::PutBackEdit);
         assert_eq!(a.doc.title, title);
-        assert_eq!(
-            a.doc.setups[0].operations[0].p,
-            before.setups[0].operations[0].p
-        );
+        assert_eq!(serde_json::to_string(&a.doc).unwrap(), before);
+    }
+    /// Undoing a turn's kind puts back its sizes, speed and tool.
+    #[test]
+    fn undoing_a_turns_kind_puts_back_its_sizes_and_speed() {
+        let mut a = app();
+        on_the_lathe(&mut a);
+        let _ = a.update(Message::AddOp(Strategy::Turn));
+        let _ = a.update(Message::Edit(Target::Operation, "diameter", "37".into()));
+        let turn = a.operation().unwrap().clone();
+        let _ = a.update(Message::Edit(Target::Operation, "turn_kind", "Face".into()));
+        assert_ne!(a.operation().unwrap().p, turn.p);
+        let _ = a.update(Message::PutBackEdit);
+        let o = a.operation().unwrap();
+        assert_eq!((&o.p, &o.tool), (&turn.p, &turn.tool));
+        assert_eq!(get(&o.p, "diameter"), "37");
     }
     #[test]
     fn holding_the_force_per_tooth_is_chosen_with_the_feed_and_the_simulation_says_its_feeds() {
