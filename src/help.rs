@@ -2625,7 +2625,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Linking(2)),
         ),
         (_, "ramp") => (
-            "How the cutter enters material. Adaptive clearing on an imported part enters with a Helix or a Plunge where it cannot reach the material from the side; the sample also records a back-and-forth or profile ramp. Match the entry to the cutter's cutting capabilities.",
+            "How the cutter enters material. Adaptive clearing on an imported part enters with a Helix or a Plunge where it cannot reach the material from the side (with Helix, in a hole hardly wider than the cutter, it ramps down round the wall instead, never straight down); the sample also records a back-and-forth or profile ramp. Match the entry to the cutter's cutting capabilities.",
             "",
             Some(Ramp),
         ),

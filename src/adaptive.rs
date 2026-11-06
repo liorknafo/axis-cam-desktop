@@ -57,6 +57,9 @@ const PROMISE: f64 = 2.;
 const CRUMB: f64 = 0.01;
 /// The engagement, over the load, past which a wall pass slows down.
 const WALL_LOAD: f64 = 1.25;
+/// The shortest wall loop, mm, a Helix entry ramps down round where there
+/// is no room for a helix; round a shorter one it refuses.
+const RAMP_LOOP: f64 = 0.05;
 /// The least share of the feed a wall pass slows to.
 const SLOWEST: f64 = 0.2;
 
@@ -437,6 +440,11 @@ enum Event {
         from: f64,
         turn: f64,
     },
+    /// Down round this closed loop, which starts and ends where the tool
+    /// is, from the level before to the level at the ramp angle, lap after
+    /// lap, then on round to its start at the level: a Helix entry where
+    /// there is no room for a helix (a hole hardly wider than the cutter).
+    Ramp(Vec<P>),
     /// Cut through these points at depth, from where the tool is.
     Cut(Vec<P>),
     /// A pass round a wall through these points at depth, from where the
@@ -878,7 +886,9 @@ impl Level<'_> {
     }
     /// Where to enter material no pass can reach from beside it: the
     /// allowed cell with the most room in solid material, and the helix
-    /// radius that room gives (0 to plunge).
+    /// radius that room gives (0 to plunge, with a Plunge entry). A Helix
+    /// entry with no room for a helix a tenth of the tool radius enters
+    /// nowhere: the walls' pass ramps down round its wall instead.
     fn entry(&self) -> Option<(P, f64)> {
         let w = self.walk;
         // Solid material at least half the tool radius all round, as
@@ -899,15 +909,11 @@ impl Level<'_> {
             }
         }
         let (room, i, j) = best?;
-        let radius = if w.helix {
-            (0.5 * w.r).min((room as f64 - 1.) * w.cells.h)
-        } else {
-            0.
-        };
-        Some((
-            w.cells.centre(i, j),
-            if radius < 0.1 * w.r { 0. } else { radius },
-        ))
+        if !w.helix {
+            return Some((w.cells.centre(i, j), 0.));
+        }
+        let radius = (0.5 * w.r).min((room as f64 - 1.) * w.cells.h);
+        (radius >= 0.1 * w.r).then(|| (w.cells.centre(i, j), radius))
     }
     /// How the tool gets from where it is to `to`.
     fn lift(&self, to: P, exact: &[Polygon]) -> Lift {
@@ -1042,12 +1048,23 @@ impl Level<'_> {
                 );
                 (self.ok(p) && !w.edges.crosses(p, start)).then_some(p)
             });
+            // With a Helix entry the tool never goes straight down into
+            // material: where some is under where the pass begins, it
+            // ramps down round the wall from its start, as a Pocket's
+            // profile ramp does.
+            let solid = |level: &Self, p: P| level.count(p, p, w.r) > 0;
+            let ramp = w.helix && lead.is_none_or(|p| solid(self, p)) && solid(self, start);
             let mut points = vec![];
-            if let Some(p) = lead {
+            if let Some(p) = lead.filter(|_| !ramp) {
                 points.push(p);
             }
             points.extend(around);
-            self.link(points[0], exact, false, &mut first);
+            if ramp {
+                self.link(start, exact, true, &mut first);
+                self.events.push(Event::Ramp(points.clone()));
+            } else {
+                self.link(points[0], exact, false, &mut first);
+            }
             // Each move a step long at most, slowed where it takes more
             // than the load so the cutter removes no more per minute.
             let mut fine = vec![points[0]];
@@ -1608,6 +1625,43 @@ fn emit(
                         return Err(OUTSIDE.into());
                     }
                     out.push(point(p, z), Motion::Feed, f.feed * 0.25, true)?;
+                }
+            }
+            Event::Ramp(path) => {
+                if !inside(exact, edges, path) {
+                    return Err(OUTSIDE.into());
+                }
+                let lap: f64 = path
+                    .windows(2)
+                    .map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
+                    .sum();
+                let start = path[0];
+                // A loop too short to ramp round is a hole the cutter
+                // all but fills: it could only plunge there.
+                if lap < RAMP_LOOP || f.slope <= 0. {
+                    return Err(format!(
+                        "Adaptive clearing has no room to ramp into the material at X{:.2} Y{:.2} with a Helix entry: the cutter, with the radial stock to leave, all but fills the space there. Choose Plunge in Linking for a centre-cutting end mill, or a smaller cutter or less radial stock to leave.",
+                        start.0, start.1
+                    ));
+                }
+                out.push(point(start, h.previous), Motion::Feed, f.feed * 0.25, false)?;
+                let mut z = h.previous;
+                loop {
+                    for pair in path.windows(2) {
+                        let (a, b) = (pair[0], pair[1]);
+                        let length = (b.0 - a.0).hypot(b.1 - a.1) as f32;
+                        if z > h.z {
+                            z = (z - length * f.slope).max(h.z);
+                            out.push(point(b, z), Motion::Feed, f.feed * 0.25, true)?;
+                        } else {
+                            // At the level, the rest of the lap at the
+                            // cutting feed, back to the start.
+                            out.push(point(b, h.z), Motion::Feed, f.feed, true)?;
+                        }
+                    }
+                    if z <= h.z {
+                        break;
+                    }
                 }
             }
             Event::Cut(path) => {
@@ -2862,6 +2916,121 @@ mod tests {
             let limit = if width <= 4. { 2. } else { 2.5 * 0.4 };
             assert!(most <= limit + 0.01, "{width}: most {most}");
         }
+    }
+    /// A hole hardly wider than the cutter, a Ø5 one in the Ø6 hole and the
+    /// 6 mm square one of `pocket::hole_plate`, with 0.3 mm of radial stock
+    /// to leave: no room for a helix. With a Helix entry the tool ramps down
+    /// round the hole's wall at the ramp angle, never straight down into
+    /// material, at a 0.25 mm stepdown and at a 10 mm one, into the stock
+    /// over the plate too; with a Plunge entry it plunges.
+    #[test]
+    fn a_helix_entry_with_no_room_for_a_helix_ramps_round_the_wall() {
+        let (setup, mut op, mut tool, mesh) = part(crate::pocket::hole_plate(false), &[], 5.);
+        tool.p.insert("length".into(), "12".into());
+        let walls = |x: f32| {
+            let scale = mesh.display_scale();
+            let placement = stock::Placement::new(&mesh, Some(&setup));
+            let id = (0..mesh.surfaces.len())
+                .find(|&id| {
+                    let c = placement
+                        .transform(mesh.surfaces[id].center)
+                        .map(|v| v / scale);
+                    crate::pocket::is_wall(&setup, &mesh, id)
+                        && (c[0] - x).abs() < 3.01
+                        && c[1].abs() < 3.01
+                })
+                .unwrap();
+            crate::pocket::hole_walls(&setup, &mesh, id).unwrap()
+        };
+        op.surfaces.as_mut().unwrap().ids = walls(-10.).into_iter().chain(walls(10.)).collect();
+        for (k, v) in [
+            ("allowance", "0.3"),
+            ("optimal_load", "0.75"),
+            ("minimum_radius", "0"),
+            ("tolerance", "0.01"),
+            ("ramp", "Helix"),
+            ("ramp_angle", "2"),
+            ("breakthrough", "0.5"),
+        ] {
+            op.p.insert(k.into(), v.into());
+        }
+        let top = |setup: &Setup| stock::resolve(setup, Some(&mesh)).unwrap().stock.max[2];
+        for (stock_top, stepdown) in [("0", "0.25"), ("0", "10"), ("2", "10")] {
+            let mut setup = setup.clone();
+            setup.p.insert("stock_top".into(), stock_top.into());
+            op.p.insert("stepdown".into(), stepdown.into());
+            let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+            // Every hole cleared wall to wall, so no feed straight down
+            // goes under where the tool has been before.
+            let mut lowest = top(&setup);
+            let mut ramps = 0;
+            for m in &plan.moves {
+                let xy = (m.to[0] - m.from[0]).hypot(m.to[1] - m.from[1]);
+                if m.motion == Motion::Feed && xy < 1e-4 && m.to[2] < m.from[2] {
+                    assert!(
+                        m.to[2] >= lowest - 0.0001,
+                        "{stock_top} {stepdown}: plunge {m:?} under {lowest}"
+                    );
+                }
+                if m.motion == Motion::Feed && xy > 1e-4 && m.to[2] < m.from[2] - 1e-5 {
+                    ramps += 1;
+                    let slope = (m.from[2] - m.to[2]) / xy;
+                    assert!(slope <= 2f32.to_radians().tan() * 1.001, "{slope}");
+                }
+                if m.motion == Motion::Feed {
+                    lowest = lowest.min(m.to[2]);
+                }
+            }
+            assert!(ramps > 0, "{stock_top} {stepdown}");
+        }
+        op.p.insert("ramp".into(), "Plunge".into());
+        assert!(
+            generate(&setup, &op, &tool, &mesh)
+                .unwrap()
+                .moves
+                .iter()
+                .all(|m| {
+                    let xy = (m.to[0] - m.from[0]).hypot(m.to[1] - m.from[1]);
+                    xy < 1e-4 || m.to[2] >= m.from[2] - 1e-5
+                })
+        );
+    }
+    /// A loop too short to ramp round refuses, naming the place, rather
+    /// than plunge.
+    #[test]
+    fn a_helix_entry_round_a_loop_too_short_to_ramp_refuses() {
+        let (setup, op, tool, mesh) = ring();
+        let mut out = Motions {
+            plan: generate(&setup, &op, &tool, &mesh).unwrap(),
+            at: [1., 2., 10.],
+        };
+        out.plan.moves.clear();
+        let tiny = vec![(1., 2.), (1.01, 2.), (1., 2.01), (1., 2.)];
+        let exact = vec![vec![(0., 0.), (5., 0.), (5., 5.), (0., 5.)]];
+        let edges = Edges::new(&exact, 2.);
+        let e = emit(
+            &mut out,
+            &[Event::Ramp(tiny)],
+            &exact,
+            &edges,
+            Heights {
+                z: 4.,
+                previous: 6.,
+                entry: 6.5,
+                clearance: 10.,
+            },
+            Feeds {
+                feed: 1000.,
+                slope: 0.035,
+            },
+            0.01,
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("no room to ramp into the material at X1.00 Y2.00"),
+            "{e}"
+        );
+        assert!(out.plan.moves.is_empty());
     }
     #[test]
     fn a_long_adaptive_moves_the_progress_bar_and_stops_soon_after_cancel() {

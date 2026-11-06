@@ -3983,7 +3983,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             if get(p, "ramp") == ADAPTIVE_ENTRIES[0] {
                 c = c.push(checks.field(p, "ramp_angle", "Helix ramp angle · degrees"));
             }
-            c = c.push(note("Where the cutter cannot come in from the side it enters the material with a Helix at the ramp angle, or a straight Plunge that needs a plunge-capable cutter. Where the floor runs off the stock, or earlier cuts opened it, the cutter comes in from the side with no entry. Between passes the tool stays down through cleared area where the move is short; otherwise it lifts just above the level before (inside the pocket) or to clearance."));
+            c = c.push(note("Where the cutter cannot come in from the side it enters the material with a Helix at the ramp angle, or a straight Plunge that needs a plunge-capable cutter. Where there is no room for a helix, as in a hole hardly wider than the cutter, a Helix entry ramps down round the wall at the ramp angle instead, as a Pocket's profile ramp does; it never plunges. Where the floor runs off the stock, or earlier cuts opened it, the cutter comes in from the side with no entry. Between passes the tool stays down through cleared area where the move is short; otherwise it lifts just above the level before (inside the pocket) or to clearance."));
             c = c.push(note(fixtures(Note::Pocket, modelled(app))));
         }
         "Linking" if !app.is_sample() && o.strategy.imported_preview() => {
