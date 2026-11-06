@@ -35,8 +35,8 @@ use clipper2::{EndType, FillRule, JoinType, Milli, Paths, difference, intersect}
 pub const DEPTH: f32 = 0.02;
 /// The band at its edge a support pass proven clear is not proven over, mm:
 /// with the polygons it is proven with, whose vertices round to 0.001 mm
-/// (`Milli`), the level after it meets no more than a stepdown but in a
-/// strip under 0.004 mm thick.
+/// (`Milli`), what it leaves uncut lies within 0.004 mm of its edge, and
+/// the level after it meets no more than a stepdown but there.
 pub const SUPPORT_GAP: f32 = 0.003;
 /// The most of a support pass's path proven clear at once, mm.
 const RUN: f32 = 5.;
@@ -290,10 +290,12 @@ impl<'a> Detector<'a> {
             let i = cutting.partition_point(|c| c[1] < b - 1e-4);
             cutting.get(i).is_some_and(|c| c[0] <= a + 1e-4)
         };
-        // The plan's own feeds surely kept: one all within what cuts, and a
-        // support pass, kept or proven clear by what is kept before it.
+        // The plan's own feeds surely kept: those all within what cuts. A
+        // support pass proven clear is not: it is proven only `SUPPORT_GAP`
+        // in from its edge, and strips that thin left by several side by
+        // side would add up.
         let kept: Vec<bool> = (0..feeds.len())
-            .map(|k| support(k) || within(feeds[k].at, feeds[k].at + feeds[k].length))
+            .map(|k| within(feeds[k].at, feeds[k].at + feeds[k].length))
             .collect();
         // Runs of support feeds, each `[from, to]` mm along the path and
         // the feed it starts in: a long feed cut in pieces.
@@ -1248,6 +1250,48 @@ mod tests {
                 && m.from[0].min(m.to[0]) < -40.
                 && m.from[0].max(m.to[0]) > -20.
         }));
+        continuous(&kept);
+    }
+    #[test]
+    fn support_passes_taken_out_side_by_side_leave_no_wider_strip() {
+        // Six support passes at Z36, each 0.002 mm to the side of the one
+        // before, over a slot cut along Y0: one taken out may not count as
+        // cutting all it would for the next, or their 0.003 mm bands add up
+        // to a strip 0.012 mm wide that the Z32 level after them meets 8 mm
+        // tall (found by the acceptance review of LIO-352).
+        let mut volume = Volume::new(STOCK, frame());
+        let flat = CutterShape::Flat;
+        volume.cut(
+            [-100., 0., 36.],
+            [100., 0., 36.],
+            1.5,
+            25.,
+            flat,
+            frame(),
+            (0, 0),
+        );
+        let mut points = vec![[-80., 0.002, 36.], [80., 0.002, 36.]];
+        for j in 2..=6 {
+            let x = points[points.len() - 1][0];
+            points.extend([[x, j as f32 * 0.002, 36.], [-x, j as f32 * 0.002, 36.]]);
+        }
+        let end = points[points.len() - 1];
+        points.extend([[end[0], end[1], 32.], [-end[0], end[1], 32.]]);
+        let mut original = plan(&points);
+        original.radius = 1.5;
+        let level = |m: &Move, z: f32| m.motion == Motion::Feed && m.from[2] == z && m.to[2] == z;
+        original.keep_air = original.moves.iter().map(|m| level(m, 36.)).collect();
+        let (kept, _) = trimmed(original, &volume);
+        let at = |p: &Plan, q: [f32; 3], z: f32| {
+            (p.moves.iter())
+                .any(|m| level(m, z) && swept(q, m.from, m.to, p.radius, p.flute_length, p.shape))
+        };
+        // Across the strip the passes add over the slot, X0, Y1.5 to 1.512:
+        // all of it cut at Z36, or else not met first by the Z32 level.
+        for i in 1..120 {
+            let q = [0., 1.5 + i as f32 * 0.0001, 38.];
+            assert!(at(&kept, q, 36.) || !at(&kept, q, 32.), "{q:?}");
+        }
         continuous(&kept);
     }
     #[test]
