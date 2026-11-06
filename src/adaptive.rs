@@ -2960,16 +2960,22 @@ mod tests {
             setup.p.insert("stock_top".into(), stock_top.into());
             op.p.insert("stepdown".into(), stepdown.into());
             let plan = generate(&setup, &op, &tool, &mesh).unwrap();
-            // Every hole cleared wall to wall, so no feed straight down
-            // goes under where the tool has been before.
-            let mut lowest = top(&setup);
+            // Each hole is cleared wall to wall, so no feed straight down
+            // goes under where the tool has already been there: the
+            // lowest feed within the cutter's radius, else the stock top.
+            let r = plan.radius;
+            let mut been: Vec<[f32; 3]> = vec![];
             let mut ramps = 0;
             for m in &plan.moves {
                 let xy = (m.to[0] - m.from[0]).hypot(m.to[1] - m.from[1]);
                 if m.motion == Motion::Feed && xy < 1e-4 && m.to[2] < m.from[2] {
+                    let here = (been.iter())
+                        .filter(|p| (p[0] - m.to[0]).hypot(p[1] - m.to[1]) < r)
+                        .map(|p| p[2])
+                        .fold(top(&setup), f32::min);
                     assert!(
-                        m.to[2] >= lowest - 0.0001,
-                        "{stock_top} {stepdown}: plunge {m:?} under {lowest}"
+                        m.to[2] >= here - 0.0001,
+                        "{stock_top} {stepdown}: plunge {m:?} under {here}"
                     );
                 }
                 if m.motion == Motion::Feed && xy > 1e-4 && m.to[2] < m.from[2] - 1e-5 {
@@ -2978,7 +2984,7 @@ mod tests {
                     assert!(slope <= 2f32.to_radians().tan() * 1.001, "{slope}");
                 }
                 if m.motion == Motion::Feed {
-                    lowest = lowest.min(m.to[2]);
+                    been.push(m.to);
                 }
             }
             assert!(ramps > 0, "{stock_top} {stepdown}");
