@@ -3083,22 +3083,15 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             match app.doc.recommended_speeds(app.doc.setup(), o) {
                 Ok((rpm, feed)) => {
                     let material = app.doc.selected_material().map_or("", |m| m.name());
-                    // A Turn's feed is the carriage's, not the operation's.
-                    let turn = o.strategy == Strategy::Turn;
-                    let shown = if turn {
-                        String::new()
-                    } else {
-                        format!(" · {feed} mm/min")
-                    };
                     c = c.push(
                         muted(format!(
-                            "Recommended for {} and this cutter:\n{rpm} rpm{shown}",
+                            "Recommended for {} and this cutter:\n{rpm} rpm · {feed} mm/min",
                             crate::proposal::clip(material, crate::material::NAME_LIMIT)
                         ))
                         .size(12),
                     );
                     let runs = |k: &str, v: f32| get(p, k).trim() == v.to_string();
-                    if runs("rpm", rpm) && (turn || runs("feed", feed)) {
+                    if runs("rpm", rpm) && runs("feed", feed) {
                         c = c.push(muted("The operation runs at it.").size(12));
                     } else {
                         c = c.push(

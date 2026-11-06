@@ -2726,11 +2726,12 @@ impl Document {
     /// The spindle speed (rpm) and feed (mm/min) recommended for `op` in
     /// `setup`: what `material::recommend_for` gives for the selected
     /// material, its tool and the setup's machine, the speed on a hand
-    /// machine's nearest gear (the feed scaled with it, so the chip stays)
-    /// and the feed at most its hand feed. Why there is none otherwise: no
-    /// material or no cutting data, a drill's, a tap's or a thread mill's
-    /// cycle (the library's chip loads are an end mill's per tooth), no
-    /// tool, or what `recommend_for` says.
+    /// machine's nearest gear that keeps the cutter in the material's data
+    /// (the feed scaled with it, so the chip stays, and at most its hand
+    /// feed). Why there is none otherwise: no material or no cutting data, a
+    /// Turn, a drill's, a tap's or a thread mill's cycle (the library's chip
+    /// loads are an end mill's per tooth), no tool, no gear in the data, or
+    /// what `recommend_for` says.
     pub fn recommended_speeds(&self, setup: &Setup, op: &Operation) -> Result<(f32, f32), String> {
         let Some(material) = self.selected_material() else {
             return Err("No material is chosen.".into());
@@ -2745,6 +2746,9 @@ impl Document {
                 "The library has no thread-milling data: set its speed and feed by hand.".into(),
             );
         }
+        if op.strategy == Strategy::Turn {
+            return Err("The library's cutting data is a milling cutter's: set a lathe operation's speed by hand.".into());
+        }
         if op.strategy == Strategy::Drill && !op.helical() && !op.finishes_holes() {
             return Err("A drill's feed is per turn and the library has no drill data: set its speed and feed by hand.".into());
         }
@@ -2756,11 +2760,30 @@ impl Document {
         if !manual::is_hand(m) {
             return Ok((rpm, feed));
         }
-        let gear = manual::gear(m, rpm);
-        let feed = (feed * gear / rpm).round();
-        Ok((
-            gear,
-            num(&m.p, "hand_feed").map_or(feed, |hand| feed.min(hand)),
+        // The nearest gear the material check passes: a gear only near the
+        // speed may run the cutter too fast or too slow for the material.
+        let mut gears = match manual::variable(m) {
+            Some(_) => vec![manual::gear(m, rpm)],
+            None => manual::gears(m),
+        };
+        gears.sort_by(|a, b| (a - rpm).abs().total_cmp(&(b - rpm).abs()));
+        let hand = num(&m.p, "hand_feed");
+        let mut at = op.clone();
+        for gear in gears {
+            let feed = (feed * gear / rpm).round();
+            let feed = hand.map_or(feed, |hand| feed.min(hand));
+            at.p.insert("rpm".into(), gear.to_string());
+            at.p.insert("feed".into(), feed.to_string());
+            if let crate::material::SpeedFeed::InRange { .. } =
+                crate::material::check(material, tool, &at, m)
+            {
+                return Ok((gear, feed));
+            }
+        }
+        let name = crate::proposal::clip(material.name(), crate::material::NAME_LIMIT);
+        Err(format!(
+            "None of the machine's speeds ({} rpm) runs this cutter within {name}'s cutting data: set its speed and feed by hand.",
+            manual::speeds(m)
         ))
     }
     /// Sets the speed and feed of operation `oi` of setup `si` to
@@ -5067,6 +5090,61 @@ mod tests {
             .unwrap();
         assert!([500., 1000., 2000.].contains(&rpm), "{rpm}");
         assert!(feed > 0. && feed <= 150., "{feed}");
+        let in_range = |doc: &mut Document| {
+            doc.fit_op_speeds(0, 0);
+            let (setup, op) = (&doc.setups[0], &doc.setups[0].operations[0]);
+            matches!(
+                doc.speed_feed(setup, op),
+                Some(crate::material::SpeedFeed::InRange { .. })
+            )
+        };
+        assert!(in_range(&mut doc));
+        // A Ø50 face mill: 1200 rpm is nearest its speed but runs it at 188
+        // m/min, over mild steel's 150, and 100 rpm far under it. No gear
+        // fits, and it says so rather than overspeed the cutter.
+        let face = Tool::new("Face 50", "Flat end mill", "50");
+        doc.setups[0].operations[0].tool = face.id.clone();
+        doc.tools.push(face);
+        let m = &mut doc.setups[0].machine;
+        m.p.insert("speeds".into(), "100, 1200, 3000".into());
+        manual::settle(m);
+        let said = doc.fit_op_speeds(0, 0);
+        assert!(
+            said.starts_with(
+                "No recommended speed and feed. None of the machine's speeds (100, 1200, 3000 rpm)"
+            ),
+            "{said}"
+        );
+        // Given a gear in the data, it takes that one though another is nearer.
+        let m = &mut doc.setups[0].machine;
+        m.p.insert("speeds".into(), "100, 700, 1200, 3000".into());
+        manual::settle(m);
+        assert!(in_range(&mut doc));
+        assert_eq!(get(&doc.setups[0].operations[0].p, "rpm"), "700");
+    }
+    #[test]
+    fn a_lathe_turn_has_no_recommended_speed_and_says_why() {
+        let tool = Tool::new("Turning tool", "Turning tool", "");
+        let mut setup = Setup::new(crate::lathe::defaults(), "G54");
+        let mut turn = Operation::new(Strategy::Turn, tool.id.clone());
+        turn.set_turn_kind("Outside");
+        setup.operations = vec![turn];
+        let mut doc = Document {
+            tools: vec![tool],
+            setups: vec![setup],
+            ..Default::default()
+        };
+        doc.adopt_materials();
+        let mild = (doc.materials.iter())
+            .find(|m| m.name().starts_with("Mild steel"))
+            .unwrap()
+            .id
+            .clone();
+        assert!(doc.select_material(&mild));
+        assert_eq!(
+            doc.fit_op_speeds(0, 0),
+            "No recommended speed and feed. The library's cutting data is a milling cutter's: set a lathe operation's speed by hand."
+        );
     }
     #[test]
     fn a_library_given_the_alloys_gets_only_the_woods_and_metals_once() {
