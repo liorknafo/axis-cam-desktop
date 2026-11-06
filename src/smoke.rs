@@ -7519,16 +7519,15 @@ flood = { pin = 8 }
         let _ = a.update(Message::Edit(Target::Tool, "flutes", "0".into()));
         let _ = a.update(Message::PutBackEdit);
         assert_eq!(get(&a.tool_draft.p, "flutes"), "7");
-        // An operation added since: the edit is undone, the new one kept.
+        // An operation added since: nothing to undo, so the new one stays.
         let _ = a.update(Message::SelectOp(0));
-        let feed = get(&a.operation().unwrap().p, "feed").to_string();
         let _ = a.update(Message::Edit(Target::Operation, "feed", "0".into()));
         let _ = a.update(Message::AddOp(Strategy::Face));
         let count = a.doc.setups[0].operations.len();
-        assert!(offers(&a));
+        assert!(!offers(&a));
         let _ = a.update(Message::PutBackEdit);
         assert_eq!(a.doc.setups[0].operations.len(), count);
-        assert_eq!(get(&a.doc.setups[0].operations[0].p, "feed"), feed);
+        assert_eq!(get(&a.doc.setups[0].operations[0].p, "feed"), "0");
         // The operation changed since: nothing to undo.
         let _ = a.update(Message::SelectOp(0));
         let _ = a.update(Message::Edit(Target::Operation, "feed", "0".into()));
@@ -7655,6 +7654,78 @@ flood = { pin = 8 }
         let _ = a.update(late);
         assert!(a.simulation.is_none() && !a.playing);
         assert_eq!(a.progress, 0.);
+    }
+    /// Rest machining turned off, then its source deleted, disabled or
+    /// moved after it: undoing would turn it on with no source before it, so
+    /// it is not offered.
+    #[test]
+    fn undo_does_not_turn_rest_machining_on_without_its_source() {
+        for action in ["delete", "disable", "move"] {
+            let mut a = app();
+            let source = a.doc.setup().operations[0].id.clone();
+            let _ = a.update(Message::AddOp(Strategy::Adaptive));
+            let target = a.operation().unwrap().id.clone();
+            let _ = a.update(Message::RestSource(source));
+            let _ = a.update(Message::Edit(Target::Operation, "rest", "Yes".into()));
+            let _ = a.update(Message::Edit(Target::Operation, "rest", "No".into()));
+            assert!(a.can_put_back(), "{action}");
+            let _ = a.update(Message::SelectOp(0));
+            match action {
+                "delete" => {
+                    let _ = a.update(Message::ConfirmDeleteOp(true));
+                }
+                "disable" => {
+                    let _ = a.update(Message::ToggleOp);
+                }
+                _ => {
+                    for _ in 0..a.doc.setup().operations.len() {
+                        let _ = a.update(Message::MoveOp(1));
+                    }
+                }
+            }
+            assert!(!a.can_put_back(), "{action}");
+            let _ = a.update(Message::PutBackEdit);
+            let i = (a.doc.setup().operations.iter())
+                .position(|o| o.id == target)
+                .unwrap();
+            let _ = a.update(Message::SelectOp(i));
+            assert_eq!(get(&a.operation().unwrap().p, "rest"), "No", "{action}");
+            assert!(
+                !a.op_issues().iter().any(|e| e.contains("Rest machining")),
+                "{action}: {:?}",
+                a.op_issues()
+            );
+        }
+    }
+    /// A pin drilling turned to the part's holes, then the setup whose pins
+    /// it drilled deleted: undoing would drill pins for a setup that is
+    /// gone, so it is not offered.
+    #[test]
+    fn undo_does_not_drill_pins_for_a_deleted_setup() {
+        let mut a = leftover_pins_app(None);
+        let _ = a.update(Message::PlacePins);
+        let source = a.doc.active.clone();
+        let _ = a.update(Message::AddPinDrilling);
+        let _ = a.update(Message::SelectSetup(0));
+        let drill = (a.doc.setup().operations.iter())
+            .position(|o| o.drills_pin_holes())
+            .unwrap();
+        let _ = a.update(Message::SelectOp(drill));
+        let target = a.operation().unwrap().id.clone();
+        let holes = crate::model::DRILL_HOLES[0];
+        let _ = a.update(Message::Edit(Target::Operation, "holes", holes.into()));
+        assert!(a.can_put_back());
+        let si = a.doc.setups.iter().position(|s| s.id == source).unwrap();
+        let _ = a.update(Message::SelectSetup(si));
+        let _ = a.update(Message::ConfirmDeleteSetup(true));
+        assert!(!a.can_put_back());
+        let _ = a.update(Message::PutBackEdit);
+        let _ = a.update(Message::SelectSetup(0));
+        let op = (a.doc.setup().operations.iter())
+            .find(|o| o.id == target)
+            .unwrap();
+        assert!(!op.drills_pin_holes());
+        assert_eq!(get(&op.p, "holes"), holes);
     }
     /// Undoing a turn's kind puts back its sizes, speed and tool.
     #[test]
