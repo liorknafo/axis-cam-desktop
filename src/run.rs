@@ -270,6 +270,9 @@ pub struct Run {
     /// The step the driver was told to stop after (Stop sent at its end):
     /// its operation (index in the setup) and step.
     stopping: Option<(usize, usize)>,
+    /// The Pi made that stop with no computer in control (this one lost
+    /// for its link-lost time), and lifted Z itself.
+    unattended: bool,
     /// Where the last tool run stopped short, until the connection keeps it
     /// (`Connection::observe`): in the journal, and as the next start.
     pub stopped: Option<Stopped>,
@@ -464,6 +467,7 @@ impl Run {
             recheck: false,
             stop_after: false,
             stopping: None,
+            unattended: false,
             stopped: None,
             completed: false,
             project: doc.title.clone(),
@@ -793,9 +797,17 @@ impl Run {
             left.filter(|l| self.checked().is_some() && (!l.after.is_empty() || l.last.is_some()));
         self.times = times.filter(|_| self.checked().is_some());
         self.pictures.clear();
-        // Where a run of this setup stopped: the start after it, while the
-        // program of its operation is the one it stopped in.
-        if let Some(j) = self.journal.take().filter(|_| self.checked().is_some()) {
+        self.take_journal();
+    }
+
+    /// Where a run of this setup stopped (`journal`), once it is checked:
+    /// the start after it, while the program of its operation is the one it
+    /// stopped in.
+    fn take_journal(&mut self) {
+        if self.checked().is_none() {
+            return;
+        }
+        if let Some(j) = self.journal.take() {
             let same = self
                 .op_steps(j.op)
                 .is_some_and(|s| s.fingerprint == j.fingerprint);
@@ -809,6 +821,68 @@ impl Run {
                 ));
             }
         }
+    }
+
+    /// Where a run of this setup stopped, found while it is open (the Pi
+    /// stopped a tool run this computer did not follow): its start is the
+    /// step after, now or once it is checked.
+    pub fn adopt_journal(&mut self, j: Journal) {
+        if self.running.is_none() && j.setup == self.setup_id {
+            self.journal = Some(j);
+            self.take_journal();
+        }
+    }
+
+    /// The journal of each stop Stop after step on the Pi can make in the
+    /// running tool run (`stop_ranges`, one range per step), the machine at
+    /// work system `wcs` and work `offset`: kept as it is sent, for when
+    /// the Pi stops it with this computer not following (closed and opened
+    /// again).
+    pub fn pi_stops(
+        &self,
+        wcs: usize,
+        offset: [f64; 6],
+    ) -> Vec<(std::ops::RangeInclusive<u32>, Journal)> {
+        let n = self.running_blocks().map_or(0, |b| b.len());
+        let mut ends: Vec<(std::ops::RangeInclusive<u32>, (usize, usize))> = vec![];
+        for block in 0..n {
+            let Some(step) = self.step_end(block) else {
+                continue;
+            };
+            // Job line n is block n - 1 (`progress`).
+            let line = block as u32 + 1;
+            match ends.last_mut() {
+                Some((r, s)) if *s == step && *r.end() + 1 == line => *r = *r.start()..=line,
+                _ => ends.push((line..=line, step)),
+            }
+        }
+        (ends.into_iter())
+            .filter_map(|(r, (op, s))| {
+                let st = Stopped {
+                    op,
+                    last: Some(s),
+                    up: None,
+                    why: "Stop after step".into(),
+                };
+                Some((r, self.journal_of(&st, wcs, offset)?))
+            })
+            .collect()
+    }
+
+    /// The journal of the running tool run done, the machine at work
+    /// system `wcs` and work `offset`: the next tool run's first operation,
+    /// nothing of it done, so the start is there. None when it is the
+    /// setup's last. Kept as `pi_stops` is.
+    pub fn pi_done(&self, wcs: usize, offset: [f64; 6]) -> Option<Journal> {
+        let r = self.running.as_ref()?;
+        let op = *self.checked()?.get(r.index + 1)?.indexes.first()?;
+        let st = Stopped {
+            op,
+            last: None,
+            up: None,
+            why: String::new(),
+        };
+        self.journal_of(&st, wcs, offset)
     }
 
     /// The journal of where this run stopped (`stopped`), the machine at
@@ -885,6 +959,7 @@ impl Run {
             return;
         }
         let stopping = self.stopping.take();
+        let unattended = std::mem::take(&mut self.unattended);
         self.stop_after = false;
         let mut message = o.message.clone();
         if o.ok {
@@ -907,19 +982,19 @@ impl Run {
         } else if let Some((op, s)) = stopping {
             // Stopped after a step, the tool at its clearance: lifted to the
             // clearance plane once the machine stands still.
-            let up = self.checked().and_then(|c| c.get(r.index)).and_then(|p| {
-                let plane = clearance_plane(p.from(r.from).ok()?);
-                Some(match p.settings.machine_home {
-                    true => 0.,
-                    false => plane as f64 - p.datum[2] as f64 + r.offset[2],
-                })
-            });
+            let up = self.step_lift();
             message = format!("Stopped after {}", self.step_label(op, s));
+            if unattended {
+                message += ": no computer controlled the machine for a minute, so the Pi stopped there, lifted Z and turned the spindle off. Cycle Start goes on from the next step.";
+            }
             self.stopped = Some(Stopped {
                 op,
                 last: Some(s),
                 up,
-                why: "Stop after step".into(),
+                why: match unattended {
+                    true => "Stop after step: no computer in control for a minute".into(),
+                    false => "Stop after step".into(),
+                },
             });
         } else if o.message.contains("E-stop") || o.message.contains("E-STOP") {
             // In a step: it counts as not done.
@@ -1035,14 +1110,28 @@ impl Run {
         out
     }
 
+    /// The machine Z the tool is lifted to after Stop after step stops
+    /// the running tool run: its clearance plane (machine home's 0).
+    pub fn step_lift(&self) -> Option<f64> {
+        let r = self.running.as_ref()?;
+        let p = self.checked()?.get(r.index)?;
+        let plane = clearance_plane(p.from(r.from).ok()?);
+        Some(match p.settings.machine_home {
+            true => 0.,
+            false => plane as f64 - p.datum[2] as f64 + r.offset[2],
+        })
+    }
+
     /// The Pi stopped the running tool run after a step, at job line
-    /// `line`: the step it ends, for when its outcome comes.
-    pub fn stopped_on_pi(&mut self, line: u32) {
+    /// `line`: the step it ends, for when its outcome comes. `unattended`:
+    /// with no computer in control, after this one was lost.
+    pub fn stopped_on_pi(&mut self, line: u32, unattended: bool) {
         if self.stopping.is_none()
             && let Some((_, _, block)) = self.progress(Some(line))
         {
             self.stopping = self.step_end(block);
         }
+        self.unattended |= unattended && self.stopping.is_some();
     }
 
     /// The tool run just started never reached the machine (`why`): it is
@@ -4287,6 +4376,7 @@ mod tests {
             recheck: false,
             stop_after: false,
             stopping: None,
+            unattended: false,
             stopped: None,
             completed: false,
             project: String::new(),

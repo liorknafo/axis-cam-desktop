@@ -2787,9 +2787,20 @@ flood = { pin = 8 }
     /// `dir`) onto a uc100-server on 127.0.0.1 running the simulator, this
     /// computer paired with it.
     fn to_pi(a: &mut App, dir: &std::path::Path) -> uc100_remote::Server {
+        to_pi_lost(a, dir, uc100_remote::server::LINK_LOST)
+    }
+
+    /// `to_pi`, the Pi stopping a tool run after a step `link_lost` after
+    /// this computer is lost.
+    fn to_pi_lost(
+        a: &mut App,
+        dir: &std::path::Path,
+        link_lost: std::time::Duration,
+    ) -> uc100_remote::Server {
         let server = uc100_remote::Server::start(uc100_remote::ServerOptions {
             data: dir.join("pi"),
             listen: "127.0.0.1:0".parse().unwrap(),
+            link_lost,
         })
         .unwrap();
         // The Pi runs its simulator: the profile asks it to.
@@ -2839,7 +2850,8 @@ flood = { pin = 8 }
     }
 
     /// The owner's case: a tool run sent to the Pi goes on and finishes while
-    /// this computer is disconnected, and closing the link does not
+    /// this computer is disconnected (for less than the Pi's link-lost
+    /// time, a minute), and closing the link does not
     /// disconnect the Pi's UC100 (no E-stop, no Disconnect). Connected again,
     /// the run follows it and takes the tool run as done.
     #[test]
@@ -3103,6 +3115,280 @@ flood = { pin = 8 }
         assert!(drill.steps.len() > 1);
     }
 
+    /// The owner's heartbeat: this computer gone while the Drill drills,
+    /// nothing armed. Once no computer has controlled the machine for the
+    /// Pi's link-lost time, the Pi stops after a hole by itself, turns the
+    /// spindle off and lifts Z to the clearance plane this computer sent;
+    /// connected again, the run says why and goes on from the next hole.
+    #[test]
+    fn the_pi_stops_after_a_step_once_this_computer_is_lost_for_its_link_lost_time() {
+        use uc100::controller::State;
+        use uc100::gcode::Spindle;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        let server = to_pi_lost(&mut a, dir.path(), std::time::Duration::from_secs(1));
+        let drill = drilling(&mut a);
+        assert!(drill.steps.len() > 2);
+        assert!(!run_of(&a).stop_after);
+        let lift = run_of(&a).step_lift().expect("the clearance plane");
+        pi_until(&server, 5.0, "the spindle on", |s| {
+            s.spindle.is_some_and(|d| d != Spindle::Off)
+        });
+        let _ = a.update(Message::Disconnect);
+        pi_until(&server, 60.0, "the Pi's stop", |s| {
+            s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| !o.ok)
+        });
+        pi_until(&server, 5.0, "Z lifted to the clearance plane", |s| {
+            (s.machine_pos[2] - lift).abs() < 1e-3 && s.state == Some(State::Idle)
+        });
+        let s = server.snapshot().unwrap();
+        assert_eq!(s.spindle, Some(Spindle::Off));
+        assert!(
+            s.log.iter().any(|l| l.contains("stopped")),
+            "{:?}",
+            s.log.iter().rev().take(6).collect::<Vec<_>>()
+        );
+        // Connected again: stopped after a hole, and why; the next start is
+        // the hole after it.
+        let _ = a.update(Message::Connect);
+        run_until(&mut a, 10.0, "the outcome", |r| r.running.is_none());
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(
+            !ok && message.starts_with("Stopped after hole"),
+            "{message}"
+        );
+        assert!(
+            message.contains("no computer controlled the machine for a minute"),
+            "{message}"
+        );
+        assert!(!run_of(&a).done[1]);
+        let hole: usize = message["Stopped after hole ".len()..]
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|n| n.parse().ok())
+            .expect("the hole's number");
+        // Once the setup is checked again.
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((1, hole)), "{message}");
+        let journal = conn(&a).journal().expect("where it stopped");
+        assert_eq!(journal.step, Some(hole - 1));
+        assert!(
+            journal.why.contains("no computer in control"),
+            "{}",
+            journal.why
+        );
+    }
+
+    /// As above, but AXIS CAM closed and opened again while the Pi stops:
+    /// nothing of the run is left in memory. Connected again, where the Pi
+    /// stopped is found from what was kept as the tool run was sent, and
+    /// picking the setup starts it from the next hole.
+    #[test]
+    fn the_pi_stop_with_this_computer_lost_is_picked_up_after_axis_cam_opens_again() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        let server = to_pi_lost(&mut a, dir.path(), std::time::Duration::from_secs(1));
+        drilling(&mut a);
+        let _ = a.update(Message::Disconnect);
+        // Closed: the run kept for connecting back is gone with the app.
+        a.pi_run = None;
+        pi_until(&server, 60.0, "the Pi's stop", |s| {
+            s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| !o.ok)
+        });
+        let _ = a.update(Message::Connect);
+        assert!(conn(&a).run.is_none());
+        let mut deadline = Deadline::new(10.);
+        while conn(&a).journal().is_none() {
+            let _ = a.update(Message::Tick);
+            assert!(
+                deadline.within(&conn(&a).snapshot),
+                "where the Pi stopped never kept: {:?}",
+                conn(&a).pi_note
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let journal = conn(&a).journal().unwrap();
+        assert_eq!(journal.op, 1);
+        assert!(
+            journal.why.contains("no computer in control"),
+            "{}",
+            journal.why
+        );
+        let hole = journal.step.expect("a hole drilled") + 1;
+        assert!(
+            conn(&a)
+                .pi_note
+                .as_ref()
+                .is_some_and(|n| n.contains("the start after it is picked")),
+            "{:?}",
+            conn(&a).pi_note
+        );
+        // Picking the setup picks the next hole as the start, checked
+        // once for the setup, then again from that hole.
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(run_of(&a).programs.is_none() && problems(&a).len() == 1);
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((1, hole)));
+        assert!(run_of(&a).resumed.is_some());
+        shows(
+            &a,
+            &[
+                &format!("Start Drilling at hole {}", hole + 1),
+                "starts here",
+            ],
+        );
+    }
+
+    /// The Facing tool run finishes on the Pi while AXIS CAM is closed.
+    /// Opened again and connected, the next tool run, the Drilling, is the
+    /// start: the Pi says the tool run this computer sent was done.
+    #[test]
+    fn a_tool_run_the_pi_finished_with_axis_cam_closed_starts_the_next_after_it_opens_again() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5.0, "the Facing on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        let _ = a.update(Message::Disconnect);
+        a.pi_run = None;
+        pi_until(&server, 60.0, "the Facing's end", |s| {
+            s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| o.ok)
+        });
+        let _ = a.update(Message::Connect);
+        let mut deadline = Deadline::new(10.);
+        while conn(&a).journal().is_none() {
+            let _ = a.update(Message::Tick);
+            assert!(
+                deadline.within(&conn(&a).snapshot),
+                "the Facing's end never kept: {:?}",
+                conn(&a).pi_note
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let journal = conn(&a).journal().unwrap();
+        assert_eq!((journal.op, journal.step), (1, None), "{journal:?}");
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let run = run_of(&a);
+        assert_eq!(
+            (run.next, run.from),
+            (1, 0),
+            "the Drilling's tool run is next"
+        );
+    }
+
+    /// Another computer runs a tool run of the same name on the Pi, done,
+    /// after this one's stopped after a hole with this computer away: AXIS
+    /// CAM closed meanwhile (`closed`), or kept open with its run. Connected
+    /// again, this computer finds its own stop by the number it sent, never
+    /// the other's end, and the start is the next hole.
+    fn another_computers_tool_run_after_this_ones_stop(closed: bool) {
+        use crate::run::Action as R;
+        use uc100::controller::{Command, State};
+        use uc100::gcode::{Action as Do, Located};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        let server = to_pi_lost(&mut a, dir.path(), std::time::Duration::from_secs(1));
+        drilling(&mut a);
+        let name = (server.snapshot().unwrap().program_name).expect("the Drilling's job");
+        let _ = a.update(Message::Disconnect);
+        if closed {
+            a.pi_run = None;
+        }
+        pi_until(&server, 60.0, "the Pi's stop", |s| {
+            s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| !o.ok)
+        });
+        // The other computer: a short move in the air, named the same.
+        let code = uc100_remote::data::Data {
+            dir: dir.path().join("pi"),
+        }
+        .new_code()
+        .unwrap();
+        let addr = server.addr().to_string();
+        let token = uc100_remote::RemoteController::pair(&addr, &code, "Laptop").unwrap();
+        let other = uc100_remote::RemoteController::watch(&addr, token);
+        other.take_control();
+        let mut deadline = Deadline::new(5.);
+        while other.link().state != uc100_remote::LinkState::Controlling {
+            assert!(deadline.within(&other.snapshot()), "no control");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut up = server.snapshot().unwrap().machine_pos;
+        up[2] += 1.0;
+        let job = Command::Job {
+            name,
+            actions: std::sync::Arc::new(vec![Located {
+                line: 1,
+                action: Do::Move {
+                    target: up,
+                    feed: None,
+                },
+            }]),
+        };
+        assert!(other.send_tool_run(99, job, vec![], None));
+        let mut deadline = Deadline::new(10.);
+        while !other.link().tool_run_ends.iter().any(|e| e.id == 99) {
+            assert!(deadline.within(&other.snapshot()), "the other's end");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = a.update(Message::Connect);
+        let mut deadline = Deadline::new(10.);
+        while conn(&a).journal().is_none() {
+            let _ = a.update(Message::Tick);
+            assert!(
+                deadline.within(&conn(&a).snapshot),
+                "this computer's stop never found: {:?}",
+                conn(&a).pi_note
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Its own stop, found by the number it sent, not the other's end.
+        let journal = conn(&a).journal().unwrap();
+        assert_eq!(journal.op, 1);
+        assert!(
+            journal.why.contains("no computer in control"),
+            "{}",
+            journal.why
+        );
+        let hole = journal.step.expect("a hole drilled") + 1;
+        if closed {
+            let _ = a.update(Message::Run(R::Setup(0)));
+            answer_skips(&mut a, 0);
+        } else {
+            // The run it kept took its own end: stopped after the hole.
+            let (ok, message) = run_of(&a).outcome.clone().unwrap();
+            assert!(
+                !ok && message.starts_with("Stopped after hole"),
+                "{message}"
+            );
+        }
+        assert!(!run_of(&a).done[1], "the Drilling taken as done");
+        assert!(run_of(&a).programs.is_none() && problems(&a).len() == 1);
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((1, hole)));
+        other.shutdown();
+    }
+
+    #[test]
+    fn another_computers_tool_run_of_the_same_name_does_not_hide_this_ones_stop() {
+        another_computers_tool_run_after_this_ones_stop(true);
+    }
+
+    /// As above, AXIS CAM open all along, the run kept (astra round 3).
+    #[test]
+    fn another_computers_tool_run_done_is_not_taken_as_the_kept_runs_outcome() {
+        another_computers_tool_run_after_this_ones_stop(false);
+    }
+
     /// A tool run lost on the way to the Pi (the link failed as it
     /// crossed): it never runs and no outcome comes, so after a few seconds
     /// with the link live it is put back, nothing having moved, and Cycle
@@ -3127,6 +3413,38 @@ flood = { pin = 8 }
         let (ok, message) = run_of(&a).outcome.clone().unwrap();
         assert!(!ok && message.contains("did not reach the Pi"), "{message}");
         assert_eq!(conn(&a).snapshot.state, Some(State::Idle));
+        assert!(!run_of(&a).done[0]);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(&mut a, 60.0, "tool run 1", |r| r.done[0]);
+    }
+
+    /// As above, but this computer disconnects at once and connects back,
+    /// the run kept: the Pi never had the tool run, so it is put back, and
+    /// Cycle Start sends it again (astra round 4).
+    #[test]
+    fn a_tool_run_lost_on_the_way_is_put_back_after_connecting_back() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        a.control.as_mut().unwrap().lose_next_job = true;
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(run_of(&a).running.is_some());
+        let _ = a.update(Message::Disconnect);
+        assert!(a.pi_run.is_some());
+        let _ = a.update(Message::Connect);
+        assert!(run_of(&a).running.is_some(), "the run kept");
+        run_until(&mut a, 10.0, "the lost tool run put back", |r| {
+            r.running.is_none()
+        });
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(!ok && message.contains("did not reach the Pi"), "{message}");
+        let s = server.snapshot().unwrap();
+        assert_eq!((s.state, s.program_name), (Some(State::Idle), None));
         assert!(!run_of(&a).done[0]);
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
         let _ = a.update(Message::Run(R::CycleStart));

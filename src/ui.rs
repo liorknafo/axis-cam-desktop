@@ -8090,7 +8090,7 @@ fn control(app: &App) -> Element<'_, Message> {
 
 /// What the Control page says over every tab while the link to the Pi is
 /// not answering.
-pub(crate) const PI_LOST: &str = "No link to the Pi. Everything shown is its last known state. The machine carries on without this computer: a tool run goes on to its end, a jog stops by itself. Hold, Stop and E-stop cannot reach it from here until the link is back: use the machine's own E-stop. Reconnecting…";
+pub(crate) const PI_LOST: &str = "No link to the Pi. Everything shown is its last known state. The machine carries on without this computer: a jog stops by itself, and a tool run goes on, but if no computer controls the machine again within a minute it stops after the step it is cutting, lifts Z and turns the spindle off. Hold, Stop and E-stop cannot reach it from here until the link is back: use the machine's own E-stop. Reconnecting…";
 
 /// The banner over the Control page while the link to the Pi is down, or
 /// the Pi refuses this computer.
