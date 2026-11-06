@@ -4800,14 +4800,18 @@ impl App {
     pub fn can_put_back(&self) -> bool {
         self.typed_last.as_ref().is_some_and(|e| {
             let now = match &e.after {
-                // The same operation, wherever it is selected or not, and the
-                // tool it took before the edit (a turn's kind changes it)
-                // still in the library.
+                // The same operation, wherever it is selected or not, and what
+                // it took before the edit still there: its tool (a turn's
+                // kind changes it) and the setup whose pins it drills.
                 Edited::Operation(setup, o) => match self.find_operation(setup, &o.id) {
                     Some(now)
                         if matches!(&e.before, Edited::Operation(_, b)
-                            if b.tool == now.tool
-                                || self.doc.tools.iter().any(|t| t.id == b.tool)) =>
+                            if (b.tool == now.tool
+                                || self.doc.tools.iter().any(|t| t.id == b.tool))
+                                && (get(&b.p, "pin_setup").is_empty()
+                                    || get(&b.p, "pin_setup") == get(&now.p, "pin_setup")
+                                    || (self.doc.setups.iter())
+                                        .any(|s| s.id == get(&b.p, "pin_setup")))) =>
                     {
                         Edited::Operation(setup.clone(), Box::new(now.clone()))
                     }

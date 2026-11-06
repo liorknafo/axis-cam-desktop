@@ -7538,6 +7538,19 @@ flood = { pin = 8 }
         assert!(!offers(&a));
         let _ = a.update(Message::PutBackEdit);
         assert_eq!(get(&a.doc.setups[0].operations[0].p, "feed"), "0");
+        // The setup whose pins it drilled deleted since: undoing would point
+        // it at a setup that is gone, so it is not offered.
+        let mut flipped = a.doc.setups[0].clone();
+        flipped.id = "flipped".into();
+        flipped.operations.clear();
+        a.doc.setups.push(flipped);
+        a.doc.setups[0].operations[0]
+            .p
+            .insert("pin_setup".into(), "flipped".into());
+        let _ = a.update(Message::Edit(Target::Operation, "pin_setup", String::new()));
+        assert!(offers(&a));
+        a.doc.setups.retain(|s| s.id != "flipped");
+        assert!(!offers(&a));
         // Another project open: nothing of the first is put into it.
         let _ = a.update(Message::Edit(Target::Operation, "feed", "1".into()));
         let other = Document::sample();
