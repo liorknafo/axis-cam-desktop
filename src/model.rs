@@ -2723,8 +2723,90 @@ impl Document {
         self.material = name;
         true
     }
-    /// Gives every operation the speed and feed `material::recommend_for`
-    /// gives for the selected material, its tool and its setup's machine,
+    /// The spindle speed (rpm) and feed (mm/min) recommended for `op` in
+    /// `setup`: what `material::recommend_for` gives for the selected
+    /// material, its tool and the setup's machine, the speed on a hand
+    /// machine's nearest gear (the feed scaled with it, so the chip stays)
+    /// and the feed at most its hand feed. Why there is none otherwise: no
+    /// material or no cutting data, a drill's, a tap's or a thread mill's
+    /// cycle (the library's chip loads are an end mill's per tooth), no
+    /// tool, or what `recommend_for` says.
+    pub fn recommended_speeds(&self, setup: &Setup, op: &Operation) -> Result<(f32, f32), String> {
+        let Some(material) = self.selected_material() else {
+            return Err("No material is chosen.".into());
+        };
+        if op.tapping() {
+            return Err(
+                "A tap is turned by hand, one pitch a turn: no cutting data applies.".into(),
+            );
+        }
+        if op.thread_milling() {
+            return Err(
+                "The library has no thread-milling data: set its speed and feed by hand.".into(),
+            );
+        }
+        if op.strategy == Strategy::Drill && !op.helical() && !op.finishes_holes() {
+            return Err("A drill's feed is per turn and the library has no drill data: set its speed and feed by hand.".into());
+        }
+        let Some(tool) = self.tools.iter().find(|t| t.id == op.tool) else {
+            return Err("The operation has no tool.".into());
+        };
+        let m = &setup.machine;
+        let (rpm, feed) = crate::material::recommend_for(material, tool, op, m)?;
+        if !manual::is_hand(m) {
+            return Ok((rpm, feed));
+        }
+        let gear = manual::gear(m, rpm);
+        let feed = (feed * gear / rpm).round();
+        Ok((
+            gear,
+            num(&m.p, "hand_feed").map_or(feed, |hand| feed.min(hand)),
+        ))
+    }
+    /// Sets the speed and feed of operation `oi` of setup `si` to
+    /// `recommended_speeds`, and says what changed, what it already ran at,
+    /// or why it has none.
+    pub fn fit_op_speeds(&mut self, si: usize, oi: usize) -> String {
+        let Some(op) = self.setups.get(si).and_then(|s| s.operations.get(oi)) else {
+            return String::new();
+        };
+        let (rpm, feed) = match self.recommended_speeds(&self.setups[si], op) {
+            Ok(speeds) => speeds,
+            Err(why) => return format!("No recommended speed and feed. {why}"),
+        };
+        let name = self.selected_material().map_or(String::new(), |m| {
+            crate::proposal::clip(m.name(), crate::material::NAME_LIMIT)
+        });
+        let op = &mut self.setups[si].operations[oi];
+        let mut said = vec![];
+        for (key, what, value, unit) in [
+            ("rpm", "Spindle speed", rpm, "rpm"),
+            ("feed", "feed", feed, "mm/min"),
+        ] {
+            let old = get(&op.p, key).trim().to_string();
+            let new = value.to_string();
+            if old != new {
+                let old = if old.is_empty() { "none" } else { &old };
+                said.push(format!("{what} {old} → {new} {unit}"));
+                op.p.insert(key.into(), new);
+            }
+        }
+        if said.is_empty() {
+            return format!(
+                "{} already runs at {name}'s recommended speed and feed.",
+                op.name()
+            );
+        }
+        let mut said = said.join(", ");
+        if let Some(first) = said.get(..1) {
+            said = first.to_uppercase() + &said[1..];
+        }
+        format!(
+            "{said}: {name}'s recommended speed and feed for {}.",
+            op.name()
+        )
+    }
+    /// Gives every operation the speed and feed `recommended_speeds` gives,
     /// whatever it had: the same material always gives the same speeds.
     /// Drilling operations keep theirs (it would give them an end mill's
     /// chip load; Helical milling, which cuts with an end mill, is given one,
@@ -2757,13 +2839,7 @@ impl Document {
                     }
                     continue;
                 }
-                let recommended = match self.tools.iter().find(|t| t.id == op.tool) {
-                    Some(tool) => {
-                        crate::material::recommend_for(&material, tool, op, &setup.machine)
-                    }
-                    None => Err("The operation has no tool.".into()),
-                };
-                let (rpm, feed) = match recommended {
+                let (rpm, feed) = match self.recommended_speeds(setup, op) {
                     Ok(speeds) => speeds,
                     Err(why) => {
                         match skipped.iter_mut().find(|(w, _)| *w == why) {
@@ -4881,6 +4957,116 @@ mod tests {
             "Bare has no cutting data: speeds and feeds are unchanged."
         );
         assert_eq!(speeds(&doc), before);
+    }
+    #[test]
+    fn one_operation_takes_its_recommended_speed_and_feed() {
+        let mut router = Machine::new(3);
+        router.p.insert("rpm".into(), "24000".into());
+        router.p.insert("feed".into(), "1000".into());
+        let mill = Tool::new("Flat 3", "Flat end mill", "3");
+        let drill = Tool::new("Drill 3", "Drill", "3");
+        let mut setup = Setup::new(router, "G54");
+        let op = |s: Strategy, tool: &str, name: &str| {
+            let mut o = Operation::new(s, tool.into());
+            o.p.insert("name".into(), name.into());
+            o.p.insert("rpm".into(), "8000".into());
+            o.p.insert("feed".into(), "800".into());
+            o
+        };
+        let mut tap = op(Strategy::Drill, &drill.id, "Tap");
+        tap.p.insert("cycle".into(), TAPPING.into());
+        setup.operations = vec![
+            op(Strategy::Contour, &mill.id, "Contour"),
+            op(Strategy::Pocket, &mill.id, "Pocket"),
+            op(Strategy::Drill, &drill.id, "Drill"),
+            tap,
+            op(Strategy::Contour, "", "Loose"),
+        ];
+        let mut doc = Document {
+            tools: vec![mill, drill],
+            setups: vec![setup],
+            ..Default::default()
+        };
+        doc.adopt_materials();
+        assert_eq!(
+            doc.fit_op_speeds(0, 0),
+            "No recommended speed and feed. No material is chosen."
+        );
+        let pine = (doc.materials.iter())
+            .find(|m| m.name() == "Pine")
+            .unwrap()
+            .id
+            .clone();
+        assert!(doc.select_material(&pine));
+        let speeds = |doc: &Document, i: usize| {
+            let p = &doc.setups[0].operations[i].p;
+            (get(p, "rpm").to_string(), get(p, "feed").to_string())
+        };
+        // Only the operation asked for changes, to what the whole project's
+        // fit gives it.
+        assert_eq!(
+            doc.recommended_speeds(&doc.setups[0], &doc.setups[0].operations[0]),
+            Ok((10611., 1000.))
+        );
+        assert_eq!(
+            doc.fit_op_speeds(0, 0),
+            "Spindle speed 8000 → 10611 rpm, feed 800 → 1000 mm/min: Pine's recommended speed and feed for Contour."
+        );
+        assert_eq!(speeds(&doc, 0), ("10611".into(), "1000".into()));
+        assert_eq!(speeds(&doc, 1), ("8000".into(), "800".into()));
+        assert_eq!(
+            doc.fit_op_speeds(0, 0),
+            "Contour already runs at Pine's recommended speed and feed."
+        );
+        // Only the feed differs: the message starts with it.
+        doc.setups[0].operations[1]
+            .p
+            .insert("rpm".into(), "10611".into());
+        assert_eq!(
+            doc.fit_op_speeds(0, 1),
+            "Feed 800 → 1000 mm/min: Pine's recommended speed and feed for Pocket."
+        );
+        // A drill, a tap and an operation without a tool keep theirs, and say why.
+        for (i, why) in [
+            (2, "A drill's feed is per turn"),
+            (3, "A tap is turned by hand"),
+            (4, "The operation has no tool."),
+        ] {
+            let said = doc.fit_op_speeds(0, i);
+            assert!(
+                said.starts_with(&format!("No recommended speed and feed. {why}")),
+                "{said}"
+            );
+            assert_eq!(speeds(&doc, i), ("8000".into(), "800".into()));
+        }
+        assert_eq!(doc.fit_op_speeds(0, 9), "");
+        assert_eq!(doc.fit_op_speeds(3, 0), "");
+    }
+    #[test]
+    fn a_hand_machines_recommended_speed_is_on_a_gear_and_its_feed_the_hand_feed() {
+        let mut mill = manual::defaults();
+        mill.p.insert("speeds".into(), "500, 1000, 2000".into());
+        manual::settle(&mut mill);
+        let tool = Tool::new("Flat 10", "Flat end mill", "10");
+        let mut setup = Setup::new(mill, "G54");
+        setup.operations = vec![Operation::new(Strategy::Face, tool.id.clone())];
+        let mut doc = Document {
+            tools: vec![tool],
+            setups: vec![setup],
+            ..Default::default()
+        };
+        doc.adopt_materials();
+        let mild = (doc.materials.iter())
+            .find(|m| m.name().starts_with("Mild steel"))
+            .unwrap()
+            .id
+            .clone();
+        assert!(doc.select_material(&mild));
+        let (rpm, feed) = doc
+            .recommended_speeds(&doc.setups[0], &doc.setups[0].operations[0])
+            .unwrap();
+        assert!([500., 1000., 2000.].contains(&rpm), "{rpm}");
+        assert!(feed > 0. && feed <= 150., "{feed}");
     }
     #[test]
     fn a_library_given_the_alloys_gets_only_the_woods_and_metals_once() {

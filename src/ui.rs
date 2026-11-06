@@ -3077,8 +3077,41 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             }
             c = c
                 .push(secondary("Open tool library", Message::Page(Page::Tools)))
-                .push(section("Feeds & speeds"))
-                .push(checks.field(p, "rpm", "Spindle speed · rpm"));
+                .push(section("Feeds & speeds"));
+            // What the project material and the cutter call for, and a
+            // button to take it when the operation runs at something else.
+            match app.doc.recommended_speeds(app.doc.setup(), o) {
+                Ok((rpm, feed)) => {
+                    let material = app.doc.selected_material().map_or("", |m| m.name());
+                    // A Turn's feed is the carriage's, not the operation's.
+                    let turn = o.strategy == Strategy::Turn;
+                    let shown = if turn {
+                        String::new()
+                    } else {
+                        format!(" · {feed} mm/min")
+                    };
+                    c = c.push(
+                        muted(format!(
+                            "Recommended for {} and this cutter:\n{rpm} rpm{shown}",
+                            crate::proposal::clip(material, crate::material::NAME_LIMIT)
+                        ))
+                        .size(12),
+                    );
+                    let runs = |k: &str, v: f32| get(p, k).trim() == v.to_string();
+                    if runs("rpm", rpm) && (turn || runs("feed", feed)) {
+                        c = c.push(muted("The operation runs at it.").size(12));
+                    } else {
+                        c = c.push(
+                            secondary("Use recommended speed & feed", Message::RecommendSpeeds)
+                                .width(Fill),
+                        );
+                    }
+                }
+                Err(why) => {
+                    c = c.push(muted(format!("No recommended speed and feed. {why}")).size(12))
+                }
+            }
+            c = c.push(checks.field(p, "rpm", "Spindle speed · rpm"));
             if o.strategy.imported_preview()
                 && !matches!(o.strategy, Strategy::Box | Strategy::Turn)
                 && !lathe

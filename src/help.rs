@@ -1365,6 +1365,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Use this saved cutter for the current operation. Check diameter, reach, feeds and speeds before generating a preview.",
             "",
         ),
+        RecommendSpeeds => (
+            "Set this operation's spindle speed and feed to those recommended for the project material and its cutter, from the material library's surface speed and chip load, within the machine's limits.",
+            "Drilling, tapping and thread milling have no data in the library: set those by hand.",
+        ),
         RestSource(_) => (
             "Choose the earlier operation whose remaining material should guide rest machining. Earlier cuts automatically lower the cutting start when the area above it is fully cleared. Selecting isolated leftover regions for rest machining is not implemented.",
             "Imported Pocket and Adaptive clearing ignore the source: they cut only where earlier operations left material.",
@@ -4877,6 +4881,7 @@ mod tests {
             DeleteHolder("h".into()),
             SuggestLayout,
             SetOpTool("t".into()),
+            RecommendSpeeds,
             RestSource("r".into()),
             Export("sheet"),
             ExportGcode,
