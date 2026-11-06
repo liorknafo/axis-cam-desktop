@@ -4800,10 +4800,18 @@ impl App {
     pub fn can_put_back(&self) -> bool {
         self.typed_last.as_ref().is_some_and(|e| {
             let now = match &e.after {
-                // The same operation, wherever it is selected or not.
+                // The same operation, wherever it is selected or not, and the
+                // tool it took before the edit (a turn's kind changes it)
+                // still in the library.
                 Edited::Operation(setup, o) => match self.find_operation(setup, &o.id) {
-                    Some(now) => Edited::Operation(setup.clone(), Box::new(now.clone())),
-                    None => return false,
+                    Some(now)
+                        if matches!(&e.before, Edited::Operation(_, b)
+                            if b.tool == now.tool
+                                || self.doc.tools.iter().any(|t| t.id == b.tool)) =>
+                    {
+                        Edited::Operation(setup.clone(), Box::new(now.clone()))
+                    }
+                    _ => return false,
                 },
                 Edited::Project(_) => self.edited(Target::Setup),
                 Edited::Machine(_) => self.edited(Target::Machine),

@@ -7657,6 +7657,18 @@ flood = { pin = 8 }
         let o = a.operation().unwrap();
         assert_eq!((&o.p, &o.tool), (&turn.p, &turn.tool));
         assert_eq!(get(&o.p, "diameter"), "37");
+        // A bore takes a boring bar; with the turning tool deleted since,
+        // undoing would leave the turn without a tool: not offered.
+        let _ = a.update(Message::Edit(Target::Operation, "turn_kind", "Bore".into()));
+        let bore = a.operation().unwrap().clone();
+        assert_ne!(bore.tool, turn.tool);
+        assert!(a.can_put_back());
+        let _ = a.update(Message::DeleteTool(turn.tool.clone()));
+        assert!(a.doc.tools.iter().all(|t| t.id != turn.tool));
+        assert!(!a.can_put_back());
+        let _ = a.update(Message::PutBackEdit);
+        let o = a.operation().unwrap();
+        assert_eq!((&o.p, &o.tool), (&bore.p, &bore.tool));
     }
     #[test]
     fn holding_the_force_per_tooth_is_chosen_with_the_feed_and_the_simulation_says_its_feeds() {
