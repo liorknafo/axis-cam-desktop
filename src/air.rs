@@ -34,12 +34,20 @@ use clipper2::{EndType, FillRule, JoinType, Milli, Paths, difference, intersect}
 /// mm: a thinner sliver, the chords of two passes over one curve, is air.
 pub const DEPTH: f32 = 0.02;
 /// The band at its edge a support pass proven clear is not proven over, mm:
-/// with the polygons it is proven with, whose vertices round to 0.001 mm
-/// (`Milli`), what it leaves uncut lies within 0.004 mm of its edge, and
-/// the level after it meets no more than a stepdown but there.
+/// what it leaves uncut lies within this of its edge, and the level after
+/// it meets no more than a stepdown but there.
 pub const SUPPORT_GAP: f32 = 0.003;
 /// The most of a support pass's path proven clear at once, mm.
 const RUN: f32 = 5.;
+/// How much nearer than it must, mm, a support pass's path is to a cut's
+/// for its stretch to be proven exactly (`reach`): a stretch's ends are
+/// worked out to far closer than that.
+const EXACT: f64 = 1e-6;
+/// clipper2's arcs: their chords at most this share of their radius inside
+/// them (its `arc_const`).
+const ARC: f64 = 0.002;
+/// How far a polygon's vertex moves rounded to `Milli`'s 0.001 mm, mm.
+const ROUND: f64 = 0.0008;
 /// The rapid rate plans are timed at, mm/min (`cam::Builder`).
 const RAPID: f32 = 6000.;
 /// The most cutter positions a path is tested at: a longer one is tested
@@ -354,13 +362,16 @@ impl<'a> Detector<'a> {
     }
     /// Whether a level run of support feeds, `[from, to]` mm along the path
     /// from within feed `start`, is proven clear: all its flat cutter would
-    /// sweep, from its tip up its flutes, inside the stock's
-    /// box and `SUPPORT_GAP` in from its edge, lies in what flat cuts before
-    /// it swept, each from no higher than its tip up to no lower than its
+    /// sweep, from its tip up its flutes, inside the stock's box and
+    /// `SUPPORT_GAP` in from its edge, lies in what flat cuts before it
+    /// swept, each from no higher than its tip up to no lower than its
     /// flutes reach (or the stock's top): the earlier operations' cuts and
-    /// the feeds of the plan's own that are `kept`. The arcs of what is
-    /// swept are polygons with their vertices on them, which claim less than
-    /// was cut, and `SUPPORT_GAP` takes up the rest of their error.
+    /// the feeds of the plan's own that are `kept`. Along the run, a stretch
+    /// near enough to one of those cuts' paths that the cutter there, so
+    /// drawn in, lies inside that cut is proven exactly (`reach`). The rest
+    /// is proven with polygons, each erring on the safe side: what the run
+    /// sweeps grown, and what the cuts swept shrunk, by more than the arcs'
+    /// chords and the vertices' rounding can be off.
     fn clear(&self, [from, to]: [f32; 2], start: usize, kept: &[bool]) -> bool {
         // The feed the run ends in: at a feed's end, that one, not the next.
         let end = self.feeds.partition_point(|f| f.at < to).saturating_sub(1);
@@ -377,23 +388,6 @@ impl<'a> Detector<'a> {
             .chain(std::iter::once(xy(self.at(end, t))))
             .collect();
         let radius = self.plan.radius;
-        let (lo, hi) = (self.stock.min, self.stock.max);
-        let stock = vec![vec![
-            (lo[0] as f64, lo[1] as f64),
-            (hi[0] as f64, lo[1] as f64),
-            (hi[0] as f64, hi[1] as f64),
-            (lo[0] as f64, hi[1] as f64),
-        ]];
-        let Ok(region) = intersect::<Milli>(
-            outline(vec![path.clone()], (radius - SUPPORT_GAP) as f64),
-            stock,
-            FillRule::NonZero,
-        ) else {
-            return false;
-        };
-        if !region.contains_points() {
-            return true;
-        }
         let near = path.iter().fold(
             [
                 f32::INFINITY,
@@ -412,7 +406,10 @@ impl<'a> Detector<'a> {
             },
         );
         let first = self.ids[0];
-        // The cuts that clear the run's column, by radius.
+        // The cuts that clear the run's column, and the same by radius, a
+        // cut that goes on from where the one before it ended (the cuts
+        // come in order) carrying on its path.
+        let mut cuts: Vec<([(f64, f64); 2], f64)> = vec![];
         let mut by: Vec<(f32, Vec<Polygon>)> = vec![];
         for (id, c) in self.history.near(near, self.ids[start]) {
             let own = id >= first;
@@ -424,8 +421,7 @@ impl<'a> Detector<'a> {
             {
                 continue;
             }
-            // A cut that goes on from where the one before it ended (the
-            // cuts come in order) carries on its path.
+            cuts.push(([xy(c.a), xy(c.b)], c.radius as f64));
             match by.iter_mut().find(|(r, _)| *r == c.radius) {
                 Some((_, paths)) if paths.last().and_then(|p| p.last()) == Some(&xy(c.a)) => {
                     paths.last_mut().unwrap().push(xy(c.b))
@@ -434,9 +430,62 @@ impl<'a> Detector<'a> {
                 None => by.push((c.radius, vec![vec![xy(c.a), xy(c.b)]])),
             }
         }
+        // The stretches of the run not proven exactly.
+        let swept = (radius - SUPPORT_GAP) as f64;
+        let mut rest: Vec<Polygon> = vec![];
+        for w in path.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let mut spans: Vec<[f64; 2]> = (cuts.iter())
+                .filter_map(|&([c, d], r)| reach(a, b, c, d, r - swept - EXACT))
+                .collect();
+            spans.sort_by(|p, q| p[0].total_cmp(&q[0]));
+            let length = (b.0 - a.0).hypot(b.1 - a.1).max(EXACT);
+            let mut done = 0.;
+            let gap = |t0: f64, t1: f64, rest: &mut Vec<Polygon>| {
+                if t1 > t0 {
+                    let at = |t: f64| (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+                    rest.push(vec![at(t0), at(t1)]);
+                }
+            };
+            for [t0, t1] in spans {
+                // A gap under `EXACT` long is within `EXACT` of a point
+                // proven with `EXACT` to spare.
+                if (t0 - done) * length > EXACT {
+                    gap(done, t0, &mut rest);
+                }
+                done = f64::max(done, t1);
+            }
+            if (1. - done) * length > EXACT {
+                gap(done, 1., &mut rest);
+            }
+        }
+        if rest.is_empty() {
+            return true;
+        }
+        // An arc's vertices are on it, its chords within `ARC` of its radius
+        // inside it (clipper2's own tolerance), each vertex rounded within
+        // `ROUND` of where it was.
+        let (lo, hi) = (self.stock.min, self.stock.max);
+        let (lo, hi) = (lo.map(|v| v as f64 - ROUND), hi.map(|v| v as f64 + ROUND));
+        let stock = vec![vec![
+            (lo[0], lo[1]),
+            (hi[0], lo[1]),
+            (hi[0], hi[1]),
+            (lo[0], hi[1]),
+        ]];
+        let Ok(region) = intersect::<Milli>(
+            outline(rest, (swept + ROUND) / (1. - ARC)),
+            stock,
+            FillRule::NonZero,
+        ) else {
+            return false;
+        };
+        if !region.contains_points() {
+            return true;
+        }
         let mut cleared: Paths<Milli> = Paths::new(vec![]);
         for (r, paths) in by {
-            cleared.append(outline(paths, r as f64));
+            cleared.append(outline(paths, r as f64 - ROUND));
         }
         difference::<Milli>(region, cleared, FillRule::NonZero)
             .is_ok_and(|left| !left.contains_points())
@@ -556,6 +605,67 @@ fn cutting(
 /// vertices on them.
 fn outline(paths: Vec<Polygon>, radius: f64) -> Paths<Milli> {
     Paths::<Milli>::from(paths).inflate(radius, JoinType::Round, EndType::Round, 2.)
+}
+
+/// The span of the segment `a` to `b` (as fractions of it) within `within`
+/// of the segment `c` to `d`, None where none is: the points within that of
+/// a segment make a convex set, which the segment crosses once.
+fn reach(
+    a: (f64, f64),
+    b: (f64, f64),
+    c: (f64, f64),
+    d: (f64, f64),
+    within: f64,
+) -> Option<[f64; 2]> {
+    if within < 0. {
+        return None;
+    }
+    let v = (b.0 - a.0, b.1 - a.1);
+    let vv = v.0 * v.0 + v.1 * v.1;
+    // Where `a + t v` lies within `within` of the point `q`.
+    let disc = |q: (f64, f64)| -> Option<[f64; 2]> {
+        let w = (a.0 - q.0, a.1 - q.1);
+        let (bb, cc) = (
+            v.0 * w.0 + v.1 * w.1,
+            w.0 * w.0 + w.1 * w.1 - within * within,
+        );
+        if vv < 1e-18 {
+            return (cc <= 0.).then_some([0., 1.]);
+        }
+        let root = bb * bb - vv * cc;
+        (root >= 0.).then(|| [(-bb - root.sqrt()) / vv, (-bb + root.sqrt()) / vv])
+    };
+    // Where it lies over the segment itself, within `within` across it.
+    let band = || -> Option<[f64; 2]> {
+        let e = (d.0 - c.0, d.1 - c.1);
+        let l = e.0.hypot(e.1);
+        if l < 1e-12 {
+            return None;
+        }
+        let (u, n) = ((e.0 / l, e.1 / l), (-e.1 / l, e.0 / l));
+        let w = (a.0 - c.0, a.1 - c.1);
+        let mut span = [f64::NEG_INFINITY, f64::INFINITY];
+        for (axis, low, high) in [(u, 0., l), (n, -within, within)] {
+            let (p, q) = (w.0 * axis.0 + w.1 * axis.1, v.0 * axis.0 + v.1 * axis.1);
+            if q.abs() < 1e-18 {
+                if p < low || p > high {
+                    return None;
+                }
+            } else {
+                let (s, t) = ((low - p) / q, (high - p) / q);
+                span = [span[0].max(s.min(t)), span[1].min(s.max(t))];
+            }
+        }
+        (span[0] <= span[1]).then_some(span)
+    };
+    let [lo, hi] = [disc(c), disc(d), band()]
+        .into_iter()
+        .flatten()
+        .fold([f64::INFINITY, f64::NEG_INFINITY], |s, t| {
+            [s[0].min(t[0]), s[1].max(t[1])]
+        });
+    let (lo, hi) = (lo.max(0.), hi.min(1.));
+    (lo <= hi).then_some([lo, hi])
 }
 
 /// `stretches` (mm of feed) sorted, the overlapping joined, within the
@@ -1293,6 +1403,81 @@ mod tests {
             assert!(at(&kept, q, 36.) || !at(&kept, q, 32.), "{q:?}");
         }
         continuous(&kept);
+    }
+    #[test]
+    fn a_support_pass_rounding_its_end_over_a_cap_is_kept() {
+        // A slot clears the stock up to Y1.4955 at Z36. A Ø3 support pass
+        // comes in along it at an angle and stops at X0 Y0, where its round
+        // end reaches Y1.5 over a cap 0.0045 mm thick, which the Z32 level
+        // after it would meet 8 mm tall (found by the acceptance review of
+        // LIO-352, with a Ø10 slot and a Ø3 one).
+        for prior in [1.5, 5.] {
+            for deg in [1_f32, 5., 10., 30., 60.] {
+                let (sin, cos) = deg.to_radians().sin_cos();
+                let mut volume = Volume::new(STOCK, frame());
+                let (edge, flat) = (1.4955, CutterShape::Flat);
+                let y = edge - prior;
+                volume.cut(
+                    [-150., y, 36.],
+                    [150., y, 36.],
+                    prior,
+                    25.,
+                    flat,
+                    frame(),
+                    (0, 0),
+                );
+                let a = [-80. * cos, -80. * sin, 36.];
+                let mut original = plan(&[a, [0., 0., 36.], a, [a[0], a[1], 32.], [0., 0., 32.]]);
+                original.radius = 1.5;
+                let level =
+                    |m: &Move, z: f32| m.motion == Motion::Feed && m.from[2] == z && m.to[2] == z;
+                original.keep_air = original.moves.iter().map(|m| level(m, 36.)).collect();
+                let (kept, _) = trimmed(original, &volume);
+                let cap = [0., 1.4958, 38.];
+                assert!(
+                    !volume
+                        .cuts
+                        .iter()
+                        .any(|c| swept(cap, c.a, c.b, c.radius, c.flute, c.shape))
+                );
+                let at = |z: f32| {
+                    (kept.moves.iter()).any(|m| {
+                        level(m, z)
+                            && swept(
+                                cap,
+                                m.from,
+                                m.to,
+                                kept.radius,
+                                kept.flute_length,
+                                kept.shape,
+                            )
+                    })
+                };
+                assert!(at(36.) || !at(32.), "Ø{} at {deg}°", 2. * prior);
+            }
+        }
+    }
+    #[test]
+    fn reach_is_the_span_of_a_segment_within_a_distance_of_another() {
+        let near = |a, b, c, d, w| reach(a, b, c, d, w).map(|s| s.map(|t| (t * 1e6).round() / 1e6));
+        // Along a segment 1 above it: within 1 from X0 to 10 of 20.
+        assert_eq!(
+            near((-5., 1.), (15., 1.), (0., 0.), (10., 0.), 1.),
+            Some([0.25, 0.75])
+        );
+        // Round its ends: within 2, over X-1.732 to 11.732.
+        let s = near((-5., 1.), (15., 1.), (0., 0.), (10., 0.), 2.).unwrap();
+        assert!(
+            (s[0] - (5. - 3f64.sqrt()) / 20.).abs() < 1e-6
+                && (s[1] - (15. + 3f64.sqrt()) / 20.).abs() < 1e-6
+        );
+        // Too far, and a point.
+        assert_eq!(near((-5., 3.), (15., 3.), (0., 0.), (10., 0.), 2.), None);
+        assert_eq!(
+            near((3., 1.), (3., 1.), (0., 0.), (10., 0.), 1.),
+            Some([0., 1.])
+        );
+        assert_eq!(near((3., 1.5), (3., 1.5), (0., 0.), (10., 0.), 1.), None);
     }
     #[test]
     fn a_ramp_made_again_over_air_is_air() {
