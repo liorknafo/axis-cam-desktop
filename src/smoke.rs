@@ -7436,32 +7436,87 @@ flood = { pin = 8 }
         }
     }
     /// The page drawn in place of one that panicked says what went wrong
-    /// and puts back the last value typed.
+    /// and puts back the field typed in last as it was before the typing:
+    /// that field only, of that operation, setup or editor draft, and not
+    /// once another is edited or another project is open.
     #[test]
-    fn the_page_that_could_not_be_drawn_puts_back_the_last_value_typed() {
+    fn the_page_that_could_not_be_drawn_puts_back_the_field_typed_in_last() {
+        const PUT_BACK: &str = "Put back the field typed in last";
+        let page_texts = |a: &App| {
+            crate::ui::probe::texts(
+                crate::ui::fault_page(a, "boom (src/x.rs:1:2)".into()),
+                WINDOW,
+            )
+        };
+        let offers = |a: &App| page_texts(a).iter().any(|t| t == PUT_BACK);
         let mut a = app();
-        let feed = get(&a.operation().unwrap().p, "feed").to_string();
-        let _ = a.update(Message::Edit(Target::Operation, "feed", "0".into()));
-        let page = crate::ui::fault_page(&a, "index out of bounds (src/x.rs:1:2)".into());
-        let texts = crate::ui::probe::texts(page, WINDOW);
+        assert!(!offers(&a));
+        let texts = page_texts(&a);
         for want in [
             "This page could not be drawn",
-            "Something went wrong: index out of bounds (src/x.rs:1:2)",
-            "Put back the last value typed",
+            "Something went wrong: boom (src/x.rs:1:2)",
             "Home",
         ] {
             assert!(texts.iter().any(|t| t == want), "{want}: {texts:?}");
         }
-        let page = crate::ui::fault_page(&a, String::new());
-        let clicks = crate::ui::probe::clicks(page, WINDOW);
+        // Typed key by key: the feed as it was before the typing comes back,
+        // and the other fields typed in before are kept.
+        let feed = get(&a.operation().unwrap().p, "feed").to_string();
+        let _ = a.update(Message::Edit(Target::Operation, "rpm", "9000".into()));
+        for typed in ["", "0"] {
+            let _ = a.update(Message::Edit(Target::Operation, "feed", typed.into()));
+        }
+        assert!(offers(&a));
+        let clicks = crate::ui::probe::clicks(crate::ui::fault_page(&a, String::new()), WINDOW);
         assert!(clicks.iter().any(|m| matches!(m, Message::PutBackEdit)));
         let _ = a.update(Message::PutBackEdit);
-        assert_eq!(get(&a.operation().unwrap().p, "feed"), feed);
-        assert!(a.before_edit.is_none());
-        // Nothing typed since: no value to put back.
-        let page = crate::ui::fault_page(&a, String::new());
-        let texts = crate::ui::probe::texts(page, WINDOW);
-        assert!(!texts.iter().any(|t| t == "Put back the last value typed"));
+        let p = &a.operation().unwrap().p;
+        assert_eq!((get(p, "feed"), get(p, "rpm")), (feed.as_str(), "9000"));
+        assert!(!offers(&a));
+        // The tool, machine, material and holder editors' drafts.
+        a.tool_draft.p.insert("flutes".into(), "3".into());
+        a.machine_draft.p.insert("feed".into(), "5000".into());
+        a.material_draft.p.insert("vc_min".into(), "150".into());
+        a.holder_draft.p.insert("jaw_width".into(), "100".into());
+        for (target, key, was) in [
+            (Target::Tool, "flutes", "3"),
+            (Target::Machine, "feed", "5000"),
+            (Target::Material, "vc_min", "150"),
+            (Target::Holder, "jaw_width", "100"),
+        ] {
+            let draft = |a: &App| match target {
+                Target::Tool => get(&a.tool_draft.p, key).to_string(),
+                Target::Machine => get(&a.machine_draft.p, key).to_string(),
+                Target::Material => get(&a.material_draft.p, key).to_string(),
+                _ => get(&a.holder_draft.p, key).to_string(),
+            };
+            let _ = a.update(Message::Edit(target, key, "0".into()));
+            assert_eq!(draft(&a), "0", "{target:?}.{key}");
+            assert!(offers(&a), "{target:?}");
+            let _ = a.update(Message::PutBackEdit);
+            assert_eq!(draft(&a), was, "{target:?}.{key}");
+        }
+        // Another operation selected: its feed is not the one typed in.
+        let _ = a.update(Message::Edit(Target::Operation, "feed", "0".into()));
+        let _ = a.update(Message::SelectOp(1));
+        assert!(!offers(&a));
+        let _ = a.update(Message::PutBackEdit);
+        let _ = a.update(Message::SelectOp(0));
+        assert_eq!(get(&a.operation().unwrap().p, "feed"), "0");
+        // Another project open: nothing of the first is put into it.
+        let _ = a.update(Message::Edit(Target::Operation, "feed", "1".into()));
+        let other = Document::sample();
+        let title = other.title.clone();
+        a.replace_document(other, None);
+        a.selected = Some(0);
+        assert!(!offers(&a));
+        let before = a.doc.clone();
+        let _ = a.update(Message::PutBackEdit);
+        assert_eq!(a.doc.title, title);
+        assert_eq!(
+            a.doc.setups[0].operations[0].p,
+            before.setups[0].operations[0].p
+        );
     }
     #[test]
     fn holding_the_force_per_tooth_is_chosen_with_the_feed_and_the_simulation_says_its_feeds() {
