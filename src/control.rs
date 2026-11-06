@@ -5391,7 +5391,7 @@ impl Connection {
             return;
         };
         let known =
-            link.tool_run_going == Some(id) || link.tool_run_ends.iter().any(|e| e.id == id);
+            link.tool_run_going.contains(&id) || link.tool_run_ends.iter().any(|e| e.id == id);
         if known {
             self.job_missing = None;
             return;
