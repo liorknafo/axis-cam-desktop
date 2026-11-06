@@ -2336,6 +2336,7 @@ pub struct PiRun {
     machine_id: String,
     run: crate::run::Run,
     job_name: Option<String>,
+    tool_run_id: Option<u64>,
 }
 
 /// How long a tool run sent to the Pi may show neither running nor a new
@@ -2361,6 +2362,9 @@ pub struct Connection {
     /// The name of the last tool run sent, which the Pi's Stop after step
     /// names when it fires.
     job_name: Option<String>,
+    /// The number the last tool run was sent to the Pi with: the Pi tells
+    /// its end by it (`run_outcome`).
+    tool_run_id: Option<u64>,
     /// Tests: the next tool run handed to the link is lost on the way, as
     /// when the link fails while it crosses.
     #[cfg(test)]
@@ -2615,6 +2619,7 @@ impl Connection {
             notes_seen: 0,
             job_sent: None,
             job_name: None,
+            tool_run_id: None,
             #[cfg(test)]
             lose_next_job: false,
             stop_sent: None,
@@ -2909,6 +2914,8 @@ impl Connection {
             done: run.pi_done(s.active_wcs, s.work_offset),
         };
         let path = self.pi_pending();
+        // Never another's end, even if it never goes.
+        self.tool_run_id = Some(pending.id);
         if let Err(e) = pending.write(&path) {
             self.pi_note = Some(format!(
                 "Where a stop after a step would leave this tool run could not be kept: {e}."
@@ -3078,11 +3085,11 @@ impl Connection {
     fn observe(&mut self) {
         let mut stop = false;
         self.watch_job();
-        // Before the outcome: a stop the Pi made after a step is that step's.
         self.follow_stop_after();
+        let outcome = self.run_outcome();
         let remote = self.pi.is_some();
         if let Some(run) = &mut self.run {
-            run.refresh(self.snapshot.program_outcome.as_ref());
+            run.refresh(outcome.as_ref());
             run.carve(&self.snapshot);
             run.track(&self.snapshot);
             // Stop after step: the driver's Stop as the step ends. On the
@@ -5395,9 +5402,30 @@ impl Connection {
         }
     }
 
+    /// The running tool run's outcome. On the Pi, the end the Pi tells of
+    /// the tool run sent with `tool_run_id`, never another job's outcome
+    /// (of the same name or not); a stop the Pi made after a step is taken
+    /// as that step's first. Otherwise the driver's last.
+    fn run_outcome(&mut self) -> Option<uc100::controller::ProgramOutcome> {
+        if self.pi.is_none() {
+            return self.snapshot.program_outcome.clone();
+        }
+        let run = self.run.as_mut().filter(|r| r.running.is_some())?;
+        let id = self.tool_run_id?;
+        let end = (self.link.as_ref()?.tool_run_ends.iter()).find(|e| e.id == id)?;
+        if let Some(line) = end.stopped_after {
+            run.stopped_on_pi(line, end.unattended);
+        }
+        Some(uc100::controller::ProgramOutcome {
+            // Its own: later than any the run started after.
+            seq: u64::MAX,
+            ok: end.ok,
+            message: end.message.clone(),
+        })
+    }
+
     /// Stop after step on the Pi: the run shows what the Pi holds (armed,
-    /// or not) once the Pi has answered the last change, and a stop the Pi
-    /// made at a step's end is taken as that step's.
+    /// or not) once the Pi has answered the last change.
     fn follow_stop_after(&mut self) {
         use uc100_remote::wire::StopAfter;
         let (Some(link), Some(run)) = (&self.link, &mut self.run) else {
@@ -5412,8 +5440,8 @@ impl Connection {
                 program,
                 unattended,
             } if program.is_some() && *program == self.job_name => {
+                // Where it stopped comes with its end (`run_outcome`).
                 run.stop_after = true;
-                run.stopped_on_pi(*line, *unattended);
             }
             StopAfter::Armed { .. } => run.stop_after = true,
             _ if self
@@ -5434,6 +5462,7 @@ impl Connection {
             machine_id: self.machine_id.clone(),
             run: self.run.take().expect("running"),
             job_name: self.job_name.take(),
+            tool_run_id: self.tool_run_id.take(),
         })
     }
 
@@ -5443,6 +5472,7 @@ impl Connection {
     pub fn resume_pi_run(&mut self, kept: PiRun) {
         if self.pi.is_some() && kept.machine_id == self.machine_id {
             (self.run, self.job_name) = (Some(kept.run), kept.job_name);
+            self.tool_run_id = kept.tool_run_id;
         }
     }
 

@@ -3286,12 +3286,13 @@ flood = { pin = 8 }
         );
     }
 
-    /// Another computer runs a tool run of the same name on the Pi after
-    /// this one's stopped, AXIS CAM closed meanwhile: opened again, this
-    /// computer finds its own stop by the number it sent, not the other's
-    /// end.
-    #[test]
-    fn another_computers_tool_run_of_the_same_name_does_not_hide_this_ones_stop() {
+    /// Another computer runs a tool run of the same name on the Pi, done,
+    /// after this one's stopped after a hole with this computer away: AXIS
+    /// CAM closed meanwhile (`closed`), or kept open with its run. Connected
+    /// again, this computer finds its own stop by the number it sent, never
+    /// the other's end, and the start is the next hole.
+    fn another_computers_tool_run_after_this_ones_stop(closed: bool) {
+        use crate::run::Action as R;
         use uc100::controller::{Command, State};
         use uc100::gcode::{Action as Do, Located};
         let dir = tempfile::tempdir().unwrap();
@@ -3300,7 +3301,9 @@ flood = { pin = 8 }
         drilling(&mut a);
         let name = (server.snapshot().unwrap().program_name).expect("the Drilling's job");
         let _ = a.update(Message::Disconnect);
-        a.pi_run = None;
+        if closed {
+            a.pi_run = None;
+        }
         pi_until(&server, 60.0, "the Pi's stop", |s| {
             s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| !o.ok)
         });
@@ -3356,7 +3359,34 @@ flood = { pin = 8 }
             "{}",
             journal.why
         );
+        let hole = journal.step.expect("a hole drilled") + 1;
+        if closed {
+            let _ = a.update(Message::Run(R::Setup(0)));
+            answer_skips(&mut a, 0);
+        } else {
+            // The run it kept took its own end: stopped after the hole.
+            let (ok, message) = run_of(&a).outcome.clone().unwrap();
+            assert!(
+                !ok && message.starts_with("Stopped after hole"),
+                "{message}"
+            );
+        }
+        assert!(!run_of(&a).done[1], "the Drilling taken as done");
+        assert!(run_of(&a).programs.is_none() && problems(&a).len() == 1);
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((1, hole)));
         other.shutdown();
+    }
+
+    #[test]
+    fn another_computers_tool_run_of_the_same_name_does_not_hide_this_ones_stop() {
+        another_computers_tool_run_after_this_ones_stop(true);
+    }
+
+    /// As above, AXIS CAM open all along, the run kept (astra round 3).
+    #[test]
+    fn another_computers_tool_run_done_is_not_taken_as_the_kept_runs_outcome() {
+        another_computers_tool_run_after_this_ones_stop(false);
     }
 
     /// A tool run lost on the way to the Pi (the link failed as it
