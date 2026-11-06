@@ -567,8 +567,8 @@ fn support_clearings(
                 None => Region::new(vec![]),
             };
             for (_, r, i) in known.iter().filter(|(z, _, _)| *z <= h + 0.0001) {
-                // This proof depends on those earlier paths being kept,
-                // including slivers below air trimming's contact threshold.
+                // This proof depends on those earlier paths: where air
+                // trimming takes one out it cut under its `DEPTH`.
                 out[*i].support = true;
                 cleared = union::<Milli>(cleared, r.clone(), FillRule::NonZero)
                     .map_err(|e| e.to_string())?;

@@ -174,9 +174,11 @@ pub struct Plan {
     /// Where the spindle stops partway through (`cam::boring`), in order.
     /// Empty for most plans.
     pub stops: Vec<Stop>,
-    /// Moves air trimming must keep: a support pass can cut a sliver
-    /// below its contact tolerance while setting up the next stepdown.
-    /// Empty means none.
+    /// Pocket's support passes, which clear the stock over a band before
+    /// its first stepdown: the force hold never feeds one up where its
+    /// voxels find nothing, as it may shave a sliver thinner than they
+    /// are. Air trimming, which measures exactly, takes one out like any
+    /// other move where it cuts nothing. Empty means none.
     pub keep_air: Vec<bool>,
 }
 /// A stop of the spindle partway through a plan: before move `at` the

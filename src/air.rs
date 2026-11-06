@@ -11,9 +11,12 @@
 //! (`volume::swept`), as the stock left was `lag` back along the path, so
 //! that a thin wall the cutter shaves (`DEPTH` or more) is found however
 //! short the moves it is shaved by. A stretch found cutting is kept with
-//! `pad` of path either side. A move that repeats one the operation already
-//! made, a finishing pass taken again (Pocket's and Contour's finishing
-//! passes), is kept whatever it cuts.
+//! `pad` of path either side. A level move that repeats one the operation
+//! already made where that one cut, a finishing pass taken again (Pocket's
+//! and Contour's finishing passes), is kept whatever it cuts. A Pocket
+//! support pass (`Plan::keep_air`) is air like any other where nothing is
+//! found: what it would shave is under `DEPTH`, so the level after it still
+//! takes no more than a stepdown and `DEPTH`.
 use crate::holding::HoldBox;
 use crate::mesh::Bounds;
 use crate::model::{Operation, Setup, Strategy, num};
@@ -348,13 +351,19 @@ fn cutting(
     .ok_or("Generation cancelled.")?;
     let mut found: Vec<f32> = found.into_iter().flatten().collect();
     found.sort_by(f32::total_cmp);
-    // A move made again where it cut the first time, a finishing pass, is
-    // kept; made again where it cut nothing, it is air too.
+    // A level move made again where it cut the first time, a finishing
+    // pass, is kept; made again where it cut nothing, it is air too. A ramp
+    // made again is no finishing pass: Pocket's bands that share a top
+    // each ramp down from it the same way, and only the first finds metal
+    // all the way.
     let mut first = std::collections::HashMap::new();
     let key = |p: [f32; 3]| p.map(|v| (v * 1e4).round() as i64);
     let mut again = vec![];
     for f in feeds {
         let m = &plan.moves[f.index];
+        if (m.from[2] - m.to[2]).abs() >= 1e-4 {
+            continue;
+        }
         let [a, b] = *first
             .entry((key(m.from), key(m.to)))
             .or_insert([f.at, f.at + f.length]);
@@ -364,11 +373,7 @@ fn cutting(
         }
     }
     let cuts = found.into_iter().map(|s| [s - lag - pad, s + pad]);
-    let required = feeds
-        .iter()
-        .filter(|f| plan.keep_air.get(f.index).copied().unwrap_or(false))
-        .map(|f| [f.at, f.at + f.length]);
-    Ok(Some(merged(cuts.chain(again).chain(required), total)))
+    Ok(Some(merged(cuts.chain(again), total)))
 }
 
 /// `stretches` (mm of feed) sorted, the overlapping joined, within the
@@ -915,7 +920,11 @@ mod tests {
     }
 
     #[test]
-    fn support_moves_survive_air_trimming_and_its_move_indices() {
+    fn a_support_pass_through_air_is_trimmed_and_its_flag_kept_where_it_cuts() {
+        // A Pocket support pass along Y0 and a pass back along Y20, each
+        // through a slot cleared from X-60 to 60: both cut only at the
+        // ends (LIO-337 kept the support pass whole, so Pocket fed through
+        // levels the bands before had cleared).
         let volume = stock(&[
             ([-60., 0., 30.], [60., 0., 30.]),
             ([-60., 20., 30.], [60., 20., 30.]),
@@ -938,14 +947,38 @@ mod tests {
             })
         };
         let (kept, air) = trimmed(original, &volume);
-        assert!(air.is_some());
-        assert!(middle(&kept, 0.));
+        assert_eq!(air.map(|air| air.stretches), Some(2), "{air:?}");
+        assert!(!middle(&kept, 0.));
         assert!(!middle(&kept, 20.));
-        assert!(kept.keep_air.iter().any(|&keep| keep));
+        // The flag stays on the support pass's ends and on nothing else.
+        assert_eq!(kept.keep_air.len(), kept.moves.len());
+        for (m, &keep) in kept.moves.iter().zip(&kept.keep_air) {
+            let support = m.motion == Motion::Feed && m.from[1] == 0. && m.to[1] == 0. && m.from[2] == 30.;
+            assert_eq!(keep, support, "{m:?}");
+        }
+        assert!(kept.keep_air.iter().filter(|&&keep| keep).count() == 2);
         continuous(&kept);
-        let (again, _) = trimmed(kept, &volume);
-        assert!(middle(&again, 0.));
-        continuous(&again);
+    }
+    #[test]
+    fn a_ramp_made_again_over_air_is_air() {
+        // A ramp from Z30 down to Z20 along X-40 to 40 and back, cutting,
+        // then the same ramp again after the floor under it was cleared to
+        // Z20: the second is air, though the first cut.
+        let volume = stock(&[]);
+        let ramp = [[-40., 0., 30.], [40., 0., 25.], [-40., 0., 20.]];
+        let mut points = vec![ramp[0], ramp[1], ramp[2]];
+        points.extend(fine([-40., 0., 20.], [40., 0., 20.], 5.));
+        points.push([40., 0., 30.]);
+        points.extend(fine([40., 0., 30.], [-40., 0., 30.], 5.));
+        points.extend(ramp);
+        let original = plan(&points);
+        let (plan, air) = trimmed(original, &volume);
+        assert!(air.is_some_and(|air| air.stretches >= 1), "{air:?}");
+        let ramps = (plan.moves.iter())
+            .filter(|m| m.motion == Motion::Feed && m.from[2] != m.to[2] && m.from[0] != m.to[0])
+            .count();
+        assert_eq!(ramps, 2, "{:?}", plan.moves);
+        continuous(&plan);
     }
     #[test]
     fn a_pass_through_a_cleared_slot_rises_over_it() {
@@ -1250,3 +1283,4 @@ mod tests {
         }
     }
 }
+
