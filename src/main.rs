@@ -12,6 +12,7 @@ mod envelope;
 mod facing;
 #[cfg(test)]
 mod fake_openai;
+mod fault;
 mod field_art;
 mod finishing;
 mod forces;
@@ -223,6 +224,9 @@ pub enum Message {
     SetupStep(&'static str),
     Tab(String),
     Edit(Target, &'static str, String),
+    /// Puts back the project as it was before the last value typed, from
+    /// the page that could not be drawn.
+    PutBackEdit,
     Title(String),
     AddOp(Strategy),
     DuplicateOp,
@@ -1145,6 +1149,9 @@ pub struct App {
     /// The setup editor's step shown (`ui::SETUP_STEPS`).
     pub setup_step: &'static str,
     pub status: String,
+    /// The project as it was before the last value typed in a field: the
+    /// page that could not be drawn puts it back (`fault`).
+    pub before_edit: Option<Document>,
     /// The page the status line was last set on: on another page it is an
     /// earlier event's, and the footer shows it as such.
     pub status_page: Page,
@@ -2040,6 +2047,7 @@ impl App {
             confirm_delete_setup: false,
             confirm_delete_op: false,
             status_page: Page::Home,
+            before_edit: None,
             pending: None,
             icons,
             closing: None,
@@ -4739,7 +4747,16 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         let before = self.status.clone();
         let (selected, page) = (self.selected, self.page);
-        let task = self.handle(message);
+        if let Message::Edit(..) = message {
+            self.before_edit = Some(self.doc.clone());
+        }
+        let task = match fault::guard(|| self.handle(message)) {
+            Ok(task) => task,
+            Err(fault) => {
+                self.status = format!("Something went wrong, and the app kept running: {fault}");
+                Task::none()
+            }
+        };
         // Batched only when it starts one: a batch is never an empty task.
         let task = match self.refresh_part_holes() {
             Some(holes) => Task::batch([task, holes]),
@@ -7739,6 +7756,13 @@ impl App {
                     "Plan applied. The previous job is in History; Undo is in AI planner. Review each operation, then export from NC review.{restored}"
                 );
             }
+            Message::PutBackEdit => {
+                if let Some(doc) = self.before_edit.take() {
+                    self.doc = doc;
+                    self.touch();
+                    self.status = "The last value typed was put back.".into();
+                }
+            }
             Message::UndoPlan => {
                 if self.undo.is_none() {
                     return Task::none();
@@ -8219,7 +8243,7 @@ impl App {
         Subscription::batch(subscriptions)
     }
     fn view(&self) -> Element<'_, Message> {
-        ui::view(self)
+        fault::guard(|| ui::view(self)).unwrap_or_else(|fault| ui::fault_page(self, fault))
     }
 }
 /// The message a window event sends, if any: shortcuts, the E-stop, jog
@@ -8721,6 +8745,7 @@ fn main() -> iced::Result {
     // The stock mesher's GPU takes a moment to open: open it now, not on the
     // first simulation's stock.
     std::thread::spawn(gpu_mesh::shared);
+    fault::install();
     iced::application(App::boot, App::update, App::view)
         .title(|app: &App| format!("{} — AXIS CAM Studio", app.doc.title))
         .theme(Theme::custom(

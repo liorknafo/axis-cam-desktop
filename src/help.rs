@@ -200,7 +200,7 @@ pub fn card<'a>(h: Help, expanded: bool, paused: bool) -> Element<'a, Message> {
         c = c
             .push(
                 container(
-                    canvas(Illustration {
+                    crate::fault::canvas(Illustration {
                         diagram: d,
                         still: paused.then_some(STILL_TIME),
                     })
@@ -3968,7 +3968,7 @@ mod tests {
                         .unwrap_or(0.);
                     jobs.push((
                         container(
-                            canvas(Illustration {
+                            crate::fault::canvas(Illustration {
                                 diagram: d,
                                 still: Some(t),
                             })
@@ -3991,7 +3991,7 @@ mod tests {
                     let t = 5. * (k as f32 + 0.5) / 8.;
                     row = row.push(
                         widget::column![
-                            canvas(Illustration {
+                            crate::fault::canvas(Illustration {
                                 diagram: d,
                                 still: Some(t)
                             })

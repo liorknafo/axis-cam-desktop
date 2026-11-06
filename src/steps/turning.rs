@@ -843,7 +843,7 @@ fn top_angle<'a>(from_cross: f32, out: bool) -> Element<'a, Message> {
         format!("{}° from the cross slide", trimmed(from_cross))
     };
     column![
-        canvas(TopAngle {
+        crate::fault::canvas(TopAngle {
             from_cross: if along { 90. } else { from_cross },
             out,
         })
@@ -1019,7 +1019,7 @@ fn dial_box<'a>(p: &Page<'a>, d: &Dial, sub: String, size: f32) -> Element<'a, M
     };
     column![
         bold(title, 13),
-        canvas(face).width(size).height(size + 10.),
+        crate::fault::canvas(face).width(size).height(size + 10.),
         text(sub).size(12).color(MUTED).center()
     ]
     .spacing(2)
@@ -1256,7 +1256,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
         use std::hash::{Hash, Hasher};
         let mut h = std::hash::DefaultHasher::new();
         (p.key, p.at, p.item, "lathe").hash(&mut h);
-        canvas(SideView {
+        crate::fault::canvas(SideView {
             key: h.finish(),
             side,
             bar,
@@ -1304,7 +1304,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 };
                 column![
                     bold(format!("Ø went down by {}", fixed(dialed * times, 2)), 13),
-                    canvas(face).width(130).height(140),
+                    crate::fault::canvas(face).width(130).height(140),
                     primary(
                         format!("by {}× → {what}", times as u32),
                         Message::Guide(GuideAction::CrossReads(reads))
@@ -2529,7 +2529,7 @@ pub(super) fn hand_over<'a>(p: &Page<'a>, to: Option<usize>) -> Element<'a, Mess
             use std::hash::{Hash, Hasher};
             let mut h = std::hash::DefaultHasher::new();
             (p.key, p.at, "lathe-hand-over").hash(&mut h);
-            canvas(SideView {
+            crate::fault::canvas(SideView {
                 key: h.finish(),
                 side,
                 bar,

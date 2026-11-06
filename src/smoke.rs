@@ -7407,6 +7407,62 @@ flood = { pin = 8 }
         }
         eprintln!("{}", a.status);
     }
+    /// A feed of 0 while the feed holds a force: the automatic force needs
+    /// a feed, and Generate says the feed must be positive. It once aborted
+    /// the app: no move cut at feed 0, so the nominal cut had no sample.
+    #[test]
+    fn a_feed_of_0_while_holding_a_force_is_an_error_not_a_crash() {
+        use crate::tooth_load::FEED_FOLLOWS;
+        for follows in &FEED_FOLLOWS[1..] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut a = run_app_of(dir.path(), FAST, &[0, 1]);
+            a.page = Page::Work;
+            let _ = a.update(Message::SelectOp(1));
+            let _ = a.update(Message::Tab("Tool".into()));
+            let _ = a.update(Message::Edit(
+                Target::Operation,
+                "feed_follows",
+                follows.to_string(),
+            ));
+            let _ = a.update(Message::Edit(Target::Operation, "feed", "0".into()));
+            shows(
+                &a,
+                &["Automatic: needs the tool's flutes, the spindle speed and the feed"],
+            );
+            let _ = a.update(Message::Generate);
+            assert!(a.simulation.is_none());
+            assert!(a.status.contains("feed"), "{}", a.status);
+            lacks(&a, &["This page could not be drawn"]);
+        }
+    }
+    /// The page drawn in place of one that panicked says what went wrong
+    /// and puts back the last value typed.
+    #[test]
+    fn the_page_that_could_not_be_drawn_puts_back_the_last_value_typed() {
+        let mut a = app();
+        let feed = get(&a.operation().unwrap().p, "feed").to_string();
+        let _ = a.update(Message::Edit(Target::Operation, "feed", "0".into()));
+        let page = crate::ui::fault_page(&a, "index out of bounds (src/x.rs:1:2)".into());
+        let texts = crate::ui::probe::texts(page, WINDOW);
+        for want in [
+            "This page could not be drawn",
+            "Something went wrong: index out of bounds (src/x.rs:1:2)",
+            "Put back the last value typed",
+            "Home",
+        ] {
+            assert!(texts.iter().any(|t| t == want), "{want}: {texts:?}");
+        }
+        let page = crate::ui::fault_page(&a, String::new());
+        let clicks = crate::ui::probe::clicks(page, WINDOW);
+        assert!(clicks.iter().any(|m| matches!(m, Message::PutBackEdit)));
+        let _ = a.update(Message::PutBackEdit);
+        assert_eq!(get(&a.operation().unwrap().p, "feed"), feed);
+        assert!(a.before_edit.is_none());
+        // Nothing typed since: no value to put back.
+        let page = crate::ui::fault_page(&a, String::new());
+        let texts = crate::ui::probe::texts(page, WINDOW);
+        assert!(!texts.iter().any(|t| t == "Put back the last value typed"));
+    }
     #[test]
     fn holding_the_force_per_tooth_is_chosen_with_the_feed_and_the_simulation_says_its_feeds() {
         use crate::tooth_load::FEED_FOLLOWS;
@@ -26832,5 +26888,201 @@ soft_max = 180.0
         let _ = a.update(Message::BoxFromFace);
         assert_eq!(a.status, crate::manual::ONE_FACE);
         assert_eq!(fields(&a), whole);
+    }
+
+    /// Each number field of each operation, its tool, its setup and its
+    /// machine takes 0, a negative, nothing, a tiny and a huge number, and
+    /// the app draws every tab, generates, plays and draws the run page
+    /// without a panic: a panic on the window's thread aborts the app.
+    #[test]
+    #[ignore = "minutes: cargo test --release -- --ignored no_number_typed"]
+    fn no_number_typed_in_a_field_panics_the_app() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::Mutex;
+        static PANICS: Mutex<Vec<String>> = Mutex::new(vec![]);
+        let quiet = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|info| {
+            let at = info.location().map(|l| l.to_string()).unwrap_or_default();
+            let what = (info.payload().downcast_ref::<&str>().map(|s| s.to_string()))
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            PANICS.lock().unwrap().push(format!("{at}: {what}"));
+        }));
+        let values = std::env::var("VALUES").unwrap_or("0,-1,,0.000001,1e9".into());
+        let values: Vec<&str> = values.split(',').collect();
+        let only = std::env::var("ONLY").ok();
+        let dir = tempfile::tempdir().unwrap();
+        // The fixture job's operations, each of which generates, then the
+        // other strategies as added to the part or on the lathe.
+        type Fresh<'a> = Box<dyn Fn() -> App + 'a>;
+        let mut cases: Vec<(String, Fresh)> = vec![];
+        for op in 0..6 {
+            let dir = dir.path();
+            cases.push((
+                format!("job op {op}"),
+                Box::new(move || {
+                    let mut a = run_app_of(dir, FAST, &[0, 1, 2, 3, 4, 5]);
+                    a.page = Page::Work;
+                    let _ = a.update(Message::SelectOp(op));
+                    a
+                }),
+            ));
+        }
+        for strategy in Strategy::ALL {
+            for on_lathe in [false, true] {
+                cases.push((
+                    format!(
+                        "added {strategy:?}{}",
+                        if on_lathe { " on the lathe" } else { "" }
+                    ),
+                    Box::new(move || {
+                        let mut a = imported_app();
+                        if on_lathe {
+                            on_the_lathe(&mut a);
+                        }
+                        let _ = a.update(Message::AddOp(strategy));
+                        a
+                    }),
+                ));
+            }
+        }
+        let mut failures: Vec<String> = vec![];
+        for (name, fresh) in &cases {
+            if only.as_ref().is_some_and(|o| !name.contains(o.as_str())) {
+                continue;
+            }
+            let mut a = fresh();
+            if a.operation().is_none() {
+                continue;
+            }
+            if a.doc.selected_material().is_none() {
+                a.doc.materials = crate::material::starters();
+                let id = a.doc.materials[0].id.clone();
+                let _ = a.update(Message::PickMaterial(id));
+            }
+            let op = a.operation().unwrap().clone();
+            let name = format!("{name} ({:?})", op.strategy);
+            let _ = a.update(Message::Generate);
+            eprintln!("{name}: generates {}", a.simulation.is_some());
+            let tool_id = op.tool.clone();
+            let mut keys: Vec<(Target, String)> = vec![];
+            keys.extend(op.p.keys().map(|k| (Target::Operation, k.clone())));
+            if let Some(t) = a.doc.tools.iter().find(|t| t.id == tool_id) {
+                keys.extend(t.p.keys().map(|k| (Target::Tool, k.clone())));
+            }
+            keys.extend(a.doc.setup().p.keys().map(|k| (Target::Setup, k.clone())));
+            keys.extend(
+                a.doc
+                    .setup()
+                    .machine
+                    .p
+                    .keys()
+                    .map(|k| (Target::Machine, k.clone())),
+            );
+            let mut follows = vec![None];
+            if crate::tooth_load::offered(op.strategy, &a.doc.setup().machine) {
+                follows.extend(crate::tooth_load::FEED_FOLLOWS[1..].iter().map(Some));
+            }
+            a.simulation = None;
+            let mut app = Some((a.doc.clone(), a.selected, a));
+            for (target, key) in &keys {
+                for value in &values {
+                    for follow in &follows {
+                        let case = format!(
+                            "{name} {target:?}.{key}={value:?}{}",
+                            follow.map_or(String::new(), |f| format!(" [{f}]"))
+                        );
+                        let started = Instant::now();
+                        PANICS.lock().unwrap().clear();
+                        let r = catch_unwind(AssertUnwindSafe(|| {
+                            let a = app.get_or_insert_with(|| {
+                                let a = fresh();
+                                (a.doc.clone(), a.selected, a)
+                            });
+                            let (doc, selected, a) = (a.0.clone(), a.1, &mut a.2);
+                            a.doc = doc;
+                            a.selected = selected;
+                            a.simulation = None;
+                            a.page = Page::Work;
+                            a.sim_details = true;
+                            if let Some(f) = follow {
+                                let _ = a.update(Message::Edit(
+                                    Target::Operation,
+                                    "feed_follows",
+                                    f.to_string(),
+                                ));
+                            }
+                            let key: &'static str = Box::leak(key.clone().into_boxed_str());
+                            match target {
+                                Target::Operation | Target::Setup => {
+                                    let _ =
+                                        a.update(Message::Edit(*target, key, value.to_string()));
+                                }
+                                Target::Tool => {
+                                    let tool_id = a.operation().unwrap().tool.clone();
+                                    let t =
+                                        (a.doc.tools.iter_mut()).find(|t| t.id == tool_id).unwrap();
+                                    t.p.insert(key.into(), value.to_string());
+                                    let _ = a.update(Message::EditTool(tool_id.clone()));
+                                    let _ = a.update(Message::Edit(
+                                        Target::Tool,
+                                        key,
+                                        value.to_string(),
+                                    ));
+                                    let _ = a.view();
+                                    a.page = Page::Work;
+                                }
+                                Target::Machine => {
+                                    let m = &mut a.doc.setup_mut().machine;
+                                    m.p.insert(key.into(), value.to_string());
+                                    a.page = Page::Machines;
+                                    let _ = a.update(Message::Edit(
+                                        Target::Machine,
+                                        key,
+                                        value.to_string(),
+                                    ));
+                                    let _ = a.view();
+                                    a.page = Page::Work;
+                                }
+                                _ => {}
+                            }
+                            let machine = a.doc.setup().machine.clone();
+                            for tab in a.operation().unwrap().tabs(&machine) {
+                                let _ = a.update(Message::Tab(tab.into()));
+                                let _ = a.view();
+                            }
+                            let _ = a.update(Message::Generate);
+                            let _ = a.view();
+                            for t in [0., 0.5, 1.] {
+                                let _ = a.update(Message::Scrub(t));
+                                let _ = a.view();
+                            }
+                            let dir = tempfile::tempdir().unwrap();
+                            render_png(a, iced::Size::new(900., 700.), &dir.path().join("w.png"));
+                            for page in [Page::Control, Page::Post, Page::Audit] {
+                                a.page = page;
+                                let _ = a.view();
+                            }
+                            render_png(a, iced::Size::new(900., 700.), &dir.path().join("c.png"));
+                        }));
+                        let took = started.elapsed();
+                        if r.is_err() {
+                            app = None;
+                            let at = PANICS.lock().unwrap().join(" | ");
+                            eprintln!("PANIC {case}: {at}");
+                            failures.push(format!("{case}: {at}"));
+                        }
+                        eprintln!("{:.2}s {case}", took.as_secs_f32());
+                    }
+                }
+            }
+        }
+        std::panic::set_hook(quiet);
+        assert!(
+            failures.is_empty(),
+            "{} panics:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
 }

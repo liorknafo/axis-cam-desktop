@@ -370,7 +370,7 @@ fn readout<'a>(r: Readout, msg: Option<Message>) -> Element<'a, Message> {
     if let Some(axes) = r.lock {
         tags = tags.push(
             row![
-                canvas(Lock).width(10).height(12),
+                crate::fault::canvas(Lock).width(10).height(12),
                 text(format!("lock {axes}")).size(12).color(MUTED)
             ]
             .spacing(4)
@@ -1087,7 +1087,7 @@ impl canvas::Program<Message> for Swatch {
 fn legend<'a>() -> Element<'a, Message> {
     let entry = |k: u8, s: &'static str| {
         row![
-            canvas(Swatch(k)).width(16).height(10),
+            crate::fault::canvas(Swatch(k)).width(16).height(10),
             text(s).size(12).color(MUTED)
         ]
         .spacing(5)
@@ -1133,7 +1133,10 @@ fn dro_tool<'a>(diameter: f32, comp: [i8; 2], height: f32) -> Vec<Element<'a, Me
             },
             None,
         ),
-        canvas(CompPicture(comp)).width(Fill).height(height).into(),
+        crate::fault::canvas(CompPicture(comp))
+            .width(Fill)
+            .height(height)
+            .into(),
     ]
 }
 
@@ -1228,7 +1231,7 @@ impl<'a> Page<'a> {
         use std::hash::{Hash, Hasher};
         let mut h = std::hash::DefaultHasher::new();
         (self.key, self.at, self.item, view).hash(&mut h);
-        canvas(Drawing {
+        crate::fault::canvas(Drawing {
             key: h.finish(),
             axes: VIEWS[view],
             stock,
@@ -1727,7 +1730,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             ]),]
             .extend(pick_up(*top))
             .extend(dro_tool(*diameter, *comp, 110.));
-            let left = canvas(ToolPicture {
+            let left = crate::fault::canvas(ToolPicture {
                 diameter: *diameter,
                 rpm: *rpm,
                 drill,
@@ -1762,7 +1765,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     None,
                 )
             }));
-            let left = canvas(CompPicture(*comp)).width(Fill).height(220).into();
+            let left = crate::fault::canvas(CompPicture(*comp))
+                .width(Fill)
+                .height(220)
+                .into();
             ("Comp".into(), "same tool, other sides", left, right)
         }
         Step::Face {

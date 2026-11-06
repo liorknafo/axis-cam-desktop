@@ -585,6 +585,10 @@ pub fn nominal(
         Hold::Tooth => forces[0],
         Hold::Cutter => forces[1],
     };
+    // A feed of 0 cuts nothing, so nothing is measured (`measure`).
+    if !(flutes > 0. && rpm > 0. && feed > 0.) {
+        return None;
+    }
     let (kc, mc) = crate::forces::kc(material);
     let mut h = std::collections::hash_map::DefaultHasher::new();
     format!("{cut:?}").hash(&mut h);
@@ -658,12 +662,13 @@ pub fn nominal(
     (sim.initial_volume, sim.frame) = (Some(volume), Some(frame));
     let load = measure(&sim, flutes, rpm, material, HELIX)?;
     // The middle fifth of the cut, well past where the cutter entered.
+    // None where the cut took no sample.
     let middle = |samples: &[f32]| {
         let n = samples.len();
-        let middle = &samples[n * 2 / 5..(n * 3 / 5).max(n * 2 / 5 + 1)];
-        middle.iter().sum::<f32>() / middle.len() as f32
+        let middle = samples.get(n * 2 / 5..(n * 3 / 5).max(n * 2 / 5 + 1))?;
+        Some(middle.iter().sum::<f32>() / middle.len() as f32)
     };
-    let forces = [middle(&load.moves[1]), middle(&load.cutter[1])];
+    let forces = [middle(&load.moves[1])?, middle(&load.cutter[1])?];
     let mut known = KNOWN.lock().ok()?;
     if known.len() >= 32 {
         known.remove(0);

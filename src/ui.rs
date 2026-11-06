@@ -920,6 +920,29 @@ pub fn project_note(app: &App) -> String {
         None => "No project file yet".into(),
     }
 }
+/// In place of a page that could not be drawn (`fault`): what went wrong,
+/// the last value typed put back, and Home, which draws without the page.
+pub fn fault_page(app: &App, fault: String) -> Element<'_, Message> {
+    let mut actions = row![].spacing(8);
+    if app.before_edit.is_some() {
+        actions = actions.push(primary(
+            "Put back the last value typed",
+            Message::PutBackEdit,
+        ));
+    }
+    actions = actions.push(secondary("Home", Message::Page(Page::Home)));
+    let body = column![
+        bold("This page could not be drawn", 18),
+        text(format!("Something went wrong: {fault}"))
+            .size(13)
+            .color(ERROR[1]),
+        muted("The app is still running and the project is as it was. The last value typed may be one this page cannot take: put it back, or go Home."),
+        actions,
+    ]
+    .spacing(12)
+    .max_width(640);
+    container(body).padding(40).width(Fill).height(Fill).into()
+}
 pub fn view(app: &App) -> Element<'_, Message> {
     if app.smoke_dir.is_some() && (13..=14).contains(&app.smoke_step) {
         return help::gallery(u8::from(app.smoke_step == 14));
@@ -1583,7 +1606,10 @@ impl canvas::Program<Message> for Grip {
     }
 }
 fn grip<'a>(side: Side, width: f32) -> Element<'a, Message> {
-    canvas(Grip { side, width }).width(GRIP).height(Fill).into()
+    crate::fault::canvas(Grip { side, width })
+        .width(GRIP)
+        .height(Fill)
+        .into()
 }
 /// A sidebar's Hide or Show button: ‹ and › point the way the sidebar goes.
 fn fold<'a>(app: &App, side: Side) -> Element<'a, Message> {
@@ -3136,11 +3162,12 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                             return Some(format!("Automatic: {takes} along most of the path at the cutting feed, measured when the operation is generated. The simulation says the force held."));
                         }
                         let cut = crate::tooth_load::nominal_cut(o, tool, None)?;
+                        let positive = |p, key| num(p, key).filter(|v| *v > 0.);
                         let force = crate::tooth_load::nominal(
                             &cut,
-                            num(&tool.p, "flutes")?,
-                            num(&o.p, "rpm")?,
-                            num(&o.p, "feed")?,
+                            positive(&tool.p, "flutes")?,
+                            positive(&o.p, "rpm")?,
+                            positive(&o.p, "feed")?,
                             app.doc.selected_material(),
                             hold,
                         )?;
@@ -10211,7 +10238,9 @@ fn machine_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'
     // The machine itself, in 3D, beside what sets it up (LIO-343): it was
     // a view of the Job tab's, where the owner did not look for it.
     // The model draws its own legend.
-    let model = canvas(machine_model(app, c)).width(Fill).height(Fill);
+    let model = crate::fault::canvas(machine_model(app, c))
+        .width(Fill)
+        .height(Fill);
     // Narrow, the model is over the controls and the log is the MDI tab's
     // alone.
     if Fit::of(app).narrow {
