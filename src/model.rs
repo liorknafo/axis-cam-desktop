@@ -2562,7 +2562,7 @@ mod path_json {
         })
     }
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelFile {
     pub name: String,
     #[serde(with = "path_json")]

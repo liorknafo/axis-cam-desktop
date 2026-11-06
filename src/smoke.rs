@@ -6607,7 +6607,10 @@ flood = { pin = 8 }
         let (doc, _) = crate::storage::load_reporting(&project).unwrap();
         a.doc = doc;
         let mesh = crate::mesh::load(&a.doc.file.as_ref().unwrap().path).unwrap();
-        let _ = a.update(Message::ModelRestored(Ok(mesh.clone())));
+        let _ = a.update(Message::ModelRestored(
+            a.doc.file.clone().unwrap(),
+            Ok(mesh.clone()),
+        ));
         let face = a
             .doc
             .setup()
@@ -6850,7 +6853,10 @@ flood = { pin = 8 }
         }
         doc.active = doc.setups[0].id.clone();
         a.replace_document(doc, None);
-        let _ = a.update(Message::ModelRestored(Ok(mesh)));
+        let _ = a.update(Message::ModelRestored(
+            a.doc.file.clone().unwrap(),
+            Ok(mesh),
+        ));
         a
     }
 
@@ -7531,6 +7537,49 @@ flood = { pin = 8 }
         let _ = a.update(Message::PutBackEdit);
         assert_eq!(a.doc.title, title);
         assert_eq!(serde_json::to_string(&a.doc).unwrap(), before);
+    }
+    /// Undoing a DXF's thickness loads its part again at the thickness put
+    /// back, and a load for the thickness undone, finishing later, is not
+    /// taken: the part, its stock and the field agree.
+    #[test]
+    fn undoing_a_dxfs_thickness_loads_the_part_at_it_again() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/mains-tray-flat.dxf");
+        let file = |thickness: f32| ModelFile {
+            name: "mains-tray-flat.dxf".into(),
+            path: path.clone(),
+            format: "dxf".into(),
+            bytes: 1,
+            thickness: Some(thickness),
+        };
+        let load = |thickness: f32| crate::mesh::load_file(&file(thickness));
+        let mut a = app();
+        let _ = a.update(Message::FileImported(Some(Ok((
+            file(1.5),
+            Some(load(1.5).unwrap()),
+        )))));
+        let tall = |a: &App| a.imported_mesh.as_ref().map(|m| m.dimensions[2]);
+        let stock = |a: &App| {
+            let s = crate::stock::resolve(a.doc.setup(), a.imported_mesh.as_ref()).unwrap();
+            s.stock.max[2] - s.stock.min[2]
+        };
+        assert_eq!(tall(&a), Some(1.5));
+        let thin = stock(&a);
+        let key = crate::sheet::DXF_THICKNESS_KEY;
+        let _ = a.update(Message::Edit(Target::Setup, key, "3".into()));
+        let _ = a.update(Message::ModelRestored(file(3.), load(3.)));
+        assert_eq!(tall(&a), Some(3.));
+        assert_eq!(stock(&a), thin + 1.5);
+        let _ = a.update(Message::PutBackEdit);
+        assert_eq!(a.doc.file, Some(file(1.5)));
+        assert_eq!(get(&a.doc.setups[0].p, key), "1.5");
+        // The model is loading again; the 3 mm load finishing now is not it.
+        assert!(a.import_busy);
+        let _ = a.update(Message::ModelRestored(file(3.), load(3.)));
+        assert_eq!(tall(&a), None);
+        let _ = a.update(Message::ModelRestored(file(1.5), load(1.5)));
+        assert_eq!(tall(&a), Some(1.5));
+        assert_eq!(stock(&a), thin);
     }
     /// Undoing a turn's kind puts back its sizes, speed and tool.
     #[test]
@@ -19813,9 +19862,10 @@ soft_max = 180.0
         assert!(matches!(a.planner, crate::Planner::Idle));
         let document = serde_json::from_str(&serde_json::to_string(&a.doc).unwrap()).unwrap();
         a.replace_document(document, None);
-        let _ = a.update(Message::ModelRestored(crate::mesh::load(
-            std::path::Path::new(&file_path),
-        )));
+        let _ = a.update(Message::ModelRestored(
+            a.doc.file.clone().unwrap(),
+            crate::mesh::load(std::path::Path::new(&file_path)),
+        ));
         let _ = a.update(Message::SelectOp(0));
         assert_eq!(
             a.operation().unwrap().surfaces.as_ref().unwrap().ids,
@@ -19871,7 +19921,10 @@ soft_max = 180.0
         let mut changed = a.imported_mesh.clone().unwrap();
         changed.fingerprint = "0".repeat(64);
         a.operation_mut().unwrap().geometry = vec![0];
-        let _ = a.update(Message::ModelRestored(Ok(changed)));
+        let _ = a.update(Message::ModelRestored(
+            a.doc.file.clone().unwrap(),
+            Ok(changed),
+        ));
         assert!(a.operation().unwrap().geometry.is_empty());
         assert!(a.op_issues().iter().any(|i| i.contains("geometry changed")));
         assert!(
@@ -22267,7 +22320,10 @@ soft_max = 180.0
         let mut a = signed_in_planning_app(&dir);
         apply_checked_plan(&mut a);
         let mesh = a.imported_mesh.clone().unwrap();
-        let _ = a.update(Message::ModelRestored(Ok(mesh)));
+        let _ = a.update(Message::ModelRestored(
+            a.doc.file.clone().unwrap(),
+            Ok(mesh),
+        ));
         assert!(a.undo.is_none());
     }
     #[test]

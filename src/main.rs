@@ -100,11 +100,11 @@ pub enum Target {
     Holder,
 }
 /// The last edit typed in a field (`App::typed_last`): what it changed as
-/// it was before, and as the edit left it, saved as a project saves it.
+/// it was before, and as the edit left it.
 #[derive(Debug, Clone)]
 pub struct LastEdit {
     pub before: Edited,
-    pub after: String,
+    pub after: Edited,
 }
 /// What an edit changes: the project for an operation or a setup (a setup's
 /// edit may turn or hold the others), else the editor's draft.
@@ -117,6 +117,8 @@ pub enum Edited {
     Holder(holding::Holder),
 }
 impl Edited {
+    /// As a project saves it: compared only when the fault page asks, not
+    /// at each keystroke.
     fn saved(&self) -> String {
         match self {
             Self::Project(d) => serde_json::to_string(d),
@@ -456,7 +458,8 @@ pub enum Message {
     Import,
     FileImported(Option<Result<(ModelFile, Option<mesh::Mesh>), String>>),
     ProjectOpened(Option<Opened>),
-    ModelRestored(Result<mesh::Mesh, String>),
+    /// The saved model loaded again for `ModelFile` (`App::restore_model`).
+    ModelRestored(ModelFile, Result<mesh::Mesh, String>),
     Saved(Option<PathBuf>),
     Export(&'static str),
     ToggleStock,
@@ -1664,7 +1667,7 @@ fn while_locked(m: &Message) -> bool {
             | Saved(_)
             | FileImported(_)
             | ProjectOpened(_)
-            | ModelRestored(_)
+            | ModelRestored(..)
             | Exported(_)
             | ExportError(_)
             | GcodeExported(_)
@@ -2272,13 +2275,14 @@ impl App {
         let file = file.clone();
         self.import_busy = true;
         self.status = format!("Loading {}…", file.name);
+        let loaded = file.clone();
         Task::perform(
             async move {
-                tokio::task::spawn_blocking(move || mesh::load_file(&file))
+                tokio::task::spawn_blocking(move || mesh::load_file(&loaded))
                     .await
                     .unwrap_or_else(|e| Err(format!("Import worker failed: {e}")))
             },
-            Message::ModelRestored,
+            move |result| Message::ModelRestored(file.clone(), result),
         )
     }
     pub fn operation(&self) -> Option<&Operation> {
@@ -4795,7 +4799,7 @@ impl App {
                 Edited::Material(_) => Target::Material,
                 Edited::Holder(_) => Target::Holder,
             };
-            self.edited(target).saved() == e.after
+            self.edited(target).saved() == e.after.saved()
         })
     }
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -4813,7 +4817,7 @@ impl App {
             }
         };
         if let Some((target, before)) = edit {
-            let after = self.edited(target).saved();
+            let after = self.edited(target);
             self.typed_last = Some(LastEdit { before, after });
         }
         // Batched only when it starts one: a batch is never an empty task.
@@ -7081,7 +7085,12 @@ impl App {
                 self.import_busy = false;
                 self.status = "Import cancelled.".into();
             }
-            Message::ModelRestored(result) => {
+            Message::ModelRestored(file, result) => {
+                // Loaded for a file the project no longer has (another DXF
+                // thickness, part or project): a later load is under way.
+                if self.doc.file.as_ref() != Some(&file) {
+                    return Task::none();
+                }
                 self.import_busy = false;
                 match result {
                     Ok(mesh) => {
@@ -7819,8 +7828,14 @@ impl App {
                 if self.can_put_back() {
                     match self.typed_last.take().map(|e| e.before) {
                         Some(Edited::Project(doc)) => {
+                            // A DXF's thickness extrudes the part: its model
+                            // is loaded again at the thickness put back.
+                            let reload = doc.file != self.doc.file;
                             self.doc = *doc;
                             self.touch();
+                            if reload {
+                                return self.restore_model();
+                            }
                         }
                         Some(Edited::Machine(m)) => self.machine_draft = *m,
                         Some(Edited::Tool(t)) => self.tool_draft = t,
