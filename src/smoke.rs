@@ -7581,6 +7581,56 @@ flood = { pin = 8 }
         assert_eq!(tall(&a), Some(1.5));
         assert_eq!(stock(&a), thin);
     }
+    /// A layout suggested for the edit undone, arriving after the undo,
+    /// leaves the workholding as undone.
+    #[test]
+    fn a_layout_arriving_after_an_undo_is_not_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), FAST, &[0, 1]);
+        a.doc.adopt_holders();
+        a.page = Page::Work;
+        let _ = a.update(Message::SetupStep("Holding"));
+        a.generate_inline = false;
+        let original = json(&a.doc);
+        let task = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        let late = first_message(task);
+        assert!(matches!(&late, Message::GeneratedLayout(..)), "{late:?}");
+        let _ = a.update(Message::PutBackEdit);
+        assert_eq!(json(&a.doc), original);
+        assert!(a.generating.is_none());
+        let _ = a.update(late);
+        assert_eq!(json(&a.doc), original);
+    }
+    /// A simulation generated, or a replay made, for the edit undone,
+    /// arriving after the undo, is not shown.
+    #[test]
+    fn a_simulation_arriving_after_an_undo_is_not_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), FAST, &[0, 1]);
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.update(Message::Edit(Target::Operation, "feed", "1000".into()));
+        a.generate_inline = false;
+        let late = first_message(a.update(Message::Generate));
+        assert!(matches!(&late, Message::Generated(..)), "{late:?}");
+        let _ = a.update(Message::PutBackEdit);
+        assert_eq!(get(&a.operation().unwrap().p, "feed"), "30000");
+        let _ = a.update(late);
+        assert!(a.simulation.is_none() && a.generating.is_none());
+        a.generate_inline = true;
+        let _ = a.update(Message::Generate);
+        assert!(a.simulation.is_some(), "{}", a.status);
+        a.generate_inline = false;
+        a.progress = 0.5;
+        a.scrub_pending = true;
+        let late = first_message(a.catch_up(true));
+        assert!(matches!(&late, Message::Replayed(..)), "{late:?}");
+        let _ = a.update(Message::Edit(Target::Operation, "feed", "0".into()));
+        let _ = a.update(Message::PutBackEdit);
+        let _ = a.update(late);
+        assert!(a.simulation.is_none() && !a.playing);
+        assert_eq!(a.progress, 0.);
+    }
     /// Undoing a turn's kind puts back its sizes, speed and tool.
     #[test]
     fn undoing_a_turns_kind_puts_back_its_sizes_and_speed() {
