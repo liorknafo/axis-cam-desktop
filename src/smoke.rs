@@ -9897,10 +9897,7 @@ flood = { pin = 8 }
         let _ = a.update(Message::SaveMachine);
         let _ = a.update(Message::AssignMachine(id.clone()));
         let m = &a.doc.setups[0].machine;
-        assert_eq!(
-            (m.name(), travel(m)),
-            ("JY5800 B".into(), [305., 405., 100.])
-        );
+        assert_eq!((m.name(), travel(m)), ("JY5800 B", [305., 405., 100.]));
         let _ = a.update(Message::EditMachine(id));
         let _ = a.update(Message::Edit(Target::Machine, "z", "55".into()));
         let _ = a.update(Message::SaveMachine);

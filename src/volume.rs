@@ -722,6 +722,30 @@ impl History {
         self.cuts.push(cut);
         id
     }
+    /// The cuts kept before cut `before` whose boxes reach over the XY box
+    /// `[x0, y0, x1, y1]` of the frame, each once, with their numbers.
+    pub(crate) fn near(
+        &self,
+        [x0, y0, x1, y1]: [f32; 4],
+        before: u32,
+    ) -> Vec<(u32, &crate::stock_surface::Cut)> {
+        let mut ids = vec![];
+        for y in self.bucket(y0, 1)..=self.bucket(y1, 1) {
+            for x in self.bucket(x0, 0)..=self.bucket(x1, 0) {
+                let bucket = &self.buckets[y * self.n[0] + x];
+                let earlier = &bucket[..bucket.partition_point(|(id, _)| *id < before)];
+                ids.extend(earlier.iter().filter_map(|(id, b)| {
+                    (b.max[0] >= x0 && b.min[0] <= x1 && b.max[1] >= y0 && b.min[1] <= y1)
+                        .then_some(*id)
+                }));
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter()
+            .map(|id| (id, &self.cuts[id as usize]))
+            .collect()
+    }
     /// Whether a cut kept before cut `before` swept the point `p` of the
     /// frame: the latest cuts first, the likeliest to have.
     pub(crate) fn swept(&self, p: [f32; 3], before: u32) -> bool {
