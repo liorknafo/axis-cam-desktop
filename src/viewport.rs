@@ -2100,8 +2100,8 @@ impl<'a> Viewport<'a> {
     pub(crate) fn view(self, height: impl Into<Length> + Copy) -> Element<'a, Event> {
         let marks = Marks(self.clone());
         iced::widget::stack![
-            canvas(self).width(Fill).height(height),
-            canvas(marks).width(Fill).height(height),
+            crate::fault::canvas(self).width(Fill).height(height),
+            crate::fault::canvas(marks).width(Fill).height(height),
         ]
         .width(Fill)
         .height(height)

@@ -6607,7 +6607,10 @@ flood = { pin = 8 }
         let (doc, _) = crate::storage::load_reporting(&project).unwrap();
         a.doc = doc;
         let mesh = crate::mesh::load(&a.doc.file.as_ref().unwrap().path).unwrap();
-        let _ = a.update(Message::ModelRestored(Ok(mesh.clone())));
+        let _ = a.update(Message::ModelRestored(
+            a.doc.file.clone().unwrap(),
+            Ok(mesh.clone()),
+        ));
         let face = a
             .doc
             .setup()
@@ -6850,7 +6853,10 @@ flood = { pin = 8 }
         }
         doc.active = doc.setups[0].id.clone();
         a.replace_document(doc, None);
-        let _ = a.update(Message::ModelRestored(Ok(mesh)));
+        let _ = a.update(Message::ModelRestored(
+            a.doc.file.clone().unwrap(),
+            Ok(mesh),
+        ));
         a
     }
 
@@ -7406,6 +7412,347 @@ flood = { pin = 8 }
             render_png(&a, size, &out.join(name));
         }
         eprintln!("{}", a.status);
+    }
+    /// A feed of 0 while the feed holds a force: the automatic force needs
+    /// a feed, and Generate says the feed must be positive. It once aborted
+    /// the app: no move cut at feed 0, so the nominal cut had no sample.
+    #[test]
+    fn a_feed_of_0_while_holding_a_force_is_an_error_not_a_crash() {
+        use crate::tooth_load::FEED_FOLLOWS;
+        for follows in &FEED_FOLLOWS[1..] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut a = run_app_of(dir.path(), FAST, &[0, 1]);
+            a.page = Page::Work;
+            let _ = a.update(Message::SelectOp(1));
+            let _ = a.update(Message::Tab("Tool".into()));
+            let _ = a.update(Message::Edit(
+                Target::Operation,
+                "feed_follows",
+                follows.to_string(),
+            ));
+            let _ = a.update(Message::Edit(Target::Operation, "feed", "0".into()));
+            shows(
+                &a,
+                &["Automatic: needs the tool's flutes, the spindle speed and the feed"],
+            );
+            let _ = a.update(Message::Generate);
+            assert!(a.simulation.is_none());
+            assert!(a.status.contains("feed"), "{}", a.status);
+            lacks(&a, &["This page could not be drawn"]);
+        }
+    }
+    /// The page drawn in place of one that panicked says what went wrong
+    /// and undoes the last edit typed in a field: all it changed (a
+    /// machine's kind, a turn's kind, the axes bring other settings), and
+    /// only while nothing changed since, so it never takes back a save, a
+    /// later change or another project.
+    #[test]
+    fn the_page_that_could_not_be_drawn_undoes_the_last_edit() {
+        const UNDO: &str = "Undo the last edit";
+        let page_texts = |a: &App| {
+            crate::ui::probe::texts(
+                crate::ui::fault_page(a, "boom (src/x.rs:1:2)".into()),
+                WINDOW,
+            )
+        };
+        let offers = |a: &App| page_texts(a).iter().any(|t| t == UNDO);
+        let mut a = app();
+        assert!(!offers(&a));
+        let texts = page_texts(&a);
+        for want in [
+            "This page could not be drawn",
+            "Something went wrong: boom (src/x.rs:1:2)",
+            "Home",
+        ] {
+            assert!(texts.iter().any(|t| t == want), "{want}: {texts:?}");
+        }
+        // The last keystroke only; what was typed before it stays.
+        let _ = a.update(Message::Edit(Target::Operation, "rpm", "9000".into()));
+        for typed in ["", "0"] {
+            let _ = a.update(Message::Edit(Target::Operation, "feed", typed.into()));
+        }
+        assert!(offers(&a));
+        let clicks = crate::ui::probe::clicks(crate::ui::fault_page(&a, String::new()), WINDOW);
+        assert!(clicks.iter().any(|m| matches!(m, Message::PutBackEdit)));
+        let _ = a.update(Message::PutBackEdit);
+        let p = &a.operation().unwrap().p;
+        assert_eq!((get(p, "feed"), get(p, "rpm")), ("", "9000"));
+        assert!(!offers(&a));
+        // A machine's kind and axes bring other settings; undone with it.
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "CNC".into()));
+        let cnc = a.machine_draft.clone();
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "Manual".into()));
+        assert_ne!(a.machine_draft.p, cnc.p);
+        let _ = a.update(Message::PutBackEdit);
+        assert_eq!(a.machine_draft.p, cnc.p);
+        let _ = a.update(Message::Edit(Target::Machine, "axes", "5".into()));
+        let five = a.machine_draft.p.clone();
+        let _ = a.update(Message::Edit(Target::Machine, "axes", "3".into()));
+        let _ = a.update(Message::PutBackEdit);
+        assert_eq!(a.machine_draft.p, five);
+        // The tool, material and holder editors' drafts.
+        a.tool_draft.p.insert("flutes".into(), "3".into());
+        a.material_draft.p.insert("vc_min".into(), "150".into());
+        a.holder_draft.p.insert("jaw_width".into(), "100".into());
+        for (target, key, was) in [
+            (Target::Tool, "flutes", "3"),
+            (Target::Material, "vc_min", "150"),
+            (Target::Holder, "jaw_width", "100"),
+        ] {
+            let draft = |a: &App| match target {
+                Target::Tool => get(&a.tool_draft.p, key).to_string(),
+                Target::Material => get(&a.material_draft.p, key).to_string(),
+                _ => get(&a.holder_draft.p, key).to_string(),
+            };
+            let _ = a.update(Message::Edit(target, key, "0".into()));
+            assert_eq!(draft(&a), "0", "{target:?}.{key}");
+            assert!(offers(&a), "{target:?}");
+            let _ = a.update(Message::PutBackEdit);
+            assert_eq!(draft(&a), was, "{target:?}.{key}");
+        }
+        // Saved and opened again: the edit after takes back to what was saved.
+        let id = a.doc.tools[0].id.clone();
+        let _ = a.update(Message::EditTool(id.clone()));
+        let _ = a.update(Message::Edit(Target::Tool, "flutes", "7".into()));
+        let _ = a.update(Message::SaveTool);
+        let _ = a.update(Message::EditTool(id));
+        let _ = a.update(Message::Edit(Target::Tool, "flutes", "0".into()));
+        let _ = a.update(Message::PutBackEdit);
+        assert_eq!(get(&a.tool_draft.p, "flutes"), "7");
+        // An operation added since: nothing to undo, so the new one stays.
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Edit(Target::Operation, "feed", "0".into()));
+        let _ = a.update(Message::AddOp(Strategy::Face));
+        let count = a.doc.setups[0].operations.len();
+        assert!(!offers(&a));
+        let _ = a.update(Message::PutBackEdit);
+        assert_eq!(a.doc.setups[0].operations.len(), count);
+        assert_eq!(get(&a.doc.setups[0].operations[0].p, "feed"), "0");
+        // The operation changed since: nothing to undo.
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Edit(Target::Operation, "feed", "0".into()));
+        a.doc.setups[0].operations[0]
+            .p
+            .insert("rpm".into(), "1".into());
+        assert!(!offers(&a));
+        let _ = a.update(Message::PutBackEdit);
+        assert_eq!(get(&a.doc.setups[0].operations[0].p, "feed"), "0");
+        // The setup whose pins it drilled deleted since: undoing would point
+        // it at a setup that is gone, so it is not offered.
+        let mut flipped = a.doc.setups[0].clone();
+        flipped.id = "flipped".into();
+        flipped.operations.clear();
+        a.doc.setups.push(flipped);
+        a.doc.setups[0].operations[0]
+            .p
+            .insert("pin_setup".into(), "flipped".into());
+        let _ = a.update(Message::Edit(Target::Operation, "pin_setup", String::new()));
+        assert!(offers(&a));
+        a.doc.setups.retain(|s| s.id != "flipped");
+        assert!(!offers(&a));
+        // Another project open: nothing of the first is put into it.
+        let _ = a.update(Message::Edit(Target::Operation, "feed", "1".into()));
+        let other = Document::sample();
+        let title = other.title.clone();
+        a.replace_document(other, None);
+        a.selected = Some(0);
+        assert!(!offers(&a));
+        let before = serde_json::to_string(&a.doc).unwrap();
+        let _ = a.update(Message::PutBackEdit);
+        assert_eq!(a.doc.title, title);
+        assert_eq!(serde_json::to_string(&a.doc).unwrap(), before);
+    }
+    /// Undoing a DXF's thickness loads its part again at the thickness put
+    /// back, and a load for the thickness undone, finishing later, is not
+    /// taken: the part, its stock and the field agree.
+    #[test]
+    fn undoing_a_dxfs_thickness_loads_the_part_at_it_again() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/mains-tray-flat.dxf");
+        let file = |thickness: f32| ModelFile {
+            name: "mains-tray-flat.dxf".into(),
+            path: path.clone(),
+            format: "dxf".into(),
+            bytes: 1,
+            thickness: Some(thickness),
+        };
+        let load = |thickness: f32| crate::mesh::load_file(&file(thickness));
+        let mut a = app();
+        let _ = a.update(Message::FileImported(Some(Ok((
+            file(1.5),
+            Some(load(1.5).unwrap()),
+        )))));
+        let tall = |a: &App| a.imported_mesh.as_ref().map(|m| m.dimensions[2]);
+        let stock = |a: &App| {
+            let s = crate::stock::resolve(a.doc.setup(), a.imported_mesh.as_ref()).unwrap();
+            s.stock.max[2] - s.stock.min[2]
+        };
+        assert_eq!(tall(&a), Some(1.5));
+        let thin = stock(&a);
+        let key = crate::sheet::DXF_THICKNESS_KEY;
+        let _ = a.update(Message::Edit(Target::Setup, key, "3".into()));
+        let _ = a.update(Message::ModelRestored(file(3.), load(3.)));
+        assert_eq!(tall(&a), Some(3.));
+        assert_eq!(stock(&a), thin + 1.5);
+        let _ = a.update(Message::PutBackEdit);
+        assert_eq!(a.doc.file, Some(file(1.5)));
+        assert_eq!(get(&a.doc.setups[0].p, key), "1.5");
+        // The model is loading again; the 3 mm load finishing now is not it.
+        assert!(a.import_busy);
+        let _ = a.update(Message::ModelRestored(file(3.), load(3.)));
+        assert_eq!(tall(&a), None);
+        let _ = a.update(Message::ModelRestored(file(1.5), load(1.5)));
+        assert_eq!(tall(&a), Some(1.5));
+        assert_eq!(stock(&a), thin);
+    }
+    /// A layout suggested for the edit undone, arriving after the undo,
+    /// leaves the workholding as undone.
+    #[test]
+    fn a_layout_arriving_after_an_undo_is_not_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), FAST, &[0, 1]);
+        a.doc.adopt_holders();
+        a.page = Page::Work;
+        let _ = a.update(Message::SetupStep("Holding"));
+        a.generate_inline = false;
+        let original = json(&a.doc);
+        let task = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        let late = first_message(task);
+        assert!(matches!(&late, Message::GeneratedLayout(..)), "{late:?}");
+        let _ = a.update(Message::PutBackEdit);
+        assert_eq!(json(&a.doc), original);
+        assert!(a.generating.is_none());
+        let _ = a.update(late);
+        assert_eq!(json(&a.doc), original);
+    }
+    /// A simulation generated, or a replay made, for the edit undone,
+    /// arriving after the undo, is not shown.
+    #[test]
+    fn a_simulation_arriving_after_an_undo_is_not_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), FAST, &[0, 1]);
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.update(Message::Edit(Target::Operation, "feed", "1000".into()));
+        a.generate_inline = false;
+        let late = first_message(a.update(Message::Generate));
+        assert!(matches!(&late, Message::Generated(..)), "{late:?}");
+        let _ = a.update(Message::PutBackEdit);
+        assert_eq!(get(&a.operation().unwrap().p, "feed"), "30000");
+        let _ = a.update(late);
+        assert!(a.simulation.is_none() && a.generating.is_none());
+        a.generate_inline = true;
+        let _ = a.update(Message::Generate);
+        assert!(a.simulation.is_some(), "{}", a.status);
+        a.generate_inline = false;
+        a.progress = 0.5;
+        a.scrub_pending = true;
+        let late = first_message(a.catch_up(true));
+        assert!(matches!(&late, Message::Replayed(..)), "{late:?}");
+        let _ = a.update(Message::Edit(Target::Operation, "feed", "0".into()));
+        let _ = a.update(Message::PutBackEdit);
+        let _ = a.update(late);
+        assert!(a.simulation.is_none() && !a.playing);
+        assert_eq!(a.progress, 0.);
+    }
+    /// Rest machining turned off, then its source deleted, disabled or
+    /// moved after it: undoing would turn it on with no source before it, so
+    /// it is not offered.
+    #[test]
+    fn undo_does_not_turn_rest_machining_on_without_its_source() {
+        for action in ["delete", "disable", "move"] {
+            let mut a = app();
+            let source = a.doc.setup().operations[0].id.clone();
+            let _ = a.update(Message::AddOp(Strategy::Adaptive));
+            let target = a.operation().unwrap().id.clone();
+            let _ = a.update(Message::RestSource(source));
+            let _ = a.update(Message::Edit(Target::Operation, "rest", "Yes".into()));
+            let _ = a.update(Message::Edit(Target::Operation, "rest", "No".into()));
+            assert!(a.can_put_back(), "{action}");
+            let _ = a.update(Message::SelectOp(0));
+            match action {
+                "delete" => {
+                    let _ = a.update(Message::ConfirmDeleteOp(true));
+                }
+                "disable" => {
+                    let _ = a.update(Message::ToggleOp);
+                }
+                _ => {
+                    for _ in 0..a.doc.setup().operations.len() {
+                        let _ = a.update(Message::MoveOp(1));
+                    }
+                }
+            }
+            assert!(!a.can_put_back(), "{action}");
+            let _ = a.update(Message::PutBackEdit);
+            let i = (a.doc.setup().operations.iter())
+                .position(|o| o.id == target)
+                .unwrap();
+            let _ = a.update(Message::SelectOp(i));
+            assert_eq!(get(&a.operation().unwrap().p, "rest"), "No", "{action}");
+            assert!(
+                !a.op_issues().iter().any(|e| e.contains("Rest machining")),
+                "{action}: {:?}",
+                a.op_issues()
+            );
+        }
+    }
+    /// A pin drilling turned to the part's holes, then the setup whose pins
+    /// it drilled deleted: undoing would drill pins for a setup that is
+    /// gone, so it is not offered.
+    #[test]
+    fn undo_does_not_drill_pins_for_a_deleted_setup() {
+        let mut a = leftover_pins_app(None);
+        let _ = a.update(Message::PlacePins);
+        let source = a.doc.active.clone();
+        let _ = a.update(Message::AddPinDrilling);
+        let _ = a.update(Message::SelectSetup(0));
+        let drill = (a.doc.setup().operations.iter())
+            .position(|o| o.drills_pin_holes())
+            .unwrap();
+        let _ = a.update(Message::SelectOp(drill));
+        let target = a.operation().unwrap().id.clone();
+        let holes = crate::model::DRILL_HOLES[0];
+        let _ = a.update(Message::Edit(Target::Operation, "holes", holes.into()));
+        assert!(a.can_put_back());
+        let si = a.doc.setups.iter().position(|s| s.id == source).unwrap();
+        let _ = a.update(Message::SelectSetup(si));
+        let _ = a.update(Message::ConfirmDeleteSetup(true));
+        assert!(!a.can_put_back());
+        let _ = a.update(Message::PutBackEdit);
+        let _ = a.update(Message::SelectSetup(0));
+        let op = (a.doc.setup().operations.iter())
+            .find(|o| o.id == target)
+            .unwrap();
+        assert!(!op.drills_pin_holes());
+        assert_eq!(get(&op.p, "holes"), holes);
+    }
+    /// Undoing a turn's kind puts back its sizes, speed and tool.
+    #[test]
+    fn undoing_a_turns_kind_puts_back_its_sizes_and_speed() {
+        let mut a = app();
+        on_the_lathe(&mut a);
+        let _ = a.update(Message::AddOp(Strategy::Turn));
+        let _ = a.update(Message::Edit(Target::Operation, "diameter", "37".into()));
+        let turn = a.operation().unwrap().clone();
+        let _ = a.update(Message::Edit(Target::Operation, "turn_kind", "Face".into()));
+        assert_ne!(a.operation().unwrap().p, turn.p);
+        let _ = a.update(Message::PutBackEdit);
+        let o = a.operation().unwrap();
+        assert_eq!((&o.p, &o.tool), (&turn.p, &turn.tool));
+        assert_eq!(get(&o.p, "diameter"), "37");
+        // A bore takes a boring bar; with the turning tool deleted since,
+        // undoing would leave the turn without a tool: not offered.
+        let _ = a.update(Message::Edit(Target::Operation, "turn_kind", "Bore".into()));
+        let bore = a.operation().unwrap().clone();
+        assert_ne!(bore.tool, turn.tool);
+        assert!(a.can_put_back());
+        let _ = a.update(Message::DeleteTool(turn.tool.clone()));
+        assert!(a.doc.tools.iter().all(|t| t.id != turn.tool));
+        assert!(!a.can_put_back());
+        let _ = a.update(Message::PutBackEdit);
+        let o = a.operation().unwrap();
+        assert_eq!((&o.p, &o.tool), (&bore.p, &bore.tool));
     }
     #[test]
     fn holding_the_force_per_tooth_is_chosen_with_the_feed_and_the_simulation_says_its_feeds() {
@@ -19775,9 +20122,10 @@ soft_max = 180.0
         assert!(matches!(a.planner, crate::Planner::Idle));
         let document = serde_json::from_str(&serde_json::to_string(&a.doc).unwrap()).unwrap();
         a.replace_document(document, None);
-        let _ = a.update(Message::ModelRestored(crate::mesh::load(
-            std::path::Path::new(&file_path),
-        )));
+        let _ = a.update(Message::ModelRestored(
+            a.doc.file.clone().unwrap(),
+            crate::mesh::load(std::path::Path::new(&file_path)),
+        ));
         let _ = a.update(Message::SelectOp(0));
         assert_eq!(
             a.operation().unwrap().surfaces.as_ref().unwrap().ids,
@@ -19833,7 +20181,10 @@ soft_max = 180.0
         let mut changed = a.imported_mesh.clone().unwrap();
         changed.fingerprint = "0".repeat(64);
         a.operation_mut().unwrap().geometry = vec![0];
-        let _ = a.update(Message::ModelRestored(Ok(changed)));
+        let _ = a.update(Message::ModelRestored(
+            a.doc.file.clone().unwrap(),
+            Ok(changed),
+        ));
         assert!(a.operation().unwrap().geometry.is_empty());
         assert!(a.op_issues().iter().any(|i| i.contains("geometry changed")));
         assert!(
@@ -22229,7 +22580,10 @@ soft_max = 180.0
         let mut a = signed_in_planning_app(&dir);
         apply_checked_plan(&mut a);
         let mesh = a.imported_mesh.clone().unwrap();
-        let _ = a.update(Message::ModelRestored(Ok(mesh)));
+        let _ = a.update(Message::ModelRestored(
+            a.doc.file.clone().unwrap(),
+            Ok(mesh),
+        ));
         assert!(a.undo.is_none());
     }
     #[test]
@@ -26934,5 +27288,201 @@ soft_max = 180.0
         let _ = a.update(Message::BoxFromFace);
         assert_eq!(a.status, crate::manual::ONE_FACE);
         assert_eq!(fields(&a), whole);
+    }
+
+    /// Each number field of each operation, its tool, its setup and its
+    /// machine takes 0, a negative, nothing, a tiny and a huge number, and
+    /// the app draws every tab, generates, plays and draws the run page
+    /// without a panic: a panic on the window's thread aborts the app.
+    #[test]
+    #[ignore = "minutes: cargo test --release -- --ignored no_number_typed"]
+    fn no_number_typed_in_a_field_panics_the_app() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::Mutex;
+        static PANICS: Mutex<Vec<String>> = Mutex::new(vec![]);
+        let quiet = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|info| {
+            let at = info.location().map(|l| l.to_string()).unwrap_or_default();
+            let what = (info.payload().downcast_ref::<&str>().map(|s| s.to_string()))
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            PANICS.lock().unwrap().push(format!("{at}: {what}"));
+        }));
+        let values = std::env::var("VALUES").unwrap_or("0,-1,,0.000001,1e9".into());
+        let values: Vec<&str> = values.split(',').collect();
+        let only = std::env::var("ONLY").ok();
+        let dir = tempfile::tempdir().unwrap();
+        // The fixture job's operations, each of which generates, then the
+        // other strategies as added to the part or on the lathe.
+        type Fresh<'a> = Box<dyn Fn() -> App + 'a>;
+        let mut cases: Vec<(String, Fresh)> = vec![];
+        for op in 0..6 {
+            let dir = dir.path();
+            cases.push((
+                format!("job op {op}"),
+                Box::new(move || {
+                    let mut a = run_app_of(dir, FAST, &[0, 1, 2, 3, 4, 5]);
+                    a.page = Page::Work;
+                    let _ = a.update(Message::SelectOp(op));
+                    a
+                }),
+            ));
+        }
+        for strategy in Strategy::ALL {
+            for on_lathe in [false, true] {
+                cases.push((
+                    format!(
+                        "added {strategy:?}{}",
+                        if on_lathe { " on the lathe" } else { "" }
+                    ),
+                    Box::new(move || {
+                        let mut a = imported_app();
+                        if on_lathe {
+                            on_the_lathe(&mut a);
+                        }
+                        let _ = a.update(Message::AddOp(strategy));
+                        a
+                    }),
+                ));
+            }
+        }
+        let mut failures: Vec<String> = vec![];
+        for (name, fresh) in &cases {
+            if only.as_ref().is_some_and(|o| !name.contains(o.as_str())) {
+                continue;
+            }
+            let mut a = fresh();
+            if a.operation().is_none() {
+                continue;
+            }
+            if a.doc.selected_material().is_none() {
+                a.doc.materials = crate::material::starters();
+                let id = a.doc.materials[0].id.clone();
+                let _ = a.update(Message::PickMaterial(id));
+            }
+            let op = a.operation().unwrap().clone();
+            let name = format!("{name} ({:?})", op.strategy);
+            let _ = a.update(Message::Generate);
+            eprintln!("{name}: generates {}", a.simulation.is_some());
+            let tool_id = op.tool.clone();
+            let mut keys: Vec<(Target, String)> = vec![];
+            keys.extend(op.p.keys().map(|k| (Target::Operation, k.clone())));
+            if let Some(t) = a.doc.tools.iter().find(|t| t.id == tool_id) {
+                keys.extend(t.p.keys().map(|k| (Target::Tool, k.clone())));
+            }
+            keys.extend(a.doc.setup().p.keys().map(|k| (Target::Setup, k.clone())));
+            keys.extend(
+                a.doc
+                    .setup()
+                    .machine
+                    .p
+                    .keys()
+                    .map(|k| (Target::Machine, k.clone())),
+            );
+            let mut follows = vec![None];
+            if crate::tooth_load::offered(op.strategy, &a.doc.setup().machine) {
+                follows.extend(crate::tooth_load::FEED_FOLLOWS[1..].iter().map(Some));
+            }
+            a.simulation = None;
+            let mut app = Some((a.doc.clone(), a.selected, a));
+            for (target, key) in &keys {
+                for value in &values {
+                    for follow in &follows {
+                        let case = format!(
+                            "{name} {target:?}.{key}={value:?}{}",
+                            follow.map_or(String::new(), |f| format!(" [{f}]"))
+                        );
+                        let started = Instant::now();
+                        PANICS.lock().unwrap().clear();
+                        let r = catch_unwind(AssertUnwindSafe(|| {
+                            let a = app.get_or_insert_with(|| {
+                                let a = fresh();
+                                (a.doc.clone(), a.selected, a)
+                            });
+                            let (doc, selected, a) = (a.0.clone(), a.1, &mut a.2);
+                            a.doc = doc;
+                            a.selected = selected;
+                            a.simulation = None;
+                            a.page = Page::Work;
+                            a.sim_details = true;
+                            if let Some(f) = follow {
+                                let _ = a.update(Message::Edit(
+                                    Target::Operation,
+                                    "feed_follows",
+                                    f.to_string(),
+                                ));
+                            }
+                            let key: &'static str = Box::leak(key.clone().into_boxed_str());
+                            match target {
+                                Target::Operation | Target::Setup => {
+                                    let _ =
+                                        a.update(Message::Edit(*target, key, value.to_string()));
+                                }
+                                Target::Tool => {
+                                    let tool_id = a.operation().unwrap().tool.clone();
+                                    let t =
+                                        (a.doc.tools.iter_mut()).find(|t| t.id == tool_id).unwrap();
+                                    t.p.insert(key.into(), value.to_string());
+                                    let _ = a.update(Message::EditTool(tool_id.clone()));
+                                    let _ = a.update(Message::Edit(
+                                        Target::Tool,
+                                        key,
+                                        value.to_string(),
+                                    ));
+                                    let _ = a.view();
+                                    a.page = Page::Work;
+                                }
+                                Target::Machine => {
+                                    let m = &mut a.doc.setup_mut().machine;
+                                    m.p.insert(key.into(), value.to_string());
+                                    a.page = Page::Machines;
+                                    let _ = a.update(Message::Edit(
+                                        Target::Machine,
+                                        key,
+                                        value.to_string(),
+                                    ));
+                                    let _ = a.view();
+                                    a.page = Page::Work;
+                                }
+                                _ => {}
+                            }
+                            let machine = a.doc.setup().machine.clone();
+                            for tab in a.operation().unwrap().tabs(&machine) {
+                                let _ = a.update(Message::Tab(tab.into()));
+                                let _ = a.view();
+                            }
+                            let _ = a.update(Message::Generate);
+                            let _ = a.view();
+                            for t in [0., 0.5, 1.] {
+                                let _ = a.update(Message::Scrub(t));
+                                let _ = a.view();
+                            }
+                            let dir = tempfile::tempdir().unwrap();
+                            render_png(a, iced::Size::new(900., 700.), &dir.path().join("w.png"));
+                            for page in [Page::Control, Page::Post, Page::Audit] {
+                                a.page = page;
+                                let _ = a.view();
+                            }
+                            render_png(a, iced::Size::new(900., 700.), &dir.path().join("c.png"));
+                        }));
+                        let took = started.elapsed();
+                        if r.is_err() {
+                            app = None;
+                            let at = PANICS.lock().unwrap().join(" | ");
+                            eprintln!("PANIC {case}: {at}");
+                            failures.push(format!("{case}: {at}"));
+                        }
+                        eprintln!("{:.2}s {case}", took.as_secs_f32());
+                    }
+                }
+            }
+        }
+        std::panic::set_hook(quiet);
+        assert!(
+            failures.is_empty(),
+            "{} panics:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
 }

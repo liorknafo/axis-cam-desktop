@@ -12,6 +12,7 @@ mod envelope;
 mod facing;
 #[cfg(test)]
 mod fake_openai;
+mod fault;
 mod field_art;
 mod finishing;
 mod forces;
@@ -97,6 +98,39 @@ pub enum Target {
     Tool,
     Material,
     Holder,
+}
+/// The last edit typed in a field (`App::typed_last`): what it changed as
+/// it was before, and as the edit left it.
+#[derive(Debug, Clone)]
+pub struct LastEdit {
+    pub before: Edited,
+    pub after: Edited,
+}
+/// What an edit changes: the project for an operation or a setup, else the
+/// editor's draft. The whole project, not the operation alone: undo is
+/// offered only while nothing else in it changed since, so it never puts
+/// back a reference to a tool, setup or operation deleted since.
+#[derive(Debug, Clone)]
+pub enum Edited {
+    Project(Box<Document>),
+    Machine(Box<Machine>),
+    Tool(Tool),
+    Material(material::Material),
+    Holder(holding::Holder),
+}
+impl Edited {
+    /// As a project saves it: compared only when the fault page asks, not
+    /// at each keystroke.
+    fn saved(&self) -> String {
+        match self {
+            Self::Project(d) => serde_json::to_string(d),
+            Self::Machine(m) => serde_json::to_string(m),
+            Self::Tool(t) => serde_json::to_string(t),
+            Self::Material(m) => serde_json::to_string(m),
+            Self::Holder(h) => serde_json::to_string(h),
+        }
+        .unwrap_or_default()
+    }
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum Account {
@@ -223,6 +257,9 @@ pub enum Message {
     SetupStep(&'static str),
     Tab(String),
     Edit(Target, &'static str, String),
+    /// Undoes the last edit typed in a field, from the page that could not
+    /// be drawn (`LastEdit`).
+    PutBackEdit,
     Title(String),
     AddOp(Strategy),
     DuplicateOp,
@@ -426,7 +463,8 @@ pub enum Message {
     Import,
     FileImported(Option<Result<(ModelFile, Option<mesh::Mesh>), String>>),
     ProjectOpened(Option<Opened>),
-    ModelRestored(Result<mesh::Mesh, String>),
+    /// The saved model loaded again for `ModelFile` (`App::restore_model`).
+    ModelRestored(ModelFile, Result<mesh::Mesh, String>),
     Saved(Option<PathBuf>),
     Export(&'static str),
     ToggleStock,
@@ -1148,6 +1186,9 @@ pub struct App {
     /// The setup editor's step shown (`ui::SETUP_STEPS`).
     pub setup_step: &'static str,
     pub status: String,
+    /// The last edit typed in a field: the page that could not be drawn
+    /// undoes it (`fault`).
+    pub typed_last: Option<LastEdit>,
     /// The page the status line was last set on: on another page it is an
     /// earlier event's, and the footer shows it as such.
     pub status_page: Page,
@@ -1631,7 +1672,7 @@ fn while_locked(m: &Message) -> bool {
             | Saved(_)
             | FileImported(_)
             | ProjectOpened(_)
-            | ModelRestored(_)
+            | ModelRestored(..)
             | Exported(_)
             | ExportError(_)
             | GcodeExported(_)
@@ -2043,6 +2084,7 @@ impl App {
             confirm_delete_setup: false,
             confirm_delete_op: false,
             status_page: Page::Home,
+            typed_last: None,
             pending: None,
             icons,
             closing: None,
@@ -2137,6 +2179,7 @@ impl App {
         self.material_draft = material_draft(&doc);
         self.holder_draft = holder_draft(&doc);
         self.clamps_draft = None;
+        self.typed_last = None;
         self.doc = doc;
         if !self.is_sample() {
             self.doc.sync_stock_sources();
@@ -2237,13 +2280,14 @@ impl App {
         let file = file.clone();
         self.import_busy = true;
         self.status = format!("Loading {}…", file.name);
+        let loaded = file.clone();
         Task::perform(
             async move {
-                tokio::task::spawn_blocking(move || mesh::load_file(&file))
+                tokio::task::spawn_blocking(move || mesh::load_file(&loaded))
                     .await
                     .unwrap_or_else(|e| Err(format!("Import worker failed: {e}")))
             },
-            Message::ModelRestored,
+            move |result| Message::ModelRestored(file.clone(), result),
         )
     }
     pub fn operation(&self) -> Option<&Operation> {
@@ -4739,10 +4783,48 @@ impl App {
             _ => return None,
         })
     }
+    /// What an edit of `target` changes, as it is now.
+    fn edited(&self, target: Target) -> Edited {
+        match target {
+            Target::Operation | Target::Setup => Edited::Project(Box::new(self.doc.clone())),
+            Target::Machine => Edited::Machine(Box::new(self.machine_draft.clone())),
+            Target::Tool => Edited::Tool(self.tool_draft.clone()),
+            Target::Material => Edited::Material(self.material_draft.clone()),
+            Target::Holder => Edited::Holder(self.holder_draft.clone()),
+        }
+    }
+    /// Whether the last edit can be undone: what it changed is still as it
+    /// left it, so undoing it takes back that edit and nothing since.
+    pub fn can_put_back(&self) -> bool {
+        self.typed_last.as_ref().is_some_and(|e| {
+            let now = match &e.after {
+                Edited::Project(_) => self.edited(Target::Setup),
+                Edited::Machine(_) => self.edited(Target::Machine),
+                Edited::Tool(_) => self.edited(Target::Tool),
+                Edited::Material(_) => self.edited(Target::Material),
+                Edited::Holder(_) => self.edited(Target::Holder),
+            };
+            now.saved() == e.after.saved()
+        })
+    }
     fn update(&mut self, message: Message) -> Task<Message> {
         let before = self.status.clone();
         let (selected, page) = (self.selected, self.page);
-        let task = self.handle(message);
+        let edit = match message {
+            Message::Edit(target, ..) => Some((target, self.edited(target))),
+            _ => None,
+        };
+        let task = match fault::guard(|| self.handle(message)) {
+            Ok(task) => task,
+            Err(fault) => {
+                self.status = format!("Something went wrong, and the app kept running: {fault}");
+                Task::none()
+            }
+        };
+        if let Some((target, before)) = edit {
+            let after = self.edited(target);
+            self.typed_last = Some(LastEdit { before, after });
+        }
         // Batched only when it starts one: a batch is never an empty task.
         let task = match self.refresh_part_holes() {
             Some(holes) => Task::batch([task, holes]),
@@ -7021,7 +7103,12 @@ impl App {
                 self.import_busy = false;
                 self.status = "Import cancelled.".into();
             }
-            Message::ModelRestored(result) => {
+            Message::ModelRestored(file, result) => {
+                // Loaded for a file the project no longer has (another DXF
+                // thickness, part or project): a later load is under way.
+                if self.doc.file.as_ref() != Some(&file) {
+                    return Task::none();
+                }
                 self.import_busy = false;
                 match result {
                     Ok(mesh) => {
@@ -7755,6 +7842,28 @@ impl App {
                     "Plan applied. The previous job is in History; Undo is in AI planner. Review each operation, then export from NC review.{restored}"
                 );
             }
+            Message::PutBackEdit => {
+                if self.can_put_back() {
+                    match self.typed_last.take().map(|e| e.before) {
+                        Some(Edited::Project(doc)) => {
+                            // A DXF's thickness extrudes the part: its model
+                            // is loaded again at the thickness put back.
+                            let reload = doc.file != self.doc.file;
+                            self.doc = *doc;
+                            self.touch();
+                            if reload {
+                                return self.restore_model();
+                            }
+                        }
+                        Some(Edited::Machine(m)) => self.machine_draft = *m,
+                        Some(Edited::Tool(t)) => self.tool_draft = t,
+                        Some(Edited::Material(m)) => self.material_draft = m,
+                        Some(Edited::Holder(h)) => self.holder_draft = h,
+                        None => {}
+                    }
+                    self.status = "The last edit was undone.".into();
+                }
+            }
             Message::UndoPlan => {
                 if self.undo.is_none() {
                     return Task::none();
@@ -8235,7 +8344,7 @@ impl App {
         Subscription::batch(subscriptions)
     }
     fn view(&self) -> Element<'_, Message> {
-        ui::view(self)
+        fault::guard(|| ui::view(self)).unwrap_or_else(|fault| ui::fault_page(self, fault))
     }
 }
 /// The message a window event sends, if any: shortcuts, the E-stop, jog
@@ -8737,6 +8846,7 @@ fn main() -> iced::Result {
     // The stock mesher's GPU takes a moment to open: open it now, not on the
     // first simulation's stock.
     std::thread::spawn(gpu_mesh::shared);
+    fault::install();
     iced::application(App::boot, App::update, App::view)
         .title(|app: &App| format!("{} — AXIS CAM Studio", app.doc.title))
         .theme(Theme::custom(
