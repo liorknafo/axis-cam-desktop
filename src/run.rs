@@ -869,6 +869,22 @@ impl Run {
             .collect()
     }
 
+    /// The journal of the running tool run done, the machine at work
+    /// system `wcs` and work `offset`: the next tool run's first operation,
+    /// nothing of it done, so the start is there. None when it is the
+    /// setup's last. Kept as `pi_stops` is.
+    pub fn pi_done(&self, wcs: usize, offset: [f64; 6]) -> Option<Journal> {
+        let r = self.running.as_ref()?;
+        let op = *self.checked()?.get(r.index + 1)?.indexes.first()?;
+        let st = Stopped {
+            op,
+            last: None,
+            up: None,
+            why: String::new(),
+        };
+        self.journal_of(&st, wcs, offset)
+    }
+
     /// The journal of where this run stopped (`stopped`), the machine at
     /// work system `wcs` and work `offset`.
     pub fn journal_of(&self, st: &Stopped, wcs: usize, offset: [f64; 6]) -> Option<Journal> {

@@ -2486,15 +2486,31 @@ pub struct Connection {
     _nap: Option<uc100::macos::ActivityToken>,
 }
 
+/// A number for a tool run sent to the Pi, its own among this computer's
+/// and others'.
+fn tool_run_id() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    h.finish()
+}
+
 /// The stops Stop after step on the Pi can make in the tool run last sent
 /// there, each with the journal of where it leaves the run
 /// (`Connection::send_tool_run`).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PiPending {
-    /// The job's name, as the Pi's `StopAfter::Fired` names its program.
-    job: String,
+    /// The number the tool run was sent with: the Pi's `ToolRunEnd` names it.
+    id: u64,
     /// Job lines of each step's end, and the journal of a stop there.
     stops: Vec<(std::ops::RangeInclusive<u32>, crate::run::Journal)>,
+    /// The journal of the tool run done: the start is the next one (None
+    /// when it is the setup's last).
+    done: Option<crate::run::Journal>,
 }
 
 impl PiPending {
@@ -2883,13 +2899,14 @@ impl Connection {
     /// kept on disk first, for when this computer does not follow it
     /// (`adopt_pi_stop`).
     fn send_tool_run(&mut self, job: Command, run: &crate::run::Run) -> bool {
-        let (Driver::Remote(_), Command::Job { name, .. }) = (&self.driver, &job) else {
+        let (Driver::Remote(_), Command::Job { .. }) = (&self.driver, &job) else {
             return self.try_send(job);
         };
         let s = &self.snapshot;
         let pending = PiPending {
-            job: name.clone(),
+            id: tool_run_id(),
             stops: run.pi_stops(s.active_wcs, s.work_offset),
+            done: run.pi_done(s.active_wcs, s.work_offset),
         };
         let path = self.pi_pending();
         if let Err(e) = pending.write(&path) {
@@ -2902,7 +2919,9 @@ impl Connection {
             return true;
         }
         let sent = match &self.driver {
-            Driver::Remote(remote) => remote.send_tool_run(job, run.stop_ranges(), run.step_lift()),
+            Driver::Remote(remote) => {
+                remote.send_tool_run(pending.id, job, run.stop_ranges(), run.step_lift())
+            }
             Driver::Local(_) => false,
         };
         if !sent {
@@ -2916,48 +2935,73 @@ impl Connection {
         self.journal.with_extension("pending.json")
     }
 
-    /// A stop the Pi made after a step of a tool run this computer does not
-    /// follow (AXIS CAM closed and opened again meanwhile): where it left
-    /// the run, kept as the tool run was sent, becomes the journal, so the
-    /// start is the step after it.
+    /// A tool run on the Pi that ended while this computer did not follow
+    /// it (AXIS CAM closed and opened again meanwhile): where it left the
+    /// run, kept as it was sent, becomes the journal, so the start is the
+    /// step after a stop after a step, or the next tool run after it was
+    /// done. Known by the number it was sent with, never by its name.
     fn adopt_pi_stop(&mut self) {
-        use uc100_remote::wire::StopAfter;
         let Some(link) = &self.link else {
             return;
         };
         if !link.live || self.run.as_ref().is_some_and(|r| r.running.is_some()) {
             return;
         }
-        let StopAfter::Fired {
-            line,
-            program: Some(program),
-            unattended,
-        } = &link.stop_after
-        else {
+        let path = self.pi_pending();
+        let Some(pending) = PiPending::read(&path) else {
             return;
         };
-        let path = self.pi_pending();
-        let Some(pending) = PiPending::read(&path).filter(|p| &p.job == program) else {
+        let Some(end) = link.tool_run_ends.iter().find(|e| e.id == pending.id) else {
             return;
         };
         let _ = std::fs::remove_file(&path);
-        let Some((_, mut j)) = pending.stops.into_iter().find(|(r, _)| r.contains(line)) else {
-            return;
+        let stopped = end.stopped_after.and_then(|line| {
+            let (_, j) = pending.stops.iter().find(|(r, _)| r.contains(&line))?;
+            Some(j.clone())
+        });
+        let (mut j, what) = match (stopped, end.ok) {
+            (Some(mut j), _) => {
+                if end.unattended {
+                    j.why = "Stop after step: no computer in control for a minute".into();
+                }
+                let what = format!(
+                    "The Pi stopped the tool run after step {} of {} ({}): the start after it is picked.",
+                    j.step.map_or(0, |s| s + 1),
+                    j.op_name,
+                    j.why
+                );
+                (j, what)
+            }
+            (None, true) => match pending.done {
+                Some(mut j) => {
+                    j.why = "its tool run done on the Pi".into();
+                    let what = format!(
+                        "The Pi finished the tool run: the next one, from {}, is picked.",
+                        j.op_name
+                    );
+                    (j, what)
+                }
+                // The setup's last: it is done.
+                None => {
+                    let _ = std::fs::remove_file(&self.journal);
+                    self.pi_note = Some("The Pi finished the setup's last tool run.".into());
+                    return;
+                }
+            },
+            (None, false) => {
+                self.pi_note = Some(format!(
+                    "The Pi's tool run ended short ({}): where it stopped is not known, so pick the start.",
+                    end.message
+                ));
+                return;
+            }
         };
-        if *unattended {
-            j.why = "Stop after step: no computer in control for a minute".into();
-        }
         j.time = crate::run::now();
         if let Err(e) = j.write(&self.journal) {
             self.pi_note = Some(format!("Where the Pi stopped could not be kept: {e}."));
             return;
         }
-        self.pi_note = Some(format!(
-            "The Pi stopped {program} after step {} of {} ({}): the start after it is picked.",
-            j.step.map_or(0, |s| s + 1),
-            j.op_name,
-            j.why
-        ));
+        self.pi_note = Some(what);
         if let Some(run) = &mut self.run {
             run.adopt_journal(j);
         }

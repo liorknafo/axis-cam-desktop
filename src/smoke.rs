@@ -3242,6 +3242,123 @@ flood = { pin = 8 }
         );
     }
 
+    /// The Facing tool run finishes on the Pi while AXIS CAM is closed.
+    /// Opened again and connected, the next tool run, the Drilling, is the
+    /// start: the Pi says the tool run this computer sent was done.
+    #[test]
+    fn a_tool_run_the_pi_finished_with_axis_cam_closed_starts_the_next_after_it_opens_again() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5.0, "the Facing on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        let _ = a.update(Message::Disconnect);
+        a.pi_run = None;
+        pi_until(&server, 60.0, "the Facing's end", |s| {
+            s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| o.ok)
+        });
+        let _ = a.update(Message::Connect);
+        let mut deadline = Deadline::new(10.);
+        while conn(&a).journal().is_none() {
+            let _ = a.update(Message::Tick);
+            assert!(
+                deadline.within(&conn(&a).snapshot),
+                "the Facing's end never kept: {:?}",
+                conn(&a).pi_note
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let journal = conn(&a).journal().unwrap();
+        assert_eq!((journal.op, journal.step), (1, None), "{journal:?}");
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let run = run_of(&a);
+        assert_eq!(
+            (run.next, run.from),
+            (1, 0),
+            "the Drilling's tool run is next"
+        );
+    }
+
+    /// Another computer runs a tool run of the same name on the Pi after
+    /// this one's stopped, AXIS CAM closed meanwhile: opened again, this
+    /// computer finds its own stop by the number it sent, not the other's
+    /// end.
+    #[test]
+    fn another_computers_tool_run_of_the_same_name_does_not_hide_this_ones_stop() {
+        use uc100::controller::{Command, State};
+        use uc100::gcode::{Action as Do, Located};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        let server = to_pi_lost(&mut a, dir.path(), std::time::Duration::from_secs(1));
+        drilling(&mut a);
+        let name = (server.snapshot().unwrap().program_name).expect("the Drilling's job");
+        let _ = a.update(Message::Disconnect);
+        a.pi_run = None;
+        pi_until(&server, 60.0, "the Pi's stop", |s| {
+            s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| !o.ok)
+        });
+        // The other computer: a short move in the air, named the same.
+        let code = uc100_remote::data::Data {
+            dir: dir.path().join("pi"),
+        }
+        .new_code()
+        .unwrap();
+        let addr = server.addr().to_string();
+        let token = uc100_remote::RemoteController::pair(&addr, &code, "Laptop").unwrap();
+        let other = uc100_remote::RemoteController::watch(&addr, token);
+        other.take_control();
+        let mut deadline = Deadline::new(5.);
+        while other.link().state != uc100_remote::LinkState::Controlling {
+            assert!(deadline.within(&other.snapshot()), "no control");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut up = server.snapshot().unwrap().machine_pos;
+        up[2] += 1.0;
+        let job = Command::Job {
+            name,
+            actions: std::sync::Arc::new(vec![Located {
+                line: 1,
+                action: Do::Move {
+                    target: up,
+                    feed: None,
+                },
+            }]),
+        };
+        assert!(other.send_tool_run(99, job, vec![], None));
+        let mut deadline = Deadline::new(10.);
+        while !other.link().tool_run_ends.iter().any(|e| e.id == 99) {
+            assert!(deadline.within(&other.snapshot()), "the other's end");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = a.update(Message::Connect);
+        let mut deadline = Deadline::new(10.);
+        while conn(&a).journal().is_none() {
+            let _ = a.update(Message::Tick);
+            assert!(
+                deadline.within(&conn(&a).snapshot),
+                "this computer's stop never found: {:?}",
+                conn(&a).pi_note
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Its own stop, found by the number it sent, not the other's end.
+        let journal = conn(&a).journal().unwrap();
+        assert_eq!(journal.op, 1);
+        assert!(
+            journal.why.contains("no computer in control"),
+            "{}",
+            journal.why
+        );
+        other.shutdown();
+    }
+
     /// A tool run lost on the way to the Pi (the link failed as it
     /// crossed): it never runs and no outcome comes, so after a few seconds
     /// with the link live it is put back, nothing having moved, and Cycle
