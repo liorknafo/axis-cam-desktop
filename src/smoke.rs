@@ -7519,13 +7519,25 @@ flood = { pin = 8 }
         let _ = a.update(Message::Edit(Target::Tool, "flutes", "0".into()));
         let _ = a.update(Message::PutBackEdit);
         assert_eq!(get(&a.tool_draft.p, "flutes"), "7");
-        // Anything changed since the edit: nothing to undo.
+        // An operation added since: the edit is undone, the new one kept.
+        let _ = a.update(Message::SelectOp(0));
+        let feed = get(&a.operation().unwrap().p, "feed").to_string();
         let _ = a.update(Message::Edit(Target::Operation, "feed", "0".into()));
         let _ = a.update(Message::AddOp(Strategy::Face));
-        assert!(!offers(&a));
-        let before = a.doc.setups[0].operations.len();
+        let count = a.doc.setups[0].operations.len();
+        assert!(offers(&a));
         let _ = a.update(Message::PutBackEdit);
-        assert_eq!(a.doc.setups[0].operations.len(), before);
+        assert_eq!(a.doc.setups[0].operations.len(), count);
+        assert_eq!(get(&a.doc.setups[0].operations[0].p, "feed"), feed);
+        // The operation changed since: nothing to undo.
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Edit(Target::Operation, "feed", "0".into()));
+        a.doc.setups[0].operations[0]
+            .p
+            .insert("rpm".into(), "1".into());
+        assert!(!offers(&a));
+        let _ = a.update(Message::PutBackEdit);
+        assert_eq!(get(&a.doc.setups[0].operations[0].p, "feed"), "0");
         // Another project open: nothing of the first is put into it.
         let _ = a.update(Message::Edit(Target::Operation, "feed", "1".into()));
         let other = Document::sample();

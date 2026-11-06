@@ -106,10 +106,12 @@ pub struct LastEdit {
     pub before: Edited,
     pub after: Edited,
 }
-/// What an edit changes: the project for an operation or a setup (a setup's
-/// edit may turn or hold the others), else the editor's draft.
+/// What an edit changes: the selected operation (with its setup's id), the
+/// project for a setup (a setup's edit may turn or hold the others), else
+/// the editor's draft.
 #[derive(Debug, Clone)]
 pub enum Edited {
+    Operation(String, Box<Operation>),
     Project(Box<Document>),
     Machine(Box<Machine>),
     Tool(Tool),
@@ -121,6 +123,7 @@ impl Edited {
     /// at each keystroke.
     fn saved(&self) -> String {
         match self {
+            Self::Operation(_, o) => serde_json::to_string(o),
             Self::Project(d) => serde_json::to_string(d),
             Self::Machine(m) => serde_json::to_string(m),
             Self::Tool(t) => serde_json::to_string(t),
@@ -4781,7 +4784,11 @@ impl App {
     /// What an edit of `target` changes, as it is now.
     fn edited(&self, target: Target) -> Edited {
         match target {
-            Target::Operation | Target::Setup => Edited::Project(Box::new(self.doc.clone())),
+            Target::Operation => match (self.doc.active_setup(), self.operation()) {
+                (Some(s), Some(o)) => Edited::Operation(s.id.clone(), Box::new(o.clone())),
+                _ => Edited::Project(Box::new(self.doc.clone())),
+            },
+            Target::Setup => Edited::Project(Box::new(self.doc.clone())),
             Target::Machine => Edited::Machine(Box::new(self.machine_draft.clone())),
             Target::Tool => Edited::Tool(self.tool_draft.clone()),
             Target::Material => Edited::Material(self.material_draft.clone()),
@@ -4792,15 +4799,26 @@ impl App {
     /// left it, so undoing it takes back that edit and nothing since.
     pub fn can_put_back(&self) -> bool {
         self.typed_last.as_ref().is_some_and(|e| {
-            let target = match e.before {
-                Edited::Project(_) => Target::Operation,
-                Edited::Machine(_) => Target::Machine,
-                Edited::Tool(_) => Target::Tool,
-                Edited::Material(_) => Target::Material,
-                Edited::Holder(_) => Target::Holder,
+            let now = match &e.after {
+                // The same operation, wherever it is selected or not.
+                Edited::Operation(setup, o) => match self.find_operation(setup, &o.id) {
+                    Some(now) => Edited::Operation(setup.clone(), Box::new(now.clone())),
+                    None => return false,
+                },
+                Edited::Project(_) => self.edited(Target::Setup),
+                Edited::Machine(_) => self.edited(Target::Machine),
+                Edited::Tool(_) => self.edited(Target::Tool),
+                Edited::Material(_) => self.edited(Target::Material),
+                Edited::Holder(_) => self.edited(Target::Holder),
             };
-            self.edited(target).saved() == e.after.saved()
+            now.saved() == e.after.saved()
         })
+    }
+    /// Operation `id` of setup `setup`.
+    fn find_operation(&self, setup: &str, id: &str) -> Option<&Operation> {
+        (self.doc.setups.iter())
+            .find(|s| s.id == setup)
+            .and_then(|s| s.operations.iter().find(|o| o.id == id))
     }
     fn update(&mut self, message: Message) -> Task<Message> {
         let before = self.status.clone();
@@ -7827,6 +7845,15 @@ impl App {
             Message::PutBackEdit => {
                 if self.can_put_back() {
                     match self.typed_last.take().map(|e| e.before) {
+                        Some(Edited::Operation(setup, before)) => {
+                            let setup = self.doc.setups.iter_mut().find(|s| s.id == setup);
+                            let op = setup
+                                .and_then(|s| s.operations.iter_mut().find(|o| o.id == before.id));
+                            if let Some(op) = op {
+                                *op = *before;
+                            }
+                            self.touch();
+                        }
                         Some(Edited::Project(doc)) => {
                             // A DXF's thickness extrudes the part: its model
                             // is loaded again at the thickness put back.
