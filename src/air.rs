@@ -48,6 +48,9 @@ const EXACT: f64 = 1e-6;
 const ARC: f64 = 0.002;
 /// How far a polygon's vertex moves rounded to `Milli`'s 0.001 mm, mm.
 const ROUND: f64 = 0.0008;
+/// How much more than they can be off the polygons a support pass is
+/// proven with err on the safe side, mm: five of `Milli`'s units.
+const MARGIN: f64 = 0.005;
 /// The rapid rate plans are timed at, mm/min (`cam::Builder`).
 const RAPID: f32 = 6000.;
 /// The most cutter positions a path is tested at: a longer one is tested
@@ -370,8 +373,8 @@ impl<'a> Detector<'a> {
     /// near enough to one of those cuts' paths that the cutter there, so
     /// drawn in, lies inside that cut is proven exactly (`reach`). The rest
     /// is proven with polygons, each erring on the safe side: what the run
-    /// sweeps grown, and what the cuts swept shrunk, by more than the arcs'
-    /// chords and the vertices' rounding can be off.
+    /// sweeps grown, and what the cuts swept shrunk, by `MARGIN` more than
+    /// the arcs' chords and the points' rounding can be off.
     fn clear(&self, [from, to]: [f32; 2], start: usize, kept: &[bool]) -> bool {
         // The feed the run ends in: at a feed's end, that one, not the next.
         let end = self.feeds.partition_point(|f| f.at < to).saturating_sub(1);
@@ -439,7 +442,11 @@ impl<'a> Detector<'a> {
                 .filter_map(|&([c, d], r)| reach(a, b, c, d, r - swept - EXACT))
                 .collect();
             spans.sort_by(|p, q| p[0].total_cmp(&q[0]));
-            let length = (b.0 - a.0).hypot(b.1 - a.1).max(EXACT);
+            if spans.is_empty() {
+                rest.push(vec![a, b]);
+                continue;
+            }
+            let length = (b.0 - a.0).hypot(b.1 - a.1);
             let mut done = 0.;
             let gap = |t0: f64, t1: f64, rest: &mut Vec<Polygon>| {
                 if t1 > t0 {
@@ -448,8 +455,8 @@ impl<'a> Detector<'a> {
                 }
             };
             for [t0, t1] in spans {
-                // A gap under `EXACT` long is within `EXACT` of a point
-                // proven with `EXACT` to spare.
+                // A gap under `EXACT` long beside a proven stretch is within
+                // `EXACT` of a point proven with `EXACT` to spare.
                 if (t0 - done) * length > EXACT {
                     gap(done, t0, &mut rest);
                 }
@@ -462,11 +469,23 @@ impl<'a> Detector<'a> {
         if rest.is_empty() {
             return true;
         }
-        // An arc's vertices are on it, its chords within `ARC` of its radius
-        // inside it (clipper2's own tolerance), each vertex rounded within
-        // `ROUND` of where it was.
+        // The polygons: an arc's vertices are on it and its chords within
+        // `ARC` of its radius inside it (clipper2's own tolerance), and each
+        // point, given or worked out, is rounded within `ROUND` of where it
+        // was. What the run sweeps is grown and what the cuts swept shrunk
+        // by `MARGIN` more than that, so that any point the cuts left within
+        // the run's sweep brings a disc `MARGIN` wide into what is left,
+        // which no rounding of the difference can lose. A piece of the run
+        // too short to sweep a polygon of its own is lengthened.
+        for piece in rest.iter_mut() {
+            let (a, b) = (piece[0], piece[1]);
+            if (b.0 - a.0).hypot(b.1 - a.1) < 0.001 {
+                piece[1] = (a.0 + 0.001, a.1);
+            }
+        }
+        let grow = MARGIN + ROUND;
         let (lo, hi) = (self.stock.min, self.stock.max);
-        let (lo, hi) = (lo.map(|v| v as f64 - ROUND), hi.map(|v| v as f64 + ROUND));
+        let (lo, hi) = (lo.map(|v| v as f64 - grow), hi.map(|v| v as f64 + grow));
         let stock = vec![vec![
             (lo[0], lo[1]),
             (hi[0], lo[1]),
@@ -474,7 +493,7 @@ impl<'a> Detector<'a> {
             (lo[0], hi[1]),
         ]];
         let Ok(region) = intersect::<Milli>(
-            outline(rest, (swept + ROUND) / (1. - ARC)),
+            outline(rest, (swept + MARGIN + 2. * ROUND) / (1. - ARC)),
             stock,
             FillRule::NonZero,
         ) else {
@@ -485,7 +504,7 @@ impl<'a> Detector<'a> {
         }
         let mut cleared: Paths<Milli> = Paths::new(vec![]);
         for (r, paths) in by {
-            cleared.append(outline(paths, r as f64 - ROUND));
+            cleared.append(outline(paths, r as f64 - MARGIN - 2. * ROUND));
         }
         difference::<Milli>(region, cleared, FillRule::NonZero)
             .is_ok_and(|left| !left.contains_points())
@@ -1456,6 +1475,122 @@ mod tests {
                 assert!(at(36.) || !at(32.), "Ø{} at {deg}°", 2. * prior);
             }
         }
+    }
+    #[test]
+    fn a_support_pass_over_a_cap_rounding_loses_is_kept() {
+        // A Ø8 slot at an angle leaves a cap 0.0033 mm thick under the end
+        // of a Ø3 support pass, 0.00307 mm inside its edge at `cap`: the
+        // polygons' difference, rounded to `Milli`, came out empty (found
+        // by the acceptance review of LIO-352).
+        let mut volume = Volume::new(STOCK, frame());
+        let (c, d) = ([-47.72959, 87.91031, 36.], [52.06938, -85.41068, 36.]);
+        volume.cut(c, d, 4., 25., CutterShape::Flat, frame(), (0, 0));
+        let (from, b) = ([-0.18829408_f32, 0.46892112], [0.000541_f32, 0.000689]);
+        let l = (from[0] - b[0]).hypot(from[1] - b[1]);
+        let a = [
+            b[0] + (from[0] - b[0]) * 20. / l,
+            b[1] + (from[1] - b[1]) * 20. / l,
+            36.,
+        ];
+        let b = [b[0], b[1], 36.];
+        let mut original = plan(&[a, b, a, [a[0], a[1], 32.], [b[0], b[1], 32.]]);
+        original.radius = 1.5;
+        let level = |m: &Move, z: f32| m.motion == Motion::Feed && m.from[2] == z && m.to[2] == z;
+        original.keep_air = original.moves.iter().map(|m| level(m, 36.)).collect();
+        let (kept, _) = trimmed(original, &volume);
+        let cap = [-1.2967059, -0.7462714, 38.];
+        assert!(
+            !volume
+                .cuts
+                .iter()
+                .any(|k| swept(cap, k.a, k.b, k.radius, k.flute, k.shape))
+        );
+        let at = |z: f32| {
+            (kept.moves.iter()).any(|m| {
+                level(m, z)
+                    && swept(
+                        cap,
+                        m.from,
+                        m.to,
+                        kept.radius,
+                        kept.flute_length,
+                        kept.shape,
+                    )
+            })
+        };
+        assert!(at(36.) || !at(32.));
+    }
+    #[test]
+    fn a_support_feed_that_goes_nowhere_over_stock_is_not_clear() {
+        // Straight up 0.000004 mm, level by the plan's measure: a point of
+        // the path, with no cut near it.
+        let volume = Volume::new(STOCK, frame());
+        let mut plan = plan(&[[0., 0., 36.], [0., 0., 36.000004]]);
+        plan.moves = vec![plan.moves[2].clone()];
+        plan.keep_air = vec![true];
+        let detector = Detector::new(&plan, &volume, frame(), (0, 1)).unwrap();
+        assert!(!detector.clear([0., detector.total], 0, &[false]));
+    }
+    #[test]
+    fn a_support_pass_proven_clear_leaves_nothing_past_its_band() {
+        // A Ø3 or Ø10 support pass ending beside a wider slot whose edge
+        // runs past its end at every angle, less than `SUPPORT_GAP` short
+        // of it or more: proven clear only where all the pass sweeps but its
+        // band is cut.
+        let mut checked = 0;
+        for radius in [1.5_f32, 5.] {
+            let gap = radius as f64 - (radius - SUPPORT_GAP) as f64;
+            for j in 0..400 {
+                let theta = (j as f64 * 2.399963229728653) % std::f64::consts::TAU;
+                let (n, u) = ([theta.cos(), theta.sin()], [-theta.sin(), theta.cos()]);
+                let prior = 2. * radius as f64 + 1.;
+                // How far inside the pass's edge the slot's edge stops.
+                let short = gap * (j % 8) as f64 / 4.;
+                let centre = [
+                    -n[0] * (prior - radius as f64 + short),
+                    -n[1] * (prior - radius as f64 + short),
+                ];
+                let mut volume = Volume::new(STOCK, frame());
+                let end = |k: f64| {
+                    [
+                        (centre[0] + u[0] * k) as f32,
+                        (centre[1] + u[1] * k) as f32,
+                        36.,
+                    ]
+                };
+                volume.cut(
+                    end(-100.),
+                    end(100.),
+                    prior as f32,
+                    25.,
+                    CutterShape::Flat,
+                    frame(),
+                    (0, 0),
+                );
+                let a = [
+                    (-n[0] * 0.07 - u[0] * 0.5) as f32,
+                    (-n[1] * 0.07 - u[1] * 0.5) as f32,
+                    36.,
+                ];
+                let mut plan = plan(&[a, [0., 0., 36.]]);
+                plan.radius = radius;
+                plan.moves = vec![plan.moves[2].clone()];
+                plan.keep_air = vec![true];
+                let detector = Detector::new(&plan, &volume, frame(), (0, 1)).unwrap();
+                if detector.clear([0., detector.total], 0, &[false]) {
+                    // The point of the pass's sweep farthest across the slot.
+                    let far = [n[0] * (radius as f64 - gap), n[1] * (radius as f64 - gap)];
+                    let reach = (far[0] - centre[0]) * n[0] + (far[1] - centre[1]) * n[1];
+                    assert!(
+                        reach <= prior + 1e-9,
+                        "Ø{} at {theta}: {short} short",
+                        2. * radius
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0);
     }
     #[test]
     fn reach_is_the_span_of_a_segment_within_a_distance_of_another() {
