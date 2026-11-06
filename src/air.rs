@@ -476,11 +476,12 @@ impl<'a> Detector<'a> {
         // by `MARGIN` more than that, so that any point the cuts left within
         // the run's sweep brings a disc `MARGIN` wide into what is left,
         // which no rounding of the difference can lose. A piece of the run
-        // too short to sweep a polygon of its own is lengthened.
+        // too short to sweep a polygon of its own goes on 0.001 mm further,
+        // so it sweeps all it did and more.
         for piece in rest.iter_mut() {
             let (a, b) = (piece[0], piece[1]);
             if (b.0 - a.0).hypot(b.1 - a.1) < 0.001 {
-                piece[1] = (a.0 + 0.001, a.1);
+                piece.push((b.0 + 0.001, b.1));
             }
         }
         let grow = MARGIN + ROUND;
