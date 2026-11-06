@@ -13,25 +13,33 @@
 //! short the moves it is shaved by. A stretch found cutting is kept with
 //! `pad` of path either side. A level move that repeats one the operation
 //! already made where that one cut, a finishing pass taken again (Pocket's
-//! and Contour's finishing passes), is kept whatever it cuts. A Pocket
-//! support pass (`Plan::keep_air`) cuts where material reaches only
-//! `SUPPORT_DEPTH` into it: `DEPTH` is a depth into the cutter's side, and a
-//! strip that thin can still stand a whole stepdown tall, which the level
-//! after the pass would meet as well as its own.
+//! and Contour's finishing passes), is kept whatever it cuts.
+//!
+//! A Pocket support pass (`Plan::keep_air`) clears the stock over a band
+//! before its first stepdown, and is taken out only where it is proven
+//! clear (`Detector::clear`), not where no sample finds material: a strip
+//! thinner than `DEPTH`, or one short enough to lie between the samples,
+//! can still stand a whole stepdown tall, which the level after the pass
+//! would meet as well as its own.
 use crate::holding::HoldBox;
 use crate::mesh::Bounds;
 use crate::model::{Operation, Setup, Strategy, num};
+use crate::pocket::Polygon;
 use crate::simulation::{CutterShape, Motion, Move, Plan};
 use crate::stock_surface::Cut;
 use crate::volume::{Frame, History, Volume, swept};
+use clipper2::{EndType, FillRule, JoinType, Milli, Paths, difference, intersect};
 
 /// How far into the cutter material must reach for the cutter to cut it,
 /// mm: a thinner sliver, the chords of two passes over one curve, is air.
 pub const DEPTH: f32 = 0.02;
-/// How far into a Pocket support pass material must reach for the pass to
-/// cut it, mm: what it touches, so that the level after it meets no more
-/// than a stepdown but in a strip thinner than this.
-pub const SUPPORT_DEPTH: f32 = 0.001;
+/// The band at its edge a support pass proven clear is not proven over, mm:
+/// with the polygons it is proven with, whose vertices round to 0.001 mm
+/// (`Milli`), the level after it meets no more than a stepdown but in a
+/// strip under 0.004 mm thick.
+pub const SUPPORT_GAP: f32 = 0.003;
+/// The most of a support pass's path proven clear at once, mm.
+const RUN: f32 = 5.;
 /// The rapid rate plans are timed at, mm/min (`cam::Builder`).
 const RAPID: f32 = 6000.;
 /// The most cutter positions a path is tested at: a longer one is tested
@@ -272,9 +280,167 @@ impl<'a> Detector<'a> {
         let m = &self.plan.moves[self.feeds[k].index];
         lerp(m.from, m.to, t)
     }
-    /// A point of material `DEPTH` (`SUPPORT_DEPTH` on a support pass)
-    /// inside the cutter `s` mm along the path that was there `lag` before:
-    /// None where it cuts nothing.
+    /// The stretches of the plan's support passes (`Plan::keep_air`) that
+    /// are not proven clear (`clear`), in runs of at most `RUN` mm along
+    /// one level path, none of them in `cutting`, what was found cutting.
+    fn unproven(&self, cutting: &[[f32; 2]]) -> Result<Vec<[f32; 2]>, String> {
+        let feeds = &self.feeds;
+        let support = |k: usize| self.plan.keep_air.get(feeds[k].index) == Some(&true);
+        let within = |a: f32, b: f32| {
+            let i = cutting.partition_point(|c| c[1] < b - 1e-4);
+            cutting.get(i).is_some_and(|c| c[0] <= a + 1e-4)
+        };
+        // The plan's own feeds surely kept: one all within what cuts, and a
+        // support pass, kept or proven clear by what is kept before it.
+        let kept: Vec<bool> = (0..feeds.len())
+            .map(|k| support(k) || within(feeds[k].at, feeds[k].at + feeds[k].length))
+            .collect();
+        // Runs of support feeds, each `[from, to]` mm along the path and
+        // the feed it starts in: a long feed cut in pieces.
+        let mut runs: Vec<([f32; 2], usize)> = vec![];
+        for k in 0..feeds.len() {
+            let (f, m) = (feeds[k], &self.plan.moves[feeds[k].index]);
+            if !support(k) || (m.from[2] - m.to[2]).abs() > 1e-4 {
+                continue;
+            }
+            let pieces = (f.length / RUN).ceil().max(1.) as usize;
+            for i in 0..pieces {
+                let a = f.at + f.length * i as f32 / pieces as f32;
+                let b = f.at + f.length * (i + 1) as f32 / pieces as f32;
+                match runs.last_mut() {
+                    Some(([from, to], start))
+                        if i == 0
+                            && *to == f.at
+                            && f.index == feeds[k - 1].index + 1
+                            && self.plan.moves[feeds[*start].index].from[2] == m.from[2]
+                            && b - *from <= RUN =>
+                    {
+                        *to = b
+                    }
+                    _ => runs.push(([a, b], k)),
+                }
+            }
+        }
+        runs.retain(|([a, b], _)| !within(*a, *b));
+        let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let progress = crate::progress::current();
+        let unproven = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|w| {
+                    let (runs, kept, progress) = (&runs, &kept, &progress);
+                    scope.spawn(move || {
+                        let mut out = vec![];
+                        for &(run, start) in runs.iter().skip(w).step_by(workers) {
+                            if progress.as_ref().is_some_and(|p| p.cancelled()) {
+                                return None;
+                            }
+                            if !self.clear(run, start, kept) {
+                                out.push(run);
+                            }
+                        }
+                        Some(out)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().ok().flatten())
+                .collect::<Option<Vec<_>>>()
+        })
+        .ok_or("Generation cancelled.")?;
+        Ok(unproven.into_iter().flatten().collect())
+    }
+    /// Whether a level run of support feeds, `[from, to]` mm along the path
+    /// from within feed `start`, is proven clear: all its flat cutter would
+    /// sweep, from its tip up its flutes, inside the stock's
+    /// box and `SUPPORT_GAP` in from its edge, lies in what flat cuts before
+    /// it swept, each from no higher than its tip up to no lower than its
+    /// flutes reach (or the stock's top): the earlier operations' cuts and
+    /// the feeds of the plan's own that are `kept`. The arcs of what is
+    /// swept are polygons with their vertices on them, which claim less than
+    /// was cut, and `SUPPORT_GAP` takes up the rest of their error.
+    fn clear(&self, [from, to]: [f32; 2], start: usize, kept: &[bool]) -> bool {
+        // The feed the run ends in: at a feed's end, that one, not the next.
+        let end = self.feeds.partition_point(|f| f.at < to).saturating_sub(1);
+        let t = ((to - self.feeds[end].at) / self.feeds[end].length).clamp(0., 1.);
+        let tip = self.at(start, 0.)[2];
+        let high = (tip + self.plan.flute_length).min(self.stock.max[2]);
+        if high <= tip + 1e-4 {
+            return true;
+        }
+        let xy = |p: [f32; 3]| (p[0] as f64, p[1] as f64);
+        let (_, t0) = self.locate(from);
+        let path: Polygon = std::iter::once(xy(self.at(start, t0)))
+            .chain((start..end).map(|k| xy(self.at(k, 1.))))
+            .chain(std::iter::once(xy(self.at(end, t))))
+            .collect();
+        let radius = self.plan.radius;
+        let (lo, hi) = (self.stock.min, self.stock.max);
+        let stock = vec![vec![
+            (lo[0] as f64, lo[1] as f64),
+            (hi[0] as f64, lo[1] as f64),
+            (hi[0] as f64, hi[1] as f64),
+            (lo[0] as f64, hi[1] as f64),
+        ]];
+        let Ok(region) = intersect::<Milli>(
+            outline(vec![path.clone()], (radius - SUPPORT_GAP) as f64),
+            stock,
+            FillRule::NonZero,
+        ) else {
+            return false;
+        };
+        if !region.contains_points() {
+            return true;
+        }
+        let near = path.iter().fold(
+            [
+                f32::INFINITY,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+            ],
+            |b, &(x, y)| {
+                let (x, y) = (x as f32, y as f32);
+                [
+                    b[0].min(x - radius),
+                    b[1].min(y - radius),
+                    b[2].max(x + radius),
+                    b[3].max(y + radius),
+                ]
+            },
+        );
+        let first = self.ids[0];
+        // The cuts that clear the run's column, by radius.
+        let mut by: Vec<(f32, Vec<Polygon>)> = vec![];
+        for (id, c) in self.history.near(near, self.ids[start]) {
+            let own = id >= first;
+            if c.frame != self.frame
+                || c.shape != CutterShape::Flat
+                || (own && !kept[(id - first) as usize])
+                || c.a[2].max(c.b[2]) > tip + 1e-4
+                || c.a[2].min(c.b[2]) + c.flute < high - 1e-4
+            {
+                continue;
+            }
+            // A cut that goes on from where the one before it ended (the
+            // cuts come in order) carries on its path.
+            match by.iter_mut().find(|(r, _)| *r == c.radius) {
+                Some((_, paths)) if paths.last().and_then(|p| p.last()) == Some(&xy(c.a)) => {
+                    paths.last_mut().unwrap().push(xy(c.b))
+                }
+                Some((_, paths)) => paths.push(vec![xy(c.a), xy(c.b)]),
+                None => by.push((c.radius, vec![vec![xy(c.a), xy(c.b)]])),
+            }
+        }
+        let mut cleared: Paths<Milli> = Paths::new(vec![]);
+        for (r, paths) in by {
+            cleared.append(outline(paths, r as f64));
+        }
+        difference::<Milli>(region, cleared, FillRule::NonZero)
+            .is_ok_and(|left| !left.contains_points())
+    }
+    /// A point of material `DEPTH` inside the cutter `s` mm along the path
+    /// that was there `lag` before: None where it cuts nothing.
     fn found(&self, s: f32) -> Option<[f32; 3]> {
         let (radius, flute, shape) = (self.plan.radius, self.plan.flute_length, self.plan.shape);
         let (k, t) = self.locate(s);
@@ -303,9 +469,7 @@ impl<'a> Detector<'a> {
                 && !partial.is_some_and(|(a, b)| swept(p, a, b, radius, flute, shape))
                 && !self.history.swept(p, before)
         };
-        let support = self.plan.keep_air.get(self.feeds[k].index) == Some(&true);
-        let depth = if support { SUPPORT_DEPTH } else { DEPTH };
-        surface(here, v, radius, flute, shape, top, depth).find(solid)
+        surface(here, v, radius, flute, shape, top).find(solid)
     }
 }
 
@@ -381,7 +545,15 @@ fn cutting(
         }
     }
     let cuts = found.into_iter().map(|s| [s - lag - pad, s + pad]);
-    Ok(Some(merged(cuts.chain(again), total)))
+    let cutting = merged(cuts.chain(again), total);
+    let unproven = detector.unproven(&cutting)?;
+    Ok(Some(merged(cutting.into_iter().chain(unproven), total)))
+}
+
+/// The area a cutter of `radius` sweeps along `paths` in XY, its arcs'
+/// vertices on them.
+fn outline(paths: Vec<Polygon>, radius: f64) -> Paths<Milli> {
+    Paths::<Milli>::from(paths).inflate(radius, JoinType::Round, EndType::Round, 2.)
 }
 
 /// `stretches` (mm of feed) sorted, the overlapping joined, within the
@@ -401,7 +573,7 @@ fn merged(stretches: impl IntoIterator<Item = [f32; 2]>, total: f32) -> Vec<[f32
 }
 
 /// The points of a cutter of `shape`, `radius` and `flute` with its tip at
-/// `tip`, moving along `v`, where material `depth` inside its surface is:
+/// `tip`, moving along `v`, where material `DEPTH` inside its surface is:
 /// round its end and up its side to `top`, every 10° round from the way it
 /// moves (so straight across it too), and up its side every `RISE`.
 fn surface(
@@ -411,7 +583,6 @@ fn surface(
     flute: f32,
     shape: CutterShape,
     top: f32,
-    depth: f32,
 ) -> impl Iterator<Item = [f32; 3]> {
     let h = v[0].hypot(v[1]);
     let (u, n) = if h > 1e-6 {
@@ -425,7 +596,7 @@ fn surface(
             [u[0] * c + n[0] * s, u[1] * c + n[1] * s]
         })
     };
-    let rho = radius - depth;
+    let rho = radius - DEPTH;
     let ring = move |r: f32, z: f32, every: usize| {
         round(every).map(move |d| [tip[0] + r * d[0], tip[1] + r * d[1], z])
     };
@@ -433,7 +604,7 @@ fn surface(
     let end: Vec<[f32; 3]> = match shape {
         CutterShape::Ball => {
             let centre = tip[2] + radius;
-            std::iter::once([tip[0], tip[1], tip[2] + depth])
+            std::iter::once([tip[0], tip[1], tip[2] + DEPTH])
                 .chain((1..=9).flat_map(move |i| {
                     let (s, c) = (i as f32 * 10_f32.to_radians()).sin_cos();
                     ring(rho * s, centre - rho * c, if i <= 3 { 12 } else { 36 })
@@ -441,7 +612,7 @@ fn surface(
                 .collect()
         }
         _ => {
-            let z = tip[2] + depth;
+            let z = tip[2] + DEPTH;
             std::iter::once([tip[0], tip[1], z])
                 .chain(ring(rho / 3., z, 12))
                 .chain(ring(rho * 2. / 3., z, 12))
@@ -452,9 +623,9 @@ fn surface(
     let from = tip[2]
         + match shape {
             CutterShape::Ball => radius,
-            _ => depth,
+            _ => DEPTH,
         };
-    let to = (tip[2] + flute - depth).min(top);
+    let to = (tip[2] + flute - DEPTH).min(top);
     let rises = if to > from {
         ((to - from) / RISE).ceil() as usize
     } else {
@@ -1023,6 +1194,61 @@ mod tests {
         let (support, _) = trimmed(original, &volume);
         assert!(shaves(&support));
         continuous(&support);
+    }
+    #[test]
+    fn a_support_pass_over_a_remnant_between_its_samples_is_kept() {
+        // Ø3 passes at Z36 along Y-0.015 and along Y0 but for a gap 0.3 mm
+        // long at X0.0625: the remnant they leave, 0.0075 mm thick, lies
+        // between the detector's samples of a support pass along Y0, and
+        // the Z32 level after it would meet it 8 mm tall (found by the
+        // acceptance review of LIO-352).
+        let mut volume = Volume::new(STOCK, frame());
+        let (c, flat) = (0.0625, CutterShape::Flat);
+        for (a, b) in [
+            ([-100., -0.015, 36.], [100., -0.015, 36.]),
+            ([-100., 0., 36.], [c - 0.15, 0., 36.]),
+            ([c + 0.15, 0., 36.], [100., 0., 36.]),
+        ] {
+            volume.cut(a, b, 1.5, 25., flat, frame(), (0, 0));
+        }
+        let remnant = [c, 1.496, 38.];
+        assert!(
+            !volume
+                .cuts
+                .iter()
+                .any(|k| swept(remnant, k.a, k.b, k.radius, k.flute, k.shape))
+        );
+        let mut original = plan(&[
+            [-80., 0., 36.],
+            [80., 0., 36.],
+            [80., 0., 32.],
+            [-80., 0., 32.],
+        ]);
+        original.radius = 1.5;
+        original.keep_air = vec![false; original.moves.len()];
+        original.keep_air[2] = true;
+        let (kept, _) = trimmed(original, &volume);
+        assert!(kept.moves.iter().any(|m| {
+            m.motion == Motion::Feed
+                && m.from[2] == 36.
+                && m.to[2] == 36.
+                && swept(
+                    remnant,
+                    m.from,
+                    m.to,
+                    kept.radius,
+                    kept.flute_length,
+                    kept.shape,
+                )
+        }));
+        // Away from the remnant, the support pass is still taken out.
+        assert!(!kept.moves.iter().any(|m| {
+            m.motion == Motion::Feed
+                && m.from[2] == 36.
+                && m.from[0].min(m.to[0]) < -40.
+                && m.from[0].max(m.to[0]) > -20.
+        }));
+        continuous(&kept);
     }
     #[test]
     fn a_ramp_made_again_over_air_is_air() {

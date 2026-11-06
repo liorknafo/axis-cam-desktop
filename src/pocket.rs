@@ -568,7 +568,7 @@ fn support_clearings(
             };
             for (_, r, i) in known.iter().filter(|(z, _, _)| *z <= h + 0.0001) {
                 // This proof depends on those earlier paths: air trimming
-                // takes one out only where it touches nothing.
+                // takes one out only where it is proven clear.
                 out[*i].support = true;
                 cleared = union::<Milli>(cleared, r.clone(), FillRule::NonZero)
                     .map_err(|e| e.to_string())?;
