@@ -45,7 +45,7 @@ pub fn defaults() -> Machine {
 }
 
 /// The `min-max` of a variable drive.
-fn variable(m: &Machine) -> Option<(f32, f32)> {
+pub fn variable(m: &Machine) -> Option<(f32, f32)> {
     let (a, b) = get(&m.p, "speeds").split_once('-')?;
     let (a, b) = (a.trim().parse::<f32>().ok()?, b.trim().parse::<f32>().ok()?);
     (a.is_finite() && b.is_finite() && 0. < a && a < b).then_some((a, b))

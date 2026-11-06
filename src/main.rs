@@ -413,6 +413,9 @@ pub enum Message {
     /// Places the active setup's vise jaws or clamps away from its toolpaths.
     SuggestLayout,
     SetOpTool(String),
+    /// Sets the selected operation's speed and feed to those recommended
+    /// for the project material and its tool (`Document::fit_op_speeds`).
+    RecommendSpeeds,
     RestSource(String),
     /// Saves the project to its file, asking for one the first time.
     SaveProject,
@@ -6833,6 +6836,19 @@ impl App {
                     o.tool = id;
                 }
                 self.touch()
+            }
+            Message::RecommendSpeeds => {
+                if let Some(oi) = self.selected {
+                    let rpm_feed = |app: &Self| {
+                        app.operation()
+                            .map(|o| (get(&o.p, "rpm").to_string(), get(&o.p, "feed").to_string()))
+                    };
+                    let before = rpm_feed(self);
+                    self.status = self.doc.fit_op_speeds(self.doc.index(), oi);
+                    if rpm_feed(self) != before {
+                        self.touch()
+                    }
+                }
             }
             Message::RestSource(id) => {
                 if let Some(o) = self.operation_mut() {

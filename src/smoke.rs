@@ -13463,6 +13463,108 @@ soft_max = 180.0
         assert_eq!(a.status, "unchanged");
     }
     #[test]
+    fn an_operations_button_sets_its_recommended_speed_and_feed() {
+        use crate::material::SpeedFeed;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = planning_app(&dir);
+        a.page = Page::Work;
+        let i = (a.doc.setup().operations.iter())
+            .position(|o| o.strategy != crate::model::Strategy::Drill)
+            .unwrap();
+        let _ = a.update(Message::SelectOp(i));
+        let _ = a.update(Message::Tab("Tool".into()));
+        let _ = a.update(Message::Edit(Target::Operation, "rpm", "5000".into()));
+        let _ = a.update(Message::Edit(Target::Operation, "feed", "100".into()));
+        let (rpm, feed) = a
+            .doc
+            .recommended_speeds(a.doc.setup(), a.operation().unwrap())
+            .unwrap();
+        let line = format!(
+            "Recommended for Aluminium 6061-T6 and this cutter:\n{rpm} rpm · {feed} mm/min"
+        );
+        shows(&a, &[&line, "Use recommended speed & feed"]);
+        // The other operations keep theirs.
+        let others = |a: &App| -> Vec<_> {
+            (a.doc.setup().operations.iter().enumerate())
+                .filter(|(j, _)| *j != i)
+                .map(|(_, o)| (get(&o.p, "rpm").to_string(), get(&o.p, "feed").to_string()))
+                .collect()
+        };
+        let before = others(&a);
+        a.dirty = false;
+        let _ = a.update(Message::RecommendSpeeds);
+        let o = a.operation().unwrap();
+        assert_eq!(
+            (get(&o.p, "rpm"), get(&o.p, "feed")),
+            (rpm.to_string().as_str(), feed.to_string().as_str())
+        );
+        assert!(matches!(
+            a.doc.speed_feed(a.doc.setup(), o),
+            Some(SpeedFeed::InRange { .. })
+        ));
+        assert!(
+            a.status.starts_with(&format!("Spindle speed 5000 → {rpm} rpm, feed 100 → {feed} mm/min: Aluminium 6061-T6's recommended speed and feed for ")),
+            "{}",
+            a.status
+        );
+        assert!(a.dirty);
+        assert_eq!(others(&a), before);
+        // Now it runs at it: no button, and pressing it again changes nothing.
+        shows(&a, &[&line, "The operation runs at it."]);
+        lacks(&a, &["Use recommended speed & feed"]);
+        a.dirty = false;
+        let _ = a.update(Message::RecommendSpeeds);
+        assert!(!a.dirty);
+        assert!(
+            a.status
+                .ends_with(" already runs at Aluminium 6061-T6's recommended speed and feed."),
+            "{}",
+            a.status
+        );
+        // A plain drilling has none, and says why.
+        let drill = (a.doc.setup().operations.iter())
+            .position(|o| {
+                o.strategy == crate::model::Strategy::Drill && !o.helical() && !o.finishes_holes()
+            })
+            .unwrap();
+        let _ = a.update(Message::SelectOp(drill));
+        let _ = a.update(Message::Tab("Tool".into()));
+        shows(
+            &a,
+            &[
+                "No recommended speed and feed. A drill's feed is per turn and the library has no drill data: set its speed and feed by hand.",
+            ],
+        );
+        lacks(&a, &["Use recommended speed & feed"]);
+    }
+    /// Renders an operation's Tool tab with the recommended speed and feed
+    /// to `$AXIS_RENDER_DIR` (default /tmp/recommend-speeds), before and
+    /// after the button. Not a check: run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_the_recommended_speed_and_feed_button() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/recommend-speeds".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = planning_app(&dir);
+        a.page = Page::Work;
+        let size = iced::Size::new(1600., 1000.);
+        let i = (a.doc.setup().operations.iter())
+            .position(|o| o.strategy != crate::model::Strategy::Drill)
+            .unwrap();
+        let _ = a.update(Message::SelectOp(i));
+        let _ = a.update(Message::Tab("Tool".into()));
+        let _ = a.update(Message::Edit(Target::Operation, "rpm", "5000".into()));
+        let _ = a.view();
+        render_png(&a, size, &out.join("1-before.png"));
+        let _ = a.update(Message::RecommendSpeeds);
+        eprintln!("status: {}", a.status);
+        let _ = a.view();
+        render_png(&a, size, &out.join("2-after.png"));
+    }
+    #[test]
     fn speeds_and_feeds_outside_the_materials_data_warn_and_never_block_export() {
         use crate::material::SpeedFeed;
         let dir = tempfile::tempdir().unwrap();
