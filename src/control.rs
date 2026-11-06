@@ -2339,8 +2339,8 @@ pub struct PiRun {
     tool_run_id: Option<u64>,
 }
 
-/// How long a tool run sent to the Pi may show neither running nor a new
-/// outcome, the link live, before it is taken as lost on the way.
+/// How long the Pi, the link live, may show neither having nor having
+/// ended a tool run sent to it before it is taken as lost on the way.
 const JOB_REACH: Duration = Duration::from_secs(3);
 
 /// A running driver controller for one machine.
@@ -2356,9 +2356,9 @@ pub struct Connection {
     /// of notes seen.
     pub pi_note: Option<String>,
     notes_seen: u64,
-    /// A tool run sent to the Pi that has not yet shown running or ended:
-    /// when it was sent, and the outcome count then.
-    job_sent: Option<(Instant, u64)>,
+    /// Since when the Pi has shown neither having nor having ended the
+    /// tool run this run follows (`watch_job`).
+    job_missing: Option<Instant>,
     /// The name of the last tool run sent, which the Pi's Stop after step
     /// names when it fires.
     job_name: Option<String>,
@@ -2617,7 +2617,7 @@ impl Connection {
             link: None,
             pi_note: None,
             notes_seen: 0,
-            job_sent: None,
+            job_missing: None,
             job_name: None,
             tool_run_id: None,
             #[cfg(test)]
@@ -3578,8 +3578,7 @@ impl Connection {
                             "The tool run was not sent ({why}). Nothing moved."
                         ));
                     } else if self.pi.is_some() {
-                        let seq = self.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
-                        (self.job_sent, self.job_name) = (Some((Instant::now(), seq)), name);
+                        (self.job_missing, self.job_name) = (None, name);
                     }
                 }
             }
@@ -5379,21 +5378,27 @@ impl Connection {
         true
     }
 
-    /// A tool run sent to the Pi that shows neither running nor a new
-    /// outcome for `JOB_REACH`, the link live, was lost on the way (the link
-    /// failed while it crossed): it is put back, nothing having moved.
+    /// A tool run on the Pi this run follows (`tool_run_id`) that the Pi
+    /// neither has nor has ended, the link live, for `JOB_REACH` never
+    /// reached it (the link failed while it crossed): it is put back,
+    /// nothing having moved. So also after connecting back: the run kept
+    /// learns whether its tool run ever reached the Pi.
     fn watch_job(&mut self) {
-        let Some((at, seq)) = self.job_sent else {
+        let following = self.run.as_ref().is_some_and(|r| r.running.is_some());
+        let link = self.link.as_ref().filter(|l| l.live);
+        let (Some(id), true, Some(link)) = (self.tool_run_id, following, link) else {
+            self.job_missing = None;
             return;
         };
-        let s = &self.snapshot;
-        let reached = crate::run::busy(s.state.as_ref())
-            || s.program_outcome.as_ref().is_some_and(|o| o.seq > seq);
-        let running = self.run.as_ref().is_some_and(|r| r.running.is_some());
-        if reached || !running {
-            self.job_sent = None;
-        } else if !self.pi_down() && at.elapsed() > JOB_REACH {
-            self.job_sent = None;
+        let known =
+            link.tool_run_going == Some(id) || link.tool_run_ends.iter().any(|e| e.id == id);
+        if known {
+            self.job_missing = None;
+            return;
+        }
+        let since = *self.job_missing.get_or_insert_with(Instant::now);
+        if since.elapsed() > JOB_REACH {
+            self.job_missing = None;
             if let Some(run) = &mut self.run {
                 run.not_started(
                     "The tool run did not reach the Pi: the link failed while it was being sent. Nothing moved; press Cycle Start again.".into(),

@@ -3419,6 +3419,38 @@ flood = { pin = 8 }
         run_until(&mut a, 60.0, "tool run 1", |r| r.done[0]);
     }
 
+    /// As above, but this computer disconnects at once and connects back,
+    /// the run kept: the Pi never had the tool run, so it is put back, and
+    /// Cycle Start sends it again (astra round 4).
+    #[test]
+    fn a_tool_run_lost_on_the_way_is_put_back_after_connecting_back() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        a.control.as_mut().unwrap().lose_next_job = true;
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(run_of(&a).running.is_some());
+        let _ = a.update(Message::Disconnect);
+        assert!(a.pi_run.is_some());
+        let _ = a.update(Message::Connect);
+        assert!(run_of(&a).running.is_some(), "the run kept");
+        run_until(&mut a, 10.0, "the lost tool run put back", |r| {
+            r.running.is_none()
+        });
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(!ok && message.contains("did not reach the Pi"), "{message}");
+        let s = server.snapshot().unwrap();
+        assert_eq!((s.state, s.program_name), (Some(State::Idle), None));
+        assert!(!run_of(&a).done[0]);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(&mut a, 60.0, "tool run 1", |r| r.done[0]);
+    }
+
     /// Machine zero on the Pi declares X, Y and Z one after another, each
     /// once the driver has logged the one before: ticked with no pause, as
     /// when the network bunches them, the driver would drop all but the
