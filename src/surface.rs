@@ -320,7 +320,8 @@ pub fn issues(operation: &Operation, setup: &Setup, mesh: Option<&Mesh>) -> Vec<
         if steps.contains(&id) {
             continue;
         }
-        // A Pocket, an inside Contour or a Drill picks a hole by its walls.
+        // A Pocket, an Adaptive clearing, an inside Contour or a Drill
+        // picks a hole by its walls.
         if picks_holes && up < crate::pocket::WALL {
             continue;
         }

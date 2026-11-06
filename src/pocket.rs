@@ -1292,7 +1292,7 @@ impl Hole {
                 None => "it is left uncut".to_string(),
             };
             return vec![format!(
-                "The hole at X{x:.2} Y{y:.2} ({w:.2} × {d:.2} mm) is too narrow for the Ø{diameter} cutter with this radial allowance: {left}. Pick it in a Pocket with a smaller cutter."
+                "The hole at X{x:.2} Y{y:.2} ({w:.2} × {d:.2} mm) is too narrow for the Ø{diameter} cutter with this radial allowance: {left}. Pick it in an operation with a smaller cutter."
             )];
         }
         (self.levels.iter().zip(fits))
@@ -2553,6 +2553,8 @@ pub(crate) fn job(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Re
     let named = |e: String| {
         if adaptive {
             e.replace("Pocket preview", "Adaptive clearing")
+                .replace("Pocket depth", "Adaptive clearing depth")
+                .replace("Pocket target", "Adaptive clearing target")
         } else {
             e
         }
@@ -6233,5 +6235,181 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    /// A Pocket of `op` and the same operation as an Adaptive clearing
+    /// (a load of a fifth of the cutter, a 2° helix), both simulated: the
+    /// Adaptive clearing removes what the Pocket does, within half a
+    /// percent, and the dexel stock it leaves is nowhere lower than the
+    /// Pocket's but where that is under the operation's target (the stock a
+    /// Pocket's rings stop short of over a lower floor, which is no part).
+    fn adaptive_as_pocket(name: &str, setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) {
+        let d = num(&tool.p, "diameter").unwrap();
+        let mut a = op.clone();
+        a.strategy = Strategy::Adaptive;
+        for (k, v) in [
+            ("optimal_load", format!("{}", 0.2 * d)),
+            ("minimum_radius", "0".into()),
+            ("tolerance", "0.01".into()),
+            ("ramp", "Helix".into()),
+            ("ramp_angle", "2".into()),
+        ] {
+            a.p.insert(k.into(), v);
+        }
+        let pocket = generate(setup, op, tool, mesh).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let adaptive = crate::adaptive::generate(setup, &a, tool, mesh)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(adaptive.strategy, Strategy::Adaptive);
+        assert!((pocket.target - adaptive.target).abs() < 0.001, "{name}");
+        let frame = crate::volume::Frame::new(setup, mesh);
+        let run = |plan: &Plan| {
+            let mut sim = Simulation::new(plan.clone());
+            sim.volume = Some(crate::volume::Volume::new(sim.plan.stock, frame));
+            sim.initial_volume = sim.volume.clone();
+            sim.frame = Some(frame);
+            sim.seek(1.);
+            (sim.volume.unwrap().removed_volume(), sim.stock)
+        };
+        let ((vp, sp), (va, sa)) = (run(&pocket), run(&adaptive));
+        assert!(
+            (va - vp).abs() <= 0.005 * vp,
+            "{name}: removed {va} vs {vp}"
+        );
+        for (k, (&a, &p)) in sa.heights.iter().zip(&sp.heights).enumerate() {
+            assert!(
+                a >= p.min(pocket.target) - 0.05,
+                "{name}: cell {k} at {a} under the Pocket's {p}"
+            );
+        }
+    }
+    /// An Adaptive clearing takes every selection a Pocket does and clears
+    /// it as the Pocket does (`adaptive_as_pocket`): floors round an island,
+    /// floors at several heights, a ledge open to a lower floor, an opening
+    /// left or cut through, terraces thinner than the stepdown, a rest pass
+    /// after a larger cutter, and holes picked by their walls: blind,
+    /// through, both, under a lip, a pocket with a slot down its wall, and
+    /// holes too narrow for the cutter, chamfered or not, whose stock is
+    /// cleared down to the rim.
+    #[test]
+    fn an_adaptive_clearing_clears_every_selection_a_pocket_does_as_it_does() {
+        let (setup, op, tool, mesh) = fixture();
+        adaptive_as_pocket("ring", &setup, &op, &tool, &mesh);
+        let (setup, mut op, tool, mesh, round, square, _) = plate(false);
+        let round = hole_walls(&setup, &mesh, round).unwrap();
+        let square = hole_walls(&setup, &mesh, square).unwrap();
+        op.p.insert("breakthrough".into(), "0.5".into());
+        for (name, ids) in [
+            ("blind hole", round.clone()),
+            ("through hole", square.clone()),
+            ("both holes", round.iter().chain(&square).copied().collect()),
+        ] {
+            pick(&mut op, &mesh, ids);
+            adaptive_as_pocket(name, &setup, &op, &tool, &mesh);
+        }
+        let (mut setup, mut op, mut tool, mesh, _, _, _) = plate(false);
+        setup.p.insert("stock_top".into(), "2".into());
+        tool.p.insert("diameter".into(), "8".into());
+        pick(
+            &mut op,
+            &mesh,
+            round.iter().chain(&square).copied().collect(),
+        );
+        adaptive_as_pocket("narrow holes", &setup, &op, &tool, &mesh);
+        let (mut setup, mut op, tool, mesh, _) = part(chamfered_hole(), &[], 8.);
+        setup.p.insert("stock_top".into(), "2".into());
+        let wall = (0..mesh.surfaces.len())
+            .find(|&id| is_wall(&setup, &mesh, id))
+            .unwrap();
+        pick(&mut op, &mesh, hole_walls(&setup, &mesh, wall).unwrap());
+        adaptive_as_pocket("narrow chamfered hole", &setup, &op, &tool, &mesh);
+        let (setup, mut op, tool, mesh, dz) = part(lipped(), &[], 2.);
+        let placement = Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        let bore = (0..mesh.surfaces.len())
+            .find(|&id| {
+                let c = placement
+                    .transform(mesh.surfaces[id].center)
+                    .map(|v| v / scale);
+                is_wall(&setup, &mesh, id) && (c[0] - 3.).abs() < 0.01 && c[2] - dz < 4.
+            })
+            .unwrap();
+        pick(&mut op, &mesh, hole_walls(&setup, &mesh, bore).unwrap());
+        op.p.insert("breakthrough".into(), "0.5".into());
+        adaptive_as_pocket("hole under a lip", &setup, &op, &tool, &mesh);
+        let (setup, mut op, mut tool, mesh, _) = part(pocket_with_slot(), &[], 1.);
+        tool.p.insert("length".into(), "8".into());
+        let placement = Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        let at = |x: f32, y: f32| {
+            (0..mesh.surfaces.len())
+                .find(|&id| {
+                    let c = placement
+                        .transform(mesh.surfaces[id].center)
+                        .map(|v| v / scale);
+                    is_wall(&setup, &mesh, id) && (c[0] - x).abs() < 0.01 && (c[1] - y).abs() < 0.01
+                })
+                .unwrap()
+        };
+        let walls = [at(0., 5.), at(-2., 0.)];
+        let ids = walls
+            .iter()
+            .flat_map(|&w| hole_walls(&setup, &mesh, w).unwrap())
+            .collect();
+        pick(&mut op, &mesh, ids);
+        adaptive_as_pocket("pocket and slot", &setup, &op, &tool, &mesh);
+        let (setup, op, tool, mesh, _) = part(stepped_pocket(), &[3., 1., -1.], 4.);
+        adaptive_as_pocket("floors at three heights", &setup, &op, &tool, &mesh);
+        let (setup, op, tool, mesh, _) = part(ledge(), &[3.], 6.);
+        adaptive_as_pocket("ledge", &setup, &op, &tool, &mesh);
+        let (setup, mut op, tool, mesh, _) = part(window(), &[0.], 2.);
+        adaptive_as_pocket("opening left", &setup, &op, &tool, &mesh);
+        op.p.insert("openings".into(), "Cut through".into());
+        op.p.insert("breakthrough".into(), "0.5".into());
+        adaptive_as_pocket("opening cut through", &setup, &op, &tool, &mesh);
+        let mut tris = vec![];
+        for (outer, inner, z) in [(15., 12., 6.), (12., 9., 3.), (9., 6., 2.7), (6., 4., 2.4)] {
+            for (x, y, xx, yy) in [
+                (-outer, -outer, outer, -inner),
+                (-outer, inner, outer, outer),
+                (-outer, -inner, -inner, inner),
+                (inner, -inner, outer, inner),
+            ] {
+                quad(&mut tris, x, y, xx, yy, z);
+            }
+        }
+        quad(&mut tris, -4., -4., 4., 4., 0.);
+        quad(&mut tris, -15., -15., 15., 15., -4.);
+        let (setup, mut op, tool, mesh, _) = part(tris, &[3., 2.7, 2.4, 0.], 2.);
+        op.p.insert("stepdown".into(), "4".into());
+        adaptive_as_pocket("terraces", &setup, &op, &tool, &mesh);
+        // The 20 × 16 mm pocket cleared to Z 2.5 by a Ø6 Pocket but in its
+        // corners, then by a Ø2.
+        let mut tris = vec![];
+        quad(&mut tris, -10., -8., 10., 8., 0.);
+        for (x, y, xx, yy) in [
+            (-15., -12., 15., -8.),
+            (-15., 8., 15., 12.),
+            (-15., -8., -10., 8.),
+            (10., -8., 15., 8.),
+        ] {
+            quad(&mut tris, x, y, xx, yy, 6.);
+        }
+        quad(&mut tris, -15., -12., 15., 12., -4.);
+        let (mut setup, mut op, mut tool, mesh, _) = part(tris, &[0.], 6.);
+        op.p.insert("stepdown".into(), "2".into());
+        let mut earlier = op.clone();
+        earlier.p.insert("bottom".into(), "2.5".into());
+        let frame = crate::volume::Frame::new(&setup, &mesh);
+        let mut sim = Simulation::new(generate(&setup, &earlier, &tool, &mesh).unwrap());
+        sim.volume = Some(crate::volume::Volume::new(sim.plan.stock, frame));
+        sim.initial_volume = sim.volume.clone();
+        sim.frame = Some(frame);
+        sim.seek(1.);
+        setup.preview_remaining = Some(std::sync::Arc::new(crate::rest::RestStock::new(
+            sim.volume.as_ref().unwrap(),
+            frame,
+        )));
+        tool.p.insert("diameter".into(), "2".into());
+        adaptive_as_pocket("rest after a larger cutter", &setup, &op, &tool, &mesh);
     }
 }
