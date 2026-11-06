@@ -2625,7 +2625,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Linking(2)),
         ),
         (_, "ramp") => (
-            "How the cutter enters material. Adaptive clearing on an imported part enters with a Helix or a Plunge where it cannot reach the material from the side; the sample also records a back-and-forth or profile ramp. Match the entry to the cutter's cutting capabilities.",
+            "How the cutter enters material. Adaptive clearing on an imported part enters with a Helix or a Plunge where it cannot reach the material from the side (a Helix with no room ramps round the wall); the sample also records a back-and-forth or profile ramp. Match the entry to the cutter's cutting capabilities.",
             "",
             Some(Ramp),
         ),
@@ -2735,7 +2735,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Allowance),
         ),
         (_, "axial_allowance") => (
-            "Material intentionally left on floors, in mm. A finishing operation removes it to reach the nominal depth. In a Pocket, floors closer together than this are cleared at the higher one's level, so the lower keeps up to this much more: never less than you set.",
+            "Material intentionally left on floors, in mm. A finishing operation removes it to reach the nominal depth. In a Pocket or an Adaptive clearing, floors closer together than this are cleared at the higher one's level, so the lower keeps up to this much more: never less than you set.",
             "",
             Some(Allowance),
         ),

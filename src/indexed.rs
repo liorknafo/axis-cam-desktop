@@ -3191,6 +3191,71 @@ pub(crate) mod tests {
     /// the stock's top to under both walls): drilled through both walls, out
     /// of the hole opposite, which no angle of the Drill has, as at A 30
     /// alone and as main drills it; A 90 cuts nothing for it (LIO-246).
+    /// A Pocket and an Adaptive clearing of a tube's radial hole at A 30
+    /// and 90, picked by its walls: each cuts it at the angle that turns it
+    /// up, A 30, to the same depth and inside the same outline.
+    #[test]
+    fn an_adaptive_clearing_cuts_a_hole_picked_at_several_angles_as_a_pocket_does() {
+        let mut cut = vec![];
+        for strategy in [
+            crate::model::Strategy::Pocket,
+            crate::model::Strategy::Adaptive,
+        ] {
+            let (mut doc, mesh) =
+                radial_doc("radial-tube", "30, 90", ("3.3", "60"), 14.3, |x, t| {
+                    (x - 20.).abs() < 2.2 && near(t, &[60.])
+                });
+            let mut tool = crate::model::Tool::new("Flat 2", "Flat end mill", "2");
+            for (k, v) in [("diameter", "2"), ("length", "50"), ("stickout", "60")] {
+                tool.p.insert(k.into(), v.into());
+            }
+            let op = &mut doc.setups[1].operations[0];
+            op.strategy = strategy;
+            op.tool = tool.id.clone();
+            for (k, v) in [
+                ("allowance", "0"),
+                ("axial_allowance", "0"),
+                ("optimal_load", "0.4"),
+                ("stepdown", "2"),
+            ] {
+                op.p.insert(k.into(), v.into());
+            }
+            doc.tools.push(tool);
+            let op = &doc.setups[1].operations[0];
+            assert!(holes_at_angles(op, &doc.setups[1]));
+            assert_eq!(
+                surface_issues(&doc, 1, op, Some(&mesh)),
+                Vec::<String>::new()
+            );
+            let sim = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap();
+            let cuts: Vec<&crate::simulation::Move> =
+                sim.plan.moves.iter().filter(|m| m.cutting_pass).collect();
+            assert!(cuts.iter().all(|m| m.a == Some(30.)), "{strategy:?}");
+            cut.push(cuts.iter().fold(
+                [f32::MAX, f32::MIN, f32::MAX, f32::MIN, f32::MAX],
+                |b, m| {
+                    [
+                        b[0].min(m.to[0]),
+                        b[1].max(m.to[0]),
+                        b[2].min(m.to[1]),
+                        b[3].max(m.to[1]),
+                        b[4].min(m.to[2]),
+                    ]
+                },
+            ));
+        }
+        let (pocket, adaptive) = (cut[0], cut[1]);
+        assert!(
+            (pocket[4] - adaptive[4]).abs() < 0.001,
+            "{pocket:?} {adaptive:?}"
+        );
+        for k in 0..4 {
+            assert!(
+                (pocket[k] - adaptive[k]).abs() < 0.05,
+                "{pocket:?} {adaptive:?}"
+            );
+        }
+    }
     #[test]
     fn a_tube_hole_over_a_hole_opposite_is_drilled_through_both_walls() {
         let (cuts, left, tips) = tube_drill("radial-tube", "30, 90", "60", |t| near(t, &[60.]));

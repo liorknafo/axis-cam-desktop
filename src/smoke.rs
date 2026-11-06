@@ -18551,6 +18551,13 @@ soft_max = 180.0
     }
     #[test]
     fn a_click_on_a_wall_picks_or_drops_its_whole_hole_in_a_pocket() {
+        for strategy in [Strategy::Pocket, Strategy::Adaptive] {
+            a_click_on_a_wall_picks_or_drops_its_whole_hole(strategy);
+        }
+    }
+    /// The same in a Pocket and in an Adaptive clearing, which pick holes
+    /// alike (`picks_holes`).
+    fn a_click_on_a_wall_picks_or_drops_its_whole_hole(strategy: Strategy) {
         // A pocket and a slot down its west wall (`pocket::pocket_with_slot`).
         let mut a = app();
         let mesh = crate::mesh::normalize(crate::pocket::pocket_with_slot()).unwrap();
@@ -18563,7 +18570,7 @@ soft_max = 180.0
         };
         let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
         let tool = a.doc.setup().operations[0].tool.clone();
-        a.doc.setup_mut().operations[0] = Operation::new(Strategy::Pocket, tool);
+        a.doc.setup_mut().operations[0] = Operation::new(strategy, tool);
         a.selected = Some(0);
         let mesh = a.imported_mesh.clone().unwrap();
         let setup = a.doc.setup().clone();
@@ -19121,36 +19128,198 @@ soft_max = 180.0
         let _ = a.update(Message::Surface(chamfer));
         assert_eq!(count(&a), 0);
         // `pocket::pocket_with_slot` with a Ø3 end mill: the 2 mm slot and
-        // the pocket's level down it are named, left uncut.
-        let mut a = pocket_app(crate::pocket::pocket_with_slot());
+        // the pocket's level down it are named, left uncut, in a Pocket and
+        // in an Adaptive clearing.
+        for strategy in [Strategy::Pocket, Strategy::Adaptive] {
+            let mut a = pocket_app(crate::pocket::pocket_with_slot());
+            a.doc.setup_mut().operations[0].strategy = strategy;
+            let id = a.operation().unwrap().tool.clone();
+            let tool = a.doc.tools.iter_mut().find(|t| t.id == id).unwrap();
+            tool.p.insert("type".into(), "Flat end mill".into());
+            tool.p.insert("diameter".into(), "3".into());
+            let setup = a.doc.setup().clone();
+            let mesh = a.imported_mesh.clone().unwrap();
+            let wall = |x: f32, y: f32| {
+                surface_at(&a, |id, c| {
+                    crate::pocket::is_wall(&setup, &mesh, id)
+                        && (c[0] - x).abs() < 0.01
+                        && (c[1] - y).abs() < 0.01
+                })
+            };
+            let (north, slot) = (wall(0., 5.), wall(-2., 0.));
+            let _ = a.update(Message::Surface(north));
+            let _ = a.update(Message::Surface(slot));
+            let warnings: Vec<String> = crate::ui::op_checks(&a)
+                .into_iter()
+                .filter(|c| !c.error && c.text.contains("too narrow for the Ø3"))
+                .map(|c| c.text)
+                .collect();
+            assert_eq!(warnings.len(), 2, "{warnings:?}");
+            assert!(warnings.iter().any(|w| w.starts_with("Part of the hole")));
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.starts_with("The hole") && w.contains("left uncut"))
+            );
+        }
+    }
+    #[test]
+    fn an_adaptive_clearing_picks_holes_chamfers_and_ramps_as_a_pocket_does_and_cuts_them() {
+        // `pocket::hole_plate` under 2 mm of stock: a Ø6 hole blind to Z 1
+        // and a 6 mm square one through, cleared adaptively.
+        let mut a = pocket_app(crate::pocket::hole_plate(false));
+        let op = &mut a.doc.setup_mut().operations[0];
+        op.strategy = Strategy::Adaptive;
+        for (k, v) in [
+            ("allowance", "0"),
+            ("axial_allowance", "0"),
+            ("optimal_load", "0.4"),
+        ] {
+            op.p.insert(k.into(), v.into());
+        }
+        a.doc.setup_mut().p.insert("stock_top".into(), "2".into());
         let id = a.operation().unwrap().tool.clone();
         let tool = a.doc.tools.iter_mut().find(|t| t.id == id).unwrap();
         tool.p.insert("type".into(), "Flat end mill".into());
-        tool.p.insert("diameter".into(), "3".into());
+        tool.p.insert("diameter".into(), "2".into());
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Tab("Geometry".into()));
+        if !a.picking {
+            let _ = a.update(Message::PickMode);
+        }
+        // Its holes are outlined while picking, and a click on a wall picks
+        // its whole hole, as in a Pocket.
+        assert_eq!(a.hole_outlines().len(), 2);
         let setup = a.doc.setup().clone();
         let mesh = a.imported_mesh.clone().unwrap();
-        let wall = |x: f32, y: f32| {
+        let wall = |x: f32| {
             surface_at(&a, |id, c| {
                 crate::pocket::is_wall(&setup, &mesh, id)
-                    && (c[0] - x).abs() < 0.01
-                    && (c[1] - y).abs() < 0.01
+                    && (c[0] - x).abs() < 3.01
+                    && c[1].abs() < 3.01
             })
         };
-        let (north, slot) = (wall(0., 5.), wall(-2., 0.));
-        let _ = a.update(Message::Surface(north));
-        let _ = a.update(Message::Surface(slot));
+        let (round, square) = (wall(-10.), wall(10.));
+        let _ = a.update(Message::Surface(round));
+        assert!(
+            a.status.starts_with("Picked the hole at X-10.00 Y0.00"),
+            "{}",
+            a.status
+        );
+        let _ = a.update(Message::Surface(square));
+        assert!(
+            a.status.starts_with("Picked the hole at X10.00 Y0.00"),
+            "{}",
+            a.status
+        );
+        assert_eq!(
+            a.operation().unwrap().surfaces.as_ref().unwrap().ids.len(),
+            28
+        );
+        assert!(a.hole_outlines().iter().all(|o| o.picked));
+        assert!(
+            crate::surface::issues(a.operation().unwrap(), a.doc.setup(), Some(&mesh)).is_empty()
+        );
+        // The square one goes through: its breakthrough is asked for.
+        let _ = a.update(Message::PickMode);
+        let _ = a.update(Message::Tab("Heights".into()));
+        shows(&a, &["Breakthrough · mm"]);
+        let _ = a.update(Message::Generate);
+        let sim = a.active_simulation().expect(&a.status);
+        assert_eq!(sim.plan.strategy, Strategy::Adaptive);
+        let dz = crate::stock::Placement::new(&mesh, Some(a.doc.setup()))
+            .bounds
+            .min[2]
+            / mesh.display_scale()
+            + 4.;
+        let cuts: Vec<[f32; 3]> = (sim.plan.moves.iter())
+            .filter(|m| m.cutting_pass)
+            .map(|m| m.to)
+            .collect();
+        // Each hole inside its walls: the round one to its floor at Z 1,
+        // the square one through the plate's bottom at Z −4.
+        assert!(
+            cuts.iter()
+                .any(|p| (p[2] - dz - 1.).abs() < 0.001 && p[0] < 0.)
+        );
+        assert!(cuts.iter().any(|p| p[2] - dz < -4. && p[0] > 0.));
+        for p in cuts.iter().filter(|p| p[2] - dz < 6.) {
+            let inside = if p[0] < 0. {
+                (p[0] + 10.).hypot(p[1]) <= 2. + 0.001
+            } else {
+                (p[0] - 10.).abs() <= 2.001 && p[1].abs() <= 2.001
+            };
+            assert!(inside, "{p:?}");
+        }
+        // A Ø8 cutter fits neither: the stock over each is cleared down to
+        // its rim, and the checks say so.
+        let tool = a.doc.tools.iter_mut().find(|t| t.id == id).unwrap();
+        tool.p.insert("diameter".into(), "8".into());
         let warnings: Vec<String> = crate::ui::op_checks(&a)
             .into_iter()
-            .filter(|c| !c.error && c.text.contains("too narrow for the Ø3"))
+            .filter(|c| !c.error && c.text.contains("too narrow for the Ø8"))
             .map(|c| c.text)
             .collect();
         assert_eq!(warnings.len(), 2, "{warnings:?}");
-        assert!(warnings.iter().any(|w| w.starts_with("Part of the hole")));
         assert!(
             warnings
                 .iter()
-                .any(|w| w.starts_with("The hole") && w.contains("left uncut"))
+                .all(|w| w.contains("cleared down to its rim")),
+            "{warnings:?}"
         );
+        let _ = a.update(Message::Generate);
+        let sim = a.active_simulation().expect(&a.status);
+        let cuts: Vec<[f32; 3]> = (sim.plan.moves.iter())
+            .filter(|m| m.cutting_pass)
+            .map(|m| m.to)
+            .collect();
+        assert!(cuts.iter().all(|p| p[2] - dz >= 6. - 0.001));
+        for x in [-10., 10.] {
+            assert!(
+                cuts.iter()
+                    .any(|p| (p[2] - dz - 6.).abs() < 0.001 && (p[0] - x).abs() <= 3.001)
+            );
+        }
+        // A click on a hole's chamfer picks the hole, as in a Pocket.
+        let mut a = pocket_app(crate::pocket::chamfered_hole());
+        a.doc.setup_mut().operations[0].strategy = Strategy::Adaptive;
+        let chamfer = surface_at(&a, |_, c| (c[2] - 9.5).abs() < 0.1 && c[0].hypot(c[1]) < 4.);
+        let _ = a.update(Message::Surface(chamfer));
+        assert_eq!(
+            a.operation().unwrap().surfaces.as_ref().unwrap().ids.len(),
+            24,
+            "{}",
+            a.status
+        );
+        assert!(a.status.starts_with("Picked the hole"), "{}", a.status);
+        // A click on a ramp no hole lies past picks the ramp, to clear in
+        // steps, in both.
+        let mut tris = vec![];
+        let quad = |tris: &mut Vec<[[f32; 3]; 3]>, x: f32, y: f32, xx: f32, yy: f32, z: f32| {
+            tris.push([[x, y, z], [xx, y, z], [xx, yy, z]]);
+            tris.push([[x, y, z], [xx, yy, z], [x, yy, z]]);
+        };
+        quad(&mut tris, -15., -6., -5., 6., 4.);
+        quad(&mut tris, 5., -6., 15., 6., 0.);
+        let (p, q, r, t) = ([-5., -6., 4.], [5., -6., 0.], [5., 6., 0.], [-5., 6., 4.]);
+        tris.extend([[p, q, r], [p, r, t]]);
+        quad(&mut tris, -15., -6., 15., 6., -4.);
+        for strategy in [Strategy::Pocket, Strategy::Adaptive] {
+            let mut a = pocket_app(tris.clone());
+            a.doc.setup_mut().operations[0].strategy = strategy;
+            let mesh = a.imported_mesh.clone().unwrap();
+            let ramp = (0..mesh.surfaces.len())
+                .find(|&i| (0.9..0.99).contains(&mesh.surfaces[i].normal[2]))
+                .unwrap();
+            let _ = a.update(Message::Surface(ramp));
+            assert_eq!(
+                a.operation().unwrap().surfaces.as_ref().unwrap().ids,
+                mesh.region_of(ramp),
+                "{strategy:?}: {}",
+                a.status
+            );
+        }
     }
     #[test]
     fn a_holes_remove_button_drops_that_hole_alone() {

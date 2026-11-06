@@ -1533,12 +1533,13 @@ pub struct FoundHoles {
     pub round: Vec<Option<cam::Hole>>,
 }
 /// Whether a click on a wall of the part picks its whole hole in `op`: a
-/// Pocket, a Contour, a Drill of the part's holes (not of the pins'), and
-/// an Internal groove's bore (a boss's wall it picks as a face).
+/// Pocket, an Adaptive clearing, a Contour, a Drill of the part's holes
+/// (not of the pins'), and an Internal groove's bore (a boss's wall it
+/// picks as a face).
 pub(crate) fn picks_holes(op: &Operation) -> bool {
     matches!(
         op.strategy,
-        Strategy::Pocket | Strategy::Contour | Strategy::Groove
+        Strategy::Pocket | Strategy::Adaptive | Strategy::Contour | Strategy::Groove
     ) || (op.strategy == Strategy::Drill && !op.drills_pin_holes())
 }
 /// Whether a click on the part picks the whole smooth face it lands on in
@@ -3857,9 +3858,10 @@ impl App {
             .hash(&mut hasher);
         hasher.finish()
     }
-    /// Which levels of the holes a Pocket's or Contour's walls pick its flat
-    /// end mill fits with its radial allowance (`pocket::Hole::fits`), and
-    /// how low a Pocket clears over each it fits none of: kept as
+    /// Which levels of the holes a Pocket's, Adaptive clearing's or
+    /// Contour's walls pick its flat end mill fits with its radial allowance
+    /// (`pocket::Hole::fits`), and how low a Pocket or an Adaptive clearing
+    /// clears over each it fits none of: kept as
     /// `pocket_holes` is, and until the tool, the allowances, the offsets or
     /// the setup change.
     pub(crate) fn pocket_fits(
@@ -3879,7 +3881,9 @@ impl App {
         self.holes_key(op, mesh).hash(&mut hasher);
         diameter.map(f32::to_bits).hash(&mut hasher);
         radial.map(f32::to_bits).hash(&mut hasher);
-        let pocket = op.strategy == Strategy::Pocket;
+        // A Pocket or an Adaptive clearing clears over a hole too narrow
+        // for its cutter; an inside Contour does not.
+        let pocket = matches!(op.strategy, Strategy::Pocket | Strategy::Adaptive);
         pocket.hash(&mut hasher);
         (get(&op.p, "bottom"), get(&op.p, "axial_allowance")).hash(&mut hasher);
         self.doc.setup().p.hash(&mut hasher);
@@ -5417,12 +5421,13 @@ impl App {
                         .is_some_and(|o| o.strategy == Strategy::Groove)
                         && wall
                         && pocket::hole_walls(&setup, mesh, n).is_err());
-                // A Pocket takes a sloped face no hole lies past, and the
-                // steep foot of one that picks no hole (a dome's), as a face
-                // to clear the stock over in steps (`pocket::slope_floors`).
+                // A Pocket or an Adaptive clearing takes a sloped face no
+                // hole lies past, and the steep foot of one that picks no
+                // hole (a dome's), as a face to clear the stock over in
+                // steps (`pocket::slope_floors`).
                 let pocket_op = self
                     .operation()
-                    .is_some_and(|o| o.strategy == Strategy::Pocket);
+                    .is_some_and(|o| matches!(o.strategy, Strategy::Pocket | Strategy::Adaptive));
                 let slope_face = pocket_op && pocket::in_sloped_face(&setup, mesh, n);
                 let near = (picks_holes && (sloped || slope_face))
                     .then(|| pocket::hole_near(&setup, mesh, n))
