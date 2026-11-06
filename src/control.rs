@@ -3419,6 +3419,12 @@ impl Connection {
                     } else if self.pi.is_some() {
                         let seq = self.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
                         (self.job_sent, self.job_name) = (Some((Instant::now(), seq)), name);
+                        // Where its steps end and how high to lift after one:
+                        // the Pi stops there if this computer is lost and no
+                        // computer takes control for its link-lost time.
+                        if let Driver::Remote(remote) = &self.driver {
+                            remote.step_ends(run.stop_ranges(), run.step_lift());
+                        }
                     }
                 }
             }
@@ -5249,11 +5255,13 @@ impl Connection {
             return;
         }
         match &link.stop_after {
-            StopAfter::Fired { line, program }
-                if program.is_some() && *program == self.job_name =>
-            {
+            StopAfter::Fired {
+                line,
+                program,
+                unattended,
+            } if program.is_some() && *program == self.job_name => {
                 run.stop_after = true;
-                run.stopped_on_pi(*line);
+                run.stopped_on_pi(*line, *unattended);
             }
             StopAfter::Armed { .. } => run.stop_after = true,
             _ if self

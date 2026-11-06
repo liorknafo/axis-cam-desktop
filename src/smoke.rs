@@ -2787,9 +2787,20 @@ flood = { pin = 8 }
     /// `dir`) onto a uc100-server on 127.0.0.1 running the simulator, this
     /// computer paired with it.
     fn to_pi(a: &mut App, dir: &std::path::Path) -> uc100_remote::Server {
+        to_pi_lost(a, dir, uc100_remote::server::LINK_LOST)
+    }
+
+    /// `to_pi`, the Pi stopping a tool run after a step `link_lost` after
+    /// this computer is lost.
+    fn to_pi_lost(
+        a: &mut App,
+        dir: &std::path::Path,
+        link_lost: std::time::Duration,
+    ) -> uc100_remote::Server {
         let server = uc100_remote::Server::start(uc100_remote::ServerOptions {
             data: dir.join("pi"),
             listen: "127.0.0.1:0".parse().unwrap(),
+            link_lost,
         })
         .unwrap();
         // The Pi runs its simulator: the profile asks it to.
@@ -2839,7 +2850,8 @@ flood = { pin = 8 }
     }
 
     /// The owner's case: a tool run sent to the Pi goes on and finishes while
-    /// this computer is disconnected, and closing the link does not
+    /// this computer is disconnected (for less than the Pi's link-lost
+    /// time, a minute), and closing the link does not
     /// disconnect the Pi's UC100 (no E-stop, no Disconnect). Connected again,
     /// the run follows it and takes the tool run as done.
     #[test]
@@ -3101,6 +3113,70 @@ flood = { pin = 8 }
         );
         assert!(!run_of(&a).done[1]);
         assert!(drill.steps.len() > 1);
+    }
+
+    /// The owner's heartbeat: this computer gone while the Drill drills,
+    /// nothing armed. Once no computer has controlled the machine for the
+    /// Pi's link-lost time, the Pi stops after a hole by itself, turns the
+    /// spindle off and lifts Z to the clearance plane this computer sent;
+    /// connected again, the run says why and goes on from the next hole.
+    #[test]
+    fn the_pi_stops_after_a_step_once_this_computer_is_lost_for_its_link_lost_time() {
+        use uc100::controller::State;
+        use uc100::gcode::Spindle;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        let server = to_pi_lost(&mut a, dir.path(), std::time::Duration::from_secs(1));
+        let drill = drilling(&mut a);
+        assert!(drill.steps.len() > 2);
+        assert!(!run_of(&a).stop_after);
+        let lift = run_of(&a).step_lift().expect("the clearance plane");
+        pi_until(&server, 5.0, "the spindle on", |s| {
+            s.spindle.is_some_and(|d| d != Spindle::Off)
+        });
+        let _ = a.update(Message::Disconnect);
+        pi_until(&server, 60.0, "the Pi's stop", |s| {
+            s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| !o.ok)
+        });
+        pi_until(&server, 5.0, "Z lifted to the clearance plane", |s| {
+            (s.machine_pos[2] - lift).abs() < 1e-3 && s.state == Some(State::Idle)
+        });
+        let s = server.snapshot().unwrap();
+        assert_eq!(s.spindle, Some(Spindle::Off));
+        assert!(
+            s.log.iter().any(|l| l.contains("stopped")),
+            "{:?}",
+            s.log.iter().rev().take(6).collect::<Vec<_>>()
+        );
+        // Connected again: stopped after a hole, and why; the next start is
+        // the hole after it.
+        let _ = a.update(Message::Connect);
+        run_until(&mut a, 10.0, "the outcome", |r| r.running.is_none());
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(
+            !ok && message.starts_with("Stopped after hole"),
+            "{message}"
+        );
+        assert!(
+            message.contains("no computer controlled the machine for a minute"),
+            "{message}"
+        );
+        assert!(!run_of(&a).done[1]);
+        let hole: usize = message["Stopped after hole ".len()..]
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|n| n.parse().ok())
+            .expect("the hole's number");
+        // Once the setup is checked again.
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((1, hole)), "{message}");
+        let journal = conn(&a).journal().expect("where it stopped");
+        assert_eq!(journal.step, Some(hole - 1));
+        assert!(
+            journal.why.contains("no computer in control"),
+            "{}",
+            journal.why
+        );
     }
 
     /// A tool run lost on the way to the Pi (the link failed as it

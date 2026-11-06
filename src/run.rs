@@ -270,6 +270,9 @@ pub struct Run {
     /// The step the driver was told to stop after (Stop sent at its end):
     /// its operation (index in the setup) and step.
     stopping: Option<(usize, usize)>,
+    /// The Pi made that stop with no computer in control (this one lost
+    /// for its link-lost time), and lifted Z itself.
+    unattended: bool,
     /// Where the last tool run stopped short, until the connection keeps it
     /// (`Connection::observe`): in the journal, and as the next start.
     pub stopped: Option<Stopped>,
@@ -464,6 +467,7 @@ impl Run {
             recheck: false,
             stop_after: false,
             stopping: None,
+            unattended: false,
             stopped: None,
             completed: false,
             project: doc.title.clone(),
@@ -885,6 +889,7 @@ impl Run {
             return;
         }
         let stopping = self.stopping.take();
+        let unattended = std::mem::take(&mut self.unattended);
         self.stop_after = false;
         let mut message = o.message.clone();
         if o.ok {
@@ -907,19 +912,19 @@ impl Run {
         } else if let Some((op, s)) = stopping {
             // Stopped after a step, the tool at its clearance: lifted to the
             // clearance plane once the machine stands still.
-            let up = self.checked().and_then(|c| c.get(r.index)).and_then(|p| {
-                let plane = clearance_plane(p.from(r.from).ok()?);
-                Some(match p.settings.machine_home {
-                    true => 0.,
-                    false => plane as f64 - p.datum[2] as f64 + r.offset[2],
-                })
-            });
+            let up = self.step_lift();
             message = format!("Stopped after {}", self.step_label(op, s));
+            if unattended {
+                message += ": no computer controlled the machine for a minute, so the Pi stopped there, lifted Z and turned the spindle off. Cycle Start goes on from the next step.";
+            }
             self.stopped = Some(Stopped {
                 op,
                 last: Some(s),
                 up,
-                why: "Stop after step".into(),
+                why: match unattended {
+                    true => "Stop after step: no computer in control for a minute".into(),
+                    false => "Stop after step".into(),
+                },
             });
         } else if o.message.contains("E-stop") || o.message.contains("E-STOP") {
             // In a step: it counts as not done.
@@ -1035,14 +1040,28 @@ impl Run {
         out
     }
 
+    /// The machine Z the tool is lifted to after Stop after step stops
+    /// the running tool run: its clearance plane (machine home's 0).
+    pub fn step_lift(&self) -> Option<f64> {
+        let r = self.running.as_ref()?;
+        let p = self.checked()?.get(r.index)?;
+        let plane = clearance_plane(p.from(r.from).ok()?);
+        Some(match p.settings.machine_home {
+            true => 0.,
+            false => plane as f64 - p.datum[2] as f64 + r.offset[2],
+        })
+    }
+
     /// The Pi stopped the running tool run after a step, at job line
-    /// `line`: the step it ends, for when its outcome comes.
-    pub fn stopped_on_pi(&mut self, line: u32) {
+    /// `line`: the step it ends, for when its outcome comes. `unattended`:
+    /// with no computer in control, after this one was lost.
+    pub fn stopped_on_pi(&mut self, line: u32, unattended: bool) {
         if self.stopping.is_none()
             && let Some((_, _, block)) = self.progress(Some(line))
         {
             self.stopping = self.step_end(block);
         }
+        self.unattended |= unattended && self.stopping.is_some();
     }
 
     /// The tool run just started never reached the machine (`why`): it is
@@ -4287,6 +4306,7 @@ mod tests {
             recheck: false,
             stop_after: false,
             stopping: None,
+            unattended: false,
             stopped: None,
             completed: false,
             project: String::new(),
