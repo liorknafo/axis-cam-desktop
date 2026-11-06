@@ -797,9 +797,17 @@ impl Run {
             left.filter(|l| self.checked().is_some() && (!l.after.is_empty() || l.last.is_some()));
         self.times = times.filter(|_| self.checked().is_some());
         self.pictures.clear();
-        // Where a run of this setup stopped: the start after it, while the
-        // program of its operation is the one it stopped in.
-        if let Some(j) = self.journal.take().filter(|_| self.checked().is_some()) {
+        self.take_journal();
+    }
+
+    /// Where a run of this setup stopped (`journal`), once it is checked:
+    /// the start after it, while the program of its operation is the one it
+    /// stopped in.
+    fn take_journal(&mut self) {
+        if self.checked().is_none() {
+            return;
+        }
+        if let Some(j) = self.journal.take() {
             let same = self
                 .op_steps(j.op)
                 .is_some_and(|s| s.fingerprint == j.fingerprint);
@@ -813,6 +821,52 @@ impl Run {
                 ));
             }
         }
+    }
+
+    /// Where a run of this setup stopped, found while it is open (the Pi
+    /// stopped a tool run this computer did not follow): its start is the
+    /// step after, now or once it is checked.
+    pub fn adopt_journal(&mut self, j: Journal) {
+        if self.running.is_none() && j.setup == self.setup_id {
+            self.journal = Some(j);
+            self.take_journal();
+        }
+    }
+
+    /// The journal of each stop Stop after step on the Pi can make in the
+    /// running tool run (`stop_ranges`, one range per step), the machine at
+    /// work system `wcs` and work `offset`: kept as it is sent, for when
+    /// the Pi stops it with this computer not following (closed and opened
+    /// again).
+    pub fn pi_stops(
+        &self,
+        wcs: usize,
+        offset: [f64; 6],
+    ) -> Vec<(std::ops::RangeInclusive<u32>, Journal)> {
+        let n = self.running_blocks().map_or(0, |b| b.len());
+        let mut ends: Vec<(std::ops::RangeInclusive<u32>, (usize, usize))> = vec![];
+        for block in 0..n {
+            let Some(step) = self.step_end(block) else {
+                continue;
+            };
+            // Job line n is block n - 1 (`progress`).
+            let line = block as u32 + 1;
+            match ends.last_mut() {
+                Some((r, s)) if *s == step && *r.end() + 1 == line => *r = *r.start()..=line,
+                _ => ends.push((line..=line, step)),
+            }
+        }
+        (ends.into_iter())
+            .filter_map(|(r, (op, s))| {
+                let st = Stopped {
+                    op,
+                    last: Some(s),
+                    up: None,
+                    why: "Stop after step".into(),
+                };
+                Some((r, self.journal_of(&st, wcs, offset)?))
+            })
+            .collect()
     }
 
     /// The journal of where this run stopped (`stopped`), the machine at

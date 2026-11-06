@@ -2486,6 +2486,28 @@ pub struct Connection {
     _nap: Option<uc100::macos::ActivityToken>,
 }
 
+/// The stops Stop after step on the Pi can make in the tool run last sent
+/// there, each with the journal of where it leaves the run
+/// (`Connection::send_tool_run`).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PiPending {
+    /// The job's name, as the Pi's `StopAfter::Fired` names its program.
+    job: String,
+    /// Job lines of each step's end, and the journal of a stop there.
+    stops: Vec<(std::ops::RangeInclusive<u32>, crate::run::Journal)>,
+}
+
+impl PiPending {
+    fn read(path: &Path) -> Option<Self> {
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    }
+
+    fn write(&self, path: &Path) -> Result<(), String> {
+        let text = serde_json::to_vec(self).map_err(|e| e.to_string())?;
+        std::fs::write(path, text).map_err(|e| e.to_string())
+    }
+}
+
 /// Why a probe whose program ended with the machine in `state`, not Idle
 /// or paused, set nothing: the driver takes SetWork in those two only.
 fn stopped_after(state: &Option<State>) -> String {
@@ -2854,6 +2876,93 @@ impl Connection {
     /// Sends `command` and says whether it went: across the network one the
     /// link cannot take now (down, or another computer in control) is
     /// dropped, with a note in `pi_note`.
+    /// Sends the tool run `job` of `run`. On the Pi it goes with where
+    /// its steps end and how high to lift after one: the Pi stops there if
+    /// this computer is lost and no computer takes control for its
+    /// link-lost time (a minute). Where each such stop leaves the run is
+    /// kept on disk first, for when this computer does not follow it
+    /// (`adopt_pi_stop`).
+    fn send_tool_run(&mut self, job: Command, run: &crate::run::Run) -> bool {
+        let (Driver::Remote(_), Command::Job { name, .. }) = (&self.driver, &job) else {
+            return self.try_send(job);
+        };
+        let s = &self.snapshot;
+        let pending = PiPending {
+            job: name.clone(),
+            stops: run.pi_stops(s.active_wcs, s.work_offset),
+        };
+        let path = self.pi_pending();
+        if let Err(e) = pending.write(&path) {
+            self.pi_note = Some(format!(
+                "Where a stop after a step would leave this tool run could not be kept: {e}."
+            ));
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.lose_next_job) {
+            return true;
+        }
+        let sent = match &self.driver {
+            Driver::Remote(remote) => remote.send_tool_run(job, run.stop_ranges(), run.step_lift()),
+            Driver::Local(_) => false,
+        };
+        if !sent {
+            let _ = std::fs::remove_file(&path);
+        }
+        sent
+    }
+
+    /// Where `send_tool_run` keeps the stops a tool run on the Pi can make.
+    fn pi_pending(&self) -> std::path::PathBuf {
+        self.journal.with_extension("pending.json")
+    }
+
+    /// A stop the Pi made after a step of a tool run this computer does not
+    /// follow (AXIS CAM closed and opened again meanwhile): where it left
+    /// the run, kept as the tool run was sent, becomes the journal, so the
+    /// start is the step after it.
+    fn adopt_pi_stop(&mut self) {
+        use uc100_remote::wire::StopAfter;
+        let Some(link) = &self.link else {
+            return;
+        };
+        if !link.live || self.run.as_ref().is_some_and(|r| r.running.is_some()) {
+            return;
+        }
+        let StopAfter::Fired {
+            line,
+            program: Some(program),
+            unattended,
+        } = &link.stop_after
+        else {
+            return;
+        };
+        let path = self.pi_pending();
+        let Some(pending) = PiPending::read(&path).filter(|p| &p.job == program) else {
+            return;
+        };
+        let _ = std::fs::remove_file(&path);
+        let Some((_, mut j)) = pending.stops.into_iter().find(|(r, _)| r.contains(line)) else {
+            return;
+        };
+        if *unattended {
+            j.why = "Stop after step: no computer in control for a minute".into();
+        }
+        j.time = crate::run::now();
+        if let Err(e) = j.write(&self.journal) {
+            self.pi_note = Some(format!("Where the Pi stopped could not be kept: {e}."));
+            return;
+        }
+        self.pi_note = Some(format!(
+            "The Pi stopped {program} after step {} of {} ({}): the start after it is picked.",
+            j.step.map_or(0, |s| s + 1),
+            j.op_name,
+            j.why
+        ));
+        if let Some(run) = &mut self.run {
+            run.adopt_journal(j);
+        }
+    }
+
     pub fn try_send(&mut self, command: Command) -> bool {
         #[cfg(test)]
         if matches!(command, Command::Job { .. }) && std::mem::take(&mut self.lose_next_job) {
@@ -2940,6 +3049,7 @@ impl Connection {
             self.send(Command::Stop);
         }
         self.keep_journal();
+        self.adopt_pi_stop();
         if let Some(st) = &self.snapshot.status {
             self.inputs.observe(self.opened.elapsed(), st);
         }
@@ -3408,7 +3518,7 @@ impl Connection {
                         Command::Job { name, .. } => Some(name.clone()),
                         _ => None,
                     };
-                    if !self.try_send(job) {
+                    if !self.send_tool_run(job, &run) {
                         let why = self
                             .pi_note
                             .clone()
@@ -3419,12 +3529,6 @@ impl Connection {
                     } else if self.pi.is_some() {
                         let seq = self.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
                         (self.job_sent, self.job_name) = (Some((Instant::now(), seq)), name);
-                        // Where its steps end and how high to lift after one:
-                        // the Pi stops there if this computer is lost and no
-                        // computer takes control for its link-lost time.
-                        if let Driver::Remote(remote) = &self.driver {
-                            remote.step_ends(run.stop_ranges(), run.step_lift());
-                        }
                     }
                 }
             }
@@ -5148,16 +5252,20 @@ impl Connection {
     /// (`run::Journal`), and after a Stop after step lifts the tool once the
     /// machine is Idle; a tool run ended done ends the journal.
     fn keep_journal(&mut self) {
+        let pending = self.pi_pending();
         let s = &self.snapshot;
         let Some(run) = &mut self.run else {
             return;
         };
         if std::mem::take(&mut run.completed) {
             let _ = std::fs::remove_file(&self.journal);
+            let _ = std::fs::remove_file(&pending);
         }
         let Some(st) = run.stopped.take() else {
             return;
         };
+        // Followed to its stop: what was kept for not following it is done.
+        let _ = std::fs::remove_file(&pending);
         self.z_up = st.up;
         if let Some(j) = run.journal_of(&st, s.active_wcs, s.work_offset)
             && let Err(e) = j.write(&self.journal)

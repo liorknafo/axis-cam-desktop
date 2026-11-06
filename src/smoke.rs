@@ -3179,6 +3179,69 @@ flood = { pin = 8 }
         );
     }
 
+    /// As above, but AXIS CAM closed and opened again while the Pi stops:
+    /// nothing of the run is left in memory. Connected again, where the Pi
+    /// stopped is found from what was kept as the tool run was sent, and
+    /// picking the setup starts it from the next hole.
+    #[test]
+    fn the_pi_stop_with_this_computer_lost_is_picked_up_after_axis_cam_opens_again() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        let server = to_pi_lost(&mut a, dir.path(), std::time::Duration::from_secs(1));
+        drilling(&mut a);
+        let _ = a.update(Message::Disconnect);
+        // Closed: the run kept for connecting back is gone with the app.
+        a.pi_run = None;
+        pi_until(&server, 60.0, "the Pi's stop", |s| {
+            s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| !o.ok)
+        });
+        let _ = a.update(Message::Connect);
+        assert!(conn(&a).run.is_none());
+        let mut deadline = Deadline::new(10.);
+        while conn(&a).journal().is_none() {
+            let _ = a.update(Message::Tick);
+            assert!(
+                deadline.within(&conn(&a).snapshot),
+                "where the Pi stopped never kept: {:?}",
+                conn(&a).pi_note
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let journal = conn(&a).journal().unwrap();
+        assert_eq!(journal.op, 1);
+        assert!(
+            journal.why.contains("no computer in control"),
+            "{}",
+            journal.why
+        );
+        let hole = journal.step.expect("a hole drilled") + 1;
+        assert!(
+            conn(&a)
+                .pi_note
+                .as_ref()
+                .is_some_and(|n| n.contains("the start after it is picked")),
+            "{:?}",
+            conn(&a).pi_note
+        );
+        // Picking the setup picks the next hole as the start, checked
+        // once for the setup, then again from that hole.
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(run_of(&a).programs.is_none() && problems(&a).len() == 1);
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((1, hole)));
+        assert!(run_of(&a).resumed.is_some());
+        shows(
+            &a,
+            &[
+                &format!("Start Drilling at hole {}", hole + 1),
+                "starts here",
+            ],
+        );
+    }
+
     /// A tool run lost on the way to the Pi (the link failed as it
     /// crossed): it never runs and no outcome comes, so after a few seconds
     /// with the link live it is put back, nothing having moved, and Cycle
