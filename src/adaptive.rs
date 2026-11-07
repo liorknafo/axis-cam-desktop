@@ -3578,4 +3578,95 @@ mod tests {
         assert_eq!(e.unwrap_err(), OUTSIDE);
         assert!(out.plan.moves.is_empty());
     }
+    /// The deepest any level move of `plan` cuts into what `before` and
+    /// its own moves before it left, swept over columns 0.1 mm apart, more
+    /// than 0.02 mm in from the cutter's edge: its fresh depth.
+    fn fresh_depth(
+        before: &[&crate::simulation::Plan],
+        plan: &crate::simulation::Plan,
+    ) -> (f32, [f32; 3]) {
+        let b = plan.stock;
+        let h = 0.1f32;
+        let nx = ((b.max[0] - b.min[0]) / h) as usize + 1;
+        let ny = ((b.max[1] - b.min[1]) / h) as usize + 1;
+        let mut top = vec![b.max[2]; nx * ny];
+        let mut worst = (0f32, [0f32; 3]);
+        for (last, p) in before.iter().map(|p| (false, *p)).chain([(true, plan)]) {
+            for m in p.moves.iter().filter(|m| m.motion == Motion::Feed) {
+                let r = p.radius;
+                let span = |a: f32, c: f32, lo: f32, n: usize| {
+                    let i0 = (((a.min(c) - r - lo) / h).floor().max(0.)) as usize;
+                    let i1 = (((a.max(c) + r - lo) / h).ceil() as usize).min(n - 1);
+                    i0..=i1
+                };
+                let (dx, dy) = (m.to[0] - m.from[0], m.to[1] - m.from[1]);
+                let l2 = dx * dx + dy * dy;
+                let flat = (m.to[2] - m.from[2]).abs() < 1e-4;
+                for j in span(m.from[1], m.to[1], b.min[1], ny) {
+                    for i in span(m.from[0], m.to[0], b.min[0], nx) {
+                        let (x, y) = (b.min[0] + i as f32 * h, b.min[1] + j as f32 * h);
+                        let t = if l2 > 0. {
+                            (((x - m.from[0]) * dx + (y - m.from[1]) * dy) / l2).clamp(0., 1.)
+                        } else {
+                            0.
+                        };
+                        let d = (x - m.from[0] - t * dx).hypot(y - m.from[1] - t * dy);
+                        let z = m.from[2] + t * (m.to[2] - m.from[2]);
+                        let c = &mut top[j * nx + i];
+                        if d <= r && z < *c {
+                            if last && flat && d <= r - 0.02 && *c - z > worst.0 {
+                                worst = (*c - z, [x, y, z]);
+                            }
+                            *c = z;
+                        }
+                    }
+                }
+            }
+        }
+        worst
+    }
+    /// The owner's TOTEM bottom (L), setup 1, as they saved it: its
+    /// Adaptive clearing (Ø3, 6 mm stepdown) after the Facing, as the job
+    /// runs it, its air taken out. Cut a band at a time it took 883 min;
+    /// deepest first, 205; and with a cut at Z16.225 taken out as air, its
+    /// level at Z12.90 cut 6.505 mm fresh at X−10.275 Y36.225. The project
+    /// is not ours to ship: point `AXIS_TOTEM_WORKSPACE` at a copy of its
+    /// saved workspace (its STEP where the workspace says) and run `cargo
+    /// test --release totem_bottoms_saved_adaptive -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn the_totem_bottoms_saved_adaptive_keeps_its_stepdown_and_its_time() {
+        let Ok(path) = std::env::var("AXIS_TOTEM_WORKSPACE") else {
+            eprintln!("skipped: set AXIS_TOTEM_WORKSPACE to the TOTEM bottom's saved workspace");
+            return;
+        };
+        let (mut doc, _) = crate::storage::load_reporting(std::path::Path::new(&path)).unwrap();
+        let mesh = mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
+        surface::settle_sloping_picks(&mut doc, &mesh);
+        let mut plans = vec![];
+        crate::simulation::sequence_with(
+            &doc,
+            &mesh,
+            None,
+            |s, o, r| {
+                if s == 0 && o < 2 {
+                    plans.push(r.unwrap().plan);
+                }
+            },
+            |_, _, _| {},
+        );
+        let (face, adaptive) = (&plans[0], &plans[1]);
+        assert_eq!(adaptive.strategy, Strategy::Adaptive);
+        let minutes = adaptive.duration / 60.;
+        eprintln!(
+            "{} levels, {} moves, {minutes:.1} min",
+            adaptive.levels,
+            adaptive.moves.len()
+        );
+        assert!(minutes < 300., "{minutes:.1} min");
+        let stepdown = num(&doc.setups[0].operations[1].p, "stepdown").unwrap();
+        let (depth, at) = fresh_depth(&[face], adaptive);
+        eprintln!("deepest fresh cut {depth:.4} mm at {at:?}");
+        assert!(depth <= stepdown + 0.001, "{depth} mm fresh at {at:?}");
+    }
 }
