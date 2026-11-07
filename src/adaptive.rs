@@ -1585,8 +1585,8 @@ type Ordered<'a> = (&'a pocket::Zone, pocket::Region, f32, Option<Vec<Polygon>>)
 /// 1 mm thick for a 6 mm stepdown, a band 0.3 mm thick round a Ø3 cutter's
 /// 10,000 mm² took 35 m of path, 883 min in all. So a run of bands each
 /// thinner than the stepdown, and the one under the last of them, are cut
-/// the other way about: the deepest first, from the run's first cutting
-/// height down by the stepdown, and each above it after, deepest first,
+/// the other way about: the deepest first, from the highest first cutting
+/// height in the run down by the stepdown, and each above it after, deepest first,
 /// from that same height, only outside the reach of those under it in the
 /// run. They have cleared what is there by then below its floor (their
 /// targets are lower), and a cutter where a zone's centres allow it is
@@ -1610,7 +1610,13 @@ fn nested(
     }
     let mut out = Vec::with_capacity(zones.len());
     for run in runs {
-        let top = zones[run.start].2;
+        // The highest any of them starts at: each zone's own first cutting
+        // height is where stock is left over it (earlier cuts, `pocket::
+        // zone_start`), and what is in a deeper zone's reach is now its own
+        // to cut from wherever any zone above it would have.
+        let top = (run.clone())
+            .map(|k| zones[k].2)
+            .fold(f32::NEG_INFINITY, f32::max);
         let mut deeper: Option<pocket::Region> = None;
         for k in run.clone().rev() {
             let (zone, centres, own) = &zones[k];

@@ -4897,6 +4897,80 @@ pub(crate) mod tests {
         assert!(over.len() <= 3, "levels over the square: {over:?}");
     }
     #[test]
+    fn thin_bands_of_pockets_left_at_different_heights_start_at_the_highest() {
+        // The review's: two pockets side by side, the left (floor Z 3)
+        // already cleared to its floor by a Pocket, the right (floor Z 0)
+        // untouched at the top, Z 6; an Adaptive clearing of both at a 4 mm
+        // stepdown with a Helix entry. The run of thin bands started at the
+        // first's height, Z 3: the right was fed straight down 3 mm into its
+        // stock and then cut 6 mm deep.
+        let mut tris = vec![];
+        quad(&mut tris, -15., -12., 15., -8., 6.);
+        quad(&mut tris, -15., 8., 15., 12., 6.);
+        quad(&mut tris, -15., -8., -12., 8., 6.);
+        quad(&mut tris, 12., -8., 15., 8., 6.);
+        quad(&mut tris, -2., -8., 2., 8., 6.);
+        quad(&mut tris, -12., -8., -2., 8., 3.);
+        quad(&mut tris, 2., -8., 12., 8., 0.);
+        quad(&mut tris, -15., -12., 15., 12., -4.);
+        let (mut setup, mut op, mut tool, mesh, dz) = part(tris, &[3., 0.], 2.);
+        tool.p.insert("length".into(), "12".into());
+        tool.p.insert("stickout".into(), "24".into());
+        op.strategy = Strategy::Adaptive;
+        for (k, v) in [
+            ("allowance", "0.3"),
+            ("stepdown", "4"),
+            ("optimal_load", "0.4"),
+            ("minimum_radius", "0"),
+            ("ramp", "Helix"),
+            ("ramp_angle", "2"),
+        ] {
+            op.p.insert(k.into(), v.into());
+        }
+        let frame = crate::volume::Frame::new(&setup, &mesh);
+        let stock = job(&setup, &op, &tool, &mesh).unwrap().stock;
+        let mut v = crate::volume::Volume::new(stock, frame);
+        let mut earlier = op.clone();
+        earlier.strategy = Strategy::Pocket;
+        earlier.p.insert("allowance".into(), "0".into());
+        let placement = Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        earlier.surfaces.as_mut().unwrap().ids.retain(|&i| {
+            (placement.transform(mesh.surfaces[i].center)[2] / scale - dz - 3.).abs() < 0.01
+        });
+        let before = generate(&setup, &earlier, &tool, &mesh).unwrap();
+        for m in before.moves.iter().filter(|m| m.motion == Motion::Feed) {
+            v.cut(
+                m.from,
+                m.to,
+                before.radius,
+                before.flute_length,
+                before.shape,
+                frame,
+                (0, 0),
+            );
+        }
+        setup.preview_remaining = Some(std::sync::Arc::new(crate::rest::RestStock::new(&v, frame)));
+        let plan = crate::adaptive::generate(&setup, &op, &tool, &mesh).unwrap();
+        // The first move into the right pocket's stock, under Z 6, is not
+        // fed straight down (a Helix was asked), and no level there is
+        // under Z 2 before one at Z 2 or over.
+        let right = |m: &&crate::simulation::Move| m.motion == Motion::Feed && m.to[0] > 2.;
+        let into = (plan.moves.iter().filter(right))
+            .find(|m| m.to[2] - dz < 6. - 0.01)
+            .unwrap();
+        let straight = (into.to[0] - into.from[0]).hypot(into.to[1] - into.from[1]) < 0.001;
+        assert!(!straight, "fed straight down into the stock: {into:?}");
+        let first = (plan.moves.iter().filter(right))
+            .find(|m| m.cutting_pass && (m.to[2] - m.from[2]).abs() < 1e-4)
+            .unwrap();
+        assert!(
+            first.to[2] - dz >= 2. - 0.001,
+            "first level in the right pocket at Z{}",
+            first.to[2] - dz
+        );
+    }
+    #[test]
     fn thin_terraces_do_not_clear_the_deep_floor_at_every_height() {
         let mut tris = vec![];
         // Three nested ledges 0.3 mm apart over a deeper square pocket.
