@@ -106,6 +106,8 @@ pub struct Running {
     tip: [f32; 3],
     /// The machine position it started from.
     start: [f64; 6],
+    /// `program_print` of what it sent.
+    print: u64,
     /// The block the tool tip is on and how far along it (`track`).
     on: Option<(usize, f32)>,
     /// The step of each of its blocks (`step_marks`).
@@ -315,8 +317,9 @@ pub struct Follow {
     /// The tool run (`Running::index`) and the operation it started at.
     pub index: usize,
     pub from: usize,
-    /// The tool runs done before it.
-    pub done: Vec<bool>,
+    /// Each tool run's, `program_print` of its whole program (no actions)
+    /// once done before it: done again only while it is unchanged.
+    pub done: Vec<Option<u64>>,
     /// The work offset it was sent with, and where the tool tip was then.
     pub offset: [f64; 6],
     pub tip: [f32; 3],
@@ -580,7 +583,7 @@ impl Run {
     /// follows it (`following`).
     pub fn follow_record(&self, name: &str) -> Option<Follow> {
         let r = self.running.as_ref()?;
-        let p = self.checked()?.get(r.index)?;
+        let programs = self.checked()?;
         Some(Follow {
             setup: self.setup_id.clone(),
             skips: self.skips.clone(),
@@ -588,11 +591,13 @@ impl Run {
             start_step: self.start_step,
             index: r.index,
             from: r.from,
-            done: self.done.clone(),
+            done: (programs.iter().zip(&self.done))
+                .map(|(p, &d)| d.then(|| program_print(p, 0, &[])).flatten())
+                .collect(),
             offset: r.offset,
             tip: r.tip,
             start: r.start,
-            program: self.sent_print(p, r.from, r.offset, r.start)?,
+            program: r.print,
             before: r.before.clone(),
             xy: self.xy,
             zero: self.zero.clone(),
@@ -617,12 +622,25 @@ impl Run {
             }
             None => return Err(why("the setup was not checked")),
         };
+        // As Cycle Start sent it: at the step it started at, if any.
+        let sent = |p: &Checked| {
+            let step = f
+                .start_step
+                .filter(|(oi, _)| p.indexes.get(f.from) == Some(oi));
+            let actions = self.job_actions(p, f.from, f.offset, f.start, step)?;
+            program_print(p, f.from, &actions)
+        };
         let p = (programs.get(f.index))
-            .filter(|p| {
-                f.done.len() == programs.len()
-                    && self.sent_print(p, f.from, f.offset, f.start) == Some(f.program)
-            })
+            .filter(|p| f.done.len() == programs.len() && sent(p) == Some(f.program))
             .ok_or_else(|| why("its setup's program has changed since it was sent"))?;
+        // A tool run done before it is done again only while unchanged.
+        let done: Vec<bool> = (programs.iter().zip(&f.done))
+            .map(|(p, d)| d.is_some() && *d == program_print(p, 0, &[]))
+            .collect();
+        let changed: Vec<String> = (f.done.iter().zip(&done).enumerate())
+            .filter(|(_, (was, now))| was.is_some() && !**now)
+            .map(|(i, _)| format!("{}", i + 1))
+            .collect();
         let blocks = p.from(f.from).map_err(|e| why(&e.join(" ")))?;
         let marks = self.marks_of(p, blocks);
         let running = Running {
@@ -635,10 +653,17 @@ impl Run {
             paths: paths(blocks, f.tip),
             tip: f.tip,
             start: f.start,
+            print: f.program,
             on: None,
             marks,
         };
-        (self.done, self.next, self.from) = (f.done, f.index, f.from);
+        if !changed.is_empty() {
+            self.journal_note = Some(format!(
+                "Tool run {} was done, but its program has changed since, so it is not shown done: run it again if it is to be cut as it is now.",
+                changed.join(", ")
+            ));
+        }
+        (self.done, self.next, self.from) = (done, f.index, f.from);
         (self.xy, self.zero, self.last) = (f.xy, f.zero, f.last);
         (self.running, self.outcome, self.journal) = (Some(running), None, None);
         Ok(f.name)
@@ -1662,7 +1687,9 @@ impl Run {
         let programs = self.checked()?;
         let (count, p) = (programs.len(), &programs[self.next]);
         let s = &c.snapshot;
-        let actions = self.job_actions(p, self.from, s.work_offset, s.machine_pos)?;
+        let actions =
+            self.job_actions(p, self.from, s.work_offset, s.machine_pos, self.at_step())?;
+        let print = program_print(p, self.from, &actions)?;
         // Where the tool tip is, in plan coordinates: the first retract's start.
         let tip =
             std::array::from_fn(|k| (s.machine_pos[k] - s.work_offset[k]) as f32 + p.datum[k]);
@@ -1692,6 +1719,7 @@ impl Run {
             paths,
             tip,
             start: s.machine_pos,
+            print,
             on: None,
             marks,
         });
@@ -1708,18 +1736,20 @@ impl Run {
     }
 
     /// What Cycle Start sends of tool run `p` from its operation `from`,
-    /// the machine at `start` with work offset `offset`.
+    /// the machine at `start` with work offset `offset`, starting at step
+    /// `step` (`at_step`).
     fn job_actions(
         &self,
         p: &Checked,
         from: usize,
         offset: [f64; 6],
         start: [f64; 6],
+        step: Option<(usize, usize)>,
     ) -> Option<Vec<Located>> {
         let mut actions = lower(p, from, offset, start).ok()?;
         // At a step, it waits over the step's entry with the spindle on,
         // after the rapids there, until Resume feeds in (LIO-275).
-        if let Some((oi, n)) = self.at_step()
+        if let Some((oi, n)) = step
             && let Some(line) = (p.from(from).ok()?.iter())
                 .position(|b| matches!(b, Block::Descend { .. }))
                 .map(|i| i as u32 + 1)
@@ -1741,18 +1771,6 @@ impl Run {
             );
         }
         Some(actions)
-    }
-
-    /// `program_print` of what Cycle Start sends of tool run `p` from its
-    /// operation `from`, the machine at `start` with work offset `offset`.
-    fn sent_print(
-        &self,
-        p: &Checked,
-        from: usize,
-        offset: [f64; 6],
-        start: [f64; 6],
-    ) -> Option<u64> {
-        program_print(p, from, &self.job_actions(p, from, offset, start)?)
     }
 
     /// The running tool run's program and where in it the machine is: the
@@ -4558,6 +4576,7 @@ mod tests {
                 paths: vec![],
                 tip: [0.; 3],
                 start: [0.; 6],
+                print: 0,
                 on: None,
                 marks: vec![],
             }),
@@ -4701,6 +4720,7 @@ mod tests {
             paths: vec![],
             tip: [0.; 3],
             start: [0.; 6],
+            print: 0,
             on: None,
             marks: vec![],
         });

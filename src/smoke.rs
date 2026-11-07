@@ -3425,8 +3425,108 @@ flood = { pin = 8 }
     #[test]
     fn a_drilling_at_another_speed_is_not_followed_after_axis_cam_opens_again() {
         edited_drilling_is_not_followed(|doc| {
-            doc.setups[0].operations[1].p.insert("rpm".into(), "1234".into());
+            doc.setups[0].operations[1]
+                .p
+                .insert("rpm".into(), "1234".into());
         });
+    }
+
+    /// Review finding: a single-tool Drilling started at its third hole,
+    /// paused on the Pi over that hole, AXIS CAM closed and opened again
+    /// with nothing changed: it is followed again, and Resume drills on to
+    /// its end, taken as done.
+    #[test]
+    fn a_start_at_a_hole_is_followed_again_after_axis_cam_opens_again() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        a.doc.setups[0].operations.remove(0);
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::Steps(Some(0))));
+        let _ = a.update(Message::Run(R::PickStep(0, 2)));
+        let _ = a.update(Message::Run(R::StartStep));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((0, 2)));
+        let _ = a.update(Message::Run(R::KeepZero));
+        let _ = a.update(Message::Run(R::KeepToolZ));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5., "the pause over hole 3", |s| {
+            matches!(s.state, Some(State::Paused(_)))
+        });
+        let _ = a.update(Message::Disconnect);
+        let mut a = reopen(a, dir.path());
+        // The project as read back from its file.
+        a.doc = serde_json::from_str(&serde_json::to_string(&a.doc).unwrap()).unwrap();
+        let _ = a.update(Message::Connect);
+        follow_again(&mut a).unwrap();
+        assert!(run_of(&a).running.is_some());
+        assert!(matches!(
+            server.snapshot().unwrap().state,
+            Some(State::Paused(_))
+        ));
+        let _ = a.update(Message::Run(R::Resume));
+        run_until(&mut a, 60.0, "the Drilling done", |r| r.done[0]);
+        assert_eq!(run_of(&a).outcome.as_ref().map(|o| o.0), Some(true));
+    }
+
+    /// The Facing done, the Drilling held on the Pi, AXIS CAM closed and
+    /// opened again, the Facing's speed changed meanwhile when `edit`:
+    /// followed again, the Drilling runs; the Facing is shown done only
+    /// while unchanged, and a note says why it is not.
+    fn facing_done_then_drilling_reopened(edit: bool) -> App {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(&mut a, 60., "the Facing done", |r| r.done[0]);
+        tick_until(&mut a, 5., "Idle", |s| s.state == Some(State::Idle));
+        let _ = a.update(Message::Run(R::Next(1)));
+        let _ = a.update(Message::Run(R::RecordReference));
+        let _ = a.update(Message::Run(R::ZFromReference));
+        tick_for(&mut a, 100);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5., "the Drilling on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        let _ = a.update(Message::Run(R::Hold));
+        pi_until(&server, 10., "Hold on the Pi", |s| {
+            s.state == Some(State::Hold)
+        });
+        let _ = a.update(Message::Disconnect);
+        let mut a = reopen(a, dir.path());
+        if edit {
+            let face = &mut a.doc.setups[0].operations[0];
+            face.p.insert("rpm".into(), "1234".into());
+        }
+        let _ = a.update(Message::Connect);
+        follow_again(&mut a).unwrap();
+        assert_eq!(run_of(&a).running.as_ref().map(|r| r.index), Some(1));
+        let _ = a.update(Message::Run(R::Stop));
+        pi_until(&server, 10., "stopped", |s| s.state == Some(State::Idle));
+        a
+    }
+
+    /// Review finding: a tool run done before the one followed again was
+    /// edited while AXIS CAM was closed. It is not shown done; unedited, it
+    /// is.
+    #[test]
+    fn a_tool_run_done_before_is_shown_done_after_reopening_only_while_unchanged() {
+        let a = facing_done_then_drilling_reopened(false);
+        assert!(run_of(&a).done[0], "the unchanged Facing not shown done");
+        assert!(run_of(&a).journal_note.is_none());
+        let a = facing_done_then_drilling_reopened(true);
+        assert!(!run_of(&a).done[0], "the edited Facing shown done");
+        let note = run_of(&a).journal_note.clone().unwrap_or_default();
+        assert!(note.starts_with("Tool run 1 was done"), "{note}");
     }
 
     /// The Facing tool run sent to the Pi, then AXIS CAM disconnected as
