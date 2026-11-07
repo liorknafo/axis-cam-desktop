@@ -2311,8 +2311,11 @@ pub fn build(
         if let Some(b) = base {
             kept_setups.push(b);
         }
+        // The CNC takes each orientation once; a hand machine may take one
+        // again, the stock coming back to it after the CNC.
         if base.is_none()
             && !angled
+            && number == 1
             && proposal.setups[..si].iter().any(|s| {
                 s.a_angles.is_none()
                     && s.orientation == proposed.orientation
@@ -5655,8 +5658,8 @@ pub(crate) mod tests {
             let message = said(edit);
             assert!(message.contains(expected), "{expected}: {message}");
         }
-        // One orientation per machine: the manual mill may face the top the
-        // CNC then machines, but the CNC may not take it twice.
+        // The manual mill may face the top the CNC then machines, but the
+        // CNC may not take an orientation twice.
         assert!(build(&doc, &mesh, &report, &milled(&report)).is_ok());
         let message = said(&|p| p.setups[2].orientation = "+Z".into());
         assert!(
@@ -5840,6 +5843,37 @@ pub(crate) mod tests {
             "{:?}",
             check.problems
         );
+    }
+    #[test]
+    fn the_stock_may_come_back_to_the_manual_mill_in_the_same_orientation() {
+        // Faced on the manual mill, machined on the CNC, then drilled from
+        // the same top on the manual mill again.
+        let (doc, mesh, report) = with_mill();
+        let mut plan = milled(&report);
+        let drill = drilled_by_hand(&report).setups.pop().unwrap();
+        plan.setups[1].operations.pop();
+        plan.setups.push(drill);
+        let (check, job) = crate::plan_check::check(&doc, &mesh, &report, &plan);
+        assert!(check.passed, "{:?}", check.problems);
+        let split = check.minutes_by_machine.unwrap();
+        assert_eq!(split.moving, 20., "{split:?}");
+        let job = job.unwrap();
+        let back = job.setups.last().unwrap();
+        assert!(crate::manual::is_manual(&back.machine));
+        // It starts from what the CNC left, its zero planned.
+        let cnc = &job.setups[job.setups.len() - 2];
+        assert_eq!(get(&back.p, "stock_source"), cnc.id);
+        assert_eq!(get(&back.p, "origin"), "Model origin");
+        // A change in the chat sees it and keeps it.
+        let again = analysis::report(&job, &mesh).unwrap();
+        let shown = shown(&job, &again);
+        assert_eq!(shown.setups.len(), plan.setups.len());
+        let numbers: Vec<_> = shown.setups.iter().map(|s| s.machine).collect();
+        assert_eq!(numbers.first(), Some(&Some(2)));
+        assert_eq!(numbers.last(), Some(&Some(2)));
+        let rebuilt = build(&job, &mesh, &again, &shown).unwrap();
+        let ids = |d: &Document| d.setups.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&rebuilt), ids(&job));
     }
     #[test]
     fn a_manual_mill_too_small_for_the_moves_is_refused() {

@@ -70,7 +70,7 @@ Let `u` be the first proposed setup on machine 1.
   - any other machine is the library entry, cloned.
   - Hand setups take no work offset of their own (the first, handed over, carries the user's, which no check reads). Only setups on machine 1 count against the six offsets.
   - A plan has at most 10 setups.
-- An orientation may be used once **per machine**: the manual mill may face the top that the CNC then machines from the same side.
+- An orientation may be used once **on the CNC**. A hand machine may use one again: the manual mill may face the top that the CNC then machines from the same side, and the stock may come back to the manual mill after the CNC on that side (review: astra round 1).
 - In each setup:
   - `Box` is refused off the manual mill.
   - On the manual mill, only `Box` and `Drill` are allowed. The Drill cycles `Helical milling` and `Thread milling` are refused there.
@@ -142,7 +142,7 @@ Decided while building phase 1 (7 November 2026):
   - A manual setup first takes the stock, orientation, zero and holding (only when the holding fits).
   - The user's setup then starts from it, keeps its id, offset, holder and stock fields, and has `stock_source` of the manual setup.
   - These are refused: a Box on the CNC; a Pocket on the manual mill; Helical milling on the manual mill; a tool or vise not on the machine; a CNC setup before the user's setup; no setup on machine 1; a manual setup first in another orientation.
-  - An orientation can be used once per machine.
+  - An orientation can be used once on the CNC; hand machines may repeat one.
   - The rpm on a hand machine is snapped to a gear.
 - **Describing a plan.** `describe` of a planned job with a manual setup in front shows it with `machine` and `box`. Building what `describe` shows keeps every setup and operation identical.
 - **Check.** A plan with a manual facing Box first passes every check. Its `manual_minutes` and `move_minutes` are in the check report, and `stocks[].work_zero` is right.
