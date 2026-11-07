@@ -7219,6 +7219,18 @@ impl App {
                         {
                             post::sync_pin_drilling(&mut self.doc, mesh);
                         }
+                        // A sloping face picked before its operation picked
+                        // holes: dropped when it faces down, else the hole
+                        // past it, as a click picks now.
+                        if self.doc.file.is_some()
+                            && let Some(mesh) = &self.imported_mesh
+                        {
+                            let notes = surface::settle_sloping_picks(&mut self.doc, mesh);
+                            if !notes.is_empty() {
+                                self.touch();
+                                self.status = with_notes("Saved model geometry restored.", &notes);
+                            }
+                        }
                         // Migrate legacy imported projects that stored sample
                         // feature IDs through the old viewport toggle.
                         if self.doc.file.is_some() {

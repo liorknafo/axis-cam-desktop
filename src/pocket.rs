@@ -948,6 +948,24 @@ pub struct Floor {
     /// reach down to.
     pub openings: Vec<(Region, f32)>,
 }
+/// Whether surface `id` is within 0.5° of facing up (`LEVEL`) but not flat
+/// (`FLAT`): its corners, as `setup` places the part, differ in height by
+/// more.
+pub fn tilted_floor(setup: &Setup, mesh: &Mesh, id: usize) -> bool {
+    let placement = Placement::new(mesh, Some(setup));
+    let scale = mesh.display_scale();
+    let up = mesh.surfaces.get(id).map_or(0., |s| {
+        crate::mesh::rotation(s.normal, placement.rotation())[2]
+    });
+    let (lo, hi) = (mesh.faces.iter())
+        .filter(|f| f.feature == Some(id))
+        .flat_map(|f| f.points.iter())
+        .map(|p| placement.transform(*p)[2] / scale)
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), z| {
+            (lo.min(z), hi.max(z))
+        });
+    up >= LEVEL && hi - lo > FLAT
+}
 /// The selected floor `ids` (mesh surfaces) as `setup` places the part.
 pub fn floor(
     setup: &Setup,
@@ -962,7 +980,20 @@ pub fn floor(
         .find(|f| f.feature.is_some_and(|id| ids.contains(&id)))
         .and_then(|f| f.points.first())
         .ok_or("The selected floor contains no triangles.")?;
-    let plane = placement.transform(*reference)[2] / scale;
+    // A face within 0.5° of level that is not flat (`FLAT`), on its own (as
+    // `job` groups it), is cleared to its highest corner: a CAD file's floor
+    // tilted a hair, never cut into, with at most its rise left on it.
+    let tilted = (ids.len() == 1)
+        .then(|| *ids.iter().next().unwrap())
+        .filter(|&id| tilted_floor(setup, mesh, id));
+    let plane = match tilted {
+        Some(id) => (mesh.faces.iter())
+            .filter(|f| f.feature == Some(id))
+            .flat_map(|f| f.points.iter())
+            .map(|p| placement.transform(*p)[2] / scale)
+            .fold(f32::NEG_INFINITY, f32::max),
+        None => placement.transform(*reference)[2] / scale,
+    };
     let mut floors = Vec::new();
     let mut obstacles = Vec::new();
     // Every face as placed, with its outline seen from above (None for a
@@ -975,7 +1006,7 @@ pub fn floor(
             .map(|p| placement.transform(*p).map(|v| v / scale))
             .collect();
         let selected = face.feature.is_some_and(|id| ids.contains(&id));
-        if selected && points.iter().any(|p| (p[2] - plane).abs() > 0.002) {
+        if selected && tilted.is_none() && points.iter().any(|p| (p[2] - plane).abs() > FLAT) {
             return Err("Pocket preview needs a flat floor perpendicular to setup Z. Reposition the part or select another floor.".into());
         }
         let mut p: Polygon = if selected {
@@ -1387,8 +1418,10 @@ pub fn sloped_faces(
             (sloped, level > rest)
         })
     };
-    (ids.into_iter())
+    let ids: Vec<usize> = (ids.into_iter())
         .filter(|&id| id < mesh.surfaces.len())
+        .collect();
+    let mut found: std::collections::HashSet<usize> = (ids.iter().copied())
         .filter(|&id| {
             let u = up(id);
             if (WALL..LEVEL).contains(&u) {
@@ -1398,8 +1431,98 @@ pub fn sloped_faces(
             let (sloped, level) = face(id);
             sloped && u > -0.001 && !(u >= LEVEL && level)
         })
-        .collect()
+        .collect();
+    // A rounded edge a CAD file gives as flat facets, each a face of its
+    // own, where they touch a selected sloped facet: its steep facets,
+    // leaning back from upright but steeper than `WALL`, are the slope's
+    // foot, unless they are a hole's walls (a drafted hole); and its facets
+    // within 0.5° of level but not flat (`FLAT`), or at the part's top,
+    // which no floor can be, are its crown.
+    let candidates: Vec<usize> = (ids.iter().copied())
+        .filter(|id| !found.contains(id) && (up(*id) >= STEEP))
+        .filter(|id| up(*id) < WALL || up(*id) >= LEVEL)
+        .collect();
+    if found.is_empty() || candidates.is_empty() {
+        return found;
+    }
+    let placement = crate::stock::Placement::new(mesh, Some(setup));
+    let scale = mesh.display_scale();
+    let corner = |p: [f32; 3]| p.map(|v| (v as f64 * 1e5).round() as i64);
+    let mut corners: std::collections::HashMap<usize, Vec<[i64; 3]>> = Default::default();
+    let mut heights: std::collections::HashMap<usize, (f32, f32)> = Default::default();
+    for f in &mesh.faces {
+        if let Some(id) = f.feature
+            && (found.contains(&id) || candidates.contains(&id))
+        {
+            corners
+                .entry(id)
+                .or_default()
+                .extend(f.points.iter().map(|&p| corner(p)));
+            let z = heights
+                .entry(id)
+                .or_insert((f32::INFINITY, f32::NEG_INFINITY));
+            for p in &f.points {
+                let h = placement.transform(*p)[2] / scale;
+                *z = (z.0.min(h), z.1.max(h));
+            }
+        }
+    }
+    // The part's top, where a level face is no floor (Facing faces it).
+    let top = placement.bounds.max[2] / scale - 0.001;
+    let mut more: Vec<usize> = (candidates.into_iter())
+        .filter(|&id| {
+            up(id) < WALL
+                || heights
+                    .get(&id)
+                    .is_some_and(|(lo, hi)| hi - lo > FLAT || *hi >= top)
+        })
+        .collect();
+    // A flat face at the part's top joins only where it touches a facet
+    // of the slope that is not one, so a whole top face picked beside the
+    // slope's top edge is still refused as no pocket floor ("Use Facing").
+    let mut sloping: std::collections::HashSet<[i64; 3]> = (found.iter())
+        .flat_map(|id| corners.get(id).into_iter().flatten().copied())
+        .collect();
+    let flat = |id: usize| heights.get(&id).is_some_and(|(lo, hi)| hi - lo <= FLAT);
+    // Whether each is a hole's wall, worked out once.
+    let mut hole: std::collections::HashMap<usize, bool> = Default::default();
+    loop {
+        let reached: std::collections::HashSet<[i64; 3]> = (found.iter())
+            .flat_map(|id| corners.get(id).into_iter().flatten().copied())
+            .collect();
+        let Some(i) = more.iter().position(|&id| {
+            let from = if up(id) >= LEVEL && flat(id) {
+                &sloping
+            } else {
+                &reached
+            };
+            corners
+                .get(&id)
+                .is_some_and(|c| c.iter().any(|c| from.contains(c)))
+                && (up(id) >= LEVEL
+                    || !*hole
+                        .entry(id)
+                        .or_insert_with(|| match hole_walls(setup, mesh, id) {
+                            Ok(_) => true,
+                            Err(e) => e == LEANING,
+                        }))
+        }) else {
+            break;
+        };
+        let id = more.swap_remove(i);
+        if !(up(id) >= LEVEL && flat(id)) {
+            sloping.extend(corners.get(&id).into_iter().flatten().copied());
+        }
+        found.insert(id);
+    }
+    found
 }
+/// The z of a unit normal a facet of a rounded edge leans back from
+/// upright by at least (about 3°): a steeper one is a wall.
+const STEEP: f32 = 0.05;
+/// How far apart in height a floor's corners may be, mm: `floor` refuses
+/// a selected face that is not flat to this.
+pub const FLAT: f32 = 0.002;
 /// Whether surface `id` is one a Pocket or an Adaptive clearing clears the
 /// stock over in steps (`sloped_faces`).
 pub fn in_sloped_face(setup: &Setup, mesh: &Mesh, id: usize) -> bool {
@@ -2621,19 +2744,29 @@ fn floor_job(
         })
         .collect();
     heights.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    // A level face that is not flat is a floor of its own (`floor`), so
+    // the flat ones beside it keep their own height.
+    let (tilted, heights): (Vec<_>, Vec<_>) = heights
+        .into_iter()
+        .partition(|&(_, id)| tilted_floor(setup, mesh, id));
     let mut groups: Vec<std::collections::HashSet<usize>> = vec![];
     let mut last = f32::INFINITY;
+    // Faces within half `FLAT` of the highest of a group are one floor, so
+    // every group is as flat as `floor` asks: two floors 0.01 mm apart (the
+    // TOTEM bottom's rim, at Z 19.394 and 19.404) are two.
     for (z, id) in heights {
-        if groups.is_empty() || last - z > 0.01 {
+        if groups.is_empty() || last - z > FLAT / 2. {
             groups.push(Default::default());
             last = z;
         }
         groups.last_mut().unwrap().insert(id);
     }
-    let floors = groups
+    groups.extend(tilted.into_iter().map(|(_, id)| [id].into_iter().collect()));
+    let mut floors = groups
         .iter()
         .map(|g| floor(setup, g, mesh))
         .collect::<Result<Vec<_>, _>>()?;
+    floors.sort_by(|a, b| b.plane.total_cmp(&a.plane));
     if floors.is_empty() && picked.is_empty() && sloped.is_empty() {
         return Err("The selected floor contains no triangles.".into());
     }
@@ -6411,5 +6544,357 @@ pub(crate) mod tests {
         )));
         tool.p.insert("diameter".into(), "2".into());
         adaptive_as_pocket("rest after a larger cutter", &setup, &op, &tool, &mesh);
+    }
+    /// `tris` extruded profiles as a CAD file gives them, each facet a CAD
+    /// face of its own (`tags`, one per triangle), set up as `part` does.
+    fn faceted(tris: Vec<[[f32; 3]; 3]>, tags: Vec<u32>) -> (Setup, Mesh, f32) {
+        let bottom = tris
+            .iter()
+            .flatten()
+            .map(|p| p[2])
+            .fold(f32::INFINITY, f32::min);
+        let mesh = mesh::normalize_faces(tris, Some(&tags)).unwrap();
+        let (mut setup, _, _, _) = fixture();
+        setup.preview_remaining = None;
+        let placement = Placement::new(&mesh, Some(&setup));
+        let dz = placement.bounds.min[2] / mesh.display_scale() - bottom;
+        (setup, mesh, dz)
+    }
+    /// The surfaces whose centres, as placed and less `dz`, `at` holds.
+    fn surfaces_at(
+        setup: &Setup,
+        mesh: &Mesh,
+        dz: f32,
+        at: impl Fn([f32; 3]) -> bool,
+    ) -> Vec<usize> {
+        let placement = Placement::new(mesh, Some(setup));
+        let scale = mesh.display_scale();
+        (0..mesh.surfaces.len())
+            .filter(|&id| {
+                let c = placement
+                    .transform(mesh.surfaces[id].center)
+                    .map(|v| v / scale);
+                at([c[0], c[1], c[2] - dz])
+            })
+            .collect()
+    }
+    /// A plate's top at Z 6 rounded down to a floor at Z 0 by four facets,
+    /// each a CAD face: a crown 0.3° off level, facets at 30° and 50°, and a
+    /// foot at 70°, steeper than a wall's limit. The top ends in a facet
+    /// 0.3 mm wide from X −0.3, 0.2° off level (flat to 0.001 mm), a CAD
+    /// face of its own. The x where
+    /// the crown and each facet after it begin.
+    fn rounded_rim() -> (Vec<[[f32; 3]; 3]>, Vec<u32>, [f32; 5]) {
+        let mut profile = vec![
+            (-15f32, 6f32),
+            (-0.3, 6.),
+            (0., 6. - 0.3 * 0.2f32.to_radians().tan()),
+        ];
+        for (width, degrees) in [(2f32, 0.3f32), (1.5, 30.), (1., 50.)] {
+            let &(x, z) = profile.last().unwrap();
+            profile.push((x + width, z - width * degrees.to_radians().tan()));
+        }
+        let &(x, z) = profile.last().unwrap();
+        profile.push((x + z / 70f32.to_radians().tan(), 0.));
+        profile.push((15., 0.));
+        let (tris, tags) = extruded(&profile);
+        let x = [
+            profile[2].0,
+            profile[3].0,
+            profile[4].0,
+            profile[5].0,
+            profile[6].0,
+        ];
+        (tris, tags, x)
+    }
+    /// `profile` (x, z) run 20 mm along Y, each segment a CAD face, over a
+    /// bottom at Z −4.
+    fn extruded(profile: &[(f32, f32)]) -> (Vec<[[f32; 3]; 3]>, Vec<u32>) {
+        let (mut tris, mut tags) = (vec![], vec![]);
+        for (k, w) in profile.windows(2).enumerate() {
+            let ((x0, z0), (x1, z1)) = (w[0], w[1]);
+            tris.push([[x0, -10., z0], [x1, -10., z1], [x1, 10., z1]]);
+            tris.push([[x0, -10., z0], [x1, 10., z1], [x0, 10., z0]]);
+            tags.extend([k as u32; 2]);
+        }
+        let mut bottom = vec![];
+        quad(
+            &mut bottom,
+            profile[0].0,
+            -10.,
+            profile[profile.len() - 1].0,
+            10.,
+            -4.,
+        );
+        for t in bottom {
+            tris.push([t[0], t[2], t[1]]);
+            tags.push(999);
+        }
+        (tris, tags)
+    }
+    /// `strategy`'s plan for `ids` with a Ø2 cutter and a 1 mm stepdown.
+    fn planned(
+        strategy: Strategy,
+        setup: &Setup,
+        mesh: &Mesh,
+        ids: &[usize],
+    ) -> Result<Plan, String> {
+        let (_, mut op, mut tool, _) = fixture();
+        op.strategy = strategy;
+        tool.p.insert("diameter".into(), "2".into());
+        op.surfaces = Some(surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: ids.to_vec(),
+        });
+        op.p.insert("stepdown".into(), "1".into());
+        assert!(surface::issues(&op, setup, Some(mesh)).is_empty());
+        if strategy == Strategy::Pocket {
+            generate(setup, &op, &tool, mesh)
+        } else {
+            crate::adaptive::generate(setup, &op, &tool, mesh)
+        }
+    }
+    #[test]
+    fn a_rounded_edge_given_as_facets_is_one_slope_its_steep_foot_and_crown_too() {
+        // On the TOTEM bottom (a STEP whose rounded rim is flat facets, each
+        // a CAD face) an Adaptive clearing of the rim was refused: its 66°
+        // foot was taken for a hole's wall ("selected only in part"), its
+        // crown, 0.49° off level, for a floor that is not flat, and three
+        // level facets on its top edge for floors at the part's top
+        // ("Select a recessed pocket floor").
+        let (tris, tags, x) = rounded_rim();
+        let (setup, mesh, dz) = faceted(tris, tags);
+        let band =
+            |a: f32, b: f32| surfaces_at(&setup, &mesh, dz, |c| c[0] > a && c[0] < b && c[2] > -1.);
+        let (crown, foot) = (band(x[0], x[1]), band(x[3], x[4]));
+        let slope = [
+            crown.clone(),
+            band(x[1], x[2]),
+            band(x[2], x[3]),
+            foot.clone(),
+        ]
+        .concat();
+        let (edge, plate, floor) = (band(-0.3, 0.), band(-15., -0.3), band(x[4], 15.));
+        assert_eq!(
+            (
+                crown.len(),
+                foot.len(),
+                slope.len(),
+                edge.len(),
+                plate.len(),
+                floor.len()
+            ),
+            (1, 1, 4, 1, 1, 1)
+        );
+        assert!(is_wall(&setup, &mesh, foot[0]));
+        let ids = [slope.as_slice(), &edge, &floor].concat();
+        let steps = sloped_faces(&setup, &mesh, ids.iter().copied());
+        let top = [slope.as_slice(), &edge].concat();
+        assert!(
+            top.iter().all(|id| steps.contains(id)),
+            "{steps:?} of {top:?}"
+        );
+        assert!(!steps.contains(&floor[0]));
+        // Alone, the foot, the crown and the edge are no slope: a wall, a
+        // level face, a level face at the top.
+        assert!(sloped_faces(&setup, &mesh, [foot[0], crown[0], edge[0]]).is_empty());
+        // The plate's top past the edge touches no sloped facet: it is no
+        // slope, and no pocket floor.
+        let all = [ids.as_slice(), &plate].concat();
+        assert!(!sloped_faces(&setup, &mesh, all.iter().copied()).contains(&plate[0]));
+        for strategy in [Strategy::Pocket, Strategy::Adaptive] {
+            let plan = planned(strategy, &setup, &mesh, &ids);
+            let plan = plan.unwrap_or_else(|e| panic!("{strategy:?}: {e}"));
+            assert!(plan.levels > 1, "{strategy:?}: {} levels", plan.levels);
+            let e = planned(strategy, &setup, &mesh, &all)
+                .err()
+                .unwrap_or_default();
+            assert!(e.contains("Use Facing"), "{strategy:?}: {e}");
+        }
+    }
+    #[test]
+    fn a_floor_tilted_a_hair_is_cleared_to_its_highest_corner() {
+        // On the TOTEM bottom a floor face 0.49° off level, 0.0104 mm higher
+        // at one corner (within the 0.5° that counts as level), beside a
+        // flat floor, and two floors 0.01 mm apart, were refused: "needs a
+        // flat floor perpendicular to setup Z".
+        let rise = 4. * 0.3f32.to_radians().tan();
+        let profile = [
+            (-15., 6.),
+            (-5., 6.),
+            (-5., 0.),
+            (2., 0.),
+            (2., 0.01),
+            (6., 0.01),
+            (6., 0.),
+            (10., rise),
+            (10., 6.),
+            (15., 6.),
+        ];
+        let (tris, tags) = extruded(&profile);
+        let (setup, mesh, dz) = faceted(tris, tags);
+        let floor_at = |a: f32, b: f32| {
+            surfaces_at(&setup, &mesh, dz, |c| {
+                c[0] > a && c[0] < b && c[2] > -1. && c[2] < 1.
+            })
+        };
+        let (flat, higher, tilted) = (floor_at(-5., 2.), floor_at(2., 6.), floor_at(6., 10.));
+        assert_eq!((flat.len(), higher.len(), tilted.len()), (1, 1, 1));
+        assert!(tilted_floor(&setup, &mesh, tilted[0]));
+        assert!(!tilted_floor(&setup, &mesh, flat[0]));
+        let one = |id: usize| {
+            floor(&setup, &[id].into_iter().collect(), &mesh)
+                .unwrap()
+                .plane
+        };
+        assert!(
+            (one(tilted[0]) - dz - rise).abs() < 0.0005,
+            "{}",
+            one(tilted[0])
+        );
+        assert!((one(flat[0]) - dz).abs() < 0.0005);
+        assert!((one(higher[0]) - dz - 0.01).abs() < 0.0005);
+        let ids = [flat.as_slice(), &higher, &tilted].concat();
+        for strategy in [Strategy::Pocket, Strategy::Adaptive] {
+            let plan = planned(strategy, &setup, &mesh, &ids);
+            let plan = plan.unwrap_or_else(|e| panic!("{strategy:?}: {e}"));
+            // Down to the flat floor, and into the tilted one, under the Ø2
+            // cutter's edge, by no more than a floor takes of the part over
+            // it (0.01 mm, `floor`'s `above`): the floor 0.01 mm up beside
+            // it runs on over its low end.
+            assert!(
+                (plan.target - dz).abs() < 0.0005,
+                "{strategy:?}: {}",
+                plan.target
+            );
+            let face = |x: f32| dz + ((x + 1.).min(10.) - 6.).max(0.) * 0.3f32.to_radians().tan();
+            let into = (plan.moves.iter())
+                .filter(|m| m.to[0] > 5. && m.to[0] < 10.)
+                .map(|m| face(m.to[0]) - m.to[2])
+                .fold(f32::NEG_INFINITY, f32::max);
+            assert!(into <= 0.0105, "{strategy:?}: {into} mm into it");
+        }
+    }
+    #[test]
+    fn a_drafted_holes_walls_beside_its_chamfer_stay_the_holes() {
+        // A hole 3° off upright, chamfered at its mouth, each facet a CAD
+        // face: its walls lean back like a rounded edge's foot, but they are
+        // the hole's.
+        let at = |r: f32, i: usize, z: f32| {
+            let t = (15. * i as f32).to_radians();
+            [r * t.cos(), r * t.sin(), z]
+        };
+        let (mut tris, mut tags) = (vec![], vec![]);
+        for i in 0..24 {
+            for (k, (r0, z0, r1, z1)) in [
+                (3., -4., 3.5, 5.),
+                (3.5, 5., 4.5, 6.),
+                (4.5, 6., 10., 6.),
+                (10., 6., 10., -4.),
+                (10., -4., 3., -4.),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (a, b) = (at(r0, i, z0), at(r0, i + 1, z0));
+                let (c, d) = (at(r1, i, z1), at(r1, i + 1, z1));
+                tris.extend([[a, d, b], [a, c, d]]);
+                tags.extend([(k * 24 + i) as u32; 2]);
+            }
+        }
+        let (setup, mesh, dz) = faceted(tris, tags);
+        let walls = surfaces_at(&setup, &mesh, dz, |c| {
+            c[0].hypot(c[1]) < 3.6 && c[2] > -3. && c[2] < 4.
+        });
+        let chamfer = surfaces_at(&setup, &mesh, dz, |c| (c[2] - 5.5).abs() < 0.1);
+        assert_eq!((walls.len(), chamfer.len()), (24, 24));
+        assert!(walls.iter().all(|&w| is_wall(&setup, &mesh, w)));
+        let steps = sloped_faces(&setup, &mesh, walls.iter().chain(&chamfer).copied());
+        assert!(chamfer.iter().all(|id| steps.contains(id)));
+        assert!(walls.iter().all(|id| !steps.contains(id)), "{steps:?}");
+    }
+    /// A hole Ø4 down from the top at Z 6 to Z 3, wider below (Ø6 from
+    /// Z 2), joined by a cone facing down: a screw's head pocket cut from
+    /// under the plate. Its faces face out of the part.
+    fn undercut_hole() -> Vec<[[f32; 3]; 3]> {
+        let at = |r: f32, i: usize, z: f32| {
+            let t = (15. * i as f32).to_radians();
+            [r * t.cos(), r * t.sin(), z]
+        };
+        let mut tris = vec![];
+        for i in 0..24 {
+            for (r0, z0, r1, z1) in [
+                (3., -4., 3., 2.),
+                (3., 2., 2., 3.),
+                (2., 3., 2., 6.),
+                (2., 6., 10., 6.),
+                (10., 6., 10., -4.),
+                (10., -4., 3., -4.),
+            ] {
+                let (a, b) = (at(r0, i, z0), at(r0, i + 1, z0));
+                let (c, d) = (at(r1, i, z1), at(r1, i + 1, z1));
+                tris.extend([[a, d, b], [a, c, d]]);
+            }
+        }
+        tris
+    }
+    #[test]
+    fn sloping_faces_saved_before_holes_were_picked_are_settled_on_load() {
+        // The owner's TOTEM bottom: an Adaptive clearing saved before it
+        // picked holes held one facet of a screw hole's cone, which faces
+        // down, and was refused: "Surface 2039 is not perpendicular to setup
+        // Z". Facing down, no cutter from above reaches it: it is dropped.
+        let (setup, mut op, _, mesh, dz) = part(undercut_hole(), &[], 2.);
+        let cone = surfaces_at(&setup, &mesh, dz, |c| (c[2] - 2.5).abs() < 0.1);
+        let top = surfaces_at(&setup, &mesh, dz, |c| (c[2] - 6.).abs() < 0.01);
+        assert_eq!((cone.len(), top.len()), (24, 1), "{cone:?} {top:?}");
+        op.surfaces.as_mut().unwrap().ids = top.clone();
+        op.strategy = Strategy::Adaptive;
+        op.surfaces.as_mut().unwrap().ids.push(cone[0]);
+        let refused = surface::issues(&op, &setup, Some(&mesh));
+        assert!(
+            refused.iter().any(|e| e.contains("not perpendicular")),
+            "{refused:?}"
+        );
+        let mut doc = crate::model::Document {
+            setups: vec![setup.clone()],
+            ..Default::default()
+        };
+        doc.setups[0].operations = vec![op.clone()];
+        let notes = surface::settle_sloping_picks(&mut doc, &mesh);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains(&format!("surface {} faces down", cone[0] + 1)),
+            "{notes:?}"
+        );
+        let settled = &doc.setups[0].operations[0];
+        assert_eq!(settled.surfaces.as_ref().unwrap().ids, top);
+        assert!(surface::issues(settled, &setup, Some(&mesh)).is_empty());
+        // Settled once, nothing is left to settle.
+        assert!(surface::settle_sloping_picks(&mut doc, &mesh).is_empty());
+        // A hole's chamfer, facing up, saved in a Contour: the hole past it
+        // is picked, as a click on the chamfer picks it.
+        let outward = chamfered_hole()
+            .into_iter()
+            .map(|t| [t[0], t[2], t[1]])
+            .collect();
+        let (setup, mut op, _, mesh, dz) = part(outward, &[], 2.);
+        let chamfer = surfaces_at(&setup, &mesh, dz, |c| {
+            (c[2] - 5.5).abs() < 0.1 && c[0].hypot(c[1]) < 4.
+        });
+        op.strategy = Strategy::Contour;
+        op.surfaces.as_mut().unwrap().ids = vec![chamfer[0]];
+        assert!(!surface::issues(&op, &setup, Some(&mesh)).is_empty());
+        let mut doc = crate::model::Document {
+            setups: vec![setup.clone()],
+            ..Default::default()
+        };
+        doc.setups[0].operations = vec![op];
+        let notes = surface::settle_sloping_picks(&mut doc, &mesh);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("now pick that hole"), "{notes:?}");
+        let ids = &doc.setups[0].operations[0].surfaces.as_ref().unwrap().ids;
+        assert_eq!(*ids, hole_near(&setup, &mesh, chamfer[0]).unwrap().unwrap());
+        assert!(surface::issues(&doc.setups[0].operations[0], &setup, Some(&mesh)).is_empty());
     }
 }

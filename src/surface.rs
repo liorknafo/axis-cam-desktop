@@ -255,6 +255,97 @@ pub fn connected(mesh: &Mesh, ids: &[usize]) -> Vec<Vec<usize>> {
     groups
 }
 
+/// Settles each sloping face (a screw hole's cone, a chamfer, a fillet)
+/// that an operation which picks holes (`picks_holes`) still holds from
+/// before it picked them, and which `issues` refuses as "not perpendicular
+/// to setup Z". One facing down, under the part where no cutter from above
+/// reaches, is dropped: the operation cuts nothing of it. One facing up is
+/// swapped for the walls of the hole past it (`pocket::hole_near`), as a
+/// click on it picks now; with no hole past it, it stays and is still
+/// refused. Returns a note for each operation changed, of each kind.
+pub fn settle_sloping_picks(doc: &mut crate::model::Document, mesh: &Mesh) -> Vec<String> {
+    let mut notes = vec![];
+    for setup in &mut doc.setups {
+        let angles = crate::stock::Placement::new(mesh, Some(setup)).rotation();
+        let mut operations = std::mem::take(&mut setup.operations);
+        for operation in &mut operations {
+            if !crate::picks_holes(operation) || !operation.needs_surfaces() {
+                continue;
+            }
+            let Some(selection) = operation.surfaces.as_ref().filter(|s| s.matches(mesh)) else {
+                continue;
+            };
+            let steps = if matches!(
+                operation.strategy,
+                crate::model::Strategy::Pocket | crate::model::Strategy::Adaptive
+            ) {
+                crate::pocket::sloped_faces(setup, mesh, selection.ids.iter().copied())
+            } else {
+                Default::default()
+            };
+            let up = |id: usize| rotation(mesh.surfaces[id].normal, angles)[2];
+            let sloping: Vec<usize> = (selection.ids.iter().copied())
+                .filter(|&id| {
+                    id < mesh.surfaces.len()
+                        && (crate::pocket::WALL..crate::pocket::LEVEL).contains(&up(id).abs())
+                        && !steps.contains(&id)
+                })
+                .collect();
+            let mut ids = selection.ids.clone();
+            let (mut down, mut holes) = (vec![], vec![]);
+            for id in sloping {
+                if up(id) < 0. {
+                    ids.retain(|&i| i != id);
+                    down.push((id + 1).to_string());
+                    continue;
+                }
+                let Some(Ok(walls)) = crate::pocket::hole_near(setup, mesh, id) else {
+                    continue;
+                };
+                let hole = crate::pocket::holes(setup, &walls.iter().copied().collect(), mesh)
+                    .ok()
+                    .and_then(|h| h.first().map(|h| h.centre()))
+                    .map_or("a hole".to_string(), |(x, y)| {
+                        format!("the hole at X{x:.2} Y{y:.2}")
+                    });
+                ids.retain(|&i| i != id && !walls.contains(&i));
+                ids.extend(walls);
+                if !holes.contains(&hole) {
+                    holes.push(hole);
+                }
+            }
+            let plural = |n: usize| if n == 1 { "surface" } else { "surfaces" };
+            if !down.is_empty() {
+                notes.push(format!(
+                    "{}: {} {} {} down, under the part where no cutter from above reaches, so {} no longer selected.",
+                    operation.name(),
+                    plural(down.len()),
+                    down.join(", "),
+                    if down.len() == 1 { "faces" } else { "face" },
+                    if down.len() == 1 { "it is" } else { "they are" },
+                ));
+            }
+            if !holes.is_empty() {
+                notes.push(format!(
+                    "{}: sloping faces picked inside {} now pick {}, as a click there does.",
+                    operation.name(),
+                    holes.join(" and "),
+                    if holes.len() == 1 {
+                        "that hole"
+                    } else {
+                        "those holes"
+                    },
+                ));
+            }
+            if let Some(selection) = operation.surfaces.as_mut() {
+                selection.ids = ids;
+            }
+        }
+        setup.operations = operations;
+    }
+    notes
+}
+
 pub fn issues(operation: &Operation, setup: &Setup, mesh: Option<&Mesh>) -> Vec<String> {
     if !operation.strategy.imported_preview() {
         return vec![operation.strategy.availability().into()];

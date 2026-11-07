@@ -1059,6 +1059,7 @@ impl Level<'_> {
                 points.push(p);
             }
             points.extend(around);
+            let points = held(exact, &w.edges, points);
             if ramp {
                 self.link(start, exact, true, &mut first);
                 self.events.push(Event::Ramp(points.clone()));
@@ -1511,6 +1512,22 @@ fn runs(cells: &Cells, outline: &[(f64, f64)]) -> Vec<(usize, usize, usize)> {
     out
 }
 
+/// `path` from its first point, less each point the step to it from the
+/// last one kept would leave `exact` (its edges `edges`) on the way to:
+/// the centres' outline can hold a needle of no width that `exact`, the
+/// centres grown by half the margin, has none of (along a rounded edge a
+/// CAD file gives as facets, where the offsets' outlines cross), and the
+/// walls' pass goes straight past it, inside, instead of out along it.
+fn held(exact: &[Polygon], edges: &Edges, path: Vec<P>) -> Vec<P> {
+    let mut kept: Vec<P> = Vec::with_capacity(path.len());
+    for p in path {
+        match kept.last() {
+            Some(&last) if !within(exact, edges, last, p) || !pocket::inside(exact, p) => {}
+            _ => kept.push(p),
+        }
+    }
+    kept
+}
 struct Heights {
     z: f32,
     previous: f32,
@@ -3357,5 +3374,34 @@ mod tests {
         eprintln!("removed: {rough:.0} mm³ roughing, {both:.0} mm³ with the finishing");
         assert!(rough > 0.8 * both, "{rough} of {both} mm³");
         assert_eq!(left.last(), Some(&0), "{left:?}");
+    }
+    #[test]
+    fn the_walls_pass_goes_past_a_needle_its_region_has_none_of() {
+        // On the TOTEM bottom's faceted rim the tool centres at one level had
+        // a needle 0.008 mm wide and 0.23 mm long whose outlines crossed, so
+        // the region the walls' pass is held to (the centres grown by half
+        // the margin) had none of it: the pass walked out along it and the
+        // operation was refused ("would leave the pocket's allowed region").
+        let exact: Vec<Polygon> = vec![vec![(0., 0.), (10., 0.), (10., 10.), (0., 10.)]];
+        let edges = Edges::new(&exact, 3.);
+        let path = vec![
+            (5., 0.01),
+            (9.99, 0.01),
+            (9.99, 9.99),
+            (0.01, 9.99),
+            (0.01, 5.004),
+            (-0.5, 5.),
+            (0.01, 4.996),
+            (0.01, 0.01),
+            (5., 0.01),
+        ];
+        assert!(!inside(&exact, &edges, &path));
+        let kept = held(&exact, &edges, path.clone());
+        assert!(inside(&exact, &edges, &kept));
+        assert_eq!(kept.len(), path.len() - 1);
+        assert!(!kept.contains(&(-0.5, 5.)));
+        // A path inside is kept whole.
+        let inner: Vec<P> = path.iter().copied().filter(|p| p.0 >= 0.).collect();
+        assert_eq!(held(&exact, &edges, inner.clone()), inner);
     }
 }
