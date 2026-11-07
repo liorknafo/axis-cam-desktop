@@ -5879,6 +5879,29 @@ flood = { pin = 8 }
         let _ = a.view();
         render_png(&a, size, &out.join("8-across-z-no-stock.png"));
     }
+    /// Pictures of the Import from path field: empty under the bar of a
+    /// blank project, and saying why a path names no file.
+    #[test]
+    #[ignore]
+    fn render_the_import_from_path_field() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/import-path-app".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        let size = iced::Size::new(1440., 900.);
+        let _ = a.update(Message::NewProject);
+        let _ = a.view();
+        render_png(&a, size, &out.join("1-blank-project.png"));
+        let _ = a.update(Message::ImportPathOpen(true));
+        let _ = a.view();
+        render_png(&a, size, &out.join("2-field-open.png"));
+        let _ = a.update(Message::ImportPath("/Users/you/parts/bracket.step".into()));
+        let _ = a.update(Message::ImportFromPath);
+        let _ = a.view();
+        render_png(&a, size, &out.join("3-no-such-file.png"));
+    }
     /// Pictures of a hole's outline under the pointer seen from above, on
     /// the outline and in the opening, and of the hole picked by a click.
     #[test]
@@ -18881,6 +18904,109 @@ soft_max = 180.0
             (Page::Work, "preview-cube", 1)
         );
         assert_eq!(a.doc.file.as_ref().unwrap().path, path);
+    }
+    /// A path pasted as people paste one names the file: in quotes, with a
+    /// Terminal's escaped spaces, as a file:// link or from ~.
+    #[test]
+    fn a_typed_path_names_the_model_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("my part.STL");
+        std::fs::write(&part, "solid x\nendsolid x\n").unwrap();
+        let whole = part.display().to_string();
+        for typed in [
+            whole.clone(),
+            format!("  {whole}\n"),
+            format!("\"{whole}\""),
+            format!("'{whole}'"),
+            whole.replace(' ', "\\ "),
+            format!("file://{}", whole.replace(' ', "%20")),
+        ] {
+            assert_eq!(crate::typed_model_path(&typed), Ok(part.clone()), "{typed}");
+        }
+        if let Some(home) = dirs::home_dir()
+            && let Ok(rest) = part.strip_prefix(&home)
+        {
+            let typed = format!("~/{}", rest.display());
+            assert_eq!(crate::typed_model_path(&typed), Ok(part.clone()));
+        }
+        // Each wrong path says what is wrong with it.
+        let notes = std::fs::write(dir.path().join("notes.txt"), "x");
+        notes.unwrap();
+        for (typed, says) in [
+            ("".to_string(), "Type or paste"),
+            ("parts/bracket.step".into(), "not a whole path"),
+            ("\\".into(), "not a whole path"),
+            ("\\\\".into(), "not a whole path"),
+            ("/no/such/part.step\\".into(), "There is no file"),
+            ("/no/such\\ part.step".into(), "There is no file"),
+            (
+                dir.path().join("gone.step").display().to_string(),
+                "There is no file",
+            ),
+            (dir.path().display().to_string(), "is a folder"),
+            (
+                dir.path().join("notes.txt").display().to_string(),
+                "not a model file",
+            ),
+        ] {
+            let e = crate::typed_model_path(&typed).unwrap_err();
+            assert!(e.contains(says), "{typed}: {e}");
+        }
+    }
+    /// Import from path loads the file as the browser's import does, and
+    /// the field closes once the part is in; a wrong path stays to correct.
+    #[tokio::test]
+    async fn importing_from_a_typed_path_loads_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        a.page = Page::Work;
+        let _ = a.update(Message::ImportPathOpen(true));
+        assert!(a.import_path_open);
+        let _ = a.update(Message::ImportPath("/no/such/part.step".into()));
+        let _ = a.update(Message::ImportFromPath);
+        assert!(!a.import_busy);
+        assert!(a.import_path_open);
+        assert!(
+            a.import_path_error
+                .as_ref()
+                .unwrap()
+                .contains("There is no file")
+        );
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/preview-cube.obj");
+        let _ = a.update(Message::ImportPath(format!("\"{}\"", path.display())));
+        assert_eq!(a.import_path_error, None);
+        let _ = a.update(Message::ImportFromPath);
+        assert!(a.import_busy);
+        let loaded = crate::load_model_file(crate::typed_model_path(&a.import_path).unwrap()).await;
+        let _ = a.update(Message::FileImported(Some(loaded)));
+        assert!(!a.import_busy);
+        assert!(!a.import_path_open);
+        assert!(a.import_path.is_empty());
+        assert!(a.imported_mesh.is_some());
+        let file = a.doc.file.as_ref().unwrap();
+        assert_eq!(
+            (file.name.as_str(), file.format.as_str(), &file.path),
+            ("preview-cube.obj", "obj", &path)
+        );
+        assert_eq!((a.page, a.doc.title.as_str()), (Page::Work, "preview-cube"));
+        // A file that fails to load says why under the field.
+        let bad = dir.path().join("broken.step");
+        std::fs::write(&bad, "not a step file").unwrap();
+        let _ = a.update(Message::ImportPathOpen(true));
+        let _ = a.update(Message::ImportPath(bad.display().to_string()));
+        let _ = a.update(Message::ImportFromPath);
+        let _ = a.update(Message::FileImported(Some(Err(
+            "The file is not a STEP file.".into(),
+        ))));
+        assert!(a.import_path_open);
+        assert_eq!(
+            a.import_path_error.as_deref(),
+            Some("The file is not a STEP file.")
+        );
+        // Esc hides the field.
+        let _ = a.update(Message::EscapeKey);
+        assert!(!a.import_path_open);
     }
     #[tokio::test]
     async fn a_close_that_stops_waiting_deletes_through_the_signing_out_client() {
