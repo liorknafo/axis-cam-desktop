@@ -138,6 +138,12 @@ impl Bits {
             *a &= b;
         }
     }
+    /// Clear the bits set in `other`.
+    fn and_not(&mut self, other: &Bits) {
+        for (a, b) in self.bits.iter_mut().zip(&other.bits) {
+            *a &= !b;
+        }
+    }
 }
 
 /// Where a zone's cells lie: cell (i, j) has its centre at
@@ -1241,10 +1247,11 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     if zones.is_empty() {
         return Err("No finite adaptive motion could be generated.".into());
     }
+    let zones = nested(zones, r, stepdown)?;
     let highest = zones.iter().map(|z| z.2).fold(f32::NEG_INFINITY, f32::max);
     let total_levels: usize = zones
         .iter()
-        .map(|(zone, _, top)| ((top - zone.target - 0.0001) / stepdown).ceil().max(1.) as usize)
+        .map(|(zone, _, top, _)| ((top - zone.target - 0.0001) / stepdown).ceil().max(1.) as usize)
         .sum();
     if total_levels > 1000 {
         return Err("Adaptive clearing exceeds 1,000 depth levels. Increase the stepdown.".into());
@@ -1284,7 +1291,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     let approach = (highest + num(&op.p, "retract").unwrap_or(0.)).min(job.retract);
     let clearance = job.clearance;
     let mut placed = false;
-    for (zone, centres, cutting_top) in zones {
+    for (zone, centres, cutting_top, deeper_reach) in zones {
         // Cells a quarter of the load wide, at most a sixth of the radius,
         // and few enough for the grid.
         let reach_by = r - margin;
@@ -1397,6 +1404,8 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
         // The walls, each with the material on the walker's side:
         // Clipper's outlines run anticlockwise and its holes clockwise,
         // the free area on their left.
+        // What the deeper zones' reach holds, cleared by them (`nested`).
+        let deeper = deeper_reach.as_ref().map(|d| walk.cells.raster(d));
         let mut walls: Vec<Polygon> = centres.clone().into();
         if side < 0. {
             for wall in &mut walls {
@@ -1419,6 +1428,11 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
                         material.clear(j, i0, i1);
                     }
                 }
+            }
+            // What a deeper zone nested in this one took from the top
+            // already (`nested`).
+            if let Some(deeper) = &deeper {
+                material.and_not(deeper);
             }
             let mut level_walk = Level {
                 walk: &walk,
@@ -1471,6 +1485,15 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     if out.plan.moves.is_empty() || !out.plan.duration.is_finite() {
         return Err("No material is left for this adaptive clearing to cut.".into());
     }
+    // Every level's cuts hold up the levels after it (the next a stepdown
+    // down, and a band over a deeper zone that its walker counts cleared,
+    // `nested`): air is taken out of them only where it is proven clear,
+    // as of a Pocket's support pass (`air`). Without that, a cut at Z16.2
+    // on the TOTEM bottom's rim, found air, was taken out, and the level
+    // under it cut 6.5 mm fresh at a 6 mm stepdown.
+    out.plan.keep_air = (out.plan.moves.iter())
+        .map(|m| m.motion == Motion::Feed && m.cutting_pass && m.from[2] == m.to[2])
+        .collect();
     Ok(out.plan)
 }
 
@@ -1558,6 +1581,71 @@ fn held(exact: &[Polygon], edges: &Edges, path: Vec<P>, most: f64) -> Result<Vec
         i = j + 1;
     }
     Ok(kept)
+}
+/// A zone as `nested` orders it: its allowed centres, its first cutting
+/// height, and the reach of the deeper zones that clear what it would of it.
+type Ordered<'a> = (&'a pocket::Zone, pocket::Region, f32, Option<Vec<Polygon>>);
+/// `zones` (each with its allowed centres and first cutting height), highest
+/// first as `pocket::banded` makes them, in the order they are cleared, each
+/// with the reach (centres grown by the cutter's radius `r`) of the zones
+/// that clear what it would of that. A band at a time, each floor's height
+/// a level over the whole pocket, bands thinner than the `stepdown` cost a
+/// whole pass each for a sliver: on the TOTEM bottom's rim, 20 bands 0.24 to
+/// 1 mm thick for a 6 mm stepdown, a band 0.3 mm thick round a Ø3 cutter's
+/// 10,000 mm² took 35 m of path, 883 min in all. So a run of bands each
+/// thinner than the stepdown, and the one under the last of them, are cut
+/// the other way about: the deepest first, from the highest first cutting
+/// height in the run down by the stepdown, and each above it after, deepest first,
+/// from that same height, only outside the reach of those under it in the
+/// run. They have cleared what is there by then below its floor (their
+/// targets are lower), and a cutter where a zone's centres allow it is
+/// clear of the part at any height over that zone's floor. Bands at least
+/// a stepdown thick are cut a band at a time over all their pocket, as
+/// before: floors side by side 2 mm apart at a 2 mm stepdown in 4 levels,
+/// not 9.
+fn nested(
+    zones: Vec<(&pocket::Zone, pocket::Region, f32)>,
+    r: f64,
+    stepdown: f32,
+) -> Result<Vec<Ordered<'_>>, String> {
+    let mut runs: Vec<std::ops::Range<usize>> = vec![];
+    let mut start = 0;
+    for k in 0..zones.len() {
+        let thin = zones[k].2 - zones[k].0.target < stepdown - 0.0001;
+        if !thin || k + 1 == zones.len() {
+            runs.push(start..k + 1);
+            start = k + 1;
+        }
+    }
+    let mut out = Vec::with_capacity(zones.len());
+    for run in runs {
+        // The highest any of them starts at: each zone's own first cutting
+        // height is where stock is left over it (earlier cuts, `pocket::
+        // zone_start`), and what is in a deeper zone's reach is now its own
+        // to cut from wherever any zone above it would have.
+        let top = (run.clone())
+            .map(|k| zones[k].2)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut deeper: Option<pocket::Region> = None;
+        for k in run.clone().rev() {
+            let (zone, centres, own) = &zones[k];
+            let alone = run.len() == 1;
+            out.push((
+                *zone,
+                centres.clone(),
+                if alone { *own } else { top },
+                deeper.clone().map(Vec::<Polygon>::from),
+            ));
+            let reach = centres.inflate(r, JoinType::Round, EndType::Polygon, 2.);
+            deeper = Some(match deeper {
+                Some(d) => {
+                    union::<Milli>(d, reach, FillRule::NonZero).map_err(|e| e.to_string())?
+                }
+                None => reach,
+            });
+        }
+    }
+    Ok(out)
 }
 struct Heights {
     z: f32,
@@ -3489,5 +3577,96 @@ mod tests {
         );
         assert_eq!(e.unwrap_err(), OUTSIDE);
         assert!(out.plan.moves.is_empty());
+    }
+    /// The deepest any level move of `plan` cuts into what `before` and
+    /// its own moves before it left, swept over columns 0.1 mm apart, more
+    /// than 0.02 mm in from the cutter's edge: its fresh depth.
+    fn fresh_depth(
+        before: &[&crate::simulation::Plan],
+        plan: &crate::simulation::Plan,
+    ) -> (f32, [f32; 3]) {
+        let b = plan.stock;
+        let h = 0.1f32;
+        let nx = ((b.max[0] - b.min[0]) / h) as usize + 1;
+        let ny = ((b.max[1] - b.min[1]) / h) as usize + 1;
+        let mut top = vec![b.max[2]; nx * ny];
+        let mut worst = (0f32, [0f32; 3]);
+        for (last, p) in before.iter().map(|p| (false, *p)).chain([(true, plan)]) {
+            for m in p.moves.iter().filter(|m| m.motion == Motion::Feed) {
+                let r = p.radius;
+                let span = |a: f32, c: f32, lo: f32, n: usize| {
+                    let i0 = (((a.min(c) - r - lo) / h).floor().max(0.)) as usize;
+                    let i1 = (((a.max(c) + r - lo) / h).ceil() as usize).min(n - 1);
+                    i0..=i1
+                };
+                let (dx, dy) = (m.to[0] - m.from[0], m.to[1] - m.from[1]);
+                let l2 = dx * dx + dy * dy;
+                let flat = (m.to[2] - m.from[2]).abs() < 1e-4;
+                for j in span(m.from[1], m.to[1], b.min[1], ny) {
+                    for i in span(m.from[0], m.to[0], b.min[0], nx) {
+                        let (x, y) = (b.min[0] + i as f32 * h, b.min[1] + j as f32 * h);
+                        let t = if l2 > 0. {
+                            (((x - m.from[0]) * dx + (y - m.from[1]) * dy) / l2).clamp(0., 1.)
+                        } else {
+                            0.
+                        };
+                        let d = (x - m.from[0] - t * dx).hypot(y - m.from[1] - t * dy);
+                        let z = m.from[2] + t * (m.to[2] - m.from[2]);
+                        let c = &mut top[j * nx + i];
+                        if d <= r && z < *c {
+                            if last && flat && d <= r - 0.02 && *c - z > worst.0 {
+                                worst = (*c - z, [x, y, z]);
+                            }
+                            *c = z;
+                        }
+                    }
+                }
+            }
+        }
+        worst
+    }
+    /// The owner's TOTEM bottom (L), setup 1, as they saved it: its
+    /// Adaptive clearing (Ø3, 6 mm stepdown) after the Facing, as the job
+    /// runs it, its air taken out. Cut a band at a time it took 883 min;
+    /// deepest first, 205; and with a cut at Z16.225 taken out as air, its
+    /// level at Z12.90 cut 6.505 mm fresh at X−10.275 Y36.225. The project
+    /// is not ours to ship: point `AXIS_TOTEM_WORKSPACE` at a copy of its
+    /// saved workspace (its STEP where the workspace says) and run `cargo
+    /// test --release totem_bottoms_saved_adaptive -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn the_totem_bottoms_saved_adaptive_keeps_its_stepdown_and_its_time() {
+        let Ok(path) = std::env::var("AXIS_TOTEM_WORKSPACE") else {
+            eprintln!("skipped: set AXIS_TOTEM_WORKSPACE to the TOTEM bottom's saved workspace");
+            return;
+        };
+        let (mut doc, _) = crate::storage::load_reporting(std::path::Path::new(&path)).unwrap();
+        let mesh = mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
+        surface::settle_sloping_picks(&mut doc, &mesh);
+        let mut plans = vec![];
+        crate::simulation::sequence_with(
+            &doc,
+            &mesh,
+            None,
+            |s, o, r| {
+                if s == 0 && o < 2 {
+                    plans.push(r.unwrap().plan);
+                }
+            },
+            |_, _, _| {},
+        );
+        let (face, adaptive) = (&plans[0], &plans[1]);
+        assert_eq!(adaptive.strategy, Strategy::Adaptive);
+        let minutes = adaptive.duration / 60.;
+        eprintln!(
+            "{} levels, {} moves, {minutes:.1} min",
+            adaptive.levels,
+            adaptive.moves.len()
+        );
+        assert!(minutes < 300., "{minutes:.1} min");
+        let stepdown = num(&doc.setups[0].operations[1].p, "stepdown").unwrap();
+        let (depth, at) = fresh_depth(&[face], adaptive);
+        eprintln!("deepest fresh cut {depth:.4} mm at {at:?}");
+        assert!(depth <= stepdown + 0.001, "{depth} mm fresh at {at:?}");
     }
 }

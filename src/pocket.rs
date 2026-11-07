@@ -4837,6 +4837,147 @@ pub(crate) mod tests {
             && (p[2] >= 3. - 0.001 || clear(p, (-15., -10., -3., 10.), 1.))));
     }
     #[test]
+    fn an_adaptive_clearing_cuts_thin_terraces_only_round_the_deep_floor() {
+        // The owner's TOTEM bottom: 20 bands 0.24 to 1 mm thick for a 6 mm
+        // stepdown, each walked over the whole pocket, 883 min (203 now).
+        // Here, ledges at Z 3, 2.7 and 2.4 round a square floor at Z 0, at a
+        // 4 mm stepdown: at the ledges' heights the cutter walks only round
+        // the square (its reach), whose own levels go down by the stepdown.
+        let mut tris = vec![];
+        for (outer, inner, z) in [(15., 12., 6.), (12., 9., 3.), (9., 6., 2.7), (6., 4., 2.4)] {
+            for (x, y, xx, yy) in [
+                (-outer, -outer, outer, -inner),
+                (-outer, inner, outer, outer),
+                (-outer, -inner, -inner, inner),
+                (inner, -inner, outer, inner),
+            ] {
+                quad(&mut tris, x, y, xx, yy, z);
+            }
+        }
+        quad(&mut tris, -4., -4., 4., 4., 0.);
+        quad(&mut tris, -15., -15., 15., 15., -4.);
+        let (setup, mut op, tool, mesh, dz) = part(tris, &[3., 2.7, 2.4, 0.], 2.);
+        op.strategy = Strategy::Adaptive;
+        for (k, v) in [
+            ("stepdown", "4"),
+            ("optimal_load", "0.4"),
+            ("minimum_radius", "0"),
+            ("ramp", "Helix"),
+            ("ramp_angle", "2"),
+        ] {
+            op.p.insert(k.into(), v.into());
+        }
+        let plan = crate::adaptive::generate(&setup, &op, &tool, &mesh).unwrap();
+        // Each level's cuts hold up those after it: air is taken out of them
+        // only where proven clear (`air`), as of a Pocket's support pass.
+        assert_eq!(plan.keep_air.len(), plan.moves.len());
+        for (m, &keep) in plan.moves.iter().zip(&plan.keep_air) {
+            let level = m.motion == Motion::Feed && m.cutting_pass && m.from[2] == m.to[2];
+            assert_eq!(keep, level, "{m:?}");
+        }
+        let r = plan.radius;
+        let level = |z: f32| {
+            (plan.moves.iter())
+                .filter(|m| m.cutting_pass && (m.to[2] - dz - z).abs() < 0.01)
+                .collect::<Vec<_>>()
+        };
+        for z in [2.7, 2.4] {
+            let moves = level(z + 0.0);
+            assert!(!moves.is_empty(), "Z {z}");
+            // Not over the square's middle, past the cutter's reach of the
+            // ledge round it, but to cross it.
+            let inside: f32 = moves
+                .iter()
+                .filter(|m| m.to[0].abs() < 4. - r - 0.5 && m.to[1].abs() < 4. - r - 0.5)
+                .map(|m| (m.to[0] - m.from[0]).hypot(m.to[1] - m.from[1]))
+                .sum();
+            // A crossing at most (0.6 mm at Z 2.7; a band at a time, 138).
+            assert!(inside < 5., "Z {z}: {inside} mm over the square");
+        }
+        // The square itself is cut at no more than the stepdown at a time,
+        // from the top: one level over it between Z 3 and Z 0 at most.
+        let over: std::collections::BTreeSet<i64> = (plan.moves.iter())
+            .filter(|m| m.cutting_pass && (m.to[2] - m.from[2]).abs() < 1e-4)
+            .filter(|m| m.to[0].abs() < 1. && m.to[1].abs() < 1.)
+            .map(|m| ((m.to[2] - dz) * 100.).round() as i64)
+            .collect();
+        assert!(over.len() <= 3, "levels over the square: {over:?}");
+    }
+    #[test]
+    fn thin_bands_of_pockets_left_at_different_heights_start_at_the_highest() {
+        // The review's: two pockets side by side, the left (floor Z 3)
+        // already cleared to its floor by a Pocket, the right (floor Z 0)
+        // untouched at the top, Z 6; an Adaptive clearing of both at a 4 mm
+        // stepdown with a Helix entry. The run of thin bands started at the
+        // first's height, Z 3: the right was fed straight down 3 mm into its
+        // stock and then cut 6 mm deep.
+        let mut tris = vec![];
+        quad(&mut tris, -15., -12., 15., -8., 6.);
+        quad(&mut tris, -15., 8., 15., 12., 6.);
+        quad(&mut tris, -15., -8., -12., 8., 6.);
+        quad(&mut tris, 12., -8., 15., 8., 6.);
+        quad(&mut tris, -2., -8., 2., 8., 6.);
+        quad(&mut tris, -12., -8., -2., 8., 3.);
+        quad(&mut tris, 2., -8., 12., 8., 0.);
+        quad(&mut tris, -15., -12., 15., 12., -4.);
+        let (mut setup, mut op, mut tool, mesh, dz) = part(tris, &[3., 0.], 2.);
+        tool.p.insert("length".into(), "12".into());
+        tool.p.insert("stickout".into(), "24".into());
+        op.strategy = Strategy::Adaptive;
+        for (k, v) in [
+            ("allowance", "0.3"),
+            ("stepdown", "4"),
+            ("optimal_load", "0.4"),
+            ("minimum_radius", "0"),
+            ("ramp", "Helix"),
+            ("ramp_angle", "2"),
+        ] {
+            op.p.insert(k.into(), v.into());
+        }
+        let frame = crate::volume::Frame::new(&setup, &mesh);
+        let stock = job(&setup, &op, &tool, &mesh).unwrap().stock;
+        let mut v = crate::volume::Volume::new(stock, frame);
+        let mut earlier = op.clone();
+        earlier.strategy = Strategy::Pocket;
+        earlier.p.insert("allowance".into(), "0".into());
+        let placement = Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        earlier.surfaces.as_mut().unwrap().ids.retain(|&i| {
+            (placement.transform(mesh.surfaces[i].center)[2] / scale - dz - 3.).abs() < 0.01
+        });
+        let before = generate(&setup, &earlier, &tool, &mesh).unwrap();
+        for m in before.moves.iter().filter(|m| m.motion == Motion::Feed) {
+            v.cut(
+                m.from,
+                m.to,
+                before.radius,
+                before.flute_length,
+                before.shape,
+                frame,
+                (0, 0),
+            );
+        }
+        setup.preview_remaining = Some(std::sync::Arc::new(crate::rest::RestStock::new(&v, frame)));
+        let plan = crate::adaptive::generate(&setup, &op, &tool, &mesh).unwrap();
+        // The first move into the right pocket's stock, under Z 6, is not
+        // fed straight down (a Helix was asked), and no level there is
+        // under Z 2 before one at Z 2 or over.
+        let right = |m: &&crate::simulation::Move| m.motion == Motion::Feed && m.to[0] > 2.;
+        let into = (plan.moves.iter().filter(right))
+            .find(|m| m.to[2] - dz < 6. - 0.01)
+            .unwrap();
+        let straight = (into.to[0] - into.from[0]).hypot(into.to[1] - into.from[1]) < 0.001;
+        assert!(!straight, "fed straight down into the stock: {into:?}");
+        let first = (plan.moves.iter().filter(right))
+            .find(|m| m.cutting_pass && (m.to[2] - m.from[2]).abs() < 1e-4)
+            .unwrap();
+        assert!(
+            first.to[2] - dz >= 2. - 0.001,
+            "first level in the right pocket at Z{}",
+            first.to[2] - dz
+        );
+    }
+    #[test]
     fn thin_terraces_do_not_clear_the_deep_floor_at_every_height() {
         let mut tris = vec![];
         // Three nested ledges 0.3 mm apart over a deeper square pocket.
