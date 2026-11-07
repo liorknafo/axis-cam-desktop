@@ -5807,7 +5807,25 @@ pub(crate) mod tests {
         plan.setups[1]
             .operations
             .retain(|o| o.strategy != "Contour");
-        let (check, _) = crate::plan_check::check(&doc, &mesh, &report, &plan);
+        let (check, job) = crate::plan_check::check(&doc, &mesh, &report, &plan);
+        let holding: Vec<_> = (check.problems.iter())
+            .filter(|p| p.stage == "workholding")
+            .collect();
+        assert!(holding.is_empty(), "{holding:?}");
+        // The manual mill gone from the library, its snapshot in the squaring
+        // setup still prepares the stock: planning stays open, the report
+        // says what the vise cannot hold, and the squaring checks again.
+        let mut job = job.unwrap();
+        job.machines.retain(|m| !crate::manual::is_hand(m));
+        assert!(crate::manual::is_manual(&job.setups[0].machine));
+        let unmet: Vec<_> = (analysis::preconditions(&job, Some(&mesh)).into_iter())
+            .filter(|p| !p.ok)
+            .collect();
+        assert!(unmet.is_empty(), "{unmet:?}");
+        let again = analysis::report(&job, &mesh).unwrap();
+        assert!(again.workholding_problem.is_some());
+        assert_eq!(again.machines.len(), 2);
+        let (check, _) = crate::plan_check::check(&job, &mesh, &again, &plan);
         let holding: Vec<_> = (check.problems.iter())
             .filter(|p| p.stage == "workholding")
             .collect();

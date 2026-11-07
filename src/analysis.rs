@@ -222,13 +222,22 @@ pub fn base(doc: &Document) -> usize {
         .unwrap_or(0)
 }
 /// `doc` as the planner reads it: the user's setup first, its own stock the
-/// fresh stock, without the hand setups before it.
+/// fresh stock, without the hand setups before it. Their machines stay, in
+/// the library when it has them no more, so the view numbers the same
+/// `machines` as `doc` and a hand machine kept only in a setup's snapshot
+/// still prepares the stock.
 pub fn planning(doc: &Document) -> std::borrow::Cow<'_, Document> {
     match base(doc) {
         0 => std::borrow::Cow::Borrowed(doc),
         b => {
             let mut view = doc.clone();
-            view.setups.drain(..b);
+            for setup in view.setups.drain(..b) {
+                if plannable(&setup.machine)
+                    && !view.machines.iter().any(|m| m.id == setup.machine.id)
+                {
+                    view.machines.push(setup.machine);
+                }
+            }
             view.sync_stock_sources();
             std::borrow::Cow::Owned(view)
         }
