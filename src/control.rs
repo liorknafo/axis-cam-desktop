@@ -2372,6 +2372,8 @@ pub struct Connection {
     /// The tool run whose run is being checked to follow it again
     /// (`take_followed`).
     attaching: Option<u64>,
+    /// Why `reattach` waits, as `pi_note` said it (`reattach_waits`).
+    reattach_note: Option<String>,
     /// Tests: the next tool run handed to the link is lost on the way, as
     /// when the link fails while it crosses.
     #[cfg(test)]
@@ -2636,6 +2638,7 @@ impl Connection {
             tool_run_id: None,
             reattach: None,
             attaching: None,
+            reattach_note: None,
             #[cfg(test)]
             lose_next_job: false,
             stop_sent: None,
@@ -2939,6 +2942,12 @@ impl Connection {
         // from before AXIS CAM was closed is over with.
         self.tool_run_id = Some(pending.id);
         self.reattach = None;
+        // Its note, "open its project", is over with it.
+        if let Some(note) = self.reattach_note.take()
+            && self.pi_note.as_ref() == Some(&note)
+        {
+            self.pi_note = None;
+        }
         if let Err(e) = pending.write(&path) {
             self.pi_note = Some(format!(
                 "Where a stop after a step would leave this tool run could not be kept: {e}."
@@ -5542,8 +5551,9 @@ impl Connection {
     /// waits, as where it ended does (`adopt_pi_stop`).
     pub fn reattach_waits(&mut self, why: String) {
         if self.pi_note.as_ref() != Some(&why) {
-            self.pi_note = Some(why);
+            self.pi_note = Some(why.clone());
         }
+        self.reattach_note = Some(why);
     }
 
     /// The app could not build the run `take_reattach` took (`why`): where

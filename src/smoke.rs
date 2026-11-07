@@ -3824,6 +3824,57 @@ flood = { pin = 8 }
         shows(&a, &["skipped: already cut", "Don't skip"]);
     }
 
+    /// Review follow-up: while the Pi's tool run waits for its project, a
+    /// tool run of the project open is sent instead. The note to open the
+    /// other project goes with what was kept for it.
+    #[test]
+    fn a_tool_run_sent_instead_ends_the_note_to_open_the_other_project() {
+        use crate::run::{Action as R, Skip};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(skip(&mut a, 0, Some(Skip::Cut)));
+        let _ = a.update(Message::Run(R::KeepZero));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5., "the Drilling on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        let _ = a.update(Message::Run(R::Stop));
+        pi_until(&server, 10., "stopped", |s| s.state == Some(State::Idle));
+        let _ = a.update(Message::Disconnect);
+        let mut a = reopen(a, dir.path());
+        let mesh = a.imported_mesh.clone();
+        let mut other = a.doc.clone();
+        other.setups[0].id = "another setup".into();
+        other.active = other.setups[0].id.clone();
+        a.replace_document(other, None);
+        a.imported_mesh = mesh;
+        a.page = Page::Control;
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 5., "the link live", |s| s.state.is_some());
+        tick_for(&mut a, 300);
+        let note = conn(&a).pi_note.clone().unwrap_or_default();
+        assert!(note.contains("open its project to follow it"), "{note}");
+        // The other project's setup, run from its start.
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::KeepZero));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5., "its tool run on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        tick_for(&mut a, 200);
+        let note = conn(&a).pi_note.clone().unwrap_or_default();
+        assert!(!note.contains("open its project"), "{note}");
+        assert!(run_of(&a).running.is_some());
+        let _ = a.update(Message::Run(R::Stop));
+        pi_until(&server, 10., "stopped", |s| s.state == Some(State::Idle));
+    }
+
     #[test]
     fn the_project_of_the_pis_tool_run_opened_after_connecting_follows_it() {
         opened_after_connecting(false);
