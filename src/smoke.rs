@@ -19817,8 +19817,12 @@ soft_max = 180.0
             for (k, v) in [("length", "40"), ("stickout", "30"), ("number", "9")] {
                 drill.p.insert(k.into(), v.into());
             }
+            // Through, 2 mm past the exit: past the 1.80 mm of its 118°
+            // point, so it is its full Ø6 down to the exit.
             let mut drilling = Operation::new(Strategy::Drill, drill.id.clone());
             drilling.geometry.clear();
+            drilling.p.insert("through".into(), "Yes".into());
+            drilling.p.insert("breakthrough".into(), "2".into());
             a.doc.tools.push(drill);
             a.doc.setup_mut().operations.push(drilling);
             let last = a.doc.setup().operations.len() - 1;
@@ -19862,12 +19866,30 @@ soft_max = 180.0
                 .insert("bottom".into(), "5".into());
             let text = said(&a);
             assert!(
-                text.contains("after it stops 5.00 mm over its bottom."),
+                text.contains(
+                    "after it is its full Ø6 only 4.80 mm over its bottom, over its point."
+                ),
                 "{strategy:?}: {text}"
             );
             a.doc.setup_mut().operations[last]
                 .p
                 .insert("bottom".into(), "0".into());
+            assert_eq!(narrow(&a), 0, "{strategy:?}");
+            // The review's: to the exit, or 1 mm past it, its point leaves
+            // a cone round the exit (stock at radius 2.5, 0.2 mm over it).
+            for (through, breakthrough, short) in [("No", "2", "1.80"), ("Yes", "1", "0.80")] {
+                let p = &mut a.doc.setup_mut().operations[last].p;
+                p.insert("through".into(), through.into());
+                p.insert("breakthrough".into(), breakthrough.into());
+                let text = said(&a);
+                assert!(
+                    text.contains(&format!("only {short} mm over its bottom, over its point.")),
+                    "{strategy:?}, Through {through}: {text}"
+                );
+            }
+            let p = &mut a.doc.setup_mut().operations[last].p;
+            p.insert("through".into(), "Yes".into());
+            p.insert("breakthrough".into(), "2".into());
             assert_eq!(narrow(&a), 0, "{strategy:?}");
             // Not when its Hole diameter filter leaves the hole out (the
             // review's: it drills none of it).

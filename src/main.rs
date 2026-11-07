@@ -3786,8 +3786,9 @@ impl App {
     /// it (its levels `fits` says `op` does not fit), what the first that
     /// cuts part of it leaves. All is what its cutter sweeps of each such
     /// level, less 0.01 mm² (`pocket::Level::left_by`): a drill's disc at
-    /// its centre, to its bottom (Bottom offset, less Breakthrough, not
-    /// over 0); a Pocket's or an Adaptive clearing's whole reach; an Inside
+    /// its centre, its full width (over its 118° point) down to each such
+    /// level's bottom (its tip at the bore's bottom over the Bottom offset,
+    /// less Breakthrough); a Pocket's or an Adaptive clearing's whole reach; an Inside
     /// Contour's one pass round the walls (`pocket::Level::swept`). A Drill
     /// cuts a hole it drills (its filters, `cam::drills`), centre within
     /// 0.1 mm, at the same A angle, with a drilling cycle and a drill no
@@ -3874,7 +3875,17 @@ impl App {
                         } else {
                             0.
                         };
-                        let short = number(o, "bottom") - through;
+                        // Its tip goes to the bore's bottom, less the
+                        // Breakthrough, over by the Bottom offset; it is
+                        // as wide as the drill only its point's height
+                        // over that (118°, `simulation::POINT_RISE`). That
+                        // must be no higher than the bottom of each level
+                        // left: its floor, or where a level through ends.
+                        let tip = found.bottom + number(o, "bottom") - through;
+                        let full = tip + diameter / 2. * crate::simulation::POINT_RISE;
+                        let short = (levels.iter())
+                            .map(|l| full - l.floor.unwrap_or(hole.bottom))
+                            .fold(f32::NEG_INFINITY, f32::max);
                         let why = if !drills {
                             Some(format!("{} after it does not drill it out", o.name()))
                         } else if diameter < bore - 0.02 {
@@ -3889,10 +3900,11 @@ impl App {
                                 o.name(),
                                 crate::post::exact_mm(diameter)
                             ))
-                        } else if short > 0.001 {
+                        } else if short > 0.01 {
                             Some(format!(
-                                "{} after it stops {short:.2} mm over its bottom",
-                                o.name()
+                                "{} after it is its full Ø{} only {short:.2} mm over its bottom, over its point",
+                                o.name(),
+                                crate::post::exact_mm(diameter)
                             ))
                         } else {
                             None
