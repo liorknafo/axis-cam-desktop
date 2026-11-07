@@ -2774,6 +2774,46 @@ flood = { pin = 8 }
         run_of(a).op_steps(1).expect("the Drill's holes").clone()
     }
 
+    /// AXIS CAM closed (`a`, disconnected as closing does) and opened again
+    /// on the same workspace and project: nothing of its run is left in
+    /// memory, only what it kept on disk.
+    fn reopen(a: App, dir: &std::path::Path) -> App {
+        assert!(a.control.is_none(), "disconnect first, as closing does");
+        let mut b = App::from_workspace(dir.join("workspace.json"), None);
+        b.replace_document(a.doc.clone(), None);
+        b.imported_mesh = a.imported_mesh.clone();
+        b.page = Page::Control;
+        b
+    }
+
+    /// Connected after AXIS CAM opened again: once the link is live, the
+    /// run of the tool run it sent the Pi before is built anew as it was
+    /// sent, setup 0's; its check answered, it follows that tool run, or
+    /// says why not.
+    fn follow_again(a: &mut App) -> Result<(), String> {
+        let mut deadline = Deadline::new(10.);
+        while !(a.control.as_ref().and_then(|c| c.run.as_ref())).is_some_and(|r| r.follow.is_some())
+        {
+            let _ = a.update(Message::Tick);
+            assert!(
+                deadline.within(&conn(a).snapshot),
+                "the run never built anew: {:?}",
+                conn(a).pi_note
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        answer_skips(a, 0);
+        let followed = run_of(a).followed.clone().expect("checked");
+        let _ = a.update(Message::Tick);
+        followed.map(|_| ())
+    }
+
+    /// Where `send_tool_run` keeps the tool run last sent to the Pi.
+    fn pi_pending(a: &App) -> std::path::PathBuf {
+        (a.state_path.parent().unwrap().join("uc100"))
+            .join(format!("{}-pi-journal.pending.json", conn(a).machine_id))
+    }
+
     /// A uc100-server on 127.0.0.1 running the driver's simulator, as the
     /// Pi does its UC100, and `run_app`'s machine connecting to it across
     /// the network, this computer paired with it.
@@ -2897,9 +2937,10 @@ flood = { pin = 8 }
         );
     }
 
-    /// AXIS CAM closed and opened again while a tool run cuts on the Pi: it
-    /// follows nothing, but the run bar's Hold, Resume and Stop now act on
-    /// the Pi's machine.
+    /// A tool run cuts on the Pi that this computer has no record of (sent
+    /// by another computer, or before this one's records were lost): it
+    /// follows nothing, but the run bar's Hold, Resume and Stop act on the
+    /// Pi's machine.
     #[test]
     fn hold_and_stop_work_on_a_pi_tool_run_this_computer_did_not_follow() {
         use crate::run::Action as R;
@@ -2914,8 +2955,14 @@ flood = { pin = 8 }
             s.state == Some(State::Run)
         });
         let _ = a.update(Message::Disconnect);
-        // As after a restart: the run is gone from this computer.
+        // The run, and what was kept as it was sent, are gone.
         a.pi_run = None;
+        let pending = std::fs::read_dir(dir.path().join("uc100"))
+            .unwrap()
+            .flatten()
+            .find(|e| e.file_name().to_string_lossy().ends_with(".pending.json"))
+            .expect("kept as it was sent");
+        std::fs::remove_file(pending.path()).unwrap();
         let _ = a.update(Message::Connect);
         tick_until(&mut a, 5.0, "the Pi running, seen again", |s| {
             s.state == Some(State::Run)
@@ -3180,36 +3227,32 @@ flood = { pin = 8 }
     }
 
     /// As above, but AXIS CAM closed and opened again while the Pi stops:
-    /// nothing of the run is left in memory. Connected again, where the Pi
-    /// stopped is found from what was kept as the tool run was sent, and
-    /// picking the setup starts it from the next hole.
+    /// nothing of the run is left in memory. Connected again, the run is
+    /// built anew from what was kept as the tool run was sent and follows
+    /// it: it takes the Pi's stop as its end, and the next hole is the
+    /// start.
     #[test]
     fn the_pi_stop_with_this_computer_lost_is_picked_up_after_axis_cam_opens_again() {
-        use crate::run::Action as R;
         use uc100::controller::State;
         let dir = tempfile::tempdir().unwrap();
         let mut a = run_app(dir.path());
         let server = to_pi_lost(&mut a, dir.path(), std::time::Duration::from_secs(1));
         drilling(&mut a);
         let _ = a.update(Message::Disconnect);
-        // Closed: the run kept for connecting back is gone with the app.
-        a.pi_run = None;
+        let mut a = reopen(a, dir.path());
         pi_until(&server, 60.0, "the Pi's stop", |s| {
             s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| !o.ok)
         });
         let _ = a.update(Message::Connect);
-        assert!(conn(&a).run.is_none());
-        let mut deadline = Deadline::new(10.);
-        while conn(&a).journal().is_none() {
-            let _ = a.update(Message::Tick);
-            assert!(
-                deadline.within(&conn(&a).snapshot),
-                "where the Pi stopped never kept: {:?}",
-                conn(&a).pi_note
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let journal = conn(&a).journal().unwrap();
+        follow_again(&mut a).unwrap();
+        let (ok, message) = run_of(&a).outcome.clone().expect("the Pi's end taken");
+        assert!(
+            !ok && message.starts_with("Stopped after hole")
+                && message.contains("no computer controlled the machine"),
+            "{message}"
+        );
+        assert!(!run_of(&a).done[1], "the Drilling taken as done");
+        let journal = conn(&a).journal().expect("where the Pi stopped kept");
         assert_eq!(journal.op, 1);
         assert!(
             journal.why.contains("no computer in control"),
@@ -3218,21 +3261,14 @@ flood = { pin = 8 }
         );
         let hole = journal.step.expect("a hole drilled") + 1;
         assert!(
-            conn(&a)
-                .pi_note
-                .as_ref()
-                .is_some_and(|n| n.contains("the start after it is picked")),
+            (conn(&a).pi_note.as_ref()).is_some_and(|n| n.contains("follows it again")),
             "{:?}",
             conn(&a).pi_note
         );
-        // Picking the setup picks the next hole as the start, checked
-        // once for the setup, then again from that hole.
-        let _ = a.update(Message::Run(R::Setup(0)));
-        answer_skips(&mut a, 0);
+        // The next hole is the start, checked again from it.
         assert!(run_of(&a).programs.is_none() && problems(&a).len() == 1);
         answer_skips(&mut a, 0);
         assert_eq!(run_of(&a).at_step(), Some((1, hole)));
-        assert!(run_of(&a).resumed.is_some());
         shows(
             &a,
             &[
@@ -3243,27 +3279,43 @@ flood = { pin = 8 }
     }
 
     /// The Facing tool run finishes on the Pi while AXIS CAM is closed.
-    /// Opened again and connected, the next tool run, the Drilling, is the
-    /// start: the Pi says the tool run this computer sent was done.
+    /// Opened again and connected, the run follows it again and takes the
+    /// Pi's end: the Facing is done, and the next tool run, the Drilling,
+    /// is the start.
     #[test]
     fn a_tool_run_the_pi_finished_with_axis_cam_closed_starts_the_next_after_it_opens_again() {
-        use crate::run::Action as R;
-        use uc100::controller::State;
         let dir = tempfile::tempdir().unwrap();
-        let (mut a, server) = pi_app(dir.path());
-        zeroed(&mut a);
-        let _ = a.update(Message::Run(R::Setup(0)));
-        answer_skips(&mut a, 0);
-        let _ = a.update(Message::Run(R::CycleStart));
-        tick_until(&mut a, 5.0, "the Facing on the Pi", |s| {
-            s.state == Some(State::Run)
-        });
-        let _ = a.update(Message::Disconnect);
-        a.pi_run = None;
-        pi_until(&server, 60.0, "the Facing's end", |s| {
-            s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| o.ok)
-        });
+        let (a, server) = facing_then_closed(dir.path());
+        let mut a = reopen(a, dir.path());
         let _ = a.update(Message::Connect);
+        follow_again(&mut a).unwrap();
+        let run = run_of(&a);
+        assert!(run.done[0], "the Facing not marked done");
+        assert_eq!(run.outcome.as_ref().map(|o| o.0), Some(true));
+        assert_eq!(
+            (run.next, run.from),
+            (1, 0),
+            "the Drilling's tool run is next"
+        );
+        assert!(conn(&a).journal().is_none());
+        assert!(!pi_pending(&a).exists(), "what was kept for it, left");
+        drop(server);
+    }
+
+    /// As above, but the Facing changed while AXIS CAM was closed: its run
+    /// does not follow a program it no longer sends, and says so. Where
+    /// the tool run ended comes from what was kept as it was sent: the
+    /// Drilling is the start.
+    #[test]
+    fn a_tool_run_the_pi_finished_is_not_followed_once_its_program_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, server) = facing_then_closed(dir.path());
+        let mut a = reopen(a, dir.path());
+        let face = &mut a.doc.setups[0].operations[0];
+        face.p.insert("stepover".into(), "70".into());
+        let _ = a.update(Message::Connect);
+        let why = follow_again(&mut a).unwrap_err();
+        assert!(why.contains("program has changed"), "{why}");
         let mut deadline = Deadline::new(10.);
         while conn(&a).journal().is_none() {
             let _ = a.update(Message::Tick);
@@ -3276,14 +3328,643 @@ flood = { pin = 8 }
         }
         let journal = conn(&a).journal().unwrap();
         assert_eq!((journal.op, journal.step), (1, None), "{journal:?}");
+        let run = run_of(&a);
+        assert!(run.running.is_none());
+        assert_eq!((run.next, run.from), (1, 0), "the Drilling is next");
+        drop(server);
+    }
+
+    /// AXIS CAM closed and opened again while the Drilling is held on the
+    /// Pi: followed again, Stop after step armed from it stops the Pi at a
+    /// hole's end, the run takes that stop as its own, and the next hole is
+    /// the start.
+    #[test]
+    fn stop_after_step_armed_after_axis_cam_opens_again_stops_the_pi_after_a_hole() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        let drill = drilling(&mut a);
+        let _ = a.update(Message::Run(R::Hold));
+        pi_until(&server, 10.0, "Hold on the Pi", |s| {
+            s.state == Some(State::Hold)
+        });
+        let _ = a.update(Message::Disconnect);
+        let mut a = reopen(a, dir.path());
+        let _ = a.update(Message::Connect);
+        follow_again(&mut a).unwrap();
+        assert_eq!(run_of(&a).running.as_ref().map(|r| r.index), Some(1));
+        assert!(!run_of(&a).stop_after);
+        let _ = a.update(Message::Run(R::StopAfterStep));
+        assert!(run_of(&a).stop_after);
+        let _ = a.update(Message::Run(R::Resume));
+        run_until(&mut a, 30.0, "the stop after a hole", |r| {
+            r.running.is_none()
+        });
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(
+            !ok && message.starts_with("Stopped after hole"),
+            "{message}"
+        );
+        assert!(!run_of(&a).done[1]);
+        let journal = conn(&a).journal().expect("where it stopped kept");
+        let last = journal.step.expect("a hole done");
+        assert!(last + 1 < drill.steps.len(), "{last}");
+        assert_eq!((journal.op, journal.why.as_str()), (1, "Stop after step"));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((1, last + 1)));
+    }
+
+    /// The Drilling held on the Pi while AXIS CAM is closed, and `edit`
+    /// made to the project meanwhile: opened again, its run does not follow
+    /// the tool run the Pi has, the edited Drilling never taken as done by
+    /// that tool run's end.
+    fn edited_drilling_is_not_followed(edit: impl Fn(&mut crate::model::Document)) {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        drilling(&mut a);
+        let _ = a.update(Message::Run(R::Hold));
+        pi_until(&server, 10.0, "Hold on the Pi", |s| {
+            s.state == Some(State::Hold)
+        });
+        let _ = a.update(Message::Disconnect);
+        let mut a = reopen(a, dir.path());
+        edit(&mut a.doc);
+        let _ = a.update(Message::Connect);
+        let why = follow_again(&mut a).unwrap_err();
+        assert!(why.contains("program has changed"), "{why}");
+        assert!(run_of(&a).running.is_none());
+        let _ = a.update(Message::Run(R::Resume));
+        pi_until(&server, 60.0, "the Drilling's end", |s| {
+            s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| o.ok)
+        });
+        let mut deadline = Deadline::new(10.);
+        while pi_pending(&a).exists() {
+            let _ = a.update(Message::Tick);
+            assert!(deadline.within(&conn(&a).snapshot), "its end never taken");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!run_of(&a).done[1], "the edited Drilling taken as done");
+        assert!(run_of(&a).outcome.is_none());
+    }
+
+    /// Review finding: the drill's diameter changed while AXIS CAM was
+    /// closed. The moves sent are the same, but not the cutter.
+    #[test]
+    fn a_drill_of_another_diameter_is_not_followed_after_axis_cam_opens_again() {
+        edited_drilling_is_not_followed(|doc| {
+            let tool = doc.setups[0].operations[1].tool.clone();
+            let t = doc.tools.iter_mut().find(|t| t.id == tool).unwrap();
+            t.p.insert("diameter".into(), "3".into());
+        });
+    }
+
+    /// As above, the Drilling's spindle speed changed instead.
+    #[test]
+    fn a_drilling_at_another_speed_is_not_followed_after_axis_cam_opens_again() {
+        edited_drilling_is_not_followed(|doc| {
+            doc.setups[0].operations[1]
+                .p
+                .insert("rpm".into(), "1234".into());
+        });
+    }
+
+    /// Review finding: a single-tool Drilling started at its third hole,
+    /// paused on the Pi over that hole, AXIS CAM closed and opened again
+    /// with nothing changed: it is followed again, and Resume drills on to
+    /// its end, taken as done.
+    #[test]
+    fn a_start_at_a_hole_is_followed_again_after_axis_cam_opens_again() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        a.doc.setups[0].operations.remove(0);
+        zeroed(&mut a);
         let _ = a.update(Message::Run(R::Setup(0)));
         answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::Steps(Some(0))));
+        let _ = a.update(Message::Run(R::PickStep(0, 2)));
+        let _ = a.update(Message::Run(R::StartStep));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((0, 2)));
+        let _ = a.update(Message::Run(R::KeepZero));
+        let _ = a.update(Message::Run(R::KeepToolZ));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5., "the pause over hole 3", |s| {
+            matches!(s.state, Some(State::Paused(_)))
+        });
+        let _ = a.update(Message::Disconnect);
+        let mut a = reopen(a, dir.path());
+        // The project as read back from its file.
+        a.doc = serde_json::from_str(&serde_json::to_string(&a.doc).unwrap()).unwrap();
+        let _ = a.update(Message::Connect);
+        follow_again(&mut a).unwrap();
+        assert!(run_of(&a).running.is_some());
+        assert!(matches!(
+            server.snapshot().unwrap().state,
+            Some(State::Paused(_))
+        ));
+        let _ = a.update(Message::Run(R::Resume));
+        run_until(&mut a, 60.0, "the Drilling done", |r| r.done[0]);
+        assert_eq!(run_of(&a).outcome.as_ref().map(|o| o.0), Some(true));
+    }
+
+    /// The Facing done, the Drilling held on the Pi, AXIS CAM closed and
+    /// opened again, the Facing's speed changed meanwhile when `edit`:
+    /// followed again, the Drilling runs; the Facing is shown done only
+    /// while unchanged, and a note says why it is not.
+    fn facing_done_then_drilling_reopened(edit: bool) -> App {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(&mut a, 60., "the Facing done", |r| r.done[0]);
+        tick_until(&mut a, 5., "Idle", |s| s.state == Some(State::Idle));
+        let _ = a.update(Message::Run(R::Next(1)));
+        let _ = a.update(Message::Run(R::RecordReference));
+        let _ = a.update(Message::Run(R::ZFromReference));
+        tick_for(&mut a, 100);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5., "the Drilling on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        let _ = a.update(Message::Run(R::Hold));
+        pi_until(&server, 10., "Hold on the Pi", |s| {
+            s.state == Some(State::Hold)
+        });
+        let _ = a.update(Message::Disconnect);
+        let mut a = reopen(a, dir.path());
+        if edit {
+            let face = &mut a.doc.setups[0].operations[0];
+            face.p.insert("rpm".into(), "1234".into());
+        }
+        let _ = a.update(Message::Connect);
+        follow_again(&mut a).unwrap();
+        assert_eq!(run_of(&a).running.as_ref().map(|r| r.index), Some(1));
+        let _ = a.update(Message::Run(R::Stop));
+        pi_until(&server, 10., "stopped", |s| s.state == Some(State::Idle));
+        a
+    }
+
+    /// Review finding: a tool run done before the one followed again was
+    /// edited while AXIS CAM was closed. It is not shown done; unedited, it
+    /// is.
+    #[test]
+    fn a_tool_run_done_before_is_shown_done_after_reopening_only_while_unchanged() {
+        let a = facing_done_then_drilling_reopened(false);
+        assert!(run_of(&a).done[0], "the unchanged Facing not shown done");
+        assert!(run_of(&a).journal_note.is_none());
+        let a = facing_done_then_drilling_reopened(true);
+        assert!(!run_of(&a).done[0], "the edited Facing shown done");
+        let note = run_of(&a).journal_note.clone().unwrap_or_default();
+        assert!(note.starts_with("Tool run 1 was done"), "{note}");
+    }
+
+    /// The Facing skipped as already cut, the Drilling held on the Pi,
+    /// AXIS CAM closed and opened again, the Facing's speed changed
+    /// meanwhile when `edit`: followed again, with the skip, and the
+    /// Operations list's rows from the check without it.
+    fn facing_cut_then_drilling_reopened(edit: bool) -> App {
+        use crate::run::{Action as R, Skip};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(skip(&mut a, 0, Some(Skip::Cut)));
+        let _ = a.update(Message::Run(R::KeepZero));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5., "the Drilling on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        let _ = a.update(Message::Run(R::Hold));
+        pi_until(&server, 10., "Hold on the Pi", |s| {
+            s.state == Some(State::Hold)
+        });
+        let _ = a.update(Message::Disconnect);
+        let mut a = reopen(a, dir.path());
+        if edit {
+            let face = &mut a.doc.setups[0].operations[0];
+            face.p.insert("rpm".into(), "1234".into());
+        }
+        let _ = a.update(Message::Connect);
+        follow_again(&mut a).unwrap();
+        assert_eq!(run_of(&a).skips, [(0, Skip::Cut)]);
+        assert!(run_of(&a).layout.is_none());
+        // The check without the skip, which tests answer themselves.
+        let programs = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0);
+        let id = a.doc.setups[0].id.clone();
+        let _ = a.update(Message::RunLayout(id, std::sync::Arc::new(programs)));
+        let _ = a.update(Message::Run(R::Stop));
+        pi_until(&server, 10., "stopped", |s| s.state == Some(State::Idle));
+        tick_until(&mut a, 5., "stopped", |s| s.state == Some(State::Idle));
+        a
+    }
+
+    /// Review finding: after reopening, the Facing skipped as already cut
+    /// kept its row, said skipped, with Don't skip to undo it.
+    #[test]
+    fn an_operation_skipped_as_cut_keeps_its_row_after_axis_cam_opens_again() {
+        let a = facing_cut_then_drilling_reopened(false);
+        let rows: Vec<Vec<usize>> = (run_of(&a).layout.as_deref().unwrap().as_ref().unwrap())
+            .iter()
+            .map(|p| p.indexes.clone())
+            .collect();
+        assert_eq!(rows, [vec![0], vec![1]]);
+        assert!(run_of(&a).journal_note.is_none());
+        shows(&a, &["skipped: already cut", "Don't skip"]);
+    }
+
+    /// Review finding: the Facing skipped as already cut was edited while
+    /// AXIS CAM was closed. Followed again, a note says it changed.
+    #[test]
+    fn an_operation_skipped_as_cut_and_edited_while_closed_is_said() {
+        let a = facing_cut_then_drilling_reopened(true);
+        let note = run_of(&a).journal_note.clone().unwrap_or_default();
+        assert!(note.starts_with("Skipped as already cut,"), "{note}");
+        let name = a.doc.setups[0].operations[0].name().to_string();
+        assert!(!name.is_empty() && note.contains(&name), "{note}");
+        shows(&a, &[&note]);
+    }
+
+    /// The Drilling skipped with its material left, the Facing held on the
+    /// Pi, AXIS CAM closed and opened again, the Drilling's speed set past
+    /// the spindle's meanwhile: the setup no longer checks without the
+    /// skip. The Facing is followed again, and the Drilling keeps its row
+    /// and Don't skip, the failed check answering before the run's own
+    /// (`early`) or after it.
+    fn left_drilling_made_unsendable_while_closed(early: bool) {
+        use crate::run::{Action as R, Skip};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(skip(&mut a, 1, Some(Skip::Left)));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5., "the Facing on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        let _ = a.update(Message::Run(R::Hold));
+        pi_until(&server, 10., "Hold on the Pi", |s| {
+            s.state == Some(State::Hold)
+        });
+        let _ = a.update(Message::Disconnect);
+        let mut a = reopen(a, dir.path());
+        let drill = &mut a.doc.setups[0].operations[1];
+        drill.p.insert("rpm".into(), "200000".into());
+        let without = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0);
+        assert!(without.is_err(), "the Drilling still checks");
+        let id = a.doc.setups[0].id.clone();
+        let layout = Message::RunLayout(id, std::sync::Arc::new(without));
+        let _ = a.update(Message::Connect);
+        let mut deadline = Deadline::new(10.);
+        while !(a.control.as_ref().and_then(|c| c.run.as_ref())).is_some_and(|r| r.follow.is_some())
+        {
+            let _ = a.update(Message::Tick);
+            assert!(deadline.within(&conn(&a).snapshot), "never built anew");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let layout = if early {
+            let _ = a.update(layout);
+            None
+        } else {
+            Some(layout)
+        };
+        answer_skips(&mut a, 0);
+        assert!(run_of(&a).followed.clone().unwrap().is_ok());
+        if let Some(layout) = layout {
+            let _ = a.update(layout);
+        }
+        let _ = a.update(Message::Run(R::Stop));
+        pi_until(&server, 10., "stopped", |s| s.state == Some(State::Idle));
+        tick_until(&mut a, 5., "stopped", |s| s.state == Some(State::Idle));
+        assert_eq!(run_of(&a).skips, [(1, Skip::Left)]);
+        let rows: Vec<Vec<usize>> = (run_of(&a).layout.as_deref().unwrap().as_ref().unwrap())
+            .iter()
+            .map(|p| p.indexes.clone())
+            .collect();
+        assert_eq!(rows, [vec![0], vec![1]]);
+        shows(&a, &["skipped: material left", "Don't skip"]);
+    }
+
+    /// Review finding: the check without the skip failed, and the skipped
+    /// Drilling lost its row and its Don't skip.
+    #[test]
+    fn an_operation_left_and_made_unsendable_while_closed_keeps_its_row() {
+        left_drilling_made_unsendable_while_closed(true);
+        left_drilling_made_unsendable_while_closed(false);
+    }
+
+    /// The rows made from a run's programs with its skipped operations put
+    /// back (`layout_with_skips`) are those of the check without skips:
+    /// the fixture's Face, Pocket and Contour share a tool run, the Pocket
+    /// taken as cut and the Contour's material left; and (review finding)
+    /// a Drill of another tool skipped between the Face and the Contour,
+    /// which the run then sends together, keeps its place between them.
+    #[test]
+    fn rows_made_with_the_skipped_operations_are_those_checked_without_them() {
+        use crate::run::Skip;
+        let of = |rows: &[crate::post::Checked]| -> Vec<Vec<(usize, String, u32)>> {
+            (rows.iter())
+                .map(|p| {
+                    (p.indexes.iter().zip(&p.ops))
+                        .map(|(&oi, o)| (oi, o.name.clone(), o.tool))
+                        .collect()
+                })
+                .collect()
+        };
+        for (ops, skips, sent_ops) in [
+            (
+                &[0, 1, 2, 3][..],
+                &[(1, Skip::Cut), (2, Skip::Left)][..],
+                vec![vec![0], vec![3]],
+            ),
+            (&[0, 3, 2][..], &[(1, Skip::Left)][..], vec![vec![0, 2]]),
+            (&[0, 3, 2][..], &[(1, Skip::Cut)][..], vec![vec![0, 2]]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let a = run_app_of(dir.path(), FAST, ops);
+            let mesh = a.part_mesh().unwrap();
+            let whole = crate::run::programs(&a.doc, mesh, 0).unwrap();
+            let (sent, _) = crate::run::check_skipping(&a.doc, mesh, 0, skips);
+            let sent = sent.unwrap();
+            let indexes: Vec<Vec<usize>> = sent.iter().map(|p| p.indexes.clone()).collect();
+            assert_eq!(indexes, sent_ops, "{ops:?} {skips:?}");
+            let rows = crate::run::layout_with_skips(&a.doc, 0, &sent, skips);
+            assert_eq!(of(&rows), of(&whole), "{ops:?} {skips:?}");
+        }
+    }
+
+    /// Review finding: AXIS CAM opened again connects while the project's
+    /// part is still loading. The run is built anew only once it has
+    /// loaded, and then follows the Pi's tool run.
+    #[test]
+    fn a_tool_run_on_the_pi_is_followed_again_once_the_part_has_loaded() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5., "the Facing on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        let _ = a.update(Message::Run(R::Hold));
+        pi_until(&server, 10., "Hold on the Pi", |s| {
+            s.state == Some(State::Hold)
+        });
+        let _ = a.update(Message::Disconnect);
+        let mut a = reopen(a, dir.path());
+        // Still loading, as when the app opens the project.
+        let (mesh, file) = (a.imported_mesh.take().unwrap(), a.doc.file.clone().unwrap());
+        a.import_busy = true;
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 5., "the link live", |s| s.state.is_some());
+        tick_for(&mut a, 300);
+        assert!(conn(&a).run.is_none(), "built anew before the part loaded");
+        let _ = a.update(Message::ModelRestored(file, Ok(mesh)));
+        follow_again(&mut a).unwrap();
+        assert_eq!(run_of(&a).running.as_ref().map(|r| r.index), Some(0));
+        let _ = a.update(Message::Run(R::Stop));
+        pi_until(&server, 10., "stopped", |s| s.state == Some(State::Idle));
+    }
+
+    /// Review finding: AXIS CAM opened again on another project connects,
+    /// then the project of the Pi's tool run opens. The Facing skipped as
+    /// already cut, the Drilling held on the Pi; still going when the
+    /// project opens, or done by then (`ended`). Until it opens a note says
+    /// to open it; then the run follows the tool run, its rows the setup's.
+    fn opened_after_connecting(ended: bool) {
+        use crate::run::{Action as R, Skip};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(skip(&mut a, 0, Some(Skip::Cut)));
+        let _ = a.update(Message::Run(R::KeepZero));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5., "the Drilling on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        let _ = a.update(Message::Run(R::Hold));
+        pi_until(&server, 10., "Hold on the Pi", |s| {
+            s.state == Some(State::Hold)
+        });
+        let _ = a.update(Message::Disconnect);
+        let mut a = reopen(a, dir.path());
+        let (project, mesh) = (a.doc.clone(), a.imported_mesh.clone());
+        // Another project, on the same machine, without that setup.
+        let mut other = project.clone();
+        other.setups[0].id = "another setup".into();
+        other.active = other.setups[0].id.clone();
+        a.replace_document(other, None);
+        a.imported_mesh = mesh.clone();
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 5., "the link live", |s| s.state.is_some());
+        tick_for(&mut a, 300);
+        assert!(conn(&a).run.is_none());
+        let note = conn(&a).pi_note.clone().unwrap_or_default();
+        assert!(note.contains("open its project to follow it"), "{note}");
+        a.page = Page::Control;
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Job));
+        shows(&a, &[&note]);
+        if ended {
+            // Hold and Resume act on the machine, followed or not.
+            let _ = a.update(Message::Run(R::Resume));
+            pi_until(&server, 60., "the Drilling's end", |s| {
+                s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| o.ok)
+            });
+            tick_for(&mut a, 300);
+            assert!(
+                conn(&a).journal().is_none(),
+                "its end taken without its project"
+            );
+        }
+        a.replace_document(project, None);
+        a.imported_mesh = mesh;
+        follow_again(&mut a).unwrap();
+        let programs = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0);
+        let id = a.doc.setups[0].id.clone();
+        let _ = a.update(Message::RunLayout(id, std::sync::Arc::new(programs)));
         let run = run_of(&a);
+        assert_eq!(run.skips, [(0, Skip::Cut)]);
+        if ended {
+            assert!(
+                run.done[0] && run.running.is_none(),
+                "the Drilling not done"
+            );
+            assert_eq!(run.outcome.as_ref().map(|o| o.0), Some(true));
+        } else {
+            assert_eq!(run.running.as_ref().map(|r| r.index), Some(0));
+            let _ = a.update(Message::Run(R::Stop));
+            pi_until(&server, 10., "stopped", |s| s.state == Some(State::Idle));
+            tick_until(&mut a, 5., "stopped", |s| s.state == Some(State::Idle));
+        }
+        let rows: Vec<Vec<usize>> = (run_of(&a).layout.as_deref().unwrap().as_ref().unwrap())
+            .iter()
+            .map(|p| p.indexes.clone())
+            .collect();
+        assert_eq!(rows, [vec![0], vec![1]]);
+        a.page = Page::Control;
+        shows(&a, &["skipped: already cut", "Don't skip"]);
+    }
+
+    /// Review follow-up: while the Pi's tool run waits for its project, a
+    /// tool run of the project open is sent instead. The note to open the
+    /// other project goes with what was kept for it.
+    #[test]
+    fn a_tool_run_sent_instead_ends_the_note_to_open_the_other_project() {
+        use crate::run::{Action as R, Skip};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(skip(&mut a, 0, Some(Skip::Cut)));
+        let _ = a.update(Message::Run(R::KeepZero));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5., "the Drilling on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        let _ = a.update(Message::Run(R::Stop));
+        pi_until(&server, 10., "stopped", |s| s.state == Some(State::Idle));
+        let _ = a.update(Message::Disconnect);
+        let mut a = reopen(a, dir.path());
+        let mesh = a.imported_mesh.clone();
+        let mut other = a.doc.clone();
+        other.setups[0].id = "another setup".into();
+        other.active = other.setups[0].id.clone();
+        a.replace_document(other, None);
+        a.imported_mesh = mesh;
+        a.page = Page::Control;
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 5., "the link live", |s| s.state.is_some());
+        tick_for(&mut a, 300);
+        let note = conn(&a).pi_note.clone().unwrap_or_default();
+        assert!(note.contains("open its project to follow it"), "{note}");
+        // The other project's setup, run from its start.
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::KeepZero));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5., "its tool run on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        tick_for(&mut a, 200);
+        let note = conn(&a).pi_note.clone().unwrap_or_default();
+        assert!(!note.contains("open its project"), "{note}");
+        assert!(conn(&a).reattach_said.is_none());
+        assert!(run_of(&a).running.is_some());
+        let _ = a.update(Message::Run(R::Stop));
+        pi_until(&server, 10., "stopped", |s| s.state == Some(State::Idle));
+    }
+
+    #[test]
+    fn the_project_of_the_pis_tool_run_opened_after_connecting_follows_it() {
+        opened_after_connecting(false);
+        opened_after_connecting(true);
+    }
+
+    /// The Facing tool run sent to the Pi, then AXIS CAM disconnected as
+    /// closing does, and the Facing done on the Pi.
+    fn facing_then_closed(dir: &std::path::Path) -> (App, uc100_remote::Server) {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let (mut a, server) = pi_app(dir);
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5.0, "the Facing on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        let _ = a.update(Message::Disconnect);
+        pi_until(&server, 60.0, "the Facing's end", |s| {
+            s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| o.ok)
+        });
+        (a, server)
+    }
+
+    /// AXIS CAM closed and opened again while a tool run cuts on the Pi
+    /// (held there, so it is still under way): connected again, its run is
+    /// built anew and follows it, the tool runs before it as they were.
+    /// Resume goes on with it, the tool tip and the stock it cuts follow
+    /// the machine, and its end is taken: the Facing done, the Drilling
+    /// next.
+    #[test]
+    fn axis_cam_opened_again_follows_the_tool_run_cutting_on_the_pi() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5.0, "the Facing on the Pi", |s| {
+            s.state == Some(State::Run) && s.current_line.is_some_and(|l| l > 5)
+        });
+        let _ = a.update(Message::Run(R::Hold));
+        pi_until(&server, 10.0, "Hold on the Pi", |s| {
+            s.state == Some(State::Hold)
+        });
+        let _ = a.update(Message::Disconnect);
+        let mut a = reopen(a, dir.path());
+        assert!(a.control.is_none() && a.pi_run.is_none());
+        let _ = a.update(Message::Connect);
+        follow_again(&mut a).unwrap();
+        let run = run_of(&a);
+        let r = run.running.as_ref().expect("following the Facing");
         assert_eq!(
-            (run.next, run.from),
-            (1, 0),
-            "the Drilling's tool run is next"
+            (r.index, r.from, run.done.clone()),
+            (0, 0, vec![false, false])
         );
+        assert!(run.outcome.is_none());
+        assert!(
+            (conn(&a).pi_note.as_ref()).is_some_and(|n| n.contains("tool run 1 of")),
+            "{:?}",
+            conn(&a).pi_note
+        );
+        // Said on the Job tab too.
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Job));
+        let said = conn(&a).reattach_said.clone().expect("said");
+        assert_eq!(conn(&a).pi_note.as_ref(), Some(&said));
+        shows(&a, &[&said]);
+        // Still held: nothing taken as its end, Hold and Resume its own.
+        assert_eq!(server.snapshot().unwrap().state, Some(State::Hold));
+        let _ = a.update(Message::Run(R::Resume));
+        pi_until(&server, 10.0, "running again", |s| {
+            s.state == Some(State::Run)
+        });
+        run_until(&mut a, 10.0, "the stock carved as it cuts", |r| {
+            r.carving.is_some()
+        });
+        assert!(a.live_tool().is_some(), "the tool tip not shown");
+        run_until(&mut a, 60.0, "the Facing done", |r| r.done[0]);
+        let run = run_of(&a);
+        assert_eq!(run.outcome.as_ref().map(|o| o.0), Some(true));
+        assert_eq!((run.next, run.from), (1, 0));
+        assert!(!pi_pending(&a).exists(), "what was kept for it, left");
     }
 
     /// Another computer runs a tool run of the same name on the Pi, done,
@@ -3292,7 +3973,6 @@ flood = { pin = 8 }
     /// again, this computer finds its own stop by the number it sent, never
     /// the other's end, and the start is the next hole.
     fn another_computers_tool_run_after_this_ones_stop(closed: bool) {
-        use crate::run::Action as R;
         use uc100::controller::{Command, State};
         use uc100::gcode::{Action as Do, Located};
         let dir = tempfile::tempdir().unwrap();
@@ -3302,7 +3982,7 @@ flood = { pin = 8 }
         let name = (server.snapshot().unwrap().program_name).expect("the Drilling's job");
         let _ = a.update(Message::Disconnect);
         if closed {
-            a.pi_run = None;
+            a = reopen(a, dir.path());
         }
         pi_until(&server, 60.0, "the Pi's stop", |s| {
             s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| !o.ok)
@@ -3341,6 +4021,9 @@ flood = { pin = 8 }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let _ = a.update(Message::Connect);
+        if closed {
+            follow_again(&mut a).unwrap();
+        }
         let mut deadline = Deadline::new(10.);
         while conn(&a).journal().is_none() {
             let _ = a.update(Message::Tick);
@@ -3360,17 +4043,13 @@ flood = { pin = 8 }
             journal.why
         );
         let hole = journal.step.expect("a hole drilled") + 1;
-        if closed {
-            let _ = a.update(Message::Run(R::Setup(0)));
-            answer_skips(&mut a, 0);
-        } else {
-            // The run it kept took its own end: stopped after the hole.
-            let (ok, message) = run_of(&a).outcome.clone().unwrap();
-            assert!(
-                !ok && message.starts_with("Stopped after hole"),
-                "{message}"
-            );
-        }
+        // The run, kept or followed again, took its own end: stopped after
+        // the hole.
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(
+            !ok && message.starts_with("Stopped after hole"),
+            "{message}"
+        );
         assert!(!run_of(&a).done[1], "the Drilling taken as done");
         assert!(run_of(&a).programs.is_none() && problems(&a).len() == 1);
         answer_skips(&mut a, 0);

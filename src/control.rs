@@ -2365,6 +2365,19 @@ pub struct Connection {
     /// The number the last tool run was sent to the Pi with: the Pi tells
     /// its end by it (`run_outcome`).
     tool_run_id: Option<u64>,
+    /// The tool run last sent to the Pi, as kept on disk, while this
+    /// computer does not follow it: AXIS CAM was closed since it was sent
+    /// (`take_reattach`).
+    reattach: Option<(u64, crate::run::Follow)>,
+    /// The tool run whose run is being checked to follow it again
+    /// (`take_followed`).
+    attaching: Option<u64>,
+    /// Why `reattach` waits, as `pi_note` said it (`reattach_waits`).
+    reattach_note: Option<String>,
+    /// What became of the tool run on the Pi kept from before AXIS CAM
+    /// was closed: followed again, not followed and why, or waiting for its
+    /// project. Said on the Job tab too, until this computer sends another.
+    pub reattach_said: Option<String>,
     /// Tests: the next tool run handed to the link is lost on the way, as
     /// when the link fails while it crosses.
     #[cfg(test)]
@@ -2515,6 +2528,10 @@ struct PiPending {
     /// The journal of the tool run done: the start is the next one (None
     /// when it is the setup's last).
     done: Option<crate::run::Journal>,
+    /// What it was sent from: AXIS CAM opened again follows it
+    /// (`take_reattach`).
+    #[serde(default)]
+    follow: Option<crate::run::Follow>,
 }
 
 impl PiPending {
@@ -2588,6 +2605,9 @@ impl Connection {
         let remote = uc100_remote::RemoteController::start(cfg.clone(), address, token);
         let mut c = Self::with(m, cfg, Driver::Remote(remote), None, journal);
         c.pi = Some(address.to_owned());
+        // The tool run last sent, to follow again if the Pi still has it or
+        // has ended it since (`take_reattach`).
+        c.reattach = PiPending::read(&c.pi_pending()).and_then(|p| Some((p.id, p.follow?)));
         Ok(c)
     }
 
@@ -2620,6 +2640,10 @@ impl Connection {
             job_missing: None,
             job_name: None,
             tool_run_id: None,
+            reattach: None,
+            attaching: None,
+            reattach_note: None,
+            reattach_said: None,
             #[cfg(test)]
             lose_next_job: false,
             stop_sent: None,
@@ -2908,14 +2932,28 @@ impl Connection {
             return self.try_send(job);
         };
         let s = &self.snapshot;
+        let follow = match &job {
+            Command::Job { name, .. } => run.follow_record(name),
+            _ => None,
+        };
         let pending = PiPending {
             id: tool_run_id(),
             stops: run.pi_stops(s.active_wcs, s.work_offset),
             done: run.pi_done(s.active_wcs, s.work_offset),
+            follow,
         };
         let path = self.pi_pending();
-        // Never another's end, even if it never goes.
+        // Never another's end, even if it never goes; and a tool run kept
+        // from before AXIS CAM was closed is over with.
         self.tool_run_id = Some(pending.id);
+        self.reattach = None;
+        self.reattach_said = None;
+        // Its note, "open its project", is over with it.
+        if let Some(note) = self.reattach_note.take()
+            && self.pi_note.as_ref() == Some(&note)
+        {
+            self.pi_note = None;
+        }
         if let Err(e) = pending.write(&path) {
             self.pi_note = Some(format!(
                 "Where a stop after a step would leave this tool run could not be kept: {e}."
@@ -2948,6 +2986,10 @@ impl Connection {
     /// step after a stop after a step, or the next tool run after it was
     /// done. Known by the number it was sent with, never by its name.
     fn adopt_pi_stop(&mut self) {
+        // Followed again instead, if its setup still checks the same.
+        if self.reattach.is_some() || self.attaching.is_some() {
+            return;
+        }
         let Some(link) = &self.link else {
             return;
         };
@@ -3084,6 +3126,7 @@ impl Connection {
     /// Acts on the snapshot `refresh` read.
     fn observe(&mut self) {
         let mut stop = false;
+        self.take_followed();
         self.watch_job();
         self.follow_stop_after();
         let outcome = self.run_outcome();
@@ -5478,6 +5521,89 @@ impl Connection {
         if self.pi.is_some() && kept.machine_id == self.machine_id {
             (self.run, self.job_name) = (Some(kept.run), kept.job_name);
             self.tool_run_id = kept.tool_run_id;
+            // Followed already.
+            self.reattach = None;
+        }
+    }
+
+    /// The tool run AXIS CAM sent the Pi before it was closed and opened
+    /// again, for the app to build its run anew and follow it
+    /// (`run::Run::following`): once the link is live, if the Pi still has
+    /// it, or tells how it ended, and this computer follows no tool run.
+    /// One the Pi does not know (its server started again since), or while
+    /// this computer follows another, is let go. It stays until the app
+    /// takes it (`take_reattach`), as when the project it is of opens.
+    pub fn reattach(&mut self) -> Option<&crate::run::Follow> {
+        let link = self.link.as_ref().filter(|l| l.live)?;
+        let (id, _) = self.reattach.as_ref()?;
+        let known =
+            link.tool_run_going.contains(id) || link.tool_run_ends.iter().any(|e| e.id == *id);
+        let following = self.run.as_ref().is_some_and(|r| r.running.is_some());
+        if !known || following {
+            self.reattach = None;
+            return None;
+        }
+        self.reattach.as_ref().map(|r| &r.1)
+    }
+
+    /// Takes the tool run `reattach` gave, its run being built anew.
+    pub fn take_reattach(&mut self) {
+        if let Some((id, _)) = self.reattach.take() {
+            self.attaching = Some(id);
+        }
+    }
+
+    /// Why the tool run `reattach` gives is not followed yet (`why`): it
+    /// waits, as where it ended does (`adopt_pi_stop`).
+    pub fn reattach_waits(&mut self, why: String) {
+        if self.pi_note.as_ref() != Some(&why) {
+            self.pi_note = Some(why.clone());
+        }
+        self.reattach_said = Some(why.clone());
+        self.reattach_note = Some(why);
+    }
+
+    /// The app could not build the run `take_reattach` took (`why`): where
+    /// the tool run ended is then taken from what was kept as it was sent
+    /// (`adopt_pi_stop`).
+    pub fn reattach_failed(&mut self, why: String) {
+        self.attaching = None;
+        self.reattach_said = Some(why.clone());
+        self.pi_note = Some(why);
+    }
+
+    /// The run built to follow the Pi's tool run again, once checked: it
+    /// follows it by the number it was sent with, or, its program changed,
+    /// what was kept as it was sent says where it ended (`adopt_pi_stop`).
+    /// A run picked over it lets it go.
+    fn take_followed(&mut self) {
+        let Some(id) = self.attaching else {
+            return;
+        };
+        let Some(run) = self
+            .run
+            .as_mut()
+            .filter(|r| r.follow.is_some() || r.followed.is_some())
+        else {
+            self.attaching = None;
+            return;
+        };
+        match run.followed.take() {
+            None => {}
+            Some(Ok(name)) => {
+                self.attaching = None;
+                (self.tool_run_id, self.job_name) = (Some(id), Some(name));
+                // Where the tool is, before an end that came meanwhile.
+                run.track(&self.snapshot);
+                let said = format!(
+                    "AXIS CAM was closed while the Pi ran tool run {} of {}: it follows it again.",
+                    run.next + 1,
+                    run.name
+                );
+                self.reattach_said = Some(said.clone());
+                self.pi_note = Some(said);
+            }
+            Some(Err(why)) => self.reattach_failed(why),
         }
     }
 

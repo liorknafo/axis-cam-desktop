@@ -78,7 +78,7 @@ pub enum Action {
 }
 
 /// How a run skips an operation of its setup (`Run::skips`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Skip {
     /// It is not sent, and the operations after it take its stock as cut,
     /// as those before a Start here are (`post::checked_to_start`).
@@ -100,8 +100,16 @@ pub struct Running {
     /// What Cycle Start recorded over (`xy`, `zero`, `last`, `touched`), put
     /// back when the driver refuses the job: nothing ran then (#168).
     before: Before,
-    /// The line each of its blocks moves the tool tip along (`paths`).
+    /// The line each of its blocks moves the tool tip along (`paths`),
+    /// from where the tool tip was as it started (plan coordinates).
     paths: Vec<Option<[[f32; 3]; 2]>>,
+    tip: [f32; 3],
+    /// The machine position it started from.
+    start: [f64; 6],
+    /// `program_print` of what it sent.
+    print: u64,
+    /// `op_print` of each operation it took as already cut (`Skip::Cut`).
+    cut_ops: Vec<(usize, u64)>,
     /// The block the tool tip is on and how far along it (`track`).
     on: Option<(usize, f32)>,
     /// The step of each of its blocks (`step_marks`).
@@ -152,8 +160,8 @@ fn step_marks(blocks: &[Block], clear: &[Option<f32>]) -> Vec<Option<Mark>> {
 }
 
 /// The run's record of its tool runs before a Cycle Start.
-#[derive(Clone)]
-struct Before {
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Before {
     xy: Option<(usize, [f64; 2])>,
     zero: Option<(String, [f32; 3])>,
     last: Option<(String, f64)>,
@@ -289,6 +297,201 @@ pub struct Run {
     /// the check found of one that no longer holds.
     pub resumed: Option<Journal>,
     pub journal_note: Option<String>,
+    /// The tool run on the Pi this run is to follow once checked, AXIS
+    /// CAM having been closed since it was sent (`following`).
+    pub follow: Option<Follow>,
+    /// Whether it follows it: the name it was sent as, or why not
+    /// (`follow_again`), until the connection takes it.
+    pub followed: Option<Result<String, String>>,
+    /// What `following` found of the operations taken as cut, for
+    /// `journal_note` once it follows.
+    cut_note: Option<String>,
+    /// The check without its skips, for the Operations list's rows, failed:
+    /// the rows are made from its programs once checked
+    /// (`layout_with_skips`).
+    pub rows_from_skips: bool,
+}
+
+/// What a tool run sent to the Pi was sent from (`Run::follow_record`),
+/// kept on disk with it: AXIS CAM opened again builds the run anew from it
+/// and follows the tool run, while the check finds the program sent
+/// (`program`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Follow {
+    /// The setup's id, and its name and its project's as they were.
+    pub setup: String,
+    #[serde(default)]
+    pub setup_name: String,
+    #[serde(default)]
+    pub project: String,
+    pub skips: Vec<(usize, Skip)>,
+    pub cut_steps: Vec<(usize, Vec<usize>)>,
+    pub start_step: Option<(usize, usize)>,
+    /// The tool run (`Running::index`) and the operation it started at.
+    pub index: usize,
+    pub from: usize,
+    /// Each tool run's, `program_print` of its whole program (no actions)
+    /// once done before it: done again only while it is unchanged.
+    pub done: Vec<Option<u64>>,
+    /// The work offset it was sent with, and where the tool tip was then.
+    pub offset: [f64; 6],
+    pub tip: [f32; 3],
+    /// The machine position it was sent from.
+    pub start: [f64; 6],
+    /// `program_print` of what it sends: its moves, its spindle, coolant
+    /// and tools, and its operations' cutters.
+    pub program: u64,
+    /// `op_print` of each operation taken as already cut (`Skip::Cut`).
+    #[serde(default)]
+    pub cut_ops: Vec<(usize, u64)>,
+    /// The run's record before and after its Cycle Start.
+    pub before: Before,
+    pub xy: Option<(usize, [f64; 2])>,
+    pub zero: Option<(String, [f32; 3])>,
+    pub last: Option<(String, f64)>,
+    /// The name it was sent as, which the Pi's Stop after step names.
+    pub name: String,
+}
+
+/// The Operations list's rows when the setup does not check without its
+/// skips (an operation whose material is left made one it cannot send):
+/// the operations `programs` sends and those of setup `si` that `skips`
+/// skips, in the setup's order, a tool run ending where the tool changes
+/// or a sent tool run ends. So a skipped operation joins the tool run of
+/// the one beside it with its tool, and one of another tool between two
+/// sent together splits them, as the check without skips does. What a
+/// skipped one would send is not known, only its name and tool.
+pub fn layout_with_skips(
+    doc: &Document,
+    si: usize,
+    programs: &[Checked],
+    skips: &[(usize, Skip)],
+) -> Vec<Checked> {
+    let (Some(setup), Some(first)) = (doc.setups.get(si), programs.first()) else {
+        return programs.to_vec();
+    };
+    // Each operation: its index in the setup, what it runs, and the tool
+    // run that sends it (None: skipped).
+    let mut all: Vec<(usize, crate::post::OpState, Option<usize>)> = (programs.iter().enumerate())
+        .flat_map(|(i, p)| {
+            (p.indexes.iter().zip(&p.ops)).map(move |(&oi, o)| (oi, o.clone(), Some(i)))
+        })
+        .collect();
+    for &(oi, _) in skips {
+        let Some(op) = setup.operations.get(oi) else {
+            continue;
+        };
+        if all.iter().any(|a| a.0 == oi) {
+            continue;
+        }
+        let tool = doc.tools.iter().find(|t| t.id == op.tool);
+        let state = crate::post::OpState {
+            name: op.name().into(),
+            strategy: op.strategy.name(),
+            tool: tool.and_then(|t| t.number()).unwrap_or(0),
+            tool_id: op.tool.clone(),
+            tool_name: tool.map_or_else(String::new, |t| t.name().into()),
+            diameter: tool
+                .and_then(|t| crate::num(&t.p, "diameter"))
+                .unwrap_or(0.),
+            stickout: 0.,
+            rpm: crate::num(&op.p, "rpm").unwrap_or(0.),
+            clockwise: true,
+            coolant: (false, false),
+        };
+        all.push((oi, state, None));
+    }
+    all.sort_by_key(|a| a.0);
+    let mut groups: Vec<Vec<(usize, crate::post::OpState, Option<usize>)>> = vec![];
+    for item in all {
+        let apart = groups.last().and_then(|g| g.last()).is_none_or(|last| {
+            last.1.tool_id != item.1.tool_id
+                || matches!((last.2, item.2), (Some(a), Some(b)) if a != b)
+        });
+        if apart {
+            groups.push(vec![item]);
+        } else {
+            groups.last_mut().expect("a group").push(item);
+        }
+    }
+    (groups.into_iter())
+        .map(|g| {
+            // The tool run that sends its operations, as it is when it is
+            // all of them; else a row of their own.
+            let mut row = g
+                .iter()
+                .find_map(|a| a.2)
+                .map_or(first, |i| &programs[i])
+                .clone();
+            let indexes: Vec<usize> = g.iter().map(|a| a.0).collect();
+            if row.indexes != indexes {
+                row.blocks.clear();
+                (row.indexes, row.ops) = (indexes, g.into_iter().map(|a| a.1).collect());
+            }
+            row
+        })
+        .collect()
+}
+
+/// FNV-1a over operation `oi` of setup `si` and its tool as the project
+/// saves them: what an operation taken as cut was (`Follow::cut_ops`).
+fn op_print(doc: &Document, si: usize, oi: usize) -> Option<u64> {
+    let op = doc.setups.get(si)?.operations.get(oi)?;
+    let tool = doc.tools.iter().find(|t| t.id == op.tool);
+    let text = serde_json::to_string(&(op, tool)).ok()?;
+    let mut h = 0xcbf29ce484222325u64;
+    for b in text.bytes() {
+        h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
+    }
+    Some(h)
+}
+
+/// `op_print` of each operation of setup `si` taken as cut in `skips`.
+fn cut_prints(doc: &Document, si: usize, skips: &[(usize, Skip)]) -> Vec<(usize, u64)> {
+    (skips.iter())
+        .filter(|s| s.1 == Skip::Cut)
+        .filter_map(|&(oi, _)| Some((oi, op_print(doc, si, oi)?)))
+        .collect()
+}
+
+/// Why AXIS CAM opened again does not follow the tool run on the Pi
+/// (`Run::follow_again`).
+fn not_followed(why: &str) -> String {
+    format!(
+        "The tool run on the Pi is not followed: {why}. The machine carries on; Hold, Stop and E-stop still act on it."
+    )
+}
+
+/// FNV-1a over what tool run `p` sends from operation `from` on
+/// (`actions`: its moves, spindle, coolant, tool changes and pauses), its
+/// blocks, and its operations with their tools and cutters (`OpState`):
+/// the program sent, stable across builds (`Follow::program`). None when
+/// it cannot start there.
+pub fn program_print(p: &Checked, from: usize, actions: &[Located]) -> Option<u64> {
+    struct Fnv(u64);
+    impl std::fmt::Write for Fnv {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            for b in s.bytes() {
+                self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x100000001b3);
+            }
+            Ok(())
+        }
+    }
+    use std::fmt::Write;
+    let mut h = Fnv(0xcbf29ce484222325);
+    write!(
+        h,
+        "{from} {:?} {:?} {:?} {:?} {} {};",
+        p.indexes, p.ops, p.datum, p.settings, p.offset, p.origin
+    )
+    .ok()?;
+    for b in p.from(from).ok()? {
+        write!(h, "{b:?};").ok()?;
+    }
+    for a in actions {
+        write!(h, "{a:?};").ok()?;
+    }
+    Some(h.0)
 }
 
 /// Where a tool run stopped short (LIO-275): after a step (Stop after
@@ -474,7 +677,147 @@ impl Run {
             journal: None,
             resumed: None,
             journal_note: None,
+            follow: None,
+            followed: None,
+            cut_note: None,
+            rows_from_skips: false,
         }
+    }
+
+    /// The run of `follow`'s setup (index `setup`) as it was when its tool
+    /// run was sent to the Pi: its skips, steps taken as cut and start at a
+    /// step, so its check finds the program sent again. Once checked, it
+    /// follows that tool run (`follow_again`).
+    pub fn following(doc: &Document, setup: usize, epoch: u64, follow: Follow) -> Self {
+        let mut r = Self::new(doc, setup, epoch);
+        // An operation taken as cut that has changed since: said, since
+        // what was cut is the operation as it was.
+        let now = cut_prints(doc, setup, &follow.skips);
+        let changed: Vec<&str> = (follow.cut_ops.iter())
+            .filter(|c| !now.contains(c))
+            .filter_map(|&(oi, _)| Some(doc.setups[setup].operations.get(oi)?.name()))
+            .collect();
+        if !changed.is_empty() {
+            r.cut_note = Some(format!(
+                "Skipped as already cut, {} changed since: what is cut is the operation as it was. Don't skip it to cut it as it is now.",
+                changed.join(", ")
+            ));
+        }
+        r.skips = follow.skips.clone();
+        r.cut_steps = follow.cut_steps.clone();
+        r.start_step = follow.start_step;
+        r.follow = Some(follow);
+        r
+    }
+
+    /// What the tool run Cycle Start just started (`cycle_start`) was sent
+    /// from, sent as `name`: kept on disk with it, so AXIS CAM opened again
+    /// follows it (`following`).
+    pub fn follow_record(&self, name: &str) -> Option<Follow> {
+        let r = self.running.as_ref()?;
+        let programs = self.checked()?;
+        Some(Follow {
+            setup: self.setup_id.clone(),
+            setup_name: self.name.clone(),
+            project: self.project.clone(),
+            skips: self.skips.clone(),
+            cut_steps: self.cut_steps.clone(),
+            start_step: self.start_step,
+            index: r.index,
+            from: r.from,
+            done: (programs.iter().zip(&self.done))
+                .map(|(p, &d)| d.then(|| program_print(p, 0, &[])).flatten())
+                .collect(),
+            offset: r.offset,
+            tip: r.tip,
+            start: r.start,
+            program: r.print,
+            cut_ops: r.cut_ops.clone(),
+            before: r.before.clone(),
+            xy: self.xy,
+            zero: self.zero.clone(),
+            last: self.last.clone(),
+            name: name.to_owned(),
+        })
+    }
+
+    /// Follows the tool run `f` was kept for, once the check answered: the
+    /// tool runs done before it are done again, and it runs, as after its
+    /// Cycle Start, while the check finds the program sent. The name it was
+    /// sent as, or why it is not followed.
+    fn follow_again(&mut self, f: Follow) -> Result<String, String> {
+        let why = not_followed;
+        let programs = match self.programs.as_deref() {
+            Some(Ok(p)) => p,
+            Some(Err(e)) => {
+                return Err(why(&format!(
+                    "the setup does not check now ({})",
+                    e.join(" ")
+                )));
+            }
+            None => return Err(why("the setup was not checked")),
+        };
+        // As Cycle Start sent it: at the step it started at, if any.
+        let sent = |p: &Checked| {
+            let step = f
+                .start_step
+                .filter(|(oi, _)| p.indexes.get(f.from) == Some(oi));
+            let actions = self.job_actions(p, f.from, f.offset, f.start, step)?;
+            program_print(p, f.from, &actions)
+        };
+        let p = (programs.get(f.index))
+            .filter(|p| f.done.len() == programs.len() && sent(p) == Some(f.program))
+            .ok_or_else(|| why("its setup's program has changed since it was sent"))?;
+        // A tool run done before it is done again only while unchanged.
+        let done: Vec<bool> = (programs.iter().zip(&f.done))
+            .map(|(p, d)| d.is_some() && *d == program_print(p, 0, &[]))
+            .collect();
+        let changed: Vec<String> = (f.done.iter().zip(&done).enumerate())
+            .filter(|(_, (was, now))| was.is_some() && !**now)
+            .map(|(i, _)| format!("{}", i + 1))
+            .collect();
+        let blocks = p.from(f.from).map_err(|e| why(&e.join(" ")))?;
+        let marks = self.marks_of(p, blocks);
+        let running = Running {
+            index: f.index,
+            from: f.from,
+            // Its end comes by its number (`Connection::run_outcome`).
+            seq: 0,
+            offset: f.offset,
+            before: f.before,
+            paths: paths(blocks, f.tip),
+            tip: f.tip,
+            start: f.start,
+            print: f.program,
+            cut_ops: f.cut_ops.clone(),
+            on: None,
+            marks,
+        };
+        let mut notes: Vec<String> = self.cut_note.take().into_iter().collect();
+        if !changed.is_empty() {
+            notes.push(format!(
+                "Tool run {} was done, but its program has changed since, so it is not shown done: run it again if it is to be cut as it is now.",
+                changed.join(", ")
+            ));
+        }
+        if !notes.is_empty() {
+            self.journal_note = Some(notes.join(" "));
+        }
+        (self.done, self.next, self.from) = (done, f.index, f.from);
+        (self.xy, self.zero, self.last) = (f.xy, f.zero, f.last);
+        (self.running, self.outcome, self.journal) = (Some(running), None, None);
+        Ok(f.name)
+    }
+
+    /// The step of each block of tool run `p` from its operation `blocks`
+    /// start at (`step_marks`).
+    fn marks_of(&self, p: &Checked, blocks: &[Block]) -> Vec<Option<Mark>> {
+        // An operation of one step ends it too, once risen to its clearance
+        // (LIO-311).
+        let clear: Vec<Option<f32>> = (p.indexes.iter())
+            .map(|&oi| self.op_steps(oi).map(|s| s.clear))
+            .collect();
+        step_marks(blocks, &clear)
     }
 
     /// Cuts the stock the tool has gone through since the last sample, while
@@ -733,6 +1076,13 @@ impl Run {
             (self.start_step, self.resumed, self.picked) = (None, None, None);
             self.cut_steps.clear();
             (self.programs, self.recheck) = (None, true);
+            // Checked otherwise, it is not the program sent.
+            if self.follow.take().is_some() {
+                self.followed = Some(Err(not_followed(&format!(
+                    "the setup does not check now ({})",
+                    why.join(" ")
+                ))));
+            }
             return;
         }
         // Refused, the progress stays kept for the skip's undoing (`skip`).
@@ -797,7 +1147,10 @@ impl Run {
             left.filter(|l| self.checked().is_some() && (!l.after.is_empty() || l.last.is_some()));
         self.times = times.filter(|_| self.checked().is_some());
         self.pictures.clear();
-        self.take_journal();
+        match self.follow.take() {
+            Some(f) => self.followed = Some(self.follow_again(f)),
+            None => self.take_journal(),
+        }
     }
 
     /// Where a run of this setup stopped (`journal`), once it is checked:
@@ -1474,41 +1827,16 @@ impl Run {
         let programs = self.checked()?;
         let (count, p) = (programs.len(), &programs[self.next]);
         let s = &c.snapshot;
-        let mut actions = lower(p, self.from, s.work_offset, s.machine_pos).ok()?;
-        // At a step, it waits over the step's entry with the spindle on,
-        // after the rapids there, until Resume feeds in (LIO-275).
-        if let Some((oi, n)) = self.at_step()
-            && let Some(line) = (p.from(self.from).ok()?.iter())
-                .position(|b| matches!(b, Block::Descend { .. }))
-                .map(|i| i as u32 + 1)
-        {
-            let at = actions
-                .iter()
-                .rposition(|l| l.line <= line)
-                .map_or(0, |i| i + 1);
-            let reason = format!(
-                "Over the entry of {}: Resume feeds in.",
-                self.step_label(oi, n)
-            );
-            actions.insert(
-                at,
-                Located {
-                    line,
-                    action: Do::Pause { reason },
-                },
-            );
-        }
+        let actions =
+            self.job_actions(p, self.from, s.work_offset, s.machine_pos, self.at_step())?;
+        let print = program_print(p, self.from, &actions)?;
+        let cut_ops = cut_prints(doc, self.setup, &self.skips);
         // Where the tool tip is, in plan coordinates: the first retract's start.
         let tip =
             std::array::from_fn(|k| (s.machine_pos[k] - s.work_offset[k]) as f32 + p.datum[k]);
         let blocks = p.from(self.from).ok()?;
         let paths = paths(blocks, tip);
-        // An operation of one step ends it too, once risen to its clearance
-        // (LIO-311).
-        let clear: Vec<Option<f32>> = (p.indexes.iter())
-            .map(|&oi| self.op_steps(oi).map(|s| s.clear))
-            .collect();
-        let marks = step_marks(blocks, &clear);
+        let marks = self.marks_of(p, blocks);
         let tool = p.ops[0].tool_id.clone();
         let zero = (p.origin.clone(), p.datum);
         let mut name = format!("{} · tool run {} of {count}", self.name, self.next + 1);
@@ -1530,6 +1858,10 @@ impl Run {
                 touched: self.touched,
             },
             paths,
+            tip,
+            start: s.machine_pos,
+            print,
+            cut_ops,
             on: None,
             marks,
         });
@@ -1543,6 +1875,44 @@ impl Run {
             name,
             actions: Arc::new(actions),
         })
+    }
+
+    /// What Cycle Start sends of tool run `p` from its operation `from`,
+    /// the machine at `start` with work offset `offset`, starting at step
+    /// `step` (`at_step`).
+    fn job_actions(
+        &self,
+        p: &Checked,
+        from: usize,
+        offset: [f64; 6],
+        start: [f64; 6],
+        step: Option<(usize, usize)>,
+    ) -> Option<Vec<Located>> {
+        let mut actions = lower(p, from, offset, start).ok()?;
+        // At a step, it waits over the step's entry with the spindle on,
+        // after the rapids there, until Resume feeds in (LIO-275).
+        if let Some((oi, n)) = step
+            && let Some(line) = (p.from(from).ok()?.iter())
+                .position(|b| matches!(b, Block::Descend { .. }))
+                .map(|i| i as u32 + 1)
+        {
+            let at = actions
+                .iter()
+                .rposition(|l| l.line <= line)
+                .map_or(0, |i| i + 1);
+            let reason = format!(
+                "Over the entry of {}: Resume feeds in.",
+                self.step_label(oi, n)
+            );
+            actions.insert(
+                at,
+                Located {
+                    line,
+                    action: Do::Pause { reason },
+                },
+            );
+        }
+        Some(actions)
     }
 
     /// The running tool run's program and where in it the machine is: the
@@ -4346,6 +4716,10 @@ mod tests {
                     touched: false,
                 },
                 paths: vec![],
+                tip: [0.; 3],
+                start: [0.; 6],
+                print: 0,
+                cut_ops: vec![],
                 on: None,
                 marks: vec![],
             }),
@@ -4383,6 +4757,10 @@ mod tests {
             journal: None,
             resumed: None,
             journal_note: None,
+            follow: None,
+            followed: None,
+            cut_note: None,
+            rows_from_skips: false,
         };
         let (_, op, block) = run.progress(Some(3)).unwrap();
         assert_eq!((op, block), (0, 2));
@@ -4485,6 +4863,10 @@ mod tests {
                 touched: false,
             },
             paths: vec![],
+            tip: [0.; 3],
+            start: [0.; 6],
+            print: 0,
+            cut_ops: vec![],
             on: None,
             marks: vec![],
         });

@@ -418,6 +418,13 @@ pub enum Message {
     RunOnMachine(usize),
     /// A setup's tool runs, checked for a UC100 run (the check's epoch).
     RunChecked(u64, std::sync::Arc<Result<Vec<post::Checked>, Vec<String>>>),
+    /// The tool runs of the setup (by id) checked without its skips: the
+    /// Operations list's rows for a run built anew with skips
+    /// (`App::follow_pi_run`).
+    RunLayout(
+        String,
+        std::sync::Arc<Result<Vec<post::Checked>, Vec<String>>>,
+    ),
     /// `RunChecked`, with the stock the check left after each operation of
     /// the setup, to picture (`run::check`), and how long its tool runs take
     /// on the connected machine (`run::Times`).
@@ -1640,6 +1647,7 @@ fn while_locked(m: &Message) -> bool {
             | EscapeKey
             | Run(_)
             | RunChecked(..)
+            | RunLayout(..)
             | RunCheckedStock(..)
             | RunPictures(..)
             | ToggleStock
@@ -3582,6 +3590,74 @@ impl App {
     /// to be checked: the Tick checks it once the machine stops, so that the
     /// simulation of the job never competes with the driver feeding it
     /// (#167). Whether the check waits.
+    /// Builds the run of the setup whose tool run AXIS CAM sent the Pi
+    /// before it was closed (`f`) as it was then, and checks it: once
+    /// checked, it follows that tool run (`run::Run::following`). The
+    /// check does not wait for the machine to stand still: the Pi drives
+    /// it, not this computer.
+    fn follow_pi_run(&mut self, f: run::Follow) -> Task<Message> {
+        let Some(c) = self.control.as_mut() else {
+            return Task::none();
+        };
+        let si =
+            (self.doc.setups.iter()).position(|s| s.id == f.setup && s.machine.id == c.machine_id);
+        // Of another project, or of a setup removed: it waits, should the
+        // project it is of open.
+        let Some(si) = si.filter(|&si| !manual::is_hand(&self.doc.setups[si].machine)) else {
+            let of = match (f.setup_name.is_empty(), f.project.is_empty()) {
+                (false, false) => format!(" ({} of {})", f.setup_name, f.project),
+                (false, true) => format!(" ({})", f.setup_name),
+                _ => String::new(),
+            };
+            c.reattach_waits(format!(
+                "The Pi runs a tool run this computer sent of a setup{of} that this project does not have: open its project to follow it. The machine carries on; Hold, Stop and E-stop still act on it."
+            ));
+            return Task::none();
+        };
+        c.take_reattach();
+        self.run_epoch += 1;
+        let skipped = !f.skips.is_empty();
+        c.run = Some(run::Run::following(&self.doc, si, self.run_epoch, f));
+        c.probe_spot = None;
+        self.run_on_connect = None;
+        if self.doc.setups[si].id != self.doc.active {
+            self.doc.active = self.doc.setups[si].id.clone();
+            self.stop_selection();
+            self.dirty = true;
+            self.last_edit = Instant::now();
+        }
+        // Its skipped operations keep their rows: the check without them
+        // gives those (`run::Run::layout`).
+        let layout = match (skipped, self.part_mesh().cloned()) {
+            (true, Some(mesh)) => {
+                let (doc, setup) = (self.doc.clone(), self.doc.setups[si].id.clone());
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || run::programs(&doc, &mesh, si))
+                            .await
+                            .unwrap_or_else(|e| Err(vec![format!("The check failed: {e}")]))
+                    },
+                    move |programs| {
+                        Message::RunLayout(setup.clone(), std::sync::Arc::new(programs))
+                    },
+                )
+            }
+            _ => Task::none(),
+        };
+        Task::batch([self.check_run(), layout])
+    }
+    /// The Operations list's rows of a run built anew whose check without
+    /// its skips failed (`run::Run::rows_from_skips`), once it is checked.
+    fn rows_from_skips(&mut self) {
+        if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut())
+            && r.rows_from_skips
+            && r.layout.is_none()
+            && let Some(programs) = r.checked()
+        {
+            let rows = run::layout_with_skips(&self.doc, r.setup, programs, &r.skips);
+            r.layout = Some(std::sync::Arc::new(Ok(rows)));
+        }
+    }
     fn check_waits(&mut self) -> bool {
         if !self.locked() {
             return false;
@@ -6651,8 +6727,23 @@ impl App {
                 {
                     r.checked_as(programs, Some(left), times);
                     c.fit_sim_block();
+                    self.rows_from_skips();
                     return self.picture_run();
                 }
+            }
+            Message::RunLayout(setup, programs) => {
+                if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut())
+                    && r.setup_id == setup
+                    && r.layout.is_none()
+                {
+                    match programs.is_ok() {
+                        true => r.layout = Some(programs),
+                        // An operation it skips cannot be sent now: its
+                        // programs, with the skipped ones put back.
+                        false => r.rows_from_skips = true,
+                    }
+                }
+                self.rows_from_skips();
             }
             Message::RunPictures(epoch, pictures) => {
                 self.picture_job = None;
@@ -7585,6 +7676,18 @@ impl App {
                     }
                 }
                 let phase_tab = self.phase_tab();
+                // AXIS CAM opened again while the Pi runs the tool run it
+                // sent before: its run, built anew, follows it, once the
+                // part it checks with is there (loaded, or loaded again
+                // after a failure); until then what was kept waits.
+                let loaded = self.part_mesh().is_some();
+                let reattach = (self.control.as_mut())
+                    .filter(|_| loaded)
+                    .and_then(|c| c.reattach().cloned());
+                let follow = match reattach {
+                    Some(f) => self.follow_pi_run(f),
+                    None => Task::none(),
+                };
                 if let Some((id, at)) = (self.control.as_mut())
                     .and_then(|c| Some((c.machine_id.clone(), c.recorded.take()?)))
                 {
@@ -7604,7 +7707,7 @@ impl App {
                         "Smoke stock meshing failed: {}",
                         self.status
                     );
-                    return self.refresh_stock_surface();
+                    return Task::batch([follow, self.refresh_stock_surface()]);
                 }
                 // The smoke run captures each screen from a frame drawn after
                 // its step (`smoke_frame`); a step whose frame does not come
@@ -7668,6 +7771,7 @@ impl App {
                     close,
                     settled,
                     phase_tab,
+                    follow,
                     self.picture_run(),
                     self.refresh_stock_surface(),
                     self.refresh_start_mesh(),
