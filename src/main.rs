@@ -3638,6 +3638,18 @@ impl App {
         };
         Task::batch([self.check_run(), layout])
     }
+    /// The Operations list's rows of a run built anew whose check without
+    /// its skips failed (`run::Run::rows_from_skips`), once it is checked.
+    fn rows_from_skips(&mut self) {
+        if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut())
+            && r.rows_from_skips
+            && r.layout.is_none()
+            && let Some(programs) = r.checked()
+        {
+            let rows = run::layout_with_skips(&self.doc, r.setup, programs, &r.skips);
+            r.layout = Some(std::sync::Arc::new(Ok(rows)));
+        }
+    }
     fn check_waits(&mut self) -> bool {
         if !self.locked() {
             return false;
@@ -6707,6 +6719,7 @@ impl App {
                 {
                     r.checked_as(programs, Some(left), times);
                     c.fit_sim_block();
+                    self.rows_from_skips();
                     return self.picture_run();
                 }
             }
@@ -6714,10 +6727,15 @@ impl App {
                 if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut())
                     && r.setup_id == setup
                     && r.layout.is_none()
-                    && programs.is_ok()
                 {
-                    r.layout = Some(programs);
+                    match programs.is_ok() {
+                        true => r.layout = Some(programs),
+                        // An operation it skips cannot be sent now: its
+                        // programs, with the skipped ones put back.
+                        false => r.rows_from_skips = true,
+                    }
                 }
+                self.rows_from_skips();
             }
             Message::RunPictures(epoch, pictures) => {
                 self.picture_job = None;

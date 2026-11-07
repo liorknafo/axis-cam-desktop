@@ -306,6 +306,10 @@ pub struct Run {
     /// What `following` found of the operations taken as cut, for
     /// `journal_note` once it follows.
     cut_note: Option<String>,
+    /// The check without its skips, for the Operations list's rows, failed:
+    /// the rows are made from its programs once checked
+    /// (`layout_with_skips`).
+    pub rows_from_skips: bool,
 }
 
 /// What a tool run sent to the Pi was sent from (`Run::follow_record`),
@@ -343,6 +347,81 @@ pub struct Follow {
     pub last: Option<(String, f64)>,
     /// The name it was sent as, which the Pi's Stop after step names.
     pub name: String,
+}
+
+/// The Operations list's rows when the setup does not check without its
+/// skips (an operation whose material is left made one it cannot send):
+/// the tool runs `programs` sends, each operation of setup `si` that
+/// `skips` skips put back where it stands in the setup. It joins the
+/// tool run of the operation sent just before or after it when that has
+/// its tool, or else it heads a tool run of its own; what it would send is
+/// not known, only its name and tool.
+pub fn layout_with_skips(
+    doc: &Document,
+    si: usize,
+    programs: &[Checked],
+    skips: &[(usize, Skip)],
+) -> Vec<Checked> {
+    let mut rows = programs.to_vec();
+    let Some(setup) = doc.setups.get(si) else {
+        return rows;
+    };
+    let mut skipped: Vec<usize> = skips.iter().map(|s| s.0).collect();
+    skipped.sort_unstable();
+    for oi in skipped {
+        let (Some(op), Some(first)) = (setup.operations.get(oi), rows.first()) else {
+            continue;
+        };
+        if rows.iter().any(|p| p.indexes.contains(&oi)) {
+            continue;
+        }
+        let tool = doc.tools.iter().find(|t| t.id == op.tool);
+        let state = crate::post::OpState {
+            name: op.name().into(),
+            strategy: op.strategy.name(),
+            tool: tool.and_then(|t| t.number()).unwrap_or(0),
+            tool_id: op.tool.clone(),
+            tool_name: tool.map_or_else(String::new, |t| t.name().into()),
+            diameter: tool
+                .and_then(|t| crate::num(&t.p, "diameter"))
+                .unwrap_or(0.),
+            stickout: 0.,
+            rpm: crate::num(&op.p, "rpm").unwrap_or(0.),
+            clockwise: true,
+            coolant: (false, false),
+        };
+        // The rows' operations next to it in the setup, before and after.
+        let near = |after: bool| {
+            (rows.iter().enumerate())
+                .flat_map(|(r, p)| p.indexes.iter().enumerate().map(move |(k, &o)| (r, k, o)))
+                .filter(|&(_, _, o)| if after { o > oi } else { o < oi })
+                .min_by_key(|&(_, _, o)| o.abs_diff(oi))
+        };
+        // The neighbour (its row and place), and where it goes beside it.
+        let joins = [
+            near(false).map(|(r, k, _)| (r, k, k + 1)),
+            near(true).map(|(r, k, _)| (r, k, k)),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|&(r, k, _)| rows[r].ops.get(k).is_some_and(|o| o.tool_id == op.tool))
+        .map(|(r, _, at)| (r, at));
+        match joins {
+            Some((r, k)) => {
+                rows[r].ops.insert(k, state);
+                rows[r].indexes.insert(k, oi);
+            }
+            None => {
+                let at = (rows.iter())
+                    .position(|p| p.indexes.first().is_some_and(|&o| o > oi))
+                    .unwrap_or(rows.len());
+                let mut own = first.clone();
+                (own.ops, own.indexes, own.blocks) = (vec![state], vec![oi], vec![]);
+                rows.insert(at, own);
+            }
+        }
+    }
+    rows
 }
 
 /// FNV-1a over operation `oi` of setup `si` and its tool as the project
@@ -592,6 +671,7 @@ impl Run {
             follow: None,
             followed: None,
             cut_note: None,
+            rows_from_skips: false,
         }
     }
 
@@ -4669,6 +4749,7 @@ mod tests {
             follow: None,
             followed: None,
             cut_note: None,
+            rows_from_skips: false,
         };
         let (_, op, block) = run.progress(Some(3)).unwrap();
         assert_eq!((op, block), (0, 2));

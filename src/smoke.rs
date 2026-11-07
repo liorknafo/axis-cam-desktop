@@ -3598,6 +3598,105 @@ flood = { pin = 8 }
         shows(&a, &[&note]);
     }
 
+    /// The Drilling skipped with its material left, the Facing held on the
+    /// Pi, AXIS CAM closed and opened again, the Drilling's speed set past
+    /// the spindle's meanwhile: the setup no longer checks without the
+    /// skip. The Facing is followed again, and the Drilling keeps its row
+    /// and Don't skip, the failed check answering before the run's own
+    /// (`early`) or after it.
+    fn left_drilling_made_unsendable_while_closed(early: bool) {
+        use crate::run::{Action as R, Skip};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(skip(&mut a, 1, Some(Skip::Left)));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5., "the Facing on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        let _ = a.update(Message::Run(R::Hold));
+        pi_until(&server, 10., "Hold on the Pi", |s| {
+            s.state == Some(State::Hold)
+        });
+        let _ = a.update(Message::Disconnect);
+        let mut a = reopen(a, dir.path());
+        let drill = &mut a.doc.setups[0].operations[1];
+        drill.p.insert("rpm".into(), "200000".into());
+        let without = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0);
+        assert!(without.is_err(), "the Drilling still checks");
+        let id = a.doc.setups[0].id.clone();
+        let layout = Message::RunLayout(id, std::sync::Arc::new(without));
+        let _ = a.update(Message::Connect);
+        let mut deadline = Deadline::new(10.);
+        while !(a.control.as_ref().and_then(|c| c.run.as_ref())).is_some_and(|r| r.follow.is_some())
+        {
+            let _ = a.update(Message::Tick);
+            assert!(deadline.within(&conn(&a).snapshot), "never built anew");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let layout = if early {
+            let _ = a.update(layout);
+            None
+        } else {
+            Some(layout)
+        };
+        answer_skips(&mut a, 0);
+        assert!(run_of(&a).followed.clone().unwrap().is_ok());
+        if let Some(layout) = layout {
+            let _ = a.update(layout);
+        }
+        let _ = a.update(Message::Run(R::Stop));
+        pi_until(&server, 10., "stopped", |s| s.state == Some(State::Idle));
+        tick_until(&mut a, 5., "stopped", |s| s.state == Some(State::Idle));
+        assert_eq!(run_of(&a).skips, [(1, Skip::Left)]);
+        let rows: Vec<Vec<usize>> = (run_of(&a).layout.as_deref().unwrap().as_ref().unwrap())
+            .iter()
+            .map(|p| p.indexes.clone())
+            .collect();
+        assert_eq!(rows, [vec![0], vec![1]]);
+        shows(&a, &["skipped: material left", "Don't skip"]);
+    }
+
+    /// Review finding: the check without the skip failed, and the skipped
+    /// Drilling lost its row and its Don't skip.
+    #[test]
+    fn an_operation_left_and_made_unsendable_while_closed_keeps_its_row() {
+        left_drilling_made_unsendable_while_closed(true);
+        left_drilling_made_unsendable_while_closed(false);
+    }
+
+    /// The rows made from a run's programs with its skipped operations put
+    /// back (`layout_with_skips`) are those of the check without skips:
+    /// the fixture's Face, Pocket and Contour share a tool run, the Pocket
+    /// taken as cut and the Contour's material left.
+    #[test]
+    fn rows_made_with_the_skipped_operations_are_those_checked_without_them() {
+        use crate::run::Skip;
+        let dir = tempfile::tempdir().unwrap();
+        let a = run_app_of(dir.path(), FAST, &[0, 1, 2, 3]);
+        let mesh = a.part_mesh().unwrap();
+        let whole = crate::run::programs(&a.doc, mesh, 0).unwrap();
+        let skips = [(1, Skip::Cut), (2, Skip::Left)];
+        let (sent, _) = crate::run::check_skipping(&a.doc, mesh, 0, &skips);
+        let sent = sent.unwrap();
+        let of = |rows: &[crate::post::Checked]| -> Vec<Vec<(usize, String, u32)>> {
+            (rows.iter())
+                .map(|p| {
+                    (p.indexes.iter().zip(&p.ops))
+                        .map(|(&oi, o)| (oi, o.name.clone(), o.tool))
+                        .collect()
+                })
+                .collect()
+        };
+        assert_eq!(of(&sent).concat().len(), 2);
+        let rows = crate::run::layout_with_skips(&a.doc, 0, &sent, &skips);
+        assert_eq!(of(&rows), of(&whole));
+    }
+
     /// The Facing tool run sent to the Pi, then AXIS CAM disconnected as
     /// closing does, and the Facing done on the Pi.
     fn facing_then_closed(dir: &std::path::Path) -> (App, uc100_remote::Server) {
