@@ -351,28 +351,33 @@ pub struct Follow {
 
 /// The Operations list's rows when the setup does not check without its
 /// skips (an operation whose material is left made one it cannot send):
-/// the tool runs `programs` sends, each operation of setup `si` that
-/// `skips` skips put back where it stands in the setup. It joins the
-/// tool run of the operation sent just before or after it when that has
-/// its tool, or else it heads a tool run of its own; what it would send is
-/// not known, only its name and tool.
+/// the operations `programs` sends and those of setup `si` that `skips`
+/// skips, in the setup's order, a tool run ending where the tool changes
+/// or a sent tool run ends. So a skipped operation joins the tool run of
+/// the one beside it with its tool, and one of another tool between two
+/// sent together splits them, as the check without skips does. What a
+/// skipped one would send is not known, only its name and tool.
 pub fn layout_with_skips(
     doc: &Document,
     si: usize,
     programs: &[Checked],
     skips: &[(usize, Skip)],
 ) -> Vec<Checked> {
-    let mut rows = programs.to_vec();
-    let Some(setup) = doc.setups.get(si) else {
-        return rows;
+    let (Some(setup), Some(first)) = (doc.setups.get(si), programs.first()) else {
+        return programs.to_vec();
     };
-    let mut skipped: Vec<usize> = skips.iter().map(|s| s.0).collect();
-    skipped.sort_unstable();
-    for oi in skipped {
-        let (Some(op), Some(first)) = (setup.operations.get(oi), rows.first()) else {
+    // Each operation: its index in the setup, what it runs, and the tool
+    // run that sends it (None: skipped).
+    let mut all: Vec<(usize, crate::post::OpState, Option<usize>)> = (programs.iter().enumerate())
+        .flat_map(|(i, p)| {
+            (p.indexes.iter().zip(&p.ops)).map(move |(&oi, o)| (oi, o.clone(), Some(i)))
+        })
+        .collect();
+    for &(oi, _) in skips {
+        let Some(op) = setup.operations.get(oi) else {
             continue;
         };
-        if rows.iter().any(|p| p.indexes.contains(&oi)) {
+        if all.iter().any(|a| a.0 == oi) {
             continue;
         }
         let tool = doc.tools.iter().find(|t| t.id == op.tool);
@@ -390,38 +395,38 @@ pub fn layout_with_skips(
             clockwise: true,
             coolant: (false, false),
         };
-        // The rows' operations next to it in the setup, before and after.
-        let near = |after: bool| {
-            (rows.iter().enumerate())
-                .flat_map(|(r, p)| p.indexes.iter().enumerate().map(move |(k, &o)| (r, k, o)))
-                .filter(|&(_, _, o)| if after { o > oi } else { o < oi })
-                .min_by_key(|&(_, _, o)| o.abs_diff(oi))
-        };
-        // The neighbour (its row and place), and where it goes beside it.
-        let joins = [
-            near(false).map(|(r, k, _)| (r, k, k + 1)),
-            near(true).map(|(r, k, _)| (r, k, k)),
-        ]
-        .into_iter()
-        .flatten()
-        .find(|&(r, k, _)| rows[r].ops.get(k).is_some_and(|o| o.tool_id == op.tool))
-        .map(|(r, _, at)| (r, at));
-        match joins {
-            Some((r, k)) => {
-                rows[r].ops.insert(k, state);
-                rows[r].indexes.insert(k, oi);
-            }
-            None => {
-                let at = (rows.iter())
-                    .position(|p| p.indexes.first().is_some_and(|&o| o > oi))
-                    .unwrap_or(rows.len());
-                let mut own = first.clone();
-                (own.ops, own.indexes, own.blocks) = (vec![state], vec![oi], vec![]);
-                rows.insert(at, own);
-            }
+        all.push((oi, state, None));
+    }
+    all.sort_by_key(|a| a.0);
+    let mut groups: Vec<Vec<(usize, crate::post::OpState, Option<usize>)>> = vec![];
+    for item in all {
+        let apart = groups.last().and_then(|g| g.last()).is_none_or(|last| {
+            last.1.tool_id != item.1.tool_id
+                || matches!((last.2, item.2), (Some(a), Some(b)) if a != b)
+        });
+        if apart {
+            groups.push(vec![item]);
+        } else {
+            groups.last_mut().expect("a group").push(item);
         }
     }
-    rows
+    (groups.into_iter())
+        .map(|g| {
+            // The tool run that sends its operations, as it is when it is
+            // all of them; else a row of their own.
+            let mut row = g
+                .iter()
+                .find_map(|a| a.2)
+                .map_or(first, |i| &programs[i])
+                .clone();
+            let indexes: Vec<usize> = g.iter().map(|a| a.0).collect();
+            if row.indexes != indexes {
+                row.blocks.clear();
+                (row.indexes, row.ops) = (indexes, g.into_iter().map(|a| a.1).collect());
+            }
+            row
+        })
+        .collect()
 }
 
 /// FNV-1a over operation `oi` of setup `si` and its tool as the project

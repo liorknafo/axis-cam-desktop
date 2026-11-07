@@ -3672,17 +3672,12 @@ flood = { pin = 8 }
     /// The rows made from a run's programs with its skipped operations put
     /// back (`layout_with_skips`) are those of the check without skips:
     /// the fixture's Face, Pocket and Contour share a tool run, the Pocket
-    /// taken as cut and the Contour's material left.
+    /// taken as cut and the Contour's material left; and (review finding)
+    /// a Drill of another tool skipped between the Face and the Contour,
+    /// which the run then sends together, keeps its place between them.
     #[test]
     fn rows_made_with_the_skipped_operations_are_those_checked_without_them() {
         use crate::run::Skip;
-        let dir = tempfile::tempdir().unwrap();
-        let a = run_app_of(dir.path(), FAST, &[0, 1, 2, 3]);
-        let mesh = a.part_mesh().unwrap();
-        let whole = crate::run::programs(&a.doc, mesh, 0).unwrap();
-        let skips = [(1, Skip::Cut), (2, Skip::Left)];
-        let (sent, _) = crate::run::check_skipping(&a.doc, mesh, 0, &skips);
-        let sent = sent.unwrap();
         let of = |rows: &[crate::post::Checked]| -> Vec<Vec<(usize, String, u32)>> {
             (rows.iter())
                 .map(|p| {
@@ -3692,9 +3687,26 @@ flood = { pin = 8 }
                 })
                 .collect()
         };
-        assert_eq!(of(&sent).concat().len(), 2);
-        let rows = crate::run::layout_with_skips(&a.doc, 0, &sent, &skips);
-        assert_eq!(of(&rows), of(&whole));
+        for (ops, skips, sent_ops) in [
+            (
+                &[0, 1, 2, 3][..],
+                &[(1, Skip::Cut), (2, Skip::Left)][..],
+                vec![vec![0], vec![3]],
+            ),
+            (&[0, 3, 2][..], &[(1, Skip::Left)][..], vec![vec![0, 2]]),
+            (&[0, 3, 2][..], &[(1, Skip::Cut)][..], vec![vec![0, 2]]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let a = run_app_of(dir.path(), FAST, ops);
+            let mesh = a.part_mesh().unwrap();
+            let whole = crate::run::programs(&a.doc, mesh, 0).unwrap();
+            let (sent, _) = crate::run::check_skipping(&a.doc, mesh, 0, skips);
+            let sent = sent.unwrap();
+            let indexes: Vec<Vec<usize>> = sent.iter().map(|p| p.indexes.clone()).collect();
+            assert_eq!(indexes, sent_ops, "{ops:?} {skips:?}");
+            let rows = crate::run::layout_with_skips(&a.doc, 0, &sent, skips);
+            assert_eq!(of(&rows), of(&whole), "{ops:?} {skips:?}");
+        }
     }
 
     /// The Facing tool run sent to the Pi, then AXIS CAM disconnected as
