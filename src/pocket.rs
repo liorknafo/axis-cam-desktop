@@ -1910,6 +1910,20 @@ pub fn dropped(
         .collect();
     Some((drop, keep))
 }
+/// The holes `op`'s picked surfaces pick, as `setup` places the part: in a
+/// Pocket or an Adaptive clearing, less the faces of a picked slope
+/// (`sloped_faces`), as `job` reads them, so a rounded edge's steep foot is
+/// no hole's wall.
+pub fn picked_holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, String> {
+    let mut ids: std::collections::HashSet<usize> = (op.surfaces.iter())
+        .flat_map(|s| s.ids.iter().copied())
+        .collect();
+    if matches!(op.strategy, Strategy::Pocket | Strategy::Adaptive) {
+        let steps = sloped_faces(setup, mesh, ids.iter().copied());
+        ids.retain(|id| !steps.contains(id));
+    }
+    holes(setup, &ids, mesh)
+}
 /// The holes the selected walls among `ids` pick (a Pocket's surfaces), as
 /// `setup` places the part: the hole of each wall not in one found before,
 /// as a click on it picks it. Two holes may share a wall (a pocket's wall
@@ -6703,6 +6717,16 @@ pub(crate) mod tests {
         let all = [ids.as_slice(), &plate].concat();
         assert!(!sloped_faces(&setup, &mesh, all.iter().copied()).contains(&plate[0]));
         for strategy in [Strategy::Pocket, Strategy::Adaptive] {
+            // The Geometry tab's holes: the foot is no hole's wall (the app
+            // said "The hole near X-44.86 Y-18.42 is selected only in part").
+            let (_, mut op, _, _) = fixture();
+            op.strategy = strategy;
+            op.surfaces = Some(surface::Selection {
+                mesh_fingerprint: mesh.fingerprint.clone(),
+                ids: ids.clone(),
+            });
+            assert!(holes(&setup, &ids.iter().copied().collect(), &mesh).is_err());
+            assert!(picked_holes(&setup, &op, &mesh).unwrap().is_empty());
             let plan = planned(strategy, &setup, &mesh, &ids);
             let plan = plan.unwrap_or_else(|e| panic!("{strategy:?}: {e}"));
             assert!(plan.levels > 1, "{strategy:?}: {} levels", plan.levels);

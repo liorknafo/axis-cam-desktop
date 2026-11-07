@@ -3772,21 +3772,16 @@ impl App {
         {
             return found.clone();
         }
-        let ids = op
-            .surfaces
-            .iter()
-            .flat_map(|s| s.ids.iter().copied())
-            .collect();
+        // As the operation reads them: a picked slope's faces are no walls.
         let found = (self
             .doc
             .holes_listed(self.doc.index(), op, mesh, |posed, op| {
-                let ids = (op.surfaces.iter()).flat_map(|s| s.ids.iter().copied());
-                pocket::holes(posed, &ids.collect(), mesh)
+                pocket::picked_holes(posed, op, mesh)
             }))
         .map(|listed| {
             listed.map(|l| (l.into_iter().map(|(a, h)| pocket::Hole { a: Some(a), ..h })).collect())
         })
-        .unwrap_or_else(|| pocket::holes(self.doc.setup(), &ids, mesh));
+        .unwrap_or_else(|| pocket::picked_holes(self.doc.setup(), op, mesh));
         let found = std::sync::Arc::new(found);
         *kept = Some((key, found.clone()));
         found
