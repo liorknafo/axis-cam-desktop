@@ -1261,6 +1261,41 @@ impl Level {
             (hi.0 - lo.0).max(hi.1 - lo.1)
         }
     }
+    /// What a later cutter of `radius` sweeps of this level of `hole`, its
+    /// centre kept as `Hole::fits` keeps it (the radius and a margin) from
+    /// the part: all it reaches (a Pocket, an Adaptive clearing), or one
+    /// pass round where its centre may go (`ring`, a Contour's wall pass).
+    pub fn swept(&self, hole: &Hole, radius: f64, ring: bool) -> Region {
+        let inset = radius + (radius * 0.01).max(0.02);
+        match self.centres(hole, inset) {
+            Ok(c) => c.inflate(
+                radius,
+                JoinType::Round,
+                if ring {
+                    EndType::Joined
+                } else {
+                    EndType::Polygon
+                },
+                2.,
+            ),
+            Err(_) => Vec::<Polygon>::new().into(),
+        }
+    }
+    /// How much of this level `swept` leaves, mm²: of what of its outline
+    /// nothing of the part is over (`open`), less a band `clear` wide along
+    /// its edges (where a cutter keeps its margin from the part), what is
+    /// over 0.02 mm thick (slivers thinner, where a faceted outline and a
+    /// round sweep part by a chord's height, are no stock left).
+    pub fn left_by(&self, swept: &Region, clear: f64) -> f64 {
+        let inner = self
+            .open
+            .inflate(-clear, JoinType::Round, EndType::Polygon, 2.);
+        difference::<Milli>(inner, swept.clone(), FillRule::NonZero).map_or(f64::INFINITY, |r| {
+            r.inflate(-0.01, JoinType::Round, EndType::Polygon, 2.)
+                .signed_area()
+                .abs()
+        })
+    }
     /// Where the centre of a cutter `inset` from the part may go to cut this
     /// level of `hole`: inside its outline, and clear of anything of the
     /// part over the level.
@@ -1927,6 +1962,17 @@ pub fn dropped(
         .flat_map(|i| now[i].walls.iter().copied())
         .collect();
     Some((drop, keep))
+}
+/// A drill's round cut, `radius` round `centre`, as a region (64 chords
+/// inside the circle).
+pub fn disc(centre: (f64, f64), radius: f64) -> Region {
+    let points: Polygon = (0..64)
+        .map(|k| {
+            let t = std::f64::consts::TAU * k as f64 / 64.;
+            (centre.0 + radius * t.cos(), centre.1 + radius * t.sin())
+        })
+        .collect();
+    vec![points].into()
 }
 /// The holes `op`'s picked surfaces pick, as `setup` places the part: in a
 /// Pocket or an Adaptive clearing, less the faces of a picked slope

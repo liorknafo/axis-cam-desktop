@@ -3782,18 +3782,19 @@ impl App {
     }
     /// What the later enabled operations of the setup `op` is in cut of
     /// `hole`, one of `op`'s picked holes: None when none cuts any of it;
-    /// else the name of one, and, when none cuts all of it, what the first
-    /// that cuts part of it leaves. A Drill cuts a hole it drills (its
-    /// filters, `cam::drills`), centre within 0.1 mm, at the same A angle;
-    /// all of it with a drilling cycle and a drill no smaller than its bore
-    /// (its narrowest, as the Drill reads it) less 0.02 mm, to its bottom
-    /// (Bottom offset, less Breakthrough, not over 0) and as wide as what
-    /// `op` leaves of it (its levels `fits` says `op` does not fit). A Pocket
-    /// or an Adaptive clearing of Selected geometry, the tool inside, or an
-    /// Inside Contour of Selected geometry, cuts one it picks in the same
-    /// place at the same angle; all of it with a cutter that fits all of it,
-    /// no stock to leave, and for the Contour's one pass round the walls, no
-    /// more than twice the cutter wide.
+    /// else the name of one, and, when none cuts all of what `op` leaves of
+    /// it (its levels `fits` says `op` does not fit), what the first that
+    /// cuts part of it leaves. All is what its cutter sweeps of each such
+    /// level, less 0.01 mm² (`pocket::Level::left_by`): a drill's disc at
+    /// its centre, to its bottom (Bottom offset, less Breakthrough, not
+    /// over 0); a Pocket's or an Adaptive clearing's whole reach; an Inside
+    /// Contour's one pass round the walls (`pocket::Level::swept`). A Drill
+    /// cuts a hole it drills (its filters, `cam::drills`), centre within
+    /// 0.1 mm, at the same A angle, with a drilling cycle and a drill no
+    /// smaller than its bore (its narrowest, as the Drill reads it) less
+    /// 0.02 mm; a Pocket or an Adaptive clearing of Selected geometry, the
+    /// tool inside, or an Inside Contour of Selected geometry, one it picks
+    /// in the same place at the same angle, with no stock to leave.
     pub(crate) fn cut_later(
         &self,
         op: &Operation,
@@ -3804,12 +3805,20 @@ impl App {
         let setup = self.doc.setup();
         let at = setup.operations.iter().position(|o| o.id == op.id)?;
         let (x, y) = hole.centre();
-        // The widest of what `op` leaves of it (its levels its cutter does
-        // not fit): a drill must be as wide, a wall pass reach its middle.
-        let left = (hole.levels.iter().zip(fits))
+        // What `op` leaves of it: its levels its cutter does not fit, the
+        // widest, and how much of them, mm², a later cut `swept` leaves
+        // (less `clear` along their edges, where a cutter keeps clear).
+        let levels: Vec<&pocket::Level> = (hole.levels.iter().zip(fits))
             .filter(|(_, f)| !**f)
-            .map(|(l, _)| l.width())
-            .fold(0., f64::max);
+            .map(|(l, _)| l)
+            .collect();
+        let left = levels.iter().map(|l| l.width()).fold(0., f64::max);
+        let uncut = |swept: &dyn Fn(&pocket::Level) -> pocket::Region, clear: f64| {
+            levels
+                .iter()
+                .map(|l| l.left_by(&swept(l), clear))
+                .sum::<f64>()
+        };
         let angle = |a: Option<f32>| match (a, hole.a) {
             (None, None) => true,
             (Some(a), Some(b)) => (a - b).abs() < 0.01,
@@ -3847,14 +3856,13 @@ impl App {
                             .or_insert_with(|| self.drill_holes(o, mesh))
                             .clone();
                         drop(kept);
-                        let bore = (listed.as_ref().as_ref().ok())?
-                            .iter()
-                            .find(|h| {
-                                cam::drills(o, h)
-                                    && angle(h.a)
-                                    && (h.center[0] as f64 - x).hypot(h.center[1] as f64 - y) <= 0.1
-                            })?
-                            .diameter;
+                        let found = (listed.as_ref().as_ref().ok())?.iter().find(|h| {
+                            cam::drills(o, h)
+                                && angle(h.a)
+                                && (h.center[0] as f64 - x).hypot(h.center[1] as f64 - y) <= 0.1
+                        })?;
+                        let bore = found.diameter;
+                        let centre = (found.center[0] as f64, found.center[1] as f64);
                         let drills = !(o.helical()
                             || o.thread_milling()
                             || o.tapping()
@@ -3875,7 +3883,7 @@ impl App {
                                 o.name(),
                                 crate::post::exact_mm(diameter)
                             ))
-                        } else if (diameter as f64) < left - 0.02 {
+                        } else if uncut(&|_| pocket::disc(centre, diameter as f64 / 2.), 0.015) > 0.01 {
                             Some(format!(
                                 "{} after it drills it Ø{}, narrower than the {left:.2} mm of it left",
                                 o.name(),
@@ -3894,9 +3902,8 @@ impl App {
                     // A Pocket or an Adaptive clearing cuts the holes it
                     // picks only of Selected geometry, the tool inside (as
                     // `pocket::job` asks); a Contour only of Selected
-                    // geometry, Inside (`cam::contour`), and as one pass
-                    // round its walls, which leaves the middle of one more
-                    // than twice the cutter wide.
+                    // geometry, Inside (`cam::contour`), as one pass round
+                    // its walls.
                     Strategy::Pocket | Strategy::Adaptive | Strategy::Contour
                         if get(&o.p, "boundary") == "Selected geometry"
                             && match o.strategy {
@@ -3914,7 +3921,7 @@ impl App {
                             .or_insert_with(|| std::sync::Arc::new(self.picked_holes(o, mesh)))
                             .clone();
                         drop(kept);
-                        let same = (listed.as_ref().as_ref().ok())?
+                        (listed.as_ref().as_ref().ok())?
                             .iter()
                             .find(|h| angle(h.a) && h.same_place(hole))?;
                         // A Contour leaves no stock on the floor (`cam::contour`).
@@ -3924,13 +3931,16 @@ impl App {
                             } else {
                                 number(o, "axial_allowance")
                             };
-                        let why = if !same.fits(diameter, radial).iter().all(|f| *f) {
-                            Some(format!("{} after it does not fit all of it either", o.name()))
-                        } else if radial > 0.001 || left_on_floor > 0.001 {
+                        let r = diameter as f64 / 2.;
+                        let ring = o.strategy == Strategy::Contour;
+                        // Past the margin it keeps from the part.
+                        let clear = (r * 0.01).max(0.02) + 0.005;
+                        let missed = uncut(&|l| l.swept(hole, r, ring), clear);
+                        let why = if radial > 0.001 || left_on_floor > 0.001 {
                             Some(format!("{} after it leaves stock to leave in it", o.name()))
-                        } else if o.strategy == Strategy::Contour && left > 2. * diameter as f64 - 0.05 {
+                        } else if missed > 0.01 {
                             Some(format!(
-                                "{} after it, one pass round its walls, leaves the middle of the {left:.2} mm of it left",
+                                "{} after it leaves {missed:.2} mm² of it its cutter does not reach",
                                 o.name()
                             ))
                         } else {
