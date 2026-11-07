@@ -3601,12 +3601,20 @@ impl App {
         };
         let si =
             (self.doc.setups.iter()).position(|s| s.id == f.setup && s.machine.id == c.machine_id);
+        // Of another project, or of a setup removed: it waits, should the
+        // project it is of open.
         let Some(si) = si.filter(|&si| !manual::is_hand(&self.doc.setups[si].machine)) else {
-            c.reattach_failed(
-                "The tool run on the Pi is of a setup this project does not have, so it is not followed. The machine carries on; Hold, Stop and E-stop still act on it.".into(),
-            );
+            let of = match (f.setup_name.is_empty(), f.project.is_empty()) {
+                (false, false) => format!(" ({} of {})", f.setup_name, f.project),
+                (false, true) => format!(" ({})", f.setup_name),
+                _ => String::new(),
+            };
+            c.reattach_waits(format!(
+                "The Pi runs a tool run this computer sent of a setup{of} that this project does not have: open its project to follow it. The machine carries on; Hold, Stop and E-stop still act on it."
+            ));
             return Task::none();
         };
+        c.take_reattach();
         self.run_epoch += 1;
         let skipped = !f.skips.is_empty();
         c.run = Some(run::Run::following(&self.doc, si, self.run_epoch, f));
@@ -7675,7 +7683,7 @@ impl App {
                 let loaded = self.part_mesh().is_some();
                 let reattach = (self.control.as_mut())
                     .filter(|_| loaded)
-                    .and_then(|c| c.take_reattach());
+                    .and_then(|c| c.reattach().cloned());
                 let follow = match reattach {
                     Some(f) => self.follow_pi_run(f),
                     None => Task::none(),

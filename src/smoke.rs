@@ -3745,6 +3745,91 @@ flood = { pin = 8 }
         pi_until(&server, 10., "stopped", |s| s.state == Some(State::Idle));
     }
 
+    /// Review finding: AXIS CAM opened again on another project connects,
+    /// then the project of the Pi's tool run opens. The Facing skipped as
+    /// already cut, the Drilling held on the Pi; still going when the
+    /// project opens, or done by then (`ended`). Until it opens a note says
+    /// to open it; then the run follows the tool run, its rows the setup's.
+    fn opened_after_connecting(ended: bool) {
+        use crate::run::{Action as R, Skip};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(skip(&mut a, 0, Some(Skip::Cut)));
+        let _ = a.update(Message::Run(R::KeepZero));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5., "the Drilling on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        let _ = a.update(Message::Run(R::Hold));
+        pi_until(&server, 10., "Hold on the Pi", |s| {
+            s.state == Some(State::Hold)
+        });
+        let _ = a.update(Message::Disconnect);
+        let mut a = reopen(a, dir.path());
+        let (project, mesh) = (a.doc.clone(), a.imported_mesh.clone());
+        // Another project, on the same machine, without that setup.
+        let mut other = project.clone();
+        other.setups[0].id = "another setup".into();
+        other.active = other.setups[0].id.clone();
+        a.replace_document(other, None);
+        a.imported_mesh = mesh.clone();
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 5., "the link live", |s| s.state.is_some());
+        tick_for(&mut a, 300);
+        assert!(conn(&a).run.is_none());
+        let note = conn(&a).pi_note.clone().unwrap_or_default();
+        assert!(note.contains("open its project to follow it"), "{note}");
+        if ended {
+            // Hold and Resume act on the machine, followed or not.
+            let _ = a.update(Message::Run(R::Resume));
+            pi_until(&server, 60., "the Drilling's end", |s| {
+                s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| o.ok)
+            });
+            tick_for(&mut a, 300);
+            assert!(
+                conn(&a).journal().is_none(),
+                "its end taken without its project"
+            );
+        }
+        a.replace_document(project, None);
+        a.imported_mesh = mesh;
+        follow_again(&mut a).unwrap();
+        let programs = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0);
+        let id = a.doc.setups[0].id.clone();
+        let _ = a.update(Message::RunLayout(id, std::sync::Arc::new(programs)));
+        let run = run_of(&a);
+        assert_eq!(run.skips, [(0, Skip::Cut)]);
+        if ended {
+            assert!(
+                run.done[0] && run.running.is_none(),
+                "the Drilling not done"
+            );
+            assert_eq!(run.outcome.as_ref().map(|o| o.0), Some(true));
+        } else {
+            assert_eq!(run.running.as_ref().map(|r| r.index), Some(0));
+            let _ = a.update(Message::Run(R::Stop));
+            pi_until(&server, 10., "stopped", |s| s.state == Some(State::Idle));
+            tick_until(&mut a, 5., "stopped", |s| s.state == Some(State::Idle));
+        }
+        let rows: Vec<Vec<usize>> = (run_of(&a).layout.as_deref().unwrap().as_ref().unwrap())
+            .iter()
+            .map(|p| p.indexes.clone())
+            .collect();
+        assert_eq!(rows, [vec![0], vec![1]]);
+        a.page = Page::Control;
+        shows(&a, &["skipped: already cut", "Don't skip"]);
+    }
+
+    #[test]
+    fn the_project_of_the_pis_tool_run_opened_after_connecting_follows_it() {
+        opened_after_connecting(false);
+        opened_after_connecting(true);
+    }
+
     /// The Facing tool run sent to the Pi, then AXIS CAM disconnected as
     /// closing does, and the Facing done on the Pi.
     fn facing_then_closed(dir: &std::path::Path) -> (App, uc100_remote::Server) {

@@ -318,8 +318,12 @@ pub struct Run {
 /// (`program`).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Follow {
-    /// The setup's id.
+    /// The setup's id, and its name and its project's as they were.
     pub setup: String,
+    #[serde(default)]
+    pub setup_name: String,
+    #[serde(default)]
+    pub project: String,
     pub skips: Vec<(usize, Skip)>,
     pub cut_steps: Vec<(usize, Vec<usize>)>,
     pub start_step: Option<(usize, usize)>,
@@ -714,6 +718,8 @@ impl Run {
         let programs = self.checked()?;
         Some(Follow {
             setup: self.setup_id.clone(),
+            setup_name: self.name.clone(),
+            project: self.project.clone(),
             skips: self.skips.clone(),
             cut_steps: self.cut_steps.clone(),
             start_step: self.start_step,

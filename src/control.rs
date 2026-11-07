@@ -2935,8 +2935,10 @@ impl Connection {
             follow,
         };
         let path = self.pi_pending();
-        // Never another's end, even if it never goes.
+        // Never another's end, even if it never goes; and a tool run kept
+        // from before AXIS CAM was closed is over with.
         self.tool_run_id = Some(pending.id);
+        self.reattach = None;
         if let Err(e) = pending.write(&path) {
             self.pi_note = Some(format!(
                 "Where a stop after a step would leave this tool run could not be kept: {e}."
@@ -5513,23 +5515,38 @@ impl Connection {
     /// again, for the app to build its run anew and follow it
     /// (`run::Run::following`): once the link is live, if the Pi still has
     /// it, or tells how it ended, and this computer follows no tool run.
-    /// One the Pi does not know (its server started again since) is let
-    /// go.
-    pub fn take_reattach(&mut self) -> Option<crate::run::Follow> {
+    /// One the Pi does not know (its server started again since), or while
+    /// this computer follows another, is let go. It stays until the app
+    /// takes it (`take_reattach`), as when the project it is of opens.
+    pub fn reattach(&mut self) -> Option<&crate::run::Follow> {
         let link = self.link.as_ref().filter(|l| l.live)?;
         let (id, _) = self.reattach.as_ref()?;
         let known =
             link.tool_run_going.contains(id) || link.tool_run_ends.iter().any(|e| e.id == *id);
         let following = self.run.as_ref().is_some_and(|r| r.running.is_some());
-        let (id, follow) = self.reattach.take()?;
         if !known || following {
+            self.reattach = None;
             return None;
         }
-        self.attaching = Some(id);
-        Some(follow)
+        self.reattach.as_ref().map(|r| &r.1)
     }
 
-    /// The app could not build the run `take_reattach` gave (`why`): where
+    /// Takes the tool run `reattach` gave, its run being built anew.
+    pub fn take_reattach(&mut self) {
+        if let Some((id, _)) = self.reattach.take() {
+            self.attaching = Some(id);
+        }
+    }
+
+    /// Why the tool run `reattach` gives is not followed yet (`why`): it
+    /// waits, as where it ended does (`adopt_pi_stop`).
+    pub fn reattach_waits(&mut self, why: String) {
+        if self.pi_note.as_ref() != Some(&why) {
+            self.pi_note = Some(why);
+        }
+    }
+
+    /// The app could not build the run `take_reattach` took (`why`): where
     /// the tool run ended is then taken from what was kept as it was sent
     /// (`adopt_pi_stop`).
     pub fn reattach_failed(&mut self, why: String) {
