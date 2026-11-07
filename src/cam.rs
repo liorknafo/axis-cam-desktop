@@ -2341,6 +2341,14 @@ fn slot_lap(c: [f32; 2], along: [f32; 2], length: f32, offset: f32) -> Vec<[f32;
     lap.push(lap[0]);
     lap
 }
+/// Whether Drill operation `op` cuts `hole`, one it lists (`holes`): of its
+/// Hole diameter (within 0.1 mm), or any for 0, and threaded when it drills
+/// only threaded holes.
+pub(crate) fn drills(op: &Operation, hole: &Hole) -> bool {
+    let filter = num(&op.p, "hole_diameter").unwrap_or(0.);
+    (filter <= 0. || (hole.diameter - filter).abs() <= 0.1)
+        && (!op.threaded_holes_only() || hole.thread.is_some())
+}
 /// The holes of the selected face a Drill operation cuts: those of its Hole
 /// diameter, or all of them for 0.
 fn drill_holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, String> {
@@ -2353,14 +2361,9 @@ fn drill_holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, 
     if filter < 0. {
         return Err("Hole diameter filter must be zero (all) or positive.".into());
     }
-    if filter > 0. {
-        holes.retain(|h| (h.diameter - filter).abs() <= 0.1);
-    }
-    if op.threaded_holes_only() {
-        holes.retain(|h| h.thread.is_some());
-        if holes.is_empty() {
-            return Err("None of the selected holes has a thread modeled in it. Set Holes to Part's holes to drill them.".into());
-        }
+    holes.retain(|h| drills(op, h));
+    if op.threaded_holes_only() && holes.is_empty() {
+        return Err("None of the selected holes has a thread modeled in it. Set Holes to Part's holes to drill them.".into());
     }
     if holes.is_empty() {
         return Err("No detected holes match the diameter filter.".into());

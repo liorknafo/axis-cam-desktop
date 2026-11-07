@@ -19869,6 +19869,36 @@ soft_max = 180.0
                 .p
                 .insert("bottom".into(), "0".into());
             assert_eq!(narrow(&a), 0, "{strategy:?}");
+            // Not when its Hole diameter filter leaves the hole out (the
+            // review's: it drills none of it).
+            a.doc.setup_mut().operations[last]
+                .p
+                .insert("hole_diameter".into(), "3".into());
+            assert_eq!(narrow(&a), 1, "{strategy:?}");
+            assert!(!said(&a).contains("after it"), "{}", said(&a));
+            a.doc.setup_mut().operations[last]
+                .p
+                .insert("hole_diameter".into(), "0".into());
+            // A Ø2 pilot before the Ø6 drill: the Ø6 drills all of it.
+            let mut pilot = a.doc.setup().operations[last].clone();
+            pilot.id = "pilot".into();
+            let mut small = a
+                .doc
+                .tools
+                .iter()
+                .find(|t| t.id == drill_id)
+                .unwrap()
+                .clone();
+            small.id = "pilot-drill".into();
+            small.p.insert("diameter".into(), "2".into());
+            pilot.tool = small.id.clone();
+            a.doc.tools.push(small);
+            a.doc.setup_mut().operations.insert(last, pilot);
+            assert_eq!(narrow(&a), 0, "{strategy:?}: {}", said(&a));
+            a.doc.setup_mut().operations[last + 1].enabled = false;
+            assert!(said(&a).contains("after it drills it Ø2"), "{}", said(&a));
+            a.doc.setup_mut().operations.remove(last + 1);
+            a.doc.setup_mut().operations[last].enabled = true;
             // Not when it is off, nor when it comes first.
             a.doc.setup_mut().operations[last].enabled = false;
             assert_eq!(narrow(&a), 1, "{strategy:?}");
@@ -19880,6 +19910,53 @@ soft_max = 180.0
             assert!(a.operation().unwrap().strategy == strategy);
             assert_eq!(narrow(&a), 1, "{strategy:?}");
         }
+    }
+    #[test]
+    fn in_an_indexed_setup_a_later_drilling_takes_only_the_holes_it_drills_at_their_angles() {
+        // The review's: radial holes of the tube at A 30, 90, 150 and 210
+        // picked in an Adaptive clearing too wide for them; a Drilling after
+        // it of the holes at 30 and 210 only. Matched by X and Y alone, the
+        // holes at 90 and 150 (in the same place, seen at their own angle)
+        // were taken as drilled too.
+        let mut a = app();
+        let (doc, mesh) = crate::indexed::tests::radial_doc(
+            "radial-tube",
+            "30, 90, 150, 210",
+            ("4", "45"),
+            14.3,
+            |x, _| (x - 20.).abs() < 2.2,
+        );
+        a.doc = doc;
+        a.imported_mesh = Some(mesh.clone());
+        a.doc.active = a.doc.setups[1].id.clone();
+        a.selected = Some(0);
+        let drill = a.doc.setup().operations[0].clone();
+        let all = a.pocket_holes(&drill, &mesh);
+        let all = all.as_ref().as_ref().unwrap();
+        assert_eq!(all.len(), 4);
+        let mut cutter = Tool::new("Rough 8", "Flat end mill", "8");
+        for (k, v) in [("length", "45"), ("stickout", "55"), ("number", "8")] {
+            cutter.p.insert(k.into(), v.into());
+        }
+        let mut rough = drill.clone();
+        rough.id = "indexed-rough".into();
+        rough.strategy = Strategy::Adaptive;
+        rough.tool = cutter.id.clone();
+        a.doc.tools.push(cutter);
+        let mut later = drill.clone();
+        later.surfaces.as_mut().unwrap().ids =
+            all[0].walls.iter().chain(&all[3].walls).copied().collect();
+        a.doc.setup_mut().operations = vec![rough.clone(), later];
+        let cut: Vec<bool> = all
+            .iter()
+            .map(|h| a.cut_later(&rough, &mesh, h).is_some())
+            .collect();
+        assert_eq!(
+            cut,
+            [true, false, false, true],
+            "{:?}",
+            all.iter().map(|h| h.a).collect::<Vec<_>>()
+        );
     }
     #[test]
     fn a_click_on_a_holes_chamfer_picks_it_and_the_pocket_names_what_its_cutter_leaves() {
