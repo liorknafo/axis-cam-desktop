@@ -3787,9 +3787,10 @@ impl App {
     /// filters, `cam::drills`), centre within 0.1 mm, at the same A angle;
     /// all of it with a drilling cycle and a drill no smaller than its bore
     /// (its narrowest, as the Drill reads it) less 0.02 mm, to its bottom
-    /// (Bottom offset, less Breakthrough, not over 0). A Pocket, an Adaptive
-    /// clearing or a Contour cuts one it picks in the same place at the same
-    /// angle; all of it with a cutter that fits all of it, no stock to leave.
+    /// (Bottom offset, less Breakthrough, not over 0). A Pocket or an
+    /// Adaptive clearing of Selected geometry, the tool inside, cuts one it
+    /// picks in the same place at the same angle; all of it with a cutter
+    /// that fits all of it, no stock to leave. A Contour cuts none.
     pub(crate) fn cut_later(
         &self,
         op: &Operation,
@@ -3874,7 +3875,14 @@ impl App {
                         };
                         Some((o.name().to_string(), why))
                     }
-                    Strategy::Pocket | Strategy::Adaptive | Strategy::Contour => {
+                    // A Pocket or an Adaptive clearing cuts the holes it
+                    // picks only of Selected geometry, the tool inside (as
+                    // `pocket::job` asks). A Contour's wall pass (`cam::
+                    // contour`) can leave a blind hole's core: none.
+                    Strategy::Pocket | Strategy::Adaptive
+                        if get(&o.p, "boundary") == "Selected geometry"
+                            && get(&o.p, "containment") == "Tool inside boundary" =>
+                    {
                         let radial = num(&o.p, "allowance").filter(|a| *a >= 0.)?;
                         let key = self.holes_key(o, mesh);
                         let mut kept = self.later_holes.borrow_mut();

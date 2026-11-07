@@ -19879,6 +19879,20 @@ soft_max = 180.0
             a.doc.setup_mut().operations[last]
                 .p
                 .insert("hole_diameter".into(), "0".into());
+            // Nor by a Contour after it, Outside (the review's: its path
+            // stays 10.9 mm off the hole) or Inside: a wall pass.
+            for side in ["Outside", "Inside"] {
+                let mut contour = Operation::new(Strategy::Contour, id.clone());
+                contour.geometry.clear();
+                contour.surfaces = a.doc.setup().operations[0].surfaces.clone();
+                contour.p.insert("side".into(), side.into());
+                contour.p.insert("allowance".into(), "0".into());
+                a.doc.setup_mut().operations[last].enabled = false;
+                a.doc.setup_mut().operations.push(contour);
+                assert_eq!(narrow(&a), 1, "{strategy:?}, {side} Contour");
+                a.doc.setup_mut().operations.pop();
+                a.doc.setup_mut().operations[last].enabled = true;
+            }
             // A Ø2 pilot before the Ø6 drill: the Ø6 drills all of it.
             let mut pilot = a.doc.setup().operations[last].clone();
             pilot.id = "pilot".into();
