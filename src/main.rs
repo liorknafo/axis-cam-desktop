@@ -3884,15 +3884,20 @@ impl App {
                         let tip = found.bottom + number(o, "bottom") - through;
                         let full = tip + diameter / 2. * crate::simulation::POINT_RISE;
                         // A blind level whose walls end over the bore's
-                        // centre (`cam::Hole::bottom`, the apex) has the
-                        // cone a drill point leaves for its floor: drilled
-                        // with the tip at the apex, a model's cone no
-                        // flatter than the point (within 5%) is cut.
+                        // centre (`cam::Hole::bottom`, the apex) has a cone
+                        // for its floor: drilled with the tip at the apex,
+                        // the point leaves over it, at its rim, the height
+                        // its own cone is over the model's there. That is
+                        // cut when no more than facets alone make it (on a
+                        // Ø6 hole of 24 facets the cone a 118° point leaves
+                        // shows 0.03 mm; a 120° one, 0.10): 0.01 mm and
+                        // 1.5% of the radius.
                         let cone = |l: &pocket::Level, floor: f32| {
-                            let rise = (floor - found.bottom) / (l.width() as f32 / 2.).max(0.001);
+                            let r = l.width() as f32 / 2.;
+                            let over = r * crate::simulation::POINT_RISE - (floor - found.bottom);
                             floor > found.bottom + 0.01
                                 && tip <= found.bottom + 0.01
-                                && rise >= 0.95 * crate::simulation::POINT_RISE
+                                && over <= 0.01 + 0.015 * r
                         };
                         let short = (levels.iter())
                             .map(|l| match l.floor {

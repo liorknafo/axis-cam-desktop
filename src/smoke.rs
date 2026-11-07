@@ -20195,55 +20195,58 @@ soft_max = 180.0
         // The review's: a Ø6 blind hole whose floor is the cone a 118° drill
         // point leaves (its walls end 0.03 mm under where the drill is full
         // width, between facets), after a Ø8 Adaptive clearing. A Ø6 drill
-        // to its bottom cuts it all; 1 mm over its bottom, not.
-        let rise = 3. * crate::simulation::POINT_RISE;
-        let section = vec![
-            (0., -4.),
-            (10., -4.),
-            (10., 10.),
-            (3., 10.),
-            (3., 2.),
-            (0., 2. - rise),
-        ];
-        let mut a = pocket_app(crate::cam::tests::revolved(&section));
-        a.doc.setup_mut().operations[0].strategy = Strategy::Adaptive;
-        let id = a.operation().unwrap().tool.clone();
-        let tool = a.doc.tools.iter_mut().find(|t| t.id == id).unwrap();
-        for (k, v) in [("diameter", "8"), ("length", "100"), ("stickout", "110")] {
-            tool.p.insert(k.into(), v.into());
+        // to its bottom cuts it all; 1 mm over its bottom, not; nor all of
+        // a flatter 120° cone (the point leaves 0.07 mm over its rim).
+        for (degrees, cut) in [(118f32, true), (120., false)] {
+            let rise = 3. / (degrees / 2.).to_radians().tan();
+            let section = vec![
+                (0., -4.),
+                (10., -4.),
+                (10., 10.),
+                (3., 10.),
+                (3., 2.),
+                (0., 2. - rise),
+            ];
+            let mut a = pocket_app(crate::cam::tests::revolved(&section));
+            a.doc.setup_mut().operations[0].strategy = Strategy::Adaptive;
+            let id = a.operation().unwrap().tool.clone();
+            let tool = a.doc.tools.iter_mut().find(|t| t.id == id).unwrap();
+            for (k, v) in [("diameter", "8"), ("length", "100"), ("stickout", "110")] {
+                tool.p.insert(k.into(), v.into());
+            }
+            let mesh = a.imported_mesh.clone().unwrap();
+            let setup = a.doc.setup().clone();
+            let wall = surface_at(&a, |id, p| {
+                crate::pocket::is_wall(&setup, &mesh, id) && p[0].hypot(p[1]) < 3.1
+            });
+            let _ = a.update(Message::Surface(wall));
+            let rough = a.operation().unwrap().clone();
+            let mut drill = Tool::new("Drill 6", "Drill", "6");
+            for (k, v) in [("length", "100"), ("stickout", "110"), ("number", "12")] {
+                drill.p.insert(k.into(), v.into());
+            }
+            let mut later = Operation::new(Strategy::Drill, drill.id.clone());
+            later.geometry.clear();
+            later.surfaces = rough.surfaces.clone();
+            later.p.insert("through".into(), "No".into());
+            a.doc.tools.push(drill);
+            a.doc.setup_mut().operations = vec![rough, later];
+            a.selected = Some(0);
+            let narrow = |a: &App| -> Vec<String> {
+                crate::ui::op_checks(a)
+                    .into_iter()
+                    .filter(|c| !c.error && c.text.contains("too narrow for the Ø8"))
+                    .map(|c| c.text)
+                    .collect()
+            };
+            assert_eq!(narrow(&a).is_empty(), cut, "{degrees}°: {:?}", narrow(&a));
+            a.doc.setup_mut().operations[1]
+                .p
+                .insert("bottom".into(), "1".into());
+            let left = narrow(&a);
+            assert_eq!(left.len(), 1, "{degrees}°: {left:?}");
+            assert!(left[0].contains("over its point."), "{left:?}");
         }
-        let mesh = a.imported_mesh.clone().unwrap();
-        let setup = a.doc.setup().clone();
-        let wall = surface_at(&a, |id, p| {
-            crate::pocket::is_wall(&setup, &mesh, id) && p[0].hypot(p[1]) < 3.1
-        });
-        let _ = a.update(Message::Surface(wall));
-        let rough = a.operation().unwrap().clone();
-        let mut drill = Tool::new("Drill 6", "Drill", "6");
-        for (k, v) in [("length", "100"), ("stickout", "110"), ("number", "12")] {
-            drill.p.insert(k.into(), v.into());
-        }
-        let mut later = Operation::new(Strategy::Drill, drill.id.clone());
-        later.geometry.clear();
-        later.surfaces = rough.surfaces.clone();
-        later.p.insert("through".into(), "No".into());
-        a.doc.tools.push(drill);
-        a.doc.setup_mut().operations = vec![rough, later];
-        a.selected = Some(0);
-        let narrow = |a: &App| -> Vec<String> {
-            crate::ui::op_checks(a)
-                .into_iter()
-                .filter(|c| !c.error && c.text.contains("too narrow for the Ø8"))
-                .map(|c| c.text)
-                .collect()
-        };
-        assert!(narrow(&a).is_empty(), "{:?}", narrow(&a));
-        a.doc.setup_mut().operations[1]
-            .p
-            .insert("bottom".into(), "1".into());
-        let left = narrow(&a);
-        assert_eq!(left.len(), 1, "{left:?}");
-        assert!(left[0].contains("over its point."), "{left:?}");
     }
     #[test]
     fn a_click_on_a_holes_chamfer_picks_it_and_the_pocket_names_what_its_cutter_leaves() {
