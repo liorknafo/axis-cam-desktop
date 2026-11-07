@@ -5844,7 +5844,7 @@ pub(crate) mod tests {
     #[test]
     fn a_manual_mill_too_small_for_the_moves_is_refused() {
         let (mut doc, mesh, _) = with_mill();
-        for (k, v) in [("x", "50"), ("y", "50"), ("z", "10")] {
+        for (k, v) in [("x", "49.9"), ("y", "50"), ("z", "10")] {
             doc.machines
                 .last_mut()
                 .unwrap()
@@ -5855,9 +5855,9 @@ pub(crate) mod tests {
         let (check, _) = crate::plan_check::check(&doc, &mesh, &report, &milled(&report));
         assert!(!check.passed);
         assert!(
-            check.problems.iter().any(
-                |p| p.setup == 1 && p.message.starts_with("The manual mill travels 50 mm in X")
-            ),
+            check.problems.iter().any(|p| p.setup == 1
+                && p.message
+                    .starts_with("The manual mill travels 49.9 mm in X")),
             "{:?}",
             check.problems
         );

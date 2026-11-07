@@ -236,8 +236,10 @@ pub fn travel_problem<'a>(
         let span = hi[k] - lo[k];
         (span > travel + 0.01).then(|| {
             format!(
-                "The manual mill travels {travel:.0} mm in {}, but these moves span {span:.1} mm: make the boxes and holes fit its travel, or cut them on the CNC.",
-                ["X", "Y", "Z"][k]
+                "The manual mill travels {} mm in {}, but these moves span {} mm: make the boxes and holes fit its travel, or cut them on the CNC.",
+                crate::envelope::mm(travel),
+                ["X", "Y", "Z"][k],
+                crate::envelope::mm(span)
             )
         })
     })
