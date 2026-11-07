@@ -8892,26 +8892,33 @@ fn typed_model_path(text: &str) -> Result<PathBuf, String> {
         decoded = percent_decoded(rest.strip_prefix("localhost").unwrap_or(rest));
         t = &decoded;
     }
-    let home = |rest: &str| dirs::home_dir().map(|h| h.join(rest));
-    let path = match t.strip_prefix('~') {
-        Some("") => home(""),
-        Some(rest) if rest.starts_with(['/', std::path::MAIN_SEPARATOR]) => home(&rest[1..]),
-        _ => Some(PathBuf::from(t)),
-    }
-    .ok_or("The home folder is unknown: give the whole path.")?;
-    // A Terminal's `\ ` for a space. The path as typed is tried first, and
-    // on Windows the backslashes are the path's own.
+    let expanded = |t: &str| {
+        let home = |rest: &str| dirs::home_dir().map(|h| h.join(rest));
+        match t.strip_prefix('~') {
+            Some("") => home(""),
+            Some(rest) if rest.starts_with(['/', std::path::MAIN_SEPARATOR]) => home(&rest[1..]),
+            _ => Some(PathBuf::from(t)),
+        }
+        .ok_or("The home folder is unknown: give the whole path.")
+    };
+    let mut path = expanded(t)?;
+    // A Terminal's `\ ` for a space, unescaped once: the path as typed is
+    // tried first, and on Windows the backslashes are the path's own.
     if !path.exists() && t.contains('\\') && !cfg!(windows) {
         let mut plain = String::new();
         let mut chars = t.chars();
         while let Some(c) = chars.next() {
-            plain.push(if c == '\\' {
-                chars.next().unwrap_or(c)
+            if c == '\\' {
+                // A lone `\` at the end escapes nothing and is dropped.
+                plain.extend(chars.next());
             } else {
-                c
-            });
+                plain.push(c);
+            }
         }
-        return typed_model_path(&plain);
+        let unescaped = expanded(&plain)?;
+        if unescaped.exists() {
+            path = unescaped;
+        }
     }
     if !path.is_absolute() {
         return Err(format!(

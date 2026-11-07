@@ -18935,6 +18935,10 @@ soft_max = 180.0
         for (typed, says) in [
             ("".to_string(), "Type or paste"),
             ("parts/bracket.step".into(), "not a whole path"),
+            ("\\".into(), "not a whole path"),
+            ("\\\\".into(), "not a whole path"),
+            ("/no/such/part.step\\".into(), "There is no file"),
+            ("/no/such\\ part.step".into(), "There is no file"),
             (
                 dir.path().join("gone.step").display().to_string(),
                 "There is no file",
