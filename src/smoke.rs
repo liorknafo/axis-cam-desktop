@@ -3375,6 +3375,60 @@ flood = { pin = 8 }
         assert_eq!(run_of(&a).at_step(), Some((1, last + 1)));
     }
 
+    /// The Drilling held on the Pi while AXIS CAM is closed, and `edit`
+    /// made to the project meanwhile: opened again, its run does not follow
+    /// the tool run the Pi has, the edited Drilling never taken as done by
+    /// that tool run's end.
+    fn edited_drilling_is_not_followed(edit: impl Fn(&mut crate::model::Document)) {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        drilling(&mut a);
+        let _ = a.update(Message::Run(R::Hold));
+        pi_until(&server, 10.0, "Hold on the Pi", |s| {
+            s.state == Some(State::Hold)
+        });
+        let _ = a.update(Message::Disconnect);
+        let mut a = reopen(a, dir.path());
+        edit(&mut a.doc);
+        let _ = a.update(Message::Connect);
+        let why = follow_again(&mut a).unwrap_err();
+        assert!(why.contains("program has changed"), "{why}");
+        assert!(run_of(&a).running.is_none());
+        let _ = a.update(Message::Run(R::Resume));
+        pi_until(&server, 60.0, "the Drilling's end", |s| {
+            s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| o.ok)
+        });
+        let mut deadline = Deadline::new(10.);
+        while pi_pending(&a).exists() {
+            let _ = a.update(Message::Tick);
+            assert!(deadline.within(&conn(&a).snapshot), "its end never taken");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!run_of(&a).done[1], "the edited Drilling taken as done");
+        assert!(run_of(&a).outcome.is_none());
+    }
+
+    /// Review finding: the drill's diameter changed while AXIS CAM was
+    /// closed. The moves sent are the same, but not the cutter.
+    #[test]
+    fn a_drill_of_another_diameter_is_not_followed_after_axis_cam_opens_again() {
+        edited_drilling_is_not_followed(|doc| {
+            let tool = doc.setups[0].operations[1].tool.clone();
+            let t = doc.tools.iter_mut().find(|t| t.id == tool).unwrap();
+            t.p.insert("diameter".into(), "3".into());
+        });
+    }
+
+    /// As above, the Drilling's spindle speed changed instead.
+    #[test]
+    fn a_drilling_at_another_speed_is_not_followed_after_axis_cam_opens_again() {
+        edited_drilling_is_not_followed(|doc| {
+            doc.setups[0].operations[1].p.insert("rpm".into(), "1234".into());
+        });
+    }
+
     /// The Facing tool run sent to the Pi, then AXIS CAM disconnected as
     /// closing does, and the Facing done on the Pi.
     fn facing_then_closed(dir: &std::path::Path) -> (App, uc100_remote::Server) {

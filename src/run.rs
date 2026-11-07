@@ -104,6 +104,8 @@ pub struct Running {
     /// from where the tool tip was as it started (plan coordinates).
     paths: Vec<Option<[[f32; 3]; 2]>>,
     tip: [f32; 3],
+    /// The machine position it started from.
+    start: [f64; 6],
     /// The block the tool tip is on and how far along it (`track`).
     on: Option<(usize, f32)>,
     /// The step of each of its blocks (`step_marks`).
@@ -318,7 +320,10 @@ pub struct Follow {
     /// The work offset it was sent with, and where the tool tip was then.
     pub offset: [f64; 6],
     pub tip: [f32; 3],
-    /// `program_print` of what it sends.
+    /// The machine position it was sent from.
+    pub start: [f64; 6],
+    /// `program_print` of what it sends: its moves, its spindle, coolant
+    /// and tools, and its operations' cutters.
     pub program: u64,
     /// The run's record before and after its Cycle Start.
     pub before: Before,
@@ -337,10 +342,12 @@ fn not_followed(why: &str) -> String {
     )
 }
 
-/// FNV-1a over tool run `p`'s blocks from operation `from` on, the
-/// operations it runs and its tools: the program sent, stable across
-/// builds (`Follow::program`). None when it cannot start there.
-pub fn program_print(p: &Checked, from: usize) -> Option<u64> {
+/// FNV-1a over what tool run `p` sends from operation `from` on
+/// (`actions`: its moves, spindle, coolant, tool changes and pauses), its
+/// blocks, and its operations with their tools and cutters (`OpState`):
+/// the program sent, stable across builds (`Follow::program`). None when
+/// it cannot start there.
+pub fn program_print(p: &Checked, from: usize, actions: &[Located]) -> Option<u64> {
     struct Fnv(u64);
     impl std::fmt::Write for Fnv {
         fn write_str(&mut self, s: &str) -> std::fmt::Result {
@@ -352,10 +359,17 @@ pub fn program_print(p: &Checked, from: usize) -> Option<u64> {
     }
     use std::fmt::Write;
     let mut h = Fnv(0xcbf29ce484222325);
-    let tools: Vec<&str> = p.ops.iter().map(|o| o.tool_id.as_str()).collect();
-    write!(h, "{from} {:?} {tools:?} {:?}", p.indexes, p.datum).ok()?;
+    write!(
+        h,
+        "{from} {:?} {:?} {:?} {:?} {} {};",
+        p.indexes, p.ops, p.datum, p.settings, p.offset, p.origin
+    )
+    .ok()?;
     for b in p.from(from).ok()? {
         write!(h, "{b:?};").ok()?;
+    }
+    for a in actions {
+        write!(h, "{a:?};").ok()?;
     }
     Some(h.0)
 }
@@ -577,7 +591,8 @@ impl Run {
             done: self.done.clone(),
             offset: r.offset,
             tip: r.tip,
-            program: program_print(p, r.from)?,
+            start: r.start,
+            program: self.sent_print(p, r.from, r.offset, r.start)?,
             before: r.before.clone(),
             xy: self.xy,
             zero: self.zero.clone(),
@@ -604,7 +619,8 @@ impl Run {
         };
         let p = (programs.get(f.index))
             .filter(|p| {
-                f.done.len() == programs.len() && program_print(p, f.from) == Some(f.program)
+                f.done.len() == programs.len()
+                    && self.sent_print(p, f.from, f.offset, f.start) == Some(f.program)
             })
             .ok_or_else(|| why("its setup's program has changed since it was sent"))?;
         let blocks = p.from(f.from).map_err(|e| why(&e.join(" ")))?;
@@ -618,6 +634,7 @@ impl Run {
             before: f.before,
             paths: paths(blocks, f.tip),
             tip: f.tip,
+            start: f.start,
             on: None,
             marks,
         };
@@ -1645,30 +1662,7 @@ impl Run {
         let programs = self.checked()?;
         let (count, p) = (programs.len(), &programs[self.next]);
         let s = &c.snapshot;
-        let mut actions = lower(p, self.from, s.work_offset, s.machine_pos).ok()?;
-        // At a step, it waits over the step's entry with the spindle on,
-        // after the rapids there, until Resume feeds in (LIO-275).
-        if let Some((oi, n)) = self.at_step()
-            && let Some(line) = (p.from(self.from).ok()?.iter())
-                .position(|b| matches!(b, Block::Descend { .. }))
-                .map(|i| i as u32 + 1)
-        {
-            let at = actions
-                .iter()
-                .rposition(|l| l.line <= line)
-                .map_or(0, |i| i + 1);
-            let reason = format!(
-                "Over the entry of {}: Resume feeds in.",
-                self.step_label(oi, n)
-            );
-            actions.insert(
-                at,
-                Located {
-                    line,
-                    action: Do::Pause { reason },
-                },
-            );
-        }
+        let actions = self.job_actions(p, self.from, s.work_offset, s.machine_pos)?;
         // Where the tool tip is, in plan coordinates: the first retract's start.
         let tip =
             std::array::from_fn(|k| (s.machine_pos[k] - s.work_offset[k]) as f32 + p.datum[k]);
@@ -1697,6 +1691,7 @@ impl Run {
             },
             paths,
             tip,
+            start: s.machine_pos,
             on: None,
             marks,
         });
@@ -1710,6 +1705,54 @@ impl Run {
             name,
             actions: Arc::new(actions),
         })
+    }
+
+    /// What Cycle Start sends of tool run `p` from its operation `from`,
+    /// the machine at `start` with work offset `offset`.
+    fn job_actions(
+        &self,
+        p: &Checked,
+        from: usize,
+        offset: [f64; 6],
+        start: [f64; 6],
+    ) -> Option<Vec<Located>> {
+        let mut actions = lower(p, from, offset, start).ok()?;
+        // At a step, it waits over the step's entry with the spindle on,
+        // after the rapids there, until Resume feeds in (LIO-275).
+        if let Some((oi, n)) = self.at_step()
+            && let Some(line) = (p.from(from).ok()?.iter())
+                .position(|b| matches!(b, Block::Descend { .. }))
+                .map(|i| i as u32 + 1)
+        {
+            let at = actions
+                .iter()
+                .rposition(|l| l.line <= line)
+                .map_or(0, |i| i + 1);
+            let reason = format!(
+                "Over the entry of {}: Resume feeds in.",
+                self.step_label(oi, n)
+            );
+            actions.insert(
+                at,
+                Located {
+                    line,
+                    action: Do::Pause { reason },
+                },
+            );
+        }
+        Some(actions)
+    }
+
+    /// `program_print` of what Cycle Start sends of tool run `p` from its
+    /// operation `from`, the machine at `start` with work offset `offset`.
+    fn sent_print(
+        &self,
+        p: &Checked,
+        from: usize,
+        offset: [f64; 6],
+        start: [f64; 6],
+    ) -> Option<u64> {
+        program_print(p, from, &self.job_actions(p, from, offset, start)?)
     }
 
     /// The running tool run's program and where in it the machine is: the
@@ -4514,6 +4557,7 @@ mod tests {
                 },
                 paths: vec![],
                 tip: [0.; 3],
+                start: [0.; 6],
                 on: None,
                 marks: vec![],
             }),
@@ -4656,6 +4700,7 @@ mod tests {
             },
             paths: vec![],
             tip: [0.; 3],
+            start: [0.; 6],
             on: None,
             marks: vec![],
         });
