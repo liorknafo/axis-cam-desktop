@@ -1243,6 +1243,24 @@ pub struct Level {
     pub floor: Option<f32>,
 }
 impl Level {
+    /// How wide it is, mm: the larger side of the box round what of the
+    /// outline nothing of the part is over (`open`), 0 when none is.
+    pub fn width(&self) -> f64 {
+        let loops: Vec<Polygon> = self.open.clone().into();
+        let (mut lo, mut hi) = (
+            (f64::INFINITY, f64::INFINITY),
+            (f64::NEG_INFINITY, f64::NEG_INFINITY),
+        );
+        for p in loops.iter().flatten() {
+            lo = (lo.0.min(p.0), lo.1.min(p.1));
+            hi = (hi.0.max(p.0), hi.1.max(p.1));
+        }
+        if lo.0 > hi.0 {
+            0.
+        } else {
+            (hi.0 - lo.0).max(hi.1 - lo.1)
+        }
+    }
     /// Where the centre of a cutter `inset` from the part may go to cut this
     /// level of `hole`: inside its outline, and clear of anything of the
     /// part over the level.
