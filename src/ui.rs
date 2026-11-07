@@ -545,6 +545,10 @@ pub(crate) fn op_checks(app: &App) -> Vec<Check> {
         && let Ok(holes) = app.pocket_holes(o, mesh).as_ref()
     {
         for ((h, fits), cleared) in holes.iter().zip(fits).zip(cleared) {
+            // A later operation (the Drilling after it) cuts what it leaves.
+            if fits.iter().any(|f| !f) && app.cut_later(o, mesh, h).is_some() {
+                continue;
+            }
             checks.extend(
                 h.uncut(*diameter, fits, *cleared)
                     .into_iter()

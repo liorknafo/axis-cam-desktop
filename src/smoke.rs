@@ -19790,6 +19790,60 @@ soft_max = 180.0
             .unwrap()
     }
     #[test]
+    fn a_hole_too_narrow_for_the_cutter_that_a_later_drilling_drills_is_not_warned_of() {
+        // The owner's TOTEM bottom: the Adaptive clearing (Ø3) picked the four
+        // Ø1.9 screw holes the Drilling after it drills, and warned of each
+        // "… too narrow for the Ø3 cutter … the hole under it left uncut. Pick
+        // it in an operation with a smaller cutter.", which it was.
+        for strategy in [Strategy::Pocket, Strategy::Adaptive] {
+            let mut a = pocket_app(crate::pocket::chamfered_hole());
+            a.doc.setup_mut().operations[0].strategy = strategy;
+            let id = a.operation().unwrap().tool.clone();
+            let tool = a.doc.tools.iter_mut().find(|t| t.id == id).unwrap();
+            tool.p.insert("type".into(), "Flat end mill".into());
+            tool.p.insert("diameter".into(), "8".into());
+            let chamfer = surface_at(&a, |_, c| (c[2] - 9.5).abs() < 0.1 && c[0].hypot(c[1]) < 4.);
+            let _ = a.update(Message::Surface(chamfer));
+            let narrow = |a: &App| {
+                crate::ui::op_checks(a)
+                    .into_iter()
+                    .filter(|c| !c.error && c.text.contains("too narrow for the Ø8"))
+                    .count()
+            };
+            assert_eq!(narrow(&a), 1, "{strategy:?}: {}", a.status);
+            // A Drilling after it, with a Ø6 drill, its hole picked by a
+            // click on its wall, as the owner picks.
+            let mut drill = Tool::new("Drill 6", "Drill", "6");
+            for (k, v) in [("length", "40"), ("stickout", "30"), ("number", "9")] {
+                drill.p.insert(k.into(), v.into());
+            }
+            let mut drilling = Operation::new(Strategy::Drill, drill.id.clone());
+            drilling.geometry.clear();
+            a.doc.tools.push(drill);
+            a.doc.setup_mut().operations.push(drilling);
+            let last = a.doc.setup().operations.len() - 1;
+            let wall = surface_at(&a, |_, c| (c[2] - 4.).abs() < 1. && c[0].hypot(c[1]) < 3.2);
+            a.selected = Some(last);
+            let _ = a.update(Message::Surface(wall));
+            let mesh = a.imported_mesh.clone().unwrap();
+            let o = a.doc.setup().operations[last].clone();
+            let drilled = a.drill_holes(&o, &mesh).as_ref().clone().map(|h| h.len());
+            assert_eq!(drilled, Ok(1), "{strategy:?}: {}", a.status);
+            a.selected = Some(0);
+            assert_eq!(narrow(&a), 0, "{strategy:?}");
+            // Not when it is off, nor when it comes first.
+            a.doc.setup_mut().operations[last].enabled = false;
+            assert_eq!(narrow(&a), 1, "{strategy:?}");
+            a.doc.setup_mut().operations[last].enabled = true;
+            let ops = &mut a.doc.setup_mut().operations;
+            let drilling = ops.remove(last);
+            ops.insert(0, drilling);
+            a.selected = Some(1);
+            assert!(a.operation().unwrap().strategy == strategy);
+            assert_eq!(narrow(&a), 1, "{strategy:?}");
+        }
+    }
+    #[test]
     fn a_click_on_a_holes_chamfer_picks_it_and_the_pocket_names_what_its_cutter_leaves() {
         // `pocket::chamfered_hole`: a click on the chamfer picks the Ø6
         // hole, and another drops it.

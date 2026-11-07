@@ -3757,6 +3757,50 @@ impl App {
         *kept = Some((key, found.clone()));
         found
     }
+    /// The later enabled operation of the setup `op` is in that cuts `hole`,
+    /// one of `op`'s picked holes, by its name: a Drill that lists it (its
+    /// centre within 0.1 mm), or a Pocket, an Adaptive clearing or a Contour
+    /// that picks it in the same place with a cutter that fits all of it.
+    /// What `op`'s cutter leaves in it is then cut after, and not warned of.
+    pub(crate) fn cut_later(
+        &self,
+        op: &Operation,
+        mesh: &mesh::Mesh,
+        hole: &pocket::Hole,
+    ) -> Option<String> {
+        let setup = self.doc.setup();
+        let at = setup.operations.iter().position(|o| o.id == op.id)?;
+        let (x, y) = hole.centre();
+        (setup.operations[at + 1..].iter())
+            .filter(|o| o.enabled)
+            .find(|o| match o.strategy {
+                Strategy::Drill => self
+                    .drill_holes(o, mesh)
+                    .as_ref()
+                    .as_ref()
+                    .is_ok_and(|holes| {
+                        holes
+                            .iter()
+                            .any(|d| (d.center[0] as f64 - x).hypot(d.center[1] as f64 - y) <= 0.1)
+                    }),
+                Strategy::Pocket | Strategy::Adaptive | Strategy::Contour => {
+                    let diameter = (self.doc.tools.iter())
+                        .find(|t| t.id == o.tool)
+                        .and_then(|t| num(&t.p, "diameter"));
+                    let radial = num(&o.p, "allowance").filter(|a| *a >= 0.);
+                    let (Some(diameter), Some(radial)) = (diameter, radial) else {
+                        return false;
+                    };
+                    pocket::picked_holes(setup, o, mesh).is_ok_and(|holes| {
+                        holes.iter().any(|h| {
+                            h.same_place(hole) && h.fits(diameter, radial).iter().all(|f| *f)
+                        })
+                    })
+                }
+                _ => false,
+            })
+            .map(|o| o.name().to_string())
+    }
     /// The holes the selected walls of a Pocket or an inside Contour pick
     /// (`pocket::holes`), for its Geometry tab: kept until the part, the
     /// setup's placement or the selected surfaces change, as `drill_holes` is.
