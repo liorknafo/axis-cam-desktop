@@ -3883,8 +3883,27 @@ impl App {
                         // left: its floor, or where a level through ends.
                         let tip = found.bottom + number(o, "bottom") - through;
                         let full = tip + diameter / 2. * crate::simulation::POINT_RISE;
+                        // A blind level whose walls end over the bore's
+                        // centre (`cam::Hole::bottom`, the apex) has the
+                        // cone a drill point leaves for its floor: drilled
+                        // with the tip at the apex, a model's cone no
+                        // flatter than the point (within 5%) is cut.
+                        let cone = |l: &pocket::Level, floor: f32| {
+                            let rise = (floor - found.bottom) / (l.width() as f32 / 2.).max(0.001);
+                            floor > found.bottom + 0.01
+                                && tip <= found.bottom + 0.01
+                                && rise >= 0.95 * crate::simulation::POINT_RISE
+                        };
                         let short = (levels.iter())
-                            .map(|l| full - l.floor.unwrap_or(hole.bottom))
+                            .map(|l| match l.floor {
+                                Some(floor) if cone(l, floor) => 0.,
+                                Some(floor) => full - floor,
+                                // Through: to where its walls end, the
+                                // bore's bottom as the Drill reads it (a
+                                // radial hole opening into a tube's bore,
+                                // high over the part's bottom under it).
+                                None => full - hole.bottom.max(found.bottom),
+                            })
                             .fold(f32::NEG_INFINITY, f32::max);
                         let why = if !drills {
                             Some(format!("{} after it does not drill it out", o.name()))
