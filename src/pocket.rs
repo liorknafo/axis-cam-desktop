@@ -4868,6 +4868,13 @@ pub(crate) mod tests {
             op.p.insert(k.into(), v.into());
         }
         let plan = crate::adaptive::generate(&setup, &op, &tool, &mesh).unwrap();
+        // Each level's cuts hold up those after it: air is taken out of them
+        // only where proven clear (`air`), as of a Pocket's support pass.
+        assert_eq!(plan.keep_air.len(), plan.moves.len());
+        for (m, &keep) in plan.moves.iter().zip(&plan.keep_air) {
+            let level = m.motion == Motion::Feed && m.cutting_pass && m.from[2] == m.to[2];
+            assert_eq!(keep, level, "{m:?}");
+        }
         let r = plan.radius;
         let level = |z: f32| {
             (plan.moves.iter())

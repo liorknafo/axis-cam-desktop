@@ -1485,6 +1485,15 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     if out.plan.moves.is_empty() || !out.plan.duration.is_finite() {
         return Err("No material is left for this adaptive clearing to cut.".into());
     }
+    // Every level's cuts hold up the levels after it (the next a stepdown
+    // down, and a band over a deeper zone that its walker counts cleared,
+    // `nested`): air is taken out of them only where it is proven clear,
+    // as of a Pocket's support pass (`air`). Without that, a cut at Z16.2
+    // on the TOTEM bottom's rim, found air, was taken out, and the level
+    // under it cut 6.5 mm fresh at a 6 mm stepdown.
+    out.plan.keep_air = (out.plan.moves.iter())
+        .map(|m| m.motion == Motion::Feed && m.cutting_pass && m.from[2] == m.to[2])
+        .collect();
     Ok(out.plan)
 }
 
