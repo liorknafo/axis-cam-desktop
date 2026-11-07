@@ -3582,6 +3582,35 @@ impl App {
     /// to be checked: the Tick checks it once the machine stops, so that the
     /// simulation of the job never competes with the driver feeding it
     /// (#167). Whether the check waits.
+    /// Builds the run of the setup whose tool run AXIS CAM sent the Pi
+    /// before it was closed (`f`) as it was then, and checks it: once
+    /// checked, it follows that tool run (`run::Run::following`). The
+    /// check does not wait for the machine to stand still: the Pi drives
+    /// it, not this computer.
+    fn follow_pi_run(&mut self, f: run::Follow) -> Task<Message> {
+        let Some(c) = self.control.as_mut() else {
+            return Task::none();
+        };
+        let si =
+            (self.doc.setups.iter()).position(|s| s.id == f.setup && s.machine.id == c.machine_id);
+        let Some(si) = si.filter(|&si| !manual::is_hand(&self.doc.setups[si].machine)) else {
+            c.reattach_failed(
+                "The tool run on the Pi is of a setup this project does not have, so it is not followed. The machine carries on; Hold, Stop and E-stop still act on it.".into(),
+            );
+            return Task::none();
+        };
+        self.run_epoch += 1;
+        c.run = Some(run::Run::following(&self.doc, si, self.run_epoch, f));
+        c.probe_spot = None;
+        self.run_on_connect = None;
+        if self.doc.setups[si].id != self.doc.active {
+            self.doc.active = self.doc.setups[si].id.clone();
+            self.stop_selection();
+            self.dirty = true;
+            self.last_edit = Instant::now();
+        }
+        self.check_run()
+    }
     fn check_waits(&mut self) -> bool {
         if !self.locked() {
             return false;
@@ -7585,6 +7614,12 @@ impl App {
                     }
                 }
                 let phase_tab = self.phase_tab();
+                // AXIS CAM opened again while the Pi runs the tool run it
+                // sent before: its run, built anew, follows it.
+                let follow = match self.control.as_mut().and_then(|c| c.take_reattach()) {
+                    Some(f) => self.follow_pi_run(f),
+                    None => Task::none(),
+                };
                 if let Some((id, at)) = (self.control.as_mut())
                     .and_then(|c| Some((c.machine_id.clone(), c.recorded.take()?)))
                 {
@@ -7604,7 +7639,7 @@ impl App {
                         "Smoke stock meshing failed: {}",
                         self.status
                     );
-                    return self.refresh_stock_surface();
+                    return Task::batch([follow, self.refresh_stock_surface()]);
                 }
                 // The smoke run captures each screen from a frame drawn after
                 // its step (`smoke_frame`); a step whose frame does not come
@@ -7668,6 +7703,7 @@ impl App {
                     close,
                     settled,
                     phase_tab,
+                    follow,
                     self.picture_run(),
                     self.refresh_stock_surface(),
                     self.refresh_start_mesh(),

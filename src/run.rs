@@ -78,7 +78,7 @@ pub enum Action {
 }
 
 /// How a run skips an operation of its setup (`Run::skips`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Skip {
     /// It is not sent, and the operations after it take its stock as cut,
     /// as those before a Start here are (`post::checked_to_start`).
@@ -100,8 +100,10 @@ pub struct Running {
     /// What Cycle Start recorded over (`xy`, `zero`, `last`, `touched`), put
     /// back when the driver refuses the job: nothing ran then (#168).
     before: Before,
-    /// The line each of its blocks moves the tool tip along (`paths`).
+    /// The line each of its blocks moves the tool tip along (`paths`),
+    /// from where the tool tip was as it started (plan coordinates).
     paths: Vec<Option<[[f32; 3]; 2]>>,
+    tip: [f32; 3],
     /// The block the tool tip is on and how far along it (`track`).
     on: Option<(usize, f32)>,
     /// The step of each of its blocks (`step_marks`).
@@ -152,8 +154,8 @@ fn step_marks(blocks: &[Block], clear: &[Option<f32>]) -> Vec<Option<Mark>> {
 }
 
 /// The run's record of its tool runs before a Cycle Start.
-#[derive(Clone)]
-struct Before {
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Before {
     xy: Option<(usize, [f64; 2])>,
     zero: Option<(String, [f32; 3])>,
     last: Option<(String, f64)>,
@@ -289,6 +291,73 @@ pub struct Run {
     /// the check found of one that no longer holds.
     pub resumed: Option<Journal>,
     pub journal_note: Option<String>,
+    /// The tool run on the Pi this run is to follow once checked, AXIS
+    /// CAM having been closed since it was sent (`following`).
+    pub follow: Option<Follow>,
+    /// Whether it follows it: the name it was sent as, or why not
+    /// (`follow_again`), until the connection takes it.
+    pub followed: Option<Result<String, String>>,
+}
+
+/// What a tool run sent to the Pi was sent from (`Run::follow_record`),
+/// kept on disk with it: AXIS CAM opened again builds the run anew from it
+/// and follows the tool run, while the check finds the program sent
+/// (`program`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Follow {
+    /// The setup's id.
+    pub setup: String,
+    pub skips: Vec<(usize, Skip)>,
+    pub cut_steps: Vec<(usize, Vec<usize>)>,
+    pub start_step: Option<(usize, usize)>,
+    /// The tool run (`Running::index`) and the operation it started at.
+    pub index: usize,
+    pub from: usize,
+    /// The tool runs done before it.
+    pub done: Vec<bool>,
+    /// The work offset it was sent with, and where the tool tip was then.
+    pub offset: [f64; 6],
+    pub tip: [f32; 3],
+    /// `program_print` of what it sends.
+    pub program: u64,
+    /// The run's record before and after its Cycle Start.
+    pub before: Before,
+    pub xy: Option<(usize, [f64; 2])>,
+    pub zero: Option<(String, [f32; 3])>,
+    pub last: Option<(String, f64)>,
+    /// The name it was sent as, which the Pi's Stop after step names.
+    pub name: String,
+}
+
+/// Why AXIS CAM opened again does not follow the tool run on the Pi
+/// (`Run::follow_again`).
+fn not_followed(why: &str) -> String {
+    format!(
+        "The tool run on the Pi is not followed: {why}. The machine carries on; Hold, Stop and E-stop still act on it."
+    )
+}
+
+/// FNV-1a over tool run `p`'s blocks from operation `from` on, the
+/// operations it runs and its tools: the program sent, stable across
+/// builds (`Follow::program`). None when it cannot start there.
+pub fn program_print(p: &Checked, from: usize) -> Option<u64> {
+    struct Fnv(u64);
+    impl std::fmt::Write for Fnv {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            for b in s.bytes() {
+                self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x100000001b3);
+            }
+            Ok(())
+        }
+    }
+    use std::fmt::Write;
+    let mut h = Fnv(0xcbf29ce484222325);
+    let tools: Vec<&str> = p.ops.iter().map(|o| o.tool_id.as_str()).collect();
+    write!(h, "{from} {:?} {tools:?} {:?}", p.indexes, p.datum).ok()?;
+    for b in p.from(from).ok()? {
+        write!(h, "{b:?};").ok()?;
+    }
+    Some(h.0)
 }
 
 /// Where a tool run stopped short (LIO-275): after a step (Stop after
@@ -474,7 +543,99 @@ impl Run {
             journal: None,
             resumed: None,
             journal_note: None,
+            follow: None,
+            followed: None,
         }
+    }
+
+    /// The run of `follow`'s setup (index `setup`) as it was when its tool
+    /// run was sent to the Pi: its skips, steps taken as cut and start at a
+    /// step, so its check finds the program sent again. Once checked, it
+    /// follows that tool run (`follow_again`).
+    pub fn following(doc: &Document, setup: usize, epoch: u64, follow: Follow) -> Self {
+        let mut r = Self::new(doc, setup, epoch);
+        r.skips = follow.skips.clone();
+        r.cut_steps = follow.cut_steps.clone();
+        r.start_step = follow.start_step;
+        r.follow = Some(follow);
+        r
+    }
+
+    /// What the tool run Cycle Start just started (`cycle_start`) was sent
+    /// from, sent as `name`: kept on disk with it, so AXIS CAM opened again
+    /// follows it (`following`).
+    pub fn follow_record(&self, name: &str) -> Option<Follow> {
+        let r = self.running.as_ref()?;
+        let p = self.checked()?.get(r.index)?;
+        Some(Follow {
+            setup: self.setup_id.clone(),
+            skips: self.skips.clone(),
+            cut_steps: self.cut_steps.clone(),
+            start_step: self.start_step,
+            index: r.index,
+            from: r.from,
+            done: self.done.clone(),
+            offset: r.offset,
+            tip: r.tip,
+            program: program_print(p, r.from)?,
+            before: r.before.clone(),
+            xy: self.xy,
+            zero: self.zero.clone(),
+            last: self.last.clone(),
+            name: name.to_owned(),
+        })
+    }
+
+    /// Follows the tool run `f` was kept for, once the check answered: the
+    /// tool runs done before it are done again, and it runs, as after its
+    /// Cycle Start, while the check finds the program sent. The name it was
+    /// sent as, or why it is not followed.
+    fn follow_again(&mut self, f: Follow) -> Result<String, String> {
+        let why = not_followed;
+        let programs = match self.programs.as_deref() {
+            Some(Ok(p)) => p,
+            Some(Err(e)) => {
+                return Err(why(&format!(
+                    "the setup does not check now ({})",
+                    e.join(" ")
+                )));
+            }
+            None => return Err(why("the setup was not checked")),
+        };
+        let p = (programs.get(f.index))
+            .filter(|p| {
+                f.done.len() == programs.len() && program_print(p, f.from) == Some(f.program)
+            })
+            .ok_or_else(|| why("its setup's program has changed since it was sent"))?;
+        let blocks = p.from(f.from).map_err(|e| why(&e.join(" ")))?;
+        let marks = self.marks_of(p, blocks);
+        let running = Running {
+            index: f.index,
+            from: f.from,
+            // Its end comes by its number (`Connection::run_outcome`).
+            seq: 0,
+            offset: f.offset,
+            before: f.before,
+            paths: paths(blocks, f.tip),
+            tip: f.tip,
+            on: None,
+            marks,
+        };
+        (self.done, self.next, self.from) = (f.done, f.index, f.from);
+        (self.xy, self.zero, self.last) = (f.xy, f.zero, f.last);
+        (self.running, self.outcome, self.journal) = (Some(running), None, None);
+        Ok(f.name)
+    }
+
+    /// The step of each block of tool run `p` from its operation `blocks`
+    /// start at (`step_marks`).
+    fn marks_of(&self, p: &Checked, blocks: &[Block]) -> Vec<Option<Mark>> {
+        // An operation of one step ends it too, once risen to its clearance
+        // (LIO-311).
+        let clear: Vec<Option<f32>> = (p.indexes.iter())
+            .map(|&oi| self.op_steps(oi).map(|s| s.clear))
+            .collect();
+        step_marks(blocks, &clear)
     }
 
     /// Cuts the stock the tool has gone through since the last sample, while
@@ -733,6 +894,13 @@ impl Run {
             (self.start_step, self.resumed, self.picked) = (None, None, None);
             self.cut_steps.clear();
             (self.programs, self.recheck) = (None, true);
+            // Checked otherwise, it is not the program sent.
+            if self.follow.take().is_some() {
+                self.followed = Some(Err(not_followed(&format!(
+                    "the setup does not check now ({})",
+                    why.join(" ")
+                ))));
+            }
             return;
         }
         // Refused, the progress stays kept for the skip's undoing (`skip`).
@@ -797,7 +965,10 @@ impl Run {
             left.filter(|l| self.checked().is_some() && (!l.after.is_empty() || l.last.is_some()));
         self.times = times.filter(|_| self.checked().is_some());
         self.pictures.clear();
-        self.take_journal();
+        match self.follow.take() {
+            Some(f) => self.followed = Some(self.follow_again(f)),
+            None => self.take_journal(),
+        }
     }
 
     /// Where a run of this setup stopped (`journal`), once it is checked:
@@ -1503,12 +1674,7 @@ impl Run {
             std::array::from_fn(|k| (s.machine_pos[k] - s.work_offset[k]) as f32 + p.datum[k]);
         let blocks = p.from(self.from).ok()?;
         let paths = paths(blocks, tip);
-        // An operation of one step ends it too, once risen to its clearance
-        // (LIO-311).
-        let clear: Vec<Option<f32>> = (p.indexes.iter())
-            .map(|&oi| self.op_steps(oi).map(|s| s.clear))
-            .collect();
-        let marks = step_marks(blocks, &clear);
+        let marks = self.marks_of(p, blocks);
         let tool = p.ops[0].tool_id.clone();
         let zero = (p.origin.clone(), p.datum);
         let mut name = format!("{} · tool run {} of {count}", self.name, self.next + 1);
@@ -1530,6 +1696,7 @@ impl Run {
                 touched: self.touched,
             },
             paths,
+            tip,
             on: None,
             marks,
         });
@@ -4346,6 +4513,7 @@ mod tests {
                     touched: false,
                 },
                 paths: vec![],
+                tip: [0.; 3],
                 on: None,
                 marks: vec![],
             }),
@@ -4383,6 +4551,8 @@ mod tests {
             journal: None,
             resumed: None,
             journal_note: None,
+            follow: None,
+            followed: None,
         };
         let (_, op, block) = run.progress(Some(3)).unwrap();
         assert_eq!((op, block), (0, 2));
@@ -4485,6 +4655,7 @@ mod tests {
                 touched: false,
             },
             paths: vec![],
+            tip: [0.; 3],
             on: None,
             marks: vec![],
         });
