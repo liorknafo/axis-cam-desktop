@@ -215,6 +215,33 @@ pub fn move_minutes(doc: &Document) -> f32 {
         .sum()
 }
 
+/// Why the manual mill `m` cannot make the moves of `plans`: the tool's
+/// centre spans more along an axis than the machine travels. None when every
+/// axis fits, or the machine gives no travel for it.
+pub fn travel_problem<'a>(
+    m: &Machine,
+    plans: impl Iterator<Item = &'a crate::simulation::Plan>,
+) -> Option<String> {
+    let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+    for mv in plans.flat_map(|p| &p.moves) {
+        for p in [mv.from, mv.to] {
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+    }
+    (0..3).find_map(|k| {
+        let travel = num(&m.p, ["x", "y", "z"][k]).filter(|t| *t > 0.)?;
+        let span = hi[k] - lo[k];
+        (span > travel + 0.01).then(|| {
+            format!(
+                "The manual mill travels {travel:.0} mm in {}, but these moves span {span:.1} mm: make the boxes and holes fit its travel, or cut them on the CNC.",
+                ["X", "Y", "Z"][k]
+            )
+        })
+    })
+}
 /// The export's line for a manual mill's setup, which has no program.
 pub fn no_gcode(setup: &str) -> String {
     format!("{setup}: manual mill, no G-code — follow the steps on the MACHINE page.")

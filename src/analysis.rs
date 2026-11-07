@@ -58,6 +58,10 @@ pub struct PartReport {
     /// Setup 1's modelled vise or clamps; absent without them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workholding: Option<WorkholdingReport>,
+    /// Why setup 1's holder cannot hold the raw stock, when a hand machine
+    /// may prepare it first; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workholding_problem: Option<String>,
     /// The first entry is setup 1's orientation.
     pub orientations: Vec<OrientationReport>,
     /// The rotary A axis, on a machine that has one with its geometry
@@ -1468,7 +1472,7 @@ pub fn preconditions(doc: &Document, mesh: Option<&Mesh>) -> Vec<Precondition> {
                     "Setup 1 must be square to the part: use rotations that are multiples of 90°.".into()
                 })
             })
-            .or_else(|| holding_problem(doc, mesh)),
+            .or_else(|| holding_problem(doc, mesh).filter(|_| !prepares(doc))),
     };
     let material = material_report(doc).err();
     let tools = if doc.tools.is_empty() {
@@ -1561,7 +1565,9 @@ fn basics<'a>(doc: &'a Document, mesh: &Mesh) -> Result<(&'a Setup, &'static str
     let first = up_axis(setup1)
         .ok_or("Setup 1 must be square to the part: use rotations that are multiples of 90°.")?;
     let stock = crate::stock::resolve(setup1, Some(mesh))?.stock;
-    if let Some(problem) = holding_problem(doc, Some(mesh)) {
+    // With a hand machine to prepare the stock on, the report says what the
+    // holder cannot hold, for the plan to answer (`workholding_problem`).
+    if let Some(problem) = holding_problem(doc, Some(mesh)).filter(|_| !prepares(doc)) {
         return Err(problem);
     }
     let round = crate::stock::round(setup1, stock);
@@ -1611,6 +1617,11 @@ pub(crate) fn report_unchecked(doc: &Document, mesh: &Mesh) -> Result<PartReport
     let view = planning(doc);
     let (setup1, first, stock) = basics(&view, mesh)?;
     describe(&view, mesh, setup1, first, &stock, &machines)
+}
+/// Whether a hand machine may prepare the stock before setup 1, so a holder
+/// that cannot hold the raw stock does not stop planning.
+fn prepares(doc: &Document) -> bool {
+    machines(doc).len() > 1
 }
 /// The first thing wrong with setup 1's modelled workholding, said for the
 /// planner: the plan could never pass the export check of setup 1 with it.
@@ -1789,7 +1800,13 @@ fn describe(
             })
             .collect(),
         workholding_library: library_report(doc, machines),
-        workholding: workholding_report(doc, mesh, setup1)?,
+        workholding: match workholding_report(doc, mesh, setup1) {
+            Err(_) if machines.len() > 1 => None,
+            other => other?,
+        },
+        workholding_problem: (machines.len() > 1)
+            .then(|| holding_problem(doc, Some(mesh)))
+            .flatten(),
         orientations: order
             .into_iter()
             .filter_map(|up| orientation(setup1, stock, mesh, up, MAX_HOLES))

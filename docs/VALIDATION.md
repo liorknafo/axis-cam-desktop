@@ -1760,6 +1760,13 @@ Design: `docs/superpowers/specs/2026-11-07-planner-hand-machines-design.md`. Pha
 - **Checking.** The planned manual facing passes every stage. The model gets `minutes_by_machine` (10 min moving). Each stock's `work_zero` is on its top: the manual setup's is the report's, and the user's setup starts 3.5 mm lower. A CNC-only job's report to the model is unchanged (`plan_check::tests::a_planned_manual_facing_in_front_passes_and_the_model_gets_its_minutes_and_zeros`).
 - **A run.** A scripted model plans the manual facing. The instructions and the report it gets name the manual mill, the applied job has the manual setup first, the planner's holding note goes to the user's setup, and the manual setup's Steps guide builds (`planner::tests::a_plan_with_the_manual_mill_in_front_applies_and_its_setup_shows_steps`).
 
+- **After the first review (gpt-6.1-sol, REJECT, four findings, all fixed).**
+  - A manual setup planned after the CNC had no work offset, and generation refused it. It now carries the user's, and the job drilling its holes on the manual mill after the CNC passes (`proposal::tests::a_manual_setup_after_the_cnc_carries_an_offset_and_moved_first_takes_the_stock`).
+  - A kept manual setup moved first kept its own stock. It now takes the user's stock, placement and zero (same test).
+  - A 124 mm block across a 120 mm vise stopped planning even with a manual mill. Now it is reported, and squaring the block on the manual mill first lets the vise hold it (`proposal::tests::a_block_too_wide_for_the_vise_is_planned_when_the_manual_mill_can_square_it`).
+  - The manual mill's travel was not checked. Moves spanning more than its travel are now refused (`proposal::tests::a_manual_mill_too_small_for_the_moves_is_refused`).
+
 **Not checked.**
-- No real model has planned with the manual mill yet: only scripted replies have.
+- A stand-in model (Claude Sonnet) planned the manual-mill project from the instructions, report and schema alone, with `--check-plan`. Its manual-facing plan passed (59.5 min). It chose the CNC alone (9.9 min) as faster, which is right for that part. Its notes on unclear instructions were addressed.
+- No GPT model has planned with the manual mill through the app's ChatGPT sign-in.
 - Whether a model converts the report's corner-based positions into Box work coordinates well is untested.

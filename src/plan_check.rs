@@ -1402,6 +1402,25 @@ fn run(
                 }
             }
         }
+        // A manual mill makes no program, so the export does not check it:
+        // its moves must still fit the machine's travel.
+        for (si, sims) in results.iter().enumerate() {
+            let machine = &job_doc.setups[si].machine;
+            if !crate::manual::is_manual(machine) {
+                continue;
+            }
+            let plans = sims
+                .iter()
+                .filter_map(|(_, r)| r.as_ref().ok().map(|s| &s.plan));
+            if let Some(message) = crate::manual::travel_problem(machine, plans) {
+                export.push(Problem {
+                    setup: si + 1,
+                    operation: None,
+                    stage: "export",
+                    message,
+                });
+            }
+        }
         if export.is_empty() && held.is_empty() {
             out.zeros = built
                 .setups

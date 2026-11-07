@@ -2373,6 +2373,17 @@ pub fn build(
             setup
         } else if let Some(b) = base {
             let mut setup = doc.setups[b].clone();
+            // A manual setup kept and put first takes the fresh stock as
+            // the user's setup defines it: its stock, placement and zero.
+            if si == 0 && hand {
+                for (k, v) in &setup1.p {
+                    if k.starts_with("stock_")
+                        || ["rx", "ry", "rz", "tx", "ty", "tz", "origin"].contains(&k.as_str())
+                    {
+                        setup.p.insert(k.clone(), v.clone());
+                    }
+                }
+            }
             if changed(1) {
                 setup.p.insert("origin".into(), proposed.origin.clone());
             }
@@ -2418,7 +2429,16 @@ pub fn build(
                 .insert("notes".into(), clip(&proposed.workholding, 500));
             setup
         } else {
-            let mut setup = Setup::new(on.clone(), if hand { "" } else { &offset });
+            // A hand setup has no work offset of its own: it carries the
+            // user's, as the first one handed the stock does.
+            let mut setup = Setup::new(
+                on.clone(),
+                if hand {
+                    get(&setup1.p, "offset")
+                } else {
+                    &offset
+                },
+            );
             let rotation = analysis::rotation_for(setup1, orientation.up).unwrap_or_default();
             for (key, value) in ["rx", "ry", "rz"].iter().zip(rotation) {
                 setup.p.insert((*key).into(), value.to_string());
@@ -5408,10 +5428,48 @@ pub(crate) mod tests {
         ] {
             tool.p.insert(k.into(), v.into());
         }
+        // T8, a 2-flute Ø4 drill on the manual mill.
+        let mut drill = Tool::new("Drill 4 hand", "Drill", "4");
+        for (k, v) in [
+            ("length", "60"),
+            ("stickout", "65"),
+            ("flutes", "2"),
+            ("number", "8"),
+            ("machines", mill.id.as_str()),
+        ] {
+            drill.p.insert(k.into(), v.into());
+        }
         doc.machines.push(mill);
         doc.tools.push(tool);
+        doc.tools.push(drill);
         let report = analysis::report(&doc, &mesh).unwrap();
         (doc, mesh, report)
+    }
+    /// `good` with its holes drilled on the manual mill after the CNC, in a
+    /// setup of their own facing +Z, instead of by the CNC's setup 1.
+    pub fn drilled_by_hand(report: &PartReport) -> Proposal {
+        let mut plan = good(report);
+        for setup in &mut plan.setups {
+            setup.machine = Some(1);
+        }
+        let mut drill = plan.setups[0].operations.pop().unwrap();
+        drill.tool = 8;
+        drill.rpm = 1600.;
+        drill.feed = 150.;
+        drill.coolant = "Off".into();
+        drill.drill_cycle = Some("Chip breaking".into());
+        plan.setups.push(ProposedSetup {
+            machine: Some(2),
+            orientation: "+Z".into(),
+            name: "Drill by hand".into(),
+            origin: "Model origin".into(),
+            workholding: "Big mill vise.".into(),
+            holder: None,
+            a_angles: None,
+            operations: vec![drill],
+            from: None,
+        });
+        plan
     }
     /// A Box on the manual mill facing 3.5 of the 4 mm of stock off the
     /// top, open on every side, in setup 1's work coordinates (stock top
@@ -5682,5 +5740,108 @@ pub(crate) mod tests {
             thickness: None,
         });
         crate::storage::save(std::path::Path::new(&out), &doc).unwrap();
+    }
+    #[test]
+    fn a_manual_setup_after_the_cnc_carries_an_offset_and_moved_first_takes_the_stock() {
+        let (doc, mesh, report) = with_mill();
+        let (check, job) =
+            crate::plan_check::check(&doc, &mesh, &report, &drilled_by_hand(&report));
+        assert!(check.passed, "{:?}", check.problems);
+        let job = job.unwrap();
+        let hand = &job.setups[2];
+        assert!(crate::manual::is_manual(&hand.machine));
+        assert_eq!(get(&hand.p, "offset"), get(&job.setups[0].p, "offset"));
+        assert!(crate::guide::build(&job, &mesh, 2).is_ok());
+        // Asked in the chat to drill first: the kept manual setup goes in
+        // front and takes the user's stock, placement and zero.
+        let mut plan = shown(&job, &report);
+        let moved = plan.setups.remove(2);
+        plan.setups.insert(0, moved);
+        let first = build(&job, &mesh, &report, &plan).unwrap();
+        assert_eq!(first.setups[0].id, hand.id);
+        for (k, v) in &doc.setups[0].p {
+            if k.starts_with("stock_") && k != "stock_source"
+                || ["rx", "ry", "rz", "tx", "ty", "tz", "origin"].contains(&k.as_str())
+            {
+                assert_eq!(first.setups[0].p.get(k), Some(v), "{k}");
+            }
+        }
+        assert_eq!(
+            first.setup_stock(0, Some(&mesh)),
+            doc.setup_stock(0, Some(&mesh))
+        );
+    }
+    #[test]
+    fn a_block_too_wide_for_the_vise_is_planned_when_the_manual_mill_can_square_it() {
+        // The 124 mm block across the 120 mm vise's jaws.
+        let (mut doc, mesh, _) = with_mill();
+        hold(&mut doc, "Vise", &[("vise_axis", "X"), ("vise_grip", "8")]);
+        let mut cnc_only = doc.clone();
+        cnc_only.machines.retain(|m| !crate::manual::is_hand(m));
+        let unmet = analysis::preconditions(&cnc_only, Some(&mesh));
+        assert!(unmet.iter().any(|p| !p.ok), "a CNC alone cannot plan it");
+        assert!(
+            analysis::preconditions(&doc, Some(&mesh))
+                .iter()
+                .all(|p| p.ok)
+        );
+        let report = analysis::report(&doc, &mesh).unwrap();
+        let problem = report.workholding_problem.clone().unwrap();
+        assert!(problem.starts_with("Setup 1's workholding"), "{problem}");
+        // Squared to 120 on the manual mill first, the vise holds it.
+        let side = |x_min: f32, x_max: f32| ProposedOp {
+            block: Some(ProposedBox {
+                x_min,
+                x_max,
+                y_min: -200.,
+                y_max: 200.,
+                z_top: 0.,
+                z_bottom: -47.,
+                allowance: Some(0.),
+            }),
+            ..facing_box()
+        };
+        let mut plan = milled(&report);
+        plan.setups[0].operations = vec![side(-200., -60.), side(60., 200.)];
+        // The outside Contour would run down beside the jaws: not this test's.
+        plan.setups[1]
+            .operations
+            .retain(|o| o.strategy != "Contour");
+        let (check, _) = crate::plan_check::check(&doc, &mesh, &report, &plan);
+        let holding: Vec<_> = (check.problems.iter())
+            .filter(|p| p.stage == "workholding")
+            .collect();
+        assert!(holding.is_empty(), "{holding:?}");
+        // Without the squaring the vise still cannot hold it.
+        let (check, _) = crate::plan_check::check(&doc, &mesh, &report, &good(&report));
+        assert!(
+            check
+                .problems
+                .iter()
+                .any(|p| p.stage == "workholding" || p.stage == "export"),
+            "{:?}",
+            check.problems
+        );
+    }
+    #[test]
+    fn a_manual_mill_too_small_for_the_moves_is_refused() {
+        let (mut doc, mesh, _) = with_mill();
+        for (k, v) in [("x", "50"), ("y", "50"), ("z", "10")] {
+            doc.machines
+                .last_mut()
+                .unwrap()
+                .p
+                .insert(k.into(), v.into());
+        }
+        let report = analysis::report(&doc, &mesh).unwrap();
+        let (check, _) = crate::plan_check::check(&doc, &mesh, &report, &milled(&report));
+        assert!(!check.passed);
+        assert!(
+            check.problems.iter().any(
+                |p| p.setup == 1 && p.message.starts_with("The manual mill travels 50 mm in X")
+            ),
+            "{:?}",
+            check.problems
+        );
     }
 }
