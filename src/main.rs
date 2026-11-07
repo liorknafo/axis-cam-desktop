@@ -7669,8 +7669,14 @@ impl App {
                 }
                 let phase_tab = self.phase_tab();
                 // AXIS CAM opened again while the Pi runs the tool run it
-                // sent before: its run, built anew, follows it.
-                let follow = match self.control.as_mut().and_then(|c| c.take_reattach()) {
+                // sent before: its run, built anew, follows it, once the
+                // part it checks with is there (loaded, or loaded again
+                // after a failure); until then what was kept waits.
+                let loaded = self.part_mesh().is_some();
+                let reattach = (self.control.as_mut())
+                    .filter(|_| loaded)
+                    .and_then(|c| c.take_reattach());
+                let follow = match reattach {
                     Some(f) => self.follow_pi_run(f),
                     None => Task::none(),
                 };

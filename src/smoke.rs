@@ -3709,6 +3709,42 @@ flood = { pin = 8 }
         }
     }
 
+    /// Review finding: AXIS CAM opened again connects while the project's
+    /// part is still loading. The run is built anew only once it has
+    /// loaded, and then follows the Pi's tool run.
+    #[test]
+    fn a_tool_run_on_the_pi_is_followed_again_once_the_part_has_loaded() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5., "the Facing on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        let _ = a.update(Message::Run(R::Hold));
+        pi_until(&server, 10., "Hold on the Pi", |s| {
+            s.state == Some(State::Hold)
+        });
+        let _ = a.update(Message::Disconnect);
+        let mut a = reopen(a, dir.path());
+        // Still loading, as when the app opens the project.
+        let (mesh, file) = (a.imported_mesh.take().unwrap(), a.doc.file.clone().unwrap());
+        a.import_busy = true;
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 5., "the link live", |s| s.state.is_some());
+        tick_for(&mut a, 300);
+        assert!(conn(&a).run.is_none(), "built anew before the part loaded");
+        let _ = a.update(Message::ModelRestored(file, Ok(mesh)));
+        follow_again(&mut a).unwrap();
+        assert_eq!(run_of(&a).running.as_ref().map(|r| r.index), Some(0));
+        let _ = a.update(Message::Run(R::Stop));
+        pi_until(&server, 10., "stopped", |s| s.state == Some(State::Idle));
+    }
+
     /// The Facing tool run sent to the Pi, then AXIS CAM disconnected as
     /// closing does, and the Facing done on the Pi.
     fn facing_then_closed(dir: &std::path::Path) -> (App, uc100_remote::Server) {
