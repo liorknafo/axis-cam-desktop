@@ -545,11 +545,32 @@ pub(crate) fn op_checks(app: &App) -> Vec<Check> {
         && let Ok(holes) = app.pocket_holes(o, mesh).as_ref()
     {
         for ((h, fits), cleared) in holes.iter().zip(fits).zip(cleared) {
-            checks.extend(
-                h.uncut(*diameter, fits, *cleared)
-                    .into_iter()
-                    .map(|text| Check::new(text, false)),
-            );
+            // A later operation (the Drilling after it) that cuts all of
+            // what it leaves takes the warning; one that cuts part of it
+            // is named, with what it leaves. A hole none of whose levels
+            // the cutter fits is one warning, taken whole; else each level
+            // left is its own, taken by what cuts that level.
+            let lines = h.uncut(*diameter, fits, *cleared);
+            let whole = fits.iter().all(|f| !f);
+            let left: Vec<usize> = (0..fits.len()).filter(|&i| !fits[i]).collect();
+            let masks: Vec<Vec<bool>> = if whole {
+                vec![fits.clone()]
+            } else {
+                left.iter()
+                    .map(|&i| (0..fits.len()).map(|j| j != i).collect())
+                    .collect()
+            };
+            for (text, mask) in lines.into_iter().zip(masks) {
+                let text = match app.cut_later(o, mesh, h, &mask) {
+                    Some((_, None)) => continue,
+                    Some((_, Some(why))) => format!(
+                        "{} {why}.",
+                        text.trim_end_matches(" Pick it in an operation with a smaller cutter.")
+                    ),
+                    None => text,
+                };
+                checks.push(Check::new(text, false));
+            }
         }
     }
     // A generated outside Contour that goes through the stock's bottom all

@@ -19790,6 +19790,523 @@ soft_max = 180.0
             .unwrap()
     }
     #[test]
+    fn a_hole_too_narrow_for_the_cutter_that_a_later_drilling_drills_is_not_warned_of() {
+        // The owner's TOTEM bottom: the Adaptive clearing (Ø3) picked the four
+        // Ø1.9 screw holes the Drilling after it drills, and warned of each
+        // "… too narrow for the Ø3 cutter … the hole under it left uncut. Pick
+        // it in an operation with a smaller cutter.", which it was.
+        for strategy in [Strategy::Pocket, Strategy::Adaptive] {
+            let mut a = pocket_app(crate::pocket::chamfered_hole());
+            a.doc.setup_mut().operations[0].strategy = strategy;
+            let id = a.operation().unwrap().tool.clone();
+            let tool = a.doc.tools.iter_mut().find(|t| t.id == id).unwrap();
+            tool.p.insert("type".into(), "Flat end mill".into());
+            tool.p.insert("diameter".into(), "8".into());
+            let chamfer = surface_at(&a, |_, c| (c[2] - 9.5).abs() < 0.1 && c[0].hypot(c[1]) < 4.);
+            let _ = a.update(Message::Surface(chamfer));
+            let narrow = |a: &App| {
+                crate::ui::op_checks(a)
+                    .into_iter()
+                    .filter(|c| !c.error && c.text.contains("too narrow for the Ø8"))
+                    .count()
+            };
+            assert_eq!(narrow(&a), 1, "{strategy:?}: {}", a.status);
+            // A Drilling after it, with a Ø6 drill, its hole picked by a
+            // click on its wall, as the owner picks.
+            let mut drill = Tool::new("Drill 6", "Drill", "6");
+            for (k, v) in [("length", "40"), ("stickout", "30"), ("number", "9")] {
+                drill.p.insert(k.into(), v.into());
+            }
+            // Through, 2 mm past the exit: past the 1.80 mm of its 118°
+            // point, so it is its full Ø6 down to the exit.
+            let mut drilling = Operation::new(Strategy::Drill, drill.id.clone());
+            drilling.geometry.clear();
+            drilling.p.insert("through".into(), "Yes".into());
+            drilling.p.insert("breakthrough".into(), "2".into());
+            a.doc.tools.push(drill);
+            a.doc.setup_mut().operations.push(drilling);
+            let last = a.doc.setup().operations.len() - 1;
+            let wall = surface_at(&a, |_, c| (c[2] - 4.).abs() < 1. && c[0].hypot(c[1]) < 3.2);
+            a.selected = Some(last);
+            let _ = a.update(Message::Surface(wall));
+            let mesh = a.imported_mesh.clone().unwrap();
+            let o = a.doc.setup().operations[last].clone();
+            let drilled = a.drill_holes(&o, &mesh).as_ref().clone().map(|h| h.len());
+            assert_eq!(drilled, Ok(1), "{strategy:?}: {}", a.status);
+            a.selected = Some(0);
+            assert_eq!(narrow(&a), 0, "{strategy:?}");
+            let said = |a: &App| {
+                crate::ui::op_checks(a)
+                    .into_iter()
+                    .find(|c| !c.error && c.text.contains("too narrow for the Ø8"))
+                    .map(|c| c.text)
+                    .unwrap_or_default()
+            };
+            // Not when it drills the hole smaller (the review's Ø2 drill in
+            // the Ø6 hole), nor when it stops 5 mm over its bottom: the
+            // warning names the Drilling and what it leaves.
+            let drill_id = a.doc.setup().operations[last].tool.clone();
+            let set_drill = |a: &mut App, d: &str| {
+                let t = a.doc.tools.iter_mut().find(|t| t.id == drill_id).unwrap();
+                t.p.insert("diameter".into(), d.into());
+            };
+            set_drill(&mut a, "2");
+            let text = said(&a);
+            assert!(
+                text.contains("after it drills it Ø2, smaller than its Ø6.00 bore."),
+                "{strategy:?}: {text}"
+            );
+            assert!(
+                !text.contains("Pick it in an operation with a smaller cutter"),
+                "{text}"
+            );
+            set_drill(&mut a, "6");
+            a.doc.setup_mut().operations[last]
+                .p
+                .insert("bottom".into(), "5".into());
+            let text = said(&a);
+            assert!(
+                text.contains(
+                    "after it is its full Ø6 only 4.80 mm over its bottom, over its point."
+                ),
+                "{strategy:?}: {text}"
+            );
+            a.doc.setup_mut().operations[last]
+                .p
+                .insert("bottom".into(), "0".into());
+            assert_eq!(narrow(&a), 0, "{strategy:?}");
+            // The review's: to the exit, or 1 mm past it, its point leaves
+            // a cone round the exit (stock at radius 2.5, 0.2 mm over it).
+            for (through, breakthrough, short) in [("No", "2", "1.80"), ("Yes", "1", "0.80")] {
+                let p = &mut a.doc.setup_mut().operations[last].p;
+                p.insert("through".into(), through.into());
+                p.insert("breakthrough".into(), breakthrough.into());
+                let text = said(&a);
+                assert!(
+                    text.contains(&format!("only {short} mm over its bottom, over its point.")),
+                    "{strategy:?}, Through {through}: {text}"
+                );
+            }
+            let p = &mut a.doc.setup_mut().operations[last].p;
+            p.insert("through".into(), "Yes".into());
+            p.insert("breakthrough".into(), "2".into());
+            assert_eq!(narrow(&a), 0, "{strategy:?}");
+            // Not when its Hole diameter filter leaves the hole out (the
+            // review's: it drills none of it).
+            a.doc.setup_mut().operations[last]
+                .p
+                .insert("hole_diameter".into(), "3".into());
+            assert_eq!(narrow(&a), 1, "{strategy:?}");
+            assert!(!said(&a).contains("after it"), "{}", said(&a));
+            a.doc.setup_mut().operations[last]
+                .p
+                .insert("hole_diameter".into(), "0".into());
+            // Nor by a Contour after it, Outside (the review's: its path
+            // stays 10.9 mm off the hole) or Inside: a wall pass.
+            for side in ["Outside", "Inside"] {
+                let mut contour = Operation::new(Strategy::Contour, id.clone());
+                contour.geometry.clear();
+                contour.surfaces = a.doc.setup().operations[0].surfaces.clone();
+                contour.p.insert("side".into(), side.into());
+                contour.p.insert("allowance".into(), "0".into());
+                a.doc.setup_mut().operations[last].enabled = false;
+                a.doc.setup_mut().operations.push(contour);
+                assert_eq!(narrow(&a), 1, "{strategy:?}, {side} Contour");
+                a.doc.setup_mut().operations.pop();
+                a.doc.setup_mut().operations[last].enabled = true;
+            }
+            // A Ø2 pilot before the Ø6 drill: the Ø6 drills all of it.
+            let mut pilot = a.doc.setup().operations[last].clone();
+            pilot.id = "pilot".into();
+            let mut small = a
+                .doc
+                .tools
+                .iter()
+                .find(|t| t.id == drill_id)
+                .unwrap()
+                .clone();
+            small.id = "pilot-drill".into();
+            small.p.insert("diameter".into(), "2".into());
+            pilot.tool = small.id.clone();
+            a.doc.tools.push(small);
+            a.doc.setup_mut().operations.insert(last, pilot);
+            assert_eq!(narrow(&a), 0, "{strategy:?}: {}", said(&a));
+            a.doc.setup_mut().operations[last + 1].enabled = false;
+            assert!(said(&a).contains("after it drills it Ø2"), "{}", said(&a));
+            a.doc.setup_mut().operations.remove(last + 1);
+            a.doc.setup_mut().operations[last].enabled = true;
+            // Not when it is off, nor when it comes first.
+            a.doc.setup_mut().operations[last].enabled = false;
+            assert_eq!(narrow(&a), 1, "{strategy:?}");
+            a.doc.setup_mut().operations[last].enabled = true;
+            let ops = &mut a.doc.setup_mut().operations;
+            let drilling = ops.remove(last);
+            ops.insert(0, drilling);
+            a.selected = Some(1);
+            assert!(a.operation().unwrap().strategy == strategy);
+            assert_eq!(narrow(&a), 1, "{strategy:?}");
+        }
+    }
+    #[test]
+    fn in_an_indexed_setup_a_later_drilling_takes_only_the_holes_it_drills_at_their_angles() {
+        // The review's: radial holes of the tube at A 30, 90, 150 and 210
+        // picked in an Adaptive clearing too wide for them; a Drilling after
+        // it of the holes at 30 and 210 only. Matched by X and Y alone, the
+        // holes at 90 and 150 (in the same place, seen at their own angle)
+        // were taken as drilled too.
+        let mut a = app();
+        let (doc, mesh) = crate::indexed::tests::radial_doc(
+            "radial-tube",
+            "30, 90, 150, 210",
+            ("4", "45"),
+            14.3,
+            |x, _| (x - 20.).abs() < 2.2,
+        );
+        a.doc = doc;
+        a.imported_mesh = Some(mesh.clone());
+        a.doc.active = a.doc.setups[1].id.clone();
+        a.selected = Some(0);
+        let drill = a.doc.setup().operations[0].clone();
+        let all = a.pocket_holes(&drill, &mesh);
+        let all = all.as_ref().as_ref().unwrap();
+        assert_eq!(all.len(), 4);
+        let mut cutter = Tool::new("Rough 8", "Flat end mill", "8");
+        for (k, v) in [("length", "45"), ("stickout", "55"), ("number", "8")] {
+            cutter.p.insert(k.into(), v.into());
+        }
+        let mut rough = drill.clone();
+        rough.id = "indexed-rough".into();
+        rough.strategy = Strategy::Adaptive;
+        rough.tool = cutter.id.clone();
+        a.doc.tools.push(cutter);
+        let mut later = drill.clone();
+        later.surfaces.as_mut().unwrap().ids =
+            all[0].walls.iter().chain(&all[3].walls).copied().collect();
+        a.doc.setup_mut().operations = vec![rough.clone(), later];
+        let cut: Vec<bool> = all
+            .iter()
+            .map(|h| {
+                a.cut_later(&rough, &mesh, h, &vec![false; h.levels.len()])
+                    .is_some()
+            })
+            .collect();
+        assert_eq!(
+            cut,
+            [true, false, false, true],
+            "{:?}",
+            all.iter().map(|h| h.a).collect::<Vec<_>>()
+        );
+    }
+    #[test]
+    fn a_later_operation_takes_only_the_levels_of_a_hole_it_cuts() {
+        // The review's stepped hole: Ø6 to Z 2, Ø3 to Z 0, Ø2 through. A Ø4
+        // Adaptive clearing cuts the Ø6 and warns of the Ø3 and the Ø2; a
+        // Ø2 Drilling after it drills the Ø2, and leaves 0.5 mm round the Ø3.
+        let at = |r: f32, i: usize, z: f32| {
+            let t = (15. * i as f32).to_radians();
+            [r * t.cos(), r * t.sin(), z]
+        };
+        let mut tris = vec![];
+        for i in 0..24 {
+            for (r0, z0, r1, z1) in [
+                (1., -4., 1., 0.),
+                (1., 0., 1.5, 0.),
+                (1.5, 0., 1.5, 2.),
+                (1.5, 2., 3., 2.),
+                (3., 2., 3., 6.),
+                (3., 6., 10., 6.),
+                (10., 6., 10., -4.),
+                (10., -4., 1., -4.),
+            ] {
+                let (a, b) = (at(r0, i, z0), at(r0, i + 1, z0));
+                let (c, d) = (at(r1, i, z1), at(r1, i + 1, z1));
+                tris.extend([[a, b, d], [a, d, c]]);
+            }
+        }
+        let mut a = pocket_app(tris);
+        a.doc.setup_mut().operations[0].strategy = Strategy::Adaptive;
+        let id = a.operation().unwrap().tool.clone();
+        let tool = a.doc.tools.iter_mut().find(|t| t.id == id).unwrap();
+        tool.p.insert("diameter".into(), "4".into());
+        let wall = surface_at(&a, |_, p| (p[2] - 8.).abs() < 0.1 && p[0].hypot(p[1]) < 3.1);
+        let _ = a.update(Message::Surface(wall));
+        let rough = a.operation().unwrap().clone();
+        a.doc.setup_mut().operations = vec![rough.clone()];
+        let narrow = |a: &App| -> Vec<String> {
+            crate::ui::op_checks(a)
+                .into_iter()
+                .filter(|c| !c.error && c.text.contains("too narrow for the Ø4"))
+                .map(|c| c.text)
+                .collect()
+        };
+        assert_eq!(narrow(&a).len(), 2, "{:?}", narrow(&a));
+        let mut drill = Tool::new("Drill 2", "Drill", "2");
+        for (k, v) in [("length", "40"), ("stickout", "50"), ("number", "12")] {
+            drill.p.insert(k.into(), v.into());
+        }
+        let mut later = Operation::new(Strategy::Drill, drill.id.clone());
+        later.geometry.clear();
+        later.surfaces = rough.surfaces.clone();
+        a.doc.tools.push(drill);
+        a.doc.setup_mut().operations.push(later);
+        let left = narrow(&a);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(left[0].contains("6.00 mm deep to a floor"), "{left:?}");
+        assert!(
+            left[0]
+                .contains("Drilling after it drills it Ø2, narrower than the 3.00 mm of it left."),
+            "{left:?}"
+        );
+        // The review's finished Contour: the Ø6 chamfered hole, a Ø8
+        // Adaptive clearing, then an Inside Contour of Selected geometry
+        // with a Ø4 cutter, which clears the bore (its one pass round the
+        // walls reaches the middle): it takes the warning; a Ø2 one, which
+        // leaves the middle, and an Outside one do not.
+        for (diameter, side, warned) in [
+            ("4", "Inside", 0),
+            ("3", "Inside", 0),
+            ("2", "Inside", 1),
+            ("4", "Outside", 1),
+        ] {
+            let mut a = pocket_app(crate::pocket::chamfered_hole());
+            a.doc.setup_mut().operations[0].strategy = Strategy::Adaptive;
+            let id = a.operation().unwrap().tool.clone();
+            let tool = a.doc.tools.iter_mut().find(|t| t.id == id).unwrap();
+            tool.p.insert("diameter".into(), "8".into());
+            let chamfer = surface_at(&a, |_, p| (p[2] - 9.5).abs() < 0.1 && p[0].hypot(p[1]) < 4.);
+            let _ = a.update(Message::Surface(chamfer));
+            let rough = a.operation().unwrap().clone();
+            let mut mill = Tool::new("Finish", "Flat end mill", diameter);
+            for (k, v) in [("length", "40"), ("stickout", "50"), ("number", "12")] {
+                mill.p.insert(k.into(), v.into());
+            }
+            let mut contour = Operation::new(Strategy::Contour, mill.id.clone());
+            contour.geometry.clear();
+            contour.surfaces = rough.surfaces.clone();
+            for (k, v) in [
+                ("boundary", "Selected geometry"),
+                ("side", side),
+                ("allowance", "0"),
+                ("bottom", "0"),
+            ] {
+                contour.p.insert(k.into(), v.into());
+            }
+            a.doc.tools.push(mill);
+            a.doc.setup_mut().operations = vec![rough, contour];
+            a.selected = Some(0);
+            let n = crate::ui::op_checks(&a)
+                .into_iter()
+                .filter(|c| !c.error && c.text.contains("too narrow for the Ø8"))
+                .count();
+            assert_eq!(n, warned, "Ø{diameter} {side} Contour");
+        }
+    }
+    #[test]
+    fn a_later_cut_that_cannot_reach_a_holes_narrow_extension_does_not_take_its_warning() {
+        // The review's keyhole: a Ø6 hole with a 3 mm wide slot out to X4.5,
+        // a Ø8 Adaptive clearing, then a Ø4 Inside Contour or Pocket, which
+        // cannot get into the slot (stock was left at X4.1): the warning
+        // stays, naming what is left; a bounding box 7.5 × 6 mm had taken it.
+        let mut ring = vec![[4.5f32, 1.5f32]];
+        for i in 2..=22 {
+            let t = (15. * i as f32).to_radians();
+            ring.push([3. * t.cos(), 3. * t.sin()]);
+        }
+        ring.push([4.5, -1.5]);
+        let outer: Vec<[f32; 2]> = (ring.iter())
+            .map(|p| {
+                let t = p[1].atan2(p[0]);
+                [10. * t.cos(), 10. * t.sin()]
+            })
+            .collect();
+        let mut tris = vec![];
+        for i in 0..ring.len() {
+            let j = (i + 1) % ring.len();
+            let (p, q, o, b) = (ring[i], ring[j], outer[i], outer[j]);
+            for (u, z, v, zz) in [
+                (p, -4., p, 6.),
+                (p, 6., o, 6.),
+                (o, 6., o, -4.),
+                (o, -4., p, -4.),
+            ] {
+                let (uq, vq) = if u == p && v == p {
+                    (q, q)
+                } else if u == p {
+                    (q, b)
+                } else if v == o {
+                    (b, b)
+                } else {
+                    (b, q)
+                };
+                let (a, b, c, d) = (
+                    [u[0], u[1], z],
+                    [uq[0], uq[1], z],
+                    [v[0], v[1], zz],
+                    [vq[0], vq[1], zz],
+                );
+                tris.extend([[a, b, d], [a, d, c]]);
+            }
+        }
+        for strategy in [Strategy::Contour, Strategy::Pocket] {
+            let mut a = pocket_app(tris.clone());
+            a.doc.setup_mut().operations[0].strategy = Strategy::Adaptive;
+            let id = a.operation().unwrap().tool.clone();
+            let tool = a.doc.tools.iter_mut().find(|t| t.id == id).unwrap();
+            tool.p.insert("diameter".into(), "8".into());
+            let wall = surface_at(&a, |_, p| {
+                (p[2] - 5.).abs() < 0.5 && p[0] > 4. && p[0] < 5. && p[1].abs() < 1.
+            });
+            let _ = a.update(Message::Surface(wall));
+            let rough = a.operation().unwrap().clone();
+            let mut mill = Tool::new("Finish", "Flat end mill", "4");
+            for (k, v) in [("length", "40"), ("stickout", "50"), ("number", "12")] {
+                mill.p.insert(k.into(), v.into());
+            }
+            let mut later = Operation::new(strategy, mill.id.clone());
+            later.geometry.clear();
+            later.surfaces = rough.surfaces.clone();
+            for (k, v) in [
+                ("boundary", "Selected geometry"),
+                ("side", "Inside"),
+                ("containment", "Tool inside boundary"),
+                ("allowance", "0"),
+                ("bottom", "0"),
+                ("axial_allowance", "0"),
+            ] {
+                later.p.insert(k.into(), v.into());
+            }
+            a.doc.tools.push(mill);
+            a.doc.setup_mut().operations = vec![rough, later];
+            a.selected = Some(0);
+            let warned: Vec<String> = crate::ui::op_checks(&a)
+                .into_iter()
+                .filter(|c| !c.error && c.text.contains("too narrow for the Ø8"))
+                .map(|c| c.text)
+                .collect();
+            assert_eq!(warned.len(), 1, "{strategy:?}: {warned:?}");
+            assert!(
+                warned[0].contains("its cutter does not reach."),
+                "{strategy:?}: {warned:?}"
+            );
+        }
+    }
+    #[test]
+    fn a_drilling_takes_a_blind_hole_whose_floor_is_its_point_and_not_one_it_stops_over() {
+        // The review's: a Ø6 blind hole whose floor is the cone a 118° drill
+        // point leaves (its walls end 0.03 mm under where the drill is full
+        // width, between facets), after a Ø8 Adaptive clearing. A Ø6 drill
+        // to its bottom cuts it all; 1 mm over its bottom, not; nor all of
+        // a flatter 120° cone (the point leaves 0.07 mm over its rim).
+        for (degrees, cut) in [(118f32, true), (120., false)] {
+            let rise = 3. / (degrees / 2.).to_radians().tan();
+            let section = vec![
+                (0., -4.),
+                (10., -4.),
+                (10., 10.),
+                (3., 10.),
+                (3., 2.),
+                (0., 2. - rise),
+            ];
+            let mut a = pocket_app(crate::cam::tests::revolved(&section));
+            a.doc.setup_mut().operations[0].strategy = Strategy::Adaptive;
+            let id = a.operation().unwrap().tool.clone();
+            let tool = a.doc.tools.iter_mut().find(|t| t.id == id).unwrap();
+            for (k, v) in [("diameter", "8"), ("length", "100"), ("stickout", "110")] {
+                tool.p.insert(k.into(), v.into());
+            }
+            let mesh = a.imported_mesh.clone().unwrap();
+            let setup = a.doc.setup().clone();
+            let wall = surface_at(&a, |id, p| {
+                crate::pocket::is_wall(&setup, &mesh, id) && p[0].hypot(p[1]) < 3.1
+            });
+            let _ = a.update(Message::Surface(wall));
+            let rough = a.operation().unwrap().clone();
+            let mut drill = Tool::new("Drill 6", "Drill", "6");
+            for (k, v) in [("length", "100"), ("stickout", "110"), ("number", "12")] {
+                drill.p.insert(k.into(), v.into());
+            }
+            let mut later = Operation::new(Strategy::Drill, drill.id.clone());
+            later.geometry.clear();
+            later.surfaces = rough.surfaces.clone();
+            later.p.insert("through".into(), "No".into());
+            a.doc.tools.push(drill);
+            a.doc.setup_mut().operations = vec![rough, later];
+            a.selected = Some(0);
+            let narrow = |a: &App| -> Vec<String> {
+                crate::ui::op_checks(a)
+                    .into_iter()
+                    .filter(|c| !c.error && c.text.contains("too narrow for the Ø8"))
+                    .map(|c| c.text)
+                    .collect()
+            };
+            assert_eq!(narrow(&a).is_empty(), cut, "{degrees}°: {:?}", narrow(&a));
+            a.doc.setup_mut().operations[1]
+                .p
+                .insert("bottom".into(), "1".into());
+            let left = narrow(&a);
+            assert_eq!(left.len(), 1, "{degrees}°: {left:?}");
+            assert!(left[0].contains("over its point."), "{left:?}");
+        }
+    }
+    #[test]
+    fn restoring_an_indexed_job_keeps_the_holes_picked_at_its_other_angles() {
+        // The second review's: the tube's radial holes picked at A 30, 90, 150
+        // and 210 in an indexed setup. Restoring the model judged its picks at
+        // one angle and dropped the walls facing down there (143 faces), so
+        // the Drilling lost its holes at 90 and 150 and was refused.
+        let (mut doc, mesh) = crate::indexed::tests::radial_doc(
+            "radial-tube",
+            "30, 90, 150, 210",
+            ("4", "80"),
+            14.3,
+            |x, _| (x - 20.).abs() < 2.2,
+        );
+        doc.file = Some(crate::model::ModelFile {
+            name: "radial-tube.3mf".into(),
+            path: std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/radial-tube.3mf"),
+            format: "3mf".into(),
+            bytes: 0,
+            thickness: None,
+        });
+        for strategy in [
+            Strategy::Drill,
+            Strategy::Pocket,
+            Strategy::Adaptive,
+            Strategy::Contour,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut a = fresh_app(&dir);
+            a.doc = doc.clone();
+            a.doc.setups[1].operations[0].strategy = strategy;
+            a.doc.active = a.doc.setups[1].id.clone();
+            a.imported_mesh = Some(mesh.clone());
+            a.selected = Some(0);
+            let ids = |a: &App| {
+                a.operation()
+                    .unwrap()
+                    .surfaces
+                    .as_ref()
+                    .unwrap()
+                    .ids
+                    .clone()
+            };
+            let before = ids(&a);
+            let ready = |a: &App| {
+                crate::simulation::prepare(&a.doc, &mesh, 1, 0).map(|s| s.plan.moves.len())
+            };
+            let moves = (strategy == Strategy::Drill).then(|| ready(&a));
+            let _ = a.update(Message::ModelRestored(
+                a.doc.file.clone().unwrap(),
+                Ok(mesh.clone()),
+            ));
+            assert_eq!(ids(&a), before, "{strategy:?}: {}", a.status);
+            if let Some(moves) = moves {
+                assert!(moves.is_ok(), "{moves:?}");
+                assert_eq!(ready(&a), moves);
+            }
+        }
+    }
+    #[test]
     fn a_click_on_a_holes_chamfer_picks_it_and_the_pocket_names_what_its_cutter_leaves() {
         // `pocket::chamfered_hole`: a click on the chamfer picks the Ø6
         // hole, and another drops it.

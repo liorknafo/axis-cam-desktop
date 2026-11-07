@@ -1059,6 +1059,7 @@ impl Level<'_> {
                 points.push(p);
             }
             points.extend(around);
+            let points = held(exact, &w.edges, points, w.r)?;
             if ramp {
                 self.link(start, exact, true, &mut first);
                 self.events.push(Event::Ramp(points.clone()));
@@ -1511,6 +1512,53 @@ fn runs(cells: &Cells, outline: &[(f64, f64)]) -> Vec<(usize, usize, usize)> {
     out
 }
 
+/// `path` with each run of its points that steps out of `exact` (its edges
+/// `edges`) left out: from the last point kept, straight on to the first
+/// after the run the step to which stays inside, the run no longer along
+/// `path` than `most`. Its first and last points are kept, so a loop stays
+/// closed; with no such point, or the first point outside, `OUTSIDE`. The
+/// centres' outline can hold a needle of no width that `exact`, the centres
+/// grown by half the margin, has none of (along a rounded edge a CAD file
+/// gives as facets, where the offsets' outlines cross): the walls' pass goes
+/// straight past it, inside, instead of out along it.
+fn held(exact: &[Polygon], edges: &Edges, path: Vec<P>, most: f64) -> Result<Vec<P>, String> {
+    let Some(&first) = path.first() else {
+        return Ok(path);
+    };
+    if !pocket::inside(exact, first) {
+        return Err(OUTSIDE.into());
+    }
+    let ok = |a: P, b: P| within(exact, edges, a, b) && pocket::inside(exact, b);
+    let mut kept: Vec<P> = Vec::with_capacity(path.len());
+    kept.push(first);
+    let mut i = 1;
+    while i < path.len() {
+        let last = *kept.last().unwrap();
+        if ok(last, path[i]) {
+            kept.push(path[i]);
+            i += 1;
+            continue;
+        }
+        let mut along = 0.;
+        let mut next = None;
+        for j in i..path.len() {
+            along += (path[j].0 - path[j - 1].0).hypot(path[j].1 - path[j - 1].1);
+            if along > most {
+                break;
+            }
+            if j > i && ok(last, path[j]) {
+                next = Some(j);
+                break;
+            }
+        }
+        let Some(j) = next else {
+            return Err(OUTSIDE.into());
+        };
+        kept.push(path[j]);
+        i = j + 1;
+    }
+    Ok(kept)
+}
 struct Heights {
     z: f32,
     previous: f32,
@@ -1628,7 +1676,9 @@ fn emit(
                 }
             }
             Event::Ramp(path) => {
-                if !inside(exact, edges, path) {
+                // Lap after lap round a closed loop: from its end back to
+                // its start is no step.
+                if !inside(exact, edges, path) || path.first() != path.last() {
                     return Err(OUTSIDE.into());
                 }
                 let lap: f64 = path
@@ -3357,5 +3407,87 @@ mod tests {
         eprintln!("removed: {rough:.0} mm³ roughing, {both:.0} mm³ with the finishing");
         assert!(rough > 0.8 * both, "{rough} of {both} mm³");
         assert_eq!(left.last(), Some(&0), "{left:?}");
+    }
+    #[test]
+    fn the_walls_pass_goes_past_a_needle_its_region_has_none_of() {
+        // On the TOTEM bottom's faceted rim the tool centres at one level had
+        // a needle 0.008 mm wide and 0.23 mm long whose outlines crossed, so
+        // the region the walls' pass is held to (the centres grown by half
+        // the margin) had none of it: the pass walked out along it and the
+        // operation was refused ("would leave the pocket's allowed region").
+        let exact: Vec<Polygon> = vec![vec![(0., 0.), (10., 0.), (10., 10.), (0., 10.)]];
+        let edges = Edges::new(&exact, 3.);
+        let path = vec![
+            (5., 0.01),
+            (9.99, 0.01),
+            (9.99, 9.99),
+            (0.01, 9.99),
+            (0.01, 5.004),
+            (-0.5, 5.),
+            (0.01, 4.996),
+            (0.01, 0.01),
+            (5., 0.01),
+        ];
+        assert!(!inside(&exact, &edges, &path));
+        let kept = held(&exact, &edges, path.clone(), 1.5).unwrap();
+        assert!(inside(&exact, &edges, &kept));
+        assert_eq!(kept.len(), path.len() - 1);
+        assert!(!kept.contains(&(-0.5, 5.)));
+        assert_eq!((kept.first(), kept.last()), (path.first(), path.last()));
+        // A path inside is kept whole.
+        let inner: Vec<P> = path.iter().copied().filter(|p| p.0 >= 0.).collect();
+        assert_eq!(held(&exact, &edges, inner.clone(), 1.5).unwrap(), inner);
+        // A needle longer than `most` is refused, not cut across.
+        assert_eq!(
+            held(&exact, &edges, path.clone(), 0.5).unwrap_err(),
+            OUTSIDE
+        );
+        // The review's case: a U-shaped region and a loop round it whose last
+        // side crosses the notch, with no point within `most` after it to
+        // come back to: refused, not left open (before, its closing point
+        // was dropped, and the ramp lapped from (9, 9) back to (1, 1),
+        // across the notch, 7 feeds outside the region).
+        let u: Vec<Polygon> = vec![vec![
+            (0., 0.),
+            (10., 0.),
+            (10., 10.),
+            (7., 10.),
+            (7., 3.),
+            (3., 3.),
+            (3., 10.),
+            (0., 10.),
+        ]];
+        let u_edges = Edges::new(&u, 2.);
+        let around = vec![(1., 9.), (1., 1.), (9., 1.), (9., 9.), (1., 9.)];
+        assert_eq!(held(&u, &u_edges, around, 1.5).unwrap_err(), OUTSIDE);
+        // And a ramp round a loop that does not close is refused, with
+        // nothing emitted outside.
+        let (setup, op, tool, mesh) = ring();
+        let mut out = Motions {
+            plan: generate(&setup, &op, &tool, &mesh).unwrap(),
+            at: [1., 9., 6.],
+        };
+        out.plan.moves.clear();
+        let open = vec![(1., 9.), (1., 1.), (9., 1.), (9., 9.)];
+        assert!(inside(&u, &u_edges, &open));
+        let e = emit(
+            &mut out,
+            &[Event::Ramp(open)],
+            &u,
+            &u_edges,
+            Heights {
+                z: 0.,
+                previous: 6.,
+                entry: 6.5,
+                clearance: 10.,
+            },
+            Feeds {
+                feed: 1000.,
+                slope: 0.035,
+            },
+            0.01,
+        );
+        assert_eq!(e.unwrap_err(), OUTSIDE);
+        assert!(out.plan.moves.is_empty());
     }
 }

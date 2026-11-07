@@ -1244,6 +1244,12 @@ pub struct App {
     /// The holes a Pocket's or Contour's selected walls pick, kept as
     /// `drill_holes` is (`App::pocket_holes`).
     pocket_holes: std::cell::RefCell<Option<(u64, std::sync::Arc<PocketHoles>)>>,
+    /// The holes the later operations `cut_later` asks about pick, by
+    /// `holes_key`, and drill (`drill_holes`), by operation id and that key:
+    /// kept as `pocket_holes` is, for up to 64 operations.
+    later_holes: std::cell::RefCell<std::collections::HashMap<u64, std::sync::Arc<PocketHoles>>>,
+    later_drills:
+        std::cell::RefCell<std::collections::HashMap<(String, u64), std::sync::Arc<DrillHoles>>>,
     /// Every hole of the part a Pocket or a Contour can pick in the current
     /// setup (`pocket::part_holes`), with what it was worked out from
     /// (`App::part_holes_key`): their outlines are what the 3D view picks a
@@ -1994,6 +2000,8 @@ impl App {
             drill_holes: std::cell::RefCell::new(None),
             bottom_holes: std::cell::RefCell::new(None),
             pocket_holes: std::cell::RefCell::new(None),
+            later_holes: Default::default(),
+            later_drills: Default::default(),
             part_holes: None,
             part_holes_job: None,
             pocket_fits: std::cell::RefCell::new(None),
@@ -3757,6 +3765,235 @@ impl App {
         *kept = Some((key, found.clone()));
         found
     }
+    /// The holes `op`'s picked surfaces pick (`pocket::picked_holes`), each
+    /// at the A angle that turns it up in an indexed setup that cuts holes
+    /// at several (`Document::holes_listed`); not kept (`pocket_holes` is).
+    pub(crate) fn picked_holes(&self, op: &Operation, mesh: &mesh::Mesh) -> PocketHoles {
+        // As the operation reads them: a picked slope's faces are no walls.
+        (self
+            .doc
+            .holes_listed(self.doc.index(), op, mesh, |posed, op| {
+                pocket::picked_holes(posed, op, mesh)
+            }))
+        .map(|listed| {
+            listed.map(|l| (l.into_iter().map(|(a, h)| pocket::Hole { a: Some(a), ..h })).collect())
+        })
+        .unwrap_or_else(|| pocket::picked_holes(self.doc.setup(), op, mesh))
+    }
+    /// What the later enabled operations of the setup `op` is in cut of
+    /// `hole`, one of `op`'s picked holes: None when none cuts any of it;
+    /// else the name of one, and, when none cuts all of what `op` leaves of
+    /// it (its levels `fits` says `op` does not fit), what the first that
+    /// cuts part of it leaves. All is what its cutter sweeps of each such
+    /// level, less 0.01 mm² (`pocket::Level::left_by`): a drill's disc at
+    /// its centre, its full width (over its 118° point) down to each such
+    /// level's bottom (its tip at the bore's bottom over the Bottom offset,
+    /// less Breakthrough); a Pocket's or an Adaptive clearing's whole reach; an Inside
+    /// Contour's one pass round the walls (`pocket::Level::swept`). A Drill
+    /// cuts a hole it drills (its filters, `cam::drills`), centre within
+    /// 0.1 mm, at the same A angle, with a drilling cycle and a drill no
+    /// smaller than its bore (its narrowest, as the Drill reads it) less
+    /// 0.02 mm; a Pocket or an Adaptive clearing of Selected geometry, the
+    /// tool inside, or an Inside Contour of Selected geometry, one it picks
+    /// in the same place at the same angle, with no stock to leave.
+    pub(crate) fn cut_later(
+        &self,
+        op: &Operation,
+        mesh: &mesh::Mesh,
+        hole: &pocket::Hole,
+        fits: &[bool],
+    ) -> Option<(String, Option<String>)> {
+        let setup = self.doc.setup();
+        let at = setup.operations.iter().position(|o| o.id == op.id)?;
+        let (x, y) = hole.centre();
+        // What `op` leaves of it: its levels its cutter does not fit, the
+        // widest, and how much of them, mm², a later cut `swept` leaves
+        // (less `clear` along their edges, where a cutter keeps clear).
+        let levels: Vec<&pocket::Level> = (hole.levels.iter().zip(fits))
+            .filter(|(_, f)| !**f)
+            .map(|(l, _)| l)
+            .collect();
+        let left = levels.iter().map(|l| l.width()).fold(0., f64::max);
+        let uncut = |swept: &dyn Fn(&pocket::Level) -> pocket::Region, clear: f64| {
+            levels
+                .iter()
+                .map(|l| l.left_by(&swept(l), clear))
+                .sum::<f64>()
+        };
+        let angle = |a: Option<f32>| match (a, hole.a) {
+            (None, None) => true,
+            (Some(a), Some(b)) => (a - b).abs() < 0.01,
+            _ => false,
+        };
+        let number = |o: &Operation, k: &str| num(&o.p, k).unwrap_or(0.);
+        let cut = (setup.operations[at + 1..].iter())
+            .filter(|o| o.enabled)
+            .filter_map(|o| {
+                let tool = self.doc.tools.iter().find(|t| t.id == o.tool)?;
+                let diameter = num(&tool.p, "diameter")?;
+                match o.strategy {
+                    Strategy::Drill => {
+                        // The hole as it drills it: its bore's narrowest
+                        // diameter, the largest drill that fits.
+                        // Kept for every later Drill (a pilot, then the
+                        // drill), by what `drill_holes` keeps it by.
+                        let key = (
+                            o.id.clone(),
+                            self.holes_key(o, mesh),
+                            get(&o.p, "cycle"),
+                            o.helical(),
+                        );
+                        let key = {
+                            use std::hash::{Hash, Hasher};
+                            let mut hasher = std::hash::DefaultHasher::new();
+                            (key.1, key.2, key.3).hash(&mut hasher);
+                            (key.0, hasher.finish())
+                        };
+                        let mut kept = self.later_drills.borrow_mut();
+                        if kept.len() > 64 {
+                            kept.clear();
+                        }
+                        let listed = (kept.entry(key))
+                            .or_insert_with(|| self.drill_holes(o, mesh))
+                            .clone();
+                        drop(kept);
+                        let found = (listed.as_ref().as_ref().ok())?.iter().find(|h| {
+                            cam::drills(o, h)
+                                && angle(h.a)
+                                && (h.center[0] as f64 - x).hypot(h.center[1] as f64 - y) <= 0.1
+                        })?;
+                        let bore = found.diameter;
+                        let centre = (found.center[0] as f64, found.center[1] as f64);
+                        let drills = !(o.helical()
+                            || o.thread_milling()
+                            || o.tapping()
+                            || o.reaming()
+                            || o.boring())
+                            && get(&tool.p, "type") == "Drill";
+                        let through = if get(&o.p, "through") == "Yes" {
+                            number(o, "breakthrough")
+                        } else {
+                            0.
+                        };
+                        // Its tip goes to the bore's bottom, less the
+                        // Breakthrough, over by the Bottom offset; it is
+                        // as wide as the drill only its point's height
+                        // over that (118°, `simulation::POINT_RISE`). That
+                        // must be no higher than the bottom of each level
+                        // left: its floor, or where a level through ends.
+                        let tip = found.bottom + number(o, "bottom") - through;
+                        let full = tip + diameter / 2. * crate::simulation::POINT_RISE;
+                        // A blind level whose walls end over the bore's
+                        // centre (`cam::Hole::bottom`, the apex) has a cone
+                        // for its floor: drilled with the tip at the apex,
+                        // the point leaves over it, at its rim, the height
+                        // its own cone is over the model's there. That is
+                        // cut when no more than facets alone make it (on a
+                        // Ø6 hole of 24 facets the cone a 118° point leaves
+                        // shows 0.03 mm; a 120° one, 0.10): 0.01 mm and
+                        // 1.5% of the radius.
+                        let cone = |l: &pocket::Level, floor: f32| {
+                            let r = l.width() as f32 / 2.;
+                            let over = r * crate::simulation::POINT_RISE - (floor - found.bottom);
+                            floor > found.bottom + 0.01
+                                && tip <= found.bottom + 0.01
+                                && over <= 0.01 + 0.015 * r
+                        };
+                        let short = (levels.iter())
+                            .map(|l| match l.floor {
+                                Some(floor) if cone(l, floor) => 0.,
+                                Some(floor) => full - floor,
+                                // Through: to where its walls end, the
+                                // bore's bottom as the Drill reads it (a
+                                // radial hole opening into a tube's bore,
+                                // high over the part's bottom under it).
+                                None => full - hole.bottom.max(found.bottom),
+                            })
+                            .fold(f32::NEG_INFINITY, f32::max);
+                        let why = if !drills {
+                            Some(format!("{} after it does not drill it out", o.name()))
+                        } else if diameter < bore - 0.02 {
+                            Some(format!(
+                                "{} after it drills it Ø{}, smaller than its Ø{bore:.2} bore",
+                                o.name(),
+                                crate::post::exact_mm(diameter)
+                            ))
+                        } else if uncut(&|_| pocket::disc(centre, diameter as f64 / 2.), 0.015) > 0.01 {
+                            Some(format!(
+                                "{} after it drills it Ø{}, narrower than the {left:.2} mm of it left",
+                                o.name(),
+                                crate::post::exact_mm(diameter)
+                            ))
+                        } else if short > 0.01 {
+                            Some(format!(
+                                "{} after it is its full Ø{} only {short:.2} mm over its bottom, over its point",
+                                o.name(),
+                                crate::post::exact_mm(diameter)
+                            ))
+                        } else {
+                            None
+                        };
+                        Some((o.name().to_string(), why))
+                    }
+                    // A Pocket or an Adaptive clearing cuts the holes it
+                    // picks only of Selected geometry, the tool inside (as
+                    // `pocket::job` asks); a Contour only of Selected
+                    // geometry, Inside (`cam::contour`), as one pass round
+                    // its walls.
+                    Strategy::Pocket | Strategy::Adaptive | Strategy::Contour
+                        if get(&o.p, "boundary") == "Selected geometry"
+                            && match o.strategy {
+                                Strategy::Contour => get(&o.p, "side") == "Inside",
+                                _ => get(&o.p, "containment") == "Tool inside boundary",
+                            } =>
+                    {
+                        let radial = num(&o.p, "allowance").filter(|a| *a >= 0.)?;
+                        let key = self.holes_key(o, mesh);
+                        let mut kept = self.later_holes.borrow_mut();
+                        if kept.len() > 64 {
+                            kept.clear();
+                        }
+                        let listed = (kept.entry(key))
+                            .or_insert_with(|| std::sync::Arc::new(self.picked_holes(o, mesh)))
+                            .clone();
+                        drop(kept);
+                        (listed.as_ref().as_ref().ok())?
+                            .iter()
+                            .find(|h| angle(h.a) && h.same_place(hole))?;
+                        // A Contour leaves no stock on the floor (`cam::contour`).
+                        let left_on_floor = number(o, "bottom")
+                            + if o.strategy == Strategy::Contour {
+                                0.
+                            } else {
+                                number(o, "axial_allowance")
+                            };
+                        let r = diameter as f64 / 2.;
+                        let ring = o.strategy == Strategy::Contour;
+                        // Past the margin it keeps from the part.
+                        let clear = (r * 0.01).max(0.02) + 0.005;
+                        let missed = uncut(&|l| l.swept(hole, r, ring), clear);
+                        let why = if radial > 0.001 || left_on_floor > 0.001 {
+                            Some(format!("{} after it leaves stock to leave in it", o.name()))
+                        } else if missed > 0.01 {
+                            Some(format!(
+                                "{} after it leaves {missed:.2} mm² of it its cutter does not reach",
+                                o.name()
+                            ))
+                        } else {
+                            None
+                        };
+                        Some((o.name().to_string(), why))
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        // A pilot drill, then the drill that cuts all of it: all of it.
+        cut.iter()
+            .find(|(_, why)| why.is_none())
+            .or(cut.first())
+            .cloned()
+    }
     /// The holes the selected walls of a Pocket or an inside Contour pick
     /// (`pocket::holes`), for its Geometry tab: kept until the part, the
     /// setup's placement or the selected surfaces change, as `drill_holes` is.
@@ -3772,22 +4009,7 @@ impl App {
         {
             return found.clone();
         }
-        let ids = op
-            .surfaces
-            .iter()
-            .flat_map(|s| s.ids.iter().copied())
-            .collect();
-        let found = (self
-            .doc
-            .holes_listed(self.doc.index(), op, mesh, |posed, op| {
-                let ids = (op.surfaces.iter()).flat_map(|s| s.ids.iter().copied());
-                pocket::holes(posed, &ids.collect(), mesh)
-            }))
-        .map(|listed| {
-            listed.map(|l| (l.into_iter().map(|(a, h)| pocket::Hole { a: Some(a), ..h })).collect())
-        })
-        .unwrap_or_else(|| pocket::holes(self.doc.setup(), &ids, mesh));
-        let found = std::sync::Arc::new(found);
+        let found = std::sync::Arc::new(self.picked_holes(op, mesh));
         *kept = Some((key, found.clone()));
         found
     }
@@ -7218,6 +7440,18 @@ impl App {
                             && let Some(mesh) = &self.imported_mesh
                         {
                             post::sync_pin_drilling(&mut self.doc, mesh);
+                        }
+                        // A sloping face picked before its operation picked
+                        // holes: dropped when it faces down, else the hole
+                        // past it, as a click picks now.
+                        if self.doc.file.is_some()
+                            && let Some(mesh) = &self.imported_mesh
+                        {
+                            let notes = surface::settle_sloping_picks(&mut self.doc, mesh);
+                            if !notes.is_empty() {
+                                self.touch();
+                                self.status = with_notes("Saved model geometry restored.", &notes);
+                            }
                         }
                         // Migrate legacy imported projects that stored sample
                         // feature IDs through the old viewport toggle.
