@@ -138,6 +138,12 @@ impl Bits {
             *a &= b;
         }
     }
+    /// Clear the bits set in `other`.
+    fn and_not(&mut self, other: &Bits) {
+        for (a, b) in self.bits.iter_mut().zip(&other.bits) {
+            *a &= !b;
+        }
+    }
 }
 
 /// Where a zone's cells lie: cell (i, j) has its centre at
@@ -1241,10 +1247,11 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     if zones.is_empty() {
         return Err("No finite adaptive motion could be generated.".into());
     }
+    let zones = nested(zones, r, stepdown)?;
     let highest = zones.iter().map(|z| z.2).fold(f32::NEG_INFINITY, f32::max);
     let total_levels: usize = zones
         .iter()
-        .map(|(zone, _, top)| ((top - zone.target - 0.0001) / stepdown).ceil().max(1.) as usize)
+        .map(|(zone, _, top, _)| ((top - zone.target - 0.0001) / stepdown).ceil().max(1.) as usize)
         .sum();
     if total_levels > 1000 {
         return Err("Adaptive clearing exceeds 1,000 depth levels. Increase the stepdown.".into());
@@ -1284,7 +1291,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     let approach = (highest + num(&op.p, "retract").unwrap_or(0.)).min(job.retract);
     let clearance = job.clearance;
     let mut placed = false;
-    for (zone, centres, cutting_top) in zones {
+    for (zone, centres, cutting_top, deeper_reach) in zones {
         // Cells a quarter of the load wide, at most a sixth of the radius,
         // and few enough for the grid.
         let reach_by = r - margin;
@@ -1397,6 +1404,8 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
         // The walls, each with the material on the walker's side:
         // Clipper's outlines run anticlockwise and its holes clockwise,
         // the free area on their left.
+        // What the deeper zones' reach holds, cleared by them (`nested`).
+        let deeper = deeper_reach.as_ref().map(|d| walk.cells.raster(d));
         let mut walls: Vec<Polygon> = centres.clone().into();
         if side < 0. {
             for wall in &mut walls {
@@ -1419,6 +1428,11 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
                         material.clear(j, i0, i1);
                     }
                 }
+            }
+            // What a deeper zone nested in this one took from the top
+            // already (`nested`).
+            if let Some(deeper) = &deeper {
+                material.and_not(deeper);
             }
             let mut level_walk = Level {
                 walk: &walk,
@@ -1558,6 +1572,65 @@ fn held(exact: &[Polygon], edges: &Edges, path: Vec<P>, most: f64) -> Result<Vec
         i = j + 1;
     }
     Ok(kept)
+}
+/// A zone as `nested` orders it: its allowed centres, its first cutting
+/// height, and the reach of the deeper zones that clear what it would of it.
+type Ordered<'a> = (&'a pocket::Zone, pocket::Region, f32, Option<Vec<Polygon>>);
+/// `zones` (each with its allowed centres and first cutting height), highest
+/// first as `pocket::banded` makes them, in the order they are cleared, each
+/// with the reach (centres grown by the cutter's radius `r`) of the zones
+/// that clear what it would of that. A band at a time, each floor's height
+/// a level over the whole pocket, bands thinner than the `stepdown` cost a
+/// whole pass each for a sliver: on the TOTEM bottom's rim, 20 bands 0.24 to
+/// 1 mm thick for a 6 mm stepdown, a band 0.3 mm thick round a Ø3 cutter's
+/// 10,000 mm² took 35 m of path, 883 min in all. So a run of bands each
+/// thinner than the stepdown, and the one under the last of them, are cut
+/// the other way about: the deepest first, from the run's first cutting
+/// height down by the stepdown, and each above it after, deepest first,
+/// from that same height, only outside the reach of those under it in the
+/// run. They have cleared what is there by then below its floor (their
+/// targets are lower), and a cutter where a zone's centres allow it is
+/// clear of the part at any height over that zone's floor. Bands at least
+/// a stepdown thick are cut a band at a time over all their pocket, as
+/// before: floors side by side 2 mm apart at a 2 mm stepdown in 4 levels,
+/// not 9.
+fn nested(
+    zones: Vec<(&pocket::Zone, pocket::Region, f32)>,
+    r: f64,
+    stepdown: f32,
+) -> Result<Vec<Ordered<'_>>, String> {
+    let mut runs: Vec<std::ops::Range<usize>> = vec![];
+    let mut start = 0;
+    for k in 0..zones.len() {
+        let thin = zones[k].2 - zones[k].0.target < stepdown - 0.0001;
+        if !thin || k + 1 == zones.len() {
+            runs.push(start..k + 1);
+            start = k + 1;
+        }
+    }
+    let mut out = Vec::with_capacity(zones.len());
+    for run in runs {
+        let top = zones[run.start].2;
+        let mut deeper: Option<pocket::Region> = None;
+        for k in run.clone().rev() {
+            let (zone, centres, own) = &zones[k];
+            let alone = run.len() == 1;
+            out.push((
+                *zone,
+                centres.clone(),
+                if alone { *own } else { top },
+                deeper.clone().map(Vec::<Polygon>::from),
+            ));
+            let reach = centres.inflate(r, JoinType::Round, EndType::Polygon, 2.);
+            deeper = Some(match deeper {
+                Some(d) => {
+                    union::<Milli>(d, reach, FillRule::NonZero).map_err(|e| e.to_string())?
+                }
+                None => reach,
+            });
+        }
+    }
+    Ok(out)
 }
 struct Heights {
     z: f32,

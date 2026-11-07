@@ -4837,6 +4837,66 @@ pub(crate) mod tests {
             && (p[2] >= 3. - 0.001 || clear(p, (-15., -10., -3., 10.), 1.))));
     }
     #[test]
+    fn an_adaptive_clearing_cuts_thin_terraces_only_round_the_deep_floor() {
+        // The owner's TOTEM bottom: 20 bands 0.24 to 1 mm thick for a 6 mm
+        // stepdown, each walked over the whole pocket, 883 min (203 now).
+        // Here, ledges at Z 3, 2.7 and 2.4 round a square floor at Z 0, at a
+        // 4 mm stepdown: at the ledges' heights the cutter walks only round
+        // the square (its reach), whose own levels go down by the stepdown.
+        let mut tris = vec![];
+        for (outer, inner, z) in [(15., 12., 6.), (12., 9., 3.), (9., 6., 2.7), (6., 4., 2.4)] {
+            for (x, y, xx, yy) in [
+                (-outer, -outer, outer, -inner),
+                (-outer, inner, outer, outer),
+                (-outer, -inner, -inner, inner),
+                (inner, -inner, outer, inner),
+            ] {
+                quad(&mut tris, x, y, xx, yy, z);
+            }
+        }
+        quad(&mut tris, -4., -4., 4., 4., 0.);
+        quad(&mut tris, -15., -15., 15., 15., -4.);
+        let (setup, mut op, tool, mesh, dz) = part(tris, &[3., 2.7, 2.4, 0.], 2.);
+        op.strategy = Strategy::Adaptive;
+        for (k, v) in [
+            ("stepdown", "4"),
+            ("optimal_load", "0.4"),
+            ("minimum_radius", "0"),
+            ("ramp", "Helix"),
+            ("ramp_angle", "2"),
+        ] {
+            op.p.insert(k.into(), v.into());
+        }
+        let plan = crate::adaptive::generate(&setup, &op, &tool, &mesh).unwrap();
+        let r = plan.radius;
+        let level = |z: f32| {
+            (plan.moves.iter())
+                .filter(|m| m.cutting_pass && (m.to[2] - dz - z).abs() < 0.01)
+                .collect::<Vec<_>>()
+        };
+        for z in [2.7, 2.4] {
+            let moves = level(z + 0.0);
+            assert!(!moves.is_empty(), "Z {z}");
+            // Not over the square's middle, past the cutter's reach of the
+            // ledge round it, but to cross it.
+            let inside: f32 = moves
+                .iter()
+                .filter(|m| m.to[0].abs() < 4. - r - 0.5 && m.to[1].abs() < 4. - r - 0.5)
+                .map(|m| (m.to[0] - m.from[0]).hypot(m.to[1] - m.from[1]))
+                .sum();
+            // A crossing at most (0.6 mm at Z 2.7; a band at a time, 138).
+            assert!(inside < 5., "Z {z}: {inside} mm over the square");
+        }
+        // The square itself is cut at no more than the stepdown at a time,
+        // from the top: one level over it between Z 3 and Z 0 at most.
+        let over: std::collections::BTreeSet<i64> = (plan.moves.iter())
+            .filter(|m| m.cutting_pass && (m.to[2] - m.from[2]).abs() < 1e-4)
+            .filter(|m| m.to[0].abs() < 1. && m.to[1].abs() < 1.)
+            .map(|m| ((m.to[2] - dz) * 100.).round() as i64)
+            .collect();
+        assert!(over.len() <= 3, "levels over the square: {over:?}");
+    }
+    #[test]
     fn thin_terraces_do_not_clear_the_deep_floor_at_every_height() {
         let mut tris = vec![];
         // Three nested ledges 0.3 mm apart over a deeper square pocket.
