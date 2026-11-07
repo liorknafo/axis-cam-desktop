@@ -2562,6 +2562,8 @@ mod path_json {
         })
     }
 }
+/// The extensions of the files Import takes, lower case.
+pub const IMPORT_FORMATS: [&str; 6] = ["step", "stp", "3mf", "stl", "obj", "dxf"];
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelFile {
     pub name: String,

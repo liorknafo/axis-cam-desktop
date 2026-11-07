@@ -468,6 +468,13 @@ pub enum Message {
     OpenProject,
     OpenHistory,
     Import,
+    /// Shows or hides the Import from path field under the application bar.
+    ImportPathOpen(bool),
+    /// The text of the Import from path field.
+    ImportPath(String),
+    /// Imports the model file at the path typed in the field, as `Import`
+    /// does the one chosen in the file browser.
+    ImportFromPath,
     FileImported(Option<Result<(ModelFile, Option<mesh::Mesh>), String>>),
     ProjectOpened(Option<Opened>),
     /// The saved model loaded again for `ModelFile` (`App::restore_model`).
@@ -1343,6 +1350,12 @@ pub struct App {
     pub save_busy: bool,
     pub last_archived: Option<PathBuf>,
     pub import_error: Option<String>,
+    /// Whether the Import from path field shows under the application bar.
+    pub import_path_open: bool,
+    /// The path typed or pasted into it.
+    pub import_path: String,
+    /// Why the last import from it failed, shown under the field.
+    pub import_path_error: Option<String>,
     pub stock: bool,
     /// "Show uncut faces": the part's faces the whole job leaves under stock
     /// are drawn magenta or amber (`uncut::Uncut`), over the simulated stock too.
@@ -2044,6 +2057,9 @@ impl App {
             save_busy: false,
             last_archived: None,
             import_error: None,
+            import_path_open: false,
+            import_path: String::new(),
+            import_path_error: None,
             stock: true,
             show_uncut: true,
             sim_details: false,
@@ -6783,7 +6799,11 @@ impl App {
                 if let Some(c) = &self.control {
                     c.send(uc100::controller::Command::EStop);
                 } else if self.esc_closes_pinned_help() {
-                    self.pinned_help = None;
+                    // The pinned card first, then the Import from path field.
+                    if self.pinned_help.take().is_none() {
+                        self.import_path_open = false;
+                        self.import_path_error = None;
+                    }
                 }
             }
             Message::JogKeyUp => {
@@ -7324,42 +7344,47 @@ impl App {
                     async {
                         let file = rfd::AsyncFileDialog::new()
                             .set_title("Import CAD or mesh")
-                            .add_filter(
-                                "CAD and mesh",
-                                &["step", "stp", "3mf", "stl", "obj", "dxf"],
-                            )
+                            .add_filter("CAD and mesh", &model::IMPORT_FORMATS)
                             .pick_file()
                             .await?;
-                        let p = file.path();
-                        let meta = match std::fs::metadata(p) {
-                            Ok(m) => m,
-                            Err(e) => return Some(Err(e.to_string())),
-                        };
-                        let ext = p
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .unwrap_or("")
-                            .to_lowercase();
-                        let info = ModelFile {
-                            name: file.file_name(),
-                            path: p.to_path_buf(),
-                            format: ext.clone(),
-                            bytes: meta.len(),
-                            // A DXF is a flat profile, extruded to this until
-                            // its thickness is set.
-                            thickness: (ext == "dxf").then_some(mesh::DXF_THICKNESS),
-                        };
-                        let path = p.to_path_buf();
-                        let mesh =
-                            match tokio::task::spawn_blocking(move || mesh::load(&path)).await {
-                                Ok(Ok(m)) => Some(m),
-                                Ok(Err(e)) => return Some(Err(e)),
-                                Err(e) => return Some(Err(format!("Import worker failed: {e}"))),
-                            };
-                        Some(Ok((info, mesh)))
+                        Some(load_model_file(file.path().to_path_buf()).await)
                     },
                     Message::FileImported,
                 );
+            }
+            Message::ImportPathOpen(open) => {
+                self.import_path_open = open;
+                self.import_path_error = None;
+                if open {
+                    return iced::widget::operation::focus(ui::IMPORT_PATH_FIELD);
+                }
+            }
+            Message::ImportPath(text) => {
+                self.import_path = text;
+                self.import_path_error = None;
+            }
+            Message::ImportFromPath => {
+                if self.import_busy || self.save_busy {
+                    return Task::none();
+                }
+                match typed_model_path(&self.import_path) {
+                    Err(e) => {
+                        self.status = format!("Import failed: {e}");
+                        self.import_path_error = Some(e);
+                    }
+                    Ok(path) => {
+                        self.import_path_error = None;
+                        self.import_busy = true;
+                        self.status = format!(
+                            "Loading {}. Geometry loads in the background…",
+                            path.display()
+                        );
+                        return Task::perform(
+                            async move { Some(load_model_file(path).await) },
+                            Message::FileImported,
+                        );
+                    }
+                }
             }
             Message::FileImported(Some(Ok((f, m)))) => {
                 self.import_busy = false;
@@ -7371,6 +7396,10 @@ impl App {
                         return Task::none();
                     }
                 }
+                // The part is in: the path field has done its work.
+                self.import_path_open = false;
+                self.import_path.clear();
+                self.import_path_error = None;
                 self.doc.title = std::path::Path::new(&f.name)
                     .file_stem()
                     .unwrap_or_default()
@@ -7416,6 +7445,11 @@ impl App {
             Message::FileImported(Some(Err(e))) => {
                 self.import_busy = false;
                 self.status = format!("Import failed: {e}");
+                // Under the path field too, while it shows, beside the path
+                // to correct.
+                if self.import_path_open {
+                    self.import_path_error = Some(e);
+                }
             }
             Message::FileImported(None) => {
                 self.import_busy = false;
@@ -8810,6 +8844,119 @@ fn jog_key(key: iced::keyboard::key::Named) -> Option<(usize, bool)> {
         Named::End => Some((3, true)),
         _ => None,
     }
+}
+/// The model file at `path`, described and loaded as an import has it: a
+/// DXF extruded to its default thickness. The conversion (up to two minutes
+/// for a STEP file) runs off the interface's thread.
+async fn load_model_file(path: PathBuf) -> Result<(ModelFile, Option<mesh::Mesh>), String> {
+    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let info = ModelFile {
+        name: path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        path: path.clone(),
+        format: ext.clone(),
+        bytes: meta.len(),
+        // A DXF is a flat profile, extruded to this until its thickness is set.
+        thickness: (ext == "dxf").then_some(mesh::DXF_THICKNESS),
+    };
+    match tokio::task::spawn_blocking(move || mesh::load(&path)).await {
+        Ok(Ok(m)) => Ok((info, Some(m))),
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(format!("Import worker failed: {e}")),
+    }
+}
+/// The model file the Import from path field names, or why it names none.
+/// It takes a path as people paste one: in quotes, from a Terminal with its
+/// spaces escaped, as a file:// link, or starting with ~ for the home folder.
+fn typed_model_path(text: &str) -> Result<PathBuf, String> {
+    let mut t = text.trim();
+    for q in ['"', '\'', '“'] {
+        let close = if q == '“' { '”' } else { q };
+        if t.len() > 1 && t.starts_with(q) && t.ends_with(close) {
+            t = t[q.len_utf8()..t.len() - close.len_utf8()].trim();
+            break;
+        }
+    }
+    if t.is_empty() {
+        return Err("Type or paste the path of the model file.".into());
+    }
+    let decoded;
+    if let Some(rest) = t.strip_prefix("file://") {
+        decoded = percent_decoded(rest.strip_prefix("localhost").unwrap_or(rest));
+        t = &decoded;
+    }
+    let home = |rest: &str| dirs::home_dir().map(|h| h.join(rest));
+    let path = match t.strip_prefix('~') {
+        Some("") => home(""),
+        Some(rest) if rest.starts_with(['/', std::path::MAIN_SEPARATOR]) => home(&rest[1..]),
+        _ => Some(PathBuf::from(t)),
+    }
+    .ok_or("The home folder is unknown: give the whole path.")?;
+    // A Terminal's `\ ` for a space. The path as typed is tried first, and
+    // on Windows the backslashes are the path's own.
+    if !path.exists() && t.contains('\\') && !cfg!(windows) {
+        let mut plain = String::new();
+        let mut chars = t.chars();
+        while let Some(c) = chars.next() {
+            plain.push(if c == '\\' {
+                chars.next().unwrap_or(c)
+            } else {
+                c
+            });
+        }
+        return typed_model_path(&plain);
+    }
+    if !path.is_absolute() {
+        return Err(format!(
+            "{} is not a whole path. Give it from the top, as /Users/you/part.step.",
+            path.display()
+        ));
+    }
+    if !path.exists() {
+        return Err(format!("There is no file at {}.", path.display()));
+    }
+    if path.is_dir() {
+        return Err(format!("{} is a folder, not a model file.", path.display()));
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if !model::IMPORT_FORMATS.contains(&ext.as_str()) {
+        return Err(format!(
+            "{} is not a model file AXIS CAM imports: STEP, STP, 3MF, STL, OBJ or DXF.",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+/// A file:// link's path with its %XX escapes (%20 for a space) decoded.
+fn percent_decoded(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2]))
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 fn sanitize_name(s: &str) -> String {
     let n: String = s

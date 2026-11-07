@@ -1014,6 +1014,11 @@ pub fn view(app: &App) -> Element<'_, Message> {
                     widget::tooltip::Position::Bottom
                 ),
                 bar_btn("Import model", Message::Import, false),
+                bar_btn(
+                    "Import from path…",
+                    Message::ImportPathOpen(!app.import_path_open),
+                    app.import_path_open,
+                ),
                 bar_btn("Open", Message::OpenProject, false),
                 bar_btn("Save", Message::SaveProject, false),
                 bar_btn("Save as…", Message::SaveProjectAs, false),
@@ -1148,7 +1153,11 @@ pub fn view(app: &App) -> Element<'_, Message> {
     // MACHINE has one bar over the Control page (LIO-274): every pixel of a
     // 13" laptop's window goes to the console under it.
     let mut layout = if manufacture {
-        column![brand, docbar]
+        let mut bars = column![brand];
+        if app.import_path_open {
+            bars = bars.push(import_path_bar(app));
+        }
+        bars.push(docbar)
     } else {
         column![machine_bar(app)]
     };
@@ -1269,14 +1278,67 @@ fn start_screen(app: &App) -> Element<'_, Message> {
     .center(Fill)
     .into()
 }
+/// The Import from path field's id, which `Message::ImportPathOpen` focuses.
+pub(crate) const IMPORT_PATH_FIELD: &str = "import-path";
+/// The Import from path field under the application bar: a model file's
+/// path typed or pasted, imported on Enter as a file chosen in the browser.
+fn import_path_bar(app: &App) -> Element<'_, Message> {
+    let mut field = text_input("/Users/you/parts/bracket.step", &app.import_path)
+        .id(IMPORT_PATH_FIELD)
+        .width(Fill)
+        .size(13)
+        .padding([7, 9])
+        .style(|theme, status| field_style(theme, status, None));
+    // While a model loads the field stands still; Import waits for it too.
+    let go = primary(
+        if app.import_busy {
+            "Loading…"
+        } else {
+            "Import"
+        },
+        Message::ImportFromPath,
+    );
+    if !app.import_busy {
+        field = field
+            .on_input(Message::ImportPath)
+            .on_submit(Message::ImportFromPath);
+    }
+    let mut body = column![
+        row![
+            text("Model file path").size(13),
+            field,
+            go,
+            secondary("Close", Message::ImportPathOpen(false)),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    ]
+    .spacing(6);
+    body = body.push(match &app.import_path_error {
+        Some(e) => Element::from(text(e).size(12).color(ERROR[1])),
+        None => muted(
+            "STEP, STP, 3MF, STL, OBJ or DXF. In Finder, select the file and press ⌥⌘C to copy its path.",
+        )
+        .size(12)
+        .into(),
+    });
+    container(body)
+        .padding([8, 18])
+        .width(Fill)
+        .style(panel_style)
+        .into()
+}
 fn blank_project(app: &App) -> Element<'_, Message> {
     let mut body = column![
         muted("NEW PROJECT"),
         bold("Your workspace is empty.", 32),
         text("Import a model to start planning your machining job.").size(16),
         space().height(8),
-        primary(if app.import_busy { "Loading model…" } else { "Import your first model" }, Message::Import),
-        muted("STEP / STP · 3MF · STL · OBJ"),
+        row![
+            primary(if app.import_busy { "Loading model…" } else { "Import your first model" }, Message::Import),
+            secondary("Import from path…", Message::ImportPathOpen(true)),
+        ].spacing(8),
+        muted("STEP / STP · 3MF · STL · OBJ · DXF"),
         space().height(16),
         section("Build your job in order"),
         text("1   Import the part you want to machine.").size(14),
@@ -2501,7 +2563,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
 }
 /// What the workspace shows in place of the 3D view without a part.
 fn no_scene(app: &App) -> Element<'_, Message> {
-    container(column![bold(if app.import_busy { "Loading geometry…" } else if !app.doc.has_model() { "Import your part" } else { "Model preview unavailable" },25),muted(app.doc.file.as_ref().map(|f|f.name.clone()).unwrap_or_default()),note(app.import_error.clone().unwrap_or_else(|| "Import STEP, STP, 3MF, STL, OBJ or DXF to view your model. Geometry loads in the background; a STEP conversion may take up to two minutes.".into())),primary("Import model",Message::Import),secondary("Start screen",Message::Page(Page::Home))].spacing(20).max_width(380)).center(Fill).into()
+    container(column![bold(if app.import_busy { "Loading geometry…" } else if !app.doc.has_model() { "Import your part" } else { "Model preview unavailable" },25),muted(app.doc.file.as_ref().map(|f|f.name.clone()).unwrap_or_default()),note(app.import_error.clone().unwrap_or_else(|| "Import STEP, STP, 3MF, STL, OBJ or DXF to view your model. Geometry loads in the background; a STEP conversion may take up to two minutes.".into())),row![primary("Import model",Message::Import),secondary("Import from path…",Message::ImportPathOpen(true))].spacing(8),secondary("Start screen",Message::Page(Page::Home))].spacing(20).max_width(380)).center(Fill).into()
 }
 /// The section's controls under the 3D view while it is on: the axis it is
 /// square to or the face it goes through, the slider that moves it across

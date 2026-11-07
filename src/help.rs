@@ -1024,6 +1024,15 @@ pub fn command(m: &Message, label: String) -> Help {
             "Open STEP/STP, 3MF, STL or OBJ geometry, or a DXF flat profile, for viewing. STEP, 3MF and DXF units are converted to mm. Import runs in the background; machining feature recognition is a future step.",
             "",
         ),
+        ImportPathOpen(true) => (
+            "Type or paste the path of a STEP/STP, 3MF, STL, OBJ or DXF file instead of choosing it in the file browser. It imports as Import model does.",
+            "",
+        ),
+        ImportPathOpen(false) => ("Hide the Import from path field. Esc hides it too.", ""),
+        ImportFromPath => (
+            "Import the model file at the path in the field. Quotes, a Terminal's escaped spaces, file:// links and ~ for your home folder are understood.",
+            "",
+        ),
         OpenHistory => (
             "Browse archived projects, including unsaved work preserved before New project or a project switch. Choose an .axis.json file to recover it.",
             "",
@@ -4809,6 +4818,9 @@ mod tests {
             Page(P::Wizard),
             Page(P::Control),
             Import,
+            ImportPathOpen(true),
+            ImportPathOpen(false),
+            ImportFromPath,
             OpenHistory,
             OpenProject,
             SaveProject,
