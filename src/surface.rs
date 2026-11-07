@@ -262,10 +262,17 @@ pub fn connected(mesh: &Mesh, ids: &[usize]) -> Vec<Vec<usize>> {
 /// reaches, is dropped: the operation cuts nothing of it. One facing up is
 /// swapped for the walls of the hole past it (`pocket::hole_near`), as a
 /// click on it picks now; with no hole past it, it stays and is still
-/// refused. Returns a note for each operation changed, of each kind.
+/// refused. Indexed setups are left as they are. Returns a note for each
+/// operation changed, of each kind.
 pub fn settle_sloping_picks(doc: &mut crate::model::Document, mesh: &Mesh) -> Vec<String> {
     let mut notes = vec![];
     for setup in &mut doc.setups {
+        // An indexed setup turns the part to several A angles: a face facing
+        // down at one faces up at another. Its picks are left as they are,
+        // judged at each angle by its checks.
+        if crate::indexed::is_indexed(setup) {
+            continue;
+        }
         let angles = crate::stock::Placement::new(mesh, Some(setup)).rotation();
         let mut operations = std::mem::take(&mut setup.operations);
         for operation in &mut operations {
@@ -320,7 +327,11 @@ pub fn settle_sloping_picks(doc: &mut crate::model::Document, mesh: &Mesh) -> Ve
                     "{}: {} {} {} down, under the part where no cutter from above reaches, so {} no longer selected.",
                     operation.name(),
                     plural(down.len()),
-                    down.join(", "),
+                    if down.len() > 5 {
+                        format!("{} and {} more", down[..5].join(", "), down.len() - 5)
+                    } else {
+                        down.join(", ")
+                    },
                     if down.len() == 1 { "faces" } else { "face" },
                     if down.len() == 1 { "it is" } else { "they are" },
                 ));

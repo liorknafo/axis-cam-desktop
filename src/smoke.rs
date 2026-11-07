@@ -20249,6 +20249,64 @@ soft_max = 180.0
         }
     }
     #[test]
+    fn restoring_an_indexed_job_keeps_the_holes_picked_at_its_other_angles() {
+        // The second review's: the tube's radial holes picked at A 30, 90, 150
+        // and 210 in an indexed setup. Restoring the model judged its picks at
+        // one angle and dropped the walls facing down there (143 faces), so
+        // the Drilling lost its holes at 90 and 150 and was refused.
+        let (mut doc, mesh) = crate::indexed::tests::radial_doc(
+            "radial-tube",
+            "30, 90, 150, 210",
+            ("4", "80"),
+            14.3,
+            |x, _| (x - 20.).abs() < 2.2,
+        );
+        doc.file = Some(crate::model::ModelFile {
+            name: "radial-tube.3mf".into(),
+            path: std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/radial-tube.3mf"),
+            format: "3mf".into(),
+            bytes: 0,
+            thickness: None,
+        });
+        for strategy in [
+            Strategy::Drill,
+            Strategy::Pocket,
+            Strategy::Adaptive,
+            Strategy::Contour,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut a = fresh_app(&dir);
+            a.doc = doc.clone();
+            a.doc.setups[1].operations[0].strategy = strategy;
+            a.doc.active = a.doc.setups[1].id.clone();
+            a.imported_mesh = Some(mesh.clone());
+            a.selected = Some(0);
+            let ids = |a: &App| {
+                a.operation()
+                    .unwrap()
+                    .surfaces
+                    .as_ref()
+                    .unwrap()
+                    .ids
+                    .clone()
+            };
+            let before = ids(&a);
+            let ready = |a: &App| {
+                crate::simulation::prepare(&a.doc, &mesh, 1, 0).map(|s| s.plan.moves.len())
+            };
+            let moves = (strategy == Strategy::Drill).then(|| ready(&a));
+            let _ = a.update(Message::ModelRestored(
+                a.doc.file.clone().unwrap(),
+                Ok(mesh.clone()),
+            ));
+            assert_eq!(ids(&a), before, "{strategy:?}: {}", a.status);
+            if let Some(moves) = moves {
+                assert!(moves.is_ok(), "{moves:?}");
+                assert_eq!(ready(&a), moves);
+            }
+        }
+    }
+    #[test]
     fn a_click_on_a_holes_chamfer_picks_it_and_the_pocket_names_what_its_cutter_leaves() {
         // `pocket::chamfered_hole`: a click on the chamfer picks the Ø6
         // hole, and another drops it.
