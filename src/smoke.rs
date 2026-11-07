@@ -1713,6 +1713,7 @@ impl App {
             chuck: None,
             setups: vec![
                 ProposedSetup {
+                    machine: None,
                     orientation: up.into(),
                     name: "Top".into(),
                     origin: "Stock top center".into(),
@@ -1727,6 +1728,7 @@ impl App {
                     from: None,
                 },
                 ProposedSetup {
+                    machine: None,
                     orientation: "-Z".into(),
                     name: "Underside".into(),
                     origin: "Model origin".into(),
@@ -1794,6 +1796,7 @@ impl App {
             summary: "Face the top, clear the main pocket and cut the outline from the top. The holes and the side features need tools and setups this plan does not have.".into(),
             chuck: None,
             setups: vec![ProposedSetup {
+                machine: None,
                 orientation: first.up.into(),
                 name: "Top".into(),
                 origin: "Stock top center".into(),

@@ -389,6 +389,7 @@ pub mod rotary {
         operation: ProposedOp,
     ) -> ProposedSetup {
         ProposedSetup {
+            machine: None,
             orientation: up.into(),
             name: name.into(),
             origin: origin.into(),

@@ -39,6 +39,10 @@ pub struct CheckReport {
     pub cnc_minutes: f32,
     #[serde(skip)]
     pub move_minutes: f32,
+    /// The same split for the model, in a job with a hand setup; absent in
+    /// a job on the CNC alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minutes_by_machine: Option<MinutesByMachine>,
     /// The stock before each setup, as far as the simulation got: none after
     /// an operation that could not be generated, nor when the job was not
     /// built.
@@ -49,6 +53,14 @@ pub struct CheckReport {
     /// (`post::model_zero`). Not sent to the model.
     #[serde(skip)]
     pub zeros: Vec<Option<(Bounds, Option<f32>)>>,
+}
+/// `CheckReport`'s minutes by machine, as the model is told them.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct MinutesByMachine {
+    pub lathe: f32,
+    pub manual_mill: f32,
+    pub cnc: f32,
+    pub moving: f32,
 }
 impl CheckReport {
     /// Sets the minutes from the operations that generated: `total_minutes`
@@ -85,6 +97,17 @@ impl CheckReport {
         self.cnc_minutes = round(cnc);
         self.move_minutes = round(moves);
         self.total_minutes = round(lathe + mill + cnc + moves);
+        self.minutes_by_machine =
+            built
+                .setups
+                .iter()
+                .any(|s| is_hand(&s.machine))
+                .then_some(MinutesByMachine {
+                    lathe: self.lathe_minutes,
+                    manual_mill: self.manual_minutes,
+                    cnc: self.cnc_minutes,
+                    moving: self.move_minutes,
+                });
     }
     /// "Lathe 20 min · Manual mill 18 min · CNC 42 min · moving 10 min", for
     /// a job that has a hand setup, the lathe's and the manual mill's parts
@@ -146,6 +169,10 @@ pub struct StockSummary {
     pub size: [f32; 3],
     /// x0, y0, z0, x1, y1, z1 from the model's -X/-Y/bottom corner.
     pub box_from_part_corner: [f32; 6],
+    /// Where the setup's work zero is, from the same corner; told in a job
+    /// with a hand setup, for a Box's work coordinates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_zero: Option<[f32; 3]>,
     /// What the earlier setups took whole off each side of the original block.
     pub removed: Sides,
     /// The earlier operations whose cuts took those layers, the most first:
@@ -337,6 +364,7 @@ pub(crate) fn stock_summary(
         setup: si + 1,
         size: stock.dimensions().map(hundredths),
         box_from_part_corner: [low[0], low[1], low[2], high[0], high[1], high[2]],
+        work_zero: None,
         removed: Sides::of(lost),
         by,
         cut_by,
@@ -948,6 +976,7 @@ pub fn evaluate_full(
                 manual_minutes: 0.,
                 cnc_minutes: 0.,
                 move_minutes: 0.,
+                minutes_by_machine: None,
                 stocks: vec![],
                 zeros: vec![],
             },
@@ -987,7 +1016,11 @@ fn laid_out(
 ) -> (Option<Document>, Vec<(usize, String)>) {
     let mut laid: Option<Document> = None;
     let mut refused = vec![];
-    for (si, setup) in built.setups.iter().enumerate().skip(1) {
+    // Setup 1's holder is placed by the user; a manual setup a plan put in
+    // front of the user's setup is laid out like a later one.
+    let laid_out =
+        |(si, s): &(usize, &crate::model::Setup)| *si > 0 || crate::manual::is_hand(&s.machine);
+    for (si, setup) in built.setups.iter().enumerate().filter(laid_out) {
         if holding::placed(setup) {
             continue;
         }
@@ -1082,7 +1115,16 @@ fn checked_setups(
         let part = Placement::new(mesh, Some(setup))
             .bounds
             .scaled(1. / mesh.display_scale());
-        let summary = stock_summary(built, si, stock, part, frame, before.as_deref());
+        let mut summary = stock_summary(built, si, stock, part, frame, before.as_deref());
+        if built
+            .setups
+            .iter()
+            .any(|s| crate::manual::is_hand(&s.machine))
+        {
+            summary.work_zero = crate::post::datum(setup, stock, mesh)
+                .ok()
+                .map(|zero| std::array::from_fn(|k| hundredths(zero[k] - part.min[k])));
+        }
         setups.push(CheckedSetup {
             stock,
             frame,
@@ -1115,6 +1157,7 @@ fn run(
         manual_minutes: 0.,
         cnc_minutes: 0.,
         move_minutes: 0.,
+        minutes_by_machine: None,
         stocks: vec![],
         zeros: vec![],
     };
@@ -2069,7 +2112,24 @@ mod tests {
             serde_json::from_str(&crate::proposal_schema(&[]).unwrap()).unwrap();
         assert_eq!(schema["additionalProperties"], false);
         assert!(
-            crate::proposal_schema(&["extra".into()])
+            crate::proposal_schema(&[project.clone(), "extra".into()])
+                .unwrap_err()
+                .starts_with("Usage")
+        );
+        // With a project, the schema and the instructions its report asks
+        // for: here without a manual mill, the plain ones.
+        assert!(crate::proposal_schema(&["missing.axis.json".into()]).is_err());
+        let own: serde_json::Value =
+            serde_json::from_str(&crate::proposal_schema(std::slice::from_ref(&project)).unwrap())
+                .unwrap();
+        assert_eq!(own, schema);
+        let told = crate::planner_instructions(std::slice::from_ref(&project)).unwrap();
+        assert_eq!(
+            told,
+            crate::planner::instructions_for(false, false, false, false)
+        );
+        assert!(
+            crate::planner_instructions(&[])
                 .unwrap_err()
                 .starts_with("Usage")
         );
@@ -2503,6 +2563,7 @@ mod tests {
                 .into_iter()
                 .enumerate()
                 .map(|(i, (up, operations))| proposal::ProposedSetup {
+                    machine: None,
                     orientation: up.into(),
                     name: format!("Setup {}", i + 1),
                     origin: if i == 0 {
@@ -3158,6 +3219,34 @@ mod tests {
         }
         assert!(json["total_minutes"].as_f64().unwrap() > 0.);
     }
+    #[test]
+    fn a_planned_manual_facing_in_front_passes_and_the_model_gets_its_minutes_and_zeros() {
+        use crate::proposal::tests::{milled, with_mill};
+        let (doc, mesh, report) = with_mill();
+        let (check, job) = check(&doc, &mesh, &report, &milled(&report));
+        assert!(check.passed, "{:?}", stages(&check));
+        let job = job.unwrap();
+        assert!(crate::manual::is_manual(&job.setups[0].machine));
+        let split = check.minutes_by_machine.unwrap();
+        assert!(split.manual_mill > 3. && split.cnc > 0., "{split:?}");
+        assert_eq!((split.lathe, split.moving), (0., 10.));
+        let json = serde_json::to_value(&check).unwrap();
+        assert_eq!(json["minutes_by_machine"]["moving"], 10.);
+        // The manual setup's zero is setup 1's, stock top centre, on the
+        // block as given; the user's setup starts 3.5 lower, its zero on
+        // the faced top.
+        let (front, user) = (&check.stocks[0], &check.stocks[1]);
+        let zero = front.work_zero.unwrap();
+        assert_eq!(zero, report.work_zero.unwrap());
+        assert!((zero[2] - front.box_from_part_corner[5]).abs() < 0.02);
+        assert!((front.box_from_part_corner[5] - user.box_from_part_corner[5] - 3.5).abs() < 0.02);
+        assert!((user.work_zero.unwrap()[2] - user.box_from_part_corner[5]).abs() < 0.02);
+        // A job on the CNC alone keeps the report the model was sent.
+        let (plain, mesh, report) = good_job();
+        let plain = serde_json::to_value(check_built(&plain, &mesh, &report)).unwrap();
+        assert!(plain.get("minutes_by_machine").is_none());
+        assert!(plain["stocks"][0].get("work_zero").is_none());
+    }
     /// A Ø30 shaft in a Ø50.2 × 100 bar held by the 3-jaw (grip 30,
     /// stickout 70), which a Face, an Outside turn to Ø40, a Groove and a
     /// Part off at work Z -62 cut, with its tools numbered.
@@ -3280,6 +3369,7 @@ mod tests {
             manual_minutes: 0.,
             cnc_minutes: 42.,
             move_minutes: 0.,
+            minutes_by_machine: None,
             stocks: vec![],
             zeros: vec![],
         };
@@ -3546,6 +3636,7 @@ mod totem {
             chuck: None,
             setups: vec![
                 ProposedSetup {
+                    machine: None,
                     orientation: "+Z".into(),
                     name: "Top".into(),
                     origin: "Stock top center".into(),
@@ -3590,6 +3681,7 @@ mod totem {
                     from: None,
                 },
                 ProposedSetup {
+                    machine: None,
                     orientation: "-Z".into(),
                     name: "Underside".into(),
                     origin: "Stock top front-left".into(),

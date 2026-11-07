@@ -53,6 +53,8 @@ fn work_zeros() -> Vec<&'static str> {
 /// stock when it names none, mm.
 pub const FREE_END: f32 = 2.;
 const MAX_SETUPS: usize = 6;
+/// The setups a plan may have on every machine together.
+const MAX_ALL_SETUPS: usize = 10;
 pub const MAX_SETUP_OPERATIONS: usize = 12;
 pub const MAX_OPERATIONS: usize = 40;
 const MAX_SURFACES: usize = 500;
@@ -114,6 +116,10 @@ pub struct ProposedSetup {
     /// The `number` of the `workholding_library` entry that holds this setup,
     /// or None: setup 1's own, which for a later setup is setup 1's.
     pub holder: Option<usize>,
+    /// The `machines` number of the machine the setup is on; None (a plan
+    /// written for a job without hand machines) is the user's setup's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<usize>,
     /// The A angles, degrees, this setup indexes to in setup 1's chuck
     /// instead of re-clamping the stock (every operation runs at each); None
     /// for a setup that is clamped.
@@ -173,6 +179,10 @@ pub struct ProposedOp {
     /// proposal saved before Chamfer had none.
     #[serde(default)]
     pub chamfer: Option<ProposedChamfer>,
+    /// A Box's block (manual mill); null for every other strategy. A
+    /// proposal for a job without a manual mill has none.
+    #[serde(default, rename = "box", skip_serializing_if = "Option::is_none")]
+    pub block: Option<ProposedBox>,
     pub coolant: String,
     pub reason: String,
     /// When the planner changes a plan: the number of the current operation
@@ -223,6 +233,20 @@ pub struct ProposedChamfer {
     pub copy_pitch: Option<f32>,
     pub first_angle: Option<f32>,
     pub axis: Option<[f32; 2]>,
+}
+/// A Box on the manual mill: the block it removes in the setup's work
+/// coordinates, mm, and the stock it leaves on its closed sides and floor.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposedBox {
+    pub x_min: f32,
+    pub x_max: f32,
+    pub y_min: f32,
+    pub y_max: f32,
+    pub z_top: f32,
+    pub z_bottom: f32,
+    /// Null: 0.5.
+    pub allowance: Option<f32>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -285,11 +309,19 @@ pub fn schema_on(report: &PartReport) -> Value {
 /// The schema with `from` when `edit` (`schema_for`), and with the chuck
 /// and the A angles when `rotary` (`schema_on`).
 pub fn schema_with(edit: bool, rotary: bool) -> Value {
+    schema_full(edit, rotary, false)
+}
+/// `schema_with`, and with `manual` (the report lists `machines` with a
+/// manual mill) every setup's `machine`, the Box strategy and its `box`.
+pub fn schema_full(edit: bool, rotary: bool, manual: bool) -> Value {
     let text = || json!({"type": "string"});
     let number = || json!({"type": "number"});
     let optional = || json!({"type": ["number", "null"]});
     let ups: Vec<&str> = analysis::ORIENTATIONS.iter().map(|(up, _)| *up).collect();
-    let strategies: Vec<&str> = STRATEGIES.iter().map(|(name, _)| *name).collect();
+    let mut strategies: Vec<&str> = STRATEGIES.iter().map(|(name, _)| *name).collect();
+    if manual {
+        strategies.push("Box");
+    }
     let chamfer = json!({"anyOf": [object(json!({
         "source": choice(&CHAMFER_SOURCES, false),
         "edges": choice(&CHAMFER_EDGES, true),
@@ -345,6 +377,23 @@ pub fn schema_with(edit: bool, rotary: bool) -> Value {
     }));
     let from = || json!({"type": ["integer", "null"]});
     let mut operation = operation;
+    if manual {
+        operation["properties"]["box"] = json!({"anyOf": [object(json!({
+            "x_min": number(),
+            "x_max": number(),
+            "y_min": number(),
+            "y_max": number(),
+            "z_top": number(),
+            "z_bottom": number(),
+            "allowance": optional(),
+        })), {"type": "null"}]});
+        let required = operation["required"].as_array_mut().unwrap();
+        let at = required
+            .iter()
+            .position(|k| k == "coolant")
+            .unwrap_or(required.len());
+        required.insert(at, json!("box"));
+    }
     if edit {
         operation["properties"]["from"] = from();
         operation["required"]
@@ -367,6 +416,9 @@ pub fn schema_with(edit: bool, rotary: bool) -> Value {
     });
     if edit {
         setup["from"] = from();
+    }
+    if manual {
+        setup["machine"] = json!({"type": "integer"});
     }
     if rotary {
         setup["a_angles"] = json!({"type": ["array", "null"], "items": number()});
@@ -622,6 +674,7 @@ fn floors_of<'a>(
 /// `sides` is set for a Face of an indexed setup's several angles, whose
 /// surfaces `faces_each_angle` has checked: the tool's centre goes out to
 /// each face's edges, as the UI's facing of a square's sides does.
+#[allow(clippy::too_many_arguments)]
 fn operation(
     p: &ProposedOp,
     si: usize,
@@ -630,8 +683,10 @@ fn operation(
     report: &PartReport,
     tools: &[Tool],
     fingerprint: &str,
+    (on, number): (&crate::model::Machine, usize),
 ) -> Result<Operation, Vec<String>> {
     let mut wrong = vec![];
+    let manual = crate::manual::is_manual(on);
     if p.surfaces.len() > MAX_SURFACES {
         wrong.push(format!(
             "The surfaces list has {} IDs; at most {MAX_SURFACES} are allowed.",
@@ -641,10 +696,12 @@ fn operation(
     let mut ids = p.surfaces.clone();
     ids.sort_unstable();
     ids.dedup();
+    let boxed = !report.machines.is_empty() && p.strategy == "Box";
     let strategy = STRATEGIES
         .iter()
         .find(|(name, _)| *name == p.strategy)
-        .map(|(_, s)| *s);
+        .map(|(_, s)| *s)
+        .or(boxed.then_some(Strategy::Box));
     if strategy.is_none() {
         wrong.push(format!(
             "\"{}\" is not one of the eight available strategies.",
@@ -654,6 +711,56 @@ fn operation(
     let tool = tools.iter().find(|t| t.number() == Some(p.tool));
     if tool.is_none() {
         wrong.push(format!("T{} is not in the tool library.", p.tool));
+    }
+    let machine = |_: &crate::model::Machine| format!("machine {number}");
+    if let Some(tool) = tool.filter(|t| !t.fits(on)) {
+        wrong.push(format!(
+            "T{} is not on {}: use a tool whose `machines` lists it.",
+            tool.number().unwrap_or_default(),
+            machine(on)
+        ));
+    }
+    match strategy {
+        Some(Strategy::Box) if !manual => wrong.push(format!(
+            "Box is for a manual mill only; {} is not one. Use Face, Pocket or Contour here, or put the Box in a setup on the manual mill.",
+            machine(on)
+        )),
+        Some(Strategy::Box | Strategy::Drill) | None => {}
+        Some(_) if manual => wrong.push(format!(
+            "{} cannot run on the manual mill ({}): it takes only Box and Drill.",
+            p.strategy,
+            machine(on)
+        )),
+        Some(_) => {}
+    }
+    if manual
+        && strategy == Some(Strategy::Drill)
+        && (suits_helical(p) || suits_cycle(p, crate::model::THREAD_MILLING))
+    {
+        wrong.push(format!(
+            "{} needs a CNC: the manual mill moves one axis at a time.",
+            p.drill_cycle.as_deref().unwrap_or_default()
+        ));
+    }
+    match (&p.block, strategy) {
+        (None, Some(Strategy::Box)) => {
+            wrong.push("A Box needs `box`: the block it removes, in work coordinates.".into())
+        }
+        (Some(_), Some(s)) if s != Strategy::Box => wrong.push(format!(
+            "box is for a Box only; set it to null for {}.",
+            p.strategy
+        )),
+        (Some(b), _) => {
+            let all = [b.x_min, b.x_max, b.y_min, b.y_max, b.z_top, b.z_bottom];
+            if all.iter().chain(&b.allowance).any(|v| !v.is_finite()) {
+                wrong.push("box has a number that is not finite.".into());
+            } else if !(b.x_min < b.x_max && b.y_min < b.y_max && b.z_bottom < b.z_top) {
+                wrong.push("box needs x_min < x_max, y_min < y_max and z_bottom < z_top.".into());
+            } else if b.allowance.is_some_and(|a| a < 0.) {
+                wrong.push("box allowance cannot be negative.".into());
+            }
+        }
+        _ => {}
     }
     for (field, value) in [
         ("rpm", Some(p.rpm)),
@@ -730,13 +837,19 @@ fn operation(
             p.clearance.unwrap_or_default()
         ));
     }
-    if p.rpm.is_finite() && !(p.rpm >= 100. && p.rpm <= report.machine.max_rpm) {
+    // A hand machine's speed is put on a gear and its feed at most the hand
+    // feed when the operation is built.
+    let hand = crate::manual::is_hand(on);
+    if hand && !(p.rpm > 0. && p.feed > 0.) {
+        wrong.push("rpm and feed must be positive.".into());
+    }
+    if !hand && p.rpm.is_finite() && !(p.rpm >= 100. && p.rpm <= report.machine.max_rpm) {
         wrong.push(format!(
             "rpm {} is outside 100-{} for this machine.",
             p.rpm, report.machine.max_rpm
         ));
     }
-    if p.feed.is_finite() && !(p.feed >= 1. && p.feed <= report.machine.max_feed) {
+    if !hand && p.feed.is_finite() && !(p.feed >= 1. && p.feed <= report.machine.max_feed) {
         wrong.push(format!(
             "feed {} is outside 1-{} mm/min for this machine.",
             p.feed, report.machine.max_feed
@@ -872,6 +985,9 @@ fn operation(
             }
         },
         Strategy::Face | Strategy::Drill | Strategy::Chamfer => {}
+        Strategy::Box if !ids.is_empty() => {
+            wrong.push("A Box is given by its `box`; its surfaces list must be empty.".into())
+        }
         _ if !ids.is_empty() => wrong.push(format!(
             "{} works on the whole model; its surfaces list must be empty.",
             p.strategy
@@ -1072,10 +1188,23 @@ fn operation(
                 set(key, value);
             }
         }
+        Strategy::Box => {
+            let b = p.block.clone().unwrap_or_default();
+            for (key, value) in crate::model::BOX_FIELDS
+                .iter()
+                .zip([b.x_min, b.x_max, b.y_min, b.y_max, b.z_top, b.z_bottom])
+            {
+                set(key, value.to_string());
+            }
+            set("allowance", b.allowance.unwrap_or(0.5).to_string());
+        }
         _ => set("boundary", "Model silhouette".into()),
     }
     if let Some(entry) = &p.pocket_entry {
         set("pocket_entry", entry.clone());
+    }
+    if hand {
+        crate::manual::snap(on, &mut op.p);
     }
     Ok(op)
 }
@@ -1300,7 +1429,11 @@ pub struct Current {
 /// [`KeptOp`]). Fields its strategy does not use are null, and `reason` is
 /// empty; a coolant that is not a choice reads `Off`.
 fn described(op: &Operation, tools: &[Tool]) -> Option<ProposedOp> {
-    let strategy = STRATEGIES.iter().find(|(_, s)| *s == op.strategy)?.0;
+    let strategy = STRATEGIES
+        .iter()
+        .find(|(_, s)| *s == op.strategy)
+        .map(|(name, _)| *name)
+        .or((op.strategy == Strategy::Box).then_some("Box"))?;
     let tool = tools.iter().find(|t| t.id == op.tool)?.number()?;
     if op.surfaces.is_none() && !op.geometry.is_empty() {
         return None;
@@ -1428,6 +1561,21 @@ fn described(op: &Operation, tools: &[Tool]) -> Option<ProposedOp> {
             p.hole_diameter = value("hole_diameter").filter(|d| *d > 0.);
         }
         Strategy::Chamfer => p.chamfer = Some(described_chamfer(op)),
+        Strategy::Box => {
+            let [x_min, x_max, y_min, y_max, z_top, z_bottom] =
+                crate::model::BOX_FIELDS.map(|k| value(k).unwrap_or(0.));
+            p.block = Some(ProposedBox {
+                x_min,
+                x_max,
+                y_min,
+                y_max,
+                z_top,
+                z_bottom,
+                allowance: value("allowance"),
+            });
+            p.stepdown = value("stepdown");
+            p.stepover_percent = value("stepover");
+        }
         _ => {
             p.stepdown = value("stepdown");
             p.bottom_offset = value("bottom");
@@ -1526,6 +1674,18 @@ fn merged(base: &Operation, fresh: &Operation, p: &ProposedOp, d: &ProposedOp) -
         (p.groove_land != d.groove_land, &["groove_land"]),
         (p.spring_pass != d.spring_pass, &["spring_pass"]),
         (p.chamfer != d.chamfer, &crate::chamfer::KEYS[..]),
+        (
+            p.block != d.block,
+            &[
+                "x_min",
+                "x_max",
+                "y_min",
+                "y_max",
+                "z_top",
+                "z_bottom",
+                "allowance",
+            ],
+        ),
     ] {
         if changed {
             copy(keys);
@@ -1548,14 +1708,15 @@ fn merged(base: &Operation, fresh: &Operation, p: &ProposedOp, d: &ProposedOp) -
 /// and holder.
 fn setup_fields(doc: &Document, si: usize) -> (String, String, String, Option<usize>) {
     let setup = &doc.setups[si];
-    let setup1 = &doc.setups[0];
+    let base = analysis::base(doc);
+    let setup1 = &doc.setups[base];
     let origin = get(&setup.p, "origin");
     let origin = if work_zeros().contains(&origin) {
         origin
     } else {
         "Model origin"
     };
-    let (notes, holder) = if si == 0 {
+    let (notes, holder) = if si == base {
         let note = get(&setup.p, crate::planner::PLANNER_NOTE_KEY);
         (note, analysis::own_entry(doc, setup1))
     } else {
@@ -1587,7 +1748,26 @@ pub fn describe(doc: &Document, report: &PartReport) -> Result<Current, String> 
         return Err("The project has no setup 1.".into());
     }
     let (mut setups, mut kept, mut number) = (vec![], vec![], 0);
+    let base = analysis::base(doc);
     for (si, setup) in doc.setups.iter().enumerate() {
+        // Each setup's machine by its number, when the report lists them.
+        let machine = match report.machines.is_empty() {
+            true => None,
+            false => match analysis::machine_number(doc, &setup.machine.id) {
+                Some(n) => Some(n),
+                None => {
+                    return Err(format!(
+                        "Setup {} is on {}, which the planner cannot plan on, so it cannot change this plan. Change the setups by hand.",
+                        si + 1,
+                        if crate::lathe::is_lathe(&setup.machine) {
+                            "the lathe"
+                        } else {
+                            "another machine"
+                        }
+                    ));
+                }
+            },
+        };
         // A plan's chuck and A angles are made afresh (`build`), not kept.
         if crate::chuck::holds(setup) || crate::indexed::is_indexed(setup) {
             return Err(format!(
@@ -1600,7 +1780,7 @@ pub fn describe(doc: &Document, report: &PartReport) -> Result<Current, String> 
                 }
             ));
         }
-        let up = if si == 0 {
+        let up = if si == base {
             report.orientations.first().map(|o| o.up)
         } else {
             analysis::up_axis(setup)
@@ -1635,6 +1815,7 @@ pub fn describe(doc: &Document, report: &PartReport) -> Result<Current, String> 
             origin,
             workholding,
             holder,
+            machine,
             a_angles: None,
             operations,
             from: Some(si + 1),
@@ -1826,7 +2007,10 @@ pub fn build(
             message,
         })
     };
-    let Some(setup1) = doc.setups.first() else {
+    // The user's setup: the first CNC setup, whose stock, holding and zero
+    // the plan keeps (`analysis::base`).
+    let base = analysis::base(doc);
+    let Some(setup1) = doc.setups.get(base) else {
         return Err(vec![Problem {
             setup: 0,
             operation: None,
@@ -1834,14 +2018,41 @@ pub fn build(
             message: "The project has no setup 1.".into(),
         }]);
     };
+    // The machines a setup may name, by number from 1: the user's setup's
+    // first. Without hand machines in the report only it is offered.
+    let machines = if report.machines.is_empty() {
+        vec![&setup1.machine]
+    } else {
+        analysis::machines(doc)
+    };
+    let number_of = |s: &ProposedSetup| s.machine.unwrap_or(1);
+    let machine_of = |s: &ProposedSetup| number_of(s).checked_sub(1).and_then(|i| machines.get(i));
     if proposal.setups.is_empty() {
         whole("The proposal has no setups.".into());
     }
-    if proposal.setups.len() > MAX_SETUPS {
+    // The user's setup is the first on its machine; hand setups may go
+    // before it and start from the stock it defines.
+    let u = proposal.setups.iter().position(|s| number_of(s) == 1);
+    if u.is_none() && !proposal.setups.is_empty() {
+        whole("Keep your setup: give one setup `machine` 1, the machine of setup 1, which holds the stock, its holding and its work zero.".into());
+    }
+    let u = u.unwrap_or(0);
+    let cnc = (proposal.setups.iter())
+        .filter(|s| machine_of(s).is_some_and(|m| !crate::manual::is_hand(m)))
+        .count();
+    if cnc > MAX_SETUPS {
         whole(format!(
-            "The proposal has {} setups; at most {MAX_SETUPS} work offsets are available.",
+            "The proposal has {cnc} setups on the CNC; at most {MAX_SETUPS} work offsets are available."
+        ));
+    }
+    if proposal.setups.len() > MAX_ALL_SETUPS {
+        whole(format!(
+            "The proposal has {} setups; at most {MAX_ALL_SETUPS} are allowed.",
             proposal.setups.len()
         ));
+    }
+    if proposal.chuck.is_some() && u > 0 {
+        whole("With `chuck`, setup 1 is held in the chuck on A and goes first: put no setup before it.".into());
     }
     let total: usize = proposal.setups.iter().map(|s| s.operations.len()).sum();
     if total > MAX_OPERATIONS {
@@ -1858,15 +2069,27 @@ pub fn build(
         whole("`a_angles` must be null: this machine has no rotary A axis.".into());
     }
     // A stock in the chuck is turned to the orientation the proposal gives
-    // setup 1; otherwise setup 1 keeps the user's.
+    // setup 1; otherwise setup 1 keeps the user's, and a manual setup in
+    // front of it takes it with the stock.
     if proposal.chuck.is_none()
         && proposal
             .setups
-            .first()
+            .get(u)
             .is_some_and(|s| Some(s.orientation.as_str()) != first)
     {
         whole(format!(
             "The first setup must use orientation {}, where the stock is defined.",
+            first.unwrap_or("?")
+        ));
+    }
+    if u > 0
+        && proposal.setups.first().is_some_and(|s| {
+            machine_of(s).is_some_and(|m| crate::manual::is_manual(m))
+                && Some(s.orientation.as_str()) != first
+        })
+    {
+        whole(format!(
+            "The first setup must use orientation {}, where the stock is defined: a manual setup in front of your setup takes its stock as it is clamped there.",
             first.unwrap_or("?")
         ));
     }
@@ -1886,10 +2109,10 @@ pub fn build(
     let reserved: Vec<&str> = proposal
         .setups
         .iter()
-        .skip(1)
         .filter_map(|s| s.from.and_then(|n| n.checked_sub(1)))
-        .filter(|&b| b > 0)
+        .filter(|&b| b != base)
         .filter_map(|b| doc.setups.get(b))
+        .filter(|s| !crate::manual::is_hand(&s.machine))
         .map(|s| get(&s.p, "offset"))
         .collect();
     // The entries a proposal's `holder` counts over, as the report numbers
@@ -1899,7 +2122,7 @@ pub fn build(
     let mut setups: Vec<Setup> = vec![];
     // The current setups and operations kept so far, by index and number.
     let (mut kept_setups, mut kept_ops) = (vec![], vec![]);
-    for (si, proposed) in proposal.setups.iter().take(MAX_SETUPS).enumerate() {
+    for (si, proposed) in proposal.setups.iter().take(MAX_ALL_SETUPS).enumerate() {
         let mut wrong = |operation: Option<usize>, message: String| {
             problems.push(Problem {
                 setup: si + 1,
@@ -1908,6 +2131,12 @@ pub fn build(
                 message,
             })
         };
+        let number = number_of(proposed);
+        let Some(&on) = machine_of(proposed) else {
+            wrong(None, format!("machine {number} is not in machines."));
+            continue;
+        };
+        let hand = crate::manual::is_hand(on);
         // Setup 1 is held by the user's own entry, so for it `holder` only
         // says which that is; a later setup is held by the entry it names.
         let holder = proposed.holder.and_then(|number| {
@@ -1918,7 +2147,7 @@ pub fn build(
                 );
                 return None;
             };
-            if si == 0 && own != Some(number) {
+            if si == u && own != Some(number) {
                 let or = own.map(|n| format!(" or {n}")).unwrap_or_default();
                 wrong(
                     None,
@@ -1926,7 +2155,14 @@ pub fn build(
                 );
                 return None;
             }
-            (si > 0).then_some(*holder)
+            if !holder.fits(on) {
+                wrong(
+                    None,
+                    format!("workholding {number} is not on machine {}: choose one whose `machines` lists it.", number_of(proposed)),
+                );
+                return None;
+            }
+            (si != u).then_some(*holder)
         });
         let angled = proposed.a_angles.is_some();
         let offset = (54..=59)
@@ -1942,7 +2178,11 @@ pub fn build(
         let mut at_angles: Option<Vec<Option<&OrientationReport>>> = None;
         let mut up = proposed.orientation.as_str();
         if let Some(list) = &proposed.a_angles {
-            if si == 0 {
+            if hand {
+                wrong(None, "a_angles must be null on a manual machine.".into());
+                continue;
+            }
+            if si <= u {
                 wrong(None, FIRST_INDEXED.into());
                 continue;
             }
@@ -2025,17 +2265,31 @@ pub fn build(
                 );
                 None
             }
-            Some(n) if si == 0 && n != 1 => {
+            Some(n) if si == u && n != base + 1 => {
                 wrong(
                     None,
-                    "The first setup is the current setup 1: its from must be 1 or null.".into(),
+                    if base == 0 {
+                        "The first setup is the current setup 1: its from must be 1 or null.".into()
+                    } else {
+                        format!(
+                            "Your setup on machine 1 is current setup {}: its from must be {} or null.",
+                            base + 1,
+                            base + 1
+                        )
+                    },
                 );
                 None
             }
-            Some(1) if si > 0 => {
+            Some(n) if n == base + 1 && si != u => {
                 wrong(
                     None,
-                    "Setup 1 stays first: no later setup can have from 1.".into(),
+                    if base == 0 && u == 0 {
+                        "Setup 1 stays first: no later setup can have from 1.".into()
+                    } else {
+                        format!(
+                            "from {n} is your setup, which only the first setup on machine 1 keeps."
+                        )
+                    },
                 );
                 None
             }
@@ -2044,12 +2298,14 @@ pub fn build(
                 None
             }
             Some(n) => {
-                let up = if n == 1 {
+                let up = if n - 1 == base {
                     first
                 } else {
                     analysis::up_axis(&doc.setups[n - 1])
                 };
-                (up == Some(proposed.orientation.as_str())).then_some(n - 1)
+                // A setup kept on another machine is made afresh.
+                (up == Some(proposed.orientation.as_str()) && doc.setups[n - 1].machine.id == on.id)
+                    .then_some(n - 1)
             }
         };
         if let Some(b) = base {
@@ -2057,9 +2313,11 @@ pub fn build(
         }
         if base.is_none()
             && !angled
-            && proposal.setups[..si]
-                .iter()
-                .any(|s| s.a_angles.is_none() && s.orientation == proposed.orientation)
+            && proposal.setups[..si].iter().any(|s| {
+                s.a_angles.is_none()
+                    && s.orientation == proposed.orientation
+                    && number_of(s) == number
+            })
         {
             wrong(
                 None,
@@ -2082,7 +2340,7 @@ pub fn build(
                     _ => proposed.holder != *holder,
                 })
         };
-        if si > 0 && !angled && changed(1) && !work_zeros().contains(&proposed.origin.as_str()) {
+        if si != u && !angled && changed(1) && !work_zeros().contains(&proposed.origin.as_str()) {
             wrong(
                 None,
                 format!("\"{}\" is not a work zero choice.", proposed.origin),
@@ -2100,7 +2358,7 @@ pub fn build(
                 ),
             );
         }
-        let mut setup = if si == 0 {
+        let mut setup = if si == u {
             let mut setup = setup1.clone();
             if let Some(chuck) = &proposal.chuck
                 && let Err(message) = in_chuck(&mut setup, chuck, orientation.up, mesh)
@@ -2141,8 +2399,26 @@ pub fn build(
                 }
             }
             setup
+        } else if si == 0 {
+            // A hand setup in front of the user's takes the stock, as Add
+            // manual setup gives it; a holder it names replaces the user's.
+            let mut setup = Setup::new(on.clone(), "");
+            doc.hand_over(setup1, &mut setup);
+            if let Some(holder) = holder {
+                for key in ["vise_axis", "vise_offset", "vise_grip", "clamps"] {
+                    setup.p.remove(key);
+                }
+                setup
+                    .p
+                    .insert("holding".into(), holding_of(holder.kind()).into());
+                setup.p.insert("holder".into(), holder.id.clone());
+            }
+            setup
+                .p
+                .insert("notes".into(), clip(&proposed.workholding, 500));
+            setup
         } else {
-            let mut setup = Setup::new(setup1.machine.clone(), &offset);
+            let mut setup = Setup::new(on.clone(), if hand { "" } else { &offset });
             let rotation = analysis::rotation_for(setup1, orientation.up).unwrap_or_default();
             for (key, value) in ["rx", "ry", "rz"].iter().zip(rotation) {
                 setup.p.insert((*key).into(), value.to_string());
@@ -2156,10 +2432,16 @@ pub fn build(
             setup
                 .p
                 .insert("fixture".into(), get(&setup1.p, "fixture").into());
-            for key in ["holding", "holder", "holding_gap"] {
-                if let Some(value) = setup1.p.get(key) {
-                    setup.p.insert(key.into(), value.clone());
+            // The user's holder only when it is on this machine.
+            let theirs = doc.holder(get(&setup1.p, "holder"));
+            if theirs.is_none_or(|h| h.fits(on)) {
+                for key in ["holding", "holder", "holding_gap"] {
+                    if let Some(value) = setup1.p.get(key) {
+                        setup.p.insert(key.into(), value.clone());
+                    }
                 }
+            } else if let Some(gap) = setup1.p.get("holding_gap") {
+                setup.p.insert("holding_gap".into(), gap.clone());
             }
             if let Some(holder) = holder {
                 let holding = holding_of(holder.kind());
@@ -2174,7 +2456,7 @@ pub fn build(
                 .insert("notes".into(), clip(&proposed.workholding, 500));
             setup
         };
-        if si > 0 && changed(0) {
+        if si != u && changed(0) {
             let name = clip(&proposed.name, 60);
             setup.p.insert(
                 "name".into(),
@@ -2259,6 +2541,7 @@ pub fn build(
                     report,
                     &doc.tools,
                     &mesh.fingerprint,
+                    (on, number),
                 )
             };
             let built = match kept {
@@ -2304,7 +2587,7 @@ pub fn build(
                 .map(|op| format!("\"{}\"", clip(get(&op.p, "name"), 60)))
                 .collect();
             if !locked.is_empty() && !kept_setups.contains(&b) {
-                let up = if b == 0 {
+                let up = if b == base {
                     first
                 } else {
                     analysis::up_axis(setup)
@@ -2336,7 +2619,7 @@ pub fn build(
     };
     built.setups = setups;
     if proposal.chuck.is_some() {
-        built.settle_holding(0);
+        built.settle_holding(u);
     }
     // A later setup in a V-block, soft jaws or a collet block takes the
     // entry's grip as the setup page fills it in.
@@ -2354,7 +2637,7 @@ pub fn build(
     built.sync_turns(Some(mesh));
     let mut refused = vec![];
     if proposal.chuck.is_some() {
-        for message in built.holding_issues(0, Some(mesh)) {
+        for message in built.holding_issues(u, Some(mesh)) {
             refused.push((1, "workholding", format!("The chuck: {message}")));
         }
     }
@@ -2418,6 +2701,7 @@ pub(crate) mod tests {
             groove_land: None,
             spring_pass: None,
             chamfer: None,
+            block: None,
             coolant: "Flood".into(),
             reason: "test".into(),
             from: None,
@@ -2487,6 +2771,7 @@ pub(crate) mod tests {
             chuck: None,
             setups: vec![
                 ProposedSetup {
+                    machine: None,
                     orientation: "+Z".into(),
                     name: "Top".into(),
                     origin: "Stock top center".into(),
@@ -2502,6 +2787,7 @@ pub(crate) mod tests {
                     from: None,
                 },
                 ProposedSetup {
+                    machine: None,
                     orientation: "-Z".into(),
                     name: "Underside".into(),
                     origin: "Model origin".into(),
@@ -4611,6 +4897,7 @@ pub(crate) mod tests {
         let mut plan = shown(&doc, &report);
         let side = side_up(&report, "-Y").setups.remove(1);
         plan.setups[1] = ProposedSetup {
+            machine: None,
             from: Some(2),
             name: "Side".into(),
             ..side
@@ -5102,5 +5389,298 @@ pub(crate) mod tests {
         assert_eq!(get(&built.setups[0].p, "holding"), "Chuck");
         assert_eq!(built.index_base(1), Some(0));
         assert_eq!(get(&built.setups[0].p, "stock_x"), "130");
+    }
+
+    /// `block` with the default manual mill in the library, machine 2 of the
+    /// report, and T9 on it: a 1-flute Ø32 end mill that cuts aluminium at
+    /// 161 m/min on the top gear (1600 rpm) with a 0.094 mm chip at the hand
+    /// feed (150 mm/min).
+    pub fn with_mill() -> (Document, Mesh, PartReport) {
+        let (mut doc, mesh, _) = block();
+        let mill = crate::manual::defaults();
+        let mut tool = Tool::new("End mill 32", "Flat end mill", "32");
+        for (k, v) in [
+            ("length", "40"),
+            ("stickout", "60"),
+            ("flutes", "1"),
+            ("number", "9"),
+            ("machines", mill.id.as_str()),
+        ] {
+            tool.p.insert(k.into(), v.into());
+        }
+        doc.machines.push(mill);
+        doc.tools.push(tool);
+        let report = analysis::report(&doc, &mesh).unwrap();
+        (doc, mesh, report)
+    }
+    /// A Box on the manual mill facing 3.5 of the 4 mm of stock off the
+    /// top, open on every side, in setup 1's work coordinates (stock top
+    /// centre); its rpm a little off the top gear.
+    pub fn facing_box() -> ProposedOp {
+        ProposedOp {
+            rpm: 1580.,
+            feed: 150.,
+            coolant: "Off".into(),
+            block: Some(ProposedBox {
+                x_min: -200.,
+                x_max: 200.,
+                y_min: -200.,
+                y_max: 200.,
+                z_top: 0.,
+                z_bottom: -3.5,
+                allowance: Some(0.),
+            }),
+            ..op("Box", 9, vec![])
+        }
+    }
+    /// `good` with a setup on the manual mill in front that faces the top.
+    pub fn milled(report: &PartReport) -> Proposal {
+        let mut plan = good(report);
+        for setup in &mut plan.setups {
+            setup.machine = Some(1);
+        }
+        plan.setups.insert(
+            0,
+            ProposedSetup {
+                machine: Some(2),
+                orientation: "+Z".into(),
+                name: "Face on the big mill".into(),
+                origin: "Stock top center".into(),
+                workholding: "Big mill vise.".into(),
+                holder: None,
+                a_angles: None,
+                operations: vec![facing_box()],
+                from: None,
+            },
+        );
+        plan
+    }
+    #[test]
+    fn the_report_lists_the_manual_mill_and_what_fits_it_only_when_there_is_one() {
+        let (_, _, plain) = block();
+        assert!(plain.machines.is_empty() && plain.work_zero.is_none());
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("machines").is_none() && json.get("work_zero").is_none());
+        assert!(json["tools"][0].get("machines").is_none());
+        let (_, _, report) = with_mill();
+        let kinds: Vec<&str> = report.machines.iter().map(|m| m.kind).collect();
+        assert_eq!(kinds, ["CNC", "Manual mill"]);
+        let mill = &report.machines[1];
+        assert_eq!(
+            mill.gears.as_deref(),
+            Some(&[90., 150., 250., 400., 640., 1000., 1600.][..])
+        );
+        assert_eq!(
+            (mill.hand_feed, mill.move_time_min),
+            (Some(150.), Some(10.))
+        );
+        assert_eq!(report.machines[0].max_rpm, Some(report.machine.max_rpm));
+        let fits = |n: u32| {
+            report
+                .tools
+                .iter()
+                .find(|t| t.number == n)
+                .unwrap()
+                .machines
+                .clone()
+        };
+        assert_eq!((fits(1), fits(9)), (Some(vec![1]), Some(vec![2])));
+        // Setup 1's zero, stock top centre, over the model's corner: half
+        // the model across and the stock's 4 mm above its top.
+        let size = report.orientations[0].model_size;
+        let zero = report.work_zero.unwrap();
+        assert!((zero[0] - size[0] / 2.).abs() < 0.02 && (zero[1] - size[1] / 2.).abs() < 0.02);
+        assert!((zero[2] - (size[2] + 4.)).abs() < 0.02, "{zero:?}");
+    }
+    #[test]
+    fn the_schema_with_a_manual_mill_adds_machine_box_and_the_box_strategy_and_stays_strict() {
+        for (edit, rotary) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert_eq!(schema_full(edit, rotary, false), schema_with(edit, rotary));
+            let schema = schema_full(edit, rotary, true);
+            let setup = &schema["properties"]["setups"]["items"];
+            assert!(
+                setup["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("machine"))
+            );
+            let op = &setup["properties"]["operations"]["items"];
+            assert!(op["required"].as_array().unwrap().contains(&json!("box")));
+            assert!(
+                op["properties"]["strategy"]["enum"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("Box"))
+            );
+            let block = &op["properties"]["box"]["anyOf"][0];
+            assert_eq!(block["additionalProperties"], false);
+            assert_eq!(block["required"].as_array().unwrap().len(), 7);
+        }
+        // A proposal in it reads back.
+        let (_, _, report) = with_mill();
+        let text = serde_json::to_string(&milled(&report)).unwrap();
+        assert_eq!(parse(&text).unwrap(), milled(&report));
+    }
+    #[test]
+    fn a_manual_setup_planned_in_front_takes_the_stock_and_the_users_setup_starts_from_it() {
+        let (doc, mesh, report) = with_mill();
+        let built = build(&doc, &mesh, &report, &milled(&report)).unwrap();
+        assert_eq!(built.setups.len(), 3);
+        let (front, user) = (&built.setups[0], &built.setups[1]);
+        assert!(crate::manual::is_manual(&front.machine));
+        assert_eq!(front.machine.id, doc.machines.last().unwrap().id);
+        // The stock, orientation and zero as setup 1 defines them.
+        for (k, v) in &doc.setups[0].p {
+            if k.starts_with("stock_") && k != "stock_source"
+                || ["rx", "ry", "rz", "origin"].contains(&k.as_str())
+            {
+                assert_eq!(front.p.get(k), Some(v), "{k}");
+            }
+        }
+        assert_eq!(get(&front.p, "stock_source"), "fresh");
+        assert_eq!(get(&front.p, "notes"), "Big mill vise.");
+        // The user's setup keeps itself and starts from the manual one.
+        assert_eq!(user.id, doc.setups[0].id);
+        assert_eq!(get(&user.p, "offset"), "G54");
+        assert_eq!(get(&user.p, "stock_source"), front.id);
+        assert_eq!(analysis::base(&built), 1);
+        // The Box, its speed on the top gear.
+        let cut = &front.operations[0];
+        assert_eq!(cut.strategy, Strategy::Box);
+        assert_eq!(get(&cut.p, "rpm"), "1600");
+        assert_eq!(
+            (get(&cut.p, "z_bottom"), get(&cut.p, "allowance")),
+            ("-3.5", "0")
+        );
+        assert!(built.issues().is_empty(), "{:?}", built.issues());
+    }
+    #[test]
+    fn work_off_its_machine_is_refused_with_the_machine() {
+        let (doc, mesh, report) = with_mill();
+        let said = |edit: &dyn Fn(&mut Proposal)| {
+            let mut plan = milled(&report);
+            edit(&mut plan);
+            messages(build(&doc, &mesh, &report, &plan)).join(" | ")
+        };
+        type Edit<'a> = &'a dyn Fn(&mut Proposal);
+        let cases: [(&str, Edit); 8] = [
+            ("Box is for a manual mill only", &|p| {
+                p.setups[1].operations.push(facing_box())
+            }),
+            ("cannot run on the manual mill", &|p| {
+                p.setups[0]
+                    .operations
+                    .push(op("Pocket", 9, ids_of(&report, "+Z", 12.)))
+            }),
+            ("Helical milling needs a CNC", &|p| {
+                let mut drill = op("Drill", 9, ids_of(&report, "+Z", 0.));
+                drill.drill_cycle = Some("Helical milling".into());
+                p.setups[0].operations.push(drill)
+            }),
+            ("T1 is not on machine 2", &|p| {
+                p.setups[0].operations[0].tool = 1
+            }),
+            ("machine 3 is not in machines", &|p| {
+                p.setups[0].machine = Some(3)
+            }),
+            ("Keep your setup", &|p| {
+                p.setups.retain(|s| s.machine == Some(2))
+            }),
+            ("must use orientation +Z", &|p| {
+                p.setups[0].orientation = "-Z".into()
+            }),
+            ("A Box needs `box`", &|p| {
+                p.setups[0].operations[0].block = None
+            }),
+        ];
+        for (expected, edit) in cases {
+            let message = said(edit);
+            assert!(message.contains(expected), "{expected}: {message}");
+        }
+        // One orientation per machine: the manual mill may face the top the
+        // CNC then machines, but the CNC may not take it twice.
+        assert!(build(&doc, &mesh, &report, &milled(&report)).is_ok());
+        let message = said(&|p| p.setups[2].orientation = "+Z".into());
+        assert!(
+            message.contains("Orientation +Z is used by an earlier setup"),
+            "{message}"
+        );
+    }
+    /// The surface IDs of the plane `depth` below the top in `up`.
+    fn ids_of(report: &PartReport, up: &str, depth: f32) -> Vec<usize> {
+        ids(report, up, depth)
+    }
+    #[test]
+    fn describe_shows_a_planned_manual_setup_and_building_it_again_keeps_the_job() {
+        let (doc, mesh, report) = with_mill();
+        let built = build(&doc, &mesh, &report, &milled(&report)).unwrap();
+        // The planner reads the job from the user's setup, as before.
+        let again = analysis::report(&built, &mesh).unwrap();
+        assert_eq!(again, report);
+        let plan = shown(&built, &again);
+        assert_eq!(plan.setups[0].machine, Some(2));
+        assert_eq!(plan.setups[0].operations[0].block, facing_box().block);
+        assert_eq!(plan.setups[0].operations[0].strategy, "Box");
+        assert_eq!(
+            (plan.setups[1].machine, plan.setups[1].from),
+            (Some(1), Some(2))
+        );
+        let rebuilt = build(&built, &mesh, &again, &plan).unwrap();
+        assert_eq!(rebuilt.setups.len(), built.setups.len());
+        for (kept, user) in rebuilt.setups.iter().zip(&built.setups) {
+            assert_eq!(kept.id, user.id);
+            assert_eq!(kept.p, user.p, "setup {}", user.id);
+            for (kept, user) in kept.operations.iter().zip(&user.operations) {
+                assert!(same_operation(kept, user), "{}", user.id);
+            }
+        }
+        // A change to the Box writes only the block.
+        let mut deeper = plan.clone();
+        deeper.setups[0].operations[0]
+            .block
+            .as_mut()
+            .unwrap()
+            .z_bottom = -3.;
+        let changed = build(&built, &mesh, &again, &deeper).unwrap();
+        let cut = &changed.setups[0].operations[0];
+        assert_eq!(cut.id, built.setups[0].operations[0].id);
+        assert_eq!(get(&cut.p, "z_bottom"), "-3");
+        // Planning afresh drops the manual setup and keeps the user's.
+        let fresh = build(&built, &mesh, &again, &good(&again)).unwrap();
+        assert_eq!(fresh.setups[0].id, doc.setups[0].id);
+        assert_eq!(get(&fresh.setups[0].p, "stock_source"), "fresh");
+        assert!(
+            fresh
+                .setups
+                .iter()
+                .all(|s| !crate::manual::is_hand(&s.machine))
+        );
+    }
+    /// Writes `with_mill`'s project, its block sawn with 12 mm over the top
+    /// and 6 mm round the sides, to `AXIS_PROJECT_OUT`, for the planner's
+    /// command-line tools and a model to plan it.
+    #[test]
+    #[ignore]
+    fn write_the_manual_mill_project() {
+        let out = std::env::var("AXIS_PROJECT_OUT").unwrap();
+        let (mut doc, _, _) = with_mill();
+        for (k, v) in [
+            ("stock_top", "12"),
+            ("stock_left", "6"),
+            ("stock_right", "6"),
+            ("stock_front", "6"),
+            ("stock_back", "6"),
+        ] {
+            doc.setups[0].p.insert(k.into(), v.into());
+        }
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        doc.file = Some(crate::model::ModelFile {
+            name: "four-setup-block.3mf".into(),
+            path: manifest.join("examples/four-setup-block.3mf"),
+            format: "3MF".into(),
+            bytes: 1,
+            thickness: None,
+        });
+        crate::storage::save(std::path::Path::new(&out), &doc).unwrap();
     }
 }

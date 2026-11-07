@@ -3813,6 +3813,19 @@ impl Document {
         }
         e
     }
+    /// Gives `setup`, a manual setup put before `old`, what it takes from
+    /// it: the stock, orientation, zero and offset, and its holding when the
+    /// vise or clamps are on `setup`'s machine (otherwise they stay behind).
+    pub fn hand_over(&self, old: &Setup, setup: &mut Setup) {
+        let fits = (self.holder(get(&old.p, "holder"))).is_none_or(|h| h.fits(&setup.machine));
+        for (k, v) in &old.p {
+            let holding = HOLDING.contains(&k.as_str());
+            if (HANDED_OVER.contains(&k.as_str()) && (fits || !holding)) || k.starts_with("stock_")
+            {
+                setup.p.insert(k.clone(), v.clone());
+            }
+        }
+    }
     /// Inserts a setup named "Big mill" on the first manual machine of the
     /// library, before the first CNC setup. Put first, it takes the stock,
     /// orientation, zero and holding of the old first setup, which then starts
@@ -3829,18 +3842,7 @@ impl Document {
         let mut setup = Setup::new(machine.clone(), &self.next_offset());
         setup.p.insert("name".into(), "Big mill".into());
         match (at, self.setups.first()) {
-            (0, Some(old)) => {
-                // A vise or clamps not on the manual mill stay behind.
-                let fits = (self.holder(get(&old.p, "holder"))).is_none_or(|h| h.fits(machine));
-                for (k, v) in &old.p {
-                    let holding = HOLDING.contains(&k.as_str());
-                    if (HANDED_OVER.contains(&k.as_str()) && (fits || !holding))
-                        || k.starts_with("stock_")
-                    {
-                        setup.p.insert(k.clone(), v.clone());
-                    }
-                }
-            }
+            (0, Some(old)) => self.hand_over(old, &mut setup),
             _ if !self.sample_model => {
                 for key in ["stock_x", "stock_y", "stock_z"] {
                     setup.p.insert(key.into(), String::new());

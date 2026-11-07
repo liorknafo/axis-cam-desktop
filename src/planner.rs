@@ -48,6 +48,9 @@ pub trait Backend {
     /// once the part report is made; a backend that asks for structured
     /// output sends that schema. The default ignores it.
     fn rotary(&self, _rotary: bool) {}
+    /// Whether the part report lists hand machines (`machines`), so the
+    /// proposals follow `proposal::schema_full` with `machine` and Box.
+    fn hand(&self, _hand: bool) {}
 }
 /// The stage a run is in; `n` counts model requests from 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,6 +259,17 @@ CHANGING THE CURRENT PLAN
 - `kept_operations` lists operations of the current plan that you cannot see or change (strategies the format does not offer). They stay in their setups at their place: keep those setups, with their `from` and orientation, and do not count them against the limits.
 - Say in `summary`, in a sentence or two for the user, what you changed. When the change cannot be made with these tools and strategies, reply with the current plan unchanged and say why in `summary`.
 - The earlier messages of the chat, if any, are for context only: `current_plan` is the job as it stands now.";
+/// `EDITING`, and with hand machines (`machines`) the user's setup kept by
+/// its own `from` wherever the hand setups put it.
+fn editing_for(hand: bool) -> String {
+    if !hand {
+        return EDITING.into();
+    }
+    EDITING.replace(
+        "Each `from` may be used once. Setup 1 stays first, with `from` 1.",
+        "Each `from` may be used once. Setup 1, the first setup on machine 1, keeps its own `from` (the setup of `current_plan` on machine 1 that comes first); hand setups may stand before it, each keeping its `from` while it keeps its machine and orientation.",
+    )
+}
 /// The part report's `rotary` bullet, on a machine with a rotary A axis.
 const ROTARY_PART: &str =
     "- `rotary`, present when the machine has a rotary A axis: see ROTARY A AXIS.\n";
@@ -309,7 +323,48 @@ pub fn instructions_with(pictures: bool, tool: bool, overview: bool) -> String {
 /// limits.
 /// With `rotary` (the machine has an A axis), the report's `rotary` and a ROTARY
 /// A AXIS section say how to use it; without, the text is the same as it was.
+#[cfg(test)]
 pub fn instructions_for(pictures: bool, tool: bool, overview: bool, rotary: bool) -> String {
+    instructions_full(pictures, tool, overview, rotary, false)
+}
+/// The opening's sentence on the hand machines, after its first.
+const HAND_OPENING: &str = " The job may also use the hand machines `machines` lists (see MACHINES): they make no program, and the user follows the steps the program draws for them.";
+/// The part report's `machines` bullet.
+const HAND_PART: &str = "- `machines` and `work_zero`: see MACHINES and MANUAL MILL.\n";
+/// The Box strategy's bullet, among the strategies.
+const BOX: &str = "- Box (manual mill only): see MANUAL MILL.\n";
+/// The MACHINES and MANUAL MILL sections, with their blank lines after them.
+const HAND: &str = "MACHINES
+- `machines` lists the machines a setup may use, by `number`. Number 1 is setup 1's machine, the CNC that `machine` and the rest of the report describe. A `Manual mill` is a hand-fed mill with a DRO: the user moves one axis at a time, following steps the program draws, and it makes no program. Give every setup its `machine`.
+- Setup 1 is the first setup on machine 1: it keeps the user's stock, holder, work zero and orientation (the first one in `orientations`), and its `holder` follows the rules for setup 1. These instructions call it setup 1, but the check report and its problems number the setups in the plan's order: with hand setups before it, it has a higher number there. Setups on a hand machine may come before it. The first of them takes the stock as setup 1 defines it: it must use the first orientation, and it takes setup 1's work zero (its own `origin` is not used) and setup 1's holder when that holder fits the hand machine; else give it a `holder` that does, or null when no entry fits the hand machine, which leaves its holding to the user, unmodelled and unchecked. Setup 1 then starts from the stock they leave. Setups on any machine may follow setup 1; none on machine 1 may come before it. Each orientation may be used by one setup per machine: a manual setup may face the top that setup 1 then machines from the same side. At most 6 setups on the CNC and 10 in all.
+- `tools[].machines` and `workholding_library[].machines` list the machine numbers each tool and holder fits: use only those in a setup on that machine, as its `holder` too.
+- On a hand machine the program sets `rpm` to the nearest of the machine's `gears` (with `variable` true, anywhere between the two) and caps `feed` at its `hand_feed`, then checks both against the material's cutting data as on the CNC: choose a gear and a feed inside it. Give `coolant` `Off` there.
+- Time: `total_minutes` in the check report is the whole job, and `minutes_by_machine` splits it: each machine's operations and tool changes (`tool_time_min` each on a hand machine, plus `pass_time_s` for every pass), and `moving`, the hand machine's `move_time_min` each time the stock goes between machines. Plan for the shortest total: put work on a hand machine when that makes the total shorter, counting the moves, or when only it can do it (Tapping); otherwise keep it on the CNC. When the user asks for or against a machine, follow the request.
+
+MANUAL MILL
+- Box: removes an axis-aligned block with one flat end mill, one axis at a time: facing a sawn block's top, squaring a side, a step, a shoulder, a slot or a rectangular pocket. `box` gives the block in the setup's work coordinates, mm from its work zero with Z up: `x_min`, `x_max`, `y_min`, `y_max`, `z_top`, `z_bottom`. The report's positions are measured from the model's -X/-Y/bottom corner: subtract `work_zero` (setup 1's in the part report; each setup's in the check report's `stocks`) to convert. Setup 1's stock, from that corner, runs from -`stock_margin[2]` to `model_size[0]` + `stock_margin[3]` in X, from -`stock_margin[4]` to `model_size[1]` + `stock_margin[5]` in Y, and from -`stock_margin[1]` to `model_size[2]` + `stock_margin[0]` in Z (the first orientation's); a later setup's is its `box_from_part_corner`. `surfaces` empty, `box` null for every other strategy.
+- A side of the block on or beyond the stock's face is open; the others are closed. The block's closed sides and its floor keep `allowance` (null: 0.5 mm) for the CNC to finish; 0 makes the manual cut final. `stepdown` null takes what the spindle's power can (give one for soft stock); `stepover_percent` null is 70. It cuts in equal levels and rows, conventional only; a block closed at both ends of its passes (a pocket, a closed slot) plunges at its first row, so give it a centre-cutting end mill; its inside corners keep the tool's radius.
+- A Box that reaches into the part is refused with the X, Y and Z where it does: keep the block and its allowance outside the part, its floor no lower than the faces under it.
+- Drill on the manual mill goes one axis at a time: `Drilling`, `Chip breaking`, `Deep drilling`, `Counterboring`, `Tapping`, `Reaming` or `Boring`; not `Helical milling` or `Thread milling`. Only Box and Drill run on the manual mill.
+- Its time: each pass feeds its length at `hand_feed` and adds `pass_time_s`. A Box has about (width ÷ (stepover × the tool's diameter)) rows on each of (depth ÷ stepdown) levels, so at 150 mm/min a 130 mm pass takes about a minute: facing a whole top by hand is much slower than the CNC, and pays only with the move time when the CNC cannot take it (stock too big or too tall for it, or its holder) or is far slower at it. Check the plan both ways when unsure: the check report gives `total_minutes`.
+- Use it for big square material the CNC cannot hold or reach, large steps and slots, and Tapping the holes a CNC setup drilled (a manual setup after it, in the same orientation). Keep curves, slopes, small features and tight tolerances on the CNC.
+
+";
+/// `instructions_for`, and with `hand` (the report lists `machines`) the
+/// MACHINES and MANUAL MILL sections; without, the text is the same as it was.
+pub fn instructions_full(
+    pictures: bool,
+    tool: bool,
+    overview: bool,
+    rotary: bool,
+    hand: bool,
+) -> String {
+    let with_hand = hand;
+    let (hand_opening, hand_part, boxed, hand) = if hand {
+        (HAND_OPENING, HAND_PART, BOX, HAND)
+    } else {
+        ("", "", "", "")
+    };
     let (rotary_part, rotary) = if rotary {
         (ROTARY_PART, ROTARY)
     } else {
@@ -354,7 +409,7 @@ pub fn instructions_for(pictures: bool, tool: bool, overview: bool, rotary: bool
         crate::cam::CEILING / 1000 % 1000,
         crate::cam::CEILING % 1000
     );
-    format!("You plan CNC milling jobs for AXIS CAM Studio, a 3-axis CAM program. You receive a JSON part report and reply with one JSON proposal that matches the given schema. The program then generates every operation, simulates the stock, runs its export safety checks and tells you what failed, so you can correct the proposal.
+    let text = format!("You plan CNC milling jobs for AXIS CAM Studio, a 3-axis CAM program.{hand_opening} You receive a JSON part report and reply with one JSON proposal that matches the given schema. The program then generates every operation, simulates the stock, runs its export safety checks and tells you what failed, so you can correct the proposal.
 
 THE PART REPORT
 - Lengths are millimetres. `tools` lists the only tools you may use, by `number`, with their `diameter`, `flutes`, flute length and stickout, and a chamfer mill's `tip_angle` (and `tip_flat`, its flat tip across, when it is not pointed). `machine` gives the maximum rpm and feed, and in `coolants` the coolant choices the machine has outputs for. `material` is the project's material with its cutting data (see SPEEDS AND FEEDS).
@@ -366,7 +421,7 @@ THE PART REPORT
 - `workholding`, when present, is setup 1's modelled vise or clamps, with its `number` in `workholding_library`, or its chuck (see WORKHOLDING).
 - `workholding_library` lists the vises and clamps you may choose from, by `number`, with their sizes (see PLANNING THE HOLDING).
 - `sheet`, when present, says setup 1's stock is a sheet of `size` (X, Y, thickness) lying on a spoilboard, for a flat part cut from it: a cut through the sheet may go on into the board by `spoilboard_allowance` mm, never deeper, so in setup 1 `bottom_offset` and a through drill's `breakthrough` may take a cut that far below the model's bottom. `holddown` is what holds the sheet: `Screws` through its waste, whose heads are setup 1's `workholding` boxes (kind `Hold-down screws`), or `Tape`. `needs_tabs` true says the screws hold only the waste: an outside Contour that cuts through must leave `tabs`. On a sheet the top plane lists `openings` too: the part's cut-outs, which a Contour `inside_holes` cuts (a Pocket needs a floor).
-{rotary_part}
+{rotary_part}{hand_part}
 STRATEGIES (the only eight)
 - Face: flattens the top. `surfaces` = the top plane's IDs. Tool: flat end mill or face mill. `stepdown` at most the flute length, `stepover_percent` 1-100. Facing needs stock above the face: use it only where the orientation's `stock_margin[0]` is greater than `bottom_offset`. `bottom_offset` above 0 leaves that much stock on the face. `facing_area` `stock` (or null) faces the whole stock top, `model` only over the model's outline seen from above, a little past it, leaving the stock beyond for later operations. Face makes levels × passes strokes: levels = (`stock_margin[0]` − `bottom_offset`) ÷ `stepdown`, rounded up; passes = (the faced width in Y + the tool diameter) ÷ the stepover in mm, rounded up, plus 1. The faced width is the stock's (the model's Y size + `stock_margin[4]` + `stock_margin[5]`), or the model's Y size with `facing_area` `model`, which also goes once round the outline at each level.
 - Pocket: clears from the stock top down to each floor it lists, each to its own depth, the highest first; a deeper floor inside a shallower one starts where that one stops. `surfaces` = all IDs of one or more floor planes of the orientation. Tool: a flat end mill no wider than the largest `max_cutter_diameter` of those floors; a floor it does not fit is skipped. A Pocket only goes where earlier operations left material, so the same Pocket again with a smaller cutter is a rest pass: it cleans the corners and narrow places a larger cutter could not reach, in a fraction of the time; give it `finish_passes` 0. `through` true also cuts each of the floors' `openings` down to where its walls end plus `breakthrough` (null means 1 mm), and the ones narrower than the cutter are left for a smaller one; their corners keep the cutter's radius, so finish cut-outs that need tight corners (switch cut-outs) with a rest pass of the smallest cutter that reaches; with `through` false or null the openings are cleared over at the floor's height only. `stepover_percent` at most 50, `stepdown` at most the flute length. The floor's depth plus the stock above the top must be less than the tool's stickout. `radial_allowance` and `axial_allowance` leave stock. `pocket_entry` is `Profile ramp` or `Plunge`; `ramp_angle` null or 0.1-15 degrees, also with `Plunge`. `finish_passes` a whole number 0-20. Its moves are about levels × the points of all its offset rings, and three settings multiply them: a smaller `stepover_percent` adds rings, each finish pass repeats the outermost ring at every level, and a smaller `ramp_angle` adds ramp moves at every entry (the tool stays down from ring to ring and enters again only for the deepest loop of each separate spot).
@@ -382,7 +437,7 @@ STRATEGIES (the only eight)
 - Parallel: surface-following finishing of the whole model from above. `surfaces` empty. Ball or flat end mill. `surface_stepover` at most the tool radius, `tolerance` 0.01-1. The pass count times the samples per pass must stay under {samples}: (the model's Y size ÷ `surface_stepover`) × (the model's X size ÷ step), where step = min(`surface_stepover`, √(8 × tool radius × `tolerance`), 1 mm) and must be at least 0.05 mm.
 - Waterline: constant-height passes around the model, always from the model's top down to its bottom plus `bottom_offset`. `surfaces` empty. Flat end mill, `stepdown` at most the flute length. That height must be less than the tool's stickout. `surface_stepover` is the most its neighbouring layers' loops may lie apart across a sloping face: over a face of slope θ (flatter than 1° excepted) layers are at most `surface_stepover` × tan θ apart instead of `stepdown`. It cuts about that height ÷ `stepdown` layers, plus each sloping face's width seen from above ÷ `surface_stepover` layers, its moves about layers × the outline's points.
 - Groove: an internal groove below the mouth of one bore (a circlip groove, an undercut nothing from above reaches), by circular interpolation. `surfaces` = the IDs of the plane the bore opens in, and `hole_diameter` the bore's `diameter`, so it picks that one hole. Tool: a `Keyseat cutter` (its `diameter` the head's, `flute_length` the head's width, `neck_diameter`, and `reach` from the head's bottom to the shank). `groove_diameter` and `groove_width` the groove's size; `groove_from` is `Land from the top of the bore` (the face of this setup), `Land from the bottom of the bore` or `Depth below the stock top`, and `groove_land` the land (or depth) in mm; `spring_pass` true repeats the last circle. The head goes down the bore's axis, arcs out to the groove, circles, arcs back to the axis and comes up it; a groove wider than the head takes several passes along the axis. Refused: a head within 0.2 mm a side of the bore, a neck that would rub the bore (groove depth more than the head radius less the neck radius less 0.2 mm), a head wider than the groove, a groove outside the bore, and a groove whose far edge is deeper below the bore's top than `reach`. Bore the hole first (Drill with `Helical milling`). Cut a groove near the far face from that face in a later setup, or with `Land from the bottom of the bore` when the reach allows.
-- Chamfer: a chamfer mill run level with the side of its cone on edges or on a line, in one pass each: edge chamfers, deburring, and V flanks at a depth. Tool: a chamfer mill (its `tip_angle`, and `tip_flat` across when it is not pointed). Give `chamfer` (null for every other strategy). `chamfer.source` `edges`: `surfaces` = the IDs of a level face of the orientation (its outline and hole mouths are the edges; `edges` `outer` or `holes` keeps only one kind). `source` `line`: `surfaces` empty, `line` [x1, y1, x2, y2] and `line_z` in work coordinates, `side` the side of the line the tool is on looking from its start to its end (`left`, `right`, or `alternate` from left for successive copies). Size it by `width` (the chamfer's width on the face; the tip goes `tip_offset`, null 0.5, below its lower end; the tool's axis is the tip flat's radius plus `tip_offset` × tan(half the tip angle) off the edge) or by `tip_z` (the tip's work Z; the axis is the cone's radius at `line_z` off the line), the other null. The cone must be no wider than the tool where it meets the face or the line. `copies` (null 1) repeats it turned `first_angle` + k × `copy_pitch` degrees anticlockwise about the vertical axis through `axis` [x, y] (work coordinates, null the work zero). The program checks the whole cone against the part, not only its centre line.
+{boxed}- Chamfer: a chamfer mill run level with the side of its cone on edges or on a line, in one pass each: edge chamfers, deburring, and V flanks at a depth. Tool: a chamfer mill (its `tip_angle`, and `tip_flat` across when it is not pointed). Give `chamfer` (null for every other strategy). `chamfer.source` `edges`: `surfaces` = the IDs of a level face of the orientation (its outline and hole mouths are the edges; `edges` `outer` or `holes` keeps only one kind). `source` `line`: `surfaces` empty, `line` [x1, y1, x2, y2] and `line_z` in work coordinates, `side` the side of the line the tool is on looking from its start to its end (`left`, `right`, or `alternate` from left for successive copies). Size it by `width` (the chamfer's width on the face; the tip goes `tip_offset`, null 0.5, below its lower end; the tool's axis is the tip flat's radius plus `tip_offset` × tan(half the tip angle) off the edge) or by `tip_z` (the tip's work Z; the axis is the cone's radius at `line_z` off the line), the other null. The cone must be no wider than the tool where it meets the face or the line. `copies` (null 1) repeats it turned `first_angle` + k × `copy_pitch` degrees anticlockwise about the vertical axis through `axis` [x, y] (work coordinates, null the work zero). The program checks the whole cone against the part, not only its centre line.
 
 WORKHOLDING
 - `workholding` in the part report, when present, describes what holds the stock in setup 1. `kind` is `Vise` (two jaws on opposite sides of the stock), `Clamps`, `Chuck`, or for a round bar `V-block`, `Soft jaws` or `Collet block`, with `round_bar` giving its `diameter`, `length` and `along` (`X` lying, `Z` standing); a lying bar's work zero may be on its axis (`Bar axis at left end`, `Bar axis center`). `boxes` lists each jaw or clamp as [x0, y0, z0, x1, y1, z1] in setup 1's axes, in mm from the model's -X/-Y/bottom corner. A clamp lies over the stock top; a jaw reaches from the stock's bottom up to its top, which is its z1.
@@ -393,7 +448,7 @@ WORKHOLDING
 - `clearance_above_stock_top` is present when a box and its gap reach above the stock top, and says how far. The default `clearance` of 15 already covers a height below 15, so leave `clearance` null then. When the height is 15 or more, give every operation a `clearance` greater than it: a machine that retracts to a clearance plane refuses a plan whose plane (the highest `clearance` in a setup) is not above the boxes and their gap, and rapids then pass over the boxes. Otherwise leave `clearance` null.
 - A `workholding` problem names its place in the setup's work coordinates (X, Y and Z measured from the setup's work zero, Z up), not from the model's corner as the report's boxes are: convert before comparing.
 
-{rotary}{holding}SPEEDS AND FEEDS
+{rotary}{holding}{hand}SPEEDS AND FEEDS
 - `material` in the report holds the cutting data for carbide tools: `vc_min_m_per_min` and `vc_max_m_per_min` give the surface speed range in m/min, and `chip_load_mm` the chip load per tooth in mm in five bands by tool diameter. A band holds the diameters up to its `up_to_mm` (and above the previous band's), with its `min` and `max`; the last band, with `up_to_mm` null, holds every larger diameter.
 - The program computes, for every operation, the surface speed Vc = π × D × rpm ÷ 1000 (m/min) and the chip load fz = feed ÷ (rpm × flutes) (mm per tooth), from the tool's diameter D and `flutes` in `tools` and the operation's `rpm` and `feed`. Vc must lie between `vc_min_m_per_min` and `vc_max_m_per_min`, and fz between the `min` and `max` of the band of the tool's diameter; under 3 mm the band's `min` and `max` shrink in proportion to the diameter (a Ø1 tool takes a third of them, a Ø0.5 a sixth). Choose a Vc in range and set rpm = Vc × 1000 ÷ (π × D), then choose an fz in the band and set feed = fz × rpm × flutes. For example, a 3-flute Ø10 mm tool at 8000 rpm and 1000 mm/min runs at Vc = 251 m/min with fz = 0.042 mm per tooth.
 - Drills are checked like end mills: a Drill's `feed` is divided by rpm × flutes in the same way and must give a chip load inside the band of the drill's diameter, so choose drill feeds inside those bands. A small drill needs a high rpm to reach the surface speed.
@@ -420,7 +475,20 @@ WORKHOLDING
 - Put risks the operator should know about in `warnings`.
 - In the check report, `covered_other` lists the remaining surface by `facing` (+X, -X, +Y, -Y, top, bottom), named in setup 1's frame, which can differ from the orientation names when setup 1 is rotated.
 - In the check report, `stocks` gives the stock each setup starts from, in that setup's axes: its `size`, its box from the model's -X/-Y/bottom corner (`box_from_part_corner`), how much the earlier setups `removed` whole from each side, and `by` which operations.
-- Reply with the JSON proposal only.")
+- Reply with the JSON proposal only.");
+    if !with_hand {
+        return text;
+    }
+    // The limits a plan on several machines has instead (see MACHINES).
+    text.replace("STRATEGIES (the only eight)", "STRATEGIES (the only nine)")
+        .replace(
+            "Each orientation may be used by one setup only, so a plan has at most 6 setups.",
+            "Each orientation may be used by one setup on each machine (see MACHINES).",
+        )
+        .replace(
+            "Spindle speed is at least 100 rpm and feed at least 1 mm/min, both within the machine's maximums.",
+            "Spindle speed is at least 100 rpm and feed at least 1 mm/min, both within the machine's maximums; on a hand machine see MACHINES.",
+        )
 }
 fn feedback(check: &CheckReport) -> String {
     let report = serde_json::to_string(check).unwrap_or_default();
@@ -763,8 +831,12 @@ pub(crate) fn setup_1_notes(notes: &str, earlier: &str, note: &str) -> (String, 
 /// while a preview is open starts from this too.
 pub fn applied(outcome: &Outcome) -> Document {
     let mut job = outcome.job.clone();
-    let note = outcome.proposal.setups.first();
-    if let Some(first) = job.setups.first_mut() {
+    // The user's setup: the first on its machine (`proposal::build`).
+    let note = (outcome.proposal.setups.iter())
+        .find(|s| s.machine.unwrap_or(1) == 1)
+        .or(outcome.proposal.setups.first());
+    let base = crate::analysis::base(&job);
+    if let Some(first) = job.setups.get_mut(base) {
         let note = note.map_or("", |s| s.workholding.as_str());
         let earlier = crate::model::get(&first.p, PLANNER_NOTE_KEY);
         let (notes, added) = setup_1_notes(crate::model::get(&first.p, "notes"), earlier, note);
@@ -947,19 +1019,24 @@ async fn ask(
         let tools = if sight.tool {
             planner_tools::offered_for(
                 sight.pictures,
-                proposal::schema_with(sight.edit, report.rotary.is_some()),
+                proposal::schema_full(
+                    sight.edit,
+                    report.rotary.is_some(),
+                    !report.machines.is_empty(),
+                ),
             )
         } else {
             vec![]
         };
-        let mut system = instructions_for(
+        let mut system = instructions_full(
             sight.pictures,
             sight.tool,
             sight.overview,
             report.rotary.is_some(),
+            !report.machines.is_empty(),
         );
         if sight.edit {
-            system.push_str(EDITING);
+            system.push_str(&editing_for(!report.machines.is_empty()));
         }
         let mut messages = vec![Item::text(Role::System, system)];
         messages.extend(outgoing(conversation, sight.pictures, sight.tool));
@@ -1152,6 +1229,7 @@ where
         })?
         .map_err(|e| fail(e, vec![], None, 0))?;
     backend.rotary(report.rotary.is_some());
+    backend.hand(!report.machines.is_empty());
     let part = serde_json::to_string(&report).map_err(|e| fail(e.to_string(), vec![], None, 0))?;
     // The plan to change, read before anything is sent.
     let current = if edit {
@@ -1382,6 +1460,7 @@ pub struct OpenAiBackend {
     pictures: bool,
     /// Whether the run's machine has a rotary A axis (`Backend::rotary`).
     rotary: std::sync::atomic::AtomicBool,
+    hand: std::sync::atomic::AtomicBool,
 }
 impl OpenAiBackend {
     pub fn new(
@@ -1397,6 +1476,7 @@ impl OpenAiBackend {
             stream,
             pictures,
             rotary: false.into(),
+            hand: false.into(),
         }
     }
 }
@@ -1413,7 +1493,11 @@ impl Backend for OpenAiBackend {
             model: self.model.clone(),
             messages: messages.to_vec(),
             schema_name: "machining_plan",
-            schema: proposal::schema_with(edit, self.rotary.load(Ordering::Relaxed)),
+            schema: proposal::schema_full(
+                edit,
+                self.rotary.load(Ordering::Relaxed),
+                self.hand.load(Ordering::Relaxed),
+            ),
             tools: tools.to_vec(),
             tool_choice: choice,
         };
@@ -1436,6 +1520,9 @@ impl Backend for OpenAiBackend {
     fn rotary(&self, rotary: bool) {
         self.rotary
             .store(rotary, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn hand(&self, hand: bool) {
+        self.hand.store(hand, std::sync::atomic::Ordering::Relaxed);
     }
 }
 /// The stock after the whole job, meshed at Standard detail for the
@@ -1634,6 +1721,57 @@ pub(crate) mod tests {
             seen[1][3].1.starts_with("The proposal passes every check.")
                 && seen[1][3].1.contains("\"covered_planes\"")
         );
+    }
+    #[test]
+    fn the_hand_sections_are_told_only_with_a_hand_machine() {
+        for bits in 0..16u8 {
+            let [p, t, o, r] = [0, 1, 2, 3].map(|k| bits & (1 << k) != 0);
+            let plain = instructions_for(p, t, o, r);
+            assert_eq!(instructions_full(p, t, o, r, false), plain);
+            assert!(!plain.contains("MANUAL MILL") && !plain.contains("`machines`"));
+            let with = instructions_full(p, t, o, r, true);
+            for told in [
+                "MACHINES\n",
+                "MANUAL MILL\n",
+                "- Box (manual mill only)",
+                "STRATEGIES (the only nine)",
+                "one setup on each machine",
+                "on a hand machine see MACHINES",
+            ] {
+                assert!(with.contains(told), "{told}");
+            }
+            assert!(!with.contains("so a plan has at most 6 setups"));
+        }
+        assert_eq!(editing_for(false), EDITING);
+        let edit = editing_for(true);
+        assert!(
+            !edit.contains("Setup 1 stays first")
+                && edit.contains("hand setups may stand before it")
+        );
+    }
+    #[tokio::test]
+    async fn a_plan_with_the_manual_mill_in_front_applies_and_its_setup_shows_steps() {
+        use crate::proposal::tests::{milled, with_mill};
+        let (doc, mesh, report) = with_mill();
+        let script = Script::new(vec![json(&milled(&report)), json(&milled(&report))]);
+        let outcome = plan(&script, doc.clone(), mesh.clone(), &Busy::default(), |_| {})
+            .await
+            .unwrap();
+        assert!(outcome.check.passed, "{:?}", outcome.check.problems);
+        // The model was told of the manual mill and the machines.
+        let seen = script.seen.lock().unwrap();
+        let (system, part) = (&seen[0][0].1, &seen[0][1].1);
+        assert!(system.contains("MANUAL MILL") && system.contains("STRATEGIES (the only nine)"));
+        assert!(part.contains("\"machines\"") && part.contains("\"Manual mill\""));
+        let job = applied(&outcome);
+        assert!(crate::manual::is_manual(&job.setups[0].machine));
+        // The planner's note for the user's holding goes to the user's setup.
+        assert_eq!(job.setups[1].id, doc.setups[0].id);
+        assert!(get(&job.setups[1].p, "notes").contains("Planner: Vise on the long sides."));
+        assert_eq!(get(&job.setups[0].p, "notes"), "Big mill vise.");
+        // MACHINE shows the manual setup as steps: the Box is a section.
+        let guide = crate::guide::build(&job, &mesh, 0).unwrap();
+        assert!(guide.steps.len() > 2, "{}", guide.steps.len());
     }
     #[tokio::test]
     async fn the_first_request_carries_the_report_and_no_private_data() {
@@ -2423,6 +2561,7 @@ pub(crate) mod tests {
                     manual_minutes: 0.,
                     cnc_minutes: 0.,
                     move_minutes: 0.,
+                    minutes_by_machine: None,
                     zeros: vec![],
                     stocks: vec![],
                 };
@@ -2473,6 +2612,7 @@ pub(crate) mod tests {
                     manual_minutes: 0.,
                     cnc_minutes: 0.,
                     move_minutes: 0.,
+                    minutes_by_machine: None,
                     zeros: vec![],
                     stocks: vec![],
                 };
@@ -3382,6 +3522,7 @@ pub(crate) mod tests {
             summary: "Face and contour.".into(),
             chuck: None,
             setups: vec![proposal::ProposedSetup {
+                machine: None,
                 orientation: report.orientations[0].up.into(),
                 name: "Top".into(),
                 origin: "Stock top center".into(),
@@ -3751,6 +3892,7 @@ pub(crate) mod tests {
                     manual_minutes: 0.,
                     cnc_minutes: 0.,
                     move_minutes: 0.,
+                    minutes_by_machine: None,
                     zeros: vec![],
                     stocks: vec![],
                 };
