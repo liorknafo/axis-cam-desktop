@@ -3529,6 +3529,75 @@ flood = { pin = 8 }
         assert!(note.starts_with("Tool run 1 was done"), "{note}");
     }
 
+    /// The Facing skipped as already cut, the Drilling held on the Pi,
+    /// AXIS CAM closed and opened again, the Facing's speed changed
+    /// meanwhile when `edit`: followed again, with the skip, and the
+    /// Operations list's rows from the check without it.
+    fn facing_cut_then_drilling_reopened(edit: bool) -> App {
+        use crate::run::{Action as R, Skip};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(skip(&mut a, 0, Some(Skip::Cut)));
+        let _ = a.update(Message::Run(R::KeepZero));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5., "the Drilling on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        let _ = a.update(Message::Run(R::Hold));
+        pi_until(&server, 10., "Hold on the Pi", |s| {
+            s.state == Some(State::Hold)
+        });
+        let _ = a.update(Message::Disconnect);
+        let mut a = reopen(a, dir.path());
+        if edit {
+            let face = &mut a.doc.setups[0].operations[0];
+            face.p.insert("rpm".into(), "1234".into());
+        }
+        let _ = a.update(Message::Connect);
+        follow_again(&mut a).unwrap();
+        assert_eq!(run_of(&a).skips, [(0, Skip::Cut)]);
+        assert!(run_of(&a).layout.is_none());
+        // The check without the skip, which tests answer themselves.
+        let programs = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0);
+        let id = a.doc.setups[0].id.clone();
+        let _ = a.update(Message::RunLayout(id, std::sync::Arc::new(programs)));
+        let _ = a.update(Message::Run(R::Stop));
+        pi_until(&server, 10., "stopped", |s| s.state == Some(State::Idle));
+        tick_until(&mut a, 5., "stopped", |s| s.state == Some(State::Idle));
+        a
+    }
+
+    /// Review finding: after reopening, the Facing skipped as already cut
+    /// kept its row, said skipped, with Don't skip to undo it.
+    #[test]
+    fn an_operation_skipped_as_cut_keeps_its_row_after_axis_cam_opens_again() {
+        let a = facing_cut_then_drilling_reopened(false);
+        let rows: Vec<Vec<usize>> = (run_of(&a).layout.as_deref().unwrap().as_ref().unwrap())
+            .iter()
+            .map(|p| p.indexes.clone())
+            .collect();
+        assert_eq!(rows, [vec![0], vec![1]]);
+        assert!(run_of(&a).journal_note.is_none());
+        shows(&a, &["skipped: already cut", "Don't skip"]);
+    }
+
+    /// Review finding: the Facing skipped as already cut was edited while
+    /// AXIS CAM was closed. Followed again, a note says it changed.
+    #[test]
+    fn an_operation_skipped_as_cut_and_edited_while_closed_is_said() {
+        let a = facing_cut_then_drilling_reopened(true);
+        let note = run_of(&a).journal_note.clone().unwrap_or_default();
+        assert!(note.starts_with("Skipped as already cut,"), "{note}");
+        let name = a.doc.setups[0].operations[0].name().to_string();
+        assert!(!name.is_empty() && note.contains(&name), "{note}");
+        shows(&a, &[&note]);
+    }
+
     /// The Facing tool run sent to the Pi, then AXIS CAM disconnected as
     /// closing does, and the Facing done on the Pi.
     fn facing_then_closed(dir: &std::path::Path) -> (App, uc100_remote::Server) {

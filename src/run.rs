@@ -108,6 +108,8 @@ pub struct Running {
     start: [f64; 6],
     /// `program_print` of what it sent.
     print: u64,
+    /// `op_print` of each operation it took as already cut (`Skip::Cut`).
+    cut_ops: Vec<(usize, u64)>,
     /// The block the tool tip is on and how far along it (`track`).
     on: Option<(usize, f32)>,
     /// The step of each of its blocks (`step_marks`).
@@ -301,6 +303,9 @@ pub struct Run {
     /// Whether it follows it: the name it was sent as, or why not
     /// (`follow_again`), until the connection takes it.
     pub followed: Option<Result<String, String>>,
+    /// What `following` found of the operations taken as cut, for
+    /// `journal_note` once it follows.
+    cut_note: Option<String>,
 }
 
 /// What a tool run sent to the Pi was sent from (`Run::follow_record`),
@@ -328,6 +333,9 @@ pub struct Follow {
     /// `program_print` of what it sends: its moves, its spindle, coolant
     /// and tools, and its operations' cutters.
     pub program: u64,
+    /// `op_print` of each operation taken as already cut (`Skip::Cut`).
+    #[serde(default)]
+    pub cut_ops: Vec<(usize, u64)>,
     /// The run's record before and after its Cycle Start.
     pub before: Before,
     pub xy: Option<(usize, [f64; 2])>,
@@ -335,6 +343,27 @@ pub struct Follow {
     pub last: Option<(String, f64)>,
     /// The name it was sent as, which the Pi's Stop after step names.
     pub name: String,
+}
+
+/// FNV-1a over operation `oi` of setup `si` and its tool as the project
+/// saves them: what an operation taken as cut was (`Follow::cut_ops`).
+fn op_print(doc: &Document, si: usize, oi: usize) -> Option<u64> {
+    let op = doc.setups.get(si)?.operations.get(oi)?;
+    let tool = doc.tools.iter().find(|t| t.id == op.tool);
+    let text = serde_json::to_string(&(op, tool)).ok()?;
+    let mut h = 0xcbf29ce484222325u64;
+    for b in text.bytes() {
+        h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
+    }
+    Some(h)
+}
+
+/// `op_print` of each operation of setup `si` taken as cut in `skips`.
+fn cut_prints(doc: &Document, si: usize, skips: &[(usize, Skip)]) -> Vec<(usize, u64)> {
+    (skips.iter())
+        .filter(|s| s.1 == Skip::Cut)
+        .filter_map(|&(oi, _)| Some((oi, op_print(doc, si, oi)?)))
+        .collect()
 }
 
 /// Why AXIS CAM opened again does not follow the tool run on the Pi
@@ -562,6 +591,7 @@ impl Run {
             journal_note: None,
             follow: None,
             followed: None,
+            cut_note: None,
         }
     }
 
@@ -571,6 +601,19 @@ impl Run {
     /// follows that tool run (`follow_again`).
     pub fn following(doc: &Document, setup: usize, epoch: u64, follow: Follow) -> Self {
         let mut r = Self::new(doc, setup, epoch);
+        // An operation taken as cut that has changed since: said, since
+        // what was cut is the operation as it was.
+        let now = cut_prints(doc, setup, &follow.skips);
+        let changed: Vec<&str> = (follow.cut_ops.iter())
+            .filter(|c| !now.contains(c))
+            .filter_map(|&(oi, _)| Some(doc.setups[setup].operations.get(oi)?.name()))
+            .collect();
+        if !changed.is_empty() {
+            r.cut_note = Some(format!(
+                "Skipped as already cut, {} changed since: what is cut is the operation as it was. Don't skip it to cut it as it is now.",
+                changed.join(", ")
+            ));
+        }
         r.skips = follow.skips.clone();
         r.cut_steps = follow.cut_steps.clone();
         r.start_step = follow.start_step;
@@ -598,6 +641,7 @@ impl Run {
             tip: r.tip,
             start: r.start,
             program: r.print,
+            cut_ops: r.cut_ops.clone(),
             before: r.before.clone(),
             xy: self.xy,
             zero: self.zero.clone(),
@@ -654,14 +698,19 @@ impl Run {
             tip: f.tip,
             start: f.start,
             print: f.program,
+            cut_ops: f.cut_ops.clone(),
             on: None,
             marks,
         };
+        let mut notes: Vec<String> = self.cut_note.take().into_iter().collect();
         if !changed.is_empty() {
-            self.journal_note = Some(format!(
+            notes.push(format!(
                 "Tool run {} was done, but its program has changed since, so it is not shown done: run it again if it is to be cut as it is now.",
                 changed.join(", ")
             ));
+        }
+        if !notes.is_empty() {
+            self.journal_note = Some(notes.join(" "));
         }
         (self.done, self.next, self.from) = (done, f.index, f.from);
         (self.xy, self.zero, self.last) = (f.xy, f.zero, f.last);
@@ -1690,6 +1739,7 @@ impl Run {
         let actions =
             self.job_actions(p, self.from, s.work_offset, s.machine_pos, self.at_step())?;
         let print = program_print(p, self.from, &actions)?;
+        let cut_ops = cut_prints(doc, self.setup, &self.skips);
         // Where the tool tip is, in plan coordinates: the first retract's start.
         let tip =
             std::array::from_fn(|k| (s.machine_pos[k] - s.work_offset[k]) as f32 + p.datum[k]);
@@ -1720,6 +1770,7 @@ impl Run {
             tip,
             start: s.machine_pos,
             print,
+            cut_ops,
             on: None,
             marks,
         });
@@ -4577,6 +4628,7 @@ mod tests {
                 tip: [0.; 3],
                 start: [0.; 6],
                 print: 0,
+                cut_ops: vec![],
                 on: None,
                 marks: vec![],
             }),
@@ -4616,6 +4668,7 @@ mod tests {
             journal_note: None,
             follow: None,
             followed: None,
+            cut_note: None,
         };
         let (_, op, block) = run.progress(Some(3)).unwrap();
         assert_eq!((op, block), (0, 2));
@@ -4721,6 +4774,7 @@ mod tests {
             tip: [0.; 3],
             start: [0.; 6],
             print: 0,
+            cut_ops: vec![],
             on: None,
             marks: vec![],
         });

@@ -418,6 +418,13 @@ pub enum Message {
     RunOnMachine(usize),
     /// A setup's tool runs, checked for a UC100 run (the check's epoch).
     RunChecked(u64, std::sync::Arc<Result<Vec<post::Checked>, Vec<String>>>),
+    /// The tool runs of the setup (by id) checked without its skips: the
+    /// Operations list's rows for a run built anew with skips
+    /// (`App::follow_pi_run`).
+    RunLayout(
+        String,
+        std::sync::Arc<Result<Vec<post::Checked>, Vec<String>>>,
+    ),
     /// `RunChecked`, with the stock the check left after each operation of
     /// the setup, to picture (`run::check`), and how long its tool runs take
     /// on the connected machine (`run::Times`).
@@ -1640,6 +1647,7 @@ fn while_locked(m: &Message) -> bool {
             | EscapeKey
             | Run(_)
             | RunChecked(..)
+            | RunLayout(..)
             | RunCheckedStock(..)
             | RunPictures(..)
             | ToggleStock
@@ -3600,6 +3608,7 @@ impl App {
             return Task::none();
         };
         self.run_epoch += 1;
+        let skipped = !f.skips.is_empty();
         c.run = Some(run::Run::following(&self.doc, si, self.run_epoch, f));
         c.probe_spot = None;
         self.run_on_connect = None;
@@ -3609,7 +3618,25 @@ impl App {
             self.dirty = true;
             self.last_edit = Instant::now();
         }
-        self.check_run()
+        // Its skipped operations keep their rows: the check without them
+        // gives those (`run::Run::layout`).
+        let layout = match (skipped, self.part_mesh().cloned()) {
+            (true, Some(mesh)) => {
+                let (doc, setup) = (self.doc.clone(), self.doc.setups[si].id.clone());
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || run::programs(&doc, &mesh, si))
+                            .await
+                            .unwrap_or_else(|e| Err(vec![format!("The check failed: {e}")]))
+                    },
+                    move |programs| {
+                        Message::RunLayout(setup.clone(), std::sync::Arc::new(programs))
+                    },
+                )
+            }
+            _ => Task::none(),
+        };
+        Task::batch([self.check_run(), layout])
     }
     fn check_waits(&mut self) -> bool {
         if !self.locked() {
@@ -6681,6 +6708,15 @@ impl App {
                     r.checked_as(programs, Some(left), times);
                     c.fit_sim_block();
                     return self.picture_run();
+                }
+            }
+            Message::RunLayout(setup, programs) => {
+                if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut())
+                    && r.setup_id == setup
+                    && r.layout.is_none()
+                    && programs.is_ok()
+                {
+                    r.layout = Some(programs);
                 }
             }
             Message::RunPictures(epoch, pictures) => {
