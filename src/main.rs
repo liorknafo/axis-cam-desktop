@@ -3757,49 +3757,94 @@ impl App {
         *kept = Some((key, found.clone()));
         found
     }
-    /// The later enabled operation of the setup `op` is in that cuts `hole`,
-    /// one of `op`'s picked holes, by its name: a Drill that lists it (its
-    /// centre within 0.1 mm), or a Pocket, an Adaptive clearing or a Contour
-    /// that picks it in the same place with a cutter that fits all of it.
-    /// What `op`'s cutter leaves in it is then cut after, and not warned of.
+    /// The first later enabled operation of the setup `op` is in that cuts
+    /// `hole`, one of `op`'s picked holes, by its name, and what it leaves
+    /// of it, if anything. It cuts all of it when it is a drilling cycle
+    /// with a drill no smaller than the hole's bore (its narrowest, as the
+    /// Drill reads it), less 0.02 mm, to its bottom (Bottom offset, less Breakthrough, not over 0); or a
+    /// Pocket, an Adaptive clearing or a Contour that picks it in the same
+    /// place with a cutter that fits all of it, no stock to leave, to its
+    /// floor. A Drill lists a hole whose centre is within 0.1 mm of it.
     pub(crate) fn cut_later(
         &self,
         op: &Operation,
         mesh: &mesh::Mesh,
         hole: &pocket::Hole,
-    ) -> Option<String> {
+    ) -> Option<(String, Option<String>)> {
         let setup = self.doc.setup();
         let at = setup.operations.iter().position(|o| o.id == op.id)?;
         let (x, y) = hole.centre();
+        let number = |o: &Operation, k: &str| num(&o.p, k).unwrap_or(0.);
         (setup.operations[at + 1..].iter())
             .filter(|o| o.enabled)
-            .find(|o| match o.strategy {
-                Strategy::Drill => self
-                    .drill_holes(o, mesh)
-                    .as_ref()
-                    .as_ref()
-                    .is_ok_and(|holes| {
-                        holes
+            .find_map(|o| {
+                let diameter = (self.doc.tools.iter())
+                    .find(|t| t.id == o.tool)
+                    .and_then(|t| num(&t.p, "diameter"))?;
+                match o.strategy {
+                    Strategy::Drill => {
+                        // The hole as it drills it: its bore's narrowest
+                        // diameter, the largest drill that fits.
+                        let bore = (self.drill_holes(o, mesh).as_ref().as_ref().ok())?
                             .iter()
-                            .any(|d| (d.center[0] as f64 - x).hypot(d.center[1] as f64 - y) <= 0.1)
-                    }),
-                Strategy::Pocket | Strategy::Adaptive | Strategy::Contour => {
-                    let diameter = (self.doc.tools.iter())
-                        .find(|t| t.id == o.tool)
-                        .and_then(|t| num(&t.p, "diameter"));
-                    let radial = num(&o.p, "allowance").filter(|a| *a >= 0.);
-                    let (Some(diameter), Some(radial)) = (diameter, radial) else {
-                        return false;
-                    };
-                    pocket::picked_holes(setup, o, mesh).is_ok_and(|holes| {
-                        holes.iter().any(|h| {
-                            h.same_place(hole) && h.fits(diameter, radial).iter().all(|f| *f)
-                        })
-                    })
+                            .find(|h| {
+                                (h.center[0] as f64 - x).hypot(h.center[1] as f64 - y) <= 0.1
+                            })?
+                            .diameter;
+                        let drills = !(o.helical()
+                            || o.thread_milling()
+                            || o.tapping()
+                            || o.reaming()
+                            || o.boring())
+                            && (self.doc.tools.iter())
+                                .find(|t| t.id == o.tool)
+                                .is_some_and(|t| get(&t.p, "type") == "Drill");
+                        let through = if get(&o.p, "through") == "Yes" {
+                            number(o, "breakthrough")
+                        } else {
+                            0.
+                        };
+                        let short = number(o, "bottom") - through;
+                        let why = if !drills {
+                            Some(format!("{} after it does not drill it out", o.name()))
+                        } else if diameter < bore - 0.02 {
+                            Some(format!(
+                                "{} after it drills it Ø{}, smaller than its Ø{bore:.2} bore",
+                                o.name(),
+                                crate::post::exact_mm(diameter)
+                            ))
+                        } else if short > 0.001 {
+                            Some(format!(
+                                "{} after it stops {short:.2} mm over its bottom",
+                                o.name()
+                            ))
+                        } else {
+                            None
+                        };
+                        Some((o.name().to_string(), why))
+                    }
+                    Strategy::Pocket | Strategy::Adaptive | Strategy::Contour => {
+                        let radial = num(&o.p, "allowance").filter(|a| *a >= 0.)?;
+                        let same = pocket::picked_holes(setup, o, mesh)
+                            .ok()?
+                            .into_iter()
+                            .find(|h| h.same_place(hole))?;
+                        let left = number(o, "bottom") + number(o, "axial_allowance");
+                        let why = if !same.fits(diameter, radial).iter().all(|f| *f) {
+                            Some(format!(
+                                "{} after it does not fit all of it either",
+                                o.name()
+                            ))
+                        } else if radial > 0.001 || left > 0.001 {
+                            Some(format!("{} after it leaves stock to leave in it", o.name()))
+                        } else {
+                            None
+                        };
+                        Some((o.name().to_string(), why))
+                    }
+                    _ => None,
                 }
-                _ => false,
             })
-            .map(|o| o.name().to_string())
     }
     /// The holes the selected walls of a Pocket or an inside Contour pick
     /// (`pocket::holes`), for its Geometry tab: kept until the part, the

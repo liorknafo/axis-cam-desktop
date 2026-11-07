@@ -19831,6 +19831,44 @@ soft_max = 180.0
             assert_eq!(drilled, Ok(1), "{strategy:?}: {}", a.status);
             a.selected = Some(0);
             assert_eq!(narrow(&a), 0, "{strategy:?}");
+            let said = |a: &App| {
+                crate::ui::op_checks(a)
+                    .into_iter()
+                    .find(|c| !c.error && c.text.contains("too narrow for the Ø8"))
+                    .map(|c| c.text)
+                    .unwrap_or_default()
+            };
+            // Not when it drills the hole smaller (the review's Ø2 drill in
+            // the Ø6 hole), nor when it stops 5 mm over its bottom: the
+            // warning names the Drilling and what it leaves.
+            let drill_id = a.doc.setup().operations[last].tool.clone();
+            let set_drill = |a: &mut App, d: &str| {
+                let t = a.doc.tools.iter_mut().find(|t| t.id == drill_id).unwrap();
+                t.p.insert("diameter".into(), d.into());
+            };
+            set_drill(&mut a, "2");
+            let text = said(&a);
+            assert!(
+                text.contains("after it drills it Ø2, smaller than its Ø6.00 bore."),
+                "{strategy:?}: {text}"
+            );
+            assert!(
+                !text.contains("Pick it in an operation with a smaller cutter"),
+                "{text}"
+            );
+            set_drill(&mut a, "6");
+            a.doc.setup_mut().operations[last]
+                .p
+                .insert("bottom".into(), "5".into());
+            let text = said(&a);
+            assert!(
+                text.contains("after it stops 5.00 mm over its bottom."),
+                "{strategy:?}: {text}"
+            );
+            a.doc.setup_mut().operations[last]
+                .p
+                .insert("bottom".into(), "0".into());
+            assert_eq!(narrow(&a), 0, "{strategy:?}");
             // Not when it is off, nor when it comes first.
             a.doc.setup_mut().operations[last].enabled = false;
             assert_eq!(narrow(&a), 1, "{strategy:?}");
