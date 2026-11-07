@@ -2374,6 +2374,10 @@ pub struct Connection {
     attaching: Option<u64>,
     /// Why `reattach` waits, as `pi_note` said it (`reattach_waits`).
     reattach_note: Option<String>,
+    /// What became of the tool run on the Pi kept from before AXIS CAM
+    /// was closed: followed again, not followed and why, or waiting for its
+    /// project. Said on the Job tab too, until this computer sends another.
+    pub reattach_said: Option<String>,
     /// Tests: the next tool run handed to the link is lost on the way, as
     /// when the link fails while it crosses.
     #[cfg(test)]
@@ -2639,6 +2643,7 @@ impl Connection {
             reattach: None,
             attaching: None,
             reattach_note: None,
+            reattach_said: None,
             #[cfg(test)]
             lose_next_job: false,
             stop_sent: None,
@@ -2942,6 +2947,7 @@ impl Connection {
         // from before AXIS CAM was closed is over with.
         self.tool_run_id = Some(pending.id);
         self.reattach = None;
+        self.reattach_said = None;
         // Its note, "open its project", is over with it.
         if let Some(note) = self.reattach_note.take()
             && self.pi_note.as_ref() == Some(&note)
@@ -5553,6 +5559,7 @@ impl Connection {
         if self.pi_note.as_ref() != Some(&why) {
             self.pi_note = Some(why.clone());
         }
+        self.reattach_said = Some(why.clone());
         self.reattach_note = Some(why);
     }
 
@@ -5561,6 +5568,7 @@ impl Connection {
     /// (`adopt_pi_stop`).
     pub fn reattach_failed(&mut self, why: String) {
         self.attaching = None;
+        self.reattach_said = Some(why.clone());
         self.pi_note = Some(why);
     }
 
@@ -5587,11 +5595,13 @@ impl Connection {
                 (self.tool_run_id, self.job_name) = (Some(id), Some(name));
                 // Where the tool is, before an end that came meanwhile.
                 run.track(&self.snapshot);
-                self.pi_note = Some(format!(
+                let said = format!(
                     "AXIS CAM was closed while the Pi ran tool run {} of {}: it follows it again.",
                     run.next + 1,
                     run.name
-                ));
+                );
+                self.reattach_said = Some(said.clone());
+                self.pi_note = Some(said);
             }
             Some(Err(why)) => self.reattach_failed(why),
         }

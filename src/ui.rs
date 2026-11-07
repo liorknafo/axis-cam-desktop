@@ -9255,6 +9255,11 @@ fn job_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, M
     // The Job tab: the setup's stock as it is cut (the machine's tool red).
     let stock = picked.is_some().then(|| scene(app, None)).flatten();
     let mut col = column![].spacing(6).height(Fill);
+    // What became of the tool run on the Pi from before AXIS CAM was
+    // closed: said where the job is, not only on the Machine tab.
+    if let Some(said) = &c.reattach_said {
+        col = col.push(note(said.clone()));
+    }
     // The line under the view, how to turn it: short, a hover card on the
     // switcher's left; narrow, the switcher is on its right.
     let foot = |title: &str, line: String| -> Option<Element<'a, Message>> {

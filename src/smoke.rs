@@ -3783,6 +3783,9 @@ flood = { pin = 8 }
         assert!(conn(&a).run.is_none());
         let note = conn(&a).pi_note.clone().unwrap_or_default();
         assert!(note.contains("open its project to follow it"), "{note}");
+        a.page = Page::Control;
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Job));
+        shows(&a, &[&note]);
         if ended {
             // Hold and Resume act on the machine, followed or not.
             let _ = a.update(Message::Run(R::Resume));
@@ -3870,6 +3873,7 @@ flood = { pin = 8 }
         tick_for(&mut a, 200);
         let note = conn(&a).pi_note.clone().unwrap_or_default();
         assert!(!note.contains("open its project"), "{note}");
+        assert!(conn(&a).reattach_said.is_none());
         assert!(run_of(&a).running.is_some());
         let _ = a.update(Message::Run(R::Stop));
         pi_until(&server, 10., "stopped", |s| s.state == Some(State::Idle));
@@ -3941,6 +3945,11 @@ flood = { pin = 8 }
             "{:?}",
             conn(&a).pi_note
         );
+        // Said on the Job tab too.
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Job));
+        let said = conn(&a).reattach_said.clone().expect("said");
+        assert_eq!(conn(&a).pi_note.as_ref(), Some(&said));
+        shows(&a, &[&said]);
         // Still held: nothing taken as its end, Hold and Resume its own.
         assert_eq!(server.snapshot().unwrap().state, Some(State::Hold));
         let _ = a.update(Message::Run(R::Resume));
