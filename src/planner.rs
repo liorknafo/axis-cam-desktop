@@ -484,7 +484,7 @@ WORKHOLDING
     text.replace("STRATEGIES (the only eight)", "STRATEGIES (the only nine)")
         .replace(
             "Each orientation may be used by one setup only, so a plan has at most 6 setups.",
-            "Each orientation may be used by one setup on each machine (see MACHINES).",
+            "Each orientation may be used by one setup on the CNC; a hand machine may use one again (see MACHINES).",
         )
         .replace(
             "Spindle speed is at least 100 rpm and feed at least 1 mm/min, both within the machine's maximums.",
@@ -1736,7 +1736,7 @@ pub(crate) mod tests {
                 "MANUAL MILL\n",
                 "- Box (manual mill only)",
                 "STRATEGIES (the only nine)",
-                "one setup on each machine",
+                "one setup on the CNC; a hand machine may use one again",
                 "on a hand machine see MACHINES",
             ] {
                 assert!(with.contains(told), "{told}");

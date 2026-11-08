@@ -99,6 +99,18 @@ pub fn speeds(m: &Machine) -> String {
     list.join(", ")
 }
 
+/// Machine `m`'s travel along `axis` (0 X, 1 Y, 2 Z) in mm, its X, Y and Z
+/// being in its `units`; None when it gives none.
+pub fn travel_mm(m: &Machine, axis: usize) -> Option<f32> {
+    let inch = if get(&m.p, "units") == "inch" {
+        25.4
+    } else {
+        1.
+    };
+    num(&m.p, ["x", "y", "z"].get(axis)?)
+        .filter(|t| t.is_finite() && *t > 0.)
+        .map(|t| t * inch)
+}
 /// Puts a new operation's `rpm` on a gear and its `feed` at most the hand feed.
 pub fn snap(m: &Machine, p: &mut Fields) {
     if let Some(rpm) = num(p, "rpm") {
@@ -232,7 +244,7 @@ pub fn travel_problem<'a>(
         }
     }
     (0..3).find_map(|k| {
-        let travel = num(&m.p, ["x", "y", "z"][k]).filter(|t| *t > 0.)?;
+        let travel = travel_mm(m, k)?;
         let span = hi[k] - lo[k];
         (span > travel + 0.01).then(|| {
             format!(

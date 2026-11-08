@@ -293,7 +293,7 @@ fn machine_entry(number: usize, m: &crate::model::Machine) -> Result<MachineEntr
         } else {
             "CNC"
         },
-        travel: ["x", "y", "z"].map(|k| r2(given(k).unwrap_or(0.))),
+        travel: [0, 1, 2].map(|k| r2(crate::manual::travel_mm(m, k).unwrap_or(0.))),
         max_rpm: None,
         max_feed: None,
         gears: None,

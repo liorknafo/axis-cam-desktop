@@ -5876,6 +5876,34 @@ pub(crate) mod tests {
         assert_eq!(ids(&rebuilt), ids(&job));
     }
     #[test]
+    fn a_manual_mill_in_inches_travels_as_far_as_the_same_one_in_mm() {
+        let (doc, mesh, _) = with_mill();
+        let with = |units: &str, scale: f32, x: f32| {
+            let mut doc = doc.clone();
+            let mill = doc.machines.last_mut().unwrap();
+            mill.p.insert("units".into(), units.into());
+            for (k, v) in [("x", x), ("y", 300.), ("z", 400.)] {
+                mill.p.insert(k.into(), (v / scale).to_string());
+            }
+            let report = analysis::report(&doc, &mesh).unwrap();
+            let (check, _) = crate::plan_check::check(&doc, &mesh, &report, &milled(&report));
+            (report.machines[1].travel, check)
+        };
+        let (mm, metric) = with("mm", 1., 700.);
+        let (inch, imperial) = with("inch", 25.4, 700.);
+        assert_eq!(mm, [700., 300., 400.]);
+        assert_eq!(inch, mm);
+        assert!(metric.passed && imperial.passed, "{:?}", imperial.problems);
+        let (_, short) = with("inch", 25.4, 49.9);
+        assert!(
+            short.problems.iter().any(|p| p
+                .message
+                .starts_with("The manual mill travels 49.9 mm in X")),
+            "{:?}",
+            short.problems
+        );
+    }
+    #[test]
     fn a_manual_mill_too_small_for_the_moves_is_refused() {
         let (mut doc, mesh, _) = with_mill();
         for (k, v) in [("x", "49.9"), ("y", "50"), ("z", "10")] {
