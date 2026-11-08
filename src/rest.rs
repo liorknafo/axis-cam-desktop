@@ -269,7 +269,7 @@ fn removal_pieces(c: &Cut, current: Frame) -> Vec<Bounds> {
         return vec![removal_box(c, current)];
     };
     let s = c.a[1] * std::f32::consts::FRAC_1_SQRT_2;
-    if !(s > 0.) {
+    if s.is_nan() || s <= 0. {
         return vec![transformed(ring, c.frame, current)];
     }
     let r = ring.max[0];
@@ -1763,6 +1763,36 @@ mod tests {
                 (0, 0),
             );
         }
+    }
+    #[test]
+    fn a_shaft_turned_from_a_bar_still_stands_on_its_end_and_is_not_cut_away_to_its_top() {
+        let mesh = mesh::normalize(vec![[[-5., -5., 0.], [5., 5., 10.], [5., -5., 0.]]]).unwrap();
+        let mut lathe = Setup::new(Machine::new(3), "G54");
+        for (k, v) in [
+            ("stock_type", "Round bar"),
+            ("stock_diameter", "34"),
+            ("stock_length", "110"),
+        ] {
+            lathe.p.insert(k.into(), v.into());
+        }
+        let stock = crate::stock::resolve(&lathe, Some(&mesh)).unwrap().stock;
+        let f = Frame::new(&lathe, &mesh);
+        let mut v = Volume::bar(stock, f);
+        // Ø30 all along, then Ø20 over the top 20 mm: rings whose boxes
+        // each cover the whole shaft across.
+        v.revolve(-1., 111., 15., 17., f, (0, 0));
+        v.revolve(90., 111., 10., 15., f, (0, 1));
+        let shaft = Bounds {
+            min: [-15., -15., 0.],
+            max: [15., 15., 110.],
+        };
+        assert_eq!(RestStock::new(&v, f).bottom(shaft), 0.);
+        // Their boxes alone would take it as cut away to its top.
+        let boxes = removal_boxes(&v, f);
+        assert!(boxes.iter().all(|b| b.min[0] <= -15. && b.max[0] >= 15.));
+        // A ring turned to the centre, a facing, does take the end it cut.
+        v.revolve(-1., 2., 0., 17., f, (0, 2));
+        assert_eq!(RestStock::new(&v, f).bottom(shaft), 2.);
     }
     #[test]
     fn a_mill_setup_turned_square_to_a_lathe_starts_from_the_turned_bar() {

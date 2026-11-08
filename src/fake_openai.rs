@@ -397,6 +397,7 @@ pub mod rotary {
             workholding: "The bar in the chuck.".into(),
             holder: None,
             a_angles: angles,
+            grip: None,
             operations: vec![operation],
             from: None,
         }

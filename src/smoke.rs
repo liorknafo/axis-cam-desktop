@@ -1721,6 +1721,7 @@ impl App {
                     workholding: "Vise on the long sides.".into(),
                     holder: None,
                     a_angles: None,
+                    grip: None,
                     operations: vec![
                         op("Face", plane(up, "top")),
                         op("Pocket", floor.clone()),
@@ -1737,6 +1738,7 @@ impl App {
                     workholding: "Turn over; the vise on the long sides.".into(),
                     holder: Some(1),
                     a_angles: None,
+                    grip: None,
                     operations: vec![op("Face", plane("-Z", "top"))],
                     from: None,
                 },
@@ -1806,6 +1808,7 @@ impl App {
                 workholding: "Vise on the long sides.".into(),
                 holder: None,
                 a_angles: None,
+                grip: None,
                 operations: vec![
                     op("Face", plane(0.)),
                     op("Pocket", plane(12.)),

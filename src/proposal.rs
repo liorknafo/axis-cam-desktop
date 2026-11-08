@@ -124,6 +124,11 @@ pub struct ProposedSetup {
     /// every other setup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bar: Option<ProposedBar>,
+    /// How much of the stock a lathe setup's chuck jaws grip, mm; None keeps
+    /// the setup's grip, or for a new one the jaws' length, less where its
+    /// cuts must stay clear of them. None for every other setup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grip: Option<f32>,
     /// The A angles, degrees, this setup indexes to in setup 1's chuck
     /// instead of re-clamping the stock (every operation runs at each); None
     /// for a setup that is clamped.
@@ -538,6 +543,7 @@ pub fn schema_full(edit: bool, rotary: bool, hands: Hands) -> Value {
             "length": number(),
             "free_end": optional(),
         })), {"type": "null"}]});
+        setup["grip"] = optional();
     }
     if rotary {
         setup["a_angles"] = json!({"type": ["array", "null"], "items": number()});
@@ -2033,6 +2039,15 @@ fn described_bar(setup: &Setup) -> Option<ProposedBar> {
         })
         .flatten()
 }
+/// Whether `setup` is on the lathe and held in one of its chucks.
+fn lathe_chuck(setup: &Setup) -> bool {
+    crate::lathe::is_lathe(&setup.machine) && get(&setup.p, "holding") == "Chuck"
+}
+/// The grip of a lathe setup's chuck, as a proposal gives it; None for any
+/// other setup.
+fn described_grip(setup: &Setup) -> Option<f32> {
+    lathe_chuck(setup).then(|| num(&setup.p, "grip")).flatten()
+}
 /// How far the part's top stands in from the free end of a lathe setup's
 /// bar, to a hundredth.
 fn free_end_of(setup: &Setup, mesh: &Mesh) -> f32 {
@@ -2062,7 +2077,9 @@ fn setup_fields(doc: &Document, si: usize) -> (String, String, String, Option<us
         let same = ["holding", "holder"]
             .iter()
             .all(|k| get(&setup.p, k) == get(&setup1.p, k));
-        let holder = (!same && crate::holding::modelled(setup))
+        // A lathe setup's chuck is told too, so a change keeps it.
+        let held = crate::holding::modelled(setup) || lathe_chuck(setup);
+        let holder = (!same && held)
             .then(|| {
                 analysis::library(doc)
                     .iter()
@@ -2151,6 +2168,7 @@ pub fn describe(doc: &Document, report: &PartReport) -> Result<Current, String> 
         let bar = described_bar(setup);
         setups.push(ProposedSetup {
             bar,
+            grip: described_grip(setup),
             orientation: up.into(),
             name,
             origin,
@@ -2389,11 +2407,23 @@ fn on_lathe(
             .p
             .insert("stickout".into(), (length + FREE_END).to_string());
     }
+    chuck_in(doc, setup, holder)
+}
+/// Holds lathe setup `setup` in `holder`, else in the chuck it is in now,
+/// else in the library's 3-jaw on the lathe (any chuck on it when there is
+/// none). A grip set for other jaws goes, for the new jaws' length.
+fn chuck_in(
+    doc: &Document,
+    setup: &mut Setup,
+    holder: Option<&crate::holding::Holder>,
+) -> Result<(), String> {
     let chucks = || {
         doc.workholding
             .iter()
             .filter(|h| h.kind() == "Chuck" && h.fits(&setup.machine))
     };
+    let now = (doc.holder(get(&setup.p, "holder")))
+        .filter(|h| lathe_chuck(setup) && h.kind() == "Chuck" && h.fits(&setup.machine));
     let chuck = match holder {
         Some(h) if h.kind() != "Chuck" => {
             return Err(format!(
@@ -2402,13 +2432,16 @@ fn on_lathe(
             ));
         }
         Some(h) => h.id.clone(),
-        None => chucks()
-            .find(|h| get(&h.p, "jaws") == "3")
+        None => now
+            .or_else(|| chucks().find(|h| get(&h.p, "jaws") == "3"))
             .or_else(|| chucks().next())
             .map(|h| h.id.clone())
             .ok_or("No chuck in the library fits the lathe: the user must add one on the Workholding page.")?,
     };
-    for key in ["vise_axis", "vise_offset", "vise_grip", "clamps", "grip"] {
+    if now.is_none_or(|h| h.id != chuck) {
+        setup.p.remove("grip");
+    }
+    for key in ["vise_axis", "vise_offset", "vise_grip", "clamps"] {
         setup.p.remove(key);
     }
     setup.p.insert("holding".into(), "Chuck".into());
@@ -2607,6 +2640,12 @@ pub fn build(
             wrong(
                 None,
                 "bar is for a setup on the lathe only; set it to null.".into(),
+            );
+        }
+        if proposed.grip.is_some() && !crate::lathe::is_lathe(on) {
+            wrong(
+                None,
+                "grip is for a setup on the lathe only; set it to null.".into(),
             );
         }
         // Setup 1 is held by the user's own entry, so for it `holder` only
@@ -2901,7 +2940,12 @@ pub fn build(
                     .p
                     .insert("notes".into(), clip(&proposed.workholding, 500));
             }
-            if changed(3) {
+            if changed(3) && crate::lathe::is_lathe(on) {
+                // A lathe setup stays in its chuck unless another is named.
+                if let Err(message) = chuck_in(doc, &mut setup, holder) {
+                    wrong(None, message);
+                }
+            } else if changed(3) {
                 // Another entry, or setup 1's: laid out afresh by the check.
                 for key in ["holding", "holder"] {
                     match setup1.p.get(key) {
@@ -3185,11 +3229,15 @@ pub fn build(
     }
     // A lathe setup's jaws grip their length of the stock, less where its
     // cuts must reach past them; the stock stands out of them by the rest,
-    // as Add lathe setup sets it for a fresh bar.
+    // as Add lathe setup sets it for a fresh bar. A grip the proposal gives
+    // (other than the one the setup has) is taken as it is, or refused.
+    let mut grips = vec![];
     for si in 0..built.setups.len() {
         if !crate::lathe::is_lathe(&built.setups[si].machine) || si == u {
             continue;
         }
+        let given = (proposal.setups.get(si).and_then(|s| s.grip))
+            .filter(|g| Some(*g) != num(&built.setups[si].p, "grip"));
         built.settle_holding(si);
         let length = if get(&built.setups[si].p, "stock_type") == "Round bar"
             && get(&built.setups[si].p, "stock_source") == "fresh"
@@ -3201,12 +3249,46 @@ pub fn build(
                 .map(|b| b.max[2] - b.min[2])
         };
         let reach = lathe_reach(&built, &built.setups[si]);
+        let jaws = (built.holder(get(&built.setups[si].p, "holder")))
+            .and_then(|h| num(&h.p, "jaw_length"));
         let p = &mut built.setups[si].p;
-        if let Some((length, grip)) = length.zip(num(p, "grip")) {
-            let grip = grip.min((length - reach - LATHE_CLEAR).floor()).max(0.);
-            p.insert("grip".into(), grip.to_string());
-            p.insert("stickout".into(), (length - grip).max(1.).to_string());
-        }
+        let Some((length, grip)) = length.zip(num(p, "grip")) else {
+            continue;
+        };
+        let most = (length - reach - LATHE_CLEAR).floor().max(0.);
+        let grip = match given {
+            None => grip.min(most).max(0.),
+            Some(g) => {
+                let why = if !(g.is_finite() && g > 0.) {
+                    Some("grip must be a positive length, mm.".to_string())
+                } else if let Some(jaws) = jaws.filter(|&j| g > j) {
+                    Some(format!(
+                        "grip {g} is longer than the chuck's {jaws} mm jaws: give at most {jaws}, or null."
+                    ))
+                } else if g > most {
+                    Some(format!(
+                        "grip {g} puts the jaws on the cuts: they reach {reach} mm from the free end of the {length} mm stock and the jaws must stay {LATHE_CLEAR} mm clear of them, so grip at most {most} mm, or give null."
+                    ))
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    grips.push(Problem {
+                        setup: si + 1,
+                        operation: None,
+                        stage: "structure",
+                        message: why,
+                    });
+                    continue;
+                }
+                g
+            }
+        };
+        p.insert("grip".into(), grip.to_string());
+        p.insert("stickout".into(), (length - grip).max(1.).to_string());
+    }
+    if !grips.is_empty() {
+        return Err(grips);
     }
     // A later setup in a V-block, soft jaws or a collet block takes the
     // entry's grip as the setup page fills it in.
@@ -3367,6 +3449,7 @@ pub(crate) mod tests {
                     workholding: "Vise on the long sides.".into(),
                     holder: None,
                     a_angles: None,
+                    grip: None,
                     operations: vec![
                         op("Face", 1, ids(report, "+Z", 0.)),
                         op("Pocket", 1, ids(report, "+Z", 12.)),
@@ -3384,6 +3467,7 @@ pub(crate) mod tests {
                     workholding: "Flip about X; clamp on the machined walls.".into(),
                     holder: None,
                     a_angles: None,
+                    grip: None,
                     operations: vec![
                         op("Face", 1, ids(report, "-Z", 0.)),
                         op("Pocket", 1, ids(report, "-Z", 6.)),
@@ -6037,6 +6121,7 @@ pub(crate) mod tests {
             workholding: "Big mill vise.".into(),
             holder: None,
             a_angles: None,
+            grip: None,
             operations: vec![drill],
             from: None,
             bar: None,
@@ -6080,6 +6165,7 @@ pub(crate) mod tests {
                 workholding: "Big mill vise.".into(),
                 holder: None,
                 a_angles: None,
+                grip: None,
                 operations: vec![facing_box()],
                 from: None,
             },
@@ -6613,6 +6699,7 @@ pub(crate) mod tests {
                     workholding: "3-jaw chuck.".into(),
                     holder: None,
                     a_angles: None,
+                    grip: None,
                     operations: vec![
                         turn("Face", 21, |t| t.face_off = Some(2.)),
                         turn("Outside", 21, |t| {
@@ -6638,6 +6725,7 @@ pub(crate) mod tests {
                     workholding: "Soft jaws on the Ø30.".into(),
                     holder: None,
                     a_angles: None,
+                    grip: None,
                     operations: vec![drill],
                     from: None,
                 },
@@ -6707,7 +6795,7 @@ pub(crate) mod tests {
         for edit in [false, true] {
             let schema = schema_full(edit, false, lathe);
             let setup = &schema["properties"]["setups"]["items"];
-            for key in ["machine", "bar"] {
+            for key in ["machine", "bar", "grip"] {
                 assert!(
                     setup["required"].as_array().unwrap().contains(&json!(key)),
                     "{key}"
@@ -6930,6 +7018,76 @@ pub(crate) mod tests {
         assert!(check.passed, "{:?}", check.problems);
         let lathe = &job.unwrap().setups[0].p;
         assert_eq!((get(lathe, "grip"), get(lathe, "stickout")), ("25", "80"));
+    }
+    /// The number of the library's 4-jaw chuck in `report`.
+    fn four_jaw(report: &PartReport) -> Option<usize> {
+        (report.workholding_library.iter())
+            .find(|h| h.kind == "Chuck" && h.sizes.get("jaws") == Some(&4.))
+            .map(|h| h.number)
+    }
+    #[test]
+    fn a_kept_lathe_setup_keeps_its_chuck_and_grip_through_a_rename_a_resize_and_a_null_holder() {
+        let (doc, mesh, report) = with_lathe();
+        let mut plan = turned(&report);
+        plan.setups[0].holder = four_jaw(&report);
+        let mut built = build(&doc, &mesh, &report, &plan).unwrap();
+        let chuck = get(&built.setups[0].p, "holder").to_string();
+        // The user grips 25 of the jaws' 30 mm.
+        for (k, v) in [("grip", "25"), ("stickout", "85")] {
+            built.setups[0].p.insert(k.into(), v.into());
+        }
+        let again = analysis::report(&built, &mesh).unwrap();
+        let shown = shown(&built, &again);
+        assert_eq!(shown.setups[0].holder, four_jaw(&report));
+        assert_eq!(shown.setups[0].grip, Some(25.));
+        assert_eq!(shown.setups[1].grip, None);
+        let held = |edit: &dyn Fn(&mut Proposal)| {
+            let mut plan = shown.clone();
+            edit(&mut plan);
+            let (check, job) = crate::plan_check::check(&built, &mesh, &again, &plan);
+            assert!(check.passed, "{:?}", check.problems);
+            let p = job.unwrap().setups[0].p.clone();
+            let got = |k: &str| get(&p, k).to_string();
+            (got("holder"), got("grip"), got("stickout"))
+        };
+        let kept = (chuck.clone(), "25".to_string(), "85".to_string());
+        assert_eq!(held(&|p| p.setups[0].name = "Turn first".into()), kept);
+        assert_eq!(held(&|p| p.setups[0].holder = None), kept);
+        assert_eq!(
+            held(&|p| p.setups[0].bar.as_mut().unwrap().length = 115.),
+            (chuck, "25".into(), "90".into())
+        );
+    }
+    #[test]
+    fn the_chat_sets_a_lathe_grip_or_is_told_how_far_the_cuts_let_the_jaws_reach() {
+        let (doc, mesh, report) = with_lathe();
+        let mut plan = turned(&report);
+        plan.setups[0].grip = Some(20.);
+        let (check, job) = crate::plan_check::check(&doc, &mesh, &report, &plan);
+        assert!(check.passed, "{:?}", check.problems);
+        let lathe = &job.unwrap().setups[0].p;
+        assert_eq!((get(lathe, "grip"), get(lathe, "stickout")), ("20", "90"));
+        let said = |edit: &dyn Fn(&mut Proposal)| {
+            let mut plan = turned(&report);
+            edit(&mut plan);
+            messages(build(&doc, &mesh, &report, &plan)).join(" | ")
+        };
+        // The part off reaches 75 mm into the 105 mm bar: 25 mm is left
+        // for the jaws, 5 mm clear of it.
+        assert_eq!(
+            said(&|p| {
+                p.setups[0].bar.as_mut().unwrap().length = 105.;
+                p.setups[0].grip = Some(28.);
+            }),
+            "1/None: grip 28 puts the jaws on the cuts: they reach 75 mm from the free end of the 105 mm stock and the jaws must stay 5 mm clear of them, so grip at most 25 mm, or give null."
+        );
+        assert!(
+            said(&|p| p.setups[0].grip = Some(32.)).contains("longer than the chuck's 30 mm jaws")
+        );
+        assert!(
+            said(&|p| p.setups[1].grip = Some(20.))
+                .contains("grip is for a setup on the lathe only")
+        );
     }
     #[test]
     fn a_centre_drill_the_size_of_the_hole_drills_it_and_a_bigger_one_is_refused() {

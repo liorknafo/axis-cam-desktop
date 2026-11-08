@@ -1091,10 +1091,12 @@ fn laid_out(
     (laid, refused)
 }
 /// The grip and stickout of lathe setup `setup` of `built` in its chuck, on
-/// the stock its first simulation starts from: the jaws' length, less where
-/// the lowest cutting move must stay `holding::STICKOUT_MARGIN` clear of
-/// them, in whole millimetres; the rest of the stock stands out. None for any
-/// other setup, one whose stock is not known, or one already so.
+/// the stock its first simulation starts from: its grip (without one, the
+/// jaws' length), lowered where the lowest cutting move must stay
+/// `holding::STICKOUT_MARGIN` clear of the jaws, in whole millimetres, but
+/// never raised: a grip the plan or the user gave stays; the rest of the
+/// stock stands out. None for any other setup, one whose stock is not
+/// known, or one already so.
 fn chucked(
     built: &Document,
     setup: &crate::model::Setup,
@@ -1118,12 +1120,12 @@ fn chucked(
         .map(|m| m.from[2].min(m.to[2]))
         .fold(stock.max[2], f32::min);
     let free = length - (stock.max[2] - lowest) - holding::STICKOUT_MARGIN;
-    let grip = jaws.min(free.floor()).max(0.);
-    let stickout = ((length - grip) * 100.).round() / 100.;
     let now = (
         crate::model::num(&setup.p, "grip"),
         crate::model::num(&setup.p, "stickout"),
     );
+    let grip = now.0.unwrap_or(jaws).min(free.floor()).max(0.);
+    let stickout = ((length - grip) * 100.).round() / 100.;
     (now != (Some(grip), Some(stickout))).then_some((grip, stickout))
 }
 /// The setups of `built` whose starting stock the sequence knew, in order,
@@ -2643,6 +2645,7 @@ mod tests {
                     workholding: String::new(),
                     holder: None,
                     a_angles: None,
+                    grip: None,
                     operations,
                     from: None,
                 })
@@ -3323,6 +3326,56 @@ mod tests {
         assert_eq!(get(&user.p, "origin"), "Model origin");
     }
     #[test]
+    fn after_the_lathe_flat_vise_jaws_are_refused_on_the_round_shaft_and_soft_jaws_bored_to_it_hold_it()
+     {
+        use crate::proposal::tests::{hold, turned, with_lathe};
+        let (mut doc, mesh, _) = with_lathe();
+        // The starter vise across Y, as the reviewer had it.
+        doc.workholding.extend(
+            crate::holding::starters()
+                .into_iter()
+                .filter(|h| h.kind() == "Vise"),
+        );
+        hold(&mut doc, "Vise", &[("vise_axis", "Y"), ("vise_grip", "8")]);
+        let report = crate::analysis::report(&doc, &mesh).unwrap();
+        let (vised, _) = check(&doc, &mesh, &report, &turned(&report));
+        let said: Vec<&str> = (vised.problems.iter())
+            .map(|p| p.message.as_str())
+            .collect();
+        assert!(!vised.passed);
+        // The shaft is still there to stand on and grip: what is wrong is
+        // the flat jaws on its round.
+        assert!(
+            said.iter()
+                .all(|m| !m.contains("stock's top") && !m.contains("bottom it would rest on")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter().any(|m| m.contains("Flat jaws touch what the lathe turned round only along a line: hold it in soft jaws bored to its diameter or in a collet block")),
+            "{said:?}"
+        );
+        // Soft jaws bored Ø30, upright, gripping 20 mm of the Ø30 foot.
+        let mut jaws = crate::round_hold::starters()
+            .into_iter()
+            .find(|h| h.kind() == crate::round_hold::SOFT_JAWS)
+            .unwrap();
+        jaws.p.insert("bore".into(), "30".into());
+        let p = &mut doc.setups[0].p;
+        for (k, v) in [
+            ("holding", crate::round_hold::SOFT_JAWS),
+            ("holder", &jaws.id),
+            ("jaw_bore", "Z"),
+            ("round_grip", "20"),
+            ("round_offset", "0"),
+        ] {
+            p.insert(k.into(), v.into());
+        }
+        doc.workholding.push(jaws);
+        let report = crate::analysis::report(&doc, &mesh).unwrap();
+        let (jawed, _) = check(&doc, &mesh, &report, &turned(&report));
+        assert!(jawed.passed, "{:?}", stages(&jawed));
+    }
+    #[test]
     fn a_planned_manual_facing_in_front_passes_and_the_model_gets_its_minutes_and_zeros() {
         use crate::proposal::tests::{milled, with_mill};
         let (doc, mesh, report) = with_mill();
@@ -3747,6 +3800,7 @@ mod totem {
                     workholding: "Vise on the stock's frame".into(),
                     holder: None,
                     a_angles: None,
+                    grip: None,
                     operations: vec![
                         cut("Face", 1, &top, 1200., &|_| {}),
                         cut("Pocket", 1, &well, 1200., &|o| {
@@ -3793,6 +3847,7 @@ mod totem {
                     workholding: "Vise on the frame".into(),
                     holder: None,
                     a_angles: None,
+                    grip: None,
                     operations: vec![
                         cut("Face", 1, &at("-Z", 0.), 1200., &|_| {}),
                         cut("Pocket", 1, &underside, 1200., &|o| o.stepdown = Some(2.)),

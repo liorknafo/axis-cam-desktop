@@ -363,7 +363,7 @@ const MILL: &str = "MANUAL MILL
 const LATHE: &str = "LATHE
 - A `Lathe` setup turns its stock about the vertical axis of its orientation: Z 0 is the free end (the part's top end in that orientation), negative toward the chuck; X and Y are radial; every size is a diameter. Its work zero is `Stock top center` on that axis (its `origin` is not used).
 - `turning` gives, for each orientation, the part as turned about that axis: its `length`, `largest_diameter`, the `round_share` of its length that is round and, when that is at least 0.3, its `steps` from the top down (`from_top` and `to_top` below the part's top, `outer_diameter`, `inner_diameter` 0 where it is solid on the axis, and `round`), and the `threads` on the axis. Turn only where the steps are round; leave flats, holes off the axis and anything not round to the mills.
-- A lathe setup is held in a `Chuck` of `workholding_library` that lists the lathe in `machines` (`jaws` 3 or 4, the diameters it grips from `min_grip` to `max_grip`, `jaw_length`); `holder` null takes the 3-jaw, which centres a round bar; the 4-jaw is for square or off-centre stock. The jaws grip `jaw_length` of the stock: cut only what stands out of them.
+- A lathe setup is held in a `Chuck` of `workholding_library` that lists the lathe in `machines` (`jaws` 3 or 4, the diameters it grips from `min_grip` to `max_grip`, `jaw_length`); `holder` null takes the 3-jaw on a new setup, which centres a round bar, and keeps the chuck a setup you keep is in; the 4-jaw is for square or off-centre stock. `grip` is how much of the stock the jaws grip, mm: null takes `jaw_length` on a new setup, less where the cuts must stay 5 mm clear of the jaws, and keeps the grip of a setup you keep; give it only to grip less (at most `jaw_length`, and 5 mm short of the deepest cut). Cut only what stands out of the jaws. Give `grip` null on every setup that is not on the lathe.
 - The first setup, when it is on the lathe, turns a fresh bar: give `bar`: `diameter` at least the `largest_diameter` plus 2 mm; `length` the part's `length` plus `free_end`, the parting blade's width, the chuck's `jaw_length` and 5 mm. The program puts the part on the bar's axis with its top `free_end` (null: 2 mm on a new bar, where it is now on a bar you keep or resize) below the bar's free end, so in work Z the part's top is at -`free_end` and a step's `from_top` at -(`free_end` + `from_top`). Give `bar` null on every other setup: a lathe setup after another setup turns what that one left. The bar is larger than the part all along: turn it to the `largest_diameter` first, with an Outside down to where the part is parted off, then the smaller steps.
 - Turn: `turn` gives its `kind` and the kind's fields, in work Z and diameters; a null field takes the kind's default, which does not know your part: always give the fields that say where it cuts (`diameter`, `z_end`, `z`, `face_off`, `to_diameter`, `size`, `width`, `pitch`); null suits only `depth`, `finish`, `allowance` (Outside: 2, 0.2 and 0; Bore: 1, 0.1 and 0) and `passes`. `surfaces` empty and `box` null. `rpm` is put on the nearest of the lathe's `gears`; `feed` must be positive but is not used (give 0.1): the carriage's power feed nearest 0.1 mm per revolution feeds Outside, Bore and Thread passes, the rest is fed by hand. The lathe's speeds are not checked against the material's cutting data, so choose them from it yourself (Vc = π × D × rpm ÷ 1000 at the largest diameter cut). The kinds, and the tool `kind` each needs:
   - `Face` (Turning tool): `face_off` mm off the end as it is, in to `to_diameter` (0: to the centre).
@@ -1836,7 +1836,13 @@ pub(crate) mod tests {
                 // With a manual mill alone, phase 1's sections word for word.
                 assert_eq!(with.contains(HAND), !lathe);
                 assert_eq!(with.contains(HAND_PART), mill);
-                for lathe_only in ["`bar`", "LATHE", "Behind a lathe setup", "`Lathe`"] {
+                for lathe_only in [
+                    "`bar`",
+                    "`grip` is how much",
+                    "LATHE",
+                    "Behind a lathe setup",
+                    "`Lathe`",
+                ] {
                     assert_eq!(with.contains(lathe_only), lathe, "{lathe_only}");
                 }
             }
@@ -3649,6 +3655,7 @@ pub(crate) mod tests {
                 workholding: "Vise.".into(),
                 holder: None,
                 a_angles: None,
+                grip: None,
                 operations: vec![
                     proposal::tests::op("Face", 1, top),
                     proposal::tests::op("Contour", 1, vec![]),

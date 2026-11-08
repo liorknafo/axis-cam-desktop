@@ -1642,6 +1642,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             touch,
             finder,
             at,
+            round,
             ..
         } => {
             let stock = p.shown.boxes[0];
@@ -1679,7 +1680,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 let what = if k == 2 {
                     "touch the top → set".to_string()
                 } else if under(k) > 0. {
-                    format!("touch the {} face {} under the top → set", side(k), mm(under(k)))
+                    format!("touch {} face {} under top → set", side(k), mm(under(k)))
                 } else {
                     format!("touch the {} face → set", side(k))
                 };
@@ -1697,14 +1698,16 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     Some(Message::Guide(GuideAction::Reached(k))),
                 )
             });
-            let right = column![
-                chips(vec![
-                    chip(format!("Ø{} edge finder", mm(*finder))),
-                    warn_chip("DRO comp off"),
-                ]),
-                label("Touch, then set the DRO"),
-            ]
-            .extend(rows);
+            let mut c = vec![
+                chip(format!("Ø{} edge finder", mm(*finder))),
+                warn_chip("DRO comp off"),
+            ];
+            // On a round the finder trips farthest out on its centre line,
+            // where the drawing puts it; off it the DRO reads short.
+            if round.iter().any(|r| *r) {
+                c.push(warn_chip("round: touch on its centre line"));
+            }
+            let right = column![chips(c), label("Touch, then set the DRO"),].extend(rows);
             (
                 "Zero".into(),
                 "pick up the corner",
@@ -3353,6 +3356,26 @@ pub(crate) mod tests {
         for i in 0..guide(&a).steps.len() {
             at(&mut a, i, 0);
             render(&a, (1280, 800), &dir.join(format!("{i:02}.png")));
+        }
+    }
+    /// The manual mill's Hold, Zero and first Tool screens of the shaft
+    /// turned on the lathe and then drilled by hand
+    /// (`guide::tests::turned_then_drilled_by_hand`), at 1280 × 800, into
+    /// `AXIS_RENDER_DIR`.
+    #[test]
+    #[ignore]
+    fn render_the_hand_drilling_after_the_lathe() {
+        let dir = std::path::PathBuf::from(std::env::var("AXIS_RENDER_DIR").unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        let (job, mesh) = crate::guide::tests::turned_then_drilled_by_hand();
+        let mut a = lathe_app_of(job, mesh, |d| d.active = d.setups[1].id.clone());
+        let tool = (guide(&a).steps.iter())
+            .position(|s| matches!(s, Step::Tool { .. }))
+            .unwrap();
+        for (name, step) in [("hold", 0), ("zero", 1), ("tool", tool)] {
+            let id = a.doc.setups[1].id.clone();
+            a.doc.guide.insert(id, step);
+            render(&a, (1280, 800), &dir.join(format!("mill-{name}.png")));
         }
     }
     use crate::guide::LatheStep as L;
