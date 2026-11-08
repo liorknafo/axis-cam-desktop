@@ -3559,6 +3559,22 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                                                 c.angle, c.depth
                                             ))
                                         );
+                                        // An arc goes as it came, by a click on it.
+                                        let said = match &h.arc {
+                                            Some(a) => format!("{said} · {:.0}° arc", a.span),
+                                            None => said,
+                                        };
+                                        if let Some(a) = &h.arc {
+                                            c = c.push(
+                                                btn(
+                                                    format!("✓ {said} · remove"),
+                                                    Message::Surface(a.walls[0]),
+                                                    true,
+                                                )
+                                                .width(Fill),
+                                            );
+                                            continue;
+                                        }
                                         c = c.push(match by_walls(h) {
                                             Some(i) => Element::from(
                                                 btn(
@@ -3580,7 +3596,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         Strategy::Adaptive => "Adaptive clearing works on the same geometry as Pocket: the selected recessed flat floors, with the walls and islands of the part, each picked hole's outline (cut down to the highest of the part under it, or through the part with the breakthrough; one too narrow for the cutter has only the stock over it cleared, down to its rim), and sloped faces cleared in steps. Vertical access only; overhanging geometry is rejected. The path keeps the cutter's side load near the optimal load, so it can take a deep stepdown. It inherits the stock left by all earlier enabled operations and setups.".to_string(),
                         Strategy::Pocket => "Pocket uses offset contours of the selected floor triangles, including islands, and of each picked hole's outline. Supports open, vertical-wall pockets with a flat floor; overhanging geometry is rejected. A picked hole is cut down to the highest of the part under it, or through the part with the breakthrough; one too narrow for the cutter has only the stock over it cleared, down to its rim. Simulation inherits the stock left by all earlier enabled operations and setups.".to_string(),
                         Strategy::Contour => "Inside contour offsets only the walls and islands of this floor, or the wall of each picked hole. It does not clear the interior. The floor must be flat and accessible along setup Z; overhangs are rejected.".to_string(),
-                        Strategy::Drill => "Hole detection uses tessellated circular openings and vertical rays. Noncircular openings and obstructions are excluded. Confirm the detected centers and depths before previewing.".to_string(),
+                        Strategy::Drill => "Hole detection uses tessellated circular openings and vertical rays. Noncircular openings and obstructions are excluded. A click on part of a round wall where no whole hole is (a half hole on the part's edge, a slot's round end) picks that arc: its whole circle is drilled round its centre. Confirm the detected centers and depths before previewing.".to_string(),
                         Strategy::Chamfer => "Chamfer milling runs the side of the cone along the edges of the picked level faces, level, with the tool in the air beside each edge. The path is checked against the part for gouging.".to_string(),
                         Strategy::Parallel => "Parallel finishing cuts only where the cutter touches a picked face. The rest of the part still holds the cutter up, so it never cuts into a face it was not given; where a picked face meets one that is not, the cutter stops at the corner between them, which keeps its radius.".to_string(),
                         Strategy::Waterline => "Waterline finishing cuts each level's loop only where the face nearest the cutter is a picked one, and goes no lower than the lowest picked face. Where a picked face meets one that is not, the cutter finishes up to the corner between them. The rest of the part still keeps the cutter out, so it never cuts into a face it was not given.".to_string(),

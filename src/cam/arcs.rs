@@ -1,0 +1,715 @@
+//! A Drill's arcs: part of a round wall of the part, picked by a click on it
+//! where the click picks no whole round hole: a half hole on the part's
+//! edge, the round end of a slot, a hole a pocket or a slot breaks into, a
+//! round inside corner. A Drill drills the arc's whole circle round its
+//! centre, as wide as the circle, down to the floor under the arc.
+use super::{Geometry, Hole, bore_at, circle_centre, plane_height};
+use crate::{mesh::Mesh, model::Setup};
+use std::collections::{HashMap, HashSet};
+
+/// Part of a round wall, as `setup` places the part (mm, setup frame).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Arc {
+    /// The circle's centre and radius: what its facets' corners lie on.
+    pub centre: [f32; 2],
+    pub r: f32,
+    /// The surfaces of its facets, in order of id.
+    pub walls: Vec<usize>,
+    /// How much of the round its facets go round, degrees (less than 360).
+    pub span: f32,
+    /// The angle about the centre of its middle, radians: the side the part
+    /// is on.
+    pub middle: f32,
+    /// The highest and the lowest of its facets' corners.
+    pub top: f32,
+    pub bottom: f32,
+    /// How far inside `r` its facets' chords come.
+    pub sagitta: f32,
+}
+/// Why a wall is no arc a Drill drills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoArc {
+    /// Not part of a round upright wall.
+    NotRound,
+    /// It curves round the part, not round a hole (a boss, a rounded
+    /// outside corner).
+    Outside,
+    /// It goes all the way round: a whole hole, read as one.
+    Whole,
+}
+/// The refusal for a wall that curves round the part (`NoArc::Outside`).
+pub const OUTSIDE: &str = "That wall curves round the outside of the part (a boss or a rounded corner), not round a hole: a Drill drills holes. Click the wall of a hole, or part of one.";
+/// One upright face of the part (a mesh surface) seen from above.
+struct Facet {
+    /// Its corners seen from above, each once.
+    xy: Vec<(f64, f64)>,
+    low: f32,
+    high: f32,
+    /// Its normal, level and of unit length: out of the part.
+    normal: [f32; 2],
+}
+/// Two corners seen from above are one within this, mm.
+const SAME: f64 = 1e-3;
+/// A corner's key, for finding the facets that meet at it.
+fn key(p: (f64, f64)) -> (i64, i64) {
+    ((p.0 / SAME).round() as i64, (p.1 / SAME).round() as i64)
+}
+/// The upright faces of `g` (mesh surfaces whose triangles lean less than
+/// about 1° from vertical) that `keep` keeps.
+fn facets(g: &Geometry, keep: impl Fn(usize) -> bool) -> HashMap<usize, Facet> {
+    // Per surface: its corners, and its normal's sum, by area.
+    let mut found: HashMap<usize, (Vec<[f32; 3]>, [f32; 3])> = HashMap::new();
+    for t in &g.triangles {
+        let Some(id) = t.feature.filter(|&id| keep(id)) else {
+            continue;
+        };
+        let [a, b, c] = t.p;
+        let (u, v) = (
+            [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+            [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
+        );
+        let n = [
+            u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0],
+        ];
+        let entry = found.entry(id).or_default();
+        entry.0.extend(t.p);
+        for (sum, v) in entry.1.iter_mut().zip(n) {
+            *sum += v;
+        }
+    }
+    let mut out = HashMap::new();
+    for (id, (corners, n)) in found {
+        let length = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        let level = n[0].hypot(n[1]);
+        if length < 1e-9 || n[2].abs() / length > 0.02 {
+            continue;
+        }
+        let mut xy: Vec<(f64, f64)> = vec![];
+        for p in &corners {
+            let q = (p[0] as f64, p[1] as f64);
+            if !xy.iter().any(|r| (r.0 - q.0).hypot(r.1 - q.1) < SAME) {
+                xy.push(q);
+            }
+        }
+        if xy.len() < 2 {
+            continue;
+        }
+        out.insert(
+            id,
+            Facet {
+                xy,
+                low: corners.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min),
+                high: (corners.iter().map(|p| p[2])).fold(f32::NEG_INFINITY, f32::max),
+                normal: [n[0] / level, n[1] / level],
+            },
+        );
+    }
+    out
+}
+/// The circle the corners of `members` lie on, and how far the farthest is
+/// off it: None for fewer than four corners, corners on no circle within
+/// 0.005 mm and 0.01 % of its radius (a CAD tessellation's corners are on
+/// it to a thousandth: a spline's are not), or a facet going more than 45°
+/// round it, or more than 4 times as far as the middle one (a flat that
+/// ends on the circle: a curve's facets are short and alike).
+fn fit(facets: &HashMap<usize, Facet>, members: &[usize]) -> Option<([f64; 2], f64, f64)> {
+    let mut points: Vec<(f64, f64)> = vec![];
+    for q in members.iter().flat_map(|m| facets[m].xy.iter()) {
+        if !points.iter().any(|r| (r.0 - q.0).hypot(r.1 - q.1) < SAME) {
+            points.push(*q);
+        }
+    }
+    if points.len() < 4 {
+        return None;
+    }
+    let c = circle_centre(&points)?;
+    let distance = |p: &(f64, f64)| (p.0 - c.0).hypot(p.1 - c.1);
+    let r = points.iter().map(distance).sum::<f64>() / points.len() as f64;
+    let off = (points.iter())
+        .map(|p| (distance(p) - r).abs())
+        .fold(0., f64::max);
+    if !(r > 0.05 && r < 5000. && off <= 0.005 + r * 1e-4) {
+        return None;
+    }
+    // How far round each facet goes: its longest chord's angle.
+    let mut angles: Vec<f64> = (members.iter().map(|m| &facets[m].xy))
+        .map(|xy| {
+            let longest = (xy.iter().enumerate())
+                .flat_map(|(i, a)| {
+                    xy[i + 1..]
+                        .iter()
+                        .map(move |b| (b.0 - a.0).hypot(b.1 - a.1))
+                })
+                .fold(0., f64::max);
+            2. * (longest / (2. * r)).min(1.).asin()
+        })
+        .collect();
+    angles.sort_by(f64::total_cmp);
+    let (median, widest) = (angles[angles.len() / 2], angles[angles.len() - 1]);
+    // A curve's facets go round about as far as each other (a last one
+    // shorter): a long one among short ones is a flat that ends on the
+    // circle, as a slot's side does between the first facets of its ends.
+    (widest <= 45f64.to_radians() && widest <= 4. * median + 0.5f64.to_radians()).then_some((
+        [c.0, c.1],
+        r,
+        off,
+    ))
+}
+/// The facets of `facets` at each of their corners, by its key.
+fn corners(facets: &HashMap<usize, Facet>) -> HashMap<(i64, i64), Vec<usize>> {
+    let mut at: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    for (&id, f) in facets {
+        for p in &f.xy {
+            at.entry(key(*p)).or_default().push(id);
+        }
+    }
+    at
+}
+/// The facets of `facets` that meet any of `members` at a corner, not among
+/// them, in order of id.
+fn neighbours(
+    facets: &HashMap<usize, Facet>,
+    at: &HashMap<(i64, i64), Vec<usize>>,
+    members: &[usize],
+) -> Vec<usize> {
+    let mut out: Vec<usize> = (members.iter())
+        .flat_map(|m| facets[m].xy.iter())
+        .flat_map(|p| at.get(&key(*p)).into_iter().flatten())
+        .copied()
+        .filter(|f| !members.contains(f))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+/// The round wall `seed` is a facet of, of `facets`: the seed and two
+/// facets next to it whose corners fit a circle best, and on round while
+/// the next facet's corners stay on the circle. None when no three do.
+/// `at` holds the facets at each corner (`corners`).
+fn grow(
+    facets: &HashMap<usize, Facet>,
+    at: &HashMap<(i64, i64), Vec<usize>>,
+    seed: usize,
+) -> Option<Vec<usize>> {
+    let mut best: Option<(f64, Vec<usize>)> = None;
+    for a in neighbours(facets, at, &[seed]) {
+        for b in neighbours(facets, at, &[seed, a]) {
+            let three = vec![seed, a, b];
+            if let Some((_, _, off)) = fit(facets, &three)
+                && best.as_ref().is_none_or(|(o, _)| off < *o)
+            {
+                best = Some((off, three));
+            }
+        }
+    }
+    let mut members = best?.1;
+    loop {
+        let mut grew = false;
+        for n in neighbours(facets, at, &members) {
+            members.push(n);
+            if fit(facets, &members).is_some() {
+                grew = true;
+            } else {
+                members.pop();
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    members.sort_unstable();
+    Some(members)
+}
+/// The arc `members` of `facets` make: its circle, how far round it goes,
+/// its middle, its heights and sagitta. `NoArc::Outside` when it curves
+/// round the part, `NoArc::Whole` when it goes all the way round.
+fn arc(facets: &HashMap<usize, Facet>, members: Vec<usize>) -> Result<Arc, NoArc> {
+    let (c, r, _) = fit(facets, &members).ok_or(NoArc::NotRound)?;
+    let tau = std::f64::consts::TAU;
+    // A hole's wall faces its centre: its normal, out of the part, points in.
+    let inward = |f: &Facet| {
+        let n = f.xy.len() as f64;
+        let mid = (
+            f.xy.iter().map(|p| p.0).sum::<f64>() / n,
+            f.xy.iter().map(|p| p.1).sum::<f64>() / n,
+        );
+        f.normal[0] as f64 * (c[0] - mid.0) + f.normal[1] as f64 * (c[1] - mid.1) > 0.
+    };
+    let concave = members.iter().filter(|m| inward(&facets[m])).count();
+    if concave * 2 <= members.len() {
+        return Err(NoArc::Outside);
+    }
+    // Each facet's stretch of the round, then their union.
+    let mut spans: Vec<(f64, f64)> = vec![];
+    for f in members.iter().map(|m| &facets[m]) {
+        let angle = |p: &(f64, f64)| (p.1 - c[1]).atan2(p.0 - c[0]);
+        let first = angle(&f.xy[0]);
+        let turned = |p: &(f64, f64)| {
+            let d = angle(p) - first;
+            d - tau * (d / tau).round()
+        };
+        let (lo, hi) = (f.xy.iter()).fold((0f64, 0f64), |(lo, hi), p| {
+            (lo.min(turned(p)), hi.max(turned(p)))
+        });
+        spans.push(((first + lo).rem_euclid(tau), hi - lo));
+    }
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // Merged, round the circle: each run's start and end.
+    let mut runs: Vec<(f64, f64)> = vec![];
+    for (start, length) in spans {
+        match runs.last_mut() {
+            Some(last) if start <= last.1 + 1e-6 => last.1 = last.1.max(start + length),
+            _ => runs.push((start, start + length)),
+        }
+    }
+    if runs.len() > 1 && runs[runs.len() - 1].1 >= runs[0].0 + tau - 1e-6 {
+        let last = runs.pop().unwrap();
+        runs[0] = (last.0 - tau, runs[0].1.max(last.1 - tau));
+    }
+    let covered: f64 = runs.iter().map(|(a, b)| b - a).sum();
+    if covered >= tau - 1e-3 {
+        return Err(NoArc::Whole);
+    }
+    // The widest gap, from a run's end to the next's start; the arc's
+    // middle is across the round from its middle.
+    let (mut gap, mut middle) = (-1f64, 0f64);
+    for (i, run) in runs.iter().enumerate() {
+        let next = runs[(i + 1) % runs.len()].0 + if i + 1 == runs.len() { tau } else { 0. };
+        if next - run.1 > gap {
+            gap = next - run.1;
+            middle = (run.1 + next) / 2. + std::f64::consts::PI;
+        }
+    }
+    let middle = (middle + std::f64::consts::PI).rem_euclid(tau) - std::f64::consts::PI;
+    // The nearest a facet's chord comes to the centre.
+    let mut inner = r;
+    for f in members.iter().map(|m| &facets[m]) {
+        for (i, a) in f.xy.iter().enumerate() {
+            for b in &f.xy[i + 1..] {
+                let d = (b.0 - a.0, b.1 - a.1);
+                let q = (c[0] - a.0, c[1] - a.1);
+                let t =
+                    ((q.0 * d.0 + q.1 * d.1) / (d.0 * d.0 + d.1 * d.1).max(1e-12)).clamp(0., 1.);
+                inner = inner.min((q.0 - t * d.0).hypot(q.1 - t * d.1));
+            }
+        }
+    }
+    let of = |m: &usize| &facets[m];
+    Ok(Arc {
+        centre: [c[0] as f32, c[1] as f32],
+        r: r as f32,
+        top: members
+            .iter()
+            .map(|m| of(m).high)
+            .fold(f32::NEG_INFINITY, f32::max),
+        bottom: members
+            .iter()
+            .map(|m| of(m).low)
+            .fold(f32::INFINITY, f32::min),
+        span: covered.to_degrees() as f32,
+        middle: middle as f32,
+        sagitta: (r - inner).max(0.) as f32,
+        walls: members,
+    })
+}
+/// The arc of a round wall of the part that surface `id` is a facet of, as
+/// `setup` places it: the facets on round from it on the circle it is on.
+pub fn arc_at(setup: &Setup, mesh: &Mesh, id: usize) -> Result<Arc, NoArc> {
+    let g = Geometry::new(setup, mesh);
+    let facets = facets(&g, |_| true);
+    if !facets.contains_key(&id) {
+        return Err(NoArc::NotRound);
+    }
+    arc(
+        &facets,
+        grow(&facets, &corners(&facets), id).ok_or(NoArc::NotRound)?,
+    )
+}
+/// The arcs a Drill drills among the surfaces `ids` (its selection), as
+/// `setup` places the part: each run of selected upright facets on one
+/// circle that goes part of the way round it, round a hole, and is no part
+/// of a whole round hole the selection picks by its walls (as a selected
+/// part of a hole's walls is, or of a modeled thread's).
+pub fn drilled_arcs(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc> {
+    let g = Geometry::new(setup, mesh);
+    let facets = facets(&g, |id| ids.contains(&id));
+    if facets.len() < 3 {
+        return vec![];
+    }
+    let at = corners(&facets);
+    let mut seeds: Vec<usize> = facets.keys().copied().collect();
+    seeds.sort_unstable();
+    let (mut done, mut found) = (HashSet::new(), vec![]);
+    for seed in seeds {
+        if done.contains(&seed) {
+            continue;
+        }
+        done.insert(seed);
+        let Some(members) = grow(&facets, &at, seed) else {
+            continue;
+        };
+        done.extend(members.iter().copied());
+        if let Ok(a) = arc(&facets, members) {
+            found.push(a);
+        }
+    }
+    if found.is_empty() {
+        return found;
+    }
+    // A whole round hole a wall of the arc picks is drilled as that hole
+    // (each such hole read once: a modeled thread's crests are many arcs).
+    let threaded = Geometry::with_threads(setup, mesh);
+    let rims = super::rims(&threaded);
+    let mut whole: HashSet<usize> = HashSet::new();
+    found.retain(|a| {
+        if a.walls.iter().any(|w| whole.contains(w)) {
+            return false;
+        }
+        let Ok(walls) = crate::pocket::hole_walls(setup, mesh, a.walls[0]) else {
+            return true;
+        };
+        let walls: HashSet<usize> = walls.into_iter().collect();
+        let round = crate::pocket::holes(setup, &walls, mesh).is_ok_and(|holes| {
+            (holes.iter()).any(|h| super::drill_hole(&threaded, h, &rims, false).is_some())
+        });
+        if round {
+            whole.extend(walls);
+        }
+        !round
+    });
+    found
+}
+/// Whether the centre of the arc `a` is over the stock `setup` holds
+/// (within 0.01 mm), where a drill there cuts: one off it (the centre of
+/// an arc of a large radius, or of a short one on the part's edge) would
+/// go down beside the part, where it is held. True when the stock cannot
+/// be sized.
+pub fn on_stock(setup: &Setup, mesh: &Mesh, a: &Arc) -> bool {
+    crate::stock::resolve(setup, Some(mesh)).map_or(true, |r| {
+        (0..2).all(|k| a.centre[k] >= r.stock.min[k] - 0.01 && a.centre[k] <= r.stock.max[k] + 0.01)
+    })
+}
+/// Whether nothing of the part is over the arc `a` past a gap, in `g`: it
+/// opens up, as a hole a Drill drills from above does.
+pub fn opens_up(g: &Geometry, a: &Arc) -> bool {
+    !super::part_past_gap(g, a.centre, a.r, a.top, true)
+}
+/// The hole a Drill drills for the arc `a` in `g`: its whole circle round
+/// its centre, from its top down to the floor under it (the highest of the
+/// part under it, inside the circle near the arc, below its top), or
+/// through the part when nothing is under it; read as a hole's bore is
+/// (`bore_at`), so that nothing of the part inside the circle over that
+/// floor is cut. None when nothing a drill fits goes down there.
+pub fn arc_hole(g: &Geometry, a: &Arc) -> Option<Hole> {
+    let half = (a.span.to_radians() / 2.).min(std::f32::consts::PI);
+    let floor = ([-0.6f32, 0., 0.6].iter())
+        .map(|k| a.middle + k * half)
+        .map(|t| {
+            [
+                a.centre[0] + 0.8 * a.r * t.cos(),
+                a.centre[1] + 0.8 * a.r * t.sin(),
+            ]
+        })
+        .flat_map(|p| {
+            (g.triangles.iter())
+                .filter_map(move |t| plane_height(&t.p, p))
+                .filter(|h| *h < a.top - 0.01)
+        })
+        .fold(f32::NEG_INFINITY, f32::max);
+    let bottom = if floor.is_finite() {
+        floor
+    } else {
+        g.bounds.min[2]
+    };
+    let mut hole = bore_at(g, a.centre, a.r, a.sagitta, a.top, bottom, None)?;
+    hole.arc = Some(a.clone());
+    Some(hole)
+}
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::{
+        cam::{generate, holes, tests::fixture},
+        mesh,
+        model::Strategy,
+        simulation::Motion,
+        surface,
+    };
+    /// One code/value pair of DXF text.
+    fn g(code: i32, value: impl std::fmt::Display) -> String {
+        format!("{code:>3}\n{value}\n")
+    }
+    /// A millimetre DXF of closed polylines, each (x, y, bulge) corners.
+    fn dxf(loops: &[&[(f64, f64, f64)]]) -> String {
+        let mut d = g(0, "SECTION") + &g(2, "HEADER") + &g(9, "$INSUNITS") + &g(70, 4);
+        d += &(g(0, "ENDSEC") + &g(0, "SECTION") + &g(2, "ENTITIES"));
+        for corners in loops {
+            d += &(g(0, "LWPOLYLINE") + &g(8, "0") + &g(90, corners.len()) + &g(70, 1));
+            for &(x, y, b) in corners.iter() {
+                d += &(g(10, x) + &g(20, y));
+                if b != 0. {
+                    d += &g(42, b);
+                }
+            }
+        }
+        d + &g(0, "ENDSEC") + &g(0, "EOF")
+    }
+    /// The solid of `loops` (`dxf`) `thickness` mm thick from Z `z`, less
+    /// its top (`top` false) or its bottom (`bottom` false).
+    fn slab(
+        loops: &[&[(f64, f64, f64)]],
+        thickness: f32,
+        z: f32,
+        top: bool,
+        bottom: bool,
+    ) -> Vec<[[f32; 3]; 3]> {
+        let flat = crate::dxf::load(dxf(loops).as_bytes(), thickness as f64).unwrap();
+        let low = (flat.triangles.iter().flatten())
+            .map(|p| p[2])
+            .fold(f32::INFINITY, f32::min);
+        (flat.triangles.iter().zip(&flat.faces))
+            .filter(|(_, f)| (top || **f != 1) && (bottom || **f != 2))
+            .map(|(t, _)| t.map(|p| [p[0], p[1], p[2] - low + z]))
+            .collect()
+    }
+    /// The front edge of a 40 x 20 block (X −20 to 20, Y 0 to 20), with a
+    /// half hole of Ø10 round X0 Y0 in it, 10 mm high: through, or `depth`
+    /// deep from its top to a half-round floor.
+    pub(crate) fn notched_block(depth: Option<f32>) -> Vec<[[f32; 3]; 3]> {
+        let notch: &[(f64, f64, f64)] = &[
+            (-20., 0., 0.),
+            (-5., 0., -1.),
+            (5., 0., 0.),
+            (20., 0., 0.),
+            (20., 20., 0.),
+            (-20., 20., 0.),
+        ];
+        let Some(depth) = depth else {
+            return slab(&[notch], 10., 0., true, true);
+        };
+        let block: &[(f64, f64, f64)] = &[
+            (-20., 0., 0.),
+            (20., 0., 0.),
+            (20., 20., 0.),
+            (-20., 20., 0.),
+        ];
+        let floor = 10. - depth;
+        let mut tris = slab(&[notch], depth, floor, true, false);
+        tris.extend(slab(&[block], floor, 0., false, true));
+        // The half-round floor, its edge the notch's 36 facets'.
+        for k in 0..36 {
+            let at = |k: usize| {
+                let t = k as f32 * std::f32::consts::PI / 36.;
+                [5. * t.cos(), 5. * t.sin(), floor]
+            };
+            tris.push([[0., 0., floor], at(k), at(k + 1)]);
+        }
+        tris
+    }
+    /// A 40 x 30 plate 8 mm thick, X −20 to 20 and Y −15 to 15, with a slot
+    /// through it 6 mm wide, its round ends' centres at X ±6 Y0.
+    fn slotted_plate() -> Vec<[[f32; 3]; 3]> {
+        slab(
+            &[
+                &[
+                    (-20., -15., 0.),
+                    (20., -15., 0.),
+                    (20., 15., 0.),
+                    (-20., 15., 0.),
+                ],
+                &[(-6., -3., 0.), (6., -3., 1.), (6., 3., 0.), (-6., 3., 1.)],
+            ],
+            8.,
+            0.,
+            true,
+            true,
+        )
+    }
+    /// The upright surfaces of `mesh` whose centres, in `setup`'s frame
+    /// (mm), `at` holds.
+    fn walls_where(setup: &Setup, mesh: &Mesh, at: impl Fn([f32; 2]) -> bool) -> Vec<usize> {
+        let g = Geometry::new(setup, mesh);
+        let mut found: Vec<usize> = facets(&g, |_| true)
+            .into_iter()
+            .filter(|(_, f)| {
+                let n = f.xy.len() as f64;
+                let mid = [
+                    (f.xy.iter().map(|p| p.0).sum::<f64>() / n) as f32,
+                    (f.xy.iter().map(|p| p.1).sum::<f64>() / n) as f32,
+                ];
+                at(mid)
+            })
+            .map(|(id, _)| id)
+            .collect();
+        found.sort_unstable();
+        found
+    }
+    /// `op` with the surfaces `ids` selected.
+    fn picking(op: &mut crate::model::Operation, mesh: &Mesh, ids: &[usize]) {
+        op.surfaces = Some(surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: ids.to_vec(),
+        });
+    }
+    #[test]
+    fn a_half_hole_on_the_parts_edge_is_drilled_round_its_centre_as_wide_as_its_circle() {
+        let mesh = mesh::normalize(notched_block(None)).unwrap();
+        let (setup, mut op, mut tool) = fixture(Strategy::Drill);
+        let g = Geometry::new(&setup, &mesh);
+        // The part is centred: the block's front edge is at Y −10.
+        let centre = [0f32, g.bounds.min[1]];
+        let on_arc = |c: [f32; 2]| ((c[0] - centre[0]).hypot(c[1] - centre[1]) - 5.).abs() < 0.1;
+        let notch = walls_where(&setup, &mesh, on_arc);
+        assert_eq!(notch.len(), 36, "{notch:?}");
+        // A click on any of its facets picks the whole half round.
+        for &id in &notch {
+            let a = arc_at(&setup, &mesh, id).unwrap();
+            assert_eq!(a.walls, notch);
+            assert!(
+                (a.r - 5.).abs() < 0.001 && (a.span - 180.).abs() < 0.01,
+                "{a:?}"
+            );
+            assert!((a.centre[0] - centre[0]).abs() < 0.001, "{a:?}");
+            assert!((a.centre[1] - centre[1]).abs() < 0.001, "{a:?}");
+            // Its middle is into the part, +Y.
+            assert!(
+                (a.middle - std::f32::consts::FRAC_PI_2).abs() < 0.01,
+                "{a:?}"
+            );
+        }
+        // The flat front wall beside it is none.
+        let front = walls_where(&setup, &mesh, |c| (c[1] - centre[1]).abs() < 0.01);
+        assert_eq!(front.len(), 2);
+        for id in front {
+            assert_eq!(arc_at(&setup, &mesh, id), Err(NoArc::NotRound));
+        }
+        // Picked, it is a Ø10 hole through the part round that centre: no
+        // hole picked by its walls, which would refuse it.
+        picking(&mut op, &mesh, &notch);
+        assert_eq!(
+            crate::pocket::picked_holes(&setup, &op, &mesh)
+                .unwrap()
+                .len(),
+            0
+        );
+        let found = holes(&setup, &op, &mesh).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        let h = &found[0];
+        assert!(h.through && (h.diameter - 10.).abs() < 0.01, "{h:?}");
+        assert!((h.top - g.bounds.max[2]).abs() < 0.01, "{h:?}");
+        assert!((h.bottom - g.bounds.min[2]).abs() < 0.01, "{h:?}");
+        assert!((h.center[0] - centre[0]).abs() < 0.001 && (h.center[1] - centre[1]).abs() < 0.001);
+        assert_eq!(h.arc.as_ref().map(|a| a.walls.clone()), Some(notch));
+        assert_eq!(crate::cam::largest_drill(h), 10.);
+        // A Ø10 drill plunges at its centre down through the part.
+        tool.p.insert("diameter".into(), "10".into());
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        let plunges: Vec<[f32; 3]> = (plan.moves.iter())
+            .filter(|m| m.motion == Motion::Feed)
+            .map(|m| m.to)
+            .collect();
+        assert!(!plunges.is_empty());
+        for p in &plunges {
+            assert!(
+                (p[0] - centre[0]).abs() < 0.001 && (p[1] - centre[1]).abs() < 0.001,
+                "{p:?}"
+            );
+        }
+        let lowest = plunges.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min);
+        assert!(lowest <= g.bounds.min[2] + 0.001, "{lowest}");
+    }
+    #[test]
+    fn a_blind_half_hole_is_drilled_down_to_its_floor() {
+        let mesh = mesh::normalize(notched_block(Some(6.))).unwrap();
+        let (setup, mut op, _) = fixture(Strategy::Drill);
+        let g = Geometry::new(&setup, &mesh);
+        let centre = [0f32, g.bounds.min[1]];
+        let notch = walls_where(&setup, &mesh, |c| {
+            ((c[0] - centre[0]).hypot(c[1] - centre[1]) - 5.).abs() < 0.1
+        });
+        let a = arc_at(&setup, &mesh, notch[0]).unwrap();
+        assert_eq!(a.walls, notch);
+        picking(&mut op, &mesh, &a.walls);
+        let found = holes(&setup, &op, &mesh).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        let h = &found[0];
+        assert!(!h.through && (h.diameter - 10.).abs() < 0.01, "{h:?}");
+        assert!((h.top - h.bottom - 6.).abs() < 0.01, "{h:?}");
+        assert!((h.bottom - (g.bounds.min[2] + 4.)).abs() < 0.01, "{h:?}");
+    }
+    #[test]
+    fn a_slots_round_end_is_drilled_as_its_circle_though_the_slot_is_not_round() {
+        let mesh = mesh::normalize(slotted_plate()).unwrap();
+        let (setup, mut op, _) = fixture(Strategy::Drill);
+        // The right end's half round, round X6 Y0.
+        let end = walls_where(&setup, &mesh, |c| {
+            c[0] > 6.01 && (c[0] - 6.).hypot(c[1]) < 3.1
+        });
+        assert!(end.len() >= 8, "{end:?}");
+        // The slot its walls pick is no round hole.
+        let slot = crate::pocket::hole_walls(&setup, &mesh, end[0]).unwrap();
+        let slot: HashSet<usize> = slot.into_iter().collect();
+        let picked = crate::pocket::holes(&setup, &slot, &mesh).unwrap();
+        assert!(crate::cam::drill_holes_of(&setup, &mesh, &picked)[0].is_none());
+        let a = arc_at(&setup, &mesh, end[0]).unwrap();
+        assert_eq!(a.walls, end);
+        assert!(
+            (a.r - 3.).abs() < 0.001 && (a.span - 180.).abs() < 0.01,
+            "{a:?}"
+        );
+        assert!(
+            (a.centre[0] - 6.).abs() < 0.001 && a.centre[1].abs() < 0.001,
+            "{a:?}"
+        );
+        picking(&mut op, &mesh, &a.walls);
+        let found = holes(&setup, &op, &mesh).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        let h = &found[0];
+        assert!(h.through && (h.diameter - 6.).abs() < 0.01, "{h:?}");
+        assert!(
+            (h.center[0] - 6.).abs() < 0.001 && h.center[1].abs() < 0.001,
+            "{h:?}"
+        );
+    }
+    #[test]
+    fn a_bosss_wall_is_no_arc_and_a_whole_bores_walls_are_its_hole() {
+        // A Ø24 disc with a Ø8 bore 8 mm deep (`cam::tests::cup`, on a base).
+        let section = [
+            (0., 0.),
+            (12., 0.),
+            (12., 10.),
+            (4., 10.),
+            (4., 2.),
+            (0., 2.),
+        ];
+        let mesh = mesh::normalize(crate::cam::tests::revolved(&section)).unwrap();
+        let (setup, mut op, _) = fixture(Strategy::Drill);
+        let outside = walls_where(&setup, &mesh, |c| c[0].hypot(c[1]) > 11.);
+        let bore = walls_where(&setup, &mesh, |c| c[0].hypot(c[1]) < 4.1);
+        assert_eq!((outside.len(), bore.len()), (64, 64));
+        assert_eq!(arc_at(&setup, &mesh, outside[0]), Err(NoArc::Outside));
+        assert_eq!(arc_at(&setup, &mesh, bore[0]), Err(NoArc::Whole));
+        // Picked by its walls, the bore is drilled as before: whole, no arc.
+        picking(&mut op, &mesh, &bore);
+        assert!(drilled_arcs(&setup, &mesh, &bore.iter().copied().collect()).is_empty());
+        let found = holes(&setup, &op, &mesh).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].arc.is_none() && (found[0].diameter - 8.).abs() < 0.02);
+        // Half its walls are part of that whole hole: refused as before, as
+        // picked only in part, not drilled as an arc.
+        let half: Vec<usize> = (bore.iter().copied())
+            .filter(|&id| {
+                let g = Geometry::new(&setup, &mesh);
+                (g.triangles.iter())
+                    .filter(|t| t.feature == Some(id))
+                    .all(|t| t.p.iter().all(|p| p[1] >= -1e-4))
+            })
+            .collect();
+        assert!(half.len() >= 30 && half.len() < 64, "{}", half.len());
+        assert!(drilled_arcs(&setup, &mesh, &half.iter().copied().collect()).is_empty());
+        picking(&mut op, &mesh, &half);
+        assert!(holes(&setup, &op, &mesh).is_err());
+    }
+}

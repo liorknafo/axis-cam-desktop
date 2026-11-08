@@ -171,6 +171,19 @@ pub fn holes_by_angle(
         let g = crate::cam::Geometry::new(&posed, mesh);
         let turned = crate::stock::Placement::new(mesh, Some(&posed)).rotation();
         let (mut up, mut down, mut faces, mut tried) = (vec![], vec![], vec![], HashSet::new());
+        // A Drill's arcs (`cam::arcs`) this angle turns up, the first to:
+        // each is drilled from above here, as a face is.
+        if op.strategy == crate::model::Strategy::Drill {
+            for arc in crate::cam::arcs::drilled_arcs(&posed, mesh, &picked) {
+                tried.extend(arc.walls.iter().copied());
+                if crate::cam::arcs::opens_up(&g, &arc)
+                    && !arc.walls.iter().any(|w| done.contains(w))
+                {
+                    done.extend(arc.walls.iter().copied());
+                    faces.extend(arc.walls);
+                }
+            }
+        }
         for &id in &ids {
             if tried.contains(&id) {
                 continue;
@@ -422,9 +435,19 @@ impl Document {
         if !is_indexed(setup) || up(setup) {
             return setup.clone();
         }
-        (angles(setup).unwrap_or_default().into_iter())
+        let posed: Vec<Setup> = (angles(setup).unwrap_or_default().into_iter())
             .filter_map(|a| self.setup_at(setup, si, a, mesh).ok())
-            .find(|posed| up(posed))
+            .collect();
+        // Else the first that turns up the part of a round wall it is a
+        // facet of, which a Drill takes (`cam::arcs`).
+        let arc_up = |posed: &Setup| {
+            crate::cam::arcs::arc_at(posed, mesh, id).is_ok_and(|a| {
+                crate::cam::arcs::opens_up(&crate::cam::Geometry::new(posed, mesh), &a)
+            })
+        };
+        (posed.iter().find(|p| up(p)))
+            .or_else(|| std::iter::once(setup).chain(&posed).find(|p| arc_up(p)))
+            .cloned()
             .unwrap_or_else(|| setup.clone())
     }
     /// What the Geometry tab lists of operation `op` of setup `si` that picks

@@ -5911,6 +5911,42 @@ flood = { pin = 8 }
         let _ = a.view();
         render_png(&a, size, &out.join("3-no-such-file.png"));
     }
+    /// Pictures of a Drill picking the half hole on a block's front edge by
+    /// a click on its wall (`cam::arcs`), its Geometry tab listing it, as
+    /// PNGs in
+    /// `$AXIS_RENDER_DIR` (default /tmp/half-hole).
+    #[test]
+    #[ignore]
+    fn render_a_half_hole_picked_in_a_drill() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/half-hole".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let mut a = pocket_app(crate::cam::arcs::tests::notched_block(Some(6.)));
+        let mut drill = crate::model::Tool::new("T9 Drill 10", "Drill", "10");
+        drill.p.insert("number".into(), "9".into());
+        let tool = drill.id.clone();
+        a.doc.tools.push(drill);
+        a.doc.setup_mut().operations[0] = Operation::new(Strategy::Drill, tool);
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Tab("Geometry".into()));
+        if !a.picking {
+            let _ = a.update(Message::PickMode);
+        }
+        let _ = a.update(Message::Camera("ISO"));
+        let size = iced::Size::new(1600., 1100.);
+        let _ = a.view();
+        render_png(&a, size, &out.join("1-before.png"));
+        let wall = surface_at(&a, |id, c| {
+            crate::pocket::is_wall(a.doc.setup(), a.part_mesh().unwrap(), id)
+                && (c[0].hypot(c[1] + 10.) - 5.).abs() < 0.1
+        });
+        let _ = a.update(Message::Surface(wall));
+        let _ = a.view();
+        render_png(&a, size, &out.join("2-picked.png"));
+        std::fs::write(out.join("status.txt"), &a.status).unwrap();
+    }
     /// Pictures of a hole's outline under the pointer seen from above, on
     /// the outline and in the opening, and of the hole picked by a click.
     #[test]
@@ -19646,6 +19682,100 @@ soft_max = 180.0
             .p
             .insert("holes".into(), crate::model::DRILL_HOLES[1].into());
         assert!(a.hole_outlines().is_empty());
+    }
+    #[test]
+    fn a_drill_picks_a_half_hole_on_the_parts_edge_by_a_click_and_drills_its_whole_circle() {
+        let mut a = pocket_app(crate::cam::arcs::tests::notched_block(None));
+        let tool = a.doc.setup().operations[0].tool.clone();
+        a.doc.setup_mut().operations[0] = Operation::new(Strategy::Drill, tool);
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Tab("Geometry".into()));
+        if !a.picking {
+            let _ = a.update(Message::PickMode);
+        }
+        // A click on a wall of the half hole round X0 Y−10 picks its arc.
+        let wall = surface_at(&a, |id, c| {
+            crate::pocket::is_wall(a.doc.setup(), a.part_mesh().unwrap(), id)
+                && (c[0].hypot(c[1] + 10.) - 5.).abs() < 0.1
+        });
+        let _ = a.update(Message::Surface(wall));
+        assert_eq!(
+            a.status,
+            "Picked the 180° arc at X0.00 Y-10.00: its walls are blue. The Drill drills its whole Ø10 circle round its centre. With only part of the drill in the part, it is pushed toward the open side: feed it gently, or clamp a block against the opening."
+        );
+        assert_eq!(
+            a.operation()
+                .unwrap()
+                .surfaces
+                .as_ref()
+                .map(|s| s.ids.len()),
+            Some(36)
+        );
+        let mesh = a.part_mesh().unwrap().clone();
+        let holes = a.drill_holes(a.operation().unwrap(), &mesh);
+        let holes = holes.as_ref().as_ref().unwrap();
+        assert_eq!(holes.len(), 1);
+        let h = &holes[0];
+        assert!(h.through && (h.diameter - 10.).abs() < 0.01, "{h:?}");
+        let row = "✓ Ø10.00 (opening Ø10.00) · X0.00 Y-10.00 · depth 10.00 mm · through · 180° arc · remove";
+        shows(&a, &["1 hole to drill", row]);
+        // With a Ø10 drill it raises nothing and drills down through there.
+        let mut drill = crate::model::Tool::new("T9 Drill 10", "Drill", "10");
+        drill.p.insert("number".into(), "9".into());
+        let drill_id = drill.id.clone();
+        a.doc.tools.push(drill);
+        a.operation_mut().unwrap().tool = drill_id;
+        assert_eq!(a.op_issues(), Vec::<String>::new());
+        let _ = a.update(Message::Generate);
+        let plan = &a.simulation.as_ref().expect(&a.status).plan;
+        let feeds: Vec<[f32; 3]> = (plan.moves.iter())
+            .filter(|m| m.motion == crate::simulation::Motion::Feed)
+            .map(|m| m.to)
+            .collect();
+        assert!(!feeds.is_empty());
+        assert!(
+            feeds
+                .iter()
+                .all(|p| p[0].abs() < 0.01 && (p[1] + 10.).abs() < 0.01),
+            "{feeds:?}"
+        );
+        let lowest = feeds.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min);
+        assert!(lowest <= h.bottom + 0.01, "{lowest} {h:?}");
+        // Its remove button drops it, as a second click on it does.
+        let _ = a.update(Message::Tab("Geometry".into()));
+        if !a.picking {
+            let _ = a.update(Message::PickMode);
+        }
+        let _ = a.update(Message::Surface(h.arc.as_ref().unwrap().walls[0]));
+        assert_eq!(a.status, "Dropped the 180° arc at X0.00 Y-10.00.");
+        assert_eq!(
+            a.operation()
+                .unwrap()
+                .surfaces
+                .as_ref()
+                .map(|s| s.ids.len()),
+            Some(0)
+        );
+        lacks(&a, &[row]);
+        let _ = a.update(Message::Surface(wall));
+        let _ = a.update(Message::Surface(wall));
+        assert_eq!(a.status, "Dropped the 180° arc at X0.00 Y-10.00.");
+        // The flat front wall beside it is no hole, and no arc.
+        let front = surface_at(&a, |id, c| {
+            crate::pocket::is_wall(a.doc.setup(), a.part_mesh().unwrap(), id)
+                && (c[1] + 10.).abs() < 0.01
+        });
+        let _ = a.update(Message::Surface(front));
+        assert!(!a.status.contains("arc"), "{}", a.status);
+        assert_eq!(
+            a.operation()
+                .unwrap()
+                .surfaces
+                .as_ref()
+                .map(|s| s.ids.len()),
+            Some(0)
+        );
     }
     /// An app with `tris` imported and its first operation a Pocket.
     fn pocket_app(tris: Vec<[[f32; 3]; 3]>) -> App {

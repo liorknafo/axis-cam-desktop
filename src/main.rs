@@ -4013,6 +4013,67 @@ impl App {
     /// The holes the selected walls of a Pocket or an inside Contour pick
     /// (`pocket::holes`), for its Geometry tab: kept until the part, the
     /// setup's placement or the selected surfaces change, as `drill_holes` is.
+    /// A click on surface `n`, a facet of the part of a round wall `arc`, in
+    /// a Drill whose selection is `picked`: drops the arc when `n` is
+    /// picked, else picks it (all its facets), when a drill fits down it.
+    fn pick_arc(
+        &mut self,
+        setup: &model::Setup,
+        n: usize,
+        arc: cam::arcs::Arc,
+        picked: &std::collections::HashSet<usize>,
+    ) -> Task<Message> {
+        let Some(mesh) = self.imported_mesh.as_ref() else {
+            return Task::none();
+        };
+        let fingerprint = mesh.fingerprint.clone();
+        let zero = |v: f32| if v.abs() < 0.005 { 0. } else { v };
+        let (x, y) = (zero(arc.centre[0]), zero(arc.centre[1]));
+        let dropping = picked.contains(&n);
+        if !dropping && !cam::arcs::on_stock(setup, mesh, &arc) {
+            self.status = format!(
+                "The centre of the {:.0}° arc at X{x:.2} Y{y:.2} (Ø{:.2}) is off the stock: a drill there would go down beside the part, where it is held.",
+                arc.span,
+                arc.r * 2.
+            );
+            return Task::none();
+        }
+        let hole = cam::arcs::arc_hole(&cam::Geometry::new(setup, mesh), &arc);
+        let said = match (&hole, dropping) {
+            (_, true) => format!("Dropped the {:.0}° arc at X{x:.2} Y{y:.2}.", arc.span),
+            (Some(h), false) => format!(
+                "Picked the {:.0}° arc at X{x:.2} Y{y:.2}: its walls are blue. The Drill drills its whole Ø{} circle round its centre. With only part of the drill in the part, it is pushed toward the open side: feed it gently, or clamp a block against the opening.",
+                arc.span,
+                crate::post::exact_mm(cam::largest_drill(h))
+            ),
+            (None, false) => {
+                self.status = format!(
+                    "No drill fits down the {:.0}° arc at X{x:.2} Y{y:.2}: the part comes inside its Ø{:.2} circle above the floor under it.",
+                    arc.span,
+                    arc.r * 2.
+                );
+                return Task::none();
+            }
+        };
+        if let Some(o) = self.operation_mut() {
+            let selected = o.surfaces.get_or_insert_with(|| surface::Selection {
+                mesh_fingerprint: fingerprint.clone(),
+                ids: vec![],
+            });
+            if selected.mesh_fingerprint != fingerprint {
+                selected.mesh_fingerprint = fingerprint;
+                selected.ids.clear();
+            }
+            selected.ids.retain(|id| !arc.walls.contains(id));
+            if !dropping {
+                selected.ids.extend(&arc.walls);
+            }
+            o.geometry.clear();
+        }
+        self.touch();
+        self.status = said;
+        Task::none()
+    }
     pub(crate) fn pocket_holes(
         &self,
         op: &Operation,
@@ -5781,6 +5842,16 @@ impl App {
                         .and_then(|c| pocket::holes(&setup, c, mesh).ok())
                         .unwrap_or_default();
                     let drop = pocket::dropped(now, &picked, n, clicked.as_ref(), &this);
+                    // A click on a picked arc of a Drill drops it (`pick_arc`).
+                    if drill
+                        && wall
+                        && picked.contains(&n)
+                        && let Some(arc) = (cam::arcs::drilled_arcs(&setup, mesh, &picked))
+                            .into_iter()
+                            .find(|a| a.walls.contains(&n))
+                    {
+                        return self.pick_arc(&setup, n, arc, &picked);
+                    }
                     // A Drill drills round holes: it reads the hole as it
                     // drills it, and names it by the diameter it drills.
                     let round = if drill {
@@ -5788,6 +5859,22 @@ impl App {
                     } else {
                         vec![]
                     };
+                    // Where it picks no whole round hole, a Drill takes the
+                    // part of a round wall clicked (a half hole on the part's
+                    // edge, a slot's round end): it drills its whole circle
+                    // round its centre (`cam::arcs`). A click on it drops it.
+                    let no_round = found.is_err()
+                        || (!this.is_empty() && round.first().is_none_or(|r| r.is_none()));
+                    if drill && wall && drop.is_none() && no_round {
+                        match cam::arcs::arc_at(&setup, mesh, n) {
+                            Ok(arc) => return self.pick_arc(&setup, n, arc, &picked),
+                            Err(cam::arcs::NoArc::Outside) => {
+                                self.status = cam::arcs::OUTSIDE.into();
+                                return Task::none();
+                            }
+                            Err(_) => {}
+                        }
+                    }
                     if drill
                         && drop.is_none()
                         && let Some(h) = this.first()
