@@ -2583,6 +2583,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, (up, operations))| proposal::ProposedSetup {
                     machine: None,
+                    bar: None,
                     orientation: up.into(),
                     name: format!("Setup {}", i + 1),
                     origin: if i == 0 {
@@ -3239,6 +3240,41 @@ mod tests {
         assert!(json["total_minutes"].as_f64().unwrap() > 0.);
     }
     #[test]
+    fn a_planned_lathe_setup_turns_the_bar_and_the_cnc_drills_the_turned_part() {
+        use crate::proposal::tests::{turned, with_lathe};
+        let (doc, mesh, report) = with_lathe();
+        let (check, job) = check(&doc, &mesh, &report, &turned(&report));
+        assert!(check.passed, "{:?}", stages(&check));
+        let job = job.unwrap();
+        assert!(crate::lathe::is_lathe(&job.setups[0].machine));
+        let split = check.minutes_by_machine.unwrap();
+        assert!(split.lathe > 0. && split.moving == 10., "{split:?}");
+        // The five turns, then the CNC's drilling of the turned part.
+        let setups: Vec<usize> = check.operations.iter().map(|o| o.setup).collect();
+        assert_eq!(setups, [1, 1, 1, 1, 1, 2]);
+        // The bar in the 3-jaw: its jaws' 30 mm gripped, the rest out; the
+        // part's top 2 mm under the bar's end, on the axis.
+        let lathe = &job.setups[0];
+        assert_eq!(get(&lathe.p, "stock_type"), "Round bar");
+        assert_eq!(
+            (get(&lathe.p, "grip"), get(&lathe.p, "stickout")),
+            ("30", "80")
+        );
+        assert_eq!(get(&lathe.p, "origin"), crate::turn::ZERO);
+        let stock = job.setup_stock(0, Some(&mesh)).unwrap();
+        let part = crate::simulation::part_box(lathe, &mesh);
+        assert!(
+            (stock.max[2] - part.max[2] - 2.).abs() < 0.01,
+            "{stock:?} {part:?}"
+        );
+        assert!(((part.min[0] + part.max[0]) / 2.).abs() < 0.01);
+        // The user's setup starts from the turned part, with the zero planned.
+        let user = &job.setups[1];
+        assert_eq!(user.id, doc.setups[0].id);
+        assert_eq!(get(&user.p, "stock_source"), lathe.id);
+        assert_eq!(get(&user.p, "origin"), "Model origin");
+    }
+    #[test]
     fn a_planned_manual_facing_in_front_passes_and_the_model_gets_its_minutes_and_zeros() {
         use crate::proposal::tests::{milled, with_mill};
         let (doc, mesh, report) = with_mill();
@@ -3656,6 +3692,7 @@ mod totem {
             setups: vec![
                 ProposedSetup {
                     machine: None,
+                    bar: None,
                     orientation: "+Z".into(),
                     name: "Top".into(),
                     origin: "Stock top center".into(),
@@ -3701,6 +3738,7 @@ mod totem {
                 },
                 ProposedSetup {
                     machine: None,
+                    bar: None,
                     orientation: "-Z".into(),
                     name: "Underside".into(),
                     origin: "Stock top front-left".into(),

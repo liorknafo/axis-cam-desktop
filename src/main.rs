@@ -9011,7 +9011,7 @@ fn proposal_schema(args: &[String]) -> Result<String, String> {
         [project] => {
             let (doc, mesh) = planning_project(project)?;
             let report = analysis::report(&doc, &mesh)?;
-            proposal::schema_full(false, report.rotary.is_some(), !report.machines.is_empty())
+            proposal::schema_full(false, report.rotary.is_some(), proposal::Hands::of(&report))
         }
         _ => return Err("Usage: axis-cam --proposal-schema [<project.json>]".into()),
     };
@@ -9030,7 +9030,7 @@ fn planner_instructions(args: &[String]) -> Result<String, String> {
         false,
         false,
         report.rotary.is_some(),
-        !report.machines.is_empty(),
+        proposal::Hands::of(&report),
     ))
 }
 /// Checks a proposal file against a saved project with every planner check.

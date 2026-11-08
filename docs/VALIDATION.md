@@ -1770,3 +1770,28 @@ Design: `docs/superpowers/specs/2026-11-07-planner-hand-machines-design.md`. Pha
 - A stand-in model (Claude Sonnet) planned the manual-mill project from the instructions, report and schema alone, with `--check-plan`. Its manual-facing plan passed (59.5 min). It chose the CNC alone (9.9 min) as faster, which is right for that part. Its notes on unclear instructions were addressed.
 - No GPT model has planned with the manual mill through the app's ChatGPT sign-in.
 - Whether a model converts the report's corner-based positions into Box work coordinates well is untested.
+
+## The AI planner plans the lathe (7 November 2026, LIO-353, phase 2)
+
+- **The report.** The shaft fixture is Ø30 for 50 mm, then Ø20 for 20 mm, with a Ø4 hole 10 mm deep on its axis. About +Z it is round all along: Ø20 with the Ø4 hole for the top 9.5 mm, then Ø20 solid, then Ø30. About X it is not round, so it has no steps. The report lists the lathe's power feeds and its unknown dial, the lathe tools with their own sizes and machines, and the two chucks. Without a lathe none of this is told (`proposal::tests::the_report_turns_the_shaft_about_its_axis_and_lists_the_lathe_its_tools_and_chucks`).
+- **The schema.** `turn` and `bar` are added only with a lathe. The schema stays strict, and the shaft's plan reads back (`proposal::tests::the_schema_with_a_lathe_adds_turn_and_bar_and_stays_strict`).
+- **Refusals.** Each of these is refused with its message:
+  - a Turn on the CNC;
+  - a Face on the lathe;
+  - a part-off with a turning tool;
+  - a bar too thin or too short for the part;
+  - a first lathe setup without a bar;
+  - a bar on a CNC setup;
+  - a Turn without `turn`, and an unknown kind.
+
+  (`proposal::tests::lathe_work_off_the_lathe_and_a_bar_out_of_place_are_refused`)
+- **Checking.** The shaft turned from a Ø34 × 110 bar passes every stage: Face, Outside Ø30, Outside Ø20, Chamfer and Part off, then the CNC's drilling of the Ø4. In that plan:
+  - the jaws grip 30 mm and 80 mm stands out;
+  - the part's top is 2 mm under the bar's end, on the axis;
+  - the user's setup starts from the lathe setup, with the Model origin zero the plan gave it;
+  - the model gets the lathe's minutes and 10 min moving.
+
+  (`plan_check::tests::a_planned_lathe_setup_turns_the_bar_and_the_cnc_drills_the_turned_part`)
+- **Changing a plan.** `describe` gives the bar and each turn, and building that again keeps every setup and operation. A changed diameter writes only the turn's settings, and a bigger bar places the part afresh in the same setup (`proposal::tests::a_planned_lathe_setup_is_described_with_its_bar_and_turns_and_kept_by_a_change`).
+- **A run.** A scripted model plans the shaft. The instructions carry LATHE but not MANUAL MILL, the report carries `turning`, the applied job has the lathe setup first, and its dial guide builds (`planner::tests::a_plan_with_the_lathe_in_front_turns_the_bar_and_the_cnc_takes_the_part`).
+- **Inspected, not asserted.** `steps::tests::render_the_planned_lathe_steps` (ignored) draws every Steps screen of the planned lathe setup into `AXIS_RENDER_DIR`. They were looked at: the Hold screen shows the bar 80 out of the 3-jaw and 30 in it, the passes show the dials, and the Hand over says to hold the round part on a V-block or in soft jaws.

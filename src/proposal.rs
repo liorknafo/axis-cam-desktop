@@ -120,6 +120,10 @@ pub struct ProposedSetup {
     /// written for a job without hand machines) is the user's setup's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<usize>,
+    /// The round bar a lathe setup that takes the fresh stock turns; None for
+    /// every other setup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bar: Option<ProposedBar>,
     /// The A angles, degrees, this setup indexes to in setup 1's chuck
     /// instead of re-clamping the stock (every operation runs at each); None
     /// for a setup that is clamped.
@@ -183,6 +187,10 @@ pub struct ProposedOp {
     /// proposal for a job without a manual mill has none.
     #[serde(default, rename = "box", skip_serializing_if = "Option::is_none")]
     pub block: Option<ProposedBox>,
+    /// A Turn's kind and settings, or a lathe Drill's depth (`kind` Drill);
+    /// null for every other operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<ProposedTurn>,
     pub coolant: String,
     pub reason: String,
     /// When the planner changes a plan: the number of the current operation
@@ -248,6 +256,57 @@ pub struct ProposedBox {
     /// Null: 0.5.
     pub allowance: Option<f32>,
 }
+/// A lathe setup's round bar, mm: the part on its axis, its top `free_end`
+/// (null: `FREE_END`) below the bar's free end.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposedBar {
+    pub diameter: f32,
+    pub length: f32,
+    pub free_end: Option<f32>,
+}
+/// A Turn on the lathe, its fields as `lathe::turn_defaults` names them in
+/// lathe work coordinates (Z 0 at the free end, negative toward the chuck;
+/// diameters), null for the kind's default; or with `kind` Drill a lathe
+/// Drill's `depth`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposedTurn {
+    pub kind: String,
+    pub diameter: Option<f32>,
+    pub z_end: Option<f32>,
+    pub depth: Option<f32>,
+    pub finish: Option<f32>,
+    pub allowance: Option<f32>,
+    pub face_off: Option<f32>,
+    pub to_diameter: Option<f32>,
+    pub edge: Option<String>,
+    pub size: Option<f32>,
+    pub z: Option<f32>,
+    pub width: Option<f32>,
+    pub thread_side: Option<String>,
+    pub pitch: Option<f32>,
+    pub passes: Option<u32>,
+}
+impl ProposedTurn {
+    /// The numeric fields by their operation key.
+    fn numbers(&self) -> [(&'static str, Option<f32>); 12] {
+        [
+            ("diameter", self.diameter),
+            ("z_end", self.z_end),
+            ("depth", self.depth),
+            ("finish", self.finish),
+            ("allowance", self.allowance),
+            ("face_off", self.face_off),
+            ("to_diameter", self.to_diameter),
+            ("size", self.size),
+            ("z", self.z),
+            ("width", self.width),
+            ("pitch", self.pitch),
+            ("passes", self.passes.map(|n| n as f32)),
+        ]
+    }
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Unmachined {
@@ -309,11 +368,44 @@ pub fn schema_on(report: &PartReport) -> Value {
 /// The schema with `from` when `edit` (`schema_for`), and with the chuck
 /// and the A angles when `rotary` (`schema_on`).
 pub fn schema_with(edit: bool, rotary: bool) -> Value {
-    schema_full(edit, rotary, false)
+    schema_full(edit, rotary, Hands::NONE)
 }
-/// `schema_with`, and with `manual` (the report lists `machines` with a
-/// manual mill) every setup's `machine`, the Box strategy and its `box`.
-pub fn schema_full(edit: bool, rotary: bool, manual: bool) -> Value {
+/// The hand machines a plan may use, as the report's `machines` lists them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Hands {
+    pub mill: bool,
+    pub lathe: bool,
+}
+impl Hands {
+    pub const NONE: Self = Self {
+        mill: false,
+        lathe: false,
+    };
+    pub fn of(report: &PartReport) -> Self {
+        let has = |kind: &str| report.machines.iter().any(|m| m.kind == kind);
+        Self {
+            mill: has("Manual mill"),
+            lathe: has("Lathe"),
+        }
+    }
+    pub fn any(self) -> bool {
+        self.mill || self.lathe
+    }
+}
+/// The place of `coolant` among the required keys of `object`, where a
+/// strategy's own settings go.
+fn before_coolant(object: &mut Value, key: &str) {
+    let required = object["required"].as_array_mut().unwrap();
+    let at = (required.iter())
+        .position(|k| k == "coolant")
+        .unwrap_or(required.len());
+    required.insert(at, json!(key));
+}
+/// `schema_with`, and with hand machines (`hands`) every setup's `machine`;
+/// with a manual mill the Box strategy and its `box`, with a lathe the Turn
+/// strategy and its `turn`, and a lathe setup's `bar`.
+pub fn schema_full(edit: bool, rotary: bool, hands: Hands) -> Value {
+    let manual = hands.mill;
     let text = || json!({"type": "string"});
     let number = || json!({"type": "number"});
     let optional = || json!({"type": ["number", "null"]});
@@ -321,6 +413,9 @@ pub fn schema_full(edit: bool, rotary: bool, manual: bool) -> Value {
     let mut strategies: Vec<&str> = STRATEGIES.iter().map(|(name, _)| *name).collect();
     if manual {
         strategies.push("Box");
+    }
+    if hands.lathe {
+        strategies.push("Turn");
     }
     let chamfer = json!({"anyOf": [object(json!({
         "source": choice(&CHAMFER_SOURCES, false),
@@ -387,12 +482,29 @@ pub fn schema_full(edit: bool, rotary: bool, manual: bool) -> Value {
             "z_bottom": number(),
             "allowance": optional(),
         })), {"type": "null"}]});
-        let required = operation["required"].as_array_mut().unwrap();
-        let at = required
-            .iter()
-            .position(|k| k == "coolant")
-            .unwrap_or(required.len());
-        required.insert(at, json!("box"));
+        before_coolant(&mut operation, "box");
+    }
+    if hands.lathe {
+        let mut kinds = crate::lathe::TURN_KINDS.to_vec();
+        kinds.push("Drill");
+        operation["properties"]["turn"] = json!({"anyOf": [object(json!({
+            "kind": choice(&kinds, false),
+            "diameter": optional(),
+            "z_end": optional(),
+            "depth": optional(),
+            "finish": optional(),
+            "allowance": optional(),
+            "face_off": optional(),
+            "to_diameter": optional(),
+            "edge": choice(&crate::lathe::EDGES, true),
+            "size": optional(),
+            "z": optional(),
+            "width": optional(),
+            "thread_side": choice(&crate::lathe::THREAD_SIDES, true),
+            "pitch": optional(),
+            "passes": {"type": ["integer", "null"]},
+        })), {"type": "null"}]});
+        before_coolant(&mut operation, "turn");
     }
     if edit {
         operation["properties"]["from"] = from();
@@ -417,8 +529,15 @@ pub fn schema_full(edit: bool, rotary: bool, manual: bool) -> Value {
     if edit {
         setup["from"] = from();
     }
-    if manual {
+    if hands.any() {
         setup["machine"] = json!({"type": "integer"});
+    }
+    if hands.lathe {
+        setup["bar"] = json!({"anyOf": [object(json!({
+            "diameter": number(),
+            "length": number(),
+            "free_end": optional(),
+        })), {"type": "null"}]});
     }
     if rotary {
         setup["a_angles"] = json!({"type": ["array", "null"], "items": number()});
@@ -696,12 +815,15 @@ fn operation(
     let mut ids = p.surfaces.clone();
     ids.sort_unstable();
     ids.dedup();
-    let boxed = !report.machines.is_empty() && p.strategy == "Box";
+    let hands = Hands::of(report);
     let strategy = STRATEGIES
         .iter()
         .find(|(name, _)| *name == p.strategy)
         .map(|(_, s)| *s)
-        .or(boxed.then_some(Strategy::Box));
+        .or((hands.mill && p.strategy == "Box").then_some(Strategy::Box))
+        .or((hands.lathe && p.strategy == "Turn").then_some(Strategy::Turn));
+    let lathe = crate::lathe::is_lathe(on);
+    let centre = lathe && strategy == Some(Strategy::Drill);
     if strategy.is_none() {
         wrong.push(format!(
             "\"{}\" is not one of the eight available strategies.",
@@ -721,6 +843,16 @@ fn operation(
         ));
     }
     match strategy {
+        Some(Strategy::Turn) if !lathe => wrong.push(format!(
+            "Turn runs on a lathe only; {} is not one. Put it in a setup on the lathe.",
+            machine(on)
+        )),
+        Some(Strategy::Turn | Strategy::Drill) if lathe => {}
+        Some(_) if lathe => wrong.push(format!(
+            "{} cannot run on the lathe ({}): it takes only Turn and Drill.",
+            p.strategy,
+            machine(on)
+        )),
         Some(Strategy::Box) if !manual => wrong.push(format!(
             "Box is for a manual mill only; {} is not one. Use Face, Pocket or Contour here, or put the Box in a setup on the manual mill.",
             machine(on)
@@ -741,6 +873,63 @@ fn operation(
             "{} needs a CNC: the manual mill moves one axis at a time.",
             p.drill_cycle.as_deref().unwrap_or_default()
         ));
+    }
+    if centre
+        && !p
+            .drill_cycle
+            .as_deref()
+            .is_none_or(|c| [crate::model::DRILL_CYCLES[0], crate::model::TAPPING].contains(&c))
+    {
+        wrong.push(format!(
+            "{} is not for the lathe, which drills on the centre: give drill_cycle Drilling or Tapping.",
+            p.drill_cycle.as_deref().unwrap_or_default()
+        ));
+    }
+    let turning = strategy == Some(Strategy::Turn) || centre;
+    match (&p.turn, turning) {
+        (None, true) => wrong.push(if centre {
+            "A Drill on the lathe needs `turn` with kind Drill and its depth.".into()
+        } else {
+            "A Turn needs `turn`: its kind and fields.".into()
+        }),
+        (Some(_), false) => wrong.push(format!(
+            "turn is for a Turn or a Drill on the lathe only; set it to null for {}.",
+            p.strategy
+        )),
+        (Some(t), true) => {
+            let kinds = &crate::lathe::TURN_KINDS[..];
+            if centre && t.kind != "Drill" {
+                wrong.push("A Drill on the lathe gives turn.kind Drill.".into());
+            } else if !centre && !kinds.contains(&t.kind.as_str()) {
+                wrong.push(format!(
+                    "\"{}\" is not a Turn kind: {}.",
+                    t.kind,
+                    kinds.join(", ")
+                ));
+            }
+            if t.numbers()
+                .iter()
+                .any(|(_, v)| v.is_some_and(|v| !v.is_finite()))
+            {
+                wrong.push("turn has a number that is not finite.".into());
+            }
+            for (value, allowed, what) in [
+                (&t.edge, &crate::lathe::EDGES[..], "chamfer edge"),
+                (
+                    &t.thread_side,
+                    &crate::lathe::THREAD_SIDES[..],
+                    "thread side",
+                ),
+            ] {
+                if value.as_deref().is_some_and(|v| !allowed.contains(&v)) {
+                    wrong.push(format!(
+                        "\"{}\" is not a {what} choice.",
+                        value.as_deref().unwrap()
+                    ));
+                }
+            }
+        }
+        (None, false) => {}
     }
     match (&p.block, strategy) {
         (None, Some(Strategy::Box)) => {
@@ -881,7 +1070,11 @@ fn operation(
         return Err(wrong);
     };
     let kind = get(&tool.p, "type");
+    let turn_kind = p.turn.as_ref().map_or("", |t| t.kind.as_str());
     let suits = match strategy {
+        Strategy::Turn => crate::lathe::takes(turn_kind, kind),
+        Strategy::Drill if centre && suits_cycle(p, crate::model::TAPPING) => kind == "Tap",
+        Strategy::Drill if centre => kind == "Drill",
         Strategy::Face => ["Flat end mill", "Face mill"].contains(&kind),
         Strategy::Drill if suits_helical(p) => kind == "Flat end mill",
         Strategy::Drill if suits_cycle(p, crate::model::THREAD_MILLING) => kind == "Thread mill",
@@ -920,6 +1113,19 @@ fn operation(
             "T{} is a {kind}; Drill with Boring takes a boring head.",
             p.tool
         ));
+    } else if !suits && strategy == Strategy::Turn {
+        wrong.push(format!(
+            "T{} is a {kind}; a {turn_kind} turn takes a {}.",
+            p.tool,
+            crate::lathe::tool_for(turn_kind)
+                .unwrap_or("lathe tool")
+                .to_lowercase()
+        ));
+    } else if !suits && centre {
+        wrong.push(format!(
+            "T{} is a {kind}; the lathe drills on the centre with a drill in the tailstock (or a tap for Tapping).",
+            p.tool
+        ));
     } else if !suits {
         wrong.push(format!(
             "T{} is a {kind}, which {} cannot use.",
@@ -934,6 +1140,10 @@ fn operation(
     let plane = plane_of(orientation, &ids);
     let floor = strategy == Strategy::Pocket || (strategy == Strategy::Contour && inside);
     match strategy {
+        _ if turning && !ids.is_empty() => wrong.push(
+            "The lathe works about its axis; the surfaces list of a Turn or a Drill on the lathe must be empty.".into(),
+        ),
+        _ if turning => {}
         Strategy::Face if sides => {}
         Strategy::Face if !plane.is_some_and(|pl| pl.kind == "top") => wrong.push(format!(
             "Facing needs surfaces of the top plane in orientation {}.",
@@ -994,7 +1204,9 @@ fn operation(
         )),
         _ => {}
     }
-    if strategy == Strategy::Drill && p.through == Some(true) && si > 0 {
+    if centre {
+        // On the centre the depth says how far: through is not used.
+    } else if strategy == Strategy::Drill && p.through == Some(true) && si > 0 {
         // Later setups may not go below the part's underside (plan check).
         wrong.push(format!(
             "through is true, but in setup {} the part rests on the face where the drill would exit, so it cannot break through. Drill through holes in setup 1, or set through to false and list the unfinished exit in unmachined.",
@@ -1141,6 +1353,15 @@ fn operation(
                 }
             }
         }
+        // On the lathe's centre: to a depth, from the tailstock.
+        Strategy::Drill if centre => {
+            set(
+                "cycle",
+                p.drill_cycle.clone().unwrap_or_else(|| "Drilling".into()),
+            );
+            let depth = p.turn.as_ref().and_then(|t| t.depth).unwrap_or(20.);
+            set("depth", depth.to_string());
+        }
         Strategy::Drill => {
             set(
                 "cycle",
@@ -1188,6 +1409,8 @@ fn operation(
                 set(key, value);
             }
         }
+        // Set after the match: the kind's own fields.
+        Strategy::Turn => {}
         Strategy::Box => {
             let b = p.block.clone().unwrap_or_default();
             for (key, value) in crate::model::BOX_FIELDS
@@ -1202,6 +1425,31 @@ fn operation(
     }
     if let Some(entry) = &p.pocket_entry {
         set("pocket_entry", entry.clone());
+    }
+    if strategy == Strategy::Turn {
+        let t = p.turn.clone().unwrap_or_default();
+        // The kind's defaults bring an rpm of their own: the plan's stays.
+        let rpm = op.p.get("rpm").cloned();
+        op.set_turn_kind(&t.kind);
+        if let Some(rpm) = rpm {
+            op.p.insert("rpm".into(), rpm);
+        }
+        for (key, value) in t.numbers() {
+            if let Some(value) = value {
+                op.p.insert(key.into(), value.to_string());
+            }
+        }
+        for (key, value) in [("edge", &t.edge), ("thread_side", &t.thread_side)] {
+            if let Some(value) = value {
+                op.p.insert(key.into(), value.clone());
+            }
+        }
+        if clip(&p.name, 60).is_empty() {
+            op.p.insert("name".into(), format!("Turn · {}", t.kind));
+        }
+    }
+    if centre {
+        op.geometry.clear();
     }
     if hand {
         crate::manual::snap(on, &mut op.p);
@@ -1428,12 +1676,14 @@ pub struct Current {
 /// `op` as a proposal writes it, or None when a proposal cannot (see
 /// [`KeptOp`]). Fields its strategy does not use are null, and `reason` is
 /// empty; a coolant that is not a choice reads `Off`.
-fn described(op: &Operation, tools: &[Tool]) -> Option<ProposedOp> {
+fn described(op: &Operation, tools: &[Tool], on: &crate::model::Machine) -> Option<ProposedOp> {
     let strategy = STRATEGIES
         .iter()
         .find(|(_, s)| *s == op.strategy)
         .map(|(name, _)| *name)
-        .or((op.strategy == Strategy::Box).then_some("Box"))?;
+        .or((op.strategy == Strategy::Box).then_some("Box"))
+        .or((op.strategy == Strategy::Turn).then_some("Turn"))?;
+    let centre = op.on_centre(on);
     let tool = tools.iter().find(|t| t.id == op.tool)?.number()?;
     if op.surfaces.is_none() && !op.geometry.is_empty() {
         return None;
@@ -1520,6 +1770,50 @@ fn described(op: &Operation, tools: &[Tool]) -> Option<ProposedOp> {
             } else {
                 p.bottom_offset = value("bottom");
             }
+        }
+        // On the lathe's centre: its cycle and depth.
+        Strategy::Drill if centre => {
+            let cycle = get(&op.p, "cycle");
+            p.drill_cycle = Some(
+                if cycle == crate::model::TAPPING {
+                    cycle
+                } else {
+                    CYCLES[0]
+                }
+                .into(),
+            );
+            p.turn = Some(ProposedTurn {
+                kind: "Drill".into(),
+                depth: value("depth"),
+                ..ProposedTurn::default()
+            });
+        }
+        Strategy::Turn => {
+            let kind = get(&op.p, "turn_kind");
+            let has = |k: &str| {
+                crate::lathe::turn_defaults(kind)
+                    .iter()
+                    .any(|(key, _)| *key == k)
+            };
+            let given = |k: &str| value(k).filter(|_| has(k));
+            let text = |k: &str| has(k).then(|| get(&op.p, k).to_string());
+            p.turn = Some(ProposedTurn {
+                kind: kind.into(),
+                diameter: given("diameter"),
+                z_end: given("z_end"),
+                depth: given("depth"),
+                finish: given("finish"),
+                allowance: given("allowance"),
+                face_off: given("face_off"),
+                to_diameter: given("to_diameter"),
+                edge: text("edge"),
+                size: given("size"),
+                z: given("z"),
+                width: given("width"),
+                thread_side: text("thread_side"),
+                pitch: given("pitch"),
+                passes: given("passes").map(|n| n.max(0.).round() as u32),
+            });
         }
         Strategy::Drill => {
             let cycle = get(&op.p, "cycle");
@@ -1686,6 +1980,27 @@ fn merged(base: &Operation, fresh: &Operation, p: &ProposedOp, d: &ProposedOp) -
                 "allowance",
             ],
         ),
+        (
+            p.turn != d.turn,
+            &[
+                "turn_kind",
+                "face_off",
+                "to_diameter",
+                "diameter",
+                "z_end",
+                "depth",
+                "finish",
+                "edge",
+                "size",
+                "z",
+                "width",
+                "thread_side",
+                "pitch",
+                "passes",
+                "allowance",
+                "name",
+            ],
+        ),
     ] {
         if changed {
             copy(keys);
@@ -1702,6 +2017,30 @@ fn merged(base: &Operation, fresh: &Operation, p: &ProposedOp, d: &ProposedOp) -
         op.geometry.clone_from(&fresh.geometry);
     }
     op
+}
+/// The fresh bar a lathe setup turns, as a proposal gives it (`free_end`
+/// null: as the setup places the part); None for any other setup.
+fn described_bar(setup: &Setup) -> Option<ProposedBar> {
+    (crate::lathe::is_lathe(&setup.machine)
+        && get(&setup.p, "stock_source") == "fresh"
+        && get(&setup.p, "stock_type") == "Round bar")
+        .then(|| {
+            Some(ProposedBar {
+                diameter: num(&setup.p, "stock_diameter")?,
+                length: num(&setup.p, "stock_length")?,
+                free_end: None,
+            })
+        })
+        .flatten()
+}
+/// How far the part's top stands in from the free end of a lathe setup's
+/// bar, to a hundredth.
+fn free_end_of(setup: &Setup, mesh: &Mesh) -> f32 {
+    let part = crate::simulation::part_box(setup, mesh);
+    crate::stock::resolve(setup, Some(mesh))
+        .map(|r| ((r.stock.max[2] - part.max[2]) * 100.).round() / 100.)
+        .unwrap_or(FREE_END)
+        .max(0.)
 }
 /// What a proposal writes of setup `si` of `doc`, the planner's last note
 /// for setup 1 as its `workholding`: its name, work zero, workholding note
@@ -1794,7 +2133,7 @@ pub fn describe(doc: &Document, report: &PartReport) -> Result<Current, String> 
         let mut operations = vec![];
         for (oi, op) in setup.operations.iter().enumerate() {
             number += 1;
-            match described(op, &doc.tools) {
+            match described(op, &doc.tools, &setup.machine) {
                 Some(p) => operations.push(ProposedOp {
                     from: Some(number),
                     ..p
@@ -1809,7 +2148,9 @@ pub fn describe(doc: &Document, report: &PartReport) -> Result<Current, String> 
             }
         }
         let (name, origin, workholding, holder) = setup_fields(doc, si);
+        let bar = described_bar(setup);
         setups.push(ProposedSetup {
+            bar,
             orientation: up.into(),
             name,
             origin,
@@ -1981,6 +2322,131 @@ fn in_chuck(setup: &mut Setup, chuck: &ProposedChuck, up: &str, mesh: &Mesh) -> 
     }
     Ok(())
 }
+/// Makes `setup` a lathe setup turning about the vertical axis of `up`: the
+/// part on the axis (`analysis::on_axis`), the work zero on the free end,
+/// held in `holder` or else the library's 3-jaw on the lathe (any chuck on
+/// it when there is none). With `bar`, a fresh round bar that the part
+/// stands in, its top `free_end` below the bar's free end.
+fn on_lathe(
+    doc: &Document,
+    setup1: &Setup,
+    setup: &mut Setup,
+    up: &str,
+    bar: Option<&ProposedBar>,
+    holder: Option<&crate::holding::Holder>,
+    mesh: &Mesh,
+) -> Result<(), String> {
+    let placed = analysis::on_axis(setup1, up, mesh).ok_or("There is no such orientation.")?;
+    for key in ["rx", "ry", "rz", "tx", "ty", "tz"] {
+        setup.p.insert(key.into(), get(&placed.p, key).into());
+    }
+    setup.p.insert("origin".into(), crate::turn::ZERO.into());
+    if let Some(bar) = bar {
+        let free_end = bar.free_end.unwrap_or(FREE_END);
+        if !(bar.diameter.is_finite()
+            && bar.diameter > 0.
+            && bar.length.is_finite()
+            && bar.length > 0.)
+        {
+            return Err("bar needs a positive diameter and length.".into());
+        }
+        if !(free_end.is_finite() && free_end >= 0.) {
+            return Err("bar.free_end cannot be negative.".into());
+        }
+        let profile = crate::turn::profile(&placed, mesh);
+        let largest = 2. * profile.iter().map(|s| s[3]).fold(0., f32::max);
+        let length = profile.iter().map(|s| s[1]).fold(0., f32::max);
+        if largest > bar.diameter + 1e-3 {
+            return Err(format!(
+                "About the axis of {up} the part is Ø{:.2}: it needs a bar of at least that, not Ø{}.",
+                (largest * 100.).ceil() / 100.,
+                bar.diameter
+            ));
+        }
+        if length + free_end > bar.length + 1e-3 {
+            return Err(format!(
+                "Along the axis of {up} the part is {:.2} mm long: with {free_end} mm beyond it the bar must be at least {:.2} mm, more for the jaws, not {} mm.",
+                length,
+                ((length + free_end) * 100.).ceil() / 100.,
+                bar.length
+            ));
+        }
+        let tz = num(&placed.p, "tz").unwrap_or(0.) + bar.length - free_end - length;
+        let p = &mut setup.p;
+        p.insert("tz".into(), tz.to_string());
+        p.insert("stock_type".into(), "Round bar".into());
+        p.insert("stock_diameter".into(), bar.diameter.to_string());
+        p.insert("stock_length".into(), bar.length.to_string());
+    }
+    if bar.is_none() {
+        // What an earlier setup left: the part stands out of the jaws by
+        // its length and the free end.
+        let length = crate::turn::profile(&placed, mesh)
+            .iter()
+            .map(|s| s[1])
+            .fold(0., f32::max);
+        setup
+            .p
+            .insert("stickout".into(), (length + FREE_END).to_string());
+    }
+    let chucks = || {
+        doc.workholding
+            .iter()
+            .filter(|h| h.kind() == "Chuck" && h.fits(&setup.machine))
+    };
+    let chuck = match holder {
+        Some(h) if h.kind() != "Chuck" => {
+            return Err(format!(
+                "A lathe setup is held in a Chuck, not a {}.",
+                h.kind()
+            ));
+        }
+        Some(h) => h.id.clone(),
+        None => chucks()
+            .find(|h| get(&h.p, "jaws") == "3")
+            .or_else(|| chucks().next())
+            .map(|h| h.id.clone())
+            .ok_or("No chuck in the library fits the lathe: the user must add one on the Workholding page.")?,
+    };
+    for key in ["vise_axis", "vise_offset", "vise_grip", "clamps", "grip"] {
+        setup.p.remove(key);
+    }
+    setup.p.insert("holding".into(), "Chuck".into());
+    setup.p.insert("holder".into(), chuck);
+    Ok(())
+}
+/// How far past the deepest cut of a lathe setup the jaws stay: the turn
+/// module's clearance and a millimetre more.
+const LATHE_CLEAR: f32 = crate::turn::CLEAR + 1.;
+/// How deep below the free end a lathe setup's operations cut: an Outside,
+/// Bore or Thread to `z_end`, a Groove from `z`, a Part off to `z` less the
+/// blade's width, a centre Drill to its `depth`.
+fn lathe_reach(doc: &Document, setup: &Setup) -> f32 {
+    let mut deepest = 0f32;
+    for op in setup.operations.iter().filter(|o| o.enabled) {
+        let n = |k: &str| num(&op.p, k);
+        let z = if op.strategy == Strategy::Drill {
+            n("depth").map(|d| -d)
+        } else {
+            match get(&op.p, "turn_kind") {
+                "Outside" | "Bore" | "Thread" => n("z_end"),
+                "Groove" => n("z"),
+                "Part off" => {
+                    let width = (doc.tools.iter())
+                        .find(|t| t.id == op.tool)
+                        .and_then(|t| num(&t.p, "width"))
+                        .unwrap_or(0.);
+                    n("z").map(|z| z - width)
+                }
+                _ => None,
+            }
+        };
+        if let Some(z) = z.filter(|z| z.is_finite()) {
+            deepest = deepest.min(z);
+        }
+    }
+    -deepest
+}
 /// Builds the job a proposal describes. Setup 1 keeps the user's machine,
 /// stock, work zero and fixture; its operations and all later setups are
 /// replaced. Returns every reference problem instead when there is any.
@@ -2137,6 +2603,12 @@ pub fn build(
             continue;
         };
         let hand = crate::manual::is_hand(on);
+        if proposed.bar.is_some() && !crate::lathe::is_lathe(on) {
+            wrong(
+                None,
+                "bar is for a setup on the lathe only; set it to null.".into(),
+            );
+        }
         // Setup 1 is held by the user's own entry, so for it `holder` only
         // says which that is; a later setup is held by the entry it names.
         let holder = proposed.holder.and_then(|number| {
@@ -2343,7 +2815,11 @@ pub fn build(
                     _ => proposed.holder != *holder,
                 })
         };
-        if si != u && !angled && changed(1) && !work_zeros().contains(&proposed.origin.as_str()) {
+        if (si != u || si > 0)
+            && !angled
+            && changed(1)
+            && !work_zeros().contains(&proposed.origin.as_str())
+        {
             wrong(
                 None,
                 format!("\"{}\" is not a work zero choice.", proposed.origin),
@@ -2368,6 +2844,14 @@ pub fn build(
             {
                 wrong(None, message);
             }
+            // Behind a lathe setup the stock its zero was on is cut all
+            // round: the plan gives its zero as for a later setup. Behind
+            // manual-mill setups alone it keeps the user's.
+            let turned = (proposal.setups[..si].iter())
+                .any(|s| machine_of(s).is_some_and(|m| crate::lathe::is_lathe(m)));
+            if turned && changed(1) {
+                setup.p.insert("origin".into(), proposed.origin.clone());
+            }
             setup
         } else if let Some(mut setup) = indexed {
             setup
@@ -2378,13 +2862,35 @@ pub fn build(
             let mut setup = doc.setups[b].clone();
             // A manual setup kept and put first takes the fresh stock as
             // the user's setup defines it: its stock, placement and zero.
-            if si == 0 && hand {
+            if si == 0 && crate::manual::is_manual(on) {
                 for (k, v) in &setup1.p {
                     if k.starts_with("stock_")
                         || ["rx", "ry", "rz", "tx", "ty", "tz", "origin"].contains(&k.as_str())
                     {
                         setup.p.insert(k.clone(), v.clone());
                     }
+                }
+            }
+            // A lathe setup whose bar the proposal changes is placed in it
+            // afresh; one it keeps stays as the user left it. A bar without
+            // `free_end` keeps the part as far in from its end as it is.
+            if crate::lathe::is_lathe(on) && proposed.bar != described_bar(&setup) {
+                let bar = proposed.bar.clone().filter(|_| si == 0).map(|mut bar| {
+                    if bar.free_end.is_none() && described_bar(&setup).is_some() {
+                        bar.free_end = Some(free_end_of(&setup, mesh));
+                    }
+                    bar
+                });
+                if let Err(message) = on_lathe(
+                    doc,
+                    setup1,
+                    &mut setup,
+                    orientation.up,
+                    bar.as_ref(),
+                    holder,
+                    mesh,
+                ) {
+                    wrong(None, message);
                 }
             }
             if changed(1) {
@@ -2412,6 +2918,38 @@ pub fn build(
                     setup.p.remove(key);
                 }
             }
+            setup
+        } else if crate::lathe::is_lathe(on) {
+            // A lathe setup: the first turns the fresh bar it names; a later
+            // one what the setup before it left.
+            let mut setup = Setup::new(on.clone(), get(&setup1.p, "offset"));
+            let bar = match (&proposed.bar, si == 0) {
+                (None, true) => {
+                    wrong(
+                        None,
+                        "The first setup, on the lathe, turns a fresh bar: give `bar`.".into(),
+                    );
+                    None
+                }
+                (Some(_), false) => {
+                    wrong(None, "Only the first setup takes a fresh bar: a lathe setup after another turns what it left, so give bar null.".into());
+                    None
+                }
+                (bar, _) => bar.as_ref(),
+            };
+            if let Err(message) =
+                on_lathe(doc, setup1, &mut setup, orientation.up, bar, holder, mesh)
+            {
+                wrong(None, message);
+            }
+            if si > 0 {
+                setup
+                    .p
+                    .insert("reposition".into(), "Reclamp and probe origin".into());
+            }
+            setup
+                .p
+                .insert("notes".into(), clip(&proposed.workholding, 500));
             setup
         } else if si == 0 {
             // A hand setup in front of the user's takes the stock, as Add
@@ -2541,7 +3079,8 @@ pub fn build(
                     }
                     Some(&(bs, bo)) => {
                         let current = &doc.setups[bs].operations[bo];
-                        let Some(d) = described(current, &doc.tools) else {
+                        let Some(d) = described(current, &doc.tools, &doc.setups[bs].machine)
+                        else {
                             wrong(
                                 Some(oi + 1),
                                 format!(
@@ -2593,7 +3132,7 @@ pub fn build(
         // The operations a proposal cannot carry stay at their place.
         if let Some(b) = base {
             for (oi, op) in doc.setups[b].operations.iter().enumerate() {
-                if described(op, &doc.tools).is_none() {
+                if described(op, &doc.tools, &doc.setups[b].machine).is_none() {
                     let at = oi.min(setup.operations.len());
                     setup.operations.insert(at, op.clone());
                 }
@@ -2606,7 +3145,7 @@ pub fn build(
             let locked: Vec<String> = setup
                 .operations
                 .iter()
-                .filter(|op| described(op, &doc.tools).is_none())
+                .filter(|op| described(op, &doc.tools, &setup.machine).is_none())
                 .map(|op| format!("\"{}\"", clip(get(&op.p, "name"), 60)))
                 .collect();
             if !locked.is_empty() && !kept_setups.contains(&b) {
@@ -2643,6 +3182,31 @@ pub fn build(
     built.setups = setups;
     if proposal.chuck.is_some() {
         built.settle_holding(u);
+    }
+    // A lathe setup's jaws grip their length of the stock, less where its
+    // cuts must reach past them; the stock stands out of them by the rest,
+    // as Add lathe setup sets it for a fresh bar.
+    for si in 0..built.setups.len() {
+        if !crate::lathe::is_lathe(&built.setups[si].machine) || si == u {
+            continue;
+        }
+        built.settle_holding(si);
+        let length = if get(&built.setups[si].p, "stock_type") == "Round bar"
+            && get(&built.setups[si].p, "stock_source") == "fresh"
+        {
+            num(&built.setups[si].p, "stock_length")
+        } else {
+            built
+                .setup_stock(si, Some(mesh))
+                .map(|b| b.max[2] - b.min[2])
+        };
+        let reach = lathe_reach(&built, &built.setups[si]);
+        let p = &mut built.setups[si].p;
+        if let Some((length, grip)) = length.zip(num(p, "grip")) {
+            let grip = grip.min(length - reach - LATHE_CLEAR).max(0.);
+            p.insert("grip".into(), grip.to_string());
+            p.insert("stickout".into(), (length - grip).max(1.).to_string());
+        }
     }
     // A later setup in a V-block, soft jaws or a collet block takes the
     // entry's grip as the setup page fills it in.
@@ -2725,6 +3289,7 @@ pub(crate) mod tests {
             spring_pass: None,
             chamfer: None,
             block: None,
+            turn: None,
             coolant: "Flood".into(),
             reason: "test".into(),
             from: None,
@@ -2795,6 +3360,7 @@ pub(crate) mod tests {
             setups: vec![
                 ProposedSetup {
                     machine: None,
+                    bar: None,
                     orientation: "+Z".into(),
                     name: "Top".into(),
                     origin: "Stock top center".into(),
@@ -2811,6 +3377,7 @@ pub(crate) mod tests {
                 },
                 ProposedSetup {
                     machine: None,
+                    bar: None,
                     orientation: "-Z".into(),
                     name: "Underside".into(),
                     origin: "Model origin".into(),
@@ -3770,7 +4337,7 @@ pub(crate) mod tests {
             assert_eq!(get(&made.p, k), v, "{k}");
         }
         // The current plan gives it back as it was proposed.
-        let back = described(made, &job.tools).unwrap();
+        let back = described(made, &job.tools, &job.setups[0].machine).unwrap();
         assert_eq!(
             (
                 back.groove_diameter,
@@ -4921,6 +5488,7 @@ pub(crate) mod tests {
         let side = side_up(&report, "-Y").setups.remove(1);
         plan.setups[1] = ProposedSetup {
             machine: None,
+            bar: None,
             from: Some(2),
             name: "Side".into(),
             ..side
@@ -5471,6 +6039,7 @@ pub(crate) mod tests {
             a_angles: None,
             operations: vec![drill],
             from: None,
+            bar: None,
         });
         plan
     }
@@ -5504,6 +6073,7 @@ pub(crate) mod tests {
             0,
             ProposedSetup {
                 machine: Some(2),
+                bar: None,
                 orientation: "+Z".into(),
                 name: "Face on the big mill".into(),
                 origin: "Stock top center".into(),
@@ -5556,8 +6126,15 @@ pub(crate) mod tests {
     #[test]
     fn the_schema_with_a_manual_mill_adds_machine_box_and_the_box_strategy_and_stays_strict() {
         for (edit, rotary) in [(false, false), (true, false), (false, true), (true, true)] {
-            assert_eq!(schema_full(edit, rotary, false), schema_with(edit, rotary));
-            let schema = schema_full(edit, rotary, true);
+            assert_eq!(
+                schema_full(edit, rotary, Hands::NONE),
+                schema_with(edit, rotary)
+            );
+            let mill = Hands {
+                mill: true,
+                lathe: false,
+            };
+            let schema = schema_full(edit, rotary, mill);
             let setup = &schema["properties"]["setups"]["items"];
             assert!(
                 setup["required"]
@@ -5923,5 +6500,544 @@ pub(crate) mod tests {
             "{:?}",
             check.problems
         );
+    }
+
+    /// A shaft standing on +Z: Ø30 for 50 mm, then Ø20 for 20 mm to its
+    /// top, with a Ø4 hole 10 mm deep down its axis; the user's CNC setup
+    /// with 2 mm of stock round it, the fixture's three tools (T3 a Ø4
+    /// drill), and a lathe in the library with one of each lathe tool
+    /// (T21 to T27, a Ø10 drill last) and the chuck starters.
+    pub fn with_lathe() -> (Document, Mesh, PartReport) {
+        let section = [
+            (0., 0.),
+            (15., 0.),
+            (15., 50.),
+            (10., 50.),
+            (10., 70.),
+            (2., 70.),
+            (2., 60.),
+            (0., 60.),
+        ];
+        let mesh = crate::mesh::normalize(crate::cam::tests::revolved(&section)).unwrap();
+        let (mut doc, _) = fixture::job();
+        doc.setups[0].operations.clear();
+        for k in [
+            "stock_top",
+            "stock_bottom",
+            "stock_left",
+            "stock_right",
+            "stock_front",
+            "stock_back",
+        ] {
+            doc.setups[0].p.insert(k.into(), "2".into());
+        }
+        let lathe = crate::lathe::defaults();
+        let mut drill = Tool::new("Drill Ø10", "Drill", "10");
+        drill.p.insert("length".into(), "60".into());
+        drill.p.insert("stickout".into(), "80".into());
+        drill.p.insert("machines".into(), lathe.id.clone());
+        for (n, mut tool) in crate::lathe::TOOLS
+            .iter()
+            .map(|kind| Tool::lathe(kind, kind))
+            .chain([drill])
+            .enumerate()
+        {
+            tool.p.insert("number".into(), (21 + n).to_string());
+            if get(&tool.p, "type") == "Parting blade" {
+                tool.p.insert("reach".into(), "30".into());
+            }
+            doc.tools.push(tool);
+        }
+        doc.machines.push(lathe);
+        doc.workholding.extend(
+            crate::holding::starters()
+                .into_iter()
+                .filter(|h| h.kind() == "Chuck"),
+        );
+        aluminium(&mut doc);
+        doc.file = Some(crate::model::ModelFile {
+            name: "shaft.stl".into(),
+            path: "shaft.stl".into(),
+            format: "stl".into(),
+            bytes: 0,
+            thickness: None,
+        });
+        let report = analysis::report(&doc, &mesh).unwrap();
+        (doc, mesh, report)
+    }
+    /// A Turn of `kind` with T`tool` at 710 rpm (the lathe's gear nearest),
+    /// its fields set by `fields`.
+    fn turn(kind: &str, tool: u32, fields: impl FnOnce(&mut ProposedTurn)) -> ProposedOp {
+        let mut t = ProposedTurn {
+            kind: kind.into(),
+            ..ProposedTurn::default()
+        };
+        fields(&mut t);
+        ProposedOp {
+            name: format!("Turn · {kind}"),
+            rpm: 700.,
+            feed: 100.,
+            coolant: "Off".into(),
+            turn: Some(t),
+            ..op("Turn", tool, vec![])
+        }
+    }
+    /// The shaft turned from a Ø34 × 110 bar on the lathe (the part's top 2
+    /// mm below the bar's end): faced, Ø30 down to its end, Ø20 for its top
+    /// 20 mm, its end chamfered and parted off; then the user's CNC setup
+    /// drills the Ø4 hole.
+    pub fn turned(report: &PartReport) -> Proposal {
+        let lathe = report
+            .machines
+            .iter()
+            .find(|m| m.kind == "Lathe")
+            .unwrap()
+            .number;
+        let mut drill = op("Drill", 3, ids(report, "+Z", 0.));
+        drill.drill_cycle = Some("Chip breaking".into());
+        drill.peck = Some(2.);
+        Proposal {
+            summary: "Turn the shaft from bar, then drill it on the CNC.".into(),
+            chuck: None,
+            setups: vec![
+                ProposedSetup {
+                    machine: Some(lathe),
+                    bar: Some(ProposedBar {
+                        diameter: 34.,
+                        length: 110.,
+                        free_end: None,
+                    }),
+                    orientation: "+Z".into(),
+                    name: "Lathe".into(),
+                    origin: "Stock top center".into(),
+                    workholding: "3-jaw chuck.".into(),
+                    holder: None,
+                    a_angles: None,
+                    operations: vec![
+                        turn("Face", 21, |t| t.face_off = Some(1.)),
+                        turn("Outside", 21, |t| {
+                            t.diameter = Some(30.);
+                            t.z_end = Some(-75.);
+                            t.depth = Some(2.);
+                        }),
+                        turn("Outside", 21, |t| {
+                            t.diameter = Some(20.);
+                            t.z_end = Some(-22.);
+                            t.depth = Some(2.);
+                        }),
+                        turn("Chamfer", 21, |t| {
+                            t.edge = Some("End outside".into());
+                            t.size = Some(0.5);
+                        }),
+                        turn("Part off", 24, |t| t.z = Some(-72.)),
+                    ],
+                    from: None,
+                },
+                ProposedSetup {
+                    machine: Some(1),
+                    bar: None,
+                    orientation: "+Z".into(),
+                    name: "Top".into(),
+                    origin: "Model origin".into(),
+                    workholding: "Soft jaws on the Ø30.".into(),
+                    holder: None,
+                    a_angles: None,
+                    operations: vec![drill],
+                    from: None,
+                },
+            ],
+            unmachined: vec![],
+            warnings: vec![],
+        }
+    }
+    #[test]
+    fn the_report_turns_the_shaft_about_its_axis_and_lists_the_lathe_its_tools_and_chucks() {
+        let (_, _, report) = with_lathe();
+        let lathe = report.machines.iter().find(|m| m.kind == "Lathe").unwrap();
+        assert_eq!(
+            lathe.feeds_mm_per_rev.as_deref(),
+            Some(&[0.05, 0.1, 0.15, 0.2][..])
+        );
+        assert_eq!(lathe.cross_reads, Some("unknown"));
+        let tool = |kind: &str| report.tools.iter().find(|t| t.kind == kind).unwrap();
+        assert_eq!(tool("Turning tool").machines, Some(vec![lathe.number]));
+        assert_eq!(tool("Turning tool").hand.as_deref(), Some("Right"));
+        assert_eq!(tool("Parting blade").width, Some(3.));
+        assert_eq!(tool("Boring bar").min_bore, Some(12.));
+        let chucks: Vec<_> = (report.workholding_library.iter())
+            .filter(|h| h.kind == "Chuck")
+            .collect();
+        assert_eq!(chucks.len(), 2);
+        assert!(
+            chucks
+                .iter()
+                .all(|c| c.machines == Some(vec![lathe.number]))
+        );
+        // About +Z: round all along, Ø20 with the Ø4 hole at the top, then Ø30.
+        let up = report.turning.iter().find(|t| t.up == "+Z").unwrap();
+        assert!(
+            (up.length - 70.).abs() < 0.6 && up.round_share > 0.95,
+            "{up:?}"
+        );
+        assert!((up.largest_diameter - 30.).abs() < 0.05);
+        let at = |depth: f32| {
+            up.steps
+                .iter()
+                .find(|s| s.from_top <= depth && depth < s.to_top)
+                .unwrap()
+        };
+        assert!(
+            (at(5.).outer_diameter - 20.).abs() < 0.05 && (at(5.).inner_diameter - 4.).abs() < 0.05
+        );
+        assert!((at(15.).outer_diameter - 20.).abs() < 0.05 && at(15.).inner_diameter < 0.05);
+        assert!((at(40.).outer_diameter - 30.).abs() < 0.05 && at(40.).round);
+        // About X the shaft lies across: not round, so no steps.
+        let across = report.turning.iter().find(|t| t.up == "+X").unwrap();
+        assert!(
+            across.round_share < 0.3 && across.steps.is_empty(),
+            "{across:?}"
+        );
+        // Without a lathe none of it is told.
+        let (_, _, plain) = block();
+        assert!(plain.turning.is_empty());
+        assert!(plain.workholding_library.iter().all(|h| h.kind != "Chuck"));
+    }
+    #[test]
+    fn the_schema_with_a_lathe_adds_turn_and_bar_and_stays_strict() {
+        let lathe = Hands {
+            mill: false,
+            lathe: true,
+        };
+        for edit in [false, true] {
+            let schema = schema_full(edit, false, lathe);
+            let setup = &schema["properties"]["setups"]["items"];
+            for key in ["machine", "bar"] {
+                assert!(
+                    setup["required"].as_array().unwrap().contains(&json!(key)),
+                    "{key}"
+                );
+            }
+            let op = &setup["properties"]["operations"]["items"];
+            assert!(op["required"].as_array().unwrap().contains(&json!("turn")));
+            assert!(!op["required"].as_array().unwrap().contains(&json!("box")));
+            let strategies = op["properties"]["strategy"]["enum"].as_array().unwrap();
+            assert!(strategies.contains(&json!("Turn")) && !strategies.contains(&json!("Box")));
+            let turn = &op["properties"]["turn"]["anyOf"][0];
+            assert_eq!(turn["additionalProperties"], false);
+            assert_eq!(turn["required"].as_array().unwrap().len(), 15);
+        }
+        let (_, _, report) = with_lathe();
+        assert_eq!(Hands::of(&report), lathe);
+        let text = serde_json::to_string(&turned(&report)).unwrap();
+        assert_eq!(parse(&text).unwrap(), turned(&report));
+    }
+    #[test]
+    fn lathe_work_off_the_lathe_and_a_bar_out_of_place_are_refused() {
+        let (doc, mesh, report) = with_lathe();
+        let said = |edit: &dyn Fn(&mut Proposal)| {
+            let mut plan = turned(&report);
+            edit(&mut plan);
+            messages(build(&doc, &mesh, &report, &plan)).join(" | ")
+        };
+        type Edit<'a> = &'a dyn Fn(&mut Proposal);
+        let cases: [(&str, Edit); 9] = [
+            ("Turn runs on a lathe only", &|p| {
+                let face = p.setups[0].operations[0].clone();
+                p.setups[1].operations.push(face)
+            }),
+            ("cannot run on the lathe", &|p| {
+                p.setups[0]
+                    .operations
+                    .push(op("Face", 1, ids(&report, "+Z", 0.)))
+            }),
+            ("a Part off turn takes a parting blade", &|p| {
+                p.setups[0].operations[4].tool = 21
+            }),
+            ("needs a bar of at least", &|p| {
+                p.setups[0].bar.as_mut().unwrap().diameter = 25.
+            }),
+            ("the bar must be at least", &|p| {
+                p.setups[0].bar.as_mut().unwrap().length = 50.
+            }),
+            ("turns a fresh bar: give `bar`", &|p| p.setups[0].bar = None),
+            ("bar is for a setup on the lathe only", &|p| {
+                p.setups[1].bar = p.setups[0].bar.clone()
+            }),
+            ("A Turn needs `turn`", &|p| {
+                p.setups[0].operations[0].turn = None
+            }),
+            ("is not a Turn kind", &|p| {
+                p.setups[0].operations[0].turn.as_mut().unwrap().kind = "Knurl".into()
+            }),
+        ];
+        for (expected, edit) in cases {
+            let message = said(edit);
+            assert!(message.contains(expected), "{expected}: {message}");
+        }
+    }
+    #[test]
+    fn a_planned_lathe_setup_is_described_with_its_bar_and_turns_and_kept_by_a_change() {
+        let (doc, mesh, report) = with_lathe();
+        let built = build(&doc, &mesh, &report, &turned(&report)).unwrap();
+        // The same report but for the zero the plan gave the user's setup.
+        let again = analysis::report(&built, &mesh).unwrap();
+        assert_eq!(again.work_zero, Some([15., 15., 0.]));
+        assert_eq!(
+            PartReport {
+                work_zero: report.work_zero,
+                ..again.clone()
+            },
+            report
+        );
+        let plan = shown(&built, &again);
+        let lathe = &plan.setups[0];
+        assert_eq!(lathe.machine, turned(&report).setups[0].machine);
+        assert_eq!(
+            lathe.bar,
+            Some(ProposedBar {
+                diameter: 34.,
+                length: 110.,
+                free_end: None
+            })
+        );
+        let outside = lathe.operations[1].turn.as_ref().unwrap();
+        assert_eq!(
+            (outside.kind.as_str(), outside.diameter, outside.z_end),
+            ("Outside", Some(30.), Some(-75.))
+        );
+        assert_eq!(outside.edge, None);
+        let rebuilt = build(&built, &mesh, &again, &plan).unwrap();
+        for (kept, user) in rebuilt.setups.iter().zip(&built.setups) {
+            assert_eq!(kept.id, user.id);
+            assert_eq!(kept.p, user.p, "setup {}", user.id);
+            for (kept, user) in kept.operations.iter().zip(&user.operations) {
+                assert!(same_operation(kept, user), "{}", user.id);
+            }
+        }
+        // A changed diameter writes only the turn's settings.
+        let mut finer = plan.clone();
+        finer.setups[0].operations[2]
+            .turn
+            .as_mut()
+            .unwrap()
+            .diameter = Some(19.5);
+        let changed = build(&built, &mesh, &again, &finer).unwrap();
+        let op = &changed.setups[0].operations[2];
+        assert_eq!(op.id, built.setups[0].operations[2].id);
+        assert_eq!(get(&op.p, "diameter"), "19.5");
+        // A bigger bar places the part in it afresh.
+        let mut bigger = plan;
+        bigger.setups[0].bar.as_mut().unwrap().diameter = 40.;
+        let rebar = build(&built, &mesh, &again, &bigger).unwrap();
+        assert_eq!(get(&rebar.setups[0].p, "stock_diameter"), "40");
+        assert_eq!(rebar.setups[0].id, built.setups[0].id);
+    }
+    #[test]
+    fn a_turn_keeps_its_planned_speed_on_the_nearest_gear() {
+        let (doc, mesh, report) = with_lathe();
+        let mut minutes = vec![];
+        for (rpm, gear) in [(75., "70"), (1100., "1120")] {
+            let mut plan = turned(&report);
+            for o in &mut plan.setups[0].operations {
+                o.rpm = rpm;
+            }
+            let job = build(&doc, &mesh, &report, &plan).unwrap();
+            for o in &job.setups[0].operations {
+                assert_eq!(get(&o.p, "rpm"), gear, "{}", o.name());
+            }
+            let (check, _) = crate::plan_check::check(&doc, &mesh, &report, &plan);
+            minutes.push(check.lathe_minutes);
+        }
+        assert!(minutes[0] > minutes[1], "{minutes:?}");
+    }
+    #[test]
+    fn a_lathe_setup_after_the_cnc_grips_what_its_cuts_leave_free() {
+        // The CNC drills the part in its block; the 4-jaw then holds the
+        // block for a facing of its top, gripping all its jaws can.
+        let (doc, mesh, report) = with_lathe();
+        let mut after = turned(&report);
+        after.setups.swap(0, 1);
+        after.setups[1].bar = None;
+        after.setups[1].holder = (report.workholding_library.iter())
+            .find(|h| h.kind == "Chuck" && h.sizes.get("jaws") == Some(&4.))
+            .map(|h| h.number);
+        after.setups[1].operations.truncate(1);
+        let (check, job) = crate::plan_check::check(&doc, &mesh, &report, &after);
+        assert!(check.passed, "{:?}", check.problems);
+        let lathe = &job.unwrap().setups[1];
+        let (grip, stickout) = (
+            num(&lathe.p, "grip").unwrap(),
+            num(&lathe.p, "stickout").unwrap(),
+        );
+        assert!((grip + stickout - 74.).abs() < 0.01, "{grip} + {stickout}");
+        // With a deep cut the jaws give way to it.
+        let mut deep = after.clone();
+        deep.setups[1].operations.push(turn("Outside", 21, |t| {
+            t.diameter = Some(33.);
+            t.z_end = Some(-60.);
+        }));
+        let job = build(&doc, &mesh, &report, &deep).unwrap();
+        let lathe = &job.setups[1];
+        assert!(
+            (num(&lathe.p, "stickout").unwrap() - 62.).abs() < 0.01,
+            "{:?}",
+            lathe.p
+        );
+    }
+    #[test]
+    fn a_resized_bar_keeps_the_part_as_far_from_its_end() {
+        let (doc, mesh, report) = with_lathe();
+        let mut custom = turned(&report);
+        let bar = custom.setups[0].bar.as_mut().unwrap();
+        bar.free_end = Some(10.);
+        bar.length = 130.;
+        for o in &mut custom.setups[0].operations {
+            let t = o.turn.as_mut().unwrap();
+            for z in [&mut t.face_off, &mut t.z_end, &mut t.z]
+                .into_iter()
+                .flatten()
+            {
+                *z += if t.kind == "Face" { 8. } else { -8. };
+            }
+        }
+        let (check, _) = crate::plan_check::check(&doc, &mesh, &report, &custom);
+        assert!(check.passed, "{:?}", check.problems);
+        let built = build(&doc, &mesh, &report, &custom).unwrap();
+        let again = analysis::report(&built, &mesh).unwrap();
+        let mut shown = shown(&built, &again);
+        shown.setups[0].bar.as_mut().unwrap().diameter = 40.;
+        let rebuilt = build(&built, &mesh, &again, &shown).unwrap();
+        assert_eq!(get(&rebuilt.setups[0].p, "stock_diameter"), "40");
+        assert_eq!(
+            get(&rebuilt.setups[0].p, "tz"),
+            get(&built.setups[0].p, "tz")
+        );
+        let (check, _) = crate::plan_check::check(&built, &mesh, &again, &shown);
+        assert!(check.passed, "{:?}", check.problems);
+    }
+    #[test]
+    fn a_centre_drill_the_size_of_the_hole_drills_it_and_a_bigger_one_is_refused() {
+        let (mut doc, mesh, _) = with_lathe();
+        let lathe = (doc.machines.iter())
+            .find(|m| crate::lathe::is_lathe(m))
+            .unwrap()
+            .id
+            .clone();
+        let mut drill = Tool::new("Lathe drill 4", "Drill", "4");
+        for (k, v) in [
+            ("number", "28"),
+            ("machines", &lathe),
+            ("length", "40"),
+            ("stickout", "50"),
+        ] {
+            drill.p.insert(k.into(), v.into());
+        }
+        doc.tools.push(drill);
+        let mut checked = |size: &str| {
+            doc.tools
+                .last_mut()
+                .unwrap()
+                .p
+                .insert("diameter".into(), size.into());
+            let report = analysis::report(&doc, &mesh).unwrap();
+            let mut plan = turned(&report);
+            let mut hole = op("Drill", 28, vec![]);
+            hole.rpm = 710.;
+            hole.feed = 0.1;
+            hole.coolant = "Off".into();
+            hole.drill_cycle = Some("Drilling".into());
+            hole.turn = Some(ProposedTurn {
+                kind: "Drill".into(),
+                depth: Some(8.),
+                ..Default::default()
+            });
+            plan.setups[0].operations.insert(4, hole);
+            crate::plan_check::check(&doc, &mesh, &report, &plan).0
+        };
+        let fits = checked("4");
+        assert!(fits.passed, "{:?}", fits.problems);
+        let wide = checked("4.5");
+        assert!(
+            wide.problems
+                .iter()
+                .any(|p| p.message.starts_with("The cut reaches the part")),
+            "{:?}",
+            wide.problems
+        );
+    }
+    #[test]
+    fn a_square_is_not_round_however_it_is_turned() {
+        let (doc, _, _) = with_lathe();
+        let v = [
+            [-10., -10., 0.],
+            [10., -10., 0.],
+            [10., 10., 0.],
+            [-10., 10., 0.],
+            [-10., -10., 40.],
+            [10., -10., 40.],
+            [10., 10., 40.],
+            [-10., 10., 40.],
+        ];
+        let faces = [
+            [0, 2, 1],
+            [0, 3, 2],
+            [4, 5, 6],
+            [4, 6, 7],
+            [0, 1, 5],
+            [0, 5, 4],
+            [1, 2, 6],
+            [1, 6, 5],
+            [2, 3, 7],
+            [2, 7, 6],
+            [3, 0, 4],
+            [3, 4, 7],
+        ];
+        for angle in [0., 30., 45.] {
+            let triangles = (faces.iter())
+                .map(|f| f.map(|i| crate::mesh::rotation(v[i], [0., 0., angle])))
+                .collect();
+            let prism = crate::mesh::normalize(triangles).unwrap();
+            let report = analysis::report(&doc, &prism).unwrap();
+            let up = report.turning.iter().find(|t| t.up == "+Z").unwrap();
+            assert!(
+                up.round_share < 0.3 && up.steps.is_empty(),
+                "{angle}°: {up:?}"
+            );
+        }
+    }
+    /// Writes `with_lathe`'s shaft as `shaft.stl` and its project as
+    /// `lathe.json` into `AXIS_PROJECT_OUT`, for the planner's command-line
+    /// tools and a model to plan it.
+    #[test]
+    #[ignore]
+    fn write_the_lathe_project() {
+        let out = std::path::PathBuf::from(std::env::var("AXIS_PROJECT_OUT").unwrap());
+        std::fs::create_dir_all(&out).unwrap();
+        let (mut doc, mesh, _) = with_lathe();
+        let mut stl = String::from("solid shaft\n");
+        for t in crate::cam::tests::revolved(&[
+            (0., 0.),
+            (15., 0.),
+            (15., 50.),
+            (10., 50.),
+            (10., 70.),
+            (2., 70.),
+            (2., 60.),
+            (0., 60.),
+        ]) {
+            stl.push_str("facet normal 0 0 0\nouter loop\n");
+            for p in t {
+                stl.push_str(&format!("vertex {} {} {}\n", p[0], p[1], p[2]));
+            }
+            stl.push_str("endloop\nendfacet\n");
+        }
+        stl.push_str("endsolid shaft\n");
+        let part = out.join("shaft.stl");
+        std::fs::write(&part, stl).unwrap();
+        let file = doc.file.as_mut().unwrap();
+        file.path = part;
+        file.bytes = 1;
+        let _ = mesh;
+        crate::storage::save(&out.join("lathe.json"), &doc).unwrap();
     }
 }

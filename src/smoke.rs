@@ -1714,6 +1714,7 @@ impl App {
             setups: vec![
                 ProposedSetup {
                     machine: None,
+                    bar: None,
                     orientation: up.into(),
                     name: "Top".into(),
                     origin: "Stock top center".into(),
@@ -1729,6 +1730,7 @@ impl App {
                 },
                 ProposedSetup {
                     machine: None,
+                    bar: None,
                     orientation: "-Z".into(),
                     name: "Underside".into(),
                     origin: "Model origin".into(),
@@ -1797,6 +1799,7 @@ impl App {
             chuck: None,
             setups: vec![ProposedSetup {
                 machine: None,
+                bar: None,
                 orientation: first.up.into(),
                 name: "Top".into(),
                 origin: "Stock top center".into(),

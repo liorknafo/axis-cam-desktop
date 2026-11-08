@@ -3334,6 +3334,26 @@ pub(crate) mod tests {
         build(&mut a);
         a
     }
+    /// Every Steps screen of the lathe setup the planner puts in front of the
+    /// shaft's CNC setup (`proposal::tests::turned`), at 1280 × 800, into
+    /// `AXIS_RENDER_DIR`.
+    #[test]
+    #[ignore]
+    fn render_the_planned_lathe_steps() {
+        use crate::proposal::tests::{turned, with_lathe};
+        let dir = std::path::PathBuf::from(std::env::var("AXIS_RENDER_DIR").unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        let (doc, mesh, report) = with_lathe();
+        let job = crate::proposal::build(&doc, &mesh, &report, &turned(&report)).unwrap();
+        let mut a = lathe_app_of(job, mesh, |d| {
+            let m = &mut d.setups[0].machine;
+            m.p.insert("cross_reads".into(), "Diameter".into());
+        });
+        for i in 0..guide(&a).steps.len() {
+            at(&mut a, i, 0);
+            render(&a, (1280, 800), &dir.join(format!("{i:02}.png")));
+        }
+    }
     use crate::guide::LatheStep as L;
     /// The index of the `n`th step (from 0) that `pick` is true of.
     fn nth(a: &App, n: usize, pick: impl Fn(&L) -> bool) -> usize {

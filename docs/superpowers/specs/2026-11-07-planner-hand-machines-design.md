@@ -58,7 +58,7 @@ The software plans the whole job. The manual mill and the manual lathe make no G
 
 Let `u` be the first proposed setup on machine 1.
 
-- It is the user's setup, built from `doc.setups[base]`: the setup-1 rules of today apply to it. Those rules cover its orientation, its `holder` (null or its own entry), and its `from` (in an edit, the user's setup's number).
+- It is the user's setup, built from `doc.setups[base]`: the setup-1 rules of today apply to it, except that behind hand setups its `origin` is the plan's, as for a later setup (they may have cut the stock its zero was on; found on the lathe, whose turning takes every side). Those rules cover its orientation, its `holder` (null or its own entry), and its `from` (in an edit, the user's setup's number).
 - A plan without one is refused: "Keep your setup: give one setup `machine` 1."
 - Setups before `u` must be on a hand machine.
 - The first proposed setup, when it is not `u`, takes the fresh stock:
@@ -68,7 +68,7 @@ Let `u` be the first proposed setup on machine 1.
 - Each setup is made on its machine:
   - machine 1 is the user's setup's machine snapshot;
   - any other machine is the library entry, cloned.
-  - Hand setups take no work offset of their own (the first, handed over, carries the user's, which no check reads). Only setups on machine 1 count against the six offsets.
+  - Hand setups take no work offset of their own: they carry the user's (generation needs one; no check reads it on a hand setup). Only setups on machine 1 count against the six offsets.
   - A plan has at most 10 setups.
 - An orientation may be used once **on the CNC**. A hand machine may use one again: the manual mill may face the top that the CNC then machines from the same side, and the stock may come back to the manual mill after the CNC on that side (review: astra round 1).
 - In each setup:

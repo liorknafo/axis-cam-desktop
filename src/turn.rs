@@ -1200,6 +1200,18 @@ fn part_check(
             for t in &geometry.triangles {
                 let polygon = clip(&t.p, low, high);
                 if let Some((r, z)) = nearest(&polygon) {
+                    // A facet of a round bore comes nearest the axis on an
+                    // edge that is a chord of the bore: its ends on it, the
+                    // chord a sagitta inside. A tool as wide as the bore at
+                    // the ends fits, as a drill does on the mills (and 0.01
+                    // over); a chord over half the radius is a flat.
+                    if let Some((ends, chord, gap)) = nearest_edge(&t.p)
+                        && r >= gap - 1e-4
+                        && chord <= ends / 2.
+                        && limit <= ends + 0.01
+                    {
+                        continue;
+                    }
                     keep(limit - r, z, r);
                 }
             }
@@ -1222,6 +1234,25 @@ fn part_check(
     }
     Ok(())
 }
+/// The edge of triangle `t` nearest the Z axis seen from above: the nearer
+/// of its ends' distances from the axis, its length and its own distance
+/// from the axis, all in XY. None for a triangle with no edge.
+fn nearest_edge(t: &[[f32; 3]; 3]) -> Option<(f32, f32, f32)> {
+    (0..3)
+        .map(|k| {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let l2 = dx * dx + dy * dy;
+            let s = if l2 > 0. {
+                (-(a[0] * dx + a[1] * dy) / l2).clamp(0., 1.)
+            } else {
+                0.
+            };
+            let gap = (a[0] + s * dx).hypot(a[1] + s * dy);
+            (a[0].hypot(a[1]).min(b[0].hypot(b[1])), l2.sqrt(), gap)
+        })
+        .min_by(|x, y| x.2.total_cmp(&y.2))
+}
 /// The part's outline about the setup's Z axis, as a lathe step's side view
 /// draws it, read from its triangles as `part_check` reads them: in slabs
 /// along Z (setup frame) of at most half a millimetre, the part's nearest
@@ -1229,8 +1260,20 @@ fn part_check(
 /// (inner 0 where the axis runs through the solid). Only the slabs the part
 /// reaches; neighbours within 0.05 mm of each other are one slab.
 pub fn profile(setup: &Setup, mesh: &Mesh) -> Vec<[f32; 4]> {
+    profile_round(setup, mesh)
+        .into_iter()
+        .map(|(slab, _)| slab)
+        .collect()
+}
+/// `profile`, each slab with whether the part is round in it: the part's
+/// farthest reach from the axis in every direction round it (every 10°) at
+/// least 98 % of its farthest distance from it, as a circle (a tessellated
+/// one too) has and a square or a hexagon, turned any way, has not.
+/// Neighbours that differ in it are two slabs.
+pub fn profile_round(setup: &Setup, mesh: &Mesh) -> Vec<([f32; 4], bool)> {
     const SLAB: f32 = 0.5;
     const SAME: f32 = 0.05;
+    const ROUND: f32 = 0.98;
     let geometry = Geometry::new(setup, mesh);
     let b = geometry.bounds;
     let length = b.max[2] - b.min[2];
@@ -1240,8 +1283,16 @@ pub fn profile(setup: &Setup, mesh: &Mesh) -> Vec<[f32; 4]> {
     let n = ((length / SLAB).ceil() as usize).clamp(1, 2000);
     let dz = length / n as f32;
     let slab = |z: f32| (((z - b.min[2]) / dz).floor().max(0.) as usize).min(n - 1);
-    // (inner, outer) per slab; outer < 0 where no triangle reaches it.
+    // (inner, outer) per slab; outer < 0 where no triangle reaches it. And
+    // the farthest the part reaches in each of `DIRECTIONS` directions round
+    // the axis, every 10°.
+    const DIRECTIONS: usize = 36;
+    let directions: [[f32; 2]; DIRECTIONS] = std::array::from_fn(|k| {
+        let a = k as f32 * std::f32::consts::TAU / DIRECTIONS as f32;
+        [a.cos(), a.sin()]
+    });
     let mut found = vec![(f32::INFINITY, -1f32); n];
+    let mut reach = vec![[0f32; DIRECTIONS]; n];
     for t in &geometry.triangles {
         let lo = t.p.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min);
         let hi = t.p.iter().map(|p| p[2]).fold(f32::NEG_INFINITY, f32::max);
@@ -1258,6 +1309,11 @@ pub fn profile(setup: &Setup, mesh: &Mesh) -> Vec<[f32; 4]> {
             };
             let far = polygon.iter().map(|p| p[0].hypot(p[1])).fold(0., f32::max);
             *at = (at.0.min(near), at.1.max(far));
+            for p in &polygon {
+                for (r, d) in reach[i].iter_mut().zip(&directions) {
+                    *r = r.max(p[0] * d[0] + p[1] * d[1]);
+                }
+            }
         }
     }
     let index = Index::new(&geometry);
@@ -1272,22 +1328,24 @@ pub fn profile(setup: &Setup, mesh: &Mesh) -> Vec<[f32; 4]> {
             }
         }
     }
-    let mut out: Vec<[f32; 4]> = vec![];
+    let mut out: Vec<([f32; 4], bool)> = vec![];
     for (i, (inner, outer)) in found.into_iter().enumerate() {
         if outer < 0. {
             continue;
         }
         let low = b.min[2] + i as f32 * dz;
         let inner = inner.min(outer);
+        let round = reach[i].iter().fold(f32::INFINITY, |a, r| a.min(*r)) >= ROUND * outer;
         match out.last_mut() {
-            Some(last)
+            Some((last, was))
                 if (last[1] - low).abs() < 1e-4
                     && (last[2] - inner).abs() < SAME
-                    && (last[3] - outer).abs() < SAME =>
+                    && (last[3] - outer).abs() < SAME
+                    && *was == round =>
             {
                 last[1] = low + dz;
             }
-            _ => out.push([low, low + dz, inner, outer]),
+            _ => out.push(([low, low + dz, inner, outer], round)),
         }
     }
     out
