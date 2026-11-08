@@ -957,7 +957,7 @@ pub fn evaluate_full(
 ) -> (CheckReport, Option<Document>, Option<Checked>) {
     match proposal::build(doc, mesh, report, proposal) {
         Ok(built) => {
-            let (out, laid, setups) = run(&built, mesh, report);
+            let (out, laid, setups) = run(&built, mesh, report, true);
             let job = laid.unwrap_or(built);
             let checked = Checked {
                 job: Arc::new(job.clone()),
@@ -999,7 +999,7 @@ pub fn check(
 /// `run` without the job, so tests can check jobs `build` would refuse.
 #[cfg(test)]
 pub(crate) fn check_built(built: &Document, mesh: &Mesh, report: &PartReport) -> CheckReport {
-    run(built, mesh, report).0
+    run(built, mesh, report, false).0
 }
 /// A copy of `built` in which every later setup that holds its stock with a
 /// vise or clamps but says nowhere has the layout the app suggests for the
@@ -1013,6 +1013,7 @@ fn laid_out(
     built: &Document,
     mesh: &Mesh,
     results: &[Vec<(usize, Result<Simulation, String>)>],
+    planned: bool,
 ) -> (Option<Document>, Vec<(usize, String)>) {
     let mut laid: Option<Document> = None;
     let mut refused = vec![];
@@ -1021,6 +1022,14 @@ fn laid_out(
     let laid_out =
         |(si, s): &(usize, &crate::model::Setup)| *si > 0 || crate::manual::is_hand(&s.machine);
     for (si, setup) in built.setups.iter().enumerate().filter(laid_out) {
+        // A lathe setup's chuck grips what the stock it starts from (as the
+        // setups before it left it) leaves free under its lowest cut.
+        if let Some((grip, stickout)) = chucked(built, setup, &results[si]).filter(|_| planned) {
+            let p = &mut laid.get_or_insert_with(|| built.clone()).setups[si].p;
+            p.insert("grip".into(), grip.to_string());
+            p.insert("stickout".into(), stickout.to_string());
+            continue;
+        }
         if holding::placed(setup) {
             continue;
         }
@@ -1080,6 +1089,44 @@ fn laid_out(
         }
     }
     (laid, refused)
+}
+/// The grip and stickout of lathe setup `setup` of `built` in its chuck, on
+/// the stock its first simulation starts from: its grip (without one, the
+/// jaws' length), lowered where the lowest cutting move must stay
+/// `holding::STICKOUT_MARGIN` clear of the jaws, in whole millimetres, but
+/// never raised: a grip the plan or the user gave stays; the rest of the
+/// stock stands out. None for any other setup, one whose stock is not
+/// known, or one already so.
+fn chucked(
+    built: &Document,
+    setup: &crate::model::Setup,
+    results: &[(usize, Result<Simulation, String>)],
+) -> Option<(f32, f32)> {
+    if !crate::lathe::is_lathe(&setup.machine) || get(&setup.p, "holding") != "Chuck" {
+        return None;
+    }
+    let sims: Vec<&Simulation> = results
+        .iter()
+        .filter_map(|(_, r)| r.as_ref().ok())
+        .collect();
+    let stock = sims.first()?.plan.stock;
+    let length = stock.max[2] - stock.min[2];
+    let jaws = built
+        .holder(get(&setup.p, "holder"))
+        .and_then(|h| crate::model::num(&h.p, "jaw_length"))?;
+    let lowest = (sims.iter())
+        .flat_map(|sim| &sim.plan.moves)
+        .filter(|m| m.motion == crate::simulation::Motion::Feed)
+        .map(|m| m.from[2].min(m.to[2]))
+        .fold(stock.max[2], f32::min);
+    let free = length - (stock.max[2] - lowest) - holding::STICKOUT_MARGIN;
+    let now = (
+        crate::model::num(&setup.p, "grip"),
+        crate::model::num(&setup.p, "stickout"),
+    );
+    let grip = now.0.unwrap_or(jaws).min(free.floor()).max(0.);
+    let stickout = ((length - grip) * 100.).round() / 100.;
+    (now != (Some(grip), Some(stickout))).then_some((grip, stickout))
 }
 /// The setups of `built` whose starting stock the sequence knew, in order,
 /// from their `results` and `starts` (the box each later setup began with and
@@ -1141,11 +1188,14 @@ fn checked_setups(
 /// project's structure check. Returns the report, the copy of the job with
 /// the layouts suggested for its later setups (`laid_out`), whose workholding
 /// the check is of, and the setups whose starting stock it knew
-/// (`checked_setups`).
+/// (`checked_setups`). With `planned` (a job a proposal built) each lathe
+/// setup's chuck is also settled on the stock it starts from (`chucked`), as
+/// a plan cannot say it; a job made by hand keeps the user's.
 fn run(
     built: &Document,
     mesh: &Mesh,
     report: &PartReport,
+    planned: bool,
 ) -> (CheckReport, Option<Document>, Vec<CheckedSetup>) {
     let mut out = CheckReport {
         passed: false,
@@ -1312,7 +1362,7 @@ fn run(
         // The workholding is checked as the plan will be applied: with the
         // layouts the app suggests for the later setups.
         let unplaced;
-        (laid, unplaced) = laid_out(built, mesh, &results);
+        (laid, unplaced) = laid_out(built, mesh, &results, planned);
         let job_doc = laid.as_ref().unwrap_or(built);
         let job = crate::post::post_simulated(job_doc, mesh, &results);
         // A UC100 machine runs the toolpaths through its driver, not as
@@ -1418,6 +1468,21 @@ fn run(
                     operation: None,
                     stage: "export",
                     message,
+                });
+            }
+        }
+        // A manual mill's Zero is picked up with an edge finder above the
+        // jaws: its Steps cannot be followed when nothing stands clear.
+        for si in 0..job_doc.setups.len() {
+            if crate::manual::is_manual(&job_doc.setups[si].machine)
+                && crate::guide::build(job_doc, mesh, si)
+                    .is_err_and(|why| why == crate::guide::NOT_CLEAR)
+            {
+                export.push(Problem {
+                    setup: si + 1,
+                    operation: None,
+                    stage: "workholding",
+                    message: crate::guide::NOT_CLEAR.into(),
                 });
             }
         }
@@ -2583,6 +2648,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, (up, operations))| proposal::ProposedSetup {
                     machine: None,
+                    bar: None,
                     orientation: up.into(),
                     name: format!("Setup {}", i + 1),
                     origin: if i == 0 {
@@ -2594,6 +2660,7 @@ mod tests {
                     workholding: String::new(),
                     holder: None,
                     a_angles: None,
+                    grip: None,
                     operations,
                     from: None,
                 })
@@ -3009,7 +3076,7 @@ mod tests {
         assert_eq!(get(&job.setups[1].p, "holding"), "Clamps");
         assert_eq!(get(&job.setups[1].p, "clamps"), "");
         job.setups[1].p.insert("clamps".into(), "-Y:0;+Y:0".into());
-        let (check, laid, _) = run(&job, &mesh, &report);
+        let (check, laid, _) = run(&job, &mesh, &report, true);
         assert!(check.passed, "{:?}", stages(&check));
         assert!(laid.is_none(), "nothing was suggested");
     }
@@ -3237,6 +3304,187 @@ mod tests {
             assert!(json.get(key).is_none(), "{key}");
         }
         assert!(json["total_minutes"].as_f64().unwrap() > 0.);
+    }
+    #[test]
+    fn a_planned_lathe_setup_turns_the_bar_and_the_cnc_drills_the_turned_part() {
+        use crate::proposal::tests::{turned, with_lathe};
+        let (doc, mesh, report) = with_lathe();
+        let (check, job) = check(&doc, &mesh, &report, &turned(&report));
+        assert!(check.passed, "{:?}", stages(&check));
+        let job = job.unwrap();
+        assert!(crate::lathe::is_lathe(&job.setups[0].machine));
+        let split = check.minutes_by_machine.unwrap();
+        assert!(split.lathe > 0. && split.moving == 10., "{split:?}");
+        // The four turns, then the CNC's drilling of the turned part.
+        let setups: Vec<usize> = check.operations.iter().map(|o| o.setup).collect();
+        assert_eq!(setups, [1, 1, 1, 1, 2]);
+        // The bar in the 3-jaw: its jaws' 30 mm gripped, the rest out; the
+        // part's top 2 mm under the bar's end, on the axis.
+        let lathe = &job.setups[0];
+        assert_eq!(get(&lathe.p, "stock_type"), "Round bar");
+        assert_eq!(
+            (get(&lathe.p, "grip"), get(&lathe.p, "stickout")),
+            ("30", "80")
+        );
+        assert_eq!(get(&lathe.p, "origin"), crate::turn::ZERO);
+        let stock = job.setup_stock(0, Some(&mesh)).unwrap();
+        let part = crate::simulation::part_box(lathe, &mesh);
+        assert!(
+            (stock.max[2] - part.max[2] - 2.).abs() < 0.01,
+            "{stock:?} {part:?}"
+        );
+        assert!(((part.min[0] + part.max[0]) / 2.).abs() < 0.01);
+        // The user's setup starts from the turned part, with the zero planned.
+        let user = &job.setups[1];
+        assert_eq!(user.id, doc.setups[0].id);
+        assert_eq!(get(&user.p, "stock_source"), lathe.id);
+        assert_eq!(get(&user.p, "origin"), "Model origin");
+    }
+    #[test]
+    fn after_the_lathe_flat_vise_jaws_are_refused_on_the_round_shaft_and_soft_jaws_bored_to_it_hold_it()
+     {
+        use crate::proposal::tests::{hold, turned, with_lathe};
+        let (mut doc, mesh, _) = with_lathe();
+        // The starter vise across Y, as the reviewer had it.
+        doc.workholding.extend(
+            crate::holding::starters()
+                .into_iter()
+                .filter(|h| h.kind() == "Vise"),
+        );
+        hold(&mut doc, "Vise", &[("vise_axis", "Y"), ("vise_grip", "8")]);
+        let report = crate::analysis::report(&doc, &mesh).unwrap();
+        let (vised, _) = check(&doc, &mesh, &report, &turned(&report));
+        let said: Vec<&str> = (vised.problems.iter())
+            .map(|p| p.message.as_str())
+            .collect();
+        assert!(!vised.passed);
+        // The shaft is still there to stand on and grip: what is wrong is
+        // the flat jaws on its round.
+        assert!(
+            said.iter()
+                .all(|m| !m.contains("stock's top") && !m.contains("bottom it would rest on")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter().any(|m| m.contains("Flat jaws touch what the lathe turned round only along a line: hold it in soft jaws bored to its diameter or in a collet block")),
+            "{said:?}"
+        );
+        // Soft jaws bored Ø30, upright, gripping 20 mm of the Ø30 foot.
+        let mut jaws = crate::round_hold::starters()
+            .into_iter()
+            .find(|h| h.kind() == crate::round_hold::SOFT_JAWS)
+            .unwrap();
+        jaws.p.insert("bore".into(), "30".into());
+        let p = &mut doc.setups[0].p;
+        for (k, v) in [
+            ("holding", crate::round_hold::SOFT_JAWS),
+            ("holder", &jaws.id),
+            ("jaw_bore", "Z"),
+            ("round_grip", "20"),
+            ("round_offset", "0"),
+        ] {
+            p.insert(k.into(), v.into());
+        }
+        doc.workholding.push(jaws);
+        let report = crate::analysis::report(&doc, &mesh).unwrap();
+        let (jawed, _) = check(&doc, &mesh, &report, &turned(&report));
+        assert!(jawed.passed, "{:?}", stages(&jawed));
+    }
+    #[test]
+    fn on_the_ø20_end_of_a_shaft_turned_over_ø30_soft_jaws_are_refused_and_ø20_ones_hold_it() {
+        use crate::guide::tests::{in_soft_jaws, lathe_then_by_hand};
+        // Ø30 for 40 mm, Ø20 for the 30 above, a Ø4 hole in each end; the
+        // CNC drills the top in Ø30 soft jaws gripping 20 mm, then the
+        // manual mill turns it over to drill the other end. The library
+        // also has soft jaws bored Ø20.
+        let section = [
+            (2., 0.),
+            (15., 0.),
+            (15., 40.),
+            (10., 40.),
+            (10., 70.),
+            (2., 70.),
+            (2., 60.),
+            (0., 60.),
+            (0., 10.),
+            (2., 10.),
+            (2., 0.),
+        ];
+        let checked = |own: bool| {
+            let (doc, mesh, report, plan) = lathe_then_by_hand(
+                Some(&section),
+                |doc| {
+                    in_soft_jaws(doc, "30", "20", "20");
+                    let mut twenty = doc.workholding.last().unwrap().clone();
+                    twenty.id = "jaws-20".into();
+                    twenty.p.insert("bore".into(), "20".into());
+                    twenty.p.insert("name".into(), "Soft jaws bored Ø20".into());
+                    doc.workholding.push(twenty);
+                },
+                |plan, report| {
+                    plan.setups[0].operations[2].turn.as_mut().unwrap().z_end = Some(-32.);
+                    let mut hand = plan.setups.remove(1);
+                    hand.orientation = "-Z".into();
+                    hand.operations[0].surfaces = (report.orientations.iter())
+                        .find(|o| o.up == "-Z")
+                        .and_then(|o| o.planes.iter().find(|p| p.depth_below_top.abs() < 0.01))
+                        .unwrap()
+                        .surfaces
+                        .clone();
+                    // Held in its own Ø20 jaws, or in the CNC's Ø30 ones.
+                    hand.holder = (report.workholding_library.iter())
+                        .find(|h| h.sizes.get("bore") == Some(&20.))
+                        .map(|h| h.number)
+                        .filter(|_| own);
+                    plan.setups.push(hand);
+                },
+            );
+            let (report, _) = check(&doc, &mesh, &report, &plan);
+            let said: Vec<String> = (report.problems.iter())
+                .map(|p| format!("{}: {}", p.setup, p.message))
+                .collect();
+            (report.passed, said)
+        };
+        let (passed, said) = checked(false);
+        assert!(!passed);
+        assert!(
+            said.iter()
+                .any(|m| m.starts_with("3: ")
+                    && m.contains("are bored to Ø30 mm and the bar is Ø20 mm")),
+            "{said:?}"
+        );
+        // The CNC's own grip, on the Ø30, holds.
+        assert!(said.iter().all(|m| !m.starts_with("2:")), "{said:?}");
+        let (passed, said) = checked(true);
+        assert!(passed, "{said:?}");
+    }
+    #[test]
+    fn a_collet_set_to_ø20_is_refused_on_the_ø30_foot_of_the_turned_shaft() {
+        use crate::proposal::tests::{turned, with_lathe};
+        let (mut doc, mesh, _) = with_lathe();
+        let collet = crate::round_hold::starters()
+            .into_iter()
+            .find(|h| h.kind() == crate::round_hold::COLLET_BLOCK)
+            .unwrap();
+        let p = &mut doc.setups[0].p;
+        for (k, v) in [
+            ("holding", crate::round_hold::COLLET_BLOCK),
+            ("holder", &collet.id),
+            ("round_grip", "20"),
+            ("round_offset", "0"),
+            ("collet_diameter", "20"),
+        ] {
+            p.insert(k.into(), v.into());
+        }
+        doc.workholding.push(collet);
+        let report = crate::analysis::report(&doc, &mesh).unwrap();
+        let (refused, _) = check(&doc, &mesh, &report, &turned(&report));
+        assert!(!refused.passed);
+        assert!(
+            refused.problems.iter().any(|p| p.message.contains("cannot be held in the collet: it is set to close on Ø20 and the stock is Ø30 where it grips")),
+            "{:?}",
+            refused.problems
+        );
     }
     #[test]
     fn a_planned_manual_facing_in_front_passes_and_the_model_gets_its_minutes_and_zeros() {
@@ -3656,12 +3904,14 @@ mod totem {
             setups: vec![
                 ProposedSetup {
                     machine: None,
+                    bar: None,
                     orientation: "+Z".into(),
                     name: "Top".into(),
                     origin: "Stock top center".into(),
                     workholding: "Vise on the stock's frame".into(),
                     holder: None,
                     a_angles: None,
+                    grip: None,
                     operations: vec![
                         cut("Face", 1, &top, 1200., &|_| {}),
                         cut("Pocket", 1, &well, 1200., &|o| {
@@ -3701,12 +3951,14 @@ mod totem {
                 },
                 ProposedSetup {
                     machine: None,
+                    bar: None,
                     orientation: "-Z".into(),
                     name: "Underside".into(),
                     origin: "Stock top front-left".into(),
                     workholding: "Vise on the frame".into(),
                     holder: None,
                     a_angles: None,
+                    grip: None,
                     operations: vec![
                         cut("Face", 1, &at("-Z", 0.), 1200., &|_| {}),
                         cut("Pocket", 1, &underside, 1200., &|o| o.stepdown = Some(2.)),

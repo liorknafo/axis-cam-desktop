@@ -50,7 +50,7 @@ pub trait Backend {
     fn rotary(&self, _rotary: bool) {}
     /// Whether the part report lists hand machines (`machines`), so the
     /// proposals follow `proposal::schema_full` with `machine` and Box.
-    fn hand(&self, _hand: bool) {}
+    fn hand(&self, _hand: proposal::Hands) {}
 }
 /// The stage a run is in; `n` counts model requests from 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,15 +325,21 @@ pub fn instructions_with(pictures: bool, tool: bool, overview: bool) -> String {
 /// A AXIS section say how to use it; without, the text is the same as it was.
 #[cfg(test)]
 pub fn instructions_for(pictures: bool, tool: bool, overview: bool, rotary: bool) -> String {
-    instructions_full(pictures, tool, overview, rotary, false)
+    instructions_full(pictures, tool, overview, rotary, proposal::Hands::NONE)
 }
 /// The opening's sentence on the hand machines, after its first.
 const HAND_OPENING: &str = " The job may also use the hand machines `machines` lists (see MACHINES): they make no program, and the user follows the steps the program draws for them.";
 /// The part report's `machines` bullet.
 const HAND_PART: &str = "- `machines` and `work_zero`: see MACHINES and MANUAL MILL.\n";
+/// The same, with a lathe and no manual mill.
+const HAND_PART_LATHE: &str = "- `machines` and `work_zero`: see MACHINES.\n";
+/// The part report's `turning` bullet, with a lathe.
+const TURNING_PART: &str = "- `turning`: see LATHE.\n";
+/// The Turn strategy's bullet, among the strategies.
+const TURN: &str = "- Turn (lathe only): see LATHE.\n";
 /// The Box strategy's bullet, among the strategies.
 const BOX: &str = "- Box (manual mill only): see MANUAL MILL.\n";
-/// The MACHINES and MANUAL MILL sections, with their blank lines after them.
+/// The MACHINES section, with its blank line after it.
 const HAND: &str = "MACHINES
 - `machines` lists the machines a setup may use, by `number`. Number 1 is setup 1's machine, the CNC that `machine` and the rest of the report describe. A `Manual mill` is a hand-fed mill with a DRO: the user moves one axis at a time, following steps the program draws, and it makes no program. Give every setup its `machine`.
 - Setup 1 is the first setup on machine 1: it keeps the user's stock, holder, work zero and orientation (the first one in `orientations`), and its `holder` follows the rules for setup 1. These instructions call it setup 1, but the check report and its problems number the setups in the plan's order: with hand setups before it, it has a higher number there. Setups on a hand machine may come before it. The first of them takes the stock as setup 1 defines it: it must use the first orientation, and it takes setup 1's work zero (its own `origin` is not used) and setup 1's holder when that holder fits the hand machine; else give it a `holder` that does, or null when no entry fits the hand machine, which leaves its holding to the user, unmodelled and unchecked. Setup 1 then starts from the stock they leave. Setups on any machine may follow setup 1; none on machine 1 may come before it. Each orientation may be used by one setup on the CNC. A hand machine may use one again: a manual setup may face the top that setup 1 then machines from the same side, and the stock may come back to the manual mill after the CNC, say to tap from that top, each move counted. At most 6 setups on the CNC and 10 in all.
@@ -342,7 +348,9 @@ const HAND: &str = "MACHINES
 - On a hand machine the program sets `rpm` to the nearest of the machine's `gears` (with `variable` true, anywhere between the two) and caps `feed` at its `hand_feed`, then checks both against the material's cutting data as on the CNC: choose a gear and a feed inside it. Give `coolant` `Off` there.
 - Time: `total_minutes` in the check report is the whole job, and `minutes_by_machine` splits it: each machine's operations and tool changes (`tool_time_min` each on a hand machine, plus `pass_time_s` for every pass), and `moving`, the hand machine's `move_time_min` each time the stock goes between machines. Plan for the shortest total: put work on a hand machine when that makes the total shorter, counting the moves, or when only it can do it (Tapping); otherwise keep it on the CNC. When the user asks for or against a machine, follow the request.
 
-MANUAL MILL
+";
+/// The MANUAL MILL section.
+const MILL: &str = "MANUAL MILL
 - Box: removes an axis-aligned block with one flat end mill, one axis at a time: facing a sawn block's top, squaring a side, a step, a shoulder, a slot or a rectangular pocket. `box` gives the block in the setup's work coordinates, mm from its work zero with Z up: `x_min`, `x_max`, `y_min`, `y_max`, `z_top`, `z_bottom`. The report's positions are measured from the model's -X/-Y/bottom corner: subtract `work_zero` (setup 1's in the part report; each setup's in the check report's `stocks`) to convert. Setup 1's stock, from that corner, runs from -`stock_margin[2]` to `model_size[0]` + `stock_margin[3]` in X, from -`stock_margin[4]` to `model_size[1]` + `stock_margin[5]` in Y, and from -`stock_margin[1]` to `model_size[2]` + `stock_margin[0]` in Z (the first orientation's); a later setup's is its `box_from_part_corner`. `surfaces` empty, `box` null for every other strategy.
 - A side of the block on or beyond the stock's face is open; the others are closed. The block's closed sides and its floor keep `allowance` (null: 0.5 mm) for the CNC to finish; 0 makes the manual cut final. `stepdown` null takes what the spindle's power can (give one for soft stock); `stepover_percent` null is 70. It cuts in equal levels and rows, conventional only; a block closed at both ends of its passes (a pocket, a closed slot) plunges at its first row, so give it a centre-cutting end mill; its inside corners keep the tool's radius.
 - A Box that reaches into the part is refused with the X, Y and Z where it does: keep the block and its allowance outside the part, its floor no lower than the faces under it.
@@ -351,21 +359,86 @@ MANUAL MILL
 - Use it for big square material the CNC cannot hold or reach, large steps and slots, and Tapping the holes a CNC setup drilled (a manual setup after it, in the same orientation). Keep curves, slopes, small features and tight tolerances on the CNC.
 
 ";
-/// `instructions_for`, and with `hand` (the report lists `machines`) the
-/// MACHINES and MANUAL MILL sections; without, the text is the same as it was.
+/// The LATHE section.
+const LATHE: &str = "LATHE
+- A `Lathe` setup turns its stock about the vertical axis of its orientation: Z 0 is the free end (the part's top end in that orientation), negative toward the chuck; X and Y are radial; every size is a diameter. Its work zero is `Stock top center` on that axis (its `origin` is not used).
+- `turning` gives, for each orientation, the part as turned about that axis: its `length`, `largest_diameter`, the `round_share` of its length that is round and, when that is at least 0.3, its `steps` from the top down (`from_top` and `to_top` below the part's top, `outer_diameter`, `inner_diameter` 0 where it is solid on the axis, and `round`), and the `threads` on the axis. Turn only where the steps are round; leave flats, holes off the axis and anything not round to the mills.
+- A lathe setup is held in a `Chuck` of `workholding_library` that lists the lathe in `machines` (`jaws` 3 or 4, the diameters it grips from `min_grip` to `max_grip`, `jaw_length`); `holder` null takes the 3-jaw on a new setup, which centres a round bar, and keeps the chuck a setup you keep is in; the 4-jaw is for square or off-centre stock. `grip` is how much of the stock the jaws grip, mm: null takes `jaw_length` on a new setup, less where the cuts must stay 5 mm clear of the jaws, and keeps the grip of a setup you keep; give it only to grip less (at most `jaw_length`, and 5 mm short of the deepest cut). Cut only what stands out of the jaws. Give `grip` null on every setup that is not on the lathe.
+- The first setup, when it is on the lathe, turns a fresh bar: give `bar`: `diameter` at least the `largest_diameter` plus 2 mm; `length` the part's `length` plus `free_end`, the parting blade's width, the chuck's `jaw_length` and 5 mm. The program puts the part on the bar's axis with its top `free_end` (null: 2 mm on a new bar, where it is now on a bar you keep or resize) below the bar's free end, so in work Z the part's top is at -`free_end` and a step's `from_top` at -(`free_end` + `from_top`). Give `bar` null on every other setup: a lathe setup after another setup turns what that one left. The bar is larger than the part all along: turn it to the `largest_diameter` first, with an Outside down to where the part is parted off, then the smaller steps.
+- Turn: `turn` gives its `kind` and the kind's fields, in work Z and diameters; a null field takes the kind's default, which does not know your part: always give the fields that say where it cuts (`diameter`, `z_end`, `z`, `face_off`, `to_diameter`, `size`, `width`, `pitch`); null suits only `depth`, `finish`, `allowance` (Outside: 2, 0.2 and 0; Bore: 1, 0.1 and 0) and `passes`. `surfaces` empty and `box` null. `rpm` is put on the nearest of the lathe's `gears`; `feed` must be positive but is not used (give 0.1): the carriage's power feed nearest 0.1 mm per revolution feeds Outside, Bore and Thread passes, the rest is fed by hand. The lathe's speeds are not checked against the material's cutting data, so choose them from it yourself (Vc = π × D × rpm ÷ 1000 at the largest diameter cut). The kinds, and the tool `kind` each needs:
+  - `Face` (Turning tool): `face_off` mm off the end as it is, in to `to_diameter` (0: to the centre).
+  - `Outside` (Turning tool): turns from the end down to `diameter` as far as `z_end` (0 or below), `depth` off the diameter per pass, a last pass of `finish`, leaving `allowance` on the diameter.
+  - `Bore` (Boring bar whose `min_bore` is at most the hole as it is and whose `reach` is at least -`z_end`): like Outside, opening a hole drilled before it to `diameter`.
+  - `Chamfer` (Turning tool): `edge` `End outside`, `End inside` or `Shoulder`, `size` mm.
+  - `Groove` (Grooving tool no wider than `width`): from `z`, its edge toward the chuck, to `z` + `width` (0 or below), down to `diameter`.
+  - `Part off` (Parting blade): at `z`, where the part's end toward the chuck is, -(`free_end` + `length`) on a fresh bar; the blade's side toward the part is at `z` and its width goes toward the chuck. The part comes free of the bar, so it is the setup's last operation.
+  - `Thread` (Threading tool whose `pitches` hold `pitch` and whose `thread_angle` is the thread's, or a Die of the thread): `thread_side` `Outside` or `Inside`, `diameter` the thread's major diameter, `pitch` one of the lathe's `pitches` for a threading tool, as far as `z_end`; `passes` null works them out from the depth.
+- Drill on the lathe drills on the centre line from the tailstock: `surfaces` empty, `turn` with `kind` `Drill` and its `depth` (the full diameter, from where the drill first touches), `drill_cycle` `Drilling` or `Tapping` (with a Tap). It makes a hole of the drill's own diameter, so it needs a lathe tool of the hole's size; otherwise leave the hole to a mill. Face the end first.
+- Order a lathe setup: Face, Outside (the larger diameters first), Drill, Bore, Groove, Chamfer, Thread, Part off.
+- A mill setup after a lathe setup starts from the turned part, whose sides the lathe has cut, so a stock-based zero is refused there: give it `origin` `Model origin`. A vise holds the turned part by its box, across its largest diameter, and a `V-block` or `Soft jaws` of the library hold it round; without either, the vise it is, and the check says whether it holds. A lathe setup after the mills turns what they left, about its orientation's axis.
+- Use the lathe for round parts and round features about one axis (shafts, bushes, spacers, round bosses, threads on the axis) when that makes the total shorter; the mills then do the flats, the holes off the axis and the pockets.
+
+";
+/// The MACHINES section for `hands`: as phase 1 told it for a manual mill,
+/// the lathe's sentences added only with a lathe.
+fn machines_section(hands: proposal::Hands) -> String {
+    if !hands.any() {
+        return String::new();
+    }
+    let mut text = HAND.to_string();
+    if hands.lathe {
+        for (from, to) in [
+            (
+                "following steps the program draws, and it makes no program.",
+                "following steps the program draws. A `Lathe` is a hand lathe without a DRO, its numbers drawn as dial pictures (see LATHE). Neither makes a program.",
+            ),
+            (
+                "and its `holder` follows the rules for setup 1.",
+                "and its `holder` follows the rules for setup 1. Behind a lathe setup its `origin` is yours to give, as for a later setup: the lathe has cut the stock its zero was on.",
+            ),
+            (
+                "The first of them takes the stock as setup 1 defines it:",
+                "The first of them takes the fresh stock. On a manual mill it takes the stock as setup 1 defines it:",
+            ),
+            (
+                "unmodelled and unchecked.",
+                "unmodelled and unchecked. On a lathe it turns the round bar its `bar` gives, in any orientation (see LATHE).",
+            ),
+        ] {
+            debug_assert!(text.contains(from), "{from}");
+            text = text.replacen(from, to, 1);
+        }
+    }
+    text
+}
+/// `instructions_for`, and with hand machines (`hands`, the report lists
+/// `machines`) the MACHINES section, with a manual mill the MANUAL MILL one
+/// and with a lathe the LATHE one; without, the text is the same as it was.
 pub fn instructions_full(
     pictures: bool,
     tool: bool,
     overview: bool,
     rotary: bool,
-    hand: bool,
+    hands: proposal::Hands,
 ) -> String {
-    let with_hand = hand;
-    let (hand_opening, hand_part, boxed, hand) = if hand {
-        (HAND_OPENING, HAND_PART, BOX, HAND)
-    } else {
-        ("", "", "", "")
-    };
+    let pick = |on: bool, text: &'static str| if on { text } else { "" };
+    let hand_opening = pick(hands.any(), HAND_OPENING);
+    let hand_part = format!(
+        "{}{}",
+        if hands.mill {
+            HAND_PART
+        } else {
+            pick(hands.lathe, HAND_PART_LATHE)
+        },
+        pick(hands.lathe, TURNING_PART)
+    );
+    let boxed = format!("{}{}", pick(hands.mill, BOX), pick(hands.lathe, TURN));
+    let hand = format!(
+        "{}{}{}",
+        machines_section(hands),
+        pick(hands.mill, MILL),
+        pick(hands.lathe, LATHE)
+    );
     let (rotary_part, rotary) = if rotary {
         (ROTARY_PART, ROTARY)
     } else {
@@ -477,11 +550,19 @@ WORKHOLDING
 - In the check report, `covered_other` lists the remaining surface by `facing` (+X, -X, +Y, -Y, top, bottom), named in setup 1's frame, which can differ from the orientation names when setup 1 is rotated.
 - In the check report, `stocks` gives the stock each setup starts from, in that setup's axes: its `size`, its box from the model's -X/-Y/bottom corner (`box_from_part_corner`), how much the earlier setups `removed` whole from each side, and `by` which operations.
 - Reply with the JSON proposal only.");
-    if !with_hand {
+    if !hands.any() {
         return text;
     }
     // The limits a plan on several machines has instead (see MACHINES).
-    text.replace("STRATEGIES (the only eight)", "STRATEGIES (the only nine)")
+    let count = match (hands.mill, hands.lathe) {
+        (true, true) => "ten",
+        (false, false) => "eight",
+        _ => "nine",
+    };
+    text.replace(
+        "STRATEGIES (the only eight)",
+        &format!("STRATEGIES (the only {count})"),
+    )
         .replace(
             "Each orientation may be used by one setup only, so a plan has at most 6 setups.",
             "Each orientation may be used by one setup on the CNC; a hand machine may use one again (see MACHINES).",
@@ -1023,7 +1104,7 @@ async fn ask(
                 proposal::schema_full(
                     sight.edit,
                     report.rotary.is_some(),
-                    !report.machines.is_empty(),
+                    proposal::Hands::of(report),
                 ),
             )
         } else {
@@ -1034,10 +1115,10 @@ async fn ask(
             sight.tool,
             sight.overview,
             report.rotary.is_some(),
-            !report.machines.is_empty(),
+            proposal::Hands::of(report),
         );
         if sight.edit {
-            system.push_str(&editing_for(!report.machines.is_empty()));
+            system.push_str(&editing_for(proposal::Hands::of(report).any()));
         }
         let mut messages = vec![Item::text(Role::System, system)];
         messages.extend(outgoing(conversation, sight.pictures, sight.tool));
@@ -1230,7 +1311,7 @@ where
         })?
         .map_err(|e| fail(e, vec![], None, 0))?;
     backend.rotary(report.rotary.is_some());
-    backend.hand(!report.machines.is_empty());
+    backend.hand(proposal::Hands::of(&report));
     let part = serde_json::to_string(&report).map_err(|e| fail(e.to_string(), vec![], None, 0))?;
     // The plan to change, read before anything is sent.
     let current = if edit {
@@ -1461,7 +1542,7 @@ pub struct OpenAiBackend {
     pictures: bool,
     /// Whether the run's machine has a rotary A axis (`Backend::rotary`).
     rotary: std::sync::atomic::AtomicBool,
-    hand: std::sync::atomic::AtomicBool,
+    hand: std::sync::Mutex<proposal::Hands>,
 }
 impl OpenAiBackend {
     pub fn new(
@@ -1477,7 +1558,7 @@ impl OpenAiBackend {
             stream,
             pictures,
             rotary: false.into(),
-            hand: false.into(),
+            hand: Default::default(),
         }
     }
 }
@@ -1497,7 +1578,7 @@ impl Backend for OpenAiBackend {
             schema: proposal::schema_full(
                 edit,
                 self.rotary.load(Ordering::Relaxed),
-                self.hand.load(Ordering::Relaxed),
+                *self.hand.lock().unwrap(),
             ),
             tools: tools.to_vec(),
             tool_choice: choice,
@@ -1522,8 +1603,8 @@ impl Backend for OpenAiBackend {
         self.rotary
             .store(rotary, std::sync::atomic::Ordering::Relaxed);
     }
-    fn hand(&self, hand: bool) {
-        self.hand.store(hand, std::sync::atomic::Ordering::Relaxed);
+    fn hand(&self, hand: proposal::Hands) {
+        *self.hand.lock().unwrap() = hand;
     }
 }
 /// The stock after the whole job, meshed at Standard detail for the
@@ -1725,23 +1806,46 @@ pub(crate) mod tests {
     }
     #[test]
     fn the_hand_sections_are_told_only_with_a_hand_machine() {
+        use proposal::Hands;
+        let hands = |mill, lathe| Hands { mill, lathe };
         for bits in 0..16u8 {
             let [p, t, o, r] = [0, 1, 2, 3].map(|k| bits & (1 << k) != 0);
             let plain = instructions_for(p, t, o, r);
-            assert_eq!(instructions_full(p, t, o, r, false), plain);
+            assert_eq!(instructions_full(p, t, o, r, Hands::NONE), plain);
             assert!(!plain.contains("MANUAL MILL") && !plain.contains("`machines`"));
-            let with = instructions_full(p, t, o, r, true);
-            for told in [
-                "MACHINES\n",
-                "MANUAL MILL\n",
-                "- Box (manual mill only)",
-                "STRATEGIES (the only nine)",
-                "one setup on the CNC; a hand machine may use one again",
-                "on a hand machine see MACHINES",
+            for (mill, lathe, count) in [
+                (true, false, "nine"),
+                (false, true, "nine"),
+                (true, true, "ten"),
             ] {
-                assert!(with.contains(told), "{told}");
+                let with = instructions_full(p, t, o, r, hands(mill, lathe));
+                for told in [
+                    "MACHINES\n",
+                    "one setup on the CNC; a hand machine may use one again",
+                    "on a hand machine see MACHINES",
+                ] {
+                    assert!(with.contains(told), "{told}");
+                }
+                assert!(with.contains(&format!("STRATEGIES (the only {count})")));
+                assert_eq!(with.contains("MANUAL MILL\n"), mill);
+                assert_eq!(with.contains("- Box (manual mill only)"), mill);
+                assert_eq!(with.contains("LATHE\n"), lathe);
+                assert_eq!(with.contains("- Turn (lathe only)"), lathe);
+                assert_eq!(with.contains("- `turning`: see LATHE."), lathe);
+                assert!(!with.contains("so a plan has at most 6 setups"));
+                // With a manual mill alone, phase 1's sections word for word.
+                assert_eq!(with.contains(HAND), !lathe);
+                assert_eq!(with.contains(HAND_PART), mill);
+                for lathe_only in [
+                    "`bar`",
+                    "`grip` is how much",
+                    "LATHE",
+                    "Behind a lathe setup",
+                    "`Lathe`",
+                ] {
+                    assert_eq!(with.contains(lathe_only), lathe, "{lathe_only}");
+                }
             }
-            assert!(!with.contains("so a plan has at most 6 setups"));
         }
         assert_eq!(editing_for(false), EDITING);
         let edit = editing_for(true);
@@ -1749,6 +1853,26 @@ pub(crate) mod tests {
             !edit.contains("Setup 1 stays first")
                 && edit.contains("hand setups may stand before it")
         );
+    }
+    #[tokio::test]
+    async fn a_plan_with_the_lathe_in_front_turns_the_bar_and_the_cnc_takes_the_part() {
+        use crate::proposal::tests::{turned, with_lathe};
+        let (doc, mesh, report) = with_lathe();
+        let script = Script::new(vec![json(&turned(&report)), json(&turned(&report))]);
+        let outcome = plan(&script, doc.clone(), mesh.clone(), &Busy::default(), |_| {})
+            .await
+            .unwrap();
+        assert!(outcome.check.passed, "{:?}", outcome.check.problems);
+        let seen = script.seen.lock().unwrap();
+        let (system, part) = (&seen[0][0].1, &seen[0][1].1);
+        assert!(system.contains("LATHE\n") && !system.contains("MANUAL MILL\n"));
+        assert!(part.contains("\"turning\"") && part.contains("\"Lathe\""));
+        let job = applied(&outcome);
+        assert!(crate::lathe::is_lathe(&job.setups[0].machine));
+        assert_eq!(job.setups[1].id, doc.setups[0].id);
+        // MACHINE shows the lathe setup as dial steps: Hold, Zero, the turns.
+        let guide = crate::guide::build(&job, &mesh, 0).unwrap();
+        assert!(guide.steps.len() > 8, "{}", guide.steps.len());
     }
     #[tokio::test]
     async fn a_plan_with_the_manual_mill_in_front_applies_and_its_setup_shows_steps() {
@@ -3524,12 +3648,14 @@ pub(crate) mod tests {
             chuck: None,
             setups: vec![proposal::ProposedSetup {
                 machine: None,
+                bar: None,
                 orientation: report.orientations[0].up.into(),
                 name: "Top".into(),
                 origin: "Stock top center".into(),
                 workholding: "Vise.".into(),
                 holder: None,
                 a_angles: None,
+                grip: None,
                 operations: vec![
                     proposal::tests::op("Face", 1, top),
                     proposal::tests::op("Contour", 1, vec![]),

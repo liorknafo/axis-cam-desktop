@@ -1714,12 +1714,14 @@ impl App {
             setups: vec![
                 ProposedSetup {
                     machine: None,
+                    bar: None,
                     orientation: up.into(),
                     name: "Top".into(),
                     origin: "Stock top center".into(),
                     workholding: "Vise on the long sides.".into(),
                     holder: None,
                     a_angles: None,
+                    grip: None,
                     operations: vec![
                         op("Face", plane(up, "top")),
                         op("Pocket", floor.clone()),
@@ -1729,12 +1731,14 @@ impl App {
                 },
                 ProposedSetup {
                     machine: None,
+                    bar: None,
                     orientation: "-Z".into(),
                     name: "Underside".into(),
                     origin: "Model origin".into(),
                     workholding: "Turn over; the vise on the long sides.".into(),
                     holder: Some(1),
                     a_angles: None,
+                    grip: None,
                     operations: vec![op("Face", plane("-Z", "top"))],
                     from: None,
                 },
@@ -1797,12 +1801,14 @@ impl App {
             chuck: None,
             setups: vec![ProposedSetup {
                 machine: None,
+                bar: None,
                 orientation: first.up.into(),
                 name: "Top".into(),
                 origin: "Stock top center".into(),
                 workholding: "Vise on the long sides.".into(),
                 holder: None,
                 a_angles: None,
+                grip: None,
                 operations: vec![
                     op("Face", plane(0.)),
                     op("Pocket", plane(12.)),

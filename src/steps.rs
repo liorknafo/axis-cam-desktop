@@ -556,6 +556,9 @@ enum Shape {
     Tool([f32; 3], f32, Option<[f32; 3]>),
     /// An edge finder touching at a point, from a direction, labelled.
     Finder([f32; 3], [f32; 2], String),
+    /// The round an edge finder touches: its centre and radius, labelled
+    /// with its diameter.
+    Round([f32; 3], f32, String),
     /// A hole: its centre, radius, number and whether done, now or next.
     Hole([f32; 3], f32, usize, Lit),
     /// A word at a point.
@@ -805,6 +808,20 @@ impl Drawing<'_> {
                     );
                 }
                 Shape::Word(q, s, c) => write(f, s.clone(), p3(*q), *c, 13., Align::Left),
+                Shape::Round(q, r, label) => {
+                    let at = p3(*q);
+                    f.stroke(&canvas::Path::circle(at, r * s), stroke(ACCENT, 2.));
+                    // On its back-right, off the finders' lines.
+                    let d = r * s * std::f32::consts::FRAC_1_SQRT_2;
+                    write(
+                        f,
+                        label.clone(),
+                        Point::new(at.x + d + 4., at.y - d - 14.),
+                        ACCENT,
+                        13.,
+                        Align::Left,
+                    );
+                }
                 Shape::Block(bx) => {
                     let r = rect(bx);
                     f.fill(&path(r), DONE);
@@ -1641,32 +1658,40 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             approach,
             touch,
             finder,
+            at,
+            round,
             ..
         } => {
             let stock = p.shown.boxes[0];
             let sides = [["left", "right"], ["front", "back"]];
             let side = |k: usize| sides[k][usize::from(approach[k] > 0)];
+            // How far under the top each face is touched: 0 at the top.
+            let under = |k: usize| {
+                let d: f32 = stock.max[2] - at[k][2];
+                if d > 0.5 { d } else { 0. }
+            };
             // The work Z 0 is on the top, or the top is at a height.
             let top = touch[2].abs() < 0.005;
             let mut shapes = vec![];
+            // A round touched on X and Y: the diameter the finder meets,
+            // its centre where their lines cross.
+            if round[0] && round[1] {
+                let centre = [at[1][0], at[0][1], at[0][2]];
+                let r = (at[0][0] - centre[0]).abs();
+                shapes.push(Shape::Round(centre, r, format!("Ø{} touched", mm(2. * r))));
+            }
             for k in 0..2 {
-                let mut at = [0., 0., stock.max[2]];
-                let o = 1 - k;
-                at[o] = (stock.min[o] + stock.max[o]) / 2.;
-                at[k] = if approach[k] > 0 {
-                    stock.max[k]
-                } else {
-                    stock.min[k]
-                };
+                let at = at[k];
                 let mut from = [0.; 2];
                 from[k] = f32::from(approach[k].signum());
                 let set = format!("{} {}", AXES[k], dro(touch[k]));
                 shapes.push(Shape::Finder(at, from, set));
             }
+            // Off the middle lines, where a round's finders come in.
             shapes.push(Shape::Word(
                 [
                     (stock.min[0] + stock.max[0]) / 2. - 12.,
-                    (stock.min[1] + stock.max[1]) / 2.,
+                    stock.min[1] + (stock.max[1] - stock.min[1]) * 0.75,
                     0.,
                 ],
                 if top {
@@ -1679,6 +1704,8 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             let rows = (0..3).map(|k| {
                 let what = if k == 2 {
                     "touch the top → set".to_string()
+                } else if under(k) > 0. {
+                    format!("touch {} face {} under top → set", side(k), mm(under(k)))
                 } else {
                     format!("touch the {} face → set", side(k))
                 };
@@ -1696,14 +1723,16 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     Some(Message::Guide(GuideAction::Reached(k))),
                 )
             });
-            let right = column![
-                chips(vec![
-                    chip(format!("Ø{} edge finder", mm(*finder))),
-                    warn_chip("DRO comp off"),
-                ]),
-                label("Touch, then set the DRO"),
-            ]
-            .extend(rows);
+            let mut c = vec![
+                chip(format!("Ø{} edge finder", mm(*finder))),
+                warn_chip("DRO comp off"),
+            ];
+            // On a round the finder trips farthest out on its centre line,
+            // where the drawing puts it; off it the DRO reads short.
+            if round.iter().any(|r| *r) {
+                c.push(warn_chip("round: touch on its centre line"));
+            }
+            let right = column![chips(c), label("Touch, then set the DRO"),].extend(rows);
             (
                 "Zero".into(),
                 "pick up the corner",
@@ -3333,6 +3362,56 @@ pub(crate) mod tests {
         let _ = a.update(Message::Page(Page::Control));
         build(&mut a);
         a
+    }
+    /// Every Steps screen of the lathe setup the planner puts in front of the
+    /// shaft's CNC setup (`proposal::tests::turned`), at 1280 × 800, into
+    /// `AXIS_RENDER_DIR`.
+    #[test]
+    #[ignore]
+    fn render_the_planned_lathe_steps() {
+        use crate::proposal::tests::{turned, with_lathe};
+        let dir = std::path::PathBuf::from(std::env::var("AXIS_RENDER_DIR").unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        let (doc, mesh, report) = with_lathe();
+        let job = crate::proposal::build(&doc, &mesh, &report, &turned(&report)).unwrap();
+        let mut a = lathe_app_of(job, mesh, |d| {
+            let m = &mut d.setups[0].machine;
+            m.p.insert("cross_reads".into(), "Diameter".into());
+        });
+        for i in 0..guide(&a).steps.len() {
+            at(&mut a, i, 0);
+            render(&a, (1280, 800), &dir.join(format!("{i:02}.png")));
+        }
+    }
+    /// The manual mill's Hold, Zero and first Tool screens of the shaft
+    /// turned on the lathe and then drilled by hand
+    /// (`guide::tests::turned_then_drilled_by_hand`), and the Hold and
+    /// Zero of `guide::tests::short_part_in_soft_jaws`, at 1280 × 800, into
+    /// `AXIS_RENDER_DIR`.
+    #[test]
+    #[ignore]
+    fn render_the_hand_drilling_after_the_lathe() {
+        let dir = std::path::PathBuf::from(std::env::var("AXIS_RENDER_DIR").unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        let (job, mesh) = crate::guide::tests::turned_then_drilled_by_hand();
+        let mut a = lathe_app_of(job, mesh, |d| d.active = d.setups[1].id.clone());
+        let tool = (guide(&a).steps.iter())
+            .position(|s| matches!(s, Step::Tool { .. }))
+            .unwrap();
+        for (name, step) in [("hold", 0), ("zero", 1), ("tool", tool)] {
+            let id = a.doc.setups[1].id.clone();
+            a.doc.guide.insert(id, step);
+            render(&a, (1280, 800), &dir.join(format!("mill-{name}.png")));
+        }
+        // The short part in soft jaws: touched on its Ø20 above them.
+        let (doc, mesh, report, plan) = crate::guide::tests::short_part_in_soft_jaws();
+        let job = crate::proposal::build(&doc, &mesh, &report, &plan).unwrap();
+        let mut a = lathe_app_of(job, mesh, |d| d.active = d.setups[1].id.clone());
+        for (name, step) in [("hold", 0), ("zero", 1)] {
+            let id = a.doc.setups[1].id.clone();
+            a.doc.guide.insert(id, step);
+            render(&a, (1280, 800), &dir.join(format!("short-{name}.png")));
+        }
     }
     use crate::guide::LatheStep as L;
     /// The index of the `n`th step (from 0) that `pick` is true of.

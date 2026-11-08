@@ -527,6 +527,58 @@ impl Bands {
     pub fn coaxial(&self) -> &crate::rest::Coaxial {
         self.rest.coaxial()
     }
+    /// The bar `round` grips in `stock` (the box the earlier setups left),
+    /// as wide as the material is where it grips: `stock` narrowed round the
+    /// bar's axis to the farthest from it that material lies over the grip
+    /// (`holding::round_span`), found 12 ways round at 4 places along it,
+    /// stepping in 0.05 mm at a time from the bar's radius, to a step. A shaft turned
+    /// down at the end a holder grips is held as that diameter, not the
+    /// box's. `stock` when no material is found there.
+    pub fn section(
+        &self,
+        stock: Bounds,
+        round: &crate::round_hold::Round,
+        holder: &Holder,
+    ) -> Bounds {
+        const STEP: f32 = 0.05;
+        let bar = crate::round_hold::Bar::of(round.lying, stock);
+        let (from, to) = round_span(round, holder, bar);
+        let removed = self.rest.removed_in(stock);
+        let has = |p: [f32; 3]| self.rest.in_stock(p) && !removed.at(p);
+        let point = |along: f32, r: f32, a: f32| {
+            let (u, v) = (bar.axis[0] + r * a.cos(), bar.axis[1] + r * a.sin());
+            if round.lying {
+                [along, u, v]
+            } else {
+                [u, v, along]
+            }
+        };
+        let steps = (bar.radius / STEP) as usize;
+        let mut farthest: Option<f32> = None;
+        for j in 0..4 {
+            let along = from + (to - from) * (0.01 + 0.98 * j as f32 / 3.);
+            for i in 0..12 {
+                let a = std::f32::consts::TAU * i as f32 / 12.;
+                let r = (0..=steps)
+                    .map(|s| bar.radius - s as f32 * STEP)
+                    .find(|&r| has(point(along, r, a)));
+                if let Some(r) = r {
+                    farthest = Some(farthest.map_or(r, |f| f.max(r)));
+                }
+            }
+        }
+        // The material reaches out to within a step past the first found.
+        let Some(r) = farthest.map(|r| r + STEP).filter(|r| *r < bar.radius) else {
+            return stock;
+        };
+        let mut narrowed = stock;
+        let across = if round.lying { [1, 2] } else { [0, 1] };
+        for (k, c) in across.into_iter().zip(bar.axis) {
+            narrowed.min[k] = c - r;
+            narrowed.max[k] = c + r;
+        }
+        narrowed
+    }
     pub fn at(&self, stock: Bounds, layout: &Layout, holder: &Holder) -> Bounds {
         let Layout::Vise {
             axis_y,
@@ -584,6 +636,8 @@ pub fn gripped(layout: &Layout, holder: &Holder, stock: Bounds, bands: Option<&B
                 girth: None,
             }
         }
+        // A round holding closes on the bar as wide as it is where it grips.
+        (Layout::Round(round), Some(bands)) => Gripped::whole(bands.section(stock, round, holder)),
         _ => Gripped::whole(stock),
     }
 }
@@ -2390,6 +2444,9 @@ fn blamed(failed: &[[f32; 3]], removed: &dyn crate::rest::Removes) -> Vec<((u16,
 /// jaws close on what stands inside. The bottom when it cannot be told.
 fn band_advice(failed: &[[f32; 3]], removed: &crate::rest::Removed, band: &str) -> String {
     let source = blamed(failed, removed).first().map(|(source, _)| *source);
+    if source.is_some_and(|s| removed.turned(s)) {
+        return "Flat jaws touch what the lathe turned round only along a line: hold it in soft jaws bored to its diameter or in a collet block, or choose another holder.".into();
+    }
     match (removed.up_in(source), source) {
         (Some(up), Some((earlier, _))) if up < 0.5 => format!(
             "Leave at least {band} mm of those sides uncut in setup {}, or cut them through all {band} mm there, or choose another holder.",
@@ -2604,6 +2661,67 @@ pub fn bare(boxes: &[HoldBox], stock: Bounds, removed: &crate::rest::Removed) ->
         })
         .collect()
 }
+/// Where along `bar` (its axis) `round`, with `holder`'s sizes, grips it:
+/// standing, from the bar's bottom up its grip; lying, the soft jaws over
+/// their width and the V-block over its length, about the offset from the
+/// bar's middle. Within the bar's ends.
+fn round_span(
+    round: &crate::round_hold::Round,
+    holder: &Holder,
+    bar: crate::round_hold::Bar,
+) -> (f32, f32) {
+    if !round.lying {
+        return (bar.ends[0], (bar.ends[0] + round.grip).min(bar.ends[1]));
+    }
+    let centre = (bar.ends[0] + bar.ends[1]) / 2. + round.offset;
+    let key = match round.kind {
+        crate::round_hold::Kind::VBlock => "length",
+        _ => "jaw_width",
+    };
+    let half = num(&holder.p, key).unwrap_or(0.) / 2.;
+    (
+        (centre - half).max(bar.ends[0]),
+        (centre + half).min(bar.ends[1]),
+    )
+}
+/// The diameter a round holding closes on, mm, and the points on the stock
+/// (its box `stock`) where it must find material to close on it: a ring
+/// `round_hold::BORE_FIT` / 2 and `INSIDE` inside that diameter, 12 round
+/// the bar, at 4 places along where it grips (inset by 1 % of the span).
+/// Soft jaws close on their bore, a collet on what it grips (the bar's
+/// diameter unless set), a V-block on the bar. Standing, they grip from the
+/// bar's bottom up their grip; lying, the soft jaws over their width and
+/// the V-block over its length, about the offset from the bar's middle.
+fn round_contact(
+    round: &crate::round_hold::Round,
+    holder: &Holder,
+    stock: Bounds,
+) -> (f32, Vec<[f32; 3]>) {
+    use crate::round_hold::{BORE_FIT, Bar, Kind};
+    let bar = Bar::of(round.lying, stock);
+    let contact = match round.kind {
+        Kind::SoftJaws => num(&holder.p, "bore").unwrap_or(0.),
+        Kind::Collet => round.diameter.unwrap_or(bar.diameter()),
+        Kind::VBlock => bar.diameter(),
+    };
+    let (from, to) = round_span(round, holder, bar);
+    let r = contact / 2. - BORE_FIT / 2. - INSIDE;
+    let inset = (to - from) * 0.01;
+    let mut points = vec![];
+    for j in 0..4 {
+        let along = from + inset + (to - from - 2. * inset) * j as f32 / 3.;
+        for i in 0..12 {
+            let a = std::f32::consts::TAU * i as f32 / 12.;
+            let (u, v) = (r * a.cos(), r * a.sin());
+            points.push(if round.lying {
+                [along, bar.axis[0] + u, bar.axis[1] + v]
+            } else {
+                [bar.axis[0] + u, bar.axis[1] + v, along]
+            });
+        }
+    }
+    (contact, points)
+}
 /// Why `layout` with `holder` cannot hold `held` (the stock setup `setup`,
 /// from 0, starts from, and the band a vise closes on, in mm) given the
 /// material earlier setups removed (`removed`, None for setup 1): stock not
@@ -2645,9 +2763,39 @@ pub fn holdable(
     let mut found: Vec<String> = height_issue(layout, stock).into_iter().collect();
     let n = setup + 1;
     match layout {
-        // The chuck's grip, and a round holding's, is not checked against
-        // earlier cuts yet.
-        Layout::None | Layout::Chuck { .. } | Layout::Round(_) => {}
+        // The chuck's grip is not checked against earlier cuts yet.
+        Layout::None | Layout::Chuck { .. } => {}
+        Layout::Round(round) => {
+            let Some(removed) = removed else {
+                return found;
+            };
+            let (contact, points) = round_contact(round, holder, stock);
+            // A collet set smaller than the bar where it grips (the soft
+            // jaws' bore is held to it by `round_hold::issues`).
+            let wide = crate::round_hold::Bar::of(round.lying, stock).diameter();
+            if round.kind == crate::round_hold::Kind::Collet
+                && wide > contact + crate::round_hold::BORE_FIT + 0.005
+            {
+                found.push(format!(
+                    "Setup {n} cannot be held in the collet: it is set to close on Ø{} and the stock is Ø{} where it grips. Set the collet to Ø{}, if it takes it, grip the stock where it is Ø{}, or choose another holder.",
+                    mm(contact),
+                    mm(wide),
+                    mm(wide),
+                    mm(contact),
+                ));
+                return found;
+            }
+            let lost = missing(&points, stock, removed, 60);
+            if !lost.is_empty() {
+                let (who, late) = cause(&lost, removed, names);
+                found.push(format!(
+                    "Setup {n} cannot be held in the {}: {who} turned or cut the stock under Ø{} where it grips, so it would not close on it. Grip the stock where it is still Ø{}, size the holder to the diameter there, or choose another holder.{late}",
+                    round.kind.words(),
+                    mm(contact),
+                    mm(contact),
+                ));
+            }
+        }
         Layout::Vise { axis_y, grip, .. } => {
             // The jaws grip the sides below what the setup itself cuts (the
             // toolpaths are kept clear of them): only earlier cuts matter.

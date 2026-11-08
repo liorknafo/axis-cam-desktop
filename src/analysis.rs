@@ -71,6 +71,10 @@ pub struct PartReport {
     /// Setup 1's sheet on its spoilboard; absent for any other stock.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sheet: Option<SheetReport>,
+    /// The part as turned about each orientation's vertical axis; only when
+    /// `machines` has a lathe.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub turning: Vec<TurningReport>,
 }
 /// Setup 1's stock when it is a sheet lying on a spoilboard (`sheet`), mm.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -211,6 +215,143 @@ pub struct MachineEntry {
     pub tool_time_min: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub move_time_min: Option<f32>,
+    /// The lathe's carriage power feeds, mm per revolution, and the threads
+    /// its gearbox cuts, mm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feeds_mm_per_rev: Option<Vec<f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pitches: Option<Vec<f32>>,
+    /// What the lathe's cross-slide dial reads, `Diameter` or `Radius`, or
+    /// `unknown` until the user's dial check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cross_reads: Option<&'static str>,
+}
+/// The part as a lathe turns it about the vertical axis of one orientation:
+/// its axis through the centre of its box across, the free end its top.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TurningReport {
+    pub up: &'static str,
+    /// Along the axis, and the largest diameter, mm.
+    pub length: f32,
+    pub largest_diameter: f32,
+    /// The share of the length (0 to 1) over which the part is round.
+    pub round_share: f32,
+    /// From the top down: where each step starts and ends below the part's
+    /// top, its outside and inside diameters (inside 0 when solid on the
+    /// axis), and whether it is round. Listed only when `round_share` is at
+    /// least 0.3.
+    pub steps: Vec<TurnStep>,
+    /// The threads on the axis.
+    pub threads: Vec<TurnThread>,
+    /// More steps than are listed.
+    pub truncated: bool,
+}
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TurnStep {
+    pub from_top: f32,
+    pub to_top: f32,
+    pub outer_diameter: f32,
+    pub inner_diameter: f32,
+    pub round: bool,
+}
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TurnThread {
+    /// Its standard size, or Ø major × pitch.
+    pub size: String,
+    pub internal: bool,
+    pub major_diameter: f32,
+    pub pitch: f32,
+    pub from_top: f32,
+    pub to_top: f32,
+}
+/// The steps a `TurningReport` lists at most.
+const MAX_STEPS: usize = 40;
+/// `setup1` turned so that `up` faces up, with the part on the axis: the
+/// centre of its box across on X0 Y0, standing on Z0, as a lathe holds it.
+pub fn on_axis(setup1: &Setup, up: &str, mesh: &Mesh) -> Option<Setup> {
+    let mut setup = oriented(setup1, up)?;
+    for key in ["tx", "ty", "tz"] {
+        setup.p.insert(key.into(), "0".into());
+    }
+    let scale = mesh.display_scale();
+    let placed = crate::stock::Placement::unturned(mesh, Some(&setup)).bounds;
+    let shift = [
+        -(placed.min[0] + placed.max[0]) / 2. / scale,
+        -(placed.min[1] + placed.max[1]) / 2. / scale,
+        -placed.min[2] / scale,
+    ];
+    for (key, value) in ["tx", "ty", "tz"].iter().zip(shift) {
+        setup.p.insert((*key).into(), value.to_string());
+    }
+    Some(setup)
+}
+/// The part turned about each orientation's vertical axis.
+fn turning_report(setup1: &Setup, mesh: &Mesh, order: &[&'static str]) -> Vec<TurningReport> {
+    order
+        .iter()
+        .filter_map(|&up| {
+            let setup = on_axis(setup1, up, mesh)?;
+            let slabs = crate::turn::profile_round(&setup, mesh);
+            let top = slabs
+                .iter()
+                .map(|(s, _)| s[1])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let bottom = slabs
+                .iter()
+                .map(|(s, _)| s[0])
+                .fold(f32::INFINITY, f32::min);
+            let length = top - bottom;
+            // Also refuses NaN.
+            if length.partial_cmp(&0.) != Some(std::cmp::Ordering::Greater) {
+                return None;
+            }
+            let round: f32 = (slabs.iter())
+                .filter(|(_, round)| *round)
+                .map(|(s, _)| s[1] - s[0])
+                .sum();
+            let round_share = r2(round / length);
+            let mut steps: Vec<TurnStep> = slabs
+                .iter()
+                .rev()
+                .map(|(s, round)| TurnStep {
+                    from_top: r2(top - s[1]),
+                    to_top: r2(top - s[0]),
+                    outer_diameter: r2(2. * s[3]),
+                    inner_diameter: r2(2. * s[2]),
+                    round: *round,
+                })
+                .collect();
+            let truncated = round_share >= 0.3 && steps.len() > MAX_STEPS;
+            if round_share < 0.3 {
+                steps.clear();
+            }
+            steps.truncate(MAX_STEPS);
+            let threads = crate::thread::in_setup(&setup, mesh)
+                .into_iter()
+                .filter(|t| t.axis == 2 && !t.tapered && t.centre[0].hypot(t.centre[1]) <= 0.2)
+                .map(|t| TurnThread {
+                    size: t.spec.map_or_else(
+                        || format!("Ø{:.2} × {}", t.major, t.pitch),
+                        |s| s.name.to_string(),
+                    ),
+                    internal: t.internal,
+                    major_diameter: r2(t.major),
+                    pitch: t.pitch,
+                    from_top: r2(top - t.to.max(t.from)),
+                    to_top: r2(top - t.to.min(t.from)),
+                })
+                .collect();
+            Some(TurningReport {
+                up,
+                length: r2(length),
+                largest_diameter: r2(2. * slabs.iter().map(|(s, _)| s[3]).fold(0., f32::max)),
+                round_share,
+                steps,
+                threads,
+                truncated,
+            })
+        })
+        .collect()
 }
 /// The index of the user's setup: the first that is not on a hand machine,
 /// or the first when every setup is. It holds the user's stock, holding and
@@ -245,7 +386,12 @@ pub fn planning(doc: &Document) -> std::borrow::Cow<'_, Document> {
 }
 /// Whether the planner may plan setups on hand machine `m`.
 pub fn plannable(m: &crate::model::Machine) -> bool {
-    crate::manual::is_manual(m)
+    crate::manual::is_hand(m)
+}
+/// Whether `machines` has a lathe, so the report and the plan take its
+/// tools, its chucks and the part as turned.
+pub fn has_lathe(machines: &[&crate::model::Machine]) -> bool {
+    machines.iter().any(|m| crate::lathe::is_lathe(m))
 }
 /// The machines a plan may use, as `machines` numbers them from 1: the
 /// user's setup's, then each plannable hand machine of the library and of
@@ -305,6 +451,9 @@ fn machine_entry(number: usize, m: &crate::model::Machine) -> Result<MachineEntr
         pass_time_s: None,
         tool_time_min: None,
         move_time_min: None,
+        feeds_mm_per_rev: None,
+        pitches: None,
+        cross_reads: None,
     };
     if !crate::manual::is_hand(m) {
         let limits = machine_report(m)?;
@@ -318,6 +467,11 @@ fn machine_entry(number: usize, m: &crate::model::Machine) -> Result<MachineEntr
     entry.pass_time_s = given("pass_time");
     entry.tool_time_min = given("tool_time");
     entry.move_time_min = given("move_time");
+    if crate::lathe::is_lathe(m) {
+        entry.feeds_mm_per_rev = Some(crate::lathe::feeds(m));
+        entry.pitches = Some(crate::lathe::pitches(m));
+        entry.cross_reads = Some(crate::lathe::cross_reads(m).unwrap_or("unknown"));
+    }
     if crate::manual::is_manual(m) {
         entry.hand_feed = given("hand_feed");
         entry.hand_rapid = given("hand_rapid");
@@ -329,10 +483,14 @@ fn machine_entry(number: usize, m: &crate::model::Machine) -> Result<MachineEntr
 /// program models. The report numbers them from 1 and a proposal's `holder`
 /// counts the same way.
 pub fn library(doc: &Document) -> Vec<&crate::holding::Holder> {
+    // A lathe's chucks only when the plan may use a lathe.
+    let chucks = has_lathe(&machines(doc));
     doc.workholding
         .iter()
         .filter(|h| {
-            matches!(h.kind(), "Vise" | "Clamp") || crate::round_hold::KINDS.contains(&h.kind())
+            matches!(h.kind(), "Vise" | "Clamp")
+                || crate::round_hold::KINDS.contains(&h.kind())
+                || (chucks && h.kind() == "Chuck")
         })
         .collect()
 }
@@ -469,7 +627,7 @@ pub struct ChipLoadBand {
     pub min: f32,
     pub max: f32,
 }
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ToolReport {
     pub number: u32,
     pub name: String,
@@ -515,6 +673,51 @@ pub struct ToolReport {
     /// The `machines` numbers the tool fits; told only with `machines`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machines: Option<Vec<usize>>,
+    /// A turning tool's hand and lead angle, degrees; its nose radius and a
+    /// boring bar's, mm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hand: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lead_angle: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nose_radius: Option<f32>,
+    /// The smallest bore a boring bar enters, mm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_bore: Option<f32>,
+    /// A grooving tool's or parting blade's width, mm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<f32>,
+}
+/// A lathe tool as the report tells it: its kind and the sizes the Turn
+/// checks use; its mill sizes are 0. None without a number.
+fn lathe_tool(t: &crate::model::Tool, machines: &[&crate::model::Machine]) -> Option<ToolReport> {
+    let value = |k: &str| num(&t.p, k).filter(|v| v.is_finite());
+    let kind = get(&t.p, "type");
+    Some(ToolReport {
+        number: t.number()?,
+        name: t.name().to_string(),
+        kind: kind.to_string(),
+        hand: (kind == "Turning tool").then(|| get(&t.p, "hand").to_string()),
+        lead_angle: (kind == "Turning tool")
+            .then(|| value("lead_angle"))
+            .flatten(),
+        nose_radius: value("nose_radius"),
+        min_bore: value("min_bore"),
+        width: value("width"),
+        reach: value("reach"),
+        thread_angle: (kind == "Threading tool")
+            .then(|| value("thread_angle"))
+            .flatten(),
+        pitches: (kind == "Threading tool")
+            .then(|| {
+                let (a, b) = get(&t.p, "pitches").split_once('-')?;
+                Some([a.trim().parse().ok()?, b.trim().parse().ok()?])
+            })
+            .flatten(),
+        thread: crate::lathe::die_spec(t).map(|s| s.name.to_string()),
+        machines: fitting(machines, |m| t.fits(m)),
+        ..ToolReport::default()
+    })
 }
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OrientationReport {
@@ -1748,6 +1951,8 @@ fn describe(
             .filter(|up| *up != first),
     );
     let keyseat = |t: &crate::model::Tool| get(&t.p, "type") == crate::model::KEYSEAT;
+    let order_copy = order.clone();
+    let lathe = has_lathe(machines);
     Ok(PartReport {
         units: "mm",
         part_size: mesh.dimensions.map(r2),
@@ -1767,6 +1972,10 @@ fn describe(
             .tools
             .iter()
             .filter_map(|t| {
+                // A lathe tool has no mill sizes: told only with a lathe.
+                if t.is_lathe() {
+                    return lathe.then(|| lathe_tool(t, machines)).flatten();
+                }
                 Some(ToolReport {
                     number: t.number()?,
                     name: t.name().to_string(),
@@ -1805,6 +2014,7 @@ fn describe(
                         .then(|| t.bore_range().map(|(a, b)| [a, b]))
                         .flatten(),
                     machines: fitting(machines, |m| t.fits(m)),
+                    ..ToolReport::default()
                 })
             })
             .collect(),
@@ -1822,6 +2032,11 @@ fn describe(
             .collect(),
         rotary: rotary_report(doc, setup1),
         sheet: sheet_report(setup1, mesh),
+        turning: if has_lathe(machines) {
+            turning_report(setup1, mesh, &order_copy)
+        } else {
+            vec![]
+        },
     })
 }
 

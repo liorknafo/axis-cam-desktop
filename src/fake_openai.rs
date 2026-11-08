@@ -390,12 +390,14 @@ pub mod rotary {
     ) -> ProposedSetup {
         ProposedSetup {
             machine: None,
+            bar: None,
             orientation: up.into(),
             name: name.into(),
             origin: origin.into(),
             workholding: "The bar in the chuck.".into(),
             holder: None,
             a_angles: angles,
+            grip: None,
             operations: vec![operation],
             from: None,
         }
