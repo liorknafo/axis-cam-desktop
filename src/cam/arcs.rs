@@ -48,6 +48,8 @@ struct Facet {
     /// Its normal, level and of unit length: out of the part.
     normal: [f32; 2],
 }
+/// The facets at each corner seen from above, by its key (`key`).
+type Corners = HashMap<(i64, i64), Vec<usize>>;
 /// Two corners seen from above are one within this, mm.
 const SAME: f64 = 1e-3;
 /// A corner's key, for finding the facets that meet at it.
@@ -158,8 +160,8 @@ fn fit(facets: &HashMap<usize, Facet>, members: &[usize]) -> Option<([f64; 2], f
     ))
 }
 /// The facets of `facets` at each of their corners, by its key.
-fn corners(facets: &HashMap<usize, Facet>) -> HashMap<(i64, i64), Vec<usize>> {
-    let mut at: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+fn corners(facets: &HashMap<usize, Facet>) -> Corners {
+    let mut at: Corners = HashMap::new();
     for (&id, f) in facets {
         for p in &f.xy {
             at.entry(key(*p)).or_default().push(id);
@@ -169,11 +171,7 @@ fn corners(facets: &HashMap<usize, Facet>) -> HashMap<(i64, i64), Vec<usize>> {
 }
 /// The facets of `facets` that meet any of `members` at a corner, not among
 /// them, in order of id.
-fn neighbours(
-    facets: &HashMap<usize, Facet>,
-    at: &HashMap<(i64, i64), Vec<usize>>,
-    members: &[usize],
-) -> Vec<usize> {
+fn neighbours(facets: &HashMap<usize, Facet>, at: &Corners, members: &[usize]) -> Vec<usize> {
     let mut out: Vec<usize> = (members.iter())
         .flat_map(|m| facets[m].xy.iter())
         .flat_map(|p| at.get(&key(*p)).into_iter().flatten())
@@ -188,11 +186,7 @@ fn neighbours(
 /// facets next to it whose corners fit a circle best, and on round while
 /// the next facet's corners stay on the circle. None when no three do.
 /// `at` holds the facets at each corner (`corners`).
-fn grow(
-    facets: &HashMap<usize, Facet>,
-    at: &HashMap<(i64, i64), Vec<usize>>,
-    seed: usize,
-) -> Option<Vec<usize>> {
+fn grow(facets: &HashMap<usize, Facet>, at: &Corners, seed: usize) -> Option<Vec<usize>> {
     let mut best: Option<(f64, Vec<usize>)> = None;
     for a in neighbours(facets, at, &[seed]) {
         for b in neighbours(facets, at, &[seed, a]) {
@@ -314,6 +308,98 @@ fn arc(facets: &HashMap<usize, Facet>, members: Vec<usize>) -> Result<Arc, NoArc
         walls: members,
     })
 }
+/// Whether the curve the arc `members` of `facets` (`at`: by corner) is
+/// on goes on past either end bending about as the arc does, though off its
+/// circle: past an end facet, a facet of the part's walls no longer than
+/// twice the arc's middle one that turns from it 0.6 to 1.67 times as far
+/// as it turns from the arc's facet before it (and less than 30°), on a
+/// circle with those two whose radius is half to twice `r` and whose centre
+/// is within 0.6 `r` of the arc's (`c`). So a patch of an ellipse or a
+/// spline is no arc. A circle's arc ends at a corner, a flat (tangent to it,
+/// the turn there half a facet's), or a curve of another size or way.
+fn curve_goes_on(
+    facets: &HashMap<usize, Facet>,
+    at: &Corners,
+    members: &[usize],
+    c: [f64; 2],
+    r: f64,
+) -> bool {
+    let chord = |f: &Facet| {
+        (f.xy.iter().enumerate())
+            .flat_map(|(i, a)| {
+                f.xy[i + 1..]
+                    .iter()
+                    .map(move |b| (b.0 - a.0).hypot(b.1 - a.1))
+            })
+            .fold(0., f64::max)
+    };
+    let turn = |a: &Facet, b: &Facet| {
+        ((a.normal[0] * b.normal[0] + a.normal[1] * b.normal[1]) as f64)
+            .clamp(-1., 1.)
+            .acos()
+    };
+    let mut chords: Vec<f64> = members.iter().map(|m| chord(&facets[m])).collect();
+    chords.sort_by(f64::total_cmp);
+    let middle = chords[chords.len() / 2];
+    for &end in members {
+        let next = neighbours(facets, at, &[end]);
+        let inside: Vec<usize> = next
+            .iter()
+            .copied()
+            .filter(|n| members.contains(n))
+            .collect();
+        if inside.len() != 1 {
+            continue;
+        }
+        let (e, before) = (&facets[&end], &facets[&inside[0]]);
+        let last = turn(before, e);
+        for n in next.iter().filter(|n| !members.contains(n)) {
+            let f = &facets[n];
+            let on = turn(e, f);
+            if chord(f) > 2. * middle
+                || on >= 30f64.to_radians()
+                || on < 0.6 * last
+                || on > last / 0.6
+            {
+                continue;
+            }
+            let mut points: Vec<(f64, f64)> = vec![];
+            for q in [before, e, f].iter().flat_map(|f| f.xy.iter()) {
+                if !points.iter().any(|p| (p.0 - q.0).hypot(p.1 - q.1) < SAME) {
+                    points.push(*q);
+                }
+            }
+            let Some(o) = circle_centre(&points) else {
+                continue;
+            };
+            let rr = points
+                .iter()
+                .map(|p| (p.0 - o.0).hypot(p.1 - o.1))
+                .sum::<f64>()
+                / points.len() as f64;
+            if rr >= 0.5 * r && rr <= 2. * r && (o.0 - c[0]).hypot(o.1 - c[1]) <= 0.6 * r {
+                return true;
+            }
+        }
+    }
+    false
+}
+/// The arc `members` of `facets` is (`arc`), unless the curve it is on
+/// goes on past it (`curve_goes_on`, over `all`, the part's upright
+/// facets, by corner `at`): then it is no circle's.
+fn whole_arc(
+    facets: &HashMap<usize, Facet>,
+    all: &HashMap<usize, Facet>,
+    at: &Corners,
+    members: Vec<usize>,
+) -> Result<Arc, NoArc> {
+    let a = arc(facets, members)?;
+    let c = [a.centre[0] as f64, a.centre[1] as f64];
+    if curve_goes_on(all, at, &a.walls, c, a.r as f64) {
+        return Err(NoArc::NotRound);
+    }
+    Ok(a)
+}
 /// The arc of a round wall of the part that surface `id` is a facet of, as
 /// `setup` places it: the facets on round from it on the circle it is on.
 pub fn arc_at(setup: &Setup, mesh: &Mesh, id: usize) -> Result<Arc, NoArc> {
@@ -322,10 +408,9 @@ pub fn arc_at(setup: &Setup, mesh: &Mesh, id: usize) -> Result<Arc, NoArc> {
     if !facets.contains_key(&id) {
         return Err(NoArc::NotRound);
     }
-    arc(
-        &facets,
-        grow(&facets, &corners(&facets), id).ok_or(NoArc::NotRound)?,
-    )
+    let at = corners(&facets);
+    let members = grow(&facets, &at, id).ok_or(NoArc::NotRound)?;
+    whole_arc(&facets, &facets, &at, members)
 }
 /// The arcs a Drill drills among the surfaces `ids` (its selection), as
 /// `setup` places the part: each run of selected upright facets on one
@@ -339,6 +424,8 @@ pub fn drilled_arcs(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc
         return vec![];
     }
     let at = corners(&facets);
+    // The part's upright facets, for where a curve goes on past an arc.
+    let mut all: Option<(HashMap<usize, Facet>, Corners)> = None;
     let mut seeds: Vec<usize> = facets.keys().copied().collect();
     seeds.sort_unstable();
     let (mut done, mut found) = (HashSet::new(), vec![]);
@@ -351,7 +438,15 @@ pub fn drilled_arcs(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc
             continue;
         };
         done.extend(members.iter().copied());
-        if let Ok(a) = arc(&facets, members) {
+        if arc(&facets, members.clone()).is_err() {
+            continue;
+        }
+        let (every, by_corner) = all.get_or_insert_with(|| {
+            let every = self::facets(&g, |_| true);
+            let by_corner = corners(&every);
+            (every, by_corner)
+        });
+        if let Ok(a) = whole_arc(&facets, every, by_corner, members) {
             found.push(a);
         }
     }
@@ -711,5 +806,126 @@ pub(crate) mod tests {
         assert!(drilled_arcs(&setup, &mesh, &half.iter().copied().collect()).is_empty());
         picking(&mut op, &mesh, &half);
         assert!(holes(&setup, &op, &mesh).is_err());
+    }
+    /// A 40 x 30 plate 8 mm thick with an opening through it, its corners
+    /// `inner`.
+    fn plate_with(inner: &[(f64, f64, f64)]) -> Vec<[[f32; 3]; 3]> {
+        slab(
+            &[
+                &[
+                    (-20., -15., 0.),
+                    (20., -15., 0.),
+                    (20., 15., 0.),
+                    (-20., 15., 0.),
+                ],
+                inner,
+            ],
+            8.,
+            0.,
+            true,
+            true,
+        )
+    }
+    #[test]
+    fn an_ellipses_wall_is_no_arc_however_finely_it_is_faceted() {
+        // Ellipses 16 x 8 and 20 x 19 (nearly round): a patch of each fits a
+        // circle to a thousandth, but the curve goes on past it, bending a
+        // little less or more: no circle's arc, so no hole is invented.
+        for (a, b) in [(8., 4.), (10., 9.5)] {
+            for sides in [64, 128, 256] {
+                let inner: Vec<(f64, f64, f64)> = (0..sides)
+                    .map(|k| {
+                        let t = k as f64 * std::f64::consts::TAU / sides as f64;
+                        (a * t.cos(), b * t.sin(), 0.)
+                    })
+                    .collect();
+                let mesh = mesh::normalize(plate_with(&inner)).unwrap();
+                let (setup, _, _) = fixture(Strategy::Drill);
+                let wall = walls_where(&setup, &mesh, |c| c[0].abs() < 10.5 && c[1].abs() < 10.);
+                assert_eq!(wall.len(), sides, "{a}x{b}");
+                for id in wall {
+                    let read = arc_at(&setup, &mesh, id);
+                    assert!(read.is_err(), "{a}x{b} {sides} sides, {id}: {read:?}");
+                }
+            }
+        }
+    }
+    #[test]
+    fn a_rounded_openings_corners_are_quarter_circle_arcs() {
+        // A 20 x 10 opening with R3 corners round X±7 Y±2.
+        let q = 22.5f64.to_radians().tan();
+        let mesh = mesh::normalize(plate_with(&[
+            (-7., -5., 0.),
+            (7., -5., q),
+            (10., -2., 0.),
+            (10., 2., q),
+            (7., 5., 0.),
+            (-7., 5., q),
+            (-10., 2., 0.),
+            (-10., -2., q),
+        ]))
+        .unwrap();
+        let (setup, mut op, _) = fixture(Strategy::Drill);
+        for (x, y) in [(7f32, -2f32), (7., 2.), (-7., 2.), (-7., -2.)] {
+            let corner = walls_where(&setup, &mesh, |c| {
+                (c[0] - x) * x > 0.
+                    && (c[1] - y) * y > 0.
+                    && ((c[0] - x).hypot(c[1] - y) - 3.).abs() < 0.1
+            });
+            assert!(corner.len() >= 4, "{corner:?}");
+            let a = arc_at(&setup, &mesh, corner[0]).unwrap();
+            assert_eq!(a.walls, corner);
+            assert!(
+                (a.r - 3.).abs() < 0.001 && (a.span - 90.).abs() < 0.01,
+                "{a:?}"
+            );
+            assert!(
+                (a.centre[0] - x).abs() < 0.001 && (a.centre[1] - y).abs() < 0.001,
+                "{a:?}"
+            );
+            picking(&mut op, &mesh, &a.walls);
+            let found = holes(&setup, &op, &mesh).unwrap();
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert!(
+                (found[0].diameter - 6.).abs() < 0.01 && found[0].through,
+                "{found:?}"
+            );
+        }
+        // Its straight sides are none.
+        let side = walls_where(&setup, &mesh, |c| {
+            (c[1].abs() - 5.).abs() < 0.1 && c[0].abs() < 1.
+        });
+        assert_eq!(side.len(), 2);
+        for id in side {
+            assert_eq!(arc_at(&setup, &mesh, id), Err(NoArc::NotRound));
+        }
+    }
+    #[test]
+    fn the_example_blocks_round_pocket_corners_are_quarter_circle_arcs() {
+        // The four-setup block's STEP: its pockets' R4 and R5 corners, each
+        // a CAD cylinder face, read as 90° arcs round their centres.
+        if crate::step::skip_without_helper() {
+            return;
+        }
+        let mesh = mesh::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/four-setup-block.step"),
+        )
+        .unwrap();
+        let (setup, _, _) = fixture(Strategy::Drill);
+        let mut corners: Vec<Arc> = vec![];
+        for id in walls_where(&setup, &mesh, |_| true) {
+            if let Ok(a) = arc_at(&setup, &mesh, id)
+                && !corners.iter().any(|c| c.walls == a.walls)
+            {
+                corners.push(a);
+            }
+        }
+        let quarter = |r: f32| {
+            (corners.iter())
+                .filter(|a| (a.r - r).abs() < 0.001 && (a.span - 90.).abs() < 0.05)
+                .count()
+        };
+        assert!(quarter(4.) >= 4 && quarter(5.) >= 4, "{corners:?}");
     }
 }
