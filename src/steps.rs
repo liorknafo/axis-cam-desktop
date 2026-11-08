@@ -556,6 +556,9 @@ enum Shape {
     Tool([f32; 3], f32, Option<[f32; 3]>),
     /// An edge finder touching at a point, from a direction, labelled.
     Finder([f32; 3], [f32; 2], String),
+    /// The round an edge finder touches: its centre and radius, labelled
+    /// with its diameter.
+    Round([f32; 3], f32, String),
     /// A hole: its centre, radius, number and whether done, now or next.
     Hole([f32; 3], f32, usize, Lit),
     /// A word at a point.
@@ -805,6 +808,20 @@ impl Drawing<'_> {
                     );
                 }
                 Shape::Word(q, s, c) => write(f, s.clone(), p3(*q), *c, 13., Align::Left),
+                Shape::Round(q, r, label) => {
+                    let at = p3(*q);
+                    f.stroke(&canvas::Path::circle(at, r * s), stroke(ACCENT, 2.));
+                    // On its back-right, off the finders' lines.
+                    let d = r * s * std::f32::consts::FRAC_1_SQRT_2;
+                    write(
+                        f,
+                        label.clone(),
+                        Point::new(at.x + d + 4., at.y - d - 14.),
+                        ACCENT,
+                        13.,
+                        Align::Left,
+                    );
+                }
                 Shape::Block(bx) => {
                     let r = rect(bx);
                     f.fill(&path(r), DONE);
@@ -1656,6 +1673,13 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             // The work Z 0 is on the top, or the top is at a height.
             let top = touch[2].abs() < 0.005;
             let mut shapes = vec![];
+            // A round touched on X and Y: the diameter the finder meets,
+            // its centre where their lines cross.
+            if round[0] && round[1] {
+                let centre = [at[1][0], at[0][1], at[0][2]];
+                let r = (at[0][0] - centre[0]).abs();
+                shapes.push(Shape::Round(centre, r, format!("Ø{} touched", mm(2. * r))));
+            }
             for k in 0..2 {
                 let at = at[k];
                 let mut from = [0.; 2];
