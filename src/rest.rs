@@ -260,33 +260,47 @@ pub fn removal_box(c: &Cut, current: Frame) -> Bounds {
     transformed(b, c.frame, current)
 }
 /// `removal_box` of one cut, in pieces that leave out what it cannot have
-/// removed: a lathe's ring with an inner radius leaves the square inscribed
-/// in that radius, so four boxes round it (in the cut's frame) take the
-/// ring; any other cut is its one box. Every piece still holds all the
-/// cut can have removed.
+/// removed: a lathe's ring with an inner radius leaves its hole, so it is
+/// taken in `STRIPS` strips across its Y (in the cut's frame), each out to
+/// the ring's outer radius and in no closer to the axis than the hole's
+/// edge comes anywhere in the strip; a strip clear of the hole is whole.
+/// A shaft turned inside a bar, or the wall of a bush bored inside a turned
+/// outside, is then left between the pieces. Any other cut is its one box.
+/// Every piece still holds all the cut can have removed.
 fn removal_pieces(c: &Cut, current: Frame) -> Vec<Bounds> {
+    // ponytail: fixed strips; a Ø30 hole in a Ø34 ring is taken about
+    // 0.15 mm small at its sides. More strips if a thinner wall matters.
+    const STRIPS: usize = 16;
     let Some(ring) = c.ring() else {
         return vec![removal_box(c, current)];
     };
-    let s = c.a[1] * std::f32::consts::FRAC_1_SQRT_2;
-    if s.is_nan() || s <= 0. {
+    let (inner, outer) = (c.a[1], ring.max[0]);
+    if inner.is_nan() || inner <= 0. {
         return vec![transformed(ring, c.frame, current)];
     }
-    let r = ring.max[0];
     let (z0, z1) = (ring.min[2], ring.max[2]);
     let piece = |x: [f32; 2], y: [f32; 2]| Bounds {
         min: [x[0], y[0], z0],
         max: [x[1], y[1], z1],
     };
-    [
-        piece([-r, -s], [-r, r]),
-        piece([s, r], [-r, r]),
-        piece([-s, s], [-r, -s]),
-        piece([-s, s], [s, r]),
-    ]
-    .into_iter()
-    .map(|b| transformed(b, c.frame, current))
-    .collect()
+    let mut pieces = vec![];
+    for i in 0..STRIPS {
+        let y = [i, i + 1].map(|k| -outer + 2. * outer * k as f32 / STRIPS as f32);
+        // The hole is narrowest across X where the strip is farthest from
+        // the axis.
+        let far = y[0].abs().max(y[1].abs());
+        let edge = (inner * inner - far * far).max(0.).sqrt();
+        if edge > 0. {
+            pieces.push(piece([-outer, -edge], y));
+            pieces.push(piece([edge, outer], y));
+        } else {
+            pieces.push(piece([-outer, outer], y));
+        }
+    }
+    pieces
+        .into_iter()
+        .map(|b| transformed(b, c.frame, current))
+        .collect()
 }
 /// What can tell which operation removed material at a point: the cuts of
 /// earlier setups (`Removed`) or a setup's own (`Cuts`).
@@ -1790,6 +1804,11 @@ mod tests {
         // Their boxes alone would take it as cut away to its top.
         let boxes = removal_boxes(&v, f);
         assert!(boxes.iter().all(|b| b.min[0] <= -15. && b.max[0] >= 15.));
+        // A bush: bored Ø24 inside the Ø30 outside, its 3 mm wall still
+        // stands on the end.
+        let mut bush = v.clone();
+        bush.revolve(-1., 111., 0., 12., f, (0, 2));
+        assert_eq!(RestStock::new(&bush, f).bottom(shaft), 0.);
         // A ring turned to the centre, a facing, does take the end it cut.
         v.revolve(-1., 2., 0., 17., f, (0, 2));
         assert_eq!(RestStock::new(&v, f).bottom(shaft), 2.);

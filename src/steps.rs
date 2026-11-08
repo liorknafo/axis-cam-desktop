@@ -1663,10 +1663,11 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 let set = format!("{} {}", AXES[k], dro(touch[k]));
                 shapes.push(Shape::Finder(at, from, set));
             }
+            // Off the middle lines, where a round's finders come in.
             shapes.push(Shape::Word(
                 [
                     (stock.min[0] + stock.max[0]) / 2. - 12.,
-                    (stock.min[1] + stock.max[1]) / 2.,
+                    stock.min[1] + (stock.max[1] - stock.min[1]) * 0.75,
                     0.,
                 ],
                 if top {
@@ -3360,7 +3361,8 @@ pub(crate) mod tests {
     }
     /// The manual mill's Hold, Zero and first Tool screens of the shaft
     /// turned on the lathe and then drilled by hand
-    /// (`guide::tests::turned_then_drilled_by_hand`), at 1280 × 800, into
+    /// (`guide::tests::turned_then_drilled_by_hand`), and the Hold and
+    /// Zero of `guide::tests::short_part_in_soft_jaws`, at 1280 × 800, into
     /// `AXIS_RENDER_DIR`.
     #[test]
     #[ignore]
@@ -3376,6 +3378,15 @@ pub(crate) mod tests {
             let id = a.doc.setups[1].id.clone();
             a.doc.guide.insert(id, step);
             render(&a, (1280, 800), &dir.join(format!("mill-{name}.png")));
+        }
+        // The short part in soft jaws: touched on its Ø20 above them.
+        let (doc, mesh, report, plan) = crate::guide::tests::short_part_in_soft_jaws();
+        let job = crate::proposal::build(&doc, &mesh, &report, &plan).unwrap();
+        let mut a = lathe_app_of(job, mesh, |d| d.active = d.setups[1].id.clone());
+        for (name, step) in [("hold", 0), ("zero", 1)] {
+            let id = a.doc.setups[1].id.clone();
+            a.doc.guide.insert(id, step);
+            render(&a, (1280, 800), &dir.join(format!("short-{name}.png")));
         }
     }
     use crate::guide::LatheStep as L;

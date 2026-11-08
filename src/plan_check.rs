@@ -3376,6 +3376,53 @@ mod tests {
         assert!(jawed.passed, "{:?}", stages(&jawed));
     }
     #[test]
+    fn soft_jaws_bored_ø30_are_refused_on_the_ø20_end_of_a_shaft_turned_over() {
+        use crate::guide::tests::{in_soft_jaws, lathe_then_by_hand};
+        // Ø30 for 40 mm, Ø20 for the 30 above, a Ø4 hole in each end; the
+        // CNC drills the top in Ø30 soft jaws gripping 20 mm, then the
+        // manual mill turns it over to drill the other end in them too.
+        let section = [
+            (2., 0.),
+            (15., 0.),
+            (15., 40.),
+            (10., 40.),
+            (10., 70.),
+            (2., 70.),
+            (2., 60.),
+            (0., 60.),
+            (0., 10.),
+            (2., 10.),
+            (2., 0.),
+        ];
+        let (doc, mesh, report, plan) = lathe_then_by_hand(
+            Some(&section),
+            |doc| in_soft_jaws(doc, "30", "20", "20"),
+            |plan, report| {
+                plan.setups[0].operations[2].turn.as_mut().unwrap().z_end = Some(-32.);
+                let mut hand = plan.setups.remove(1);
+                hand.orientation = "-Z".into();
+                hand.operations[0].surfaces = (report.orientations.iter())
+                    .find(|o| o.up == "-Z")
+                    .and_then(|o| o.planes.iter().find(|p| p.depth_below_top.abs() < 0.01))
+                    .unwrap()
+                    .surfaces
+                    .clone();
+                plan.setups.push(hand);
+            },
+        );
+        let (turned_over, _) = check(&doc, &mesh, &report, &plan);
+        let said: Vec<String> = (turned_over.problems.iter())
+            .map(|p| format!("{}: {}", p.setup, p.message))
+            .collect();
+        assert!(!turned_over.passed);
+        assert!(
+            said.iter().any(|m| m.starts_with("3: ") && m.contains("Setup 3 cannot be held in the soft jaws: setup 1, operation 3 turned or cut the stock under Ø30 where it grips")),
+            "{said:?}"
+        );
+        // The CNC's own grip, on the Ø30, holds.
+        assert!(said.iter().all(|m| !m.starts_with("2:")), "{said:?}");
+    }
+    #[test]
     fn a_planned_manual_facing_in_front_passes_and_the_model_gets_its_minutes_and_zeros() {
         use crate::proposal::tests::{milled, with_mill};
         let (doc, mesh, report) = with_mill();

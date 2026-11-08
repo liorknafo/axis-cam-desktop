@@ -2607,6 +2607,57 @@ pub fn bare(boxes: &[HoldBox], stock: Bounds, removed: &crate::rest::Removed) ->
         })
         .collect()
 }
+/// The diameter a round holding closes on, mm, and the points on the stock
+/// (its box `stock`) where it must find material to close on it: a ring
+/// `round_hold::BORE_FIT` / 2 and `INSIDE` inside that diameter, 12 round
+/// the bar, at 4 places along where it grips (inset by 1 % of the span).
+/// Soft jaws close on their bore, a collet on what it grips (the bar's
+/// diameter unless set), a V-block on the bar. Standing, they grip from the
+/// bar's bottom up their grip; lying, the soft jaws over their width and
+/// the V-block over its length, about the offset from the bar's middle.
+fn round_contact(
+    round: &crate::round_hold::Round,
+    holder: &Holder,
+    stock: Bounds,
+) -> (f32, Vec<[f32; 3]>) {
+    use crate::round_hold::{BORE_FIT, Bar, Kind};
+    let bar = Bar::of(round.lying, stock);
+    let n = |k| num(&holder.p, k).unwrap_or(0.);
+    let contact = match round.kind {
+        Kind::SoftJaws => n("bore"),
+        Kind::Collet => round.diameter.unwrap_or(bar.diameter()),
+        Kind::VBlock => bar.diameter(),
+    };
+    let (from, to) = if round.lying {
+        let centre = (bar.ends[0] + bar.ends[1]) / 2. + round.offset;
+        let half = match round.kind {
+            Kind::VBlock => n("length"),
+            _ => n("jaw_width"),
+        } / 2.;
+        (
+            (centre - half).max(bar.ends[0]),
+            (centre + half).min(bar.ends[1]),
+        )
+    } else {
+        (bar.ends[0], (bar.ends[0] + round.grip).min(bar.ends[1]))
+    };
+    let r = contact / 2. - BORE_FIT / 2. - INSIDE;
+    let inset = (to - from) * 0.01;
+    let mut points = vec![];
+    for j in 0..4 {
+        let along = from + inset + (to - from - 2. * inset) * j as f32 / 3.;
+        for i in 0..12 {
+            let a = std::f32::consts::TAU * i as f32 / 12.;
+            let (u, v) = (r * a.cos(), r * a.sin());
+            points.push(if round.lying {
+                [along, bar.axis[0] + u, bar.axis[1] + v]
+            } else {
+                [bar.axis[0] + u, bar.axis[1] + v, along]
+            });
+        }
+    }
+    (contact, points)
+}
 /// Why `layout` with `holder` cannot hold `held` (the stock setup `setup`,
 /// from 0, starts from, and the band a vise closes on, in mm) given the
 /// material earlier setups removed (`removed`, None for setup 1): stock not
@@ -2648,9 +2699,24 @@ pub fn holdable(
     let mut found: Vec<String> = height_issue(layout, stock).into_iter().collect();
     let n = setup + 1;
     match layout {
-        // The chuck's grip, and a round holding's, is not checked against
-        // earlier cuts yet.
-        Layout::None | Layout::Chuck { .. } | Layout::Round(_) => {}
+        // The chuck's grip is not checked against earlier cuts yet.
+        Layout::None | Layout::Chuck { .. } => {}
+        Layout::Round(round) => {
+            let Some(removed) = removed else {
+                return found;
+            };
+            let (contact, points) = round_contact(round, holder, stock);
+            let lost = missing(&points, stock, removed, 60);
+            if !lost.is_empty() {
+                let (who, late) = cause(&lost, removed, names);
+                found.push(format!(
+                    "Setup {n} cannot be held in the {}: {who} turned or cut the stock under Ø{} where it grips, so it would not close on it. Grip the stock where it is still Ø{}, size the holder to the diameter there, or choose another holder.{late}",
+                    round.kind.words(),
+                    mm(contact),
+                    mm(contact),
+                ));
+            }
+        }
         Layout::Vise { axis_y, grip, .. } => {
             // The jaws grip the sides below what the setup itself cuts (the
             // toolpaths are kept clear of them): only earlier cuts matter.
