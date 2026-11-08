@@ -113,9 +113,8 @@ fn facets(g: &Geometry, keep: impl Fn(usize) -> bool) -> HashMap<usize, Facet> {
 /// The circle the corners of `members` lie on, and how far the farthest is
 /// off it: None for fewer than four corners, corners on no circle within
 /// 0.005 mm and 0.01 % of its radius (a CAD tessellation's corners are on
-/// it to a thousandth: a spline's are not), or a facet going more than 45°
-/// round it, or more than 4 times as far as the middle one (a flat that
-/// ends on the circle: a curve's facets are short and alike).
+/// it to a thousandth: a spline's are not), or facets going more than 45°
+/// round it, or not as far round as each other.
 fn fit(facets: &HashMap<usize, Facet>, members: &[usize]) -> Option<([f64; 2], f64, f64)> {
     let mut points: Vec<(f64, f64)> = vec![];
     for q in members.iter().flat_map(|m| facets[m].xy.iter()) {
@@ -150,10 +149,13 @@ fn fit(facets: &HashMap<usize, Facet>, members: &[usize]) -> Option<([f64; 2], f
         .collect();
     angles.sort_by(f64::total_cmp);
     let (median, widest) = (angles[angles.len() / 2], angles[angles.len() - 1]);
-    // A curve's facets go round about as far as each other (a last one
-    // shorter): a long one among short ones is a flat that ends on the
-    // circle, as a slot's side does between the first facets of its ends.
-    (widest <= 45f64.to_radians() && widest <= 4. * median + 0.5f64.to_radians()).then_some((
+    // A circle's facets go round as far as each other, 2 % give or take
+    // (a CAD part's, a DXF's arc's: the same step round it), but for two
+    // shorter ones, its ends'. A wider one is a flat that ends on the circle
+    // (a slot's side between the first facets of its ends); more that are
+    // not alike are a patch of a curve that is no circle (an ellipse's).
+    let short = angles.iter().filter(|a| **a < 0.98 * median).count();
+    (widest <= 45f64.to_radians() && widest <= 1.02 * median + 1e-4 && short <= 2).then_some((
         [c.0, c.1],
         r,
         off,
@@ -308,22 +310,17 @@ fn arc(facets: &HashMap<usize, Facet>, members: Vec<usize>) -> Result<Arc, NoArc
         walls: members,
     })
 }
-/// Whether the curve the arc `members` of `facets` (`at`: by corner) is
-/// on goes on past either end bending about as the arc does, though off its
-/// circle: past an end facet, a facet of the part's walls no longer than
-/// twice the arc's middle one that turns from it 0.6 to 1.67 times as far
-/// as it turns from the arc's facet before it (and less than 30°), on a
-/// circle with those two whose radius is half to twice `r` and whose centre
-/// is within 0.6 `r` of the arc's (`c`). So a patch of an ellipse or a
-/// spline is no arc. A circle's arc ends at a corner, a flat (tangent to it,
-/// the turn there half a facet's), or a curve of another size or way.
-fn curve_goes_on(
-    facets: &HashMap<usize, Facet>,
-    at: &Corners,
-    members: &[usize],
-    c: [f64; 2],
-    r: f64,
-) -> bool {
+/// Whether the arc `members` of `facets` (`at`: by corner) ends cleanly at
+/// both ends, as a circle's arc in a part does: past each end facet, each
+/// facet of the part's walls there turns 10° or more from it, and twice as
+/// far as the arc's facets turn from each other or onto a flat at least
+/// three times as long as the arc's middle facet (a corner: a half hole's
+/// on the part's edge), or is such a flat leaving it at no more than three
+/// quarters of that turn (tangent: a slot's side, a pocket's wall past its
+/// corner's round), or there is none. A curve that goes on past it in
+/// facets like its own (an ellipse, a spline: a patch of one fits a circle
+/// as closely as a circle's facets do) is no circle's arc.
+fn ends_cleanly(facets: &HashMap<usize, Facet>, at: &Corners, members: &[usize]) -> bool {
     let chord = |f: &Facet| {
         (f.xy.iter().enumerate())
             .flat_map(|(i, a)| {
@@ -351,42 +348,24 @@ fn curve_goes_on(
         if inside.len() != 1 {
             continue;
         }
-        let (e, before) = (&facets[&end], &facets[&inside[0]]);
-        let last = turn(before, e);
+        let e = &facets[&end];
+        let last = turn(&facets[&inside[0]], e);
         for n in next.iter().filter(|n| !members.contains(n)) {
             let f = &facets[n];
             let on = turn(e, f);
-            if chord(f) > 2. * middle
-                || on >= 30f64.to_radians()
-                || on < 0.6 * last
-                || on > last / 0.6
-            {
-                continue;
-            }
-            let mut points: Vec<(f64, f64)> = vec![];
-            for q in [before, e, f].iter().flat_map(|f| f.xy.iter()) {
-                if !points.iter().any(|p| (p.0 - q.0).hypot(p.1 - q.1) < SAME) {
-                    points.push(*q);
-                }
-            }
-            let Some(o) = circle_centre(&points) else {
-                continue;
-            };
-            let rr = points
-                .iter()
-                .map(|p| (p.0 - o.0).hypot(p.1 - o.1))
-                .sum::<f64>()
-                / points.len() as f64;
-            if rr >= 0.5 * r && rr <= 2. * r && (o.0 - c[0]).hypot(o.1 - c[1]) <= 0.6 * r {
-                return true;
+            let (long, sharp) = (chord(f) >= 3. * middle, on >= 10f64.to_radians());
+            let corner = sharp && (on >= 2. * last || long);
+            let flat = long && on <= 0.75 * last + 1e-3;
+            if !corner && !flat {
+                return false;
             }
         }
     }
-    false
+    true
 }
-/// The arc `members` of `facets` is (`arc`), unless the curve it is on
-/// goes on past it (`curve_goes_on`, over `all`, the part's upright
-/// facets, by corner `at`): then it is no circle's.
+/// The arc `members` of `facets` is (`arc`), unless it does not end
+/// cleanly (`ends_cleanly`, over `all`, the part's upright facets, by
+/// corner `at`): then it is no circle's.
 fn whole_arc(
     facets: &HashMap<usize, Facet>,
     all: &HashMap<usize, Facet>,
@@ -394,8 +373,7 @@ fn whole_arc(
     members: Vec<usize>,
 ) -> Result<Arc, NoArc> {
     let a = arc(facets, members)?;
-    let c = [a.centre[0] as f64, a.centre[1] as f64];
-    if curve_goes_on(all, at, &a.walls, c, a.r as f64) {
+    if !ends_cleanly(all, at, &a.walls) {
         return Err(NoArc::NotRound);
     }
     Ok(a)
@@ -827,25 +805,87 @@ pub(crate) mod tests {
         )
     }
     #[test]
-    fn an_ellipses_wall_is_no_arc_however_finely_it_is_faceted() {
-        // Ellipses 16 x 8 and 20 x 19 (nearly round): a patch of each fits a
-        // circle to a thousandth, but the curve goes on past it, bending a
-        // little less or more: no circle's arc, so no hole is invented.
-        for (a, b) in [(8., 4.), (10., 9.5)] {
-            for sides in [64, 128, 256] {
-                let inner: Vec<(f64, f64, f64)> = (0..sides)
+    fn no_wall_of_a_curve_that_is_no_circle_is_an_arc_however_it_is_faceted() {
+        // Openings round ellipses and superellipses (|x/a|^p + |y/b|^p = 1,
+        // p 2, 2.5 and 4) of four sizes, nearly round too, their facets
+        // spaced evenly or unevenly two ways, and a parabola, of 12 to 256
+        // facets: a patch of each fits a circle as closely as a circle's
+        // facets do, but none ends cleanly, so no wall of them picks an arc
+        // and no hole is invented (the reviewer's probes, rounds 1 and 2).
+        let mut picked = vec![];
+        let mut check = |what: String, inner: Vec<(f64, f64, f64)>| {
+            let mesh = mesh::normalize(plate_with(&inner)).unwrap();
+            let (setup, _, _) = fixture(Strategy::Drill);
+            for id in walls_where(&setup, &mesh, |c| c[0].abs() < 14.5 && c[1].abs() < 11.) {
+                if let Ok(a) = arc_at(&setup, &mesh, id) {
+                    picked.push(format!("{what}: {:.0}° r{:.2}", a.span, a.r));
+                }
+            }
+        };
+        for n in [12usize, 16, 24, 32, 48, 64, 96, 128, 256] {
+            for (a, b) in [(8., 4.), (10., 9.5), (14., 5.), (6., 5.)] {
+                for p in [2., 2.5, 4.] {
+                    for (k, waves) in [(0., 0.), (0.22, 3.), (0.15, 5.)] {
+                        let inner = (0..n)
+                            .map(|i| {
+                                let t = i as f64 * std::f64::consts::TAU / n as f64;
+                                let t = t + k * (waves * t).sin();
+                                let along =
+                                    |v: f64, size: f64| size * v.signum() * v.abs().powf(2. / p);
+                                (along(t.cos(), a), along(t.sin(), b), 0.)
+                            })
+                            .collect();
+                        check(format!("{a}x{b} p{p} uneven {k} of {n}"), inner);
+                    }
+                }
+            }
+            let mut parabola: Vec<_> = (0..=n)
+                .map(|i| {
+                    let x = -8. + 16. * i as f64 / n as f64;
+                    (x, 0.125 * x * x - 4., 0.)
+                })
+                .collect();
+            parabola.extend([(8., 10., 0.), (-8., 10., 0.)]);
+            check(format!("parabola of {n}"), parabola);
+        }
+        assert!(picked.is_empty(), "{} picked: {picked:?}", picked.len());
+    }
+    #[test]
+    fn a_short_arc_of_a_circle_meeting_flats_at_corners_is_picked_from_any_facet() {
+        // R5 arcs of 30° to 180° round X0 Y0, in 6 to 24 facets of up to
+        // 30°, closed by two flats to X−12 Y±10.
+        for span in [30f64, 45., 60., 90., 180.] {
+            for n in [3usize, 6, 12, 24] {
+                if span / n as f64 > 30. || (span >= 90. && n < 6) {
+                    continue;
+                }
+                let start = -span.to_radians() / 2.;
+                let mut inner: Vec<(f64, f64, f64)> = (0..=n)
                     .map(|k| {
-                        let t = k as f64 * std::f64::consts::TAU / sides as f64;
-                        (a * t.cos(), b * t.sin(), 0.)
+                        let t = start + span.to_radians() * k as f64 / n as f64;
+                        (5. * t.cos(), 5. * t.sin(), 0.)
                     })
                     .collect();
+                inner.extend([(-12., 10., 0.), (-12., -10., 0.)]);
                 let mesh = mesh::normalize(plate_with(&inner)).unwrap();
                 let (setup, _, _) = fixture(Strategy::Drill);
-                let wall = walls_where(&setup, &mesh, |c| c[0].abs() < 10.5 && c[1].abs() < 10.);
-                assert_eq!(wall.len(), sides, "{a}x{b}");
-                for id in wall {
-                    let read = arc_at(&setup, &mesh, id);
-                    assert!(read.is_err(), "{a}x{b} {sides} sides, {id}: {read:?}");
+                let g = Geometry::new(&setup, &mesh);
+                // The part is centred: X0 Y0 is at the middle of its box.
+                let mid = [
+                    (g.bounds.min[0] + g.bounds.max[0]) / 2.,
+                    (g.bounds.min[1] + g.bounds.max[1]) / 2.,
+                ];
+                let walls = walls_where(&setup, &mesh, |c| {
+                    ((c[0] - mid[0]).hypot(c[1] - mid[1]) - 5.).abs() < 0.2 && c[0] - mid[0] > 0.
+                });
+                assert_eq!(walls.len(), n, "{span}° in {n}");
+                for id in walls {
+                    let a = arc_at(&setup, &mesh, id)
+                        .unwrap_or_else(|e| panic!("{span}° in {n}: {e:?}"));
+                    assert!(
+                        (a.r - 5.).abs() < 0.01 && (a.span - span as f32).abs() < 0.1,
+                        "{span}° in {n}: {a:?}"
+                    );
                 }
             }
         }
