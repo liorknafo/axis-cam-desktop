@@ -887,6 +887,88 @@ fn meets(t: &[[f32; 3]; 3], b: &Bounds) -> bool {
             .iter()
             .any(|&u| edges.iter().any(|&e| apart(cross(u, e)))))
 }
+/// How far inside the round it stands for a part's facet may lie before a
+/// cutter that just fits the round is taken to cut it, mm: a round's
+/// facets are inside it by their chord's sagitta (0.005 for Ø8 in 64
+/// sides), and a manual mill's DRO reads 0.01.
+const FACETS: f32 = 0.01;
+/// Whether a flat cutter of radius `r` whose centre stays in the rectangle
+/// `centres` (XY, its two corners) cuts triangle `t` between the heights
+/// `z`: whether the triangle, clipped to those heights, comes within `r`
+/// (less `FACETS`) of the rectangle. The sweep's corners are round, so a
+/// part with ends round to the cutter, a slot's, is not cut where the box
+/// around the sweep would be.
+fn swept(t: &[[f32; 3]; 3], centres: [[f32; 2]; 2], r: f32, z: [f32; 2]) -> bool {
+    // The triangle between the heights (Sutherland–Hodgman), in XY.
+    let mut poly: Vec<[f32; 3]> = t.to_vec();
+    for (plane, above) in [(z[0], true), (z[1], false)] {
+        let keep = |p: &[f32; 3]| if above { p[2] >= plane } else { p[2] <= plane };
+        let mut kept = vec![];
+        for i in 0..poly.len() {
+            let (a, b) = (poly[i], poly[(i + 1) % poly.len()]);
+            if keep(&a) {
+                kept.push(a);
+            }
+            if keep(&a) != keep(&b) {
+                let f = (plane - a[2]) / (b[2] - a[2]);
+                kept.push(std::array::from_fn(|k| a[k] + (b[k] - a[k]) * f));
+            }
+        }
+        poly = kept;
+        if poly.is_empty() {
+            return false;
+        }
+    }
+    let pts: Vec<[f32; 2]> = poly.iter().map(|p| [p[0], p[1]]).collect();
+    let n = pts.len();
+    let [lo, hi] = centres;
+    let corners = [lo, [hi[0], lo[1]], hi, [lo[0], hi[1]]];
+    // Overlapping: no separating axis among X, Y and the polygon's edges'
+    // normals.
+    let mut axes = vec![[1., 0.], [0., 1.]];
+    for i in 0..n {
+        let (a, b) = (pts[i], pts[(i + 1) % n]);
+        axes.push([a[1] - b[1], b[0] - a[0]]);
+    }
+    let span = |points: &[[f32; 2]], ax: [f32; 2]| {
+        (points.iter().map(|q| q[0] * ax[0] + q[1] * ax[1]))
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, z), v| {
+                (a.min(v), z.max(v))
+            })
+    };
+    let overlap = axes.iter().all(|&ax| {
+        let (p, q) = (span(&pts, ax), span(&corners, ax));
+        p.0 <= q.1 && q.0 <= p.1
+    });
+    if overlap {
+        return true;
+    }
+    // Apart: the nearest of the polygon's points to the rectangle and of the
+    // rectangle's corners to the polygon's edges.
+    let to_rect = |q: [f32; 2]| {
+        let dx = (lo[0] - q[0]).max(q[0] - hi[0]).max(0.);
+        let dy = (lo[1] - q[1]).max(q[1] - hi[1]).max(0.);
+        dx.hypot(dy)
+    };
+    let to_edge = |q: [f32; 2], a: [f32; 2], b: [f32; 2]| {
+        let (ux, uy) = (b[0] - a[0], b[1] - a[1]);
+        let len = ux * ux + uy * uy;
+        let f = if len > 0. {
+            (((q[0] - a[0]) * ux + (q[1] - a[1]) * uy) / len).clamp(0., 1.)
+        } else {
+            0.
+        };
+        (q[0] - a[0] - f * ux).hypot(q[1] - a[1] - f * uy)
+    };
+    let pts = &pts;
+    let nearest = (pts.iter().map(|&q| to_rect(q)))
+        .chain(
+            (corners.iter())
+                .flat_map(|&q| (0..n).map(move |i| to_edge(q, pts[i], pts[(i + 1) % n]))),
+        )
+        .fold(f32::INFINITY, f32::min);
+    nearest < r - FACETS
+}
 /// A Box on a manual mill: the block `x_min`..`z_bottom`, in the setup's work
 /// frame (`post::datum` on the stock the setup starts from), cleared in rows
 /// along its longer side, every move along one axis. Its sides on or beyond
@@ -1003,19 +1085,23 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     } else {
         (near[1], near[0], ends[1])
     };
-    // 6. The cut, from the floor up through the stock top, clear of the part.
+    // 6. The cut, from the floor up through the stock top, clear of the part:
+    // the box round the cutter's sweep, then the sweep itself, round at its
+    // corners.
     let mut cut = Bounds {
         min: [0., 0., lo[2] + ON],
         max: [0., 0., s.max[2]],
     };
+    let mut centres = [[0.; 2]; 2];
     for (k, a, z) in [(p, start, end), (c, rows[0], rows[rows.len() - 1])] {
         cut.min[k] = (a.min(z) - r).max(s.min[k]) + ON;
         cut.max[k] = (a.max(z) + r).min(s.max[k]) - ON;
+        (centres[0][k], centres[1][k]) = (a.min(z), a.max(z));
     }
     if let Some(t) = Geometry::new(setup, mesh)
         .triangles
         .iter()
-        .find(|t| meets(&t.p, &cut))
+        .find(|t| meets(&t.p, &cut) && swept(&t.p, centres, r, [cut.min[2], cut.max[2]]))
     {
         let at: [f32; 3] = std::array::from_fn(|k| {
             let (a, z) =

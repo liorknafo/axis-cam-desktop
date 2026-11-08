@@ -744,6 +744,54 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn a_box_the_cutters_size_clears_a_round_hole_its_square_corners_never_reach() {
+        // A Ø30 × 20 cylinder with a Ø8 hole 10 deep down its axis, the
+        // stock its box and the work zero on its top's centre.
+        let section = [
+            (0., 0.),
+            (15., 0.),
+            (15., 20.),
+            (4., 20.),
+            (4., 10.),
+            (0., 10.),
+        ];
+        let mesh = crate::mesh::normalize(crate::cam::tests::revolved(&section)).unwrap();
+        let mut setup = Setup::new(defaults(), "G54");
+        for side in ["top", "bottom", "left", "right", "front", "back"] {
+            setup.p.insert(format!("stock_{side}"), "0".into());
+        }
+        let mut tool = crate::model::Tool::new("End mill 8", "Flat end mill", "8");
+        for (k, v) in [("length", "40"), ("stickout", "60")] {
+            tool.p.insert(k.into(), v.into());
+        }
+        let cut = |b: [f32; 6]| {
+            let mut op = Operation::new(Strategy::Box, tool.id.clone());
+            for (k, v) in crate::model::BOX_FIELDS.iter().zip(b) {
+                op.p.insert((*k).into(), v.to_string());
+            }
+            op.p.insert("allowance".into(), "0".into());
+            op.p.insert("stepdown".into(), "5".into());
+            crate::cam::generate(&setup, &op, &tool, &mesh).map(|_| ())
+        };
+        // The Ø8 cutter's sweep in the 8 × 8 box is the hole itself: the
+        // box's corners are in the part, but the cutter never reaches them.
+        cut([-4., 4., -4., 4., 0., -10.]).unwrap();
+        // Half a millimetre to one side its edge cuts the hole's wall, a
+        // millimetre deeper the hole's floor, and in a 10 × 10 box its
+        // round corners reach past the hole into the part.
+        for b in [
+            [-3.5, 4.5, -4., 4., 0., -10.],
+            [-4., 4., -4., 4., 0., -11.],
+            [-5., 5., -5., 5., 0., -10.],
+        ] {
+            let error = cut(b).unwrap_err();
+            assert!(
+                error.starts_with("The box cuts into the part"),
+                "{b:?}: {error}"
+            );
+        }
+    }
+    #[test]
     fn a_floor_grows_to_the_stock_edges_and_passes_the_part_check() {
         let (setup, mesh) = block();
         // The block's top, now facing up, with 10 mm of stock over it and
@@ -767,9 +815,10 @@ mod tests {
         let pocket = face(&setup, &mesh, [-44., -22., TOP - 6.], [-6., 22., TOP - 6.]);
         let b = box_from_face(&setup, &mesh, &pocket, stock).unwrap();
         close(&b, &[-44., -6., -22., 22., 0., -6.]);
-        // Its corners are rounded: the box's are in the part, and say so.
-        let error = generated(&setup, &mesh, b).unwrap_err();
-        assert!(error.starts_with("The box cuts into the part"), "{error}");
+        // Its corners are rounded no more than the Ø8 cutter's radius: the
+        // box's square corners are in the part, but the cutter's sweep is
+        // round there too and stays clear of them.
+        generated(&setup, &mesh, b).unwrap();
         // A floor between a wall and the stock's edge, a ledge 2 mm up on both
         // sides and a wall at its inner end: only the open end grows.
         let keyway = face(&setup, &mesh, [54., -12., TOP - 27.], [60., 12., TOP - 27.]);
