@@ -519,7 +519,10 @@ fn check_holding(arguments: &str, state: &ToolState) -> Answer {
     let (si, vise) = (args.setup - 1, entry.kind() == "Vise");
     // Setup 1's holder is the user's: only its own entry is checked there,
     // as the user placed it, which is how the plan check checks it.
-    if si == 0 && analysis::own_entry(&checked.job, &checked.job.setups[0]) != Some(args.holder) {
+    let base = analysis::base(&checked.job);
+    if si == base
+        && analysis::own_entry(&checked.job, &checked.job.setups[base]) != Some(args.holder)
+    {
         return Answer::sentence(SETUP_1_HOLDER);
     }
     let mut job = (*checked.job).clone();
@@ -528,7 +531,7 @@ fn check_holding(arguments: &str, state: &ToolState) -> Answer {
     // Why clamps cannot be laid out for the setup's toolpaths, which the plan
     // check reports instead of any other workholding problem of the setup.
     let mut refused = None;
-    let layout = if si == 0 {
+    let layout = if si == base {
         holding::layout(setup).ok()
     } else {
         // The job with that entry on the setup, laid out as the plan check

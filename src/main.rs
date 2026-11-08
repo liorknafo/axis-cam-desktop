@@ -9002,12 +9002,36 @@ fn part_report(args: &[String]) -> Result<String, String> {
     let (doc, mesh) = planning_project(project)?;
     serde_json::to_string_pretty(&analysis::report(&doc, &mesh)?).map_err(|e| e.to_string())
 }
-/// The JSON Schema a proposal must follow.
+/// The JSON Schema a proposal must follow: the plain one, or with a project
+/// the one its part report asks for (the chuck and A angles on a rotary
+/// machine, `machine` and Box with a manual mill).
 fn proposal_schema(args: &[String]) -> Result<String, String> {
-    if !args.is_empty() {
-        return Err("Usage: axis-cam --proposal-schema".into());
-    }
-    serde_json::to_string_pretty(&proposal::schema()).map_err(|e| e.to_string())
+    let schema = match args {
+        [] => proposal::schema(),
+        [project] => {
+            let (doc, mesh) = planning_project(project)?;
+            let report = analysis::report(&doc, &mesh)?;
+            proposal::schema_full(false, report.rotary.is_some(), !report.machines.is_empty())
+        }
+        _ => return Err("Usage: axis-cam --proposal-schema [<project.json>]".into()),
+    };
+    serde_json::to_string_pretty(&schema).map_err(|e| e.to_string())
+}
+/// The instructions the planner sends the model for a project, without
+/// pictures or tools, as plain text.
+fn planner_instructions(args: &[String]) -> Result<String, String> {
+    let [project] = args else {
+        return Err("Usage: axis-cam --planner-instructions <project.json>".into());
+    };
+    let (doc, mesh) = planning_project(project)?;
+    let report = analysis::report(&doc, &mesh)?;
+    Ok(planner::instructions_full(
+        false,
+        false,
+        false,
+        report.rotary.is_some(),
+        !report.machines.is_empty(),
+    ))
 }
 /// Checks a proposal file against a saved project with every planner check.
 /// Returns the JSON report, a one-line summary and whether the plan passed;
@@ -9321,6 +9345,7 @@ fn main() -> iced::Result {
         })),
         Some("--part-report") => Some(json(part_report(rest))),
         Some("--proposal-schema") => Some(json(proposal_schema(rest))),
+        Some("--planner-instructions") => Some(json(planner_instructions(rest))),
         _ => None,
     };
     if let Some(outcome) = outcome {

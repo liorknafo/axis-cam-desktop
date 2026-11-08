@@ -99,6 +99,18 @@ pub fn speeds(m: &Machine) -> String {
     list.join(", ")
 }
 
+/// Machine `m`'s travel along `axis` (0 X, 1 Y, 2 Z) in mm, its X, Y and Z
+/// being in its `units`; None when it gives none.
+pub fn travel_mm(m: &Machine, axis: usize) -> Option<f32> {
+    let inch = if get(&m.p, "units") == "inch" {
+        25.4
+    } else {
+        1.
+    };
+    num(&m.p, ["x", "y", "z"].get(axis)?)
+        .filter(|t| t.is_finite() && *t > 0.)
+        .map(|t| t * inch)
+}
 /// Puts a new operation's `rpm` on a gear and its `feed` at most the hand feed.
 pub fn snap(m: &Machine, p: &mut Fields) {
     if let Some(rpm) = num(p, "rpm") {
@@ -215,6 +227,35 @@ pub fn move_minutes(doc: &Document) -> f32 {
         .sum()
 }
 
+/// Why the manual mill `m` cannot make the moves of `plans`: the tool's
+/// centre spans more along an axis than the machine travels. None when every
+/// axis fits, or the machine gives no travel for it.
+pub fn travel_problem<'a>(
+    m: &Machine,
+    plans: impl Iterator<Item = &'a crate::simulation::Plan>,
+) -> Option<String> {
+    let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+    for mv in plans.flat_map(|p| &p.moves) {
+        for p in [mv.from, mv.to] {
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+    }
+    (0..3).find_map(|k| {
+        let travel = travel_mm(m, k)?;
+        let span = hi[k] - lo[k];
+        (span > travel + 0.01).then(|| {
+            format!(
+                "The manual mill travels {} mm in {}, but these moves span {} mm: make the boxes and holes fit its travel, or cut them on the CNC.",
+                crate::envelope::mm(travel),
+                ["X", "Y", "Z"][k],
+                crate::envelope::mm(span)
+            )
+        })
+    })
+}
 /// The export's line for a manual mill's setup, which has no program.
 pub fn no_gcode(setup: &str) -> String {
     format!("{setup}: manual mill, no G-code — follow the steps on the MACHINE page.")

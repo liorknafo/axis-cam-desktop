@@ -42,6 +42,15 @@ pub struct PartReport {
     pub part_size: [f32; 3],
     pub material: MaterialReport,
     pub machine: MachineReport,
+    /// The machines a setup may be planned on, numbered from 1: the user's
+    /// setup's first, then the hand machines (`machines`). Empty, and not
+    /// told, when there is no hand machine to plan on.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub machines: Vec<MachineEntry>,
+    /// Where setup 1's work zero is, from the model's -X/-Y/bottom corner in
+    /// setup 1's axes; told only with `machines`, for a Box's coordinates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_zero: Option<[f32; 3]>,
     pub tools: Vec<ToolReport>,
     /// The vises and clamps of the user's library a setup may be held by,
     /// numbered from 1 in library order, by size only.
@@ -49,6 +58,10 @@ pub struct PartReport {
     /// Setup 1's modelled vise or clamps; absent without them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workholding: Option<WorkholdingReport>,
+    /// Why setup 1's holder cannot hold the raw stock, when a hand machine
+    /// may prepare it first; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workholding_problem: Option<String>,
     /// The first entry is setup 1's orientation.
     pub orientations: Vec<OrientationReport>,
     /// The rotary A axis, on a machine that has one with its geometry
@@ -158,6 +171,159 @@ pub struct LibraryEntry {
     /// name; a size the entry lacks is left out.
     #[serde(flatten)]
     pub sizes: BTreeMap<&'static str, f32>,
+    /// The `machines` numbers the entry fits; told only with `machines`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machines: Option<Vec<usize>>,
+}
+/// One machine a setup may be planned on, by number: never its name.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MachineEntry {
+    pub number: usize,
+    /// "CNC", "Manual mill" or "Lathe".
+    pub kind: &'static str,
+    pub travel: [f32; 3],
+    /// A CNC's maximum rpm and feed, as `machine` gives them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_rpm: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_feed: Option<f32>,
+    /// A hand machine's spindle speeds, rpm, lowest first; with `variable`
+    /// true the two ends of a variable drive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gears: Option<Vec<f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variable: Option<bool>,
+    /// The manual mill's fastest steady hand feed and its hand rapid, mm/min.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hand_feed: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hand_rapid: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub power_w: Option<f32>,
+    /// Whether the manual mill's DRO has tool-radius compensation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dro_compensation: Option<bool>,
+    /// A hand machine's time to set one pass, s, to change a tool, min, and
+    /// to move the stock to or from it, min.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pass_time_s: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_time_min: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub move_time_min: Option<f32>,
+}
+/// The index of the user's setup: the first that is not on a hand machine,
+/// or the first when every setup is. It holds the user's stock, holding and
+/// work zero; hand setups a plan puts before it start from that stock.
+pub fn base(doc: &Document) -> usize {
+    doc.setups
+        .iter()
+        .position(|s| !crate::manual::is_hand(&s.machine))
+        .unwrap_or(0)
+}
+/// `doc` as the planner reads it: the user's setup first, its own stock the
+/// fresh stock, without the hand setups before it. Their machines stay, in
+/// the library when it has them no more, so the view numbers the same
+/// `machines` as `doc` and a hand machine kept only in a setup's snapshot
+/// still prepares the stock.
+pub fn planning(doc: &Document) -> std::borrow::Cow<'_, Document> {
+    match base(doc) {
+        0 => std::borrow::Cow::Borrowed(doc),
+        b => {
+            let mut view = doc.clone();
+            for setup in view.setups.drain(..b) {
+                if plannable(&setup.machine)
+                    && !view.machines.iter().any(|m| m.id == setup.machine.id)
+                {
+                    view.machines.push(setup.machine);
+                }
+            }
+            view.sync_stock_sources();
+            std::borrow::Cow::Owned(view)
+        }
+    }
+}
+/// Whether the planner may plan setups on hand machine `m`.
+pub fn plannable(m: &crate::model::Machine) -> bool {
+    crate::manual::is_manual(m)
+}
+/// The machines a plan may use, as `machines` numbers them from 1: the
+/// user's setup's, then each plannable hand machine of the library and of
+/// the current setups, once by id. Only the user's when there is none.
+pub fn machines(doc: &Document) -> Vec<&crate::model::Machine> {
+    let Some(own) = doc.setups.get(base(doc)).map(|s| &s.machine) else {
+        return vec![];
+    };
+    let mut list = vec![own];
+    for m in doc
+        .machines
+        .iter()
+        .chain(doc.setups.iter().map(|s| &s.machine))
+    {
+        if plannable(m) && !list.iter().any(|x| x.id == m.id) {
+            list.push(m);
+        }
+    }
+    list
+}
+/// The `machines` number of the machine with `id`.
+pub fn machine_number(doc: &Document, id: &str) -> Option<usize> {
+    machines(doc).iter().position(|m| m.id == id).map(|i| i + 1)
+}
+/// The `machines` numbers `fits` holds for, None without hand machines.
+fn fitting(
+    list: &[&crate::model::Machine],
+    fits: impl Fn(&crate::model::Machine) -> bool,
+) -> Option<Vec<usize>> {
+    (list.len() > 1).then(|| {
+        (list.iter().enumerate())
+            .filter(|(_, m)| fits(m))
+            .map(|(i, _)| i + 1)
+            .collect()
+    })
+}
+fn machine_entry(number: usize, m: &crate::model::Machine) -> Result<MachineEntry, String> {
+    let given = |k: &str| num(&m.p, k).filter(|v| v.is_finite());
+    let mut entry = MachineEntry {
+        number,
+        kind: if crate::manual::is_manual(m) {
+            "Manual mill"
+        } else if crate::lathe::is_lathe(m) {
+            "Lathe"
+        } else {
+            "CNC"
+        },
+        travel: [0, 1, 2].map(|k| r2(crate::manual::travel_mm(m, k).unwrap_or(0.))),
+        max_rpm: None,
+        max_feed: None,
+        gears: None,
+        variable: None,
+        hand_feed: None,
+        hand_rapid: None,
+        power_w: None,
+        dro_compensation: None,
+        pass_time_s: None,
+        tool_time_min: None,
+        move_time_min: None,
+    };
+    if !crate::manual::is_hand(m) {
+        let limits = machine_report(m)?;
+        (entry.travel, entry.max_rpm, entry.max_feed) =
+            (limits.travel, Some(limits.max_rpm), Some(limits.max_feed));
+        return Ok(entry);
+    }
+    entry.gears = Some(crate::manual::gears(m));
+    entry.variable = Some(crate::manual::variable(m).is_some());
+    entry.power_w = given("power");
+    entry.pass_time_s = given("pass_time");
+    entry.tool_time_min = given("tool_time");
+    entry.move_time_min = given("move_time");
+    if crate::manual::is_manual(m) {
+        entry.hand_feed = given("hand_feed");
+        entry.hand_rapid = given("hand_rapid");
+        entry.dro_compensation = Some(get(&m.p, "dro_comp") == "Yes");
+    }
+    Ok(entry)
 }
 /// The library entries a setup may use, in library order: those of a kind the
 /// program models. The report numbers them from 1 and a proposal's `holder`
@@ -184,7 +350,7 @@ pub fn own_entry(doc: &Document, setup1: &Setup) -> Option<usize> {
         .flatten()
         .map(|i| i + 1)
 }
-fn library_report(doc: &Document) -> Vec<LibraryEntry> {
+fn library_report(doc: &Document, machines: &[&crate::model::Machine]) -> Vec<LibraryEntry> {
     library(doc)
         .into_iter()
         .enumerate()
@@ -196,6 +362,7 @@ fn library_report(doc: &Document) -> Vec<LibraryEntry> {
                 .iter()
                 .filter_map(|k| Some((*k, r2(num(&holder.p, k)?))))
                 .collect(),
+            machines: fitting(machines, |m| holder.fits(m)),
         })
         .collect()
 }
@@ -345,6 +512,9 @@ pub struct ToolReport {
     /// its body's and its `flute_length` how far its bar reaches below it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bore_range: Option<[f32; 2]>,
+    /// The `machines` numbers the tool fits; told only with `machines`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machines: Option<Vec<usize>>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OrientationReport {
@@ -1298,6 +1468,7 @@ pub fn preconditions(doc: &Document, mesh: Option<&Mesh>) -> Vec<Precondition> {
     let part = (doc.file.is_none() || mesh.is_none()).then(|| {
         "Import a part and wait for it to load. The built-in example cannot be planned.".to_string()
     });
+    let doc = &*planning(doc);
     let setup = match doc.setups.first() {
         None => Some("Create setup 1 with your machine and stock.".to_string()),
         Some(setup1) => crate::post::PostSettings::for_machine(&setup1.machine)
@@ -1310,7 +1481,7 @@ pub fn preconditions(doc: &Document, mesh: Option<&Mesh>) -> Vec<Precondition> {
                     "Setup 1 must be square to the part: use rotations that are multiples of 90°.".into()
                 })
             })
-            .or_else(|| holding_problem(doc, mesh)),
+            .or_else(|| holding_problem(doc, mesh).filter(|_| !prepares(doc))),
     };
     let material = material_report(doc).err();
     let tools = if doc.tools.is_empty() {
@@ -1403,7 +1574,9 @@ fn basics<'a>(doc: &'a Document, mesh: &Mesh) -> Result<(&'a Setup, &'static str
     let first = up_axis(setup1)
         .ok_or("Setup 1 must be square to the part: use rotations that are multiples of 90°.")?;
     let stock = crate::stock::resolve(setup1, Some(mesh))?.stock;
-    if let Some(problem) = holding_problem(doc, Some(mesh)) {
+    // With a hand machine to prepare the stock on, the report says what the
+    // holder cannot hold, for the plan to answer (`workholding_problem`).
+    if let Some(problem) = holding_problem(doc, Some(mesh)).filter(|_| !prepares(doc)) {
         return Err(problem);
     }
     let round = crate::stock::round(setup1, stock);
@@ -1417,9 +1590,12 @@ fn basics<'a>(doc: &'a Document, mesh: &Mesh) -> Result<(&'a Setup, &'static str
 /// be a closed solid: no open edges, an enclosed volume, and vertical rays (in
 /// setup 1's frame) that cross it consistently.
 pub fn report(doc: &Document, mesh: &Mesh) -> Result<PartReport, String> {
-    let (setup1, first, stock) = basics(doc, mesh)?;
+    // Numbered over the whole job, as `proposal::build` numbers them.
+    let machines = machines(doc);
+    let view = planning(doc);
+    let (setup1, first, stock) = basics(&view, mesh)?;
     closed_solid(setup1, mesh)?;
-    describe(doc, mesh, setup1, first, &stock)
+    describe(&view, mesh, setup1, first, &stock, &machines)
 }
 /// `Ok` when the part is a closed solid, otherwise why it is not.
 fn closed_solid(setup1: &Setup, mesh: &Mesh) -> Result<(), String> {
@@ -1446,8 +1622,15 @@ fn closed_solid(setup1: &Setup, mesh: &Mesh) -> Result<(), String> {
 /// checks on open meshes.
 #[cfg(test)]
 pub(crate) fn report_unchecked(doc: &Document, mesh: &Mesh) -> Result<PartReport, String> {
-    let (setup1, first, stock) = basics(doc, mesh)?;
-    describe(doc, mesh, setup1, first, &stock)
+    let machines = machines(doc);
+    let view = planning(doc);
+    let (setup1, first, stock) = basics(&view, mesh)?;
+    describe(&view, mesh, setup1, first, &stock, &machines)
+}
+/// Whether a hand machine may prepare the stock before setup 1, so a holder
+/// that cannot hold the raw stock does not stop planning.
+fn prepares(doc: &Document) -> bool {
+    machines(doc).len() > 1
 }
 /// The first thing wrong with setup 1's modelled workholding, said for the
 /// planner: the plan could never pass the export check of setup 1 with it.
@@ -1461,6 +1644,14 @@ fn holding_problem(doc: &Document, mesh: Option<&Mesh>) -> Option<String> {
 /// rounding (f32, about 1e-5 mm here) adds below the thousandth.
 fn up2(v: f32) -> f32 {
     ((v * 1000.).round() / 10.).ceil() / 100.
+}
+/// Where `setup`'s work zero is on its own stock, from the model's
+/// -X/-Y/bottom corner in its axes, mm.
+pub fn work_zero(setup: &Setup, mesh: &Mesh) -> Option<[f32; 3]> {
+    let resolved = crate::stock::resolve(setup, Some(mesh)).ok()?;
+    let zero = crate::post::datum(setup, resolved.stock, mesh).ok()?;
+    let corner = resolved.part?.min;
+    Some([0, 1, 2].map(|k| r2(zero[k] - corner[k])))
 }
 /// Setup 1's workholding for the report, or None without it.
 fn workholding_report(
@@ -1547,6 +1738,7 @@ fn describe(
     setup1: &Setup,
     first: &'static str,
     stock: &Volume,
+    machines: &[&crate::model::Machine],
 ) -> Result<PartReport, String> {
     let mut order: Vec<&'static str> = vec![first];
     order.extend(
@@ -1561,6 +1753,16 @@ fn describe(
         part_size: mesh.dimensions.map(r2),
         material: material_report(doc)?,
         machine: machine_report(&setup1.machine)?,
+        machines: if machines.len() > 1 {
+            (machines.iter().enumerate())
+                .map(|(i, m)| machine_entry(i + 1, m))
+                .collect::<Result<_, _>>()?
+        } else {
+            vec![]
+        },
+        work_zero: (machines.len() > 1)
+            .then(|| work_zero(setup1, mesh))
+            .flatten(),
         tools: doc
             .tools
             .iter()
@@ -1602,11 +1804,18 @@ fn describe(
                     bore_range: (get(&t.p, "type") == "Boring head")
                         .then(|| t.bore_range().map(|(a, b)| [a, b]))
                         .flatten(),
+                    machines: fitting(machines, |m| t.fits(m)),
                 })
             })
             .collect(),
-        workholding_library: library_report(doc),
-        workholding: workholding_report(doc, mesh, setup1)?,
+        workholding_library: library_report(doc, machines),
+        workholding: match workholding_report(doc, mesh, setup1) {
+            Err(_) if machines.len() > 1 => None,
+            other => other?,
+        },
+        workholding_problem: (machines.len() > 1)
+            .then(|| holding_problem(doc, Some(mesh)))
+            .flatten(),
         orientations: order
             .into_iter()
             .filter_map(|up| orientation(setup1, stock, mesh, up, MAX_HOLES))

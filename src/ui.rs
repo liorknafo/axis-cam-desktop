@@ -13125,6 +13125,17 @@ pub(crate) fn plan_not_checked(held: Held, uc100: bool) -> &'static str {
         }
     }
 }
+/// What a planned setup's card names at its top right: a CNC setup's work
+/// offset, or the hand machine that has none.
+fn plan_machine_tag(setup: &crate::model::Setup) -> String {
+    if crate::lathe::is_lathe(&setup.machine) {
+        "Manual lathe · no G-code".into()
+    } else if crate::manual::is_manual(&setup.machine) {
+        "Manual mill · no G-code".into()
+    } else {
+        get(&setup.p, "offset").into()
+    }
+}
 /// Setup `si`'s rotation and work-zero line on the plan preview, with the
 /// Model-origin values the plan check found (see `work_zero_line`).
 pub(crate) fn plan_work_zero_line(outcome: &crate::planner::Outcome, si: usize) -> String {
@@ -13370,7 +13381,7 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             row![
                 bold(setup_title(si, setup.name()), 16),
                 space().width(Fill),
-                muted(get(&setup.p, "offset"))
+                muted(plan_machine_tag(setup))
             ],
             muted(plan_work_zero_line(outcome, si))
         ]

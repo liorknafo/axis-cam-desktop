@@ -2069,14 +2069,33 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             } else {
                 // A reamer is fed back out: pulled out at a rapid, it scores
                 // the wall it has just cut.
-                let reaming = p.setup.operations.get(*op).is_some_and(|o| o.reaming());
+                let o = p.setup.operations.get(*op);
+                let reaming = o.is_some_and(|o| o.reaming());
+                let feed = o.and_then(|o| num(&o.p, "feed")).unwrap_or(0.);
                 let mut said = vec![
                     chip(p.tool_name(*op, 2. * r)),
                     chip(format!("{} rpm", rpm.round())),
+                    chip(format!("{} mm/min", feed.round())),
                     warn_chip("centres"),
                 ];
                 if reaming {
                     said.push(warn_chip("feed back out"));
+                }
+                // The planned cycle, as the hand on the quill does it.
+                let cycle = o.map(|o| get(&o.p, "cycle")).unwrap_or_default();
+                let peck = o.and_then(|o| num(&o.p, "peck")).filter(|p| *p > 0.);
+                let pecking = match (cycle, peck) {
+                    ("Chip breaking", Some(peck)) => {
+                        vec![format!("peck {} mm", mm(peck)), "back off 0.5 each".into()]
+                    }
+                    ("Deep drilling", Some(peck)) => vec![
+                        format!("peck {} mm", mm(peck)),
+                        "out of the hole each".into(),
+                    ],
+                    _ => vec![],
+                };
+                if !pecking.is_empty() {
+                    said.push(chip(cycle.to_string()));
                 }
                 let right = column![
                     chips(said),
@@ -2114,10 +2133,13 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             axis: "Z".into(),
                             value: dro(h[2]),
                             lock: None,
-                            tags: vec![
+                            tags: [
                                 if reaming { "ream to" } else { "drill to" }.into(),
                                 format!("{} deep", mm(depth))
-                            ],
+                            ]
+                            .into_iter()
+                            .chain(pecking)
+                            .collect(),
                             lit: Lit::Next,
                             big: false
                         },
@@ -3009,6 +3031,42 @@ pub(crate) mod tests {
         crate::storage::save(&path, &a.doc).unwrap();
         let doc = crate::storage::load(&path).unwrap();
         assert_eq!(doc.guide.get(&doc.setups[0].id), Some(&(holes - 1)));
+    }
+    #[test]
+    fn a_drill_step_says_the_cycle_its_pecks_and_feed() {
+        // The Holes' drill as planned: its feed, and the pecks of each cycle
+        // with how far the quill comes back between them.
+        for (cycle, back) in [
+            ("Chip breaking", Some("back off 0.5 each")),
+            ("Deep drilling", Some("out of the hole each")),
+            ("Drilling", None),
+        ] {
+            let mut a = app_with("Yes", |doc| {
+                let op = (doc.setups[0].operations.iter_mut())
+                    .find(|o| o.strategy == Strategy::Drill)
+                    .unwrap();
+                op.p.insert("cycle".into(), cycle.into());
+                op.p.insert("peck".into(), "3".into());
+                op.p.insert("feed".into(), "150".into());
+            });
+            let holes = (guide(&a).steps.iter())
+                .position(|s| matches!(s, Step::Holes { .. }))
+                .unwrap();
+            send(&mut a, GuideAction::Go(holes));
+            if let Ok(dir) = std::env::var("AXIS_RENDER_DIR") {
+                let path = std::path::Path::new(&dir).join(format!("drill-{cycle}.png"));
+                render(&a, (1280, 800), &path);
+            }
+            let t = texts(&a);
+            assert!(has(&a, "150 mm/min"), "{t:?}");
+            match back {
+                Some(back) => {
+                    let line = format!("drill to · 42 deep · peck 3 mm · {back}");
+                    assert!(has(&a, &line) && has(&a, cycle), "{t:?}");
+                }
+                None => assert!(has(&a, "drill to · 42 deep"), "{t:?}"),
+            }
+        }
     }
     #[test]
     fn a_section_opens_at_its_first_unfinished_step_and_the_bar_shows_progress() {
