@@ -1471,6 +1471,21 @@ fn run(
                 });
             }
         }
+        // A manual mill's Zero is picked up with an edge finder above the
+        // jaws: its Steps cannot be followed when nothing stands clear.
+        for si in 0..job_doc.setups.len() {
+            if crate::manual::is_manual(&job_doc.setups[si].machine)
+                && crate::guide::build(job_doc, mesh, si)
+                    .is_err_and(|why| why == crate::guide::NOT_CLEAR)
+            {
+                export.push(Problem {
+                    setup: si + 1,
+                    operation: None,
+                    stage: "workholding",
+                    message: crate::guide::NOT_CLEAR.into(),
+                });
+            }
+        }
         if export.is_empty() && held.is_empty() {
             out.zeros = built
                 .setups
@@ -3376,11 +3391,12 @@ mod tests {
         assert!(jawed.passed, "{:?}", stages(&jawed));
     }
     #[test]
-    fn soft_jaws_bored_ø30_are_refused_on_the_ø20_end_of_a_shaft_turned_over() {
+    fn on_the_ø20_end_of_a_shaft_turned_over_ø30_soft_jaws_are_refused_and_ø20_ones_hold_it() {
         use crate::guide::tests::{in_soft_jaws, lathe_then_by_hand};
         // Ø30 for 40 mm, Ø20 for the 30 above, a Ø4 hole in each end; the
         // CNC drills the top in Ø30 soft jaws gripping 20 mm, then the
-        // manual mill turns it over to drill the other end in them too.
+        // manual mill turns it over to drill the other end. The library
+        // also has soft jaws bored Ø20.
         let section = [
             (2., 0.),
             (15., 0.),
@@ -3394,33 +3410,81 @@ mod tests {
             (2., 10.),
             (2., 0.),
         ];
-        let (doc, mesh, report, plan) = lathe_then_by_hand(
-            Some(&section),
-            |doc| in_soft_jaws(doc, "30", "20", "20"),
-            |plan, report| {
-                plan.setups[0].operations[2].turn.as_mut().unwrap().z_end = Some(-32.);
-                let mut hand = plan.setups.remove(1);
-                hand.orientation = "-Z".into();
-                hand.operations[0].surfaces = (report.orientations.iter())
-                    .find(|o| o.up == "-Z")
-                    .and_then(|o| o.planes.iter().find(|p| p.depth_below_top.abs() < 0.01))
-                    .unwrap()
-                    .surfaces
-                    .clone();
-                plan.setups.push(hand);
-            },
-        );
-        let (turned_over, _) = check(&doc, &mesh, &report, &plan);
-        let said: Vec<String> = (turned_over.problems.iter())
-            .map(|p| format!("{}: {}", p.setup, p.message))
-            .collect();
-        assert!(!turned_over.passed);
+        let checked = |own: bool| {
+            let (doc, mesh, report, plan) = lathe_then_by_hand(
+                Some(&section),
+                |doc| {
+                    in_soft_jaws(doc, "30", "20", "20");
+                    let mut twenty = doc.workholding.last().unwrap().clone();
+                    twenty.id = "jaws-20".into();
+                    twenty.p.insert("bore".into(), "20".into());
+                    twenty.p.insert("name".into(), "Soft jaws bored Ø20".into());
+                    doc.workholding.push(twenty);
+                },
+                |plan, report| {
+                    plan.setups[0].operations[2].turn.as_mut().unwrap().z_end = Some(-32.);
+                    let mut hand = plan.setups.remove(1);
+                    hand.orientation = "-Z".into();
+                    hand.operations[0].surfaces = (report.orientations.iter())
+                        .find(|o| o.up == "-Z")
+                        .and_then(|o| o.planes.iter().find(|p| p.depth_below_top.abs() < 0.01))
+                        .unwrap()
+                        .surfaces
+                        .clone();
+                    // Held in its own Ø20 jaws, or in the CNC's Ø30 ones.
+                    hand.holder = (report.workholding_library.iter())
+                        .find(|h| h.sizes.get("bore") == Some(&20.))
+                        .map(|h| h.number)
+                        .filter(|_| own);
+                    plan.setups.push(hand);
+                },
+            );
+            let (report, _) = check(&doc, &mesh, &report, &plan);
+            let said: Vec<String> = (report.problems.iter())
+                .map(|p| format!("{}: {}", p.setup, p.message))
+                .collect();
+            (report.passed, said)
+        };
+        let (passed, said) = checked(false);
+        assert!(!passed);
         assert!(
-            said.iter().any(|m| m.starts_with("3: ") && m.contains("Setup 3 cannot be held in the soft jaws: setup 1, operation 3 turned or cut the stock under Ø30 where it grips")),
+            said.iter()
+                .any(|m| m.starts_with("3: ")
+                    && m.contains("are bored to Ø30 mm and the bar is Ø20 mm")),
             "{said:?}"
         );
         // The CNC's own grip, on the Ø30, holds.
         assert!(said.iter().all(|m| !m.starts_with("2:")), "{said:?}");
+        let (passed, said) = checked(true);
+        assert!(passed, "{said:?}");
+    }
+    #[test]
+    fn a_collet_set_to_ø20_is_refused_on_the_ø30_foot_of_the_turned_shaft() {
+        use crate::proposal::tests::{turned, with_lathe};
+        let (mut doc, mesh, _) = with_lathe();
+        let collet = crate::round_hold::starters()
+            .into_iter()
+            .find(|h| h.kind() == crate::round_hold::COLLET_BLOCK)
+            .unwrap();
+        let p = &mut doc.setups[0].p;
+        for (k, v) in [
+            ("holding", crate::round_hold::COLLET_BLOCK),
+            ("holder", &collet.id),
+            ("round_grip", "20"),
+            ("round_offset", "0"),
+            ("collet_diameter", "20"),
+        ] {
+            p.insert(k.into(), v.into());
+        }
+        doc.workholding.push(collet);
+        let report = crate::analysis::report(&doc, &mesh).unwrap();
+        let (refused, _) = check(&doc, &mesh, &report, &turned(&report));
+        assert!(!refused.passed);
+        assert!(
+            refused.problems.iter().any(|p| p.message.contains("cannot be held in the collet: it is set to close on Ø20 and the stock is Ø30 where it grips")),
+            "{:?}",
+            refused.problems
+        );
     }
     #[test]
     fn a_planned_manual_facing_in_front_passes_and_the_model_gets_its_minutes_and_zeros() {

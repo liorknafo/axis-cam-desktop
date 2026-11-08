@@ -779,8 +779,13 @@ fn simulate(doc: &Document, mesh: &Mesh, si: usize, empty: &str) -> Result<Walke
     })
 }
 /// How far above the top of the holding's jaws an edge finder touches the
-/// stock, mm: room for its tip to come in over them.
+/// stock, mm: room for its tip to come in over them; no closer than
+/// `FINDER_LEAST` when nothing stands that far above them.
 const FINDER_CLEAR: f32 = 2.;
+const FINDER_LEAST: f32 = 0.5;
+/// Why a manual mill's setup has no Zero: nothing of its stock stands clear
+/// of the jaws for the edge finder to touch.
+pub const NOT_CLEAR: &str = "Nothing of the stock stands clear of the jaws for the edge finder to touch on X and Y: grip less of it, or hold it by another part, so that X and Y can be picked up above the jaws.";
 /// Where an edge finder touches the stock (the box of what the earlier
 /// setups left, `before`, in the setup's `frame`) coming in along axis `k`
 /// (X or Y) from its + side when `plus`, else from its − side, and whether
@@ -796,7 +801,8 @@ const FINDER_CLEAR: f32 = 2.;
 /// can reach, at the highest height it has any, on the line where it stands
 /// out farthest, found to 0.01 mm. Round when the material is met over less
 /// than half the stock's width: a turned diameter, met along a line. With
-/// no earlier cuts, or nothing found, the top's middle on the box's face.
+/// no earlier cuts, the top's middle on the box's face; None when nothing
+/// of the stock stands above `above`.
 fn contact(
     before: &Volume,
     frame: crate::volume::Frame,
@@ -804,7 +810,7 @@ fn contact(
     k: usize,
     plus: bool,
     above: f32,
-) -> ([f32; 3], bool) {
+) -> Option<([f32; 3], bool)> {
     // Inside the face, as far as a turned bar's chord is wide enough to
     // find; samples across it, and rows down it a whole millimetre apart
     // (more for a tall stock); steps in from the face where it is not.
@@ -821,7 +827,7 @@ fn contact(
     at[2] = stock.max[2];
     let height = stock.max[2] - stock.min[2];
     if before.cuts.is_empty() || height.is_nan() || height <= 2. * IN {
-        return (at, false);
+        return Some((at, false));
     }
     let rest = crate::rest::RestStock::new(before, frame);
     // Only the cuts that reach the stock, by cell.
@@ -859,7 +865,7 @@ fn contact(
         let round;
         if n == 0 {
             (at[o], round) = met(&found);
-            return (at, round);
+            return Some((at, round));
         }
         let lower = z - UNDER;
         let below = if lower >= low {
@@ -874,7 +880,7 @@ fn contact(
         };
         (at[o], round) = met(&found);
         at[2] = z;
-        return (at, round);
+        return Some((at, round));
     }
     // The box's face is only in the jaws: the outermost material above
     // them, stepped in to, then found between the steps.
@@ -910,9 +916,9 @@ fn contact(
         if n > 0 {
             at[2] = z;
         }
-        return (at, round);
+        return Some((at, round));
     }
-    (at, false)
+    None
 }
 /// The guide of setup `si`, a setup on a manual mill or a manual lathe
 /// (`lathe_guide`): the document's operations simulated in order up to the
@@ -982,9 +988,16 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
         }
         _ => None,
     };
-    let above = jaws.map_or(f32::NEG_INFINITY, |top| top + FINDER_CLEAR);
-    let touched: [([f32; 3], bool); 2] =
-        std::array::from_fn(|k| contact(&before, frame, stock, k, approach[k] > 0, above));
+    let touch = |k: usize, clear: f32| {
+        let above = jaws.map_or(f32::NEG_INFINITY, |top| top + clear);
+        contact(&before, frame, stock, k, approach[k] > 0, above)
+    };
+    let mut touched = [([0.; 3], false); 2];
+    for (k, t) in touched.iter_mut().enumerate() {
+        *t = (touch(k, FINDER_CLEAR))
+            .or_else(|| touch(k, FINDER_LEAST))
+            .ok_or(NOT_CLEAR)?;
+    }
     let mut steps = vec![
         Step::Hold {
             stock: work(stock),
@@ -2101,10 +2114,25 @@ pub(crate) mod tests {
         doc.workholding.push(jaws);
     }
     /// A short stepped part, Ø30 for its bottom 10 mm and Ø20 for the 20
-    /// above, turned from a Ø34 × 70 bar (`lathe_then_by_hand`), then held
-    /// by its Ø30 in soft jaws 8 mm tall, gripping 8, on the manual mill
-    /// and the CNC.
+    /// above, held by its Ø30 in soft jaws 8 mm tall gripping 8
+    /// (`stepped_in_soft_jaws`).
     pub(crate) fn short_part_in_soft_jaws() -> (
+        Document,
+        Mesh,
+        crate::analysis::PartReport,
+        crate::proposal::Proposal,
+    ) {
+        stepped_in_soft_jaws(10., 8.)
+    }
+    /// A part 30 mm tall, Ø30 for its bottom `foot` mm and Ø20 above, a Ø4
+    /// hole 10 deep in its top, turned from a Ø34 × 70 bar
+    /// (`lathe_then_by_hand`: faced 2, Ø30 to −35, Ø20 down to the foot,
+    /// parted off at −32), then held by its Ø30 in soft jaws bored Ø30,
+    /// `grip` tall and gripping `grip`, on the manual mill and the CNC.
+    pub(crate) fn stepped_in_soft_jaws(
+        foot: f32,
+        grip: f32,
+    ) -> (
         Document,
         Mesh,
         crate::analysis::PartReport,
@@ -2113,30 +2141,59 @@ pub(crate) mod tests {
         let section = [
             (0., 0.),
             (15., 0.),
-            (15., 10.),
-            (10., 10.),
+            (15., foot),
+            (10., foot),
             (10., 30.),
             (2., 30.),
             (2., 20.),
             (0., 20.),
         ];
+        let grip = grip.to_string();
         lathe_then_by_hand(
             Some(&section),
-            |doc| in_soft_jaws(doc, "30", "8", "8"),
+            |doc| in_soft_jaws(doc, "30", &grip, &grip),
             |plan, _| {
                 let lathe = &mut plan.setups[0];
                 lathe.bar.as_mut().unwrap().length = 70.;
                 lathe.operations[1].turn.as_mut().unwrap().z_end = Some(-35.);
+                lathe.operations[2].turn.as_mut().unwrap().z_end = Some(foot - 32.);
                 lathe.operations[3].turn.as_mut().unwrap().z = Some(-32.);
             },
         )
+    }
+    #[test]
+    fn with_only_2_mm_of_ø20_over_the_jaws_the_zero_touches_it_and_with_none_it_is_refused() {
+        // The CNC grips the Ø30 foot 28 mm.
+        let (doc, mesh, report, plan) = stepped_in_soft_jaws(28., 28.);
+        let (check, job) = crate::plan_check::check(&doc, &mesh, &report, &plan);
+        assert!(check.passed, "{:?}", check.problems);
+        let mut job = job.unwrap();
+        // The manual mill grips 28 mm of the 30 too.
+        job.setups[1].p.insert("round_grip".into(), "28".into());
+        let guide = build(&job, &mesh, 1).unwrap();
+        let Step::Zero { touch, at, .. } = &guide.steps[1] else {
+            panic!("{:?}", guide.steps[1])
+        };
+        // The Ø20 stands 2 mm over the jaws' top at 28: the finder comes
+        // in over them to it, at the top, and X/Y are set to −15 for it.
+        for k in 0..2 {
+            close(at[k][k], -10.);
+            close(at[k][2], touch[2]);
+            close(touch[k], -15.);
+        }
+        // Gripped to 29.6, nothing stands 0.5 mm clear of the jaws.
+        job.setups[1].p.insert("round_grip".into(), "29.6".into());
+        assert_eq!(build(&job, &mesh, 1).unwrap_err(), NOT_CLEAR);
     }
     #[test]
     fn a_short_part_in_soft_jaws_is_touched_on_its_ø20_above_them_not_its_ø30_inside_them() {
         let (doc, mesh, report, plan) = short_part_in_soft_jaws();
         let (check, job) = crate::plan_check::check(&doc, &mesh, &report, &plan);
         assert!(check.passed, "{:?}", check.problems);
-        let guide = build(&job.unwrap(), &mesh, 1).unwrap();
+        // The manual mill grips 8 mm of it too.
+        let mut job = job.unwrap();
+        job.setups[1].p.insert("round_grip".into(), "8".into());
+        let guide = build(&job, &mesh, 1).unwrap();
         let Step::Zero {
             touch, at, round, ..
         } = &guide.steps[1]
