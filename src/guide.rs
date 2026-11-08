@@ -71,12 +71,15 @@ pub enum Step {
     /// one face (`approach`: −1 the − face from outside it, +1 the + face; a
     /// centre zero touches the − face) and are set there to `touch`, the
     /// face less or plus the finder's radius; Z touches the top, set to
-    /// `touch[2]`.
+    /// `touch[2]`. `at` is where on its face each of X and Y is touched
+    /// (work coordinates, `contact`): at the top's height when the face
+    /// reaches it, lower where earlier setups cut the top of the face back.
     Zero {
         corner: [f32; 3],
         approach: [i8; 2],
         touch: [f32; 3],
         finder: f32,
+        at: [[f32; 3]; 2],
     },
     /// Put in the tool `tool` (an id) at `rpm`, touch the stock's top with
     /// it and set Z to `top` (the top before the operation, work Z); with
@@ -770,6 +773,67 @@ fn simulate(doc: &Document, mesh: &Mesh, si: usize, empty: &str) -> Result<Walke
         before,
     })
 }
+/// Where an edge finder touches the face of `stock` (the box of what the
+/// earlier setups left, `before`, in the setup's `frame`) on the + side of
+/// axis `k` (X or Y) when `plus`, else the − side: on the face, at the
+/// middle of the material it meets there, at the top when the face reaches
+/// the top, else 2 mm under the highest the face reaches (on that height
+/// when the face is no taller). A stepped or turned stock, a shaft whose
+/// top is narrower than its foot, is touched on its widest part, which is
+/// what sets the box's face; with nothing found, the top's middle.
+fn contact(before: &Volume, frame: crate::volume::Frame, stock: Bounds, k: usize, plus: bool) -> [f32; 3] {
+    // Inside the face, as far as a turned bar's chord is wide enough to
+    // find; rows down the face and samples across it.
+    const IN: f32 = 0.2;
+    const ROWS: usize = 70;
+    const ACROSS: usize = 61;
+    const UNDER: f32 = 2.;
+    let o = 1 - k;
+    let mut at = [0.; 3];
+    at[k] = if plus { stock.max[k] } else { stock.min[k] };
+    at[o] = (stock.min[o] + stock.max[o]) / 2.;
+    at[2] = stock.max[2];
+    let height = stock.max[2] - stock.min[2];
+    if before.cuts.is_empty() || !(height > 2. * IN) {
+        return at;
+    }
+    let removed = crate::rest::Removed::new(before, frame);
+    let rest = crate::rest::RestStock::new(before, frame);
+    let face = if plus { stock.max[k] - IN } else { stock.min[k] + IN };
+    let width = stock.max[o] - stock.min[o];
+    // The material on the face at height `z`: the samples across it.
+    let solid = |z: f32| -> Vec<f32> {
+        (0..ACROSS)
+            .map(|i| stock.min[o] + (i as f32 + 0.5) / ACROSS as f32 * width)
+            .filter(|&a| {
+                let mut p = [0.; 3];
+                (p[k], p[o], p[2]) = (face, a, z);
+                rest.in_stock(p) && !removed.at(p)
+            })
+            .collect()
+    };
+    let middle = |found: &[f32]| (found[0] + found[found.len() - 1]) / 2.;
+    let top = stock.max[2] - IN;
+    let found = solid(top);
+    if !found.is_empty() {
+        at[o] = middle(&found);
+        return at;
+    }
+    for row in 1..=ROWS {
+        let z = top - (height - 2. * IN) * row as f32 / ROWS as f32;
+        let found = solid(z);
+        if found.is_empty() {
+            continue;
+        }
+        let lower = (z - UNDER).max(stock.min[2] + IN);
+        let under = solid(lower);
+        let (z, found) = if under.is_empty() { (z, found) } else { (lower, under) };
+        at[o] = middle(&found);
+        at[2] = z;
+        return at;
+    }
+    at
+}
 /// The guide of setup `si`, a setup on a manual mill or a manual lathe
 /// (`lathe_guide`): the document's operations simulated in order up to the
 /// end of it.
@@ -848,6 +912,10 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                 None => stock.max[2] - zero[2],
             }),
             finder,
+            at: std::array::from_fn(|k| {
+                let p = contact(&before, frame, stock, k, approach[k] > 0);
+                std::array::from_fn(|i| p[i] - zero[i])
+            }),
         },
     ];
     let mut sections = vec![Section {
@@ -1758,6 +1826,7 @@ pub(crate) mod tests {
                 approach: [-1, -1],
                 touch: [-5., -5., 0.],
                 finder: 10.,
+                at: [[0., 60., 0.], [62., 0., 0.]],
             }
         );
         let Step::Face {
@@ -1873,6 +1942,7 @@ pub(crate) mod tests {
                 approach: a,
                 touch: t,
                 finder,
+                ..
             } = &guide.steps[1]
             else {
                 panic!()

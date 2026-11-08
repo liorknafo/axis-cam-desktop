@@ -1641,23 +1641,22 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             approach,
             touch,
             finder,
+            at,
             ..
         } => {
             let stock = p.shown.boxes[0];
             let sides = [["left", "right"], ["front", "back"]];
             let side = |k: usize| sides[k][usize::from(approach[k] > 0)];
+            // How far under the top each face is touched: 0 at the top.
+            let under = |k: usize| {
+                let d: f32 = stock.max[2] - at[k][2];
+                if d > 0.5 { d } else { 0. }
+            };
             // The work Z 0 is on the top, or the top is at a height.
             let top = touch[2].abs() < 0.005;
             let mut shapes = vec![];
             for k in 0..2 {
-                let mut at = [0., 0., stock.max[2]];
-                let o = 1 - k;
-                at[o] = (stock.min[o] + stock.max[o]) / 2.;
-                at[k] = if approach[k] > 0 {
-                    stock.max[k]
-                } else {
-                    stock.min[k]
-                };
+                let at = at[k];
                 let mut from = [0.; 2];
                 from[k] = f32::from(approach[k].signum());
                 let set = format!("{} {}", AXES[k], dro(touch[k]));
@@ -1679,6 +1678,8 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             let rows = (0..3).map(|k| {
                 let what = if k == 2 {
                     "touch the top → set".to_string()
+                } else if under(k) > 0. {
+                    format!("touch the {} face {} under the top → set", side(k), mm(under(k)))
                 } else {
                     format!("touch the {} face → set", side(k))
                 };

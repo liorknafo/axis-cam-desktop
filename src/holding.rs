@@ -2390,6 +2390,9 @@ fn blamed(failed: &[[f32; 3]], removed: &dyn crate::rest::Removes) -> Vec<((u16,
 /// jaws close on what stands inside. The bottom when it cannot be told.
 fn band_advice(failed: &[[f32; 3]], removed: &crate::rest::Removed, band: &str) -> String {
     let source = blamed(failed, removed).first().map(|(source, _)| *source);
+    if source.is_some_and(|s| removed.turned(s)) {
+        return "Flat jaws touch what the lathe turned round only along a line: hold it in soft jaws bored to its diameter or in a collet block, or choose another holder.".into();
+    }
     match (removed.up_in(source), source) {
         (Some(up), Some((earlier, _))) if up < 0.5 => format!(
             "Leave at least {band} mm of those sides uncut in setup {}, or cut them through all {band} mm there, or choose another holder.",

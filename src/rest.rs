@@ -259,6 +259,35 @@ pub fn removal_box(c: &Cut, current: Frame) -> Bounds {
     });
     transformed(b, c.frame, current)
 }
+/// `removal_box` of one cut, in pieces that leave out what it cannot have
+/// removed: a lathe's ring with an inner radius leaves the square inscribed
+/// in that radius, so four boxes round it (in the cut's frame) take the
+/// ring; any other cut is its one box. Every piece still holds all the
+/// cut can have removed.
+fn removal_pieces(c: &Cut, current: Frame) -> Vec<Bounds> {
+    let Some(ring) = c.ring() else {
+        return vec![removal_box(c, current)];
+    };
+    let s = c.a[1] * std::f32::consts::FRAC_1_SQRT_2;
+    if !(s > 0.) {
+        return vec![transformed(ring, c.frame, current)];
+    }
+    let r = ring.max[0];
+    let (z0, z1) = (ring.min[2], ring.max[2]);
+    let piece = |x: [f32; 2], y: [f32; 2]| Bounds {
+        min: [x[0], y[0], z0],
+        max: [x[1], y[1], z1],
+    };
+    [
+        piece([-r, -s], [-r, r]),
+        piece([s, r], [-r, r]),
+        piece([-s, s], [-r, -s]),
+        piece([-s, s], [s, r]),
+    ]
+    .into_iter()
+    .map(|b| transformed(b, c.frame, current))
+    .collect()
+}
 /// What can tell which operation removed material at a point: the cuts of
 /// earlier setups (`Removed`) or a setup's own (`Cuts`).
 pub trait Removes {
@@ -494,6 +523,12 @@ impl<'a> Removed<'a> {
         let up = transfer([0., 0., 1.], self.current, cut.frame);
         Some(up[2] - origin[2])
     }
+    /// Whether `source`'s cuts were made on a lathe (`Revolve` rings).
+    pub fn turned(&self, source: (u16, u16)) -> bool {
+        self.cuts
+            .iter()
+            .any(|c| c.source == source && c.ring().is_some())
+    }
     /// The operation whose cut removed material at `p` (`at`), as its
     /// `Cut::source`: the first such cut's, in the order they were made.
     pub fn by(&self, p: [f32; 3]) -> Option<(u16, u16)> {
@@ -686,7 +721,11 @@ impl RestStock {
             extent: turned(volume, current).unwrap_or(whole),
             whole,
             cuts,
-            removal: removal_boxes(volume, current),
+            removal: volume
+                .cuts
+                .iter()
+                .flat_map(|c| removal_pieces(c, current))
+                .collect(),
             coaxial: coaxial(volume, current),
             all: volume.cuts.clone(),
             round: volume.round,
