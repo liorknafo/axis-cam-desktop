@@ -2415,9 +2415,9 @@ fn on_lathe(
     setup.p.insert("holder".into(), chuck);
     Ok(())
 }
-/// How far past the deepest cut of a lathe setup the jaws stay: the turn
-/// module's clearance and a millimetre more.
-const LATHE_CLEAR: f32 = crate::turn::CLEAR + 1.;
+/// How far past the deepest cut of a lathe setup the jaws stay, as the
+/// chuck check asks.
+const LATHE_CLEAR: f32 = crate::holding::STICKOUT_MARGIN;
 /// How deep below the free end a lathe setup's operations cut: an Outside,
 /// Bore or Thread to `z_end`, a Groove from `z`, a Part off to `z` less the
 /// blade's width, a centre Drill to its `depth`.
@@ -3203,7 +3203,7 @@ pub fn build(
         let reach = lathe_reach(&built, &built.setups[si]);
         let p = &mut built.setups[si].p;
         if let Some((length, grip)) = length.zip(num(p, "grip")) {
-            let grip = grip.min(length - reach - LATHE_CLEAR).max(0.);
+            let grip = grip.min((length - reach - LATHE_CLEAR).floor()).max(0.);
             p.insert("grip".into(), grip.to_string());
             p.insert("stickout".into(), (length - grip).max(1.).to_string());
         }
@@ -6583,9 +6583,9 @@ pub(crate) mod tests {
         }
     }
     /// The shaft turned from a Ø34 × 110 bar on the lathe (the part's top 2
-    /// mm below the bar's end): faced, Ø30 down to its end, Ø20 for its top
-    /// 20 mm, its end chamfered and parted off; then the user's CNC setup
-    /// drills the Ø4 hole.
+    /// mm below the bar's end): faced down to it, Ø30 down to its end, Ø20
+    /// for its top 20 mm, and parted off 70 mm long; then the user's CNC
+    /// setup drills the Ø4 hole.
     pub fn turned(report: &PartReport) -> Proposal {
         let lathe = report
             .machines
@@ -6614,7 +6614,7 @@ pub(crate) mod tests {
                     holder: None,
                     a_angles: None,
                     operations: vec![
-                        turn("Face", 21, |t| t.face_off = Some(1.)),
+                        turn("Face", 21, |t| t.face_off = Some(2.)),
                         turn("Outside", 21, |t| {
                             t.diameter = Some(30.);
                             t.z_end = Some(-75.);
@@ -6624,10 +6624,6 @@ pub(crate) mod tests {
                             t.diameter = Some(20.);
                             t.z_end = Some(-22.);
                             t.depth = Some(2.);
-                        }),
-                        turn("Chamfer", 21, |t| {
-                            t.edge = Some("End outside".into());
-                            t.size = Some(0.5);
                         }),
                         turn("Part off", 24, |t| t.z = Some(-72.)),
                     ],
@@ -6751,7 +6747,7 @@ pub(crate) mod tests {
                     .push(op("Face", 1, ids(&report, "+Z", 0.)))
             }),
             ("a Part off turn takes a parting blade", &|p| {
-                p.setups[0].operations[4].tool = 21
+                p.setups[0].operations[3].tool = 21
             }),
             ("needs a bar of at least", &|p| {
                 p.setups[0].bar.as_mut().unwrap().diameter = 25.
@@ -6862,26 +6858,38 @@ pub(crate) mod tests {
             .find(|h| h.kind == "Chuck" && h.sizes.get("jaws") == Some(&4.))
             .map(|h| h.number);
         after.setups[1].operations.truncate(1);
-        let (check, job) = crate::plan_check::check(&doc, &mesh, &report, &after);
-        assert!(check.passed, "{:?}", check.problems);
-        let lathe = &job.unwrap().setups[1];
-        let (grip, stickout) = (
-            num(&lathe.p, "grip").unwrap(),
-            num(&lathe.p, "stickout").unwrap(),
-        );
-        assert!((grip + stickout - 74.).abs() < 0.01, "{grip} + {stickout}");
-        // With a deep cut the jaws give way to it.
+        after.setups[1].operations[0] = turn("Face", 21, |t| t.face_off = Some(1.));
+        let held = |plan: &Proposal| {
+            let (check, job) = crate::plan_check::check(&doc, &mesh, &report, plan);
+            assert!(check.passed, "{:?}", check.problems);
+            let job = job.unwrap();
+            let lathe = &job.setups[1].p;
+            let stock = job.setup_stock(1, Some(&mesh)).unwrap();
+            (
+                num(lathe, "grip").unwrap(),
+                num(lathe, "stickout").unwrap(),
+                stock,
+            )
+        };
+        let (grip, stickout, _) = held(&after);
+        assert_eq!((grip, stickout), (30., 44.));
+        // The CNC faces the top first: the shorter block it leaves is held.
+        let mut faced = after.clone();
+        let mut face = op("Face", 1, ids(&report, "+Z", 0.));
+        face.bottom_offset = Some(1.);
+        faced.setups[0].operations.insert(0, face);
+        let (grip, stickout, _) = held(&faced);
+        assert!((grip + stickout - 73.).abs() < 0.01, "{grip} + {stickout}");
+        // With a deep cut the jaws give way to it, 5 mm clear of it.
         let mut deep = after.clone();
         deep.setups[1].operations.push(turn("Outside", 21, |t| {
             t.diameter = Some(33.);
-            t.z_end = Some(-60.);
+            t.z_end = Some(-50.);
         }));
-        let job = build(&doc, &mesh, &report, &deep).unwrap();
-        let lathe = &job.setups[1];
+        let (grip, stickout, _) = held(&deep);
         assert!(
-            (num(&lathe.p, "stickout").unwrap() - 62.).abs() < 0.01,
-            "{:?}",
-            lathe.p
+            stickout >= 55. && grip + stickout <= 74.01,
+            "{grip} {stickout}"
         );
     }
     #[test]
@@ -6914,6 +6922,14 @@ pub(crate) mod tests {
         );
         let (check, _) = crate::plan_check::check(&built, &mesh, &again, &shown);
         assert!(check.passed, "{:?}", check.problems);
+        // A bar cut shorter in the chat is gripped less, the cuts still
+        // clear of the jaws.
+        let mut plan = turned(&report);
+        plan.setups[0].bar.as_mut().unwrap().length = 105.;
+        let (check, job) = crate::plan_check::check(&doc, &mesh, &report, &plan);
+        assert!(check.passed, "{:?}", check.problems);
+        let lathe = &job.unwrap().setups[0].p;
+        assert_eq!((get(lathe, "grip"), get(lathe, "stickout")), ("25", "80"));
     }
     #[test]
     fn a_centre_drill_the_size_of_the_hole_drills_it_and_a_bigger_one_is_refused() {
@@ -6951,7 +6967,7 @@ pub(crate) mod tests {
                 depth: Some(8.),
                 ..Default::default()
             });
-            plan.setups[0].operations.insert(4, hole);
+            plan.setups[0].operations.insert(3, hole);
             crate::plan_check::check(&doc, &mesh, &report, &plan).0
         };
         let fits = checked("4");

@@ -957,7 +957,7 @@ pub fn evaluate_full(
 ) -> (CheckReport, Option<Document>, Option<Checked>) {
     match proposal::build(doc, mesh, report, proposal) {
         Ok(built) => {
-            let (out, laid, setups) = run(&built, mesh, report);
+            let (out, laid, setups) = run(&built, mesh, report, true);
             let job = laid.unwrap_or(built);
             let checked = Checked {
                 job: Arc::new(job.clone()),
@@ -999,7 +999,7 @@ pub fn check(
 /// `run` without the job, so tests can check jobs `build` would refuse.
 #[cfg(test)]
 pub(crate) fn check_built(built: &Document, mesh: &Mesh, report: &PartReport) -> CheckReport {
-    run(built, mesh, report).0
+    run(built, mesh, report, false).0
 }
 /// A copy of `built` in which every later setup that holds its stock with a
 /// vise or clamps but says nowhere has the layout the app suggests for the
@@ -1013,6 +1013,7 @@ fn laid_out(
     built: &Document,
     mesh: &Mesh,
     results: &[Vec<(usize, Result<Simulation, String>)>],
+    planned: bool,
 ) -> (Option<Document>, Vec<(usize, String)>) {
     let mut laid: Option<Document> = None;
     let mut refused = vec![];
@@ -1021,6 +1022,14 @@ fn laid_out(
     let laid_out =
         |(si, s): &(usize, &crate::model::Setup)| *si > 0 || crate::manual::is_hand(&s.machine);
     for (si, setup) in built.setups.iter().enumerate().filter(laid_out) {
+        // A lathe setup's chuck grips what the stock it starts from (as the
+        // setups before it left it) leaves free under its lowest cut.
+        if let Some((grip, stickout)) = chucked(built, setup, &results[si]).filter(|_| planned) {
+            let p = &mut laid.get_or_insert_with(|| built.clone()).setups[si].p;
+            p.insert("grip".into(), grip.to_string());
+            p.insert("stickout".into(), stickout.to_string());
+            continue;
+        }
         if holding::placed(setup) {
             continue;
         }
@@ -1080,6 +1089,42 @@ fn laid_out(
         }
     }
     (laid, refused)
+}
+/// The grip and stickout of lathe setup `setup` of `built` in its chuck, on
+/// the stock its first simulation starts from: the jaws' length, less where
+/// the lowest cutting move must stay `holding::STICKOUT_MARGIN` clear of
+/// them, in whole millimetres; the rest of the stock stands out. None for any
+/// other setup, one whose stock is not known, or one already so.
+fn chucked(
+    built: &Document,
+    setup: &crate::model::Setup,
+    results: &[(usize, Result<Simulation, String>)],
+) -> Option<(f32, f32)> {
+    if !crate::lathe::is_lathe(&setup.machine) || get(&setup.p, "holding") != "Chuck" {
+        return None;
+    }
+    let sims: Vec<&Simulation> = results
+        .iter()
+        .filter_map(|(_, r)| r.as_ref().ok())
+        .collect();
+    let stock = sims.first()?.plan.stock;
+    let length = stock.max[2] - stock.min[2];
+    let jaws = built
+        .holder(get(&setup.p, "holder"))
+        .and_then(|h| crate::model::num(&h.p, "jaw_length"))?;
+    let lowest = (sims.iter())
+        .flat_map(|sim| &sim.plan.moves)
+        .filter(|m| m.motion == crate::simulation::Motion::Feed)
+        .map(|m| m.from[2].min(m.to[2]))
+        .fold(stock.max[2], f32::min);
+    let free = length - (stock.max[2] - lowest) - holding::STICKOUT_MARGIN;
+    let grip = jaws.min(free.floor()).max(0.);
+    let stickout = ((length - grip) * 100.).round() / 100.;
+    let now = (
+        crate::model::num(&setup.p, "grip"),
+        crate::model::num(&setup.p, "stickout"),
+    );
+    (now != (Some(grip), Some(stickout))).then_some((grip, stickout))
 }
 /// The setups of `built` whose starting stock the sequence knew, in order,
 /// from their `results` and `starts` (the box each later setup began with and
@@ -1141,11 +1186,14 @@ fn checked_setups(
 /// project's structure check. Returns the report, the copy of the job with
 /// the layouts suggested for its later setups (`laid_out`), whose workholding
 /// the check is of, and the setups whose starting stock it knew
-/// (`checked_setups`).
+/// (`checked_setups`). With `planned` (a job a proposal built) each lathe
+/// setup's chuck is also settled on the stock it starts from (`chucked`), as
+/// a plan cannot say it; a job made by hand keeps the user's.
 fn run(
     built: &Document,
     mesh: &Mesh,
     report: &PartReport,
+    planned: bool,
 ) -> (CheckReport, Option<Document>, Vec<CheckedSetup>) {
     let mut out = CheckReport {
         passed: false,
@@ -1312,7 +1360,7 @@ fn run(
         // The workholding is checked as the plan will be applied: with the
         // layouts the app suggests for the later setups.
         let unplaced;
-        (laid, unplaced) = laid_out(built, mesh, &results);
+        (laid, unplaced) = laid_out(built, mesh, &results, planned);
         let job_doc = laid.as_ref().unwrap_or(built);
         let job = crate::post::post_simulated(job_doc, mesh, &results);
         // A UC100 machine runs the toolpaths through its driver, not as
@@ -3010,7 +3058,7 @@ mod tests {
         assert_eq!(get(&job.setups[1].p, "holding"), "Clamps");
         assert_eq!(get(&job.setups[1].p, "clamps"), "");
         job.setups[1].p.insert("clamps".into(), "-Y:0;+Y:0".into());
-        let (check, laid, _) = run(&job, &mesh, &report);
+        let (check, laid, _) = run(&job, &mesh, &report, true);
         assert!(check.passed, "{:?}", stages(&check));
         assert!(laid.is_none(), "nothing was suggested");
     }
@@ -3249,9 +3297,9 @@ mod tests {
         assert!(crate::lathe::is_lathe(&job.setups[0].machine));
         let split = check.minutes_by_machine.unwrap();
         assert!(split.lathe > 0. && split.moving == 10., "{split:?}");
-        // The five turns, then the CNC's drilling of the turned part.
+        // The four turns, then the CNC's drilling of the turned part.
         let setups: Vec<usize> = check.operations.iter().map(|o| o.setup).collect();
-        assert_eq!(setups, [1, 1, 1, 1, 1, 2]);
+        assert_eq!(setups, [1, 1, 1, 1, 2]);
         // The bar in the 3-jaw: its jaws' 30 mm gripped, the rest out; the
         // part's top 2 mm under the bar's end, on the axis.
         let lathe = &job.setups[0];
