@@ -2614,6 +2614,30 @@ pub struct Document {
     /// (a diameter), keyed by setup id and step (`guide::measure_key`).
     #[serde(default)]
     pub measured: BTreeMap<String, f32>,
+    /// Where each operation's picked surfaces are on the part, in the model
+    /// file's units, by operation id, so that they are found again when the
+    /// file changes (`picks::follow`). Kept beside the operations, not in
+    /// them: recording them is no edit of an operation, and changes none of
+    /// what its toolpaths and programs are known by.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub places: BTreeMap<String, crate::picks::Places>,
+    /// What changed in each operation's picks when the model file changed
+    /// (`picks::follow`), by operation id: shown on the operation until its
+    /// picks are checked, picked again or cleared.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pick_checks: BTreeMap<String, String>,
+}
+impl Document {
+    /// Operation `to`, a copy of `from`, keeps its picks' places and what
+    /// changed in them: its picks are the same.
+    pub fn copy_picks(&mut self, from: &str, to: &str) {
+        if let Some(p) = self.places.get(from).cloned() {
+            self.places.insert(to.into(), p);
+        }
+        if let Some(n) = self.pick_checks.get(from).cloned() {
+            self.pick_checks.insert(to.into(), n);
+        }
+    }
 }
 impl Default for Document {
     fn default() -> Self {
@@ -2634,6 +2658,8 @@ impl Default for Document {
             active: String::new(),
             guide: BTreeMap::new(),
             measured: BTreeMap::new(),
+            places: BTreeMap::new(),
+            pick_checks: BTreeMap::new(),
         }
     }
 }

@@ -34,6 +34,7 @@ mod model;
 mod ngc;
 mod oauth;
 mod openai;
+mod picks;
 mod plan_changes;
 mod plan_check;
 mod planner;
@@ -476,6 +477,15 @@ pub enum Message {
     /// does the one chosen in the file browser.
     ImportFromPath,
     FileImported(Option<Result<(ModelFile, Option<mesh::Mesh>), String>>),
+    /// Loads the project's model file again after it changed, keeping the
+    /// setups and operations (`App::take_model`).
+    Reimport,
+    /// The model file `Reimport` asked for, loaded again: the file as it is
+    /// now and its part.
+    ModelReimported(ModelFile, Result<(ModelFile, mesh::Mesh), String>),
+    /// The selected operation's picks checked after the model file changed:
+    /// its note (`Document::pick_checks`) goes.
+    PicksChecked,
     ProjectOpened(Option<Opened>),
     /// The saved model loaded again for `ModelFile` (`App::restore_model`).
     ModelRestored(ModelFile, Result<mesh::Mesh, String>),
@@ -1701,6 +1711,7 @@ fn while_locked(m: &Message) -> bool {
             | FileImported(_)
             | ProjectOpened(_)
             | ModelRestored(..)
+            | ModelReimported(..)
             | Exported(_)
             | ExportError(_)
             | GcodeExported(_)
@@ -2305,6 +2316,11 @@ impl App {
         }
     }
     fn restore_model(&mut self) -> Task<Message> {
+        if self.doc.file.is_some()
+            && let Some(mesh) = &self.imported_mesh
+        {
+            picks::record(&mut self.doc, mesh);
+        }
         self.imported_mesh = None;
         self.import_error = None;
         let Some(file) = &self.doc.file else {
@@ -2322,6 +2338,77 @@ impl App {
             },
             move |result| Message::ModelRestored(file.clone(), result),
         )
+    }
+    /// The part of the project's model file, loaded: as restored when the
+    /// project opens or a DXF's thickness changes, or as reimported
+    /// (`reimport`) after the file changed, the setups and operations kept.
+    /// Each operation's picks made on the part as it was are picked again
+    /// on this one where they still are (`picks::follow`), and the status
+    /// says which are not.
+    fn take_model(&mut self, mesh: mesh::Mesh, reimport: bool) {
+        let old = self.imported_mesh.take();
+        if let Some(old) = &old {
+            picks::record(&mut self.doc, old);
+        }
+        let followed = picks::follow(&mut self.doc, &mesh, old.as_ref());
+        let unchanged = old
+            .as_ref()
+            .is_some_and(|o| o.fingerprint == mesh.fingerprint);
+        self.imported_mesh = Some(mesh);
+        self.sync_turns();
+        self.undo = None;
+        self.invalidate_post();
+        if reimport {
+            // A field put back would put picks made on the old part back.
+            self.typed_last = None;
+        }
+        let mut notes = followed.notes;
+        let mut changed = reimport || followed.operations > 0 || !notes.is_empty();
+        if let Some(mesh) = &self.imported_mesh {
+            // The pin holes follow the pins as the part places them.
+            post::sync_pin_drilling(&mut self.doc, mesh);
+            // A sloping face picked before its operation picked holes:
+            // dropped when it faces down, else the hole past it, as a click
+            // picks now.
+            let settled = surface::settle_sloping_picks(&mut self.doc, mesh);
+            changed |= !settled.is_empty();
+            notes.extend(settled);
+        }
+        // Migrate legacy imported projects that stored sample feature IDs
+        // through the old viewport toggle.
+        let mut migrated = false;
+        for setup in &mut self.doc.setups {
+            for operation in &mut setup.operations {
+                migrated |= !operation.geometry.is_empty();
+                operation.geometry.clear();
+            }
+        }
+        if migrated {
+            changed = true;
+            notes.push(
+                "Old sample-only selections were cleared; select surfaces on your part in Geometry."
+                    .into(),
+            );
+        }
+        let done = if !reimport {
+            "Saved model geometry restored.".to_string()
+        } else if unchanged {
+            "Model reimported. The file has not changed since it was loaded.".to_string()
+        } else {
+            let n = followed.operations;
+            format!(
+                "Model reimported. Setups and operations are kept{}.",
+                match n {
+                    0 => String::new(),
+                    1 => "; one operation's picked surfaces were found on the new part".into(),
+                    n => format!("; {n} operations' picked surfaces were found on the new part"),
+                }
+            )
+        };
+        if changed {
+            self.touch();
+        }
+        self.status = with_notes(&done, &notes);
     }
     pub fn operation(&self) -> Option<&Operation> {
         self.doc
@@ -2844,6 +2931,8 @@ impl App {
                 post::sync_pin_drilling(&mut self.doc, mesh);
             }
         }
+        // Where picks made by this edit are, kept with the edit itself.
+        self.record_picks();
         self.sync_turns();
         self.audit_report.clear();
         self.invalidate_post();
@@ -3010,7 +3099,10 @@ impl App {
     /// Planning work still under way in the background, which Cycle Start
     /// waits for (see `locked`).
     pub fn planning_busy(&self) -> Option<&'static str> {
-        if matches!(self.planner, Planner::Running(_)) || self.plan_busy.running() > 0 {
+        // A part loading would replace the job under the run.
+        if self.import_busy {
+            Some("A model is loading: wait for it.")
+        } else if matches!(self.planner, Planner::Running(_)) || self.plan_busy.running() > 0 {
             Some("The AI planner is working: wait for it, or cancel it.")
         } else if self.picturing() {
             Some("The stock after each operation is still being pictured: wait a moment.")
@@ -3152,10 +3244,21 @@ impl App {
             None => Task::none(),
         }
     }
+    /// Keeps where each operation's picked surfaces are with it
+    /// (`picks::record`), for the file saved to find them again after the
+    /// model file changes.
+    fn record_picks(&mut self) {
+        if self.doc.file.is_some()
+            && let Some(mesh) = &self.imported_mesh
+        {
+            picks::record(&mut self.doc, mesh);
+        }
+    }
     fn persist(&mut self) {
         if !self.dirty {
             return;
         }
+        self.record_picks();
         match storage::save(&self.state_path, &self.doc) {
             Ok(()) => {
                 self.dirty = false;
@@ -5193,6 +5296,11 @@ impl App {
             Message::Edit(target, ..) => Some((target, self.edited(target))),
             _ => None,
         };
+        // A click that picks or drops a surface: the selected operation's
+        // picks as they were, to see whether it changed them.
+        let picked = matches!(message, Message::Surface(_) | Message::DropHole(_))
+            .then(|| self.operation().map(|o| (o.id.clone(), o.surfaces.clone())))
+            .flatten();
         let task = match fault::guard(|| self.handle(message)) {
             Ok(task) => task,
             Err(fault) => {
@@ -5203,6 +5311,20 @@ impl App {
         if let Some((target, before)) = edit {
             let after = self.edited(target);
             self.typed_last = Some(LastEdit { before, after });
+        }
+        // Picked or dropped: what the model file's change did to its picks
+        // is seen to. A click refused leaves the note.
+        if let Some((id, was)) = picked {
+            let ids = |s: &Option<surface::Selection>| {
+                s.as_ref()
+                    .map(|s| (s.mesh_fingerprint.clone(), s.ids.clone()))
+            };
+            let changed = (self.doc.setups.iter().flat_map(|s| &s.operations))
+                .find(|o| o.id == id)
+                .is_some_and(|o| ids(&o.surfaces) != ids(&was));
+            if changed {
+                self.doc.pick_checks.remove(&id);
+            }
         }
         // Batched only when it starts one: a batch is never an empty task.
         let task = match self.refresh_part_holes() {
@@ -5707,6 +5829,8 @@ impl App {
                     let mut o = self.doc.setup().operations[i].clone();
                     o.id = id();
                     o.p.insert("name".into(), format!("{} · copy", o.name()));
+                    let from = self.doc.setup().operations[i].id.clone();
+                    self.doc.copy_picks(&from, &o.id);
                     self.doc.setup_mut().operations.insert(i + 1, o);
                     self.selected = Some(i + 1);
                     self.touch()
@@ -6051,8 +6175,17 @@ impl App {
             Message::ClearSurfaces => {
                 if let Some(o) = self.operation_mut() {
                     o.surfaces = None;
+                    let id = o.id.clone();
+                    self.doc.pick_checks.remove(&id);
                 }
                 self.touch();
+            }
+            Message::PicksChecked => {
+                if let Some(id) = self.operation().map(|o| o.id.clone())
+                    && self.doc.pick_checks.remove(&id).is_some()
+                {
+                    self.touch();
+                }
             }
             Message::PickPinHoles => {
                 self.picking_pins = !self.picking_pins;
@@ -6109,6 +6242,11 @@ impl App {
                 match hole_stages::add(&self.doc, si, oi, mesh) {
                     Ok(added) => {
                         let n = added.ops.len();
+                        // The stages pick what it picks.
+                        let from = self.doc.setups[si].operations[oi].id.clone();
+                        for o in &added.ops {
+                            self.doc.copy_picks(&from, &o.id);
+                        }
                         let ops = &mut self.doc.setups[si].operations;
                         ops.splice(oi..oi, added.ops);
                         if let Some(cut) = added.bore_cut {
@@ -6442,6 +6580,13 @@ impl App {
             },
             Message::DuplicateSetup => {
                 let s = self.doc.setup().duplicate(&self.doc.next_offset());
+                let ids: Vec<(String, String)> = (self.doc.setup().operations.iter())
+                    .zip(&s.operations)
+                    .map(|(a, b)| (a.id.clone(), b.id.clone()))
+                    .collect();
+                for (from, to) in ids {
+                    self.doc.copy_picks(&from, &to);
+                }
                 self.doc.active = s.id.clone();
                 self.doc.setups.push(s);
                 self.stop_selection();
@@ -7497,6 +7642,28 @@ impl App {
                 self.import_path_open = false;
                 self.import_path.clear();
                 self.import_path_error = None;
+                // The project's own model file chosen again is reimported:
+                // its picks are found again on it, not cleared. A DXF is
+                // loaded again at the project's thickness.
+                // The same file by another spelling of its path too (a
+                // letter's case on Windows, `..`, a link).
+                let same = |d: &std::path::Path| {
+                    d == f.path
+                        || std::fs::canonicalize(d).is_ok_and(|d| {
+                            std::fs::canonicalize(&f.path).is_ok_and(|p| p == d)
+                        })
+                };
+                if self.doc.file.as_ref().is_some_and(|d| same(&d.path)) {
+                    match m {
+                        Some(mesh) if f.thickness.is_none() => {
+                            self.doc.file = Some(f);
+                            self.take_model(mesh, true);
+                            self.page = Page::Work;
+                            return Task::none();
+                        }
+                        _ => return self.update(Message::Reimport),
+                    }
+                }
                 self.doc.title = std::path::Path::new(&f.name)
                     .file_stem()
                     .unwrap_or_default()
@@ -7560,49 +7727,55 @@ impl App {
                 }
                 self.import_busy = false;
                 match result {
-                    Ok(mesh) => {
-                        self.imported_mesh = Some(mesh);
-                        self.sync_turns();
-                        self.undo = None;
-                        self.invalidate_post();
-                        self.status = "Saved model geometry restored.".into();
-                        // The pin holes follow the pins as the part places them.
-                        if self.doc.file.is_some()
-                            && let Some(mesh) = &self.imported_mesh
-                        {
-                            post::sync_pin_drilling(&mut self.doc, mesh);
-                        }
-                        // A sloping face picked before its operation picked
-                        // holes: dropped when it faces down, else the hole
-                        // past it, as a click picks now.
-                        if self.doc.file.is_some()
-                            && let Some(mesh) = &self.imported_mesh
-                        {
-                            let notes = surface::settle_sloping_picks(&mut self.doc, mesh);
-                            if !notes.is_empty() {
-                                self.touch();
-                                self.status = with_notes("Saved model geometry restored.", &notes);
-                            }
-                        }
-                        // Migrate legacy imported projects that stored sample
-                        // feature IDs through the old viewport toggle.
-                        if self.doc.file.is_some() {
-                            let mut migrated = false;
-                            for setup in &mut self.doc.setups {
-                                for operation in &mut setup.operations {
-                                    migrated |= !operation.geometry.is_empty();
-                                    operation.geometry.clear();
-                                }
-                            }
-                            if migrated {
-                                self.touch();
-                                self.status = "Model restored. Old sample-only selections were cleared; select surfaces on your part in Geometry.".into();
-                            }
-                        }
-                    }
+                    Ok(mesh) => self.take_model(mesh, false),
                     Err(e) => {
                         self.status = format!("Model could not be restored: {e}");
                         self.import_error = Some(e);
+                    }
+                }
+            }
+            Message::Reimport => {
+                if self.import_busy || self.save_busy {
+                    return Task::none();
+                }
+                let Some(file) = self.doc.file.clone() else {
+                    return Task::none();
+                };
+                // The places of picks made since the last save, for the new
+                // part to find them by.
+                if let Some(mesh) = &self.imported_mesh {
+                    picks::record(&mut self.doc, mesh);
+                }
+                self.import_busy = true;
+                self.status = format!(
+                    "Reimporting {}. Geometry loads in the background…",
+                    file.name
+                );
+                let asked = file.clone();
+                return Task::perform(reload_model_file(file), move |result| {
+                    Message::ModelReimported(asked.clone(), result)
+                });
+            }
+            Message::ModelReimported(asked, result) => {
+                // Another part, project or DXF thickness since: a later load
+                // is under way, or none is wanted.
+                if self.doc.file.as_ref() != Some(&asked) {
+                    return Task::none();
+                }
+                self.import_busy = false;
+                match result {
+                    Ok((file, mesh)) => {
+                        self.doc.file = Some(file);
+                        self.take_model(mesh, true);
+                    }
+                    Err(e) => {
+                        if self.imported_mesh.is_some() {
+                            self.status =
+                                format!("Reimport failed: {e} The part stays as it was loaded.");
+                        } else {
+                            self.status = format!("Reimport failed: {e}");
+                            self.import_error = Some(e);
+                        }
                     }
                 }
             }
@@ -7632,6 +7805,7 @@ impl App {
                 self.save_busy = false;
                 // The document as it is now: edits made while the dialog was
                 // open are in the file.
+                self.record_picks();
                 match storage::save(&p, &self.doc) {
                     Ok(()) => {
                         self.status = format!("Saved {}", p.display());
@@ -8400,6 +8574,9 @@ impl App {
                 status += &self.doc.restore_holders(&before, &before.setups);
                 self.doc.setups = before.setups;
                 self.doc.active = before.active;
+                // With their picks' places and what changed in them.
+                self.doc.places.extend(before.places);
+                self.doc.pick_checks.extend(before.pick_checks);
                 self.travel_from_connected();
                 self.stop_selection();
                 self.touch();
@@ -8965,6 +9142,20 @@ async fn load_model_file(path: PathBuf) -> Result<(ModelFile, Option<mesh::Mesh>
     };
     match tokio::task::spawn_blocking(move || mesh::load(&path)).await {
         Ok(Ok(m)) => Ok((info, Some(m))),
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(format!("Import worker failed: {e}")),
+    }
+}
+/// The project's model file `file` loaded again as it is now, at its DXF
+/// thickness: its size read anew, and its part.
+async fn reload_model_file(file: ModelFile) -> Result<(ModelFile, mesh::Mesh), String> {
+    let bytes = std::fs::metadata(&file.path)
+        .map_err(|e| format!("{} could not be read: {e}.", file.path.display()))?
+        .len();
+    let file = ModelFile { bytes, ..file };
+    let loaded = file.clone();
+    match tokio::task::spawn_blocking(move || mesh::load_file(&loaded)).await {
+        Ok(Ok(m)) => Ok((file, m)),
         Ok(Err(e)) => Err(e),
         Err(e) => Err(format!("Import worker failed: {e}")),
     }
