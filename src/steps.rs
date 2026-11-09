@@ -361,10 +361,14 @@ pub(crate) fn measures(
                     [false, true] => format!("from the {} face", faces[k][1]),
                     [false, false] => "between the walls".into(),
                 };
-                // On the edge of the top the pictures see: the front's
-                // (−Y) for an X width, the right's (+X) for a Y width.
+                // Off the side of the stock the pictures see, clear of it:
+                // in front (−Y) for an X width, right (+X) for a Y width.
                 let mut a = [0., 0., top];
-                a[o] = if o == 0 { s.max[0] } else { s.min[1] };
+                a[o] = if o == 0 {
+                    s.max[0] + OFF
+                } else {
+                    s.min[1] - OFF
+                };
                 let mut b = a;
                 (a[k], b[k]) = (lo[k], hi[k]);
                 wall.get_or_insert(if open[k][0] { b } else { a });
@@ -377,8 +381,8 @@ pub(crate) fn measures(
                     leader: false,
                 });
             }
-            // Down the wall where that edge meets it.
-            let at = wall.unwrap_or([s.max[0], s.min[1], top]);
+            // Down from where that width meets the wall.
+            let at = wall.unwrap_or([s.max[0] + OFF, s.min[1] - OFF, top]);
             let words = if open[2][0] {
                 vec!["through".into()]
             } else {
@@ -454,6 +458,8 @@ pub(crate) fn measures(
     }
     out
 }
+/// How far off the stock a size is drawn, mm.
+const OFF: f32 = 12.;
 /// A DRO number: two decimals, a true minus, never −0.00.
 fn dro(v: f32) -> String {
     let v = if v.abs() < 0.005 { 0. } else { v };
@@ -1226,10 +1232,16 @@ impl canvas::Program<Message> for Dims<'_> {
                 let mid = Point::new((a.x + b.x) / 2., (a.y + b.y) / 2.);
                 arrow(&mut f, mid, a, ACCENT, 2.5);
                 arrow(&mut f, mid, b, ACCENT, 2.5);
-                // Off the line, away from the picture's middle.
-                let (dx, dy) = (mid.x - centre.x, mid.y - centre.y);
+                // Square off the line, on the side away from the picture's
+                // middle, so two sizes at one corner do not cover each other.
+                let (dx, dy) = (b.x - a.x, b.y - a.y);
                 let l = dx.hypot(dy).max(1.);
-                Point::new(mid.x + dx / l * 40. - 10., mid.y + dy / l * 30.)
+                let (mut nx, mut ny) = (-dy / l, dx / l);
+                if nx * (mid.x - centre.x) + ny * (mid.y - centre.y) < 0. {
+                    (nx, ny) = (-nx, -ny);
+                }
+                let width = d.label.chars().count() as f32 * 9.5;
+                Point::new(mid.x + nx * 26. - width * (1. - nx) / 2., mid.y + ny * 22.)
             };
             // On a white tag, to read over the stock.
             let width = d.label.chars().count() as f32 * 9.5 + 12.;
