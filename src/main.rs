@@ -4203,12 +4203,10 @@ impl App {
             return None;
         }
         let mesh = self.part_mesh()?;
-        let setup = self.doc.setup();
         let mut hasher = std::hash::DefaultHasher::new();
         mesh.fingerprint.hash(&mut hasher);
-        for key in ["rx", "ry", "rz", "tx", "ty", "tz"] {
-            get(&setup.p, key).hash(&mut hasher);
-        }
+        // An indexed setup's A turn too: a click is matched against them.
+        self.hash_placement(&mut hasher);
         Some(hasher.finish())
     }
     /// Works out the part's holes for picking by their outline when they
@@ -4237,6 +4235,46 @@ impl App {
             },
             move |found| Message::PartHoles(key, PartHoles(std::sync::Arc::new(found))),
         ))
+    }
+    /// The hole a click on surface `n` picks when `n` lies in a thread
+    /// modeled in it (`part_holes`, once known), with how a Drill reads it:
+    /// a thread's flanks and crests are no walls a hole is read from, and at
+    /// its walls' heights its outline runs over the flanks (`LEANING`). The
+    /// surface lies between the thread's minor and major diameters (a flat
+    /// face round the hole, centred on its axis, does not). Of two holes the
+    /// thread is in (a counterbore over it, a bore under it), the one as
+    /// wide as its major diameter. Not in an Internal groove, which takes a
+    /// wall as a face.
+    fn threaded_hole(
+        &self,
+        mesh: &mesh::Mesh,
+        n: usize,
+    ) -> Option<(pocket::Hole, Option<cam::Hole>)> {
+        let (key, found) = self.part_holes.as_ref()?;
+        if self.part_holes_key() != Some(*key) || self.operation()?.strategy == Strategy::Groove {
+            return None;
+        }
+        let placement = crate::stock::Placement::new(mesh, Some(self.doc.setup()));
+        let c = placement
+            .transform(mesh.surfaces.get(n)?.center)
+            .map(|v| v / mesh.display_scale());
+        let thread = |i: usize| found.round.get(i)?.as_ref()?.thread.as_ref();
+        let i = (0..found.holes.len())
+            .filter(|&i| {
+                thread(i).is_some_and(|t| {
+                    let r = (c[0] - t.centre[0]).hypot(c[1] - t.centre[1]);
+                    (t.minor / 2. - 0.1..=t.major / 2. + 0.05).contains(&r)
+                        && (t.from - t.pitch..=t.to + t.pitch).contains(&c[2])
+                })
+            })
+            .min_by(|&i, &j| {
+                let off = |k: usize| {
+                    let (w, d) = found.holes[k].size();
+                    (w.max(d) - thread(k).map_or(0., |t| t.major) as f64).abs()
+                };
+                off(i).total_cmp(&off(j))
+            })?;
+        Some((found.holes[i].clone(), found.round[i].clone()))
     }
     /// Whether the part's holes for the outlines are being worked out.
     pub(crate) fn finding_holes(&self) -> bool {
@@ -5896,10 +5934,20 @@ impl App {
                 if n >= mesh.surfaces.len() {
                     return Task::none();
                 }
+                // A modeled thread's flanks and crests pick its hole as its
+                // outline does, by its first wall, read as it was found.
+                let threaded = self.threaded_hole(mesh, n);
+                let n = (threaded.as_ref())
+                    .and_then(|(h, _)| h.walls.first().copied())
+                    .unwrap_or(n);
                 let fingerprint = mesh.fingerprint.clone();
                 // An indexed setup reads the click at the A angle that turns
                 // its hole up, which may not be the one shown.
                 let setup = self.doc.picking_pose(self.doc.index(), mesh, n);
+                let threaded = threaded.filter(|_| {
+                    crate::stock::Placement::new(mesh, Some(&setup)).rotation()
+                        == crate::stock::Placement::new(mesh, Some(self.doc.setup())).rotation()
+                });
                 // A Pocket, an inside Contour or a Drill takes a wall as its
                 // hole: every wall of it, added or removed together. A face
                 // that is neither a floor nor a wall (a cone, a chamfer, a
@@ -5931,7 +5979,10 @@ impl App {
                 let near = (picks_holes && (sloped || slope_face))
                     .then(|| pocket::hole_near(&setup, mesh, n))
                     .flatten();
-                let walls = (picks_holes && wall).then(|| pocket::hole_walls(&setup, mesh, n));
+                let walls = (picks_holes && wall).then(|| match &threaded {
+                    Some((h, _)) => Ok(h.walls.clone()),
+                    None => pocket::hole_walls(&setup, mesh, n),
+                });
                 let steps =
                     slope_face && !matches!(near, Some(Ok(_))) && !matches!(walls, Some(Ok(_)));
                 if picks_holes && !steps && (wall || (sloped && (near.is_some() || !pocket_op))) {
@@ -5962,9 +6013,12 @@ impl App {
                         .map_or(&[], |h| h.as_slice());
                     let clicked: Option<std::collections::HashSet<usize>> =
                         found.as_ref().ok().map(|w| w.iter().copied().collect());
-                    let this = (clicked.as_ref())
-                        .and_then(|c| pocket::holes(&setup, c, mesh).ok())
-                        .unwrap_or_default();
+                    let this = match &threaded {
+                        Some((h, _)) => vec![h.clone()],
+                        None => (clicked.as_ref())
+                            .and_then(|c| pocket::holes(&setup, c, mesh).ok())
+                            .unwrap_or_default(),
+                    };
                     let drop = pocket::dropped(now, &picked, n, clicked.as_ref(), &this);
                     // A click on a picked arc of a Drill drops it (`pick_arc`).
                     if drill
@@ -5978,10 +6032,10 @@ impl App {
                     }
                     // A Drill drills round holes: it reads the hole as it
                     // drills it, and names it by the diameter it drills.
-                    let round = if drill {
-                        cam::drill_holes_of(&setup, mesh, &this)
-                    } else {
-                        vec![]
+                    let round = match &threaded {
+                        _ if !drill => vec![],
+                        Some((_, r)) => vec![r.clone()],
+                        None => cam::drill_holes_of(&setup, mesh, &this),
                     };
                     // Where it picks no whole round hole, a Drill takes the
                     // part of a round wall clicked (a half hole on the part's

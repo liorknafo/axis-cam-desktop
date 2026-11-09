@@ -29900,4 +29900,80 @@ soft_max = 180.0
             failures.join("\n")
         );
     }
+
+    /// A click on a modeled thread's flank or crest in a Drill picks its
+    /// hole as the hole's outline does, the Drill drills it at the
+    /// thread's centre, and a click again drops it (LIO-358).
+    #[test]
+    fn a_click_on_a_modeled_threads_flank_picks_its_hole_in_a_drill() {
+        let mut a = threaded_app();
+        let _ = a.update(Message::AddOp(Strategy::Drill));
+        if !a.picking {
+            let _ = a.update(Message::PickMode);
+        }
+        assert!(a.picking && a.part_holes.is_some());
+        let mesh = a.imported_mesh.clone().unwrap();
+        let setup = a.doc.setup().clone();
+        let placement = crate::stock::Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        let threads = crate::thread::holes_in_setup(&setup, &mesh);
+        assert_eq!(threads.len(), 4, "{threads:?}");
+        for t in &threads {
+            // Halfway down the thread, a flank (sloped) and a crest (a wall).
+            let mid = (t.from + t.to) / 2.;
+            let surfaces: Vec<usize> = (0..mesh.surfaces.len())
+                .filter(|&id| {
+                    let c = placement
+                        .transform(mesh.surfaces[id].center)
+                        .map(|v| v / scale);
+                    (t.minor / 2. ..=t.major / 2.)
+                        .contains(&(c[0] - t.centre[0]).hypot(c[1] - t.centre[1]))
+                        && (c[2] - mid).abs() < 2.
+                })
+                .collect();
+            let flank = (surfaces.iter().copied())
+                .find(|&id| !crate::pocket::is_wall(&setup, &mesh, id))
+                .unwrap();
+            let crest = (surfaces.iter().copied())
+                .find(|&id| crate::pocket::is_wall(&setup, &mesh, id))
+                .unwrap();
+            for id in [flank, crest] {
+                a.doc.setup_mut().operations[a.selected.unwrap()].surfaces = None;
+                let _ = a.update(Message::Surface(id));
+                assert!(
+                    a.status.starts_with("Picked the Ø"),
+                    "{} surface {id}: {}",
+                    t.name(),
+                    a.status
+                );
+                let op = a.operation().unwrap().clone();
+                let holes = a.drill_holes(&op, &mesh).as_ref().clone().unwrap();
+                let [h] = &holes[..] else {
+                    panic!("{} surface {id}: {holes:?}", t.name())
+                };
+                assert!(
+                    (h.center[0] - t.centre[0]).hypot(h.center[1] - t.centre[1]) < 0.1
+                        && h.thread.is_some(),
+                    "{} surface {id}: {h:?}",
+                    t.name()
+                );
+                let _ = a.update(Message::Surface(id));
+                assert!(
+                    a.status.starts_with("Dropped"),
+                    "{} surface {id}: {}",
+                    t.name(),
+                    a.status
+                );
+                assert!(
+                    a.operation()
+                        .unwrap()
+                        .surfaces
+                        .as_ref()
+                        .unwrap()
+                        .ids
+                        .is_empty()
+                );
+            }
+        }
+    }
 }

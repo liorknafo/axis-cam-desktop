@@ -1170,6 +1170,7 @@ pub const WALL: f32 = 0.5;
 /// A hole picked by its walls, as `setup` places the part (mm): what a Pocket
 /// or an inside Contour cuts when the walls of a hole are selected instead
 /// of a floor.
+#[derive(Clone)]
 pub struct Hole {
     /// The walls' outline seen from above, at the height `ring` takes it.
     pub outline: Region,
