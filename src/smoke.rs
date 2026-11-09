@@ -29326,7 +29326,8 @@ soft_max = 180.0
                     let c = placement
                         .transform(mesh.surfaces[id].center)
                         .map(|v| v / scale);
-                    (c[0] - t.centre[0]).hypot(c[1] - t.centre[1]) <= t.major / 2.
+                    (t.minor / 2. ..=t.major / 2.)
+                        .contains(&(c[0] - t.centre[0]).hypot(c[1] - t.centre[1]))
                         && (c[2] - mid).abs() < 2.
                 })
                 .collect();
