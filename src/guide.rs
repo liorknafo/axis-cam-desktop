@@ -86,20 +86,26 @@ pub enum Step {
         at: [[f32; 3]; 2],
         round: [bool; 2],
     },
-    /// Put in the tool `tool` (an id) at `rpm`, touch the stock's top with
-    /// it and set Z to `top` (the top before the operation, work Z); with
-    /// the DRO's compensation on, enter `diameter` and set X and Y to
-    /// `comp` (0 off: centres).
+    /// Set the gear to `rpm` for the tool `tool` (an id). With `top`, a new
+    /// tool: put it in, touch the stock's top with it and set Z to `top`
+    /// (the top before the operation, work Z); without, the tool is in
+    /// already and only its gear changes. With `comp`, enter `diameter` in
+    /// the DRO and set X and Y to `comp` (0 off: centres).
     Tool {
         op: usize,
         tool: String,
         rpm: f32,
         diameter: f32,
-        comp: [i8; 2],
-        top: f32,
+        comp: Option<[i8; 2]>,
+        top: Option<f32>,
     },
-    /// Same tool: only the compensation sides change.
-    Comp { op: usize, comp: [i8; 2] },
+    /// Same tool and gear: enter its `diameter` in the DRO and set the
+    /// compensation sides `comp`, not set before or changed.
+    Comp {
+        op: usize,
+        comp: [i8; 2],
+        diameter: f32,
+    },
     /// One pass of a Box, 1-based `index` of `of`. `cut` is what it sweeps
     /// out of the stock, `earlier` what the operation's passes before it did.
     Pass {
@@ -113,14 +119,14 @@ pub enum Step {
         turns_per_minute: f32,
     },
     /// A facing Box (open on all four sides): face the top down to `to`,
-    /// taking off `remove`; the user plans the passes. The tool picks up Z
+    /// taking off `remove`; the user plans the passes. A new tool picks up Z
     /// on the top first, set to `top`, as on a Tool step.
     Face {
         op: usize,
         tool: String,
         rpm: f32,
         diameter: f32,
-        top: f32,
+        top: Option<f32>,
         remove: f32,
         to: f32,
     },
@@ -130,7 +136,7 @@ pub enum Step {
     /// (the edge with compensation, else the centre), taking off `remove`,
     /// down to `down_to` (the floor as cut). With the DRO's compensation on,
     /// enter `diameter` and set `axis` to its side in `comp` (toward the
-    /// wall; the other axis 0); all 0 with it off. The tool picks up Z on
+    /// wall; the other axis 0); all 0 with it off. A new tool picks up Z on
     /// the top first, set to `top`, as on a Tool step.
     Square {
         op: usize,
@@ -138,7 +144,7 @@ pub enum Step {
         rpm: f32,
         diameter: f32,
         comp: [i8; 2],
-        top: f32,
+        top: Option<f32>,
         axis: usize,
         side: i8,
         to: f32,
@@ -804,7 +810,10 @@ fn simulate(doc: &Document, mesh: &Mesh, si: usize, empty: &str) -> Result<Walke
                     done.push((oi, sim.plan));
                 }
             }
-            Err(e) if s == si && error.is_none() => error = Some(e),
+            // Named by its operation, for the Steps page to open (LIO-374).
+            Err(e) if s == si && error.is_none() => {
+                error = Some(format!("{}: {e}", setup.operations[oi].name()))
+            }
             _ => {}
         },
         |s, _, volume| {
@@ -1097,22 +1106,37 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
         // The stock before this operation.
         let earlier = done_ops.last().map_or(&before, |d: &Done| &d.after);
         let left = simulation::leftover_box(earlier, setup, mesh);
-        // Where a new tool picks up Z: the highest top left.
-        let top = left.max[2] - zero[2];
+        // Where a new tool picks up Z: the highest top left. A tool already
+        // in keeps its Z (LIO-368).
+        let top = changed.then_some(left.max[2] - zero[2]);
+        // The screen that sets the tool, gear and DRO for this operation:
+        // all of them for a new tool; with the same tool only what changes,
+        // a gear with the DRO when it changes too, else the DRO alone (its
+        // diameter and sides; nothing with its compensation off), or none.
         let mut sides = |comp: [i8; 2], steps: &mut Vec<Step>| {
-            let new = (set.as_ref())
-                .is_some_and(|&(t, s, c)| t == tool && s == rpm && c.is_some_and(|c| c != comp));
-            steps.push(match new {
-                true => Step::Comp { op: oi, comp },
-                false => Step::Tool {
-                    op: oi,
-                    tool: tool.into(),
-                    rpm,
-                    diameter,
-                    comp,
-                    top,
-                },
-            });
+            let tool_step = |comp: Option<[i8; 2]>| Step::Tool {
+                op: oi,
+                tool: tool.into(),
+                rpm,
+                diameter,
+                comp,
+                top,
+            };
+            match set {
+                Some((t, s, c)) if t == tool => {
+                    let dro = c != Some(comp) && comp != [0; 2];
+                    if s != rpm {
+                        steps.push(tool_step(dro.then_some(comp)));
+                    } else if dro {
+                        steps.push(Step::Comp {
+                            op: oi,
+                            comp,
+                            diameter,
+                        });
+                    }
+                }
+                _ => steps.push(tool_step(Some(comp))),
+            }
             set = Some((tool, rpm, Some(comp)));
         };
         match op.strategy {
@@ -1937,8 +1961,9 @@ pub(crate) mod tests {
         let of = |i: usize| kinds(&guide, guide.sections[i].steps.clone());
         assert_eq!(of(0), ["Hold", "Zero"]);
         assert_eq!(of(1), ["Face"]);
-        // The 15 mm step is one row on each of its two levels (LIO-366).
-        assert_eq!(of(2), ["Tool", "Pass", "Pass", "Check"]);
+        // The 15 mm step is one row on each of its two levels (LIO-366); the
+        // Face's tool is still in, so only the DRO is set (LIO-368).
+        assert_eq!(of(2), ["Comp", "Pass", "Pass", "Check"]);
         assert_eq!(of(3), ["Tool", "Holes", "Check"]);
         assert_eq!(of(4), ["HandOver"]);
         let counts: Vec<usize> = guide.sections.iter().map(|s| s.count).collect();
@@ -1991,7 +2016,7 @@ pub(crate) mod tests {
         let (work, all, steps) = routes(&doc);
         let says = |e: &Option<String>| {
             e.as_ref()
-                .is_some_and(|e| e.starts_with("The manual mill travels 100 mm in X"))
+                .is_some_and(|e| e.contains("The manual mill travels 100 mm in X"))
         };
         assert!(says(&work), "{work:?}");
         assert!(all.len() == 3 && all.iter().all(says), "{all:?}");
@@ -2007,7 +2032,7 @@ pub(crate) mod tests {
         assert_eq!(
             kinds(&guide, 0..guide.steps.len()),
             [
-                "Hold", "Zero", "Face", "Tool", "Pass", "Pass", "Check", "Tool", "Holes", "Check",
+                "Hold", "Zero", "Face", "Comp", "Pass", "Pass", "Check", "Tool", "Holes", "Check",
                 "HandOver"
             ]
         );
@@ -2058,10 +2083,18 @@ pub(crate) mod tests {
         close(*to, -2.);
         close(*remove, 2.);
         // The first tool picks up Z on the untouched top.
-        close(*top, 0.);
+        close(top.unwrap(), 0.);
         assert_eq!(guide.steps[10], Step::HandOver { next: Some(1) });
-        // The Step's floor is closed: not a squaring Box.
-        assert!(matches!(guide.steps[3], Step::Tool { op: 1, .. }));
+        // The Step's floor is closed: not a squaring Box. The Face's tool
+        // is still in: only the DRO's diameter and sides (LIO-368).
+        assert_eq!(
+            guide.steps[3],
+            Step::Comp {
+                op: 1,
+                comp: [1, 1],
+                diameter: 25.
+            }
+        );
     }
     /// The job in the manual mill's vise, its jaws on the Y sides.
     pub(crate) fn in_the_vise(doc: &mut Document) {
@@ -2100,20 +2133,21 @@ pub(crate) mod tests {
     fn every_new_tool_picks_up_z_on_the_top_left_before_its_operation() {
         let (doc, mesh) = job("Yes");
         let guide = build(&doc, &mesh, 0).unwrap();
-        // After the 2 mm face, the Step's mill and the Holes' drill touch a
-        // top 2 mm down.
-        let tops: Vec<(usize, f32)> = (guide.steps.iter())
+        // The Face's mill on the untouched top; after the 2 mm face, the
+        // Holes' drill touches a top 2 mm down. The Step keeps the Face's
+        // mill and its Z (LIO-368).
+        let tops: Vec<(usize, Option<f32>)> = (guide.steps.iter())
             .filter_map(|s| match s {
                 Step::Tool { op, top, .. } | Step::Face { op, top, .. } => Some((*op, *top)),
                 _ => None,
             })
             .collect();
-        assert_eq!(tops.len(), 3, "{tops:?}");
-        for ((op, top), want) in tops.into_iter().zip([(0, 0.), (1, -2.), (2, -2.)]) {
+        assert_eq!(tops.len(), 2, "{tops:?}");
+        for ((op, top), want) in tops.into_iter().zip([(0, 0.), (2, -2.)]) {
             assert_eq!(op, want.0);
-            assert!((top - want.1).abs() < 0.01, "{op} {top}");
+            assert!((top.unwrap() - want.1).abs() < 0.01, "{op} {top:?}");
         }
-        // A square after the face picks up on it too.
+        // A square after the face with its tool still in picks up nothing.
         let (mut doc, mesh) = job("Yes");
         let mill = doc.tools[3].id.clone();
         let b = [123., 500., -500., 500., 0., -30.];
@@ -2123,7 +2157,64 @@ pub(crate) mod tests {
         let Step::Square { top, .. } = &guide.steps[3] else {
             panic!("{:?}", guide.steps[3])
         };
-        assert!((top + 2.).abs() < 0.01, "{top}");
+        assert_eq!(*top, None);
+    }
+    #[test]
+    fn a_tool_already_in_gets_only_what_changes() {
+        let (mut doc, mesh) = job("Yes");
+        let mill = doc.tools[3].id.clone();
+        // A deeper step after the Step: same tool, gear and sides.
+        let b = [-500., 500., -500., 15.5, 0., -14.];
+        let deeper = boxed("Deeper", &mill, b, &[("stepdown", "5")]);
+        doc.setups[0].operations.insert(2, deeper);
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let first = |g: &Guide, i: usize| g.steps[g.sections[i].steps.start].clone();
+        // After the Face: only the DRO's diameter and sides.
+        assert_eq!(
+            first(&guide, 2),
+            Step::Comp {
+                op: 1,
+                comp: [1, 1],
+                diameter: 25.
+            }
+        );
+        // Nothing changes: the section starts with its first pass.
+        assert!(
+            matches!(
+                first(&guide, 3),
+                Step::Pass {
+                    op: 2,
+                    index: 1,
+                    ..
+                }
+            ),
+            "{:?}",
+            first(&guide, 3)
+        );
+        // A change of tool: put it in, pick up Z, the DRO.
+        assert!(matches!(
+            first(&guide, 4),
+            Step::Tool {
+                op: 3,
+                top: Some(_),
+                comp: Some([0, 0]),
+                ..
+            }
+        ));
+        // Another gear alone: the gear and nothing else.
+        doc.setups[0].operations[2]
+            .p
+            .insert("rpm".into(), "400".into());
+        let guide = build(&doc, &mesh, 0).unwrap();
+        assert!(matches!(
+            first(&guide, 3),
+            Step::Tool {
+                op: 2,
+                top: None,
+                comp: None,
+                ..
+            }
+        ));
     }
     /// The shaft turned on the lathe (`proposal::tests::turned`), Ø20 over
     /// its top 20 mm and Ø30 under it; the manual mill, setup 2, then
@@ -2440,11 +2531,13 @@ pub(crate) mod tests {
             close(near, 123. + 12.5);
             close(plan.target - guide.zero[2], down_to);
             // The 15.5 mm front step, wider than the radius, is not squaring:
-            // its section starts with its tool and runs its passes.
-            assert_eq!(
-                kinds(&guide, guide.sections[3].steps.clone()),
-                ["Tool", "Pass", "Pass", "Check"]
-            );
+            // it runs its passes, the same tool still in (LIO-368), after
+            // the DRO's diameter and sides when its compensation is on.
+            let want: &[&str] = match dro {
+                "Yes" => &["Comp", "Pass", "Pass", "Check"],
+                _ => &["Pass", "Pass", "Check"],
+            };
+            assert_eq!(kinds(&guide, guide.sections[3].steps.clone()), want);
         }
     }
     #[test]
@@ -2529,8 +2622,14 @@ pub(crate) mod tests {
         let (doc, mesh) = job("Yes");
         let guide = build(&doc, &mesh, 0).unwrap();
         // Open on both X ends (+), closed on +Y (+).
-        assert!(matches!(guide.steps[3], Step::Tool { comp: [1, 1], .. }));
-        assert!(matches!(guide.steps[7], Step::Tool { comp: [0, 0], .. }));
+        assert!(matches!(guide.steps[3], Step::Comp { comp: [1, 1], .. }));
+        assert!(matches!(
+            guide.steps[7],
+            Step::Tool {
+                comp: Some([0, 0]),
+                ..
+            }
+        ));
         let all = targets(&guide);
         for (_, t) in &all {
             match t.axis {
@@ -2556,7 +2655,9 @@ pub(crate) mod tests {
         // Without it, every readout is the centre.
         let (doc, mesh) = job("No");
         let guide = build(&doc, &mesh, 0).unwrap();
-        assert!(matches!(guide.steps[3], Step::Tool { comp: [0, 0], .. }));
+        // The Face's tool is still in and there are no sides to set: the
+        // Step starts with its first pass (LIO-368).
+        assert!(matches!(guide.steps[3], Step::Pass { op: 1, .. }));
         for (_, t) in targets(&guide) {
             assert!(!t.edge && t.shown == t.centre, "{t:?}");
         }
@@ -2734,7 +2835,8 @@ pub(crate) mod tests {
             guide.steps[guide.sections[3].steps.start],
             Step::Comp {
                 op: 2,
-                comp: [1, -1]
+                comp: [1, -1],
+                diameter: 25.
             }
         );
         // The back step's row reads its wall less the allowance: set on its

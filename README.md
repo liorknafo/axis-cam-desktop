@@ -481,17 +481,21 @@ Open a manual setup in MACHINE to see its **Steps** page in place of Run. It wor
 
 The page is split into sections: **Set up** (Hold, Zero), one section per cutting operation, and **Hand over**. A bar of sections on top shows progress ("pass 2/4"), ticks finished ones and ends with "→ CNC setup N". Tapping a section jumps to where you left it, or its first step. Each section header gives the tool, the number of passes or holes and the minutes. The last button of a section is "Section done"; you can stop after any section and come back. The place is saved with the project, without marking the plan changed.
 
+Each screen fills the page: its drawings and 3D pictures grow with the window, its numbers scroll beside them when they do not fit, and **Back** and the step's own button are large and in the same place at the foot of every screen. Back is dimmed on the first screen, and Back onto a Holes or Bore screen lands on its last hole.
+
+When the steps cannot be worked out, the page says why and names the operation it is in ("Step: Spindle speed must be one of the machine's gears: …"), with a button that opens that operation in MANUFACTURE on the tab the problem is on, or the setup when the problem is the setup's (a setup with no operation).
+
 | Screen | What it shows |
 | --- | --- |
 | Hold | The stock in 3D in the vise or clamps, and a view across the jaws: the jaws at their height, the parallels under the stock, how much is in the jaws ("8 in the jaws") and a THIS FACE UP arrow; the size |
 | Zero | The corner to pick up with the edge finder (DRO compensation off): the face each of X and Y is touched on and the number to set there, the zero less or plus the finder's radius ("touch the left face → set X −5.00" with a Ø10 finder), and Z set on the top |
-| Tool | The tool drawn to scale, the gear, the Z pick-up ("touch the top → set Z −2.00": the top the operations before left, in work Z), and with compensation on the diameter to enter and the sides to set (a Comp screen follows when only the sides change) |
-| Face | The whole facing on one screen: tool, gear, the Z pick-up, how much comes off and the Z to face down to. You plan the passes and stepdown yourself, so it has no Pass or Check screen |
-| Square | A thin slab along one wall (one closed X or Y side, at most one tool radius wide) on one screen: tool, gear, the Z pick-up, with compensation on the diameter to enter and the side to set (toward the wall), the X or Y to cut that side to, how much comes off and the Z to go down to. No Pass or Check screen |
+| Tool | For the setup's first tool and each change of tool: the stock as it is in 3D with the tool standing on the spot to touch, drawn to scale (its diameter, flute length and stick-out, a drill's point, the holder over it), the spot ringed on the highest top left; the gear large beside it; the Z pick-up ("touch the top → set Z −2.00": the top the operations before left, in work Z), and with compensation on the diameter to enter and the sides to set. With the same tool still in, only what changes: a **Gear** screen for another speed (with the DRO when its sides change too), a **Comp** screen with the diameter and sides when only they are new (after a Face or Square, or other open sides), and no screen when nothing changes |
+| Face | The whole facing on one screen: tool, gear, the Z pick-up (only for a tool not already in), how much comes off and the Z to face down to. You plan the passes and stepdown yourself, so it has no Pass or Check screen |
+| Square | A thin slab along one wall (one closed X or Y side, at most one tool radius wide) on one screen: tool, gear, the Z pick-up (only for a tool not already in), with compensation on the diameter to enter and the side to set (toward the wall), the X or Y to cut that side to, how much comes off and the Z to go down to. No Pass or Check screen |
 | Pass | One pass: top and front views, the band it removes, the tool where it starts and an arrow to where it stops, what earlier passes removed, and the DRO numbers |
-| Holes | The top view with every hole numbered, the current one lit, and its X, Y and the Z to drill to; a Reaming says Ream, "ream to" and "feed back out" |
+| Holes | The top view with every hole numbered, the current one lit, and its X, Y and the Z to drill to, with how deep that is from the hole's mouth (where the drill enters, lower where an earlier cut took the top down); a Reaming says Ream, "ream to" and "feed back out" |
 | Bore | One pass of a Boring: the holes and the bore as this pass leaves it over the last one's, then in order the bore to measure ("measure Ø31.90", after the first pass), the head setting ("head Ø32.00 · out 0.10 on Ø · 10 divisions", set with the spindle off), each hole's X and Y and the Z to bore to, and how to come out (spindle off, then raise; or feed back out) |
-| Check | The stock after the operation next to the one before, and the allowance left |
+| Check | The stock after the operation, lit as the one before it so that only the cut differs, with the sizes to measure drawn on it and listed large: a Box's width from the face it is measured from (or between its walls) and its depth below the top, with the stock to leave in them ("15.00 wide · from the front face", "9.50 deep below the top · floor Z −11.50"); holes' count, diameter and depth from the mouth |
 | Hand over | The stock as it leaves and the next setup it goes to |
 
 **The DRO numbers.**
@@ -500,7 +504,7 @@ The page is split into sections: **Set up** (Hold, Zero), one section per cuttin
 - **Edge or centre.** With DRO compensation on, X and Y show the **tool edge**, with the tool-centre number small beside it. Otherwise they show the tool centre. The compensation side is fixed for each operation and axis, toward the box's closed side on that axis (plus when both or neither are closed), so one operation never asks for a change. Holes always show centres.
 - **Locks.** A padlock tag names the axes to lock during the cut, and the axis that is set for the last time before it.
 - **Depths.** The Z down to a pass's level says how much deeper the pass cuts ("4.75 deeper"), and the tiles of the passes are their depths in work Z ("−6.75 · 2" for the second row on a level).
-- **Never below.** The lowest Z and the extreme X and Y the tool's edge reaches in the operation are drawn as red lines on the views.
+- **Never below.** The lowest Z and the extreme X and Y the tool's edge reaches in the operation are drawn as red lines on the views, each labelled with what the DRO reads with the tool against it: the edge on the compensation side (a diameter on from a wall on the other side), or the centre with compensation off.
 - **Handwheel turn rate.** The feed is shown in turns, such as "1 turn every 2 s", from the hand feed and the axis's mm per turn, with a dot that blinks once per turn.
 
 ### Minutes

@@ -2,8 +2,8 @@
 //! on the left, you at the front) and every number as a picture of a dial
 //! collar, as the lathe has no DRO.
 use super::{
-    ACCENT, CHIP, Lit, NEVER, Page, STOCK, TOOL, arrow, buttons, chip, chips, dashed, disc, frame,
-    label, lit, stroke, tiles, warn_chip,
+    ACCENT, CHIP, Lit, NEVER, Page, STOCK, TOOL, arrow, chip, chips, dashed, disc, frame, label,
+    lit, stroke, tiles, warn_chip,
 };
 use crate::{
     GuideAction, Message, Target,
@@ -2536,15 +2536,19 @@ pub(super) fn hand_over<'a>(p: &Page<'a>, to: Option<usize>) -> Element<'a, Mess
                 marks: vec![],
             })
             .width(iced::Length::Fill)
-            .height(380)
+            .height(iced::Length::Fill)
             .into()
         }
         None => space().into(),
     };
-    let right = column![chips(c)]
-        .push(space().height(iced::Length::Fill))
-        .push(buttons(next));
-    frame("Hand over".into(), "the part leaves the lathe", left, right)
+    frame(
+        "Hand over".into(),
+        "the part leaves the lathe",
+        left,
+        column![chips(c)],
+        next,
+        true,
+    )
 }
 
 #[cfg(test)]

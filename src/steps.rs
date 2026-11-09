@@ -57,8 +57,23 @@ pub struct Shown {
     pictures: Vec<Option<image::Handle>>,
     /// The stock in 3D as it starts, in the vise on its parallels.
     held: Option<image::Handle>,
+    /// By picture, the sizes drawn on it (the Check screen's), in its
+    /// pixels.
+    dims: Vec<Vec<Dim>>,
+    /// By step, a Tool step's picture: the stock before its operation with
+    /// the tool to scale on the spot to touch (`viewport::tool_triangles`).
+    tools: Vec<Option<image::Handle>>,
     /// On the lathe: what its side views draw.
     side: Option<turning::Side>,
+}
+/// A size drawn on a picture: a dimension line from `a` to `b` (picture
+/// pixels), or with `leader` an arrow onto `a` from `b`, labelled.
+#[derive(Debug, Clone)]
+struct Dim {
+    a: Point,
+    b: Point,
+    label: String,
+    leader: bool,
 }
 impl Shown {
     /// The same pictures with the guide worked out again for `doc`
@@ -73,6 +88,8 @@ impl Shown {
             parallels: self.parallels.clone(),
             pictures: self.pictures.clone(),
             held: self.held.clone(),
+            dims: self.dims.clone(),
+            tools: self.tools.clone(),
             side: self.side.clone(),
         })
     }
@@ -174,26 +191,85 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
             .collect()
     };
     let held = solid(&jaws);
-    let picture = |v: &crate::volume::Volume, box_: Bounds, held: &[_]| {
-        let surface =
-            crate::stock_surface::Snapshot::of(v, crate::stock_surface::Detail::Draft).build();
-        let mut triangles: Vec<_> = match &surface {
-            Ok(s) => viewport::stock_triangles(v, s, frame, None).collect(),
+    // The stock before the setup, then after each operation, lit alike
+    // over the depth of every cut of the setup (LIO-370).
+    let volumes: Vec<&crate::volume::Volume> = std::iter::once(&guide.before)
+        .chain(guide.done.iter().map(|d| &d.after))
+        .collect();
+    let surfaces: Vec<_> = (volumes.iter())
+        .map(|v| crate::stock_surface::Snapshot::of(v, crate::stock_surface::Detail::Draft).build())
+        .collect();
+    let span = (volumes.iter().zip(&surfaces))
+        .filter_map(|(v, s)| Some(viewport::cut_span(v, s.as_ref().ok()?, frame)))
+        .fold([f32::NEG_INFINITY, f32::INFINITY], |a, b| {
+            [a[0].max(b[0]), a[1].min(b[1])]
+        });
+    let stock: Vec<Vec<_>> = (volumes.iter().zip(&surfaces).zip(&boxes))
+        .map(|((v, surface), box_)| match surface {
+            Ok(s) => viewport::stock_triangles_lit(v, s, frame, None, span).collect(),
             Err(_) => viewport::box_triangles(box_.translated(zero), viewport::BLOCK),
-        };
+        })
+        .collect();
+    let picture = |i: usize, held: &[_]| {
+        let mut triangles = stock[i].clone();
         triangles.extend(held.iter().copied());
         viewport::stock_picture(&triangles, PICTURE)
     };
-    let mut pictures = vec![picture(&guide.before, boxes[0], &held)];
-    for (d, b) in guide.done.iter().zip(&boxes[1..]) {
-        pictures.push(picture(&d.after, *b, &held));
-    }
+    let pictures: Vec<_> = (0..stock.len()).map(|i| picture(i, &held)).collect();
     let held = if vise.is_empty() {
         pictures[0].clone()
     } else {
         let tall = solid(&[&vise[..], &parallels].concat());
-        picture(&guide.before, boxes[0], &tall)
+        picture(0, &tall)
     };
+    // The sizes each operation leaves, on the picture after it.
+    let mut dims = vec![vec![]];
+    for (j, d) in guide.done.iter().enumerate() {
+        let measures = measures(doc, &guide, d, boxes[j].max[2] + zero[2]);
+        let ends: Vec<[f32; 3]> = measures.iter().flat_map(|m| [m.from, m.to]).collect();
+        let points = viewport::picture_points(&stock[j + 1], PICTURE, &ends);
+        dims.push(
+            (measures.iter().zip(points.chunks(2)))
+                .map(|(m, p)| Dim {
+                    a: p[0],
+                    b: p[1],
+                    label: format!("{} {}", m.axis, mm(m.value)),
+                    leader: m.leader,
+                })
+                .collect(),
+        );
+    }
+    // A new tool on the stock before its operation, standing on the
+    // highest top left (LIO-376).
+    let jaw = solid(&jaws);
+    let tools = (guide.steps.iter())
+        .map(|step| {
+            let Step::Tool {
+                op,
+                top: Some(_),
+                diameter,
+                tool,
+                ..
+            } = step
+            else {
+                return None;
+            };
+            let j = guide.done.iter().position(|d| d.op == *op)?;
+            let t = doc.tools.iter().find(|t| &t.id == tool);
+            let length = |k: &str| t.and_then(|t| num(&t.p, k)).filter(|v| *v > 0.);
+            let flutes = length("length").unwrap_or(3. * diameter);
+            let stickout = length("stickout").unwrap_or(flutes + diameter);
+            let point = t.is_some_and(|t| get(&t.p, "type").to_lowercase().contains("drill"));
+            let centre = t.and_then(|t| t.centre_drill());
+            let spot = touch_spot(&stock[j])?;
+            let mut triangles = stock[j].clone();
+            triangles.extend(viewport::tool_triangles(
+                spot, *diameter, flutes, stickout, point, centre,
+            ));
+            triangles.extend(jaw.iter().copied());
+            viewport::stock_picture(&triangles, PICTURE)
+        })
+        .collect();
     let side = crate::lathe::is_lathe(&setup.machine).then(|| turning::side(doc, mesh, &guide));
     Ok(Shown {
         guide,
@@ -204,10 +280,186 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
         parallels,
         pictures,
         held,
+        dims,
+        tools,
         side,
     })
 }
+/// Where a new tool touches the top: on the highest flat face of the stock
+/// `triangles` (stock frame), the middle of it, or the face's triangle
+/// nearest that when the face is not convex.
+pub(crate) fn touch_spot(triangles: &[([[f32; 3]; 3], [u8; 4])]) -> Option<[f32; 3]> {
+    let flat = |t: &[[f32; 3]; 3]| {
+        let n = normal(t);
+        let size = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        size > 1e-9 && n[2].abs() / size > 0.999
+    };
+    let top = (triangles.iter())
+        .filter(|(t, _)| flat(t))
+        .map(|(t, _)| t[0][2])
+        .fold(f32::NEG_INFINITY, f32::max);
+    let middles: Vec<[f32; 3]> = (triangles.iter())
+        .filter(|(t, _)| flat(t) && t.iter().all(|p| (p[2] - top).abs() < 0.01))
+        .map(|(t, _)| std::array::from_fn(|k| (t[0][k] + t[1][k] + t[2][k]) / 3.))
+        .collect();
+    let n = middles.len() as f32;
+    let centre: [f32; 3] = std::array::from_fn(|k| middles.iter().map(|m| m[k]).sum::<f32>() / n);
+    middles
+        .into_iter()
+        .min_by(|a, b| {
+            let d = |m: &[f32; 3]| (m[0] - centre[0]).hypot(m[1] - centre[1]);
+            d(a).total_cmp(&d(b))
+        })
+        .map(|m| [m[0], m[1], top])
+}
 
+/// A size the Check screen gives to measure (LIO-370): `value` mm along
+/// `axis` ("X", "Y", "Z" or "Ø"), said by `words` as a caliper or depth
+/// gauge reads it, and drawn on the picture from `from` to `to` (stock
+/// frame, mm): a dimension line, or with `leader` an arrow onto `from`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Measure {
+    pub axis: &'static str,
+    pub value: f32,
+    pub words: Vec<String>,
+    pub from: [f32; 3],
+    pub to: [f32; 3],
+    pub leader: bool,
+}
+/// The sizes operation `op` of the guide (its `done` entry `d`) was to
+/// leave, as it leaves them, with the stock to leave in them; `top` is the
+/// Z of the stock's top before it (stock frame). A Box: its width from the
+/// face it is measured from, or between its walls, on each axis it has a
+/// wall on, and its depth below that top; holes: how many, their
+/// diameter and their depth from the mouth.
+pub(crate) fn measures(
+    doc: &Document,
+    g: &Guide,
+    d: &crate::guide::Done,
+    top: f32,
+) -> Vec<Measure> {
+    let Some(op) = doc.setups.get(g.setup).and_then(|s| s.operations.get(d.op)) else {
+        return vec![];
+    };
+    let (zero, s) = (g.zero, d.plan.stock);
+    let mut out = vec![];
+    match op.strategy {
+        Strategy::Box => {
+            let Ok((low, high)) = crate::cam::box_block(op, zero) else {
+                return out;
+            };
+            let allowance = crate::cam::number(op, "allowance").unwrap_or(0.);
+            let open = crate::cam::open_sides(low, high, &s);
+            let (lo, hi) = crate::cam::box_cut(low, high, &s, allowance);
+            let faces = [["left", "right"], ["front", "back"]];
+            let mut wall = None;
+            for k in 0..2 {
+                let o = 1 - k;
+                let from = match open[k] {
+                    [true, true] => continue,
+                    [true, false] => format!("from the {} face", faces[k][0]),
+                    [false, true] => format!("from the {} face", faces[k][1]),
+                    [false, false] => "between the walls".into(),
+                };
+                // Off the side of the stock the pictures see, clear of it:
+                // in front (−Y) for an X width, right (+X) for a Y width.
+                let mut a = [0., 0., top];
+                a[o] = if o == 0 {
+                    s.max[0] + OFF
+                } else {
+                    s.min[1] - OFF
+                };
+                let mut b = a;
+                (a[k], b[k]) = (lo[k], hi[k]);
+                wall.get_or_insert(if open[k][0] { b } else { a });
+                out.push(Measure {
+                    axis: AXES[k],
+                    value: hi[k] - lo[k],
+                    words: vec!["wide".into(), from],
+                    from: a,
+                    to: b,
+                    leader: false,
+                });
+            }
+            // Down from where that width meets the wall.
+            let at = wall.unwrap_or([s.max[0] + OFF, s.min[1] - OFF, top]);
+            let words = if open[2][0] {
+                vec!["through".into()]
+            } else {
+                vec![
+                    "deep below the top".into(),
+                    format!("floor Z {}", dro(lo[2] - zero[2])),
+                ]
+            };
+            out.push(Measure {
+                axis: "Z",
+                value: top - lo[2],
+                words,
+                from: at,
+                to: [at[0], at[1], lo[2]],
+                leader: false,
+            });
+        }
+        Strategy::Drill => {
+            let Some((holes, mouths)) = g.steps.iter().find_map(|st| match st {
+                Step::Holes {
+                    op: o,
+                    holes,
+                    mouths,
+                    ..
+                } if *o == d.op => Some((holes, mouths)),
+                Step::Bore {
+                    op: o,
+                    holes,
+                    mouths,
+                    ..
+                } if *o == d.op => Some((holes, mouths)),
+                _ => None,
+            }) else {
+                return out;
+            };
+            let Some(h) = holes.first() else {
+                return out;
+            };
+            let mouth = mouths.first().copied().unwrap_or(top - zero[2]);
+            let at = [h[0] + zero[0], h[1] + zero[1], mouth + zero[2]];
+            let up = [at[0], at[1], at[2] + 2. * d.plan.radius.max(6.)];
+            let count = if holes.len() == 1 {
+                "1 hole".to_string()
+            } else {
+                format!("{} holes", holes.len())
+            };
+            out.push(Measure {
+                axis: "Ø",
+                value: 2. * d.plan.radius,
+                words: vec![count],
+                from: at,
+                to: up,
+                leader: true,
+            });
+            let deep: Vec<f32> = (holes.iter().zip(mouths)).map(|(h, m)| m - h[2]).collect();
+            let (least, most) = deep
+                .iter()
+                .fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
+            let mut words = vec!["deep from the mouth".to_string()];
+            if most - least > 0.005 {
+                words.push(format!("{}–{} by hole", mm(least), mm(most)));
+            }
+            out.push(Measure {
+                axis: "Z",
+                value: most,
+                words,
+                from: at,
+                to: [at[0], at[1], at[2] - deep[0]],
+                leader: false,
+            });
+        }
+        _ => {}
+    }
+    out
+}
+/// How far off the stock a size is drawn, mm.
+const OFF: f32 = 12.;
 /// A DRO number: two decimals, a true minus, never −0.00.
 fn dro(v: f32) -> String {
     let v = if v.abs() < 0.005 { 0. } else { v };
@@ -420,13 +672,14 @@ fn tiles<'a>(labels: Vec<(String, Option<Message>)>, at: usize) -> Element<'a, M
     }
     line.into()
 }
-/// Back and the step's own command under a screen's right column.
-fn buttons<'a>(next: Option<(String, Message)>) -> Element<'a, Message> {
+/// Back (dimmed when there is no step before) and the step's own command,
+/// large enough to tap with a glove on.
+fn buttons<'a>(next: Option<(String, Message)>, back: bool) -> Element<'a, Message> {
     let back = HelpButton::new(
-        button(text("◀ Back").size(13).center())
+        button(text("◀ Back").size(16).width(Fill).center())
             .width(Fill)
-            .padding([8, 12])
-            .on_press(Message::Guide(GuideAction::Back))
+            .padding([14, 12])
+            .on_press_maybe(back.then_some(Message::Guide(GuideAction::Back)))
             .style(|_, status| button::Style {
                 background: Some(
                     if matches!(status, button::Status::Hovered) {
@@ -436,7 +689,11 @@ fn buttons<'a>(next: Option<(String, Message)>) -> Element<'a, Message> {
                     }
                     .into(),
                 ),
-                text_color: INK,
+                text_color: if matches!(status, button::Status::Disabled) {
+                    LINE
+                } else {
+                    INK
+                },
                 border: Border {
                     color: BUTTON_EDGE,
                     width: 1.,
@@ -449,7 +706,28 @@ fn buttons<'a>(next: Option<(String, Message)>) -> Element<'a, Message> {
     );
     let mut line = row![container(back).width(FillPortion(1))].spacing(8);
     if let Some((label, msg)) = next {
-        line = line.push(container(primary(label, msg).width(Fill)).width(FillPortion(2)));
+        let go = button(text(label.clone()).size(16).width(Fill).center())
+            .width(Fill)
+            .padding([14, 12])
+            .on_press(msg.clone())
+            .style(|_, status| button::Style {
+                background: Some(
+                    if matches!(status, button::Status::Hovered) {
+                        Color::from_rgb8(32, 97, 155)
+                    } else {
+                        BLUE
+                    }
+                    .into(),
+                ),
+                text_color: Color::WHITE,
+                border: Border {
+                    radius: 6.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        line = line
+            .push(container(HelpButton::new(go, &msg, label).width(Fill)).width(FillPortion(2)));
     }
     line.into()
 }
@@ -926,15 +1204,10 @@ impl canvas::Program<Message> for Drawing<'_> {
         vec![state.0.draw(renderer, bounds.size(), |f| self.paint(f))]
     }
 }
-/// A tool in its holder, its diameter and the gear it runs at.
-struct ToolPicture {
-    diameter: f32,
-    rpm: f32,
-    drill: bool,
-    /// A centre drill's sizes: its 60° cone and pilot under the body.
-    centre: Option<crate::model::CentreDrill>,
-}
-impl canvas::Program<Message> for ToolPicture {
+/// The sizes `dims` drawn over a picture of `PICTURE` pixels shown as wide
+/// and high as it fits in the canvas, centred (an image's `Contain`).
+struct Dims<'a>(&'a [Dim]);
+impl canvas::Program<Message> for Dims<'_> {
     type State = ();
     fn draw(
         &self,
@@ -945,98 +1218,73 @@ impl canvas::Program<Message> for ToolPicture {
         _: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         let mut f = canvas::Frame::new(renderer, bounds.size());
-        let (cx, w) = (bounds.width * 0.6, 60.);
-        f.fill_rectangle(Point::new(cx - 44., 16.), Size::new(88., 62.), JAW);
-        f.stroke(
-            &canvas::Path::rectangle(Point::new(cx - 44., 16.), Size::new(88., 62.)),
-            stroke(MUTED, 1.),
-        );
-        write(
-            &mut f,
-            "holder",
-            Point::new(cx + 52., 46.),
-            MUTED,
-            13.,
-            Align::Left,
-        );
-        let (top, h) = (78., 96.);
-        // A centre drill's cone and pilot, to scale with the body: the cone's
-        // end and the pilot's half-width and tip.
-        let centre = self.centre.map(|c| {
-            let q = c.pilot * w / c.body / 2.;
-            let cone = top + h + (w / 2. - q) * crate::model::CentreDrill::rise();
-            (cone, q, cone + (c.pilot_length * w / c.body).min(40.))
-        });
-        let body = canvas::Path::new(|b| {
-            b.move_to(Point::new(cx - w / 2., top));
-            b.line_to(Point::new(cx + w / 2., top));
-            b.line_to(Point::new(cx + w / 2., top + h));
-            if let Some((cone, q, tip)) = centre {
-                for p in [[q, cone], [q, tip], [-q, tip], [-q, cone]] {
-                    b.line_to(Point::new(cx + p[0], p[1]));
+        let (w, h) = (PICTURE.0 as f32, PICTURE.1 as f32);
+        let k = (bounds.width / w).min(bounds.height / h);
+        let (ox, oy) = ((bounds.width - w * k) / 2., (bounds.height - h * k) / 2.);
+        let at = |p: Point| Point::new(ox + p.x * k, oy + p.y * k);
+        let centre = Point::new(bounds.width / 2., bounds.height / 2.);
+        for d in self.0 {
+            let (a, b) = (at(d.a), at(d.b));
+            let label = if d.leader {
+                arrow(&mut f, b, a, ACCENT, 2.5);
+                Point::new(b.x + 8., b.y - 10.)
+            } else {
+                let mid = Point::new((a.x + b.x) / 2., (a.y + b.y) / 2.);
+                arrow(&mut f, mid, a, ACCENT, 2.5);
+                arrow(&mut f, mid, b, ACCENT, 2.5);
+                // Square off the line, on the side away from the picture's
+                // middle, so two sizes at one corner do not cover each other.
+                let (dx, dy) = (b.x - a.x, b.y - a.y);
+                let l = dx.hypot(dy).max(1.);
+                let (mut nx, mut ny) = (-dy / l, dx / l);
+                if nx * (mid.x - centre.x) + ny * (mid.y - centre.y) < 0. {
+                    (nx, ny) = (-nx, -ny);
                 }
-            } else if self.drill {
-                b.line_to(Point::new(cx, top + h + 18.));
-            }
-            b.line_to(Point::new(cx - w / 2., top + h));
-            b.close();
-        });
-        f.fill(&body, Color { a: 0.3, ..TOOL });
-        f.stroke(&body, stroke(TOOL, 1.6));
-        for i in 0..4 {
-            let y = top + 14. + i as f32 * 21.;
-            f.stroke(
-                &canvas::Path::line(Point::new(cx - w / 2., y), Point::new(cx + w / 2., y + 14.)),
-                stroke(TOOL, 1.4),
+                let width = d.label.chars().count() as f32 * 9.5;
+                Point::new(mid.x + nx * 26. - width * (1. - nx) / 2., mid.y + ny * 22.)
+            };
+            // On a white tag, to read over the stock.
+            let width = d.label.chars().count() as f32 * 9.5 + 12.;
+            let tag = canvas::Path::rounded_rectangle(
+                Point::new(label.x - 6., label.y - 13.),
+                Size::new(width, 26.),
+                5.into(),
             );
+            f.fill(&tag, Color::WHITE);
+            f.stroke(&tag, stroke(ACCENT, 1.5));
+            write(&mut f, d.label.clone(), label, ACCENT, 17., Align::Left);
         }
-        let y = centre.map_or(top + h + 34., |(_, _, tip)| tip + 16.);
-        arrow(
-            &mut f,
-            Point::new(cx, y),
-            Point::new(cx - w / 2., y),
-            INK,
-            1.2,
-        );
-        arrow(
-            &mut f,
-            Point::new(cx, y),
-            Point::new(cx + w / 2., y),
-            INK,
-            1.2,
-        );
-        f.fill_text(canvas::Text {
-            content: format!("Ø {}", dro(self.diameter)),
-            position: Point::new(cx, y + 18.),
-            color: INK,
-            size: 16.into(),
-            align_x: iced::advanced::text::Alignment::Center,
-            align_y: iced::alignment::Vertical::Center,
-            ..Default::default()
-        });
-        // The gear.
-        let g = Point::new(bounds.width * 0.18, 120.);
-        f.stroke(&canvas::Path::circle(g, 40.), stroke(ACCENT, 2.5));
-        f.fill_text(canvas::Text {
-            content: format!("{}", self.rpm.round()),
-            position: g,
-            color: ACCENT,
-            size: 22.into(),
-            align_x: iced::advanced::text::Alignment::Center,
-            align_y: iced::alignment::Vertical::Center,
-            ..Default::default()
-        });
-        f.fill_text(canvas::Text {
-            content: "rpm".into(),
-            position: Point::new(g.x, g.y + 58.),
-            color: MUTED,
-            size: 13.into(),
-            align_x: iced::advanced::text::Alignment::Center,
-            align_y: iced::alignment::Vertical::Center,
-            ..Default::default()
-        });
         vec![f.into_geometry()]
     }
+}
+/// The gear to set, large: `rpm` in a ring.
+fn gear<'a>(rpm: f32) -> Element<'a, Message> {
+    let mono = Font {
+        weight: iced::font::Weight::Bold,
+        ..Font::MONOSPACE
+    };
+    container(
+        column![
+            text(format!("{}", rpm.round()))
+                .size(44)
+                .font(mono)
+                .color(ACCENT),
+            text("rpm · set the gear").size(14).color(MUTED)
+        ]
+        .align_x(Alignment::Center)
+        .spacing(2),
+    )
+    .padding([18, 20])
+    .style(|_| container::Style {
+        background: Some(Color::WHITE.into()),
+        border: Border {
+            color: ACCENT,
+            width: 3.,
+            radius: 14.into(),
+        },
+        ..Default::default()
+    })
+    .into()
 }
 /// The tool seen from above with the edge the DRO's compensation shows on
 /// X and Y.
@@ -1184,9 +1432,13 @@ fn dro_tool<'a>(diameter: f32, comp: [i8; 2], height: f32) -> Vec<Element<'a, Me
     ]
 }
 
-/// A new tool picks up Z: touch the top and set Z to `top`.
-fn pick_up<'a>(top: f32) -> [Element<'a, Message>; 2] {
-    [
+/// A new tool picks up Z: touch the top and set Z to `top`; nothing for a
+/// tool already in.
+fn pick_up<'a>(top: Option<f32>, ringed: bool) -> Vec<Element<'a, Message>> {
+    let Some(top) = top else {
+        return vec![];
+    };
+    vec![
         label("Pick up Z with the tool"),
         readout(
             Readout {
@@ -1195,7 +1447,10 @@ fn pick_up<'a>(top: f32) -> [Element<'a, Message>; 2] {
                 axis: "Z".into(),
                 value: dro(top),
                 lock: None,
-                tags: vec![],
+                tags: match ringed {
+                    true => vec!["where it is ringed".into()],
+                    false => vec![],
+                },
                 lit: Lit::Next,
                 big: false,
             },
@@ -1259,7 +1514,7 @@ impl<'a> Page<'a> {
         view: usize,
         stock: Bounds,
         shapes: Vec<Shape>,
-        height: f32,
+        height: impl Into<Length>,
     ) -> Element<'a, Message> {
         self.drawing_with(view, stock, shapes, height, &self.shown.jaws)
     }
@@ -1269,7 +1524,7 @@ impl<'a> Page<'a> {
         view: usize,
         stock: Bounds,
         shapes: Vec<Shape>,
-        height: f32,
+        height: impl Into<Length>,
         jaws: &'a [Bounds],
     ) -> Element<'a, Message> {
         use std::hash::{Hash, Hasher};
@@ -1287,14 +1542,17 @@ impl<'a> Page<'a> {
         .height(height)
         .into()
     }
-    fn picture(&self, i: usize, size: (f32, f32)) -> Element<'a, Message> {
-        Self::image(self.shown.pictures.get(i).cloned().flatten(), size)
+    /// The stock in 3D before the setup (0) or after its operation `i`,
+    /// as wide as the room and `height` high.
+    fn picture(&self, i: usize, height: impl Into<Length>) -> Element<'a, Message> {
+        Self::image(self.shown.pictures.get(i).cloned().flatten(), height.into())
     }
     /// The stock as it starts, in its vise on its parallels.
-    fn held_picture(&self, size: (f32, f32)) -> Element<'a, Message> {
-        Self::image(self.shown.held.clone(), size)
+    fn held_picture(&self, height: impl Into<Length>) -> Element<'a, Message> {
+        Self::image(self.shown.held.clone(), height.into())
     }
-    fn image(picture: Option<image::Handle>, (w, h): (f32, f32)) -> Element<'a, Message> {
+    fn image(picture: Option<image::Handle>, h: Length) -> Element<'a, Message> {
+        let w = Fill;
         match picture {
             Some(p) => image(p).width(w).height(h).into(),
             None => container(muted("No picture of the stock."))
@@ -1323,7 +1581,7 @@ impl<'a> Page<'a> {
 pub fn view(app: &App) -> Element<'_, Message> {
     let main: Element<_> = match app.current_guide() {
         Some(Ok(shown)) => guide_page(app, shown),
-        Some(Err(e)) => notice(vec![e.clone(), "Fix the setup in MANUFACTURE.".into()]),
+        Some(Err(e)) => problem(app, e),
         None if app.guide_key().is_none() => notice(vec!["Load the part to see the steps.".into()]),
         None => notice(vec!["Simulating the setup…".into()]),
     };
@@ -1331,6 +1589,28 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .spacing(12)
         .padding(12)
         .height(Fill)
+        .into()
+}
+/// Why the active setup's steps cannot be shown, `e`, with a button to fix
+/// it in MANUFACTURE: the operation it names (`guide::simulate` puts its
+/// name first) at the tab the problem is on, else the setup (LIO-374).
+fn problem<'a>(app: &'a App, e: &str) -> Element<'a, Message> {
+    let named = (app.doc.active_setup().into_iter())
+        .flat_map(|s| s.operations.iter().enumerate())
+        .find_map(|(i, o)| Some((i, o.name(), e.strip_prefix(&format!("{}: ", o.name()))?)));
+    let (label, action) = match named {
+        Some((i, name, rest)) => (
+            format!("Open {name} in MANUFACTURE ▶"),
+            GuideAction::Fix(Some(i), rest.to_string()),
+        ),
+        None => (
+            "Open the setup in MANUFACTURE ▶".to_string(),
+            GuideAction::Fix(None, e.to_string()),
+        ),
+    };
+    let open = primary(label, Message::Guide(action));
+    column![notice(vec![e.to_string()]), open]
+        .spacing(12)
         .into()
 }
 fn notice<'a>(lines: Vec<String>) -> Element<'a, Message> {
@@ -1584,7 +1864,7 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
         top,
         bar.wrap().vertical_spacing(6),
         header,
-        scrollable(screen(&page)).height(Fill)
+        container(screen(&page)).height(Fill)
     ]
     .spacing(12)
     .into()
@@ -1656,8 +1936,8 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 }
             }
             let left = column![
-                p.held_picture((420., 250.)),
-                p.drawing_with(view, *stock, shapes, 200., &p.shown.vise),
+                p.held_picture(FillPortion(3)),
+                p.drawing_with(view, *stock, shapes, FillPortion(2), &p.shown.vise),
             ]
             .spacing(6)
             .align_x(Alignment::Center)
@@ -1763,43 +2043,63 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             (
                 "Zero".into(),
                 "pick up the corner",
-                p.drawing(0, stock, shapes, 380.),
+                p.drawing(0, stock, shapes, Fill),
                 right,
             )
         }
         Step::Tool {
-            op,
             tool,
             rpm,
             diameter,
             comp,
             top,
+            ..
         } => {
-            let drill = p
-                .setup
-                .operations
-                .get(*op)
-                .is_some_and(|o| o.strategy == Strategy::Drill);
             let right = column![chips(vec![
                 chip(p.named(tool, *diameter)),
                 chip(format!("{} rpm", rpm.round()))
             ]),]
-            .extend(pick_up(*top))
-            .extend(dro_tool(*diameter, *comp, 110.));
-            let left = crate::fault::canvas(ToolPicture {
-                diameter: *diameter,
-                rpm: *rpm,
-                drill,
-                centre: p.tool(*op).and_then(|t| t.centre_drill()),
-            })
-            .width(Fill)
-            .height(300)
+            .extend(pick_up(*top, true))
+            .extend(
+                comp.map(|c| dro_tool(*diameter, c, 110.))
+                    .unwrap_or_default(),
+            );
+            // The stock as it is with the tool to scale on the spot to
+            // touch, ringed (LIO-376), beside the gear.
+            let picture = p.shown.tools.get(p.at).cloned().flatten();
+            let left = row![
+                gear(*rpm),
+                match picture {
+                    Some(_) => Page::image(picture, Fill),
+                    None => space().width(Fill).into(),
+                }
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center)
+            .height(Fill)
             .into();
-            ("Tool".into(), "put it in, set the gear", left, right)
+            match top {
+                Some(_) => ("Tool".into(), "put it in, set the gear", left, right),
+                None => ("Gear".into(), "same tool, set the gear", left, right),
+            }
         }
-        Step::Comp { op, comp } => {
+        Step::Comp { op, comp, diameter } => {
             let right = column![
                 chips(vec![chip(p.tool(*op).map_or("", |t| t.name()).to_string())]),
+                label("Enter in the DRO"),
+                readout(
+                    Readout {
+                        order: None,
+                        lead: None,
+                        axis: "Ø".into(),
+                        value: dro(*diameter),
+                        lock: None,
+                        tags: vec!["tool diameter".into()],
+                        lit: Lit::Now,
+                        big: false,
+                    },
+                    None,
+                ),
                 label("Set the DRO comp"),
             ]
             .extend((0..2).map(|k| {
@@ -1824,9 +2124,14 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             }));
             let left = crate::fault::canvas(CompPicture(*comp))
                 .width(Fill)
-                .height(220)
+                .height(Fill)
                 .into();
-            ("Comp".into(), "same tool, other sides", left, right)
+            (
+                "Comp".into(),
+                "same tool: its diameter and sides",
+                left,
+                right,
+            )
         }
         Step::Face {
             op,
@@ -1852,7 +2157,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     0,
                     stock,
                     vec![Shape::Hatch(band, Hatch::Cut), Shape::Tool(tool, r, None)],
-                    250.
+                    FillPortion(3)
                 ),
                 p.drawing(
                     1,
@@ -1862,7 +2167,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                         never,
                         Shape::Tool([tool[0], 0., *to], r, None)
                     ],
-                    160.
+                    FillPortion(2)
                 ),
             ]
             .spacing(6)
@@ -1871,7 +2176,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 chip(p.named(id, *diameter)),
                 chip(format!("{} rpm", rpm.round()))
             ]),]
-            .extend(pick_up(*top))
+            .extend(pick_up(*top, false))
             .push(label("Face down to"))
             .push(readout(
                 Readout {
@@ -1956,7 +2261,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                         Shape::Tool(tool, r, None),
                         Shape::Word(word, format!("{} mm off", mm(*remove)), ACCENT)
                     ],
-                    260.
+                    FillPortion(3)
                 ),
                 p.drawing(
                     view,
@@ -1966,7 +2271,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                         never,
                         Shape::Tool(tool_side, r, None)
                     ],
-                    150.
+                    FillPortion(2)
                 ),
             ]
             .spacing(6)
@@ -1978,7 +2283,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 chip(format!("{} rpm", rpm.round())),
                 chip(format!("down to Z {}", dro(*down_to)))
             ]),]
-            .extend(pick_up(*top))
+            .extend(pick_up(*top, false))
             .extend(dro_tool(*diameter, *comp, 70.))
             .push(label("Cut the side to"))
             .push(readout(
@@ -2039,13 +2344,9 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             }));
             let h = holes.get(i).copied().unwrap_or([0.; 3]);
             let tapping = p.setup.operations.get(*op).is_some_and(|o| o.tapping());
-            // A tap and a centre drill cut from the hole's mouth: the stock
-            // above it may be gone already.
-            let mouth = if tapping || spotting.is_some() {
-                mouths.get(i).copied().unwrap_or(stock.max[2])
-            } else {
-                stock.max[2]
-            };
+            // Every hole is cut from its mouth: the stock above it may be
+            // gone already (LIO-365).
+            let mouth = mouths.get(i).copied().unwrap_or(stock.max[2]);
             let drilled = Bounds {
                 min: [h[0] - r, h[1] - r, h[2]],
                 max: [h[0] + r, h[1] + r, mouth],
@@ -2077,8 +2378,8 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 ),
             ];
             let left = column![
-                p.drawing(0, stock, shapes, 260.),
-                p.drawing(1, stock, side, 150.)
+                p.drawing(0, stock, shapes, FillPortion(3)),
+                p.drawing(1, stock, side, FillPortion(2))
             ]
             .spacing(6)
             .into();
@@ -2088,16 +2389,11 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 .get(*op)
                 .and_then(|o| num(&o.p, "rpm"))
                 .unwrap_or(0.);
-            let depth = if spotting.is_some() {
-                mouth
-            } else {
-                stock.max[2]
-            } - h[2];
+            let depth = mouth - h[2];
             // Tapping: by hand, the spindle holding the tap square; the
             // depth is how many turns the tap goes in.
             let pitch = p.tool(*op).and_then(|t| t.tap_spec()).map(|s| s.pitch);
             if let (true, Some(pitch)) = (tapping, pitch) {
-                let depth = mouth - h[2];
                 // Rounded down: a turn more would go past the drilled hole.
                 let turns = (depth / pitch * 10.).floor() / 10.;
                 let mut said = vec![
@@ -2305,8 +2601,8 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 format!("Z {}", dro(h[2])),
             ));
             let left = column![
-                p.drawing(0, stock, shapes, 260.),
-                p.drawing(1, stock, side, 150.)
+                p.drawing(0, stock, shapes, FillPortion(3)),
+                p.drawing(1, stock, side, FillPortion(2))
             ]
             .spacing(6)
             .into();
@@ -2418,13 +2714,40 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             {
                 c.push(chip(format!("{} mm left on the walls and floor", mm(a))));
             }
-            let right = column![label("Before"), p.picture(j, (240., 160.)), chips(c)];
-            (
-                "Check".into(),
-                "the stock after it",
-                p.picture(j + 1, (480., 320.)),
-                right,
-            )
+            // The sizes to measure, drawn on the picture and listed large
+            // (LIO-370).
+            let top = p.shown.boxes[j].max[2] + g.zero[2];
+            let sizes = g
+                .done
+                .get(j)
+                .map_or(vec![], |d| measures(&p.app.doc, g, d, top));
+            let rows = sizes.into_iter().map(|m| {
+                readout(
+                    Readout {
+                        order: None,
+                        lead: None,
+                        axis: m.axis.into(),
+                        value: dro(m.value),
+                        lock: None,
+                        tags: m.words,
+                        lit: Lit::Next,
+                        big: true,
+                    },
+                    None,
+                )
+            });
+            let right = column![label("Measure")]
+                .extend(rows)
+                .push(chips(c))
+                .push(label("Before"))
+                .push(p.picture(j, Length::Fixed(160.)));
+            let dims = p.shown.dims.get(j + 1).map_or(&[][..], Vec::as_slice);
+            let left = iced::widget::stack![
+                p.picture(j + 1, Fill),
+                crate::fault::canvas(Dims(dims)).width(Fill).height(Fill)
+            ]
+            .into();
+            ("Check".into(), "measure what it left", left, right)
         }
         Step::Lathe(step) => turning::screen(p, step),
         Step::HandOver { next: to } if p.shown.side.is_some() => {
@@ -2446,41 +2769,55 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     None
                 }
             };
-            let right = column![chips(c)];
             return frame(
                 "Hand over".into(),
                 "the stock leaves the mill",
-                p.picture(last, (480., 320.)),
-                right.push(space().height(Fill)).push(buttons(next)),
+                p.picture(last, Fill),
+                column![chips(c)],
+                next,
+                true,
             );
         }
     };
-    frame(
-        title,
-        sub,
-        left,
-        right.push(space().height(Fill)).push(buttons(next)),
-    )
+    frame(title, sub, left, right, next, p.at > 0 || p.item > 0)
 }
-/// A step's screen: its caption, the pictures and the numbers.
-fn frame<'a>(
+/// A step's screen: its caption, the pictures, which grow with the room
+/// the page has, and the numbers, which scroll when they do not fit; Back
+/// (live unless `back` is false) and `next` in one place at the card's foot
+/// on every screen (LIO-369).
+pub(super) fn frame<'a>(
     title: String,
     sub: &str,
     left: Element<'a, Message>,
     right: Column<'a, Message>,
+    next: Option<(String, Message)>,
+    back: bool,
 ) -> Element<'a, Message> {
     let body = row![
-        container(left).width(FillPortion(11)),
-        container(right.spacing(10).height(Length::Shrink)).width(FillPortion(9))
+        container(left).width(FillPortion(11)).height(Fill),
+        container(scrollable(right.spacing(10)).height(Fill))
+            .width(FillPortion(9))
+            .height(Fill)
+    ]
+    .spacing(18)
+    .height(Fill);
+    let foot = row![
+        space().width(FillPortion(11)),
+        container(buttons(next, back)).width(FillPortion(9))
     ]
     .spacing(18);
     column![
         row![bold(title, 15), muted(sub.to_string()).size(13)]
             .spacing(8)
             .align_y(Alignment::Center),
-        container(body).padding(16).width(Fill).style(card)
+        container(column![body, foot].spacing(14))
+            .padding(16)
+            .width(Fill)
+            .height(Fill)
+            .style(card)
     ]
     .spacing(6)
+    .height(Fill)
     .into()
 }
 /// Where the tool is before and after the cut of pass `index` of `op`: the
@@ -2507,6 +2844,54 @@ fn ends(g: &Guide, op: usize, index: usize) -> ([f32; 3], [f32; 3]) {
         }
     }
     (start, at)
+}
+/// The lines not to pass of operation `op` (tool radius `r`) where they are
+/// inside `stock`, as `view` sees them, each labelled with what the DRO
+/// reads with the tool against it (LIO-363): a line is the tool's edge on
+/// its low (−1) or high (+1) side, and the DRO reads the edge on the
+/// compensation side its targets read, or the centre with it off.
+fn never_lines(
+    g: &Guide,
+    op: usize,
+    stock: Bounds,
+    never: Limits,
+    r: f32,
+    view: [usize; 2],
+) -> Vec<Shape> {
+    let comp: [f32; 2] = std::array::from_fn(|a| {
+        (g.steps.iter())
+            .filter_map(|s| match s {
+                Step::Pass { op: o, targets, .. } if *o == op => Some(targets),
+                _ => None,
+            })
+            .flatten()
+            .find(|t| t.axis == a && t.edge)
+            .map_or(0., |t| ((t.shown - t.centre) / r).round())
+    });
+    let mut out = vec![];
+    for (axis, (lo, hi)) in [
+        (0, (never.x[0], never.x[1])),
+        (1, (never.y[0], never.y[1])),
+        (2, (never.z, f32::INFINITY)),
+    ] {
+        if !view.contains(&axis) {
+            continue;
+        }
+        let other = view[usize::from(view[0] == axis)];
+        for (v, side) in [(lo, -1.), (hi, 1.)] {
+            if v > stock.min[axis] + 0.05 && v < stock.max[axis] - 0.05 {
+                let (mut a, mut b) = ([0.; 3], [0.; 3]);
+                (a[axis], b[axis]) = (v, v);
+                (a[other], b[other]) = (stock.min[other] - 4., stock.max[other] + 4.);
+                let reads = match comp.get(axis) {
+                    Some(c) => v + (c - side) * r,
+                    None => v,
+                };
+                out.push(Shape::Never(a, b, format!("{} {}", AXES[axis], dro(reads))));
+            }
+        }
+    }
+    out
 }
 /// The screen of a Pass `step`.
 fn pass<'a>(
@@ -2539,29 +2924,7 @@ fn pass<'a>(
     let (start, end) = ends(g, op, index);
     let r = g.done.get(p.done(op)).map_or(0., |d| d.plan.radius);
     let k = targets.last().map_or(0, |t| t.axis);
-    // The lines not to pass where they are inside the stock.
-    let lines = |view: [usize; 2]| {
-        let mut out = vec![];
-        for (axis, (lo, hi)) in [
-            (0, (never.x[0], never.x[1])),
-            (1, (never.y[0], never.y[1])),
-            (2, (never.z, f32::INFINITY)),
-        ] {
-            if !view.contains(&axis) {
-                continue;
-            }
-            let other = view[usize::from(view[0] == axis)];
-            for v in [lo, hi] {
-                if v > stock.min[axis] + 0.05 && v < stock.max[axis] - 0.05 {
-                    let (mut a, mut b) = ([0.; 3], [0.; 3]);
-                    (a[axis], b[axis]) = (v, v);
-                    (a[other], b[other]) = (stock.min[other] - 4., stock.max[other] + 4.);
-                    out.push(Shape::Never(a, b, format!("{} {}", AXES[axis], dro(v))));
-                }
-            }
-        }
-        out
-    };
+    let lines = |view: [usize; 2]| never_lines(g, op, stock, never, r, view);
     let later: Vec<Shape> = (g.steps.iter())
         .filter_map(|s| match s {
             Step::Pass {
@@ -2584,8 +2947,8 @@ fn pass<'a>(
     shapes.extend(lines(VIEWS[0]));
     shapes.push(Shape::Tool(start, r, Some(end)));
     let left = column![
-        p.drawing(0, stock, shapes, 250.),
-        p.drawing(side, stock, across, 160.),
+        p.drawing(0, stock, shapes, FillPortion(3)),
+        p.drawing(side, stock, across, FillPortion(2)),
         legend()
     ]
     .spacing(6)
@@ -3003,16 +3366,27 @@ pub(crate) mod tests {
             .filter(|(_, s)| matches!(s, Step::Tool { .. }))
             .map(|(i, _)| i)
             .collect();
-        // The Step's mill and the Holes' drill, after the 2 mm face.
-        assert_eq!(tools.len(), 2);
+        // The Holes' drill, after the 2 mm face.
+        assert_eq!(tools.len(), 1);
         for i in tools {
             send(&mut a, GuideAction::Go(i));
             let t = texts(&a);
             assert!(t.iter().any(|s| s == "PICK UP Z WITH THE TOOL"), "{t:?}");
             assert_eq!(after(&t, "touch the top → set"), ["Z", "−2.00"]);
         }
-        let t = texts(&squared("Yes"));
-        assert_eq!(after(&t, "touch the top → set"), ["Z", "−2.00"]);
+        // The Step keeps the Face's mill and its Z: its first screen is
+        // the DRO's diameter and sides, with no pick-up; nor does a Square
+        // after the Face pick up (LIO-368).
+        let comp = (guide(&a).steps.iter())
+            .position(|s| matches!(s, Step::Comp { op: 1, .. }))
+            .unwrap();
+        send(&mut a, GuideAction::Go(comp));
+        let t = texts(&a);
+        assert!(t.iter().any(|s| s == "ENTER IN THE DRO"), "{t:?}");
+        assert!(t.iter().any(|s| s == "25.00"), "{t:?}");
+        for t in [t, texts(&squared("Yes"))] {
+            assert!(!t.iter().any(|s| s == "PICK UP Z WITH THE TOOL"), "{t:?}");
+        }
     }
     /// The job with the stock's +X side squared 1 mm first (step 3).
     fn squared(dro: &str) -> App {
@@ -3161,6 +3535,221 @@ pub(crate) mod tests {
         assert_eq!(a.guide_item, 1);
     }
     #[test]
+    fn the_check_screen_gives_the_sizes_to_measure_on_and_beside_the_picture() {
+        let mut a = app("Yes");
+        let g = guide(&a);
+        let checks: Vec<usize> = (g.steps.iter().enumerate())
+            .filter(|(_, s)| matches!(s, Step::Check { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        // The Step: 15 wide from the front face, 9.5 below the faced top.
+        send(&mut a, GuideAction::Go(checks[0]));
+        let t = texts(&a);
+        for want in [
+            "15.00",
+            "wide · from the front face",
+            "9.50",
+            "deep below the top · floor Z −11.50",
+        ] {
+            assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
+        }
+        // The Holes: 4 of Ø4, 42 deep from their mouths on the faced top.
+        send(&mut a, GuideAction::Go(checks[1]));
+        let t = texts(&a);
+        for want in ["4.00", "4 holes", "42.00", "deep from the mouth"] {
+            assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
+        }
+        // Drawn on the pictures after them, inside the picture.
+        let shown = a.guide_at().unwrap().0;
+        let labels = |i: usize| -> Vec<String> {
+            for d in &shown.dims[i] {
+                for q in [d.a, d.b] {
+                    assert!(
+                        (0. ..=960.).contains(&q.x) && (0. ..=640.).contains(&q.y),
+                        "{d:?}"
+                    );
+                }
+            }
+            shown.dims[i].iter().map(|d| d.label.clone()).collect()
+        };
+        assert_eq!(labels(2), ["Y 15", "Z 9.5"]);
+        assert_eq!(labels(3), ["Ø 4", "Z 42"]);
+    }
+    #[test]
+    fn a_new_tool_is_drawn_to_scale_on_the_highest_top() {
+        // To scale: the cutting part as wide as the tool.
+        for d in [4., 25.] {
+            let tool = viewport::tool_triangles([0., 0., 10.], d, 20., 40., d < 10., None);
+            let (lo, hi) = (tool.iter())
+                .flat_map(|(t, _)| t.iter())
+                // Below the shank, less the ring round the spot.
+                .filter(|p| p[2] < 29.9 && (p[2] - 10.05).abs() > 0.001)
+                .fold((f32::MAX, f32::MIN), |(a, b), p| (a.min(p[0]), b.max(p[0])));
+            close(hi - lo, d);
+        }
+        // A step 2 mm down along the front: the spot is on the higher top.
+        let low = Bounds {
+            min: [0., 0., 0.],
+            max: [100., 15., 8.],
+        };
+        let high = Bounds {
+            min: [0., 15., 0.],
+            max: [100., 60., 10.],
+        };
+        let mut stock = viewport::box_triangles(low, viewport::BLOCK);
+        stock.extend(viewport::box_triangles(high, viewport::BLOCK));
+        let spot = touch_spot(&stock).unwrap();
+        assert!(spot[2] == 10. && spot[1] > 15., "{spot:?}");
+        // On the guide's job every new tool has its picture.
+        let a = app("Yes");
+        let shown = a.guide_at().unwrap().0;
+        for (i, s) in shown.guide.steps.iter().enumerate() {
+            let new = matches!(s, Step::Tool { top: Some(_), .. });
+            assert_eq!(shown.tools[i].is_some(), new, "{i} {s:?}");
+        }
+    }
+    #[test]
+    fn back_and_next_are_in_one_place_on_every_screen() {
+        let mut a = app("Yes");
+        let g = guide(&a);
+        let first = |want: fn(&Step) -> bool| g.steps.iter().position(want).unwrap();
+        let screens = [
+            0,
+            first(|s| matches!(s, Step::Pass { .. })),
+            first(|s| matches!(s, Step::Check { .. })),
+            g.steps.len() - 1,
+        ];
+        let window = Size::new(1280., 800.);
+        let bottom = Rectangle::new(Point::new(0., 400.), Size::new(1280., 400.));
+        let mut spans = vec![];
+        for at in screens {
+            send(&mut a, GuideAction::Go(at));
+            let presses = crate::ui::probe::presses(a.view(), window, bottom, 5.);
+            // Where pressing gives what `want` matches: (x min, y min, x
+            // max, y max), None when nowhere.
+            let span = |want: &dyn Fn(&str) -> bool| {
+                let points: Vec<Point> = (presses.iter())
+                    .filter(|(_, m)| want(&format!("{m:?}")))
+                    .map(|(p, _)| *p)
+                    .collect();
+                (!points.is_empty()).then(|| {
+                    points.iter().fold([f32::MAX, f32::MAX, 0., 0.], |b, p| {
+                        [b[0].min(p.x), b[1].min(p.y), b[2].max(p.x), b[3].max(p.y)]
+                    })
+                })
+            };
+            let next = span(&|m| m == "Guide(Next)" || m == "Guide(Open(1))");
+            spans.push((next, span(&|m| m == "Guide(Back)")));
+        }
+        // Next (or Go to the next setup) in one place; Back beside it, dead
+        // on the first screen.
+        assert!(spans[0].0.is_some() && spans[0].1.is_none(), "{spans:?}");
+        for s in &spans[1..] {
+            assert_eq!(s.0, spans[0].0, "{spans:?}");
+            assert_eq!(s.1, spans[1].1, "{spans:?}");
+        }
+        assert!(spans[1].1.is_some());
+        // Back from the Holes' Check lands on its last hole.
+        let check = (g.steps.iter()).rposition(|s| matches!(s, Step::Check { .. }));
+        send(&mut a, GuideAction::Go(check.unwrap()));
+        send(&mut a, GuideAction::Back);
+        assert!(matches!(g.steps[place(&a)], Step::Holes { .. }));
+        assert_eq!(a.guide_item, 3);
+    }
+    #[test]
+    fn a_setup_that_cannot_be_shown_names_its_operation_and_opens_it() {
+        // The Step's speed off the gears: the page names the Step, and its
+        // button opens it in MANUFACTURE on its Tool tab.
+        let mut a = app_with("Yes", |doc| {
+            (doc.setups[0].operations[1].p).insert("rpm".into(), "700".into());
+        });
+        let gears = "Spindle speed must be one of the machine's gears:";
+        assert!(
+            texts(&a)
+                .iter()
+                .any(|s| s.starts_with(&format!("Step: {gears}"))),
+            "{:?}",
+            texts(&a)
+        );
+        assert!(has(&a, "Open Step in MANUFACTURE ▶"), "{:?}", texts(&a));
+        let Some(Err(e)) = a.current_guide().cloned() else {
+            panic!()
+        };
+        let _ = a.update(Message::Guide(GuideAction::Fix(
+            Some(1),
+            e.strip_prefix("Step: ").unwrap().into(),
+        )));
+        assert_eq!(
+            (a.page, a.selected, a.tab.as_str()),
+            (Page::Work, Some(1), "Tool")
+        );
+        // No operation: the button opens the setup on the Work page.
+        let mut a = app_with("Yes", |doc| doc.setups[0].operations.clear());
+        assert!(
+            has(&a, "Open the setup in MANUFACTURE ▶"),
+            "{:?}",
+            texts(&a)
+        );
+        a.selected = Some(0);
+        let _ = a.update(Message::Guide(GuideAction::Fix(None, String::new())));
+        assert_eq!((a.page, a.selected), (Page::Work, None));
+    }
+    #[test]
+    fn a_holes_depth_is_counted_from_its_mouth() {
+        // A Box takes the top down to Z −3 over the two holes left of X 30.
+        let mut a = app_with("Yes", |doc| {
+            let mill = doc.tools[3].id.clone();
+            let b = [-500., 30., -500., 500., 0., -3.5];
+            let low = crate::guide::tests::boxed("Low", &mill, b, &[("stepdown", "5")]);
+            doc.setups[0].operations[0] = low;
+            doc.setups[0].operations.remove(1);
+        });
+        let g = guide(&a);
+        let (at, holes, mouths) = (g.steps.iter().enumerate())
+            .find_map(|(i, s)| match s {
+                Step::Holes { holes, mouths, .. } => Some((i, holes.clone(), mouths.clone())),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            mouths.iter().any(|m| (m - mouths[0]).abs() > 1.),
+            "{mouths:?}"
+        );
+        send(&mut a, GuideAction::Go(at));
+        for (i, (h, m)) in holes.iter().zip(&mouths).enumerate() {
+            a.guide_item = i;
+            let deep = format!("{} deep", mm(m - h[2]));
+            assert!(texts(&a).iter().any(|s| s.contains(&deep)), "{i} {deep}");
+        }
+    }
+    #[test]
+    fn a_do_not_pass_line_reads_what_the_dro_reads_with_the_tool_at_it() {
+        // The labels of the Step's lines in the top view, Ø25 cutter.
+        let labels = |a: App| -> Vec<String> {
+            let shown = a.guide_at().unwrap().0;
+            let never = (shown.guide.steps.iter())
+                .find_map(|s| match s {
+                    Step::Pass { op: 1, never, .. } => Some(*never),
+                    _ => None,
+                })
+                .unwrap();
+            never_lines(&shown.guide, 1, shown.boxes[1], never, 12.5, [0, 1])
+                .into_iter()
+                .filter_map(|s| match s {
+                    Shape::Never(_, _, label) => Some(label),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Comp X +, closed at X 20.5 and 99.5: the low wall reads its edge
+        // a diameter on (it said X 20.50, 25 mm into the wall); the high one
+        // and the +Y wall read as they are, the comp on their side.
+        let closed = labels(app_with("Yes", crate::guide::tests::close_the_step));
+        assert_eq!(closed, ["X 45.50", "X 99.50", "Y 15.00"]);
+        // Comp off: the centre, a radius off the wall.
+        assert_eq!(labels(app("No")), ["Y 2.50"]);
+    }
+    #[test]
     fn a_pass_that_plunges_warns_of_a_centre_cutting_end_mill() {
         let mut a = app_with("Yes", crate::guide::tests::pocket_the_step);
         let g = guide(&a);
@@ -3307,7 +3896,7 @@ pub(crate) mod tests {
             key,
             Err("It broke.".into()),
         )));
-        assert!(has(&a, "It broke.") && has(&a, "Fix the setup in MANUFACTURE."));
+        assert!(has(&a, "It broke.") && has(&a, "Open the setup in MANUFACTURE ▶"));
         a.guide = built;
         // The setup card in MANUFACTURE opens it.
         a.page = Page::Work;
@@ -3377,6 +3966,18 @@ pub(crate) mod tests {
             Size::new(w as f32, h as f32),
             Cache::default(),
             &mut renderer,
+        );
+        // A frame's redraw, which sets each button's status: without it a
+        // button draws as disabled.
+        let redraw = iced::Event::Window(iced::window::Event::RedrawRequested(
+            std::time::Instant::now(),
+        ));
+        let _ = ui.update(
+            &[redraw],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut vec![],
         );
         ui.draw(
             &mut renderer,

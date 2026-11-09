@@ -1798,6 +1798,11 @@ fn guide_help(a: &crate::GuideAction) -> (&'static str, &'static str) {
             "Open this setup in MACHINE: a setup on the manual mill shows its steps with the DRO numbers to move to, one on the lathe with its dial pictures, whether or not the CNC is connected.",
             "",
         ),
+        Fix(Some(_), _) => (
+            "Open the operation that stops the steps in MANUFACTURE, at the tab the problem is on.",
+            "",
+        ),
+        Fix(None, _) => ("Open this setup in MANUFACTURE to fix it.", ""),
         Beat(_) | Built(..) => ("Show the steps of this manual setup.", ""),
         CrossReads(crate::lathe::Reads::Diameter) => (
             "The diameter went down by the dial's reading: the cross-slide dial reads the diameter. Saved to this lathe in the library and in every setup on it; the cross-slide numbers then show.",
@@ -5055,6 +5060,8 @@ mod tests {
             crate::GuideAction::Section(0),
             crate::GuideAction::Reached(0),
             crate::GuideAction::Open(0),
+            crate::GuideAction::Fix(Some(0), String::new()),
+            crate::GuideAction::Fix(None, String::new()),
         ] {
             messages.push(Message::Guide(a));
         }

@@ -2889,7 +2889,7 @@ const DEPTH_SHADE: f32 = 0.45;
 /// The Z, in the frame `current`, of the top of `volume`'s stock and of the
 /// lowest point of `surface` inside its box: from the stock's top to its
 /// deepest cut, the span `shade_cut` darkens cut faces over.
-fn cut_span(
+pub(crate) fn cut_span(
     volume: &crate::volume::Volume,
     surface: &crate::stock_surface::SurfaceMesh,
     current: crate::volume::Frame,
@@ -2990,6 +2990,19 @@ pub(crate) fn stock_triangles<'a>(
     current: crate::volume::Frame,
     since: Option<usize>,
 ) -> impl Iterator<Item = ([[f32; 3]; 3], [u8; 4])> + 'a {
+    let span = cut_span(volume, surface, current);
+    stock_triangles_lit(volume, surface, current, since, span)
+}
+/// `stock_triangles` with its cut faces shaded by depth over `span` (Z
+/// from, Z to), so that pictures of the same stock at different stages
+/// are lit alike.
+pub(crate) fn stock_triangles_lit<'a>(
+    volume: &'a crate::volume::Volume,
+    surface: &'a crate::stock_surface::SurfaceMesh,
+    current: crate::volume::Frame,
+    since: Option<usize>,
+    span: [f32; 2],
+) -> impl Iterator<Item = ([[f32; 3]; 3], [u8; 4])> + 'a {
     let newest = since.map(|from| {
         let extent = volume.bounds.dimensions().into_iter().fold(0., f32::max);
         let mut history =
@@ -2999,7 +3012,6 @@ pub(crate) fn stock_triangles<'a>(
         }
         (from as u32, history)
     });
-    let span = cut_span(volume, surface, current);
     surface.triangles.iter().map(move |triangle| {
         let points = triangle.map(|i| volume.frame.transfer(surface.vertices[i], current));
         let color = stock_color(volume, surface, triangle, points, span, newest.as_ref());
@@ -3300,6 +3312,22 @@ pub(crate) fn stock_picture(
     triangles: &[([[f32; 3]; 3], [u8; 4])],
     (w, h): (u32, u32),
 ) -> Option<iced::widget::image::Handle> {
+    let p = picture_projector(triangles, (w, h))?;
+    let mut rgba = vec![0; (w * h * 4) as usize];
+    let mut depths = vec![f32::NEG_INFINITY; (w * h) as usize];
+    let projected = on_every_core(triangles, |(t, color)| {
+        (t.map(|v| (p.p(v), p.depth(v))), *color)
+    });
+    raster_triangles(&mut rgba, &mut depths, w, h, projected.len(), |i| {
+        projected[i]
+    });
+    Some(iced::widget::image::Handle::from_rgba(w, h, rgba))
+}
+/// The projection `stock_picture` sees `triangles` with at (w, h) px.
+fn picture_projector(
+    triangles: &[([[f32; 3]; 3], [u8; 4])],
+    (w, h): (u32, u32),
+) -> Option<Projector> {
     let mut all = crate::mesh::Bounds {
         min: [f32::INFINITY; 3],
         max: [f32::NEG_INFINITY; 3],
@@ -3311,16 +3339,104 @@ pub(crate) fn stock_picture(
     if !all.min.iter().chain(&all.max).all(|v| v.is_finite()) {
         return None;
     }
-    let p = Projector::filling(Camera::default(), (w as f32, h as f32), &[all], 0.9);
-    let mut rgba = vec![0; (w * h * 4) as usize];
-    let mut depths = vec![f32::NEG_INFINITY; (w * h) as usize];
-    let projected = on_every_core(triangles, |(t, color)| {
-        (t.map(|v| (p.p(v), p.depth(v))), *color)
-    });
-    raster_triangles(&mut rgba, &mut depths, w, h, projected.len(), |i| {
-        projected[i]
-    });
-    Some(iced::widget::image::Handle::from_rgba(w, h, rgba))
+    Some(Projector::filling(
+        Camera::default(),
+        (w as f32, h as f32),
+        &[all],
+        0.9,
+    ))
+}
+/// Where `points` (in the frame of `triangles`) fall in the picture
+/// `stock_picture` makes of `triangles` at `size`, px; empty without one.
+pub(crate) fn picture_points(
+    triangles: &[([[f32; 3]; 3], [u8; 4])],
+    size: (u32, u32),
+    points: &[[f32; 3]],
+) -> Vec<Point> {
+    picture_projector(triangles, size).map_or(vec![], |p| points.iter().map(|v| p.p(*v)).collect())
+}
+/// A tool standing on `at` (the tip, mm), its axis along +Z, to scale:
+/// its cutting part `diameter` wide and `flutes` long, ending in a 118°
+/// point when `point` (a centre drill, `centre`: its pilot and 60° cone
+/// under the body), its shank on up to `stickout`, then a holder; and
+/// an orange ring on the face round it, the spot it touches. Shaded as
+/// the view shades stock.
+pub(crate) fn tool_triangles(
+    at: [f32; 3],
+    diameter: f32,
+    flutes: f32,
+    stickout: f32,
+    point: bool,
+    centre: Option<crate::model::CentreDrill>,
+) -> Vec<([[f32; 3]; 3], [u8; 4])> {
+    const SIDES: usize = 48;
+    const STEEL: [f32; 3] = [196., 202., 210.];
+    const FLUTED: [f32; 3] = [120., 150., 190.];
+    const HOLDER: [f32; 3] = [90., 96., 104.];
+    const SPOT: [f32; 3] = [235., 110., 30.];
+    let r = diameter / 2.;
+    let tip = if point {
+        r / (59f32.to_radians()).tan()
+    } else {
+        0.
+    };
+    let ring = |rad: f32, z: f32| -> Vec<[f32; 3]> {
+        (0..SIDES)
+            .map(|i| {
+                let a = i as f32 / SIDES as f32 * std::f32::consts::TAU;
+                [at[0] + rad * a.cos(), at[1] + rad * a.sin(), at[2] + z]
+            })
+            .collect()
+    };
+    let mut out = vec![];
+    // A band between two rings, its faces outward.
+    let mut band = |a: &[[f32; 3]], b: &[[f32; 3]], base: [f32; 3]| {
+        for i in 0..SIDES {
+            let j = (i + 1) % SIDES;
+            for t in [[a[i], a[j], b[j]], [a[i], b[j], b[i]]] {
+                out.push((t, shade(&t, base)));
+            }
+        }
+    };
+    let flutes = flutes.max(tip + 0.1).min(stickout.max(tip + 0.1));
+    let stickout = stickout.max(flutes);
+    let holder = (diameter * 1.6).max(diameter + 10.);
+    let (point_ring, flute_top, shank_top) = (ring(r, tip), ring(r, flutes), ring(r, stickout));
+    match centre {
+        Some(c) => {
+            let (q, length) = (c.pilot / 2., c.pilot_length);
+            let cone = length + (r - q).max(0.) * crate::model::CentreDrill::rise();
+            let pilot = [ring(0., 0.), ring(q, q * 0.6), ring(q, length)];
+            band(&pilot[0], &pilot[1], FLUTED);
+            band(&pilot[1], &pilot[2], FLUTED);
+            band(&pilot[2], &ring(r, cone), FLUTED);
+            band(&ring(r, cone), &flute_top, FLUTED);
+        }
+        None => {
+            band(&ring(0., 0.), &point_ring, FLUTED);
+            band(&point_ring, &flute_top, FLUTED);
+        }
+    }
+    band(&flute_top, &shank_top, STEEL);
+    let (h0, h1) = (
+        ring(holder / 2., stickout),
+        ring(holder / 2., stickout + holder),
+    );
+    band(&shank_top, &h0, HOLDER);
+    band(&h0, &h1, HOLDER);
+    band(&h1, &ring(0., stickout + holder), HOLDER);
+    // The spot: a flat ring just over the face.
+    let (inner, outer) = (ring(r * 1.25 + 0.5, 0.05), ring(r * 1.25 + 2.5, 0.05));
+    for i in 0..SIDES {
+        let j = (i + 1) % SIDES;
+        for t in [
+            [inner[i], outer[i], outer[j]],
+            [inner[i], outer[j], inner[j]],
+        ] {
+            out.push((t, shade(&t, SPOT)));
+        }
+    }
+    out
 }
 fn box_vertices(bounds: crate::mesh::Bounds) -> [[f32; 3]; 8] {
     let [x, y, z] = bounds.min;
