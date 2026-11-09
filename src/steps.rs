@@ -2994,8 +2994,8 @@ pub(crate) mod tests {
             "{t:?}"
         );
         assert!(!t.iter().any(|s| s.contains(" down")), "{t:?}");
-        // The tiles are the passes' depths, two rows on each level.
-        for tile in ["−6.75 · 1", "−6.75 · 2", "−11.50 · 1", "−11.50 · 2"] {
+        // The tiles are the passes' depths, one row on each level (LIO-366).
+        for tile in ["−6.75", "−11.50"] {
             assert!(t.iter().any(|s| s == tile), "{tile} in {t:?}");
         }
         // Tapping a readout lights the next.
@@ -3105,12 +3105,13 @@ pub(crate) mod tests {
         assert_eq!(names, ["Set up", "Face", "Step", "Holes", "Hand over"]);
         send(&mut a, GuideAction::Section(2));
         assert_eq!(place(&a), g.sections[2].steps.start);
-        assert!(has(&a, "1/6"), "{:?}", texts(&a));
+        // The Step: Tool, its two passes (one row a level, LIO-366), Check.
+        assert!(has(&a, "1/4"), "{:?}", texts(&a));
         // Two passes on: the bar and the header say where.
         send(&mut a, GuideAction::Next);
         send(&mut a, GuideAction::Next);
         let t = texts(&a);
-        assert_eq!(t.iter().filter(|s| *s == "pass 2/4").count(), 2, "{t:?}");
+        assert_eq!(t.iter().filter(|s| *s == "pass 2/2").count(), 2, "{t:?}");
         // The sections ahead show their counts, the next setup is last.
         assert!(t.contains(&"Holes".to_string()) && t.contains(&"4".to_string()));
         assert!(

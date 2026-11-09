@@ -1866,11 +1866,12 @@ pub(crate) mod tests {
         let of = |i: usize| kinds(&guide, guide.sections[i].steps.clone());
         assert_eq!(of(0), ["Hold", "Zero"]);
         assert_eq!(of(1), ["Face"]);
-        assert_eq!(of(2), ["Tool", "Pass", "Pass", "Pass", "Pass", "Check"]);
+        // The 15 mm step is one row on each of its two levels (LIO-366).
+        assert_eq!(of(2), ["Tool", "Pass", "Pass", "Check"]);
         assert_eq!(of(3), ["Tool", "Holes", "Check"]);
         assert_eq!(of(4), ["HandOver"]);
         let counts: Vec<usize> = guide.sections.iter().map(|s| s.count).collect();
-        assert_eq!(counts, [0, 0, 4, 4, 0]);
+        assert_eq!(counts, [0, 0, 2, 4, 0]);
         // The minutes: the operations' plans and two tool changes of 3 minutes.
         let plans: f32 = guide.done.iter().map(|d| d.plan.duration / 60.).sum();
         close(guide.minutes, plans + 6.);
@@ -1935,8 +1936,8 @@ pub(crate) mod tests {
         assert_eq!(
             kinds(&guide, 0..guide.steps.len()),
             [
-                "Hold", "Zero", "Face", "Tool", "Pass", "Pass", "Pass", "Pass", "Check", "Tool",
-                "Holes", "Check", "HandOver"
+                "Hold", "Zero", "Face", "Tool", "Pass", "Pass", "Check", "Tool", "Holes", "Check",
+                "HandOver"
             ]
         );
         let Step::Hold {
@@ -1987,7 +1988,7 @@ pub(crate) mod tests {
         close(*remove, 2.);
         // The first tool picks up Z on the untouched top.
         close(*top, 0.);
-        assert_eq!(guide.steps[12], Step::HandOver { next: Some(1) });
+        assert_eq!(guide.steps[10], Step::HandOver { next: Some(1) });
         // The Step's floor is closed: not a squaring Box.
         assert!(matches!(guide.steps[3], Step::Tool { op: 1, .. }));
     }
@@ -2369,7 +2370,7 @@ pub(crate) mod tests {
             // its section starts with its tool and runs its passes.
             assert_eq!(
                 kinds(&guide, guide.sections[3].steps.clone()),
-                ["Tool", "Pass", "Pass", "Pass", "Pass", "Check"]
+                ["Tool", "Pass", "Pass", "Check"]
             );
         }
     }
@@ -2390,7 +2391,7 @@ pub(crate) mod tests {
                 continue;
             };
             n += 1;
-            assert_eq!((*index, *of), (n, 4));
+            assert_eq!((*index, *of), (n, 2));
             // The plan's moves since the last cut, this cut last.
             let mut legs = vec![];
             for m in moves.by_ref() {
@@ -2403,13 +2404,12 @@ pub(crate) mod tests {
             let got: Vec<(usize, f32)> = targets.iter().map(|t| (t.axis, t.centre)).collect();
             if n == 1 {
                 // The first pass also sets, before the plunge, each axis the
-                // plan leaves where it starts (here Y on the stock's front).
+                // plan leaves where it starts. Its one row (Y 2.5, LIO-366)
+                // is off the plan's start, so here every axis moves.
                 let extra: Vec<(usize, f32)> =
                     got.iter().copied().filter(|g| !legs.contains(g)).collect();
-                assert_eq!(extra, [(1, start[1])]);
-                assert_eq!(got.len(), legs.len() + 1);
-                let plunge = got.iter().rposition(|g| g.0 == 2).unwrap();
-                assert_eq!(got[plunge - 1], extra[0]);
+                assert!(extra.iter().all(|e| *e == (e.0, start[e.0])), "{extra:?}");
+                assert_eq!(got.len(), legs.len() + extra.len());
                 for k in 0..3 {
                     assert!(got[..got.len() - 1].iter().any(|g| g.0 == k));
                 }
@@ -2443,17 +2443,13 @@ pub(crate) mod tests {
                 );
             }
         }
-        assert_eq!(n, 4);
+        assert_eq!(n, 2);
         assert!(moves.all(|m| !m.cutting_pass));
-        // Conventional with M3: the rows step toward the wall on +Y, so they
-        // feed along +X with the uncut material on their left.
+        // Conventional with M3: one row on each level, its wall on +Y, so it
+        // feeds along +X with the uncut material on its left.
         let rows: Vec<&Move> = plan.moves.iter().filter(|m| m.cutting_pass).collect();
         assert!(rows.iter().all(|m| m.to[0] > m.from[0]));
-        let sides = simulation::uncut_sides(&rows);
-        assert!(
-            !sides.is_empty() && sides.iter().all(|s| *s > 0.),
-            "{sides:?}"
-        );
+        assert!(simulation::uncut_sides(&rows).is_empty());
     }
     #[test]
     fn x_and_y_read_the_tool_edge_on_the_comp_side_with_the_dros_compensation() {
@@ -2461,7 +2457,7 @@ pub(crate) mod tests {
         let guide = build(&doc, &mesh, 0).unwrap();
         // Open on both X ends (+), closed on +Y (+).
         assert!(matches!(guide.steps[3], Step::Tool { comp: [1, 1], .. }));
-        assert!(matches!(guide.steps[9], Step::Tool { comp: [0, 0], .. }));
+        assert!(matches!(guide.steps[7], Step::Tool { comp: [0, 0], .. }));
         let all = targets(&guide);
         for (_, t) in &all {
             match t.axis {
@@ -2477,7 +2473,7 @@ pub(crate) mod tests {
         close(y.shown, 15.);
         close(y.centre, 2.5);
         // Never past the wall's allowance, the floor's, nor below the floor.
-        let Step::Pass { never, cut, .. } = &guide.steps[7] else {
+        let Step::Pass { never, cut, .. } = &guide.steps[5] else {
             panic!()
         };
         close(never.y[1], 15.);
@@ -2496,7 +2492,7 @@ pub(crate) mod tests {
     fn the_holes_are_centres_and_depths_in_work_coordinates() {
         let (doc, mesh) = job("Yes");
         let guide = build(&doc, &mesh, 0).unwrap();
-        let Step::Holes { op, holes, .. } = &guide.steps[10] else {
+        let Step::Holes { op, holes, .. } = &guide.steps[8] else {
             panic!()
         };
         assert_eq!((*op, holes.len()), (2, 4));
@@ -2590,12 +2586,16 @@ pub(crate) mod tests {
                 comp: [1, -1]
             }
         );
-        // The back step's last row reads its wall less the allowance.
-        let pass = |s: &&Step| matches!(s, Step::Pass { op: 2, .. });
-        let Some(Step::Pass { targets, .. }) = guide.steps.iter().rfind(pass) else {
-            panic!()
-        };
-        let y = targets.iter().rev().find(|t| t.axis == 1).unwrap();
+        // The back step's row reads its wall less the allowance: set on its
+        // first pass, its one row on each level (LIO-366).
+        let y = (guide.steps.iter())
+            .filter_map(|s| match s {
+                Step::Pass { op: 2, targets, .. } => Some(targets),
+                _ => None,
+            })
+            .flatten()
+            .rfind(|t| t.axis == 1)
+            .unwrap();
         close(y.shown, 105.);
         close(y.centre, 117.5);
         // A different speed with the same tool is a Tool step.

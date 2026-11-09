@@ -1042,30 +1042,46 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
             })
             .collect()
     };
-    // 4. Rows from the open side (else −) toward the closed side (else +).
+    // 4. Rows from the open side toward the closed side. Conventional with
+    // M3: the uncut material (toward) on the left of the feed; left of +X is
+    // +Y, left of +Y is −X. With both cross sides open or both closed, the
+    // rows step the way that starts each pass at an open end when only one
+    // end is open, so the cutter goes down outside the stock (LIO-367).
     let side = open[c];
-    let (first, last) = match side {
-        [false, true] => ((hi[c] - width + r).max(hi[c]), lo[c] + r),
-        [false, false] => (lo[c] + r, hi[c] - r),
-        _ if side[1] => (
-            (lo[c] + width - r).min(lo[c]),
-            (hi[c] - width + r).max(hi[c]),
-        ),
-        _ => ((lo[c] + width - r).min(lo[c]), hi[c] - r),
-    };
-    let toward = if side == [false, true] { -1. } else { 1. };
-    if (last - first) * toward < -ON && side == [false, false] {
-        return Err("The box is narrower than the tool after the stock to leave.".into());
-    }
-    let rows = if (last - first) * toward > ON {
-        [vec![first], steps(first, last, width)].concat()
-    } else {
-        vec![last]
-    };
-    // Conventional with M3: the uncut material (toward) on the left of the
-    // feed. Left of +X is +Y, left of +Y is −X.
-    let forward = if p == 0 { toward } else { -toward };
     let ends = open[p];
+    let mut toward: f32 = if side == [false, true] { -1. } else { 1. };
+    let starts_closed = |toward: f32| !ends[usize::from((p == 0) != (toward > 0.))];
+    if side[0] == side[1] && ends[0] != ends[1] && starts_closed(toward) {
+        toward = -toward;
+    }
+    let rows = if side == [false, false] {
+        // A full slot first, then steps of at most `width` to the far wall.
+        let (first, last) = if toward > 0. {
+            (lo[c] + r, hi[c] - r)
+        } else {
+            (hi[c] - r, lo[c] + r)
+        };
+        if (last - first) * toward < -ON {
+            return Err("The box is narrower than the tool after the stock to leave.".into());
+        }
+        if (last - first) * toward > ON {
+            [vec![first], steps(first, last, width)].concat()
+        } else {
+            vec![last]
+        }
+    } else {
+        // The fewest equal bands no wider than the stepover, from the open
+        // side; each row's leading edge on its band's far edge (LIO-366).
+        let (from, to) = if toward > 0. {
+            (lo[c], hi[c])
+        } else {
+            (hi[c], lo[c])
+        };
+        (steps(from, to, width).into_iter())
+            .map(|edge| edge - toward * r)
+            .collect()
+    };
+    let forward = if p == 0 { toward } else { -toward };
     let near = [
         if ends[0] {
             s.min[p] - r - 2.
@@ -7085,9 +7101,11 @@ pub(crate) mod tests {
         assert_eq!(plan.milling_direction, "Conventional");
         assert!(plan.spindle_clockwise);
         let rows: Vec<f32> = cuts(&plan).iter().map(|m| m.to[1]).collect();
-        // From the − side's face to the + side's in five equal steps of
-        // 16 (at most 17.5), every row's tool inside Y ± the radius.
-        assert_eq!(rows, [-40., -24., -8., 8., 24., 40.]);
+        // The 80 mm split into the fewest equal bands of at most 17.5: five
+        // of 16, each row's +Y edge on its band's far side, the last on the
+        // stock's +Y face, so its centre is inside it by the radius (LIO-366;
+        // it was on the face, cutting only on its right: a climb cut).
+        assert_eq!(rows, [-36.5, -20.5, -4.5, 11.5, 27.5]);
         assert!(
             rows.windows(2)
                 .all(|w| w[1] > w[0] && w[1] - w[0] <= 17.5 + 1e-4)
@@ -7112,12 +7130,11 @@ pub(crate) mod tests {
         let edges: Vec<f32> = cuts.iter().map(|m| m.to[1] + 12.5).collect();
         assert!(edges.iter().all(|e| *e <= 15. + 1e-4), "{edges:?}");
         assert!((edges[edges.len() - 1] - 15.).abs() < 1e-4);
-        // From the open face at −40 to 2.5 in three equal steps.
+        // From the open face at −40 to the wall less the allowance at 15:
+        // four equal bands of 13.75, each row's edge on its band's far side.
         let rows: Vec<f32> = cuts.iter().map(|m| m.to[1]).collect();
-        for (row, want) in rows
-            .iter()
-            .zip([-40., -40. + 42.5 / 3., 2.5 - 42.5 / 3., 2.5])
-        {
+        assert_eq!(rows.len(), 4);
+        for (row, want) in rows.iter().zip([-38.75, -25., -11.25, 2.5]) {
             assert!((row - want).abs() < 1e-4, "{rows:?}");
         }
         // Rows step toward +Y (the uncut material), so they feed along +X
