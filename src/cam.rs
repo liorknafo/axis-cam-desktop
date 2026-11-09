@@ -11,6 +11,7 @@ use crate::{
 };
 use clipper2::{EndType, FillRule, JoinType, Milli, Paths, union};
 use std::collections::{HashMap, HashSet};
+pub mod arcs;
 pub(crate) mod boring;
 pub(crate) type Polygon = Vec<(f64, f64)>;
 pub(crate) type Region = Paths<Milli>;
@@ -1408,6 +1409,10 @@ pub struct Hole {
     /// setup of several angles lists it (`Document::holes_listed`): its
     /// centre is in the setup's frame at that angle. None otherwise.
     pub a: Option<f32>,
+    /// The part of a round wall it was picked by (`arcs`), when that goes
+    /// only part of the way round: a half hole on the part's edge, a slot's
+    /// round end. Its whole circle is drilled. None for a whole hole.
+    pub arc: Option<arcs::Arc>,
 }
 impl Hole {
     /// The widest drill the hole takes: its bore, which a drill may fill
@@ -1460,13 +1465,18 @@ pub fn holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, St
     }
     // A selected rim face's round openings, and each round hole picked by
     // its walls (as a Pocket picks holes), once each.
-    let walls: std::collections::HashSet<usize> = (op.surfaces.iter())
+    let mut walls: std::collections::HashSet<usize> = (op.surfaces.iter())
         .flat_map(|s| s.ids.iter().copied())
         .filter(|&id| crate::pocket::is_wall(setup, mesh, id))
         .collect();
     let rim: Vec<&Triangle> = (selected.iter().copied())
         .filter(|t| t.feature.is_none_or(|id| !walls.contains(&id)))
         .collect();
+    // The parts of round walls picked where no whole hole is (`arcs`).
+    let arcs = arcs::drilled_arcs(setup, mesh, &walls);
+    for a in &arcs {
+        walls.retain(|w| !a.walls.contains(w));
+    }
     let mut holes = if rim.is_empty() {
         vec![]
     } else {
@@ -1488,6 +1498,15 @@ pub fn holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, St
                 holes.push(h);
             }
         }
+    }
+    for a in arcs.iter().filter(|a| arcs::on_stock(setup, mesh, a)) {
+        if let Some(h) = arcs::arc_hole(&g, a)
+            && !holes.iter().any(|o| same_centre(o, &h))
+        {
+            holes.push(h);
+        }
+    }
+    if !walls.is_empty() || !arcs.is_empty() {
         holes.sort_by(|a, b| {
             a.center[0]
                 .total_cmp(&b.center[0])
@@ -1868,6 +1887,22 @@ fn round_hole(g: &Geometry, path: &Polygon, top: f32) -> Option<Hole> {
     // Its chords' midpoints lie this far inside the circle.
     let sagitta = radius * (1. - (std::f32::consts::PI / path.len() as f32).cos());
     let bottom = g.height(center).unwrap_or(g.bounds.min[2]);
+    bore_at(g, center, radius, sagitta, top, bottom, Some(path.len()))
+}
+/// The round hole of radius `radius` (its facets' chords `sagitta` inside
+/// it) round `center`, from `top` down to `bottom`: the narrowest vertical
+/// corridor over its bottom, the thread in it, and, for an opening that is
+/// a loop of `rim` chords in the face at `top`, its countersink. None when
+/// nothing a drill fits goes down there.
+fn bore_at(
+    g: &Geometry,
+    center: [f32; 2],
+    radius: f32,
+    sagitta: f32,
+    top: f32,
+    bottom: f32,
+    rim: Option<usize>,
+) -> Option<Hole> {
     if bottom >= top - 0.01 {
         return None;
     }
@@ -1928,9 +1963,10 @@ fn round_hole(g: &Geometry, path: &Polygon, top: f32) -> Option<Hole> {
         top,
         bottom,
         through,
-        countersink: countersink(g, center, top, radius, path.len()),
+        countersink: rim.and_then(|sides| countersink(g, center, top, radius, sides)),
         thread,
         a: None,
+        arc: None,
     })
 }
 /// The countersink of the opening of radius `radius` round `center` in the
@@ -2599,6 +2635,23 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
                 "The Ø{:.2} drill exceeds an opening Ø{:.2}. Choose a smaller drill or a diameter filter.",
                 b.plan.radius * 2.,
                 h.diameter
+            ));
+        }
+        // A drill narrower than an arc's circle, at its centre, does not
+        // reach the arc's wall (0.1 mm a side give or take): an arc is drilled
+        // with a drill of its circle's size.
+        if !chamfer
+            && let Some(a) = &h.arc
+            && b.plan.radius * 2. < h.diameter - 2. * h.sagitta - 0.2
+        {
+            return Err(format!(
+                "The Ø{:.2} drill at the centre of the {:.0}° arc at X{:.2} Y{:.2} would not reach its wall, on a Ø{:.2} circle: choose a Ø{} drill, or a diameter filter.",
+                b.plan.radius * 2.,
+                a.span,
+                h.center[0],
+                h.center[1],
+                h.diameter,
+                crate::post::exact_mm(largest_drill(&h)),
             ));
         }
         if through && !h.through {
