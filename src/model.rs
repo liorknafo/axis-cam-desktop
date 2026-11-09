@@ -2627,6 +2627,18 @@ pub struct Document {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pick_checks: BTreeMap<String, String>,
 }
+impl Document {
+    /// Operation `to`, a copy of `from`, keeps its picks' places and what
+    /// changed in them: its picks are the same.
+    pub fn copy_picks(&mut self, from: &str, to: &str) {
+        if let Some(p) = self.places.get(from).cloned() {
+            self.places.insert(to.into(), p);
+        }
+        if let Some(n) = self.pick_checks.get(from).cloned() {
+            self.pick_checks.insert(to.into(), n);
+        }
+    }
+}
 impl Default for Document {
     fn default() -> Self {
         Self {

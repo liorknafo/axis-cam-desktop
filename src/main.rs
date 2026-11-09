@@ -5765,6 +5765,8 @@ impl App {
                     let mut o = self.doc.setup().operations[i].clone();
                     o.id = id();
                     o.p.insert("name".into(), format!("{} · copy", o.name()));
+                    let from = self.doc.setup().operations[i].id.clone();
+                    self.doc.copy_picks(&from, &o.id);
                     self.doc.setup_mut().operations.insert(i + 1, o);
                     self.selected = Some(i + 1);
                     self.touch()
@@ -6473,6 +6475,13 @@ impl App {
             },
             Message::DuplicateSetup => {
                 let s = self.doc.setup().duplicate(&self.doc.next_offset());
+                let ids: Vec<(String, String)> = (self.doc.setup().operations.iter())
+                    .zip(&s.operations)
+                    .map(|(a, b)| (a.id.clone(), b.id.clone()))
+                    .collect();
+                for (from, to) in ids {
+                    self.doc.copy_picks(&from, &to);
+                }
                 self.doc.active = s.id.clone();
                 self.doc.setups.push(s);
                 self.stop_selection();
@@ -8452,6 +8461,9 @@ impl App {
                 status += &self.doc.restore_holders(&before, &before.setups);
                 self.doc.setups = before.setups;
                 self.doc.active = before.active;
+                // With their picks' places and what changed in them.
+                self.doc.places.extend(before.places);
+                self.doc.pick_checks.extend(before.pick_checks);
                 self.travel_from_connected();
                 self.stop_selection();
                 self.touch();

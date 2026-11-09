@@ -19482,6 +19482,25 @@ soft_max = 180.0
             crate::surface::issues(&a.doc.setup().operations[0], a.doc.setup(), Some(mesh))
                 .is_empty()
         );
+        // A copy of the operation, or of its setup, has its picks and what
+        // changed in them.
+        a.doc.pick_checks.insert(id.clone(), "changed shape".into());
+        let _ = a.update(Message::DuplicateOp);
+        let copy = a.doc.setup().operations[1].id.clone();
+        assert_ne!(copy, id);
+        assert_eq!(a.doc.pick_checks[&copy], "changed shape");
+        assert_eq!(a.doc.places[&copy], a.doc.places[&id]);
+        let _ = a.update(Message::DuplicateSetup);
+        assert_eq!(a.doc.setups.len(), 2);
+        let pairs = a.doc.setups[0]
+            .operations
+            .iter()
+            .zip(&a.doc.setups[1].operations);
+        for (o, c) in pairs {
+            assert_eq!(a.doc.pick_checks.get(&c.id), a.doc.pick_checks.get(&o.id));
+            assert_eq!(a.doc.places.get(&c.id), a.doc.places.get(&o.id));
+        }
+        assert_eq!(a.doc.pick_checks.len(), 4);
     }
     /// The file unchanged, Reimport model says so and changes nothing; a
     /// file gone keeps the part as it was loaded.
@@ -24205,8 +24224,11 @@ soft_max = 180.0
     fn applying_a_plan_replaces_the_job_and_undo_restores_it() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = signed_in_planning_app(&dir);
-        // The picks' places kept, as loading the part keeps them.
+        // The picks' places kept, as loading the part keeps them, and what
+        // a changed model file did to one's.
         a.record_picks();
+        let checked = a.doc.setups[0].operations[0].id.clone();
+        (a.doc.pick_checks).insert(checked.clone(), "1 picked surface changed shape.".into());
         let before = serde_json::to_string(&a.doc).unwrap();
         let first = a.doc.setups[0].id.clone();
         let _ = a.update(Message::ApplyPlan);
@@ -24234,6 +24256,7 @@ soft_max = 180.0
         assert!(matches!(a.planner, crate::Planner::Idle));
         assert!(a.undo.is_some() && a.dirty);
         assert!(a.doc.validate_structure().is_ok());
+        assert!(!a.doc.pick_checks.contains_key(&checked));
         let _ = a.update(Message::UndoPlan);
         assert_eq!(serde_json::to_string(&a.doc).unwrap(), before);
         assert!(a.undo.is_none());
