@@ -1232,6 +1232,7 @@ pub fn sequence_walk(
         // The stock an indexed setup starts from, which each angle's own box
         // is taken from.
         let began = if indexed { volume.clone() } else { None };
+        let mut travelled: Vec<Plan> = vec![];
         for (oi, op) in setup.operations.iter().enumerate() {
             if !op.enabled {
                 if stop == Some((si, oi)) {
@@ -1317,6 +1318,18 @@ pub fn sequence_walk(
                     }
                 }
             }
+            // A manual mill's moves so far in the setup must fit its travel
+            // (LIO-362). The stock is still cut, so later setups go on.
+            let result = match result {
+                Ok(sim) if crate::manual::is_manual(&setup.machine) => {
+                    travelled.push(sim.plan.clone());
+                    match crate::manual::travel_problem(&setup.machine, travelled.iter()) {
+                        Some(problem) => Err(problem),
+                        None => Ok(sim),
+                    }
+                }
+                result => result,
+            };
             visit(si, oi, result);
             if stop == Some((si, oi)) {
                 return;

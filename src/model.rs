@@ -2129,15 +2129,25 @@ impl Operation {
         }
         for k in ["rpm", "feed"] {
             positive(&self.p, k, &mut e);
+            // A manual mill's feed is its hand feed, in mm/min whatever its
+            // units (LIO-364).
+            let hand = k == "feed" && manual::is_manual(m);
             let cap = num(&m.p, k).map(|x| {
-                if k == "feed" && get(&m.p, "units") == "inch" {
+                if k == "feed" && !hand && get(&m.p, "units") == "inch" {
                     x * 25.4
                 } else {
                     x
                 }
             });
-            if num(&self.p, k).zip(cap).is_some_and(|(v, c)| v > c) {
-                e.push(format!("{} exceeds the saved machine limit.", label(k)));
+            if let Some(c) = cap.filter(|c| num(&self.p, k).is_some_and(|v| v > *c)) {
+                e.push(if hand {
+                    format!(
+                        "Feed is above the hand feed, {} mm/min.",
+                        crate::envelope::mm(c)
+                    )
+                } else {
+                    format!("{} exceeds the saved machine limit.", label(k))
+                });
             }
         }
         // Empty: the force at the cutting feed on the nominal cut.
@@ -6814,14 +6824,32 @@ mod manual_setups {
     }
     #[test]
     fn a_manual_operation_feeds_no_faster_than_the_hand_feed() {
-        let (m, tools, mut op) = on_the_big_mill();
-        op.p.insert("feed".into(), "151".into());
-        assert_eq!(
-            box_issues(&m, &tools, &op),
-            vec!["feed exceeds the saved machine limit.".to_string()]
-        );
-        op.p.insert("feed".into(), "150".into());
-        assert!(box_issues(&m, &tools, &op).is_empty());
+        // The message names the limit (LIO-364), in mm/min on a mill entered
+        // in inches too, where it was taken as inch/min.
+        let (mut m, tools, mut op) = on_the_big_mill();
+        for units in ["mm", "inch"] {
+            m.p.insert("units".into(), units.into());
+            op.p.insert("feed".into(), "151".into());
+            let message = "Feed is above the hand feed, 150 mm/min.";
+            assert_eq!(box_issues(&m, &tools, &op), vec![message.to_string()]);
+            assert_eq!(issue_field(message), Some("feed"));
+            op.p.insert("feed".into(), "150".into());
+            assert!(box_issues(&m, &tools, &op).is_empty());
+        }
+        // A CNC machine in inches keeps its conversion.
+        let mut cnc = Machine::new(3);
+        cnc.p.insert("units".into(), "inch".into());
+        cnc.p.insert("feed".into(), "100".into());
+        let tool = Tool::new("End mill 10", "Flat end mill", "10");
+        let mut cut = Operation::new(Strategy::Face, tool.id.clone());
+        cut.p.insert("feed".into(), "2540".into());
+        let limit = |cut: &Operation| {
+            (cut.issues(&cnc, std::slice::from_ref(&tool), &[]).iter())
+                .any(|i| i == "feed exceeds the saved machine limit.")
+        };
+        assert!(!limit(&cut));
+        cut.p.insert("feed".into(), "2541".into());
+        assert!(limit(&cut));
     }
     #[test]
     fn the_box_must_have_its_sides_in_order() {

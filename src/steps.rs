@@ -2994,8 +2994,8 @@ pub(crate) mod tests {
             "{t:?}"
         );
         assert!(!t.iter().any(|s| s.contains(" down")), "{t:?}");
-        // The tiles are the passes' depths, two rows on each level.
-        for tile in ["−6.75 · 1", "−6.75 · 2", "−11.50 · 1", "−11.50 · 2"] {
+        // The tiles are the passes' depths, one row on each level (LIO-366).
+        for tile in ["−6.75", "−11.50"] {
             assert!(t.iter().any(|s| s == tile), "{tile} in {t:?}");
         }
         // Tapping a readout lights the next.
@@ -3004,7 +3004,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn a_pass_that_plunges_warns_of_a_centre_cutting_end_mill() {
-        let mut a = app_with("Yes", crate::guide::tests::close_the_step);
+        let mut a = app_with("Yes", crate::guide::tests::pocket_the_step);
         let g = guide(&a);
         let passes: Vec<usize> = (g.steps.iter().enumerate())
             .filter(|(_, s)| matches!(s, Step::Pass { op: 1, .. }))
@@ -3015,18 +3015,24 @@ pub(crate) mod tests {
             send(&mut a, GuideAction::Go(i));
             let t = texts(&a);
             assert_eq!(t.iter().any(|s| s == warning), n % 2 == 0, "{n} {t:?}");
+            // The pocket's first row lies on its −Y wall's allowance: the
+            // second goes back along it, with no room to come off a wall.
             if n % 2 == 1 {
                 assert!(t.iter().any(|s| s.contains("feed, cuts")), "{t:?}");
-                assert!(t.iter().any(|s| s.contains("off the wall")), "{t:?}");
             }
         }
-        // The open-ended Step drops outside the stock: no warning.
-        let mut a = app("Yes");
-        let first = (guide(&a).steps.iter())
-            .position(|s| matches!(s, Step::Pass { .. }))
-            .unwrap();
-        send(&mut a, GuideAction::Go(first));
-        assert!(!texts(&a).iter().any(|s| s == warning));
+        // The open-ended Step drops outside the stock, and the Step closed
+        // at both ends comes in across its open front: no warning.
+        for mut a in [
+            app("Yes"),
+            app_with("Yes", crate::guide::tests::close_the_step),
+        ] {
+            let first = (guide(&a).steps.iter())
+                .position(|s| matches!(s, Step::Pass { .. }))
+                .unwrap();
+            send(&mut a, GuideAction::Go(first));
+            assert!(!texts(&a).iter().any(|s| s == warning));
+        }
     }
     #[test]
     fn next_and_back_move_the_place_and_it_is_saved_without_an_undo_step() {
@@ -3105,12 +3111,13 @@ pub(crate) mod tests {
         assert_eq!(names, ["Set up", "Face", "Step", "Holes", "Hand over"]);
         send(&mut a, GuideAction::Section(2));
         assert_eq!(place(&a), g.sections[2].steps.start);
-        assert!(has(&a, "1/6"), "{:?}", texts(&a));
+        // The Step: Tool, its two passes (one row a level, LIO-366), Check.
+        assert!(has(&a, "1/4"), "{:?}", texts(&a));
         // Two passes on: the bar and the header say where.
         send(&mut a, GuideAction::Next);
         send(&mut a, GuideAction::Next);
         let t = texts(&a);
-        assert_eq!(t.iter().filter(|s| *s == "pass 2/4").count(), 2, "{t:?}");
+        assert_eq!(t.iter().filter(|s| *s == "pass 2/2").count(), 2, "{t:?}");
         // The sections ahead show their counts, the next setup is last.
         assert!(t.contains(&"Holes".to_string()) && t.contains(&"4".to_string()));
         assert!(
@@ -3297,8 +3304,8 @@ pub(crate) mod tests {
             .unwrap();
         at(&mut a, comp, 0);
         render(&a, (1280, 800), &dir.join("12-comp.png"));
-        // A step closed at both X ends: a plunge, then feeds across.
-        let mut a = app_with("Yes", crate::guide::tests::close_the_step);
+        // A pocket: a plunge, then feeds across.
+        let mut a = app_with("Yes", crate::guide::tests::pocket_the_step);
         let first = (a.guide_at().unwrap().0.guide.steps.iter())
             .position(|s| matches!(s, Step::Pass { .. }))
             .unwrap();

@@ -1042,30 +1042,46 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
             })
             .collect()
     };
-    // 4. Rows from the open side (else −) toward the closed side (else +).
+    // 4. Rows from the open side toward the closed side. Conventional with
+    // M3: the uncut material (toward) on the left of the feed; left of +X is
+    // +Y, left of +Y is −X. With both cross sides open or both closed, the
+    // rows step the way that starts each pass at an open end when only one
+    // end is open, so the cutter goes down outside the stock (LIO-367).
     let side = open[c];
-    let (first, last) = match side {
-        [false, true] => ((hi[c] - width + r).max(hi[c]), lo[c] + r),
-        [false, false] => (lo[c] + r, hi[c] - r),
-        _ if side[1] => (
-            (lo[c] + width - r).min(lo[c]),
-            (hi[c] - width + r).max(hi[c]),
-        ),
-        _ => ((lo[c] + width - r).min(lo[c]), hi[c] - r),
-    };
-    let toward = if side == [false, true] { -1. } else { 1. };
-    if (last - first) * toward < -ON && side == [false, false] {
-        return Err("The box is narrower than the tool after the stock to leave.".into());
-    }
-    let rows = if (last - first) * toward > ON {
-        [vec![first], steps(first, last, width)].concat()
-    } else {
-        vec![last]
-    };
-    // Conventional with M3: the uncut material (toward) on the left of the
-    // feed. Left of +X is +Y, left of +Y is −X.
-    let forward = if p == 0 { toward } else { -toward };
     let ends = open[p];
+    let mut toward: f32 = if side == [false, true] { -1. } else { 1. };
+    let starts_closed = |toward: f32| !ends[usize::from((p == 0) != (toward > 0.))];
+    if side[0] == side[1] && ends[0] != ends[1] && starts_closed(toward) {
+        toward = -toward;
+    }
+    let rows = if side == [false, false] {
+        // A full slot first, then steps of at most `width` to the far wall.
+        let (first, last) = if toward > 0. {
+            (lo[c] + r, hi[c] - r)
+        } else {
+            (hi[c] - r, lo[c] + r)
+        };
+        if (last - first) * toward < -ON {
+            return Err("The box is narrower than the tool after the stock to leave.".into());
+        }
+        if (last - first) * toward > ON {
+            [vec![first], steps(first, last, width)].concat()
+        } else {
+            vec![last]
+        }
+    } else {
+        // The fewest equal bands no wider than the stepover, from the open
+        // side; each row's leading edge on its band's far edge (LIO-366).
+        let (from, to) = if toward > 0. {
+            (lo[c], hi[c])
+        } else {
+            (hi[c], lo[c])
+        };
+        (steps(from, to, width).into_iter())
+            .map(|edge| edge - toward * r)
+            .collect()
+    };
+    let forward = if p == 0 { toward } else { -toward };
     let near = [
         if ends[0] {
             s.min[p] - r - 2.
@@ -1086,6 +1102,17 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     } else {
         (near[1], near[0], ends[1])
     };
+    // A pass that starts inside the stock goes down outside the open cross
+    // side behind the first row, when there is one, and feeds across into
+    // it; only a box closed all round plunges (LIO-367).
+    let behind = usize::from(toward < 0.);
+    let entry = (!outside && open[c][behind]).then(|| {
+        if toward > 0. {
+            s.min[c] - r - 2.
+        } else {
+            s.max[c] + r + 2.
+        }
+    });
     // 6. The cut, from the floor up through the stock top, clear of the part:
     // the box round the cutter's sweep, then the sweep itself, round at its
     // corners.
@@ -1094,7 +1121,8 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         max: [0., 0., s.max[2]],
     };
     let mut centres = [[0.; 2]; 2];
-    for (k, a, z) in [(p, start, end), (c, rows[0], rows[rows.len() - 1])] {
+    let across = entry.unwrap_or(rows[0]);
+    for (k, a, z) in [(p, start, end), (c, across, rows[rows.len() - 1])] {
         cut.min[k] = (a.min(z) - r).max(s.min[k]) + ON;
         cut.max[k] = (a.max(z) + r).min(s.max[k]) - ON;
         (centres[0][k], centres[1][k]) = (a.min(z), a.max(z));
@@ -1124,7 +1152,8 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     let levels = steps(top, lo[2], down);
     // 5. Each row: up, along, across, down, a pause to set the axes, one
     // feed, up. A row that starts inside the stock does not go up between
-    // rows of a level: one plunge at the level's first row; after each
+    // rows of a level: one entry at the level's first row, down outside the
+    // open cross side and across, else a plunge; after each
     // pass the tool backs off the wall it just cut (at most 0.2 mm, never
     // past the stock to leave), returns along the cleared row and feeds
     // across into the next row.
@@ -1134,7 +1163,6 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     let rapid = b.rapid;
     // The room behind a row, away from the uncut material, before the cut's
     // edge on that side: unbounded when that side is open.
-    let behind = usize::from(toward < 0.);
     let room = |row: f32| match open[c][behind] {
         true => f32::INFINITY,
         false => ((row - toward * r) - [lo[c], hi[c]][behind]) * toward,
@@ -1154,13 +1182,17 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
                 b.push(at, Motion::Rapid, false, rapid)?;
                 at[p] = start;
                 b.push(at, Motion::Rapid, false, rapid)?;
-                at[c] = row;
+                at[c] = entry.unwrap_or(row);
                 b.push(at, Motion::Rapid, false, rapid)?;
                 at[2] = z;
-                if outside {
+                if outside || entry.is_some() {
                     b.push(at, Motion::Rapid, false, rapid)?;
                 } else {
                     b.push(at, Motion::Feed, false, b.feed * 0.25)?;
+                }
+                if entry.is_some() {
+                    at[c] = row;
+                    b.push(at, Motion::Feed, false, b.feed)?;
                 }
             }
             b.dwell(pause);
@@ -7085,9 +7117,11 @@ pub(crate) mod tests {
         assert_eq!(plan.milling_direction, "Conventional");
         assert!(plan.spindle_clockwise);
         let rows: Vec<f32> = cuts(&plan).iter().map(|m| m.to[1]).collect();
-        // From the − side's face to the + side's in five equal steps of
-        // 16 (at most 17.5), every row's tool inside Y ± the radius.
-        assert_eq!(rows, [-40., -24., -8., 8., 24., 40.]);
+        // The 80 mm split into the fewest equal bands of at most 17.5: five
+        // of 16, each row's +Y edge on its band's far side, the last on the
+        // stock's +Y face, so its centre is inside it by the radius (LIO-366;
+        // it was on the face, cutting only on its right: a climb cut).
+        assert_eq!(rows, [-36.5, -20.5, -4.5, 11.5, 27.5]);
         assert!(
             rows.windows(2)
                 .all(|w| w[1] > w[0] && w[1] - w[0] <= 17.5 + 1e-4)
@@ -7112,12 +7146,11 @@ pub(crate) mod tests {
         let edges: Vec<f32> = cuts.iter().map(|m| m.to[1] + 12.5).collect();
         assert!(edges.iter().all(|e| *e <= 15. + 1e-4), "{edges:?}");
         assert!((edges[edges.len() - 1] - 15.).abs() < 1e-4);
-        // From the open face at −40 to 2.5 in three equal steps.
+        // From the open face at −40 to the wall less the allowance at 15:
+        // four equal bands of 13.75, each row's edge on its band's far side.
         let rows: Vec<f32> = cuts.iter().map(|m| m.to[1]).collect();
-        for (row, want) in rows
-            .iter()
-            .zip([-40., -40. + 42.5 / 3., 2.5 - 42.5 / 3., 2.5])
-        {
+        assert_eq!(rows.len(), 4);
+        for (row, want) in rows.iter().zip([-38.75, -25., -11.25, 2.5]) {
             assert!((row - want).abs() < 1e-4, "{rows:?}");
         }
         // Rows step toward +Y (the uncut material), so they feed along +X
@@ -7230,16 +7263,64 @@ pub(crate) mod tests {
             next.from[1] == next.to[1] && next.to[0] < next.from[0],
             "{next:?}"
         );
-        // A step closed at both X ends, open on −Y: off the open side
-        // without limit, once per level.
+        // A step closed at both X ends, open on −Y: down outside the −Y face
+        // and a feed across into the first row, no plunge (LIO-367).
         let fields = [("stepdown", "5"), ("allowance", "0.5")];
         let plan = boxed_plan([-50., 50., -100., 15.5, 0., -5.], &fields).unwrap();
         assert_inside(&plan, [-49.5, -100., 35.5], [49.5, 15., 40.]);
         let plunges = (plan.moves.iter())
             .filter(|m| m.motion == Motion::Feed && m.to[2] < m.from[2])
             .count();
-        assert_eq!((plunges, plan.levels), (1, 1));
+        assert_eq!((plunges, plan.levels), (0, 1));
+        let first = cuts(&plan)[0];
+        let before: Vec<&Move> = (plan.moves.iter())
+            .filter(|m| m.end <= first.start && m.motion != Motion::Dwell)
+            .collect();
+        let (down, across) = (before[before.len() - 2], before[before.len() - 1]);
+        assert!(
+            down.motion == Motion::Rapid && down.to[1] == -54.5,
+            "{down:?}"
+        );
+        assert!(across.motion == Motion::Feed && across.from[1] == -54.5);
+        assert_eq!(across.to, first.from);
         assert!(assert_conventional(&plan).len() >= 2);
+    }
+    #[test]
+    fn a_box_open_at_one_end_with_both_cross_sides_open_starts_each_pass_outside() {
+        // X −30..60 on the 120 mm block: closed at −X, open at +X and on both
+        // Y sides. The rows step toward −Y so each pass starts past +X and
+        // still has the material on its left (LIO-367).
+        let plan = boxed_plan([-30., 100., -100., 100., 0., -5.], &[("stepdown", "5")]).unwrap();
+        assert!(
+            (plan.moves.iter()).all(|m| m.motion == Motion::Rapid || m.to[2] == m.from[2]),
+            "a plunge"
+        );
+        let cuts = cuts(&plan);
+        assert!(
+            cuts.iter()
+                .all(|m| m.from[0] == 74.5 && m.to[0] < m.from[0])
+        );
+        assert!(cuts.windows(2).all(|w| w[1].to[1] < w[0].to[1]));
+    }
+    #[test]
+    fn a_box_splits_its_width_into_equal_bands_that_all_cut() {
+        // A 15 mm step under the stepover: one row per level (LIO-366; the
+        // first row was held to half the cutter, a second cut a sliver).
+        let step = boxed_plan([-100., 100., -100., -24.5, 0., -10.], &[("stepdown", "5")]).unwrap();
+        assert_eq!(step.levels, 2);
+        assert!(cuts(&step).len() == 2 && cuts(&step).iter().all(|m| m.to[1] == -37.5));
+        // A stepover under 50 %: every row's leading edge cuts new stock.
+        let fields = [("allowance", "0"), ("stepover", "30")];
+        let top = boxed_plan([-100., 100., -100., 100., 0., -2.], &fields).unwrap();
+        let edges: Vec<f32> = cuts(&top).iter().map(|m| m.to[1] + 12.5).collect();
+        assert_eq!(edges.len(), 11);
+        let band = 80. / 11.;
+        for (i, e) in edges.iter().enumerate() {
+            assert!(
+                (e - (-40. + band * (i + 1) as f32)).abs() < 1e-3,
+                "{edges:?}"
+            );
+        }
     }
     #[test]
     fn a_closed_pocket_plunges_at_a_quarter_feed_onto_its_floor_and_allowance() {
