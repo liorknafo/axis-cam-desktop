@@ -2525,8 +2525,47 @@ pub(crate) mod tests {
             &[("stepdown", "5")],
         );
     }
+    /// The job's Step as a Ø10 pocket in the stock in front of the part
+    /// (X 20..100, Y 2..18, 5 deep): closed all round, so it plunges.
+    pub(crate) fn pocket_the_step(doc: &mut Document) {
+        let mut mill = Tool::new("End mill 10", "Flat end mill", "10");
+        let machine = doc.setups[0].machine.id.clone();
+        for (k, v) in [("length", "30"), ("stickout", "40"), ("machines", &machine)] {
+            mill.p.insert(k.into(), v.into());
+        }
+        let b = [20., 100., 2., 18., 0., -5.];
+        doc.setups[0].operations[1] = boxed("Pocket", &mill.id, b, &[("stepdown", "5")]);
+        doc.tools.push(mill);
+    }
     #[test]
-    fn a_closed_step_plunges_once_per_level_and_feeds_across_to_its_rows() {
+    fn a_closed_pocket_plunges_once_per_level_and_feeds_across_to_its_rows() {
+        let (mut doc, mesh) = job("Yes");
+        pocket_the_step(&mut doc);
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let passes: Vec<&Vec<Target>> = (guide.steps.iter())
+            .filter_map(|s| match s {
+                Step::Pass { op: 1, targets, .. } => Some(targets),
+                _ => None,
+            })
+            .collect();
+        // Two rows (Y 7.5 and 12.5) on one level.
+        assert_eq!(passes.len(), 2);
+        for (i, targets) in passes.iter().enumerate() {
+            let (cut, setting) = targets.split_last().unwrap();
+            assert!(cut.feed && cut.axis == 0);
+            let plunges = setting.iter().filter(|t| t.axis == 2 && t.feed).count();
+            let across = setting.iter().filter(|t| t.axis == 1 && t.feed).count();
+            // The first row plunges; the second feeds across.
+            assert_eq!((plunges, across), [(1, 0), (0, 1)][i], "{i} {targets:?}");
+        }
+        // Feeds along +X with the uncut material on +Y on the left.
+        let plan = &guide.done[1].plan;
+        let rows: Vec<&Move> = plan.moves.iter().filter(|m| m.cutting_pass).collect();
+        assert!(rows.iter().all(|m| m.to[0] > m.from[0]));
+        assert!(simulation::uncut_sides(&rows).iter().all(|s| *s > 0.));
+    }
+    #[test]
+    fn a_step_closed_at_both_ends_goes_down_outside_its_open_front_and_feeds_across() {
         let (mut doc, mesh) = job("Yes");
         close_the_step(&mut doc);
         let guide = build(&doc, &mesh, 0).unwrap();
@@ -2536,26 +2575,20 @@ pub(crate) mod tests {
                 _ => None,
             })
             .collect();
-        // Two rows (Y 0 and 2.5) on two levels.
-        assert_eq!(passes.len(), 4);
-        for (i, targets) in passes.iter().enumerate() {
+        // One row (Y 2.5) on each of two levels.
+        assert_eq!(passes.len(), 2);
+        for targets in &passes {
             let (cut, setting) = targets.split_last().unwrap();
             assert!(cut.feed && cut.axis == 0);
-            let plunges = setting.iter().filter(|t| t.axis == 2 && t.feed).count();
-            let across = setting.iter().filter(|t| t.axis == 1 && t.feed).count();
-            // The first row of a level plunges; the second feeds across.
-            assert_eq!(
-                (plunges, across),
-                [(1, 0), (0, 1)][i % 2],
-                "{i} {targets:?}"
+            // No plunge: down in front of the stock, then the first target
+            // that cuts is a feed across into the row (LIO-367).
+            assert!(
+                !setting.iter().any(|t| t.axis == 2 && t.feed),
+                "{targets:?}"
             );
-            if i % 2 == 1 {
-                // Off the wall 0.2 mm on −Y, back along X, across into the row.
-                let axes: Vec<(usize, bool)> = setting.iter().map(|t| (t.axis, t.feed)).collect();
-                assert_eq!(axes, [(1, false), (0, false), (1, true)]);
-                close(setting[0].centre, -0.2);
-                close(setting[2].centre, 2.5);
-            }
+            let first = setting.iter().find(|t| t.feed).unwrap();
+            assert_eq!(first.axis, 1);
+            close(first.centre, 2.5);
         }
         // Feeds along +X with the wall on +Y on the left: conventional.
         let plan = &guide.done[1].plan;
