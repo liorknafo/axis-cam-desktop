@@ -5646,6 +5646,12 @@ flood = { pin = 8 }
             ("Drill Ø6.8", "Drill", "6.8", &[][..]),
             ("Drill Ø4.2", "Drill", "4.2", &[][..]),
             ("End mill 25", "Flat end mill", "25", &[][..]),
+            (
+                "Centre drill A2.5×6.3",
+                crate::model::CENTRE_DRILL,
+                "6.3",
+                &[][..],
+            ),
         ] {
             let mut t = Tool::new(name, kind, d);
             t.set_type(kind);
@@ -5699,6 +5705,43 @@ flood = { pin = 8 }
                 matches!(s, Step::Holes { op, .. } if ops[*op].tapping() && ops[*op].name().starts_with("M6"))
             })
             .expect("a Tap step")
+    }
+    #[test]
+    fn a_manual_drill_gets_a_centre_drilling_and_takes_it_when_deleted() {
+        use crate::model::{CENTRE_DRILL, Strategy, get};
+        let mut a = manual_threaded_app(false);
+        // Add threading centre drilled each tap drill.
+        let ops = &a.doc.setups[0].operations;
+        let drills = ops
+            .iter()
+            .filter(|o| crate::centre::wants_centre(o, &a.doc.tools, &a.doc.setups[0].machine));
+        for (n, d) in drills.enumerate() {
+            let i = ops.iter().position(|o| o.id == d.id).unwrap();
+            assert_eq!(
+                crate::centre::centres(&ops[i - 1]),
+                Some(d.id.as_str()),
+                "drill {n}"
+            );
+        }
+        a.doc.setups[0].operations.clear();
+        let _ = a.update(Message::Page(Page::Work));
+        let _ = a.update(Message::AddOp(Strategy::Drill));
+        let ops = &a.doc.setups[0].operations;
+        assert_eq!(ops.len(), 2, "{}", a.status);
+        let tool = |o: &crate::model::Operation| {
+            let t = a.doc.tools.iter().find(|t| t.id == o.tool).unwrap();
+            get(&t.p, "type").to_string()
+        };
+        assert_eq!(
+            (tool(&ops[0]).as_str(), tool(&ops[1]).as_str()),
+            (CENTRE_DRILL, "Drill")
+        );
+        assert_eq!(crate::centre::centres(&ops[0]), Some(ops[1].id.as_str()));
+        assert_eq!(a.selected, Some(1));
+        assert!(a.status.contains("Added Centre drill · "), "{}", a.status);
+        // Deleting the drill deletes its centre drilling.
+        let _ = a.update(Message::RemoveOp);
+        assert!(a.doc.setups[0].operations.is_empty());
     }
     #[test]
     fn a_taps_turns_are_counted_from_the_holes_mouth() {

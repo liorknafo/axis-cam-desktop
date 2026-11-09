@@ -598,6 +598,10 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "The groove's top edge is this deep below the stock top.",
             "",
         ),
+        ("type", "Centre drill") => (
+            "A 60° A-type centre drill: a short pilot under a 60° cone that opens to its body. On the manual mill it starts each hole a twist drill then drills, so the drill finds the centre and does not walk. AXIS CAM adds a centre drilling before every manual-mill drill.",
+            "Its cone goes in until it is as wide as the hole, or its body when the hole is wider; the pilot must be narrower than the hole. It is for the manual mill only: on a CNC, spot with a chamfer mill.",
+        ),
         ("type", "Reamer") => (
             "A tool of one size that finishes a drilled hole to it, to its tolerance class (H7 for a bearing's or a bush's fit), with the Reaming cycle on a CNC or the manual mill. Its flutes must be as long as the hole is deep.",
             "Drill the hole a little under it first: Ø9.8 for a Ø10.",

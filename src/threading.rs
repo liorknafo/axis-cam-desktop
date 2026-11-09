@@ -625,8 +625,8 @@ mod tests {
     fn the_owners_tools_are_given_once_and_are_valid() {
         let mut doc = Document::default();
         doc.adopt_tools();
-        // 27 taps, 27 dies and the insert, each checking clean.
-        assert_eq!(doc.tools.len(), 55);
+        // 27 taps, 27 dies, the insert and 3 centre drills, each clean.
+        assert_eq!(doc.tools.len(), 58);
         for t in &doc.tools {
             assert!(t.issues().is_empty(), "{}: {:?}", t.name(), t.issues());
         }
@@ -637,7 +637,27 @@ mod tests {
         // Deleted, a tool stays deleted.
         doc.tools.retain(|t| t.name() != "M6×1 tap");
         doc.adopt_tools();
-        assert_eq!(doc.tools.len(), 54);
+        assert_eq!(doc.tools.len(), 57);
+        // A library given set 1 takes the centre drills alone.
+        let mut old = Document {
+            starter_tools: 1,
+            ..Document::default()
+        };
+        old.adopt_tools();
+        let names: Vec<&str> = old.tools.iter().map(|t| t.name()).collect();
+        assert_eq!(
+            names,
+            [
+                "Centre drill A1.6×4",
+                "Centre drill A2.5×6.3",
+                "Centre drill A3.15×8"
+            ]
+        );
+        assert!(
+            old.tools
+                .iter()
+                .all(|t| t.fits(&manual) && !t.fits(&Machine::new(3)))
+        );
     }
     #[test]
     fn the_manual_mill_taps_with_the_sets_taps() {
