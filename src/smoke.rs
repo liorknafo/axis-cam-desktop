@@ -18965,6 +18965,10 @@ soft_max = 180.0
             format!("'{whole}'"),
             format!("file://{}", whole.replace(' ', "%20")),
         ];
+        // A file URL as a browser or Explorer gives it: file:///C:/… on Windows.
+        let url = whole.replace('\\', "/").replace(' ', "%20");
+        let slash = if url.starts_with('/') { "" } else { "/" };
+        typings.push(format!("file://{slash}{url}"));
         // On Windows `\` is the path's separator, not a Terminal's escape.
         if !cfg!(windows) {
             typings.push(whole.replace(' ', "\\ "));
