@@ -1327,7 +1327,7 @@ impl<'a> Page<'a> {
 pub fn view(app: &App) -> Element<'_, Message> {
     let main: Element<_> = match app.current_guide() {
         Some(Ok(shown)) => guide_page(app, shown),
-        Some(Err(e)) => notice(vec![e.clone(), "Fix the setup in MANUFACTURE.".into()]),
+        Some(Err(e)) => problem(app, e),
         None if app.guide_key().is_none() => notice(vec!["Load the part to see the steps.".into()]),
         None => notice(vec!["Simulating the setup…".into()]),
     };
@@ -1335,6 +1335,28 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .spacing(12)
         .padding(12)
         .height(Fill)
+        .into()
+}
+/// Why the active setup's steps cannot be shown, `e`, with a button to fix
+/// it in MANUFACTURE: the operation it names (`guide::simulate` puts its
+/// name first) at the tab the problem is on, else the setup (LIO-374).
+fn problem<'a>(app: &'a App, e: &str) -> Element<'a, Message> {
+    let named = (app.doc.active_setup().into_iter())
+        .flat_map(|s| s.operations.iter().enumerate())
+        .find_map(|(i, o)| Some((i, o.name(), e.strip_prefix(&format!("{}: ", o.name()))?)));
+    let (label, action) = match named {
+        Some((i, name, rest)) => (
+            format!("Open {name} in MANUFACTURE ▶"),
+            GuideAction::Fix(Some(i), rest.to_string()),
+        ),
+        None => (
+            "Open the setup in MANUFACTURE ▶".to_string(),
+            GuideAction::Fix(None, e.to_string()),
+        ),
+    };
+    let open = primary(label, Message::Guide(action));
+    column![notice(vec![e.to_string()]), open]
+        .spacing(12)
         .into()
 }
 fn notice<'a>(lines: Vec<String>) -> Element<'a, Message> {
@@ -3218,6 +3240,44 @@ pub(crate) mod tests {
         assert_eq!(a.guide_item, 1);
     }
     #[test]
+    fn a_setup_that_cannot_be_shown_names_its_operation_and_opens_it() {
+        // The Step's speed off the gears: the page names the Step, and its
+        // button opens it in MANUFACTURE on its Tool tab.
+        let mut a = app_with("Yes", |doc| {
+            (doc.setups[0].operations[1].p).insert("rpm".into(), "700".into());
+        });
+        let gears = "Spindle speed must be one of the machine's gears:";
+        assert!(
+            texts(&a)
+                .iter()
+                .any(|s| s.starts_with(&format!("Step: {gears}"))),
+            "{:?}",
+            texts(&a)
+        );
+        assert!(has(&a, "Open Step in MANUFACTURE ▶"), "{:?}", texts(&a));
+        let Some(Err(e)) = a.current_guide().cloned() else {
+            panic!()
+        };
+        let _ = a.update(Message::Guide(GuideAction::Fix(
+            Some(1),
+            e.strip_prefix("Step: ").unwrap().into(),
+        )));
+        assert_eq!(
+            (a.page, a.selected, a.tab.as_str()),
+            (Page::Work, Some(1), "Tool")
+        );
+        // No operation: the button opens the setup on the Work page.
+        let mut a = app_with("Yes", |doc| doc.setups[0].operations.clear());
+        assert!(
+            has(&a, "Open the setup in MANUFACTURE ▶"),
+            "{:?}",
+            texts(&a)
+        );
+        a.selected = Some(0);
+        let _ = a.update(Message::Guide(GuideAction::Fix(None, String::new())));
+        assert_eq!((a.page, a.selected), (Page::Work, None));
+    }
+    #[test]
     fn a_holes_depth_is_counted_from_its_mouth() {
         // A Box takes the top down to Z −3 over the two holes left of X 30.
         let mut a = app_with("Yes", |doc| {
@@ -3419,7 +3479,7 @@ pub(crate) mod tests {
             key,
             Err("It broke.".into()),
         )));
-        assert!(has(&a, "It broke.") && has(&a, "Fix the setup in MANUFACTURE."));
+        assert!(has(&a, "It broke.") && has(&a, "Open the setup in MANUFACTURE ▶"));
         a.guide = built;
         // The setup card in MANUFACTURE opens it.
         a.page = Page::Work;

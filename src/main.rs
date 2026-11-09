@@ -648,6 +648,10 @@ pub enum GuideAction {
     Reached(usize),
     /// Setup `i` on the MACHINE page: its steps, or the CNC's control.
     Open(usize),
+    /// What stops the active setup's steps, `problem`, opened in
+    /// MANUFACTURE: operation `op` at the tab the problem is on, or the
+    /// setup's editor.
+    Fix(Option<usize>, String),
     /// The page's clock, for the handwheel's beat.
     Beat(Instant),
     /// The guide of the job with this fingerprint (`App::guide_key`), built.
@@ -4793,6 +4797,27 @@ impl App {
         self.guide_item = 0;
         self.guide_clock.0 = Instant::now();
     }
+    /// Operation `oi` of setup `si` opened in MANUFACTURE at the tab
+    /// `problem` is on.
+    fn open_issue(&mut self, si: usize, oi: usize, problem: &str) -> Task<Message> {
+        let setup = self.update(Message::SelectSetup(si));
+        let operation = self.update(Message::SelectOp(oi));
+        let tab = match self.operation() {
+            Some(o) => ui::operation_issue_tab(o.strategy, problem),
+            None => ui::issue_tab(problem),
+        };
+        if let Some(tab) = tab {
+            // A tab the operation does not have (a lathe Drill has no
+            // Passes) gives its place to the one with its sizes.
+            let tabs = (self.operation()).map(|o| o.tabs(&self.doc.setup().machine));
+            let tab = match tabs {
+                Some(tabs) if !tabs.contains(&tab) => tabs.get(1).copied().unwrap_or(tab),
+                _ => tab,
+            };
+            let _ = self.update(Message::Tab(tab.into()));
+        }
+        Task::batch([setup, operation])
+    }
     fn guide_action(&mut self, action: GuideAction) -> Task<Message> {
         match action {
             GuideAction::Built(key, result) => {
@@ -4822,6 +4847,17 @@ impl App {
                 }
                 self.machine_setup = false;
                 return self.update(Message::Page(Page::Control));
+            }
+            GuideAction::Fix(op, problem) => {
+                let si = self.doc.index();
+                return match op {
+                    Some(oi) => self.open_issue(si, oi, &problem),
+                    None => {
+                        let task = self.update(Message::SelectSetup(si));
+                        let _ = self.update(Message::SetupEditor);
+                        task
+                    }
+                };
             }
             _ => {}
         }
@@ -5589,25 +5625,7 @@ impl App {
             }
             Message::AuditRow(i) => {
                 if let Some(row) = self.audit_report.get(i).cloned() {
-                    let setup = self.update(Message::SelectSetup(row.setup));
-                    let operation = self.update(Message::SelectOp(row.operation));
-                    let tab = match self.operation() {
-                        Some(o) => ui::operation_issue_tab(o.strategy, &row.detail),
-                        None => ui::issue_tab(&row.detail),
-                    };
-                    if let Some(tab) = tab {
-                        // A tab the operation does not have (a lathe Drill has
-                        // no Passes) gives its place to the one with its sizes.
-                        let tabs = (self.operation()).map(|o| o.tabs(&self.doc.setup().machine));
-                        let tab = match tabs {
-                            Some(tabs) if !tabs.contains(&tab) => {
-                                tabs.get(1).copied().unwrap_or(tab)
-                            }
-                            _ => tab,
-                        };
-                        let _ = self.update(Message::Tab(tab.into()));
-                    }
-                    return Task::batch([setup, operation]);
+                    return self.open_issue(row.setup, row.operation, &row.detail);
                 }
             }
             Message::SetupEditor => {

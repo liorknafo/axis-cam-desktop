@@ -810,7 +810,10 @@ fn simulate(doc: &Document, mesh: &Mesh, si: usize, empty: &str) -> Result<Walke
                     done.push((oi, sim.plan));
                 }
             }
-            Err(e) if s == si && error.is_none() => error = Some(e),
+            // Named by its operation, for the Steps page to open (LIO-374).
+            Err(e) if s == si && error.is_none() => {
+                error = Some(format!("{}: {e}", setup.operations[oi].name()))
+            }
             _ => {}
         },
         |s, _, volume| {
@@ -2013,7 +2016,7 @@ pub(crate) mod tests {
         let (work, all, steps) = routes(&doc);
         let says = |e: &Option<String>| {
             e.as_ref()
-                .is_some_and(|e| e.starts_with("The manual mill travels 100 mm in X"))
+                .is_some_and(|e| e.contains("The manual mill travels 100 mm in X"))
         };
         assert!(says(&work), "{work:?}");
         assert!(all.len() == 3 && all.iter().all(says), "{all:?}");
