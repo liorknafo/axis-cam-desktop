@@ -2508,6 +2508,54 @@ fn ends(g: &Guide, op: usize, index: usize) -> ([f32; 3], [f32; 3]) {
     }
     (start, at)
 }
+/// The lines not to pass of operation `op` (tool radius `r`) where they are
+/// inside `stock`, as `view` sees them, each labelled with what the DRO
+/// reads with the tool against it (LIO-363): a line is the tool's edge on
+/// its low (−1) or high (+1) side, and the DRO reads the edge on the
+/// compensation side its targets read, or the centre with it off.
+fn never_lines(
+    g: &Guide,
+    op: usize,
+    stock: Bounds,
+    never: Limits,
+    r: f32,
+    view: [usize; 2],
+) -> Vec<Shape> {
+    let comp: [f32; 2] = std::array::from_fn(|a| {
+        (g.steps.iter())
+            .filter_map(|s| match s {
+                Step::Pass { op: o, targets, .. } if *o == op => Some(targets),
+                _ => None,
+            })
+            .flatten()
+            .find(|t| t.axis == a && t.edge)
+            .map_or(0., |t| ((t.shown - t.centre) / r).round())
+    });
+    let mut out = vec![];
+    for (axis, (lo, hi)) in [
+        (0, (never.x[0], never.x[1])),
+        (1, (never.y[0], never.y[1])),
+        (2, (never.z, f32::INFINITY)),
+    ] {
+        if !view.contains(&axis) {
+            continue;
+        }
+        let other = view[usize::from(view[0] == axis)];
+        for (v, side) in [(lo, -1.), (hi, 1.)] {
+            if v > stock.min[axis] + 0.05 && v < stock.max[axis] - 0.05 {
+                let (mut a, mut b) = ([0.; 3], [0.; 3]);
+                (a[axis], b[axis]) = (v, v);
+                (a[other], b[other]) = (stock.min[other] - 4., stock.max[other] + 4.);
+                let reads = match comp.get(axis) {
+                    Some(c) => v + (c - side) * r,
+                    None => v,
+                };
+                out.push(Shape::Never(a, b, format!("{} {}", AXES[axis], dro(reads))));
+            }
+        }
+    }
+    out
+}
 /// The screen of a Pass `step`.
 fn pass<'a>(
     p: &Page<'a>,
@@ -2539,29 +2587,7 @@ fn pass<'a>(
     let (start, end) = ends(g, op, index);
     let r = g.done.get(p.done(op)).map_or(0., |d| d.plan.radius);
     let k = targets.last().map_or(0, |t| t.axis);
-    // The lines not to pass where they are inside the stock.
-    let lines = |view: [usize; 2]| {
-        let mut out = vec![];
-        for (axis, (lo, hi)) in [
-            (0, (never.x[0], never.x[1])),
-            (1, (never.y[0], never.y[1])),
-            (2, (never.z, f32::INFINITY)),
-        ] {
-            if !view.contains(&axis) {
-                continue;
-            }
-            let other = view[usize::from(view[0] == axis)];
-            for v in [lo, hi] {
-                if v > stock.min[axis] + 0.05 && v < stock.max[axis] - 0.05 {
-                    let (mut a, mut b) = ([0.; 3], [0.; 3]);
-                    (a[axis], b[axis]) = (v, v);
-                    (a[other], b[other]) = (stock.min[other] - 4., stock.max[other] + 4.);
-                    out.push(Shape::Never(a, b, format!("{} {}", AXES[axis], dro(v))));
-                }
-            }
-        }
-        out
-    };
+    let lines = |view: [usize; 2]| never_lines(g, op, stock, never, r, view);
     let later: Vec<Shape> = (g.steps.iter())
         .filter_map(|s| match s {
             Step::Pass {
@@ -3159,6 +3185,33 @@ pub(crate) mod tests {
         // Tapping a readout lights the next.
         send(&mut a, GuideAction::Reached(0));
         assert_eq!(a.guide_item, 1);
+    }
+    #[test]
+    fn a_do_not_pass_line_reads_what_the_dro_reads_with_the_tool_at_it() {
+        // The labels of the Step's lines in the top view, Ø25 cutter.
+        let labels = |a: App| -> Vec<String> {
+            let shown = a.guide_at().unwrap().0;
+            let never = (shown.guide.steps.iter())
+                .find_map(|s| match s {
+                    Step::Pass { op: 1, never, .. } => Some(*never),
+                    _ => None,
+                })
+                .unwrap();
+            never_lines(&shown.guide, 1, shown.boxes[1], never, 12.5, [0, 1])
+                .into_iter()
+                .filter_map(|s| match s {
+                    Shape::Never(_, _, label) => Some(label),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Comp X +, closed at X 20.5 and 99.5: the low wall reads its edge
+        // a diameter on (it said X 20.50, 25 mm into the wall); the high one
+        // and the +Y wall read as they are, the comp on their side.
+        let closed = labels(app_with("Yes", crate::guide::tests::close_the_step));
+        assert_eq!(closed, ["X 45.50", "X 99.50", "Y 15.00"]);
+        // Comp off: the centre, a radius off the wall.
+        assert_eq!(labels(app("No")), ["Y 2.50"]);
     }
     #[test]
     fn a_pass_that_plunges_warns_of_a_centre_cutting_end_mill() {

@@ -500,7 +500,7 @@ The page is split into sections: **Set up** (Hold, Zero), one section per cuttin
 - **Edge or centre.** With DRO compensation on, X and Y show the **tool edge**, with the tool-centre number small beside it. Otherwise they show the tool centre. The compensation side is fixed for each operation and axis, toward the box's closed side on that axis (plus when both or neither are closed), so one operation never asks for a change. Holes always show centres.
 - **Locks.** A padlock tag names the axes to lock during the cut, and the axis that is set for the last time before it.
 - **Depths.** The Z down to a pass's level says how much deeper the pass cuts ("4.75 deeper"), and the tiles of the passes are their depths in work Z ("−6.75 · 2" for the second row on a level).
-- **Never below.** The lowest Z and the extreme X and Y the tool's edge reaches in the operation are drawn as red lines on the views.
+- **Never below.** The lowest Z and the extreme X and Y the tool's edge reaches in the operation are drawn as red lines on the views, each labelled with what the DRO reads with the tool against it: the edge on the compensation side (a diameter on from a wall on the other side), or the centre with compensation off.
 - **Handwheel turn rate.** The feed is shown in turns, such as "1 turn every 2 s", from the hand feed and the axis's mm per turn, with a dot that blinks once per turn.
 
 ### Minutes
