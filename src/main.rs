@@ -21,6 +21,7 @@ mod groove;
 mod guide;
 mod help;
 mod holding;
+mod centre;
 mod hole_stages;
 mod illustration;
 mod indexed;
@@ -296,6 +297,9 @@ pub enum Message {
     /// Add the drilling (and roughing) before the selected Reaming or
     /// Boring, on its holes (`hole_stages::add`).
     AddHoleStages,
+    /// Add a centre drilling before the selected manual-mill drill, on its
+    /// holes (`centre::centring`).
+    AddCentring,
     /// Fill the selected Turn thread's side, diameter, pitch and end from
     /// the thread on the part's axis (`lathe::thread_from_part`).
     ThreadFromPart,
@@ -2931,6 +2935,8 @@ impl App {
                 post::sync_pin_drilling(&mut self.doc, mesh);
             }
         }
+        // A centre drilling's holes are the drill's it centres.
+        centre::sync(&mut self.doc);
         // Where picks made by this edit are, kept with the edit itself.
         self.record_picks();
         self.sync_turns();
@@ -5851,6 +5857,17 @@ impl App {
                             .insert("silhouette_extend".into(), model::outline_extend_for(d));
                     }
                 }
+                // A drill on the manual mill is centre drilled first.
+                let centring = centre::wants_centre(&operation, &self.doc.tools, machine)
+                    .then(|| centre::centring(&self.doc, self.doc.setup(), &operation, None));
+                let centred = centring.as_ref().map(|c| {
+                    let named = c.op.name().to_string();
+                    let missing = c.missing.clone().map(|m| (named.clone(), m));
+                    (named, missing)
+                });
+                if let Some(c) = centring {
+                    self.doc.setup_mut().operations.push(c.op);
+                }
                 self.doc.setup_mut().operations.push(operation);
                 self.selected = Some(self.doc.setup().operations.len() - 1);
                 self.tab = "Tool".into();
@@ -5861,6 +5878,11 @@ impl App {
                     "Added {}. Choose a tool and machining geometry.",
                     strategy.name()
                 );
+                if let Some((named, missing)) = centred {
+                    self.status.push(' ');
+                    self.status
+                        .push_str(&centre::said(&[named], &Vec::from_iter(missing)));
+                }
             }
             Message::DuplicateOp => {
                 if let Some(i) = self.selected {
@@ -5876,7 +5898,15 @@ impl App {
             }
             Message::RemoveOp => {
                 if let Some(i) = self.selected {
-                    self.doc.setup_mut().operations.remove(i);
+                    let gone = self.doc.setup_mut().operations.remove(i);
+                    // Its centre drillings go with it.
+                    let ops = &mut self.doc.setup_mut().operations;
+                    let before = ops[..i.min(ops.len())]
+                        .iter()
+                        .filter(|o| centre::centres(o) == Some(gone.id.as_str()))
+                        .count();
+                    ops.retain(|o| centre::centres(o) != Some(gone.id.as_str()));
+                    let i = i - before;
                     self.selected = if self.doc.setup().operations.is_empty() {
                         None
                     } else {
@@ -6280,8 +6310,14 @@ impl App {
                 match threading::add(&self.doc, si, mesh) {
                     Ok(added) => {
                         self.doc.setups[si].operations.extend(added.ops);
+                        // On the manual mill each tap drill is centre drilled.
+                        let (centrings, said) = centre::needed(&self.doc, si, self.part_mesh());
+                        centre::insert(&mut self.doc, si, centrings);
                         self.touch();
                         self.status = added.status;
+                        if !said.is_empty() {
+                            self.status = format!("{} {said}", self.status);
+                        }
                     }
                     Err(why) => self.status = why,
                 }
@@ -6301,18 +6337,44 @@ impl App {
                         for o in &added.ops {
                             self.doc.copy_picks(&from, &o.id);
                         }
+                        let finish = from.clone();
                         let ops = &mut self.doc.setups[si].operations;
                         ops.splice(oi..oi, added.ops);
                         if let Some(cut) = added.bore_cut {
                             ops[oi + n].p.insert("bore_cut".into(), cut.to_string());
                         }
+                        // On the manual mill the first drill is centre drilled.
+                        let (centrings, said) = centre::needed(&self.doc, si, self.part_mesh());
+                        centre::insert(&mut self.doc, si, centrings);
                         // The finishing operation stays the one open.
-                        self.selected = Some(oi + n);
+                        self.selected = (self.doc.setups[si].operations.iter())
+                            .position(|o| o.id == finish);
                         self.touch();
                         self.status = added.status;
+                        if !said.is_empty() {
+                            self.status = format!("{} {said}", self.status);
+                        }
                     }
                     Err(why) => self.status = why,
                 }
+            }
+            Message::AddCentring => {
+                let (si, Some(oi)) = (self.doc.index(), self.selected) else {
+                    return Task::none();
+                };
+                let setup = &self.doc.setups[si];
+                let Some(drill) = setup.operations.get(oi) else {
+                    return Task::none();
+                };
+                let c = centre::centring(&self.doc, setup, drill, self.part_mesh());
+                let named = c.op.name().to_string();
+                let missing: Vec<(String, String)> =
+                    c.missing.into_iter().map(|m| (named.clone(), m)).collect();
+                self.doc.setups[si].operations.insert(oi, c.op);
+                // The drill stays the one open.
+                self.selected = Some(oi + 1);
+                self.touch();
+                self.status = centre::said(&[named], &missing);
             }
             Message::AddPinDrilling => {
                 let si = self.doc.index();

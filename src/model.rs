@@ -753,6 +753,10 @@ impl Tool {
         if get(&self.p, "type") == "Tap" && get(&self.p, "machines").trim().is_empty() {
             return manual::is_hand(m);
         }
+        // A centre drill: with no list, every manual mill (`CENTRE_ON_CNC`).
+        if get(&self.p, "type") == CENTRE_DRILL && get(&self.p, "machines").trim().is_empty() {
+            return manual::is_manual(m);
+        }
         manual::fits(get(&self.p, "machines"), self.is_lathe(), m)
     }
     /// Makes the tool of type `kind`, adding the keys that type needs and the
@@ -857,6 +861,24 @@ impl Tool {
                     e.push("Choose the reamer's tolerance class, like H7.".into())
                 }
             }
+            CENTRE_DRILL => {
+                positive(&self.p, "pilot", &mut e);
+                positive(&self.p, "pilot_length", &mut e);
+                if let (Some(pilot), Some(body)) = (num(&self.p, "pilot"), num(&self.p, "diameter"))
+                    && pilot > 0.
+                    && pilot >= body
+                {
+                    e.push("The pilot must be narrower than the body: its cone opens from the pilot to the body's diameter.".into())
+                }
+                if let Some(c) = self.centre_drill()
+                    && num(&self.p, "length").is_some_and(|l| l + 1e-3 < c.length())
+                {
+                    e.push(format!(
+                        "Flute length must reach the top of the cone: the pilot and the cone are {:.2} mm.",
+                        c.length()
+                    ))
+                }
+            }
             "Boring head" => {
                 if self.bore_range().is_none() {
                     e.push(
@@ -882,6 +904,22 @@ impl Tool {
             _ => {}
         }
         e
+    }
+    /// A centre drill's pilot and body (`CENTRE_DRILL`); None for other
+    /// tools, or when its sizes are not positive or its pilot not narrower
+    /// than its body.
+    pub fn centre_drill(&self) -> Option<CentreDrill> {
+        if get(&self.p, "type") != CENTRE_DRILL {
+            return None;
+        }
+        let size = |k: &str| num(&self.p, k).filter(|v| v.is_finite() && *v > 0.);
+        let (pilot, pilot_length, body) =
+            (size("pilot")?, size("pilot_length")?, size("diameter")?);
+        (pilot < body).then_some(CentreDrill {
+            pilot,
+            pilot_length,
+            body,
+        })
     }
     /// A boring head's smallest and largest bore in mm, from its
     /// `bore_range` ("12-50"); None unless both are positive and the first
@@ -1014,6 +1052,38 @@ impl Tool {
             .filter(|n| (1..=TOOL_NUMBER_MAX).contains(n))
     }
 }
+/// A centre drill's sizes (`Tool::centre_drill`), mm.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CentreDrill {
+    pub pilot: f32,
+    pub pilot_length: f32,
+    pub body: f32,
+}
+impl CentreDrill {
+    /// How far the cone rises per mm from the axis: cot 30°.
+    pub fn rise() -> f32 {
+        1. / (CENTRE_ANGLE / 2.).to_radians().tan()
+    }
+    /// How deep, from the pilot's top, the cone is Ø`d` (from the pilot's
+    /// Ø up to the body's).
+    pub fn cone_depth(&self, d: f32) -> f32 {
+        (d.clamp(self.pilot, self.body) - self.pilot) / 2. * Self::rise()
+    }
+    /// The pilot and the whole cone, tip to body.
+    pub fn length(&self) -> f32 {
+        self.pilot_length + self.cone_depth(self.body)
+    }
+    /// The cone the stock simulation sweeps: 60° over a flat as wide as
+    /// the pilot, the programmed point the pilot's top. The pilot under it
+    /// is not swept: it goes down the hole the drill after it cuts, which
+    /// `cam` checks it stays inside.
+    pub fn shape(&self) -> crate::simulation::CutterShape {
+        crate::simulation::CutterShape::Chamfer(
+            (CENTRE_ANGLE * 10.).round() as u16,
+            (self.pilot * 1000.).round().min(f32::from(u16::MAX)) as u16,
+        )
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Operation {
     pub id: String,
@@ -1072,6 +1142,17 @@ pub const BORING: &str = "Boring";
 pub const BORE_RETRACTS: [&str; 2] = ["Stop the spindle, rapid out", "Feed out"];
 /// A reamer's tolerance classes (its `tolerance`): the hole fits it makes.
 pub const REAMER_CLASSES: [&str; 4] = ["H6", "H7", "H8", "H9"];
+/// A 60° A-type centre drill (DIN 333 form A): a short pilot of Ø`pilot`,
+/// `pilot_length` long, under a 60° cone that opens to the body's
+/// `diameter`. On the manual mill it starts every twist-drilled hole, so
+/// that the drill finds its centre and does not walk (`centre`).
+pub const CENTRE_DRILL: &str = "Centre drill";
+/// A centre drill's included cone angle, degrees.
+pub const CENTRE_ANGLE: f32 = 60.;
+/// A centre drill is the manual mill's: a CNC spots with a chamfer mill.
+/// A centre drill goes in once to its depth.
+pub const CENTRE_CYCLE: &str = "A centre drill goes in once to its depth: choose the Drilling cycle.";
+pub const CENTRE_ON_CNC: &str = "A centre drill is for the manual mill. On a CNC, spot the holes with a chamfer mill (a Drill with a chamfer mill countersinks them), or drill them straight away.";
 /// A boring head is set to one size: a Boring bores the holes of one
 /// Hole diameter.
 pub const BORE_ONE_SIZE: &str =
@@ -1118,6 +1199,14 @@ pub fn mill_tool_defaults(kind: &str) -> &'static [(&'static str, &'static str)]
             ("flutes", "3"),
         ],
         "Reamer" => &[("tolerance", "H7"), ("diameter", "10"), ("flutes", "6")],
+        // DIN 333 A 2.5×6.3: its flute length the pilot and the cone.
+        CENTRE_DRILL => &[
+            ("pilot", "2.5"),
+            ("pilot_length", "3.1"),
+            ("diameter", "6.3"),
+            ("flutes", "2"),
+            ("length", "7"),
+        ],
         // Its diameter is the head's body, its flute length how far the
         // bar reaches below it.
         "Boring head" => &[
@@ -1621,6 +1710,8 @@ impl Operation {
             Strategy::Drill if self.thread_milling() => vec!["Thread mill"],
             Strategy::Drill if self.reaming() => vec!["Reamer"],
             Strategy::Drill if self.boring() => vec!["Boring head"],
+            // The manual mill centre drills its holes first (`centre`).
+            Strategy::Drill if manual::is_manual(m) => vec!["Drill", "Chamfer mill", CENTRE_DRILL],
             Strategy::Drill => vec!["Drill", "Chamfer mill"],
             // A Thread is cut by the threading tool, or by a die.
             Strategy::Turn => {
@@ -2093,6 +2184,18 @@ impl Operation {
                 e.push("Choose a reamer for Reaming.".into())
             } else if self.boring() && get(&t.p, "type") != "Boring head" {
                 e.push("Choose a boring head for Boring.".into())
+            } else if self.strategy == Strategy::Drill
+                && !self.helical()
+                && !self.threads()
+                && !self.finishes_holes()
+                && get(&t.p, "type") == CENTRE_DRILL
+                && !centre
+            {
+                if !manual::is_manual(m) {
+                    e.push(CENTRE_ON_CNC.into())
+                } else if get(&self.p, "cycle") != "Drilling" {
+                    e.push(CENTRE_CYCLE.into())
+                }
             } else if self.strategy == Strategy::Drill
                 && !self.helical()
                 && !self.threads()

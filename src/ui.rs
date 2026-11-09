@@ -1,5 +1,5 @@
 use crate::{
-    App, Message, Page, Target, chamfer,
+    App, Message, Page, Target, centre, chamfer,
     help::{self, Help, HelpButton},
     holding::Held,
     lathe, manual,
@@ -3227,9 +3227,26 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     .width(Fill),
                 );
             }
-            c = c
-                .push(secondary("Open tool library", Message::Page(Page::Tools)))
-                .push(section("Feeds & speeds"));
+            c = c.push(secondary("Open tool library", Message::Page(Page::Tools)));
+            // A manual-mill drill on a flat face walks: centre drill first.
+            if centre::wants_centre(o, &app.doc.tools, machine)
+                && app
+                    .selected
+                    .is_some_and(|oi| !centre::centred(app.doc.setup(), oi))
+            {
+                c = c
+                    .push(caution("Centre drill first", vec![centre::CENTRE_FIRST.into()]))
+                    .push(secondary("+ Add a centre drilling before it", Message::AddCentring));
+            }
+            if let Some(drill) = centre::centres(o)
+                .and_then(|id| app.doc.setup().operations.iter().find(|d| d.id == id))
+            {
+                c = c.push(note(format!(
+                    "Centre drills the holes of {}, its cone opened to each hole's diameter (the body's when the hole is wider), so that the drill finds the centre.",
+                    drill.name()
+                )));
+            }
+            c = c.push(section("Feeds & speeds"));
             // What the project material and the cutter call for, and a
             // button to take it when the operation runs at something else.
             match app.doc.recommended_speeds(app.doc.setup(), o) {
@@ -3353,6 +3370,14 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             }
         }
         "Geometry" => {
+            if let Some(drill) = centre::centres(o)
+                .and_then(|id| app.doc.setup().operations.iter().find(|d| d.id == id))
+            {
+                c = c.push(note(format!(
+                    "Its holes are {}'s: they follow the holes picked there.",
+                    drill.name()
+                )));
+            }
             if o.strategy == Strategy::Chamfer {
                 c = c.push(choice_value(
                     p,

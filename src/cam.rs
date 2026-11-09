@@ -2574,9 +2574,24 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         return boring::bore(setup, op, tool, mesh);
     }
     let mut b = Builder::new(setup, op, tool, mesh)?;
-    // A chamfer mill countersinks each opening rather than drilling it.
-    let chamfer = get(&tool.p, "type") == "Chamfer mill";
-    if get(&tool.p, "type") != "Drill" && !chamfer {
+    // A chamfer mill countersinks each opening rather than drilling it; a
+    // centre drill's cone opens each hole's mouth for the drill after it.
+    let centre = tool.centre_drill();
+    let chamfer = get(&tool.p, "type") == "Chamfer mill" || centre.is_some();
+    if get(&tool.p, "type") == crate::model::CENTRE_DRILL {
+        if !crate::manual::is_manual(&setup.machine) {
+            return Err(crate::model::CENTRE_ON_CNC.into());
+        }
+        if centre.is_none() {
+            return Err(
+                "Enter the centre drill's pilot, pilot length and body, its pilot narrower than its body."
+                    .into(),
+            );
+        }
+        if get(&op.p, "cycle") != "Drilling" {
+            return Err(crate::model::CENTRE_CYCLE.into());
+        }
+    } else if get(&tool.p, "type") != "Drill" && !chamfer {
         return Err(
             "Choose a drill, or a chamfer mill to countersink, for a drilling cycle. Helical milling takes a flat end mill.".into(),
         );
@@ -2615,7 +2630,10 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     // The sweep is the drill's shape: its 118° point under its flutes, so
     // that a blind hole's drill-point floor is left as it is (#155); a
     // chamfer mill's is the cone of its tip angle.
-    b.plan.shape = if chamfer {
+    b.plan.shape = if let Some(c) = centre {
+        b.plan.milling_direction = "Centre drilling · axial feed";
+        c.shape()
+    } else if chamfer {
         let angle = tool
             .tip_angle()
             .ok_or("Enter a chamfer mill tip angle from 20° to 160°.")?;
@@ -2636,7 +2654,8 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         // A countersink is cut by a cone of its own angle: a sharper one
         // would cut into its wall and the bore under it, a blunter one would
         // leave the cone but for its rim.
-        if let (CutterShape::Chamfer(tenths, _), Some(c)) = (b.plan.shape, h.countersink)
+        if let (CutterShape::Chamfer(tenths, _), Some(c), None) =
+            (b.plan.shape, h.countersink, centre)
             && (f32::from(tenths) / 10. - c.angle).abs() > 0.5
         {
             let angle = (c.angle * 10.).round() / 10.;
@@ -2647,7 +2666,16 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
                 f32::from(tenths) / 10.,
             ));
         }
-        if chamfer && b.plan.radius * 2. < h.opening - 2. * h.sagitta - 0.01 {
+        // The pilot goes down the hole: the drill after it opens it out.
+        if let Some(c) = centre
+            && c.pilot >= h.widest_drill()
+        {
+            return Err(format!(
+                "The centre drill's Ø{:.2} pilot is as wide as the Ø{:.2} hole at X{:.2} Y{:.2}. Choose a centre drill with a smaller pilot, or a diameter filter.",
+                c.pilot, h.diameter, h.center[0], h.center[1]
+            ));
+        }
+        if chamfer && centre.is_none() && b.plan.radius * 2. < h.opening - 2. * h.sagitta - 0.01 {
             return Err(format!(
                 "The Ø{:.2} chamfer mill is narrower than an opening Ø{:.2} it would countersink. Choose a wider one or a diameter filter.",
                 b.plan.radius * 2.,
@@ -2655,7 +2683,7 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
             ));
         }
         // A flat tip wider than the bore would flatten the countersink.
-        if chamfer && b.plan.shape.flat() * 2. >= h.diameter {
+        if chamfer && centre.is_none() && b.plan.shape.flat() * 2. >= h.diameter {
             return Err(format!(
                 "The chamfer mill's {:.2} mm flat tip is as wide as the Ø{:.2} hole it would countersink. Choose a pointed one.",
                 b.plan.shape.flat() * 2.,
@@ -2695,15 +2723,36 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         let top = b.plan.stock.max[2] + number(op, "top")?.max(0.);
         // A chamfer mill's cone is as wide as the opening at its rim; it
         // rises from the edge of its flat tip.
-        let target = if chamfer {
+        // A centre drill's cone opens to the hole's size at its top, or
+        // to the body when the hole is wider; its pilot reaches below.
+        let target = if let Some(c) = centre {
+            h.top - c.cone_depth(h.diameter) + number(op, "bottom")?
+        } else if chamfer {
             h.top - (h.opening / 2. - b.plan.shape.flat()) * rise + number(op, "bottom")?
         } else {
             h.bottom + number(op, "bottom")? - breakthrough
         };
+        let tip = target - centre.map_or(0., |c| c.pilot_length);
+        if let Some(c) = centre
+            && tip < h.bottom - 0.001
+            && target < h.top
+        {
+            return Err(format!(
+                "The Ø{:.2} hole at X{:.2} Y{:.2} is {:.2} deep: too shallow for the centre drill, whose {:.2} mm pilot would go {:.2} past its bottom. Choose a centre drill with a shorter pilot, or a diameter filter.",
+                h.diameter,
+                h.center[0],
+                h.center[1],
+                h.top - h.bottom,
+                c.pilot_length,
+                h.bottom - tip
+            ));
+        }
         if target >= h.top
-            || target < h.bottom - breakthrough - 0.001
-            || target < b.plan.stock.min[2] - breakthrough - 0.001
-            || top - target >= b.plan.flute_length
+            || tip < h.bottom - breakthrough - 0.001
+            || tip < b.plan.stock.min[2] - breakthrough - 0.001
+            // A centre drill's body is as wide as its cone: only the cone
+            // and the pilot go into the stock, which its flutes cover.
+            || (centre.is_none() && top - tip >= b.plan.flute_length)
         {
             return Err(TOO_DEEP.into());
         }
