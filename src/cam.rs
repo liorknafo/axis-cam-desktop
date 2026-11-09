@@ -2637,6 +2637,12 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         // the holder checks find the holder where it is.
         b.plan.tool_length -= c.pilot_length;
         b.plan.flute_length -= c.pilot_length;
+        // And the pilot's tip clears the stock as the point would: the
+        // clearance, the retract and the approach go up by the pilot.
+        b.clearance += c.pilot_length;
+        b.retract += c.pilot_length;
+        b.retract_margin += c.pilot_length;
+        b.pos[2] = b.clearance;
         c.shape()
     } else if chamfer {
         let angle = tool
@@ -2769,6 +2775,19 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
             top,
             number(op, "top")?,
         );
+        // A centre drill's flutes end at its body: above them its shank
+        // would rub in a bore of its own size, so the stock left over the
+        // hole must be no deeper than they reach.
+        if centre.is_some() && cutting_top - target > b.plan.flute_length + 0.001 {
+            return Err(format!(
+                "The centre drill's flutes reach {:.2} mm up from its cone's narrow end, but at the Ø{:.2} hole at X{:.2} Y{:.2} the stock stands {:.2} mm above it. Face or clear the stock over the holes first, or choose a centre drill with longer flutes.",
+                b.plan.flute_length,
+                h.diameter,
+                h.center[0],
+                h.center[1],
+                cutting_top - target
+            ));
+        }
         let lower = (cutting_top < top - 0.0001).then_some(cutting_top);
         b.plan.rest_top = if b.plan.levels == 0 {
             lower

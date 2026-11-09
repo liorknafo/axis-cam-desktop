@@ -404,6 +404,30 @@ mod tests {
         assert!(why.contains("too shallow for the centre drill"), "{why}");
         set(&mut doc, "pilot_length", "3.1");
         assert!(plan(&doc, &mesh, ci).is_ok());
+        // Flutes 6.5 long reach 3.4 over the pilot: the 3.29 of the cone
+        // alone, not the stock standing over the holes as well.
+        set(&mut doc, "length", "6.5");
+        let why = plan(&doc, &mesh, ci).unwrap_err();
+        assert!(
+            why.contains("The centre drill's flutes reach 3.40 mm"),
+            "{why}"
+        );
+        set(&mut doc, "length", "50");
+        // With the clearance and the retract 1 mm over the stock, the
+        // pilot's tip, 3.1 under the plan's point, moves across clear of it.
+        for k in ["clearance", "retract"] {
+            doc.setups[0].operations[ci].p.insert(k.into(), "1".into());
+        }
+        let p = plan(&doc, &mesh, ci).unwrap();
+        let across = (p.moves.iter()).filter(|m| m.from[0] != m.to[0] || m.from[1] != m.to[1]);
+        for m in across {
+            let tip = m.from[2].min(m.to[2]) - 3.1;
+            assert!(
+                tip >= p.stock.max[2] + 0.999,
+                "{m:?} over {}",
+                p.stock.max[2]
+            );
+        }
         // On the CNC it is refused, and with no machine checked it fits
         // none.
         let manual = doc.setups[0].machine.clone();
