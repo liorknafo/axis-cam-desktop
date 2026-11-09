@@ -19796,6 +19796,16 @@ soft_max = 180.0
         assert_eq!(holes.len(), 1, "{holes:?}");
         assert_eq!(holes[0].a, Some(270.));
         assert!(!holes[0].through && (holes[0].top - holes[0].bottom - 6.).abs() < 0.01);
+        // Its facets are the arc's walls, not rim faces, though the angle
+        // shown does not stand them up.
+        let texts = page_texts(&a);
+        assert!(
+            !texts.iter().any(|t| t.contains("rim face selected")
+                || t.contains("rim faces selected")
+                || t.starts_with("✓ Surface")),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|t| t.contains("180° arc")), "{texts:?}");
         let _ = a.update(Message::Generate);
         let plan = &a.simulation.as_ref().expect(&a.status).plan;
         let feeds: Vec<_> = (plan.moves.iter())
