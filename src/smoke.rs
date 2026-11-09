@@ -8644,6 +8644,8 @@ flood = { pin = 8 }
         a.page = Page::Work;
         let _ = a.update(Message::SetupStep("Holding"));
         a.generate_inline = false;
+        // The picks' places kept, as loading the part keeps them.
+        a.record_picks();
         let original = json(&a.doc);
         let task = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
         let late = first_message(task);
@@ -24194,6 +24196,8 @@ soft_max = 180.0
     fn applying_a_plan_replaces_the_job_and_undo_restores_it() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = signed_in_planning_app(&dir);
+        // The picks' places kept, as loading the part keeps them.
+        a.record_picks();
         let before = serde_json::to_string(&a.doc).unwrap();
         let first = a.doc.setups[0].id.clone();
         let _ = a.update(Message::ApplyPlan);
