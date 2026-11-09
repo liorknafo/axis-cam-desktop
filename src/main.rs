@@ -5863,10 +5863,20 @@ impl App {
                     // part of a round wall clicked (a half hole on the part's
                     // edge, a slot's round end): it drills its whole circle
                     // round its centre (`cam::arcs`). A click on it drops it.
+                    // So does one whose whole hole is read as round about
+                    // another centre (a slot so short it is nearly round).
+                    let arc = (drill && wall && drop.is_none())
+                        .then(|| cam::arcs::arc_at(&setup, mesh, n));
                     let no_round = found.is_err()
-                        || (!this.is_empty() && round.first().is_none_or(|r| r.is_none()));
-                    if drill && wall && drop.is_none() && no_round {
-                        match cam::arcs::arc_at(&setup, mesh, n) {
+                        || (!this.is_empty() && round.first().is_none_or(|r| r.is_none()))
+                        || matches!(
+                            (round.first(), &arc),
+                            (Some(Some(r)), Some(Ok(a))) if !cam::arcs::same_centre(r, a)
+                        );
+                    if let Some(arc) = arc
+                        && no_round
+                    {
+                        match arc {
                             Ok(arc) => return self.pick_arc(&setup, n, arc, &picked),
                             Err(cam::arcs::NoArc::Outside) => {
                                 self.status = cam::arcs::OUTSIDE.into();

@@ -19684,6 +19684,60 @@ soft_max = 180.0
         assert!(a.hole_outlines().is_empty());
     }
     #[test]
+    fn a_drill_picks_the_round_end_of_a_slot_so_short_it_reads_as_round() {
+        // A slot 10 mm wide with sides 0.25 mm long reads as one round Ø10
+        // hole round X0 (to 2 % of its radius); a click on one of its ends
+        // picks that end's R5 arc round X0.125, and drills there (review,
+        // round 4).
+        let mut a = pocket_app(crate::cam::arcs::tests::slot(0.25));
+        let tool = a.doc.setup().operations[0].tool.clone();
+        a.doc.setup_mut().operations[0] = Operation::new(Strategy::Drill, tool);
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Tab("Geometry".into()));
+        if !a.picking {
+            let _ = a.update(Message::PickMode);
+        }
+        let end = surface_at(&a, |id, c| {
+            crate::pocket::is_wall(a.doc.setup(), a.part_mesh().unwrap(), id)
+                && c[0] > 0.2
+                && ((c[0] - 0.125).hypot(c[1]) - 5.).abs() < 0.1
+        });
+        let _ = a.update(Message::Surface(end));
+        assert!(
+            a.status.starts_with("Picked the 180° arc at X0.1"),
+            "{}",
+            a.status
+        );
+        let mesh = a.part_mesh().unwrap().clone();
+        let holes = a.drill_holes(a.operation().unwrap(), &mesh);
+        let holes = holes.as_ref().as_ref().unwrap();
+        assert_eq!(holes.len(), 1);
+        let h = &holes[0];
+        assert!(
+            (h.center[0] - 0.125).abs() < 0.001 && h.center[1].abs() < 0.001 && h.arc.is_some(),
+            "{h:?}"
+        );
+        let mut drill = crate::model::Tool::new("T9 Drill 10", "Drill", "10");
+        drill.p.insert("number".into(), "9".into());
+        let drill_id = drill.id.clone();
+        a.doc.tools.push(drill);
+        a.operation_mut().unwrap().tool = drill_id;
+        let _ = a.update(Message::Generate);
+        let plan = &a.simulation.as_ref().expect(&a.status).plan;
+        let feeds: Vec<[f32; 3]> = (plan.moves.iter())
+            .filter(|m| m.motion == crate::simulation::Motion::Feed)
+            .map(|m| m.to)
+            .collect();
+        assert!(!feeds.is_empty());
+        assert!(
+            feeds
+                .iter()
+                .all(|p| (p[0] - 0.125).abs() < 0.001 && p[1].abs() < 0.001),
+            "{feeds:?}"
+        );
+    }
+    #[test]
     fn a_drill_picks_a_half_hole_on_the_parts_edge_by_a_click_and_drills_its_whole_circle() {
         let mut a = pocket_app(crate::cam::arcs::tests::notched_block(None));
         let tool = a.doc.setup().operations[0].tool.clone();
