@@ -1184,9 +1184,13 @@ fn dro_tool<'a>(diameter: f32, comp: [i8; 2], height: f32) -> Vec<Element<'a, Me
     ]
 }
 
-/// A new tool picks up Z: touch the top and set Z to `top`.
-fn pick_up<'a>(top: f32) -> [Element<'a, Message>; 2] {
-    [
+/// A new tool picks up Z: touch the top and set Z to `top`; nothing for a
+/// tool already in.
+fn pick_up<'a>(top: Option<f32>) -> Vec<Element<'a, Message>> {
+    let Some(top) = top else {
+        return vec![];
+    };
+    vec![
         label("Pick up Z with the tool"),
         readout(
             Readout {
@@ -1785,7 +1789,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 chip(format!("{} rpm", rpm.round()))
             ]),]
             .extend(pick_up(*top))
-            .extend(dro_tool(*diameter, *comp, 110.));
+            .extend(
+                comp.map(|c| dro_tool(*diameter, c, 110.))
+                    .unwrap_or_default(),
+            );
             let left = crate::fault::canvas(ToolPicture {
                 diameter: *diameter,
                 rpm: *rpm,
@@ -1795,11 +1802,28 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             .width(Fill)
             .height(300)
             .into();
-            ("Tool".into(), "put it in, set the gear", left, right)
+            match top {
+                Some(_) => ("Tool".into(), "put it in, set the gear", left, right),
+                None => ("Gear".into(), "same tool, set the gear", left, right),
+            }
         }
-        Step::Comp { op, comp } => {
+        Step::Comp { op, comp, diameter } => {
             let right = column![
                 chips(vec![chip(p.tool(*op).map_or("", |t| t.name()).to_string())]),
+                label("Enter in the DRO"),
+                readout(
+                    Readout {
+                        order: None,
+                        lead: None,
+                        axis: "Ø".into(),
+                        value: dro(*diameter),
+                        lock: None,
+                        tags: vec!["tool diameter".into()],
+                        lit: Lit::Now,
+                        big: false,
+                    },
+                    None,
+                ),
                 label("Set the DRO comp"),
             ]
             .extend((0..2).map(|k| {
@@ -1826,7 +1850,12 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 .width(Fill)
                 .height(220)
                 .into();
-            ("Comp".into(), "same tool, other sides", left, right)
+            (
+                "Comp".into(),
+                "same tool: its diameter and sides",
+                left,
+                right,
+            )
         }
         Step::Face {
             op,
@@ -3020,16 +3049,27 @@ pub(crate) mod tests {
             .filter(|(_, s)| matches!(s, Step::Tool { .. }))
             .map(|(i, _)| i)
             .collect();
-        // The Step's mill and the Holes' drill, after the 2 mm face.
-        assert_eq!(tools.len(), 2);
+        // The Holes' drill, after the 2 mm face.
+        assert_eq!(tools.len(), 1);
         for i in tools {
             send(&mut a, GuideAction::Go(i));
             let t = texts(&a);
             assert!(t.iter().any(|s| s == "PICK UP Z WITH THE TOOL"), "{t:?}");
             assert_eq!(after(&t, "touch the top → set"), ["Z", "−2.00"]);
         }
-        let t = texts(&squared("Yes"));
-        assert_eq!(after(&t, "touch the top → set"), ["Z", "−2.00"]);
+        // The Step keeps the Face's mill and its Z: its first screen is
+        // the DRO's diameter and sides, with no pick-up; nor does a Square
+        // after the Face pick up (LIO-368).
+        let comp = (guide(&a).steps.iter())
+            .position(|s| matches!(s, Step::Comp { op: 1, .. }))
+            .unwrap();
+        send(&mut a, GuideAction::Go(comp));
+        let t = texts(&a);
+        assert!(t.iter().any(|s| s == "ENTER IN THE DRO"), "{t:?}");
+        assert!(t.iter().any(|s| s == "25.00"), "{t:?}");
+        for t in [t, texts(&squared("Yes"))] {
+            assert!(!t.iter().any(|s| s == "PICK UP Z WITH THE TOOL"), "{t:?}");
+        }
     }
     /// The job with the stock's +X side squared 1 mm first (step 3).
     fn squared(dro: &str) -> App {

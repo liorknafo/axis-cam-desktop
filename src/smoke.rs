@@ -11614,8 +11614,10 @@ flood = { pin = 8 }
             a.guide_at().unwrap().1,
             a.guide_at().unwrap().0.guide.sections[2].steps.start
         );
+        // The Step's first screen: the Face's tool is still in, so only
+        // the DRO (LIO-368).
         let texts = page_texts(&a);
-        assert!(texts.iter().any(|t| t == "Tool"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "Comp"), "{texts:?}");
         // The way back to the CNC works too.
         let _ = a.update(Message::Guide(crate::GuideAction::Open(1)));
         assert!(!a.steps_page() && a.doc.active == a.doc.setups[1].id);
