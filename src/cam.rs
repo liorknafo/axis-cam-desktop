@@ -2637,6 +2637,23 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
                 h.diameter
             ));
         }
+        // A drill narrower than an arc's circle, at its centre, does not
+        // reach the arc's wall (0.1 mm a side give or take): an arc is drilled
+        // with a drill of its circle's size.
+        if !chamfer
+            && let Some(a) = &h.arc
+            && b.plan.radius * 2. < h.diameter - 2. * h.sagitta - 0.2
+        {
+            return Err(format!(
+                "The Ø{:.2} drill at the centre of the {:.0}° arc at X{:.2} Y{:.2} would not reach its wall, on a Ø{:.2} circle: choose a Ø{} drill, or a diameter filter.",
+                b.plan.radius * 2.,
+                a.span,
+                h.center[0],
+                h.center[1],
+                h.diameter,
+                crate::post::exact_mm(largest_drill(&h)),
+            ));
+        }
         if through && !h.through {
             return Err(format!(
                 "The Ø{:.2} hole at X{:.2} Y{:.2} is blind: the part goes on under its bottom, so it cannot be drilled through. Set Through to No, or use the diameter filter to drill only the holes that go through.",

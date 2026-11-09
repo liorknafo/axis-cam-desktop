@@ -607,7 +607,8 @@ fn near_arc(a: &Arc) -> [[f32; 2]; 3] {
 /// part under it, inside the circle near the arc, below its top), or
 /// through the part when nothing is under it; read as a hole's bore is
 /// (`bore_at`), so that nothing of the part inside the circle over that
-/// floor is cut. None when nothing a drill fits goes down there.
+/// floor is cut. None when the part comes inside the circle over the floor
+/// (a drill as wide as it would cut the part).
 pub fn arc_hole(g: &Geometry, a: &Arc) -> Option<Hole> {
     let floor = (near_arc(a).into_iter())
         .flat_map(|p| {
@@ -622,6 +623,12 @@ pub fn arc_hole(g: &Geometry, a: &Arc) -> Option<Hole> {
         g.bounds.min[2]
     };
     let mut hole = bore_at(g, a.centre, a.r, a.sagitta, a.top, bottom, None)?;
+    // The part inside the circle over the floor narrows the bore: a drill as
+    // wide as the circle would cut it, and a narrower one at the centre
+    // would not reach the arc.
+    if hole.diameter < 2. * (a.r - a.sagitta) - 0.05 {
+        return None;
+    }
     hole.arc = Some(a.clone());
     Some(hole)
 }
@@ -1326,5 +1333,55 @@ pub(crate) mod tests {
                 "{a:?}"
             );
         }
+    }
+    #[test]
+    fn a_patch_of_a_coarse_ellipse_is_no_hole_and_a_small_drill_is_refused_on_an_arc() {
+        // An 18 x 6 ellipse in 10 uneven facets (the reviewer's, stage 2,
+        // round 2): three of its facets fit an R21 circle round a centre off
+        // the opening. The part comes inside that circle, so no hole is read
+        // there: no drill as wide as it goes down, and a narrower one at its
+        // centre would cut the stock beside the part.
+        let mesh = mesh::normalize(plate_with(&[
+            (8.98314391805965, -0.1835227347187729, 0.),
+            (7.5123225767760395, 1.6521033564137095, 0.),
+            (2.469909175663699, 2.884817511347069, 0.),
+            (-2.7152041230991566, 2.8602188449663415, 0.),
+            (-7.572124048518679, 1.6214855121100489, 0.),
+            (-8.999888200921667, -0.014953152439612531, 0.),
+            (-7.0890800692943, -1.8482707765528754, 0.),
+            (-2.5067506178780103, -2.881284461635667, 0.),
+            (2.9208423975826814, -2.837617930755056, 0.),
+            (7.471317446788217, -1.6726364953210178, 0.),
+        ]))
+        .unwrap();
+        let (setup, mut op, _) = fixture(Strategy::Drill);
+        let g = Geometry::new(&setup, &mesh);
+        let mut patches = 0;
+        for id in walls_where(&setup, &mesh, |c| c[0].abs() < 9.5 && c[1].abs() < 3.5) {
+            if let Ok(a) = arc_at(&setup, &mesh, id) {
+                patches += 1;
+                assert!(arc_hole(&g, &a).is_none(), "{id}: {a:?}");
+                picking(&mut op, &mesh, &a.walls);
+                assert!(holes(&setup, &op, &mesh).is_err(), "{id}");
+            }
+        }
+        // Its three facets read as an arc (a mesh's limit), but no hole.
+        assert_eq!(patches, 3);
+        // On a half hole, a drill narrower than its circle is refused.
+        let mesh = mesh::normalize(notched_block(None)).unwrap();
+        let (setup, mut op, mut tool) = fixture(Strategy::Drill);
+        let g = Geometry::new(&setup, &mesh);
+        let wall = walls_where(&setup, &mesh, |c| {
+            (c[0].hypot(c[1] - g.bounds.min[1]) - 5.).abs() < 0.1
+        });
+        picking(&mut op, &mesh, &wall);
+        tool.p.insert("diameter".into(), "6".into());
+        let refused = generate(&setup, &op, &tool, &mesh).unwrap_err();
+        assert!(
+            refused.starts_with("The Ø6.00 drill at the centre of the 180° arc"),
+            "{refused}"
+        );
+        tool.p.insert("diameter".into(), "9.9".into());
+        assert!(generate(&setup, &op, &tool, &mesh).is_ok());
     }
 }
