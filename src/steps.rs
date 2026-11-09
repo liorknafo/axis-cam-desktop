@@ -420,13 +420,14 @@ fn tiles<'a>(labels: Vec<(String, Option<Message>)>, at: usize) -> Element<'a, M
     }
     line.into()
 }
-/// Back and the step's own command under a screen's right column.
-fn buttons<'a>(next: Option<(String, Message)>) -> Element<'a, Message> {
+/// Back (dimmed when there is no step before) and the step's own command,
+/// large enough to tap with a glove on.
+fn buttons<'a>(next: Option<(String, Message)>, back: bool) -> Element<'a, Message> {
     let back = HelpButton::new(
-        button(text("◀ Back").size(13).center())
+        button(text("◀ Back").size(16).width(Fill).center())
             .width(Fill)
-            .padding([8, 12])
-            .on_press(Message::Guide(GuideAction::Back))
+            .padding([14, 12])
+            .on_press_maybe(back.then_some(Message::Guide(GuideAction::Back)))
             .style(|_, status| button::Style {
                 background: Some(
                     if matches!(status, button::Status::Hovered) {
@@ -436,7 +437,11 @@ fn buttons<'a>(next: Option<(String, Message)>) -> Element<'a, Message> {
                     }
                     .into(),
                 ),
-                text_color: INK,
+                text_color: if matches!(status, button::Status::Disabled) {
+                    LINE
+                } else {
+                    INK
+                },
                 border: Border {
                     color: BUTTON_EDGE,
                     width: 1.,
@@ -449,7 +454,28 @@ fn buttons<'a>(next: Option<(String, Message)>) -> Element<'a, Message> {
     );
     let mut line = row![container(back).width(FillPortion(1))].spacing(8);
     if let Some((label, msg)) = next {
-        line = line.push(container(primary(label, msg).width(Fill)).width(FillPortion(2)));
+        let go = button(text(label.clone()).size(16).width(Fill).center())
+            .width(Fill)
+            .padding([14, 12])
+            .on_press(msg.clone())
+            .style(|_, status| button::Style {
+                background: Some(
+                    if matches!(status, button::Status::Hovered) {
+                        Color::from_rgb8(32, 97, 155)
+                    } else {
+                        BLUE
+                    }
+                    .into(),
+                ),
+                text_color: Color::WHITE,
+                border: Border {
+                    radius: 6.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        line = line
+            .push(container(HelpButton::new(go, &msg, label).width(Fill)).width(FillPortion(2)));
     }
     line.into()
 }
@@ -1263,7 +1289,7 @@ impl<'a> Page<'a> {
         view: usize,
         stock: Bounds,
         shapes: Vec<Shape>,
-        height: f32,
+        height: impl Into<Length>,
     ) -> Element<'a, Message> {
         self.drawing_with(view, stock, shapes, height, &self.shown.jaws)
     }
@@ -1273,7 +1299,7 @@ impl<'a> Page<'a> {
         view: usize,
         stock: Bounds,
         shapes: Vec<Shape>,
-        height: f32,
+        height: impl Into<Length>,
         jaws: &'a [Bounds],
     ) -> Element<'a, Message> {
         use std::hash::{Hash, Hasher};
@@ -1291,14 +1317,17 @@ impl<'a> Page<'a> {
         .height(height)
         .into()
     }
-    fn picture(&self, i: usize, size: (f32, f32)) -> Element<'a, Message> {
-        Self::image(self.shown.pictures.get(i).cloned().flatten(), size)
+    /// The stock in 3D before the setup (0) or after its operation `i`,
+    /// as wide as the room and `height` high.
+    fn picture(&self, i: usize, height: impl Into<Length>) -> Element<'a, Message> {
+        Self::image(self.shown.pictures.get(i).cloned().flatten(), height.into())
     }
     /// The stock as it starts, in its vise on its parallels.
-    fn held_picture(&self, size: (f32, f32)) -> Element<'a, Message> {
-        Self::image(self.shown.held.clone(), size)
+    fn held_picture(&self, height: impl Into<Length>) -> Element<'a, Message> {
+        Self::image(self.shown.held.clone(), height.into())
     }
-    fn image(picture: Option<image::Handle>, (w, h): (f32, f32)) -> Element<'a, Message> {
+    fn image(picture: Option<image::Handle>, h: Length) -> Element<'a, Message> {
+        let w = Fill;
         match picture {
             Some(p) => image(p).width(w).height(h).into(),
             None => container(muted("No picture of the stock."))
@@ -1610,7 +1639,7 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
         top,
         bar.wrap().vertical_spacing(6),
         header,
-        scrollable(screen(&page)).height(Fill)
+        container(screen(&page)).height(Fill)
     ]
     .spacing(12)
     .into()
@@ -1682,8 +1711,8 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 }
             }
             let left = column![
-                p.held_picture((420., 250.)),
-                p.drawing_with(view, *stock, shapes, 200., &p.shown.vise),
+                p.held_picture(FillPortion(3)),
+                p.drawing_with(view, *stock, shapes, FillPortion(2), &p.shown.vise),
             ]
             .spacing(6)
             .align_x(Alignment::Center)
@@ -1789,12 +1818,11 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             (
                 "Zero".into(),
                 "pick up the corner",
-                p.drawing(0, stock, shapes, 380.),
+                p.drawing(0, stock, shapes, Fill),
                 right,
             )
         }
         Step::Tool {
-            op,
             tool,
             rpm,
             diameter,
@@ -1870,7 +1898,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             }));
             let left = crate::fault::canvas(CompPicture(*comp))
                 .width(Fill)
-                .height(220)
+                .height(Fill)
                 .into();
             (
                 "Comp".into(),
@@ -1903,7 +1931,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     0,
                     stock,
                     vec![Shape::Hatch(band, Hatch::Cut), Shape::Tool(tool, r, None)],
-                    250.
+                    FillPortion(3)
                 ),
                 p.drawing(
                     1,
@@ -1913,7 +1941,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                         never,
                         Shape::Tool([tool[0], 0., *to], r, None)
                     ],
-                    160.
+                    FillPortion(2)
                 ),
             ]
             .spacing(6)
@@ -2007,7 +2035,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                         Shape::Tool(tool, r, None),
                         Shape::Word(word, format!("{} mm off", mm(*remove)), ACCENT)
                     ],
-                    260.
+                    FillPortion(3)
                 ),
                 p.drawing(
                     view,
@@ -2017,7 +2045,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                         never,
                         Shape::Tool(tool_side, r, None)
                     ],
-                    150.
+                    FillPortion(2)
                 ),
             ]
             .spacing(6)
@@ -2124,8 +2152,8 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 ),
             ];
             let left = column![
-                p.drawing(0, stock, shapes, 260.),
-                p.drawing(1, stock, side, 150.)
+                p.drawing(0, stock, shapes, FillPortion(3)),
+                p.drawing(1, stock, side, FillPortion(2))
             ]
             .spacing(6)
             .into();
@@ -2347,8 +2375,8 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 format!("Z {}", dro(h[2])),
             ));
             let left = column![
-                p.drawing(0, stock, shapes, 260.),
-                p.drawing(1, stock, side, 150.)
+                p.drawing(0, stock, shapes, FillPortion(3)),
+                p.drawing(1, stock, side, FillPortion(2))
             ]
             .spacing(6)
             .into();
@@ -2488,41 +2516,55 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     None
                 }
             };
-            let right = column![chips(c)];
             return frame(
                 "Hand over".into(),
                 "the stock leaves the mill",
-                p.picture(last, (480., 320.)),
-                right.push(space().height(Fill)).push(buttons(next)),
+                p.picture(last, Fill),
+                column![chips(c)],
+                next,
+                true,
             );
         }
     };
-    frame(
-        title,
-        sub,
-        left,
-        right.push(space().height(Fill)).push(buttons(next)),
-    )
+    frame(title, sub, left, right, next, p.at > 0 || p.item > 0)
 }
-/// A step's screen: its caption, the pictures and the numbers.
-fn frame<'a>(
+/// A step's screen: its caption, the pictures, which grow with the room
+/// the page has, and the numbers, which scroll when they do not fit; Back
+/// (live unless `back` is false) and `next` in one place at the card's foot
+/// on every screen (LIO-369).
+pub(super) fn frame<'a>(
     title: String,
     sub: &str,
     left: Element<'a, Message>,
     right: Column<'a, Message>,
+    next: Option<(String, Message)>,
+    back: bool,
 ) -> Element<'a, Message> {
     let body = row![
-        container(left).width(FillPortion(11)),
-        container(right.spacing(10).height(Length::Shrink)).width(FillPortion(9))
+        container(left).width(FillPortion(11)).height(Fill),
+        container(scrollable(right.spacing(10)).height(Fill))
+            .width(FillPortion(9))
+            .height(Fill)
+    ]
+    .spacing(18)
+    .height(Fill);
+    let foot = row![
+        space().width(FillPortion(11)),
+        container(buttons(next, back)).width(FillPortion(9))
     ]
     .spacing(18);
     column![
         row![bold(title, 15), muted(sub.to_string()).size(13)]
             .spacing(8)
             .align_y(Alignment::Center),
-        container(body).padding(16).width(Fill).style(card)
+        container(column![body, foot].spacing(14))
+            .padding(16)
+            .width(Fill)
+            .height(Fill)
+            .style(card)
     ]
     .spacing(6)
+    .height(Fill)
     .into()
 }
 /// Where the tool is before and after the cut of pass `index` of `op`: the
@@ -2652,8 +2694,8 @@ fn pass<'a>(
     shapes.extend(lines(VIEWS[0]));
     shapes.push(Shape::Tool(start, r, Some(end)));
     let left = column![
-        p.drawing(0, stock, shapes, 250.),
-        p.drawing(side, stock, across, 160.),
+        p.drawing(0, stock, shapes, FillPortion(3)),
+        p.drawing(side, stock, across, FillPortion(2)),
         legend()
     ]
     .spacing(6)
@@ -3240,6 +3282,54 @@ pub(crate) mod tests {
         assert_eq!(a.guide_item, 1);
     }
     #[test]
+    fn back_and_next_are_in_one_place_on_every_screen() {
+        let mut a = app("Yes");
+        let g = guide(&a);
+        let first = |want: fn(&Step) -> bool| g.steps.iter().position(want).unwrap();
+        let screens = [
+            0,
+            first(|s| matches!(s, Step::Pass { .. })),
+            first(|s| matches!(s, Step::Check { .. })),
+            g.steps.len() - 1,
+        ];
+        let window = Size::new(1280., 800.);
+        let bottom = Rectangle::new(Point::new(0., 400.), Size::new(1280., 400.));
+        let mut spans = vec![];
+        for at in screens {
+            send(&mut a, GuideAction::Go(at));
+            let presses = crate::ui::probe::presses(a.view(), window, bottom, 5.);
+            // Where pressing gives what `want` matches: (x min, y min, x
+            // max, y max), None when nowhere.
+            let span = |want: &dyn Fn(&str) -> bool| {
+                let points: Vec<Point> = (presses.iter())
+                    .filter(|(_, m)| want(&format!("{m:?}")))
+                    .map(|(p, _)| *p)
+                    .collect();
+                (!points.is_empty()).then(|| {
+                    points.iter().fold([f32::MAX, f32::MAX, 0., 0.], |b, p| {
+                        [b[0].min(p.x), b[1].min(p.y), b[2].max(p.x), b[3].max(p.y)]
+                    })
+                })
+            };
+            let next = span(&|m| m == "Guide(Next)" || m == "Guide(Open(1))");
+            spans.push((next, span(&|m| m == "Guide(Back)")));
+        }
+        // Next (or Go to the next setup) in one place; Back beside it, dead
+        // on the first screen.
+        assert!(spans[0].0.is_some() && spans[0].1.is_none(), "{spans:?}");
+        for s in &spans[1..] {
+            assert_eq!(s.0, spans[0].0, "{spans:?}");
+            assert_eq!(s.1, spans[1].1, "{spans:?}");
+        }
+        assert!(spans[1].1.is_some());
+        // Back from the Holes' Check lands on its last hole.
+        let check = (g.steps.iter()).rposition(|s| matches!(s, Step::Check { .. }));
+        send(&mut a, GuideAction::Go(check.unwrap()));
+        send(&mut a, GuideAction::Back);
+        assert!(matches!(g.steps[place(&a)], Step::Holes { .. }));
+        assert_eq!(a.guide_item, 3);
+    }
+    #[test]
     fn a_setup_that_cannot_be_shown_names_its_operation_and_opens_it() {
         // The Step's speed off the gears: the page names the Step, and its
         // button opens it in MANUFACTURE on its Tool tab.
@@ -3549,6 +3639,18 @@ pub(crate) mod tests {
             Size::new(w as f32, h as f32),
             Cache::default(),
             &mut renderer,
+        );
+        // A frame's redraw, which sets each button's status: without it a
+        // button draws as disabled.
+        let redraw = iced::Event::Window(iced::window::Event::RedrawRequested(
+            std::time::Instant::now(),
+        ));
+        let _ = ui.update(
+            &[redraw],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut vec![],
         );
         ui.draw(
             &mut renderer,

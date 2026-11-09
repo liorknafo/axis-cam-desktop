@@ -481,6 +481,8 @@ Open a manual setup in MACHINE to see its **Steps** page in place of Run. It wor
 
 The page is split into sections: **Set up** (Hold, Zero), one section per cutting operation, and **Hand over**. A bar of sections on top shows progress ("pass 2/4"), ticks finished ones and ends with "→ CNC setup N". Tapping a section jumps to where you left it, or its first step. Each section header gives the tool, the number of passes or holes and the minutes. The last button of a section is "Section done"; you can stop after any section and come back. The place is saved with the project, without marking the plan changed.
 
+Each screen fills the page: its drawings and 3D pictures grow with the window, its numbers scroll beside them when they do not fit, and **Back** and the step's own button are large and in the same place at the foot of every screen. Back is dimmed on the first screen, and Back onto a Holes or Bore screen lands on its last hole.
+
 When the steps cannot be worked out, the page says why and names the operation it is in ("Step: Spindle speed must be one of the machine's gears: …"), with a button that opens that operation in MANUFACTURE on the tab the problem is on, or the setup when the problem is the setup's (a setup with no operation).
 
 | Screen | What it shows |

@@ -4872,7 +4872,16 @@ impl App {
             GuideAction::Next if self.guide_item + 1 < holes => self.guide_item += 1,
             GuideAction::Next => self.guide_to(&shown, at + 1),
             GuideAction::Back if holes > 0 && self.guide_item > 0 => self.guide_item -= 1,
-            GuideAction::Back => self.guide_to(&shown, at.saturating_sub(1)),
+            GuideAction::Back => {
+                self.guide_to(&shown, at.saturating_sub(1));
+                // Back onto a Holes or Bore screen: its last hole (LIO-369).
+                if let Some(guide::Step::Holes { holes, .. } | guide::Step::Bore { holes, .. }) =
+                    shown.guide.steps.get(at.saturating_sub(1))
+                    && at > 0
+                {
+                    self.guide_item = holes.len().saturating_sub(1);
+                }
+            }
             GuideAction::Go(i) => self.guide_to(&shown, i),
             GuideAction::Section(i) => {
                 if let Some(s) = shown.guide.sections.get(i)
