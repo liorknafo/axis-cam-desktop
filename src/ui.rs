@@ -3235,8 +3235,14 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     .is_some_and(|oi| !centre::centred(app.doc.setup(), oi))
             {
                 c = c
-                    .push(caution("Centre drill first", vec![centre::CENTRE_FIRST.into()]))
-                    .push(secondary("+ Add a centre drilling before it", Message::AddCentring));
+                    .push(caution(
+                        "Centre drill first",
+                        vec![centre::CENTRE_FIRST.into()],
+                    ))
+                    .push(secondary(
+                        "+ Add a centre drilling before it",
+                        Message::AddCentring,
+                    ));
             }
             if let Some(drill) = centre::centres(o)
                 .and_then(|id| app.doc.setup().operations.iter().find(|d| d.id == id))
@@ -4226,8 +4232,17 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
     foot = if app.confirm_delete_op {
         // Asked in the place of the commands, as a setup's Delete is
         // (`setup_editor`).
+        // Its centre drillings go with it (`Message::RemoveOp`).
+        let centring: Vec<&str> = (app.doc.setup().operations.iter())
+            .filter(|c| centre::centres(c) == Some(o.id.as_str()))
+            .map(|c| c.name())
+            .collect();
+        let with = match centring.as_slice() {
+            [] => String::new(),
+            names => format!(" Its centre drilling, {}, goes with it.", names.join(", ")),
+        };
         foot.push(note(format!(
-            "Delete {}? Later rest-machining operations that start from it lose that reference.",
+            "Delete {}? Later rest-machining operations that start from it lose that reference.{with}",
             o.name()
         )))
         .push(
@@ -12132,6 +12147,7 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
                 "Face mill",
                 "Drill",
                 "Chamfer mill",
+                crate::model::CENTRE_DRILL,
                 "Thread mill",
                 crate::model::KEYSEAT,
                 "Tap",
@@ -12163,6 +12179,8 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
                     "Head diameter · mm"
                 } else if head {
                     "Head body diameter · mm"
+                } else if get(p, "type") == crate::model::CENTRE_DRILL {
+                    "Body diameter · mm"
                 } else {
                     "Diameter · mm"
                 },
@@ -12262,6 +12280,11 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
             form = form
                 .push(choice(p, "thread", "Thread", &sizes, t))
                 .push(field(p, "od", "Die outside diameter · mm", t));
+        }
+        crate::model::CENTRE_DRILL => {
+            form = form
+                .push(field(p, "pilot", "Pilot diameter · mm", t))
+                .push(field(p, "pilot_length", "Pilot length · mm", t));
         }
         "Reamer" => {
             form = form.push(choice(
@@ -13058,6 +13081,14 @@ fn tool_details(tool: &Tool) -> String {
                 "Boring head · Ø{} mm · bar Ø{} mm",
                 get(&tool.p, "bore_range"),
                 get(&tool.p, "bar_diameter")
+            );
+        }
+        crate::model::CENTRE_DRILL => {
+            return format!(
+                "Centre drill · 60° · pilot Ø{} × {} mm · body Ø{} mm",
+                get(&tool.p, "pilot"),
+                get(&tool.p, "pilot_length"),
+                get(&tool.p, "diameter")
             );
         }
         "Reamer" => {

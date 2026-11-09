@@ -2,6 +2,7 @@ mod adaptive;
 mod air;
 mod analysis;
 mod cam;
+mod centre;
 mod chamfer;
 mod choice_diagram;
 mod choice_help;
@@ -21,7 +22,6 @@ mod groove;
 mod guide;
 mod help;
 mod holding;
-mod centre;
 mod hole_stages;
 mod illustration;
 mod indexed;
@@ -6347,8 +6347,8 @@ impl App {
                         let (centrings, said) = centre::needed(&self.doc, si, self.part_mesh());
                         centre::insert(&mut self.doc, si, centrings);
                         // The finishing operation stays the one open.
-                        self.selected = (self.doc.setups[si].operations.iter())
-                            .position(|o| o.id == finish);
+                        self.selected =
+                            (self.doc.setups[si].operations.iter()).position(|o| o.id == finish);
                         self.touch();
                         self.status = added.status;
                         if !said.is_empty() {

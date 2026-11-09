@@ -1453,18 +1453,41 @@ fn run(
             }
         }
         // A manual mill's Zero is picked up with an edge finder above the
-        // jaws: its Steps cannot be followed when nothing stands clear.
+        // jaws: its Steps cannot be followed when nothing stands clear. A
+        // twist drill started on a flat face there walks off its position.
         for si in 0..job_doc.setups.len() {
-            if crate::manual::is_manual(&job_doc.setups[si].machine)
-                && crate::guide::build(job_doc, mesh, si)
-                    .is_err_and(|why| why == crate::guide::NOT_CLEAR)
-            {
-                export.push(Problem {
+            if !crate::manual::is_manual(&job_doc.setups[si].machine) {
+                continue;
+            }
+            match crate::guide::build(job_doc, mesh, si) {
+                Err(why) if why == crate::guide::NOT_CLEAR => export.push(Problem {
                     setup: si + 1,
                     operation: None,
                     stage: "workholding",
                     message: crate::guide::NOT_CLEAR.into(),
-                });
+                }),
+                Ok(guide) => {
+                    for step in &guide.steps {
+                        if let crate::guide::Step::Holes { op, uncentred, .. } = step
+                            && uncentred.iter().any(|u| *u)
+                        {
+                            export.push(Problem {
+                                setup: si + 1,
+                                operation: Some(op + 1),
+                                stage: "drilling",
+                                message: format!(
+                                    "{} on a flat face. {}",
+                                    match uncentred.iter().filter(|u| **u).count() {
+                                        1 => "1 of its holes starts".to_string(),
+                                        n => format!("{n} of its holes start"),
+                                    },
+                                    crate::centre::CENTRE_FIRST
+                                ),
+                            });
+                        }
+                    }
+                }
+                Err(_) => {}
             }
         }
         if export.is_empty() && held.is_empty() {

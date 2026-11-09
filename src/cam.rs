@@ -2666,9 +2666,10 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
                 f32::from(tenths) / 10.,
             ));
         }
-        // The pilot goes down the hole: the drill after it opens it out.
+        // The pilot goes down the hole, under a cone as wide as the hole:
+        // the drill after it opens it out.
         if let Some(c) = centre
-            && c.pilot >= h.widest_drill()
+            && c.pilot >= h.widest_drill().min(h.diameter)
         {
             return Err(format!(
                 "The centre drill's Ø{:.2} pilot is as wide as the Ø{:.2} hole at X{:.2} Y{:.2}. Choose a centre drill with a smaller pilot, or a diameter filter.",

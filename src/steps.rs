@@ -548,6 +548,9 @@ enum Hatch {
 #[derive(Debug, Clone)]
 enum Shape {
     Hatch(Bounds, Hatch),
+    /// What a cut takes in a side view, by its outline: a centre drill's
+    /// pilot and cone.
+    Section(Vec<[f32; 3]>),
     /// A line not to pass, labelled with its DRO number.
     Never([f32; 3], [f32; 3], String),
     /// A finished wall.
@@ -620,6 +623,7 @@ impl Drawing<'_> {
                     grow([bx.min[a], bx.min[b]]);
                     grow([bx.max[a], bx.max[b]]);
                 }
+                Shape::Section(q) => q.iter().for_each(|q| grow([q[a], q[b]])),
                 _ => {}
             }
         }
@@ -699,6 +703,16 @@ impl Drawing<'_> {
                 }
                 Shape::Wall(from, to) => {
                     f.stroke(&canvas::Path::line(p3(*from), p3(*to)), stroke(INK, 2.5))
+                }
+                Shape::Section(q) if q.is_empty() => {}
+                Shape::Section(q) => {
+                    let outline = canvas::Path::new(|b| {
+                        b.move_to(p3(q[0]));
+                        q[1..].iter().for_each(|q| b.line_to(p3(*q)));
+                        b.close();
+                    });
+                    f.fill(&outline, Color { a: 0.14, ..ACCENT });
+                    f.stroke(&outline, stroke(ACCENT, 1.5));
                 }
                 Shape::Never(from, to, s) => {
                     let (m, n) = (p3(*from), p3(*to));
@@ -917,6 +931,8 @@ struct ToolPicture {
     diameter: f32,
     rpm: f32,
     drill: bool,
+    /// A centre drill's sizes: its 60° cone and pilot under the body.
+    centre: Option<crate::model::CentreDrill>,
 }
 impl canvas::Program<Message> for ToolPicture {
     type State = ();
@@ -944,11 +960,22 @@ impl canvas::Program<Message> for ToolPicture {
             Align::Left,
         );
         let (top, h) = (78., 96.);
+        // A centre drill's cone and pilot, to scale with the body: the cone's
+        // end and the pilot's half-width and tip.
+        let centre = self.centre.map(|c| {
+            let q = c.pilot * w / c.body / 2.;
+            let cone = top + h + (w / 2. - q) * crate::model::CentreDrill::rise();
+            (cone, q, cone + (c.pilot_length * w / c.body).min(40.))
+        });
         let body = canvas::Path::new(|b| {
             b.move_to(Point::new(cx - w / 2., top));
             b.line_to(Point::new(cx + w / 2., top));
             b.line_to(Point::new(cx + w / 2., top + h));
-            if self.drill {
+            if let Some((cone, q, tip)) = centre {
+                for p in [[q, cone], [q, tip], [-q, tip], [-q, cone]] {
+                    b.line_to(Point::new(cx + p[0], p[1]));
+                }
+            } else if self.drill {
                 b.line_to(Point::new(cx, top + h + 18.));
             }
             b.line_to(Point::new(cx - w / 2., top + h));
@@ -963,7 +990,7 @@ impl canvas::Program<Message> for ToolPicture {
                 stroke(TOOL, 1.4),
             );
         }
-        let y = top + h + 34.;
+        let y = centre.map_or(top + h + 34., |(_, _, tip)| tip + 16.);
         arrow(
             &mut f,
             Point::new(cx, y),
@@ -1763,6 +1790,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 diameter: *diameter,
                 rpm: *rpm,
                 drill,
+                centre: p.tool(*op).and_then(|t| t.centre_drill()),
             })
             .width(Fill)
             .height(300)
@@ -1981,7 +2009,12 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             )
         }
         step @ Step::Pass { .. } => pass(p, step),
-        Step::Holes { op, holes, mouths } => {
+        Step::Holes {
+            op,
+            holes,
+            mouths,
+            uncentred,
+        } => {
             let stock = p.before(*op);
             let i = p.item.min(holes.len().saturating_sub(1));
             let r = p
@@ -1990,11 +2023,19 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 .unwrap_or(4.)
                 / 2.;
             let mut shapes = p.cut_before(*op);
+            // A centre drill's hole is its cone at the top.
+            let cone = |h: &[f32; 3]| {
+                p.tool(*op).and_then(|t| t.centre_drill()).map_or(r, |c| {
+                    (c.pilot / 2.
+                        + (stock.max[2] - h[2] - c.pilot_length)
+                            / crate::model::CentreDrill::rise())
+                    .clamp(c.pilot / 2., c.body / 2.)
+                })
+            };
             shapes.extend(
-                holes
-                    .iter()
-                    .enumerate()
-                    .map(|(n, h)| Shape::Hole([h[0], h[1], stock.max[2]], r, n + 1, lit(n, i))),
+                holes.iter().enumerate().map(|(n, h)| {
+                    Shape::Hole([h[0], h[1], stock.max[2]], cone(h), n + 1, lit(n, i))
+                }),
             );
             let h = holes.get(i).copied().unwrap_or([0.; 3]);
             let tapping = p.setup.operations.get(*op).is_some_and(|o| o.tapping());
@@ -2009,8 +2050,26 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 min: [h[0] - r, h[1] - r, h[2]],
                 max: [h[0] + r, h[1] + r, mouth],
             };
+            // A centre drill's pilot, to its tip, under its cone, which is
+            // as wide as the hole at the top or as its body when wider.
+            let spot = p.tool(*op).and_then(|t| t.centre_drill()).map(|c| {
+                let (x, y, (q, b)) = (h[0], h[1], (c.pilot / 2., c.body / 2.));
+                let shoulder = h[2] + c.pilot_length;
+                let wide = (q + (mouth - shoulder) / crate::model::CentreDrill::rise()).min(b);
+                let rim = shoulder + (wide - q) * crate::model::CentreDrill::rise();
+                Shape::Section(vec![
+                    [x - q, y, h[2]],
+                    [x + q, y, h[2]],
+                    [x + q, y, shoulder],
+                    [x + wide, y, rim],
+                    [x + wide, y, mouth],
+                    [x - wide, y, mouth],
+                    [x - wide, y, rim],
+                    [x - q, y, shoulder],
+                ])
+            });
             let side = vec![
-                Shape::Hatch(drilled, Hatch::Cut),
+                spot.unwrap_or(Shape::Hatch(drilled, Hatch::Cut)),
                 Shape::Never(
                     [h[0] - 3. * r, 0., h[2]],
                     [h[0] + 3. * r, 0., h[2]],
@@ -2100,6 +2159,9 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 // the wall it has just cut.
                 let o = p.setup.operations.get(*op);
                 let reaming = o.is_some_and(|o| o.reaming());
+                // A centre drill goes in to its pilot's tip, its cone opened
+                // to the hole's size at the top, the body's when wider.
+                let centre = p.tool(*op).and_then(|t| t.centre_drill());
                 let feed = o.and_then(|o| num(&o.p, "feed")).unwrap_or(0.);
                 let mut said = vec![
                     chip(p.tool_name(*op, 2. * r)),
@@ -2110,6 +2172,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 if reaming {
                     said.push(warn_chip("feed back out"));
                 }
+                if uncentred.get(i).copied().unwrap_or(false) {
+                    said.push(warn_chip("centre drill first"));
+                }
+                let cone = centre.map(|_| format!("cone Ø{} at the top", mm(2. * cone(&h))));
                 // The planned cycle, as the hand on the quill does it.
                 let cycle = o.map(|o| get(&o.p, "cycle")).unwrap_or_default();
                 let peck = o.and_then(|o| num(&o.p, "peck")).filter(|p| *p > 0.);
@@ -2163,10 +2229,18 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             value: dro(h[2]),
                             lock: None,
                             tags: [
-                                if reaming { "ream to" } else { "drill to" }.into(),
+                                if centre.is_some() {
+                                    "pilot tip to"
+                                } else if reaming {
+                                    "ream to"
+                                } else {
+                                    "drill to"
+                                }
+                                .into(),
                                 format!("{} deep", mm(depth))
                             ]
                             .into_iter()
+                            .chain(cone)
                             .chain(pecking)
                             .collect(),
                             lit: Lit::Next,
@@ -2179,7 +2253,13 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                         i
                     ),
                 ];
-                let title = if reaming { "Ream" } else { "Holes" };
+                let title = if centre.is_some() {
+                    "Centre drill"
+                } else if reaming {
+                    "Ream"
+                } else {
+                    "Holes"
+                };
                 (title.into(), "one hole at a time", left, right)
             }
         }
@@ -2789,6 +2869,80 @@ pub(crate) mod tests {
             after(&t, "head"),
             ["Ø32.00", "out 0.10 on Ø · 10 divisions"]
         );
+    }
+    /// `app` with an A2.5×6.3 centre drilling before its Holes, as Add
+    /// would put it there.
+    fn centred_app() -> App {
+        app_with("Yes", |doc| {
+            let mut c =
+                crate::model::Tool::new("Centre drill A2.5×6.3", crate::model::CENTRE_DRILL, "6.3");
+            c.set_type(crate::model::CENTRE_DRILL);
+            c.p.insert("stickout".into(), "40".into());
+            doc.tools.push(c);
+            let (ops, _) = crate::centre::needed(doc, 0, None);
+            crate::centre::insert(doc, 0, ops);
+        })
+    }
+    /// The Holes step of operation `op`.
+    fn holes_step(a: &App, op: usize) -> usize {
+        (guide(a).steps.iter())
+            .position(|s| matches!(s, Step::Holes { op: o, .. } if *o == op))
+            .unwrap()
+    }
+    #[test]
+    fn a_centre_drill_goes_to_its_pilot_tip_and_an_uncentred_drill_is_warned() {
+        // Without a centre drilling, each hole of the drill is warned.
+        let mut a = app("Yes");
+        let at = holes_step(&a, 2);
+        send(&mut a, GuideAction::Go(at));
+        let t = texts(&a);
+        assert!(t.iter().any(|s| s == "centre drill first"), "{t:?}");
+        assert!(t.iter().any(|s| s == "Holes"), "{t:?}");
+        // With one: its own screen, to the pilot's tip, the cone at the top
+        // as wide as the body; the drill after it is not warned.
+        let mut a = centred_app();
+        let at = holes_step(&a, 2);
+        send(&mut a, GuideAction::Go(at));
+        let t = texts(&a);
+        assert!(t.iter().any(|s| s == "Centre drill"), "{t:?}");
+        let tags = t
+            .iter()
+            .find(|s| s.starts_with("pilot tip to · "))
+            .expect("pilot tip to");
+        assert!(tags.ends_with(" deep · cone Ø6.3 at the top"), "{tags}");
+        assert!(!t.iter().any(|s| s == "centre drill first"), "{t:?}");
+        let at = holes_step(&a, 3);
+        send(&mut a, GuideAction::Go(at));
+        let t = texts(&a);
+        assert!(t.iter().any(|s| s.starts_with("drill to · ")), "{t:?}");
+        assert!(!t.iter().any(|s| s == "centre drill first"), "{t:?}");
+    }
+    /// The centre drilling's Tool and Holes screens, the drill's after it,
+    /// and the drill's with no centre drilling, at 1280 × 800, into
+    /// `AXIS_RENDER_DIR`.
+    #[test]
+    #[ignore]
+    fn render_the_centre_drilling() {
+        let dir = std::path::PathBuf::from(std::env::var("AXIS_RENDER_DIR").unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = centred_app();
+        let tool = (guide(&a).steps.iter())
+            .position(|s| matches!(s, Step::Tool { op: 2, .. }))
+            .unwrap();
+        let shots = [
+            ("centre-tool", tool, 0),
+            ("centre-hole1", holes_step(&a, 2), 0),
+            ("centre-hole3", holes_step(&a, 2), 2),
+            ("drill-centred", holes_step(&a, 3), 0),
+        ];
+        for (name, step, item) in shots {
+            at(&mut a, step, item);
+            render(&a, (1280, 800), &dir.join(format!("{name}.png")));
+        }
+        let mut a = app("Yes");
+        let step = holes_step(&a, 2);
+        at(&mut a, step, 0);
+        render(&a, (1280, 800), &dir.join("drill-uncentred.png"));
     }
     /// The last boring pass at 1280 × 800, in AXIS_RENDER_DIR (default
     /// /tmp/manual-steps), with the first beside it.

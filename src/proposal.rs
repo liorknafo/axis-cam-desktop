@@ -1087,6 +1087,11 @@ fn operation(
         Strategy::Drill if suits_cycle(p, crate::model::TAPPING) => kind == "Tap",
         Strategy::Drill if suits_cycle(p, crate::model::REAMING) => kind == "Reamer",
         Strategy::Drill if suits_cycle(p, crate::model::BORING) => kind == "Boring head",
+        // The manual mill centre drills; the planner need not ask for it
+        // (`centre::needed` adds one before each drill).
+        Strategy::Drill if kind == crate::model::CENTRE_DRILL => {
+            crate::manual::is_manual(on) && p.drill_cycle.as_deref().is_none_or(|c| c == "Drilling")
+        }
         Strategy::Drill => ["Drill", "Chamfer mill"].contains(&kind),
         Strategy::Parallel => ["Ball end mill", "Flat end mill"].contains(&kind),
         Strategy::Groove => kind == crate::model::KEYSEAT,
@@ -3298,6 +3303,16 @@ pub fn build(
         }
     }
     built.sync_stock_sources();
+    // On the manual mill each twist drill is centre drilled first, with the
+    // library's centre drill; without one the plan check says so.
+    for si in 0..built.setups.len() {
+        let (centrings, _) = crate::centre::needed(&built, si, Some(mesh));
+        let found = centrings
+            .into_iter()
+            .filter(|(_, op)| !op.tool.is_empty())
+            .collect();
+        crate::centre::insert(&mut built, si, found);
+    }
     if !rotary {
         return Ok(built);
     }
@@ -6094,11 +6109,26 @@ pub(crate) mod tests {
         ] {
             drill.p.insert(k.into(), v.into());
         }
+        doc.tools.push(hand_centre_drill(&mill));
         doc.machines.push(mill);
         doc.tools.push(tool);
         doc.tools.push(drill);
         let report = analysis::report(&doc, &mesh).unwrap();
         (doc, mesh, report)
+    }
+    /// T10, an A2.5×6.3 centre drill on `mill`, which the plan puts before
+    /// each of its drills (`centre::needed`).
+    pub fn hand_centre_drill(mill: &crate::model::Machine) -> Tool {
+        let mut c = Tool::new("Centre drill A2.5×6.3", crate::model::CENTRE_DRILL, "6.3");
+        c.set_type(crate::model::CENTRE_DRILL);
+        for (k, v) in [
+            ("stickout", "40"),
+            ("number", "10"),
+            ("machines", mill.id.as_str()),
+        ] {
+            c.p.insert(k.into(), v.into());
+        }
+        c
     }
     /// `good` with its holes drilled on the manual mill after the CNC, in a
     /// setup of their own facing +Z, instead of by the CNC's setup 1.

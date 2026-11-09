@@ -1151,7 +1151,8 @@ pub const CENTRE_DRILL: &str = "Centre drill";
 pub const CENTRE_ANGLE: f32 = 60.;
 /// A centre drill is the manual mill's: a CNC spots with a chamfer mill.
 /// A centre drill goes in once to its depth.
-pub const CENTRE_CYCLE: &str = "A centre drill goes in once to its depth: choose the Drilling cycle.";
+pub const CENTRE_CYCLE: &str =
+    "A centre drill goes in once to its depth: choose the Drilling cycle.";
 pub const CENTRE_ON_CNC: &str = "A centre drill is for the manual mill. On a CNC, spot the holes with a chamfer mill (a Drill with a chamfer mill countersinks them), or drill them straight away.";
 /// A boring head is set to one size: a Boring bores the holes of one
 /// Hole diameter.
@@ -1222,8 +1223,9 @@ pub fn mill_tool_defaults(kind: &str) -> &'static [(&'static str, &'static str)]
         _ => &[],
     }
 }
-/// The starter tool set `Document::adopt_tools` has given a library.
-pub const STARTER_TOOLS: u32 = 1;
+/// The starter tool set `Document::adopt_tools` has given a library: 2
+/// added the centre drills.
+pub const STARTER_TOOLS: u32 = 2;
 /// The sizes of the owner's SharCreatives 60-piece tap and die set (a tap
 /// and a die of each).
 const SET_SIZES: [&str; 27] = [
@@ -1255,7 +1257,7 @@ const SET_SIZES: [&str; 27] = [
     "1/2-20 UNF",
     "1/8-27 NPT",
 ];
-/// The owner's threading tools (`Document::adopt_tools`).
+/// The owner's threading tools and centre drills (`Document::adopt_tools`).
 pub fn starter_tools() -> Vec<Tool> {
     let mut out = vec![];
     for size in SET_SIZES {
@@ -1279,6 +1281,21 @@ pub fn starter_tools() -> Vec<Tool> {
     insert.p.insert("thread_angle".into(), "60".into());
     insert.p.insert("pitches".into(), "0.5-3".into());
     out.push(insert);
+    // A set of DIN 333 A centre drills, for the manual mill (`centre`):
+    // pilot, pilot length, body and flute length (the pilot and the cone).
+    for (pilot, reach, body, flutes) in [
+        ("1.6", "2", "4", "4.5"),
+        ("2.5", "3.1", "6.3", "7"),
+        ("3.15", "3.9", "8", "8.5"),
+    ] {
+        let mut c = Tool::new(&format!("Centre drill A{pilot}×{body}"), CENTRE_DRILL, body);
+        c.p.insert("pilot".into(), pilot.into());
+        c.p.insert("pilot_length".into(), reach.into());
+        c.p.insert("flutes".into(), "2".into());
+        c.p.insert("length".into(), flutes.into());
+        c.p.insert("stickout".into(), "30".into());
+        out.push(c);
+    }
     out
 }
 /// A tap's kind: which way its flutes send the chips, and so the holes it
@@ -3067,14 +3084,18 @@ impl Document {
     /// Gives the library the owner's threading tools once (`STARTER_TOOLS`):
     /// the taps and dies of the SharCreatives 60-piece set (taps for the
     /// manual mill and the lathe's tailstock, dies for the lathe) and the
-    /// 16ER AG60 insert as the lathe's threading tool. A tool of the same
-    /// name already there is kept.
+    /// 16ER AG60 insert as the lathe's threading tool; since set 2, three
+    /// centre drills for the manual mill. A tool of the same name already
+    /// there is kept.
     pub fn adopt_tools(&mut self) {
         if self.starter_tools >= STARTER_TOOLS {
             return;
         }
         for tool in starter_tools() {
-            if !self.tools.iter().any(|t| t.name() == tool.name()) {
+            // A library given set 1 takes set 2's centre drills alone: the
+            // taps and dies it has deleted stay deleted.
+            let new = self.starter_tools < 1 || get(&tool.p, "type") == CENTRE_DRILL;
+            if new && !self.tools.iter().any(|t| t.name() == tool.name()) {
                 self.tools.push(tool);
             }
         }

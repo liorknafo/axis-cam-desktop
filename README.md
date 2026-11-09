@@ -465,6 +465,16 @@ Box removes an axis-aligned block with one flat end mill. Facing, squaring a sid
 
 **Drill** is the same Drill as on the CNC. On the manual mill its moves are split so that Z goes up, then X, then Y, then Z down. The holes are drilled at the DRO's centres.
 
+### Centre drilling
+
+A twist drill started on a flat face walks: its chisel edge skids before its lips bite, and the hole lands off its place. So on the manual mill every hole a drill opens from the solid (Drilling, Chip breaking or Deep drilling with a **Drill**, not the pin holes) is centre drilled first.
+
+- **The tool.** A **Centre drill** is a 60° A-type (DIN 333 form A): a pilot of **Pilot diameter** and **Pilot length** under a 60° cone that opens to the **Body diameter**. Its flute length must reach the top of the cone. With no machine checked it fits every manual mill and no CNC; a CNC refuses it (spot there with a chamfer mill). The library is given A1.6×4, A2.5×6.3 and A3.15×8 once.
+- **Added for you.** A new Drill on the manual mill, **+ Add the drilling**, **Add threading** and the AI planner put a centre drilling (a Drill named "Centre drill · …") just before each such drill. It picks the library's centre drill whose pilot goes down the narrowest hole and, of those, the narrowest body that reaches the widest hole. It runs at the project material's cutting data for a cutter of its body and flutes, as the plan check holds it; with no data, at the drill's surface speed at its body and the drill's feed per turn, on the gears and within the hand feed. Its holes follow the drill's (it names the drill it centres), and deleting the drill deletes it. A drill without one says **Centre drill first** on its Tool tab, with **+ Add a centre drilling before it**.
+- **Depth.** The cone goes in until it is as wide as the hole at its top, or the body when the hole is wider; the pilot goes on below. A pilot as wide as the hole, a hole too shallow for the pilot, or a cycle other than Drilling is refused by name.
+- **Simulation.** The cone is swept with a flat as wide as the pilot; the pilot itself lies inside the hole the drill then cuts, and is not swept.
+- **Steps.** A centre drilling has its own tool change and its own **Centre drill** screen, hole by hole: the DRO Z is the pilot's tip, with the cone's Ø at the top; the side view draws the pilot and the cone. A drill's hole that still starts on a flat face (no centre drilling, countersink or pilot hole before it opens its axis) has the warning **centre drill first**, and the plan check reports the drill.
+
 ### The Steps page
 
 Open a manual setup in MACHINE to see its **Steps** page in place of Run. It works with no controller connected, and while the CNC runs another job. The steps are made from the setup's simulated operations, so each picture and number is a move the app checked. Every number is a work coordinate: Z 0 is the top picked up in the Zero step, for the whole setup.

@@ -1146,7 +1146,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "",
         ),
         RemoveOp | AskRemoveOp | ConfirmDeleteOp(true) => (
-            "Delete this operation from the current setup. References from later rest-machining operations are cleared.",
+            "Delete this operation from the current setup. References from later rest-machining operations are cleared, and a centre drilling added for it goes with it.",
             "",
         ),
         ConfirmDeleteOp(false) => (
@@ -1196,6 +1196,10 @@ pub fn command(m: &Message, label: String) -> Help {
         AddHoleStages => (
             "Add before this Reaming or Boring the operations that open its holes, on the same holes: for a reamer, a drill a little under its size (Ø9.8 for Ø10); for a boring head, a drill, then on a CNC Helical milling to 0.6 under the size; on the manual mill the drills step up and the head roughs the rest.",
             "The tools come from the library: the drill nearest a reamer's drill size; for a bore the widest drill and the widest flat end mill that reach through. One that is missing is added without a tool, and the status says which to add.",
+        ),
+        AddCentring => (
+            "Add a centre drilling just before this drill, on its holes: a 60° centre drill of the library, its cone opened to each hole's size (its body's when the hole is wider), so the drill finds the centre instead of walking on the flat face.",
+            "Its holes follow the drill's, and deleting the drill deletes it. The library's centre drill whose pilot goes down the narrowest hole and whose body reaches the widest; with none, it is added without a tool and the status says which to add.",
         ),
         AddThreading => (
             "Add, for each thread size of the setup's threaded holes that open upwards, a Drill of its tap drill and then its thread: Thread milling with a thread mill on the CNC, Tapping by hand on the manual mill. Tools come from the library; the status says which are missing.",
@@ -4869,6 +4873,7 @@ mod tests {
             AddPinDrilling,
             AddThreading,
             AddHoleStages,
+            AddCentring,
             ThreadFromPart,
             Generate,
             GenerateAll,
