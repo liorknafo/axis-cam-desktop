@@ -9018,8 +9018,13 @@ fn typed_model_path(text: &str) -> Result<PathBuf, String> {
         }
     }
     if !path.is_absolute() {
+        let example = if cfg!(windows) {
+            r"C:\Users\you\part.step"
+        } else {
+            "/Users/you/part.step"
+        };
         return Err(format!(
-            "{} is not a whole path. Give it from the top, as /Users/you/part.step.",
+            "{} is not a whole path. Give it from the top, as {example}.",
             path.display()
         ));
     }

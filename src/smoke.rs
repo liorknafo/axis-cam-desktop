@@ -18958,14 +18958,18 @@ soft_max = 180.0
         let part = dir.path().join("my part.STL");
         std::fs::write(&part, "solid x\nendsolid x\n").unwrap();
         let whole = part.display().to_string();
-        for typed in [
+        let mut typings = vec![
             whole.clone(),
             format!("  {whole}\n"),
             format!("\"{whole}\""),
             format!("'{whole}'"),
-            whole.replace(' ', "\\ "),
             format!("file://{}", whole.replace(' ', "%20")),
-        ] {
+        ];
+        // On Windows `\` is the path's separator, not a Terminal's escape.
+        if !cfg!(windows) {
+            typings.push(whole.replace(' ', "\\ "));
+        }
+        for typed in typings {
             assert_eq!(crate::typed_model_path(&typed), Ok(part.clone()), "{typed}");
         }
         if let Some(home) = dirs::home_dir()
@@ -18977,13 +18981,15 @@ soft_max = 180.0
         // Each wrong path says what is wrong with it.
         let notes = std::fs::write(dir.path().join("notes.txt"), "x");
         notes.unwrap();
+        // A whole path that names nothing; /no/such has no drive on Windows.
+        let such = dir.path().join("no").join("such").display().to_string();
         for (typed, says) in [
             ("".to_string(), "Type or paste"),
             ("parts/bracket.step".into(), "not a whole path"),
             ("\\".into(), "not a whole path"),
             ("\\\\".into(), "not a whole path"),
-            ("/no/such/part.step\\".into(), "There is no file"),
-            ("/no/such\\ part.step".into(), "There is no file"),
+            (format!("{such}/part.step\\"), "There is no file"),
+            (format!("{such}\\ part.step"), "There is no file"),
             (
                 dir.path().join("gone.step").display().to_string(),
                 "There is no file",
@@ -18997,6 +19003,10 @@ soft_max = 180.0
             let e = crate::typed_model_path(&typed).unwrap_err();
             assert!(e.contains(says), "{typed}: {e}");
         }
+        // A part path is shown the way this OS writes one.
+        let e = crate::typed_model_path("parts/bracket.step").unwrap_err();
+        let example = if cfg!(windows) { r"as C:\Users\" } else { "as /Users/" };
+        assert!(e.contains(example), "{e}");
     }
     /// Import from path loads the file as the browser's import does, and
     /// the field closes once the part is in; a wrong path stays to correct.
@@ -19007,7 +19017,8 @@ soft_max = 180.0
         a.page = Page::Work;
         let _ = a.update(Message::ImportPathOpen(true));
         assert!(a.import_path_open);
-        let _ = a.update(Message::ImportPath("/no/such/part.step".into()));
+        let missing = dir.path().join("no").join("such").join("part.step");
+        let _ = a.update(Message::ImportPath(missing.display().to_string()));
         let _ = a.update(Message::ImportFromPath);
         assert!(!a.import_busy);
         assert!(a.import_path_open);
