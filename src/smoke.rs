@@ -19456,6 +19456,17 @@ soft_max = 180.0
         assert!(a.status.starts_with("Model reimported. Setups and operations are kept; one operation's picked surfaces were found"), "{}", a.status);
         assert!(a.status.contains("changed shape"), "{}", a.status);
         assert!(a.project_dirty);
+        // Said on the operation too, until its picks are checked.
+        let id = a.doc.setup().operations[0].id.clone();
+        assert!(a.doc.pick_checks[&id].contains("changed shape"));
+        let _ = a.update(Message::SelectOp(0));
+        shows(
+            &a,
+            &["Part changed · check picked surfaces", "Picks checked"],
+        );
+        let _ = a.update(Message::PicksChecked);
+        assert!(!a.doc.pick_checks.contains_key(&id));
+        let mesh = a.imported_mesh.as_ref().unwrap();
         assert!(
             crate::surface::issues(&a.doc.setup().operations[0], a.doc.setup(), Some(mesh))
                 .is_empty()

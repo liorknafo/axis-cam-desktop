@@ -2621,6 +2621,11 @@ pub struct Document {
     /// what its toolpaths and programs are known by.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub places: BTreeMap<String, crate::picks::Places>,
+    /// What changed in each operation's picks when the model file changed
+    /// (`picks::follow`), by operation id: shown on the operation until its
+    /// picks are checked, picked again or cleared.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pick_checks: BTreeMap<String, String>,
 }
 impl Default for Document {
     fn default() -> Self {
@@ -2642,6 +2647,7 @@ impl Default for Document {
             guide: BTreeMap::new(),
             measured: BTreeMap::new(),
             places: BTreeMap::new(),
+            pick_checks: BTreeMap::new(),
         }
     }
 }

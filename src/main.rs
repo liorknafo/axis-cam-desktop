@@ -483,6 +483,9 @@ pub enum Message {
     /// The model file `Reimport` asked for, loaded again: the file as it is
     /// now and its part.
     ModelReimported(ModelFile, Result<(ModelFile, mesh::Mesh), String>),
+    /// The selected operation's picks checked after the model file changed:
+    /// its note (`Document::pick_checks`) goes.
+    PicksChecked,
     ProjectOpened(Option<Opened>),
     /// The saved model loaded again for `ModelFile` (`App::restore_model`).
     ModelRestored(ModelFile, Result<mesh::Mesh, String>),
@@ -5808,6 +5811,11 @@ impl App {
                 if n >= mesh.surfaces.len() {
                     return Task::none();
                 }
+                // Picked again: what the model file's change did to the
+                // picks is seen to.
+                if let Some(id) = self.operation().map(|o| o.id.clone()) {
+                    self.doc.pick_checks.remove(&id);
+                }
                 let fingerprint = mesh.fingerprint.clone();
                 // An indexed setup reads the click at the A angle that turns
                 // its hole up, which may not be the one shown.
@@ -6051,8 +6059,17 @@ impl App {
             Message::ClearSurfaces => {
                 if let Some(o) = self.operation_mut() {
                     o.surfaces = None;
+                    let id = o.id.clone();
+                    self.doc.pick_checks.remove(&id);
                 }
                 self.touch();
+            }
+            Message::PicksChecked => {
+                if let Some(id) = self.operation().map(|o| o.id.clone())
+                    && self.doc.pick_checks.remove(&id).is_some()
+                {
+                    self.touch();
+                }
             }
             Message::PickPinHoles => {
                 self.picking_pins = !self.picking_pins;

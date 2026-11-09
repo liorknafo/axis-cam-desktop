@@ -1840,6 +1840,7 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
             let checks = app.current_ready();
             for (i, o) in s.operations.iter().enumerate() {
                 let selected = app.selected == Some(i) && app.page == Page::Work;
+                let check_picks = app.doc.pick_checks.contains_key(&o.id);
                 let mark = op_mark(app, checks, i);
                 let (glyph, color) = (mark.glyph(), mark.color());
                 let content = row![
@@ -1884,6 +1885,16 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
                     o.name(),
                     mark_help(app, checks, i, mark),
                 ));
+                if check_picks {
+                    tree = tree.push(
+                        container(
+                            text("Part changed · check picked surfaces")
+                                .size(11)
+                                .color(Color::from_rgb8(166, 101, 32)),
+                        )
+                        .padding([0, 16]),
+                    );
+                }
             }
             if let Some(picture) = stock_picture(app, si, true) {
                 let selected = app.setup_end && app.selected.is_none() && app.page == Page::Work;
@@ -3154,6 +3165,20 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
     }
     let head = column![identity, tabs, rule::horizontal(1)].spacing(13);
     let mut c = column![checks.field(&o.p, "name", "Operation name")].spacing(13);
+    // What the model file's change did to this operation's picks, until
+    // they are checked: first, on every tab.
+    if let Some(note) = app.doc.pick_checks.get(&o.id) {
+        c = c.push(
+            column![
+                caution(
+                    "The part changed: check the picked surfaces",
+                    vec![note.clone()]
+                ),
+                secondary("Picks checked", Message::PicksChecked),
+            ]
+            .spacing(6),
+        );
+    }
     // The strategy's explanation and availability, behind a disclosure that
     // stays as it was left.
     let open = app.settings.layout.strategy_help_open;

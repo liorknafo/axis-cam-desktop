@@ -1028,6 +1028,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Load the project's model file again after you changed it in your CAD program. The setups and operations are kept, and each operation's picked surfaces are picked again on the new part where they still are. The status says which were not found.",
             "A picked surface whose shape changed on its plane picks the surfaces now on that plane; one that moved or is gone is dropped. Check those operations in Geometry. Choosing the project's own file with Import model reimports it too.",
         ),
+        PicksChecked => (
+            "Say that this operation's picked surfaces are right on the changed part: the note about them goes. Picking or clearing a surface does the same.",
+            "",
+        ),
         ImportPathOpen(true) => (
             "Type or paste the path of a STEP/STP, 3MF, STL, OBJ or DXF file instead of choosing it in the file browser. It imports as Import model does.",
             "",
@@ -4823,6 +4827,7 @@ mod tests {
             Page(P::Control),
             Import,
             Reimport,
+            PicksChecked,
             ImportPathOpen(true),
             ImportPathOpen(false),
             ImportFromPath,

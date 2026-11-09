@@ -27,6 +27,10 @@ pub struct Place {
 pub struct Places {
     pub mesh_fingerprint: String,
     pub faces: Vec<Place>,
+    /// The surfaces not picked on the plane of a picked one, where their
+    /// boxes meet: never taken for a picked surface that changed shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub others: Vec<Place>,
 }
 impl Places {
     /// Whether these are the places of `selection`'s surfaces.
@@ -37,7 +41,8 @@ impl Places {
     }
 }
 /// What `follow` did: how many picks it found again, and a note for each
-/// operation it could not carry whole.
+/// operation it could not carry whole (also kept in `Document::pick_checks`
+/// until its picks are checked).
 #[derive(Debug, Default)]
 pub struct Followed {
     /// The operations whose picks are now on the new part.
@@ -84,6 +89,7 @@ pub fn record(doc: &mut Document, mesh: &Mesh) {
     let Document {
         setups,
         places: kept,
+        pick_checks,
         ..
     } = doc;
     // Those of operations deleted since go.
@@ -104,16 +110,34 @@ pub fn record(doc: &mut Document, mesh: &Mesh) {
             .map(|&id| all.get(id).cloned())
             .collect();
         match faces {
-            Some(faces) => kept.insert(
-                o.id.clone(),
-                Places {
-                    mesh_fingerprint: selection.mesh_fingerprint.clone(),
-                    faces,
-                },
-            ),
+            Some(faces) => {
+                let tol = tolerance(mesh);
+                let others = (all.iter())
+                    .filter(|p| {
+                        !selection.ids.contains(&p.id)
+                            && faces.iter().any(|f| same_plane(f, p, tol))
+                    })
+                    .cloned()
+                    .collect();
+                kept.insert(
+                    o.id.clone(),
+                    Places {
+                        mesh_fingerprint: selection.mesh_fingerprint.clone(),
+                        faces,
+                        others,
+                    },
+                )
+            }
             None => kept.remove(&o.id),
         };
     }
+    pick_checks.retain(|id, _| ids.contains(id.as_str()));
+}
+/// How near two places are the same, in the model file's units: a ten
+/// thousandth of the part's largest dimension.
+fn tolerance(mesh: &Mesh) -> f32 {
+    let extent = mesh.dimensions.into_iter().fold(0f32, f32::max);
+    (extent * 1e-4).max(f32::EPSILON)
 }
 
 const SAME_NORMAL: f32 = 1. - 1e-6;
@@ -135,6 +159,22 @@ fn same_plane(a: &Place, b: &Place, tol: f32) -> bool {
     dot(a.normal, b.normal) >= SAME_NORMAL
         && dot(a.normal, sub(b.center, a.center)).abs() <= tol
         && (0..3).all(|i| a.min[i] <= b.max[i] + tol && b.min[i] <= a.max[i] + tol)
+}
+/// How much of the boxes `a` and `b` of surfaces on a plane facing `normal`
+/// is common to both, from 0 to 1: their overlap over their union, seen
+/// along the axis nearest the normal.
+fn overlap(normal: [f32; 3], a: ([f32; 3], [f32; 3]), b: ([f32; 3], [f32; 3])) -> f32 {
+    let along = (0..3)
+        .max_by(|&i, &j| normal[i].abs().total_cmp(&normal[j].abs()))
+        .unwrap_or(2);
+    let (mut both, mut area_a, mut area_b) = (1f32, 1f32, 1f32);
+    for i in (0..3).filter(|&i| i != along) {
+        both *= (a.1[i].min(b.1[i]) - a.0[i].max(b.0[i])).max(0.);
+        area_a *= (a.1[i] - a.0[i]).max(0.);
+        area_b *= (b.1[i] - b.0[i]).max(0.);
+    }
+    let union = area_a + area_b - both;
+    if union > 0. { both / union } else { 0. }
 }
 /// The surfaces of a part by where their centres are, in cells `tol` wide,
 /// to find the one `same` as a place without trying them all.
@@ -197,8 +237,7 @@ pub fn follow(doc: &mut Document, mesh: &Mesh, old: Option<&Mesh>) -> Followed {
     if mesh.fingerprint.is_empty() {
         return followed;
     }
-    let extent = mesh.dimensions.into_iter().fold(0f32, f32::max);
-    let tol = (extent * 1e-4).max(f32::EPSILON);
+    let tol = tolerance(mesh);
     let new = places(mesh);
     let grid = Grid::new(&new, tol);
     // The surfaces of `mesh` that `old` had too, unchanged: worked out only
@@ -208,6 +247,7 @@ pub fn follow(doc: &mut Document, mesh: &Mesh, old: Option<&Mesh>) -> Followed {
     let Document {
         setups,
         places: kept_places_of,
+        pick_checks,
         ..
     } = doc;
     for (si, setup) in setups.iter_mut().enumerate() {
@@ -225,11 +265,15 @@ pub fn follow(doc: &mut Document, mesh: &Mesh, old: Option<&Mesh>) -> Followed {
             };
             let Some(kept_places) = kept_places_of.get(&o.id).filter(|p| p.describe(selection))
             else {
-                followed.notes.push(format!(
-                    "{name}: its surfaces were picked before picks were kept with their places, so they are not found on the new part. Pick them again in Geometry."
-                ));
+                let note = "Its surfaces were picked before picks were kept with their places, so they are not found on the new part. Pick them again in Geometry.";
+                followed.notes.push(format!("{name}: {note}"));
+                pick_checks.insert(o.id.clone(), note.into());
                 continue;
             };
+            // The surfaces not picked beside the picks before: never taken.
+            let others: HashSet<usize> = (kept_places.others.iter())
+                .filter_map(|p| grid.same(p))
+                .collect();
             let mut ids: Vec<usize> = vec![];
             let (mut reshaped, mut lost) = (0, 0);
             for place in &kept_places.faces {
@@ -244,14 +288,32 @@ pub fn follow(doc: &mut Document, mesh: &Mesh, old: Option<&Mesh>) -> Followed {
                         .map(|old| places(old).iter().filter_map(|p| grid.same(p)).collect())
                         .unwrap_or_default()
                 });
-                let there: Vec<usize> = (new.iter())
-                    .filter(|n| !kept.contains(&n.id) && same_plane(place, n, tol))
-                    .map(|n| n.id)
+                let there: Vec<&Place> = (new.iter())
+                    .filter(|n| {
+                        !kept.contains(&n.id)
+                            && !others.contains(&n.id)
+                            && same_plane(place, n, tol)
+                    })
                     .collect();
-                if there.is_empty() {
+                // Taken for the surface only when they are about as large
+                // and cover about the same part of the plane: not a small
+                // boss top left where a deepened floor was.
+                let area: f32 = there.iter().map(|n| n.area).sum();
+                let mut span = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+                for n in &there {
+                    for i in 0..3 {
+                        span.0[i] = span.0[i].min(n.min[i]);
+                        span.1[i] = span.1[i].max(n.max[i]);
+                    }
+                }
+                if there.is_empty()
+                    || !(0.5..=2.).contains(&(area / place.area))
+                    || overlap(place.normal, (place.min, place.max), span) < 0.5
+                {
                     lost += 1;
                     continue;
                 }
+                let there: Vec<usize> = there.iter().map(|n| n.id).collect();
                 reshaped += 1;
                 for id in there {
                     if !ids.contains(&id) {
@@ -261,34 +323,41 @@ pub fn follow(doc: &mut Document, mesh: &Mesh, old: Option<&Mesh>) -> Followed {
             }
             let total = kept_places.faces.len();
             let faces = |n: usize| if n == 1 { "surface" } else { "surfaces" };
+            let mut notes = vec![];
             if ids.is_empty() {
-                followed.notes.push(format!(
-                    "{name}: none of its {total} picked {} is on the new part. Pick them again in Geometry.",
+                notes.push(format!(
+                    "None of its {total} picked {} is on the new part. Pick them again in Geometry.",
                     faces(total)
                 ));
-                continue;
+            } else {
+                o.surfaces = Some(Selection {
+                    mesh_fingerprint: mesh.fingerprint.clone(),
+                    ids,
+                });
+                followed.operations += 1;
             }
-            o.surfaces = Some(Selection {
-                mesh_fingerprint: mesh.fingerprint.clone(),
-                ids,
-            });
-            followed.operations += 1;
             if reshaped > 0 {
-                followed.notes.push(format!(
-                    "{name}: {reshaped} picked {} changed shape; the surfaces now on {} plane are picked instead. Check them in Geometry.",
+                notes.push(format!(
+                    "{reshaped} picked {} changed shape; the surfaces now on {} plane are picked instead. Check them in Geometry.",
                     faces(reshaped),
                     if reshaped == 1 { "its" } else { "their" },
                 ));
             }
-            if lost > 0 {
-                followed.notes.push(format!(
-                    "{name}: {lost} of its {total} picked {} {} not on the new part and {} dropped. Pick {} again in Geometry if it still needs {}.",
+            if lost > 0 && lost < total {
+                notes.push(format!(
+                    "{lost} of its {total} picked {} {} not found on the new part and {} dropped. Pick {} again in Geometry if it still needs {}.",
                     faces(total),
                     if lost == 1 { "is" } else { "are" },
                     if lost == 1 { "was" } else { "were" },
                     if lost == 1 { "it" } else { "them" },
                     if lost == 1 { "it" } else { "them" },
                 ));
+            }
+            if !notes.is_empty() {
+                followed
+                    .notes
+                    .extend(notes.iter().map(|n| format!("{name}: {n}")));
+                pick_checks.insert(o.id.clone(), notes.join(" "));
             }
         }
     }
@@ -385,7 +454,11 @@ pub(crate) mod tests {
         assert_eq!(s.ids, vec![surface(&after, [0., 0., 1.])]);
         assert_eq!(followed.notes.len(), 2, "{:?}", followed.notes);
         assert!(followed.notes[0].contains("1 picked surface changed shape"));
-        assert!(followed.notes[1].contains("1 of its 2 picked surfaces is not on the new part"));
+        assert!(
+            followed.notes[1].contains("1 of its 2 picked surfaces is not found on the new part")
+        );
+        let id = &doc.setup().operations[0].id;
+        assert!(doc.pick_checks[id].contains("changed shape"));
     }
 
     /// Nothing found: the selection is left as it was, with its places, for
@@ -402,7 +475,7 @@ pub(crate) mod tests {
         let followed = follow(&mut doc, &after, Some(&before));
         assert_eq!(followed.operations, 0);
         assert!(
-            followed.notes[0].contains("none of its 1 picked surface"),
+            followed.notes[0].contains("None of its 1 picked surface"),
             "{:?}",
             followed.notes
         );
@@ -417,5 +490,100 @@ pub(crate) mod tests {
             "{:?}",
             followed.notes
         );
+    }
+
+    /// A rectangle `[x0, x1] × [y0, y1]` at height `z` facing up (or down).
+    fn rect(x0: f32, y0: f32, x1: f32, y1: f32, z: f32, up: bool) -> Vec<[[f32; 3]; 3]> {
+        let (a, b, c, d) = ([x0, y0, z], [x1, y0, z], [x1, y1, z], [x0, y1, z]);
+        if up {
+            vec![[a, b, c], [a, c, d]]
+        } else {
+            vec![[a, c, b], [a, d, c]]
+        }
+    }
+    fn up_at(mesh: &Mesh, x: f32, y: f32, z: f32) -> usize {
+        let scale = mesh.display_scale();
+        (mesh.surfaces.iter().enumerate())
+            .filter(|(_, s)| s.normal[2] > 0.999)
+            .map(|(i, s)| {
+                (
+                    i,
+                    (0..3)
+                        .map(|k| (s.center[k] - mesh.origin[k]) / scale)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .min_by(|a, b| {
+                let d = |c: &Vec<f32>| (c[0] - x).hypot(c[1] - y) + (c[2] - z).abs();
+                d(&a.1).total_cmp(&d(&b.1))
+            })
+            .unwrap()
+            .0
+    }
+
+    /// Review finding: a pocket floor deepened, with a small boss left at
+    /// its old height, is not taken for the boss's top: it is not found,
+    /// and the operation says so until checked.
+    #[test]
+    fn a_deepened_floor_is_not_taken_for_a_boss_left_at_its_height() {
+        let mut before = rect(0., 0., 40., 40., 0., false);
+        before.extend(rect(12., 12., 28., 28., 5., true));
+        let mut after = rect(0., 0., 40., 40., 0., false);
+        after.extend(rect(12., 12., 28., 28., 3., true));
+        after.extend(rect(18., 18., 22., 22., 5., true));
+        let before = crate::mesh::normalize(before).unwrap();
+        let after = crate::mesh::normalize(after).unwrap();
+        let mut doc = doc_picking(&before, vec![up_at(&before, 20., 20., 5.)]);
+        record(&mut doc, &before);
+        for old in [Some(&before), None] {
+            let mut doc = doc.clone();
+            let followed = follow(&mut doc, &after, old);
+            assert_eq!(followed.operations, 0);
+            assert!(
+                followed.notes[0].contains("None of its 1 picked surface"),
+                "{:?}",
+                followed.notes
+            );
+            let op = &doc.setup().operations[0];
+            assert!(!op.surfaces.as_ref().unwrap().matches(&after));
+            assert!(doc.pick_checks[&op.id].contains("Pick them again"));
+        }
+    }
+
+    /// Review finding: an L-shaped floor shortened, beside a small pocket
+    /// floor on its plane inside its box that was not picked, picks the
+    /// floor alone, the part as it was loaded or not (a project opened after
+    /// its file changed).
+    #[test]
+    fn a_reshaped_floor_does_not_take_a_surface_beside_it_not_picked() {
+        let part = |x: f32| {
+            let mut t = rect(0., 0., 40., 40., 0., false);
+            t.extend(rect(0., 0., 6., 6., 5., true));
+            t.extend(rect(6., 0., x, 6., 5., true));
+            t.extend(rect(0., 6., 6., 20., 5., true));
+            t.extend(rect(12., 12., 16., 16., 5., true));
+            crate::mesh::normalize(t).unwrap()
+        };
+        let (before, after) = (part(20.), part(16.));
+        let l = before.region_of(up_at(&before, 1., 1., 5.));
+        let floor: Vec<usize> = (0..before.surfaces.len())
+            .filter(|&i| before.surfaces[i].normal[2] > 0.999 && i != up_at(&before, 14., 14., 5.))
+            .collect();
+        assert!(!l.is_empty());
+        let mut doc = doc_picking(&before, floor);
+        record(&mut doc, &before);
+        let small = up_at(&after, 14., 14., 5.);
+        for old in [Some(&before), None] {
+            let mut doc = doc.clone();
+            let followed = follow(&mut doc, &after, old);
+            let ids = &doc.setup().operations[0].surfaces.as_ref().unwrap().ids;
+            assert!(!ids.contains(&small), "{ids:?} {:?}", followed.notes);
+            assert!(!ids.is_empty());
+            assert!(
+                followed.notes.iter().any(|n| n.contains("changed shape")),
+                "{:?}",
+                followed.notes
+            );
+        }
     }
 }
