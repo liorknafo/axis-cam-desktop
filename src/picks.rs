@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 /// A surface of the part, in the model file's units: its normal, centre,
-/// area and box.
+/// area, box and second moments of area.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Place {
     /// The surface's number on the mesh the places were recorded on.
@@ -20,6 +20,12 @@ pub struct Place {
     pub area: f32,
     pub min: [f32; 3],
     pub max: [f32; 3],
+    /// Its second moments of area about its centre: xx, yy, zz, xy, xz,
+    /// yz. Two surfaces at one place as large but of another shape (a ring
+    /// and the boss top inside it) differ in them. All 0 in places kept
+    /// before they were: not known, so not compared.
+    #[serde(default)]
+    pub moments: [f32; 6],
 }
 /// The places of an operation's picked surfaces, one for each, in the order
 /// of its selection, on the mesh `mesh_fingerprint` names.
@@ -63,17 +69,40 @@ fn places(mesh: &Mesh) -> Vec<Place> {
             area: s.area / (scale * scale),
             min: [f32::INFINITY; 3],
             max: [f32::NEG_INFINITY; 3],
+            moments: [0.; 6],
         })
         .collect();
+    const PAIRS: [(usize, usize); 6] = [(0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2)];
     for face in &mesh.faces {
         let Some(place) = face.feature.and_then(|id| out.get_mut(id)) else {
             continue;
         };
-        for p in &face.points {
-            let p = file(*p);
+        let points: Vec<[f32; 3]> = face.points.iter().map(|p| file(*p)).collect();
+        for p in &points {
             for i in 0..3 {
                 place.min[i] = place.min[i].min(p[i]);
                 place.max[i] = place.max[i].max(p[i]);
+            }
+        }
+        // Each triangle's second moments about the surface's centre (a face
+        // of more points as a fan): its area over 12 times (the sum of v vᵀ
+        // plus (Σv)(Σv)ᵀ), v from the centre.
+        for k in 2..points.len() {
+            let [a, b, c] = [points[0], points[k - 1], points[k]];
+            let v = [a, b, c].map(|p| sub(p, place.center));
+            let cross = {
+                let (e, f) = (sub(b, a), sub(c, a));
+                [
+                    e[1] * f[2] - e[2] * f[1],
+                    e[2] * f[0] - e[0] * f[2],
+                    e[0] * f[1] - e[1] * f[0],
+                ]
+            };
+            let area = dot(cross, cross).sqrt() / 2.;
+            let sum: [f32; 3] = std::array::from_fn(|i| v[0][i] + v[1][i] + v[2][i]);
+            for (m, (i, j)) in place.moments.iter_mut().zip(PAIRS) {
+                let vv: f32 = v.iter().map(|p| p[i] * p[j]).sum();
+                *m += area / 12. * (vv + sum[i] * sum[j]);
             }
         }
     }
@@ -147,12 +176,24 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
 fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     std::array::from_fn(|i| a[i] - b[i])
 }
-/// The same surface: facing the same way, at the same place, as large.
+/// The same surface: facing the same way, at the same place, as large, in
+/// the same box and of the same shape (its second moments).
 fn same(a: &Place, b: &Place, tol: f32) -> bool {
     let d = sub(a.center, b.center);
+    let area = a.area.max(b.area);
+    // A moment is an area times a length squared: its scale here.
+    let reach = (0..3)
+        .map(|i| (a.max[i] - a.min[i]).max(b.max[i] - b.min[i]))
+        .fold(0f32, f32::max);
+    let moment = area * reach * reach;
     dot(a.normal, b.normal) >= SAME_NORMAL
         && dot(d, d).sqrt() <= tol
-        && (a.area - b.area).abs() <= 1e-3 * a.area.max(b.area) + tol * tol
+        && (a.area - b.area).abs() <= 1e-3 * area + tol * tol
+        && (0..3).all(|i| (a.min[i] - b.min[i]).abs() <= tol && (a.max[i] - b.max[i]).abs() <= tol)
+        && (a.moments == [0.; 6]
+            || b.moments == [0.; 6]
+            || (a.moments.iter().zip(&b.moments))
+                .all(|(x, y)| (x - y).abs() <= 1e-3 * moment + tol * tol * area))
 }
 /// On the same plane, facing the same way, with boxes that meet.
 fn same_plane(a: &Place, b: &Place, tol: f32) -> bool {
@@ -298,6 +339,9 @@ pub fn follow(doc: &mut Document, mesh: &Mesh, old: Option<&Mesh>) -> Followed {
                 // Taken for the surface only when they are about as large
                 // and cover about the same part of the plane: not a small
                 // boss top left where a deepened floor was.
+                // ponytail: boxes, not outlines: a ring's plane taken by the
+                // boss inside it, as large, passes, said as changed shape;
+                // keep outlines with the places if that needs telling apart.
                 let area: f32 = there.iter().map(|n| n.area).sum();
                 let mut span = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
                 for n in &there {
@@ -415,6 +459,19 @@ pub(crate) mod tests {
         );
         let mut doc = doc_picking(&before, vec![top, side]);
         record(&mut doc, &before);
+        // As kept before places had their moments: read back, and found as
+        // they were.
+        let mut old = serde_json::to_value(&doc).unwrap();
+        for p in old["places"].as_object_mut().unwrap().values_mut() {
+            for f in p["faces"].as_array_mut().unwrap() {
+                f.as_object_mut().unwrap().remove("moments");
+            }
+        }
+        let mut old: Document = serde_json::from_value(old).unwrap();
+        assert!((old.places.values().flat_map(|p| &p.faces)).all(|f| f.moments == [0.; 6]));
+        let followed = follow(&mut old, &after, None);
+        assert!(followed.notes.is_empty(), "{:?}", followed.notes);
+        assert_eq!(followed.operations, 1);
         let followed = follow(&mut doc, &after, None);
         assert_eq!(followed.operations, 1);
         assert!(followed.notes.is_empty(), "{:?}", followed.notes);
@@ -583,6 +640,53 @@ pub(crate) mod tests {
                 followed.notes.iter().any(|n| n.contains("changed shape")),
                 "{:?}",
                 followed.notes
+            );
+        }
+    }
+
+    /// Review finding: a square ring floor deepened, with the boss inside it
+    /// grown to the ring's area at the ring's old height, is not taken for
+    /// the boss top unchanged: same centre and area are not the same
+    /// surface. Taken as the ring changed shape, it says so until checked.
+    #[test]
+    fn a_ring_is_not_taken_for_a_boss_top_of_its_centre_and_area() {
+        // A 20 × 20 ring round a 12 × 12 hole: 256 mm², at `z`, in four
+        // trapezoids sharing whole edges, so one surface.
+        let ring = |z: f32| {
+            let o = [[0., 0.], [20., 0.], [20., 20.], [0., 20.]];
+            let i = [[4., 4.], [16., 4.], [16., 16.], [4., 16.]];
+            let p = |[x, y]: [f32; 2]| [x, y, z];
+            (0..4)
+                .flat_map(|k| {
+                    let n = (k + 1) % 4;
+                    [[p(o[k]), p(o[n]), p(i[n])], [p(o[k]), p(i[n]), p(i[k])]]
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut before = rect(-10., -10., 30., 30., 0., false);
+        before.extend(ring(5.));
+        let mut after = rect(-10., -10., 30., 30., 0., false);
+        after.extend(ring(3.));
+        after.extend(rect(2., 2., 18., 18., 5., true));
+        let before = crate::mesh::normalize(before).unwrap();
+        let after = crate::mesh::normalize(after).unwrap();
+        let ring_ids: Vec<usize> = (0..before.surfaces.len())
+            .filter(|&i| before.surfaces[i].normal[2] > 0.999)
+            .collect();
+        assert_eq!(ring_ids.len(), 1);
+        let mut doc = doc_picking(&before, ring_ids);
+        record(&mut doc, &before);
+        let boss = up_at(&after, 10., 10., 5.);
+        for old in [Some(&before), None] {
+            let mut doc = doc.clone();
+            let followed = follow(&mut doc, &after, old);
+            let op = &doc.setup().operations[0];
+            let s = op.surfaces.as_ref().unwrap();
+            let note = &doc.pick_checks[&op.id];
+            assert!(
+                !(s.matches(&after) && s.ids.contains(&boss)) || note.contains("changed shape"),
+                "{:?} {note}",
+                s.ids
             );
         }
     }

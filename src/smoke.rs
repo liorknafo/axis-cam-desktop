@@ -19466,8 +19466,17 @@ soft_max = 180.0
             &a,
             &["Part changed · check picked surfaces", "Picks checked"],
         );
+        // A click refused changes no pick and leaves the note.
+        let _ = a.update(Message::Surface(usize::MAX));
+        assert!(a.doc.pick_checks.contains_key(&id));
         let _ = a.update(Message::PicksChecked);
         assert!(!a.doc.pick_checks.contains_key(&id));
+        // A click that picks or drops a surface sees to it too.
+        let top = top_of(&a)[0];
+        a.doc.pick_checks.insert(id.clone(), "changed shape".into());
+        let _ = a.update(Message::Surface(top));
+        assert!(!a.doc.pick_checks.contains_key(&id));
+        let _ = a.update(Message::Surface(top));
         let mesh = a.imported_mesh.as_ref().unwrap();
         assert!(
             crate::surface::issues(&a.doc.setup().operations[0], a.doc.setup(), Some(mesh))

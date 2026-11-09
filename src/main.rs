@@ -5232,6 +5232,11 @@ impl App {
             Message::Edit(target, ..) => Some((target, self.edited(target))),
             _ => None,
         };
+        // A click that picks or drops a surface: the selected operation's
+        // picks as they were, to see whether it changed them.
+        let picked = matches!(message, Message::Surface(_) | Message::DropHole(_))
+            .then(|| self.operation().map(|o| (o.id.clone(), o.surfaces.clone())))
+            .flatten();
         let task = match fault::guard(|| self.handle(message)) {
             Ok(task) => task,
             Err(fault) => {
@@ -5242,6 +5247,20 @@ impl App {
         if let Some((target, before)) = edit {
             let after = self.edited(target);
             self.typed_last = Some(LastEdit { before, after });
+        }
+        // Picked or dropped: what the model file's change did to its picks
+        // is seen to. A click refused leaves the note.
+        if let Some((id, was)) = picked {
+            let ids = |s: &Option<surface::Selection>| {
+                s.as_ref()
+                    .map(|s| (s.mesh_fingerprint.clone(), s.ids.clone()))
+            };
+            let changed = (self.doc.setups.iter().flat_map(|s| &s.operations))
+                .find(|o| o.id == id)
+                .is_some_and(|o| ids(&o.surfaces) != ids(&was));
+            if changed {
+                self.doc.pick_checks.remove(&id);
+            }
         }
         // Batched only when it starts one: a batch is never an empty task.
         let task = match self.refresh_part_holes() {
@@ -5810,11 +5829,6 @@ impl App {
                 };
                 if n >= mesh.surfaces.len() {
                     return Task::none();
-                }
-                // Picked again: what the model file's change did to the
-                // picks is seen to.
-                if let Some(id) = self.operation().map(|o| o.id.clone()) {
-                    self.doc.pick_checks.remove(&id);
                 }
                 let fingerprint = mesh.fingerprint.clone();
                 // An indexed setup reads the click at the A angle that turns
