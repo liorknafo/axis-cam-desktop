@@ -50,6 +50,12 @@ struct Facet {
 }
 /// The facets at each corner seen from above, by its key (`key`).
 type Corners = HashMap<(i64, i64), Vec<usize>>;
+#[cfg(test)]
+thread_local! {
+    /// How many circles `fit` has fitted on this thread: what a click on
+    /// a wall costs.
+    pub static FITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 /// Two corners seen from above are one within this, mm.
 const SAME: f64 = 1e-3;
 /// A corner's key, for finding the facets that meet at it.
@@ -116,6 +122,8 @@ fn facets(g: &Geometry, keep: impl Fn(usize) -> bool) -> HashMap<usize, Facet> {
 /// it to a thousandth: a spline's are not), or facets going more than 45°
 /// round it, or not as far round as each other.
 fn fit(facets: &HashMap<usize, Facet>, members: &[usize]) -> Option<([f64; 2], f64, f64)> {
+    #[cfg(test)]
+    FITS.with(|n| n.set(n.get() + 1));
     let mut seen = HashSet::new();
     let points: Vec<(f64, f64)> = (members.iter())
         .flat_map(|m| facets[m].xy.iter().copied())
@@ -192,11 +200,21 @@ fn corners(facets: &HashMap<usize, Facet>) -> Corners {
     at
 }
 /// The facets of `facets` that meet any of `members` at a corner, not among
-/// them, in order of id.
+/// them, in order of id: at a corner seen from above and at a height both
+/// reach. Facets over each other only (a modeled thread's crests, a turn
+/// apart) do not meet: taken as meeting, a thread's hundreds made every
+/// click on it grow arcs for minutes.
 fn neighbours(facets: &HashMap<usize, Facet>, at: &Corners, members: &[usize]) -> Vec<usize> {
     let mut out: Vec<usize> = (members.iter())
-        .flat_map(|m| facets[m].xy.iter())
-        .flat_map(|p| at.get(&key(*p)).into_iter().flatten())
+        .flat_map(|m| {
+            let a = &facets[m];
+            (a.xy.iter())
+                .flat_map(|p| at.get(&key(*p)).into_iter().flatten())
+                .filter(move |f| {
+                    let b = &facets[*f];
+                    b.low <= a.high + SAME as f32 && a.low <= b.high + SAME as f32
+                })
+        })
         .copied()
         .filter(|f| !members.contains(f))
         .collect();
@@ -485,7 +503,22 @@ pub fn arc_at(setup: &Setup, mesh: &Mesh, id: usize) -> Result<Arc, NoArc> {
     }
     let at = corners(&facets);
     let members = grow(&facets, &at, id).ok_or(NoArc::NotRound)?;
-    whole_arc(across(setup, mesh, &g), &facets, &facets, &at, members)
+    let a = whole_arc(across(setup, mesh, &g), &facets, &facets, &at, members)?;
+    if on_thread(&crate::thread::holes_in_setup(setup, mesh), &a) {
+        return Err(NoArc::NotRound);
+    }
+    Ok(a)
+}
+/// Whether arc `a` is a crest of one of the modeled `threads` (along Z):
+/// round its axis and no wider than it. Its hole's wall, drilled as that
+/// hole, not an arc. Known by the thread, not by the hole a wall of it
+/// picks: a thread's walls past a leaning flank pick none by themselves
+/// (`pocket::LEANING`).
+fn on_thread(threads: &[crate::thread::Thread], a: &Arc) -> bool {
+    threads.iter().any(|t| {
+        (t.centre[0] - a.centre[0]).hypot(t.centre[1] - a.centre[1]) <= 0.05
+            && a.r <= t.major / 2. + 0.05
+    })
 }
 /// The arcs a Drill drills among the surfaces `ids` (its selection), as
 /// `setup` places the part: each run of selected upright facets on one
@@ -529,11 +562,13 @@ pub fn drilled_arcs(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc
     if found.is_empty() {
         return found;
     }
-    // A whole round hole a wall of the arc picks, round the arc's centre, is
-    // drilled as that hole (each such hole read once: a modeled thread's
-    // crests are many arcs round its axis). One round another centre (a
-    // slot so short it reads as round) leaves the arc its own.
+    // A modeled thread's crests, arcs round its axis, are its hole's
+    // (`on_thread`). A whole round hole a wall of the arc picks, round the
+    // arc's centre, is drilled as that hole (each such hole read once). One
+    // round another centre (a slot so short it reads as round) leaves the
+    // arc its own.
     let threaded = Geometry::with_threads(setup, mesh);
+    found.retain(|a| !on_thread(&threaded.threads, a));
     let rims = super::rims(&threaded);
     let mut whole: HashSet<usize> = HashSet::new();
     found.retain(|a| {
