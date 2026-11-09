@@ -3355,6 +3355,89 @@ pub(crate) fn picture_points(
 ) -> Vec<Point> {
     picture_projector(triangles, size).map_or(vec![], |p| points.iter().map(|v| p.p(*v)).collect())
 }
+/// A tool standing on `at` (the tip, mm), its axis along +Z, to scale:
+/// its cutting part `diameter` wide and `flutes` long, ending in a 118°
+/// point when `point` (a centre drill, `centre`: its pilot and 60° cone
+/// under the body), its shank on up to `stickout`, then a holder; and
+/// an orange ring on the face round it, the spot it touches. Shaded as
+/// the view shades stock.
+pub(crate) fn tool_triangles(
+    at: [f32; 3],
+    diameter: f32,
+    flutes: f32,
+    stickout: f32,
+    point: bool,
+    centre: Option<crate::model::CentreDrill>,
+) -> Vec<([[f32; 3]; 3], [u8; 4])> {
+    const SIDES: usize = 48;
+    const STEEL: [f32; 3] = [196., 202., 210.];
+    const FLUTED: [f32; 3] = [120., 150., 190.];
+    const HOLDER: [f32; 3] = [90., 96., 104.];
+    const SPOT: [f32; 3] = [235., 110., 30.];
+    let r = diameter / 2.;
+    let tip = if point {
+        r / (59f32.to_radians()).tan()
+    } else {
+        0.
+    };
+    let ring = |rad: f32, z: f32| -> Vec<[f32; 3]> {
+        (0..SIDES)
+            .map(|i| {
+                let a = i as f32 / SIDES as f32 * std::f32::consts::TAU;
+                [at[0] + rad * a.cos(), at[1] + rad * a.sin(), at[2] + z]
+            })
+            .collect()
+    };
+    let mut out = vec![];
+    // A band between two rings, its faces outward.
+    let mut band = |a: &[[f32; 3]], b: &[[f32; 3]], base: [f32; 3]| {
+        for i in 0..SIDES {
+            let j = (i + 1) % SIDES;
+            for t in [[a[i], a[j], b[j]], [a[i], b[j], b[i]]] {
+                out.push((t, shade(&t, base)));
+            }
+        }
+    };
+    let flutes = flutes.max(tip + 0.1).min(stickout.max(tip + 0.1));
+    let stickout = stickout.max(flutes);
+    let holder = (diameter * 1.6).max(diameter + 10.);
+    let (point_ring, flute_top, shank_top) = (ring(r, tip), ring(r, flutes), ring(r, stickout));
+    match centre {
+        Some(c) => {
+            let (q, length) = (c.pilot / 2., c.pilot_length);
+            let cone = length + (r - q).max(0.) * crate::model::CentreDrill::rise();
+            let pilot = [ring(0., 0.), ring(q, q * 0.6), ring(q, length)];
+            band(&pilot[0], &pilot[1], FLUTED);
+            band(&pilot[1], &pilot[2], FLUTED);
+            band(&pilot[2], &ring(r, cone), FLUTED);
+            band(&ring(r, cone), &flute_top, FLUTED);
+        }
+        None => {
+            band(&ring(0., 0.), &point_ring, FLUTED);
+            band(&point_ring, &flute_top, FLUTED);
+        }
+    }
+    band(&flute_top, &shank_top, STEEL);
+    let (h0, h1) = (
+        ring(holder / 2., stickout),
+        ring(holder / 2., stickout + holder),
+    );
+    band(&shank_top, &h0, HOLDER);
+    band(&h0, &h1, HOLDER);
+    band(&h1, &ring(0., stickout + holder), HOLDER);
+    // The spot: a flat ring just over the face.
+    let (inner, outer) = (ring(r * 1.25 + 0.5, 0.05), ring(r * 1.25 + 2.5, 0.05));
+    for i in 0..SIDES {
+        let j = (i + 1) % SIDES;
+        for t in [
+            [inner[i], outer[i], outer[j]],
+            [inner[i], outer[j], inner[j]],
+        ] {
+            out.push((t, shade(&t, SPOT)));
+        }
+    }
+    out
+}
 fn box_vertices(bounds: crate::mesh::Bounds) -> [[f32; 3]; 8] {
     let [x, y, z] = bounds.min;
     let [xx, yy, zz] = bounds.max;

@@ -60,6 +60,9 @@ pub struct Shown {
     /// By picture, the sizes drawn on it (the Check screen's), in its
     /// pixels.
     dims: Vec<Vec<Dim>>,
+    /// By step, a Tool step's picture: the stock before its operation with
+    /// the tool to scale on the spot to touch (`viewport::tool_triangles`).
+    tools: Vec<Option<image::Handle>>,
     /// On the lathe: what its side views draw.
     side: Option<turning::Side>,
 }
@@ -86,6 +89,7 @@ impl Shown {
             pictures: self.pictures.clone(),
             held: self.held.clone(),
             dims: self.dims.clone(),
+            tools: self.tools.clone(),
             side: self.side.clone(),
         })
     }
@@ -235,6 +239,37 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
                 .collect(),
         );
     }
+    // A new tool on the stock before its operation, standing on the
+    // highest top left (LIO-376).
+    let jaw = solid(&jaws);
+    let tools = (guide.steps.iter())
+        .map(|step| {
+            let Step::Tool {
+                op,
+                top: Some(_),
+                diameter,
+                tool,
+                ..
+            } = step
+            else {
+                return None;
+            };
+            let j = guide.done.iter().position(|d| d.op == *op)?;
+            let t = doc.tools.iter().find(|t| &t.id == tool);
+            let length = |k: &str| t.and_then(|t| num(&t.p, k)).filter(|v| *v > 0.);
+            let flutes = length("length").unwrap_or(3. * diameter);
+            let stickout = length("stickout").unwrap_or(flutes + diameter);
+            let point = t.is_some_and(|t| get(&t.p, "type").to_lowercase().contains("drill"));
+            let centre = t.and_then(|t| t.centre_drill());
+            let spot = touch_spot(&stock[j])?;
+            let mut triangles = stock[j].clone();
+            triangles.extend(viewport::tool_triangles(
+                spot, *diameter, flutes, stickout, point, centre,
+            ));
+            triangles.extend(jaw.iter().copied());
+            viewport::stock_picture(&triangles, PICTURE)
+        })
+        .collect();
     let side = crate::lathe::is_lathe(&setup.machine).then(|| turning::side(doc, mesh, &guide));
     Ok(Shown {
         guide,
@@ -246,9 +281,38 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
         pictures,
         held,
         dims,
+        tools,
         side,
     })
 }
+/// Where a new tool touches the top: on the highest flat face of the stock
+/// `triangles` (stock frame), the middle of it, or the face's triangle
+/// nearest that when the face is not convex.
+pub(crate) fn touch_spot(triangles: &[([[f32; 3]; 3], [u8; 4])]) -> Option<[f32; 3]> {
+    let flat = |t: &[[f32; 3]; 3]| {
+        let n = normal(t);
+        let size = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        size > 1e-9 && n[2].abs() / size > 0.999
+    };
+    let top = (triangles.iter())
+        .filter(|(t, _)| flat(t))
+        .map(|(t, _)| t[0][2])
+        .fold(f32::NEG_INFINITY, f32::max);
+    let middles: Vec<[f32; 3]> = (triangles.iter())
+        .filter(|(t, _)| flat(t) && t.iter().all(|p| (p[2] - top).abs() < 0.01))
+        .map(|(t, _)| std::array::from_fn(|k| (t[0][k] + t[1][k] + t[2][k]) / 3.))
+        .collect();
+    let n = middles.len() as f32;
+    let centre: [f32; 3] = std::array::from_fn(|k| middles.iter().map(|m| m[k]).sum::<f32>() / n);
+    middles
+        .into_iter()
+        .min_by(|a, b| {
+            let d = |m: &[f32; 3]| (m[0] - centre[0]).hypot(m[1] - centre[1]);
+            d(a).total_cmp(&d(b))
+        })
+        .map(|m| [m[0], m[1], top])
+}
+
 /// A size the Check screen gives to measure (LIO-370): `value` mm along
 /// `axis` ("X", "Y", "Z" or "Ø"), said by `words` as a caliper or depth
 /// gauge reads it, and drawn on the picture from `from` to `to` (stock
@@ -1134,118 +1198,6 @@ impl canvas::Program<Message> for Drawing<'_> {
         vec![state.0.draw(renderer, bounds.size(), |f| self.paint(f))]
     }
 }
-/// A tool in its holder, its diameter and the gear it runs at.
-struct ToolPicture {
-    diameter: f32,
-    rpm: f32,
-    drill: bool,
-    /// A centre drill's sizes: its 60° cone and pilot under the body.
-    centre: Option<crate::model::CentreDrill>,
-}
-impl canvas::Program<Message> for ToolPicture {
-    type State = ();
-    fn draw(
-        &self,
-        _: &(),
-        renderer: &iced::Renderer,
-        _: &Theme,
-        bounds: Rectangle,
-        _: mouse::Cursor,
-    ) -> Vec<canvas::Geometry> {
-        let mut f = canvas::Frame::new(renderer, bounds.size());
-        let (cx, w) = (bounds.width * 0.6, 60.);
-        f.fill_rectangle(Point::new(cx - 44., 16.), Size::new(88., 62.), JAW);
-        f.stroke(
-            &canvas::Path::rectangle(Point::new(cx - 44., 16.), Size::new(88., 62.)),
-            stroke(MUTED, 1.),
-        );
-        write(
-            &mut f,
-            "holder",
-            Point::new(cx + 52., 46.),
-            MUTED,
-            13.,
-            Align::Left,
-        );
-        let (top, h) = (78., 96.);
-        // A centre drill's cone and pilot, to scale with the body: the cone's
-        // end and the pilot's half-width and tip.
-        let centre = self.centre.map(|c| {
-            let q = c.pilot * w / c.body / 2.;
-            let cone = top + h + (w / 2. - q) * crate::model::CentreDrill::rise();
-            (cone, q, cone + (c.pilot_length * w / c.body).min(40.))
-        });
-        let body = canvas::Path::new(|b| {
-            b.move_to(Point::new(cx - w / 2., top));
-            b.line_to(Point::new(cx + w / 2., top));
-            b.line_to(Point::new(cx + w / 2., top + h));
-            if let Some((cone, q, tip)) = centre {
-                for p in [[q, cone], [q, tip], [-q, tip], [-q, cone]] {
-                    b.line_to(Point::new(cx + p[0], p[1]));
-                }
-            } else if self.drill {
-                b.line_to(Point::new(cx, top + h + 18.));
-            }
-            b.line_to(Point::new(cx - w / 2., top + h));
-            b.close();
-        });
-        f.fill(&body, Color { a: 0.3, ..TOOL });
-        f.stroke(&body, stroke(TOOL, 1.6));
-        for i in 0..4 {
-            let y = top + 14. + i as f32 * 21.;
-            f.stroke(
-                &canvas::Path::line(Point::new(cx - w / 2., y), Point::new(cx + w / 2., y + 14.)),
-                stroke(TOOL, 1.4),
-            );
-        }
-        let y = centre.map_or(top + h + 34., |(_, _, tip)| tip + 16.);
-        arrow(
-            &mut f,
-            Point::new(cx, y),
-            Point::new(cx - w / 2., y),
-            INK,
-            1.2,
-        );
-        arrow(
-            &mut f,
-            Point::new(cx, y),
-            Point::new(cx + w / 2., y),
-            INK,
-            1.2,
-        );
-        f.fill_text(canvas::Text {
-            content: format!("Ø {}", dro(self.diameter)),
-            position: Point::new(cx, y + 18.),
-            color: INK,
-            size: 16.into(),
-            align_x: iced::advanced::text::Alignment::Center,
-            align_y: iced::alignment::Vertical::Center,
-            ..Default::default()
-        });
-        // The gear.
-        let g = Point::new(bounds.width * 0.18, 120.);
-        f.stroke(&canvas::Path::circle(g, 40.), stroke(ACCENT, 2.5));
-        f.fill_text(canvas::Text {
-            content: format!("{}", self.rpm.round()),
-            position: g,
-            color: ACCENT,
-            size: 22.into(),
-            align_x: iced::advanced::text::Alignment::Center,
-            align_y: iced::alignment::Vertical::Center,
-            ..Default::default()
-        });
-        f.fill_text(canvas::Text {
-            content: "rpm".into(),
-            position: Point::new(g.x, g.y + 58.),
-            color: MUTED,
-            size: 13.into(),
-            align_x: iced::advanced::text::Alignment::Center,
-            align_y: iced::alignment::Vertical::Center,
-            ..Default::default()
-        });
-        vec![f.into_geometry()]
-    }
-}
 /// The sizes `dims` drawn over a picture of `PICTURE` pixels shown as wide
 /// and high as it fits in the canvas, centred (an image's `Contain`).
 struct Dims<'a>(&'a [Dim]);
@@ -1292,6 +1244,35 @@ impl canvas::Program<Message> for Dims<'_> {
         }
         vec![f.into_geometry()]
     }
+}
+/// The gear to set, large: `rpm` in a ring.
+fn gear<'a>(rpm: f32) -> Element<'a, Message> {
+    let mono = Font {
+        weight: iced::font::Weight::Bold,
+        ..Font::MONOSPACE
+    };
+    container(
+        column![
+            text(format!("{}", rpm.round()))
+                .size(44)
+                .font(mono)
+                .color(ACCENT),
+            text("rpm · set the gear").size(14).color(MUTED)
+        ]
+        .align_x(Alignment::Center)
+        .spacing(2),
+    )
+    .padding([18, 20])
+    .style(|_| container::Style {
+        background: Some(Color::WHITE.into()),
+        border: Border {
+            color: ACCENT,
+            width: 3.,
+            radius: 14.into(),
+        },
+        ..Default::default()
+    })
+    .into()
 }
 /// The tool seen from above with the edge the DRO's compensation shows on
 /// X and Y.
@@ -1441,7 +1422,7 @@ fn dro_tool<'a>(diameter: f32, comp: [i8; 2], height: f32) -> Vec<Element<'a, Me
 
 /// A new tool picks up Z: touch the top and set Z to `top`; nothing for a
 /// tool already in.
-fn pick_up<'a>(top: Option<f32>) -> Vec<Element<'a, Message>> {
+fn pick_up<'a>(top: Option<f32>, ringed: bool) -> Vec<Element<'a, Message>> {
     let Some(top) = top else {
         return vec![];
     };
@@ -1454,7 +1435,10 @@ fn pick_up<'a>(top: Option<f32>) -> Vec<Element<'a, Message>> {
                 axis: "Z".into(),
                 value: dro(top),
                 lock: None,
-                tags: vec![],
+                tags: match ringed {
+                    true => vec!["where it is ringed".into()],
+                    false => vec![],
+                },
                 lit: Lit::Next,
                 big: false,
             },
@@ -2057,29 +2041,30 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             diameter,
             comp,
             top,
+            ..
         } => {
-            let drill = p
-                .setup
-                .operations
-                .get(*op)
-                .is_some_and(|o| o.strategy == Strategy::Drill);
             let right = column![chips(vec![
                 chip(p.named(tool, *diameter)),
                 chip(format!("{} rpm", rpm.round()))
             ]),]
-            .extend(pick_up(*top))
+            .extend(pick_up(*top, true))
             .extend(
                 comp.map(|c| dro_tool(*diameter, c, 110.))
                     .unwrap_or_default(),
             );
-            let left = crate::fault::canvas(ToolPicture {
-                diameter: *diameter,
-                rpm: *rpm,
-                drill,
-                centre: p.tool(*op).and_then(|t| t.centre_drill()),
-            })
-            .width(Fill)
-            .height(300)
+            // The stock as it is with the tool to scale on the spot to
+            // touch, ringed (LIO-376), beside the gear.
+            let picture = p.shown.tools.get(p.at).cloned().flatten();
+            let left = row![
+                gear(*rpm),
+                match picture {
+                    Some(_) => Page::image(picture, Fill),
+                    None => space().width(Fill).into(),
+                }
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center)
+            .height(Fill)
             .into();
             match top {
                 Some(_) => ("Tool".into(), "put it in, set the gear", left, right),
@@ -2179,7 +2164,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 chip(p.named(id, *diameter)),
                 chip(format!("{} rpm", rpm.round()))
             ]),]
-            .extend(pick_up(*top))
+            .extend(pick_up(*top, false))
             .push(label("Face down to"))
             .push(readout(
                 Readout {
@@ -2286,7 +2271,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 chip(format!("{} rpm", rpm.round())),
                 chip(format!("down to Z {}", dro(*down_to)))
             ]),]
-            .extend(pick_up(*top))
+            .extend(pick_up(*top, false))
             .extend(dro_tool(*diameter, *comp, 70.))
             .push(label("Cut the side to"))
             .push(readout(
@@ -3579,6 +3564,39 @@ pub(crate) mod tests {
         assert_eq!(labels(3), ["Ø 4", "Z 42"]);
     }
     #[test]
+    fn a_new_tool_is_drawn_to_scale_on_the_highest_top() {
+        // To scale: the cutting part as wide as the tool.
+        for d in [4., 25.] {
+            let tool = viewport::tool_triangles([0., 0., 10.], d, 20., 40., d < 10., None);
+            let (lo, hi) = (tool.iter())
+                .flat_map(|(t, _)| t.iter())
+                // Below the shank, less the ring round the spot.
+                .filter(|p| p[2] < 29.9 && (p[2] - 10.05).abs() > 0.001)
+                .fold((f32::MAX, f32::MIN), |(a, b), p| (a.min(p[0]), b.max(p[0])));
+            close(hi - lo, d);
+        }
+        // A step 2 mm down along the front: the spot is on the higher top.
+        let low = Bounds {
+            min: [0., 0., 0.],
+            max: [100., 15., 8.],
+        };
+        let high = Bounds {
+            min: [0., 15., 0.],
+            max: [100., 60., 10.],
+        };
+        let mut stock = viewport::box_triangles(low, viewport::BLOCK);
+        stock.extend(viewport::box_triangles(high, viewport::BLOCK));
+        let spot = touch_spot(&stock).unwrap();
+        assert!(spot[2] == 10. && spot[1] > 15., "{spot:?}");
+        // On the guide's job every new tool has its picture.
+        let a = app("Yes");
+        let shown = a.guide_at().unwrap().0;
+        for (i, s) in shown.guide.steps.iter().enumerate() {
+            let new = matches!(s, Step::Tool { top: Some(_), .. });
+            assert_eq!(shown.tools[i].is_some(), new, "{i} {s:?}");
+        }
+    }
+    #[test]
     fn back_and_next_are_in_one_place_on_every_screen() {
         let mut a = app("Yes");
         let g = guide(&a);
@@ -4715,5 +4733,4 @@ pub(crate) mod tests {
         let thread = nth(&a, 0, |l| matches!(l, L::ThreadPass { .. }));
         shot(&mut a, "25-inside-thread-pass-2", thread + 1, 1);
     }
-
 }
