@@ -19502,6 +19502,42 @@ soft_max = 180.0
         }
         assert_eq!(a.doc.pick_checks.len(), 4);
     }
+    /// The stages Add the drilling puts before a reaming have its picks, so
+    /// what changed in them too.
+    #[test]
+    fn the_drilling_added_before_a_reaming_keeps_its_picks_note() {
+        use crate::cam::boring::tests::{drill, drilling, job, reamer, ring};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), FAST);
+        let mesh = ring(10., 40., 8.7);
+        let r = reamer("10");
+        let (mut doc, _) = job(
+            &mesh,
+            crate::model::Machine::new(3),
+            vec![(r.clone(), drilling(&mesh, &r, crate::model::REAMING))],
+        );
+        doc.tools.extend(["8", "9.5", "9.8", "10"].map(drill));
+        doc.file = Some(ModelFile {
+            name: "ring.stl".into(),
+            path: dir.path().join("ring.stl"),
+            format: "stl".into(),
+            bytes: 0,
+            thickness: None,
+        });
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        let id = a.doc.setup().operations[0].id.clone();
+        a.record_picks();
+        a.doc.pick_checks.insert(id.clone(), "changed shape".into());
+        a.selected = Some(0);
+        let _ = a.update(Message::AddHoleStages);
+        let ops = &a.doc.setup().operations;
+        assert!(ops.len() > 1, "{}", a.status);
+        for o in &ops[..ops.len() - 1] {
+            assert_eq!(a.doc.pick_checks[&o.id], "changed shape");
+            assert_eq!(a.doc.places.get(&o.id), a.doc.places.get(&id));
+        }
+    }
     /// The file unchanged, Reimport model says so and changes nothing; a
     /// file gone keeps the part as it was loaded.
     #[test]

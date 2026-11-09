@@ -6142,6 +6142,11 @@ impl App {
                 match hole_stages::add(&self.doc, si, oi, mesh) {
                     Ok(added) => {
                         let n = added.ops.len();
+                        // The stages pick what it picks.
+                        let from = self.doc.setups[si].operations[oi].id.clone();
+                        for o in &added.ops {
+                            self.doc.copy_picks(&from, &o.id);
+                        }
                         let ops = &mut self.doc.setups[si].operations;
                         ops.splice(oi..oi, added.ops);
                         if let Some(cut) = added.bore_cut {
