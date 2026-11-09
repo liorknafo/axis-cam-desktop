@@ -8988,6 +8988,10 @@ fn typed_model_path(text: &str) -> Result<PathBuf, String> {
     if let Some(rest) = t.strip_prefix("file://") {
         decoded = percent_decoded(rest.strip_prefix("localhost").unwrap_or(rest));
         t = &decoded;
+        // On Windows file:///C:/part.step names C:/part.step.
+        if cfg!(windows) && t.starts_with('/') && t.get(2..3) == Some(":") {
+            t = &t[1..];
+        }
     }
     let expanded = |t: &str| {
         let home = |rest: &str| dirs::home_dir().map(|h| h.join(rest));
@@ -9018,8 +9022,13 @@ fn typed_model_path(text: &str) -> Result<PathBuf, String> {
         }
     }
     if !path.is_absolute() {
+        let example = if cfg!(windows) {
+            r"C:\Users\you\part.step"
+        } else {
+            "/Users/you/part.step"
+        };
         return Err(format!(
-            "{} is not a whole path. Give it from the top, as /Users/you/part.step.",
+            "{} is not a whole path. Give it from the top, as {example}.",
             path.display()
         ));
     }
