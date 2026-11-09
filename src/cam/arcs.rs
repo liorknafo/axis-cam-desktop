@@ -437,19 +437,25 @@ fn ends_cleanly(
     }
     true
 }
-/// The arc `members` of `facets` is (`arc`) in the part `g`, unless it is
-/// wider round than the part is across seen from above (a nearly flat
-/// stretch of a wall) or does not end cleanly (`ends_cleanly`, over `all`,
-/// the part's upright facets, by corner `at`): then it is no circle's.
+/// How far across the stock `setup` holds is seen from above, mm (the
+/// part's box's, when the stock cannot be sized): no circle a Drill drills
+/// is wider.
+fn across(setup: &Setup, mesh: &Mesh, g: &Geometry) -> f32 {
+    let b = crate::stock::resolve(setup, Some(mesh)).map_or(g.bounds, |r| r.stock);
+    (b.max[0] - b.min[0]).hypot(b.max[1] - b.min[1])
+}
+/// The arc `members` of `facets` is (`arc`), unless its radius is more
+/// than `across` (`across`: a nearly flat stretch of a wall) or it does not
+/// end cleanly (`ends_cleanly`, over `all`, the part's upright facets, by
+/// corner `at`): then it is no circle's.
 fn whole_arc(
-    g: &Geometry,
+    across: f32,
     facets: &HashMap<usize, Facet>,
     all: &HashMap<usize, Facet>,
     at: &Corners,
     members: Vec<usize>,
 ) -> Result<Arc, NoArc> {
     let a = arc(facets, members)?;
-    let across = (g.bounds.max[0] - g.bounds.min[0]).hypot(g.bounds.max[1] - g.bounds.min[1]);
     if a.r > across {
         return Err(NoArc::NotRound);
     }
@@ -469,7 +475,7 @@ pub fn arc_at(setup: &Setup, mesh: &Mesh, id: usize) -> Result<Arc, NoArc> {
     }
     let at = corners(&facets);
     let members = grow(&facets, &at, id).ok_or(NoArc::NotRound)?;
-    whole_arc(&g, &facets, &facets, &at, members)
+    whole_arc(across(setup, mesh, &g), &facets, &facets, &at, members)
 }
 /// The arcs a Drill drills among the surfaces `ids` (its selection), as
 /// `setup` places the part: each run of selected upright facets on one
@@ -483,6 +489,7 @@ pub fn drilled_arcs(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc
         return vec![];
     }
     let at = corners(&facets);
+    let wide = across(setup, mesh, &g);
     // The part's upright facets, for where a curve goes on past an arc.
     let mut all: Option<(HashMap<usize, Facet>, Corners)> = None;
     let mut seeds: Vec<usize> = facets.keys().copied().collect();
@@ -505,7 +512,7 @@ pub fn drilled_arcs(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc
             let by_corner = corners(&every);
             (every, by_corner)
         });
-        if let Ok(a) = whole_arc(&g, &facets, every, by_corner, members) {
+        if let Ok(a) = whole_arc(wide, &facets, every, by_corner, members) {
             found.push(a);
         }
     }
@@ -554,10 +561,27 @@ pub fn on_stock(setup: &Setup, mesh: &Mesh, a: &Arc) -> bool {
 pub fn same_centre(h: &Hole, a: &Arc) -> bool {
     (h.center[0] - a.centre[0]).hypot(h.center[1] - a.centre[1]) <= 0.05
 }
-/// Whether nothing of the part is over the arc `a` past a gap, in `g`: it
-/// opens up, as a hole a Drill drills from above does.
+/// Whether the arc `a` opens up in `g`, a Drill drilling it from above:
+/// nothing of the part is over its top inside its circle near it (where
+/// its floor is looked for, `arc_hole`), and a drill fits down it there.
+/// Turned over, a blind arc's floor and the part past it are over it.
 pub fn opens_up(g: &Geometry, a: &Arc) -> bool {
-    !super::part_past_gap(g, a.centre, a.r, a.top, true)
+    let over = near_arc(a).iter().any(|p| {
+        (g.triangles.iter()).any(|t| plane_height(&t.p, *p).is_some_and(|h| h > a.top + 0.05))
+    });
+    !over && arc_hole(g, a).is_some()
+}
+/// Points inside the circle of the arc `a`, 0.8 of its radius out, at its
+/// middle and on either side of it: where its floor is.
+fn near_arc(a: &Arc) -> [[f32; 2]; 3] {
+    let half = (a.span.to_radians() / 2.).min(std::f32::consts::PI);
+    [-0.6f32, 0., 0.6].map(|k| {
+        let t = a.middle + k * half;
+        [
+            a.centre[0] + 0.8 * a.r * t.cos(),
+            a.centre[1] + 0.8 * a.r * t.sin(),
+        ]
+    })
 }
 /// The hole a Drill drills for the arc `a` in `g`: its whole circle round
 /// its centre, from its top down to the floor under it (the highest of the
@@ -566,15 +590,7 @@ pub fn opens_up(g: &Geometry, a: &Arc) -> bool {
 /// (`bore_at`), so that nothing of the part inside the circle over that
 /// floor is cut. None when nothing a drill fits goes down there.
 pub fn arc_hole(g: &Geometry, a: &Arc) -> Option<Hole> {
-    let half = (a.span.to_radians() / 2.).min(std::f32::consts::PI);
-    let floor = ([-0.6f32, 0., 0.6].iter())
-        .map(|k| a.middle + k * half)
-        .map(|t| {
-            [
-                a.centre[0] + 0.8 * a.r * t.cos(),
-                a.centre[1] + 0.8 * a.r * t.sin(),
-            ]
-        })
+    let floor = (near_arc(a).into_iter())
         .flat_map(|p| {
             (g.triangles.iter())
                 .filter_map(move |t| plane_height(&t.p, p))
@@ -1143,5 +1159,51 @@ pub(crate) mod tests {
             assert_eq!(found.len(), 1, "{found:?}");
             assert!((found[0].diameter - 10.).abs() < 0.01, "{found:?}");
         }
+    }
+    #[test]
+    fn a_shallow_arc_on_a_small_part_is_picked_in_its_stock() {
+        // A 1.1 x 3 part 4 mm thick whose -X side is an R5 arc of 20° round
+        // a centre 5.5 mm off it, in a 20 x 10 stock: wider round than the
+        // part is across, but not than the stock (the reviewer's, round 5).
+        let mut edge: Vec<(f64, f64, f64)> = (0..=20)
+            .map(|k| {
+                let t = (-10. + k as f64).to_radians();
+                (5. * t.cos(), 5. * t.sin(), 0.)
+            })
+            .collect();
+        edge.extend([(6., 1.5, 0.), (6., -1.5, 0.)]);
+        let mesh = mesh::normalize(slab(&[&edge], 4., 0., true, true)).unwrap();
+        let (mut setup, mut op, mut tool) = fixture(Strategy::Drill);
+        for (k, v) in [
+            ("stock_type", "Fixed size box"),
+            ("stock_x", "20"),
+            ("stock_y", "10"),
+            ("stock_z", "6"),
+        ] {
+            setup.p.insert(k.into(), v.into());
+        }
+        let wall = walls_where(&setup, &mesh, |c| c[0] < -0.4 && c[1].abs() < 0.9);
+        assert_eq!(wall.len(), 20);
+        let a = arc_at(&setup, &mesh, wall[0]).unwrap();
+        assert_eq!(a.walls, wall);
+        assert!(
+            (a.r - 5.).abs() < 0.001 && (a.span - 20.).abs() < 0.01,
+            "{a:?}"
+        );
+        assert!(
+            (a.centre[0] + 5.462).abs() < 0.002 && a.centre[1].abs() < 0.001,
+            "{a:?}"
+        );
+        assert!(on_stock(&setup, &mesh, &a));
+        picking(&mut op, &mesh, &a.walls);
+        let found = holes(&setup, &op, &mesh).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        tool.p.insert("diameter".into(), "10".into());
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert!(
+            (plan.moves.iter())
+                .filter(|m| m.motion == Motion::Feed)
+                .all(|m| (m.to[0] - a.centre[0]).abs() < 0.001 && m.to[1].abs() < 0.001)
+        );
     }
 }

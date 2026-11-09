@@ -19738,6 +19738,73 @@ soft_max = 180.0
         );
     }
     #[test]
+    fn a_drill_at_several_angles_picks_a_blind_half_hole_at_the_angle_that_drills_it() {
+        // A blind R5 half hole 6 deep on a block's edge, turned onto its side
+        // on the rotary (A 0, 90, 180 and 270): A90 turns its floor up, over
+        // it, and A270 its opening. A click on it picks it at A270 and drills
+        // it there (the reviewer's, round 5).
+        let tris = (crate::cam::arcs::tests::notched_block(Some(6.)).into_iter())
+            .map(|t| t.map(|p| [p[0], -p[2], p[1]]))
+            .collect();
+        let mesh = crate::mesh::normalize(tris).unwrap();
+        let mut tool = crate::model::Tool::new("T9 Drill 10", "Drill", "10");
+        for (k, v) in [("number", "9"), ("length", "35"), ("stickout", "50")] {
+            tool.p.insert(k.into(), v.into());
+        }
+        let op = Operation::new(Strategy::Drill, tool.id.clone());
+        let mut doc =
+            crate::indexed::tests::bar_job(&mesh, 0., "80", "-150", "0, 90, 180, 270", op);
+        doc.setups[1].operations[0].tool = tool.id.clone();
+        doc.tools = vec![tool];
+        doc.file = Some(ModelFile {
+            name: "side-half-hole.stl".into(),
+            path: "side-half-hole.stl".into(),
+            format: "stl".into(),
+            bytes: 1,
+            thickness: None,
+        });
+        doc.setups[1].operations[0].surfaces = None;
+        doc.active = doc.setups[1].id.clone();
+        let at = |a: f32| doc.setup_at(&doc.setups[1], 1, a, &mesh).unwrap();
+        let (id, arc) = (0..mesh.surfaces.len())
+            .find_map(|id| {
+                let arc = crate::cam::arcs::arc_at(&at(270.), &mesh, id).ok()?;
+                ((arc.span - 180.).abs() < 0.1).then_some((id, arc))
+            })
+            .unwrap();
+        // Over at A90; open at A270.
+        let g = |a: f32| crate::cam::Geometry::new(&at(a), &mesh);
+        let over = crate::cam::arcs::arc_at(&at(90.), &mesh, id).unwrap();
+        assert!(!crate::cam::arcs::opens_up(&g(90.), &over));
+        assert!(crate::cam::arcs::opens_up(&g(270.), &arc));
+        assert_eq!(doc.picking_pose(1, &mesh, id).turn.map(|t| t.a), Some(270.));
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh.clone());
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Tab("Geometry".into()));
+        if !a.picking {
+            let _ = a.update(Message::PickMode);
+        }
+        let _ = a.update(Message::Surface(id));
+        assert!(a.status.starts_with("Picked the 180° arc"), "{}", a.status);
+        let holes = a.drill_holes(a.operation().unwrap(), &mesh);
+        let holes = holes.as_ref().as_ref().unwrap();
+        assert_eq!(holes.len(), 1, "{holes:?}");
+        assert_eq!(holes[0].a, Some(270.));
+        assert!(!holes[0].through && (holes[0].top - holes[0].bottom - 6.).abs() < 0.01);
+        let _ = a.update(Message::Generate);
+        let plan = &a.simulation.as_ref().expect(&a.status).plan;
+        let feeds: Vec<_> = (plan.moves.iter())
+            .filter(|m| m.motion == crate::simulation::Motion::Feed)
+            .collect();
+        assert!(!feeds.is_empty());
+        assert!(feeds.iter().all(|m| m.a == Some(270.)), "{feeds:?}");
+    }
+    #[test]
     fn a_drill_picks_a_half_hole_on_the_parts_edge_by_a_click_and_drills_its_whole_circle() {
         let mut a = pocket_app(crate::cam::arcs::tests::notched_block(None));
         let tool = a.doc.setup().operations[0].tool.clone();
