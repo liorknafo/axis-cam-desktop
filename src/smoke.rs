@@ -29300,4 +29300,76 @@ soft_max = 180.0
             failures.join("\n")
         );
     }
+
+    #[test]
+    #[ignore]
+    fn scratch_user_threaded_holes_pick() {
+        let mut a = app();
+        a.doc = crate::storage::load(std::path::Path::new("/tmp/axis-thread-pick/workspace.json")).unwrap();
+        let path = std::path::PathBuf::from("/tmp/axis-thread-pick/adapter-plate.step");
+        let mesh = crate::mesh::load(&path).unwrap();
+        let file = ModelFile { name: "adapter-plate.step".into(), path: path.clone(), format: "step".into(), bytes: 1, thickness: None };
+        let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
+        let oi = a.doc.setup().operations.iter().position(|o| o.strategy == Strategy::Drill).unwrap();
+        a.selected = Some(oi);
+        a.picking = true;
+        let mesh = a.imported_mesh.clone().unwrap();
+        let setup = a.doc.setup().clone();
+        let op = a.operation().unwrap().clone();
+        eprintln!("drill holes={:?} thread={:?} surfaces={:?}", get(&op.p, "holes"), get(&op.p, "thread"), op.surfaces);
+        let t0 = std::time::Instant::now();
+        let found = crate::find_holes(&setup, &mesh);
+        eprintln!("find_holes {:?}", t0.elapsed());
+        let threads = crate::thread::in_setup(&setup, &mesh);
+        eprintln!("threads {}", threads.len());
+        for (i, h) in found.holes.iter().enumerate() {
+            let ((x, y), (w, d)) = (h.centre(), h.size());
+            let r = found.round.get(i).cloned().flatten();
+            eprintln!("hole {i}: X{x:.2} Y{y:.2} {w:.2}x{d:.2} walls {} round {:?}", h.walls.len(), r.as_ref().map(|r| (r.diameter, r.thread.is_some())));
+        }
+        {
+            let w = found.holes[0].walls[0];
+            let tm = |label: &str, t0: std::time::Instant| eprintln!("  {label}: {:?}", t0.elapsed());
+            let t0 = std::time::Instant::now(); let pose = a.doc.picking_pose(a.doc.index(), &mesh, w); tm("picking_pose", t0);
+            let t0 = std::time::Instant::now(); let _ = crate::stock::Placement::new(&mesh, Some(&pose)).rotation(); tm("placement", t0);
+            let t0 = std::time::Instant::now(); let iw = crate::pocket::is_wall(&pose, &mesh, w); tm("is_wall", t0);
+            let t0 = std::time::Instant::now(); let hw = crate::pocket::hole_walls(&pose, &mesh, w); tm("hole_walls", t0);
+            let t0 = std::time::Instant::now(); let _ = a.pocket_holes(&op, &mesh); tm("pocket_holes(op)", t0);
+            let set: std::collections::HashSet<usize> = hw.clone().unwrap_or_default().into_iter().collect();
+            let t0 = std::time::Instant::now(); let this = crate::pocket::holes(&pose, &set, &mesh).unwrap_or_default(); tm("pocket::holes", t0);
+            let t0 = std::time::Instant::now(); let _ = crate::cam::drill_holes_of(&pose, &mesh, &this); tm("drill_holes_of", t0);
+            eprintln!("  is_wall {iw} hole_walls ok {}", hw.is_ok());
+        }
+        for (i, h) in found.holes.iter().enumerate() {
+            if i > 4 { break; }
+            let before = a.operation().unwrap().surfaces.as_ref().map_or(0, |s| s.ids.len());
+            let t0 = std::time::Instant::now();
+            let _ = a.update(Message::Surface(h.walls[0]));
+            eprintln!("  click took {:?}", t0.elapsed());
+            let after = a.operation().unwrap().surfaces.as_ref().map_or(0, |s| s.ids.len());
+            eprintln!("click hole {i} wall {}: ids {before}->{after}: {}", h.walls[0], a.status);
+        }
+        // Every surface round the first threaded hole's axis: what a click on it does.
+        let placement = crate::stock::Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        let h = &found.holes[2];
+        let (cx, cy) = h.centre(); let (cx, cy) = (cx as f32, cy as f32);
+        let mut tally: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut n = 0;
+        for id in 0..mesh.surfaces.len() {
+            let c = placement.transform(mesh.surfaces[id].center).map(|v| v / scale);
+            if ((c[0] - cx).powi(2) + (c[1] - cy).powi(2)).sqrt() > 4.6 { continue; }
+            n += 1;
+            if n % 400 != 0 { continue; }
+            a.doc.setup_mut().operations[oi].surfaces = None;
+            let t0 = std::time::Instant::now();
+            let _ = a.update(Message::Surface(id));
+            let dt = t0.elapsed();
+            let st: String = a.status.chars().take(60).collect();
+            let key = format!("wall={} {} ({}ms~)", crate::pocket::is_wall(&setup, &mesh, id), st, dt.as_millis() / 1000 * 1000);
+            *tally.entry(key).or_default() += 1;
+        }
+        eprintln!("surfaces round hole 2: {n}");
+        for (k, v) in tally { eprintln!("  {v:4}  {k}"); }
+    }
 }
