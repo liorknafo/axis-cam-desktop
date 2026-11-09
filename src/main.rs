@@ -3099,7 +3099,10 @@ impl App {
     /// Planning work still under way in the background, which Cycle Start
     /// waits for (see `locked`).
     pub fn planning_busy(&self) -> Option<&'static str> {
-        if matches!(self.planner, Planner::Running(_)) || self.plan_busy.running() > 0 {
+        // A part loading would replace the job under the run.
+        if self.import_busy {
+            Some("A model is loading: wait for it.")
+        } else if matches!(self.planner, Planner::Running(_)) || self.plan_busy.running() > 0 {
             Some("The AI planner is working: wait for it, or cancel it.")
         } else if self.picturing() {
             Some("The stock after each operation is still being pictured: wait a moment.")
@@ -7545,7 +7548,15 @@ impl App {
                 // The project's own model file chosen again is reimported:
                 // its picks are found again on it, not cleared. A DXF is
                 // loaded again at the project's thickness.
-                if self.doc.file.as_ref().is_some_and(|d| d.path == f.path) {
+                // The same file by another spelling of its path too (a
+                // letter's case on Windows, `..`, a link).
+                let same = |d: &std::path::Path| {
+                    d == f.path
+                        || std::fs::canonicalize(d).is_ok_and(|d| {
+                            std::fs::canonicalize(&f.path).is_ok_and(|p| p == d)
+                        })
+                };
+                if self.doc.file.as_ref().is_some_and(|d| same(&d.path)) {
                     match m {
                         Some(mesh) if f.thickness.is_none() => {
                             self.doc.file = Some(f);

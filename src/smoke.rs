@@ -19590,6 +19590,24 @@ soft_max = 180.0
         let mesh = a.imported_mesh.as_ref().unwrap();
         assert!(mesh.surfaces[ids[0]].normal[2] > 0.999);
         assert!(a.status.starts_with("Model reimported."), "{}", a.status);
+        // So is its path spelled another way.
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let mut spelled = vec![dir.path().join("sub").join("..").join("block.stl")];
+        if cfg!(windows) {
+            let p = file.path.to_string_lossy();
+            spelled.push(p.replace("block.stl", "BLOCK.STL").into());
+        }
+        for path in spelled {
+            let mesh = crate::mesh::load(&path).unwrap();
+            let again = ModelFile { path, ..file.clone() };
+            let _ = a.update(Message::FileImported(Some(Ok((again, Some(mesh))))));
+            assert!(a.status.starts_with("Model reimported."), "{}", a.status);
+            assert_eq!(top_of(&a).len(), 1);
+        }
+        // A model loading holds Cycle Start: it would replace the job.
+        a.import_busy = true;
+        assert_eq!(a.planning_busy(), Some("A model is loading: wait for it."));
+        a.import_busy = false;
         let other = dir.path().join("other.stl");
         std::fs::copy(&file.path, &other).unwrap();
         let mesh = crate::mesh::load(&other).unwrap();
