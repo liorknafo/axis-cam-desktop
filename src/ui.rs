@@ -3387,7 +3387,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 } else if !o.needs_surfaces() && o.strategy.imported_preview() {
                     c = c.push(note("Uses the current imported model in this setup. No demonstration geometry or saved sample features are used."));
                 } else if o.strategy.imported_preview() {
-                    c = c.push(note(if o.strategy == Strategy::Chamfer { "Click a level face of your part, one facing up: its outline and the mouths of its holes are the edges to chamfer. Click it again to drop it. To break only one edge, also click the wall beside it: only the edge the level face shares with that wall is chamfered. Amber = hover; blue = selected. Click Finish picking when done." } else if o.strategy == Strategy::Groove { "Click the wall of the bore the groove goes in: the whole hole is picked, its walls blue. For a groove round a boss, click every face of the boss's outside wall instead. Amber = hover. Click Finish picking when done." } else if o.strategy == Strategy::Drill { "While picking, every round hole of the part is outlined in teal with the diameter it drills. Click a hole (its outline, its wall or inside it) to drill it: its outline turns blue. Click it again to drop it. Or click a horizontal rim face: every round opening in it is drilled. The diameter filter can restrict the holes. Amber = hover." } else if matches!(o.strategy, Strategy::Pocket | Strategy::Contour) { "Click the recessed pocket floor on your part: its outline defines the walls, and holes in the floor preserve islands. Or pick a whole hole: hold the pointer over it until its outline shows, then click the outline or the hole's wall. Its outline is cut down to its floor, or through the part if nothing is under it. Picked holes' outlines are blue; click one again to drop the hole. In a Pocket, a sloped face with no hole past it (a ramp, a dome, a fillet) is picked whole and cleared in steps no taller than the stepdown on slopes. Amber = hover; blue = selected. Click Finish picking when done." } else if o.strategy == Strategy::Adaptive { "Click the recessed pocket floor on your part. Its outline defines the walls; holes in the floor preserve islands. Or pick a whole hole: hold the pointer over it until its outline shows, then click the outline or the hole's wall. Its outline is cleared down to its floor, or through the part if nothing is under it; one too narrow for the cutter has only the stock over it cleared, down to its rim. Picked holes' outlines are blue; click one again to drop the hole. Or click a sloped face (a ramp, a dome, a fillet): the whole face is picked, and the stock over it is cleared in steps no taller than the stepdown on slopes, for a finishing pass. Floors, holes and sloped faces picked together are cleared as one pocket, each to its own height. Amber = hover; blue = selected. Click Finish picking when done." } else if crate::picks_faces(o) { "Click any face of your part, flat or curved: the whole face, up to its sharp edges, is picked. Click it again to drop it. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." } else { "Click a planar surface on your part. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." }));
+                    c = c.push(note(if o.strategy == Strategy::Chamfer { "Click a level face of your part, one facing up: its outline and the mouths of its holes are the edges to chamfer. Click it again to drop it. To break only one edge, also click the wall beside it: only the edge the level face shares with that wall is chamfered. Amber = hover; blue = selected. Click Finish picking when done." } else if o.strategy == Strategy::Groove { "Click the wall of the bore the groove goes in: the whole hole is picked, its walls blue. For a groove round a boss, click every face of the boss's outside wall instead. Amber = hover. Click Finish picking when done." } else if o.strategy == Strategy::Drill { "While picking, every round hole of the part is outlined in teal with the diameter it drills. Click a hole (its outline, its wall or inside it) to drill it: its outline turns blue. Click it again to drop it. Click part of a round wall where there is no whole hole (a half hole on the part's edge, a slot's round end, a round corner) to drill its whole circle round its centre. Or click a horizontal rim face: every round opening in it is drilled. The diameter filter can restrict the holes. Amber = hover." } else if matches!(o.strategy, Strategy::Pocket | Strategy::Contour) { "Click the recessed pocket floor on your part: its outline defines the walls, and holes in the floor preserve islands. Or pick a whole hole: hold the pointer over it until its outline shows, then click the outline or the hole's wall. Its outline is cut down to its floor, or through the part if nothing is under it. Picked holes' outlines are blue; click one again to drop the hole. In a Pocket, a sloped face with no hole past it (a ramp, a dome, a fillet) is picked whole and cleared in steps no taller than the stepdown on slopes. Amber = hover; blue = selected. Click Finish picking when done." } else if o.strategy == Strategy::Adaptive { "Click the recessed pocket floor on your part. Its outline defines the walls; holes in the floor preserve islands. Or pick a whole hole: hold the pointer over it until its outline shows, then click the outline or the hole's wall. Its outline is cleared down to its floor, or through the part if nothing is under it; one too narrow for the cutter has only the stock over it cleared, down to its rim. Picked holes' outlines are blue; click one again to drop the hole. Or click a sloped face (a ramp, a dome, a fillet): the whole face is picked, and the stock over it is cleared in steps no taller than the stepdown on slopes, for a finishing pass. Floors, holes and sloped faces picked together are cleared as one pocket, each to its own height. Amber = hover; blue = selected. Click Finish picking when done." } else if crate::picks_faces(o) { "Click any face of your part, flat or curved: the whole face, up to its sharp edges, is picked. Click it again to drop it. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." } else { "Click a planar surface on your part. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." }));
                     if app.imported_mesh.is_some() {
                         c = c.push(
                             btn(
@@ -3411,12 +3411,34 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     // Drill lists the holes it drills (below).
                     let picks_holes = crate::picks_holes(o);
                     let drill = o.strategy == Strategy::Drill;
+                    // The walls of the holes and arcs it lists, as the angle
+                    // that reads each turns it (at several A angles, not
+                    // the one shown): none is a rim face.
+                    let held: std::collections::HashSet<usize> = match &app.imported_mesh {
+                        Some(mesh) if picks_holes && selection.is_some_and(|s| s.matches(mesh)) => {
+                            let mut held: std::collections::HashSet<usize> =
+                                (app.pocket_holes(o, mesh).as_ref().as_ref().ok())
+                                    .into_iter()
+                                    .flatten()
+                                    .flat_map(|h| h.walls.iter().copied())
+                                    .collect();
+                            if drill && let Ok(holes) = app.drill_holes(o, mesh).as_ref() {
+                                held.extend(
+                                    (holes.iter())
+                                        .filter_map(|h| h.arc.as_ref())
+                                        .flat_map(|a| a.walls.iter().copied()),
+                                );
+                            }
+                            held
+                        }
+                        _ => Default::default(),
+                    };
                     let wall = |id: usize| {
                         picks_holes
-                            && app
-                                .imported_mesh
-                                .as_ref()
-                                .is_some_and(|m| crate::pocket::is_wall(app.doc.setup(), m, id))
+                            && (held.contains(&id)
+                                || app.imported_mesh.as_ref().is_some_and(|m| {
+                                    crate::pocket::is_wall(app.doc.setup(), m, id)
+                                }))
                     };
                     // Parallel and Waterline finishing list whole faces: a
                     // curved one is many surfaces of one face.
@@ -3600,6 +3622,22 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                                                 c.angle, c.depth
                                             ))
                                         );
+                                        // An arc goes as it came, by a click on it.
+                                        let said = match &h.arc {
+                                            Some(a) => format!("{said} · {:.0}° arc", a.span),
+                                            None => said,
+                                        };
+                                        if let Some(a) = &h.arc {
+                                            c = c.push(
+                                                btn(
+                                                    format!("✓ {said} · remove"),
+                                                    Message::Surface(a.walls[0]),
+                                                    true,
+                                                )
+                                                .width(Fill),
+                                            );
+                                            continue;
+                                        }
                                         c = c.push(match by_walls(h) {
                                             Some(i) => Element::from(
                                                 btn(
@@ -3612,6 +3650,9 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                                             None => muted(said).into(),
                                         });
                                     }
+                                    if holes.iter().any(|h| h.arc.is_some()) {
+                                        c = c.push(note(ARC_ENGAGEMENT));
+                                    }
                                 }
                                 Err(error) => c = c.push(note(error.clone())),
                             }
@@ -3621,7 +3662,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         Strategy::Adaptive => "Adaptive clearing works on the same geometry as Pocket: the selected recessed flat floors, with the walls and islands of the part, each picked hole's outline (cut down to the highest of the part under it, or through the part with the breakthrough; one too narrow for the cutter has only the stock over it cleared, down to its rim), and sloped faces cleared in steps. Vertical access only; overhanging geometry is rejected. The path keeps the cutter's side load near the optimal load, so it can take a deep stepdown. It inherits the stock left by all earlier enabled operations and setups.".to_string(),
                         Strategy::Pocket => "Pocket uses offset contours of the selected floor triangles, including islands, and of each picked hole's outline. Supports open, vertical-wall pockets with a flat floor; overhanging geometry is rejected. A picked hole is cut down to the highest of the part under it, or through the part with the breakthrough; one too narrow for the cutter has only the stock over it cleared, down to its rim. Simulation inherits the stock left by all earlier enabled operations and setups.".to_string(),
                         Strategy::Contour => "Inside contour offsets only the walls and islands of this floor, or the wall of each picked hole. It does not clear the interior. The floor must be flat and accessible along setup Z; overhangs are rejected.".to_string(),
-                        Strategy::Drill => "Hole detection uses tessellated circular openings and vertical rays. Noncircular openings and obstructions are excluded. Confirm the detected centers and depths before previewing.".to_string(),
+                        Strategy::Drill => "Hole detection uses tessellated circular openings and vertical rays. Noncircular openings and obstructions are excluded. A click on part of a round wall where no whole hole is (a half hole on the part's edge, a slot's round end) picks that arc: its whole circle is drilled round its centre. Confirm the detected centers and depths before previewing.".to_string(),
                         Strategy::Chamfer => "Chamfer milling runs the side of the cone along the edges of the picked level faces, level, with the tool in the air beside each edge. The path is checked against the part for gouging.".to_string(),
                         Strategy::Parallel => "Parallel finishing cuts only where the cutter touches a picked face. The rest of the part still holds the cutter up, so it never cuts into a face it was not given; where a picked face meets one that is not, the cutter stops at the corner between them, which keeps its radius.".to_string(),
                         Strategy::Waterline => "Waterline finishing cuts each level's loop only where the face nearest the cutter is a picked one, and goes no lower than the lowest picked face. Where a picked face meets one that is not, the cutter finishes up to the corner between them. The rest of the part still keeps the cutter out, so it never cuts into a face it was not given.".to_string(),
@@ -5773,6 +5814,9 @@ pub(crate) fn speed_feed_heading(lines: &[(bool, String)]) -> &'static str {
         "Speeds and feeds not checked (export still allowed)"
     }
 }
+/// What a Drill listing an arc (`cam::arcs`) says under its holes: only part
+/// of the drill is in the part there.
+pub(crate) const ARC_ENGAGEMENT: &str = "An arc's whole circle is drilled round its centre, with only part of the drill in the part: the drill is pushed toward the open side. Feed it gently (a slower plunge feed), or clamp a block against the opening so it cuts a whole hole.";
 /// Which of the holes `picked` by their walls (`App::pocket_holes`) the
 /// drill's hole `h` (`App::drill_holes`) is, for its remove button: the one
 /// at its centre, and at several A angles at its angle too, as each angle

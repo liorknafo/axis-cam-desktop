@@ -1986,6 +1986,13 @@ pub fn picked_holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Ho
         let steps = sloped_faces(setup, mesh, ids.iter().copied());
         ids.retain(|id| !steps.contains(id));
     }
+    // A Drill's arcs, parts of round walls, are no holes picked by their
+    // walls: it drills each's circle (`cam::arcs`).
+    if op.strategy == Strategy::Drill {
+        for a in crate::cam::arcs::drilled_arcs(setup, mesh, &ids) {
+            ids.retain(|id| !a.walls.contains(id));
+        }
+    }
     holes(setup, &ids, mesh)
 }
 /// The holes the selected walls among `ids` pick (a Pocket's surfaces), as
