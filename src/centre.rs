@@ -29,7 +29,12 @@ pub const FOLLOWS: [&str; 6] = [
     "retract",
 ];
 /// The cycles of a drill that drills its holes from the solid.
-pub const FROM_SOLID: [&str; 3] = ["Drilling", "Chip breaking", "Deep drilling"];
+pub const FROM_SOLID: [&str; 4] = [
+    "Drilling",
+    "Chip breaking",
+    "Deep drilling",
+    "Counterboring",
+];
 /// What a manual-mill drill with no centre drilling before it is told.
 pub const CENTRE_FIRST: &str = "On the manual mill a drill started on a flat face walks off its position: centre drill its holes first, so that it finds their centres.";
 /// The key of a centre drilling that names the drill it centres (its id).

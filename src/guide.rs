@@ -712,9 +712,10 @@ fn tenths_down(turns: f32) -> f32 {
 /// Whether the mouth of the hole Ø`d` at `at` (stock frame), drilled from
 /// as high as `top` down to `bottom`, is opened in `before` so that a twist
 /// drill finds its centre: its axis is open, or the material on it starts
-/// lower than on the hole's rim (a centre drill's or a countersink's cone,
-/// a pilot hole). A flat face, or a flat-bottomed pocket the hole starts
-/// in, is not. Exact: the cuts' sweeps, every 0.02 mm down.
+/// lower than all round the hole's rim (a centre drill's or a countersink's
+/// cone, a pilot hole). A flat face, a flat-bottomed pocket the hole starts
+/// in, a slope, a step beside it, or a rim with no material somewhere (the
+/// stock's edge) is not. Exact: the cuts' sweeps, every 0.02 mm down.
 pub(crate) fn opened(
     before: &Volume,
     frame: crate::volume::Frame,
@@ -742,12 +743,16 @@ pub(crate) fn opened(
     let Some(axis) = first(at[0], at[1]) else {
         return true;
     };
-    let rim = (0..8)
-        .filter_map(|k| {
-            let a = k as f32 * std::f32::consts::TAU / 8.;
-            first(at[0] + r * a.cos(), at[1] + r * a.sin())
-        })
-        .fold(f32::NEG_INFINITY, f32::max);
+    // The rim's lowest material: a cone round the axis keeps all of it
+    // higher than the axis; a step or a slope keeps some no higher.
+    let mut rim = f32::INFINITY;
+    for k in 0..8 {
+        let a = k as f32 * std::f32::consts::TAU / 8.;
+        match first(at[0] + r * a.cos(), at[1] + r * a.sin()) {
+            Some(z) => rim = rim.min(z),
+            None => return false,
+        }
+    }
     axis < rim - STEP
 }
 fn holes(plan: &Plan, zero: [f32; 3]) -> Vec<[f32; 3]> {
@@ -2555,6 +2560,51 @@ pub(crate) mod tests {
         for (_, t) in targets(&guide) {
             assert!(!t.edge && t.shown == t.centre, "{t:?}");
         }
+    }
+    #[test]
+    fn a_step_beside_a_hole_or_a_flat_face_does_not_centre_it_and_a_cone_does() {
+        use crate::simulation::CutterShape;
+        let f = crate::volume::Frame::identity();
+        let b = Bounds {
+            min: [0., 0., 0.],
+            max: [40., 40., 10.],
+        };
+        let fresh = Volume::new(b, f);
+        assert!(!opened(&fresh, f, [30., 20.], 6., 10., 0.));
+        // A step: the stock up to X 20 cut down to Z 5. A hole at X 17.5
+        // has its axis on the step's floor and part of its rim on the
+        // step's wall, higher.
+        let mut v = fresh.clone();
+        for y in (0..=40).step_by(4) {
+            let y = y as f32;
+            v.cut(
+                [-10., y, 5.],
+                [15., y, 5.],
+                5.,
+                20.,
+                CutterShape::Flat,
+                f,
+                (0, 0),
+            );
+        }
+        assert!(!opened(&v, f, [17.5, 20.], 6., 10., 0.));
+        // A centre drill's cone opened to Ø6 at the top centres it.
+        let c = crate::model::CentreDrill {
+            pilot: 2.5,
+            pilot_length: 3.1,
+            body: 6.3,
+        };
+        let point = 10. - c.cone_depth(6.);
+        v.cut(
+            [30., 20., 12.],
+            [30., 20., point],
+            3.15,
+            10.,
+            c.shape(),
+            f,
+            (0, 0),
+        );
+        assert!(opened(&v, f, [30., 20.], 6., 10., 0.));
     }
     #[test]
     fn the_holes_are_centres_and_depths_in_work_coordinates() {

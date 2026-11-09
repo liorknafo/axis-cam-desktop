@@ -2023,25 +2023,25 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 .unwrap_or(4.)
                 / 2.;
             let mut shapes = p.cut_before(*op);
-            // A centre drill's hole is its cone at the top.
-            let cone = |h: &[f32; 3]| {
-                p.tool(*op).and_then(|t| t.centre_drill()).map_or(r, |c| {
+            let spotting = p.tool(*op).and_then(|t| t.centre_drill());
+            // A centre drill's hole is its cone at hole `n`'s mouth, where
+            // the material over it starts (a pocket's floor, say).
+            let cone = |n: usize, h: &[f32; 3]| {
+                spotting.map_or(r, |c| {
+                    let mouth = mouths.get(n).copied().unwrap_or(stock.max[2]);
                     (c.pilot / 2.
-                        + (stock.max[2] - h[2] - c.pilot_length)
-                            / crate::model::CentreDrill::rise())
+                        + (mouth - h[2] - c.pilot_length) / crate::model::CentreDrill::rise())
                     .clamp(c.pilot / 2., c.body / 2.)
                 })
             };
-            shapes.extend(
-                holes.iter().enumerate().map(|(n, h)| {
-                    Shape::Hole([h[0], h[1], stock.max[2]], cone(h), n + 1, lit(n, i))
-                }),
-            );
+            shapes.extend(holes.iter().enumerate().map(|(n, h)| {
+                Shape::Hole([h[0], h[1], stock.max[2]], cone(n, h), n + 1, lit(n, i))
+            }));
             let h = holes.get(i).copied().unwrap_or([0.; 3]);
             let tapping = p.setup.operations.get(*op).is_some_and(|o| o.tapping());
-            // A tap cuts from the hole's mouth: the stock above it may be
-            // gone already.
-            let mouth = if tapping {
+            // A tap and a centre drill cut from the hole's mouth: the stock
+            // above it may be gone already.
+            let mouth = if tapping || spotting.is_some() {
                 mouths.get(i).copied().unwrap_or(stock.max[2])
             } else {
                 stock.max[2]
@@ -2088,7 +2088,11 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 .get(*op)
                 .and_then(|o| num(&o.p, "rpm"))
                 .unwrap_or(0.);
-            let depth = stock.max[2] - h[2];
+            let depth = if spotting.is_some() {
+                mouth
+            } else {
+                stock.max[2]
+            } - h[2];
             // Tapping: by hand, the spindle holding the tap square; the
             // depth is how many turns the tap goes in.
             let pitch = p.tool(*op).and_then(|t| t.tap_spec()).map(|s| s.pitch);
@@ -2175,7 +2179,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 if uncentred.get(i).copied().unwrap_or(false) {
                     said.push(warn_chip("centre drill first"));
                 }
-                let cone = centre.map(|_| format!("cone Ø{} at the top", mm(2. * cone(&h))));
+                let cone = centre.map(|_| format!("cone Ø{} at the top", mm(2. * cone(i, &h))));
                 // The planned cycle, as the hand on the quill does it.
                 let cycle = o.map(|o| get(&o.p, "cycle")).unwrap_or_default();
                 let peck = o.and_then(|o| num(&o.p, "peck")).filter(|p| *p > 0.);
