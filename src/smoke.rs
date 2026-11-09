@@ -19363,6 +19363,215 @@ soft_max = 180.0
         let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
         a
     }
+    /// `triangles` written to `path` as a binary STL.
+    fn write_stl(path: &std::path::Path, triangles: &[[[f32; 3]; 3]]) {
+        let mut b = vec![0u8; 80];
+        b.extend((triangles.len() as u32).to_le_bytes());
+        for t in triangles {
+            b.extend([0u8; 12]);
+            for v in t.iter().flatten() {
+                b.extend(v.to_le_bytes());
+            }
+            b.extend([0u8; 2]);
+        }
+        std::fs::write(path, b).unwrap();
+    }
+    /// A block imported from an STL file on disk, its Facing picking the
+    /// block's top: the app, the file and the top's number.
+    fn block_app(dir: &std::path::Path) -> (App, ModelFile) {
+        let path = dir.join("block.stl");
+        write_stl(&path, &crate::picks::tests::block(40., 8., false));
+        let mut a = app();
+        let file = ModelFile {
+            name: "block.stl".into(),
+            path: path.clone(),
+            format: "stl".into(),
+            bytes: std::fs::metadata(&path).unwrap().len(),
+            thickness: None,
+        };
+        let mesh = crate::mesh::load(&path).unwrap();
+        let _ = a.update(Message::FileImported(Some(Ok((file.clone(), Some(mesh))))));
+        let mesh = a.imported_mesh.as_ref().unwrap();
+        let top = (0..mesh.surfaces.len())
+            .find(|&i| mesh.surfaces[i].normal[2] > 0.999)
+            .unwrap();
+        let fingerprint = mesh.fingerprint.clone();
+        let op = &mut a.doc.setup_mut().operations[0];
+        assert_eq!(op.strategy, Strategy::Face);
+        op.surfaces = Some(crate::surface::Selection {
+            mesh_fingerprint: fingerprint,
+            ids: vec![top],
+        });
+        (a, file)
+    }
+    fn top_of(a: &App) -> Vec<usize> {
+        let mesh = a.imported_mesh.as_ref().unwrap();
+        let s = a.doc.setup().operations[0].surfaces.as_ref().unwrap();
+        assert!(s.matches(mesh), "{}", a.status);
+        s.ids.clone()
+    }
+    /// Reimport model, after the file changed: the setups and operations are
+    /// kept, and the Facing's top, longer now, is picked on the new part,
+    /// the status saying to check it. The file's new size is the project's.
+    #[test]
+    fn reimport_keeps_the_job_and_finds_its_picks_on_the_changed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, file) = block_app(dir.path());
+        let (title, setups, ops) = (
+            a.doc.title.clone(),
+            a.doc.setups.len(),
+            a.doc.setup().operations.len(),
+        );
+        write_stl(&file.path, &crate::picks::tests::block(60., 8., true));
+        let _ = a.update(Message::Reimport);
+        assert!(a.import_busy);
+        assert!(
+            a.status.starts_with("Reimporting block.stl"),
+            "{}",
+            a.status
+        );
+        // The pick's place was kept before the old part goes.
+        assert!(a.doc.places.contains_key(&a.doc.setup().operations[0].id));
+        // Nothing else loads meanwhile.
+        let _ = a.update(Message::Reimport);
+        let new_file = ModelFile {
+            bytes: std::fs::metadata(&file.path).unwrap().len(),
+            ..file.clone()
+        };
+        let mesh = crate::mesh::load(&file.path).unwrap();
+        let _ = a.update(Message::ModelReimported(
+            file.clone(),
+            Ok((new_file.clone(), mesh)),
+        ));
+        assert!(!a.import_busy);
+        assert_eq!(a.doc.file, Some(new_file));
+        assert_eq!(a.doc.title, title);
+        assert_eq!(a.doc.setups.len(), setups);
+        assert_eq!(a.doc.setup().operations.len(), ops);
+        let mesh = a.imported_mesh.as_ref().unwrap();
+        assert_eq!(mesh.dimensions[0], 60.);
+        let ids = top_of(&a);
+        assert_eq!(ids.len(), 1);
+        assert!(mesh.surfaces[ids[0]].normal[2] > 0.999);
+        assert!(a.status.starts_with("Model reimported. Setups and operations are kept; one operation's picked surfaces were found"), "{}", a.status);
+        assert!(a.status.contains("changed shape"), "{}", a.status);
+        assert!(a.project_dirty);
+        assert!(
+            crate::surface::issues(&a.doc.setup().operations[0], a.doc.setup(), Some(mesh))
+                .is_empty()
+        );
+    }
+    /// The file unchanged, Reimport model says so and changes nothing; a
+    /// file gone keeps the part as it was loaded.
+    #[test]
+    fn reimporting_an_unchanged_or_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, file) = block_app(dir.path());
+        let ids = top_of(&a);
+        let _ = a.update(Message::Reimport);
+        let mesh = crate::mesh::load(&file.path).unwrap();
+        let _ = a.update(Message::ModelReimported(
+            file.clone(),
+            Ok((file.clone(), mesh)),
+        ));
+        assert_eq!(top_of(&a), ids);
+        assert_eq!(
+            a.status,
+            "Model reimported. The file has not changed since it was loaded."
+        );
+        let _ = a.update(Message::Reimport);
+        let _ = a.update(Message::ModelReimported(file.clone(), Err("gone.".into())));
+        assert_eq!(
+            a.status,
+            "Reimport failed: gone. The part stays as it was loaded."
+        );
+        assert_eq!(top_of(&a), ids);
+        assert!(!a.import_busy);
+        // A load for a file the project no longer has is not taken.
+        let other = ModelFile {
+            thickness: Some(2.),
+            ..file.clone()
+        };
+        a.import_busy = true;
+        let mesh = crate::mesh::load(&file.path).unwrap();
+        let _ = a.update(Message::ModelReimported(other, Ok((file.clone(), mesh))));
+        assert!(a.import_busy);
+    }
+    /// Import model choosing the project's own file is a reimport: the
+    /// picks found again, the title kept; another file is a new part.
+    #[test]
+    fn importing_the_projects_own_file_again_reimports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, file) = block_app(dir.path());
+        a.doc.title = "Bracket".into();
+        // The same block, its triangles in another order.
+        write_stl(&file.path, &crate::picks::tests::block(40., 8., true));
+        let mesh = crate::mesh::load(&file.path).unwrap();
+        let _ = a.update(Message::FileImported(Some(Ok((file.clone(), Some(mesh))))));
+        assert_eq!(a.doc.title, "Bracket");
+        let ids = top_of(&a);
+        let mesh = a.imported_mesh.as_ref().unwrap();
+        assert!(mesh.surfaces[ids[0]].normal[2] > 0.999);
+        assert!(a.status.starts_with("Model reimported."), "{}", a.status);
+        let other = dir.path().join("other.stl");
+        std::fs::copy(&file.path, &other).unwrap();
+        let mesh = crate::mesh::load(&other).unwrap();
+        let file = ModelFile {
+            name: "other.stl".into(),
+            path: other,
+            ..file
+        };
+        let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
+        assert_eq!(a.doc.title, "other");
+        assert!(a.doc.setup().operations[0].surfaces.is_none());
+    }
+    /// Renders the application bar with Reimport model, and the status after
+    /// a reimport of a changed file, to `$AXIS_RENDER_DIR` (default
+    /// /tmp/reimport).
+    #[test]
+    #[ignore]
+    fn picture_reimport() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/reimport".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, file) = block_app(dir.path());
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Tab("Geometry".into()));
+        write_stl(&file.path, &crate::picks::tests::block(60., 8., true));
+        let _ = a.update(Message::Reimport);
+        let mesh = crate::mesh::load(&file.path).unwrap();
+        let _ = a.update(Message::ModelReimported(file.clone(), Ok((file, mesh))));
+        let _ = a.view();
+        render_png(
+            &a,
+            iced::Size::new(1600., 1000.),
+            &out.join("reimported.png"),
+        );
+    }
+    /// The project saved, then its file changed before it is opened again:
+    /// the picks are found on the part from the places saved with them.
+    #[test]
+    fn a_project_opened_after_its_file_changed_finds_its_picks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, file) = block_app(dir.path());
+        a.dirty = true;
+        a.persist();
+        let saved = std::fs::read_to_string(&a.state_path).unwrap();
+        let doc: Document = serde_json::from_str(&saved).unwrap();
+        assert!(doc.places.contains_key(&doc.setup().operations[0].id));
+        write_stl(&file.path, &crate::picks::tests::block(40., 8., true));
+        a.replace_document(doc, None);
+        let _ = a.restore_model();
+        assert!(a.import_busy);
+        let mesh = crate::mesh::load(&file.path).unwrap();
+        let _ = a.update(Message::ModelRestored(file.clone(), Ok(mesh)));
+        let ids = top_of(&a);
+        let mesh = a.imported_mesh.as_ref().unwrap();
+        assert!(mesh.surfaces[ids[0]].normal[2] > 0.999);
+        assert_eq!(a.status, "Saved model geometry restored.");
+    }
     #[test]
     fn a_click_on_a_wall_picks_or_drops_its_whole_hole_in_a_pocket() {
         for strategy in [Strategy::Pocket, Strategy::Adaptive] {
@@ -21964,7 +22173,11 @@ soft_max = 180.0
     fn imported_replacement_invalidates_selections_and_unsupported_strategies_keep_part() {
         let mut a = imported_app();
         let _ = a.update(Message::Surface(0));
-        let file = a.doc.file.clone().unwrap();
+        // Another file: the project's own, chosen again, is reimported.
+        let file = ModelFile {
+            path: "replacement.3mf".into(),
+            ..a.doc.file.clone().unwrap()
+        };
         let mesh = a.imported_mesh.clone().unwrap();
         let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
         assert!(
@@ -21996,10 +22209,20 @@ soft_max = 180.0
         let mut changed = a.imported_mesh.clone().unwrap();
         changed.fingerprint = "0".repeat(64);
         a.operation_mut().unwrap().geometry = vec![0];
+        // Picked before picks were kept with their places, and restored as
+        // a project opening does, the part as it was gone: they cannot be
+        // found on the changed part.
+        a.doc.places.clear();
+        a.imported_mesh = None;
         let _ = a.update(Message::ModelRestored(
             a.doc.file.clone().unwrap(),
             Ok(changed),
         ));
+        assert!(
+            a.status.contains("Pick them again in Geometry"),
+            "{}",
+            a.status
+        );
         assert!(a.operation().unwrap().geometry.is_empty());
         assert!(a.op_issues().iter().any(|i| i.contains("geometry changed")));
         assert!(

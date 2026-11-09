@@ -2614,6 +2614,13 @@ pub struct Document {
     /// (a diameter), keyed by setup id and step (`guide::measure_key`).
     #[serde(default)]
     pub measured: BTreeMap<String, f32>,
+    /// Where each operation's picked surfaces are on the part, in the model
+    /// file's units, by operation id, so that they are found again when the
+    /// file changes (`picks::follow`). Kept beside the operations, not in
+    /// them: recording them is no edit of an operation, and changes none of
+    /// what its toolpaths and programs are known by.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub places: BTreeMap<String, crate::picks::Places>,
 }
 impl Default for Document {
     fn default() -> Self {
@@ -2634,6 +2641,7 @@ impl Default for Document {
             active: String::new(),
             guide: BTreeMap::new(),
             measured: BTreeMap::new(),
+            places: BTreeMap::new(),
         }
     }
 }

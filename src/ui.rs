@@ -997,34 +997,40 @@ pub fn view(app: &App) -> Element<'_, Message> {
     .spacing(7)
     .align_y(Alignment::Center);
     brand = if manufacture {
+        let mut files = row![
+            bar_btn("Start", Message::Page(Page::Home), app.page == Page::Home),
+            bar_btn("New project", Message::NewProject, false),
+            help::wrap(
+                text_input("Project name", &app.doc.title)
+                    .on_input(Message::Title)
+                    .width(180)
+                    .size(13)
+                    .padding([5, 8]),
+                Help::text(
+                    "Project name",
+                    "The name shown in the browser and used as the suggested project filename."
+                ),
+                widget::tooltip::Position::Bottom
+            ),
+            bar_btn("Import model", Message::Import, false),
+            bar_btn(
+                "Import from path…",
+                Message::ImportPathOpen(!app.import_path_open),
+                app.import_path_open,
+            ),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center);
+        // The project's model file loaded again after it changed, the setups
+        // and operations kept: only once the project has one.
+        if app.doc.file.is_some() {
+            files = files.push(bar_btn("Reimport model", Message::Reimport, false));
+        }
         brand.push(
-            row![
-                bar_btn("Start", Message::Page(Page::Home), app.page == Page::Home),
-                bar_btn("New project", Message::NewProject, false),
-                help::wrap(
-                    text_input("Project name", &app.doc.title)
-                        .on_input(Message::Title)
-                        .width(180)
-                        .size(13)
-                        .padding([5, 8]),
-                    Help::text(
-                        "Project name",
-                        "The name shown in the browser and used as the suggested project filename."
-                    ),
-                    widget::tooltip::Position::Bottom
-                ),
-                bar_btn("Import model", Message::Import, false),
-                bar_btn(
-                    "Import from path…",
-                    Message::ImportPathOpen(!app.import_path_open),
-                    app.import_path_open,
-                ),
-                bar_btn("Open", Message::OpenProject, false),
-                bar_btn("Save", Message::SaveProject, false),
-                bar_btn("Save as…", Message::SaveProjectAs, false),
-            ]
-            .spacing(4)
-            .align_y(Alignment::Center),
+            files
+                .push(bar_btn("Open", Message::OpenProject, false))
+                .push(bar_btn("Save", Message::SaveProject, false))
+                .push(bar_btn("Save as…", Message::SaveProjectAs, false)),
         )
     } else {
         brand.push(
@@ -2563,7 +2569,17 @@ fn workspace(app: &App) -> Element<'_, Message> {
 }
 /// What the workspace shows in place of the 3D view without a part.
 fn no_scene(app: &App) -> Element<'_, Message> {
-    container(column![bold(if app.import_busy { "Loading geometry…" } else if !app.doc.has_model() { "Import your part" } else { "Model preview unavailable" },25),muted(app.doc.file.as_ref().map(|f|f.name.clone()).unwrap_or_default()),note(app.import_error.clone().unwrap_or_else(|| "Import STEP, STP, 3MF, STL, OBJ or DXF to view your model. Geometry loads in the background; a STEP conversion may take up to two minutes.".into())),row![primary("Import model",Message::Import),secondary("Import from path…",Message::ImportPathOpen(true))].spacing(8),secondary("Start screen",Message::Page(Page::Home))].spacing(20).max_width(380)).center(Fill).into()
+    let mut imports = row![
+        primary("Import model", Message::Import),
+        secondary("Import from path…", Message::ImportPathOpen(true))
+    ]
+    .spacing(8);
+    // The project's file failed to load, or is loading: loaded again once
+    // it is put back or fixed.
+    if app.doc.file.is_some() && !app.import_busy {
+        imports = imports.push(secondary("Reimport model", Message::Reimport));
+    }
+    container(column![bold(if app.import_busy { "Loading geometry…" } else if !app.doc.has_model() { "Import your part" } else { "Model preview unavailable" },25),muted(app.doc.file.as_ref().map(|f|f.name.clone()).unwrap_or_default()),note(app.import_error.clone().unwrap_or_else(|| "Import STEP, STP, 3MF, STL, OBJ or DXF to view your model. Geometry loads in the background; a STEP conversion may take up to two minutes.".into())),imports,secondary("Start screen",Message::Page(Page::Home))].spacing(20).max_width(380)).center(Fill).into()
 }
 /// The section's controls under the 3D view while it is on: the axis it is
 /// square to or the face it goes through, the slider that moves it across
