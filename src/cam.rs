@@ -2632,6 +2632,11 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     // chamfer mill's is the cone of its tip angle.
     b.plan.shape = if let Some(c) = centre {
         b.plan.milling_direction = "Centre drilling · axial feed";
+        // Its point is the pilot's top: its flutes and stickout, measured
+        // from the pilot's tip, reach that much less above the point, so
+        // the holder checks find the holder where it is.
+        b.plan.tool_length -= c.pilot_length;
+        b.plan.flute_length -= c.pilot_length;
         c.shape()
     } else if chamfer {
         let angle = tool

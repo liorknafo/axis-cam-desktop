@@ -119,34 +119,52 @@ pub fn sync(doc: &mut Document) -> bool {
     }
     changed
 }
-/// The narrowest hole drill `op` of `setup` drills (its diameter, or the
-/// widest drill it takes when narrower) and the widest (its diameter); None
-/// when its holes are not known.
-fn sizes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Option<(f32, f32)> {
-    let holes = cam::holes(setup, op, mesh).ok()?;
-    let holes: Vec<_> = holes.iter().filter(|h| cam::drills(op, h)).collect();
-    let narrowest = (holes.iter())
-        .map(|h| h.widest_drill().min(h.diameter))
-        .reduce(f32::min)?;
-    let widest = holes.iter().map(|h| h.diameter).reduce(f32::max)?;
-    Some((narrowest, widest))
+/// A hole a centre drill starts: the widest its pilot may be (its Ø, or the
+/// widest drill it takes when narrower), its Ø, and how deep it is from its
+/// top to its bottom.
+#[derive(Debug, Clone, Copy)]
+pub struct Spot {
+    pub room: f32,
+    pub diameter: f32,
+    pub depth: f32,
 }
-/// The library's centre drill for holes of `sizes` (the narrowest, by the
-/// widest drill it takes, and the widest diameter) on machine `m`: its pilot
-/// goes down the narrowest; of those, the narrowest body that opens the
-/// widest hole's cone to its size, else the widest body. Without sizes, the
-/// one whose body is nearest 6.3 mm, the common A 2.5×6.3.
-pub fn pick<'a>(tools: &'a [Tool], m: &Machine, sizes: Option<(f32, f32)>) -> Option<&'a Tool> {
+impl Spot {
+    /// Whether centre drill `c` starts it as `cam` cuts it: its pilot
+    /// narrower, and the pilot under the cone opened to its Ø (or the
+    /// body's) no deeper than it.
+    fn takes(&self, c: &crate::model::CentreDrill) -> bool {
+        c.pilot < self.room && c.cone_depth(self.diameter) + c.pilot_length <= self.depth + 1e-3
+    }
+}
+/// The holes drill `op` of `setup` drills (`Spot`); None when they are not
+/// known.
+fn spots(setup: &Setup, op: &Operation, mesh: &Mesh) -> Option<Vec<Spot>> {
+    let holes = cam::holes(setup, op, mesh).ok()?;
+    let spots: Vec<Spot> = (holes.iter().filter(|h| cam::drills(op, h)))
+        .map(|h| Spot {
+            room: h.widest_drill().min(h.diameter),
+            diameter: h.diameter,
+            depth: h.top - h.bottom,
+        })
+        .collect();
+    (!spots.is_empty()).then_some(spots)
+}
+/// The library's centre drill for the holes `spots` on machine `m`: one
+/// that starts every one of them (`Spot::takes`); of those, the narrowest
+/// body that opens the widest hole's cone to its size, else the widest body.
+/// Without holes, the one whose body is nearest 6.3 mm, the common A 2.5×6.3.
+pub fn pick<'a>(tools: &'a [Tool], m: &Machine, spots: Option<&[Spot]>) -> Option<&'a Tool> {
     let fitting: Vec<(&Tool, crate::model::CentreDrill)> = (tools.iter())
         .filter(|t| t.fits(m) && t.issues().is_empty())
         .filter_map(|t| Some((t, t.centre_drill()?)))
-        .filter(|(_, c)| sizes.is_none_or(|(narrowest, _)| c.pilot < narrowest))
+        .filter(|(_, c)| spots.is_none_or(|s| s.iter().all(|h| h.takes(c))))
         .collect();
-    let Some((_, widest)) = sizes else {
+    let Some(spots) = spots else {
         return (fitting.iter())
             .min_by(|a, b| (a.1.body - 6.3).abs().total_cmp(&(b.1.body - 6.3).abs()))
             .map(|(t, _)| *t);
     };
+    let widest = spots.iter().map(|h| h.diameter).fold(0., f32::max);
     (fitting.iter().filter(|(_, c)| c.body >= widest))
         .min_by(|a, b| a.1.body.total_cmp(&b.1.body))
         .or_else(|| fitting.iter().max_by(|a, b| a.1.body.total_cmp(&b.1.body)))
@@ -194,8 +212,8 @@ fn speeds(
 /// `mesh`), to go just before it.
 pub fn centring(doc: &Document, setup: &Setup, drill: &Operation, mesh: Option<&Mesh>) -> Centring {
     let machine = &setup.machine;
-    let sizes = mesh.and_then(|mesh| sizes(setup, drill, mesh));
-    let tool = pick(&doc.tools, machine, sizes);
+    let spots = mesh.and_then(|mesh| spots(setup, drill, mesh));
+    let tool = pick(&doc.tools, machine, spots.as_deref());
     let mut op = Operation::for_machine(
         Strategy::Drill,
         tool.map(|t| t.id.clone()).unwrap_or_default(),
@@ -218,10 +236,11 @@ pub fn centring(doc: &Document, setup: &Setup, drill: &Operation, mesh: Option<&
         op.p.insert("rpm".into(), rpm.to_string());
         op.p.insert("feed".into(), feed.to_string());
     }
-    let missing = tool.is_none().then(|| match sizes {
-        Some((narrowest, _)) => format!(
-            "a centre drill whose pilot is under Ø{}",
-            crate::post::exact_mm(narrowest)
+    let missing = tool.is_none().then(|| match spots.as_deref() {
+        Some(s) => format!(
+            "a centre drill whose pilot is under Ø{} and whose pilot and cone go no deeper than {} mm",
+            crate::post::exact_mm(s.iter().map(|h| h.room).fold(f32::INFINITY, f32::min)),
+            crate::post::exact_mm(s.iter().map(|h| h.depth).fold(f32::INFINITY, f32::min))
         ),
         None => "a centre drill".into(),
     });
@@ -330,6 +349,18 @@ mod tests {
             let holes = cam::holes(setup, centre, &mesh).unwrap();
             let plan = plan(&doc, &mesh, ci).unwrap();
             assert_eq!(plan.milling_direction, "Centre drilling · axial feed");
+            // The holder and flutes are measured from the pilot's top, the
+            // plan's point: 40 and 12 from the tip, less the 3.1 pilot.
+            assert!(
+                (plan.tool_length - 36.9).abs() < 1e-4,
+                "{}",
+                plan.tool_length
+            );
+            assert!(
+                (plan.flute_length - 8.9).abs() < 1e-4,
+                "{}",
+                plan.flute_length
+            );
             // The pilot's top goes down until the cone is the hole's size,
             // or the body's, at the hole's top.
             let depth = (cone - 2.5) / 2. * 3f32.sqrt();
@@ -393,8 +424,28 @@ mod tests {
             centre_drill("2.5", "3.1", "6.3"),
             centre_drill("3.15", "3.9", "8"),
         ];
-        let name = |s| pick(&tools, &m, s).map(|t| t.name().to_string());
+        // Holes from Ø`narrowest` to Ø`widest`, 50 deep.
+        let deep = |narrowest: f32, widest: f32| {
+            [narrowest, widest].map(|d| Spot {
+                room: d,
+                diameter: d,
+                depth: 50.,
+            })
+        };
+        let name = |s: Option<(f32, f32)>| {
+            let spots = s.map(|(a, b)| deep(a, b));
+            pick(&tools, &m, spots.as_ref().map(|s| &s[..])).map(|t| t.name().to_string())
+        };
         assert_eq!(name(None).as_deref(), Some("Centre drill A2.5×6.3"));
+        // A Ø6 hole 5 deep: the A2.5's pilot and cone go 6.13 down it, the
+        // A3.15's 6.37; the A1.6's 4.08, its cone at its Ø4 body.
+        let shallow = [Spot {
+            room: 6.,
+            diameter: 6.,
+            depth: 5.,
+        }];
+        let picked = pick(&tools, &m, Some(&shallow)).map(|t| t.name());
+        assert_eq!(picked, Some("Centre drill A1.6×4"));
         // Ø5 to Ø7 holes: the A2.5 and the A3.15 go down a Ø5; only the
         // A3.15's body reaches Ø7.
         assert_eq!(
@@ -430,6 +481,11 @@ mod tests {
         // The drill is centred: nothing more is needed.
         assert!(centred(&doc.setups[0], 3));
         assert!(needed(&doc, 0, None).0.is_empty());
+        // A copied setup's centre drilling centres the copied drill.
+        let copy = doc.setups[0].duplicate("G55");
+        let ops = &copy.operations;
+        assert_ne!(ops[3].id, doc.setups[0].operations[3].id);
+        assert_eq!(centres(&ops[ci]), Some(ops[3].id.as_str()));
     }
     /// The holes and the uncentred flags of the Holes step of operation
     /// `oi` in `guide`.

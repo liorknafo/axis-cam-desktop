@@ -2587,8 +2587,12 @@ impl Setup {
         for o in &mut s.operations {
             o.id = mapping[&o.id].clone();
             o.preview = false;
-            if let Some(new) = mapping.get(get(&o.p, "rest_source")) {
-                o.p.insert("rest_source".into(), new.clone());
+            // A rest machining's source and a centre drilling's drill are
+            // the copies'.
+            for k in ["rest_source", crate::centre::CENTRES] {
+                if let Some(new) = mapping.get(get(&o.p, k)) {
+                    o.p.insert(k.into(), new.clone());
+                }
             }
         }
         s

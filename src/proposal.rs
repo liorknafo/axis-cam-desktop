@@ -3304,7 +3304,9 @@ pub fn build(
     }
     built.sync_stock_sources();
     // On the manual mill each twist drill is centre drilled first, with the
-    // library's centre drill; without one the plan check says so.
+    // library's centre drill; without one the plan check says so. A kept
+    // centre drilling takes its drill's holes as the plan now picks them.
+    crate::centre::sync(&mut built);
     for si in 0..built.setups.len() {
         let (centrings, _) = crate::centre::needed(&built, si, Some(mesh));
         let found = centrings
