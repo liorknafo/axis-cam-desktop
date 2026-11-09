@@ -495,7 +495,7 @@ When the steps cannot be worked out, the page says why and names the operation i
 | Pass | One pass: top and front views, the band it removes, the tool where it starts and an arrow to where it stops, what earlier passes removed, and the DRO numbers |
 | Holes | The top view with every hole numbered, the current one lit, and its X, Y and the Z to drill to, with how deep that is from the hole's mouth (where the drill enters, lower where an earlier cut took the top down); a Reaming says Ream, "ream to" and "feed back out" |
 | Bore | One pass of a Boring: the holes and the bore as this pass leaves it over the last one's, then in order the bore to measure ("measure Ø31.90", after the first pass), the head setting ("head Ø32.00 · out 0.10 on Ø · 10 divisions", set with the spindle off), each hole's X and Y and the Z to bore to, and how to come out (spindle off, then raise; or feed back out) |
-| Check | The stock after the operation next to the one before, and the allowance left |
+| Check | The stock after the operation, lit as the one before it so that only the cut differs, with the sizes to measure drawn on it and listed large: a Box's width from the face it is measured from (or between its walls) and its depth below the top, with the stock to leave in them ("15.00 wide · from the front face", "9.50 deep below the top · floor Z −11.50"); holes' count, diameter and depth from the mouth |
 | Hand over | The stock as it leaves and the next setup it goes to |
 
 **The DRO numbers.**

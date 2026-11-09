@@ -57,8 +57,20 @@ pub struct Shown {
     pictures: Vec<Option<image::Handle>>,
     /// The stock in 3D as it starts, in the vise on its parallels.
     held: Option<image::Handle>,
+    /// By picture, the sizes drawn on it (the Check screen's), in its
+    /// pixels.
+    dims: Vec<Vec<Dim>>,
     /// On the lathe: what its side views draw.
     side: Option<turning::Side>,
+}
+/// A size drawn on a picture: a dimension line from `a` to `b` (picture
+/// pixels), or with `leader` an arrow onto `a` from `b`, labelled.
+#[derive(Debug, Clone)]
+struct Dim {
+    a: Point,
+    b: Point,
+    label: String,
+    leader: bool,
 }
 impl Shown {
     /// The same pictures with the guide worked out again for `doc`
@@ -73,6 +85,7 @@ impl Shown {
             parallels: self.parallels.clone(),
             pictures: self.pictures.clone(),
             held: self.held.clone(),
+            dims: self.dims.clone(),
             side: self.side.clone(),
         })
     }
@@ -174,26 +187,54 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
             .collect()
     };
     let held = solid(&jaws);
-    let picture = |v: &crate::volume::Volume, box_: Bounds, held: &[_]| {
-        let surface =
-            crate::stock_surface::Snapshot::of(v, crate::stock_surface::Detail::Draft).build();
-        let mut triangles: Vec<_> = match &surface {
-            Ok(s) => viewport::stock_triangles(v, s, frame, None).collect(),
+    // The stock before the setup, then after each operation, lit alike
+    // over the depth of every cut of the setup (LIO-370).
+    let volumes: Vec<&crate::volume::Volume> = std::iter::once(&guide.before)
+        .chain(guide.done.iter().map(|d| &d.after))
+        .collect();
+    let surfaces: Vec<_> = (volumes.iter())
+        .map(|v| crate::stock_surface::Snapshot::of(v, crate::stock_surface::Detail::Draft).build())
+        .collect();
+    let span = (volumes.iter().zip(&surfaces))
+        .filter_map(|(v, s)| Some(viewport::cut_span(v, s.as_ref().ok()?, frame)))
+        .fold([f32::NEG_INFINITY, f32::INFINITY], |a, b| {
+            [a[0].max(b[0]), a[1].min(b[1])]
+        });
+    let stock: Vec<Vec<_>> = (volumes.iter().zip(&surfaces).zip(&boxes))
+        .map(|((v, surface), box_)| match surface {
+            Ok(s) => viewport::stock_triangles_lit(v, s, frame, None, span).collect(),
             Err(_) => viewport::box_triangles(box_.translated(zero), viewport::BLOCK),
-        };
+        })
+        .collect();
+    let picture = |i: usize, held: &[_]| {
+        let mut triangles = stock[i].clone();
         triangles.extend(held.iter().copied());
         viewport::stock_picture(&triangles, PICTURE)
     };
-    let mut pictures = vec![picture(&guide.before, boxes[0], &held)];
-    for (d, b) in guide.done.iter().zip(&boxes[1..]) {
-        pictures.push(picture(&d.after, *b, &held));
-    }
+    let pictures: Vec<_> = (0..stock.len()).map(|i| picture(i, &held)).collect();
     let held = if vise.is_empty() {
         pictures[0].clone()
     } else {
         let tall = solid(&[&vise[..], &parallels].concat());
-        picture(&guide.before, boxes[0], &tall)
+        picture(0, &tall)
     };
+    // The sizes each operation leaves, on the picture after it.
+    let mut dims = vec![vec![]];
+    for (j, d) in guide.done.iter().enumerate() {
+        let measures = measures(doc, &guide, d, boxes[j].max[2] + zero[2]);
+        let ends: Vec<[f32; 3]> = measures.iter().flat_map(|m| [m.from, m.to]).collect();
+        let points = viewport::picture_points(&stock[j + 1], PICTURE, &ends);
+        dims.push(
+            (measures.iter().zip(points.chunks(2)))
+                .map(|(m, p)| Dim {
+                    a: p[0],
+                    b: p[1],
+                    label: format!("{} {}", m.axis, mm(m.value)),
+                    leader: m.leader,
+                })
+                .collect(),
+        );
+    }
     let side = crate::lathe::is_lathe(&setup.machine).then(|| turning::side(doc, mesh, &guide));
     Ok(Shown {
         guide,
@@ -204,10 +245,151 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
         parallels,
         pictures,
         held,
+        dims,
         side,
     })
 }
-
+/// A size the Check screen gives to measure (LIO-370): `value` mm along
+/// `axis` ("X", "Y", "Z" or "Ø"), said by `words` as a caliper or depth
+/// gauge reads it, and drawn on the picture from `from` to `to` (stock
+/// frame, mm): a dimension line, or with `leader` an arrow onto `from`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Measure {
+    pub axis: &'static str,
+    pub value: f32,
+    pub words: Vec<String>,
+    pub from: [f32; 3],
+    pub to: [f32; 3],
+    pub leader: bool,
+}
+/// The sizes operation `op` of the guide (its `done` entry `d`) was to
+/// leave, as it leaves them, with the stock to leave in them; `top` is the
+/// Z of the stock's top before it (stock frame). A Box: its width from the
+/// face it is measured from, or between its walls, on each axis it has a
+/// wall on, and its depth below that top; holes: how many, their
+/// diameter and their depth from the mouth.
+pub(crate) fn measures(
+    doc: &Document,
+    g: &Guide,
+    d: &crate::guide::Done,
+    top: f32,
+) -> Vec<Measure> {
+    let Some(op) = doc.setups.get(g.setup).and_then(|s| s.operations.get(d.op)) else {
+        return vec![];
+    };
+    let (zero, s) = (g.zero, d.plan.stock);
+    let mut out = vec![];
+    match op.strategy {
+        Strategy::Box => {
+            let Ok((low, high)) = crate::cam::box_block(op, zero) else {
+                return out;
+            };
+            let allowance = crate::cam::number(op, "allowance").unwrap_or(0.);
+            let open = crate::cam::open_sides(low, high, &s);
+            let (lo, hi) = crate::cam::box_cut(low, high, &s, allowance);
+            let faces = [["left", "right"], ["front", "back"]];
+            let mut wall = None;
+            for k in 0..2 {
+                let o = 1 - k;
+                let from = match open[k] {
+                    [true, true] => continue,
+                    [true, false] => format!("from the {} face", faces[k][0]),
+                    [false, true] => format!("from the {} face", faces[k][1]),
+                    [false, false] => "between the walls".into(),
+                };
+                // On the edge of the top the pictures see: the front's
+                // (−Y) for an X width, the right's (+X) for a Y width.
+                let mut a = [0., 0., top];
+                a[o] = if o == 0 { s.max[0] } else { s.min[1] };
+                let mut b = a;
+                (a[k], b[k]) = (lo[k], hi[k]);
+                wall.get_or_insert(if open[k][0] { b } else { a });
+                out.push(Measure {
+                    axis: AXES[k],
+                    value: hi[k] - lo[k],
+                    words: vec!["wide".into(), from],
+                    from: a,
+                    to: b,
+                    leader: false,
+                });
+            }
+            // Down the wall where that edge meets it.
+            let at = wall.unwrap_or([s.max[0], s.min[1], top]);
+            let words = if open[2][0] {
+                vec!["through".into()]
+            } else {
+                vec![
+                    "deep below the top".into(),
+                    format!("floor Z {}", dro(lo[2] - zero[2])),
+                ]
+            };
+            out.push(Measure {
+                axis: "Z",
+                value: top - lo[2],
+                words,
+                from: at,
+                to: [at[0], at[1], lo[2]],
+                leader: false,
+            });
+        }
+        Strategy::Drill => {
+            let Some((holes, mouths)) = g.steps.iter().find_map(|st| match st {
+                Step::Holes {
+                    op: o,
+                    holes,
+                    mouths,
+                    ..
+                } if *o == d.op => Some((holes, mouths)),
+                Step::Bore {
+                    op: o,
+                    holes,
+                    mouths,
+                    ..
+                } if *o == d.op => Some((holes, mouths)),
+                _ => None,
+            }) else {
+                return out;
+            };
+            let Some(h) = holes.first() else {
+                return out;
+            };
+            let mouth = mouths.first().copied().unwrap_or(top - zero[2]);
+            let at = [h[0] + zero[0], h[1] + zero[1], mouth + zero[2]];
+            let up = [at[0], at[1], at[2] + 2. * d.plan.radius.max(6.)];
+            let count = if holes.len() == 1 {
+                "1 hole".to_string()
+            } else {
+                format!("{} holes", holes.len())
+            };
+            out.push(Measure {
+                axis: "Ø",
+                value: 2. * d.plan.radius,
+                words: vec![count],
+                from: at,
+                to: up,
+                leader: true,
+            });
+            let deep: Vec<f32> = (holes.iter().zip(mouths)).map(|(h, m)| m - h[2]).collect();
+            let (least, most) = deep
+                .iter()
+                .fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
+            let mut words = vec!["deep from the mouth".to_string()];
+            if most - least > 0.005 {
+                words.push(format!("{}–{} by hole", mm(least), mm(most)));
+            }
+            out.push(Measure {
+                axis: "Z",
+                value: most,
+                words,
+                from: at,
+                to: [at[0], at[1], at[2] - deep[0]],
+                leader: false,
+            });
+        }
+        _ => {}
+    }
+    out
+}
 /// A DRO number: two decimals, a true minus, never −0.00.
 fn dro(v: f32) -> String {
     let v = if v.abs() < 0.005 { 0. } else { v };
@@ -1061,6 +1243,53 @@ impl canvas::Program<Message> for ToolPicture {
             align_y: iced::alignment::Vertical::Center,
             ..Default::default()
         });
+        vec![f.into_geometry()]
+    }
+}
+/// The sizes `dims` drawn over a picture of `PICTURE` pixels shown as wide
+/// and high as it fits in the canvas, centred (an image's `Contain`).
+struct Dims<'a>(&'a [Dim]);
+impl canvas::Program<Message> for Dims<'_> {
+    type State = ();
+    fn draw(
+        &self,
+        _: &(),
+        renderer: &iced::Renderer,
+        _: &Theme,
+        bounds: Rectangle,
+        _: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut f = canvas::Frame::new(renderer, bounds.size());
+        let (w, h) = (PICTURE.0 as f32, PICTURE.1 as f32);
+        let k = (bounds.width / w).min(bounds.height / h);
+        let (ox, oy) = ((bounds.width - w * k) / 2., (bounds.height - h * k) / 2.);
+        let at = |p: Point| Point::new(ox + p.x * k, oy + p.y * k);
+        let centre = Point::new(bounds.width / 2., bounds.height / 2.);
+        for d in self.0 {
+            let (a, b) = (at(d.a), at(d.b));
+            let label = if d.leader {
+                arrow(&mut f, b, a, ACCENT, 2.5);
+                Point::new(b.x + 8., b.y - 10.)
+            } else {
+                let mid = Point::new((a.x + b.x) / 2., (a.y + b.y) / 2.);
+                arrow(&mut f, mid, a, ACCENT, 2.5);
+                arrow(&mut f, mid, b, ACCENT, 2.5);
+                // Off the line, away from the picture's middle.
+                let (dx, dy) = (mid.x - centre.x, mid.y - centre.y);
+                let l = dx.hypot(dy).max(1.);
+                Point::new(mid.x + dx / l * 40. - 10., mid.y + dy / l * 30.)
+            };
+            // On a white tag, to read over the stock.
+            let width = d.label.chars().count() as f32 * 9.5 + 12.;
+            let tag = canvas::Path::rounded_rectangle(
+                Point::new(label.x - 6., label.y - 13.),
+                Size::new(width, 26.),
+                5.into(),
+            );
+            f.fill(&tag, Color::WHITE);
+            f.stroke(&tag, stroke(ACCENT, 1.5));
+            write(&mut f, d.label.clone(), label, ACCENT, 17., Align::Left);
+        }
         vec![f.into_geometry()]
     }
 }
@@ -2488,13 +2717,40 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             {
                 c.push(chip(format!("{} mm left on the walls and floor", mm(a))));
             }
-            let right = column![label("Before"), p.picture(j, (240., 160.)), chips(c)];
-            (
-                "Check".into(),
-                "the stock after it",
-                p.picture(j + 1, (480., 320.)),
-                right,
-            )
+            // The sizes to measure, drawn on the picture and listed large
+            // (LIO-370).
+            let top = p.shown.boxes[j].max[2] + g.zero[2];
+            let sizes = g
+                .done
+                .get(j)
+                .map_or(vec![], |d| measures(&p.app.doc, g, d, top));
+            let rows = sizes.into_iter().map(|m| {
+                readout(
+                    Readout {
+                        order: None,
+                        lead: None,
+                        axis: m.axis.into(),
+                        value: dro(m.value),
+                        lock: None,
+                        tags: m.words,
+                        lit: Lit::Next,
+                        big: true,
+                    },
+                    None,
+                )
+            });
+            let right = column![label("Measure")]
+                .extend(rows)
+                .push(chips(c))
+                .push(label("Before"))
+                .push(p.picture(j, Length::Fixed(160.)));
+            let dims = p.shown.dims.get(j + 1).map_or(&[][..], Vec::as_slice);
+            let left = iced::widget::stack![
+                p.picture(j + 1, Fill),
+                crate::fault::canvas(Dims(dims)).width(Fill).height(Fill)
+            ]
+            .into();
+            ("Check".into(), "measure what it left", left, right)
         }
         Step::Lathe(step) => turning::screen(p, step),
         Step::HandOver { next: to } if p.shown.side.is_some() => {
@@ -3280,6 +3536,47 @@ pub(crate) mod tests {
         // Tapping a readout lights the next.
         send(&mut a, GuideAction::Reached(0));
         assert_eq!(a.guide_item, 1);
+    }
+    #[test]
+    fn the_check_screen_gives_the_sizes_to_measure_on_and_beside_the_picture() {
+        let mut a = app("Yes");
+        let g = guide(&a);
+        let checks: Vec<usize> = (g.steps.iter().enumerate())
+            .filter(|(_, s)| matches!(s, Step::Check { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        // The Step: 15 wide from the front face, 9.5 below the faced top.
+        send(&mut a, GuideAction::Go(checks[0]));
+        let t = texts(&a);
+        for want in [
+            "15.00",
+            "wide · from the front face",
+            "9.50",
+            "deep below the top · floor Z −11.50",
+        ] {
+            assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
+        }
+        // The Holes: 4 of Ø4, 42 deep from their mouths on the faced top.
+        send(&mut a, GuideAction::Go(checks[1]));
+        let t = texts(&a);
+        for want in ["4.00", "4 holes", "42.00", "deep from the mouth"] {
+            assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
+        }
+        // Drawn on the pictures after them, inside the picture.
+        let shown = a.guide_at().unwrap().0;
+        let labels = |i: usize| -> Vec<String> {
+            for d in &shown.dims[i] {
+                for q in [d.a, d.b] {
+                    assert!(
+                        (0. ..=960.).contains(&q.x) && (0. ..=640.).contains(&q.y),
+                        "{d:?}"
+                    );
+                }
+            }
+            shown.dims[i].iter().map(|d| d.label.clone()).collect()
+        };
+        assert_eq!(labels(2), ["Y 15", "Z 9.5"]);
+        assert_eq!(labels(3), ["Ø 4", "Z 42"]);
     }
     #[test]
     fn back_and_next_are_in_one_place_on_every_screen() {
@@ -4418,4 +4715,5 @@ pub(crate) mod tests {
         let thread = nth(&a, 0, |l| matches!(l, L::ThreadPass { .. }));
         shot(&mut a, "25-inside-thread-pass-2", thread + 1, 1);
     }
+
 }

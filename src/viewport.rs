@@ -2889,7 +2889,7 @@ const DEPTH_SHADE: f32 = 0.45;
 /// The Z, in the frame `current`, of the top of `volume`'s stock and of the
 /// lowest point of `surface` inside its box: from the stock's top to its
 /// deepest cut, the span `shade_cut` darkens cut faces over.
-fn cut_span(
+pub(crate) fn cut_span(
     volume: &crate::volume::Volume,
     surface: &crate::stock_surface::SurfaceMesh,
     current: crate::volume::Frame,
@@ -2990,6 +2990,19 @@ pub(crate) fn stock_triangles<'a>(
     current: crate::volume::Frame,
     since: Option<usize>,
 ) -> impl Iterator<Item = ([[f32; 3]; 3], [u8; 4])> + 'a {
+    let span = cut_span(volume, surface, current);
+    stock_triangles_lit(volume, surface, current, since, span)
+}
+/// `stock_triangles` with its cut faces shaded by depth over `span` (Z
+/// from, Z to), so that pictures of the same stock at different stages
+/// are lit alike.
+pub(crate) fn stock_triangles_lit<'a>(
+    volume: &'a crate::volume::Volume,
+    surface: &'a crate::stock_surface::SurfaceMesh,
+    current: crate::volume::Frame,
+    since: Option<usize>,
+    span: [f32; 2],
+) -> impl Iterator<Item = ([[f32; 3]; 3], [u8; 4])> + 'a {
     let newest = since.map(|from| {
         let extent = volume.bounds.dimensions().into_iter().fold(0., f32::max);
         let mut history =
@@ -2999,7 +3012,6 @@ pub(crate) fn stock_triangles<'a>(
         }
         (from as u32, history)
     });
-    let span = cut_span(volume, surface, current);
     surface.triangles.iter().map(move |triangle| {
         let points = triangle.map(|i| volume.frame.transfer(surface.vertices[i], current));
         let color = stock_color(volume, surface, triangle, points, span, newest.as_ref());
@@ -3300,6 +3312,22 @@ pub(crate) fn stock_picture(
     triangles: &[([[f32; 3]; 3], [u8; 4])],
     (w, h): (u32, u32),
 ) -> Option<iced::widget::image::Handle> {
+    let p = picture_projector(triangles, (w, h))?;
+    let mut rgba = vec![0; (w * h * 4) as usize];
+    let mut depths = vec![f32::NEG_INFINITY; (w * h) as usize];
+    let projected = on_every_core(triangles, |(t, color)| {
+        (t.map(|v| (p.p(v), p.depth(v))), *color)
+    });
+    raster_triangles(&mut rgba, &mut depths, w, h, projected.len(), |i| {
+        projected[i]
+    });
+    Some(iced::widget::image::Handle::from_rgba(w, h, rgba))
+}
+/// The projection `stock_picture` sees `triangles` with at (w, h) px.
+fn picture_projector(
+    triangles: &[([[f32; 3]; 3], [u8; 4])],
+    (w, h): (u32, u32),
+) -> Option<Projector> {
     let mut all = crate::mesh::Bounds {
         min: [f32::INFINITY; 3],
         max: [f32::NEG_INFINITY; 3],
@@ -3311,16 +3339,21 @@ pub(crate) fn stock_picture(
     if !all.min.iter().chain(&all.max).all(|v| v.is_finite()) {
         return None;
     }
-    let p = Projector::filling(Camera::default(), (w as f32, h as f32), &[all], 0.9);
-    let mut rgba = vec![0; (w * h * 4) as usize];
-    let mut depths = vec![f32::NEG_INFINITY; (w * h) as usize];
-    let projected = on_every_core(triangles, |(t, color)| {
-        (t.map(|v| (p.p(v), p.depth(v))), *color)
-    });
-    raster_triangles(&mut rgba, &mut depths, w, h, projected.len(), |i| {
-        projected[i]
-    });
-    Some(iced::widget::image::Handle::from_rgba(w, h, rgba))
+    Some(Projector::filling(
+        Camera::default(),
+        (w as f32, h as f32),
+        &[all],
+        0.9,
+    ))
+}
+/// Where `points` (in the frame of `triangles`) fall in the picture
+/// `stock_picture` makes of `triangles` at `size`, px; empty without one.
+pub(crate) fn picture_points(
+    triangles: &[([[f32; 3]; 3], [u8; 4])],
+    size: (u32, u32),
+    points: &[[f32; 3]],
+) -> Vec<Point> {
+    picture_projector(triangles, size).map_or(vec![], |p| points.iter().map(|v| p.p(*v)).collect())
 }
 fn box_vertices(bounds: crate::mesh::Bounds) -> [[f32; 3]; 8] {
     let [x, y, z] = bounds.min;
