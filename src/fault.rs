@@ -110,7 +110,8 @@ mod tests {
         })
         .unwrap_err();
         assert!(fault.contains("index out of bounds"), "{fault}");
-        assert!(fault.contains("src/fault.rs"), "{fault}");
+        // The place is as the compiler gives it: src\fault.rs on Windows.
+        assert!(fault.contains(file!()), "{fault}");
         assert_eq!(catch(|| 2 + 2), Ok(4));
     }
 }
