@@ -19833,7 +19833,7 @@ soft_max = 180.0
         let _ = a.update(Message::Surface(wall));
         assert_eq!(
             a.status,
-            "Picked the 180° arc at X0.00 Y-10.00: its walls are blue. The Drill drills its whole Ø10 circle round its centre. With only part of the drill in the part, it is pushed toward the open side: feed it gently, or clamp a block against the opening."
+            "Picked the 180° arc at X0.00 Y-10.00: its walls are blue. The Drill drills its whole Ø10 circle round its centre."
         );
         assert_eq!(
             a.operation()
@@ -19850,7 +19850,7 @@ soft_max = 180.0
         let h = &holes[0];
         assert!(h.through && (h.diameter - 10.).abs() < 0.01, "{h:?}");
         let row = "✓ Ø10.00 (opening Ø10.00) · X0.00 Y-10.00 · depth 10.00 mm · through · 180° arc · remove";
-        shows(&a, &["1 hole to drill", row]);
+        shows(&a, &["1 hole to drill", row, crate::ui::ARC_ENGAGEMENT]);
         // With a Ø10 drill it raises nothing and drills down through there.
         let mut drill = crate::model::Tool::new("T9 Drill 10", "Drill", "10");
         drill.p.insert("number".into(), "9".into());

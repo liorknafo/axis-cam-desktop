@@ -3609,6 +3609,9 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                                             None => muted(said).into(),
                                         });
                                     }
+                                    if holes.iter().any(|h| h.arc.is_some()) {
+                                        c = c.push(note(ARC_ENGAGEMENT));
+                                    }
                                 }
                                 Err(error) => c = c.push(note(error.clone())),
                             }
@@ -5770,6 +5773,9 @@ pub(crate) fn speed_feed_heading(lines: &[(bool, String)]) -> &'static str {
         "Speeds and feeds not checked (export still allowed)"
     }
 }
+/// What a Drill listing an arc (`cam::arcs`) says under its holes: only part
+/// of the drill is in the part there.
+pub(crate) const ARC_ENGAGEMENT: &str = "An arc's whole circle is drilled round its centre, with only part of the drill in the part: the drill is pushed toward the open side. Feed it gently (a slower plunge feed), or clamp a block against the opening so it cuts a whole hole.";
 /// Which of the holes `picked` by their walls (`App::pocket_holes`) the
 /// drill's hole `h` (`App::drill_holes`) is, for its remove button: the one
 /// at its centre, and at several A angles at its angle too, as each angle

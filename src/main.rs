@@ -4042,7 +4042,7 @@ impl App {
         let said = match (&hole, dropping) {
             (_, true) => format!("Dropped the {:.0}° arc at X{x:.2} Y{y:.2}.", arc.span),
             (Some(h), false) => format!(
-                "Picked the {:.0}° arc at X{x:.2} Y{y:.2}: its walls are blue. The Drill drills its whole Ø{} circle round its centre. With only part of the drill in the part, it is pushed toward the open side: feed it gently, or clamp a block against the opening.",
+                "Picked the {:.0}° arc at X{x:.2} Y{y:.2}: its walls are blue. The Drill drills its whole Ø{} circle round its centre.",
                 arc.span,
                 crate::post::exact_mm(cam::largest_drill(h))
             ),

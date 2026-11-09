@@ -134,7 +134,7 @@ fn fit(facets: &HashMap<usize, Facet>, members: &[usize]) -> Option<([f64; 2], f
         return None;
     }
     // How far round each facet goes: its longest chord's angle.
-    let mut angles: Vec<f64> = (members.iter().map(|m| &facets[m].xy))
+    let angles: Vec<f64> = (members.iter().map(|m| &facets[m].xy))
         .map(|xy| {
             let longest = (xy.iter().enumerate())
                 .flat_map(|(i, a)| {
@@ -146,19 +146,12 @@ fn fit(facets: &HashMap<usize, Facet>, members: &[usize]) -> Option<([f64; 2], f
             2. * (longest / (2. * r)).min(1.).asin()
         })
         .collect();
-    angles.sort_by(f64::total_cmp);
-    let (median, widest) = (angles[angles.len() / 2], angles[angles.len() - 1]);
-    // A circle's facets go round as far as each other, 2 % give or take
-    // (a CAD part's, a DXF's arc's: the same step round it), but for two
-    // shorter ones, its ends'. A wider one is a flat that ends on the circle
-    // (a slot's side between the first facets of its ends); more that are
-    // not alike are a patch of a curve that is no circle (an ellipse's).
-    let short = angles.iter().filter(|a| **a < 0.98 * median).count();
-    (widest <= 45f64.to_radians() && widest <= 1.02 * median + 1e-4 && short <= 2).then_some((
-        [c.0, c.1],
-        r,
-        off,
-    ))
+    // A facet going more than 45° round is a flat that ends on the circle
+    // (a slot's side between the first facets of its ends): no circle's
+    // facet. Facets may go round unevenly: each two next to each other are
+    // checked as chords of one circle (`inscribed`).
+    let widest = angles.iter().copied().fold(0., f64::max);
+    (widest <= 45f64.to_radians()).then_some(([c.0, c.1], r, off))
 }
 /// The longest chord of facet `f` seen from above.
 fn chord(f: &Facet) -> f64 {
@@ -178,13 +171,15 @@ fn turn(a: &Facet, b: &Facet) -> f64 {
 }
 /// Whether facets `a` and `b`, next to each other, are two chords of one
 /// circle of radius `r`: `b` turns from `a` half of the two's angles round
-/// it together (10 % give or take). A flat tangent to the circle at the
+/// it together (3 % give or take): exact for any two chords of a circle,
+/// however unevenly it is cut, and off for two of an ellipse's or a
+/// spline's, whose curve bends more or less from one to the next. A flat tangent to the circle at the
 /// end of `a` turns half of `a`'s only, however close its far end is to
 /// the circle (a slot's short side).
 fn inscribed(a: &Facet, b: &Facet, r: f64) -> bool {
     let angle = |f: &Facet| 2. * (chord(f) / (2. * r)).min(1.).asin();
     let expected = (angle(a) + angle(b)) / 2.;
-    (turn(a, b) - expected).abs() <= 0.1 * expected + 1e-3
+    (turn(a, b) - expected).abs() <= 0.03 * expected + 1e-4
 }
 /// The facets of `facets` at each of their corners, by its key.
 fn corners(facets: &HashMap<usize, Facet>) -> Corners {
@@ -437,6 +432,20 @@ fn ends_cleanly(
     }
     true
 }
+/// Whether the facets `members` of `facets` go round a circle of radius
+/// `r` as far as each other (2 %), but for two shorter ones (its ends'): a
+/// CAD part's or a DXF's arc's facets do. Asked of an arc of four facets or
+/// fewer, whose few corners fit a circle by chance on a curve that is none
+/// (a coarse ellipse's); a longer one may be cut unevenly.
+fn alike(facets: &HashMap<usize, Facet>, members: &[usize], r: f64) -> bool {
+    let mut angles: Vec<f64> = (members.iter())
+        .map(|m| 2. * (chord(&facets[m]) / (2. * r)).min(1.).asin())
+        .collect();
+    angles.sort_by(f64::total_cmp);
+    let (median, widest) = (angles[angles.len() / 2], angles[angles.len() - 1]);
+    let short = angles.iter().filter(|a| **a < 0.98 * median).count();
+    widest <= 1.02 * median + 1e-4 && short <= 2
+}
 /// How far across the stock `setup` holds is seen from above, mm (the
 /// part's box's, when the stock cannot be sized): no circle a Drill drills
 /// is wider.
@@ -445,7 +454,8 @@ fn across(setup: &Setup, mesh: &Mesh, g: &Geometry) -> f32 {
     (b.max[0] - b.min[0]).hypot(b.max[1] - b.min[1])
 }
 /// The arc `members` of `facets` is (`arc`), unless its radius is more
-/// than `across` (`across`: a nearly flat stretch of a wall) or it does not
+/// than `across` (`across`: a nearly flat stretch of a wall), it is four
+/// facets or fewer not alike (`alike`), or it does not
 /// end cleanly (`ends_cleanly`, over `all`, the part's upright facets, by
 /// corner `at`): then it is no circle's.
 fn whole_arc(
@@ -456,7 +466,7 @@ fn whole_arc(
     members: Vec<usize>,
 ) -> Result<Arc, NoArc> {
     let a = arc(facets, members)?;
-    if a.r > across {
+    if a.r > across || !(a.walls.len() > 4 || alike(facets, &a.walls, a.r as f64)) {
         return Err(NoArc::NotRound);
     }
     let c = [a.centre[0] as f64, a.centre[1] as f64];
@@ -571,16 +581,25 @@ pub fn opens_up(g: &Geometry, a: &Arc) -> bool {
     });
     !over && arc_hole(g, a).is_some()
 }
-/// Points inside the circle of the arc `a`, 0.8 of its radius out, at its
-/// middle and on either side of it: where its floor is.
+/// Points inside the circle of the arc `a`, at its middle and on either
+/// side of it, between its facets and the chord across its ends (half way
+/// from that chord to the arc; 0.8 of the radius out for an arc going half
+/// round or more): where its
+/// floor is, however little of the round the arc goes (a shallow scallop's
+/// floor is a thin crescent).
 fn near_arc(a: &Arc) -> [[f32; 2]; 3] {
     let half = (a.span.to_radians() / 2.).min(std::f32::consts::PI);
     [-0.6f32, 0., 0.6].map(|k| {
         let t = a.middle + k * half;
-        [
-            a.centre[0] + 0.8 * a.r * t.cos(),
-            a.centre[1] + 0.8 * a.r * t.sin(),
-        ]
+        // Half way out from the chord across the arc's ends at `t`, when
+        // the arc goes less than half round; else 0.8 of the radius.
+        let out = if half < std::f32::consts::FRAC_PI_2 {
+            (a.r * half.cos() / (k * half).cos() + a.r) / 2.
+        } else {
+            0.8 * a.r
+        };
+        let out = out.min(a.r - 2. * a.sagitta - 0.001);
+        [a.centre[0] + out * t.cos(), a.centre[1] + out * t.sin()]
     })
 }
 /// The hole a Drill drills for the arc `a` in `g`: its whole circle round
@@ -1205,5 +1224,107 @@ pub(crate) mod tests {
                 .filter(|m| m.motion == Motion::Feed)
                 .all(|m| (m.to[0] - a.centre[0]).abs() < 0.001 && m.to[1].abs() < 0.001)
         );
+    }
+    /// A 7 mm wide bar from X4.33 to X6, 10 mm high, whose -X side is an R5
+    /// scallop of 60° round X0 Y0 (in 60 facets): through, or 6 mm deep
+    /// from its top to a floor, the crescent between the arc and its chord
+    /// (the reviewer's, stage 2).
+    fn scallop(blind: bool) -> Vec<[[f32; 3]; 3]> {
+        let arc: Vec<(f64, f64, f64)> = (0..=60)
+            .map(|k| {
+                let t = (-30. + k as f64).to_radians();
+                (5. * t.cos(), 5. * t.sin(), 0.)
+            })
+            .collect();
+        let x = 5. * 30f64.to_radians().cos();
+        let mut edge = arc.clone();
+        edge.extend([(x, 3.5, 0.), (6., 3.5, 0.), (6., -3.5, 0.), (x, -3.5, 0.)]);
+        if !blind {
+            return slab(&[&edge], 10., 0., true, true);
+        }
+        let base = [(x, -3.5, 0.), (6., -3.5, 0.), (6., 3.5, 0.), (x, 3.5, 0.)];
+        let mut tris = slab(&[&edge], 6., 4., true, false);
+        tris.extend(slab(&[&base], 4., 0., false, true));
+        tris.extend(
+            (slab(&[&arc], 4., 0., true, false).into_iter())
+                .filter(|t| t.iter().all(|p| (p[2] - 4.).abs() < 1e-5)),
+        );
+        tris
+    }
+    #[test]
+    fn a_shallow_scallops_floor_is_found_however_thin_its_crescent() {
+        for blind in [true, false] {
+            let mesh = mesh::normalize(scallop(blind)).unwrap();
+            let (mut setup, mut op, mut tool) = fixture(Strategy::Drill);
+            for (k, v) in [
+                ("stock_type", "Fixed size box"),
+                ("stock_x", "20"),
+                ("stock_y", "10"),
+                ("stock_z", "20"),
+            ] {
+                setup.p.insert(k.into(), v.into());
+            }
+            let g = Geometry::new(&setup, &mesh);
+            let wall = walls_where(&setup, &mesh, |c| {
+                (c[0] - g.bounds.min[0] - 0.6).abs() < 0.2 && c[1].abs() < 0.9
+            });
+            let a = arc_at(&setup, &mesh, wall[0]).unwrap();
+            assert!(
+                (a.r - 5.).abs() < 0.001 && (a.span - 60.).abs() < 0.01,
+                "{a:?}"
+            );
+            picking(&mut op, &mesh, &a.walls);
+            let found = holes(&setup, &op, &mesh).unwrap();
+            assert_eq!(found.len(), 1, "{found:?}");
+            let h = &found[0];
+            assert!(
+                (h.diameter - 10.).abs() < 0.01 && h.through != blind,
+                "{blind}: {h:?}"
+            );
+            let depth = if blind { 6. } else { 10. };
+            assert!((h.top - h.bottom - depth).abs() < 0.01, "{blind}: {h:?}");
+            tool.p.insert("diameter".into(), "10".into());
+            let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+            let lowest = (plan.moves.iter())
+                .filter(|m| m.motion == Motion::Feed)
+                .map(|m| m.to[2])
+                .fold(f32::INFINITY, f32::min);
+            if blind {
+                assert!((lowest - h.bottom).abs() < 0.01, "{lowest} {h:?}");
+            }
+        }
+    }
+    #[test]
+    fn a_circle_cut_unevenly_is_an_arc_from_any_facet() {
+        // An R5 half round in facets of 4° and 6° by turns (the reviewer's,
+        // stage 2): its chords are all of one circle.
+        let mut inner = vec![];
+        let mut degrees = -90f64;
+        let at = |d: f64| (5. * d.to_radians().cos(), 5. * d.to_radians().sin(), 0.);
+        inner.push(at(degrees));
+        for i in 0..36 {
+            degrees += if i % 2 == 0 { 4. } else { 6. };
+            inner.push(at(degrees));
+        }
+        inner.extend([(-6., 5., 0.), (-6., -5., 0.)]);
+        let mesh = mesh::normalize(plate_with(&inner)).unwrap();
+        let (setup, _, _) = fixture(Strategy::Drill);
+        let g = Geometry::new(&setup, &mesh);
+        let mid = [
+            (g.bounds.min[0] + g.bounds.max[0]) / 2.,
+            (g.bounds.min[1] + g.bounds.max[1]) / 2.,
+        ];
+        let wall = walls_where(&setup, &mesh, |c| {
+            ((c[0] - mid[0]).hypot(c[1] - mid[1]) - 5.).abs() < 0.1 && c[0] - mid[0] > 0.
+        });
+        assert_eq!(wall.len(), 36);
+        for &id in &wall {
+            let a = arc_at(&setup, &mesh, id).unwrap_or_else(|e| panic!("{id}: {e:?}"));
+            assert_eq!(a.walls, wall);
+            assert!(
+                (a.r - 5.).abs() < 0.001 && (a.span - 180.).abs() < 0.01,
+                "{a:?}"
+            );
+        }
     }
 }
