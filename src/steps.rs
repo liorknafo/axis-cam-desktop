@@ -2039,13 +2039,9 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             }));
             let h = holes.get(i).copied().unwrap_or([0.; 3]);
             let tapping = p.setup.operations.get(*op).is_some_and(|o| o.tapping());
-            // A tap and a centre drill cut from the hole's mouth: the stock
-            // above it may be gone already.
-            let mouth = if tapping || spotting.is_some() {
-                mouths.get(i).copied().unwrap_or(stock.max[2])
-            } else {
-                stock.max[2]
-            };
+            // Every hole is cut from its mouth: the stock above it may be
+            // gone already (LIO-365).
+            let mouth = mouths.get(i).copied().unwrap_or(stock.max[2]);
             let drilled = Bounds {
                 min: [h[0] - r, h[1] - r, h[2]],
                 max: [h[0] + r, h[1] + r, mouth],
@@ -2088,16 +2084,11 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 .get(*op)
                 .and_then(|o| num(&o.p, "rpm"))
                 .unwrap_or(0.);
-            let depth = if spotting.is_some() {
-                mouth
-            } else {
-                stock.max[2]
-            } - h[2];
+            let depth = mouth - h[2];
             // Tapping: by hand, the spindle holding the tap square; the
             // depth is how many turns the tap goes in.
             let pitch = p.tool(*op).and_then(|t| t.tap_spec()).map(|s| s.pitch);
             if let (true, Some(pitch)) = (tapping, pitch) {
-                let depth = mouth - h[2];
                 // Rounded down: a turn more would go past the drilled hole.
                 let turns = (depth / pitch * 10.).floor() / 10.;
                 let mut said = vec![
@@ -3185,6 +3176,34 @@ pub(crate) mod tests {
         // Tapping a readout lights the next.
         send(&mut a, GuideAction::Reached(0));
         assert_eq!(a.guide_item, 1);
+    }
+    #[test]
+    fn a_holes_depth_is_counted_from_its_mouth() {
+        // A Box takes the top down to Z −3 over the two holes left of X 30.
+        let mut a = app_with("Yes", |doc| {
+            let mill = doc.tools[3].id.clone();
+            let b = [-500., 30., -500., 500., 0., -3.5];
+            let low = crate::guide::tests::boxed("Low", &mill, b, &[("stepdown", "5")]);
+            doc.setups[0].operations[0] = low;
+            doc.setups[0].operations.remove(1);
+        });
+        let g = guide(&a);
+        let (at, holes, mouths) = (g.steps.iter().enumerate())
+            .find_map(|(i, s)| match s {
+                Step::Holes { holes, mouths, .. } => Some((i, holes.clone(), mouths.clone())),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            mouths.iter().any(|m| (m - mouths[0]).abs() > 1.),
+            "{mouths:?}"
+        );
+        send(&mut a, GuideAction::Go(at));
+        for (i, (h, m)) in holes.iter().zip(&mouths).enumerate() {
+            a.guide_item = i;
+            let deep = format!("{} deep", mm(m - h[2]));
+            assert!(texts(&a).iter().any(|s| s.contains(&deep)), "{i} {deep}");
+        }
     }
     #[test]
     fn a_do_not_pass_line_reads_what_the_dro_reads_with_the_tool_at_it() {

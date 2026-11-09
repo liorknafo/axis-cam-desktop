@@ -489,7 +489,7 @@ The page is split into sections: **Set up** (Hold, Zero), one section per cuttin
 | Face | The whole facing on one screen: tool, gear, the Z pick-up, how much comes off and the Z to face down to. You plan the passes and stepdown yourself, so it has no Pass or Check screen |
 | Square | A thin slab along one wall (one closed X or Y side, at most one tool radius wide) on one screen: tool, gear, the Z pick-up, with compensation on the diameter to enter and the side to set (toward the wall), the X or Y to cut that side to, how much comes off and the Z to go down to. No Pass or Check screen |
 | Pass | One pass: top and front views, the band it removes, the tool where it starts and an arrow to where it stops, what earlier passes removed, and the DRO numbers |
-| Holes | The top view with every hole numbered, the current one lit, and its X, Y and the Z to drill to; a Reaming says Ream, "ream to" and "feed back out" |
+| Holes | The top view with every hole numbered, the current one lit, and its X, Y and the Z to drill to, with how deep that is from the hole's mouth (where the drill enters, lower where an earlier cut took the top down); a Reaming says Ream, "ream to" and "feed back out" |
 | Bore | One pass of a Boring: the holes and the bore as this pass leaves it over the last one's, then in order the bore to measure ("measure Ø31.90", after the first pass), the head setting ("head Ø32.00 · out 0.10 on Ø · 10 divisions", set with the spindle off), each hole's X and Y and the Z to bore to, and how to come out (spindle off, then raise; or feed back out) |
 | Check | The stock after the operation next to the one before, and the allowance left |
 | Hand over | The stock as it leaves and the next setup it goes to |
