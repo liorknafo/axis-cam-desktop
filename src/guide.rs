@@ -1899,6 +1899,36 @@ pub(crate) mod tests {
         );
     }
     #[test]
+    fn a_mill_too_short_for_the_moves_is_refused_on_every_route() {
+        let (mut doc, mesh) = job("Yes");
+        let routes = |doc: &Document| {
+            let mut all = vec![];
+            simulation::sequence(doc, &mesh, None, |si, _, r| {
+                if si == 0 {
+                    all.push(r.err())
+                }
+            });
+            // The Work page's generation, Generate all and the Steps page.
+            (
+                simulation::prepare(doc, &mesh, 0, 0).err(),
+                all,
+                build(doc, &mesh, 0).err(),
+            )
+        };
+        (doc.setups[0].machine.p).insert("x".into(), "100".into());
+        let (work, all, steps) = routes(&doc);
+        let says = |e: &Option<String>| {
+            e.as_ref()
+                .is_some_and(|e| e.starts_with("The manual mill travels 100 mm in X"))
+        };
+        assert!(says(&work), "{work:?}");
+        assert!(all.len() == 3 && all.iter().all(says), "{all:?}");
+        assert!(says(&steps), "{steps:?}");
+        (doc.setups[0].machine.p).insert("x".into(), "700".into());
+        let (work, all, steps) = routes(&doc);
+        assert!(work.is_none() && all.iter().all(Option::is_none) && steps.is_none());
+    }
+    #[test]
     fn steps_run_hold_zero_then_each_operation_and_a_face_is_one_step() {
         let (doc, mesh) = job("Yes");
         let guide = build(&doc, &mesh, 0).unwrap();
