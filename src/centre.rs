@@ -276,11 +276,16 @@ pub fn needed(doc: &Document, si: usize, mesh: Option<&Mesh>) -> (Vec<(usize, Op
 }
 /// Puts `needed`'s centre drillings into setup `si`, each before its drill.
 pub fn insert(doc: &mut Document, si: usize, needed: Vec<(usize, Operation)>) {
-    let Some(setup) = doc.setups.get_mut(si) else {
+    if si >= doc.setups.len() {
         return;
-    };
+    }
     for (oi, op) in needed.into_iter().rev() {
-        setup.operations.insert(oi.min(setup.operations.len()), op);
+        // It picks what its drill picks, so a reimport finds them again.
+        if let Some(drill) = centres(&op) {
+            doc.copy_picks(drill, &op.id);
+        }
+        let ops = &mut doc.setups[si].operations;
+        ops.insert(oi.min(ops.len()), op);
     }
 }
 /// "Added Centre drill · Holes before Holes." and what to add to the

@@ -6370,7 +6370,7 @@ impl App {
                 let named = c.op.name().to_string();
                 let missing: Vec<(String, String)> =
                     c.missing.into_iter().map(|m| (named.clone(), m)).collect();
-                self.doc.setups[si].operations.insert(oi, c.op);
+                centre::insert(&mut self.doc, si, vec![(oi, c.op)]);
                 // The drill stays the one open.
                 self.selected = Some(oi + 1);
                 self.touch();
@@ -7765,9 +7765,8 @@ impl App {
                 // letter's case on Windows, `..`, a link).
                 let same = |d: &std::path::Path| {
                     d == f.path
-                        || std::fs::canonicalize(d).is_ok_and(|d| {
-                            std::fs::canonicalize(&f.path).is_ok_and(|p| p == d)
-                        })
+                        || std::fs::canonicalize(d)
+                            .is_ok_and(|d| std::fs::canonicalize(&f.path).is_ok_and(|p| p == d))
                 };
                 if self.doc.file.as_ref().is_some_and(|d| same(&d.path)) {
                     match m {
