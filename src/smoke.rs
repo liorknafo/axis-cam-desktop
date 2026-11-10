@@ -29178,6 +29178,37 @@ soft_max = 180.0
             assert_ne!(shot(&a, k), before, "{k}");
             let _ = a.update(Message::Edit(crate::Target::Operation, k, was));
         }
+        // The walls it keeps read as blue faces (LIO-380), against the same
+        // page with a box open all round and through the stock (the page's
+        // own blue buttons are in both): the new box's floor, then X min
+        // closed off the stock's face, change the picture's blue.
+        let blue = |a: &App, name: &str| {
+            let png = shot(a, name);
+            let mut reader = png::Decoder::new(std::io::Cursor::new(png))
+                .read_info()
+                .unwrap();
+            let mut buf = vec![0; reader.output_buffer_size()];
+            let info = reader.next_frame(&mut buf).unwrap();
+            let px = (info.color_type.samples()) as usize;
+            (buf[..info.buffer_size()].chunks(px))
+                .filter(|p| {
+                    let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
+                    b > 130 && b - r > 40 && b - g > 20
+                })
+                .count()
+        };
+        let floor = blue(&a, "floor");
+        let edit = |a: &mut App, k: &'static str, v: &str| {
+            let _ = a.update(Message::Edit(crate::Target::Operation, k, v.into()));
+        };
+        edit(&mut a, "x_min", "20");
+        let closed = blue(&a, "x-closed");
+        edit(&mut a, "x_min", "0");
+        edit(&mut a, "z_bottom", "-200");
+        let none = blue(&a, "no-walls");
+        assert!(floor > none + 300, "the floor: {floor} vs {none}");
+        assert!(closed > none + 300, "X min closed: {closed} vs {none}");
+        assert_ne!(closed, floor);
         // A CNC operation draws no box.
         let cnc = &a.doc.setups[1];
         assert!(crate::cam::box_shown(cnc, &cnc.operations[0], &mesh, stock).is_none());

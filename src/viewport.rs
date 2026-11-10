@@ -1676,19 +1676,37 @@ impl Viewport<'_> {
                 );
             }
         }
-        // A Box being edited (LIO-373): its cut, translucent; the sides and
-        // floor it keeps, solid; where it reaches into the part, red.
+        // A Box being edited (LIO-373): the sides and floor it keeps, solid
+        // blue walls (LIO-380); its cut over them, a translucent orange lid
+        // and its edges, no face on its open sides; where it reaches into
+        // the part, red.
         if let (Some(setup), Some(op), Some(stock)) =
             (self.setup, self.operation, self.resolved_stock())
             && let Some(shown) = crate::cam::box_shown(setup, op, self.mesh, stock.stock)
         {
             let scale = self.mesh.display_scale();
             let project = |v: [f32; 3]| (screen(v), p.depth(v));
-            let solids = (shown.walls.iter().map(|w| (*w, &BOX_WALL)))
-                .chain(std::iter::once((shown.cut, &BOX_CUT)))
-                .chain(shown.into.map(|b| (b, &LOST)));
-            for (b, look) in solids {
-                let solid_box = box_solid(b.scaled(scale), cut.as_ref(), project);
+            let solid_of =
+                |b: crate::mesh::Bounds| box_solid(b.scaled(scale), cut.as_ref(), project);
+            // Only the lid's top (and a section's face): its sides are the
+            // walls or open.
+            let mut lid = solid_of(shown.cut);
+            lid.faces
+                .retain(|(_, tone)| *tone == 1 || *tone == CUT_TONE);
+            // The walls as one solid, so the nearer hides the farther.
+            let mut walls = SolidBox {
+                faces: vec![],
+                edges: vec![],
+            };
+            for w in &shown.walls {
+                let s = solid_of(*w);
+                walls.faces.extend(s.faces);
+                walls.edges.extend(s.edges);
+            }
+            let solids = [(walls, &BOX_WALL), (lid, &BOX_CUT)]
+                .into_iter()
+                .chain(shown.into.map(|b| (solid_of(b), &LOST)));
+            for (solid_box, look) in solids {
                 raster_solid(
                     look,
                     &mut rgba,
@@ -3537,21 +3555,23 @@ const STOCK: Look = Look {
     open: 0.30,
     behind: 0.12,
 };
-/// What a Box being edited cuts: translucent orange.
+/// What a Box being edited cuts: a translucent orange lid with its edges,
+/// light enough that the walls under it show through.
 const BOX_CUT: Look = Look {
     faces: [[246, 150, 70], [226, 126, 46], [236, 138, 58]],
-    edge: [176, 78, 18],
+    edge: [196, 88, 18],
     hidden_edge: [214, 146, 96],
-    open: 0.65,
-    behind: 0.45,
+    open: 0.3,
+    behind: 0.3,
 };
-/// The sides and floor a Box keeps: the stock to leave, steel blue.
+/// The sides and floor a Box keeps: the stock to leave, a solid blue that
+/// reads against the orange cut and the tan stock (LIO-380).
 const BOX_WALL: Look = Look {
-    faces: [[136, 174, 216], [108, 146, 194], [122, 160, 206]],
-    edge: [46, 76, 118],
-    hidden_edge: [108, 138, 170],
-    open: 0.75,
-    behind: 0.5,
+    faces: [[58, 128, 206], [34, 98, 172], [46, 112, 190]],
+    edge: [18, 52, 104],
+    hidden_edge: [70, 110, 160],
+    open: 0.95,
+    behind: 0.9,
 };
 /// Jaws and clamps: solid neutral grey blocks.
 const HOLDING: Look = Look {

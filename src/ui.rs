@@ -2061,7 +2061,11 @@ pub(crate) fn uncut_legend(app: &App) -> Option<Element<'_, Message>> {
     let magenta = app.show_uncut && found.is_some_and(|f| f.faces.iter().any(|f| *f));
     let amber = app.show_uncut && found.is_some_and(|f| f.thin.faces.iter().any(|f| *f));
     let section = app.view_section().is_some();
-    if !app.stock && !magenta && !amber && !section {
+    // A Box being edited on the manual mill (LIO-380): what it cuts and the
+    // walls it keeps, as the view draws them.
+    let boxed = (app.doc.active_setup().zip(app.operation()))
+        .is_some_and(|(s, o)| o.strategy == Strategy::Box && crate::manual::is_manual(&s.machine));
+    if !app.stock && !magenta && !amber && !section && !boxed {
         return None;
     }
     let key = |colour: Color, name: &'static str| {
@@ -2075,6 +2079,11 @@ pub(crate) fn uncut_legend(app: &App) -> Option<Element<'_, Message>> {
     }
     if section {
         legend = legend.push(key(Color::from_rgb8(64, 88, 118), "part's section"));
+    }
+    if boxed {
+        legend = legend
+            .push(key(Color::from_rgb8(246, 150, 70), "box: cut, open sides"))
+            .push(key(Color::from_rgb8(46, 112, 190), "walls and floor kept"));
     }
     if magenta {
         legend = legend.push(key(Color::from_rgb8(214, 72, 166), "still under stock"));
