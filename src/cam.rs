@@ -1086,37 +1086,7 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     // 2. Passes along the longer side.
     let size = |k: usize| high[k].min(s.max[k]) - low[k].max(s.min[k]);
     let (p, c) = if size(0) >= size(1) { (0, 1) } else { (1, 0) };
-    // The stepdown: given, or what the spindle takes at a full stepover,
-    // at the operation's rpm with the tool's flutes, in the project's
-    // material (steel when none is chosen). Rows cut one stepover wide, except the first row
-    // of a box closed on both cross-axis sides: it starts inside the stock
-    // and cuts a full slot, the tool's whole diameter, so the depth is
-    // sized for that width.
     let width = stepover / 100. * 2. * r;
-    let down = if get(&op.p, "stepdown").trim().is_empty() {
-        let rpm = number(op, "rpm").ok().filter(|n| *n > 0.);
-        let flutes = num(&tool.p, "flutes").filter(|z| *z >= 1.);
-        let (Some(rpm), Some(flutes)) = (rpm, flutes) else {
-            return Err("An automatic stepdown needs a positive rpm and the tool's flutes.".into());
-        };
-        let slot = open[c] == [false, false];
-        let cut_width = if slot { 2. * r } else { width };
-        crate::forces::power_stepdown(
-            &setup.machine,
-            setup.job_material.as_ref(),
-            2. * r,
-            cut_width,
-            b.feed,
-            rpm,
-            flutes,
-        )
-        .min(b.plan.flute_length)
-    } else {
-        number(op, "stepdown")?
-    };
-    if !(down > 0. && down <= b.plan.flute_length) {
-        return Err("Use a stepdown within the flute length.".into());
-    }
     // Equal steps of at most `by` from `from` (left out) to exactly `to`.
     let steps = |from: f32, to: f32, by: f32| -> Vec<f32> {
         let n = ((to - from).abs() / by - 0.0001)
@@ -1203,6 +1173,39 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
             s.max[c] + r + 2.
         }
     });
+    // The stepdown: given, or what the spindle takes at the widest cut, at
+    // the operation's rpm with the tool's flutes, in the project's material
+    // (steel when none is chosen). Rows cut one stepover wide when every
+    // pass starts outside the stock. A box closed on both cross-axis sides
+    // starts with a full slot, and a pass that starts inside the stock feeds
+    // across into each row (and from an open cross side into the first)
+    // across the tool's whole diameter, so the depth is sized for that
+    // width (LIO-378).
+    let down = if get(&op.p, "stepdown").trim().is_empty() {
+        let rpm = number(op, "rpm").ok().filter(|n| *n > 0.);
+        let flutes = num(&tool.p, "flutes").filter(|z| *z >= 1.);
+        let (Some(rpm), Some(flutes)) = (rpm, flutes) else {
+            return Err("An automatic stepdown needs a positive rpm and the tool's flutes.".into());
+        };
+        let feeds_in = !outside && (rows.len() > 1 || entry.is_some());
+        let full = open[c] == [false, false] || feeds_in;
+        let cut_width = if full { 2. * r } else { width };
+        crate::forces::power_stepdown(
+            &setup.machine,
+            setup.job_material.as_ref(),
+            2. * r,
+            cut_width,
+            b.feed,
+            rpm,
+            flutes,
+        )
+        .min(b.plan.flute_length)
+    } else {
+        number(op, "stepdown")?
+    };
+    if !(down > 0. && down <= b.plan.flute_length) {
+        return Err("Use a stepdown within the flute length.".into());
+    }
     // 6. The cut, from the floor up through the stock top, clear of the part:
     // the box round the cutter's sweep, then the sweep itself, round at its
     // corners.
@@ -7639,7 +7642,9 @@ pub(crate) mod tests {
     }
     /// A box closed on both cross sides cuts a full slot with its first row:
     /// its automatic stepdown is sized at the tool's diameter, not the
-    /// stepover. An open face only ever engages the stepover.
+    /// stepover. So is a box whose passes start inside the stock, which
+    /// feeds across into its rows at the full diameter (LIO-378). A box whose
+    /// passes start outside the stock only ever engages the stepover.
     #[test]
     fn a_closed_pockets_automatic_stepdown_is_sized_for_the_full_slot() {
         let (setup, ..) = big_mill([0.; 6]);
@@ -7661,9 +7666,16 @@ pub(crate) mod tests {
         assert_eq!(closed.levels, steps(full), "{:?}", levels(&closed));
         let open = boxed_plan([-100., 100., -100., 100., 0., -12.], &[("allowance", "0")]).unwrap();
         assert_eq!(open.levels, steps(narrow), "{:?}", levels(&open));
-        // Closed on one cross side only, the first row hangs off the open one.
+        // Closed at both X ends and open at the front: each pass starts
+        // inside the stock, and the cutter feeds across into the first row
+        // from the open side and into each later one, at its whole diameter.
+        // It was sized for the stepover until LIO-378.
         let step = boxed_plan([-50., 50., -100., 30., 0., -12.], &[("allowance", "0")]).unwrap();
-        assert_eq!(step.levels, steps(narrow));
+        assert_eq!(step.levels, steps(full), "{:?}", levels(&step));
+        // Open at both ends of its passes, closed on one cross side: each row
+        // goes down outside the stock and cuts one stepover.
+        let ends = boxed_plan([-100., 100., -100., 30., 0., -12.], &[("allowance", "0")]).unwrap();
+        assert_eq!(ends.levels, steps(narrow), "{:?}", levels(&ends));
     }
     /// Steps between levels (from the top) and between rows: none under half
     /// of the stepdown or the stepover, and none over it, unless it is the
