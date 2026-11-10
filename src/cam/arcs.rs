@@ -508,15 +508,19 @@ fn round_thread(f: &Facet, t: &crate::thread::Thread) -> bool {
 }
 /// The upright facets of `g` that `keep` keeps and that are a modeled
 /// thread's own walls, of `threads`: round its axis (`round_thread`), and
-/// meeting its flanks, faces leaning as a thread's do (`thread::detect`'s
-/// 0.80 to 0.93 up its axis) round its axis between its minor and major
-/// diameters, at a corner. A thread's crests and roots, which a click and
-/// an arc's growth meet a turn apart over each other, are bounded by its
-/// flanks; a wall round another centre over it (an obround's end, however
-/// finely cut) or one past solid stock (a recess round its axis over it)
-/// meets none. Walls round its axis that do not meet its flanks (slivers
-/// where it runs out at a face) are looked at as any wall is. A thread's
-/// own wall is its hole's, never an arc.
+/// meeting its flanks at a corner. Its flanks: faces leaning as a thread's
+/// do (`thread::detect`'s 0.80 to 0.93 up its axis), round its axis between
+/// its minor and major diameters, joined corner to corner over two pitches
+/// or more along it, as a thread's helical flanks run on over its length. A
+/// chamfer or cone at that slope round its axis is a band less than a pitch
+/// high there (its slope over the band's width), and no thread's. A
+/// thread's crests and roots, which a click and an arc's growth meet a turn
+/// apart over each other, are bounded by its flanks; a wall round another
+/// centre over it (an obround's end, however finely cut), or past solid
+/// stock round its axis (a recess, even one a chamfer opens), meets none.
+/// Walls round its axis that do not meet its flanks (slivers where it runs
+/// out at a face, meshed apart from them) are looked at as any wall is. A
+/// thread's own wall is its hole's, never an arc.
 fn own_walls(
     g: &Geometry,
     threads: &[crate::thread::Thread],
@@ -526,14 +530,15 @@ fn own_walls(
         return HashSet::new();
     }
     let corner = |p: &[f32; 3]| p.map(|v| (v as f64 * 1e4).round() as i64);
-    let in_band = |x: f32, y: f32| {
-        threads.iter().any(|t| {
+    // The thread whose band a point seen from above is in.
+    let band = |x: f32, y: f32| {
+        threads.iter().position(|t| {
             let r = (x - t.centre[0]).hypot(y - t.centre[1]);
             (t.minor / 2. - 0.05..=t.major / 2. + 0.05).contains(&r)
         })
     };
-    let flanks: HashSet<[i64; 3]> = (g.triangles.iter())
-        .filter(|t| {
+    let leaning: Vec<(usize, &[[f32; 3]; 3])> = (g.triangles.iter())
+        .filter_map(|t| {
             let [a, b, c] = t.p;
             let (u, v) = (
                 [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
@@ -545,11 +550,48 @@ fn own_walls(
                 u[0] * v[1] - u[1] * v[0],
             ];
             let length = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-            length > 1e-12
-                && (0.80..0.93).contains(&(n[2].abs() / length))
-                && in_band((a[0] + b[0] + c[0]) / 3., (a[1] + b[1] + c[1]) / 3.)
+            if length <= 1e-12 || !(0.80..0.93).contains(&(n[2].abs() / length)) {
+                return None;
+            }
+            Some((
+                band((a[0] + b[0] + c[0]) / 3., (a[1] + b[1] + c[1]) / 3.)?,
+                &t.p,
+            ))
         })
-        .flat_map(|t| t.p.iter().map(corner))
+        .collect();
+    // Those joined corner to corner, each group by its first.
+    let mut group: Vec<usize> = (0..leaning.len()).collect();
+    fn root(group: &mut [usize], mut i: usize) -> usize {
+        while group[i] != i {
+            group[i] = group[group[i]];
+            i = group[i];
+        }
+        i
+    }
+    let mut first: HashMap<[i64; 3], usize> = HashMap::new();
+    for (i, (_, p)) in leaning.iter().enumerate() {
+        for q in p.iter() {
+            let j = *first.entry(corner(q)).or_insert(i);
+            let (a, b) = (root(&mut group, i), root(&mut group, j));
+            group[a] = b;
+        }
+    }
+    // Each group's height along the axis.
+    let mut span: HashMap<usize, (f32, f32)> = HashMap::new();
+    for (i, (_, p)) in leaning.iter().enumerate() {
+        let r = root(&mut group, i);
+        let e = span.entry(r).or_insert((f32::INFINITY, f32::NEG_INFINITY));
+        for q in p.iter() {
+            *e = (e.0.min(q[2]), e.1.max(q[2]));
+        }
+    }
+    let flanks: HashSet<[i64; 3]> = (0..leaning.len())
+        .filter(|&i| {
+            let (t, _) = leaning[i];
+            let (low, high) = span[&root(&mut group, i)];
+            high - low >= 2. * threads[t].pitch
+        })
+        .flat_map(|i| leaning[i].1.iter().map(corner))
         .collect();
     let touching: HashSet<usize> = (g.triangles.iter())
         .filter_map(|t| t.feature.filter(|&id| keep(id)).map(|id| (id, t)))
@@ -583,9 +625,8 @@ pub fn drilled_arcs(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc
     let wide = across(setup, mesh, &g);
     // A modeled thread's own walls (`own_walls`) are its hole's: no arc
     // starts from them (grown along a thread's hundreds of crests, one took
-    // minutes), though one may grow on through them. Other walls round its
-    // axis (an obround's ends over it, a recess past solid stock) start arcs
-    // as before.
+    // minutes), though one may grow on through them. Other walls start arcs
+    // as on main.
     let threads = crate::thread::holes_in_setup(setup, mesh);
     // The part's upright facets, for where a curve goes on past an arc.
     let mut all: Option<(HashMap<usize, Facet>, Corners)> = None;
@@ -623,6 +664,9 @@ pub fn drilled_arcs(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc
     // slot so short it reads as round) leaves the arc its own.
     let threaded = Geometry::with_threads(setup, mesh);
     let rims = super::rims(&threaded);
+    if !found.is_empty() {
+        eprintln!("PROBE arcs left for the slow check: {}", found.len());
+    }
     let mut whole: HashSet<usize> = HashSet::new();
     found.retain(|a| {
         if a.walls.iter().any(|w| whole.contains(w)) {
@@ -1627,14 +1671,16 @@ pub(crate) mod tests {
     }
     #[test]
     fn a_recess_round_a_threads_axis_past_solid_stock_is_no_wall_of_it() {
-        // A modeled M12×1.75 thread round X0 Y0, Z0 to 6, and over it, past
+        // A modeled M12×1.75 thread round X0 Y0, Z0 to 12, and over it, past
         // solid stock, an R5.5 half-round recess round the same axis on the
-        // plate's front edge, Z14 to 19 (review, LIO-361): the recess's walls
-        // are not the thread's, and a click on one picks the recess as an
-        // arc; the thread's crests are its own.
+        // plate's front edge, Z20 to 25, cut every 5°, opened by a 120°
+        // chamfer from R5.5 at Z24.77 to R5.9 at Z25: sloping as the thread's
+        // flanks do, in its band, on the recess walls' corners (review,
+        // LIO-361). The recess's walls are not the thread's, and a click on
+        // one picks the recess as an arc; the thread's crests are its own.
         let mut front = vec![(-20., 0., 0.)];
-        front.extend((0..=180).map(|k| {
-            let t = (180. - k as f64).to_radians();
+        front.extend((0..=36).map(|k| {
+            let t = (180. - 5. * k as f64).to_radians();
             (5.5 * t.cos(), 5.5 * t.sin(), 0.)
         }));
         front.extend([(20., 0., 0.), (20., 20., 0.), (-20., 20., 0.)]);
@@ -1644,9 +1690,32 @@ pub(crate) mod tests {
             (20., 20., 0.),
             (-20., 20., 0.),
         ];
-        let mut tris = slab(&[&front], 5., 14., true, false);
-        tris.extend(slab(&[&block], 8., 6., false, true));
-        tris.extend(m12());
+        let lip = 0.4 / 3f64.sqrt();
+        let mut tris = slab(&[&front], (5. - lip) as f32, 20., true, false);
+        tris.extend(slab(&[&block], 8., 12., false, true));
+        tris.extend(crate::thread::tests::modeled(
+            [0., 0.],
+            12.,
+            1.75,
+            60.,
+            true,
+            true,
+            12.,
+            0.,
+        ));
+        // The chamfer, on the recess walls' top corners (the DXF slab's own
+        // f32 corners, so they are the same points).
+        let low = (25. - lip) as f32;
+        let ring = |r: f64, z: f32| -> Vec<[f32; 3]> {
+            (front[1..=37].iter())
+                .map(|&(x, y, _)| [(x * r / 5.5) as f32, (y * r / 5.5) as f32, z])
+                .collect()
+        };
+        let (under, over) = (ring(5.5, low), ring(5.9, 25.));
+        for k in 0..36 {
+            tris.push([under[k], under[k + 1], over[k + 1]]);
+            tris.push([under[k], over[k + 1], over[k]]);
+        }
         let mesh = mesh::normalize(tris).unwrap();
         let (setup, _, _) = fixture(Strategy::Drill);
         let threads = crate::thread::holes_in_setup(&setup, &mesh);
@@ -1659,7 +1728,36 @@ pub(crate) mod tests {
             .filter(|(_, f)| f.low > g.bounds.max[2] - 5.5 && round(f))
             .map(|(id, _)| *id)
             .collect();
-        assert!(recess.len() > 100, "{}", recess.len());
+        assert!(recess.len() >= 36, "{}", recess.len());
+        // The chamfer's faces meet the recess walls at their corners.
+        let corner = |p: &[f32; 3]| p.map(|v| (v as f64 * 1e4).round() as i64);
+        let leaning: HashSet<[i64; 3]> = (g.triangles.iter())
+            .filter(|t| {
+                let [a, b, c] = t.p;
+                let (u, v) = (
+                    [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+                    [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
+                );
+                let n = [
+                    u[1] * v[2] - u[2] * v[1],
+                    u[2] * v[0] - u[0] * v[2],
+                    u[0] * v[1] - u[1] * v[0],
+                ];
+                let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                a[2] > g.bounds.max[2] - 1. && (0.80..0.93).contains(&(n[2].abs() / l))
+            })
+            .flat_map(|t| t.p.iter().map(corner))
+            .collect();
+        let met = (recess.iter())
+            .filter(|&&id| {
+                (g.triangles.iter()).any(|t| {
+                    t.feature == Some(id) && t.p.iter().any(|p| leaning.contains(&corner(p)))
+                })
+            })
+            .count();
+        assert!(met >= 36, "{met}");
+        let threaded = Geometry::with_threads(&setup, &mesh);
+        assert!(own_walls(&threaded, &threaded.threads, |id| recess.contains(&id)).is_empty());
         for &id in &recess {
             assert!(!thread_wall(&setup, &mesh, id), "{id}");
         }
