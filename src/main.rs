@@ -6724,11 +6724,22 @@ impl App {
                 }
             }
             Message::AddSetup => {
-                if let Some(setup) = self.doc.active_setup() {
+                // Always a CNC setup (LIO-381): the open setup's machine, or
+                // with a hand setup open the nearest CNC setup's, the one
+                // before it else the one after; with none, the library's.
+                let setups = &self.doc.setups;
+                let cnc = |m: &Machine| !manual::is_hand(m);
+                let near = (setups.iter().position(|s| s.id == self.doc.active)).and_then(|i| {
+                    (setups[..=i].iter().rev())
+                        .chain(&setups[i + 1..])
+                        .find(|s| cnc(&s.machine))
+                });
+                let library: Vec<&Machine> = self.doc.machines.iter().filter(|m| cnc(m)).collect();
+                if let Some(setup) = near {
                     self.create_setup(setup.machine.clone());
-                } else if let [machine] = &self.doc.machines[..] {
+                } else if let [machine] = library[..] {
                     self.create_setup(machine.clone());
-                } else if self.doc.machines.is_empty() {
+                } else if library.is_empty() {
                     let task = self.update(Message::NewMachine);
                     self.pending = Some((Page::Wizard, Message::AddSetup));
                     self.status = "Set up your machine: saving it creates the first setup.".into();
