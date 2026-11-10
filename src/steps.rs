@@ -1140,7 +1140,7 @@ impl Drawing<'_> {
                         Align::Left,
                     );
                 }
-                Shape::Pattern(pattern, holes, r) => paint_pattern(f, &p, s, pattern, holes, *r),
+                Shape::Pattern(pattern, holes, r) => paint_pattern(f, p, s, pattern, holes, *r),
                 Shape::Word(q, s, c) => write(f, s.clone(), p3(*q), *c, 13., Align::Left),
                 Shape::Round(q, r, label) => {
                     let at = p3(*q);
