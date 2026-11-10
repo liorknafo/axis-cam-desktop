@@ -200,21 +200,11 @@ fn corners(facets: &HashMap<usize, Facet>) -> Corners {
     at
 }
 /// The facets of `facets` that meet any of `members` at a corner, not among
-/// them, in order of id: at a corner seen from above and at a height both
-/// reach. Facets over each other only (a modeled thread's crests, a turn
-/// apart) do not meet: taken as meeting, a thread's hundreds made every
-/// click on it grow arcs for minutes.
+/// them, in order of id.
 fn neighbours(facets: &HashMap<usize, Facet>, at: &Corners, members: &[usize]) -> Vec<usize> {
     let mut out: Vec<usize> = (members.iter())
-        .flat_map(|m| {
-            let a = &facets[m];
-            (a.xy.iter())
-                .flat_map(|p| at.get(&key(*p)).into_iter().flatten())
-                .filter(move |f| {
-                    let b = &facets[*f];
-                    b.low <= a.high + SAME as f32 && a.low <= b.high + SAME as f32
-                })
-        })
+        .flat_map(|m| facets[m].xy.iter())
+        .flat_map(|p| at.get(&key(*p)).into_iter().flatten())
         .copied()
         .filter(|f| !members.contains(f))
         .collect();
@@ -222,17 +212,36 @@ fn neighbours(facets: &HashMap<usize, Facet>, at: &Corners, members: &[usize]) -
     out.dedup();
     out
 }
+/// The `neighbours` of `members` at a height they reach too, or, when none
+/// is, all of them: what a round wall's first three facets are looked for
+/// among (`grow`). A modeled thread's crests a turn apart meet at their
+/// corners seen from above; tried in threes, its hundreds made every click
+/// on it look for minutes.
+fn beside(facets: &HashMap<usize, Facet>, at: &Corners, members: &[usize]) -> Vec<usize> {
+    let all = neighbours(facets, at, members);
+    let level: Vec<usize> = (all.iter().copied())
+        .filter(|f| {
+            let b = &facets[f];
+            members.iter().any(|m| {
+                let a = &facets[m];
+                b.low <= a.high + SAME as f32 && a.low <= b.high + SAME as f32
+            })
+        })
+        .collect();
+    if level.is_empty() { all } else { level }
+}
 /// The round wall `seed` is a facet of, of `facets`: the seed and two
-/// facets next to it whose corners fit a circle best, and on round while
-/// the next facet's corners stay on the circle. None when no three do.
-/// `at` holds the facets at each corner (`corners`).
+/// facets next to it (at its height, `beside`) whose corners fit a circle
+/// best, and on round while the next facet's corners stay on the circle, at
+/// any height. None when no three do. `at` holds the facets at each corner
+/// (`corners`).
 fn grow(facets: &HashMap<usize, Facet>, at: &Corners, seed: usize) -> Option<Vec<usize>> {
     // Each three that fit, grown on round: the one that goes on round
     // farthest (a slot's short side and its ends' first facets fit a circle
     // too, the one the side is a chord of), the closest of those.
     let mut best: Option<(usize, f64, Vec<usize>)> = None;
-    for a in neighbours(facets, at, &[seed]) {
-        for b in neighbours(facets, at, &[seed, a]) {
+    for a in beside(facets, at, &[seed]) {
+        for b in beside(facets, at, &[seed, a]) {
             let three = vec![seed, a, b];
             let Some((_, r, off)) = fit(facets, &three) else {
                 continue;
@@ -254,57 +263,7 @@ fn grow(facets: &HashMap<usize, Facet>, at: &Corners, seed: usize) -> Option<Vec
             }
         }
     }
-    best.map(|(_, _, members)| close(facets, at, members))
-}
-/// `members`, a round wall grown on round (`grow`), with every facet of
-/// `facets` over or under it at any height: met at a corner seen from
-/// above, and on to the next, while its corners lie on the arc's circle (to
-/// `fit`'s 0.005 mm and 0.01 % of its radius) and within the arc's span
-/// round it (to `SAME`). That is the same round wall past a gap in it (a
-/// relief groove across a half hole), however finely it is cut there,
-/// which a drill enters from its top, and a thread's crests over each other
-/// a turn apart. A facet going on past the arc (a slot's tangent side) has
-/// a corner past its end and is not taken. No facet past the span is
-/// looked on from, so the work stays within it.
-fn close(facets: &HashMap<usize, Facet>, at: &Corners, mut members: Vec<usize>) -> Vec<usize> {
-    let Some((c, r, _)) = fit(facets, &members) else {
-        return members;
-    };
-    use std::f64::consts::{PI, TAU};
-    let angle = |p: &(f64, f64)| (p.1 - c[1]).atan2(p.0 - c[0]);
-    // Angles round the centre, from the arc's middle (its corners' mean
-    // direction), in (−π, π]: an arc short of a whole turn is within them.
-    let (sx, sy) = (members.iter().flat_map(|m| facets[m].xy.iter()))
-        .map(angle)
-        .fold((0., 0.), |(x, y): (f64, f64), t| (x + t.cos(), y + t.sin()));
-    let middle = sy.atan2(sx);
-    let from_middle = |p: &(f64, f64)| (angle(p) - middle + PI).rem_euclid(TAU) - PI;
-    let (low, high) = (members.iter().flat_map(|m| facets[m].xy.iter()))
-        .map(from_middle)
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), t| {
-            (a.min(t), b.max(t))
-        });
-    let slack = SAME / r;
-    let within = |f: &Facet| {
-        f.xy.iter().all(|p| {
-            ((p.0 - c[0]).hypot(p.1 - c[1]) - r).abs() <= 0.005 + r * 1e-4
-                && (low - slack..=high + slack).contains(&from_middle(p))
-        })
-    };
-    let mut seen: HashSet<usize> = members.iter().copied().collect();
-    let mut from = members.clone();
-    while let Some(m) = from.pop() {
-        for p in &facets[&m].xy {
-            for &n in at.get(&key(*p)).into_iter().flatten() {
-                if seen.insert(n) && within(&facets[&n]) {
-                    members.push(n);
-                    from.push(n);
-                }
-            }
-        }
-    }
-    members.sort_unstable();
-    members
+    best.map(|(_, _, members)| members)
 }
 /// `members` of `facets` (by corner `at`), on round from each facet taken
 /// to the next it meets at a corner while their corners fit one circle
@@ -568,11 +527,28 @@ pub fn drilled_arcs(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc
     }
     let at = corners(&facets);
     let wide = across(setup, mesh, &g);
+    // The whole round holes the selection reads as (`pocket::whole_holes`),
+    // by their walls. A wall of a thread past a leaning flank picks no hole
+    // by itself (`pocket::LEANING`), but its picked hole's walls read as the
+    // hole together. A modeled thread's walls are its hole's: they start no
+    // arc (grown along a thread's hundreds of crests, one took seconds).
+    let threaded = Geometry::with_threads(setup, mesh);
+    let rims = super::rims(&threaded);
+    let read: Vec<(HashSet<usize>, Hole)> = (crate::pocket::whole_holes(setup, ids, mesh))
+        .into_iter()
+        .filter_map(|h| {
+            let round = super::drill_hole(&threaded, &h, &rims, false)?;
+            Some((h.walls.iter().copied().collect(), round))
+        })
+        .collect();
     // The part's upright facets, for where a curve goes on past an arc.
     let mut all: Option<(HashMap<usize, Facet>, Corners)> = None;
     let mut seeds: Vec<usize> = facets.keys().copied().collect();
     seeds.sort_unstable();
-    let (mut done, mut found) = (HashSet::new(), vec![]);
+    let (mut done, mut found): (HashSet<usize>, Vec<Arc>) = (HashSet::new(), vec![]);
+    for (walls, _) in read.iter().filter(|(_, round)| round.thread.is_some()) {
+        done.extend(walls.iter().copied());
+    }
     for seed in seeds {
         if done.contains(&seed) {
             continue;
@@ -598,22 +574,9 @@ pub fn drilled_arcs(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc
         return found;
     }
     // A whole round hole the selection reads as, round the arc's centre,
-    // that holds all the arc's walls is drilled as that hole: a modeled
-    // thread's crests are many arcs round its axis, and a wall of a thread
-    // past a leaning flank picks no hole by itself (`pocket::LEANING`), but
-    // its picked hole's walls read as the hole together. So is a whole round
-    // hole a wall of the arc picks (each such hole read once). One round
-    // another centre (a slot so short it reads as round) leaves the arc its
-    // own.
-    let threaded = Geometry::with_threads(setup, mesh);
-    let rims = super::rims(&threaded);
-    let read: Vec<(HashSet<usize>, Hole)> = (crate::pocket::whole_holes(setup, ids, mesh))
-        .into_iter()
-        .filter_map(|h| {
-            let round = super::drill_hole(&threaded, &h, &rims, false)?;
-            Some((h.walls.iter().copied().collect(), round))
-        })
-        .collect();
+    // that holds all the arc's walls is drilled as that hole; so is one a
+    // wall of the arc picks (each such hole read once). One round another
+    // centre (a slot so short it reads as round) leaves the arc its own.
     found.retain(|a| {
         !read.iter().any(|(walls, round)| {
             same_centre(round, a) && a.walls.iter().all(|w| walls.contains(w))
