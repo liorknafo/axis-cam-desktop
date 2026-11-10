@@ -212,14 +212,12 @@ fn neighbours(facets: &HashMap<usize, Facet>, at: &Corners, members: &[usize]) -
     out.dedup();
     out
 }
-/// The `neighbours` of `members` at a height they reach too, or, when none
-/// is, all of them: what a round wall's first three facets are looked for
-/// among (`grow`). A modeled thread's crests a turn apart meet at their
-/// corners seen from above; tried in threes, its hundreds made every click
-/// on it look for minutes.
+/// The `neighbours` of `members` at a height they reach too: where a round
+/// wall's first three facets are looked for first (`grow`). A modeled
+/// thread's crests a turn apart meet at their corners seen from above;
+/// tried in threes, its hundreds made every click on it look for minutes.
 fn beside(facets: &HashMap<usize, Facet>, at: &Corners, members: &[usize]) -> Vec<usize> {
-    let all = neighbours(facets, at, members);
-    let level: Vec<usize> = (all.iter().copied())
+    (neighbours(facets, at, members).into_iter())
         .filter(|f| {
             let b = &facets[f];
             members.iter().any(|m| {
@@ -227,21 +225,30 @@ fn beside(facets: &HashMap<usize, Facet>, at: &Corners, members: &[usize]) -> Ve
                 b.low <= a.high + SAME as f32 && a.low <= b.high + SAME as f32
             })
         })
-        .collect();
-    if level.is_empty() { all } else { level }
+        .collect()
 }
 /// The round wall `seed` is a facet of, of `facets`: the seed and two
-/// facets next to it (at its height, `beside`) whose corners fit a circle
-/// best, and on round while the next facet's corners stay on the circle, at
-/// any height. None when no three do. `at` holds the facets at each corner
-/// (`corners`).
+/// facets next to it whose corners fit a circle best, and on round while
+/// the next facet's corners stay on the circle. None when no three do.
+/// `at` holds the facets at each corner (`corners`). The three are looked
+/// for at the seed's height (`beside`), and only when none are there among
+/// all its neighbours (a land of the wall left between flats over a gap).
 fn grow(facets: &HashMap<usize, Facet>, at: &Corners, seed: usize) -> Option<Vec<usize>> {
+    grow_among(facets, at, seed, beside).or_else(|| grow_among(facets, at, seed, neighbours))
+}
+/// `grow`, its first three facets among those `near` gives.
+fn grow_among(
+    facets: &HashMap<usize, Facet>,
+    at: &Corners,
+    seed: usize,
+    near: fn(&HashMap<usize, Facet>, &Corners, &[usize]) -> Vec<usize>,
+) -> Option<Vec<usize>> {
     // Each three that fit, grown on round: the one that goes on round
     // farthest (a slot's short side and its ends' first facets fit a circle
     // too, the one the side is a chord of), the closest of those.
     let mut best: Option<(usize, f64, Vec<usize>)> = None;
-    for a in beside(facets, at, &[seed]) {
-        for b in beside(facets, at, &[seed, a]) {
+    for a in near(facets, at, &[seed]) {
+        for b in near(facets, at, &[seed, a]) {
             let three = vec![seed, a, b];
             let Some((_, r, off)) = fit(facets, &three) else {
                 continue;
@@ -514,6 +521,14 @@ pub fn arc_at(setup: &Setup, mesh: &Mesh, id: usize) -> Result<Arc, NoArc> {
     let members = grow(&facets, &at, id).ok_or(NoArc::NotRound)?;
     whole_arc(across(setup, mesh, &g), &facets, &facets, &at, members)
 }
+/// Whether facet `f` lies round modeled thread `t`'s axis, all its corners
+/// seen from above between its minor and major diameters (to 0.05 mm): one
+/// of the thread's own walls, not another feature's over it.
+fn in_band(f: &Facet, t: &crate::thread::Thread) -> bool {
+    let (lo, hi) = ((t.minor / 2. - 0.05) as f64, (t.major / 2. + 0.05) as f64);
+    (f.xy.iter())
+        .all(|p| (lo..=hi).contains(&(p.0 - t.centre[0] as f64).hypot(p.1 - t.centre[1] as f64)))
+}
 /// The arcs a Drill drills among the surfaces `ids` (its selection), as
 /// `setup` places the part: each run of selected upright facets on one
 /// circle that goes part of the way round it, round a hole, and is no part
@@ -530,8 +545,10 @@ pub fn drilled_arcs(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc
     // The whole round holes the selection reads as (`pocket::whole_holes`),
     // by their walls. A wall of a thread past a leaning flank picks no hole
     // by itself (`pocket::LEANING`), but its picked hole's walls read as the
-    // hole together. A modeled thread's walls are its hole's: they start no
-    // arc (grown along a thread's hundreds of crests, one took seconds).
+    // hole together. A modeled thread's walls (its facets round its axis,
+    // within its band, `in_band`) are its hole's: they start no arc (grown
+    // along a thread's hundreds of crests, one took seconds). Other walls of
+    // a hole read with a thread (a slot's ends over it) start as before.
     let threaded = Geometry::with_threads(setup, mesh);
     let rims = super::rims(&threaded);
     let read: Vec<(HashSet<usize>, Hole)> = (crate::pocket::whole_holes(setup, ids, mesh))
@@ -546,8 +563,11 @@ pub fn drilled_arcs(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc
     let mut seeds: Vec<usize> = facets.keys().copied().collect();
     seeds.sort_unstable();
     let (mut done, mut found): (HashSet<usize>, Vec<Arc>) = (HashSet::new(), vec![]);
-    for (walls, _) in read.iter().filter(|(_, round)| round.thread.is_some()) {
-        done.extend(walls.iter().copied());
+    for (walls, round) in &read {
+        if let Some(t) = &round.thread {
+            let own = |w: &&usize| facets.get(w).is_some_and(|f| in_band(f, t));
+            done.extend(walls.iter().filter(own).copied());
+        }
     }
     for seed in seeds {
         if done.contains(&seed) {
@@ -1479,5 +1499,83 @@ pub(crate) mod tests {
             );
             assert!((found[0].diameter - 10.).abs() < 0.01, "{:?}", found[0]);
         }
+    }
+    #[test]
+    fn a_land_of_a_half_hole_left_over_a_relief_is_picked_with_it() {
+        // The notched block's R5 half hole up to Z4, a relief to R6 from Z4
+        // to Z6, and over it a recess to R6 up to Z10 but for one R5 facet
+        // from 80° to 85°, between two radial flats (review, LIO-361): a
+        // click on that land picks it with the half hole under it.
+        let at = |r: f64, degrees: f64| {
+            let t = degrees.to_radians();
+            (r * t.cos(), r * t.sin(), 0.)
+        };
+        let block = [(20., 0., 0.), (20., 20., 0.), (-20., 20., 0.)];
+        let notch = |r: f64| {
+            let mut corners = vec![(-20., 0., 0.)];
+            corners.extend((0..=36).map(|k| at(r, 180. - 5. * k as f64)));
+            corners.extend(block);
+            corners
+        };
+        let mut recess = vec![(-20., 0., 0.)];
+        recess.extend((0..=19).map(|k| at(6., 180. - 5. * k as f64)));
+        recess.extend([at(5., 85.), at(5., 80.)]);
+        recess.extend((0..=16).map(|k| at(6., 80. - 5. * k as f64)));
+        recess.extend(block);
+        let mut tris = slab(&[&notch(5.)], 4., 0., false, true);
+        tris.extend(slab(&[&notch(6.)], 2., 4., false, false));
+        tris.extend(slab(&[&recess], 4., 6., true, false));
+        let mesh = mesh::normalize(tris).unwrap();
+        let (setup, _, _) = fixture(Strategy::Drill);
+        let g = Geometry::new(&setup, &mesh);
+        let centre = [0f32, g.bounds.min[1]];
+        let on_arc = |c: [f32; 2]| ((c[0] - centre[0]).hypot(c[1] - centre[1]) - 5.).abs() < 0.1;
+        let walls = walls_where(&setup, &mesh, on_arc);
+        // The half hole's 36 facets and the land.
+        assert_eq!(walls.len(), 37, "{walls:?}");
+        let land = *walls
+            .iter()
+            .find(|&&id| facets(&g, |_| true)[&id].high > g.bounds.max[2] - 1.)
+            .unwrap();
+        let a = arc_at(&setup, &mesh, land).unwrap();
+        assert_eq!(a.walls, walls);
+        assert!((a.top - g.bounds.max[2]).abs() < 0.01, "{a:?}");
+        assert!((a.span - 180.).abs() < 0.01, "{a:?}");
+    }
+    #[test]
+    fn only_a_threads_own_facets_are_in_its_band() {
+        // An M8×1.25 round the origin; a crest of it, and an R5 slot end
+        // round X0.125 over it.
+        let thread = crate::thread::Thread {
+            axis: 2,
+            centre: [0., 0.],
+            from: 0.,
+            to: 8.,
+            internal: true,
+            right_hand: true,
+            pitch: 1.25,
+            angle: 60.,
+            major: 8.,
+            minor: 6.65,
+            tapered: false,
+            spec: None,
+        };
+        let facet = |c: (f64, f64), r: f64, from: f64, to: f64| Facet {
+            xy: [from, to]
+                .map(|d: f64| {
+                    (
+                        c.0 + r * d.to_radians().cos(),
+                        c.1 + r * d.to_radians().sin(),
+                    )
+                })
+                .to_vec(),
+            low: 0.,
+            high: 1.,
+            normal: [0., 0.],
+        };
+        assert!(in_band(&facet((0., 0.), 3.33, 10., 15.), &thread));
+        assert!(in_band(&facet((0., 0.), 4., 10., 15.), &thread));
+        assert!(!in_band(&facet((0.125, 0.), 5., 10., 15.), &thread));
+        assert!(!in_band(&facet((0., 0.), 3., 10., 15.), &thread));
     }
 }
