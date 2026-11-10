@@ -458,12 +458,13 @@ pub fn detect(triangles: &[[[f32; 3]; 3]]) -> Vec<Thread> {
                 sectors.iter().filter(|s| **s).count() >= 18
             };
             // A hole's ring is read in stretches along the axis that no
-            // face of the part parts (`stretches`): a hole tapped from both
-            // faces of a web is two threads, and faces round the axis past
-            // solid stock (a coaxial slot's rounded lip) are none of its. A
-            // stud's axis runs through its solid core, where faces inside it
-            // (a cross hole's walls, an axial bore's floor) part no thread
-            // round it: its ring is read whole.
+            // face of the part closing its bore parts (`stretches`): a hole
+            // tapped from both faces of a web is two threads, and faces
+            // round the axis past a web or floor (a coaxial slot's rounded
+            // lip over a tapped hole) are none of its. A stud's axis runs
+            // through its solid core, where faces inside it (a cross hole's
+            // walls, an axial bore's floor) part no thread round it: its
+            // ring is read whole.
             let inside = |ring: &[&Flank]| {
                 let facing: f32 = (ring.iter())
                     .map(|f| {
@@ -478,7 +479,7 @@ pub fn detect(triangles: &[[[f32; 3]; 3]]) -> Vec<Thread> {
                 .filter(|ring| ring.len() >= LEAST && around(ring))
                 .map(|ring| {
                     let parts = if inside(ring) {
-                        stretches(ring, |f| f.index, axis, at, triangles)
+                        stretches(ring, |f| f.index, axis, at, 0.8 * dist(ring[0]), triangles)
                     } else {
                         vec![ring.clone()]
                     };
@@ -505,41 +506,66 @@ pub fn detect(triangles: &[[[f32; 3]; 3]]) -> Vec<Thread> {
 }
 
 /// A hole's flank triangles `ring` (by `index` into `triangles`) round the
-/// axis through `at` along `axis`, whose axis runs through the hole's air,
-/// in stretches along the axis that no face of the part parts: one that
-/// crosses the axis between two of them (a blind hole's floor, a web of
-/// solid stock) does; a clearance groove or a plain bore between them
-/// leaves the axis open, and they are one. Not for a stud's: its axis runs
-/// through its solid core.
+/// axis through `at` along `axis`, in stretches along the axis that no face
+/// of the part parts: one that closes the hole's bore between two of them
+/// (a blind hole's floor, a web of solid stock, even with a narrow passage
+/// through it) does. The bore is sampled at twelve points round the axis at
+/// radius `bore`, inside the thread's minor diameter; a face across nine or
+/// more of them in the gap closes it. A clearance groove, a plain bore as
+/// wide as the thread's, or a cross bore leaves it open, and they are one.
+/// Not for a stud's: its axis runs through its solid core.
 fn stretches<T: Copy>(
     ring: &[T],
     index: impl Fn(&T) -> usize,
     axis: usize,
     at: [f32; 2],
+    bore: f32,
     triangles: &[[[f32; 3]; 3]],
 ) -> Vec<Vec<T>> {
     let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
-    // Just off the axis, off any corner a face's triangles fan out from.
-    let core = [at[0] + 1.3e-3, at[1] + 0.7e-3];
-    let across: Vec<f32> = (triangles.iter())
-        .filter_map(|t| {
+    // Off the seams of faces fanned round the axis.
+    let points: Vec<[f32; 2]> = (0..12)
+        .map(|k| {
+            let turn = (k as f32 * 30. + 7.).to_radians();
+            [at[0] + bore * turn.cos(), at[1] + bore * turn.sin()]
+        })
+        .collect();
+    // Where a face crosses the bore: its height there, and which point.
+    let across: Vec<(f32, usize)> = (triangles.iter())
+        .flat_map(|t| {
             let (a, b) = (
                 [t[1][u] - t[0][u], t[1][v] - t[0][v]],
                 [t[2][u] - t[0][u], t[2][v] - t[0][v]],
             );
-            let p = [core[0] - t[0][u], core[1] - t[0][v]];
             let det = a[0] * b[1] - a[1] * b[0];
-            if det.abs() < 1e-9 {
-                return None;
-            }
-            let (s, w) = (
-                (p[0] * b[1] - p[1] * b[0]) / det,
-                (a[0] * p[1] - a[1] * p[0]) / det,
-            );
-            (s > 0. && w > 0. && s + w < 1.)
-                .then(|| t[0][axis] + s * (t[1][axis] - t[0][axis]) + w * (t[2][axis] - t[0][axis]))
+            (points.iter().enumerate()).filter_map(move |(k, q)| {
+                if det.abs() < 1e-9 {
+                    return None;
+                }
+                let p = [q[0] - t[0][u], q[1] - t[0][v]];
+                let (s, w) = (
+                    (p[0] * b[1] - p[1] * b[0]) / det,
+                    (a[0] * p[1] - a[1] * p[0]) / det,
+                );
+                (s > 0. && w > 0. && s + w < 1.).then(|| {
+                    let z =
+                        t[0][axis] + s * (t[1][axis] - t[0][axis]) + w * (t[2][axis] - t[0][axis]);
+                    (z, k)
+                })
+            })
         })
         .collect();
+    // Whether faces close the bore from `top` to `low`. A face at either end
+    // counts: a hole's floor is where its thread's last flank ends.
+    let closed = |top: f32, low: f32| {
+        let mut hit = [false; 12];
+        for &(z, k) in &across {
+            if z >= top - 1e-3 && z <= low + 1e-3 {
+                hit[k] = true;
+            }
+        }
+        hit.iter().filter(|h| **h).count() >= 9
+    };
     let span = |f: &T| {
         let t = &triangles[index(f)];
         t.iter()
@@ -553,11 +579,7 @@ fn stretches<T: Copy>(
     let mut top = f32::NEG_INFINITY;
     for f in sorted {
         let (low, high) = span(&f);
-        // A face at either end of a gap counts: a hole's floor is where its
-        // thread's last flank ends.
-        if out.is_empty()
-            || (low > top && across.iter().any(|&z| z >= top - 1e-3 && z <= low + 1e-3))
-        {
+        if out.is_empty() || (low > top && closed(top, low)) {
             out.push(vec![]);
         }
         out.last_mut().unwrap().push(f);
@@ -872,6 +894,22 @@ pub(crate) mod tests {
             [[-6., -6., z], [6., 6., z], [-6., 6., z]],
         ]
     }
+    /// A face across the axis at height `z` from radius `r` out, past the
+    /// thread's major diameter: a web with a passage of radius `r` through it.
+    fn annulus(z: f32, r: f32) -> Vec<[[f32; 3]; 3]> {
+        let at = |k: usize, r: f32| {
+            let turn = (k as f32 * 15.).to_radians();
+            [r * turn.cos(), r * turn.sin(), z]
+        };
+        (0..24)
+            .flat_map(|k| {
+                [
+                    [at(k, r), at(k, 6.), at(k + 1, 6.)],
+                    [at(k, r), at(k + 1, 6.), at(k + 1, r)],
+                ]
+            })
+            .collect()
+    }
     /// An M8×1.25 along Z round the origin from `from` to `to`.
     fn m8(from: f32, to: f32) -> Vec<[[f32; 3]; 3]> {
         (modeled([0., 0.], 8., 1.25, 60., true, true, to - from, 0.).into_iter())
@@ -897,6 +935,15 @@ pub(crate) mod tests {
         // coaxial slot's rounded lip at its flank angle, Z8.5-9.1 (LIO-361):
         // the thread is Z0-8, an M8, and the lip no thread.
         let got = read(vec![m8(0., 8.), across(8.), across(8.5), m8(8.5, 9.1)]);
+        assert!(near(&got, &[(0., 8.)]), "{got:?}");
+        // The same over a 0.5 mm web with a Ø2 passage through it on the
+        // axis: the web still closes the bore.
+        let got = read(vec![
+            m8(0., 8.),
+            annulus(8., 1.),
+            annulus(8.5, 1.),
+            m8(8.5, 9.1),
+        ]);
         assert!(near(&got, &[(0., 8.)]), "{got:?}");
         // Tapped Z0-20 with a clearance groove at Z8-10, the axis open
         // through it: one thread, Z0-20.
