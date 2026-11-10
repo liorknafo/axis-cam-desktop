@@ -29,6 +29,9 @@ pub const TAP_DRILL: &str = "tap_drill";
 /// What a threading operation needs when it has no tool: "an M6×1 tap",
 /// "a Ø5 drill" (LIO-412).
 pub fn needs(op: &Operation) -> Option<String> {
+    if crate::centre::centres(op).is_some() {
+        return Some("a centre drill".into());
+    }
     let name = get(&op.p, THREAD_NAME);
     if name.is_empty() {
         return None;
@@ -41,7 +44,11 @@ pub fn needs(op: &Operation) -> Option<String> {
 /// The tool `op` needs (`needs`), for `machine`, numbered `number`.
 pub fn needed_tool(op: &Operation, machine: &Machine, number: u32) -> Option<Tool> {
     let name = get(&op.p, THREAD_NAME);
-    let mut t = if op.tapping() {
+    let mut t = if crate::centre::centres(op).is_some() {
+        let mut t = Tool::new("Centre drill A2.5×6.3", crate::model::CENTRE_DRILL, "6.3");
+        t.set_type(crate::model::CENTRE_DRILL);
+        t
+    } else if op.tapping() {
         let spec = crate::thread::spec(name)?;
         let mut t = Tool::new(&format!("{name} tap"), "Tap", &trim(spec.major));
         t.set_type("Tap");

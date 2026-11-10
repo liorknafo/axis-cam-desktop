@@ -3033,7 +3033,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     chip("by hand · spindle off"),
                     warn_chip("oil"),
                     // Held square as on the lathe (LIO-410).
-                    chip("square: in the chuck, or a wrench on a centre in the chuck"),
+                    chip("square: chuck, or wrench on a centre"),
                 ];
                 // The tap's tip comes out under the stock: a parallel there
                 // stops it, or it cuts the vise.
