@@ -3609,7 +3609,7 @@ mod tests {
         assert!(
             found
                 .iter()
-                .all(|f| f.starts_with("workholding 1/None: Lathe: ")),
+                .all(|f| f.starts_with("workholding 1/None: Manual Lathe: ")),
             "{found:?}"
         );
         assert!(found[0].contains("these jaws are 30 mm long"), "{found:?}");
@@ -3748,7 +3748,7 @@ mod tests {
         assert_eq!(
             stages(&check_built(&job, &mesh, &report)),
             vec![
-                "workholding 1/None: Big mill: The workholding entry was deleted; choose another."
+                "workholding 1/None: Manual Mill: The workholding entry was deleted; choose another."
             ]
         );
     }

@@ -11515,7 +11515,7 @@ flood = { pin = 8 }
         crate::steps::tests::build(&mut a);
         a.smoke_manual_check();
         let texts = page_texts(&a);
-        for want in ["Big mill", "Set up", "Face", "Hold"] {
+        for want in ["Manual Mill", "Set up", "Face", "Hold"] {
             assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
         }
     }
@@ -14109,8 +14109,9 @@ soft_max = 180.0
         assert!(page.ready && page.problems().is_empty());
         assert!(matches!(page.cards[0].1, NcCard::Manual));
         assert!(matches!(page.cards[1].1, NcCard::Programs(_)));
-        let line = "Big mill: manual mill, no G-code — follow the steps on the MACHINE page.";
-        assert_eq!(crate::manual::no_gcode("Big mill"), line);
+        // The manual setup is named as its machine (LIO-371).
+        let line = "Manual Mill: manual mill, no G-code — follow the steps on the MACHINE page.";
+        assert_eq!(crate::manual::no_gcode("Manual Mill"), line);
         assert!(page_texts(&a).iter().any(|t| t == line));
     }
     #[test]
@@ -29138,9 +29139,18 @@ soft_max = 180.0
         let old = a.doc.active.clone();
         let _ = a.update(Message::AddManualSetup);
         assert_eq!(a.doc.setups.len(), 2);
-        assert_eq!(a.doc.setups[0].name(), "Big mill");
+        // Named as its machine, and opened (LIO-371): it was left closed.
+        assert_eq!(a.doc.setups[0].name(), "Manual Mill");
         assert_eq!(a.doc.setups[1].id, old);
-        assert_eq!(a.doc.active, old);
+        assert_eq!(a.doc.active, a.doc.setups[0].id);
+        // No work offset in its browser row nor in the view's header.
+        let t = crate::ui::probe::texts(a.view(), WINDOW);
+        assert!(t.iter().any(|s| s == "Manual Mill · 3-axis"), "{t:?}");
+        assert!(
+            !t.iter()
+                .any(|s| s.starts_with("G54 / ") || s.starts_with("G55")),
+            "{t:?}"
+        );
         assert_eq!(a.page, Page::Work);
         assert_eq!(a.selected, None);
         // Without a manual machine the press says so and changes nothing.
@@ -29212,9 +29222,9 @@ soft_max = 180.0
         let old = a.doc.active.clone();
         let _ = a.update(Message::AddLatheSetup);
         assert_eq!(a.doc.setups.len(), 2);
-        assert_eq!(a.doc.setups[0].name(), "Lathe");
+        assert_eq!(a.doc.setups[0].name(), "Manual Lathe");
         assert_eq!(a.doc.setups[1].id, old);
-        assert_eq!(a.doc.active, old);
+        assert_eq!(a.doc.active, a.doc.setups[0].id);
         assert_eq!(a.page, Page::Work);
         assert_eq!(a.selected, None);
         assert!(a.status.contains("Lathe setup added"), "{}", a.status);

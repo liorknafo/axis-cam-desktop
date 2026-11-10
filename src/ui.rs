@@ -1788,9 +1788,10 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
             container(
                 column![
                     bold(ellipsize(s.name(), SETUP_NAME_CHARS), 12).wrapping(Wrapping::None),
+                    // A hand machine's setup has no work offset (LIO-371).
                     muted(format!(
                         "{} · {}-axis",
-                        get(&s.p, "offset"),
+                        s.offset().unwrap_or(s.machine.name()),
                         s.machine.axes()
                     ))
                     .size(12)
@@ -2488,8 +2489,8 @@ fn workspace(app: &App) -> Element<'_, Message> {
                                 .on_press(Message::SetupStep("Work zero"))
                                 .style(|_, status| flat(false, status)),
                                 muted(format!(
-                                    "{} / {}{}",
-                                    get(&s.p, "offset"),
+                                    "{}{}{}",
+                                    s.offset().map_or(String::new(), |o| format!("{o} / ")),
                                     app.doc.holding_label(s),
                                     crate::indexed::label(s)
                                         .map(|a| format!(" / {a}"))
@@ -4704,7 +4705,7 @@ pub(crate) fn setup_step_done(app: &App, step: &str) -> bool {
     match step {
         "Machine" => s.machine.issues().is_empty(),
         "Work zero" => {
-            !get(&s.p, "offset").is_empty()
+            s.offset().is_none_or(|o| !o.is_empty())
                 && (crate::post::references(get(&s.p, "origin")).is_some()
                     || crate::indexed::ORIGINS.contains(&get(&s.p, "origin")))
                 && crate::post::pins_issue(s).is_none()
@@ -4914,10 +4915,26 @@ fn setup_zero<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
         }
         grid = grid.push(line);
     }
+    // A hand machine runs no program and has no work offset (LIO-371).
+    let what = if crate::lathe::is_lathe(&s.machine) {
+        "Where the lathe's dials are zeroed: the point every dial number on the Steps page counts from. The 3D view marks it with a cross."
+    } else if crate::manual::is_manual(&s.machine) {
+        "Where the DRO's zero is: the point you pick up with the edge finder, which every DRO number on the Steps page counts from. The 3D view marks it with a cross."
+    } else {
+        "Where the program's X0 Y0 Z0 is: the point you touch off or probe on the machine. The 3D view marks it with a cross."
+    };
+    let offset: Element<_> = match s.offset() {
+        Some(_) => choice(
+            p,
+            "offset",
+            "Work offset",
+            &["G54", "G55", "G56", "G57", "G58", "G59"],
+            t,
+        ),
+        None => column![].into(),
+    };
     c.push(section("Work zero"))
-        .push(muted(
-            "Where the program's X0 Y0 Z0 is: the point you touch off or probe on the machine. The 3D view marks it with a cross.",
-        ))
+        .push(muted(what))
         .push(faces)
         .push(muted(if model {
             "Model origin is the part file's own 0,0,0. Pick a spot below to put the zero on the stock instead."
@@ -4927,13 +4944,7 @@ fn setup_zero<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
         .push(grid)
         .push(rotary_zeros(s, origin))
         .push(bar_zeros(s, origin))
-        .push(choice(
-            p,
-            "offset",
-            "Work offset",
-            &["G54", "G55", "G56", "G57", "G58", "G59"],
-            t,
-        ))
+        .push(offset)
         .push(pins_block(app, s))
         .push(zero_note(app))
 }

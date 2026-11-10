@@ -447,7 +447,7 @@ A tool and a library vise or clamp set have a check box for each machine that ho
 
 ### + Add manual setup
 
-**+ Add manual setup** on the setup list adds a setup on a manual machine from the library, before the first CNC setup. When it becomes the first setup it takes the stock, orientation, zero and holding of the old first setup (the holding only when its vise or clamps fit the manual machine; otherwise the manual setup starts with none), which then starts from the stock the manual setup leaves. Later manual setups go before the first CNC setup; they can be moved, for example to face the bottom after a flip.
+**+ Add manual setup** on the setup list adds a setup on a manual machine from the library, before the first CNC setup, and opens it. It is named as the machine ("Manual Mill", then "Manual Mill 2"). A setup on a hand machine (manual mill or lathe) has no work offset: none is shown for it, it uses none of G54–G59, and its Work zero step speaks of the DRO's zero (the lathe's dials), not of a program. When it becomes the first setup it takes the stock, orientation, zero and holding of the old first setup (the holding only when its vise or clamps fit the manual machine; otherwise the manual setup starts with none), which then starts from the stock the manual setup leaves. Later manual setups go before the first CNC setup; they can be moved, for example to face the bottom after a flip.
 
 Only **Box** and **Drill** can run on a manual setup. The ribbon dims the other strategies there, and a plan that puts one on a manual setup is refused. Box is refused on a CNC setup.
 
@@ -597,7 +597,7 @@ On a lathe setup the ribbon offers only **Turn** and **Drill**; Turn is dimmed a
 
 ### + Add lathe setup
 
-**+ Add lathe setup** on the setup list (shown once the library has a lathe) inserts a setup named "Lathe" with a Ø50 × 100 round bar held in a chuck, the 3-jaw when the library has one, the grip the chuck's jaw length and the rest of the bar standing out. It goes before the first CNC setup. Placed first it takes the old first setup's orientation (so that the turning axis is the one you chose), and the old first setup then starts from the bar it leaves; a bar of another size is set in the setup editor. A library without a chuck is given the chuck starters. Turning a box stock into a round bar is not automatic: pick Round bar.
+**+ Add lathe setup** on the setup list (shown once the library has a lathe) inserts a setup named as the lathe, and opens it, with a Ø50 × 100 round bar held in a chuck, the 3-jaw when the library has one, the grip the chuck's jaw length and the rest of the bar standing out. It goes before the first CNC setup. Placed first it takes the old first setup's orientation (so that the turning axis is the one you chose), and the old first setup then starts from the bar it leaves; a bar of another size is set in the setup editor. A library without a chuck is given the chuck starters. Turning a box stock into a round bar is not automatic: pick Round bar.
 
 ### The Steps page for a lathe
 

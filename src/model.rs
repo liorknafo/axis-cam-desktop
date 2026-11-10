@@ -2536,6 +2536,11 @@ pub struct Setup {
     pub operations: Vec<Operation>,
 }
 impl Setup {
+    /// The work offset the setup's program runs in; None on a hand machine
+    /// (manual mill or lathe), which runs no program (LIO-371).
+    pub fn offset(&self) -> Option<&str> {
+        (!manual::is_hand(&self.machine)).then(|| get(&self.p, "offset"))
+    }
     pub fn new(machine: Machine, offset: &str) -> Self {
         Self {
             preview_stock: None,
@@ -2628,7 +2633,7 @@ impl Setup {
         if self.name().trim().is_empty() {
             e.push("Give the setup a name.".into())
         }
-        if get(&self.p, "offset").is_empty() {
+        if get(&self.p, "offset").is_empty() && !crate::manual::is_hand(&self.machine) {
             e.push("Choose a work offset.".into())
         }
         e.extend(crate::stock::parameter_issues(self));
@@ -3710,10 +3715,23 @@ impl Document {
         let i = self.index();
         &mut self.setups[i]
     }
+    /// The lowest work offset no CNC setup uses: a setup on a hand machine
+    /// has none (LIO-371), whatever an older project saved on it.
     pub fn next_offset(&self) -> String {
         (54..=59)
             .map(|i| format!("G{i}"))
-            .find(|v| !self.setups.iter().any(|s| get(&s.p, "offset") == v))
+            .find(|v| !(self.setups.iter()).any(|s| s.offset() == Some(v.as_str())))
+            .unwrap_or_default()
+    }
+    /// `base`, or `base 2`, `base 3`… when a setup has that name already.
+    fn unique_setup_name(&self, base: &str) -> String {
+        let taken = |n: &str| self.setups.iter().any(|s| s.name() == n);
+        (1..)
+            .map(|i| match i {
+                1 => base.to_string(),
+                _ => format!("{base} {i}"),
+            })
+            .find(|n| !taken(n))
             .unwrap_or_default()
     }
     pub fn next_tool_number(&self) -> u32 {
@@ -3990,11 +4008,12 @@ impl Document {
             }
         }
     }
-    /// Inserts a setup named "Big mill" on the first manual machine of the
-    /// library, before the first CNC setup. Put first, it takes the stock,
-    /// orientation, zero and holding of the old first setup, which then starts
-    /// from the stock it leaves. `active` is a setup id, so it keeps its setup.
-    pub fn add_manual_setup(&mut self) -> Result<(), String> {
+    /// Inserts a setup on the first manual machine of the library, named as
+    /// the machine (numbered when that name is taken), before the first CNC
+    /// setup, with no work offset (LIO-371). Put first, it takes the stock,
+    /// orientation, zero and holding of the old first setup, which then
+    /// starts from the stock it leaves. Its index.
+    pub fn add_manual_setup(&mut self) -> Result<usize, String> {
         let Some(machine) = self.machines.iter().find(|m| crate::manual::is_manual(m)) else {
             return Err("Add a manual machine to the library first.".into());
         };
@@ -4003,8 +4022,9 @@ impl Document {
             .iter()
             .position(|s| !crate::manual::is_hand(&s.machine))
             .unwrap_or(self.setups.len());
-        let mut setup = Setup::new(machine.clone(), &self.next_offset());
-        setup.p.insert("name".into(), "Big mill".into());
+        let mut setup = Setup::new(machine.clone(), "");
+        let name = self.unique_setup_name(machine.name());
+        setup.p.insert("name".into(), name);
         match (at, self.setups.first()) {
             (0, Some(old)) => self.hand_over(old, &mut setup),
             _ if !self.sample_model => {
@@ -4014,19 +4034,21 @@ impl Document {
             }
             _ => {}
         }
+        setup.p.insert("offset".into(), String::new());
         self.setups.insert(at, setup);
         self.sync_stock_sources();
-        Ok(())
+        Ok(at)
     }
-    /// Inserts a setup named "Lathe" on the first lathe of the library,
-    /// before the first CNC setup, with a Ø50 × 100 round bar held in a
+    /// Inserts a setup on the first lathe of the library, named as the
+    /// machine (numbered when taken), with no work offset, before the first
+    /// CNC setup, with a Ø50 × 100 round bar held in a
     /// chuck: the 3-jaw when the library has one that fits, the grip the
     /// chuck's jaw length and the stickout the rest of the bar. A library
     /// without a chuck is given the chuck starters. Put first, it takes the
     /// old first setup's orientation (so that the part's turning axis is the
     /// one the user chose) and the old first setup starts from the bar it
-    /// leaves. `active` is a setup id, so it keeps its setup.
-    pub fn add_lathe_setup(&mut self) -> Result<(), String> {
+    /// leaves. Its index.
+    pub fn add_lathe_setup(&mut self) -> Result<usize, String> {
         let Some(machine) = self.machines.iter().find(|m| crate::lathe::is_lathe(m)) else {
             return Err("Add a lathe to the library first.".into());
         };
@@ -4057,9 +4079,10 @@ impl Document {
             .iter()
             .position(|s| !crate::manual::is_hand(&s.machine))
             .unwrap_or(self.setups.len());
-        let mut setup = Setup::new(machine, &self.next_offset());
+        let name = self.unique_setup_name(machine.name());
+        let mut setup = Setup::new(machine, "");
+        setup.p.insert("name".into(), name);
         for (k, v) in [
-            ("name", "Lathe"),
             ("stock_type", "Round bar"),
             ("stock_diameter", "50"),
             ("stock_length", "100"),
@@ -4086,7 +4109,7 @@ impl Document {
             p.insert("stickout".into(), stickout.to_string());
         }
         self.sync_stock_sources();
-        Ok(())
+        Ok(at)
     }
     pub fn setup_sheet(&self, mesh: Option<&crate::mesh::Mesh>) -> String {
         let mut s = format!(
@@ -4127,7 +4150,7 @@ impl Document {
             s += &format!(
                 "\n## {} · {}\n\nMachine: {}\n\n{}\n\nOrigin: {}\n\n{}{}Rotation: [{}, {}, {}]°\n\nTranslation: [{}, {}, {}] mm\n\nReposition: {}\n\nRequested fixture clearance (not checked): {}\n\n{}\n\n",
                 setup.name(),
-                get(&setup.p, "offset"),
+                setup.offset().unwrap_or("hand-fed, no work offset"),
                 if crate::manual::is_hand(&setup.machine) {
                     let kind = if crate::lathe::is_lathe(&setup.machine) {
                         "lathe"
@@ -6674,7 +6697,8 @@ mod manual_setups {
         d.add_manual_setup().unwrap();
         assert_eq!(d.setups.len(), 2);
         let (new, kept) = (&d.setups[0], &d.setups[1]);
-        assert_eq!(new.name(), "Big mill");
+        // Named as its machine (LIO-371).
+        assert_eq!(new.name(), "Manual Mill");
         assert!(crate::manual::is_manual(&new.machine));
         assert_eq!(stock(new), stock(&was));
         for k in [
@@ -6685,12 +6709,13 @@ mod manual_setups {
             "ty",
             "tz",
             "origin",
-            "offset",
             "holding",
             "vise_axis",
         ] {
             assert_eq!(get(&new.p, k), get(&was.p, k), "{k}");
         }
+        // A hand machine has no work offset (LIO-371).
+        assert_eq!((new.offset(), get(&new.p, "offset")), (None, ""));
         assert!(new.operations.is_empty());
         assert_eq!(kept.id, old);
         assert_eq!(get(&new.p, "stock_source"), "fresh");
@@ -6788,6 +6813,13 @@ mod manual_setups {
         assert_eq!(get(&d.setups[2].p, "stock_source"), d.setups[1].id);
         assert_eq!(d.active, d.setups[2].id);
         assert_eq!(d.issues(), Vec::<String>::new());
+        // Named apart, and using no offset: the next CNC setup takes the
+        // lowest the CNC setup does not use (LIO-371).
+        assert_eq!(
+            [d.setups[0].name(), d.setups[1].name()],
+            ["Manual Mill", "Manual Mill 2"]
+        );
+        assert_eq!(d.next_offset(), "G55");
     }
     #[test]
     fn a_manual_setup_needs_a_manual_machine_in_the_library() {
@@ -6811,6 +6843,11 @@ mod manual_setups {
         );
         assert!(sheet.contains("Machine: Workshop Mill (v1)"));
         assert_eq!(sheet.matches("steps on the MACHINE page").count(), 1);
+        // No work offset in the manual setup's heading (LIO-371).
+        assert!(
+            sheet.contains("## Manual Mill · hand-fed, no work offset"),
+            "{sheet}"
+        );
     }
     fn on_the_big_mill() -> (Machine, Vec<Tool>, Operation) {
         let m = manual::defaults();
@@ -7911,7 +7948,7 @@ mod manual_setups {
         );
         assert_eq!(d.setups.len(), 2);
         let lathe = &d.setups[0];
-        assert_eq!(lathe.name(), "Lathe");
+        assert_eq!((lathe.name(), lathe.offset()), ("Manual Lathe", None));
         assert!(crate::lathe::is_lathe(&lathe.machine));
         for (k, v) in [
             ("stock_type", "Round bar"),
