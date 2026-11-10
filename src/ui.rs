@@ -3931,20 +3931,20 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 let picked = o.surfaces.as_ref().is_some_and(|s| !s.ids.is_empty());
                 c = c
                     .push(section("From the part"))
-                    .push(note("Click the face this cut leaves: a floor facing up, or a wall facing sideways. One click fills the numbers below. Drag to orbit."))
-                    .push(
-                        btn(
-                            if app.picking {
-                                "Finish picking"
-                            } else {
-                                "Pick the face on the part"
-                            },
-                            Message::PickMode,
-                            app.picking,
-                        )
-                        .width(Fill),
-                    );
-                if let Some(why) = &app.box_refused {
+                    .push(note("Click a face of the part: the Box removes the stock that covers it. A floor is cut from above, a wall from the side. One click fills the numbers below. Drag to orbit."))
+                    // Outlined as a button when picking is off (LIO-408).
+                    .push(if app.picking {
+                        Element::from(btn("Finish picking", Message::PickMode, true).width(Fill))
+                    } else {
+                        secondary("Pick the face on the part", Message::PickMode)
+                            .width(Fill)
+                            .into()
+                    });
+                // The note of the click just made on this Box (LIO-408).
+                if let Some((id, why)) = &app.box_refused
+                    && app.picking
+                    && *id == o.id
+                {
                     c = c.push(caution("No box from that face", vec![why.clone()]));
                 }
                 if picked {
