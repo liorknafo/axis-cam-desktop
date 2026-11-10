@@ -13,10 +13,68 @@ use crate::{
     },
 };
 
-/// What Add threading adds to a setup, and what to tell the user.
+/// What Add threading adds to a setup, and what to tell the user: on a
+/// hand mill also the sizes done ("2× M6×1") and the tools missing ("an
+/// M6×1 tap"), for `hand_status`.
 pub struct Added {
     pub ops: Vec<Operation>,
     pub status: String,
+    pub done: Vec<String>,
+    pub missing: Vec<String>,
+}
+/// The key of a threading operation's thread ("M6×1"), and of a tap
+/// drill's diameter: what it needs when its tool is missing (LIO-412).
+pub const THREAD_NAME: &str = "thread_name";
+pub const TAP_DRILL: &str = "tap_drill";
+/// What a threading operation needs when it has no tool: "an M6×1 tap",
+/// "a Ø5 drill" (LIO-412).
+pub fn needs(op: &Operation) -> Option<String> {
+    let name = get(&op.p, THREAD_NAME);
+    if name.is_empty() {
+        return None;
+    }
+    if op.tapping() {
+        return Some(format!("an {name} tap"));
+    }
+    num(&op.p, TAP_DRILL).map(|d| format!("a Ø{} drill", trim(d)))
+}
+/// The tool `op` needs (`needs`), for `machine`, numbered `number`.
+pub fn needed_tool(op: &Operation, machine: &Machine, number: u32) -> Option<Tool> {
+    let name = get(&op.p, THREAD_NAME);
+    let mut t = if op.tapping() {
+        let spec = crate::thread::spec(name)?;
+        let mut t = Tool::new(&format!("{name} tap"), "Tap", &trim(spec.major));
+        t.set_type("Tap");
+        t.p.insert("thread".into(), name.into());
+        t
+    } else {
+        let d = num(&op.p, TAP_DRILL)?;
+        let mut t = Tool::new(&format!("Drill Ø{}", trim(d)), "Drill", &trim(d));
+        t.set_type("Drill");
+        t
+    };
+    for (k, v) in [("length", "30"), ("stickout", "45")] {
+        t.p.insert(k.into(), v.into());
+    }
+    t.p.insert("number".into(), number.to_string());
+    if crate::manual::is_hand(machine) {
+        t.p.insert("machines".into(), machine.id.clone());
+    }
+    Some(t)
+}
+/// The status of Add threading on a hand mill: the tools missing first, so
+/// that it survives the status line's cut (LIO-412), then what was added in
+/// the order the hand does it (LIO-411).
+pub fn hand_status(setup: &str, done: &[String], missing: &[String]) -> String {
+    let what = format!("centre drill, then drill and tap {}.", done.join(", "));
+    match missing.len() {
+        0 => format!("Added to {setup}: {what}"),
+        n => format!(
+            "Added to {setup}, {n} tool{} missing: {}. Then {what}",
+            if n == 1 { "" } else { "s" },
+            missing.join(", ")
+        ),
+    }
 }
 
 /// One thread size's holes opening in one face: what one pair of
@@ -80,7 +138,17 @@ pub fn add(doc: &Document, si: usize, mesh: &Mesh) -> Result<Added, String> {
             machine,
         );
         selection(&mut hole);
-        hole.p.insert("name".into(), format!("{name} · tap drill"));
+        // Named for what the hand does, short enough for the browser's 20
+        // letters (LIO-411).
+        let drill_name = format!("{name} · tap drill Ø{}", trim(tap_drill));
+        let drill_name = if drill_name.chars().count() <= 20 || !hand {
+            drill_name
+        } else {
+            format!("{name} · drill Ø{}", trim(tap_drill))
+        };
+        hole.p.insert("name".into(), drill_name);
+        hole.p.insert(THREAD_NAME.into(), name.clone());
+        hole.p.insert(TAP_DRILL.into(), trim(tap_drill));
         hole.p
             .insert("through".into(), if through { "Yes" } else { "No" }.into());
         // Through the part far enough that the drill's 118° point is past
@@ -121,7 +189,11 @@ pub fn add(doc: &Document, si: usize, mesh: &Mesh) -> Result<Added, String> {
             machine,
         );
         selection(&mut thread);
-        thread.p.insert("name".into(), format!("{name} · thread"));
+        thread.p.insert(
+            "name".into(),
+            format!("{name} · {}", if hand { "tap" } else { "thread" }),
+        );
+        thread.p.insert(THREAD_NAME.into(), name.clone());
         thread.p.insert(
             "cycle".into(),
             if hand { TAPPING } else { THREAD_MILLING }.into(),
@@ -174,7 +246,15 @@ pub fn add(doc: &Document, si: usize, mesh: &Mesh) -> Result<Added, String> {
             missing.join("; ")
         ));
     }
-    Ok(Added { ops, status })
+    if hand {
+        status = hand_status(setup.name(), &done, &missing);
+    }
+    Ok(Added {
+        ops,
+        status,
+        done,
+        missing,
+    })
 }
 /// On the lathe: a Turn of kind Thread, filled from the thread on the
 /// part's axis, with a die of its size for an outside thread when the
@@ -241,6 +321,8 @@ fn lathe(doc: &Document, setup: &crate::model::Setup, mesh: &Mesh) -> Result<Add
     Ok(Added {
         ops: vec![op],
         status,
+        done: vec![],
+        missing: vec![],
     })
 }
 /// The threaded holes of `setup` opening up its faces, by face and thread

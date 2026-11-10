@@ -1699,6 +1699,10 @@ impl Operation {
         } else {
             self.strategy.tabs()
         };
+        // A hand machine's Drill has no linking moves: no Linking (LIO-410).
+        if self.strategy == Strategy::Drill && crate::manual::is_hand(m) {
+            tabs.retain(|t| *t != "Linking");
+        }
         // Only the kinds that cut in several passes have Passes.
         if self.strategy == Strategy::Turn
             && !["Outside", "Bore", "Thread"].contains(&get(&self.p, "turn_kind"))

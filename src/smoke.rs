@@ -5710,6 +5710,10 @@ flood = { pin = 8 }
     /// stock down to the plate's top (8 mm under the stock's), so the holes'
     /// mouths are below the stock's top. Its guide built.
     fn manual_threaded_app(faced: bool) -> App {
+        manual_threaded_app_without(faced, &[])
+    }
+    /// `manual_threaded_app` without the library's tools named `skip`.
+    fn manual_threaded_app_without(faced: bool, skip: &[&str]) -> App {
         use crate::model::{BOX_FIELDS, Operation, Strategy, Tool};
         let mut a = threaded_app();
         let machine = crate::manual::defaults();
@@ -5728,6 +5732,9 @@ flood = { pin = 8 }
                 &[][..],
             ),
         ] {
+            if skip.contains(&name) {
+                continue;
+            }
             let mut t = Tool::new(name, kind, d);
             t.set_type(kind);
             for (k, v) in [("length", "30"), ("stickout", "45")].iter().chain(extra) {
@@ -5762,7 +5769,9 @@ flood = { pin = 8 }
         }
         let _ = a.update(Message::Page(Page::Control));
         crate::steps::tests::build(&mut a);
-        if let Some((_, Err(e))) = &a.guide {
+        if let Some((_, Err(e))) = &a.guide
+            && skip.is_empty()
+        {
             panic!("no guide: {e}");
         }
         a
@@ -5785,18 +5794,19 @@ flood = { pin = 8 }
     fn a_manual_drill_gets_a_centre_drilling_and_takes_it_when_deleted() {
         use crate::model::{CENTRE_DRILL, Strategy, get};
         let mut a = manual_threaded_app(false);
-        // Add threading centre drilled each tap drill.
+        // Add threading centre drilled each tap drill, all of them first, so
+        // the centre drill goes in once (LIO-411).
         let ops = &a.doc.setups[0].operations;
-        let drills = ops
-            .iter()
-            .filter(|o| crate::centre::wants_centre(o, &a.doc.tools, &a.doc.setups[0].machine));
-        for (n, d) in drills.enumerate() {
-            let i = ops.iter().position(|o| o.id == d.id).unwrap();
-            assert_eq!(
-                crate::centre::centres(&ops[i - 1]),
-                Some(d.id.as_str()),
-                "drill {n}"
-            );
+        let drills: Vec<usize> = (0..ops.len())
+            .filter(|&i| {
+                crate::centre::wants_centre(&ops[i], &a.doc.tools, &a.doc.setups[0].machine)
+            })
+            .collect();
+        for &i in &drills {
+            let spot = (ops.iter())
+                .position(|o| crate::centre::centres(o) == Some(ops[i].id.as_str()))
+                .expect("its centre drilling");
+            assert!(spot < drills[0], "{}", ops[spot].name());
         }
         a.doc.setups[0].operations.clear();
         let _ = a.update(Message::Page(Page::Work));
@@ -5848,12 +5858,147 @@ flood = { pin = 8 }
             let _ = a.update(Message::Guide(crate::GuideAction::Go(at)));
             crate::ui::probe::texts(a.view(), iced::Size::new(1280., 800.))
         };
+        // Says how far since LIO-417.
+        let under = |t: &Vec<String>| {
+            t.iter()
+                .any(|t| t.ends_with("under the stock: nothing under the hole"))
+        };
         // 4 mm of stock under the plate: the tap's tip stays in it.
-        assert!(!texts(&mut a).iter().any(|t| t == "nothing under the hole"));
+        assert!(!under(&texts(&mut a)));
         // None: the tip comes out under the plate.
         a.doc.setups[0].p.insert("stock_bottom".into(), "0".into());
         crate::steps::tests::build(&mut a);
-        assert!(texts(&mut a).iter().any(|t| t == "nothing under the hole"));
+        assert!(under(&texts(&mut a)));
+    }
+    /// The guide's step of the operation named `name`, of kind `holes`
+    /// (its Holes) or the step before it.
+    fn op_step(a: &App, name: &str) -> usize {
+        use crate::guide::Step;
+        let (shown, _) = a.guide_at().expect("a guide");
+        let ops = &a.doc.setups[0].operations;
+        (shown.guide.steps.iter())
+            .position(|s| matches!(s, Step::Holes { op, .. } if ops[*op].name() == name))
+            .unwrap_or_else(|| panic!("{name}"))
+    }
+    fn texts_at(a: &mut App, at: usize) -> Vec<String> {
+        let _ = a.update(Message::Guide(crate::GuideAction::Go(at)));
+        crate::ui::probe::texts(a.view(), iced::Size::new(1280., 800.))
+    }
+    /// LIO-410: a hand tap has its own screen before it (spindle off, no
+    /// gear, no Z pick-up), its depth said as a hand follows it, and no
+    /// speeds, feeds or Linking in the editor.
+    #[test]
+    fn a_hand_tap_is_put_in_with_the_spindle_off_and_its_depth_followed_by_hand() {
+        use crate::guide::Step;
+        let mut a = manual_threaded_app(false);
+        let at = m6_tap_step(&a);
+        let (shown, _) = a.guide_at().unwrap();
+        assert!(
+            matches!(shown.guide.steps[at - 1], Step::TapIn { .. }),
+            "{:?}",
+            shown.guide.steps[at - 1]
+        );
+        let t = texts_at(&mut a, at - 1);
+        assert!(t.iter().any(|s| s == "spindle off"), "{t:?}");
+        assert!(
+            !t.iter()
+                .any(|s| s.contains("set the gear") || s.contains("PICK UP Z")),
+            "{t:?}"
+        );
+        // Through: turn until it runs free; the blind M5: mark the tap.
+        let t = texts_at(&mut a, at);
+        assert!(
+            t.iter()
+                .any(|s| s.starts_with("through: turn until it runs free")),
+            "{t:?}"
+        );
+        let m5 = op_step(&a, "M5×0.8 · tap");
+        let t = texts_at(&mut a, m5);
+        assert!(t.iter().any(|s| s.starts_with("mark the tap ")), "{t:?}");
+        let tap = (a.doc.setups[0].operations.iter())
+            .find(|o| o.name() == "M6×1 · tap")
+            .unwrap();
+        assert!(!tap.tabs(&a.doc.setups[0].machine).contains(&"Linking"));
+    }
+    /// LIO-411: the centre drill goes in once; names fit the browser.
+    #[test]
+    fn add_threading_centre_drills_all_holes_first_with_names_that_fit() {
+        use crate::guide::Step;
+        let a = manual_threaded_app(false);
+        let ops = &a.doc.setups[0].operations;
+        let names: Vec<&str> = ops.iter().map(|o| o.name()).collect();
+        for n in &names {
+            assert!(n.chars().count() <= 20, "{n} in {names:?}");
+        }
+        assert!(
+            names.contains(&"M6×1 · tap drill Ø5") && names.contains(&"M6×1 · tap"),
+            "{names:?}"
+        );
+        let (shown, _) = a.guide_at().unwrap();
+        let centre = |o: usize| crate::centre::centres(&ops[o]).is_some();
+        let tools = (shown.guide.steps.iter())
+            .filter(|s| matches!(s, Step::Tool { op, .. } if centre(*op)))
+            .count();
+        assert_eq!(tools, 1, "one Tool screen for the centre drill");
+        assert!(
+            a.status
+                .starts_with("Added to Manual Mill: centre drill, then drill and tap 2× M6×1"),
+            "{}",
+            a.status
+        );
+    }
+    /// LIO-412: a missing tap is named on its Tool tab, added with one press,
+    /// and the status's first sentence says tools are missing.
+    #[test]
+    fn a_missing_threading_tool_is_named_and_added_with_one_press() {
+        let mut a = manual_threaded_app_without(false, &["M6 tap", "Drill Ø5"]);
+        let first = a.status.split(". ").next().unwrap_or_default().to_string();
+        assert!(first.contains("missing"), "{}", a.status);
+        let tap = (a.doc.setups[0].operations.iter())
+            .position(|o| o.name() == "M6×1 · tap")
+            .unwrap();
+        let _ = a.update(Message::Page(Page::Work));
+        let _ = a.update(Message::SelectOp(tap));
+        let _ = a.update(Message::Tab("Tool".into()));
+        shows(&a, &["Needs an M6×1 tap", "Add an M6×1 tap"]);
+        lacks(&a, &["M8 tap", "M5 tap"]);
+        let _ = a.update(Message::AddNeededTool);
+        let op = a.operation().unwrap();
+        let tool = a
+            .doc
+            .tools
+            .iter()
+            .find(|t| t.id == op.tool)
+            .expect("the new tap");
+        assert_eq!(tool.tap_spec().map(|s| s.name), Some("M6×1"));
+        assert!(tool.fits(&a.doc.setups[0].machine));
+        assert!(
+            !a.op_issues().iter().any(|i| i.contains("Choose a tool")),
+            "{:?}",
+            a.op_issues()
+        );
+    }
+    /// LIO-413, LIO-417: a tapped hole is tried with a screw; a tap drill
+    /// coming out under the stock says so, and not with stock under it.
+    #[test]
+    fn a_tapped_hole_is_tried_with_a_screw_and_a_drill_under_the_stock_warned() {
+        use crate::guide::Step;
+        let mut a = manual_threaded_app(false);
+        let at = m6_tap_step(&a);
+        let (shown, _) = a.guide_at().unwrap();
+        let check = (at..shown.guide.steps.len())
+            .find(|&i| matches!(shown.guide.steps[i], Step::Check { .. }))
+            .unwrap();
+        let t = texts_at(&mut a, check);
+        assert!(t.iter().any(|s| s == "M6×1 screw"), "{t:?}");
+        assert!(!t.iter().any(|s| s == "Ø"), "{t:?}");
+        let drill = op_step(&a, "M6×1 · tap drill Ø5");
+        let under = |t: &Vec<String>| t.iter().any(|s| s.contains("under the stock"));
+        assert!(under(&texts_at(&mut a, drill)));
+        a.doc.setups[0].p.insert("stock_bottom".into(), "10".into());
+        crate::steps::tests::build(&mut a);
+        let drill = op_step(&a, "M6×1 · tap drill Ø5");
+        assert!(!under(&texts_at(&mut a, drill)));
     }
     /// Renders tapping on the manual mill to `$AXIS_RENDER_DIR` (default
     /// /tmp/threading): Add threading on a manual setup faced first, and
