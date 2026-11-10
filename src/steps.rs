@@ -3427,7 +3427,7 @@ fn pattern_screen<'a>(
         .count();
     let r = (p.tool(op).and_then(|t| num(&t.p, "diameter"))).unwrap_or(4.) / 2.;
     // Smaller at a narrow window, where the numbers get half the card.
-    let size = if p.app.window_width < 1200. { 34 } else { 40 };
+    let size = if p.app.window_width < 1200. { 30 } else { 40 };
     let mono = Font {
         weight: iced::font::Weight::Bold,
         ..Font::MONOSPACE
@@ -4172,7 +4172,11 @@ pub(crate) mod tests {
             };
             for start in [closing, "first hole", order] {
                 let r = find(start);
-                assert!(r.y + r.height < back.y, "{start} {r:?} over {back:?}");
+                // Above the gap over the buttons, where the column ends.
+                assert!(
+                    r.y + r.height + 14. <= back.y,
+                    "{start} {r:?} over {back:?}"
+                );
             }
         }
     }
