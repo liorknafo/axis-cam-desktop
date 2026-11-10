@@ -2517,9 +2517,10 @@ pub(crate) mod tests {
             found(&four, true, true),
             arc([0., 0.], 50., 4, 0., 90., true)
         );
+        // (In the grid's order, not the circle's.)
         assert!(matches!(
-            found(&four, true, false),
-            Some(Pattern::Grid { angle, .. }) if (angle.abs() - 45.).abs() < 0.05
+            pattern(&four, true, false),
+            Some((Pattern::Grid { angle, .. }, _)) if (angle.abs() - 45.).abs() < 0.05
         ));
     }
     #[test]
