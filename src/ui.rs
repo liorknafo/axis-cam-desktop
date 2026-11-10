@@ -6752,7 +6752,13 @@ pub(crate) fn run_check(app: &App) -> Option<(String, Vec<String>, bool, bool)> 
         ("Export", "export")
     };
     let name = setup.name();
-    let checking = format!("Checking {name} as {verb} will…");
+    // A hand machine has no program and no export (LIO-375).
+    let hand = manual::is_hand(&setup.machine);
+    let checking = if hand {
+        format!("Checking {name}: its moves and its holding…")
+    } else {
+        format!("Checking {name} as {verb} will…")
+    };
     let (r, checked) = match (app.current_ready(), app.stale_ready()) {
         (Some(r), _) => (r, true),
         (None, Some(r)) => (r, false),
@@ -6767,16 +6773,23 @@ pub(crate) fn run_check(app: &App) -> Option<(String, Vec<String>, bool, bool)> 
     let machine = "The machine's position and the work zero are checked on the Control page.";
     let (heading, lines, ok) = match mark {
         OpMark::Suppressed => return None,
+        OpMark::Ready if hand => (
+            format!("{name} passes its checks: follow its Steps on the MACHINE page."),
+            vec![],
+            true,
+        ),
         OpMark::Ready => (
             format!("Ready to {verb}: {by}'s checks of {name} pass."),
             if uc100 { vec![machine.into()] } else { vec![] },
             true,
         ),
+        OpMark::Collides if hand => (format!("Workholding problem in {name}"), lines, false),
         OpMark::Collides => (
             format!("Workholding problem: {by} will refuse {name}"),
             lines,
             false,
         ),
+        _ if hand => (format!("{name} does not pass its checks"), lines, false),
         _ => (format!("{by} will refuse {name}"), lines, false),
     };
     Some(if checked {
@@ -6792,13 +6805,15 @@ fn holding_note(
     name: &str,
     setup: &Setup,
 ) -> crate::HoldingNote {
-    // A lathe setup has no export to refuse anything.
+    // A lathe setup has no export to refuse anything, nor has a manual
+    // mill's (LIO-375).
     let on_lathe = lathe::is_lathe(&setup.machine);
+    let hand = manual::is_hand(&setup.machine);
     let boxes = match app.doc.holding_boxes(setup, held_of(app, plan.stock)) {
         Ok(boxes) => boxes,
         Err(error) => {
             return Some((
-                if on_lathe {
+                if hand {
                     "Workholding cannot be checked until it is fixed"
                 } else {
                     "Workholding cannot be checked; export will refuse this setup until it is fixed"
@@ -6841,6 +6856,10 @@ fn holding_note(
         };
         let what = if on_lathe {
             "This cut conflicts with the chuck".to_string()
+        } else if hand && hit {
+            format!("Too close to the workholding{frame}")
+        } else if hand {
+            format!("A clamp would lose the stock under it{frame}")
         } else if hit {
             format!("Too close to the workholding (export will refuse this{frame})")
         } else {
@@ -7130,28 +7149,61 @@ fn wizard(app: &App) -> Element<'_, Message> {
             form=form.push(choice(p,"units","Machine specification units",&["mm","inch"],t)).push(note("Machine profile values use these units. The CAM project and tool definitions use millimeters."));
         }
         "Travel & spindle" => {
-            let spindle = if manual::is_manual(m) {
-                vec![
-                    ("power", "Spindle power · W"),
-                    ("speeds", "Spindle speeds · rpm, or a range"),
-                    ("hand_feed", "Hand feed · mm/min"),
-                    ("hand_rapid", "Hand rapid · mm/min"),
-                    ("turn_x", "X per handwheel turn · mm"),
-                    ("turn_y", "Y per handwheel turn · mm"),
-                    ("turn_z", "Z per handwheel turn · mm"),
+            // X, Y and Z on one row, with the machine's unit (LIO-375).
+            let travel = if get(p, "units") == "inch" {
+                [
+                    ("x", "X travel · inch"),
+                    ("y", "Y travel · inch"),
+                    ("z", "Z travel · inch"),
                 ]
             } else {
-                vec![
+                [
+                    ("x", "X travel · mm"),
+                    ("y", "Y travel · mm"),
+                    ("z", "Z travel · mm"),
+                ]
+            };
+            let three = |fields: [(&'static str, &'static str); 3]| {
+                Row::with_children(
+                    fields.map(|(k, l)| container(field(p, k, l, t)).width(Fill).into()),
+                )
+                .spacing(8)
+            };
+            form = form.push(three(travel));
+            if manual::is_manual(m) {
+                // In pairs, so that the step fits without scrolling.
+                for pair in [
+                    [
+                        ("power", "Spindle power · W"),
+                        ("speeds", "Spindle speeds · rpm, or a range"),
+                    ],
+                    [
+                        ("hand_feed", "Hand feed · mm/min"),
+                        ("hand_rapid", "Hand rapid · mm/min"),
+                    ],
+                ] {
+                    form = form.push(
+                        Row::with_children(
+                            pair.map(|(k, l)| container(field(p, k, l, t)).width(Fill).into()),
+                        )
+                        .spacing(8),
+                    );
+                }
+            } else {
+                for (k, l) in [
                     ("rpm", "Maximum spindle speed · rpm"),
                     ("power", "Spindle power · W"),
                     ("feed", "Maximum feed · machine units/min"),
-                ]
-            };
-            for (k, l) in [("x", "X travel"), ("y", "Y travel"), ("z", "Z travel")]
-                .into_iter()
-                .chain(spindle)
-            {
-                form = form.push(field(p, k, l, t));
+                ] {
+                    form = form.push(field(p, k, l, t));
+                }
+            }
+            if manual::is_manual(m) {
+                form = form.push(three([
+                    ("turn_x", "X per handwheel turn · mm"),
+                    ("turn_y", "Y per handwheel turn · mm"),
+                    ("turn_z", "Z per handwheel turn · mm"),
+                ]));
             }
             if !manual::is_manual(m) {
                 form = form
@@ -14989,6 +15041,49 @@ mod tests {
     use crate::model::Strategy;
     use std::path::Path;
 
+    /// A manual setup's checks speak of no export, a CNC setup's as before;
+    /// the manual mill's Travel & spindle step fits without scrolling
+    /// (LIO-375).
+    #[test]
+    fn a_manual_setup_is_checked_without_an_export_and_its_wizard_step_fits() {
+        use crate::{Message, Target};
+        let mut a = crate::steps::tests::app("Yes");
+        let _ = a.update(Message::SelectSetup(0));
+        let _ = a.update(Message::SelectOp(1));
+        let (heading, ..) = super::run_check(&a).unwrap();
+        assert!(!heading.to_lowercase().contains("export"), "{heading}");
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::SelectOp(0));
+        let (heading, ..) = super::run_check(&a).unwrap();
+        assert!(
+            [
+                " as export will",
+                " as run will",
+                "Ready to ",
+                " will refuse "
+            ]
+            .iter()
+            .any(|w| heading.contains(w)),
+            "{heading}"
+        );
+        let window = iced::Size::new(1440., 900.);
+        let _ = a.update(Message::Resized(window));
+        let _ = a.update(Message::NewMachine);
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "Manual".into()));
+        let _ = a.update(Message::WizardStep(1));
+        let texts = crate::ui::probe::texts(a.view(), window);
+        assert!(texts.iter().any(|t| t == "X travel · mm"), "{texts:?}");
+        let bounds = crate::ui::probe::scrollables(a.view(), window);
+        let seen = crate::ui::probe::seen(a.view(), window);
+        let contents = seen.iter().filter_map(|s| match s {
+            crate::ui::probe::Seen::Scroll(_, size) => Some(*size),
+            _ => None,
+        });
+        let over: Vec<_> = (bounds.iter().zip(contents))
+            .filter(|((_, b), c)| c.height > b.height + 1.)
+            .collect();
+        assert!(over.is_empty(), "{over:?}");
+    }
     /// The cutter list and the speed of an operation on the manual mill
     /// offer only what the mill has (LIO-372).
     #[test]

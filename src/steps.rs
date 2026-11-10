@@ -1959,7 +1959,13 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     None
                 ),
             ];
-            ("Hold".into(), "where it goes in the vise", left, right)
+            // The caption follows the holding (LIO-375).
+            let sub = match (vise, get(&p.setup.p, "holding")) {
+                (Some(_), _) => "where it goes in the vise",
+                (None, "Clamps") => "where the clamps hold it",
+                _ => "the stock as it starts",
+            };
+            ("Hold".into(), sub, left, right)
         }
         Step::Zero {
             approach,
@@ -2417,10 +2423,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             value: dro(h[0]),
                             lock: Some("X".into()),
                             tags: vec!["centre".into()],
-                            lit: Lit::Next,
+                            lit: lit(0, p.app.guide_reached),
                             big: false
                         },
-                        None
+                        Some(Message::Guide(GuideAction::Reached(0)))
                     ),
                     readout(
                         Readout {
@@ -2430,10 +2436,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             value: dro(h[1]),
                             lock: Some("Y".into()),
                             tags: vec!["centre".into()],
-                            lit: Lit::Next,
+                            lit: lit(1, p.app.guide_reached),
                             big: false
                         },
-                        None
+                        Some(Message::Guide(GuideAction::Reached(1)))
                     ),
                     readout(
                         Readout {
@@ -2443,10 +2449,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             value: format!("{:.1}", turns),
                             lock: None,
                             tags: vec![format!("{} deep", mm(depth)), "½ back every turn".into(),],
-                            lit: Lit::Next,
+                            lit: lit(2, p.app.guide_reached),
                             big: true
                         },
-                        None
+                        Some(Message::Guide(GuideAction::Reached(2)))
                     ),
                     tiles(
                         (1..=holes.len()).map(|n| (n.to_string(), None)).collect(),
@@ -2503,10 +2509,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             value: dro(h[0]),
                             lock: Some("X".into()),
                             tags: vec!["centre".into()],
-                            lit: Lit::Next,
+                            lit: lit(0, p.app.guide_reached),
                             big: false
                         },
-                        None
+                        Some(Message::Guide(GuideAction::Reached(0)))
                     ),
                     readout(
                         Readout {
@@ -2516,10 +2522,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             value: dro(h[1]),
                             lock: Some("Y".into()),
                             tags: vec!["centre".into()],
-                            lit: Lit::Next,
+                            lit: lit(1, p.app.guide_reached),
                             big: false
                         },
-                        None
+                        Some(Message::Guide(GuideAction::Reached(1)))
                     ),
                     readout(
                         Readout {
@@ -2543,10 +2549,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             .chain(cone)
                             .chain(pecking)
                             .collect(),
-                            lit: Lit::Next,
+                            lit: lit(2, p.app.guide_reached),
                             big: false
                         },
-                        None
+                        Some(Message::Guide(GuideAction::Reached(2)))
                     ),
                     tiles(
                         (1..=holes.len()).map(|n| (n.to_string(), None)).collect(),
@@ -3693,6 +3699,27 @@ pub(crate) mod tests {
         a.selected = Some(0);
         let _ = a.update(Message::Guide(GuideAction::Fix(None, String::new())));
         assert_eq!((a.page, a.selected), (Page::Work, None));
+    }
+    #[test]
+    fn the_hold_caption_follows_the_holding_and_a_holes_readouts_light_in_turn() {
+        // No holding modelled, then a vise (LIO-375).
+        let a = app("Yes");
+        assert!(has(&a, "the stock as it starts") && !has(&a, "where it goes in the vise"));
+        let a = app_with("Yes", crate::guide::tests::in_the_vise);
+        assert!(has(&a, "where it goes in the vise"));
+        // Tapping X on a Holes screen lights Y and keeps the hole.
+        let mut a = app("Yes");
+        let holes = (guide(&a).steps.iter())
+            .position(|s| matches!(s, Step::Holes { .. }))
+            .unwrap();
+        send(&mut a, GuideAction::Go(holes));
+        send(&mut a, GuideAction::Next);
+        assert_eq!((a.guide_item, a.guide_reached), (1, 0));
+        send(&mut a, GuideAction::Reached(0));
+        assert_eq!((a.guide_item, a.guide_reached), (1, 1));
+        // Hole done: the next hole, from its first readout.
+        send(&mut a, GuideAction::Next);
+        assert_eq!((a.guide_item, a.guide_reached), (2, 0));
     }
     #[test]
     fn a_holes_depth_is_counted_from_its_mouth() {
