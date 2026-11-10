@@ -457,15 +457,32 @@ pub fn detect(triangles: &[[[f32; 3]; 3]]) -> Vec<Thread> {
                 }
                 sectors.iter().filter(|s| **s).count() >= 18
             };
-            // A ring is read in stretches along the axis that no face of
-            // the part parts (`stretches`): a hole tapped from both faces
-            // of a web is two threads, and faces round the axis past solid
-            // stock (a coaxial slot's rounded lip) are none of its.
+            // A hole's ring is read in stretches along the axis that no
+            // face of the part parts (`stretches`): a hole tapped from both
+            // faces of a web is two threads, and faces round the axis past
+            // solid stock (a coaxial slot's rounded lip) are none of its. A
+            // stud's axis runs through its solid core, where faces inside it
+            // (a cross hole's walls, an axial bore's floor) part no thread
+            // round it: its ring is read whole.
+            let inside = |ring: &[&Flank]| {
+                let facing: f32 = (ring.iter())
+                    .map(|f| {
+                        let off = [f.at[0] - at[0], f.at[1] - at[1]];
+                        (f.toward[0] * off[0] + f.toward[1] * off[1]).signum()
+                    })
+                    .sum();
+                facing < 0.
+            };
             let threads = rings
                 .iter()
                 .filter(|ring| ring.len() >= LEAST && around(ring))
                 .map(|ring| {
-                    (stretches(ring, |f| f.index, axis, at, triangles).into_iter())
+                    let parts = if inside(ring) {
+                        stretches(ring, |f| f.index, axis, at, triangles)
+                    } else {
+                        vec![ring.clone()]
+                    };
+                    (parts.into_iter())
                         .filter(|s| s.len() >= LEAST && around(s))
                         .filter_map(|s| {
                             let members: Vec<_> =
@@ -487,11 +504,13 @@ pub fn detect(triangles: &[[[f32; 3]; 3]]) -> Vec<Thread> {
     found
 }
 
-/// `ring`'s flank triangles (by `index` into `triangles`) round the axis
-/// through `at` along `axis`, in stretches along the axis that no face of
-/// the part parts: one that crosses the axis between two of them (a blind
-/// hole's floor, a web of solid stock) does; a clearance groove or a plain
-/// bore between them leaves the axis open, and they are one.
+/// A hole's flank triangles `ring` (by `index` into `triangles`) round the
+/// axis through `at` along `axis`, whose axis runs through the hole's air,
+/// in stretches along the axis that no face of the part parts: one that
+/// crosses the axis between two of them (a blind hole's floor, a web of
+/// solid stock) does; a clearance groove or a plain bore between them
+/// leaves the axis open, and they are one. Not for a stud's: its axis runs
+/// through its solid core.
 fn stretches<T: Copy>(
     ring: &[T],
     index: impl Fn(&T) -> usize,
@@ -889,6 +908,17 @@ pub(crate) mod tests {
         // Tapped from both faces of a 1 mm web: two threads.
         let got = read(vec![m8(0., 8.), across(8.), across(9.), m8(9., 17.)]);
         assert!(near(&got, &[(0., 8.), (9., 17.)]), "{got:?}");
+        // A stud Z0-20 with a clearance groove at Z8-10, and an axial
+        // Ø2 bore from its top whose floor crosses its axis at Z9, in the
+        // groove: the bore parts no thread round the stud's solid core, which
+        // is one thread, Z0-20, its whole length for the lathe.
+        let stud = modeled([0., 0.], 8., 1.25, 60., true, false, 20., 0.);
+        let grooved: Vec<_> = (stud.into_iter())
+            .filter(|t| t.iter().all(|p| p[2] <= 8. || p[2] >= 10.))
+            .chain(across(9.))
+            .collect();
+        let got = read(vec![grooved]);
+        assert!(near(&got, &[(0., 20.)]), "{got:?}");
     }
     #[test]
     fn left_hand_fine_and_small_threads_read_true() {
