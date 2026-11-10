@@ -29647,7 +29647,68 @@ soft_max = 180.0
         let _ = b.update(Message::AddOp(Strategy::Turn));
         assert_eq!(b.page, Page::Tools);
         assert!(b.doc.setups[0].operations.is_empty());
-        assert!(b.status.contains("needs a cutter"), "{}", b.status);
+        // It names the tool it needs and offers it: saving adds the Turn (LIO-393).
+        assert!(b.status.contains("needs a turning tool"), "{}", b.status);
+        let _ = b.update(Message::SaveTool);
+        assert_eq!(b.doc.setups[0].operations.len(), 1, "{}", b.status);
+    }
+    /// An operation with no cutter for it in the library offers a tool of
+    /// its type, named, with a free number, marked for a hand machine; it
+    /// saves as offered and adds the operation (LIO-393).
+    #[test]
+    fn adding_an_operation_with_no_cutter_offers_one_of_its_type() {
+        let offered = |a: &mut App, s: Strategy, kind: &str| {
+            let _ = a.update(Message::AddOp(s));
+            assert_eq!(a.page, Page::Tools, "{kind}");
+            let draft = a.tool_draft.clone();
+            assert_eq!((get(&draft.p, "type"), draft.name()), (kind, kind));
+            let mut issues = draft.issues();
+            issues.extend(a.doc.tool_number_issues(&draft));
+            assert_eq!(issues, Vec::<String>::new(), "{kind}");
+            assert!(a.status.contains(&kind.to_lowercase()), "{}", a.status);
+            // Another type is said to be the wrong one; this one is not.
+            let note = format!("{} takes a ", s.name());
+            let noted = |a: &App| page_texts(a).iter().any(|t| t.starts_with(&note));
+            assert!(!noted(a), "{kind}");
+            let _ = a.update(Message::Edit(Target::Tool, "type", "Face mill".into()));
+            assert!(noted(a), "{kind}");
+            let _ = a.update(Message::Edit(Target::Tool, "type", kind.into()));
+            let _ = a.update(Message::SaveTool);
+            assert!(
+                (a.doc.setup().operations.iter()).any(|o| o.strategy == s && o.tool == draft.id),
+                "{kind}: {}",
+                a.status
+            );
+            draft
+        };
+        let mut a = app();
+        let types = [crate::model::KEYSEAT, "Chamfer mill", "Drill"];
+        a.doc.tools.retain(|t| !types.contains(&get(&t.p, "type")));
+        offered(&mut a, Strategy::Drill, "Drill");
+        offered(&mut a, Strategy::Groove, crate::model::KEYSEAT);
+        offered(&mut a, Strategy::Chamfer, "Chamfer mill");
+        // A Box on a manual mill with no tool on it: a flat end mill on it.
+        with_manual(&mut a);
+        let _ = a.update(Message::AddManualSetup);
+        a.doc.active = a.doc.setups[0].id.clone();
+        let m = a.doc.setup().machine.clone();
+        a.doc.tools.retain(|t| !t.fits(&m));
+        let flat = offered(&mut a, Strategy::Box, "Flat end mill");
+        assert_eq!(get(&flat.p, "machines"), m.id);
+        // "+ New tool" is unchanged.
+        let _ = a.update(Message::NewTool);
+        assert_eq!(a.tool_draft.name(), "New tool");
+        assert_eq!(get(&a.tool_draft.p, "type"), "Flat end mill");
+        // A tool with no name: its number's message has no stray colon.
+        a.tool_draft.p.insert("name".into(), String::new());
+        a.tool_draft
+            .p
+            .insert("number".into(), get(&flat.p, "number").into());
+        let e = a.doc.tool_number_issues(&a.tool_draft);
+        assert!(
+            !e.is_empty() && e.iter().all(|e| e.starts_with("Tool number T")),
+            "{e:?}"
+        );
     }
     #[test]
     fn the_turn_editor_has_a_kind_chooser_and_the_fields_of_each_kind() {

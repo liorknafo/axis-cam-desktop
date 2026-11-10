@@ -258,7 +258,7 @@ Other checks:
   - Face opens the Tool library and adds nothing. After New tool, Save reads "Save and continue to Facing", and the page builds. Saving adds the Facing operation and returns to MANUFACTURE, with no action left pending.
   - Face again with no tool, then MANUFACTURE and back to Tools: saving a tool adds nothing and stays on Tools.
   - With one machine in the library, Create first setup creates the setup with it, without the Machine library.
-- Not a test: the window was not driven or looked at; the labels and the empty Tool library's text ("Facing needs a cutter. Create one: saving it adds Facing.") come from the same code.
+- Not a test: the window was not driven or looked at; the labels and the Tool library's status ("Facing needs a flat end mill. Create one: saving it adds Facing.", LIO-393) come from the same code.
 - `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 815 passed, 4 failed: the two STEP tests, as before, and two simulated-UC100 smoke tests that timed out under the load of parallel builds (`machine_zero_turns_the_soft_limits_on`, `the_control_page_renders_in_every_state`); each passes alone.
 
 ## Planning for a UC100 machine (LIO-141)

@@ -12288,15 +12288,9 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
                 page_header("Tool library", "Save cutters you actually use."),
                 space().height(40),
                 bold("No tools yet", 28),
-                muted(match &app.pending {
-                    Some((_, Message::AddOp(s))) => format!(
-                        "{} needs a cutter. Create one: saving it adds {}.",
-                        s.name(),
-                        s.name()
-                    ),
-                    _ =>
-                        "Create your first cutter, then select it when adding an operation.".into(),
-                }),
+                // An operation waiting for a cutter has its draft already
+                // (`Message::AddOp`, LIO-393), so this page is not shown for it.
+                muted("Create your first cutter, then select it when adding an operation."),
                 primary("+ Create first tool", Message::NewTool)
             ]
             .spacing(18),
@@ -12513,11 +12507,27 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
     let mut tool_issues = app.tool_draft.issues();
     tool_issues.extend(app.doc.tool_number_issues(&app.tool_draft));
     form = form.push(warnings(tool_issues.clone()));
+    // The operation waiting for a cutter names the types it takes (LIO-393).
+    let wanted = match &app.pending {
+        Some((_, Message::AddOp(s))) => {
+            let m = &app.doc.setup().machine;
+            let types = crate::model::Operation::for_machine(*s, String::new(), m).tool_types(m);
+            (!types.contains(&get(p, "type"))).then(|| {
+                format!(
+                    "{} takes a {}.",
+                    s.name(),
+                    types.join(" or ").to_lowercase()
+                )
+            })
+        }
+        _ => None,
+    };
     let editor = library_editor(
         form,
         &tool_issues,
-        tool_unsaved(app)
+        wanted
             .into_iter()
+            .chain(tool_unsaved(app))
             .chain(app.doc.tool_in_use_note(&app.tool_draft.id)),
         primary(
             app.resume_label().unwrap_or("Save tool".into()),

@@ -3788,22 +3788,20 @@ impl Document {
         ))
     }
     pub fn tool_number_issues(&self, tool: &Tool) -> Vec<String> {
+        // A tool with no name has no "name: " before its message (LIO-393).
+        let said = |rest: String| match tool.name().trim() {
+            "" => rest[..1].to_uppercase() + &rest[1..],
+            name => format!("{name}: {rest}"),
+        };
         let Some(n) = tool.number() else {
-            return vec![format!(
-                "{}: enter a tool number from 1 to {TOOL_NUMBER_MAX}.",
-                tool.name()
-            )];
+            return vec![said(format!(
+                "enter a tool number from 1 to {TOOL_NUMBER_MAX}."
+            ))];
         };
         self.tools
             .iter()
             .filter(|t| t.id != tool.id && t.number() == Some(n))
-            .map(|t| {
-                format!(
-                    "{}: tool number T{n} is also used by {}.",
-                    tool.name(),
-                    t.name()
-                )
-            })
+            .map(|t| said(format!("tool number T{n} is also used by {}.", t.name())))
             .collect()
     }
     pub fn validate_structure(&self) -> Result<(), String> {
