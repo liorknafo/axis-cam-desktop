@@ -3145,9 +3145,9 @@ fn never_lines(
     }
     out
 }
-/// The most a pass lifts off the floor to return (`cam::boxed`: 0.2 mm),
-/// with room for rounding.
-const LIFT: f32 = 0.25;
+/// The most a pass lifts off the floor to return (`cam::LIFT`), with room
+/// for rounding.
+const LIFT: f32 = crate::cam::LIFT + 0.05;
 /// The screen of a Pass `step`.
 fn pass<'a>(
     p: &Page<'a>,
