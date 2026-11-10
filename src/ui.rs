@@ -4770,6 +4770,7 @@ pub(crate) fn setup_step_done(app: &App, step: &str) -> bool {
             s.offset().is_none_or(|o| !o.is_empty())
                 && (crate::post::references(get(&s.p, "origin")).is_some()
                     || crate::indexed::ORIGINS.contains(&get(&s.p, "origin")))
+                && (!crate::lathe::is_lathe(&s.machine) || get(&s.p, "origin") == crate::turn::ZERO)
                 && crate::post::pins_issue(s).is_none()
                 && !app
                     .current_ready()
@@ -4919,6 +4920,26 @@ fn setup_zero<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
             base + 1,
             app.doc.setups[base].name()
         )));
+    }
+    // A lathe's zero is fixed (LIO-386): every Turn and Drill refuses another.
+    if crate::lathe::is_lathe(&s.machine) {
+        let mut c = c.push(section("Work zero")).push(muted(
+            "The free end of the bar, on its axis: every dial number on the Steps page counts from it. The Steps page's Zero screen sets it: touch the end and zero the carriage dial, then touch the bar and zero the cross-slide dial. The 3D view marks it with a cross.",
+        ));
+        if origin != crate::turn::ZERO {
+            c = c
+                .push(caution(
+                    "Not the lathe's work zero",
+                    vec![format!(
+                        "This setup's work zero is {origin}, which every Turn and Drill refuses: a lathe's is the free end of the bar, on the axis."
+                    )],
+                ))
+                .push(secondary(
+                    "Put it back",
+                    Message::Edit(t, "origin", crate::turn::ZERO.into()),
+                ));
+        }
+        return c;
     }
     let zero = crate::post::stock_zero(origin);
     let model = origin == "Model origin";
@@ -5408,7 +5429,13 @@ fn zero_note(app: &App) -> Element<'_, Message> {
         }
     );
     let refs = crate::post::references(origin);
+    // A hand machine has no probe and no Control page (LIO-386): the Steps
+    // page's Zero screen picks the zero up with the edge finder.
+    let hand = crate::manual::is_hand(&setup.machine);
     let mut lines = vec![match (crate::post::touch_off_spots(origin, stock), refs) {
+        (_, Some(_)) if hand => format!(
+            "On the stock this setup starts from ({from}): the Steps page's Zero screen has you touch a side for X and one for Y with the edge finder and the top for Z, and set the DRO so that it reads 0 at this work zero."
+        ),
         (Some(spots), _) => format!(
             "On the stock this setup starts from ({from}): touch off {spots}.{}",
             crate::round_hold::side_note(setup, stock)
@@ -5426,13 +5453,13 @@ fn zero_note(app: &App) -> Element<'_, Message> {
             None => "Choose a work zero.".into(),
         },
     }];
-    if let Some(refs) = refs {
+    if let Some(refs) = refs.filter(|_| !hand) {
         lines.push(format!(
             "On the Control page, {} sets exactly this work zero, probed from its own spot or, under Probe from, from another corner, edge middle or the centre a probe can reach.",
             crate::control::probe_name(refs)
         ));
     }
-    if crate::post::sits_on_pins(setup) {
+    if crate::post::sits_on_pins(setup) && !hand {
         lines.insert(0, "On the pins, the pins locate X and Y and the touch-off or probe sets Z: Probe corner, Probe edge and Probe centre stay available to check the part's place.".into());
     }
     let mut c = column![muted(lines.join(" "))].spacing(8);
@@ -5445,7 +5472,9 @@ fn zero_note(app: &App) -> Element<'_, Message> {
                 "The work zero is not on the stock",
                 zero.refused.clone(),
             ));
-        } else if let Err(why) = &zero.probe {
+        } else if let Err(why) = &zero.probe
+            && !hand
+        {
             c = c.push(caution("No probe finds this work zero", vec![why.clone()]));
         }
     }
