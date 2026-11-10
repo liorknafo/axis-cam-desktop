@@ -28661,10 +28661,10 @@ soft_max = 180.0
             &a,
             &[
                 "Cross-slide dial reads",
-                "Cross slide · dial per turn",
+                "Cross slide · the dial reads this after one turn",
                 "Cross slide · divisions",
-                "Top slide · dial per turn",
-                "Carriage · dial per turn",
+                "Top slide · the dial reads this after one turn",
+                "Carriage · the dial reads this after one turn",
                 "Tailstock quill · divisions",
                 "Power feeds · mm per revolution",
                 "Threads the gearbox cuts · mm",
@@ -29249,7 +29249,14 @@ soft_max = 180.0
         assert!(!t.iter().any(|s| s == "Manual Mill · 3-axis"), "{t:?}");
         assert!(t.iter().any(|s| s.starts_with("G54 · ")), "{t:?}");
         let _ = a.update(Message::SetupStep("Machine"));
-        shows(&a, &["The DRO's zero is in the Work zero step."]);
+        // Its line names no axes, its kind is under it (LIO-390).
+        shows(
+            &a,
+            &[
+                "Manual Mill · v1",
+                "Manual mill, no G-code. The DRO's zero is in the Work zero step.",
+            ],
+        );
         lacks(
             &a,
             &["The work zero and its offset (G54–G59) are in the Work zero step."],

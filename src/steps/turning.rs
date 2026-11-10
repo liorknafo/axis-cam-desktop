@@ -913,18 +913,18 @@ fn collar(machine: &crate::model::Machine, slide: Slide) -> (f32, f32) {
         num(&machine.p, d).unwrap_or(100.),
     )
 }
-/// What to do with a dial wound out: "2 turns out", "reads 2.20" (its
-/// collar counts down).
-fn out_tags(d: &Dial) -> Vec<String> {
+/// What a dial wound out reads, its collar counting down: the large text,
+/// "reads 2.20", and the turns beside it, "2 turns out" (LIO-390).
+fn out_read(p: &Page<'_>, d: &Dial) -> (String, Vec<String>) {
     let (t, _) = d.reading.clone().unwrap_or((0, 0.));
-    let r = d.reads.unwrap_or(0.);
-    vec![
-        match t {
+    let reads = fixed(d.reads.unwrap_or(0.), places_of(p, d.slide));
+    (
+        format!("reads {reads}"),
+        vec![match t {
             1 => "1 turn out".into(),
             t => format!("{t} turns out"),
-        },
-        format!("reads {r:.2}"),
-    ]
+        }],
+    )
 }
 /// The decimals the `slide`'s collar shows.
 fn places_of(p: &Page<'_>, slide: Slide) -> usize {
@@ -1750,10 +1750,10 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             let way = if *bore { "out" } else { "in" };
             let c = reading(p, cross);
             let at = reading(p, carriage);
-            let mut cross_tags = match c.at {
-                Some(_) if cross.out => out_tags(cross),
-                Some(_) => vec![format!("{} on the dial", c.long)],
-                None => vec![c.long.clone()],
+            let (cross_big, mut cross_tags) = match c.at {
+                Some(_) if cross.out => out_read(p, cross),
+                Some(_) => (c.total.clone(), vec![format!("{} on the dial", c.long)]),
+                None => (c.total.clone(), vec![c.long.clone()]),
             };
             if index == of
                 && let Some(m) = measured
@@ -1796,7 +1796,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 line(
                     Some(2),
                     "cross slide",
-                    big(c.total.clone(), lit(1, item)),
+                    big(cross_big, lit(1, item)),
                     cross_tags,
                     lit(1, item),
                     reached(1),

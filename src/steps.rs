@@ -4743,11 +4743,12 @@ pub(crate) mod tests {
                 "Pass 5 of 6",
                 "2 turns out, reads 2.20",
                 "cross slide · out to Ø19.80",
-                "2 t out, 2.20",
                 "2 turns out",
                 "reads 2.20",
             ],
         );
+        // The large text is what the collar reads, said once (LIO-390).
+        assert!(!has(&a, "2 t out, 2.20"));
         assert!(!has(&a, "out to 9.80 (Ø19.80)"));
         assert!(!has(&a, "set the carriage stop at the bottom"));
         // The first pass: the carriage stop before the power feed.
