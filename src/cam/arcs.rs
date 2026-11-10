@@ -664,9 +664,6 @@ pub fn drilled_arcs(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc
     // slot so short it reads as round) leaves the arc its own.
     let threaded = Geometry::with_threads(setup, mesh);
     let rims = super::rims(&threaded);
-    if !found.is_empty() {
-        eprintln!("PROBE arcs left for the slow check: {}", found.len());
-    }
     let mut whole: HashSet<usize> = HashSet::new();
     found.retain(|a| {
         if a.walls.iter().any(|w| whole.contains(w)) {
