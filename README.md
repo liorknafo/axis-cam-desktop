@@ -434,6 +434,8 @@ A machine has a kind, **CNC** (the default, so older projects read unchanged), *
 | Hand rapid | How fast you move an axis off the cut, mm/min | 1500 |
 | Handwheel mm per turn | X, Y and Z | 5, 5, 2.5 |
 | DRO compensation | Whether the DRO has tool-radius compensation | Yes |
+| DRO has matrix holes (`dro_matrix`) | Whether the DRO leads to the holes of a grid typed in once (see **Hole patterns**) | No |
+| DRO has arc holes (`dro_arc`) | Whether the DRO leads to the holes on a circle typed in once (see **Hole patterns**) | No |
 | Edge finder | The diameter of the edge finder the Zero step picks up the corner with, mm | 10 |
 | Pass time | Seconds to reset, set and lock the axes for one pass | 20 |
 | Tool time | Minutes to change a tool and pick up the zero again | 3 |
@@ -494,6 +496,7 @@ When the steps cannot be worked out, the page says why and names the operation i
 | Face | The whole facing on one screen: tool, gear, the Z pick-up (only for a tool not already in), how much comes off and the Z to face down to. You plan the passes and stepdown yourself, so it has no Pass or Check screen |
 | Square | A thin slab along one wall (one closed X or Y side, at most one tool radius wide) on one screen: tool, gear, the Z pick-up (only for a tool not already in), with compensation on the diameter to enter and the side to set (toward the wall), the X or Y to cut that side to, how much comes off and the Z to go down to. No Pass or Check screen |
 | Pass | One pass: top and front views, the band it removes, the tool where it starts and an arrow to where it stops, what earlier passes removed, and the DRO numbers |
+| Matrix holes, Arc holes | Before the Holes screen of a Drill whose holes are one pattern the DRO has (**Hole patterns**): the numbers to type into the DRO, large, two to a row, and the top view with the holes numbered in the DRO's order, hole 1 in orange, arrows from hole to hole, and the pitches (a grid) or the circle, its centre and the angle from +X round to hole 1 (an arc). After a centre drilling of the same pattern it says "the same pattern: start the DRO again at hole 1" |
 | Holes | The top view with every hole numbered, the current one lit, and its X, Y and the Z to drill to, with how deep that is from the hole's mouth (where the drill enters, lower where an earlier cut took the top down); a Reaming says Ream, "ream to" and "feed back out" |
 | Bore | One pass of a Boring: the holes and the bore as this pass leaves it over the last one's, then in order the bore to measure ("measure Ø31.90", after the first pass), the head setting ("head Ø32.00 · out 0.10 on Ø · 10 divisions", set with the spindle off), each hole's X and Y and the Z to bore to, and how to come out (spindle off, then raise; or feed back out) |
 | Check | The stock after the operation, lit as the one before it so that only the cut differs, with the sizes to measure drawn on it and listed large: a Box's width from the face it is measured from (or between its walls) and its depth below the top, with the stock to leave in them ("15.00 wide · from the front face", "9.50 deep below the top · floor Z −11.50"); holes' count, diameter and depth from the mouth |
@@ -506,7 +509,16 @@ When the steps cannot be worked out, the page says why and names the operation i
 - **Locks.** A padlock tag names the axes to lock during the cut, and the axis that is set for the last time before it.
 - **Depths.** The Z down to a pass's level says how much deeper the pass cuts ("4.75 deeper"); a row with no room to back off the wall lifts 0.2 mm "off the floor" to return and goes "back to the level" before its feed. The tiles of the passes are their depths in work Z ("−6.75 · 2" for the second row on a level).
 - **Never below.** The lowest Z and the extreme X and Y the tool's edge reaches in the operation are drawn as red lines on the views, each labelled with what the DRO reads with the tool against it: the edge on the compensation side (a diameter on from a wall on the other side), or the centre with compensation off.
+- **Holes of a pattern.** On the Holes screen of a pattern, X and Y read 0.00 "on the DRO's hole N", with the hole's own X and Y small beside them; Z and the rest are as for any hole.
 - **Handwheel turn rate.** The feed is shown in turns, such as "1 turn every 2 s", from the hand feed and the axis's mm per turn, with a dot that blinks once per turn.
+
+### Hole patterns
+
+Many DROs have **matrix holes** (a grid) and **arc holes** (holes on a circle or part of one): you type the pattern in once and the DRO then leads to each hole, which you reach by moving X and Y until both read 0. Set **DRO has matrix holes** and **DRO has arc holes** on the manual mill (both No by default, and on machines saved before them) and the Steps page uses them.
+
+- **What counts.** A Drill's holes (a drilling, a centre drilling, a reaming or a tapping) all together: a **grid** is rows and columns at even pitches, square to each other, at any angle, and one row of three or more is a grid of one row; an **arc** is three or more holes on one circle at even angles, all the way round or along part of it (at least 10° from the first to the last). Holes match within 0.02 mm and the numbers are given to 0.01. Four holes on a square's corners are both: the grid is taken when the DRO has it. Fewer than three holes, holes that are no such pattern and a pattern the DRO does not have are shown hole by hole.
+- **The DRO's order.** A grid's rows run along the pitch nearer X, toward +X (+Y when upright), and the holes go row by row from the first hole, each row the same way, the rows after the first counter-clockwise of it: front-left first for a grid square to the axes. An arc goes counter-clockwise from its first hole: the one at the least angle from +X on a full circle, the one after the widest gap on part of one. The Holes screen takes the holes in that order.
+- **What to type.** A grid: the first hole's X and Y, the pitch along a row and between the rows (each with the whole span), how many holes a row and how many rows, and the rows' angle from +X. An arc: the centre's X and Y, the diameter (and the radius), how many holes and whether it is a full circle, the first hole's and the last hole's angle from +X and the angle between holes, counter-clockwise. DROs ask for different ones of these; type the ones yours asks for.
 
 ### Minutes
 
@@ -518,7 +530,7 @@ A manual setup is left out of the export and the run bar. The NC review page say
 
 ### Not in this version
 
-Power feed, a DRO connection, arcs or two axes moving together on the manual mill and a rotary table are not planned. The AI planner can choose the manual work for you (see **Manual machines in the plan** under **Plan a job with AI**), or you mark it yourself; suggested boxes without the planner and saving the steps as pages to take to the machine are not built yet. The Steps screens can be drawn headless to PNG files with the ignored test `steps::tests::render_the_steps` (it writes to `/tmp/manual-steps`).
+Power feed, a DRO connection, arcs or two axes moving together on the manual mill and a rotary table are not planned. Hole patterns: several patterns in one Drill (its holes are one pattern or are shown hole by hole: give each pattern its own Drill), Boring (a boring pass visits its holes one by one) and anything for the AI planner (the patterns change how holes are found at the machine, not the plan) are not in this version. The AI planner can choose the manual work for you (see **Manual machines in the plan** under **Plan a job with AI**), or you mark it yourself; suggested boxes without the planner and saving the steps as pages to take to the machine are not built yet. The Steps screens can be drawn headless to PNG files with the ignored test `steps::tests::render_the_steps` (it writes to `/tmp/manual-steps`), and the hole patterns' screens with `steps::tests::render_the_hole_patterns` (into `AXIS_RENDER_DIR`).
 
 ## Manual lathe
 

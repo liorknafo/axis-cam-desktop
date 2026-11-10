@@ -156,12 +156,23 @@ pub enum Step {
     /// Z each is drilled to; and, by hole, the Z its cut starts at: its
     /// mouth, where a tap's turns are counted from. A centre drill's Z is
     /// its pilot's tip. By hole, whether a twist drill starts it on a flat
-    /// face, with nothing before it to centre it (`uncentred`).
+    /// face, with nothing before it to centre it (`uncentred`). With a
+    /// `pattern` the DRO leads to (LIO-399), the holes are in the DRO's
+    /// order and each is reached when X and Y read 0.
     Holes {
         op: usize,
         holes: Vec<[f32; 3]>,
         mouths: Vec<f32>,
         uncentred: Vec<bool>,
+        pattern: Option<Pattern>,
+    },
+    /// What to type into the DRO for the holes of `op`, which are all one
+    /// `pattern`; `same` when the operation before used the same one (a
+    /// centre drill before its drill): start it again at hole 1.
+    Pattern {
+        op: usize,
+        pattern: Pattern,
+        same: bool,
     },
     /// One pass of a Boring (1-based `index` of `of`): the boring head set
     /// to `size` (Ø mm), from `before` (what the last pass left, or None
@@ -766,6 +777,245 @@ pub(crate) fn opened(
 fn holes(plan: &Plan, zero: [f32; 3]) -> Vec<[f32; 3]> {
     holes_of(&plan.moves, zero)
 }
+/// `v` in `order`.
+fn reordered<T: Clone>(v: &[T], order: &[usize]) -> Vec<T> {
+    order.iter().filter_map(|&j| v.get(j).cloned()).collect()
+}
+/// A pattern of holes a DRO leads to by itself (LIO-399): its matrix holes
+/// (a grid) or its arc holes. Work coordinates; mm, and degrees from +X
+/// counter-clockwise; rounded to 0.01.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    /// `columns` holes a row and `rows` rows: `first` the first hole,
+    /// `pitch` along a row and between the rows, the rows at `angle`. The
+    /// DRO's order: row by row from the first hole, each row the same way.
+    Grid {
+        first: [f32; 2],
+        columns: usize,
+        rows: usize,
+        pitch: [f32; 2],
+        angle: f32,
+    },
+    /// `count` holes on the circle Ø`diameter` round `centre`, the first at
+    /// angle `first`, each one `step` on counter-clockwise; `full` all the
+    /// way round. The DRO's order: from the first, counter-clockwise.
+    Arc {
+        centre: [f32; 2],
+        diameter: f32,
+        count: usize,
+        first: f32,
+        step: f32,
+        full: bool,
+    },
+}
+/// How far a hole may be off its place in a pattern, mm: the centres come
+/// from the part's mesh.
+const ON_PATTERN: f32 = 0.02;
+fn hundredths(v: f32) -> f32 {
+    (v * 100.).round() / 100. + 0.
+}
+/// The one pattern the hole centres `holes` (work coordinates) make all
+/// together, of those the DRO has (`grids`, `arcs`), with the holes'
+/// indices in the DRO's order; None for fewer than three holes. A grid is
+/// taken first: four holes on a square's corners are both.
+pub fn pattern(holes: &[[f32; 2]], grids: bool, arcs: bool) -> Option<(Pattern, Vec<usize>)> {
+    if holes.len() < 3 {
+        return None;
+    }
+    (grids.then(|| grid(holes)).flatten()).or_else(|| arcs.then(|| arc(holes)).flatten())
+}
+/// `holes` as one grid: its rows along the direction of a pair of holes,
+/// the longest pairs first, as their direction is the truest.
+// ponytail: every pair's direction is tried, cubic in the holes; a Drill
+// has tens. Bin the directions first if hundreds of holes get slow.
+fn grid(holes: &[[f32; 2]]) -> Option<(Pattern, Vec<usize>)> {
+    let n = holes.len();
+    let d = |&(a, b): &(usize, usize)| (holes[b][0] - holes[a][0]).hypot(holes[b][1] - holes[a][1]);
+    let mut pairs: Vec<(usize, usize)> = (0..n)
+        .flat_map(|a| (a + 1..n).map(move |b| (a, b)))
+        .collect();
+    pairs.sort_by(|x, y| d(y).total_cmp(&d(x)));
+    let mut tried: Vec<f32> = vec![];
+    pairs.into_iter().find_map(|(a, b)| {
+        let (dx, dy) = (holes[b][0] - holes[a][0], holes[b][1] - holes[a][1]);
+        let turn = dy.atan2(dx).rem_euclid(std::f32::consts::PI);
+        let near = |t: &f32| {
+            let off = (t - turn).abs();
+            off.min(std::f32::consts::PI - off) < 1e-3
+        };
+        if tried.iter().any(near) {
+            return None;
+        }
+        tried.push(turn);
+        grid_along(holes, [turn.cos(), turn.sin()])
+    })
+}
+/// The ranks of `values` with those within 0.2 mm of the one before as one,
+/// and how many ranks.
+fn ranks(values: &[f32]) -> (Vec<usize>, usize) {
+    let mut by: Vec<usize> = (0..values.len()).collect();
+    by.sort_by(|a, b| values[*a].total_cmp(&values[*b]));
+    let mut rank = vec![0; values.len()];
+    let mut r = 0;
+    for w in 1..by.len() {
+        if values[by[w]] - values[by[w - 1]] > 10. * ON_PATTERN {
+            r += 1;
+        }
+        rank[by[w]] = r;
+    }
+    (rank, r + 1)
+}
+/// `holes` as a grid with its rows roughly along the unit vector `u`.
+fn grid_along(holes: &[[f32; 2]], u: [f32; 2]) -> Option<(Pattern, Vec<usize>)> {
+    let n = holes.len();
+    let dot = |p: [f32; 2], q: [f32; 2]| p[0] * q[0] + p[1] * q[1];
+    let along: Vec<f32> = holes.iter().map(|p| dot(*p, u)).collect();
+    let across: Vec<f32> = holes.iter().map(|p| dot(*p, [-u[1], u[0]])).collect();
+    let (mut i, mut c) = ranks(&along);
+    let (mut k, mut r) = ranks(&across);
+    if c * r != n {
+        return None;
+    }
+    let mut seen = vec![false; n];
+    for h in 0..n {
+        let at = k[h] * c + i[h];
+        if std::mem::replace(&mut seen[at], true) {
+            return None;
+        }
+    }
+    // A full grid: the least-squares pitch on each index alone.
+    let fit = |idx: &[usize]| -> [f32; 2] {
+        let m = idx.iter().sum::<usize>() as f32 / n as f32;
+        let ss: f32 = idx.iter().map(|&j| (j as f32 - m).powi(2)).sum();
+        if ss == 0. {
+            return [0.; 2];
+        }
+        std::array::from_fn(|a| {
+            let pm = holes.iter().map(|p| p[a]).sum::<f32>() / n as f32;
+            (idx.iter().zip(holes))
+                .map(|(&j, p)| (j as f32 - m) * (p[a] - pm))
+                .sum::<f32>()
+                / ss
+        })
+    };
+    let (mut pa, mut pb) = (fit(&i), fit(&k));
+    // Rows along the pitch nearer X; a column alone is a row.
+    let len = |v: [f32; 2]| v[0].hypot(v[1]);
+    if c == 1 || (r > 1 && pb[0].abs() / len(pb) > pa[0].abs() / len(pa)) {
+        (i, k, c, r, pa, pb) = (k, i, r, c, pb, pa);
+    }
+    // The rows run toward +X, or +Y when upright within the 0.1° a mesh's
+    // centres can turn them (their angle over −89.9° and up to 90.1°); the
+    // rows after the first go counter-clockwise of them, square to them.
+    let turned = pa[1].atan2(pa[0]).to_degrees();
+    if !(-89.9..=90.1).contains(&turned) {
+        pa = pa.map(|v| -v);
+        i.iter_mut().for_each(|j| *j = c - 1 - *j);
+    }
+    let ua = pa.map(|v| v / len(pa));
+    let ub = [-ua[1], ua[0]];
+    let mut across = dot(pb, ub);
+    if across < 0. {
+        across = -across;
+        k.iter_mut().for_each(|j| *j = r - 1 - *j);
+    }
+    let pb = ub.map(|v| v * across);
+    let mean = |idx: &[usize]| idx.iter().sum::<usize>() as f32 / n as f32;
+    let (mi, mk) = (mean(&i), mean(&k));
+    let first: [f32; 2] = std::array::from_fn(|a| {
+        holes.iter().map(|p| p[a]).sum::<f32>() / n as f32 - mi * pa[a] - mk * pb[a]
+    });
+    let off = |h: usize| {
+        let at: [f32; 2] =
+            std::array::from_fn(|a| first[a] + i[h] as f32 * pa[a] + k[h] as f32 * pb[a]);
+        (at[0] - holes[h][0]).hypot(at[1] - holes[h][1])
+    };
+    if (0..n).any(|h| off(h) > ON_PATTERN) {
+        return None;
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&h| (k[h], i[h]));
+    let pattern = Pattern::Grid {
+        first: first.map(hundredths),
+        columns: c,
+        rows: r,
+        pitch: [len(pa), across].map(hundredths),
+        angle: hundredths(pa[1].atan2(pa[0]).to_degrees()),
+    };
+    Some((pattern, order))
+}
+/// `holes` as one arc: on the circle that fits them best, at even angles,
+/// all the way round or along part of it (at least 10° from the first to
+/// the last, not a line).
+fn arc(holes: &[[f32; 2]]) -> Option<(Pattern, Vec<usize>)> {
+    let n = holes.len();
+    // The algebraic (Kåsa) fit, about the holes' middle.
+    let m: [f64; 2] =
+        std::array::from_fn(|a| holes.iter().map(|p| f64::from(p[a])).sum::<f64>() / n as f64);
+    let (mut uu, mut uv, mut vv, mut r1, mut r2) = (0., 0., 0., 0., 0.);
+    for p in holes {
+        let (u, v) = (f64::from(p[0]) - m[0], f64::from(p[1]) - m[1]);
+        (uu, uv, vv) = (uu + u * u, uv + u * v, vv + v * v);
+        r1 += u * (u * u + v * v) / 2.;
+        r2 += v * (u * u + v * v) / 2.;
+    }
+    let det = uu * vv - uv * uv;
+    if det.abs() < 1e-9 * (uu * vv).max(1e-12) {
+        return None;
+    }
+    let (cu, cv) = ((r1 * vv - r2 * uv) / det, (r2 * uu - r1 * uv) / det);
+    let radius = (cu * cu + cv * cv + (uu + vv) / n as f64).sqrt() as f32;
+    let centre = [(m[0] + cu) as f32, (m[1] + cv) as f32];
+    // Each hole's angle, 0 to 360, a hair under 0 taken as 0.
+    let angle = |p: [f32; 2]| {
+        let a = (p[1] - centre[1]).atan2(p[0] - centre[0]).to_degrees();
+        if a < -0.005 { a + 360. } else { a.max(0.) }
+    };
+    let mut by: Vec<usize> = (0..n).collect();
+    by.sort_by(|a, b| angle(holes[*a]).total_cmp(&angle(holes[*b])));
+    let gap = |j: usize| {
+        let next = angle(holes[by[(j + 1) % n]]);
+        (next - angle(holes[by[j]])).rem_euclid(360.)
+    };
+    let widest = (0..n).max_by(|a, b| gap(*a).total_cmp(&gap(*b)))?;
+    // All the way round, from the hole at the least angle; else from the
+    // hole after the widest gap.
+    let tries = [
+        (true, 0, 360. / n as f32),
+        (
+            false,
+            (widest + 1) % n,
+            (360. - gap(widest)) / (n - 1) as f32,
+        ),
+    ];
+    tries.into_iter().find_map(|(full, start, step)| {
+        if !full && step * ((n - 1) as f32) < 10. {
+            return None;
+        }
+        let order: Vec<usize> = (0..n).map(|j| by[(start + j) % n]).collect();
+        let a0 = angle(holes[order[0]]);
+        let first = (order.iter().enumerate())
+            .map(|(j, &h)| (angle(holes[h]) - a0).rem_euclid(360.) + a0 - j as f32 * step)
+            .sum::<f32>()
+            / n as f32;
+        let fits = order.iter().enumerate().all(|(j, &h)| {
+            let t = (first + j as f32 * step).to_radians();
+            let at = [centre[0] + radius * t.cos(), centre[1] + radius * t.sin()];
+            (at[0] - holes[h][0]).hypot(at[1] - holes[h][1]) <= ON_PATTERN
+        });
+        fits.then(|| {
+            let pattern = Pattern::Arc {
+                centre: centre.map(hundredths),
+                diameter: hundredths(2. * radius),
+                count: n,
+                first: hundredths(first).rem_euclid(360.),
+                step: hundredths(step),
+                full,
+            };
+            (pattern, order)
+        })
+    })
+}
 /// `holes` of the holes `moves` cut.
 fn holes_of(moves: &[Move], zero: [f32; 3]) -> Vec<[f32; 3]> {
     let mut holes: Vec<[f32; 3]> = vec![];
@@ -1012,6 +1262,9 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
     let zero = crate::post::datum(setup, stock, mesh)?;
     let work = |b: Bounds| b.translated(zero.map(|v| -v));
     let dro = get(&machine.p, "dro_comp") == "Yes";
+    // The DRO's own hole functions (LIO-399); No when not set.
+    let grids = get(&machine.p, "dro_matrix") == "Yes";
+    let arcs = get(&machine.p, "dro_arc") == "Yes";
     let tool_time = num(&machine.p, "tool_time").unwrap_or(0.);
 
     // Set up.
@@ -1096,7 +1349,10 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
     // The tool, rpm and compensation sides the last operation left set.
     let mut set: Option<(&str, f32, Option<[i8; 2]>)> = None;
     let mut done_ops = vec![];
+    // The hole pattern of the operation before, and of this one.
+    let mut next_pattern: Option<Pattern> = None;
     for ((oi, plan), after) in done.into_iter().zip(afters) {
+        let last_pattern = next_pattern.take();
         let op = &setup.operations[oi];
         let tool = op.tool.as_str();
         let rpm = num(&op.p, "rpm").unwrap_or(0.);
@@ -1241,7 +1497,7 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                 if let Some(c) = centre {
                     holes.iter_mut().for_each(|h| h[2] -= c.pilot_length);
                 }
-                let uncentred = holes
+                let uncentred: Vec<bool> = holes
                     .iter()
                     .map(|h| {
                         crate::centre::wants_centre(op, &doc.tools, machine)
@@ -1255,11 +1511,33 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                             )
                     })
                     .collect();
+                // ponytail: one pattern an operation, all its holes or none;
+                // several would need the holes split into patterns first.
+                let xy: Vec<[f32; 2]> = holes.iter().map(|h| [h[0], h[1]]).collect();
+                let found = pattern(&xy, grids, arcs);
+                let (holes, mouths, uncentred, pattern) = match found {
+                    Some((pattern, order)) => {
+                        steps.push(Step::Pattern {
+                            op: oi,
+                            pattern: pattern.clone(),
+                            same: last_pattern.as_ref() == Some(&pattern),
+                        });
+                        (
+                            reordered(&holes, &order),
+                            reordered(&mouths, &order),
+                            reordered(&uncentred, &order),
+                            Some(pattern),
+                        )
+                    }
+                    None => (holes, mouths, uncentred, None),
+                };
+                next_pattern = pattern.clone();
                 steps.push(Step::Holes {
                     op: oi,
                     holes,
                     mouths,
                     uncentred,
+                    pattern,
                 });
                 steps.push(Step::Check { op: oi });
             }
@@ -1926,6 +2204,7 @@ pub(crate) mod tests {
                 Step::Face { .. } => "Face",
                 Step::Square { .. } => "Square",
                 Step::Holes { .. } => "Holes",
+                Step::Pattern { .. } => "Pattern",
                 Step::Bore { .. } => "Bore",
                 Step::Check { .. } => "Check",
                 Step::HandOver { .. } => "HandOver",
@@ -1945,6 +2224,296 @@ pub(crate) mod tests {
             })
             .flat_map(|(i, t)| t.iter().map(move |t| (i, t)))
             .collect()
+    }
+    /// `cols` × `rows` holes from `first`, `pitch` apart, the rows at
+    /// `angle`° from +X, row by row.
+    pub(crate) fn grid_at(
+        first: [f32; 2],
+        cols: usize,
+        rows: usize,
+        pitch: [f32; 2],
+        angle: f32,
+    ) -> Vec<[f32; 2]> {
+        let (s, c) = angle.to_radians().sin_cos();
+        (0..rows)
+            .flat_map(|r| {
+                (0..cols).map(move |k| {
+                    let (u, v) = (k as f32 * pitch[0], r as f32 * pitch[1]);
+                    [first[0] + u * c - v * s, first[1] + u * s + v * c]
+                })
+            })
+            .collect()
+    }
+    /// `n` holes on the circle Ø`d` round `centre`, from `first`° each
+    /// `step`° on counter-clockwise.
+    pub(crate) fn circle_at(
+        centre: [f32; 2],
+        d: f32,
+        n: usize,
+        first: f32,
+        step: f32,
+    ) -> Vec<[f32; 2]> {
+        (0..n)
+            .map(|j| {
+                let t = (first + j as f32 * step).to_radians();
+                [centre[0] + d / 2. * t.cos(), centre[1] + d / 2. * t.sin()]
+            })
+            .collect()
+    }
+    #[test]
+    fn grids_and_arcs_of_holes_are_found_to_the_hundredth_in_the_dros_order() {
+        // Out of order and up to 0.002 off, as a mesh's centres are.
+        let jumble = |v: &[[f32; 2]]| {
+            let mut v = v.to_vec();
+            v.reverse();
+            v.rotate_left(1);
+            for (j, p) in v.iter_mut().enumerate() {
+                p[0] += 0.002 * ((j % 3) as f32 - 1.);
+                p[1] -= 0.002 * (j % 2) as f32;
+            }
+            v
+        };
+        let found = |holes: &[[f32; 2]], grids: bool, arcs: bool| {
+            let given = jumble(holes);
+            let (p, order) = pattern(&given, grids, arcs)?;
+            // In the DRO's order, the holes as made.
+            for (a, b) in reordered(&given, &order).iter().zip(holes) {
+                assert!((a[0] - b[0]).hypot(a[1] - b[1]) < 0.02, "{a:?} {b:?}");
+            }
+            Some(p)
+        };
+        let grid = |first, columns, rows, pitch, angle| {
+            Some(Pattern::Grid {
+                first,
+                columns,
+                rows,
+                pitch,
+                angle,
+            })
+        };
+        // A 3 × 4 grid, and turned 30° round its first hole.
+        for angle in [0., 30.] {
+            let holes = grid_at([10., 20.], 4, 3, [15., 10.], angle);
+            let want = grid([10., 20.], 4, 3, [15., 10.], angle);
+            assert_eq!(found(&holes, true, true), want);
+            assert_eq!(found(&holes, false, true), None);
+        }
+        // A row of four, upright: a grid of one row.
+        let row = grid_at([5., 5.], 4, 1, [12.5, 0.], 90.);
+        // Its noise turns it a hair, which the hundredths show.
+        let Some(Pattern::Grid {
+            first,
+            columns: 4,
+            rows: 1,
+            pitch,
+            angle,
+        }) = found(&row, true, false)
+        else {
+            panic!()
+        };
+        let near = |a: f32, b: f32| (a - b).abs() <= 0.02;
+        assert!(near(first[0], 5.) && near(first[1], 5.), "{first:?}");
+        assert!(
+            near(pitch[0], 12.5) && pitch[1] == 0. && near(angle, 90.),
+            "{pitch:?} {angle}"
+        );
+        // A bolt circle of six, and an arc of four over 90°.
+        let bolts = circle_at([50., 40.], 80., 6, 15., 60.);
+        let arc = |centre, diameter, count, first, step, full| {
+            Some(Pattern::Arc {
+                centre,
+                diameter,
+                count,
+                first,
+                step,
+                full,
+            })
+        };
+        assert_eq!(
+            found(&bolts, true, true),
+            arc([50., 40.], 80., 6, 15., 60., true)
+        );
+        assert_eq!(found(&bolts, true, false), None);
+        // Part of a circle fits the noise less tightly than the whole.
+        let part = circle_at([-20., 10.], 50., 4, 10., 30.);
+        let Some(Pattern::Arc {
+            centre,
+            diameter,
+            count: 4,
+            first,
+            step,
+            full: false,
+        }) = found(&part, false, true)
+        else {
+            panic!()
+        };
+        let near = |a: f32, b: f32| (a - b).abs() <= 0.03;
+        let all = [centre[0], centre[1], diameter, first, step];
+        for (got, want) in all.into_iter().zip([-20., 10., 50., 10., 30.]) {
+            assert!(near(got, want), "{all:?}");
+        }
+        // A square of four: a grid when the DRO has grids, else an arc.
+        let square = grid_at([0., 0.], 2, 2, [40., 40.], 0.);
+        assert_eq!(
+            found(&square, true, true),
+            grid([0., 0.], 2, 2, [40., 40.], 0.)
+        );
+        // As an arc it starts at the corner at 45°, the back-right one.
+        let round = circle_at([20., 20.], 40. * std::f32::consts::SQRT_2, 4, 45., 90.);
+        assert!(round.iter().all(|p| {
+            square
+                .iter()
+                .any(|q| (p[0] - q[0]).hypot(p[1] - q[1]) < 1e-3)
+        }));
+        assert_eq!(
+            found(&round, false, true),
+            arc([20., 20.], 56.57, 4, 45., 90., true)
+        );
+        // No pattern: a ragged set, two holes, one hole; a grid one hole
+        // short; three in a line unevenly.
+        let ragged = [[0., 0.], [10., 0.], [25., 3.], [7., 19.]];
+        let short = &grid_at([0., 0.], 3, 3, [10., 10.], 0.)[..8];
+        for holes in [
+            &ragged[..],
+            &ragged[..2],
+            &ragged[..1],
+            short,
+            &[[0., 0.], [10., 0.], [25., 0.]][..],
+        ] {
+            assert_eq!(found(holes, true, true), None, "{holes:?}");
+        }
+    }
+    /// A 120 × 90 × 10 plate with Ø6 holes through at `at` (its middle at
+    /// 0), drilled Ø6 on a manual mill whose DRO has matrix holes (`grids`)
+    /// and arc holes (`arcs`); with `centred` a centre drilling of the same
+    /// holes before it.
+    pub(crate) fn pattern_job(
+        at: &[[f32; 2]],
+        grids: bool,
+        arcs: bool,
+        centred: bool,
+    ) -> (Document, Mesh) {
+        use crate::cam::boring::tests::{drill, drilling, job};
+        let outer = [
+            (-60., -45., 0.),
+            (60., -45., 0.),
+            (60., 45., 0.),
+            (-60., 45., 0.),
+        ];
+        let circles: Vec<[(f64, f64, f64); 2]> = (at.iter())
+            .map(|p| [f64::from(p[0]), f64::from(p[1])])
+            .map(|[x, y]| [(x + 3., y, 1.), (x - 3., y, 1.)])
+            .collect();
+        let mut loops: Vec<&[(f64, f64, f64)]> = vec![&outer[..]];
+        loops.extend(circles.iter().map(|c| &c[..]));
+        let mesh = crate::cam::arcs::tests::slab(&loops, 10., 0., true, true);
+        let mesh = crate::mesh::normalize(mesh).unwrap();
+        let mut machine = manual::defaults();
+        for (k, on) in [("dro_matrix", grids), ("dro_arc", arcs)] {
+            machine
+                .p
+                .insert(k.into(), if on { "Yes" } else { "No" }.into());
+        }
+        let mut d = drill("6");
+        d.p.insert("machines".into(), machine.id.clone());
+        let mut op = drilling(&mesh, &d, "Drilling");
+        for (k, v) in [("name", "Holes"), ("rpm", "1000"), ("feed", "100")] {
+            op.p.insert(k.into(), v.into());
+        }
+        let (mut doc, _) = job(&mesh, machine, vec![(d, op)]);
+        if centred {
+            let mut c = Tool::new("Centre drill A2.5×6.3", crate::model::CENTRE_DRILL, "6.3");
+            c.set_type(crate::model::CENTRE_DRILL);
+            c.p.insert("stickout".into(), "40".into());
+            doc.tools.push(c);
+            let (ops, _) = crate::centre::needed(&doc, 0, None);
+            crate::centre::insert(&mut doc, 0, ops);
+        }
+        (doc, mesh)
+    }
+    /// The plate's 3 × 4 grid: Ø6 holes 20 apart in X, 15 in Y.
+    pub(crate) fn plate_grid() -> Vec<[f32; 2]> {
+        grid_at([-30., -15.], 4, 3, [20., 15.], 0.)
+    }
+    /// The plate's bolt circle: six Ø6 holes on Ø60, the first at 30°.
+    pub(crate) fn plate_circle() -> Vec<[f32; 2]> {
+        circle_at([0., 0.], 60., 6, 30., 60.)
+    }
+    #[test]
+    fn a_drilled_grid_has_a_pattern_screen_and_its_holes_in_the_dros_order() {
+        let (doc, mesh) = pattern_job(&plate_grid(), true, false, false);
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let section = guide.sections[1].steps.clone();
+        assert_eq!(
+            kinds(&guide, section.clone()),
+            ["Tool", "Pattern", "Holes", "Check"]
+        );
+        let Step::Pattern {
+            pattern:
+                Pattern::Grid {
+                    first,
+                    columns,
+                    rows,
+                    pitch,
+                    angle,
+                },
+            same: false,
+            ..
+        } = guide.steps[section.start + 1]
+        else {
+            panic!("{:?}", guide.steps[section.start + 1])
+        };
+        assert_eq!((columns, rows, pitch, angle), (4, 3, [20., 15.], 0.));
+        let Step::Holes { holes, pattern, .. } = &guide.steps[section.start + 2] else {
+            panic!()
+        };
+        assert!(pattern.is_some());
+        // Row by row from the first hole, each from left to right.
+        assert_eq!(holes.len(), 12);
+        for (j, h) in holes.iter().enumerate() {
+            let want = [
+                first[0] + (j % 4) as f32 * 20.,
+                first[1] + (j / 4) as f32 * 15.,
+            ];
+            assert!((h[0] - want[0]).hypot(h[1] - want[1]) < 0.02, "{j} {h:?}");
+        }
+        // Without the DRO's matrix holes: hole by hole, as before.
+        let (doc, mesh) = pattern_job(&plate_grid(), false, true, false);
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let section = guide.sections[1].steps.clone();
+        assert_eq!(kinds(&guide, section.clone()), ["Tool", "Holes", "Check"]);
+        assert!(matches!(
+            guide.steps[section.start + 1],
+            Step::Holes { pattern: None, .. }
+        ));
+    }
+    #[test]
+    fn a_drill_after_its_centre_drill_on_the_same_circle_says_the_pattern_is_the_same() {
+        let (doc, mesh) = pattern_job(&plate_circle(), false, true, true);
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let patterns: Vec<(&Pattern, bool)> = (guide.steps.iter())
+            .filter_map(|s| match s {
+                Step::Pattern { pattern, same, .. } => Some((pattern, *same)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(patterns.len(), 2, "{:?}", guide.steps);
+        assert_eq!((patterns[0].1, patterns[1].1), (false, true));
+        let Pattern::Arc {
+            diameter,
+            count,
+            first,
+            step,
+            full,
+            ..
+        } = patterns[1].0
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (*diameter, *count, *first, *step, *full),
+            (60., 6, 30., 60., true)
+        );
     }
     #[test]
     fn one_section_per_operation_between_set_up_and_hand_over() {

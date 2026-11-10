@@ -35,6 +35,7 @@ Power feed, a DRO connection (the app does not read the DRO), arcs or two axes m
 | `hand_rapid` | How fast the user moves an axis off the cut, mm/min | `1500` |
 | `turn_x`, `turn_y`, `turn_z` | mm per handwheel turn on each axis | `5`, `5`, `2.5` |
 | `dro_comp` | `Yes` when the DRO has tool-radius compensation | `Yes` |
+| `dro_matrix`, `dro_arc` | `Yes` when the DRO has matrix holes (a grid) or arc holes, which it leads to once the pattern is typed in (LIO-399, §3 Hole patterns); absent reads `No` | absent |
 | `edge_finder` | Diameter of the edge finder the Zero step uses, mm; its radius is taken off each face touched | `10` |
 | `pass_time` | Seconds to reset, set and lock the axes for one pass | `20` |
 | `tool_time` | Minutes to change a tool and pick up the zero again | `3` |
@@ -103,7 +104,8 @@ A manual setup in MACHINE shows a **Steps** page instead of Run. It works with n
 | Face | **One screen for a whole facing cut** (a Box open on all four sides, over the whole top): the tool and its gear, how much comes off, and the Z to face down to. Top and front views show the area and the final top. The user plans the passes themselves, so there is no Pass step and no Check step for it |
 | Square | **One screen for squaring a side** (a Box with exactly one closed X/Y side, the wall, and no closed floor): the tool and its gear, the side, the X or Y to cut the side to (an edge readout with compensation), how much comes off, and how deep to go. No Pass or Check steps |
 | Pass | One pass (the mockup): top view and front view, the hatched band this pass removes, the tool where it starts, an arrow to where it stops, what earlier passes removed |
-| Holes | Top view with every hole numbered, the current hole highlighted, its X and Y, and the depth on the quill or Z |
+| Pattern | Before the Holes of a Drill whose holes are one pattern the DRO has (LIO-399): the numbers to type into the DRO, large, and the top view with the pattern drawn on it (see Hole patterns) |
+| Holes | Top view with every hole numbered, the current hole highlighted, its X and Y, and the depth on the quill or Z; for a pattern, X and Y read 0 on the DRO's hole N |
 | Check | 3D view of the stock after the operation, next to the previous one, with the main sizes |
 | Hand over | The stock as it leaves, and the next setup it goes to ("→ CNC setup 1"), with its 3D view |
 
@@ -125,6 +127,17 @@ The guide is split into **one section per cutting operation**, between a **Set u
 - **Never below.** The lowest Z and the closest X/Y the operation reaches are shown as red lines on the views. These are the numbers the user must not pass.
 - Buttons: Back and Pass done. Pass done on the last pass goes to the Check step. The guide remembers its place per setup (saved with the project, without marking the plan changed) so a restart resumes there.
 - The guide works while the CNC runs another job, so both machines can work at once.
+
+### Hole patterns (LIO-399)
+
+With `dro_matrix` or `dro_arc` on, `guide::pattern` looks at a (non-boring) Drill's hole centres in work coordinates, all together, and finds one grid or one arc, within 0.02 mm, rounded to 0.01:
+
+- **Grid.** Each pair of holes gives a direction to try, the longest pairs first; the holes' positions along it and across it rank into columns and rows (values within 0.2 mm one rank), which must fill a full grid, and a least-squares fit of the two pitches, square to each other, must place every hole within 0.02 mm. One row of three or more is a grid. The rows run along the pitch nearer X, toward +X (+Y when upright, within 0.1°), the rows after the first counter-clockwise of them; the DRO's order is row by row from the first hole, each row the same way.
+- **Arc.** An algebraic (Kåsa) circle fit, then even angles: all the way round from the hole at the least angle from +X, else from the hole after the widest gap, counter-clockwise, at least 10° from the first to the last, every hole within 0.02 mm of its place.
+- A grid is tried first when the DRO has both: four holes on a square are a grid there, an arc on a DRO with arc holes only.
+- `Step::Holes` carries the `pattern` and its holes, mouths and `uncentred` flags in the DRO's order; a `Step::Pattern { op, pattern, same }` comes before it, `same` when the operation before used the same pattern (a centre drill before its drill).
+- **The Pattern screen** gives the numbers two to a row, each the ways DROs differ (diameter and radius; the last hole's angle and the angle between holes; pitch and span), and draws the pattern on the part from above: the holes numbered in the DRO's order, hole 1 in the accent, arrows from hole to hole, the pitches off hole 1, or the circle, its centre and the angle from +X to hole 1 outside it.
+- Not in this version: several patterns in one Drill, Boring passes, anything for the AI planner.
 
 ### Pages to take to the machine (phase 2)
 

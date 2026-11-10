@@ -4,7 +4,7 @@
 mod turning;
 use crate::{
     App, GuideAction, Message,
-    guide::{Guide, Limits, Section, Step, Target},
+    guide::{Guide, Limits, Pattern, Section, Step, Target},
     help::HelpButton,
     holding::Gripped,
     manual,
@@ -878,6 +878,11 @@ enum Shape {
     Round([f32; 3], f32, String),
     /// A hole: its centre, radius, number and whether done, now or next.
     Hole([f32; 3], f32, usize, Lit),
+    /// A pattern the DRO leads to, its holes (centres, the DRO's order) and
+    /// their radius, in the top view: the holes numbered and their order,
+    /// hole 1 marked, the pitches or the circle with its centre and first
+    /// angle.
+    Pattern(Pattern, Vec<[f32; 2]>, f32),
     /// A word at a point.
     Word([f32; 3], String, Color),
     /// A solid block, such as a parallel under the stock.
@@ -1135,6 +1140,7 @@ impl Drawing<'_> {
                         Align::Left,
                     );
                 }
+                Shape::Pattern(pattern, holes, r) => paint_pattern(f, &p, s, pattern, holes, *r),
                 Shape::Word(q, s, c) => write(f, s.clone(), p3(*q), *c, 13., Align::Left),
                 Shape::Round(q, r, label) => {
                     let at = p3(*q);
@@ -1221,6 +1227,210 @@ impl Drawing<'_> {
             12.,
             Align::Left,
         );
+    }
+}
+/// `Shape::Pattern` in the top view, `at` from mm to the canvas at `s` px
+/// a mm: the order the DRO goes in as arrows from hole to hole (dashed onto
+/// the next row), the pitches as sizes off hole 1, or the circle with its
+/// centre, its diameter and the angle from +X round to hole 1; then the
+/// holes numbered, hole 1 in the accent.
+fn paint_pattern(
+    f: &mut canvas::Frame,
+    at: impl Fn([f32; 2]) -> Point,
+    s: f32,
+    pattern: &Pattern,
+    holes: &[[f32; 2]],
+    r: f32,
+) {
+    if holes.is_empty() {
+        return;
+    }
+    let rs = (r * s).max(6.);
+    // The words a little smaller on a small drawing.
+    let k = (s / 4.).clamp(0.8, 1.);
+    let pts: Vec<Point> = holes.iter().map(|h| at(*h)).collect();
+    // `px` on from `q` along the direction `d` (mm axes: +Y is up).
+    let on = |q: Point, d: [f32; 2], px: f32| Point::new(q.x + d[0] * px, q.y - d[1] * px);
+    let unit = |deg: f32| {
+        let t = deg.to_radians();
+        [t.cos(), t.sin()]
+    };
+    // A label on a white tag, `from` a point out along `out`, clear of it.
+    let tag = |f: &mut canvas::Frame, from: Point, out: [f32; 2], label: String| {
+        let (w, h) = (label.chars().count() as f32 * 9. * k + 16., 26. * k);
+        let c = on(
+            from,
+            out,
+            8. + out[0].abs() * w / 2. + out[1].abs() * h / 2.,
+        );
+        let r = canvas::Path::rounded_rectangle(
+            Point::new(c.x - w / 2., c.y - h / 2.),
+            Size::new(w, h),
+            5.into(),
+        );
+        f.fill(&r, Color::WHITE);
+        f.stroke(&r, stroke(ACCENT, 1.5));
+        write(f, label, c, ACCENT, 16. * k, Align::Center);
+    };
+    // A size from `a` to `b`, `gap` px off the holes along `out`.
+    let size = |f: &mut canvas::Frame, a: Point, b: Point, out: [f32; 2], label: String| {
+        let gap = rs + 22.;
+        let (m, n) = (on(a, out, gap), on(b, out, gap));
+        for (h, e) in [(a, m), (b, n)] {
+            let tick = canvas::Path::line(on(h, out, rs + 4.), on(e, out, 6.));
+            f.stroke(&tick, stroke(Color { a: 0.7, ..ACCENT }, 1.2));
+        }
+        let mid = Point::new((m.x + n.x) / 2., (m.y + n.y) / 2.);
+        arrow(f, mid, m, ACCENT, 2.);
+        arrow(f, mid, n, ACCENT, 2.);
+        tag(f, mid, out, label);
+    };
+    // The order: hole to hole, onto the next row dashed.
+    let row = match pattern {
+        Pattern::Grid { columns, .. } => *columns,
+        Pattern::Arc { .. } => usize::MAX,
+    };
+    for (j, w) in pts.windows(2).enumerate() {
+        let (dx, dy) = (w[1].x - w[0].x, w[1].y - w[0].y);
+        let l = dx.hypot(dy);
+        if l < 2. * rs + 10. {
+            continue;
+        }
+        let (ux, uy) = (dx / l * (rs + 4.), dy / l * (rs + 4.));
+        let a = Point::new(w[0].x + ux, w[0].y + uy);
+        let b = Point::new(w[1].x - ux, w[1].y - uy);
+        if (j + 1) % row == 0 {
+            f.stroke(
+                &canvas::Path::line(a, b),
+                dashed(Color { a: 0.6, ..TOOL }, 1.4),
+            );
+        } else {
+            arrow(f, a, b, Color { a: 0.85, ..TOOL }, 2.);
+        }
+    }
+    let outward: Vec<[f32; 2]> = match *pattern {
+        Pattern::Grid {
+            columns,
+            rows,
+            pitch,
+            angle,
+            ..
+        } => {
+            let (ua, ub) = (unit(angle), unit(angle + 90.));
+            let back = |d: [f32; 2]| [-d[0], -d[1]];
+            if columns > 1 {
+                size(
+                    f,
+                    pts[0],
+                    pts[1],
+                    back(ub),
+                    format!("pitch {}", dro(pitch[0])),
+                );
+            }
+            if rows > 1 {
+                let to = pts[columns];
+                size(f, pts[0], to, back(ua), format!("rows {}", dro(pitch[1])));
+            }
+            if angle.abs() >= 0.005 {
+                let c = pts[0];
+                let reach = 3. * rs + 30.;
+                let x = canvas::Path::line(c, on(c, [1., 0.], reach + 20.));
+                f.stroke(&x, dashed(MUTED, 1.3));
+                let sweep = canvas::Path::new(|b| {
+                    b.arc(canvas::path::Arc {
+                        center: c,
+                        radius: reach,
+                        start_angle: iced::Radians(0.),
+                        end_angle: iced::Radians(-angle.to_radians()),
+                    })
+                });
+                f.stroke(&sweep, stroke(ACCENT, 2.));
+                let end = on(c, unit(angle), reach);
+                arrow(f, on(end, unit(angle - 90.), 12.), end, ACCENT, 2.);
+                tag(
+                    f,
+                    on(c, unit(angle / 2.), reach),
+                    unit(angle / 2.),
+                    degrees(angle),
+                );
+            }
+            // Each number up and right of its hole.
+            vec![unit(45.); pts.len()]
+        }
+        Pattern::Arc {
+            centre,
+            diameter,
+            first,
+            ..
+        } => {
+            let c = at(centre);
+            let big = diameter / 2. * s;
+            f.stroke(&canvas::Path::circle(c, big), dashed(ACCENT, 1.6));
+            for d in [[1., 0.], [0., 1.]] {
+                let cross = canvas::Path::line(on(c, d, -11.), on(c, d, 11.));
+                f.stroke(&cross, stroke(ACCENT, 2.2));
+            }
+            let under = Point::new(c.x - 10., c.y + 16.);
+            write(f, "centre", under, ACCENT, 15. * k, Align::Right);
+            // From +X round to hole 1, counter-clockwise, outside the circle
+            // and its numbers.
+            let reach = big + rs + 34. * k;
+            let x = canvas::Path::line(c, on(c, [1., 0.], reach + 16.));
+            f.stroke(&x, dashed(MUTED, 1.3));
+            let one = canvas::Path::line(c, on(c, unit(first), big - rs));
+            f.stroke(&one, stroke(ACCENT, 1.6));
+            if first >= 0.005 {
+                let sweep = canvas::Path::new(|b| {
+                    b.arc(canvas::path::Arc {
+                        center: c,
+                        radius: reach,
+                        start_angle: iced::Radians(0.),
+                        end_angle: iced::Radians(-first.to_radians()),
+                    })
+                });
+                f.stroke(&sweep, stroke(ACCENT, 2.2));
+                let end = on(c, unit(first), reach);
+                arrow(f, on(end, unit(first - 90.), 12.), end, ACCENT, 2.2);
+            }
+            let half = unit(first / 2.);
+            tag(
+                f,
+                on(c, half, reach),
+                half,
+                format!("first {}", degrees(first)),
+            );
+            // Each number outside its hole.
+            (holes.iter())
+                .map(|h| {
+                    let d = [h[0] - centre[0], h[1] - centre[1]];
+                    let l = d[0].hypot(d[1]).max(1e-6);
+                    [d[0] / l, d[1] / l]
+                })
+                .collect()
+        }
+    };
+    for (j, (c, out)) in pts.iter().zip(outward).enumerate() {
+        let body = canvas::Path::circle(*c, rs);
+        let one = j == 0;
+        f.fill(
+            &body,
+            if one {
+                Color { a: 0.3, ..ACCENT }
+            } else {
+                Color::WHITE
+            },
+        );
+        f.stroke(
+            &body,
+            if one {
+                stroke(ACCENT, 3.)
+            } else {
+                stroke(INK, 1.5)
+            },
+        );
+        let n = on(*c, out, rs + (if one { 15. } else { 12. }) * k);
+        let (ink, size) = if one { (ACCENT, 20.) } else { (INK, 16.) };
+        write(f, (j + 1).to_string(), n, ink, size * k, Align::Center);
     }
 }
 impl canvas::Program<Message> for Drawing<'_> {
@@ -2552,11 +2762,13 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             )
         }
         step @ Step::Pass { .. } => pass(p, step),
+        Step::Pattern { op, pattern, same } => pattern_screen(p, *op, pattern, *same),
         Step::Holes {
             op,
             holes,
             mouths,
             uncentred,
+            pattern,
         } => {
             let stock = p.before(*op);
             let i = p.item.min(holes.len().saturating_sub(1));
@@ -2581,6 +2793,33 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 Shape::Hole([h[0], h[1], stock.max[2]], cone(n, h), n + 1, lit(n, i))
             }));
             let h = holes.get(i).copied().unwrap_or([0.; 3]);
+            // X and Y: the centre, or 0 on the DRO's hole of a pattern with
+            // the centre small beside it (LIO-399).
+            let xy = |k: usize| {
+                let (value, tags) = match pattern {
+                    Some(_) => (
+                        dro(0.),
+                        vec![
+                            format!("on the DRO's hole {}", i + 1),
+                            format!("{}\u{a0}{}", AXES[k], dro(h[k])),
+                        ],
+                    ),
+                    None => (dro(h[k]), vec!["centre".into()]),
+                };
+                readout(
+                    Readout {
+                        order: Some(k as u8 + 1),
+                        lead: None,
+                        axis: AXES[k].into(),
+                        value,
+                        lock: Some(AXES[k].into()),
+                        tags,
+                        lit: lit(k, p.app.guide_reached),
+                        big: false,
+                    },
+                    Some(Message::Guide(GuideAction::Reached(k))),
+                )
+            };
             let tapping = p.setup.operations.get(*op).is_some_and(|o| o.tapping());
             // Every hole is cut from its mouth: the stock above it may be
             // gone already (LIO-365).
@@ -2647,32 +2886,8 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 let right = column![
                     chips(said),
                     label(format!("Hole {} of {}", i + 1, holes.len())),
-                    readout(
-                        Readout {
-                            order: Some(1),
-                            lead: None,
-                            axis: "X".into(),
-                            value: dro(h[0]),
-                            lock: Some("X".into()),
-                            tags: vec!["centre".into()],
-                            lit: lit(0, p.app.guide_reached),
-                            big: false
-                        },
-                        Some(Message::Guide(GuideAction::Reached(0)))
-                    ),
-                    readout(
-                        Readout {
-                            order: Some(2),
-                            lead: None,
-                            axis: "Y".into(),
-                            value: dro(h[1]),
-                            lock: Some("Y".into()),
-                            tags: vec!["centre".into()],
-                            lit: lit(1, p.app.guide_reached),
-                            big: false
-                        },
-                        Some(Message::Guide(GuideAction::Reached(1)))
-                    ),
+                    xy(0),
+                    xy(1),
                     readout(
                         Readout {
                             order: Some(3),
@@ -2733,32 +2948,8 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 let right = column![
                     chips(said),
                     label(format!("Hole {} of {}", i + 1, holes.len())),
-                    readout(
-                        Readout {
-                            order: Some(1),
-                            lead: None,
-                            axis: "X".into(),
-                            value: dro(h[0]),
-                            lock: Some("X".into()),
-                            tags: vec!["centre".into()],
-                            lit: lit(0, p.app.guide_reached),
-                            big: false
-                        },
-                        Some(Message::Guide(GuideAction::Reached(0)))
-                    ),
-                    readout(
-                        Readout {
-                            order: Some(2),
-                            lead: None,
-                            axis: "Y".into(),
-                            value: dro(h[1]),
-                            lock: Some("Y".into()),
-                            tags: vec!["centre".into()],
-                            lit: lit(1, p.app.guide_reached),
-                            big: false
-                        },
-                        Some(Message::Guide(GuideAction::Reached(1)))
-                    ),
+                    xy(0),
+                    xy(1),
                     readout(
                         Readout {
                             order: Some(3),
@@ -3020,6 +3211,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
     // The lathe's numbers take half the card at a narrow window (LIO-389).
     let split = match &g.steps[p.at] {
         Step::Lathe(_) => turning::split(p),
+        Step::Pattern { .. } if p.app.window_width < 1200. => (1, 1),
         _ => (11, 9),
     };
     framed(title, sub, left, right, next, p.at > 0 || p.item > 0, split)
@@ -3165,6 +3357,145 @@ fn never_lines(
 /// The most a pass lifts off the floor to return (`cam::LIFT`), with room
 /// for rounding.
 const LIFT: f32 = crate::cam::LIFT + 0.05;
+/// An angle as the DRO takes it: "30.00°".
+fn degrees(v: f32) -> String {
+    format!("{}°", dro(v))
+}
+/// The Pattern screen (LIO-399): the numbers to type into the DRO's matrix
+/// or arc holes, large, two to a row, each the ways DROs ask for it, and
+/// the part from above with the pattern on it.
+fn pattern_screen<'a>(
+    p: &Page<'a>,
+    op: usize,
+    pattern: &Pattern,
+    same: bool,
+) -> (
+    String,
+    &'static str,
+    Element<'a, Message>,
+    Column<'a, Message>,
+) {
+    let holes: Vec<[f32; 2]> = match p.guide().steps.get(p.at + 1) {
+        Some(Step::Holes { holes, .. }) => holes.iter().map(|h| [h[0], h[1]]).collect(),
+        _ => vec![],
+    };
+    let r = (p.tool(op).and_then(|t| num(&t.p, "diameter"))).unwrap_or(4.) / 2.;
+    // Smaller at a narrow window, where the numbers get half the card.
+    let size = if p.app.window_width < 1200. { 34 } else { 40 };
+    let mono = Font {
+        weight: iced::font::Weight::Bold,
+        ..Font::MONOSPACE
+    };
+    // A number to type: what it is, the number, and the other way to say it.
+    let typed = |what: &str, value: String, other: Option<String>| -> Element<'a, Message> {
+        let c = column![
+            text(what.to_string()).size(14).color(MUTED),
+            text(value)
+                .size(size)
+                .font(mono)
+                .color(INK)
+                .wrapping(text::Wrapping::None),
+        ]
+        .push(other.map(|o| text(o).size(13).color(MUTED)));
+        boxed(c.spacing(2).padding([6, 12]), false)
+            .width(Fill)
+            .into()
+    };
+    let mut said = vec![chip(p.tool_name(op, 2. * r))];
+    if same {
+        said.push(warn_chip("the same pattern: start the DRO again at hole 1"));
+    }
+    let (title, sub, kind, numbers) = match *pattern {
+        Pattern::Grid {
+            first,
+            columns,
+            rows,
+            pitch,
+            angle,
+        } => {
+            let span =
+                |k: usize, n: usize| Some(format!("span {}", dro(pitch[k] * (n - 1) as f32)));
+            let mut c = vec![
+                typed("first hole X", dro(first[0]), None),
+                typed("first hole Y", dro(first[1]), None),
+                typed("pitch along a row", dro(pitch[0]), span(0, columns)),
+            ];
+            if rows > 1 {
+                c.push(typed("pitch between rows", dro(pitch[1]), span(1, rows)));
+            }
+            c.push(typed(
+                "holes: a row × rows",
+                format!("{columns} × {rows}"),
+                None,
+            ));
+            c.push(typed(
+                "rows from +X",
+                degrees(angle),
+                Some("counter-clockwise".into()),
+            ));
+            (
+                "Matrix holes",
+                "type the grid into the DRO",
+                "the DRO's matrix holes",
+                c,
+            )
+        }
+        Pattern::Arc {
+            centre,
+            diameter,
+            count,
+            first,
+            step,
+            full,
+        } => {
+            let last = (first + step * (count - 1) as f32).rem_euclid(360.);
+            let round = if full {
+                "full circle"
+            } else {
+                "part of a circle"
+            };
+            let c = vec![
+                typed("centre X", dro(centre[0]), None),
+                typed("centre Y", dro(centre[1]), None),
+                typed(
+                    "circle Ø",
+                    dro(diameter),
+                    Some(format!("radius {}", dro(diameter / 2.))),
+                ),
+                typed("holes", count.to_string(), Some(round.into())),
+                typed("first hole from +X", degrees(first), None),
+                typed("last hole from +X", degrees(last), None),
+                typed(
+                    "between holes",
+                    degrees(step),
+                    Some("counter-clockwise".into()),
+                ),
+            ];
+            (
+                "Arc holes",
+                "type the arc into the DRO",
+                "the DRO's arc holes",
+                c,
+            )
+        }
+    };
+    let mut right = column![chips(said), label(format!("Type into {kind}"))];
+    let mut numbers = numbers.into_iter();
+    while let Some(a) = numbers.next() {
+        let b = numbers.next().unwrap_or_else(|| space().width(Fill).into());
+        right = right.push(row![a, b].spacing(8));
+    }
+    let right =
+        right.push(muted("Then the DRO leads to each hole: move X and Y to 0.00.").size(13));
+    let stock = p.before(op);
+    let left = p.drawing(
+        0,
+        stock,
+        vec![Shape::Pattern(pattern.clone(), holes, r)],
+        Fill,
+    );
+    (title.into(), sub, left, right)
+}
 /// The screen of a Pass `step`.
 fn pass<'a>(
     p: &Page<'a>,
@@ -3463,7 +3794,11 @@ pub(crate) mod tests {
             op.p.insert("rpm".into(), "640".into());
             op.p.insert("feed".into(), "60".into());
         }
-        let (mut doc, _) = job(&mesh, manual, vec![(d, hole), (h, bore)]);
+        let (doc, _) = job(&mesh, manual, vec![(d, hole), (h, bore)]);
+        on_page(doc, mesh)
+    }
+    /// `doc` and its part `mesh` on the Steps page, its guide built.
+    fn on_page(mut doc: Document, mesh: Mesh) -> App {
         doc.file = Some(crate::model::ModelFile {
             name: "ring.3mf".into(),
             path: "ring.3mf".into(),
@@ -3479,6 +3814,118 @@ pub(crate) mod tests {
         let _ = a.update(Message::Page(Page::Control));
         build(&mut a);
         a
+    }
+    /// The plate of `guide::tests::pattern_job` with its holes `at` on the
+    /// Steps page.
+    fn pattern_app(at: &[[f32; 2]], grids: bool, arcs: bool, centred: bool) -> App {
+        let (doc, mesh) = crate::guide::tests::pattern_job(at, grids, arcs, centred);
+        on_page(doc, mesh)
+    }
+    /// The Pattern steps.
+    fn patterns(a: &App) -> Vec<usize> {
+        (guide(a).steps.iter().enumerate())
+            .filter(|(_, s)| matches!(s, Step::Pattern { .. }))
+            .map(|(i, _)| i)
+            .collect()
+    }
+    #[test]
+    fn the_pattern_and_holes_screens_say_what_to_type_and_each_hole_reads_zero() {
+        use crate::guide::tests::{plate_circle, plate_grid};
+        let shows = |a: &App, wants: &[&str]| {
+            let t = texts(a);
+            for want in wants {
+                assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
+            }
+        };
+        // Hole 2's readouts: X and Y 0 on the DRO's hole 2, its centre beside.
+        let hole_2 = |a: &mut App, at: usize| {
+            send(a, GuideAction::Go(at + 1));
+            send(a, GuideAction::Next);
+            let Step::Holes { holes, .. } = &guide(a).steps[at + 1] else {
+                panic!()
+            };
+            let t = texts(a);
+            for k in 0..2 {
+                let tag = format!(
+                    "on the DRO's hole 2 · {}\u{a0}{}",
+                    AXES[k],
+                    dro(holes[1][k])
+                );
+                assert_eq!(after(&t, AXES[k])[0], "0.00", "{t:?}");
+                assert!(t.contains(&tag), "{tag} in {t:?}");
+            }
+            assert!(t.iter().any(|s| s.starts_with("drill to · ")), "{t:?}");
+        };
+        let mut a = pattern_app(&plate_grid(), true, false, false);
+        let at = patterns(&a)[0];
+        send(&mut a, GuideAction::Go(at));
+        let Step::Pattern {
+            pattern: Pattern::Grid { first, .. },
+            ..
+        } = guide(&a).steps[at]
+        else {
+            panic!()
+        };
+        shows(
+            &a,
+            &[
+                "Matrix holes",
+                "TYPE INTO THE DRO'S MATRIX HOLES",
+                &dro(first[0]),
+                &dro(first[1]),
+                "20.00",
+                "span 60.00",
+                "15.00",
+                "span 30.00",
+                "4 × 3",
+                "holes: a row × rows",
+                "0.00°",
+            ],
+        );
+        assert!(!texts(&a).iter().any(|s| s.contains("same pattern")));
+        hole_2(&mut a, at);
+        // A centre drilling, then its drill: the second says it is the same.
+        let mut a = pattern_app(&plate_circle(), false, true, true);
+        let at = patterns(&a);
+        assert_eq!(at.len(), 2);
+        send(&mut a, GuideAction::Go(at[1]));
+        shows(
+            &a,
+            &[
+                "Arc holes",
+                "TYPE INTO THE DRO'S ARC HOLES",
+                "the same pattern: start the DRO again at hole 1",
+                "60.00",
+                "radius 30.00",
+                "6",
+                "full circle",
+                "30.00°",
+                "330.00°",
+                "60.00°",
+            ],
+        );
+        hole_2(&mut a, at[1]);
+    }
+    /// The Pattern screen and hole 2's Holes screen of the plate's grid and
+    /// of its bolt circle, at 1440 × 900 and 1024 × 700, into
+    /// `AXIS_RENDER_DIR`.
+    #[test]
+    #[ignore]
+    fn render_the_hole_patterns() {
+        use crate::guide::tests::{plate_circle, plate_grid};
+        let dir = std::path::PathBuf::from(std::env::var("AXIS_RENDER_DIR").unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, holes, grids) in [("grid", plate_grid(), true), ("arc", plate_circle(), false)] {
+            let mut a = pattern_app(&holes, grids, !grids, false);
+            let step = patterns(&a)[0];
+            for (w, h) in [(1440, 900), (1024, 700)] {
+                (a.window_width, a.window_height) = (w as f32, h as f32);
+                at(&mut a, step, 0);
+                render(&a, (w, h), &dir.join(format!("{name}-pattern-{w}.png")));
+                at(&mut a, step + 1, 1);
+                render(&a, (w, h), &dir.join(format!("{name}-holes-{w}.png")));
+            }
+        }
     }
     #[test]
     fn a_bore_pass_shows_what_to_measure_the_head_setting_and_the_hole() {
