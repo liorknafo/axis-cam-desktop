@@ -30628,6 +30628,8 @@ soft_max = 180.0
         let scale = mesh.display_scale();
         let threads = crate::thread::holes_in_setup(&setup, &mesh);
         assert_eq!(threads.len(), 4, "{threads:?}");
+        let fits = || crate::cam::arcs::FITS.with(|n| n.get());
+        let before = fits();
         for t in &threads {
             // Halfway down the thread, a flank (sloped) and a crest (a wall).
             let mid = (t.from + t.to) / 2.;
@@ -30685,5 +30687,10 @@ soft_max = 180.0
                 );
             }
         }
+        // Growing arcs along a thread's crests, which lie over each other a
+        // turn apart, took minutes a click on the user's adapter plate
+        // (LIO-361): here 2.2 million circle fits, about 59,000 since.
+        let cost = fits() - before;
+        assert!(cost < 200_000, "{cost} circle fits");
     }
 }
