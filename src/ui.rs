@@ -4770,6 +4770,7 @@ pub(crate) fn setup_step_done(app: &App, step: &str) -> bool {
             s.offset().is_none_or(|o| !o.is_empty())
                 && (crate::post::references(get(&s.p, "origin")).is_some()
                     || crate::indexed::ORIGINS.contains(&get(&s.p, "origin")))
+                && (!crate::lathe::is_lathe(&s.machine) || get(&s.p, "origin") == crate::turn::ZERO)
                 && crate::post::pins_issue(s).is_none()
                 && !app
                     .current_ready()
@@ -4878,26 +4879,30 @@ fn setup_editor(app: &App) -> Panel<'_> {
         foot: Some(foot.into()),
     }
 }
+/// The setup editor's line for machine `m`: a CNC's axes, not a hand
+/// machine's, whose kind is said under it (LIO-390).
+fn machine_line(m: &Machine) -> String {
+    if manual::is_hand(m) {
+        format!("{} · v{}", m.name(), m.version)
+    } else {
+        format!("{} · {}-axis · v{}", m.name(), m.axes(), m.version)
+    }
+}
 fn setup_machine<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
     let s = app.doc.setup();
     c.push(section("Machine"))
         .push(
             btn(
-                format!(
-                    "{} · {}-axis · v{}",
-                    s.machine.name(),
-                    s.machine.axes(),
-                    s.machine.version
-                ),
+                machine_line(&s.machine),
                 Message::Page(Page::Machines),
                 true,
             )
             .width(Fill),
         )
         .push(muted(if crate::lathe::is_lathe(&s.machine) {
-            "The dials' zero is in the Work zero step."
+            "Manual lathe, no G-code. The dials' zero is in the Work zero step."
         } else if crate::manual::is_manual(&s.machine) {
-            "The DRO's zero is in the Work zero step."
+            "Manual mill, no G-code. The DRO's zero is in the Work zero step."
         } else {
             "The work zero and its offset (G54–G59) are in the Work zero step."
         }))
@@ -4919,6 +4924,26 @@ fn setup_zero<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
             base + 1,
             app.doc.setups[base].name()
         )));
+    }
+    // A lathe's zero is fixed (LIO-386): every Turn and Drill refuses another.
+    if crate::lathe::is_lathe(&s.machine) {
+        let mut c = c.push(section("Work zero")).push(muted(
+            "The free end of the bar, on its axis: every dial number on the Steps page counts from it. The Steps page's Zero screen sets it: touch the end and zero the carriage dial, then touch the bar and zero the cross-slide dial. The 3D view marks it with a cross.",
+        ));
+        if origin != crate::turn::ZERO {
+            c = c
+                .push(caution(
+                    "Not the lathe's work zero",
+                    vec![format!(
+                        "This setup's work zero is {origin}, which every Turn and Drill refuses: a lathe's is the free end of the bar, on the axis."
+                    )],
+                ))
+                .push(secondary(
+                    "Put it back",
+                    Message::Edit(t, "origin", crate::turn::ZERO.into()),
+                ));
+        }
+        return c;
     }
     let zero = crate::post::stock_zero(origin);
     let model = origin == "Model origin";
@@ -5408,7 +5433,13 @@ fn zero_note(app: &App) -> Element<'_, Message> {
         }
     );
     let refs = crate::post::references(origin);
+    // A hand machine has no probe and no Control page (LIO-386): the Steps
+    // page's Zero screen picks the zero up with the edge finder.
+    let hand = crate::manual::is_hand(&setup.machine);
     let mut lines = vec![match (crate::post::touch_off_spots(origin, stock), refs) {
+        (_, Some(_)) if hand => format!(
+            "On the stock this setup starts from ({from}): the Steps page's Zero screen has you touch a side for X and one for Y with the edge finder and the top for Z, and set the DRO so that it reads 0 at this work zero."
+        ),
         (Some(spots), _) => format!(
             "On the stock this setup starts from ({from}): touch off {spots}.{}",
             crate::round_hold::side_note(setup, stock)
@@ -5426,13 +5457,13 @@ fn zero_note(app: &App) -> Element<'_, Message> {
             None => "Choose a work zero.".into(),
         },
     }];
-    if let Some(refs) = refs {
+    if let Some(refs) = refs.filter(|_| !hand) {
         lines.push(format!(
             "On the Control page, {} sets exactly this work zero, probed from its own spot or, under Probe from, from another corner, edge middle or the centre a probe can reach.",
             crate::control::probe_name(refs)
         ));
     }
-    if crate::post::sits_on_pins(setup) {
+    if crate::post::sits_on_pins(setup) && !hand {
         lines.insert(0, "On the pins, the pins locate X and Y and the touch-off or probe sets Z: Probe corner, Probe edge and Probe centre stay available to check the part's place.".into());
     }
     let mut c = column![muted(lines.join(" "))].spacing(8);
@@ -5445,7 +5476,9 @@ fn zero_note(app: &App) -> Element<'_, Message> {
                 "The work zero is not on the stock",
                 zero.refused.clone(),
             ));
-        } else if let Err(why) = &zero.probe {
+        } else if let Err(why) = &zero.probe
+            && !hand
+        {
             c = c.push(caution("No probe finds this work zero", vec![why.clone()]));
         }
     }
@@ -7028,9 +7061,11 @@ fn machines(app: &App) -> Element<'_, Message> {
                 column![
                     bold(m.name(), 18),
                     muted({
-                        // A 3-axis machine's mode is "3-axis" again.
+                        // A 3-axis machine's mode is "3-axis" again; a hand
+                        // machine's kind is on the line below (LIO-390).
                         let axes = format!("{}-axis", m.axes());
                         match get(&m.p, "mode") {
+                            _ if manual::is_hand(m) => format!("Profile v{}", m.version),
                             mode if mode == axes => format!("{axes}  ·  Profile v{}", m.version),
                             mode => format!("{axes}  ·  {mode}  ·  Profile v{}", m.version),
                         }
@@ -7272,53 +7307,79 @@ fn wizard(app: &App) -> Element<'_, Message> {
             }
         }
         "Dials & feeds" => {
+            // Two dials a row and the times on one, so that the step fits
+            // without scrolling at 1440 × 900 (LIO-390).
+            let cell = |k: &'static str, l: &'static str, share: u16| -> Element<'_, Message> {
+                container(field(p, k, l, t))
+                    .width(Length::FillPortion(share))
+                    .into()
+            };
+            // Each dial: what it reads after one turn, and its divisions.
+            let dials = |pair: [[(&'static str, &'static str); 2]; 2]| {
+                Row::with_children(
+                    pair.into_iter()
+                        .flat_map(|[(turn, a), (div, b)]| [cell(turn, a, 5), cell(div, b, 3)]),
+                )
+                .spacing(8)
+            };
             form = form
-                .push(choice_value(
-                    p,
-                    lathe::cross_reads(m).unwrap_or("Not known yet"),
-                    "cross_reads",
-                    "Cross-slide dial reads",
-                    &["Not known yet", "Diameter", "Radius"],
-                    t,
-                ))
                 .push(
                     row![
-                        field(p, "cross_turn", "Cross slide · dial per turn", t),
-                        field(p, "cross_div", "Cross slide · divisions", t),
+                        container(choice_value(
+                            p,
+                            lathe::cross_reads(m).unwrap_or("Not known yet"),
+                            "cross_reads",
+                            "Cross-slide dial reads",
+                            &["Not known yet", "Diameter", "Radius"],
+                            t,
+                        ))
+                        .width(Fill),
+                        cell("feeds", "Power feeds · mm per revolution", 1),
+                        cell("pitches", "Threads the gearbox cuts · mm", 1),
                     ]
                     .spacing(8),
                 )
+                .push(dials([
+                    [
+                        (
+                            "cross_turn",
+                            "Cross slide · the dial reads this after one turn",
+                        ),
+                        ("cross_div", "Cross slide · divisions"),
+                    ],
+                    [
+                        ("top_turn", "Top slide · the dial reads this after one turn"),
+                        ("top_div", "Top slide · divisions"),
+                    ],
+                ]))
+                .push(dials([
+                    [
+                        (
+                            "carriage_turn",
+                            "Carriage · the dial reads this after one turn",
+                        ),
+                        ("carriage_div", "Carriage · divisions"),
+                    ],
+                    [
+                        (
+                            "quill_turn",
+                            "Tailstock quill · the dial reads this after one turn",
+                        ),
+                        ("quill_div", "Tailstock quill · divisions"),
+                    ],
+                ]))
                 .push(
                     row![
-                        field(p, "top_turn", "Top slide · dial per turn", t),
-                        field(p, "top_div", "Top slide · divisions", t),
+                        cell("pass_time", "Time per pass · s", 1),
+                        cell("tool_time", "Time per tool change · min", 1),
+                        cell(
+                            "move_time",
+                            "Time to move the stock to another machine · min",
+                            1
+                        ),
                     ]
                     .spacing(8),
                 )
-                .push(
-                    row![
-                        field(p, "carriage_turn", "Carriage · dial per turn", t),
-                        field(p, "carriage_div", "Carriage · divisions", t),
-                    ]
-                    .spacing(8),
-                )
-                .push(
-                    row![
-                        field(p, "quill_turn", "Tailstock quill · dial per turn", t),
-                        field(p, "quill_div", "Tailstock quill · divisions", t),
-                    ]
-                    .spacing(8),
-                )
-                .push(field(p, "feeds", "Power feeds · mm per revolution", t))
-                .push(field(p, "pitches", "Threads the gearbox cuts · mm", t))
-                .push(field(p, "pass_time", "Time per pass · s", t))
-                .push(field(p, "tool_time", "Time per tool change · min", t))
-                .push(field(
-                    p,
-                    "move_time",
-                    "Time to move the stock to another machine · min",
-                    t,
-                ))
                 .push(note("Manual lathe — no G-code; MACHINE shows the steps."));
         }
         "Manual mill" => {
@@ -13192,9 +13253,26 @@ pub(crate) fn preview_totals(outcome: &crate::planner::Outcome) -> Vec<String> {
 }
 /// A tool in a list: its name, with its diameter when the name does not
 /// already give it ("Flat end mill · Ø10", not "… Ø10 · Ø10 mm").
+/// A lathe tool has no diameter: its label says what tells it apart
+/// ("Turning tool · right hand · R0.4", "Parting blade · 3 wide").
 fn tool_label(tool: &Tool) -> String {
     let name = tool.name();
-    if name.contains('Ø') {
+    let p = &tool.p;
+    let lathe = match get(p, "type") {
+        "Turning tool" => Some(format!(
+            "{} hand · R{}",
+            get(p, "hand").to_lowercase(),
+            get(p, "nose_radius")
+        )),
+        "Boring bar" => Some(format!("from Ø{}", get(p, "min_bore"))),
+        "Grooving tool" | "Parting blade" => Some(format!("{} wide", get(p, "width"))),
+        "Threading tool" => Some(format!("{}°", get(p, "thread_angle"))),
+        "Die" => Some(get(p, "thread").to_string()),
+        _ => None,
+    };
+    if let Some(detail) = lathe {
+        format!("{name} · {detail}")
+    } else if name.contains('Ø') {
         name.to_string()
     } else {
         format!("{name} · Ø{} mm", get(&tool.p, "diameter"))
@@ -15065,6 +15143,52 @@ pub(crate) mod probe {
 mod tests {
     use crate::model::Strategy;
     use std::path::Path;
+
+    /// LIO-390: a lathe tool's label says what tells it apart, not an empty
+    /// "Ø mm"; a hand machine's line names no axes, a CNC's does; the
+    /// lathe wizard's Dials & feeds fits without scrolling at 1440 × 900.
+    #[test]
+    fn lathe_tool_labels_machine_lines_and_the_lathe_wizard_step_fit() {
+        use crate::{Message, Target};
+        let labels: Vec<String> = (crate::lathe::TOOLS.iter())
+            .map(|kind| super::tool_label(&crate::model::Tool::lathe(kind, kind)))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Turning tool · right hand · R0.4",
+                "Boring bar · from Ø12",
+                "Grooving tool · 3 wide",
+                "Parting blade · 3 wide",
+                "Threading tool · 60°",
+                "Die · M6×1",
+            ]
+        );
+        let cnc = crate::model::Document::sample().setups[0].machine.clone();
+        assert!(super::machine_line(&cnc).contains("3-axis"));
+        for m in [crate::lathe::defaults(), crate::manual::defaults()] {
+            let line = super::machine_line(&m);
+            assert!(!line.contains("axis"), "{line}");
+        }
+        let mut a = crate::steps::tests::app("Yes");
+        let window = iced::Size::new(1440., 900.);
+        let _ = a.update(Message::Resized(window));
+        let _ = a.update(Message::NewMachine);
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "Lathe".into()));
+        let _ = a.update(Message::WizardStep(2));
+        let texts = crate::ui::probe::texts(a.view(), window);
+        assert!(texts.iter().any(|t| t == "Time per pass · s"), "{texts:?}");
+        let bounds = crate::ui::probe::scrollables(a.view(), window);
+        let seen = crate::ui::probe::seen(a.view(), window);
+        let contents = seen.iter().filter_map(|s| match s {
+            crate::ui::probe::Seen::Scroll(_, size) => Some(*size),
+            _ => None,
+        });
+        let over: Vec<_> = (bounds.iter().zip(contents))
+            .filter(|((_, b), c)| c.height > b.height + 1.)
+            .collect();
+        assert!(over.is_empty(), "{over:?}");
+    }
 
     /// A manual setup's checks speak of no export, a CNC setup's as before;
     /// the manual mill's Travel & spindle step fits without scrolling

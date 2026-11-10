@@ -1490,7 +1490,7 @@ pub(crate) mod tests {
         let mut doc = Document::sample();
         doc.sample_model = false;
         doc.machines.push(lathe::defaults());
-        doc.add_lathe_setup().unwrap();
+        doc.add_lathe_setup(None).unwrap();
         doc.setups.truncate(1);
         doc.active = doc.setups[0].id.clone();
         let lathe_id = doc.setups[0].machine.id.clone();

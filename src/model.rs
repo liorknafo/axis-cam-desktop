@@ -4046,14 +4046,16 @@ impl Document {
     }
     /// Inserts a setup on the first lathe of the library, named as the
     /// machine (numbered when taken), with no work offset, before the first
-    /// CNC setup, with a Ø50 × 100 round bar held in a
-    /// chuck: the 3-jaw when the library has one that fits, the grip the
-    /// chuck's jaw length and the stickout the rest of the bar. A library
-    /// without a chuck is given the chuck starters. Put first, it takes the
-    /// old first setup's orientation (so that the part's turning axis is the
-    /// one the user chose) and the old first setup starts from the bar it
-    /// leaves. Its index.
-    pub fn add_lathe_setup(&mut self) -> Result<usize, String> {
+    /// CNC setup, with a round bar held in a chuck: the 3-jaw when the
+    /// library has one that fits, the grip the chuck's jaw length and the
+    /// stickout the rest of the bar. The bar fits `part` when there is one
+    /// (LIO-391): 1 mm over its largest radius, 1 mm to face off the free
+    /// end, and the grip and room for the part off at the chuck's end; else
+    /// it is Ø50 × 100. A library without a chuck is given the chuck
+    /// starters. Put first, it takes the old first setup's orientation (so
+    /// that the part's turning axis is the one the user chose) and the old
+    /// first setup starts from the bar it leaves. Its index.
+    pub fn add_lathe_setup(&mut self, part: Option<&crate::mesh::Mesh>) -> Result<usize, String> {
         let Some(machine) = self.machines.iter().find(|m| crate::lathe::is_lathe(m)) else {
             return Err("Add a lathe to the library first.".into());
         };
@@ -4105,9 +4107,23 @@ impl Document {
         }
         self.setups.insert(at, setup);
         self.settle_holding(at);
+        if let Some(grip) = part.and(num(&self.setups[at].p, "grip")) {
+            // Behind the part: the grip, and twice the stickout's margin
+            // past the furthest cut, for the parting blade's width and that margin.
+            let bottom = grip + 2. * crate::holding::STICKOUT_MARGIN;
+            for (k, v) in [
+                ("stock_type", "Relative round bar".to_string()),
+                ("stock_radial", "1".into()),
+                ("stock_top", "1".into()),
+                ("stock_bottom", bottom.to_string()),
+            ] {
+                self.setups[at].p.insert(k.into(), v);
+            }
+        }
         // The jaws take the grip; the rest of the bar stands out.
+        let length = crate::stock::resolve(&self.setups[at], part).map(|r| r.stock.dimensions()[2]);
         let p = &mut self.setups[at].p;
-        if let Some(stickout) = num(p, "stock_length")
+        if let Some(stickout) = (length.ok())
             .zip(num(p, "grip"))
             .map(|(length, grip)| (length - grip).max(1.))
         {
@@ -7783,7 +7799,7 @@ mod manual_setups {
     }
     fn lathe_with_bar(d: &mut Document) {
         d.machines.push(crate::lathe::defaults());
-        d.add_lathe_setup().unwrap();
+        d.add_lathe_setup(None).unwrap();
         for tool in lathe_tools() {
             d.tools.push(tool);
         }
@@ -7945,7 +7961,7 @@ mod manual_setups {
         d.setup_mut().p.insert("holding".into(), "Vise".into());
         let old = d.setups[0].id.clone();
         assert!(d.workholding.is_empty());
-        d.add_lathe_setup().unwrap();
+        d.add_lathe_setup(None).unwrap();
         // The library has the chuck starters now, the 3-jaw first.
         assert_eq!(
             d.workholding.iter().filter(|h| h.kind() == "Chuck").count(),
@@ -7991,7 +8007,7 @@ mod manual_setups {
         d.add_manual_setup().unwrap();
         let (mill, cnc) = (d.setups[0].id.clone(), d.setups[1].id.clone());
         d.setups[0].p.insert("rz".into(), "90".into());
-        d.add_lathe_setup().unwrap();
+        d.add_lathe_setup(None).unwrap();
         assert_eq!(d.setups.len(), 3);
         assert_eq!(
             (d.setups[0].id.as_str(), d.setups[2].id.as_str()),
@@ -8004,7 +8020,7 @@ mod manual_setups {
         assert_eq!(get(&lathe.p, "stock_source"), mill);
         assert_eq!(get(&d.setups[2].p, "stock_source"), lathe.id);
         // A second lathe setup follows the first and keeps its chuck.
-        d.add_lathe_setup().unwrap();
+        d.add_lathe_setup(None).unwrap();
         assert_eq!(d.setups.len(), 4);
         assert!(crate::lathe::is_lathe(&d.setups[2].machine));
         assert_eq!(get(&d.setups[2].p, "stock_source"), d.setups[1].id);
@@ -8025,7 +8041,7 @@ mod manual_setups {
         // No lathe: the press says so and changes nothing.
         let mut d = Document::sample();
         assert_eq!(
-            d.add_lathe_setup(),
+            d.add_lathe_setup(None),
             Err("Add a lathe to the library first.".into())
         );
         assert_eq!((d.setups.len(), d.workholding.len()), (1, 0));
@@ -8033,7 +8049,7 @@ mod manual_setups {
         d.machines.push(crate::lathe::defaults());
         d.adopt_holders();
         d.workholding.reverse();
-        d.add_lathe_setup().unwrap();
+        d.add_lathe_setup(None).unwrap();
         let chuck = d.holder(get(&d.setups[0].p, "holder")).unwrap();
         assert_eq!(get(&chuck.p, "jaws"), "3");
         let mut only_four = Document::sample();
@@ -8042,7 +8058,7 @@ mod manual_setups {
             .into_iter()
             .filter(|h| h.kind() == "Chuck" && get(&h.p, "jaws") == "4")
             .collect();
-        only_four.add_lathe_setup().unwrap();
+        only_four.add_lathe_setup(None).unwrap();
         let chuck = only_four
             .holder(get(&only_four.setups[0].p, "holder"))
             .unwrap();
@@ -8057,7 +8073,7 @@ mod manual_setups {
         }
         assert!(
             other
-                .add_lathe_setup()
+                .add_lathe_setup(None)
                 .unwrap_err()
                 .contains("No chuck in the library fits")
         );
@@ -8069,7 +8085,7 @@ mod manual_setups {
         for h in &mut shorter.workholding {
             h.p.insert("jaw_length".into(), "25".into());
         }
-        shorter.add_lathe_setup().unwrap();
+        shorter.add_lathe_setup(None).unwrap();
         assert_eq!(
             (
                 get(&shorter.setups[0].p, "grip"),
@@ -8077,6 +8093,34 @@ mod manual_setups {
             ),
             ("25", "75")
         );
+    }
+    /// With a part loaded the new lathe setup's bar fits it (LIO-391): the
+    /// sleeve of the lathe sample (Ø35 × 61) lies inside it, with the grip
+    /// and the part off's room behind it, and nothing is wrong with the
+    /// stock or the holding as it is added.
+    #[test]
+    fn a_lathe_setup_added_on_a_part_starts_with_a_bar_that_fits_it() {
+        use crate::turn::tests::{job, tube};
+        let (_, mesh) = job(50.2, 100., tube(5.5, 17.5, 0., 61.), -62.);
+        let mut d = Document::sample();
+        d.sample_model = false;
+        d.machines.push(crate::lathe::defaults());
+        let at = d.add_lathe_setup(Some(&mesh)).unwrap();
+        let s = &d.setups[at];
+        assert_eq!(get(&s.p, "stock_type"), "Relative round bar");
+        let r = crate::stock::resolve(s, Some(&mesh)).unwrap();
+        let part = r.part.unwrap();
+        let [width, _, length] = r.stock.dimensions();
+        let radius = width / 2.;
+        assert!((radius - 18.5).abs() < 0.01, "{radius}");
+        assert!(r.part_radius.unwrap() < radius);
+        assert!(part.min[2] > r.stock.min[2] && part.max[2] < r.stock.max[2]);
+        // The grip, 10 mm past the part for the part off, and 1 mm to face.
+        let grip = num(&s.p, "grip").unwrap();
+        assert!((length - (61. + 1. + grip + 10.)).abs() < 0.01, "{length}");
+        assert_eq!(num(&s.p, "stickout"), Some(length - grip));
+        assert_eq!(d.holding_issues(at, Some(&mesh)), Vec::<String>::new());
+        assert_eq!(s.issues(), Vec::<String>::new());
     }
     /// An Adaptive clearing on a Ø10 flat end mill (radius 5), and its issues.
     fn adaptive_with(settings: &[(&str, &str)]) -> Vec<String> {

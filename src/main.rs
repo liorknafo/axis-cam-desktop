@@ -6754,7 +6754,9 @@ impl App {
                 self.open_added(added, "Manual");
             }
             Message::AddLatheSetup => {
-                let added = self.doc.add_lathe_setup();
+                // The bar fits the part loaded, not the sample block (LIO-391).
+                let part = self.part_mesh().filter(|_| !self.is_sample()).cloned();
+                let added = self.doc.add_lathe_setup(part.as_ref());
                 self.open_added(added, "Lathe");
             }
             Message::DuplicateSetup => {

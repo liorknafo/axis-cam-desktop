@@ -1521,7 +1521,7 @@ impl App {
         face.p.insert("face_off".into(), "0.5".into());
         self.doc.machines.push(lathe);
         self.doc.tools.push(tool);
-        self.doc.add_lathe_setup().expect("a lathe setup");
+        self.doc.add_lathe_setup(None).expect("a lathe setup");
         let at = (self.doc.setups.iter())
             .position(|s| crate::lathe::is_lathe(&s.machine))
             .expect("the lathe setup");
@@ -28661,10 +28661,10 @@ soft_max = 180.0
             &a,
             &[
                 "Cross-slide dial reads",
-                "Cross slide · dial per turn",
+                "Cross slide · the dial reads this after one turn",
                 "Cross slide · divisions",
-                "Top slide · dial per turn",
-                "Carriage · dial per turn",
+                "Top slide · the dial reads this after one turn",
+                "Carriage · the dial reads this after one turn",
                 "Tailstock quill · divisions",
                 "Power feeds · mm per revolution",
                 "Threads the gearbox cuts · mm",
@@ -29249,7 +29249,14 @@ soft_max = 180.0
         assert!(!t.iter().any(|s| s == "Manual Mill · 3-axis"), "{t:?}");
         assert!(t.iter().any(|s| s.starts_with("G54 · ")), "{t:?}");
         let _ = a.update(Message::SetupStep("Machine"));
-        shows(&a, &["The DRO's zero is in the Work zero step."]);
+        // Its line names no axes, its kind is under it (LIO-390).
+        shows(
+            &a,
+            &[
+                "Manual Mill · v1",
+                "Manual mill, no G-code. The DRO's zero is in the Work zero step.",
+            ],
+        );
         lacks(
             &a,
             &["The work zero and its offset (G54–G59) are in the Work zero step."],
@@ -29395,6 +29402,72 @@ soft_max = 180.0
         let _ = b.update(Message::AddLatheSetup);
         assert_eq!(b.doc.setups.len(), 1);
         assert!(b.status.contains("lathe"), "{}", b.status);
+    }
+    /// The Work zero step (LIO-386): a lathe's offers no zero to pick, only
+    /// "Put it back" while the setup has another; neither hand machine's
+    /// speaks of probing or the Control page; a CNC setup's is as it was.
+    #[test]
+    fn the_work_zero_step_of_a_hand_setup_has_no_probing_and_the_lathe_no_picker() {
+        let open = |a: &mut App| {
+            let _ = a.update(Message::SetupEditor);
+            let _ = a.update(Message::SetupStep("Work zero"));
+        };
+        // The step's texts: from its heading on.
+        let step = |a: &App| {
+            let texts = page_texts(a);
+            let at = texts.iter().rposition(|t| t == "Work zero").unwrap();
+            texts[at..].join(" | ")
+        };
+        let origins = |a: &App| -> Vec<String> {
+            // The setup editor, on the right.
+            let editor = iced::Rectangle::new(
+                iced::Point::new(WINDOW.width - 380., 200.),
+                iced::Size::new(380., WINDOW.height - 200.),
+            );
+            (crate::ui::probe::presses(a.view(), WINDOW, editor, 8.).into_iter())
+                .filter_map(|(_, m)| match m {
+                    Message::Edit(Target::Setup, "origin", v) => Some(v),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut a = app();
+        open(&mut a);
+        let cnc = step(&a);
+        assert!(cnc.contains("On the Control page, Probe centre"), "{cnc}");
+        assert!(origins(&a).len() > 10);
+        // The manual mill keeps its picker, picked up with the edge finder.
+        with_manual(&mut a);
+        let _ = a.update(Message::AddManualSetup);
+        open(&mut a);
+        let mill = step(&a);
+        assert!(mill.contains("edge finder"), "{mill}");
+        assert!(
+            !mill.contains("Probe") && !mill.contains("Control page"),
+            "{mill}"
+        );
+        assert!(origins(&a).len() > 10);
+        // The lathe: no picker.
+        with_lathe(&mut a);
+        let _ = a.update(Message::AddLatheSetup);
+        assert!(crate::lathe::is_lathe(&a.doc.setup().machine));
+        open(&mut a);
+        let lathe = step(&a);
+        assert!(lathe.contains("free end of the bar"), "{lathe}");
+        assert!(
+            !lathe.contains("Probe") && !lathe.contains("Control page"),
+            "{lathe}"
+        );
+        assert_eq!(origins(&a), Vec::<String>::new());
+        assert!(crate::ui::setup_step_done(&a, "Work zero"));
+        // Saved with another zero: the one button puts it back.
+        (a.doc.setup_mut().p).insert("origin".into(), "Stock top back-left".into());
+        assert!(!crate::ui::setup_step_done(&a, "Work zero"));
+        let wrong = origins(&a);
+        assert!(!wrong.is_empty());
+        assert!(wrong.iter().all(|v| v == crate::turn::ZERO), "{wrong:?}");
+        let _ = a.update(Message::Edit(Target::Setup, "origin", wrong[0].clone()));
+        assert!(crate::ui::setup_step_done(&a, "Work zero"));
     }
     #[test]
     fn the_ribbon_has_a_lathe_group_and_enables_only_turn_and_drill_on_a_lathe_setup() {
