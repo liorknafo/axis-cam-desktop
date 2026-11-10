@@ -294,6 +294,9 @@ pub enum Message {
     /// Add the operations that drill and thread the setup's threaded holes
     /// (`threading::add`).
     AddThreading,
+    /// Adds the tool the selected threading operation needs and gives it to
+    /// it (LIO-412).
+    AddNeededTool,
     /// Add the drilling (and roughing) before the selected Reaming or
     /// Boring, on its holes (`hole_stages::add`).
     AddHoleStages,
@@ -6502,18 +6505,88 @@ impl App {
                 };
                 match threading::add(&self.doc, si, mesh) {
                     Ok(added) => {
+                        let ids: std::collections::HashSet<String> =
+                            added.ops.iter().map(|o| o.id.clone()).collect();
                         self.doc.setups[si].operations.extend(added.ops);
                         // On the manual mill each tap drill is centre drilled.
                         let (centrings, said) = centre::needed(&self.doc, si, self.part_mesh());
+                        let spotless = centrings.iter().any(|(_, c)| c.tool.is_empty());
                         centre::insert(&mut self.doc, si, centrings);
+                        // The centre drill goes in once: the new centrings first,
+                        // one after the other, named by their thread (LIO-411).
+                        let ops = &mut self.doc.setups[si].operations;
+                        let ours = |o: &Operation| {
+                            ids.contains(&o.id)
+                                || centre::centres(o).is_some_and(|d| ids.contains(d))
+                        };
+                        if let Some(at) = ops.iter().position(ours) {
+                            let tail = ops.split_off(at);
+                            let (mut spots, rest): (Vec<_>, Vec<_>) = tail
+                                .into_iter()
+                                .partition(|o| centre::centres(o).is_some_and(|d| ids.contains(d)));
+                            for s in &mut spots {
+                                let drill = centre::centres(s).unwrap_or_default().to_string();
+                                let thread = (rest.iter().find(|o| o.id == drill))
+                                    .map(|o| get(&o.p, threading::THREAD_NAME).to_string())
+                                    .unwrap_or_default();
+                                if !thread.is_empty() {
+                                    s.p.insert("name".into(), format!("Centre drill {thread}"));
+                                }
+                            }
+                            // One gear for them all: the slowest of their
+                            // speeds, and its feed.
+                            let speed =
+                                |o: &Operation, k: &str| num(&o.p, k).unwrap_or(f32::INFINITY);
+                            if let Some(slow) = (spots.iter())
+                                .min_by(|a, b| speed(a, "rpm").total_cmp(&speed(b, "rpm")))
+                                .map(|o| {
+                                    (get(&o.p, "rpm").to_string(), get(&o.p, "feed").to_string())
+                                })
+                            {
+                                for s in &mut spots {
+                                    s.p.insert("rpm".into(), slow.0.clone());
+                                    s.p.insert("feed".into(), slow.1.clone());
+                                }
+                            }
+                            ops.extend(spots);
+                            ops.extend(rest);
+                        }
                         self.touch();
                         self.status = added.status;
-                        if !said.is_empty() {
+                        if manual::is_manual(&self.doc.setups[si].machine) {
+                            let mut missing = added.missing;
+                            if spotless {
+                                missing.insert(0, "a centre drill".into());
+                            }
+                            self.status = threading::hand_status(
+                                self.doc.setups[si].name(),
+                                &added.done,
+                                &missing,
+                            );
+                        } else if !said.is_empty() {
                             self.status = format!("{} {said}", self.status);
                         }
                     }
                     Err(why) => self.status = why,
                 }
+            }
+            Message::AddNeededTool => {
+                let number = self.doc.next_tool_number();
+                let machine = self.doc.setup().machine.clone();
+                let Some(tool) =
+                    (self.operation()).and_then(|o| threading::needed_tool(o, &machine, number))
+                else {
+                    return Task::none();
+                };
+                self.status = format!(
+                    "Added {} to the library and to this operation.",
+                    tool.name()
+                );
+                if let Some(o) = self.operation_mut() {
+                    o.tool = tool.id.clone();
+                }
+                self.doc.tools.push(tool);
+                self.touch();
             }
             Message::AddHoleStages => {
                 let (si, Some(oi)) = (self.doc.index(), self.selected) else {

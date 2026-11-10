@@ -99,6 +99,9 @@ pub enum Step {
         comp: Option<[i8; 2]>,
         top: Option<f32>,
     },
+    /// A hand tap `tool` (an id) for the tapping `op`: put it in, the
+    /// spindle off and free to turn; no gear and no Z to pick up (LIO-410).
+    TapIn { op: usize, tool: String },
     /// Same tool and gear: enter its `diameter` in the DRO and set the
     /// compensation sides `comp`, not set before or changed.
     Comp {
@@ -1215,7 +1218,13 @@ fn simulate(doc: &Document, mesh: &Mesh, si: usize, empty: &str) -> Result<Walke
             }
             // Named by its operation, for the Steps page to open (LIO-374).
             Err(e) if s == si && error.is_none() => {
-                error = Some(format!("{}: {e}", setup.operations[oi].name()))
+                let op = &setup.operations[oi];
+                // A threading's missing tool, named (LIO-412).
+                let e = match crate::threading::needs(op) {
+                    Some(n) => e.replace("Choose a tool from the library.", &format!("needs {n}.")),
+                    None => e,
+                };
+                error = Some(format!("{}: {e}", op.name()))
             }
             _ => {}
         },
@@ -1523,7 +1532,18 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
         // all of them for a new tool; with the same tool only what changes,
         // a gear with the DRO when it changes too, else the DRO alone (its
         // diameter and sides; nothing with its compensation off), or none.
+        let tap = op.tapping();
         let mut sides = |comp: [i8; 2], steps: &mut Vec<Step>| {
+            // A tap is turned by hand: its own screen, no gear, no Z
+            // pick-up (LIO-410).
+            if tap {
+                steps.push(Step::TapIn {
+                    op: oi,
+                    tool: tool.into(),
+                });
+                set = Some((tool, rpm, Some(comp)));
+                return;
+            }
             let tool_step = |comp: Option<[i8; 2]>| Step::Tool {
                 op: oi,
                 tool: tool.into(),
@@ -2363,6 +2383,7 @@ pub(crate) mod tests {
                 Step::Hold { .. } => "Hold",
                 Step::Zero { .. } => "Zero",
                 Step::Tool { .. } => "Tool",
+                Step::TapIn { .. } => "TapIn",
                 Step::Comp { .. } => "Comp",
                 Step::Pass { .. } => "Pass",
                 Step::Face { .. } => "Face",

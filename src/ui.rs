@@ -3283,9 +3283,30 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             c = c.push(section("Cutter"));
             // The operation offers the tools of the types it cuts with that
             // are on the setup's machine, and the one it has (LIO-372).
+            // A tap of another thread is not offered for a threading's
+            // thread (LIO-412).
+            let thread = get(p, crate::threading::THREAD_NAME);
+            let other_thread = |tool: &&crate::model::Tool| {
+                o.tapping()
+                    && !thread.is_empty()
+                    && tool.tap_spec().is_some_and(|s| s.name != thread)
+            };
             let offered: Vec<_> = (app.doc.tools.iter())
                 .filter(|tool| o.tool == tool.id || (o.takes(tool, machine) && tool.fits(machine)))
+                .filter(|tool| o.tool == tool.id || !other_thread(tool))
                 .collect();
+            // The tool a threading needs, named, with one press to add it
+            // (LIO-412).
+            if !app.doc.tools.iter().any(|t| t.id == o.tool)
+                && let Some(need) = crate::threading::needs(o)
+            {
+                c = c
+                    .push(caution(
+                        format!("Needs {need}"),
+                        vec![format!("None in the library for {}.", machine.name())],
+                    ))
+                    .push(secondary(format!("Add {need}"), Message::AddNeededTool).width(Fill));
+            }
             if !offered
                 .iter()
                 .any(|tool| o.takes(tool, machine) && tool.fits(machine))
@@ -3347,50 +3368,55 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 )));
             }
             c = c.push(section("Feeds & speeds"));
-            // What the project material and the cutter call for, and a
-            // button to take it when the operation runs at something else.
-            match app.doc.recommended_speeds(app.doc.setup(), o) {
-                Ok((rpm, feed)) => {
-                    let material = app.doc.selected_material().map_or("", |m| m.name());
-                    c = c.push(
-                        muted(format!(
-                            "Recommended for {} and this cutter:\n{rpm} rpm · {feed} mm/min",
-                            crate::proposal::clip(material, crate::material::NAME_LIMIT)
-                        ))
-                        .size(12),
-                    );
-                    let runs = |k: &str, v: f32| get(p, k).trim() == v.to_string();
-                    if runs("rpm", rpm) && runs("feed", feed) {
-                        c = c.push(muted("The operation runs at it.").size(12));
-                    } else {
+            // A tap on a hand machine is turned by hand (LIO-410).
+            let by_hand = o.tapping() && crate::manual::is_hand(machine);
+            if by_hand {
+                c = c.push(note("Turned by hand, the spindle off."));
+            } else {
+                // What the project material and the cutter call for, and a
+                // button to take it when the operation runs at something else.
+                match app.doc.recommended_speeds(app.doc.setup(), o) {
+                    Ok((rpm, feed)) => {
+                        let material = app.doc.selected_material().map_or("", |m| m.name());
                         c = c.push(
-                            secondary("Use recommended speed & feed", Message::RecommendSpeeds)
-                                .width(Fill),
+                            muted(format!(
+                                "Recommended for {} and this cutter:\n{rpm} rpm · {feed} mm/min",
+                                crate::proposal::clip(material, crate::material::NAME_LIMIT)
+                            ))
+                            .size(12),
                         );
+                        let runs = |k: &str, v: f32| get(p, k).trim() == v.to_string();
+                        if runs("rpm", rpm) && runs("feed", feed) {
+                            c = c.push(muted("The operation runs at it.").size(12));
+                        } else {
+                            c = c.push(
+                                secondary("Use recommended speed & feed", Message::RecommendSpeeds)
+                                    .width(Fill),
+                            );
+                        }
+                    }
+                    Err(why) => {
+                        c = c.push(muted(format!("No recommended speed and feed. {why}")).size(12))
                     }
                 }
-                Err(why) => {
-                    c = c.push(muted(format!("No recommended speed and feed. {why}")).size(12))
+                // A machine with gears takes one of them; a variable drive any
+                // speed in its range (LIO-372).
+                c = c.push(match speed_options(machine) {
+                    Some(gears) => {
+                        let gears: Vec<&str> = gears.iter().map(String::as_str).collect();
+                        choice(p, "rpm", "Spindle speed · rpm", &gears, t)
+                    }
+                    None => checks.field(p, "rpm", "Spindle speed · rpm"),
+                });
+                if let Some((a, b)) = crate::manual::variable(machine) {
+                    c = c.push(muted(format!("The drive runs {a}–{b} rpm.")).size(12));
                 }
-            }
-            // A machine with gears takes one of them; a variable drive any
-            // speed in its range (LIO-372).
-            c = c.push(match speed_options(machine) {
-                Some(gears) => {
-                    let gears: Vec<&str> = gears.iter().map(String::as_str).collect();
-                    choice(p, "rpm", "Spindle speed · rpm", &gears, t)
-                }
-                None => checks.field(p, "rpm", "Spindle speed · rpm"),
-            });
-            if let Some((a, b)) = crate::manual::variable(machine) {
-                c = c.push(muted(format!("The drive runs {a}–{b} rpm.")).size(12));
-            }
-            if o.strategy.imported_preview()
-                && !matches!(o.strategy, Strategy::Box | Strategy::Turn)
-                && !lathe
-                && !app.is_sample()
-            {
-                c = c
+                if o.strategy.imported_preview()
+                    && !matches!(o.strategy, Strategy::Box | Strategy::Turn)
+                    && !lathe
+                    && !app.is_sample()
+                {
+                    c = c
                     .push(choice_value(
                         p,
                         facing_setting(p, "spindle_rotation"),
@@ -3405,21 +3431,22 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         )
                         .size(12),
                     );
-            }
-            if o.strategy == Strategy::Turn {
-                c = c.push(muted("Feed: the carriage power feed, or by hand.").size(12));
-            } else {
-                c = c.push(checks.field(p, "feed", "Cutting feed · mm/min"));
-                if crate::manual::is_manual(machine)
-                    && let Some(hand) = num(&machine.p, "hand_feed")
-                {
-                    c = c.push(
-                        muted(format!(
-                            "At most the hand feed, {} mm/min.",
-                            crate::envelope::mm(hand)
-                        ))
-                        .size(12),
-                    );
+                }
+                if o.strategy == Strategy::Turn {
+                    c = c.push(muted("Feed: the carriage power feed, or by hand.").size(12));
+                } else {
+                    c = c.push(checks.field(p, "feed", "Cutting feed · mm/min"));
+                    if crate::manual::is_manual(machine)
+                        && let Some(hand) = num(&machine.p, "hand_feed")
+                    {
+                        c = c.push(
+                            muted(format!(
+                                "At most the hand feed, {} mm/min.",
+                                crate::envelope::mm(hand)
+                            ))
+                            .size(12),
+                        );
+                    }
                 }
             }
             if crate::tooth_load::offered(o.strategy, machine) {

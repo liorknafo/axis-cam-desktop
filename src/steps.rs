@@ -433,6 +433,8 @@ pub(crate) fn measures(
                 leader: false,
             });
         }
+        // A thread is tried, not measured (LIO-413).
+        Strategy::Drill if op.tapping() => {}
         Strategy::Drill => {
             let Some((holes, mouths)) = g.steps.iter().find_map(|st| match st {
                 Step::Holes {
@@ -867,6 +869,9 @@ enum Shape {
     Section(Vec<[f32; 3]>),
     /// A line not to pass, labelled with its DRO number.
     Never([f32; 3], [f32; 3], String),
+    /// The depth a hole is cut to: a line not to pass, its label right of
+    /// its right end, clear of the hole drawn across it (LIO-417).
+    Depth([f32; 3], [f32; 3], String),
     /// A finished wall.
     Wall([f32; 3], [f32; 3]),
     /// The tool's centre at the start of the cut, its radius and the end.
@@ -1032,6 +1037,11 @@ impl Drawing<'_> {
                     });
                     f.fill(&outline, Color { a: 0.14, ..ACCENT });
                     f.stroke(&outline, stroke(ACCENT, 1.5));
+                }
+                Shape::Depth(from, to, s) => {
+                    let (m, n) = (p3(*from), p3(*to));
+                    f.stroke(&canvas::Path::line(m, n), dashed(NEVER, 1.8));
+                    write(f, s.clone(), depth_label(m, n), NEVER, 12., Align::Left);
                 }
                 Shape::Never(from, to, s) => {
                     let (m, n) = (p3(*from), p3(*to));
@@ -1241,6 +1251,66 @@ fn tag_box(from: Point, out: [f32; 2], chars: usize, k: f32, size: Size) -> Rect
     let x = (c.x - w / 2.).clamp(2., (size.width - w - 2.).max(2.));
     let y = (c.y - h / 2.).clamp(2., (size.height - h - 2.).max(2.));
     Rectangle::new(Point::new(x, y), Size::new(w, h))
+}
+/// Where a hole's depth line from `m` to `n` puts its label: right of its
+/// right end, past the hole the line crosses (LIO-417).
+fn depth_label(m: Point, n: Point) -> Point {
+    Point::new(m.x.max(n.x) + 5., (m.y + n.y) / 2.)
+}
+/// The lowest Z of the part, work coordinates: a hole whose tip goes below
+/// it goes through.
+// ponytail: the part's lowest point, not the bottom under each hole; a part
+// with a step under a blind hole reads it as blind, which is the safe side.
+fn part_bottom(p: &Page<'_>) -> f32 {
+    (p.shown.part[1].iter().flatten())
+        .map(|q| q[1])
+        .fold(f32::INFINITY, f32::min)
+}
+/// A Drill's warning when its tip comes out under the stock, how far
+/// (LIO-417).
+fn under_stock<'a>(tip: f32, stock: &Bounds) -> Option<Element<'a, Message>> {
+    let under = stock.min[2] - tip;
+    (under > 0.005).then(|| {
+        warn_chip(format!(
+            "comes out {} under the stock: nothing under the hole",
+            mm(under)
+        ))
+    })
+}
+/// The Check of a tapping `op`: try a screw, as a thread is not measured
+/// (LIO-413).
+fn screw_try<'a>(p: &Page<'a>, op: usize) -> Option<Element<'a, Message>> {
+    let tool = p.tool(op)?;
+    let spec = tool.tap_spec()?;
+    let (tip, mouth) = p.guide().steps.iter().find_map(|s| match s {
+        Step::Holes {
+            op: o,
+            holes,
+            mouths,
+            ..
+        } if *o == op => Some((holes.first()?[2], *mouths.first()?)),
+        _ => None,
+    })?;
+    let through = tip < part_bottom(p) - 0.005;
+    let thread = (mouth - tip) - crate::cam::tap_lead(tool) * spec.pitch;
+    let goes = if through {
+        "it goes through by hand".to_string()
+    } else {
+        format!("it goes in {} by hand", mm(thread))
+    };
+    Some(readout(
+        Readout {
+            order: None,
+            lead: Some("try".into()),
+            axis: String::new(),
+            value: format!("{} screw", spec.name),
+            lock: None,
+            tags: vec![goes],
+            lit: Lit::Next,
+            big: true,
+        },
+        None,
+    ))
 }
 /// `Shape::Pattern` in the top view, `at` from mm to the canvas at `s` px
 /// a mm: the order the DRO goes in as arrows from hole to hole (dashed onto
@@ -2487,17 +2557,32 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             )
         }
         Step::Tool {
+            op,
             tool,
             rpm,
             diameter,
             comp,
             top,
-            ..
         } => {
-            let right = column![chips(vec![
-                chip(p.named(tool, *diameter)),
-                chip(format!("{} rpm", rpm.round()))
-            ]),]
+            // Set the parallels before drilling starts (LIO-417).
+            let tip = (g.steps.iter())
+                .filter_map(|s| match s {
+                    Step::Holes { op: o, holes, .. } if o == op => {
+                        holes.iter().map(|h| h[2]).reduce(f32::min)
+                    }
+                    _ => None,
+                })
+                .reduce(f32::min);
+            let under = tip.and_then(|tip| under_stock(tip, &p.before(*op)));
+            let right = column![chips(
+                vec![
+                    chip(p.named(tool, *diameter)),
+                    chip(format!("{} rpm", rpm.round()))
+                ]
+                .into_iter()
+                .chain(under)
+                .collect()
+            ),]
             .extend(pick_up(*top, true))
             .extend(
                 comp.map(|c| dro_tool(*diameter, c, 110.))
@@ -2519,6 +2604,53 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 Some(_) => ("Tool".into(), "put it in, set the gear", left, right),
                 None => ("Gear".into(), "same tool, set the gear", left, right),
             }
+        }
+        // A hand tap: put it in, the spindle off and free; no gear and no
+        // Z pick-up (LIO-410).
+        Step::TapIn { op, tool } => {
+            let d = p
+                .tool(*op)
+                .and_then(|t| num(&t.p, "diameter"))
+                .unwrap_or(0.);
+            let row = |n: u8, axis: &str, value: &str, tags: Vec<String>| {
+                readout(
+                    Readout {
+                        order: Some(n),
+                        lead: None,
+                        axis: axis.into(),
+                        value: value.into(),
+                        lock: None,
+                        tags,
+                        lit: lit(usize::from(n) - 1, p.item),
+                        big: false,
+                    },
+                    Some(Message::Guide(GuideAction::Reached(usize::from(n) - 1))),
+                )
+            };
+            let right = column![
+                chips(vec![chip(p.named(tool, d)), warn_chip("spindle off")]),
+                label("Put the tap in"),
+                row(
+                    1,
+                    "spindle",
+                    "off",
+                    vec![
+                        "neutral, or the lowest gear".into(),
+                        "free to turn by hand".into()
+                    ]
+                ),
+                row(
+                    2,
+                    "tap",
+                    "in the chuck",
+                    vec![
+                        "or in a wrench, a centre in the chuck".into(),
+                        "in its back end to keep it square".into()
+                    ]
+                ),
+            ];
+            let left = p.picture(p.done(*op), Fill);
+            ("Tap".into(), "put it in", left, right)
         }
         Step::Comp { op, comp, diameter } => {
             let right = column![
@@ -2871,7 +3003,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             });
             let side = vec![
                 spot.unwrap_or(Shape::Hatch(drilled, Hatch::Cut)),
-                Shape::Never(
+                Shape::Depth(
                     [h[0] - 3. * r, 0., h[2]],
                     [h[0] + 3. * r, 0., h[2]],
                     format!("Z {}", dro(h[2])),
@@ -2900,12 +3032,19 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     chip(p.tool_name(*op, 2. * r)),
                     chip("by hand · spindle off"),
                     warn_chip("oil"),
+                    // Held square as on the lathe (LIO-410).
+                    chip("square: chuck, or wrench on a centre"),
                 ];
                 // The tap's tip comes out under the stock: a parallel there
                 // stops it, or it cuts the vise.
-                if h[2] < stock.min[2] {
-                    said.push(warn_chip("nothing under the hole"));
-                }
+                said.extend(under_stock(h[2], &stock));
+                // The depth as a hand follows it (LIO-410).
+                let through = h[2] < part_bottom(p) - 0.005;
+                let how = if through {
+                    "through: turn until it runs free".to_string()
+                } else {
+                    format!("mark the tap {} from its tip", mm(depth))
+                };
                 let right = column![
                     chips(said),
                     hole_label(i, holes.len(), number(i)),
@@ -2918,7 +3057,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             axis: "turns".into(),
                             value: format!("{:.1}", turns),
                             lock: None,
-                            tags: vec![format!("{} deep", mm(depth)), "½ back every turn".into(),],
+                            tags: vec![how, "½ back every turn".into()],
                             lit: lit(z, p.app.guide_reached),
                             big: true
                         },
@@ -2953,6 +3092,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 if uncentred.get(i).copied().unwrap_or(false) {
                     said.push(warn_chip("centre drill first"));
                 }
+                said.extend(under_stock(h[2], &stock));
                 let cone = centre.map(|_| format!("cone Ø{} at the top", mm(2. * cone(i, &h))));
                 // The planned cycle, as the hand on the quill does it.
                 let cycle = o.map(|o| get(&o.p, "cycle")).unwrap_or_default();
@@ -3192,11 +3332,15 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     None,
                 )
             });
-            let right = column![label("Measure")]
-                .extend(rows)
-                .push(chips(c))
-                .push(label("Before"))
-                .push(p.picture(j, Length::Fixed(160.)));
+            // A tapped hole is tried with a screw (LIO-413).
+            let tried = o.filter(|o| o.tapping()).and_then(|_| screw_try(p, *op));
+            let right = match tried {
+                Some(row) => column![label("Try"), row],
+                None => column![label("Measure")].extend(rows),
+            }
+            .push(chips(c))
+            .push(label("Before"))
+            .push(p.picture(j, Length::Fixed(160.)));
             let dims = p.shown.dims.get(j + 1).map_or(&[][..], Vec::as_slice);
             let left = iced::widget::stack![
                 p.picture(j + 1, Fill),
@@ -4102,6 +4246,18 @@ pub(crate) mod tests {
             t.iter().any(|s| s.starts_with("on the DRO's hole 3 · X")),
             "{t:?}"
         );
+    }
+    /// LIO-417: a hole's depth label is right of its line, past the hole.
+    #[test]
+    fn a_holes_depth_label_is_clear_of_the_hole() {
+        // A Ø10 hole drawn 4 px a mm round X 200: its line ±3 radii.
+        let (x, r, s) = (200., 5., 4.);
+        let (m, n) = (
+            Point::new(x - 3. * r * s, 150.),
+            Point::new(x + 3. * r * s, 150.),
+        );
+        let at = depth_label(m, n);
+        assert!(at.x > x + r * s + 4., "{at:?}");
     }
     /// LIO-407: an arc taken round (four from 45°) has no order line and a
     /// plain heading.
