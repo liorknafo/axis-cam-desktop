@@ -329,6 +329,17 @@ impl SideView<'_> {
     fn labels(&self, size: Size) -> Vec<Option<Label>> {
         let k = self.scale(size);
         let mut taken: Vec<Rectangle> = k.chuck(self.side.stickout).to_vec();
+        // The tool and the cut it makes, which the labels name (LIO-392).
+        for m in &self.marks {
+            match m {
+                Mark::Tool(kind, q) => taken.push(tool_box(*kind, k.at(*q), k.cy, k.s)),
+                Mark::Cut(g) => {
+                    taken.push(k.rect(g[0], g[1], g[2], g[3]));
+                    taken.push(k.rect(g[0], g[1], -g[2], -g[3]));
+                }
+                _ => {}
+            }
+        }
         let inside = |r: &Rectangle| {
             r.x >= 0. && r.y >= 0. && r.x + r.width <= size.width && r.y + r.height <= size.height
         };
@@ -378,9 +389,11 @@ impl SideView<'_> {
                 let dx = (-r.x).max(0.) - (r.x + r.width - size.width).max(0.);
                 (Point::new(at.x + dx, at.y), align)
             };
+            // A few px clear of what it must not lie on (LIO-392).
             let free = |(at, align): &(Point, Align)| {
                 let r = text_box(text, size_px, *at, *align);
-                inside(&r) && !taken.iter().any(|t| meets(&r, t))
+                let clear = r.expand(3.);
+                inside(&r) && !taken.iter().any(|t| meets(&clear, t))
             };
             let (at, align) = (tries.into_iter().map(slid))
                 .find(free)
@@ -731,92 +744,105 @@ fn outline(
         }
     }
 }
-/// The tool of `kind` with its tip at `tip`; `cy` is the axis, `s` px per mm.
-fn tool(f: &mut canvas::Frame, kind: Cutter, tip: Point, cy: f32, s: f32) {
-    let fill = Color { a: 0.3, ..TOOL };
-    let draw = |f: &mut canvas::Frame, p: canvas::Path| {
-        f.fill(&p, fill);
-        f.stroke(&p, stroke(TOOL, 1.5));
-    };
+/// The outlines of the tool of `kind` with its tip at `tip`, each a closed
+/// polygon; `cy` is the axis, `s` px per mm.
+fn tool_shapes(kind: Cutter, tip: Point, cy: f32, s: f32) -> Vec<Vec<(f32, f32)>> {
     let (x, y) = (tip.x, tip.y);
-    let poly = |points: &[(f32, f32)]| {
-        canvas::Path::new(|b| {
-            b.move_to(Point::new(points[0].0, points[0].1));
-            for p in &points[1..] {
-                b.line_to(Point::new(p.0, p.1));
-            }
-            b.close();
-        })
-    };
     let bar = |x0: f32, y0: f32, w: f32, h: f32| {
-        canvas::Path::rectangle(Point::new(x0, y0), Size::new(w, h))
+        vec![(x0, y0), (x0 + w, y0), (x0 + w, y0 + h), (x0, y0 + h)]
     };
     match kind {
-        Cutter::Turn => {
-            draw(f, bar(x + 6., y - 40., 20., 26.));
-            draw(
-                f,
-                poly(&[(x, y), (x + 10., y - 14.), (x + 28., y - 14.), (x + 22., y)]),
-            );
-        }
-        Cutter::Bore => {
-            draw(f, bar(x, y - 2., 90., 8.));
-            draw(f, poly(&[(x, y - 2.), (x - 6., y - 8.), (x - 6., y - 2.)]));
-        }
+        Cutter::Turn => vec![
+            bar(x + 6., y - 40., 20., 26.),
+            vec![(x, y), (x + 10., y - 14.), (x + 28., y - 14.), (x + 22., y)],
+        ],
+        Cutter::Bore => vec![
+            bar(x, y - 2., 90., 8.),
+            vec![(x, y - 2.), (x - 6., y - 8.), (x - 6., y - 2.)],
+        ],
         Cutter::Blade(w) => {
             let w = (w * s).max(4.);
-            draw(f, bar(x - w / 2., y - 36., w, 36.));
+            vec![bar(x - w / 2., y - 36., w, 36.)]
         }
         Cutter::Drill(r) => {
             let r = (r * s).max(3.);
-            draw(f, bar(x, cy - r, 70., 2. * r));
-            draw(f, poly(&[(x, cy - r), (x - r * 0.6, cy), (x, cy + r)]));
+            vec![
+                bar(x, cy - r, 70., 2. * r),
+                vec![(x, cy - r), (x - r * 0.6, cy), (x, cy + r)],
+            ]
         }
         Cutter::Tap(r) => {
             // The tap with its chamfered lead, its square end in a wrench
             // across it, the tailstock's centre behind.
             let r = (r * s).max(3.);
-            draw(f, bar(x, cy - r, 54., 2. * r));
-            draw(
-                f,
-                poly(&[(x, cy - r * 0.7), (x - r * 0.6, cy), (x, cy + r * 0.7)]),
-            );
-            draw(f, bar(x + 54., cy - 5., 10., 10.));
-            draw(f, bar(x + 60., cy - 30., 8., 60.));
-            draw(f, bar(x + 68., cy - 3., 16., 6.));
+            vec![
+                bar(x, cy - r, 54., 2. * r),
+                vec![(x, cy - r * 0.7), (x - r * 0.6, cy), (x, cy + r * 0.7)],
+                bar(x + 54., cy - 5., 10., 10.),
+                bar(x + 60., cy - 30., 8., 60.),
+                bar(x + 68., cy - 3., 16., 6.),
+            ]
         }
         Cutter::Die(r) => {
             // The die's holder face on, with its two handles; the quill
             // pushes the holder's back.
             let r = (r * s).max(8.);
-            draw(f, bar(x, cy - r, 18., 2. * r));
-            draw(f, bar(x + 4., cy - r - 26., 8., 26.));
-            draw(f, bar(x + 4., cy + r, 8., 26.));
-            draw(f, bar(x + 18., cy - 7., 56., 14.));
+            vec![
+                bar(x, cy - r, 18., 2. * r),
+                bar(x + 4., cy - r - 26., 8., 26.),
+                bar(x + 4., cy + r, 8., 26.),
+                bar(x + 18., cy - 7., 56., 14.),
+            ]
         }
-        Cutter::Thread => {
-            draw(f, bar(x - 7., y - 42., 14., 26.));
-            draw(f, poly(&[(x, y), (x - 7., y - 16.), (x + 7., y - 16.)]));
-        }
+        Cutter::Thread => vec![
+            bar(x - 7., y - 42., 14., 26.),
+            vec![(x, y), (x - 7., y - 16.), (x + 7., y - 16.)],
+        ],
         Cutter::Chamfer(inside) => {
             // The 45° edge runs from the point toward the chuck and out
-            // (in, inside a hole), drawn bold.
+            // (in, inside a hole).
             let l = 18.;
             let v = if inside { 1. } else { -1. };
-            draw(
-                f,
-                poly(&[(x, y), (x - l, y + v * l), (x + 0.5 * l, y + v * l)]),
-            );
+            let edge = vec![(x, y), (x - l, y + v * l), (x + 0.5 * l, y + v * l)];
             if inside {
-                draw(f, bar(x - l, y + l, 90., 8.));
+                vec![edge, bar(x - l, y + l, 90., 8.)]
             } else {
-                draw(f, bar(x - l, y - l - 24., 1.5 * l, 24.));
+                vec![edge, bar(x - l, y - l - 24., 1.5 * l, 24.)]
             }
-            f.stroke(
-                &canvas::Path::line(Point::new(x, y), Point::new(x - l, y + v * l)),
-                stroke(ACCENT, 2.5),
-            );
         }
+    }
+}
+/// The box round the tool's drawing (`tool_shapes`), which labels keep off
+/// (LIO-392).
+fn tool_box(kind: Cutter, tip: Point, cy: f32, s: f32) -> Rectangle {
+    let points: Vec<(f32, f32)> = tool_shapes(kind, tip, cy, s).concat();
+    let (mut lo, mut hi) = (tip, tip);
+    for (x, y) in points {
+        (lo.x, lo.y, hi.x, hi.y) = (lo.x.min(x), lo.y.min(y), hi.x.max(x), hi.y.max(y));
+    }
+    Rectangle::new(lo, Size::new(hi.x - lo.x, hi.y - lo.y))
+}
+/// The tool of `kind` with its tip at `tip`; `cy` is the axis, `s` px per mm.
+fn tool(f: &mut canvas::Frame, kind: Cutter, tip: Point, cy: f32, s: f32) {
+    let fill = Color { a: 0.3, ..TOOL };
+    for points in tool_shapes(kind, tip, cy, s) {
+        let p = canvas::Path::new(|b| {
+            b.move_to(Point::new(points[0].0, points[0].1));
+            for q in &points[1..] {
+                b.line_to(Point::new(q.0, q.1));
+            }
+            b.close();
+        });
+        f.fill(&p, fill);
+        f.stroke(&p, stroke(TOOL, 1.5));
+    }
+    // A chamfering tool's edge, drawn bold.
+    if let Cutter::Chamfer(inside) = kind {
+        let (l, v) = (18., if inside { 1. } else { -1. });
+        f.stroke(
+            &canvas::Path::line(tip, Point::new(tip.x - l, tip.y + v * l)),
+            stroke(ACCENT, 2.5),
+        );
     }
 }
 impl canvas::Program<Message> for SideView<'_> {
@@ -3025,6 +3051,50 @@ mod tests {
                 assert!(
                     !chuck.iter().any(|c| meets(&l.rect, c)),
                     "{size:?}: {l:?} on {chuck:?}"
+                );
+            }
+            assert!(!meets(&labels[0].rect, &labels[1].rect), "{labels:?}");
+        }
+        // A Thread pass's two labels keep off each other, the threading
+        // tool and the band it cuts, at both sizes (LIO-392), as the pass
+        // draws them: 39 mm of 1.5 pitch on the outside.
+        let (end, r0) = (super::end_of(&bar), super::outer_of(&bar));
+        let (z0, r) = (end - 39., r0 - 0.3);
+        let view = super::SideView {
+            marks: vec![
+                super::Mark::Cut([z0, end, r, r0]),
+                super::Mark::Path([end + 2., r], [z0 + 1., r]),
+                super::Mark::Tool(super::Cutter::Thread, [end + 2., r]),
+                super::Mark::Never(
+                    [z0, r - 1.5],
+                    [z0, r0 + 2.],
+                    "thread stops 39 from the end".into(),
+                ),
+                super::Mark::Word(
+                    [(z0 + end) / 2. + 4., r0 + 7.],
+                    "1.5 pitch · 39 long".into(),
+                    super::ACCENT,
+                    super::Align::Center,
+                ),
+            ],
+            ..view
+        };
+        for size in [iced::Size::new(630., 560.), iced::Size::new(390., 330.)] {
+            let k = view.scale(size);
+            let mut kept = k.chuck(side.stickout).to_vec();
+            kept.push(super::tool_box(
+                super::Cutter::Thread,
+                k.at([end + 2., r]),
+                k.cy,
+                k.s,
+            ));
+            kept.push(k.rect(z0, end, r, r0));
+            let labels: Vec<_> = view.labels(size).into_iter().flatten().collect();
+            assert_eq!(labels.len(), 2);
+            for l in &labels {
+                assert!(
+                    !kept.iter().any(|c| meets(&l.rect, c)),
+                    "{size:?}: {l:?} on {kept:?}"
                 );
             }
             assert!(!meets(&labels[0].rect, &labels[1].rect), "{labels:?}");

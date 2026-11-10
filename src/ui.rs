@@ -2555,14 +2555,22 @@ fn workspace(app: &App) -> Element<'_, Message> {
                         Some(s) => Element::from(
                             row![
                                 muted("Work zero:").wrapping(Wrapping::None),
-                                button(
-                                    text(format!("{} · Change", get(&s.p, "origin")))
-                                        .size(12)
-                                        .wrapping(Wrapping::None)
-                                )
-                                .padding([2, 6])
-                                .on_press(Message::SetupStep("Work zero"))
-                                .style(|_, status| flat(false, status)),
+                                // A lathe's zero is fixed (LIO-386, LIO-392).
+                                if lathe::is_lathe(&s.machine) {
+                                    Element::from(
+                                        muted("the free end, on the axis").wrapping(Wrapping::None),
+                                    )
+                                } else {
+                                    button(
+                                        text(format!("{} · Change", get(&s.p, "origin")))
+                                            .size(12)
+                                            .wrapping(Wrapping::None),
+                                    )
+                                    .padding([2, 6])
+                                    .on_press(Message::SetupStep("Work zero"))
+                                    .style(|_, status| flat(false, status))
+                                    .into()
+                                },
                                 muted(format!(
                                     "{}{}{}",
                                     s.offset().map_or(String::new(), |o| format!("{o} / ")),

@@ -14001,6 +14001,17 @@ soft_max = 180.0
         let _ = a.view();
     }
 
+    /// A lathe setup's header names its fixed work zero and offers no
+    /// change; a mill's still does (LIO-392).
+    #[test]
+    fn a_lathe_setups_header_offers_no_work_zero_change() {
+        let changes = |a: &App| page_texts(a).iter().any(|t| t.ends_with(" · Change"));
+        let mut lathe = crate::steps::tests::lathe_app("Diameter", |_| {});
+        let _ = lathe.update(Message::Page(Page::Work));
+        shows(&lathe, &["the free end, on the axis"]);
+        assert!(!changes(&lathe));
+        assert!(changes(&app()));
+    }
     /// Small things of the CNC flow (LIO-396): a status line's problem that
     /// an edit put right is cleared; the G-code pane's lines end clear of
     /// its scrollbar; the wizard's review says "3-axis" once; no "-0.0 min"
