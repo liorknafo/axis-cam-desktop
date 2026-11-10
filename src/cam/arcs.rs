@@ -516,9 +516,11 @@ fn round_thread(f: &Facet, t: &crate::thread::Thread) -> bool {
 /// along it. A chamfer or cone at that slope round its axis, flat or on an
 /// inclined rim, follows no helix, and is no thread's. A
 /// thread's crests and roots, which a click and an arc's growth meet a turn
-/// apart over each other, are bounded by its flanks; a wall round another
-/// centre over it (an obround's end, however finely cut), or past solid
-/// stock round its axis (a recess, even one a chamfer opens), meets none.
+/// apart over each other, are bounded by its flanks and lie within their
+/// height. A wall round another centre over it (an obround's end, however
+/// finely cut), or past solid stock round its axis (a recess, even one a
+/// chamfer opens), meets none; one of another feature that meets them (a
+/// pocket breaking into the hole) runs on past their height.
 /// Walls round its axis that do not meet its flanks (slivers where it runs
 /// out at a face, meshed apart from them) are looked at as any wall is. A
 /// thread's own wall is its hole's, never an arc.
@@ -626,24 +628,44 @@ fn own_walls(
     };
     // Each group's verdict, once.
     let mut thread_of: HashMap<usize, bool> = HashMap::new();
-    let flanks: HashSet<[i64; 3]> = (0..leaning.len())
-        .filter(|&i| {
-            let t = &threads[leaning[i].0];
-            let r = root(&mut group, i);
-            *thread_of.entry(r).or_insert_with(|| {
-                let (low, high) = span[&r];
-                high - low >= 2. * t.pitch && helical(r, t)
-            })
+    // The thread's flanks' corners, each with its group's height along the
+    // axis.
+    let mut flanks: HashMap<[i64; 3], (f32, f32)> = HashMap::new();
+    for i in 0..leaning.len() {
+        let t = &threads[leaning[i].0];
+        let r = root(&mut group, i);
+        let (low, high) = span[&r];
+        let ok = *thread_of
+            .entry(r)
+            .or_insert_with(|| high - low >= 2. * t.pitch && helical(r, t));
+        if ok {
+            for q in leaning[i].1.iter() {
+                flanks.insert(corner(q), (low, high));
+            }
+        }
+    }
+    // The facets meeting them, with the height the flanks they meet span.
+    let mut touching: HashMap<usize, (f32, f32)> = HashMap::new();
+    for t in &g.triangles {
+        let Some(id) = t.feature.filter(|&id| keep(id)) else {
+            continue;
+        };
+        for q in &t.p {
+            if let Some(&(low, high)) = flanks.get(&corner(q)) {
+                let e = touching.entry(id).or_insert((low, high));
+                *e = (e.0.min(low), e.1.max(high));
+            }
+        }
+    }
+    // A crest or root lies within its flanks' height; a wall of another
+    // feature meeting them (a pocket's breaking into the hole) runs on past.
+    (facets(g, |id| touching.contains_key(&id)).into_iter())
+        .filter(|(id, f)| {
+            let (low, high) = touching[id];
+            f.low >= low - 1e-3
+                && f.high <= high + 1e-3
+                && threads.iter().any(|t| round_thread(f, t))
         })
-        .flat_map(|i| leaning[i].1.iter().map(corner))
-        .collect();
-    let touching: HashSet<usize> = (g.triangles.iter())
-        .filter_map(|t| t.feature.filter(|&id| keep(id)).map(|id| (id, t)))
-        .filter(|(_, t)| t.p.iter().any(|p| flanks.contains(&corner(p))))
-        .map(|(id, _)| id)
-        .collect();
-    (facets(g, |id| touching.contains(&id)).into_iter())
-        .filter(|(_, f)| threads.iter().any(|t| round_thread(f, t)))
         .map(|(id, _)| id)
         .collect()
 }
@@ -1870,5 +1892,55 @@ pub(crate) mod tests {
         let own = own_walls(&g, &g.threads, |id| recess.contains(&id));
         assert!(own.is_empty(), "{own:?}");
         assert!(!own_walls(&g, &g.threads, |id| !recess.contains(&id)).is_empty());
+    }
+    #[test]
+    fn a_wall_breaking_into_a_thread_at_a_flank_is_no_wall_of_it() {
+        // A modeled M12×1.75 thread round X0 Y0, Z0 to 12, and the wall of
+        // a pocket breaking into it from over it (review, LIO-361): it meets
+        // a flank of the thread at a corner the two share, round the thread's
+        // axis as far as that corner is, and rises 6 mm past the thread. It
+        // is not the thread's own wall; the thread's crests are.
+        let mut tris = crate::thread::tests::modeled([0., 0.], 12., 1.75, 60., true, true, 12., 0.);
+        let lean = |t: &[[f32; 3]; 3]| {
+            let [a, b, c] = *t;
+            let (u, v) = (
+                [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+                [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
+            );
+            let n = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
+            n[2].abs() / (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt()
+        };
+        // A corner of a flank at the thread's top.
+        let shared = *(tris.iter())
+            .filter(|t| (0.80..0.93).contains(&lean(t)))
+            .flat_map(|t| t.iter())
+            .find(|p| p[2] > 12. - 1e-4)
+            .unwrap();
+        let (r, at) = (shared[0].hypot(shared[1]), shared[1].atan2(shared[0]));
+        let along = [
+            r * (at + 2f32.to_radians()).cos(),
+            r * (at + 2f32.to_radians()).sin(),
+            shared[2],
+        ];
+        let up = |p: [f32; 3]| [p[0], p[1], p[2] + 6.];
+        tris.push([shared, along, up(along)]);
+        tris.push([shared, up(along), up(shared)]);
+        let mesh = mesh::normalize(tris).unwrap();
+        let (setup, _, _) = fixture(Strategy::Drill);
+        let g = Geometry::with_threads(&setup, &mesh);
+        assert_eq!(g.threads.len(), 1);
+        let t = &g.threads[0];
+        let wall: Vec<usize> = (facets(&g, |_| true).into_iter())
+            .filter(|(_, f)| f.high > g.bounds.max[2] - 1. && round_thread(f, t))
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(wall.len(), 1, "{wall:?}");
+        assert!(own_walls(&g, &g.threads, |id| id == wall[0]).is_empty());
+        assert!(!thread_wall(&setup, &mesh, wall[0]));
+        assert!(!own_walls(&g, &g.threads, |id| id != wall[0]).is_empty());
     }
 }
