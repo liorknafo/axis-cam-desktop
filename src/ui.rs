@@ -14571,18 +14571,12 @@ fn plan_result(app: &App) -> Element<'_, Message> {
         },
     }
 }
-/// The page's right side. A running plan fills it and keeps its stage and
-/// Cancel in view, scrolling only the timeline (`running_view`); the rest
-/// scroll as a whole.
+/// The page's right side, headed by the applied plan's Undo. A running plan
+/// fills the rest and keeps its stage and Cancel in view, scrolling only the
+/// timeline (`running_view`); the rest scroll as a whole.
 pub(crate) fn plan_side(app: &App) -> Element<'_, Message> {
-    if matches!(app.planner, crate::Planner::Running(_)) {
-        return container(plan_result(app))
-            .padding(iced::Padding::default().right(14))
-            .width(Fill)
-            .height(Fill)
-            .into();
-    }
-    // After Apply, Undo heads the page where the plan was shown (LIO-397).
+    // After Apply, Undo heads the page where the plan was shown (LIO-397),
+    // over a plan running since too (LIO-400).
     let undo = app.undo.is_some().then(|| {
         container(
             row![
@@ -14601,6 +14595,14 @@ pub(crate) fn plan_side(app: &App) -> Element<'_, Message> {
         .width(Fill)
         .style(panel_style)
     });
+    if matches!(app.planner, crate::Planner::Running(_)) {
+        let side = column![].push(undo).push(plan_result(app)).spacing(12);
+        return container(side.height(Fill))
+            .padding(iced::Padding::default().right(14))
+            .width(Fill)
+            .height(Fill)
+            .into();
+    }
     let side = column![].push(undo).push(plan_result(app)).spacing(12);
     scrollable(container(side).padding(iced::Padding::default().right(14)))
         .id("planner-result")

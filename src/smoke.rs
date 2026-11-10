@@ -24956,6 +24956,72 @@ soft_max = 180.0
         assert!(a.undo.is_none());
         assert_eq!(json(&a.doc.setups), before, "the setups are back");
     }
+    /// LIO-400: with a plan applied and another run under way, the page
+    /// offers Undo above the running plan, whose stage and Cancel stay in the
+    /// window at 1440 × 900 and 1120 × 690. With `AXIS_RENDER_DIR` set, the
+    /// page at both sizes is drawn there.
+    #[test]
+    fn undo_heads_the_page_over_a_running_plan_with_its_cancel_in_view() {
+        use crate::planner::{Event, Look, Progress};
+        use crate::ui::probe::{clicks_in, placed};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        a.settings.plan_notice_shown = true;
+        apply_checked_plan(&mut a);
+        let _ = a.update(Message::Page(Page::Ai));
+        // A run with its overview, a picture and a long timeline.
+        a.planner = crate::Planner::Running(Progress::Asking(1));
+        a.record_plan_event(Event::Overview(Look {
+            description: "+Z up, isometric; stock shown; tags: none".into(),
+            purpose: String::new(),
+            png: Some(picture(300, 200)),
+        }));
+        a.record_plan_event(Event::Stage(Progress::Analyzing));
+        a.record_plan_event(Event::Stage(Progress::Asking(1)));
+        for n in 0..12 {
+            a.record_plan_event(Event::Stage(Progress::Checking(n % 4 + 1)));
+        }
+        let crate::Planner::Running(stage) = a.planner else {
+            panic!("running")
+        };
+        let running = crate::ui::running_text(&a, stage);
+        for window in [iced::Size::new(1440., 900.), iced::Size::new(1120., 690.)] {
+            let _ = a.update(Message::Resized(window));
+            let seen = placed(a.view(), window);
+            let at = |label: &str| {
+                (seen.iter())
+                    .find(|(t, _)| t == label)
+                    .unwrap_or_else(|| panic!("{label} is on the page at {window:?}"))
+                    .1
+            };
+            let page = iced::Rectangle::with_size(window);
+            for label in ["Undo applied plan", "Cancel", running.as_str()] {
+                let r = at(label);
+                let end = iced::Point::new(r.x + r.width, r.y + r.height);
+                assert!(
+                    page.contains(r.position()) && page.contains(end),
+                    "{label} {r:?} is in the window at {window:?}"
+                );
+            }
+            assert!(at("Undo applied plan").y < at(&running).y);
+            for (label, wanted) in [
+                ("Undo applied plan", Message::UndoPlan),
+                ("Cancel", Message::PlanCancel),
+            ] {
+                let pressed = iced::Rectangle::new(at(label).center(), iced::Size::new(1., 1.));
+                assert!(
+                    (clicks_in(a.view(), window, pressed, 1.).iter())
+                        .any(|m| std::mem::discriminant(m) == std::mem::discriminant(&wanted)),
+                    "{label} at {window:?}"
+                );
+            }
+            if let Ok(out) = std::env::var("AXIS_RENDER_DIR") {
+                let path =
+                    std::path::Path::new(&out).join(format!("undo-running-{}.png", window.width));
+                render_png(&a, window, &path);
+            }
+        }
+    }
     fn json<T: serde::Serialize>(value: &T) -> String {
         serde_json::to_string(value).unwrap()
     }
