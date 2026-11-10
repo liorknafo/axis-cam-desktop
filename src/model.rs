@@ -2265,8 +2265,17 @@ impl Operation {
                         "Feed is above the hand feed, {} mm/min.",
                         crate::envelope::mm(c)
                     )
+                } else if k == "rpm" {
+                    // The limit named, as the hand feed's is (LIO-394).
+                    format!(
+                        "Spindle speed is above the machine's limit, {} rpm.",
+                        crate::envelope::mm(c)
+                    )
                 } else {
-                    format!("{} exceeds the saved machine limit.", label(k))
+                    format!(
+                        "Feed is above the machine's limit, {} mm/min.",
+                        crate::envelope::mm(c)
+                    )
                 });
             }
         }
@@ -3788,22 +3797,20 @@ impl Document {
         ))
     }
     pub fn tool_number_issues(&self, tool: &Tool) -> Vec<String> {
+        // A tool with no name has no "name: " before its message (LIO-393).
+        let said = |rest: String| match tool.name().trim() {
+            "" => rest[..1].to_uppercase() + &rest[1..],
+            name => format!("{name}: {rest}"),
+        };
         let Some(n) = tool.number() else {
-            return vec![format!(
-                "{}: enter a tool number from 1 to {TOOL_NUMBER_MAX}.",
-                tool.name()
-            )];
+            return vec![said(format!(
+                "enter a tool number from 1 to {TOOL_NUMBER_MAX}."
+            ))];
         };
         self.tools
             .iter()
             .filter(|t| t.id != tool.id && t.number() == Some(n))
-            .map(|t| {
-                format!(
-                    "{}: tool number T{n} is also used by {}.",
-                    tool.name(),
-                    t.name()
-                )
-            })
+            .map(|t| said(format!("tool number T{n} is also used by {}.", t.name())))
             .collect()
     }
     pub fn validate_structure(&self) -> Result<(), String> {
@@ -4696,7 +4703,10 @@ mod tests {
         d.setup_mut().operations[0]
             .p
             .insert("rpm".into(), "99999".into());
-        assert!(d.issues().iter().any(|s| s.contains("exceeds")))
+        // The message names the limit (LIO-394).
+        assert!(
+            (d.issues().iter()).any(|s| s.contains("Spindle speed is above the machine's limit, "))
+        )
     }
     #[test]
     fn a_pocket_stepover_over_50_percent_is_an_issue_but_a_facing_one_is_not() {
@@ -4752,7 +4762,14 @@ mod tests {
             ("allowance cannot be negative or blank.", Some("allowance")),
             ("slope max must not be below slope min.", Some("slope_max")),
             ("Clearance must be above retract height.", Some("clearance")),
-            ("feed exceeds the saved machine limit.", Some("feed")),
+            (
+                "Feed is above the machine's limit, 1000 mm/min.",
+                Some("feed"),
+            ),
+            (
+                "Spindle speed is above the machine's limit, 12000 rpm.",
+                Some("rpm"),
+            ),
             (
                 "Finishing passes must be a whole number.",
                 Some("finish_passes"),
@@ -7031,7 +7048,7 @@ mod manual_setups {
         cut.p.insert("feed".into(), "2540".into());
         let limit = |cut: &Operation| {
             (cut.issues(&cnc, std::slice::from_ref(&tool), &[]).iter())
-                .any(|i| i == "feed exceeds the saved machine limit.")
+                .any(|i| i == "Feed is above the machine's limit, 2540 mm/min.")
         };
         assert!(!limit(&cut));
         cut.p.insert("feed".into(), "2541".into());
@@ -7709,7 +7726,7 @@ mod manual_setups {
         assert!(
             op.issues(&m, &tools, &[])
                 .iter()
-                .any(|i| i.contains("exceeds the saved machine limit"))
+                .any(|i| i.starts_with("Spindle speed is above the machine's limit"))
         );
     }
     fn lathe_drill() -> (Machine, Vec<Tool>, Operation) {

@@ -415,6 +415,9 @@ pub enum Message {
     /// A row of the operation audit's report: opens its operation, at the
     /// tab its line names.
     AuditRow(usize),
+    /// A problem of the NC review page (setup, operation, its message): opens
+    /// the operation at the tab the message names (LIO-394).
+    OpenIssue(usize, usize, String),
     /// An action of the Run panel on the Control page.
     Run(run::Action),
     /// NC review's Run on the machine for a UC100 setup: the MACHINE
@@ -5660,6 +5663,11 @@ impl App {
                     return self.open_issue(row.setup, row.operation, &row.detail);
                 }
             }
+            Message::OpenIssue(si, oi, problem) => {
+                if (self.doc.setups.get(si)).is_some_and(|s| oi < s.operations.len()) {
+                    return self.open_issue(si, oi, &problem);
+                }
+            }
             Message::SetupEditor => {
                 self.selected = None;
                 self.setup_end = false;
@@ -5867,11 +5875,33 @@ impl App {
                     .or_else(|| self.doc.tools.iter().find(fitting))
                     .cloned()
                 else {
+                    // Offer a tool of the operation's first type, named for
+                    // it, with a free number, on this machine when it is
+                    // worked by hand (LIO-393).
+                    let kind = types.first().copied().unwrap_or("Flat end mill");
+                    let mut draft = if crate::lathe::is_tool(kind) {
+                        Tool::lathe(kind, kind)
+                    } else {
+                        // A keyseat cutter's head is wider than its Ø10 neck
+                        // (`groove::KEYSEAT_DEFAULTS`).
+                        let d = if kind == KEYSEAT { "16" } else { "6" };
+                        let mut t = Tool::new(kind, kind, d);
+                        t.set_type(kind);
+                        t
+                    };
+                    draft
+                        .p
+                        .insert("number".into(), self.doc.next_tool_number().to_string());
+                    if manual::is_hand(machine) {
+                        draft.p.insert("machines".into(), machine.id.clone());
+                    }
+                    self.tool_draft = draft;
                     self.page = Page::Tools;
                     self.pending = Some((Page::Tools, Message::AddOp(strategy)));
                     self.status = format!(
-                        "{} needs a cutter. Create one: saving it adds {}.",
+                        "{} needs a {}. Create one: saving it adds {}.",
                         strategy.name(),
+                        kind.to_lowercase(),
                         strategy.name()
                     );
                     return Task::none();

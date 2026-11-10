@@ -477,13 +477,25 @@ fn warnings<'a>(issues: Vec<String>) -> Element<'a, Message> {
 }
 /// An amber box: a heading and one bullet per line.
 pub(crate) fn caution<'a>(heading: impl Into<String>, lines: Vec<String>) -> Element<'a, Message> {
+    caution_box(
+        heading,
+        lines
+            .into_iter()
+            .map(|line| caution_line(format!("• {line}")).into()),
+    )
+}
+/// A line of a `caution` box.
+fn caution_line<'a>(line: String) -> widget::Text<'a> {
+    text(line).size(12).color(Color::from_rgb8(141, 90, 39))
+}
+/// `caution` with lines of any kind.
+fn caution_box<'a>(
+    heading: impl Into<String>,
+    lines: impl IntoIterator<Item = Element<'a, Message>>,
+) -> Element<'a, Message> {
     let mut c = column![bold(heading, 12).color(Color::from_rgb8(166, 101, 32))].spacing(5);
     for line in lines {
-        c = c.push(
-            text(format!("• {line}"))
-                .size(12)
-                .color(Color::from_rgb8(141, 90, 39)),
-        )
+        c = c.push(line)
     }
     container(c)
         .padding(12)
@@ -12288,15 +12300,9 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
                 page_header("Tool library", "Save cutters you actually use."),
                 space().height(40),
                 bold("No tools yet", 28),
-                muted(match &app.pending {
-                    Some((_, Message::AddOp(s))) => format!(
-                        "{} needs a cutter. Create one: saving it adds {}.",
-                        s.name(),
-                        s.name()
-                    ),
-                    _ =>
-                        "Create your first cutter, then select it when adding an operation.".into(),
-                }),
+                // An operation waiting for a cutter has its draft already
+                // (`Message::AddOp`, LIO-393), so this page is not shown for it.
+                muted("Create your first cutter, then select it when adding an operation."),
                 primary("+ Create first tool", Message::NewTool)
             ]
             .spacing(18),
@@ -12513,11 +12519,27 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
     let mut tool_issues = app.tool_draft.issues();
     tool_issues.extend(app.doc.tool_number_issues(&app.tool_draft));
     form = form.push(warnings(tool_issues.clone()));
+    // The operation waiting for a cutter names the types it takes (LIO-393).
+    let wanted = match &app.pending {
+        Some((_, Message::AddOp(s))) => {
+            let m = &app.doc.setup().machine;
+            let types = crate::model::Operation::for_machine(*s, String::new(), m).tool_types(m);
+            (!types.contains(&get(p, "type"))).then(|| {
+                format!(
+                    "{} takes a {}.",
+                    s.name(),
+                    types.join(" or ").to_lowercase()
+                )
+            })
+        }
+        _ => None,
+    };
     let editor = library_editor(
         form,
         &tool_issues,
-        tool_unsaved(app)
+        wanted
             .into_iter()
+            .chain(tool_unsaved(app))
             .chain(app.doc.tool_in_use_note(&app.tool_draft.id)),
         primary(
             app.resume_label().unwrap_or("Save tool".into()),
@@ -14677,6 +14699,41 @@ pub(crate) fn nc_page(app: &App) -> NcPage<'_> {
     }
     page
 }
+/// The operation of setup `name` a problem of the NC review is about, and
+/// the message after its name: what opens it there (LIO-394).
+pub(crate) fn nc_issue(app: &App, name: &str, problem: &str) -> Option<Message> {
+    let si = app.doc.setups.iter().position(|s| s.name() == name)?;
+    let ops = app.doc.setups[si].operations.iter().enumerate();
+    ops.filter(|(_, o)| !o.name().is_empty())
+        .find_map(|(oi, o)| {
+            let rest = problem.strip_prefix(o.name())?.strip_prefix(": ")?;
+            Some(Message::OpenIssue(si, oi, rest.to_string()))
+        })
+}
+/// A setup's problems on the NC review page: its causes, counted, each with
+/// Open beside it when it is an operation's, then the operations that wait
+/// for a failure, in the one line `post::waiting_line` makes (LIO-394).
+fn nc_problems<'a>(app: &App, name: &str, problems: &[String]) -> Element<'a, Message> {
+    let (waits, causes): (Vec<&String>, Vec<&String>) =
+        problems.iter().partition(|p| crate::post::is_waiting(p));
+    let heading = match causes.len() {
+        0 => "Waits for an earlier setup".to_string(),
+        1 => "1 issue".to_string(),
+        n => format!("{n} issues"),
+    };
+    let causes = causes.into_iter().map(|cause| {
+        let line = caution_line(format!("• {cause}"));
+        match nc_issue(app, name, cause) {
+            Some(open) => row![container(line).width(Fill), secondary("Open", open)]
+                .spacing(8)
+                .align_y(iced::Alignment::Center)
+                .into(),
+            None => line.into(),
+        }
+    });
+    let waits = waits.into_iter().map(|w| caution_line(w.clone()).into());
+    caution_box(heading, causes.chain(waits).collect::<Vec<_>>())
+}
 fn post(app: &App) -> Element<'_, Message> {
     let page = nc_page(app);
     let mut summary = column![bold(page.heading, 20), note(page.note),].spacing(14);
@@ -14729,7 +14786,7 @@ fn post(app: &App) -> Element<'_, Message> {
                     NcCard::Refused(problems) => {
                         summary = summary
                             .push(bold(format!("!  {name}"), 13))
-                            .push(warnings(problems.to_vec()));
+                            .push(nc_problems(app, name, problems));
                     }
                     NcCard::Manual => {
                         let line = match app.doc.setups.iter().find(|x| x.name() == *name) {
@@ -14742,7 +14799,7 @@ fn post(app: &App) -> Element<'_, Message> {
                         let mark = if problems.is_empty() { "✓" } else { "!" };
                         summary = summary.push(bold(format!("{mark}  Run on UC100: {name}"), 13));
                         if !problems.is_empty() {
-                            summary = summary.push(warnings(problems.to_vec()));
+                            summary = summary.push(nc_problems(app, name, problems));
                         }
                         summary = summary
                             .push(muted(RUN_PREREQUISITES))
