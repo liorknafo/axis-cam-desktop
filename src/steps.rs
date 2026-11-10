@@ -5080,7 +5080,7 @@ pub(crate) mod tests {
         shot(&mut a, "20a-bore-pass-1", fifth - 4, 0);
         let measure = nth(&a, 0, |l| matches!(l, L::Measure { .. }));
         shot(&mut a, "22-bore-measure", measure, 0);
-        // Only inside tools: the Zero touches the end and measures the bar.
+        // Only inside tools: the Zero touches the end only (LIO-203).
         let zero = nth(&a, 0, |l| matches!(l, L::Zero { .. }));
         shot(&mut a, "21-zero-bore-first", zero, 1);
         // An inside thread: the top slide wound out, away from the axis.

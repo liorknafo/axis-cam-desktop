@@ -610,13 +610,13 @@ A lathe setup opens in MACHINE on its **Steps** page, like the manual mill's: th
 | --- | --- |
 | Dial check | Only while the cross-slide dial is not known (see above) |
 | Hold | The bar in the chuck: the chuck and its jaws, the bar's size, the stickout as a big number and the grip ("in the jaws") |
-| Zero | With the first turning tool (the outside one): touch the end and zero the carriage dial, measure the bar and type its diameter, touch the bar and zero the cross-slide dial. A setup with only inside tools (drill, boring bar) touches the end and measures the bar, and its sections touch the hole |
+| Zero | With the first turning tool (the outside one): touch the end and zero the carriage dial, measure the bar and type its diameter, touch the bar and zero the cross-slide dial. A setup with only inside tools (drill, boring bar) touches the end only: nothing would read a measurement of the bar's outside, and its sections touch the hole |
 | Touch | Before a section, only what needs zeroing (see below) |
 | Face | One screen: the tool, the gear, "lock the carriage", the top slide dial for how much comes off, and the carriage zeroed again on the new end |
 | Pass | One screen per pass of an Outside or a Bore: the cross-slide dial in (out, boring) for this pass, the carriage dial where to stop, the power feed and "last 1 mm by hand", and the pass tiles with their diameters |
 | Measure | Before the last pass: type the measured diameter; the last pass's cross-slide reading is worked out again from it and is shown at once |
 | Drill | The tailstock: centre drill first, then the drill; the quill dial for the depth and the point, a peck every diameter |
-| Chamfer | A tool with a **45° edge**, the top slide set **along the bed (90° from the cross slide)**: the edge on the corner, zero the top slide, then in the chamfer's size toward the chuck, so both legs are the size (a shoulder one first sets the carriage with the tool's point that size short of the shoulder); carriage locked |
+| Chamfer | A tool with a **45° edge**, the top slide set **along the bed (90° from the cross slide)**: the edge on the corner, zero the top slide, then in the chamfer's size toward the chuck, so both legs are the size (a shoulder one first sets the carriage with the tool's point that size short of the shoulder, and says how far its edge reaches past the corner and how far that leaves it from the jaws: "4 to the jaws"); carriage locked |
 | Groove, Part off | The carriage dial for the tool's left side, the cross-slide dial for the depth (to the centre for a part off), "lock the carriage", and "catch the part" |
 | Thread pass | One screen per pass: the gearbox pitch, the top slide, the top slide dial for the infeed of this pass, the cross slide back to its zero, and the half-nuts rule |
 | Hand over | The bar as it leaves, the next setup and how it is held |

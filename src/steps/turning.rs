@@ -408,6 +408,125 @@ impl SideView<'_> {
         }
         out
     }
+    /// A cut drawn less than 40 px across (a groove, a chamfer) drawn again,
+    /// enlarged, in a corner of the view (LIO-203): the bar `bar` and the
+    /// part `part` round it, its half above the axis, the spot it shows
+    /// marked on the view with a leader to it.
+    fn inset(&self, f: &mut canvas::Frame, k: &Scale, bar: &[[f32; 4]], part: &[[f32; 4]]) {
+        let cut: Vec<[f32; 4]> = (self.marks.iter())
+            .filter_map(|m| match m {
+                Mark::Cut(g) => Some(*g),
+                _ => None,
+            })
+            .collect();
+        let Some(e) = extent(&cut) else {
+            return;
+        };
+        if (e[1] - e[0]).max(e[3] - e[2]) * k.s >= 40. {
+            return;
+        }
+        let size = f.size();
+        let w = (size.width * 0.3).clamp(120., 200.);
+        let h = w * 0.65;
+        // The corner whose rows the bar crosses least.
+        let (top, bottom) = (k.y(outer_of(bar)), k.y(-outer_of(bar)));
+        let over = |y: f32| (y + h).min(bottom) - y.max(top);
+        let y = [6., size.height - h - 22.]
+            .into_iter()
+            .min_by(|a, b| over(*a).total_cmp(&over(*b)))
+            .unwrap_or(6.);
+        let r = Rectangle::new(Point::new(size.width - w - 6., y), Size::new(w, h));
+        // The cut with as much again round it.
+        let pad = (e[1] - e[0]).max(e[3] - e[2]).max(1.) * 1.2;
+        let (z0, z1, r0, r1) = (e[0] - pad, e[1] + pad, (e[2] - pad).max(0.), e[3] + pad);
+        let zs = (w / (z1 - z0)).min(h / (r1 - r0));
+        // In the view's own coordinates, everything cut to the inset's box
+        // by hand: a frame's clip is not kept by every renderer.
+        let ix = |z: f32| r.x + (w - (z1 - z0) * zs) / 2. + (z - z0) * zs;
+        let iy = |q: f32| r.y + (h - (r1 - r0) * zs) / 2. + (r1 - q) * zs;
+        let inside = |q: Rectangle| {
+            let (x0, y0) = (q.x.max(r.x), q.y.max(r.y));
+            let (x1, y1) = ((q.x + q.width).min(r.x + w), (q.y + q.height).min(r.y + h));
+            (x1 > x0 && y1 > y0)
+                .then(|| Rectangle::new(Point::new(x0, y0), Size::new(x1 - x0, y1 - y0)))
+        };
+        // `[z0, z1]` × `[ra, rb]` (above the axis), cut to the box.
+        let boxed = |a: f32, b: f32, ra: f32, rb: f32| {
+            inside(Rectangle::new(
+                Point::new(ix(a), iy(ra.max(rb))),
+                Size::new(ix(b) - ix(a), (ra - rb).abs() * zs),
+            ))
+        };
+        let path = |q: Rectangle| canvas::Path::rectangle(q.position(), q.size());
+        // A line along Z or across it, cut to the box.
+        let line = |f: &mut canvas::Frame, a: Point, b: Point, pen: canvas::Stroke<'_>| {
+            let (x0, x1) = (a.x.min(b.x).max(r.x), a.x.max(b.x).min(r.x + w));
+            let (y0, y1) = (a.y.min(b.y).max(r.y), a.y.max(b.y).min(r.y + h));
+            if x1 >= x0 && y1 >= y0 {
+                f.stroke(
+                    &canvas::Path::line(Point::new(x0, y0), Point::new(x1, y1)),
+                    pen,
+                );
+            }
+        };
+        // Each section's edges above the axis.
+        let edges = |f: &mut canvas::Frame, sections: &[[f32; 4]], pen: canvas::Stroke<'_>| {
+            for g in sections {
+                let (a, b) = (ix(g[0]), ix(g[1]));
+                let (top, low) = (iy(g[3]), iy(g[2]));
+                line(f, Point::new(a, top), Point::new(b, top), pen);
+                if g[2] > 1e-3 {
+                    line(f, Point::new(a, low), Point::new(b, low), pen);
+                }
+                line(f, Point::new(a, top), Point::new(a, low), pen);
+                line(f, Point::new(b, top), Point::new(b, low), pen);
+            }
+        };
+        // Where it is on the view, and the leader to it.
+        let spot = k.rect(z0, z1, r1, r0);
+        f.stroke(&path(spot), dashed(ACCENT, 1.2));
+        let from = Point::new(spot.x + spot.width, spot.y + spot.height / 2.);
+        let to = Point::new(r.x, r.y + r.height / 2.);
+        f.stroke(
+            &canvas::Path::line(from, to),
+            stroke(Color { a: 0.6, ..ACCENT }, 1.),
+        );
+        f.fill(&path(r), Color::WHITE);
+        for g in bar {
+            if let Some(q) = boxed(g[0], g[1], g[3], g[2]) {
+                f.fill(&path(q), STOCK);
+            }
+        }
+        edges(f, bar, stroke(INK, 1.2));
+        for m in &self.marks {
+            match m {
+                Mark::Earlier(g) => {
+                    if let Some(q) = boxed(g[0], g[1], g[3], g[2]) {
+                        hatch(f, q, Color { a: 0.5, ..MUTED }, 1.);
+                    }
+                }
+                Mark::Cut(g) => {
+                    if let Some(q) = boxed(g[0], g[1], g[3], g[2]) {
+                        f.fill(&path(q), Color { a: 0.14, ..ACCENT });
+                        hatch(f, q, ACCENT, 1.6);
+                        f.stroke(&path(q), stroke(ACCENT, 1.4));
+                    }
+                }
+                _ => {}
+            }
+        }
+        edges(f, part, stroke(INK, 2.));
+        word(
+            f,
+            &format!("×{}", (zs / k.s).round()),
+            Point::new(r.x + w - 6., r.y + 10.),
+            ACCENT,
+            12.,
+            Align::Right,
+            bold_font(),
+        );
+        f.stroke(&path(r), stroke(ACCENT, 1.4));
+    }
     fn paint(&self, f: &mut canvas::Frame) {
         let side = self.side;
         let size = f.size();
@@ -557,6 +676,7 @@ impl SideView<'_> {
                 _ => {}
             }
         }
+        self.inset(f, &k, &bar, &part);
         word(
             f,
             "chuck ◀ · side view, you at the front · tailstock ▶",
@@ -1629,6 +1749,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             planned,
             measured,
             cross,
+            measure,
         } => {
             let end = end_of(start).max(0.);
             let r = outer_at(start, end);
@@ -1646,7 +1767,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     [end - (r * 0.5).clamp(4., 15.), r],
                     "touch the Ø".into(),
                 ));
-            } else {
+            } else if *measure {
                 marks.push(Mark::Across(
                     end - (r * 0.9).clamp(8., 30.),
                     r,
@@ -1655,10 +1776,10 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             }
             let mut right = column![
                 chips(vec![tool_chip(p, tool), warn_chip(EVERY_ON_CENTRE)]),
-                label(if *cross {
-                    "Touch, then zero the collars"
-                } else {
-                    "Touch the end, measure the bar"
+                label(match (*cross, *measure) {
+                    (true, _) => "Touch, then zero the collars",
+                    (false, true) => "Touch the end, measure the bar",
+                    (false, false) => "Touch the end",
                 }),
                 line(
                     narrow,
@@ -1669,7 +1790,10 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     lit(0, item),
                     reached(0),
                 ),
-                line(
+            ];
+            // Only when an outside touch reads from it (LIO-203).
+            if *measure {
+                right = right.push(line(
                     narrow,
                     Some(2),
                     "measure",
@@ -1677,8 +1801,8 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     vec!["type what the".into(), "calipers read".into()],
                     lit(1, item),
                     None,
-                ),
-            ];
+                ));
+            }
             if *cross {
                 right = right.push(line(
                     narrow,
@@ -2371,6 +2495,21 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 ACCENT,
                 Align::Right,
             ));
+            // A shoulder's: how far its foot is from the jaws, which the
+            // tool's edge reaches toward (LIO-203).
+            // The chamfer's foot is its size short of the shoulder (`e[1]`).
+            let foot = e[1] - size;
+            let to_jaws = (edge == "Shoulder").then_some(foot + side.stickout);
+            if let Some(to_jaws) = to_jaws {
+                let y = -(outer_of(bar) + 3.);
+                marks.push(Mark::Span([-side.stickout, y], [foot, y], String::new()));
+                marks.push(Mark::Word(
+                    [foot + 1., y - 4.],
+                    format!("{} to the jaws", mm(to_jaws)),
+                    NEVER,
+                    Align::Left,
+                ));
+            }
             // Sized as three in a row: its chips take two or three rows.
             let size_of = dial_size(p, 3.);
             let mut d = vec![];
@@ -2415,7 +2554,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 lit(n, item),
                 reached(n),
             ));
-            let right = column![
+            let mut right = column![
                 chips(vec![
                     tool_chip(p, tool),
                     rpm_chip(*rpm),
@@ -2426,9 +2565,15 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     set_back(*swung),
                     warn_chip("lock the carriage"),
                 ]),
-                dials(d),
-            ]
-            .extend(rows);
+            ];
+            if let Some(n) = to_jaws {
+                right = right.push(chips(vec![warn_chip(format!(
+                    "the edge reaches {} past the corner: {} to the jaws",
+                    mm(*size),
+                    mm(n)
+                ))]));
+            }
+            let right = right.push(dials(d)).extend(rows);
             (
                 "Chamfer".into(),
                 "a 45° tool edge, fed along the bed",
@@ -2884,6 +3029,26 @@ mod tests {
             }
             assert!(!meets(&labels[0].rect, &labels[1].rect), "{labels:?}");
         }
+    }
+    /// LIO-203: a shoulder chamfer 5 mm from the jaws says how far the tool's
+    /// edge reaches and how far that leaves it from the jaws; a Zero with
+    /// only inside tools asks for no measurement of the bar's outside.
+    #[test]
+    fn a_shoulder_chamfer_says_its_reach_to_the_jaws_and_a_bore_only_zero_measures_nothing() {
+        let mut a = crate::steps::tests::lathe_app("Diameter", |doc| {
+            doc.setups[0].operations.truncate(2);
+            crate::turn::tests::add(doc, "Chamfer", &[("edge", "Shoulder"), ("size", "1")]);
+        });
+        let t = shown(&mut a, 0, |l| matches!(l, L::Chamfer { .. }));
+        has(&t, &["the edge reaches 1 past the corner: 4 to the jaws"]);
+        let mut a = crate::steps::tests::bore_app(|_| {});
+        let t = shown(&mut a, 0, |l| matches!(l, L::Zero { .. }));
+        has(&t, &["TOUCH THE END", "zero the carriage dial"]);
+        assert!(
+            !t.iter()
+                .any(|s| s == "measure" || s.contains("measure the bar")),
+            "{t:?}"
+        );
     }
     #[test]
     fn the_tap_screen_shows_the_quill_the_turns_and_how_to_turn_it() {
