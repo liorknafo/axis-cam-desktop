@@ -1087,9 +1087,8 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     let size = |k: usize| high[k].min(s.max[k]) - low[k].max(s.min[k]);
     let (p, c) = if size(0) >= size(1) { (0, 1) } else { (1, 0) };
     // The stepdown: given, or what the spindle takes at a full stepover,
-    // at the operation's rpm with the tool's flutes. The project's material
-    // does not reach `generate`: it is counted as steel, the hardest common
-    // group but stainless. Rows cut one stepover wide, except the first row
+    // at the operation's rpm with the tool's flutes, in the project's
+    // material (steel when none is chosen). Rows cut one stepover wide, except the first row
     // of a box closed on both cross-axis sides: it starts inside the stock
     // and cuts a full slot, the tool's whole diameter, so the depth is
     // sized for that width.
@@ -1102,8 +1101,16 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         };
         let slot = open[c] == [false, false];
         let cut_width = if slot { 2. * r } else { width };
-        crate::forces::power_stepdown(&setup.machine, None, 2. * r, cut_width, b.feed, rpm, flutes)
-            .min(b.plan.flute_length)
+        crate::forces::power_stepdown(
+            &setup.machine,
+            setup.job_material.as_ref(),
+            2. * r,
+            cut_width,
+            b.feed,
+            rpm,
+            flutes,
+        )
+        .min(b.plan.flute_length)
     } else {
         number(op, "stepdown")?
     };
@@ -1254,10 +1261,22 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         for (i, &row) in rows.iter().enumerate() {
             let mut at = b.pos;
             if i > 0 && !outside {
-                at[c] -= toward * room(at[c]).clamp(0., 0.2);
+                // Off the wall just cut; with no room for that (a first row
+                // on the stock to leave), up off the floor instead, so the
+                // return does not rub (LIO-176).
+                let off = room(at[c]).clamp(0., 0.2);
+                if off > 0. {
+                    at[c] -= toward * off;
+                } else {
+                    at[2] += 0.2;
+                }
                 b.push(at, Motion::Rapid, false, rapid)?;
                 at[p] = start;
                 b.push(at, Motion::Rapid, false, rapid)?;
+                if off == 0. {
+                    at[2] = z;
+                    b.push(at, Motion::Rapid, false, rapid)?;
+                }
                 at[c] = row;
                 b.push(at, Motion::Feed, false, b.feed)?;
             } else {
@@ -2884,6 +2903,15 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         b.plan.target = b.plan.target.min(target);
         b.plan.levels += levels;
         b.start_at([h.center[0], h.center[1], cutting_top], Some(cutting_top))?;
+        // By hand, X and Y are set and locked at each hole: the pass time
+        // (LIO-377).
+        if crate::manual::is_manual(&setup.machine) {
+            b.dwell(
+                num(&setup.machine.p, "pass_time")
+                    .filter(|t| *t >= 0.)
+                    .unwrap_or(0.),
+            );
+        }
         for level in 1..=levels {
             let depth = (cutting_top - level as f32 * peck).max(target);
             b.push(
@@ -7204,6 +7232,27 @@ pub(crate) mod tests {
         assert_plan(manual);
     }
     #[test]
+    fn a_hand_drilled_hole_costs_the_pass_time_and_a_cnc_one_does_not() {
+        let mesh = mesh::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/four-setup-block.3mf"),
+        )
+        .unwrap();
+        let (mut setup, mut op, tool) = fixture(Strategy::Drill);
+        select_top(&mut op, &mesh);
+        let n = holes(&setup, &op, &mesh).unwrap().len() as f32;
+        let duration = |setup: &Setup, pass: &str| {
+            let mut setup = setup.clone();
+            setup.machine.p.insert("pass_time".into(), pass.into());
+            generate(&setup, &op, &tool, &mesh).unwrap().duration
+        };
+        // On the CNC the pass time is nothing to it.
+        assert_eq!(duration(&setup, "20"), duration(&setup, "0"));
+        // By hand each hole takes 20 s more to set X and Y (LIO-377).
+        setup.machine = crate::manual::defaults();
+        let more = duration(&setup, "20") - duration(&setup, "0");
+        assert!((more - 20. * n).abs() < 0.01, "{more} for {n} holes");
+    }
+    #[test]
     fn box_coordinates_are_work_coordinates_on_the_setups_zero() {
         let (mut setup, mut op, tool) = big_mill([0., 10., -10., 200., 0., -2.]);
         setup
@@ -7363,8 +7412,9 @@ pub(crate) mod tests {
         let fields = [("stepdown", "2"), ("allowance", "0.5")];
         let plan = boxed_plan([-50., 50., -30., 30., 0., -6.], &fields).unwrap();
         assert_inside(&plan, [-49.5, -29.5, 34.5], [49.5, 29.5, 40.]);
+        // The plunges: the returns' rapids back down 0.2 are not (LIO-176).
         let down: Vec<&Move> = (plan.moves.iter())
-            .filter(|m| m.to[2] < m.from[2] && m.to[2] < 40.)
+            .filter(|m| m.motion == Motion::Feed && m.to[2] < m.from[2] && m.to[2] < 40.)
             .collect();
         assert_eq!(plan.levels, 3);
         assert_eq!(down.len(), 3, "{down:?}");
@@ -7381,25 +7431,41 @@ pub(crate) mod tests {
         // The first row lies on the −Y wall's allowance: no room behind it,
         // so it goes back along its own cut.
         for pair in rows.windows(2).filter(|w| w[0].to[2] == w[1].to[2]) {
-            let mut between: Vec<&Move> = (plan.moves.iter())
+            let between: Vec<&Move> = (plan.moves.iter())
                 .filter(|m| m.start >= pair[0].end && m.end <= pair[1].start)
                 .collect();
             let first = (pair[0].to[1] + 17.).abs() < 1e-4;
             let kinds: Vec<Motion> = between.iter().map(|m| m.motion).collect();
+            if first {
+                // No room before the −Y wall's allowance: up 0.2 off the
+                // floor, back along the row, down again, across (LIO-176:
+                // it went back along its own cut, rubbing).
+                assert_eq!(
+                    kinds,
+                    [
+                        Motion::Rapid,
+                        Motion::Rapid,
+                        Motion::Rapid,
+                        Motion::Feed,
+                        Motion::Dwell
+                    ],
+                    "{between:?}"
+                );
+                let (up, back, down, across) = (between[0], between[1], between[2], between[3]);
+                assert!((up.to[2] - pair[0].to[2] - 0.2).abs() < 1e-4, "{up:?}");
+                assert!(up.from[1] == up.to[1] && up.from[0] == up.to[0]);
+                assert_eq!((back.to[0], back.to[2]), (pair[1].from[0], up.to[2]));
+                assert_eq!(down.to[2], pair[0].to[2]);
+                assert_eq!(across.to, pair[1].from);
+                continue;
+            }
             assert_eq!(
                 kinds,
-                [Motion::Rapid, Motion::Rapid, Motion::Feed, Motion::Dwell][usize::from(first)..],
+                [Motion::Rapid, Motion::Rapid, Motion::Feed, Motion::Dwell],
                 "{between:?}"
             );
-            if first {
-                between.insert(0, pair[0]);
-            }
             let (off, back, across) = (between[0], between[1], between[2]);
-            let backed = if first { 0. } else { 0.2 };
-            assert!(
-                (off.to[1] - (pair[0].to[1] - backed)).abs() < 1e-4,
-                "{off:?}"
-            );
+            assert!((off.to[1] - (pair[0].to[1] - 0.2)).abs() < 1e-4, "{off:?}");
             assert_eq!(back.feed, 1500.);
             assert_eq!(back.to[0], pair[1].from[0]);
             assert!(back.to[2] == pair[0].to[2] && back.from[1] == back.to[1]);
@@ -7408,17 +7474,18 @@ pub(crate) mod tests {
         }
         assert_eq!(assert_conventional(&plan).len(), 6);
         // The first row's cross side is closed with nothing behind it: it
-        // goes back along its own cut, not into the wall's allowance.
+        // goes up off the floor, not into the wall's allowance, and back.
         let fields = [("stepdown", "6"), ("allowance", "0")];
         let plan = boxed_plan([-50., 50., -30., 30., 0., -6.], &fields).unwrap();
         assert_inside(&plan, [-50., -30., 34.], [50., 30., 40.]);
         let first = cuts(&plan)[0];
-        let next = (plan.moves.iter())
-            .find(|m| m.start >= first.end && m.motion != Motion::Dwell)
-            .unwrap();
+        let mut next =
+            (plan.moves.iter()).filter(|m| m.start >= first.end && m.motion != Motion::Dwell);
+        let (up, back) = (next.next().unwrap(), next.next().unwrap());
+        assert!(up.to[2] > up.from[2] && up.from[1] == up.to[1], "{up:?}");
         assert!(
-            next.from[1] == next.to[1] && next.to[0] < next.from[0],
-            "{next:?}"
+            back.from[1] == back.to[1] && back.to[0] < back.from[0],
+            "{back:?}"
         );
         // A step closed at both X ends, open on −Y: down outside the −Y face
         // and a feed across into the first row, no plunge (LIO-367).
@@ -7554,6 +7621,21 @@ pub(crate) mod tests {
         );
         op.p.insert("stepdown".into(), "5".into());
         assert!(generate(&setup, &op, &tool, &block()).is_err());
+    }
+    /// The automatic stepdown is sized for the project's material: deeper in
+    /// aluminium than in steel, which it counts when none is chosen
+    /// (LIO-176).
+    #[test]
+    fn a_boxs_automatic_stepdown_follows_the_projects_material() {
+        let (mut setup, mut op, tool) = big_mill([-100., 100., -100., 100., 0., -12.]);
+        op.p.insert("allowance".into(), "0".into());
+        let levels = |setup: &Setup| generate(setup, &op, &tool, &block()).unwrap().levels;
+        let steel = levels(&setup);
+        let aluminium = (crate::material::starters().into_iter())
+            .find(|m| m.name().starts_with("Aluminium"))
+            .unwrap();
+        setup.job_material = Some(aluminium);
+        assert!(levels(&setup) < steel, "{} vs {steel}", levels(&setup));
     }
     /// A box closed on both cross sides cuts a full slot with its first row:
     /// its automatic stepdown is sized at the tool's diameter, not the

@@ -28503,7 +28503,8 @@ soft_max = 180.0
         shows(
             &a,
             &[
-                "X travel",
+                // With the machine's unit (LIO-375).
+                "X travel · mm",
                 "Spindle power · W",
                 "Spindle speeds · rpm, or a range",
                 "Hand feed · mm/min",
@@ -29685,7 +29686,11 @@ soft_max = 180.0
         lacks(&a, &["Pass direction · degrees", "Tolerance · mm"]);
         // Under X min, wherever the new box starts (LIO-373).
         let x_min = crate::model::num(&a.operation().unwrap().p, "x_min").unwrap();
-        let _ = a.update(Message::Edit(Target::Operation, "x_max", (x_min - 5.).to_string()));
+        let _ = a.update(Message::Edit(
+            Target::Operation,
+            "x_max",
+            (x_min - 5.).to_string(),
+        ));
         let _ = a.update(Message::Tab("Box".into()));
         let checks = crate::ui::op_checks(&a);
         assert_eq!(

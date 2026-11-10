@@ -1734,6 +1734,19 @@ fn progress(g: &Guide, s: &Section, at: usize, item: usize) -> String {
         _ => String::new(),
     }
 }
+/// What a section's count counts: "4 passes", "1 hole". A Boring's count
+/// is its passes.
+fn counted(setup: &Setup, s: &Section) -> String {
+    let hole =
+        s.op.and_then(|op| setup.operations.get(op))
+            .is_some_and(|o| o.strategy == Strategy::Drill && !o.boring());
+    match (s.count, hole) {
+        (1, true) => "1 hole".into(),
+        (1, false) => "1 pass".into(),
+        (n, true) => format!("{n} holes"),
+        (n, false) => format!("{n} passes"),
+    }
+}
 fn section_name(app: &App, g: &Guide, s: &Section) -> String {
     let lathe = (app.doc.setups.get(g.setup)).is_some_and(|s| crate::lathe::is_lathe(&s.machine));
     match (s.op, &g.steps[s.steps.start]) {
@@ -1763,10 +1776,11 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
     for (i, s) in g.sections.iter().enumerate() {
         let done = s.steps.end <= at;
         let now = i == here;
+        // Numbered from 1 (LIO-377).
         let mark = if done {
             "✓".to_string()
         } else {
-            i.to_string()
+            (i + 1).to_string()
         };
         let mut face = row![disc(mark, now, 20.), text(section_name(app, g, s)).size(13)]
             .spacing(6)
@@ -1774,7 +1788,7 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
         let small = if now {
             progress(g, s, at, app.guide_item)
         } else if s.count > 0 && !done {
-            s.count.to_string()
+            counted(setup, s)
         } else {
             String::new()
         };
@@ -1808,7 +1822,7 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
     // The header of the section the place is in.
     let s = &g.sections[here];
     let mut header = row![
-        disc(here.to_string(), true, 26.),
+        disc((here + 1).to_string(), true, 26.),
         bold(section_name(app, g, s), 17)
     ]
     .spacing(10)
@@ -1818,7 +1832,7 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
     if lathe && let Some(op) = s.op {
         tags.extend(turning::header(&page, op, s));
     } else if let Some(op) = s.op
-        && let Some(o) = setup.operations.get(op)
+        && setup.operations.get(op).is_some()
     {
         let d = num(
             &page.tool(op).map_or(Default::default(), |t| t.p.clone()),
@@ -1828,18 +1842,7 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
             tags.push(chip(page.tool_name(op, d)));
         }
         if s.count > 0 {
-            // A Boring's count is its passes.
-            let what = if o.strategy == Strategy::Drill && !o.boring() {
-                "hole"
-            } else {
-                "pass"
-            };
-            let what = match (s.count, what) {
-                (1, w) => w.to_string(),
-                (_, "pass") => "passes".into(),
-                (_, w) => format!("{w}s"),
-            };
-            tags.push(chip(format!("{} {what}", s.count)));
+            tags.push(chip(counted(setup, s)));
         }
         tags.push(chip(format!("~{} min", s.minutes.ceil())));
     }
@@ -1959,7 +1962,13 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     None
                 ),
             ];
-            ("Hold".into(), "where it goes in the vise", left, right)
+            // The caption follows the holding (LIO-375).
+            let sub = match (vise, get(&p.setup.p, "holding")) {
+                (Some(_), _) => "where it goes in the vise",
+                (None, "Clamps") => "where the clamps hold it",
+                _ => "the stock as it starts",
+            };
+            ("Hold".into(), sub, left, right)
         }
         Step::Zero {
             approach,
@@ -2232,6 +2241,14 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             tool[o] = (stock.min[o] + stock.max[o]) / 2.;
             let mut word = tool;
             word[k] = to + sd * (r * 2. + 2.);
+            // The way it feeds along the wall, conventional as its plan
+            // cuts (LIO-176).
+            let feed = feed_along(g, p.done(*op), o);
+            let along = (feed != 0.).then(|| {
+                let mut end = tool;
+                end[o] += feed * (stock.max[o] - stock.min[o]) * 0.35;
+                end
+            });
             let view = if k == 0 { 1 } else { 2 };
             let never = Shape::Never(
                 {
@@ -2258,7 +2275,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     vec![
                         Shape::Hatch(slab, Hatch::Cut),
                         Shape::Wall(a, b),
-                        Shape::Tool(tool, r, None),
+                        Shape::Tool(tool, r, along),
                         Shape::Word(word, format!("{} mm off", mm(*remove)), ACCENT)
                     ],
                     FillPortion(3)
@@ -2417,10 +2434,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             value: dro(h[0]),
                             lock: Some("X".into()),
                             tags: vec!["centre".into()],
-                            lit: Lit::Next,
+                            lit: lit(0, p.app.guide_reached),
                             big: false
                         },
-                        None
+                        Some(Message::Guide(GuideAction::Reached(0)))
                     ),
                     readout(
                         Readout {
@@ -2430,10 +2447,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             value: dro(h[1]),
                             lock: Some("Y".into()),
                             tags: vec!["centre".into()],
-                            lit: Lit::Next,
+                            lit: lit(1, p.app.guide_reached),
                             big: false
                         },
-                        None
+                        Some(Message::Guide(GuideAction::Reached(1)))
                     ),
                     readout(
                         Readout {
@@ -2443,10 +2460,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             value: format!("{:.1}", turns),
                             lock: None,
                             tags: vec![format!("{} deep", mm(depth)), "½ back every turn".into(),],
-                            lit: Lit::Next,
+                            lit: lit(2, p.app.guide_reached),
                             big: true
                         },
-                        None
+                        Some(Message::Guide(GuideAction::Reached(2)))
                     ),
                     tiles(
                         (1..=holes.len()).map(|n| (n.to_string(), None)).collect(),
@@ -2503,10 +2520,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             value: dro(h[0]),
                             lock: Some("X".into()),
                             tags: vec!["centre".into()],
-                            lit: Lit::Next,
+                            lit: lit(0, p.app.guide_reached),
                             big: false
                         },
-                        None
+                        Some(Message::Guide(GuideAction::Reached(0)))
                     ),
                     readout(
                         Readout {
@@ -2516,10 +2533,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             value: dro(h[1]),
                             lock: Some("Y".into()),
                             tags: vec!["centre".into()],
-                            lit: Lit::Next,
+                            lit: lit(1, p.app.guide_reached),
                             big: false
                         },
-                        None
+                        Some(Message::Guide(GuideAction::Reached(1)))
                     ),
                     readout(
                         Readout {
@@ -2543,10 +2560,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             .chain(cone)
                             .chain(pecking)
                             .collect(),
-                            lit: Lit::Next,
+                            lit: lit(2, p.app.guide_reached),
                             big: false
                         },
-                        None
+                        Some(Message::Guide(GuideAction::Reached(2)))
                     ),
                     tiles(
                         (1..=holes.len()).map(|n| (n.to_string(), None)).collect(),
@@ -2844,6 +2861,14 @@ fn ends(g: &Guide, op: usize, index: usize) -> ([f32; 3], [f32; 3]) {
         }
     }
     (start, at)
+}
+/// Which way (−1, +1; 0 when it does not) the first cut of the plan of
+/// the setup's `done`th operation feeds along `axis`.
+fn feed_along(g: &Guide, done: usize, axis: usize) -> f32 {
+    (g.done.get(done).into_iter())
+        .flat_map(|d| d.plan.moves.iter())
+        .find(|m| m.cutting_pass)
+        .map_or(0., |m| (m.to[axis] - m.from[axis]).signum())
 }
 /// The lines not to pass of operation `op` (tool radius `r`) where they are
 /// inside `stock`, as `view` sees them, each labelled with what the DRO
@@ -3445,6 +3470,26 @@ pub(crate) mod tests {
         assert!((a - b).abs() < 1e-3, "{a} != {b}");
     }
     #[test]
+    fn the_square_step_feeds_along_its_wall_as_its_plan_cuts() {
+        // Squaring the +X side: its arrow runs along Y (LIO-176), the way
+        // its plan feeds, with the material on its left (conventional).
+        let a = squared("Yes");
+        let g = guide(&a);
+        let Step::Square { op, .. } = g.steps[3] else {
+            panic!()
+        };
+        let i = g.done.iter().position(|d| d.op == op).unwrap();
+        let feed = feed_along(&g, i, 1);
+        assert!(feed != 0., "no feed along Y");
+        let cut = g.done[i]
+            .plan
+            .moves
+            .iter()
+            .find(|m| m.cutting_pass)
+            .unwrap();
+        assert_eq!(feed, (cut.to[1] - cut.from[1]).signum());
+    }
+    #[test]
     fn the_square_step_shows_the_dro_diameter_and_comp_side() {
         let t = texts(&squared("Yes"));
         for want in [
@@ -3695,6 +3740,27 @@ pub(crate) mod tests {
         assert_eq!((a.page, a.selected), (Page::Work, None));
     }
     #[test]
+    fn the_hold_caption_follows_the_holding_and_a_holes_readouts_light_in_turn() {
+        // No holding modelled, then a vise (LIO-375).
+        let a = app("Yes");
+        assert!(has(&a, "the stock as it starts") && !has(&a, "where it goes in the vise"));
+        let a = app_with("Yes", crate::guide::tests::in_the_vise);
+        assert!(has(&a, "where it goes in the vise"));
+        // Tapping X on a Holes screen lights Y and keeps the hole.
+        let mut a = app("Yes");
+        let holes = (guide(&a).steps.iter())
+            .position(|s| matches!(s, Step::Holes { .. }))
+            .unwrap();
+        send(&mut a, GuideAction::Go(holes));
+        send(&mut a, GuideAction::Next);
+        assert_eq!((a.guide_item, a.guide_reached), (1, 0));
+        send(&mut a, GuideAction::Reached(0));
+        assert_eq!((a.guide_item, a.guide_reached), (1, 1));
+        // Hole done: the next hole, from its first readout.
+        send(&mut a, GuideAction::Next);
+        assert_eq!((a.guide_item, a.guide_reached), (2, 0));
+    }
+    #[test]
     fn a_holes_depth_is_counted_from_its_mouth() {
         // A Box takes the top down to Z −3 over the two holes left of X 30.
         let mut a = app_with("Yes", |doc| {
@@ -3866,7 +3932,8 @@ pub(crate) mod tests {
         let t = texts(&a);
         assert_eq!(t.iter().filter(|s| *s == "pass 2/2").count(), 2, "{t:?}");
         // The sections ahead show their counts, the next setup is last.
-        assert!(t.contains(&"Holes".to_string()) && t.contains(&"4".to_string()));
+        // Each with what it counts (LIO-377).
+        assert!(t.contains(&"Holes".to_string()) && t.contains(&"4 holes".to_string()));
         assert!(
             t.contains(&format!("→ {}", a.doc.setups[1].name())),
             "{t:?}"

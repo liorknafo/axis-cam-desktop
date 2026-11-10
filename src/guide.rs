@@ -2026,6 +2026,23 @@ pub(crate) mod tests {
         assert!(work.is_none() && all.iter().all(Option::is_none) && steps.is_none());
     }
     #[test]
+    fn a_manual_setups_holding_is_checked_without_tool_numbers() {
+        // No tool has a T number: the manual mill changes them by hand, so
+        // its holding is still walked; the CNC setup's is not (LIO-176).
+        let (mut doc, mesh) = job("Yes");
+        in_the_vise(&mut doc);
+        for t in &mut doc.tools {
+            t.p.remove("number");
+        }
+        let mut results: Vec<Vec<_>> = vec![vec![]; doc.setups.len()];
+        simulation::sequence(&doc, &mesh, None, |si, oi, r| results[si].push((oi, r)));
+        let held = |si: usize| crate::post::held(&doc, &mesh, si, &results[si]);
+        let unchecked =
+            |si: usize| (held(si).iter()).any(|h| h.message.starts_with("Holding not checked"));
+        assert!(!unchecked(0), "{:?}", held(0));
+        assert!(unchecked(1), "{:?}", held(1));
+    }
+    #[test]
     fn steps_run_hold_zero_then_each_operation_and_a_face_is_one_step() {
         let (doc, mesh) = job("Yes");
         let guide = build(&doc, &mesh, 0).unwrap();

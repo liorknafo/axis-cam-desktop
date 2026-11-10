@@ -4160,11 +4160,17 @@ mod tests {
 
     #[test]
     fn a_setup_that_cannot_be_walked_says_its_holding_was_not_checked() {
-        let (doc, mesh) = crate::guide::tests::job("Yes");
-        // The manual mill's tools have no numbers: it makes no programs, so
-        // its holding is not checked, and that is said.
+        let (mut doc, mesh) = crate::guide::tests::job("Yes");
+        // The CNC setup's tools have no numbers: it makes no programs, so
+        // its holding is not checked, and that is said. (The manual mill's
+        // tools need none, LIO-176: its holding is checked without them.)
+        for t in &mut doc.tools {
+            t.p.remove("number");
+        }
         let sims = simulated(&doc, &mesh, 0);
-        let errors = crate::post::held_walked(&doc, &mesh, 0, &sims).unwrap_err();
+        assert!(crate::post::held_walked(&doc, &mesh, 0, &sims).is_ok());
+        let sims = simulated(&doc, &mesh, 1);
+        let errors = crate::post::held_walked(&doc, &mesh, 1, &sims).unwrap_err();
         let line = crate::post::not_checked(&errors);
         let why = errors[0].trim_end_matches('.');
         assert_eq!(line, format!("Holding not checked: {why}."));
@@ -4172,13 +4178,13 @@ mod tests {
             line.contains("tool number") || line.contains("number"),
             "{line}"
         );
-        let held: Vec<(Option<usize>, String)> = (crate::post::held(&doc, &mesh, 0, &sims))
+        let held: Vec<(Option<usize>, String)> = (crate::post::held(&doc, &mesh, 1, &sims))
             .into_iter()
             .map(|h| (h.operation, h.message))
             .collect();
         assert_eq!(held, [(None, line.clone())]);
         // The marks do not call it a refused vise: it is one of the problems.
-        let ready = ready(&doc, &mesh, 0, 1);
+        let ready = ready(&doc, &mesh, 1, 1);
         assert!(ready.held.is_empty(), "{:?}", ready.held);
         assert!(ready.problems.contains(&line), "{:?}", ready.problems);
         assert_eq!(

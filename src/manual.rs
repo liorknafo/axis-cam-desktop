@@ -164,13 +164,15 @@ pub fn fits(machines: &str, lathe_only: bool, m: &Machine) -> bool {
     machines.split(',').any(|id| id.trim() == m.id)
 }
 
-/// Makes the wizard's draft `kind` ("Manual", "Lathe" or "CNC"). Choosing
-/// Manual or Lathe fills that machine's defaults and keeps the name, units,
-/// travel and power entered.
+/// Makes the wizard's draft `kind` ("Manual mill", "Manual lathe" or "CNC",
+/// as the wizard names them; the saved "Manual" and "Lathe" too). Choosing
+/// a manual mill or lathe fills that machine's defaults and keeps the name,
+/// units, travel and power entered. The kind saved stays "Manual" or
+/// "Lathe" (LIO-377).
 pub fn set_kind(m: &mut Machine, kind: &str) {
     let (fresh, new) = match kind {
-        "Manual" => (!is_manual(m), defaults()),
-        "Lathe" => (!crate::lathe::is_lathe(m), crate::lathe::defaults()),
+        "Manual" | "Manual mill" => (!is_manual(m), defaults()),
+        "Lathe" | "Manual lathe" => (!crate::lathe::is_lathe(m), crate::lathe::defaults()),
         _ => {
             m.p.insert("kind".into(), "CNC".into());
             return;
@@ -559,6 +561,14 @@ mod tests {
         assert_eq!(get(&m.p, "hand_feed"), "100");
         set_kind(&mut m, "CNC");
         assert!(!is_manual(&m));
+        // The wizard names the kinds "Manual mill" and "Manual lathe"; the
+        // kind saved stays "Manual" and "Lathe", which older projects have
+        // (LIO-377).
+        set_kind(&mut m, "Manual mill");
+        assert!(is_manual(&m) && get(&m.p, "kind") == "Manual");
+        set_kind(&mut m, "CNC");
+        set_kind(&mut m, "Manual lathe");
+        assert!(crate::lathe::is_lathe(&m) && get(&m.p, "kind") == "Lathe");
     }
     #[test]
     fn the_check_boxes_add_and_take_off_one_id() {

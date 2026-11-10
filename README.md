@@ -425,7 +425,7 @@ A job can use a hand-fed milling machine with a DRO for the cuts that move one a
 
 ### The manual machine
 
-A machine has a kind, **CNC** (the default, so older projects read unchanged) or **Manual**. The wizard's first step chooses it and fills the manual defaults. A manual machine has the name, travel and power of any machine and these fields. The post, probe and controller fields do not apply and are hidden; the editor says "Manual mill — no G-code; MACHINE shows the steps."
+A machine has a kind, **CNC** (the default, so older projects read unchanged), **Manual mill** or **Manual lathe** (saved as "Manual" and "Lathe", as before). The wizard's first step chooses it and fills the manual defaults. A manual machine has the name, travel and power of any machine and these fields. The post, probe and controller fields do not apply and are hidden; the editor says "Manual mill — no G-code; MACHINE shows the steps."
 
 | Field | Meaning | Default |
 | --- | --- | --- |
@@ -455,7 +455,7 @@ Only **Box** and **Drill** can run on a manual setup. The ribbon dims the other 
 
 Box removes an axis-aligned block with one flat end mill. Facing, squaring a side, a step, a slot and a pocket are all boxes with different open sides. A side of the block that is on or beyond the stock's face is open; the others are closed.
 
-- **Fields**, in the setup's work frame: X min and max, Y min and max, Z top and bottom, **allowance**, stepover and stepdown, rpm and feed. The allowance is 0.5 mm by default. It is left on every closed side and on the floor, for the CNC to finish; 0 makes the manual cut final. Open sides and the top keep none. Stepover is a percentage of the diameter (default 70 %). An empty stepdown means automatic: the depth 70 % of the machine's spindle power can take at that width and feed, with the specific cutting force corrected for the chip thickness (kc = kc1.1 × h^−0.25, h = feed ÷ (rpm × flutes), at least 0.01 mm), at most the flute length and the diameter. The project's material does not reach the path generator, so the automatic stepdown always counts steel (kc1.1 1700 N/mm²); enter a stepdown for softer or harder stock.
+- **Fields**, in the setup's work frame: X min and max, Y min and max, Z top and bottom, **allowance**, stepover and stepdown, rpm and feed. The allowance is 0.5 mm by default. It is left on every closed side and on the floor, for the CNC to finish; 0 makes the manual cut final. Open sides and the top keep none. Stepover is a percentage of the diameter (default 70 %). An empty stepdown means automatic: the depth 70 % of the machine's spindle power can take at that width and feed, with the specific cutting force corrected for the chip thickness (kc = kc1.1 × h^−0.25, h = feed ÷ (rpm × flutes), at least 0.01 mm), at most the flute length and the diameter. The specific cutting force is the project's material's (steel, kc1.1 1700 N/mm², when none is chosen), so the automatic stepdown is deeper in aluminium than in steel.
 - **One axis at a time.** Every move changes exactly one of X, Y and Z. A pass goes up, along, across, down, then feeds along its length, and lifts off the cut; it never cuts back the other way.
 - **Conventional milling with M3.** The uncut material stays on the left of the feed (on the right would be climb). A pass returns to its start off the cut, because backlash on a hand-fed mill can pull the cutter into a climb cut.
 - **Equal levels and rows.** The depth is cut in equal levels, none deeper than the stepdown, and the width in equal rows, none wider than the stepover, so no pass is a thin sliver: the width is split into the fewest equal bands no wider than the stepover, one row to a band from the open side, the last row's edge on the far wall or, open there too, on the stock's far face. A box closed on both cross sides cuts a full slot first. Levels start from the highest material left in the cut, after earlier operations.
@@ -480,7 +480,7 @@ A twist drill started on a flat face walks: its chisel edge skids before its lip
 
 Open a manual setup in MACHINE to see its **Steps** page in place of Run. It works with no controller connected, and while the CNC runs another job. The steps are made from the setup's simulated operations, so each picture and number is a move the app checked. Every number is a work coordinate: Z 0 is the top picked up in the Zero step, for the whole setup.
 
-The page is split into sections: **Set up** (Hold, Zero), one section per cutting operation, and **Hand over**. A bar of sections on top shows progress ("pass 2/4"), ticks finished ones and ends with "→ CNC setup N". Tapping a section jumps to where you left it, or its first step. Each section header gives the tool, the number of passes or holes and the minutes. The last button of a section is "Section done"; you can stop after any section and come back. The place is saved with the project, without marking the plan changed.
+The page is split into sections: **Set up** (Hold, Zero), one section per cutting operation, and **Hand over**. A bar of sections on top shows progress ("pass 2/4"), ticks finished ones and ends with "→ CNC setup N". Sections are numbered from 1, and one not yet reached says what it counts ("4 passes", "4 holes"). Tapping another section jumps to its first step; tapping the one you are in keeps your place. Each section header gives the tool, the number of passes or holes and the minutes. The last button of a section is "Section done"; you can stop after any section and come back. The place is saved with the project, without marking the plan changed.
 
 Each screen fills the page: its drawings and 3D pictures grow with the window, its numbers scroll beside them when they do not fit, and **Back** and the step's own button are large and in the same place at the foot of every screen. Back is dimmed on the first screen, and Back onto a Holes or Bore screen lands on its last hole.
 
@@ -510,7 +510,7 @@ When the steps cannot be worked out, the page says why and names the operation i
 
 ### Minutes
 
-The minutes of a manual operation are the cut length over the feed, plus the travel off the cut over the hand rapid, plus the pass time for each pass, plus the tool time for each tool and change of tool. The plan check adds the move time each time the stock goes between a manual and another machine, and shows the split as "Lathe 20 min · Manual mill 18 min · CNC 42 min · moving 10 min" beside the total (the lathe's and the manual mill's parts only when they have minutes). The Steps page shows the setup's minutes.
+The minutes of a manual operation are the cut length over the feed, plus the travel off the cut over the hand rapid, plus the pass time for each pass and for each hole a Drill drills (to set and lock X and Y), plus the tool time for each tool and change of tool. The plan check adds the move time each time the stock goes between a manual and another machine, and shows the split as "Lathe 20 min · Manual mill 18 min · CNC 42 min · moving 10 min" beside the total (the lathe's and the manual mill's parts only when they have minutes). The Steps page shows the setup's minutes.
 
 ### No G-code
 

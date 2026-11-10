@@ -1248,6 +1248,9 @@ pub struct App {
     /// The readout the Steps page is at within its step, or the hole of a
     /// Holes step.
     pub guide_item: usize,
+    /// On a Holes or Bore screen, the readout of the hole the place is at
+    /// (LIO-375); 0 again on each hole.
+    pub guide_reached: usize,
     /// What is typed in a lathe step's measure box: its key and the text.
     pub guide_typed: Option<(String, String)>,
     /// When the step shown was opened, and the page's clock since
@@ -2024,6 +2027,7 @@ impl App {
             guide: None,
             guide_job: None,
             guide_item: 0,
+            guide_reached: 0,
             guide_typed: None,
             guide_clock: (Instant::now(), Instant::now()),
             ready: run::Ready::default(),
@@ -4882,7 +4886,12 @@ impl App {
             guide::Step::Holes { holes, .. } | guide::Step::Bore { holes, .. } => holes.len(),
             _ => 0,
         };
+        // Each hole starts at its first readout.
+        if !matches!(action, GuideAction::Reached(_)) {
+            self.guide_reached = 0;
+        }
         match action {
+            GuideAction::Reached(i) if holes > 0 => self.guide_reached = i + 1,
             GuideAction::Next if self.guide_item + 1 < holes => self.guide_item += 1,
             GuideAction::Next => self.guide_to(&shown, at + 1),
             GuideAction::Back if holes > 0 && self.guide_item > 0 => self.guide_item -= 1,
