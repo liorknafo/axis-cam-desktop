@@ -495,13 +495,10 @@ pub fn arc_at(setup: &Setup, mesh: &Mesh, id: usize) -> Result<Arc, NoArc> {
     let members = grow(&facets, &at, id).ok_or(NoArc::NotRound)?;
     whole_arc(across(setup, mesh, &g), &facets, &facets, &at, members)
 }
-/// Whether facet `f` is one of modeled thread `t`'s own walls: round its
-/// axis (its corners seen from above as far from the axis as each other, to
-/// `fit`'s 0.005 mm and 0.01 % of that) and between its minor and major
-/// diameters (to 0.05 mm). A thread's own wall is its hole's, never an arc.
-/// A wall round another centre over the thread (an obround's end) has
-/// corners at different distances from its axis, and is not one.
-fn own_wall(f: &Facet, t: &crate::thread::Thread) -> bool {
+/// Whether facet `f` lies round modeled thread `t`'s axis: its corners seen
+/// from above as far from the axis as each other (to `fit`'s 0.005 mm and
+/// 0.01 % of that), between its minor and major diameters (to 0.05 mm).
+fn round_thread(f: &Facet, t: &crate::thread::Thread) -> bool {
     let d: Vec<f64> = (f.xy.iter())
         .map(|p| (p.0 - t.centre[0] as f64).hypot(p.1 - t.centre[1] as f64))
         .collect();
@@ -509,15 +506,67 @@ fn own_wall(f: &Facet, t: &crate::thread::Thread) -> bool {
     let (lo, hi) = ((t.minor / 2. - 0.05) as f64, (t.major / 2. + 0.05) as f64);
     near >= lo && far <= hi && far - near <= 0.005 + far * 1e-4
 }
+/// The upright facets of `g` that `keep` keeps and that are a modeled
+/// thread's own walls, of `threads`: round its axis (`round_thread`), and
+/// meeting its flanks, faces leaning as a thread's do (`thread::detect`'s
+/// 0.80 to 0.93 up its axis) round its axis between its minor and major
+/// diameters, at a corner. A thread's crests and roots, which a click and
+/// an arc's growth meet a turn apart over each other, are bounded by its
+/// flanks; a wall round another centre over it (an obround's end, however
+/// finely cut) or one past solid stock (a recess round its axis over it)
+/// meets none. Walls round its axis that do not meet its flanks (slivers
+/// where it runs out at a face) are looked at as any wall is. A thread's
+/// own wall is its hole's, never an arc.
+fn own_walls(
+    g: &Geometry,
+    threads: &[crate::thread::Thread],
+    keep: impl Fn(usize) -> bool,
+) -> HashSet<usize> {
+    if threads.is_empty() {
+        return HashSet::new();
+    }
+    let corner = |p: &[f32; 3]| p.map(|v| (v as f64 * 1e4).round() as i64);
+    let in_band = |x: f32, y: f32| {
+        threads.iter().any(|t| {
+            let r = (x - t.centre[0]).hypot(y - t.centre[1]);
+            (t.minor / 2. - 0.05..=t.major / 2. + 0.05).contains(&r)
+        })
+    };
+    let flanks: HashSet<[i64; 3]> = (g.triangles.iter())
+        .filter(|t| {
+            let [a, b, c] = t.p;
+            let (u, v) = (
+                [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+                [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
+            );
+            let n = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
+            let length = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            length > 1e-12
+                && (0.80..0.93).contains(&(n[2].abs() / length))
+                && in_band((a[0] + b[0] + c[0]) / 3., (a[1] + b[1] + c[1]) / 3.)
+        })
+        .flat_map(|t| t.p.iter().map(corner))
+        .collect();
+    let touching: HashSet<usize> = (g.triangles.iter())
+        .filter_map(|t| t.feature.filter(|&id| keep(id)).map(|id| (id, t)))
+        .filter(|(_, t)| t.p.iter().any(|p| flanks.contains(&corner(p))))
+        .map(|(id, _)| id)
+        .collect();
+    (facets(g, |id| touching.contains(&id)).into_iter())
+        .filter(|(_, f)| threads.iter().any(|t| round_thread(f, t)))
+        .map(|(id, _)| id)
+        .collect()
+}
 /// Whether surface `id` of `mesh`, as `setup` places it, is a modeled
-/// thread's own wall (`own_wall`): no arc is looked for from it. Looked for
+/// thread's own wall (`own_walls`): no arc is looked for from it. Looked for
 /// along a thread's hundreds of crests, one took minutes.
 pub fn thread_wall(setup: &Setup, mesh: &Mesh, id: usize) -> bool {
     let g = Geometry::new(setup, mesh);
-    let Some(f) = facets(&g, |f| f == id).remove(&id) else {
-        return false;
-    };
-    (crate::thread::holes_in_setup(setup, mesh).iter()).any(|t| own_wall(&f, t))
+    own_walls(&g, &crate::thread::holes_in_setup(setup, mesh), |f| f == id).contains(&id)
 }
 /// The arcs a Drill drills among the surfaces `ids` (its selection), as
 /// `setup` places the part: each run of selected upright facets on one
@@ -532,34 +581,18 @@ pub fn drilled_arcs(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc
     }
     let at = corners(&facets);
     let wide = across(setup, mesh, &g);
-    // The whole round holes the selection reads as (`pocket::whole_holes`),
-    // by their walls. A wall of a thread past a leaning flank picks no hole
-    // by itself (`pocket::LEANING`), but its picked hole's walls read as the
-    // hole together. A modeled thread's own walls (`own_wall`) are its
-    // hole's: no arc starts from them (grown along a thread's hundreds of
-    // crests, one took minutes), though one may grow on through them. Other
-    // walls of a hole read with a thread (an obround's ends over it) start
-    // arcs as before.
-    let threaded = Geometry::with_threads(setup, mesh);
-    let rims = super::rims(&threaded);
-    let read: Vec<(HashSet<usize>, Hole)> = (crate::pocket::whole_holes(setup, ids, mesh))
-        .into_iter()
-        .filter_map(|h| {
-            let round = super::drill_hole(&threaded, &h, &rims, false)?;
-            Some((h.walls.iter().copied().collect(), round))
-        })
-        .collect();
+    // A modeled thread's own walls (`own_walls`) are its hole's: no arc
+    // starts from them (grown along a thread's hundreds of crests, one took
+    // minutes), though one may grow on through them. Other walls round its
+    // axis (an obround's ends over it, a recess past solid stock) start arcs
+    // as before.
+    let threads = crate::thread::holes_in_setup(setup, mesh);
     // The part's upright facets, for where a curve goes on past an arc.
     let mut all: Option<(HashMap<usize, Facet>, Corners)> = None;
     let mut seeds: Vec<usize> = facets.keys().copied().collect();
     seeds.sort_unstable();
-    let (mut done, mut found): (HashSet<usize>, Vec<Arc>) = (HashSet::new(), vec![]);
-    for (walls, round) in &read {
-        if let Some(t) = &round.thread {
-            let own = |w: &&usize| facets.get(w).is_some_and(|f| own_wall(f, t));
-            done.extend(walls.iter().filter(own).copied());
-        }
-    }
+    let (mut done, mut found) = (HashSet::new(), vec![]);
+    done.extend(own_walls(&g, &threads, |id| ids.contains(&id)));
     for seed in seeds {
         if done.contains(&seed) {
             continue;
@@ -584,15 +617,12 @@ pub fn drilled_arcs(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc
     if found.is_empty() {
         return found;
     }
-    // A whole round hole the selection reads as, round the arc's centre,
-    // that holds all the arc's walls is drilled as that hole; so is one a
-    // wall of the arc picks (each such hole read once). One round another
-    // centre (a slot so short it reads as round) leaves the arc its own.
-    found.retain(|a| {
-        !read.iter().any(|(walls, round)| {
-            same_centre(round, a) && a.walls.iter().all(|w| walls.contains(w))
-        })
-    });
+    // A whole round hole a wall of the arc picks, round the arc's centre, is
+    // drilled as that hole (each such hole read once: a modeled thread's
+    // crests are many arcs round its axis). One round another centre (a
+    // slot so short it reads as round) leaves the arc its own.
+    let threaded = Geometry::with_threads(setup, mesh);
+    let rims = super::rims(&threaded);
     let mut whole: HashSet<usize> = HashSet::new();
     found.retain(|a| {
         if a.walls.iter().any(|w| whole.contains(w)) {
@@ -1533,109 +1563,115 @@ pub(crate) mod tests {
         assert!((a.top - g.bounds.max[2]).abs() < 0.01, "{a:?}");
         assert!((a.span - 180.).abs() < 0.01, "{a:?}");
     }
+    /// A modeled M12×1.75 thread round X0 Y0, Z0 to 6 (`thread::tests`).
+    fn m12() -> Vec<[[f32; 3]; 3]> {
+        crate::thread::tests::modeled([0., 0.], 12., 1.75, 60., true, true, 6., 0.)
+    }
+    /// The plate's facets from 1 mm under its top within 7 mm of its middle
+    /// seen from above, in `setup`'s frame: an opening's walls round it.
+    fn opening(setup: &Setup, mesh: &Mesh) -> HashSet<usize> {
+        let g = Geometry::new(setup, mesh);
+        let top = g.bounds.max[2];
+        let mid = [
+            (g.bounds.min[0] + g.bounds.max[0]) as f64 / 2.,
+            (g.bounds.min[1] + g.bounds.max[1]) as f64 / 2.,
+        ];
+        (facets(&g, |_| true).into_iter())
+            .filter(|(_, f)| {
+                f.high > top - 1. && (f.xy.iter()).all(|p| (p.0 - mid[0]).hypot(p.1 - mid[1]) < 7.)
+            })
+            .map(|(id, _)| id)
+            .collect()
+    }
     #[test]
-    fn only_a_threads_own_walls_are_its() {
-        // An M12×1.75 round the origin: a crest and a root of it are its own
-        // walls; a narrower bore round it is not (review, LIO-361).
-        let thread = crate::thread::Thread {
-            axis: 2,
-            centre: [0., 0.],
-            from: 0.,
-            to: 12.,
-            internal: true,
-            right_hand: true,
-            pitch: 1.75,
-            angle: 60.,
-            major: 12.,
-            minor: 10.106,
-            tapered: false,
-            spec: None,
+    fn an_obrounds_ends_over_a_modeled_thread_are_no_walls_of_it() {
+        // An obround through a 5 mm plate, its R5.5 ends round X±0.125, over
+        // a modeled M12×1.75 thread round X0 under it (review, LIO-361): none
+        // of its walls is the thread's own, so its ends' arcs are looked for
+        // from them as on main, its ends cut as a DXF's arcs are or every 2°
+        // (every facet then as far from the thread's axis as the next, to
+        // 0.005 mm). The thread's crests are its own.
+        let square = [
+            (-20., -15., 0.),
+            (20., -15., 0.),
+            (20., 15., 0.),
+            (-20., 15., 0.),
+        ];
+        let dxf_cut = vec![
+            (-0.125, -5.5, 0.),
+            (0.125, -5.5, 1.),
+            (0.125, 5.5, 0.),
+            (-0.125, 5.5, 1.),
+        ];
+        let end = |x: f64, from: f64| {
+            (0..=90).map(move |k| {
+                let t = (from + 2. * k as f64).to_radians();
+                (x + 5.5 * t.cos(), 5.5 * t.sin(), 0.)
+            })
         };
-        let facet = |c: (f64, f64), r: f64, from: f64| Facet {
-            xy: [from, from + 5.]
-                .map(|d: f64| {
-                    (
-                        c.0 + r * d.to_radians().cos(),
-                        c.1 + r * d.to_radians().sin(),
-                    )
-                })
-                .to_vec(),
-            low: 0.,
-            high: 1.,
-            normal: [0., 0.],
-        };
-        assert!(own_wall(&facet((0., 0.), 5.06, 10.), &thread));
-        assert!(own_wall(&facet((0., 0.), 6., 100.), &thread));
-        assert!(!own_wall(&facet((0., 0.), 4.5, 10.), &thread));
-        // The R5.5 ends round X±0.125 of an obround over it lie within its
-        // band, but round another centre: most of each end's facets have
-        // corners at other distances from its axis, and start its arc.
-        for side in [1f64, -1.] {
-            let not_own = (-18..18)
-                .map(|k| facet((0.125 * side, 0.), 5.5, 90. * (1. - side) + 5. * k as f64))
-                .filter(|f| !own_wall(f, &thread))
-                .count();
-            assert!(not_own >= 18, "{side}: {not_own}");
+        let fine: Vec<_> = end(0.125, -90.).chain(end(-0.125, 90.)).collect();
+        for obround in [dxf_cut, fine] {
+            let mut tris = slab(&[&square, &obround], 5., 6., true, true);
+            tris.extend(m12());
+            let mesh = mesh::normalize(tris).unwrap();
+            let (setup, _, _) = fixture(Strategy::Drill);
+            let g = Geometry::with_threads(&setup, &mesh);
+            assert_eq!(g.threads.len(), 1);
+            let walls = opening(&setup, &mesh);
+            assert!(walls.len() > 8, "{}", walls.len());
+            let own = own_walls(&g, &g.threads, |id| walls.contains(&id));
+            assert!(own.is_empty(), "{own:?}");
+            let crests = own_walls(&g, &g.threads, |id| !walls.contains(&id));
+            assert!(crests.len() > 20, "{}", crests.len());
         }
     }
     #[test]
-    fn an_obrounds_ends_over_a_modeled_thread_stay_arcs() {
-        // An obround through a 5 mm plate, its R5.5 ends round X±0.125, over
-        // a modeled M12×1.75 thread round X0 under it (review, LIO-361): with
-        // the whole obround selected, each end is an arc round its own centre.
-        let mut tris = slab(
-            &[
-                &[
-                    (-20., -15., 0.),
-                    (20., -15., 0.),
-                    (20., 15., 0.),
-                    (-20., 15., 0.),
-                ],
-                &[
-                    (-0.125, -5.5, 0.),
-                    (0.125, -5.5, 1.),
-                    (0.125, 5.5, 0.),
-                    (-0.125, 5.5, 1.),
-                ],
-            ],
-            5.,
-            12.,
-            true,
-            true,
-        );
-        tris.extend(crate::thread::tests::modeled(
-            [0., 0.],
-            12.,
-            1.75,
-            60.,
-            true,
-            true,
-            12.,
-            0.,
-        ));
+    fn a_recess_round_a_threads_axis_past_solid_stock_is_no_wall_of_it() {
+        // A modeled M12×1.75 thread round X0 Y0, Z0 to 6, and over it, past
+        // solid stock, an R5.5 half-round recess round the same axis on the
+        // plate's front edge, Z14 to 19 (review, LIO-361): the recess's walls
+        // are not the thread's, and a click on one picks the recess as an
+        // arc; the thread's crests are its own.
+        let mut front = vec![(-20., 0., 0.)];
+        front.extend((0..=180).map(|k| {
+            let t = (180. - k as f64).to_radians();
+            (5.5 * t.cos(), 5.5 * t.sin(), 0.)
+        }));
+        front.extend([(20., 0., 0.), (20., 20., 0.), (-20., 20., 0.)]);
+        let block = [
+            (-20., 0., 0.),
+            (20., 0., 0.),
+            (20., 20., 0.),
+            (-20., 20., 0.),
+        ];
+        let mut tris = slab(&[&front], 5., 14., true, false);
+        tris.extend(slab(&[&block], 8., 6., false, true));
+        tris.extend(m12());
         let mesh = mesh::normalize(tris).unwrap();
         let (setup, _, _) = fixture(Strategy::Drill);
+        let threads = crate::thread::holes_in_setup(&setup, &mesh);
+        assert_eq!(threads.len(), 1);
+        let t = &threads[0];
         let g = Geometry::new(&setup, &mesh);
-        let top = g.bounds.max[2];
-        let mid = [
-            (g.bounds.min[0] + g.bounds.max[0]) / 2.,
-            (g.bounds.min[1] + g.bounds.max[1]) / 2.,
-        ];
-        // The obround's walls: the plate's, from its top, round the middle.
-        let obround: HashSet<usize> = facets(&g, |_| true)
-            .into_iter()
-            .filter(|(_, f)| {
-                f.high > top - 1.
-                    && (f.xy.iter()).all(|p| (p.0 - mid[0] as f64).hypot(p.1 - mid[1] as f64) < 7.)
-            })
-            .map(|(id, _)| id)
+        let all = facets(&g, |_| true);
+        let round = |f: &Facet| round_thread(f, t);
+        let recess: Vec<usize> = (all.iter())
+            .filter(|(_, f)| f.low > g.bounds.max[2] - 5.5 && round(f))
+            .map(|(id, _)| *id)
             .collect();
-        assert!(obround.len() > 8, "{}", obround.len());
-        let arcs = drilled_arcs(&setup, &mesh, &obround);
-        let mut centres: Vec<f32> = arcs.iter().map(|a| a.centre[0]).collect();
-        centres.sort_by(f32::total_cmp);
-        assert_eq!(centres.len(), 2, "{arcs:?}");
-        assert!((centres[0] - mid[0] + 0.125).abs() < 0.01, "{centres:?}");
-        assert!((centres[1] - mid[0] - 0.125).abs() < 0.01, "{centres:?}");
+        assert!(recess.len() > 100, "{}", recess.len());
+        for &id in &recess {
+            assert!(!thread_wall(&setup, &mesh, id), "{id}");
+        }
+        let a = arc_at(&setup, &mesh, recess[0]).unwrap();
+        assert!(
+            (a.r - 5.5).abs() < 0.01 && (a.span - 180.).abs() < 0.1,
+            "{a:?}"
+        );
+        let crests: Vec<usize> = (all.iter())
+            .filter(|(_, f)| f.high < g.bounds.max[2] - 12.5 && round(f))
+            .map(|(id, _)| *id)
+            .collect();
+        assert!(crests.iter().any(|&id| thread_wall(&setup, &mesh, id)));
     }
 }
