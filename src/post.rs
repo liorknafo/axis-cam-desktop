@@ -1327,15 +1327,19 @@ pub(crate) fn op_state(
     op: &Operation,
     plan: &Plan,
     settings: Option<&PostSettings>,
+    hand: bool,
 ) -> Result<OpState, Vec<String>> {
     let Some(tool) = doc.tools.iter().find(|t| t.id == op.tool) else {
         return Err(vec![format!("{}: choose a saved tool.", op.name())]);
     };
-    let mut e: Vec<String> = doc
-        .tool_number_issues(tool)
-        .into_iter()
-        .map(|x| format!("{}: {x}", op.name()))
-        .collect();
+    // A tool on a hand machine is changed by hand: it needs no T number
+    // for its moves to be walked (LIO-176).
+    let mut e: Vec<String> = match hand {
+        true => vec![],
+        false => (doc.tool_number_issues(tool).into_iter())
+            .map(|x| format!("{}: {x}", op.name()))
+            .collect(),
+    };
     let coolant = coolant(op, settings.and_then(|s| s.air));
     if coolant.is_none() {
         e.push(format!(
@@ -1350,7 +1354,7 @@ pub(crate) fn op_state(
     Ok(OpState {
         name: op.name().into(),
         strategy: op.strategy.name(),
-        tool: tool.number().unwrap(),
+        tool: tool.number().unwrap_or(0),
         tool_id: tool.id.clone(),
         tool_name: tool.name().into(),
         diameter: plan.radius * 2.,
@@ -2765,7 +2769,13 @@ fn walk<'a>(
         let op = &setup.operations[*oi];
         match result {
             Err(e) => errors.push(format!("{}: {e}", op.name())),
-            Ok(sim) => match op_state(doc, op, &sim.plan, settings.as_ref()) {
+            Ok(sim) => match op_state(
+                doc,
+                op,
+                &sim.plan,
+                settings.as_ref(),
+                crate::manual::is_hand(&setup.machine),
+            ) {
                 Ok(state) => {
                     ops.push(state);
                     simulations.push(sim);

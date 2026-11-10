@@ -408,6 +408,7 @@ pub fn check_clamps(setup: &Setup, text: &str) -> Result<(), String> {
         preview_stock: None,
         preview_remaining: None,
         turn: None,
+        job_material: None,
         id: setup.id.clone(),
         machine: setup.machine.clone(),
         p: fields(&[("holding", "Clamps"), ("clamps", text)]),

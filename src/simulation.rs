@@ -1204,6 +1204,7 @@ pub fn sequence_walk(
         }
         let frame = Frame::new(saved_setup, mesh);
         let mut setup = saved_setup.clone();
+        setup.job_material = doc.selected_material().cloned();
         // Stock is automatic in document order; inherited geometry supersedes
         // the later setup's nominal bounding-box settings for generation.
         setup.p.insert("stock_source".into(), "fresh".into());

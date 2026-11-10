@@ -2241,6 +2241,14 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             tool[o] = (stock.min[o] + stock.max[o]) / 2.;
             let mut word = tool;
             word[k] = to + sd * (r * 2. + 2.);
+            // The way it feeds along the wall, conventional as its plan
+            // cuts (LIO-176).
+            let feed = feed_along(g, p.done(*op), o);
+            let along = (feed != 0.).then(|| {
+                let mut end = tool;
+                end[o] += feed * (stock.max[o] - stock.min[o]) * 0.35;
+                end
+            });
             let view = if k == 0 { 1 } else { 2 };
             let never = Shape::Never(
                 {
@@ -2267,7 +2275,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     vec![
                         Shape::Hatch(slab, Hatch::Cut),
                         Shape::Wall(a, b),
-                        Shape::Tool(tool, r, None),
+                        Shape::Tool(tool, r, along),
                         Shape::Word(word, format!("{} mm off", mm(*remove)), ACCENT)
                     ],
                     FillPortion(3)
@@ -2853,6 +2861,14 @@ fn ends(g: &Guide, op: usize, index: usize) -> ([f32; 3], [f32; 3]) {
         }
     }
     (start, at)
+}
+/// Which way (−1, +1; 0 when it does not) the first cut of the plan of
+/// the setup's `done`th operation feeds along `axis`.
+fn feed_along(g: &Guide, done: usize, axis: usize) -> f32 {
+    (g.done.get(done).into_iter())
+        .flat_map(|d| d.plan.moves.iter())
+        .find(|m| m.cutting_pass)
+        .map_or(0., |m| (m.to[axis] - m.from[axis]).signum())
 }
 /// The lines not to pass of operation `op` (tool radius `r`) where they are
 /// inside `stock`, as `view` sees them, each labelled with what the DRO
@@ -3452,6 +3468,26 @@ pub(crate) mod tests {
     }
     fn close(a: f32, b: f32) {
         assert!((a - b).abs() < 1e-3, "{a} != {b}");
+    }
+    #[test]
+    fn the_square_step_feeds_along_its_wall_as_its_plan_cuts() {
+        // Squaring the +X side: its arrow runs along Y (LIO-176), the way
+        // its plan feeds, with the material on its left (conventional).
+        let a = squared("Yes");
+        let g = guide(&a);
+        let Step::Square { op, .. } = g.steps[3] else {
+            panic!()
+        };
+        let i = g.done.iter().position(|d| d.op == op).unwrap();
+        let feed = feed_along(&g, i, 1);
+        assert!(feed != 0., "no feed along Y");
+        let cut = g.done[i]
+            .plan
+            .moves
+            .iter()
+            .find(|m| m.cutting_pass)
+            .unwrap();
+        assert_eq!(feed, (cut.to[1] - cut.from[1]).signum());
     }
     #[test]
     fn the_square_step_shows_the_dro_diameter_and_comp_side() {

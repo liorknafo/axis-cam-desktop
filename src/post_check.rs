@@ -697,7 +697,9 @@ mod tests {
         let ops: Vec<OpState> = sims
             .iter()
             .zip(&setup.operations)
-            .map(|(s, op)| crate::post::op_state(&doc, op, &s.plan, Some(&settings)).unwrap())
+            .map(|(s, op)| {
+                crate::post::op_state(&doc, op, &s.plan, Some(&settings), false).unwrap()
+            })
             .collect();
         let zero = crate::post::datum(setup, sims[0].plan.stock, &mesh).unwrap();
         let top = sims[0].plan.stock.max[2];
@@ -1284,7 +1286,9 @@ mod tests {
             let ops: Vec<OpState> = sims
                 .iter()
                 .zip(&setup.operations)
-                .map(|(s, op)| crate::post::op_state(&doc, op, &s.plan, Some(&settings)).unwrap())
+                .map(|(s, op)| {
+                    crate::post::op_state(&doc, op, &s.plan, Some(&settings), false).unwrap()
+                })
                 .collect();
             let zero = crate::post::datum(&setup, sims[0].plan.stock, &mesh).unwrap();
             let mut sims = sims.clone();

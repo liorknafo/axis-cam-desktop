@@ -2530,6 +2530,10 @@ pub struct Setup {
     /// (`indexed`), worked out by `Document::sync_turns`; None otherwise.
     #[serde(skip)]
     pub turn: Option<crate::indexed::Turn>,
+    /// The project's material, while the job is simulated: what a Box's
+    /// automatic stepdown is sized for (LIO-176). None: steel.
+    #[serde(skip)]
+    pub job_material: Option<crate::material::Material>,
     pub id: String,
     pub machine: Machine,
     pub p: Fields,
@@ -2546,6 +2550,7 @@ impl Setup {
             preview_stock: None,
             preview_remaining: None,
             turn: None,
+            job_material: None,
             id: id(),
             machine,
             p: fields(&[
