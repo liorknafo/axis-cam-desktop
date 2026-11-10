@@ -506,6 +506,8 @@ fn round_thread(f: &Facet, t: &crate::thread::Thread) -> bool {
     let (lo, hi) = ((t.minor / 2. - 0.05) as f64, (t.major / 2. + 0.05) as f64);
     near >= lo && far <= hi && far - near <= 0.005 + far * 1e-4
 }
+/// A corner round an axis: its radius, angle and height.
+type Polar = (f32, f32, f32);
 /// The upright facets of `g` that `keep` keeps and that are a modeled
 /// thread's own walls, of `threads`: round its axis (`round_thread`), and
 /// meeting its flanks at a corner. Its flanks: faces leaning as a thread's
@@ -593,7 +595,7 @@ fn own_walls(
     }
     // Each group's corners by side (facing up the axis or down), round its
     // thread's axis: (radius, angle, height).
-    let mut sides: HashMap<(usize, bool), Vec<(f32, f32, f32)>> = HashMap::new();
+    let mut sides: HashMap<(usize, bool), Vec<Polar>> = HashMap::new();
     for (i, (t, p)) in leaning.iter().enumerate() {
         let r = root(&mut group, i);
         let up = {
