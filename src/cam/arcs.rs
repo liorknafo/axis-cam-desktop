@@ -511,9 +511,10 @@ fn round_thread(f: &Facet, t: &crate::thread::Thread) -> bool {
 /// meeting its flanks at a corner. Its flanks: faces leaning as a thread's
 /// do (`thread::detect`'s 0.80 to 0.93 up its axis), round its axis between
 /// its minor and major diameters, joined corner to corner over two pitches
-/// or more along it, as a thread's helical flanks run on over its length. A
-/// chamfer or cone at that slope round its axis is a band less than a pitch
-/// high there (its slope over the band's width), and no thread's. A
+/// or more along it, their corners on its helix (of its pitch and hand, as
+/// `thread::detect` reads one): a thread's flanks run on over its length
+/// along it. A chamfer or cone at that slope round its axis, flat or on an
+/// inclined rim, follows no helix, and is no thread's. A
 /// thread's crests and roots, which a click and an arc's growth meet a turn
 /// apart over each other, are bounded by its flanks; a wall round another
 /// centre over it (an obround's end, however finely cut), or past solid
@@ -585,11 +586,54 @@ fn own_walls(
             *e = (e.0.min(q[2]), e.1.max(q[2]));
         }
     }
+    // Each group's corners by side (facing up the axis or down), round its
+    // thread's axis: (radius, angle, height).
+    let mut sides: HashMap<(usize, bool), Vec<(f32, f32, f32)>> = HashMap::new();
+    for (i, (t, p)) in leaning.iter().enumerate() {
+        let r = root(&mut group, i);
+        let up = {
+            let [a, b, c] = **p;
+            (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]) > 0.
+        };
+        let at = threads[*t].centre;
+        let side = sides.entry((r, up)).or_default();
+        for q in p.iter() {
+            let (x, y) = (q[0] - at[0], q[1] - at[1]);
+            side.push((x.hypot(y), y.atan2(x), q[2]));
+        }
+    }
+    // Whether a group's corners lie on its thread's helix, as
+    // `thread::detect` reads one: on a side, all at one phase of the helix
+    // of its pitch and hand once their height along the flank is taken off.
+    let helical = |r: usize, t: &crate::thread::Thread| {
+        let hand = if t.right_hand { 1. } else { -1. };
+        let k = (t.angle / 2.).to_radians().tan();
+        [true, false].iter().any(|&up| {
+            let Some(side) = sides.get(&(r, up)).filter(|s| s.len() >= 9) else {
+                return false;
+            };
+            [k, -k].iter().any(|&k| {
+                let (mut c, mut s) = (0f64, 0f64);
+                for &(rad, th, z) in side {
+                    let phase = std::f32::consts::TAU / t.pitch
+                        * (z - hand * t.pitch * th / std::f32::consts::TAU - k * rad);
+                    c += phase.cos() as f64;
+                    s += phase.sin() as f64;
+                }
+                (c.hypot(s) / side.len() as f64) as f32 >= crate::thread::COHERENT
+            })
+        })
+    };
+    // Each group's verdict, once.
+    let mut thread_of: HashMap<usize, bool> = HashMap::new();
     let flanks: HashSet<[i64; 3]> = (0..leaning.len())
         .filter(|&i| {
-            let (t, _) = leaning[i];
-            let (low, high) = span[&root(&mut group, i)];
-            high - low >= 2. * threads[t].pitch
+            let t = &threads[leaning[i].0];
+            let r = root(&mut group, i);
+            *thread_of.entry(r).or_insert_with(|| {
+                let (low, high) = span[&r];
+                high - low >= 2. * t.pitch && helical(r, t)
+            })
         })
         .flat_map(|i| leaning[i].1.iter().map(corner))
         .collect();
@@ -1768,5 +1812,63 @@ pub(crate) mod tests {
             .map(|(id, _)| *id)
             .collect();
         assert!(crests.iter().any(|&id| thread_wall(&setup, &mesh, id)));
+    }
+    #[test]
+    fn a_recess_with_an_inclined_rim_round_a_threads_axis_is_no_wall_of_it() {
+        // A modeled M12×1.75 thread round X0 Y0, Z0 to 24, a 2 mm web over
+        // it, and an R5.5 half-round recess round the same axis, cut every 5°,
+        // from Z26 up to a rim inclined about 19° (Z30 + 1.925 cos θ), opened
+        // by a 120° chamfer to R5.9 on its walls' top corners (review,
+        // LIO-361): the chamfer slopes as the thread's flanks do, in its band,
+        // and runs over 4 mm round, but follows no helix. None of the recess
+        // walls is the thread's.
+        let block = [
+            (-20., 0., 0.),
+            (20., 0., 0.),
+            (20., 20., 0.),
+            (-20., 20., 0.),
+        ];
+        let mut tris = slab(&[&block], 2., 24., false, true);
+        tris.extend(crate::thread::tests::modeled(
+            [0., 0.],
+            12.,
+            1.75,
+            60.,
+            true,
+            true,
+            24.,
+            0.,
+        ));
+        let at = |k: usize, r: f32, lift: f32| {
+            let t = (5. * k as f32).to_radians();
+            let rim = 30. + 0.35 * 5.5 * t.cos();
+            [r * t.cos(), r * t.sin(), rim + lift]
+        };
+        let foot = |k: usize| {
+            let t = (5. * k as f32).to_radians();
+            [5.5 * t.cos(), 5.5 * t.sin(), 26.]
+        };
+        let rise = 0.4 / 3f32.sqrt();
+        for k in 0..36 {
+            let (a, b) = (at(k, 5.5, 0.), at(k + 1, 5.5, 0.));
+            tris.push([foot(k), foot(k + 1), b]);
+            tris.push([foot(k), b, a]);
+            let (c, d) = (at(k, 5.9, rise), at(k + 1, 5.9, rise));
+            tris.push([a, b, d]);
+            tris.push([a, d, c]);
+        }
+        let mesh = mesh::normalize(tris).unwrap();
+        let (setup, _, _) = fixture(Strategy::Drill);
+        let g = Geometry::with_threads(&setup, &mesh);
+        assert_eq!(g.threads.len(), 1);
+        let t = &g.threads[0];
+        let recess: Vec<usize> = (facets(&g, |_| true).into_iter())
+            .filter(|(_, f)| f.low > g.bounds.min[2] + 25. && round_thread(f, t))
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(recess.len(), 36, "{recess:?}");
+        let own = own_walls(&g, &g.threads, |id| recess.contains(&id));
+        assert!(own.is_empty(), "{own:?}");
+        assert!(!own_walls(&g, &g.threads, |id| !recess.contains(&id)).is_empty());
     }
 }

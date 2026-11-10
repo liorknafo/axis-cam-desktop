@@ -305,7 +305,7 @@ const CELL: f32 = 0.25;
 /// Least flank triangles that make a thread.
 const LEAST: usize = 40;
 /// Least helix coherence of a thread's flank vertices.
-const COHERENT: f32 = 0.8;
+pub(crate) const COHERENT: f32 = 0.8;
 
 /// The threads in `triangles` (mm), along each of the frame's axes. The
 /// triangles' winding gives their outside.
