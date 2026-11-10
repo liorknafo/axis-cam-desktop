@@ -1053,6 +1053,9 @@ pub(crate) fn box_shown(setup: &Setup, op: &Operation, mesh: &Mesh, s: Bounds) -
         });
     Some(BoxShown { cut, walls, into })
 }
+/// How far a Box's pass lifts off the floor to return when it cannot back
+/// off the wall (LIO-176); the Steps page names that move by it (LIO-385).
+pub(crate) const LIFT: f32 = 0.2;
 /// A Box on a manual mill: the block `x_min`..`z_bottom`, in the setup's work
 /// frame (`post::datum` on the stock the setup starts from), cleared in rows
 /// along its longer side, every move along one axis. Its sides on or beyond
@@ -1271,7 +1274,7 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
                 if off > 0. {
                     at[c] -= toward * off;
                 } else {
-                    at[2] += 0.2;
+                    at[2] += LIFT;
                 }
                 b.push(at, Motion::Rapid, false, rapid)?;
                 at[p] = start;

@@ -1703,20 +1703,29 @@ impl Viewport<'_> {
                 walls.faces.extend(s.faces);
                 walls.edges.extend(s.edges);
             }
-            let solids = [(walls, &BOX_WALL), (lid, &BOX_CUT)]
-                .into_iter()
-                .chain(shown.into.map(|b| (solid_of(b), &LOST)));
-            for (solid_box, look) in solids {
-                raster_solid(
-                    look,
-                    &mut rgba,
-                    &depths,
-                    (w, h),
-                    &solid_box,
-                    ratio,
-                    p.scale,
-                    &mut solid,
-                );
+            // The lid first; the walls only where it does not hide them, so
+            // that from above the cut reads orange and the floor under it
+            // does not tint it blue (LIO-384); red over both.
+            let mut draw =
+                |solid_box: &SolidBox, look: &Look, depths: &[f32], solid: &mut SolidBuffers| {
+                    raster_solid(
+                        look,
+                        &mut rgba,
+                        depths,
+                        (w, h),
+                        solid_box,
+                        ratio,
+                        p.scale,
+                        solid,
+                    )
+                };
+            draw(&lid, &BOX_CUT, &depths, &mut solid);
+            let hidden: Vec<f32> = (depths.iter().zip(&solid.near))
+                .map(|(a, b)| a.max(*b))
+                .collect();
+            draw(&walls, &BOX_WALL, &hidden, &mut solid);
+            if let Some(b) = shown.into {
+                draw(&solid_of(b), &LOST, &depths, &mut solid);
             }
         }
         if let Some((tip, radius, stickout)) = self.live {
@@ -3556,13 +3565,13 @@ const STOCK: Look = Look {
     behind: 0.12,
 };
 /// What a Box being edited cuts: a translucent orange lid with its edges,
-/// light enough that the walls under it show through.
+/// over the walls and floor it hides (LIO-384).
 const BOX_CUT: Look = Look {
     faces: [[246, 150, 70], [226, 126, 46], [236, 138, 58]],
     edge: [196, 88, 18],
     hidden_edge: [214, 146, 96],
-    open: 0.3,
-    behind: 0.3,
+    open: 0.65,
+    behind: 0.45,
 };
 /// The sides and floor a Box keeps: the stock to leave, a solid blue that
 /// reads against the orange cut and the tan stock (LIO-380).
