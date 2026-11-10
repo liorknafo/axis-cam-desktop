@@ -230,10 +230,76 @@ fn hatch(f: &mut canvas::Frame, r: Rectangle, c: Color, w: f32) {
         k += 6.;
     }
 }
+/// Where a side view of `size` puts the lathe: px per mm `s`, the work Z at
+/// its left edge `low` (the chuck's back), the axis `cy`, and the chuck's.
+struct Scale {
+    s: f32,
+    low: f32,
+    left: f32,
+    cy: f32,
+    /// The jaws' back (work Z), how far the chuck's body and the jaws reach
+    /// from the axis, and the radius the jaws close on.
+    back: f32,
+    body: f32,
+    jaw: f32,
+    gripped: f32,
+}
+impl Scale {
+    fn x(&self, z: f32) -> f32 {
+        self.left + (z - self.low) * self.s
+    }
+    fn y(&self, r: f32) -> f32 {
+        self.cy - r * self.s
+    }
+    fn at(&self, q: [f32; 2]) -> Point {
+        Point::new(self.x(q[0]), self.y(q[1]))
+    }
+    /// `[z0, z1]` × `[ra, rb]`, at least 3 px across, so a thin cut shows.
+    fn rect(&self, z0: f32, z1: f32, ra: f32, rb: f32) -> Rectangle {
+        let (mut x0, mut x1) = (self.x(z0.max(self.low)), self.x(z1));
+        let (mut y0, mut y1) = (self.y(ra.max(rb)), self.y(ra.min(rb)));
+        if x1 - x0 < 3. {
+            let m = (x0 + x1) / 2.;
+            (x0, x1) = (m - 1.5, m + 1.5);
+        }
+        if y1 - y0 < 3. {
+            let m = (y0 + y1) / 2.;
+            (y0, y1) = (m - 1.5, m + 1.5);
+        }
+        Rectangle::new(Point::new(x0, y0), Size::new(x1 - x0, y1 - y0))
+    }
+    /// The chuck's body, then its two jaws.
+    fn chuck(&self, stickout: f32) -> [Rectangle; 3] {
+        let g = self.gripped;
+        [
+            self.rect(self.low, self.back, self.body, -self.body),
+            self.rect(self.back, -stickout, g + self.jaw, g),
+            self.rect(self.back, -stickout, -g, -g - self.jaw),
+        ]
+    }
+}
+/// A label of a side view as placed: where its text is anchored and how,
+/// its box, and the leader back to the point it names when it had to move.
+#[derive(Debug, Clone)]
+struct Label {
+    at: Point,
+    align: Align,
+    rect: Rectangle,
+    leader: Option<(Point, Point)>,
+}
+/// The box of `text` at `size` px anchored at `at` (its middle's height).
+fn text_box(text: &str, size: f32, at: Point, align: Align) -> Rectangle {
+    let (w, h) = (text.chars().count() as f32 * size * 0.6, size + 4.);
+    let x = match align {
+        Align::Right => at.x - w,
+        Align::Center => at.x - w / 2.,
+        _ => at.x,
+    };
+    Rectangle::new(Point::new(x, at.y - h / 2.), Size::new(w, h))
+}
 impl SideView<'_> {
-    fn paint(&self, f: &mut canvas::Frame) {
+    fn scale(&self, size: Size) -> Scale {
         let side = self.side;
-        let size = f.size();
         let start = side.bars.first().map_or(self.bar, |b| b.as_slice());
         let big = outer_of(start).max(side.gripped).max(1.);
         let jaw = (big * 0.45).clamp(5., 25.);
@@ -244,28 +310,117 @@ impl SideView<'_> {
         let (top, bottom, left, right) = (30., 26., 8., 84.);
         let s = ((size.width - left - right) / (high - low).max(1.))
             .min((size.height - top - bottom) / (2. * body));
-        let cy = top + (size.height - top - bottom) / 2.;
-        let x = |z: f32| left + (z - low) * s;
-        let y = |r: f32| cy - r * s;
-        let at = |q: [f32; 2]| Point::new(x(q[0]), y(q[1]));
-        // At least 3 px across, so a thin cut still shows.
-        let rect = |z0: f32, z1: f32, ra: f32, rb: f32| {
-            let (mut x0, mut x1) = (x(z0.max(low)), x(z1));
-            let (mut y0, mut y1) = (y(ra.max(rb)), y(ra.min(rb)));
-            if x1 - x0 < 3. {
-                let m = (x0 + x1) / 2.;
-                (x0, x1) = (m - 1.5, m + 1.5);
-            }
-            if y1 - y0 < 3. {
-                let m = (y0 + y1) / 2.;
-                (y0, y1) = (m - 1.5, m + 1.5);
-            }
-            Rectangle::new(Point::new(x0, y0), Size::new(x1 - x0, y1 - y0))
+        Scale {
+            s,
+            low,
+            left,
+            cy: top + (size.height - top - bottom) / 2.,
+            back,
+            body,
+            jaw,
+            gripped: side.gripped.max(1.),
+        }
+    }
+    /// Each mark's label, placed (LIO-389): beside its point as the mark
+    /// asks, else, when that meets the chuck, the jaws, another label or the
+    /// view's edge, on the other side of the point or up or down from it
+    /// until it meets none, with a leader back to the point. None for a
+    /// mark without a label.
+    fn labels(&self, size: Size) -> Vec<Option<Label>> {
+        let k = self.scale(size);
+        let mut taken: Vec<Rectangle> = k.chuck(self.side.stickout).to_vec();
+        let inside = |r: &Rectangle| {
+            r.x >= 0. && r.y >= 0. && r.x + r.width <= size.width && r.y + r.height <= size.height
         };
+        let meets = |a: &Rectangle, b: &Rectangle| {
+            a.x < b.x + b.width
+                && b.x < a.x + a.width
+                && a.y < b.y + b.height
+                && b.y < a.y + a.height
+        };
+        let mut out = vec![];
+        for m in &self.marks {
+            let (text, size_px, wanted, align, point) = match m {
+                Mark::Never(a, b, s) => {
+                    let (m, n) = (k.at(*a), k.at(*b));
+                    let top = if m.y < n.y { m } else { n };
+                    (
+                        s,
+                        12.,
+                        Point::new(top.x - 5., top.y - 9.),
+                        Align::Right,
+                        top,
+                    )
+                }
+                Mark::Word(q, s, _, align) => (s, 13., k.at(*q), *align, k.at(*q)),
+                _ => {
+                    out.push(None);
+                    continue;
+                }
+            };
+            let flip = |a: Align| match a {
+                Align::Right => Align::Left,
+                Align::Left => Align::Right,
+                other => other,
+            };
+            let mirrored = Point::new(2. * point.x - wanted.x, wanted.y);
+            let mut tries = vec![(wanted, align), (mirrored, flip(align))];
+            for step in 1..8 {
+                let dy = 16. * step as f32;
+                for dy in [-dy, dy] {
+                    tries.push((Point::new(wanted.x, wanted.y + dy), align));
+                    tries.push((Point::new(mirrored.x, wanted.y + dy), flip(align)));
+                }
+            }
+            // Each slid along to lie inside the view, when it is wider.
+            let slid = |(at, align): (Point, Align)| {
+                let r = text_box(text, size_px, at, align);
+                let dx = (-r.x).max(0.) - (r.x + r.width - size.width).max(0.);
+                (Point::new(at.x + dx, at.y), align)
+            };
+            let free = |(at, align): &(Point, Align)| {
+                let r = text_box(text, size_px, *at, *align);
+                inside(&r) && !taken.iter().any(|t| meets(&r, t))
+            };
+            let (at, align) = (tries.into_iter().map(slid))
+                .find(free)
+                .unwrap_or((wanted, align));
+            let rect = text_box(text, size_px, at, align);
+            taken.push(rect);
+            let moved = (at.y - wanted.y).abs() > 1. || (at.x - wanted.x).abs() > 1.;
+            let leader = moved.then(|| {
+                let end = Point::new(
+                    point.x.clamp(rect.x, rect.x + rect.width),
+                    if point.y < rect.y {
+                        rect.y
+                    } else {
+                        rect.y + rect.height
+                    },
+                );
+                (end, point)
+            });
+            out.push(Some(Label {
+                at,
+                align,
+                rect,
+                leader,
+            }));
+        }
+        out
+    }
+    fn paint(&self, f: &mut canvas::Frame) {
+        let side = self.side;
+        let size = f.size();
+        let k = self.scale(size);
+        let (low, back, cy, s) = (k.low, k.back, k.cy, k.s);
+        let x = |z: f32| k.x(z);
+        let y = |r: f32| k.y(r);
+        let at = |q: [f32; 2]| k.at(q);
+        let rect = |z0: f32, z1: f32, ra: f32, rb: f32| k.rect(z0, z1, ra, rb);
         let both = |g: [f32; 4]| [rect(g[0], g[1], g[2], g[3]), rect(g[0], g[1], -g[2], -g[3])];
         let path = |r: Rectangle| canvas::Path::rectangle(r.position(), r.size());
+        let [chuck, jaw_up, jaw_down] = k.chuck(side.stickout);
         // The chuck's body, behind the jaws.
-        let chuck = rect(low, back, body, -body);
         f.fill(&path(chuck), LINE);
         f.stroke(&path(chuck), stroke(MUTED, 1.));
         // The bar, as it is before this step's operation.
@@ -308,11 +463,7 @@ impl SideView<'_> {
             }
         }
         // The jaws over the bar.
-        let g = side.gripped.max(1.);
-        for r in [
-            rect(back, -side.stickout, g + jaw, g),
-            rect(back, -side.stickout, -g, -g - jaw),
-        ] {
+        for r in [jaw_up, jaw_down] {
             f.fill(&path(r), Color { a: 0.55, ..MUTED });
             f.stroke(&path(r), stroke(INK, 1.));
         }
@@ -334,26 +485,33 @@ impl SideView<'_> {
             .map(|g| [g[0].max(low), g[1], g[2], g[3]])
             .collect();
         outline(f, &part, &x, &y, stroke(INK, 2.));
-        for m in &self.marks {
-            match m {
-                Mark::Never(a, b, s) => {
-                    let (m, n) = (at(*a), at(*b));
-                    f.stroke(&canvas::Path::line(m, n), dashed(NEVER, 1.8));
-                    let top = if m.y < n.y { m } else { n };
-                    word(
-                        f,
-                        s,
-                        Point::new(top.x - 5., top.y - 9.),
-                        NEVER,
-                        12.,
-                        Align::Right,
-                        bold_font(),
-                    );
+        // A label that had to move clear of the chuck, the jaws or another
+        // label, with its leader (LIO-389).
+        let label = |f: &mut canvas::Frame, l: &Label, s: &str, c: Color, size: f32| {
+            if let Some((a, b)) = l.leader {
+                f.stroke(&canvas::Path::line(a, b), stroke(Color { a: 0.7, ..c }, 1.));
+                // On a plate, as it may lie over the drawing.
+                f.fill_rectangle(
+                    l.rect.position(),
+                    l.rect.size(),
+                    Color {
+                        a: 0.85,
+                        ..Color::WHITE
+                    },
+                );
+            }
+            word(f, s, l.at, c, size, l.align, bold_font());
+        };
+        for (m, l) in self.marks.iter().zip(self.labels(size)) {
+            match (m, l) {
+                (Mark::Never(a, b, s), Some(l)) => {
+                    f.stroke(&canvas::Path::line(at(*a), at(*b)), dashed(NEVER, 1.8));
+                    label(f, &l, s, NEVER, 12.);
                 }
-                Mark::Tool(kind, q) => tool(f, *kind, at(*q), cy, s),
-                Mark::Path(a, b) => arrow(f, at(*a), at(*b), TOOL, 2.),
-                Mark::Word(q, s, c, align) => word(f, s, at(*q), *c, 13., *align, bold_font()),
-                Mark::Dot(q, s) => {
+                (Mark::Tool(kind, q), _) => tool(f, *kind, at(*q), cy, s),
+                (Mark::Path(a, b), _) => arrow(f, at(*a), at(*b), TOOL, 2.),
+                (Mark::Word(_, s, c, _), Some(l)) => label(f, &l, s, *c, 13.),
+                (Mark::Dot(q, s), _) => {
                     let p = at(*q);
                     f.fill(&canvas::Path::circle(p, 5.), ACCENT);
                     word(
@@ -366,7 +524,7 @@ impl SideView<'_> {
                         bold_font(),
                     );
                 }
-                Mark::Span(a, b, s) => {
+                (Mark::Span(a, b, s), _) => {
                     let (m, n) = (at(*a), at(*b));
                     let mid = Point::new((m.x + n.x) / 2., (m.y + n.y) / 2.);
                     arrow(f, mid, m, ACCENT, 1.8);
@@ -381,7 +539,7 @@ impl SideView<'_> {
                         bold_font(),
                     );
                 }
-                Mark::Across(z, r, s) => {
+                (Mark::Across(z, r, s), _) => {
                     let (m, n) = (at([*z, *r]), at([*z, -*r]));
                     let mid = Point::new(m.x, cy);
                     arrow(f, mid, m, ACCENT, 2.);
@@ -620,7 +778,8 @@ impl canvas::Program<Message> for DialFace {
         for i in (0..div).step_by(every) {
             let a = TAU * i as f32 / div as f32;
             let big = i % 10 == 0;
-            let r0 = r - if big { 10. } else { 5. };
+            let tick = if big { 10. } else { 5. };
+            let r0 = r - tick * (r / 55.).max(1.);
             f.stroke(
                 &canvas::Path::line(point(a, r0), point(a, r)),
                 stroke(ink, if big { 1.4 } else { 1. }),
@@ -629,9 +788,9 @@ impl canvas::Program<Message> for DialFace {
                 word(
                     &mut f,
                     &trimmed(i as f32 * self.turn / div as f32),
-                    point(a, r - (r * 0.3).clamp(15., 21.)),
+                    point(a, r - (r * 0.3).clamp(15., 34.)),
                     if grey { ink } else { MUTED },
-                    if r < 60. { 10. } else { 11. },
+                    (r * 0.12).clamp(10., 17.),
                     Align::Center,
                     Font::MONOSPACE,
                 );
@@ -665,18 +824,18 @@ impl canvas::Program<Message> for DialFace {
                         &arc,
                         canvas::Stroke {
                             line_cap: canvas::LineCap::Round,
-                            ..stroke(Color { a: 0.85, ..ACCENT }, 6.)
+                            ..stroke(Color { a: 0.85, ..ACCENT }, (r * 0.05).max(6.))
                         },
                     );
                     let tip = Point::new(c.x + end.cos() * (r - 3.), c.y + end.sin() * (r - 3.));
-                    f.fill(&canvas::Path::circle(tip, 5.5), ACCENT);
+                    f.fill(&canvas::Path::circle(tip, (r * 0.045).max(5.5)), ACCENT);
                 }
                 word(
                     &mut f,
                     &fixed(*v, places),
                     c,
                     INK,
-                    (r * 0.3).clamp(14., 20.),
+                    (r * 0.3).clamp(14., 34.),
                     Align::Center,
                     Font {
                         weight: iced::font::Weight::Bold,
@@ -1024,8 +1183,31 @@ fn dial_box<'a>(p: &Page<'a>, d: &Dial, sub: String, size: f32) -> Element<'a, M
     ]
     .spacing(2)
     .align_x(Alignment::Center)
-    .width(if d.out { size + 100. } else { size + 60. })
+    .width(if d.out { size + 40. } else { size + 24. })
     .into()
+}
+/// How wide a dial is drawn, px (LIO-389): as wide as `n` pictures side by
+/// side leave of the right-hand column (`frame`'s 9 parts of 20 of the card
+/// beside the setups list), and no taller than the window leaves above a
+/// Pass screen's three readouts, so that at 1024 × 700 they are all in
+/// sight; 84 to 260.
+fn dial_size(p: &Page<'_>, n: f32) -> f32 {
+    let (pictures, numbers) = split(p);
+    let column = (p.app.window_width - 300.) * f32::from(numbers) / f32::from(pictures + numbers);
+    (column / n - 30.)
+        .min(p.app.window_height - 608.)
+        .clamp(84., 260.)
+}
+/// Whether the window is narrow: the lathe's numbers then take half the card
+/// (`split`) and its readouts' keys only their width (LIO-389).
+fn narrow(p: &Page<'_>) -> bool {
+    p.app.window_width < 1200.
+}
+/// How the side view and the numbers share a lathe screen's card, as
+/// `steps::frame` has it: half each at a narrow window, so that a Pass
+/// screen's readouts and both dials are in sight at 1024 × 700.
+pub(super) fn split(p: &Page<'_>) -> (u16, u16) {
+    if narrow(p) { (1, 1) } else { (11, 9) }
 }
 /// The dials side by side, centred.
 fn dials<'a>(items: Vec<Element<'a, Message>>) -> Element<'a, Message> {
@@ -1052,6 +1234,7 @@ fn big<'a>(s: impl Into<String>, state: Lit) -> Element<'a, Message> {
 /// One line of what to do: its order, what it is, the big number (or a
 /// box to type it) and short tags; tapping it lights the next.
 fn line<'a>(
+    narrow: bool,
     order: Option<u8>,
     key: &str,
     value: Element<'a, Message>,
@@ -1060,7 +1243,10 @@ fn line<'a>(
     msg: Option<Message>,
 ) -> Element<'a, Message> {
     let now = state == Lit::Now;
-    let mut l = row![].spacing(10).align_y(Alignment::Center);
+    // At a narrow window the key takes only its width, so that the tags
+    // keep room beside the number (LIO-389).
+    let gap = if narrow { 6. } else { 10. };
+    let mut l = row![].spacing(gap).align_y(Alignment::Center);
     if let Some(n) = order {
         let mark = if state == Lit::Done {
             "✓".to_string()
@@ -1070,7 +1256,16 @@ fn line<'a>(
         l = l.push(disc(mark, now, 22.));
     }
     l = l
-        .push(text(key.to_string()).size(13).color(MUTED).width(78))
+        .push(
+            text(key.to_string())
+                .size(13)
+                .color(MUTED)
+                .width(if narrow {
+                    iced::Length::Shrink
+                } else {
+                    iced::Length::Fixed(78.)
+                }),
+        )
         .push(value)
         .push(space().width(iced::Length::Fill));
     let mut t = column![].spacing(1).align_x(Alignment::End);
@@ -1252,7 +1447,8 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
         );
     };
     let start = side.bars.first().map_or(&[][..], |b| b.as_slice());
-    let view = |bar: &'a [[f32; 4]], marks: Vec<Mark>, height: f32| -> Element<'a, Message> {
+    // The side view fills the room its panel has (LIO-389).
+    let view = |bar: &'a [[f32; 4]], marks: Vec<Mark>| -> Element<'a, Message> {
         use std::hash::{Hash, Hasher};
         let mut h = std::hash::DefaultHasher::new();
         (p.key, p.at, p.item, "lathe").hash(&mut h);
@@ -1263,11 +1459,12 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             marks,
         })
         .width(iced::Length::Fill)
-        .height(height)
+        .height(iced::Length::Fill)
         .into()
     };
     let note = |s: String| -> Element<'a, Message> { text(s).size(12).color(MUTED).into() };
     let item = p.item;
+    let narrow = narrow(p);
     let reached = |i: usize| Some(Message::Guide(GuideAction::Reached(i)));
     let machine = &p.setup.machine;
     let k_of = |op: usize| p.done(op);
@@ -1318,6 +1515,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             let right = column![
                 label("Turn a light skin, then:"),
                 line(
+                    narrow,
                     Some(1),
                     "cross slide",
                     big(format!("{divisions} div"), lit(0, item)),
@@ -1329,6 +1527,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     reached(0),
                 ),
                 line(
+                    narrow,
                     Some(2),
                     "measure",
                     big("Ø ?", lit(1, item)),
@@ -1345,7 +1544,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             (
                 "Check the cross-slide dial".into(),
                 "once per machine: diameter or radius?",
-                view(start, marks, 380.),
+                view(start, marks),
                 right,
             )
         }
@@ -1389,6 +1588,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             let right = column![
                 chips(c),
                 line(
+                    narrow,
                     None,
                     "stick out",
                     text(mm(*stickout))
@@ -1407,6 +1607,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     None,
                 ),
                 line(
+                    narrow,
                     None,
                     "in the jaws",
                     big(mm(*grip), Lit::Next),
@@ -1418,7 +1619,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             (
                 "Hold".into(),
                 "the bar in the chuck",
-                view(start, marks, 380.),
+                view(start, marks),
                 right,
             )
         }
@@ -1460,6 +1661,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     "Touch the end, measure the bar"
                 }),
                 line(
+                    narrow,
                     Some(1),
                     "carriage",
                     big("0", lit(0, item)),
@@ -1468,6 +1670,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     reached(0),
                 ),
                 line(
+                    narrow,
                     Some(2),
                     "measure",
                     measure_box(p, key, *measured, *planned),
@@ -1478,6 +1681,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             ];
             if *cross {
                 right = right.push(line(
+                    narrow,
                     Some(3),
                     "cross slide",
                     big("0", lit(2, item)),
@@ -1493,7 +1697,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 } else {
                     "the carriage; the hole is touched later"
                 },
-                view(start, marks, 380.),
+                view(start, marks),
                 right,
             )
         }
@@ -1516,6 +1720,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 let i = n;
                 n += 1;
                 line(
+                    narrow,
                     Some(i as u8 + 1),
                     key,
                     big(value, lit(i, item)),
@@ -1578,7 +1783,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             (
                 "Touch".into(),
                 "zero the dials for this tool",
-                view(bar, marks, 380.),
+                view(bar, marks),
                 right,
             )
         }
@@ -1611,7 +1816,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 p,
                 top,
                 format!("in {} from the touch", fixed(*face_off, 2)),
-                150.,
+                dial_size(p, 2.),
             )];
             if swung.is_some() {
                 face_dials.push(top_angle(90., false));
@@ -1626,6 +1831,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 chips(vec![set_back(*swung), warn_chip("lock the carriage")]),
                 dials(face_dials),
                 line(
+                    narrow,
                     Some(1),
                     "top slide",
                     big(reading(p, top).total, lit(0, item)),
@@ -1634,6 +1840,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     reached(0),
                 ),
                 line(
+                    narrow,
                     Some(2),
                     "carriage",
                     big("0", lit(1, item)),
@@ -1645,7 +1852,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             (
                 "Face".into(),
                 "the only screen: the tool and how much",
-                view(bar, marks, 380.),
+                view(bar, marks),
                 right,
             )
         }
@@ -1718,7 +1925,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             let from = touched(g, *op, p.at).unwrap_or(2. * big_r);
             let depth = along.first().map_or(0., |a| (2. * a.0 - from).abs());
             let mut left = column![
-                view(bar, marks, 380.),
+                view(bar, marks),
                 note(format!(
                     "{} → {} · {} long · {} off the Ø a pass · the last after you measure",
                     dia(from),
@@ -1781,11 +1988,17 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                         } else {
                             format!("{way} to {} ({})", c.total, dia(*diameter))
                         },
-                        112.
+                        dial_size(p, 2.)
                     ),
-                    dial_box(p, carriage, format!("stop at {}", at.short), 112.),
+                    dial_box(
+                        p,
+                        carriage,
+                        format!("stop at {}", at.short),
+                        dial_size(p, 2.)
+                    ),
                 ]),
                 line(
+                    narrow,
                     Some(1),
                     "back off",
                     big("—", lit(0, item)),
@@ -1794,6 +2007,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     reached(0),
                 ),
                 line(
+                    narrow,
                     Some(2),
                     "cross slide",
                     big(cross_big, lit(1, item)),
@@ -1802,6 +2016,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     reached(1),
                 ),
                 line(
+                    narrow,
                     Some(3),
                     "carriage",
                     big(at.short.clone(), lit(2, item)),
@@ -1866,6 +2081,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             let mut right = column![
                 label(format!("Measure the {what}")),
                 line(
+                    narrow,
                     None,
                     "about",
                     big(dia(*expect), Lit::Next),
@@ -1874,6 +2090,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     None,
                 ),
                 line(
+                    narrow,
                     Some(1),
                     "measured",
                     measure_box(p, key, *measured, *expect),
@@ -1895,14 +2112,14 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                         } else {
                             format!("{way} to {} → {}", c.total, dia(*target))
                         },
-                        140.,
+                        dial_size(p, 1.),
                     )]));
             }
             right = right.push(pass_tiles(p, *op));
             (
                 "Measure".into(),
                 "before the last pass",
-                view(bar, marks, 380.),
+                view(bar, marks),
                 right,
             )
         }
@@ -1939,9 +2156,10 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     p,
                     quill,
                     format!("{} deep + {} for the point", mm(*depth), fixed(*point, 2)),
-                    150.
+                    dial_size(p, 1.)
                 )]),
                 line(
+                    narrow,
                     Some(1),
                     "tailstock",
                     big("lock", lit(0, item)),
@@ -1950,6 +2168,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     reached(0),
                 ),
                 line(
+                    narrow,
                     Some(2),
                     "quill",
                     big(q.total.clone(), lit(1, item)),
@@ -1964,7 +2183,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             (
                 "Drill".into(),
                 "the tailstock quill",
-                view(bar, marks, 380.),
+                view(bar, marks),
                 right,
             )
         }
@@ -2002,9 +2221,10 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     p,
                     quill,
                     format!("{} deep + {} for the lead", mm(*depth), mm(*lead)),
-                    150.
+                    dial_size(p, 1.)
                 )]),
                 line(
+                    narrow,
                     Some(1),
                     "tailstock",
                     big("lock", lit(0, item)),
@@ -2016,6 +2236,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     reached(0),
                 ),
                 line(
+                    narrow,
                     Some(2),
                     "quill",
                     big(q.total.clone(), lit(1, item)),
@@ -2027,6 +2248,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     reached(1),
                 ),
                 line(
+                    narrow,
                     Some(3),
                     "tap",
                     big(format!("{} turns", trim_turns(*turns)), lit(2, item)),
@@ -2041,7 +2263,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             (
                 "Tap".into(),
                 "by hand, the spindle off",
-                view(bar, marks, 380.),
+                view(bar, marks),
                 right,
             )
         }
@@ -2084,6 +2306,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     chip("oil"),
                 ]),
                 line(
+                    narrow,
                     Some(1),
                     "die",
                     big("square", lit(0, item)),
@@ -2095,6 +2318,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     reached(0),
                 ),
                 line(
+                    narrow,
                     Some(2),
                     "holder",
                     big(format!("{} turns", trim_turns(*turns)), lit(1, item)),
@@ -2110,7 +2334,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             (
                 "Die".into(),
                 "by hand, the spindle off",
-                view(bar, marks, 380.),
+                view(bar, marks),
                 right,
             )
         }
@@ -2147,12 +2371,8 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 ACCENT,
                 Align::Right,
             ));
-            // Three pictures in a row are smaller.
-            let size_of = if swung.is_some() && carriage.is_some() {
-                104.
-            } else {
-                130.
-            };
+            // Sized as three in a row: its chips take two or three rows.
+            let size_of = dial_size(p, 3.);
             let mut d = vec![];
             let mut rows = vec![];
             if let Some(c) = carriage {
@@ -2164,6 +2384,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     size_of,
                 ));
                 rows.push(line(
+                    narrow,
                     Some(1),
                     "carriage",
                     big(at.short, lit(0, item)),
@@ -2186,6 +2407,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 d.push(top_angle(90., false));
             }
             rows.push(line(
+                narrow,
                 Some(n as u8 + 1),
                 "top slide",
                 big(reading(p, top).total, lit(n, item)),
@@ -2210,7 +2432,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             (
                 "Chamfer".into(),
                 "a 45° tool edge, fed along the bed",
-                view(bar, marks, 380.),
+                view(bar, marks),
                 right,
             )
         }
@@ -2262,12 +2484,13 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     p,
                     c,
                     format!("blade's left side at {}", reading(p, c).short),
-                    130.,
+                    dial_size(p, 2.),
                 ));
             }
             let mut rows = vec![];
             if let Some(c) = carriages.get(i) {
                 rows.push(line(
+                    narrow,
                     Some(1),
                     "carriage",
                     big(reading(p, c).short, Lit::Now),
@@ -2284,9 +2507,10 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                         p,
                         c,
                         format!("in {} → {}", cr.total, dia(*bottom)),
-                        130.,
+                        dial_size(p, 2.),
                     ));
                     rows.push(line(
+                        narrow,
                         Some(2),
                         "cross slide",
                         big(cr.total, Lit::Next),
@@ -2296,6 +2520,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     ));
                 }
                 None => rows.push(line(
+                    narrow,
                     Some(2),
                     "cross slide",
                     big("centre", Lit::Next),
@@ -2327,7 +2552,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             } else {
                 ("Groove", "one plunge")
             };
-            (title.into(), sub, view(bar, marks, 380.), right)
+            (title.into(), sub, view(bar, marks), right)
         }
         LatheStep::ThreadPass {
             op,
@@ -2372,7 +2597,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 Align::Center,
             ));
             let mut left = column![
-                view(bar, marks, 380.),
+                view(bar, marks),
                 note(format!(
                     "gearbox {} · half-nuts stay closed: back the tool out, reverse the spindle to come back",
                     mm(*pitch)
@@ -2403,11 +2628,12 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                         } else {
                             format!("pass {index}: in to {}", t.total)
                         },
-                        118.
+                        dial_size(p, 2.)
                     ),
                     top_angle(*angle, top.out),
                 ]),
                 line(
+                    narrow,
                     Some(1),
                     "cross slide",
                     big("0", lit(0, item)),
@@ -2416,6 +2642,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     reached(0),
                 ),
                 line(
+                    narrow,
                     Some(2),
                     "top slide",
                     big(t.total.clone(), lit(1, item)),
@@ -2439,6 +2666,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     reached(1),
                 ),
                 line(
+                    narrow,
                     Some(3),
                     "half-nuts",
                     big("close", lit(2, item)),
@@ -2596,6 +2824,67 @@ mod tests {
         }
     }
 
+    /// LIO-389: at 1024 × 700 a Pass screen's third readout, the carriage's
+    /// stop, lies in the visible part of its column; the side view's red
+    /// labels keep off the chuck and the jaws at both window sizes.
+    #[test]
+    fn a_pass_screen_shows_its_carriage_stop_at_1024_and_labels_keep_off_the_jaws() {
+        let mut a = crate::steps::tests::lathe_app("Diameter", |_| {});
+        let window = iced::Size::new(1024., 700.);
+        let _ = a.update(Message::Resized(window));
+        let _ = shown(&mut a, 0, |l| matches!(l, L::Pass { .. }));
+        let texts = crate::ui::probe::placed(a.view(), window);
+        let (_, stop) = texts.iter().find(|(t, _)| t == "carriage").unwrap();
+        let column = (crate::ui::probe::scrollables(a.view(), window).into_iter())
+            .map(|(_, b)| b)
+            .filter(|b| b.x <= stop.x && stop.x <= b.x + b.width && b.y <= stop.y)
+            .min_by(|p, q| (p.width * p.height).total_cmp(&(q.width * q.height)))
+            .unwrap();
+        assert!(
+            stop.y + stop.height <= column.y + column.height,
+            "{stop:?} below {column:?}"
+        );
+        // The shoulder 6 mm from the jaws and the thread's end, as the
+        // Outside's and the Thread's passes draw them.
+        let side = a.guide_at().unwrap().0.side.clone().unwrap();
+        let bar = side.bars[1].clone();
+        let view = super::SideView {
+            key: 0,
+            side: &side,
+            bar: &bar,
+            marks: vec![
+                super::Mark::Never(
+                    [-64., 18.5],
+                    [-64., 27.1],
+                    "shoulder 64 from the end".into(),
+                ),
+                super::Mark::Never(
+                    [-39., 18.5],
+                    [-39., 22.],
+                    "thread stops 39 from the end".into(),
+                ),
+            ],
+        };
+        let meets = |a: &iced::Rectangle, b: &iced::Rectangle| {
+            a.x < b.x + b.width
+                && b.x < a.x + a.width
+                && a.y < b.y + b.height
+                && b.y < a.y + a.height
+        };
+        // The side view's room at 1440 × 900 and at 1024 × 700.
+        for size in [iced::Size::new(630., 560.), iced::Size::new(390., 330.)] {
+            let chuck = view.scale(size).chuck(side.stickout);
+            let labels: Vec<_> = view.labels(size).into_iter().flatten().collect();
+            assert_eq!(labels.len(), 2);
+            for l in &labels {
+                assert!(
+                    !chuck.iter().any(|c| meets(&l.rect, c)),
+                    "{size:?}: {l:?} on {chuck:?}"
+                );
+            }
+            assert!(!meets(&labels[0].rect, &labels[1].rect), "{labels:?}");
+        }
+    }
     #[test]
     fn the_tap_screen_shows_the_quill_the_turns_and_how_to_turn_it() {
         let (mut doc, mesh, tap) = crate::turn::tests::m12_job();

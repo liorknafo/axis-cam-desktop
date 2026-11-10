@@ -14995,6 +14995,26 @@ pub(crate) mod probe {
             })
             .collect()
     }
+    struct Placed(Vec<(String, iced::Rectangle)>);
+    impl Operation for Placed {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+        fn text(&mut self, _: Option<&Id>, bounds: iced::Rectangle, text: &str) {
+            self.0.push((text.to_string(), bounds));
+        }
+    }
+    /// The texts of `page` and where each is laid out, unscrolled.
+    pub(crate) fn placed(
+        page: Element<'_, Message>,
+        window: Size,
+    ) -> Vec<(String, iced::Rectangle)> {
+        let mut renderer = renderer();
+        let mut ui = UserInterface::build(page, window, Cache::default(), &mut renderer);
+        let mut placed = Placed(vec![]);
+        ui.operate(&renderer, &mut placed);
+        placed.0
+    }
     struct Bounds(Vec<(Option<Id>, iced::Rectangle)>);
     impl Operation for Bounds {
         fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
