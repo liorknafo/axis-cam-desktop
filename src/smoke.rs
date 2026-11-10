@@ -8019,6 +8019,33 @@ flood = { pin = 8 }
         let _ = a.view();
     }
 
+    /// The legend under the view names the path's colours with the
+    /// operation's feed range while the path is shown, and not with Toolpath
+    /// off (LIO-395).
+    #[test]
+    fn the_legend_names_the_paths_colours_while_it_is_shown() {
+        let mut a = app();
+        let (mut doc, mesh) = crate::post::fixture::job();
+        doc.active = doc.setups[0].id.clone();
+        a.doc = doc;
+        a.imported_mesh = Some(mesh);
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.update(Message::Generate);
+        let (slowest, fastest) = (a.active_simulation())
+            .and_then(|s| s.plan.feed_range())
+            .expect(&a.status);
+        assert!(fastest > slowest);
+        let keys = [
+            format!("feed {slowest:.0} mm/min"),
+            format!("feed {fastest:.0} mm/min"),
+            "rapid".to_string(),
+        ];
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        assert!(a.paths);
+        shows(&a, &keys);
+        let _ = a.update(Message::TogglePaths);
+        lacks(&a, &keys);
+    }
     /// Generates the selected Facing in `a` and writes its pictures to `out`.
     fn picture_the_outline_facing(a: &mut App, mesh: &crate::mesh::Mesh, out: &std::path::Path) {
         let size = iced::Size::new(1440., 1700.);

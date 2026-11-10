@@ -2030,7 +2030,9 @@ impl Viewport<'_> {
             );
             outline = crossings;
         }
-        if self.show_stock && sim.volume.is_none() {
+        // Without a volume, or until its surface is worked out after a
+        // Generate, the top-down grid stands in: never an empty scene (LIO-395).
+        if self.show_stock && (sim.volume.is_none() || sim.stock_surface.is_none()) {
             let mut grid = |points: &[[f32; 3]], color: [u8; 4]| {
                 let mut points: Vec<_> = points.iter().map(|v| v.map(|n| n * scale)).collect();
                 if let Some(cut) = cut {
@@ -2218,8 +2220,27 @@ impl Viewport<'_> {
                 lines.push((shown(from), shown(to), colour));
             }
             lines.sort_by(|p, q| (p.0.1 + p.1.1).total_cmp(&(q.0.1 + q.1.1)));
+            // Ended, the cuts lie over the faces they made, closer than a
+            // pixel: a wash of their colours, each pixel once however many
+            // cross it, so the cut part reads through them (LIO-395).
+            let under = (sim.seconds >= sim.plan.duration).then(|| rgba.to_vec());
             for (a, b, colour) in lines {
                 raster_depth_line(rgba, depths, w, h, a, b, colour, ratio * 0.5);
+            }
+            if let Some(under) = under {
+                let pixels = rgba.as_chunks_mut::<4>().0.iter_mut();
+                for (px, was) in pixels.zip(under.as_chunks::<4>().0) {
+                    if px != was {
+                        // The colour over what was there, which may be the
+                        // empty background (straight alpha).
+                        let (s, d) = (PATH_WASH, was[3] as f32 / 255.);
+                        let alpha = s + d * (1. - s);
+                        for (p, w) in px[..3].iter_mut().zip(&was[..3]) {
+                            *p = ((*p as f32 * s + *w as f32 * d * (1. - s)) / alpha) as u8;
+                        }
+                        px[3] = (alpha * 255.).round() as u8;
+                    }
+                }
             }
         }
         outline
@@ -4444,6 +4465,8 @@ fn raster_rows_with(
         }
     }
 }
+/// How much of an ended preview's path colour is over the faces under it.
+const PATH_WASH: f32 = 0.35;
 #[allow(clippy::too_many_arguments)]
 fn raster_depth_line(
     pixels: &mut [u8],
@@ -5493,6 +5516,87 @@ mod tests {
             bounds: Placement::new(&mesh, job.setups.first()).bounds,
         };
         assert_ne!(key(None, vec![]), key(None, vec![jaw]));
+    }
+    /// A simulation whose cut stock's surface is still being worked out has
+    /// its stock drawn all the same; an ended one's path is a wash over the
+    /// faces it cut, which show through it (LIO-395).
+    #[test]
+    fn a_simulation_shows_its_stock_before_the_surface_and_its_faces_through_its_path() {
+        let (doc, mesh, report) = crate::proposal::tests::block();
+        let good = crate::proposal::tests::good(&report);
+        let job = crate::proposal::build(&doc, &mesh, &report, &good).unwrap();
+        let mut sim =
+            crate::planner::view_after(&job, &mesh, 0, 0, crate::stock_surface::Detail::Draft)
+                .unwrap();
+        sim.seek(1.);
+        let view = |simulation, show_stock, show_paths| Viewport {
+            setup: job.setups.first(),
+            operation: None,
+            mesh: &mesh,
+            simulation,
+            sample: false,
+            camera: Camera::default(),
+            picking: false,
+            pin_holes: Default::default(),
+            hole_outlines: vec![],
+            pin_aim: Default::default(),
+            show_stock,
+            show_paths,
+            progress: None,
+            holding: vec![],
+            first_setup: None,
+            tools: &[],
+            framed: vec![],
+            leftover: None,
+            live: None,
+            live_stock: None,
+            a: None,
+            live_volume: None,
+            run_stock: None,
+            start_stock: None,
+            uncut: &[],
+            uncut_pieces: &[],
+            thin: &crate::uncut::EMPTY,
+            show_uncut: true,
+            section: Default::default(),
+            frame: None,
+        };
+        let bounds = Rectangle {
+            x: 0.,
+            y: 0.,
+            width: 300.,
+            height: 200.,
+        };
+        let pixels = |v: Viewport| {
+            let p = v.projector(bounds);
+            v.pixels(&p, bounds, None).2
+        };
+        let differ = |a: &[u8], b: &[u8]| {
+            (a.chunks(4).zip(b.chunks(4)))
+                .filter(|(a, b)| a != b)
+                .count()
+        };
+        let mut unmeshed = sim.clone();
+        unmeshed.stock_surface = None;
+        let stock = pixels(view(Some(&unmeshed), true, false));
+        let none = pixels(view(Some(&unmeshed), false, false));
+        assert!(differ(&stock, &none) > 300 * 200 / 10, "the stock is drawn");
+        // The path changes many pixels, each by no more than its wash.
+        let bare = pixels(view(Some(&sim), true, false));
+        let washed = pixels(view(Some(&sim), true, true));
+        assert!(differ(&bare, &washed) > 1000);
+        // Over a face its colour by no more than the wash; over the empty
+        // background no more opaque than the wash.
+        let limit = PATH_WASH * 255. + 1.;
+        let (bare, washed) = (bare.as_chunks::<4>().0, washed.as_chunks::<4>().0);
+        for (a, b) in bare.iter().zip(washed) {
+            let most = if a[3] == 255 {
+                (0..3).map(|k| a[k].abs_diff(b[k])).max().unwrap()
+            } else {
+                b[3].saturating_sub(a[3])
+            };
+            assert!(f32::from(most) <= limit, "{a:?} {b:?}");
+        }
     }
     /// Without a simulation the view shows the stock the operation starts
     /// from as the operations before it leave it: solid, as the simulation
