@@ -2884,6 +2884,15 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         b.plan.target = b.plan.target.min(target);
         b.plan.levels += levels;
         b.start_at([h.center[0], h.center[1], cutting_top], Some(cutting_top))?;
+        // By hand, X and Y are set and locked at each hole: the pass time
+        // (LIO-377).
+        if crate::manual::is_manual(&setup.machine) {
+            b.dwell(
+                num(&setup.machine.p, "pass_time")
+                    .filter(|t| *t >= 0.)
+                    .unwrap_or(0.),
+            );
+        }
         for level in 1..=levels {
             let depth = (cutting_top - level as f32 * peck).max(target);
             b.push(
@@ -7202,6 +7211,27 @@ pub(crate) mod tests {
         }
         assert_eq!(a, b);
         assert_plan(manual);
+    }
+    #[test]
+    fn a_hand_drilled_hole_costs_the_pass_time_and_a_cnc_one_does_not() {
+        let mesh = mesh::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/four-setup-block.3mf"),
+        )
+        .unwrap();
+        let (mut setup, mut op, tool) = fixture(Strategy::Drill);
+        select_top(&mut op, &mesh);
+        let n = holes(&setup, &op, &mesh).unwrap().len() as f32;
+        let duration = |setup: &Setup, pass: &str| {
+            let mut setup = setup.clone();
+            setup.machine.p.insert("pass_time".into(), pass.into());
+            generate(&setup, &op, &tool, &mesh).unwrap().duration
+        };
+        // On the CNC the pass time is nothing to it.
+        assert_eq!(duration(&setup, "20"), duration(&setup, "0"));
+        // By hand each hole takes 20 s more to set X and Y (LIO-377).
+        setup.machine = crate::manual::defaults();
+        let more = duration(&setup, "20") - duration(&setup, "0");
+        assert!((more - 20. * n).abs() < 0.01, "{more} for {n} holes");
     }
     #[test]
     fn box_coordinates_are_work_coordinates_on_the_setups_zero() {

@@ -1734,6 +1734,19 @@ fn progress(g: &Guide, s: &Section, at: usize, item: usize) -> String {
         _ => String::new(),
     }
 }
+/// What a section's count counts: "4 passes", "1 hole". A Boring's count
+/// is its passes.
+fn counted(setup: &Setup, s: &Section) -> String {
+    let hole =
+        s.op.and_then(|op| setup.operations.get(op))
+            .is_some_and(|o| o.strategy == Strategy::Drill && !o.boring());
+    match (s.count, hole) {
+        (1, true) => "1 hole".into(),
+        (1, false) => "1 pass".into(),
+        (n, true) => format!("{n} holes"),
+        (n, false) => format!("{n} passes"),
+    }
+}
 fn section_name(app: &App, g: &Guide, s: &Section) -> String {
     let lathe = (app.doc.setups.get(g.setup)).is_some_and(|s| crate::lathe::is_lathe(&s.machine));
     match (s.op, &g.steps[s.steps.start]) {
@@ -1763,10 +1776,11 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
     for (i, s) in g.sections.iter().enumerate() {
         let done = s.steps.end <= at;
         let now = i == here;
+        // Numbered from 1 (LIO-377).
         let mark = if done {
             "✓".to_string()
         } else {
-            i.to_string()
+            (i + 1).to_string()
         };
         let mut face = row![disc(mark, now, 20.), text(section_name(app, g, s)).size(13)]
             .spacing(6)
@@ -1774,7 +1788,7 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
         let small = if now {
             progress(g, s, at, app.guide_item)
         } else if s.count > 0 && !done {
-            s.count.to_string()
+            counted(setup, s)
         } else {
             String::new()
         };
@@ -1808,7 +1822,7 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
     // The header of the section the place is in.
     let s = &g.sections[here];
     let mut header = row![
-        disc(here.to_string(), true, 26.),
+        disc((here + 1).to_string(), true, 26.),
         bold(section_name(app, g, s), 17)
     ]
     .spacing(10)
@@ -1818,7 +1832,7 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
     if lathe && let Some(op) = s.op {
         tags.extend(turning::header(&page, op, s));
     } else if let Some(op) = s.op
-        && let Some(o) = setup.operations.get(op)
+        && setup.operations.get(op).is_some()
     {
         let d = num(
             &page.tool(op).map_or(Default::default(), |t| t.p.clone()),
@@ -1828,18 +1842,7 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
             tags.push(chip(page.tool_name(op, d)));
         }
         if s.count > 0 {
-            // A Boring's count is its passes.
-            let what = if o.strategy == Strategy::Drill && !o.boring() {
-                "hole"
-            } else {
-                "pass"
-            };
-            let what = match (s.count, what) {
-                (1, w) => w.to_string(),
-                (_, "pass") => "passes".into(),
-                (_, w) => format!("{w}s"),
-            };
-            tags.push(chip(format!("{} {what}", s.count)));
+            tags.push(chip(counted(setup, s)));
         }
         tags.push(chip(format!("~{} min", s.minutes.ceil())));
     }
@@ -3893,7 +3896,8 @@ pub(crate) mod tests {
         let t = texts(&a);
         assert_eq!(t.iter().filter(|s| *s == "pass 2/2").count(), 2, "{t:?}");
         // The sections ahead show their counts, the next setup is last.
-        assert!(t.contains(&"Holes".to_string()) && t.contains(&"4".to_string()));
+        // Each with what it counts (LIO-377).
+        assert!(t.contains(&"Holes".to_string()) && t.contains(&"4 holes".to_string()));
         assert!(
             t.contains(&format!("→ {}", a.doc.setups[1].name())),
             "{t:?}"

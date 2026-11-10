@@ -7131,16 +7131,17 @@ fn wizard(app: &App) -> Element<'_, Message> {
                 .push(field(p, "name", "Machine name", t))
                 .push(choice_value(
                     p,
+                    // Both hand machines are manual (LIO-377).
                     if lathe::is_lathe(m) {
-                        "Lathe"
+                        "Manual lathe"
                     } else if manual::is_manual(m) {
-                        "Manual"
+                        "Manual mill"
                     } else {
                         "CNC"
                     },
                     "kind",
                     "Machine kind",
-                    &["CNC", "Manual", "Lathe"],
+                    &["CNC", "Manual mill", "Manual lathe"],
                     t,
                 ));
             if !manual::is_hand(m) {
