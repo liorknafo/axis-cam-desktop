@@ -1521,7 +1521,7 @@ impl App {
         face.p.insert("face_off".into(), "0.5".into());
         self.doc.machines.push(lathe);
         self.doc.tools.push(tool);
-        self.doc.add_lathe_setup().expect("a lathe setup");
+        self.doc.add_lathe_setup(None).expect("a lathe setup");
         let at = (self.doc.setups.iter())
             .position(|s| crate::lathe::is_lathe(&s.machine))
             .expect("the lathe setup");

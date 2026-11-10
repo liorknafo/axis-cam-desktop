@@ -598,7 +598,7 @@ On a lathe setup the ribbon offers only **Turn** and **Drill**; Turn is dimmed a
 
 ### + Add lathe setup
 
-**+ Add lathe setup** on the setup list (shown once the library has a lathe) inserts a setup named as the lathe, and opens it, with a Ø50 × 100 round bar held in a chuck, the 3-jaw when the library has one, the grip the chuck's jaw length and the rest of the bar standing out. It goes before the first CNC setup. Placed first it takes the old first setup's orientation (so that the turning axis is the one you chose), and the old first setup then starts from the bar it leaves; a bar of another size is set in the setup editor. A library without a chuck is given the chuck starters. Turning a box stock into a round bar is not automatic: pick Round bar.
+**+ Add lathe setup** on the setup list (shown once the library has a lathe) inserts a setup named as the lathe, and opens it, with a round bar held in a chuck, the 3-jaw when the library has one, the grip the chuck's jaw length and the rest of the bar standing out. With a part loaded the bar fits it: a Relative round bar 1 mm over the part's largest radius about the axis, 1 mm beyond its free end to face off, and at the chuck's end the grip and 10 mm for the part off. With no part loaded (or on the sample) it is a Ø50 × 100 bar. It goes before the first CNC setup. Placed first it takes the old first setup's orientation (so that the turning axis is the one you chose), and the old first setup then starts from the bar it leaves; a bar of another size is set in the setup editor. A library without a chuck is given the chuck starters. Turning a box stock into a round bar is not automatic: pick Round bar.
 
 ### The Steps page for a lathe
 

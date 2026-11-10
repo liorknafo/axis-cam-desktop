@@ -4197,7 +4197,7 @@ pub(crate) mod fixture {
             tool.p.insert(k.into(), v.into());
         }
         doc.machines.push(machine.clone());
-        doc.add_lathe_setup().unwrap();
+        doc.add_lathe_setup(None).unwrap();
         let stock: Vec<(String, String)> = doc.setups[1]
             .p
             .iter()

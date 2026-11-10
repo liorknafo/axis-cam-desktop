@@ -4891,7 +4891,7 @@ pub(crate) mod tests {
             (lathe::Reads::Radius, "Radius", "3.00 on the dial"),
         ] {
             let mut a = lathe_app("", |doc| {
-                doc.add_lathe_setup().unwrap();
+                doc.add_lathe_setup(None).unwrap();
                 assert!(doc.setups.len() == 2);
             });
             let id = a.doc.setups[0].machine.id.clone();
