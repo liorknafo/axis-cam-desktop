@@ -29240,10 +29240,18 @@ soft_max = 180.0
         // Only hand setups in the job: the library's one CNC machine.
         a.doc.setups.retain(|s| hand(&s.machine));
         a.doc.active = a.doc.setups[0].id.clone();
-        let library: Vec<_> = (a.doc.machines.iter()).filter(|m| !hand(m)).collect();
-        assert_eq!(library.len(), 1);
-        let want = library[0].name().to_string();
+        // Several CNC machines in the library: the Machine library to choose.
+        let n = a.doc.setups.len();
+        assert!((a.doc.machines.iter()).filter(|m| !hand(m)).count() > 1);
         let _ = a.update(Message::AddSetup);
+        assert_eq!((a.doc.setups.len(), a.page), (n, Page::Machines));
+        // One CNC machine beside the hand ones: that one.
+        let want = (a.doc.machines.iter()).find(|m| !hand(m)).unwrap().id.clone();
+        a.doc.machines.retain(|m| hand(m) || m.id == want);
+        let want = (a.doc.machines.iter()).find(|m| m.id == want).unwrap();
+        let want = want.name().to_string();
+        let _ = a.update(Message::AddSetup);
+        assert_eq!(a.doc.setups.len(), n + 1);
         assert_eq!(a.doc.setup().machine.name(), want);
         assert!(!hand(&a.doc.setup().machine));
     }
