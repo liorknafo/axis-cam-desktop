@@ -30501,6 +30501,59 @@ soft_max = 180.0
         assert_eq!(picked(&a), vec![floor]);
     }
 
+    /// LIO-408: a Box with no face picks again when its tab opens, and the
+    /// note of a refused face goes with the click: picking off, another
+    /// operation, or a number typed clears it.
+    #[test]
+    fn the_box_tab_picks_until_a_face_is_picked_and_its_note_is_the_last_clicks() {
+        let mut a = imported_app();
+        with_big_cutter(&mut a);
+        let _ = a.update(Message::AddManualSetup);
+        a.doc.active = a.doc.setups[0].id.clone();
+        let _ = a.update(Message::Edit(Target::Setup, "stock_top", "10".into()));
+        let _ = a.update(Message::AddOp(Strategy::Box));
+        assert!(a.picking);
+        let _ = a.update(Message::Tab("Tool".into()));
+        let _ = a.update(Message::Tab("Box".into()));
+        assert!(a.picking, "back on the Box tab with no face: picking again");
+        let mesh = a.imported_mesh.as_ref().unwrap();
+        let chamfer = (mesh.surfaces.iter())
+            .position(|s| s.normal[2] > 0.5 && s.normal[2] < 0.9)
+            .unwrap();
+        let top_z = (mesh.surfaces.iter())
+            .filter(|s| s.normal[2] > 0.99999)
+            .map(|s| s.center[2])
+            .fold(f32::MIN, f32::max);
+        let top = (mesh.surfaces.iter())
+            .position(|s| s.normal[2] > 0.99999 && s.center[2] == top_z)
+            .unwrap();
+        let note = "No box from that face";
+        // Picking off clears the note.
+        let _ = a.update(Message::Surface(chamfer));
+        shows(&a, &[note]);
+        let _ = a.update(Message::PickMode);
+        assert!(!a.picking);
+        lacks(&a, &[note]);
+        shows(&a, &["Pick the face on the part"]);
+        // Another operation and back: no note.
+        let _ = a.update(Message::PickMode);
+        let _ = a.update(Message::Surface(chamfer));
+        shows(&a, &[note]);
+        let _ = a.update(Message::AddOp(Strategy::Box));
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Tab("Box".into()));
+        lacks(&a, &[note]);
+        // A number typed clears it.
+        let _ = a.update(Message::Surface(chamfer));
+        shows(&a, &[note]);
+        let _ = a.update(Message::Edit(Target::Operation, "x_max", "40".into()));
+        lacks(&a, &[note]);
+        // With a face picked, coming back to the tab leaves picking off.
+        let _ = a.update(Message::Surface(top));
+        let _ = a.update(Message::Tab("Tool".into()));
+        let _ = a.update(Message::Tab("Box".into()));
+        assert!(!a.picking);
+    }
     /// Each number field of each operation, its tool, its setup and its
     /// machine takes 0, a negative, nothing, a tiny and a huge number, and
     /// the app draws every tab, generates, plays and draws the run page

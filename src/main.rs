@@ -1401,9 +1401,10 @@ pub struct App {
     pub picking_section: bool,
     pub paths: bool,
     pub picking: bool,
-    /// Why the face last clicked for a Box makes none, shown on its tab
-    /// (LIO-401).
-    pub box_refused: Option<String>,
+    /// Why the face last clicked for a Box makes none, with the Box's id:
+    /// shown on its tab while it picks (LIO-401); any edit clears it
+    /// (LIO-408).
+    pub box_refused: Option<(String, String)>,
     /// "Pick holes on the part" in the Work zero step: a click on the part
     /// chooses or removes the hole it is in for the fixture pins, while
     /// that step of a setup on the pins is open (`picking_pin_holes`).
@@ -2566,7 +2567,8 @@ impl App {
             }
             Err(error) => {
                 self.status = error.clone();
-                self.box_refused = Some(error);
+                let id = self.operation().map(|o| o.id.clone()).unwrap_or_default();
+                self.box_refused = Some((id, error));
             }
         }
     }
@@ -2966,6 +2968,8 @@ impl App {
         self.doc.sync_turns(mesh);
     }
     fn touch(&mut self) {
+        // A refused face's note belongs to the click before an edit (LIO-408).
+        self.box_refused = None;
         // A generation under way makes the job as it was.
         let placing = self
             .generating
@@ -5670,6 +5674,7 @@ impl App {
                 return Task::batch([self.refresh_post(), restore, self.refresh_guide()]);
             }
             Message::SelectSetup(i) => {
+                self.box_refused = None;
                 // An operation's preview is generated for the setup it is in.
                 if i != self.doc.index()
                     && self
@@ -5688,6 +5693,7 @@ impl App {
                 }
             }
             Message::SelectOp(i) => {
+                self.box_refused = None;
                 if self
                     .generating
                     .as_ref()
@@ -5759,7 +5765,17 @@ impl App {
                 self.setup_step = step;
             }
             Message::Tab(t) => {
-                self.picking = t == "Geometry" && self.can_pick();
+                self.box_refused = None;
+                // A Box with no face yet picks on its tab, as when added
+                // (LIO-408).
+                let unpicked_box = t == "Box"
+                    && !self.is_sample()
+                    && self.part_mesh().is_some()
+                    && self.operation().is_some_and(|o| {
+                        o.strategy == Strategy::Box
+                            && o.surfaces.as_ref().is_none_or(|s| s.ids.is_empty())
+                    });
+                self.picking = (t == "Geometry" || unpicked_box) && self.can_pick();
                 if self.picking {
                     self.playing = false;
                     self.simulation = None;
@@ -6042,7 +6058,7 @@ impl App {
                 {
                     self.tab = "Box".into();
                     self.picking = true;
-                    self.status = "Added Box. Click the face this cut leaves: a floor facing up, or a wall facing sideways.".into();
+                    self.status = "Added Box. Click a face of the part: the Box removes the stock that covers it. A floor is cut from above, a wall from the side.".into();
                 }
             }
             Message::DuplicateOp => {
@@ -6617,6 +6633,8 @@ impl App {
                 return self.update(Message::Edit(Target::Setup, "pin_holes", text));
             }
             Message::PickMode => {
+                // Picking off ends the note of the click made in it (LIO-408).
+                self.box_refused = None;
                 self.picking = !self.picking && self.can_pick();
                 if self.picking {
                     self.playing = false;

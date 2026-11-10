@@ -1231,6 +1231,17 @@ impl Drawing<'_> {
         );
     }
 }
+/// Where a pattern drawing's tag of `chars` letters goes on a canvas of
+/// `size`: out from `from` along `out`, clear of it, and kept whole inside
+/// the canvas, pushed in from an edge it would cross (LIO-407).
+fn tag_box(from: Point, out: [f32; 2], chars: usize, k: f32, size: Size) -> Rectangle {
+    let (w, h) = (chars as f32 * 9. * k + 16., 26. * k);
+    let reach = 8. + out[0].abs() * w / 2. + out[1].abs() * h / 2.;
+    let c = Point::new(from.x + out[0] * reach, from.y - out[1] * reach);
+    let x = (c.x - w / 2.).clamp(2., (size.width - w - 2.).max(2.));
+    let y = (c.y - h / 2.).clamp(2., (size.height - h - 2.).max(2.));
+    Rectangle::new(Point::new(x, y), Size::new(w, h))
+}
 /// `Shape::Pattern` in the top view, `at` from mm to the canvas at `s` px
 /// a mm: the order the DRO goes in as arrows from hole to hole (dashed onto
 /// the next row), the pitches as sizes off hole 1, or the circle with its
@@ -1260,17 +1271,9 @@ fn paint_pattern(
     };
     // A label on a white tag, `from` a point out along `out`, clear of it.
     let tag = |f: &mut canvas::Frame, from: Point, out: [f32; 2], label: String| {
-        let (w, h) = (label.chars().count() as f32 * 9. * k + 16., 26. * k);
-        let c = on(
-            from,
-            out,
-            8. + out[0].abs() * w / 2. + out[1].abs() * h / 2.,
-        );
-        let r = canvas::Path::rounded_rectangle(
-            Point::new(c.x - w / 2., c.y - h / 2.),
-            Size::new(w, h),
-            5.into(),
-        );
+        let place = tag_box(from, out, label.chars().count(), k, f.size());
+        let c = place.center();
+        let r = canvas::Path::rounded_rectangle(place.position(), place.size(), 5.into());
         f.fill(&r, Color::WHITE);
         f.stroke(&r, stroke(ACCENT, 1.5));
         write(f, label, c, ACCENT, 16. * k, Align::Center);
@@ -2905,7 +2908,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 }
                 let right = column![
                     chips(said),
-                    label(format!("Hole {} of {}", i + 1, holes.len())),
+                    hole_label(i, holes.len(), number(i)),
                     xy(0),
                     xy(1),
                     readout(
@@ -2969,7 +2972,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 }
                 let right = column![
                     chips(said),
-                    label(format!("Hole {} of {}", i + 1, holes.len())),
+                    hole_label(i, holes.len(), number(i)),
                     xy(0),
                     xy(1),
                     readout(
@@ -3381,6 +3384,17 @@ fn never_lines(
 /// The most a pass lifts off the floor to return (`cam::LIFT`), with room
 /// for rounding.
 const LIFT: f32 = crate::cam::LIFT + 0.05;
+/// The heading over a hole's readouts: "Hole 2 of 6", and the DRO's hole
+/// to call up when that is another number (LIO-407).
+fn hole_label<'a>(i: usize, of: usize, called: usize) -> Element<'a, Message> {
+    match called == i + 1 {
+        true => label(format!("Hole {} of {of}", i + 1)),
+        false => label(format!(
+            "Hole {} of {of} · call up the DRO's hole {called}",
+            i + 1
+        )),
+    }
+}
 /// An angle as the DRO takes it: "30.00°".
 fn degrees(v: f32) -> String {
     format!("{}°", dro(v))
@@ -3522,8 +3536,9 @@ fn pattern_screen<'a>(
                 "the DRO's arc holes",
                 c,
                 if out_of_order {
+                    // One sentence (LIO-407).
                     format!(
-                        "Call up each hole on the DRO in the order shown: {one_axis} of the {} moves are along one axis. Move to 0.00.",
+                        "Call up each hole on the DRO in this order and move to 0.00: {one_axis} of the {} moves are along one axis.",
                         holes.len().saturating_sub(1)
                     )
                 } else {
@@ -3548,6 +3563,11 @@ fn pattern_screen<'a>(
         " If the DRO takes the holes in another order, follow it: every hole is drilled alike."
             .into()
     };
+    // An arc out of the DRO's order, written out (LIO-407).
+    let right = right.push(out_of_order.then(|| {
+        let order: Vec<String> = called.iter().map(|n| n.to_string()).collect();
+        bold(format!("Order on the DRO: {}", order.join(" → ")), 16)
+    }));
     let right = right.push(muted(format!("{then}{after}")).size(13));
     let stock = p.before(op);
     let left = p.drawing(
@@ -4065,21 +4085,59 @@ pub(crate) mod tests {
         let at = patterns(&a)[0];
         send(&mut a, GuideAction::Go(at));
         let t = texts(&a);
-        assert!(
-            t.iter().any(|s| s.starts_with(
-                "Call up each hole on the DRO in the order shown: 4 of the 5 moves are along one axis."
-            )),
-            "{t:?}"
-        );
+        // The order written out, the closing line one sentence (LIO-407).
+        for want in [
+            "Order on the DRO: 1 → 3 → 4 → 6 → 5 → 2",
+            "Call up each hole on the DRO in this order and move to 0.00: 4 of the 5 moves are along one axis.",
+        ] {
+            assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
+        }
         send(&mut a, GuideAction::Go(at + 1));
         send(&mut a, GuideAction::Next);
         let t = texts(&a);
-        assert!(t.contains(&"HOLE 2 OF 6".to_string()), "{t:?}");
+        let heading = "HOLE 2 OF 6 · CALL UP THE DRO'S HOLE 3".to_string();
+        assert!(t.contains(&heading), "{t:?}");
         assert_eq!(after(&t, "Y"), ["stays", "leave it locked"]);
         assert!(
             t.iter().any(|s| s.starts_with("on the DRO's hole 3 · X")),
             "{t:?}"
         );
+    }
+    /// LIO-407: an arc taken round (four from 45°) has no order line and a
+    /// plain heading.
+    #[test]
+    fn an_arc_taken_round_needs_no_order_line() {
+        let four = crate::guide::tests::circle_at([0., 0.], 60., 4, 45., 90.);
+        let mut a = pattern_app(&four, false, true, false);
+        let at = patterns(&a)[0];
+        send(&mut a, GuideAction::Go(at));
+        assert!(!texts(&a).iter().any(|s| s.starts_with("Order on the DRO")));
+        send(&mut a, GuideAction::Go(at + 1));
+        send(&mut a, GuideAction::Next);
+        let t = texts(&a);
+        assert!(t.contains(&"HOLE 2 OF 4".to_string()), "{t:?}");
+        assert!(!t.iter().any(|s| s.contains("CALL UP")), "{t:?}");
+    }
+    /// LIO-407: a pattern drawing's tag stays whole inside the drawing, at
+    /// its left, bottom, right and top edges.
+    #[test]
+    fn a_pattern_tag_stays_inside_the_drawing() {
+        let size = Size::new(400., 300.);
+        for (from, out) in [
+            (Point::new(5., 150.), [-1., 0.]),
+            (Point::new(200., 295.), [0., -1.]),
+            (Point::new(395., 150.), [1., 0.]),
+            (Point::new(200., 3.), [0., 1.]),
+        ] {
+            let r = tag_box(from, out, "rows 56.00".len(), 1., size);
+            assert!(
+                r.x >= 0.
+                    && r.y >= 0.
+                    && r.x + r.width <= size.width
+                    && r.y + r.height <= size.height,
+                "{from:?} {r:?}"
+            );
+        }
     }
     /// LIO-404: at 1024 x 700 every number of the Arc holes screen and its
     /// closing line are above the buttons, with nothing to scroll.
@@ -4107,7 +4165,12 @@ pub(crate) mod tests {
             } else {
                 "Call up each hole"
             };
-            for start in [closing, "first hole"] {
+            let order = if grids {
+                "first hole"
+            } else {
+                "Order on the DRO"
+            };
+            for start in [closing, "first hole", order] {
                 let r = find(start);
                 assert!(r.y + r.height < back.y, "{start} {r:?} over {back:?}");
             }
