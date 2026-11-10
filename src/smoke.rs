@@ -24821,6 +24821,66 @@ soft_max = 180.0
         let _ = a.update(Message::ApplyPlan);
         assert!(a.undo.is_some());
     }
+    /// LIO-397: the AI planner page's subtitle asks to sign in only when
+    /// signed out; the pictures box is in view in the left card at
+    /// 1440 × 900; after Apply, Undo heads the page in the window at
+    /// 1440 × 900 and 1120 × 690, and pressing it puts the setups back.
+    #[test]
+    fn the_planner_page_keeps_undo_and_the_pictures_box_in_view() {
+        use crate::ui::probe::{clicks_in, id, placed, scrollables, texts};
+        let (big, small) = (iced::Size::new(1440., 900.), iced::Size::new(1120., 690.));
+        let inside = |outer: iced::Rectangle, r: iced::Rectangle| {
+            outer.contains(r.position())
+                && outer.contains(iced::Point::new(r.x + r.width, r.y + r.height))
+        };
+        let at = |a: &App, window: iced::Size, label: &str| {
+            (placed(a.view(), window).into_iter())
+                .find(|(t, _)| t == label)
+                .unwrap_or_else(|| panic!("{label} is on the page"))
+                .1
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = planning_app(&dir);
+        // Set, not opened: opening the page looks for a saved sign-in.
+        a.page = Page::Ai;
+        let _ = a.update(Message::Resized(big));
+        let sign_in =
+            "Sign in with ChatGPT, then let the planner propose and check a complete job.";
+        assert!(texts(a.view(), big).iter().any(|t| t == sign_in));
+        sign_in_with(&mut a, &dir, crate::session::sample());
+        let epoch = a.account_epoch;
+        let _ = a.update(Message::ModelsLoaded(epoch, Ok(vec!["gpt-6.1-sol".into()])));
+        a.settings.plan_notice_shown = true;
+        assert!(!texts(a.view(), big).iter().any(|t| t == sign_in));
+        let boxed = at(&a, big, "Let the AI see pictures of the part");
+        assert!(
+            (scrollables(a.view(), big).iter()).any(|(_, card)| inside(*card, boxed)),
+            "the pictures box {boxed:?} is in view in its card"
+        );
+        let before = json(&a.doc.setups);
+        apply_checked_plan(&mut a);
+        let _ = a.update(Message::Page(Page::Ai));
+        for window in [big, small] {
+            let _ = a.update(Message::Resized(window));
+            let undo = at(&a, window, "Undo applied plan");
+            let side = (scrollables(a.view(), window).into_iter())
+                .find(|(i, _)| *i == id("planner-result"))
+                .expect("the page's main area")
+                .1;
+            assert!(
+                inside(iced::Rectangle::with_size(window), undo) && inside(side, undo),
+                "Undo {undo:?} is in view at {window:?}"
+            );
+            let pressed = iced::Rectangle::new(undo.center(), iced::Size::new(1., 1.));
+            assert!(
+                (clicks_in(a.view(), window, pressed, 1.).iter())
+                    .any(|m| matches!(m, Message::UndoPlan))
+            );
+        }
+        let _ = a.update(Message::UndoPlan);
+        assert!(a.undo.is_none());
+        assert_eq!(json(&a.doc.setups), before, "the setups are back");
+    }
     fn json<T: serde::Serialize>(value: &T) -> String {
         serde_json::to_string(value).unwrap()
     }
