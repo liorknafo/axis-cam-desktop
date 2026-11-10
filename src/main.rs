@@ -1401,6 +1401,9 @@ pub struct App {
     pub picking_section: bool,
     pub paths: bool,
     pub picking: bool,
+    /// Why the face last clicked for a Box makes none, shown on its tab
+    /// (LIO-401).
+    pub box_refused: Option<String>,
     /// "Pick holes on the part" in the Work zero step: a click on the part
     /// chooses or removes the hole it is in for the fixture pins, while
     /// that step of a setup on the pins is open (`picking_pin_holes`).
@@ -2098,6 +2101,7 @@ impl App {
             picking_section: false,
             paths: true,
             picking: false,
+            box_refused: None,
             picking_pins: false,
             placing_pins: false,
             pin_aim: None,
@@ -2536,6 +2540,35 @@ impl App {
             && self.part_mesh().is_some()
             && (self.doc.active_setup())
                 .is_some_and(|s| post::sits_on_pins(s) && post::pins_in_leftover(s))
+    }
+    /// Fills the selected Box's six numbers from the face `pick` and keeps
+    /// it as the Box's face; a face that makes no box says why, on the
+    /// status line and the Box tab, and changes nothing (LIO-401).
+    fn fill_box(&mut self, pick: surface::Selection) {
+        let found = (|| {
+            let mesh = self.part_mesh().ok_or("Load the part first.")?;
+            let stock =
+                (self.known_stock(self.doc.index()).0).ok_or("The stock is not known yet.")?;
+            manual::box_from_face(self.doc.setup(), mesh, &pick, stock)
+        })();
+        match found {
+            Ok(block) => {
+                if let Some(o) = self.operation_mut() {
+                    for (k, v) in model::BOX_FIELDS.into_iter().zip(block) {
+                        o.p.insert(k.into(), v.to_string());
+                    }
+                    o.surfaces = Some(pick);
+                    o.geometry.clear();
+                }
+                self.box_refused = None;
+                self.touch();
+                self.status = "Box filled from the selected face.".into();
+            }
+            Err(error) => {
+                self.status = error.clone();
+                self.box_refused = Some(error);
+            }
+        }
     }
     pub fn can_pick(&self) -> bool {
         self.operation().is_some_and(|o| {
@@ -5999,6 +6032,18 @@ impl App {
                     self.status
                         .push_str(&centre::said(&[named], &Vec::from_iter(missing)));
                 }
+                // A Box on a part starts its pick: one click on a face fills
+                // it, nothing to type (LIO-401).
+                self.box_refused = None;
+                if strategy == Strategy::Box
+                    && !self.is_sample()
+                    && self.part_mesh().is_some()
+                    && self.can_pick()
+                {
+                    self.tab = "Box".into();
+                    self.picking = true;
+                    self.status = "Added Box. Click the face this cut leaves: a floor facing up, or a wall facing sideways.".into();
+                }
             }
             Message::DuplicateOp => {
                 if let Some(i) = self.selected {
@@ -6312,6 +6357,19 @@ impl App {
                     }
                     return Task::none();
                 }
+                // A Box takes one face, and a click on it fills the box at
+                // once; a face that makes none says why and changes nothing
+                // (LIO-401).
+                if self
+                    .operation()
+                    .is_some_and(|o| o.strategy == Strategy::Box)
+                {
+                    self.fill_box(surface::Selection {
+                        mesh_fingerprint: fingerprint,
+                        ids: vec![n],
+                    });
+                    return Task::none();
+                }
                 // Parallel and Waterline finishing take a whole face, curved or
                 // flat: every surface of the smooth face clicked, added or
                 // removed together. So does a Pocket or an Adaptive clearing
@@ -6335,12 +6393,7 @@ impl App {
                         selected.ids.clear();
                     }
                     let had = selected.ids.contains(&n);
-                    // A Box takes one face: a click replaces the one before.
-                    if o.strategy == Strategy::Box {
-                        selected.ids.clear();
-                    } else {
-                        selected.ids.retain(|id| !face.contains(id));
-                    }
+                    selected.ids.retain(|id| !face.contains(id));
                     if !had {
                         selected.ids.extend(face);
                     }
@@ -6575,33 +6628,16 @@ impl App {
                     self.tab = "Geometry".into();
                 }
             }
+            // Fills the Box again from its face, after the stock or the zero
+            // changed (LIO-401).
             Message::BoxFromFace => {
-                let found = (|| {
-                    let mesh = self.part_mesh().ok_or("Load the part first.")?;
-                    let selection = self
-                        .operation()
-                        .filter(|o| o.strategy == Strategy::Box)
-                        .ok_or("Select a Box operation first.")?
-                        .surfaces
-                        .as_ref()
-                        .ok_or(manual::ONE_FACE)?;
-                    let stock = self
-                        .known_stock(self.doc.index())
-                        .0
-                        .ok_or("The stock is not known yet.")?;
-                    manual::box_from_face(self.doc.setup(), mesh, selection, stock)
-                })();
-                match found {
-                    Ok(block) => {
-                        if let Some(o) = self.operation_mut() {
-                            for (k, v) in model::BOX_FIELDS.into_iter().zip(block) {
-                                o.p.insert(k.into(), v.to_string());
-                            }
-                        }
-                        self.touch();
-                        self.status = "Box filled from the selected face.".into();
-                    }
-                    Err(error) => self.status = error,
+                let picked = (self.operation())
+                    .filter(|o| o.strategy == Strategy::Box)
+                    .map(|o| o.surfaces.clone());
+                match picked {
+                    Some(Some(pick)) => self.fill_box(pick),
+                    Some(None) => self.status = manual::ONE_FACE.into(),
+                    None => self.status = "Select a Box operation first.".into(),
                 }
             }
             Message::Generate => {
