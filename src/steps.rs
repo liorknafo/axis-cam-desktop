@@ -3334,6 +3334,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             });
             // A tapped hole is tried with a screw (LIO-413).
             let tried = o.filter(|o| o.tapping()).and_then(|_| screw_try(p, *op));
+            let tapped = tried.is_some();
             let right = match tried {
                 Some(row) => column![label("Try"), row],
                 None => column![label("Measure")].extend(rows),
@@ -3347,7 +3348,12 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 crate::fault::canvas(Dims(dims)).width(Fill).height(Fill)
             ]
             .into();
-            ("Check".into(), "measure what it left", left, right)
+            let sub = if tapped {
+                "try the thread"
+            } else {
+                "measure what it left"
+            };
+            ("Check".into(), sub, left, right)
         }
         Step::Lathe(step) => turning::screen(p, step),
         Step::HandOver { next: to } if p.shown.side.is_some() => {
