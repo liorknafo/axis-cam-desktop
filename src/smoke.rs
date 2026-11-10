@@ -29213,6 +29213,52 @@ soft_max = 180.0
         assert_eq!(b.doc.setups.len(), 1);
         assert!(b.status.contains("manual machine"), "{}", b.status);
     }
+    /// "+ Add setup" always adds a CNC setup (LIO-381): with a hand setup
+    /// open, on the nearest CNC setup's machine, else the library's one CNC
+    /// machine. It added another setup on the hand machine.
+    #[test]
+    fn add_setup_on_a_hand_setup_adds_a_cnc_setup() {
+        let hand = |m: &crate::model::Machine| crate::manual::is_hand(m);
+        let mut a = app();
+        with_manual(&mut a);
+        with_lathe(&mut a);
+        let cnc = a.doc.setup().machine.name().to_string();
+        for add in [Message::AddManualSetup, Message::AddLatheSetup] {
+            let _ = a.update(add);
+            assert!(hand(&a.doc.setup().machine));
+            let _ = a.update(Message::AddSetup);
+            let added = a.doc.setups.last().unwrap();
+            assert!(!hand(&added.machine), "{}", added.machine.name());
+            assert_eq!(added.machine.name(), cnc);
+            assert_eq!(a.doc.active, added.id);
+        }
+        // With a CNC setup open, as before: another on its machine.
+        let n = a.doc.setups.len();
+        let _ = a.update(Message::AddSetup);
+        assert_eq!(a.doc.setups.len(), n + 1);
+        assert_eq!(a.doc.setup().machine.name(), cnc);
+        // Only hand setups in the job: the library's one CNC machine.
+        a.doc.setups.retain(|s| hand(&s.machine));
+        a.doc.active = a.doc.setups[0].id.clone();
+        // Several CNC machines in the library: the Machine library to choose.
+        let n = a.doc.setups.len();
+        assert!((a.doc.machines.iter()).filter(|m| !hand(m)).count() > 1);
+        let _ = a.update(Message::AddSetup);
+        assert_eq!((a.doc.setups.len(), a.page), (n, Page::Machines));
+        // One CNC machine beside the hand ones: that one.
+        let want = (a.doc.machines.iter())
+            .find(|m| !hand(m))
+            .unwrap()
+            .id
+            .clone();
+        a.doc.machines.retain(|m| hand(m) || m.id == want);
+        let want = (a.doc.machines.iter()).find(|m| m.id == want).unwrap();
+        let want = want.name().to_string();
+        let _ = a.update(Message::AddSetup);
+        assert_eq!(a.doc.setups.len(), n + 1);
+        assert_eq!(a.doc.setup().machine.name(), want);
+        assert!(!hand(&a.doc.setup().machine));
+    }
     #[test]
     fn the_ribbon_dims_all_but_box_and_drill_on_a_manual_setup() {
         let mut a = app();
