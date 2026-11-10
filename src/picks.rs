@@ -79,9 +79,9 @@ fn places(mesh: &Mesh) -> Vec<Place> {
         };
         let points: Vec<[f32; 3]> = face.points.iter().map(|p| file(*p)).collect();
         for p in &points {
-            for i in 0..3 {
-                place.min[i] = place.min[i].min(p[i]);
-                place.max[i] = place.max[i].max(p[i]);
+            for (i, &v) in p.iter().enumerate() {
+                place.min[i] = place.min[i].min(v);
+                place.max[i] = place.max[i].max(v);
             }
         }
         // Each triangle's second moments about the surface's centre (a face
@@ -679,7 +679,7 @@ pub(crate) mod tests {
         let boss = up_at(&after, 10., 10., 5.);
         for old in [Some(&before), None] {
             let mut doc = doc.clone();
-            let followed = follow(&mut doc, &after, old);
+            follow(&mut doc, &after, old);
             let op = &doc.setup().operations[0];
             let s = op.surfaces.as_ref().unwrap();
             let note = &doc.pick_checks[&op.id];

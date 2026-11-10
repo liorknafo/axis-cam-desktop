@@ -19057,7 +19057,11 @@ soft_max = 180.0
         }
         // A part path is shown the way this OS writes one.
         let e = crate::typed_model_path("parts/bracket.step").unwrap_err();
-        let example = if cfg!(windows) { r"as C:\Users\" } else { "as /Users/" };
+        let example = if cfg!(windows) {
+            r"as C:\Users\"
+        } else {
+            "as /Users/"
+        };
         assert!(e.contains(example), "{e}");
     }
     /// Import from path loads the file as the browser's import does, and
@@ -19696,7 +19700,10 @@ soft_max = 180.0
         }
         for path in spelled {
             let mesh = crate::mesh::load(&path).unwrap();
-            let again = ModelFile { path, ..file.clone() };
+            let again = ModelFile {
+                path,
+                ..file.clone()
+            };
             let _ = a.update(Message::FileImported(Some(Ok((again, Some(mesh))))));
             assert!(a.status.starts_with("Model reimported."), "{}", a.status);
             assert_eq!(top_of(&a).len(), 1);
