@@ -29653,6 +29653,17 @@ soft_max = 180.0
     fn the_turn_editor_has_a_kind_chooser_and_the_fields_of_each_kind() {
         let mut a = imported_app();
         on_the_lathe(&mut a);
+        // The imported block is no turned part: a new lathe setup's bar now
+        // fits round it (LIO-391), so the Ø40 turned below would cut it. The
+        // Ø50 × 100 bar it had stands well past the block, as before.
+        for (k, v) in [
+            ("stock_type", "Round bar"),
+            ("stock_diameter", "50"),
+            ("stock_length", "100"),
+            ("stickout", "70"),
+        ] {
+            a.doc.setup_mut().p.insert(k.into(), v.into());
+        }
         let _ = a.update(Message::AddOp(Strategy::Turn));
         let _ = a.update(Message::Tab("Turn".into()));
         shows(&a, &["Kind", "Diameter · mm", "Z end · mm"]);
