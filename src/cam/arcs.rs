@@ -519,8 +519,11 @@ fn round_thread(f: &Facet, t: &crate::thread::Thread) -> bool {
 /// apart over each other, are bounded by its flanks and lie within their
 /// height. A wall round another centre over it (an obround's end, however
 /// finely cut), or past solid stock round its axis (a recess, even one a
-/// chamfer opens), meets none; one of another feature that meets them (a
-/// pocket breaking into the hole) runs on past their height.
+/// chamfer opens), meets none. The height is a further filter: a wall of
+/// another feature that meets them and runs on past their height (a pocket
+/// breaking into the hole from over it) is not taken. One within their
+/// height (a cross slot through the threaded length) can be, when it is
+/// round the thread's axis in its band; such a wall interrupts the thread.
 /// Walls round its axis that do not meet its flanks (slivers where it runs
 /// out at a face, meshed apart from them) are looked at as any wall is. A
 /// thread's own wall is its hole's, never an arc.
@@ -658,7 +661,8 @@ fn own_walls(
         }
     }
     // A crest or root lies within its flanks' height; a wall of another
-    // feature meeting them (a pocket's breaking into the hole) runs on past.
+    // feature meeting them that runs on past it (a pocket breaking into the
+    // hole from over it) is not taken.
     (facets(g, |id| touching.contains_key(&id)).into_iter())
         .filter(|(id, f)| {
             let (low, high) = touching[id];
