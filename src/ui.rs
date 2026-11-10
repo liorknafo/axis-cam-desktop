@@ -14576,26 +14576,31 @@ fn plan_result(app: &App) -> Element<'_, Message> {
 /// timeline (`running_view`); the rest scroll as a whole.
 pub(crate) fn plan_side(app: &App) -> Element<'_, Message> {
     // After Apply, Undo heads the page where the plan was shown (LIO-397),
-    // over a plan running since too (LIO-400).
+    // over a plan running since too (LIO-400): there one line, to leave the
+    // running plan its stage and Cancel at 1120 x 690.
+    let running = matches!(app.planner, crate::Planner::Running(_));
     let undo = app.undo.is_some().then(|| {
+        let said = if running {
+            column![bold("Plan applied", 15)]
+        } else {
+            column![
+                bold("Plan applied", 15),
+                muted("Undo puts back the setups and operations from before the plan; the applied job, with your edits since, goes to History first.")
+            ]
+        };
         container(
             row![
-                column![
-                    bold("Plan applied", 15),
-                    muted("Undo puts back the setups and operations from before the plan; the applied job, with your edits since, goes to History first.")
-                ]
-                .spacing(4)
-                .width(Fill),
+                said.spacing(4).width(Fill),
                 secondary("Undo applied plan", Message::UndoPlan)
             ]
             .spacing(12)
             .align_y(Alignment::Center),
         )
-        .padding(16)
+        .padding(if running { 10 } else { 16 })
         .width(Fill)
         .style(panel_style)
     });
-    if matches!(app.planner, crate::Planner::Running(_)) {
+    if running {
         let side = column![].push(undo).push(plan_result(app)).spacing(12);
         return container(side.height(Fill))
             .padding(iced::Padding::default().right(14))
