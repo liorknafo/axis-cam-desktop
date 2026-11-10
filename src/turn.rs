@@ -423,77 +423,9 @@ fn below_end(op: &Operation, key: &str) -> Result<f32, String> {
 
 /// The plan of a Turn, or of a Drill on a lathe's centre line, on `setup`.
 pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
-    if !op.enabled {
-        return Err("Enable the operation before generating it.".into());
-    }
-    if !lathe::is_lathe(&setup.machine) {
-        return Err(lathe::TURN_ON_MILL.into());
-    }
-    if get(&setup.p, "origin") != ZERO {
-        return Err(format!(
-            "A lathe's work zero is {ZERO}: Z 0 at the free end, on the axis."
-        ));
-    }
     let resolved = stock::resolve(setup, Some(mesh))?;
     let stock = resolved.stock;
-    let rpm = num(&op.p, "rpm")
-        .filter(|v| *v > 0.)
-        .ok_or("Enter a positive spindle speed.")?;
-    let pause = num(&setup.machine.p, "pass_time")
-        .filter(|t| *t >= 0.)
-        .unwrap_or(0.);
-    let kind = if op.strategy == Strategy::Drill {
-        "Drill"
-    } else {
-        get(&op.p, "turn_kind")
-    };
-    if op.strategy == Strategy::Turn {
-        let Some(needed) = lathe::tool_for(kind) else {
-            return Err(format!("Unknown turn kind \"{kind}\"."));
-        };
-        if !lathe::takes(kind, get(&tool.p, "type")) {
-            return Err(format!(
-                "Choose a {} for the {kind} turn.",
-                needed.to_lowercase()
-            ));
-        }
-    } else if op.tapping() {
-        if tool.tap_spec().is_none() {
-            return Err(TAP_NEEDED.into());
-        }
-    } else if get(&tool.p, "type") != "Drill" {
-        return Err("A lathe drills on the centre with a drill in the tailstock.".into());
-    }
-    let material = Material::new(setup, stock);
-    let lathe = Lathe {
-        op,
-        tool,
-        stock,
-        end: end(stock),
-        rpm,
-        material,
-    };
-    let start = [lathe.material.rim + CLEAR, lathe.end + CLEAR];
-    let mut cut = Cut::new(start[0], start[1], pause);
-    let radius = match kind {
-        "Outside" | "Bore" => {
-            lathe.along(&mut cut, kind == "Outside", power_feed(&setup.machine)?)?;
-            num(&tool.p, "nose_radius").unwrap_or(0.)
-        }
-        "Face" => {
-            lathe.face(&mut cut)?;
-            num(&tool.p, "nose_radius").unwrap_or(0.)
-        }
-        "Chamfer" => {
-            lathe.chamfer(&mut cut)?;
-            num(&tool.p, "nose_radius").unwrap_or(0.)
-        }
-        "Groove" => lathe.groove(&mut cut)? / 2.,
-        "Part off" => lathe.part_off(&mut cut)? / 2.,
-        "Thread" => lathe.thread(&mut cut)? / 8.,
-        _ if op.tapping() => lathe.tap(&mut cut)?,
-        _ => lathe.drill(&mut cut)?,
-    };
+    let (cut, radius) = planned(setup, op, tool, stock, Material::new(setup, stock))?;
     part_check(setup, mesh, stock, &cut.checks)?;
     if !cut.moves.iter().any(|m| m.motion == Motion::Feed) || !cut.duration.is_finite() {
         return Err("No cutting motion fits the selected geometry and settings.".into());
@@ -533,6 +465,151 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
         milling_direction: "Turning",
         rings: cut.rings,
     })
+}
+/// What the 3D view draws of a Turn or a lathe Drill being edited
+/// (LIO-388), in the setup frame (mm): the material it removes, as
+/// `[z0, z1, r0, r1]` rings about the axis, and where its cut reaches into
+/// the part.
+pub(crate) struct Shown {
+    pub cut: Vec<[f32; 4]>,
+    pub into: Vec<[f32; 4]>,
+    /// Whether it cuts from the axis out (a drill, a bore, a part off),
+    /// inside what the part hides.
+    pub inside: bool,
+}
+/// `Shown` of `setup`'s operation `at`, planned by `generate`'s own code from
+/// the material the enabled lathe operations before it leave (each of them
+/// planned in turn), so that the picture and the cut agree. None when it
+/// plans nothing. A cut reaches into the part where its rings, or what its
+/// part check keeps clear, meet the part's outline about the axis.
+pub(crate) fn shown(setup: &Setup, at: usize, tools: &[Tool], mesh: &Mesh) -> Option<Shown> {
+    let tool = |op: &Operation| tools.iter().find(|t| t.id == op.tool);
+    let stock = stock::resolve(setup, Some(mesh)).ok()?.stock;
+    let mut material = Material::new(setup, stock);
+    for op in setup.operations[..at.min(setup.operations.len())].iter() {
+        if let Some((cut, _)) =
+            tool(op).and_then(|t| planned(setup, op, t, stock, material.clone()).ok())
+        {
+            for r in cut.rings {
+                material = material.with([r.z[0], r.z[1], r.r[0], r.r[1]]);
+            }
+        }
+    }
+    let op = setup.operations.get(at)?;
+    let (cut, _) = planned(setup, op, tool(op)?, stock, material.clone()).ok()?;
+    // The material each ring takes away: no air.
+    let removed = |g: &[f32; 4]| -> Vec<[f32; 4]> {
+        (material.sections(g[0], g[1]).into_iter())
+            .filter_map(|s| {
+                let (a, b) = (g[2].max(s.inner), g[3].min(s.outer));
+                (b - a > ON).then_some([s.z[0], s.z[1], a, b])
+            })
+            .collect()
+    };
+    let mut rings: Vec<[f32; 4]> = cut
+        .rings
+        .iter()
+        .map(|r| [r.z[0], r.z[1], r.r[0], r.r[1]])
+        .collect();
+    // A part off's second ring is the bar left in the chuck, not the blade's.
+    if op.strategy == Strategy::Turn && get(&op.p, "turn_kind") == "Part off" {
+        rings.truncate(1);
+    }
+    let part = profile(setup, mesh);
+    let into = (rings.iter().chain(cut.checks.iter().map(|(g, _)| g)))
+        .flat_map(|g| {
+            part.iter().filter_map(move |s| {
+                let z = [g[0].max(s[0]) + ON, g[1].min(s[1]) - ON];
+                let r = [g[2].max(s[2]), g[3].min(s[3])];
+                (z[1] > z[0] && r[1] - r[0] > ON).then_some([z[0], z[1], r[0], r[1]])
+            })
+        })
+        .collect();
+    Some(Shown {
+        cut: rings.iter().flat_map(removed).collect(),
+        into,
+        inside: rings.iter().all(|g| g[2] < ON),
+    })
+}
+/// The cut of a Turn or a lathe Drill on `setup` from `material` (on
+/// `stock`, its box), before the part check, and the tool's radius as the
+/// plan draws it.
+fn planned(
+    setup: &Setup,
+    op: &Operation,
+    tool: &Tool,
+    stock: Bounds,
+    material: Material,
+) -> Result<(Cut, f32), String> {
+    if !op.enabled {
+        return Err("Enable the operation before generating it.".into());
+    }
+    if !lathe::is_lathe(&setup.machine) {
+        return Err(lathe::TURN_ON_MILL.into());
+    }
+    if get(&setup.p, "origin") != ZERO {
+        return Err(format!(
+            "A lathe's work zero is {ZERO}: Z 0 at the free end, on the axis."
+        ));
+    }
+    let rpm = num(&op.p, "rpm")
+        .filter(|v| *v > 0.)
+        .ok_or("Enter a positive spindle speed.")?;
+    let pause = num(&setup.machine.p, "pass_time")
+        .filter(|t| *t >= 0.)
+        .unwrap_or(0.);
+    let kind = if op.strategy == Strategy::Drill {
+        "Drill"
+    } else {
+        get(&op.p, "turn_kind")
+    };
+    if op.strategy == Strategy::Turn {
+        let Some(needed) = lathe::tool_for(kind) else {
+            return Err(format!("Unknown turn kind \"{kind}\"."));
+        };
+        if !lathe::takes(kind, get(&tool.p, "type")) {
+            return Err(format!(
+                "Choose a {} for the {kind} turn.",
+                needed.to_lowercase()
+            ));
+        }
+    } else if op.tapping() {
+        if tool.tap_spec().is_none() {
+            return Err(TAP_NEEDED.into());
+        }
+    } else if get(&tool.p, "type") != "Drill" {
+        return Err("A lathe drills on the centre with a drill in the tailstock.".into());
+    }
+    let lathe = Lathe {
+        op,
+        tool,
+        stock,
+        end: end(stock),
+        rpm,
+        material,
+    };
+    let start = [lathe.material.rim + CLEAR, lathe.end + CLEAR];
+    let mut cut = Cut::new(start[0], start[1], pause);
+    let radius = match kind {
+        "Outside" | "Bore" => {
+            lathe.along(&mut cut, kind == "Outside", power_feed(&setup.machine)?)?;
+            num(&tool.p, "nose_radius").unwrap_or(0.)
+        }
+        "Face" => {
+            lathe.face(&mut cut)?;
+            num(&tool.p, "nose_radius").unwrap_or(0.)
+        }
+        "Chamfer" => {
+            lathe.chamfer(&mut cut)?;
+            num(&tool.p, "nose_radius").unwrap_or(0.)
+        }
+        "Groove" => lathe.groove(&mut cut)? / 2.,
+        "Part off" => lathe.part_off(&mut cut)? / 2.,
+        "Thread" => lathe.thread(&mut cut)? / 8.,
+        _ if op.tapping() => lathe.tap(&mut cut)?,
+        _ => lathe.drill(&mut cut)?,
+    };
+    Ok((cut, radius))
 }
 /// The machine's power feed nearest `POWER_FEED`, the finer of two as near
 /// (to a micron per revolution).
@@ -1563,6 +1640,68 @@ pub(crate) mod tests {
         let mut out = vec![];
         simulation::sequence(doc, mesh, None, |_, _, r| out.push(r));
         out
+    }
+    /// What the 3D view draws of a Turn being edited (LIO-388) is what its
+    /// plan removes of the material the operations before it leave: an
+    /// Outside's ring from the bar to the diameter, a Bore's from the drilled
+    /// hole out; a part off's blade only; nothing reaches into the part
+    /// until the diameter does.
+    #[test]
+    fn a_turn_being_edited_shows_what_it_removes_and_where_it_reaches_the_part() {
+        let (mut doc, mesh) = crate::guide::tests::sample("Diameter");
+        for t in &mut doc.tools {
+            if get(&t.p, "type") == "Boring bar" {
+                t.p.insert("min_bore".into(), "8".into());
+            }
+        }
+        add(
+            &mut doc,
+            "Bore",
+            &[
+                ("diameter", "11"),
+                ("z_end", "-20"),
+                ("depth", "1"),
+                ("finish", "0.2"),
+                ("allowance", "0"),
+            ],
+        );
+        let setup = &doc.setups[0];
+        let end = end(stock::resolve(setup, Some(&mesh)).unwrap().stock);
+        let shown = |at| super::shown(setup, at, &doc.tools, &mesh).unwrap();
+        let reach = |rings: &[[f32; 4]]| {
+            let low = rings.iter().map(|g| g[0]).fold(f32::INFINITY, f32::min);
+            let inner = rings.iter().map(|g| g[2]).fold(f32::INFINITY, f32::min);
+            let outer = rings.iter().map(|g| g[3]).fold(0., f32::max);
+            [low - end, inner, outer]
+        };
+        // The Outside: Ø50.2 to Ø40, from the faced end to Z −65.
+        let outside = shown(1);
+        let [low, inner, outer] = reach(&outside.cut);
+        assert!(
+            near(low, -65.) && near(inner, 20.) && (outer - 25.1).abs() < 0.01,
+            "{low} {inner} {outer}"
+        );
+        assert!(outside.into.is_empty());
+        // A bore and a drill cut inside what the part hides; an Outside not.
+        assert!(!outside.inside && shown(6).inside && shown(2).inside);
+        // The Bore after the Ø10 drill: from the hole out to Ø11, 20 deep.
+        let [low, inner, outer] = reach(&shown(6).cut);
+        assert!(
+            low > -21. && near(inner, 5.) && near(outer, 5.5),
+            "{low} {inner} {outer}"
+        );
+        // The part off: the blade's ring only, not the bar left in the chuck.
+        let [low, ..] = reach(&shown(5).cut);
+        assert!(low > -66., "{low}");
+        // Turned to Ø30, into the Ø35 part: red where it meets it.
+        let mut doc = doc.clone();
+        doc.setups[0].operations[1]
+            .p
+            .insert("diameter".into(), "30".into());
+        let into = super::shown(&doc.setups[0], 1, &doc.tools, &mesh)
+            .unwrap()
+            .into;
+        assert!(into.iter().any(|g| g[2] < 17.5 && g[3] > 15.), "{into:?}");
     }
     fn plan(result: &Result<Simulation, String>) -> &Plan {
         &result.as_ref().unwrap().plan

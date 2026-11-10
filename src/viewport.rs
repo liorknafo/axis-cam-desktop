@@ -216,6 +216,9 @@ pub type Ghost = ([f32; 2], Result<(f32, f32), String>);
 pub struct Viewport<'a> {
     pub setup: Option<&'a Setup>,
     pub operation: Option<&'a Operation>,
+    /// The tool library: a Turn's or a lathe Drill's cut is drawn from its
+    /// tool and those of the operations before it (LIO-388). Empty draws none.
+    pub tools: &'a [crate::model::Tool],
     pub mesh: &'a Mesh,
     pub simulation: Option<&'a crate::simulation::Simulation>,
     pub sample: bool,
@@ -1159,8 +1162,18 @@ impl Viewport<'_> {
             self.sample,
             self.simulation.map(|s| (s.id.as_str(), s.revision))
         );
+        // A Box's fields change what is drawn of its cut; a Turn's, those
+        // of the lathe operations before it and their tools too (LIO-388).
+        let lathe = (self.setup.filter(|s| crate::lathe::is_lathe(&s.machine))).map(|s| {
+            let ops: Vec<_> = (s.operations.iter())
+                .map(|o| (&o.p, o.enabled, &o.tool))
+                .collect();
+            (ops, self.tools.iter().map(|t| &t.p).collect::<Vec<_>>())
+        });
         let key = format!(
-            "{key}|{:?}|{:?}|{}",
+            "{key}|{:?}|{:?}|{:?}|{:?}|{}",
+            self.operation.map(|o| &o.p),
+            lathe,
             self.shown_a(),
             self.thin.faces.first().map(std::ptr::from_ref),
             self.thin.faces.len()
@@ -1771,6 +1784,44 @@ impl Viewport<'_> {
             draw(&walls, &BOX_WALL, &hidden, &mut solid);
             if let Some(b) = shown.into {
                 draw(&solid_of(b), &LOST, &depths, &mut solid);
+            }
+        }
+        // A Turn or a lathe Drill being edited (LIO-388): what it removes, a
+        // turned solid in the Box's cut colour, seen through the part when it
+        // cuts from the axis out (a drill, a bore), which the part hides;
+        // where it reaches into the part, red, seen through the part.
+        if self.simulation.is_none()
+            && let (Some(setup), Some(op)) = (self.setup, self.operation)
+            && crate::lathe::is_lathe(&setup.machine)
+            && let Some(at) = setup.operations.iter().position(|o| o.id == op.id)
+            && let Some(shown) = crate::turn::shown(setup, at, self.tools, self.mesh)
+        {
+            let scale = self.mesh.display_scale();
+            let project = |v: [f32; 3]| (screen(v), p.depth(v));
+            let cut_solid = turned_solid(&shown.cut, [0., 0.], scale, cut.as_ref(), project);
+            let seen = vec![f32::NEG_INFINITY; depths.len()];
+            raster_solid(
+                &BOX_CUT,
+                &mut rgba,
+                if shown.inside { &seen } else { &depths },
+                (w, h),
+                &cut_solid,
+                ratio,
+                p.scale,
+                &mut solid,
+            );
+            if !shown.into.is_empty() {
+                let into = turned_solid(&shown.into, [0., 0.], scale, cut.as_ref(), project);
+                raster_solid(
+                    &LOST,
+                    &mut rgba,
+                    &seen,
+                    (w, h),
+                    &into,
+                    ratio,
+                    p.scale,
+                    &mut solid,
+                );
             }
         }
         if let Some((tip, radius, stickout)) = self.live {
@@ -4963,6 +5014,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -5125,6 +5177,7 @@ mod tests {
                 progress: None,
                 holding: vec![],
                 first_setup: None,
+                tools: &[],
                 framed: vec![],
                 leftover: None,
                 live: None,
@@ -5207,6 +5260,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -5299,6 +5353,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -5375,6 +5430,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -5468,6 +5524,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -5548,6 +5605,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -5684,6 +5742,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -5806,6 +5865,7 @@ mod tests {
                 progress: None,
                 holding: vec![],
                 first_setup: None,
+                tools: &[],
                 framed: vec![],
                 leftover: None,
                 live: None,
@@ -5858,6 +5918,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -5953,6 +6014,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover,
             live: None,
@@ -6041,6 +6103,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -6187,6 +6250,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -6300,6 +6364,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -6376,6 +6441,7 @@ mod tests {
             progress: None,
             holding,
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -6494,6 +6560,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -6565,6 +6632,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -6632,6 +6700,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -6691,6 +6760,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -6748,6 +6818,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -6819,6 +6890,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -7017,6 +7089,7 @@ mod tests {
             show_paths: false,
             progress: None,
             first_setup: None,
+            tools: &[],
             framed: holding.clone(),
             holding,
             leftover: None,
