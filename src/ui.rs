@@ -1506,7 +1506,7 @@ fn ribbon(app: &App) -> Element<'_, Message> {
 }
 /// Room kept at the right of a scrolled column for its scrollbar, which
 /// Iced's `scrollable` draws over the content: the bar is 10 wide.
-const SCROLLBAR_GUTTER: f32 = 14.;
+pub(crate) const SCROLLBAR_GUTTER: f32 = 14.;
 /// The browser's mark column: wide enough for the widest mark, "✓·".
 const MARK_WIDTH: f32 = 22.;
 /// How many characters of an operation's or a setup's name the browser shows
@@ -1798,14 +1798,25 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
             container(
                 column![
                     bold(ellipsize(s.name(), SETUP_NAME_CHARS), 12).wrapping(Wrapping::None),
-                    // A hand machine's setup has no work offset (LIO-371).
-                    muted(format!(
-                        "{} · {}-axis",
-                        s.offset().unwrap_or(s.machine.name()),
-                        s.machine.axes()
-                    ))
+                    // A hand machine's setup has no work offset (LIO-371),
+                    // and its name is the machine's: say what it is
+                    // (LIO-382).
+                    muted(if crate::manual::is_hand(&s.machine) {
+                        "hand-fed · no G-code".to_string()
+                    } else {
+                        format!(
+                            "{} · {}-axis",
+                            s.offset().unwrap_or(s.machine.name()),
+                            s.machine.axes()
+                        )
+                    })
                     .size(12)
-                    .wrapping(Wrapping::None)
+                    // In full, on two lines beside the picture if need be.
+                    .wrapping(if crate::manual::is_hand(&s.machine) {
+                        Wrapping::Word
+                    } else {
+                        Wrapping::None
+                    })
                 ]
                 // The setup's A angle, on a line of its own: a list of them
                 // is long.
@@ -4883,9 +4894,13 @@ fn setup_machine<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message
             )
             .width(Fill),
         )
-        .push(muted(
-            "The work zero and its offset (G54–G59) are in the Work zero step.",
-        ))
+        .push(muted(if crate::lathe::is_lathe(&s.machine) {
+            "The dials' zero is in the Work zero step."
+        } else if crate::manual::is_manual(&s.machine) {
+            "The DRO's zero is in the Work zero step."
+        } else {
+            "The work zero and its offset (G54–G59) are in the Work zero step."
+        }))
 }
 /// The setup editor's Work zero step: where the program's X0 Y0 Z0 is, on
 /// the stock's top or bottom at a corner, an edge's middle or the centre

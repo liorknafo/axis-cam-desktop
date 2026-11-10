@@ -1650,29 +1650,35 @@ fn setups(app: &App) -> Element<'_, Message> {
         }
         let on = s.id == app.doc.active;
         let msg = Message::Guide(GuideAction::Open(si));
-        let b = button(column![bold(s.name(), 13), muted(s.machine.name())].spacing(2))
-            .width(Fill)
-            .padding([8, 10])
-            .on_press(msg.clone())
-            .style(move |_, status| button::Style {
-                background: Some(
-                    if on {
-                        crate::ui::BG
-                    } else if matches!(status, button::Status::Hovered) {
-                        HOVER_BUTTON
-                    } else {
-                        Color::WHITE
-                    }
-                    .into(),
-                ),
-                text_color: INK,
-                border: Border {
-                    color: if on { BLUE } else { LINE },
-                    width: 1.,
-                    radius: 6.into(),
-                },
-                ..Default::default()
-            });
+        // The machine under the name only when the name does not say it.
+        let named = s.name().starts_with(s.machine.name());
+        let b = button(
+            column![bold(s.name(), 13)]
+                .push((!named).then(|| muted(s.machine.name())))
+                .spacing(2),
+        )
+        .width(Fill)
+        .padding([8, 10])
+        .on_press(msg.clone())
+        .style(move |_, status| button::Style {
+            background: Some(
+                if on {
+                    crate::ui::BG
+                } else if matches!(status, button::Status::Hovered) {
+                    HOVER_BUTTON
+                } else {
+                    Color::WHITE
+                }
+                .into(),
+            ),
+            text_color: INK,
+            border: Border {
+                color: if on { BLUE } else { LINE },
+                width: 1.,
+                radius: 6.into(),
+            },
+            ..Default::default()
+        });
         c = c.push(HelpButton::new(b, &msg, s.name()).width(Fill));
     }
     let active = app.doc.index();
@@ -1851,8 +1857,13 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
         .push(space().width(Fill))
         .push(bold(progress(g, s, at, app.guide_item), 14).color(ACCENT));
     let top = row![
+        // A setup named as its machine says it once (LIO-382).
         bold(
-            format!("{} on the {}", setup.name(), setup.machine.name()),
+            if setup.name().starts_with(setup.machine.name()) {
+                format!("{} · steps", setup.name())
+            } else {
+                format!("{} on the {}", setup.name(), setup.machine.name())
+            },
             16
         ),
         muted(format!(
@@ -2812,9 +2823,15 @@ pub(super) fn frame<'a>(
 ) -> Element<'a, Message> {
     let body = row![
         container(left).width(FillPortion(11)).height(Fill),
-        container(scrollable(right.spacing(10)).height(Fill))
-            .width(FillPortion(9))
+        // Clear of the scrollbar, as the other pages are (LIO-382).
+        container(
+            scrollable(
+                (right.spacing(10)).padding(iced::Padding::ZERO.right(crate::ui::SCROLLBAR_GUTTER)),
+            )
             .height(Fill)
+        )
+        .width(FillPortion(9))
+        .height(Fill)
     ]
     .spacing(18)
     .height(Fill);
@@ -2918,6 +2935,9 @@ fn never_lines(
     }
     out
 }
+/// The most a pass lifts off the floor to return (`cam::boxed`: 0.2 mm),
+/// with room for rounding.
+const LIFT: f32 = 0.25;
 /// The screen of a Pass `step`.
 fn pass<'a>(
     p: &Page<'a>,
@@ -2998,11 +3018,19 @@ fn pass<'a>(
             );
             tags.push("feed".into());
         } else if t.axis == 2 && (t.centre - cut.min[2]).abs() < 0.005 {
-            // Down to the pass's level: how much deeper it cuts.
-            tags.push(format!("{} deeper", mm(cut.max[2] - cut.min[2])));
-            if t.feed {
-                tags.push("plunge".into());
+            if last[2].is_some_and(|v| v > t.centre && v - t.centre < LIFT) {
+                // Down again after the lift off the floor (LIO-382).
+                tags.push("back to the level".into());
+            } else {
+                // Down to the pass's level: how much deeper it cuts.
+                tags.push(format!("{} deeper", mm(cut.max[2] - cut.min[2])));
+                if t.feed {
+                    tags.push("plunge".into());
+                }
             }
+        } else if t.axis == 2 && last[2].is_some_and(|v| t.centre > v && t.centre - v < LIFT) {
+            // Up off the floor so the return does not rub (LIO-176, LIO-382).
+            tags.push("off the floor".into());
         } else if t.axis < 2 && t.feed {
             tags.push("feed, cuts".into());
         } else if t.axis < 2
@@ -3540,6 +3568,11 @@ pub(crate) mod tests {
         };
         let t = texts(&a);
         assert!(t.contains(&format!("Pass 1 of {of}")), "{t:?}");
+        // The setup carries its machine's name: said once in the title and
+        // once in the list (LIO-382; "Manual Mill on the Manual Mill").
+        assert!(t.iter().any(|s| s == "Manual Mill · steps"), "{t:?}");
+        assert_eq!(t.iter().filter(|s| *s == "Manual Mill").count(), 1, "{t:?}");
+        assert!(!t.iter().any(|s| s.contains(" on the ")), "{t:?}");
         assert!(t.contains(&format!("pass 1/{of}")), "{t:?}");
         // Every readout's number, the cut's with its direction, in order.
         let shown: Vec<usize> = (targets.iter())
@@ -3832,6 +3865,12 @@ pub(crate) mod tests {
             // second goes back along it, with no room to come off a wall.
             if n % 2 == 1 {
                 assert!(t.iter().any(|s| s.contains("feed, cuts")), "{t:?}");
+                // Its lift off the floor and back down say so; it was a
+                // bare Z, then "1 deeper" (LIO-382).
+                for tag in ["off the floor", "back to the level"] {
+                    assert_eq!(t.iter().filter(|s| *s == tag).count(), 1, "{tag} {t:?}");
+                }
+                assert!(!t.iter().any(|s| s.ends_with(" deeper")), "{t:?}");
             }
         }
         // The open-ended Step drops outside the stock, and the Step closed

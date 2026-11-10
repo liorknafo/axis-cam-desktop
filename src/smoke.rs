@@ -29228,9 +29228,20 @@ soft_max = 180.0
         assert_eq!(a.doc.setups[0].name(), "Manual Mill");
         assert_eq!(a.doc.setups[1].id, old);
         assert_eq!(a.doc.active, a.doc.setups[0].id);
-        // No work offset in its browser row nor in the view's header.
+        // No work offset in its browser row nor in the view's header. The
+        // row's second line says what it is, not the machine's name again
+        // and "3-axis" (LIO-382); the CNC setup's is unchanged. Its Machine
+        // step speaks of the DRO's zero, not of G54–G59.
         let t = crate::ui::probe::texts(a.view(), WINDOW);
-        assert!(t.iter().any(|s| s == "Manual Mill · 3-axis"), "{t:?}");
+        assert!(t.iter().any(|s| s == "hand-fed · no G-code"), "{t:?}");
+        assert!(!t.iter().any(|s| s == "Manual Mill · 3-axis"), "{t:?}");
+        assert!(t.iter().any(|s| s.starts_with("G54 · ")), "{t:?}");
+        let _ = a.update(Message::SetupStep("Machine"));
+        shows(&a, &["The DRO's zero is in the Work zero step."]);
+        lacks(
+            &a,
+            &["The work zero and its offset (G54–G59) are in the Work zero step."],
+        );
         assert!(
             !t.iter()
                 .any(|s| s.starts_with("G54 / ") || s.starts_with("G55")),
@@ -29238,6 +29249,13 @@ soft_max = 180.0
         );
         assert_eq!(a.page, Page::Work);
         assert_eq!(a.selected, None);
+        // The CNC setup's Machine step still names its offset.
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::SetupStep("Machine"));
+        shows(
+            &a,
+            &["The work zero and its offset (G54–G59) are in the Work zero step."],
+        );
         // Without a manual machine the press says so and changes nothing.
         let mut b = app();
         let _ = b.update(Message::AddManualSetup);
