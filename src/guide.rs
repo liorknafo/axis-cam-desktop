@@ -511,6 +511,39 @@ pub enum LatheStep {
         top: Dial,
         carriage: Dial,
     },
+    /// Before a single-point thread's first pass, set once: the gearbox to
+    /// `pitch`, the gear to `rpm`, the top slide to `angle`° from the cross
+    /// slide, the tool on centre and square, the half-nuts closed and left
+    /// closed to the end (LIO-415).
+    ThreadSetUp {
+        op: usize,
+        rpm: f32,
+        pitch: f32,
+        angle: f32,
+    },
+    /// The end of a thread: try it with its mating part, `what` ("M16×2
+    /// nut", "M12×1.75 screw"); `spring` for a single-point thread, which
+    /// takes spring passes when it is tight (LIO-413).
+    Try {
+        op: usize,
+        what: String,
+        spring: bool,
+    },
+}
+/// A thread's name: the standard size of `major` × `pitch` ("M16×2"), else
+/// "M16.5×1.5".
+pub fn thread_label(major: f32, pitch: f32) -> String {
+    (crate::thread::SPECS.iter())
+        .find(|s| (s.major - major).abs() < 0.05 && (s.pitch - pitch).abs() < 1e-3)
+        .map_or_else(
+            || format!("M{}×{}", trim(major), trim(pitch)),
+            |s| s.name.to_string(),
+        )
+}
+/// A number without trailing zeros.
+fn trim(v: f32) -> String {
+    let s = format!("{v:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 impl LatheStep {
     /// The step's name, as a screen's title.
@@ -530,6 +563,8 @@ impl LatheStep {
             LatheStep::Plunge { part_off: true, .. } => "Part off",
             LatheStep::Plunge { .. } => "Groove",
             LatheStep::ThreadPass { .. } => "Thread pass",
+            LatheStep::ThreadSetUp { .. } => "Set up the thread",
+            LatheStep::Try { .. } => "Try",
         }
     }
 }
@@ -2084,6 +2119,11 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
                     turns: tenths_down(quill / spec.pitch),
                     quill: zeroes.dial(Slide::Quill, quill),
                 }));
+                steps.push(Step::Lathe(LatheStep::Try {
+                    op: oi,
+                    what: format!("{} screw", spec.name),
+                    spring: false,
+                }));
                 1
             }
             "Drill" => {
@@ -2179,6 +2219,11 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
                     length,
                     turns: tenths_down(length / spec.pitch),
                 }));
+                steps.push(Step::Lathe(LatheStep::Try {
+                    op: oi,
+                    what: format!("{} nut", spec.name),
+                    spring: false,
+                }));
                 1
             }
             "Thread" => {
@@ -2194,6 +2239,12 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
                 let touch = contact(planned, inside);
                 let r0 = touch.diameter() / 2.;
                 let zc = zeroes.touch(&mut steps, (oi, tool, rpm), true, Some(touch), Some(angle));
+                steps.push(Step::Lathe(LatheStep::ThreadSetUp {
+                    op: oi,
+                    rpm,
+                    pitch,
+                    angle,
+                }));
                 let n = along.len();
                 // In toward the axis from the touch (out, inside), as
                 // planned.
@@ -2231,6 +2282,13 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
                         carriage: zeroes.dial(Slide::Carriage, zc - z0),
                     }));
                 }
+                let label = thread_label(num(&op.p, "diameter").unwrap_or(0.), pitch);
+                let mate = if inside { "screw" } else { "nut" };
+                steps.push(Step::Lathe(LatheStep::Try {
+                    op: oi,
+                    what: format!("{label} {mate}"),
+                    spring: true,
+                }));
                 // The top slide is swung and fed in: the carriage zero no
                 // longer holds.
                 zeroes.carriage = None;
@@ -2239,8 +2297,21 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
             }
             other => return Err(format!("\"{other}\" does not run on the manual lathe.")),
         };
+        // A thread's section is named for it (LIO-415).
+        let name = if kind == "Thread" {
+            let pitch = num(&op.p, "pitch").unwrap_or(0.);
+            match tool_of(tool).and_then(lathe::die_spec) {
+                Some(spec) => format!("Thread {}", spec.name),
+                None => format!(
+                    "Thread {}",
+                    thread_label(num(&op.p, "diameter").unwrap_or(0.), pitch)
+                ),
+            }
+        } else {
+            op.name().into()
+        };
         sections.push(Section {
-            name: op.name().into(),
+            name,
             op: Some(oi),
             steps: begin..steps.len(),
             count,
@@ -3950,8 +4021,12 @@ pub(crate) mod tests {
         let (doc, mesh) = sample("Diameter");
         let guide = build(&doc, &mesh, 0).unwrap();
         let names: Vec<&str> = guide.sections.iter().map(|s| s.name.as_str()).collect();
+        // A thread's section is named for its thread (LIO-415).
         let ops: Vec<String> = (doc.setups[0].operations.iter())
-            .map(|o| o.name().to_string())
+            .map(|o| match o.name() {
+                "Turn · Thread" => "Thread M40×1.5".to_string(),
+                n => n.to_string(),
+            })
             .collect();
         assert_eq!(names[0], "Set up");
         assert_eq!(
@@ -3973,8 +4048,9 @@ pub(crate) mod tests {
         );
         assert_eq!(of(3), ["Drill"]);
         assert_eq!(of(4), ["Touch", "Groove"]);
-        assert_eq!(of(5)[..2], ["Touch", "Thread pass"]);
-        assert_eq!(of(5).len(), 9);
+        // Set up once before the passes, tried after them (LIO-415, LIO-413).
+        assert_eq!(of(5)[..3], ["Touch", "Set up the thread", "Thread pass"]);
+        assert_eq!((of(5).len(), of(5).last().copied()), (11, Some("Try")));
         assert_eq!(of(6), ["Touch", "Part off"]);
         assert_eq!(of(7), ["HandOver"]);
         let counts: Vec<usize> = guide.sections.iter().map(|s| s.count).collect();
@@ -4566,7 +4642,11 @@ pub(crate) mod tests {
         let of = |i: usize| kinds(&guide, guide.sections[i].steps.clone());
         // No turning tool, so no Zero; the tap is its own section.
         assert_eq!(of(0), ["Hold"]);
-        assert_eq!([of(1), of(2), of(3)], [["Drill"], ["Tap"], ["HandOver"]]);
+        // The tap ends tried with a screw (LIO-413).
+        assert_eq!(
+            [of(1), of(2), of(3)],
+            [vec!["Drill"], vec!["Tap", "Try"], vec!["HandOver"]]
+        );
         assert_eq!(guide.sections[2].count, 1);
         assert!(guide.sections[2].minutes > 1.);
         let Some(LatheStep::TailTap {
@@ -4642,7 +4722,8 @@ pub(crate) mod tests {
         let of = |i: usize| kinds(&guide, guide.sections[i].steps.clone());
         // The Zero is the turning tool's; the die has no Touch, no Thread pass.
         assert_eq!(of(0), ["Hold", "Zero"]);
-        assert_eq!(of(2), ["Die"]);
+        // Then tried with the nut (LIO-413).
+        assert_eq!(of(2), ["Die", "Try"]);
         assert!(
             !lathe_steps(&guide)
                 .iter()
@@ -4705,7 +4786,10 @@ pub(crate) mod tests {
         doc.setups[0].p.insert("stock_diameter".into(), "16".into());
         let guide = build(&doc, &mesh, 0).unwrap();
         assert_eq!(kinds(&guide, guide.sections[0].steps.clone()), ["Hold"]);
-        assert_eq!(kinds(&guide, guide.sections[1].steps.clone()), ["Die"]);
+        assert_eq!(
+            kinds(&guide, guide.sections[1].steps.clone()),
+            ["Die", "Try"]
+        );
     }
 
     #[test]

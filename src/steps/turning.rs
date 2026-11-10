@@ -2769,10 +2769,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             ));
             let mut left = column![
                 view(bar, marks),
-                note(format!(
-                    "gearbox {} · half-nuts stay closed: back the tool out, reverse the spindle to come back",
-                    mm(*pitch)
-                ))
+                note("the half-nuts stay closed through every pass".into())
             ]
             .spacing(4);
             if index == of {
@@ -2785,10 +2782,13 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 chips(vec![
                     tool_chip(p, &p.setup.operations[*op].tool),
                     rpm_chip(*rpm),
-                    warn_chip(format!("gearbox {}", mm(*pitch))),
+                    chip(format!("gearbox {}", mm(*pitch))),
+                    chip("half-nuts stay closed"),
                 ]),
-                dials(vec![
-                    dial_box(
+                // At a narrow window the top slide's number is in its row:
+                // no dial, so the four motions are in view (LIO-415).
+                dials(
+                    vec![dial_box(
                         p,
                         top,
                         if top.out {
@@ -2800,9 +2800,12 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                             format!("pass {index}: in to {}", t.total)
                         },
                         dial_size(p, 2.)
-                    ),
-                    top_angle(*angle, top.out),
-                ]),
+                    ),]
+                    .into_iter()
+                    .chain([top_angle(*angle, top.out)])
+                    .filter(|_| !narrow)
+                    .collect()
+                ),
                 line(
                     narrow,
                     Some(1),
@@ -2836,17 +2839,35 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     lit(1, item),
                     reached(1),
                 ),
+                // The motions in order: the cut forward, then out and back
+                // in the warning colour (LIO-415).
                 line(
                     narrow,
                     Some(3),
-                    "half-nuts",
-                    big("close", lit(2, item)),
+                    "spindle",
+                    big("forward", lit(2, item)),
                     vec![
-                        format!("stay closed to {}", reading(p, carriage).short),
-                        "back out, reverse".into()
+                        format!("cut to {} from the end", mm(end - z0)),
+                        format!("{} on the dial", reading(p, carriage).long),
                     ],
                     lit(2, item),
                     reached(2),
+                ),
+                line(
+                    narrow,
+                    Some(4),
+                    "cross slide",
+                    text("OUT")
+                        .size(26)
+                        .font(Font {
+                            weight: iced::font::Weight::Bold,
+                            ..Font::MONOSPACE
+                        })
+                        .color(super::WARNING[1])
+                        .into(),
+                    vec!["at the end, then".into(), "reverse to come back".into()],
+                    lit(3, item),
+                    reached(3),
                 ),
                 thread_tiles(p, *op),
             ];
@@ -2856,6 +2877,98 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 left,
                 right,
             )
+        }
+        LatheStep::ThreadSetUp {
+            op,
+            rpm,
+            pitch,
+            angle,
+        } => {
+            let bar = bar_of(*op);
+            let (end, r) = (end_of(bar), outer_of(bar));
+            let left = column![
+                view(bar, vec![Mark::Tool(Cutter::Thread, [end + 2., r])]),
+                note("set once: the passes after it leave it all as it is".into())
+            ]
+            .spacing(4)
+            .into();
+            let step = |n: usize, key: &str, value: String, tags: Vec<String>| {
+                line(
+                    narrow,
+                    Some(n as u8 + 1),
+                    key,
+                    big(value, lit(n, item)),
+                    tags,
+                    lit(n, item),
+                    reached(n),
+                )
+            };
+            let right = column![
+                chips(vec![tool_chip(p, &p.setup.operations[*op].tool)]),
+                label("Before the first pass"),
+                step(0, "gearbox", mm(*pitch), vec!["mm pitch".into()]),
+                step(1, "spindle", format!("{}", rpm.round()), vec!["rpm".into()]),
+                step(
+                    2,
+                    "top slide",
+                    format!("{}°", trimmed(*angle)),
+                    vec!["swung from the cross slide".into()]
+                ),
+                step(
+                    3,
+                    "tool",
+                    "on centre".into(),
+                    vec!["square to the work".into(), "with the thread gauge".into()]
+                ),
+                step(
+                    4,
+                    "half-nuts",
+                    "close".into(),
+                    vec![
+                        "leave them closed".into(),
+                        "until the thread is done".into()
+                    ]
+                ),
+            ];
+            (
+                "Set up the thread".into(),
+                "once, before the first pass",
+                left,
+                right,
+            )
+        }
+        LatheStep::Try { op, what, spring } => {
+            let bar = bar_of(*op);
+            let marks = all(*op).iter().map(|g| Mark::Cut(*g)).collect();
+            let left = view(bar, marks);
+            let mut right = column![
+                chips(vec![tool_chip(p, &p.setup.operations[*op].tool)]),
+                label("Try it"),
+                line(
+                    narrow,
+                    None,
+                    "try",
+                    big(format!("the {what}"), Lit::Now),
+                    vec!["it goes on by hand".into()],
+                    Lit::Now,
+                    None,
+                ),
+            ];
+            if *spring {
+                right = right.push(line(
+                    narrow,
+                    None,
+                    "if tight",
+                    big("spring pass", Lit::Next),
+                    vec![
+                        "one at the same setting,".into(),
+                        "then 0.02 more on the top slide at a time".into(),
+                    ],
+                    Lit::Next,
+                    None,
+                ));
+            }
+            ("Try".into(), "the thread with what goes on it", left, right)
         }
     }
 }
