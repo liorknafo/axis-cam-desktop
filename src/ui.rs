@@ -2088,11 +2088,20 @@ pub(crate) fn uncut_legend(app: &App) -> Option<Element<'_, Message>> {
     // walls it keeps, as the view draws them.
     let boxed = (app.doc.active_setup().zip(app.operation()))
         .is_some_and(|(s, o)| o.strategy == Strategy::Box && crate::manual::is_manual(&s.machine));
-    if !app.stock && !magenta && !amber && !section && !boxed {
+    // The path's colours whenever it is shown (LIO-395): its feed range, as
+    // the view colours it (`tooth_load::colour`), and its rapids.
+    let feeds = (app.active_simulation())
+        .filter(|_| app.paths)
+        .map(|s| s.plan.feed_range());
+    if !app.stock && !magenta && !amber && !section && !boxed && feeds.is_none() {
         return None;
     }
-    let key = |colour: Color, name: &'static str| {
-        row![text("■").size(12).color(colour), muted(name).size(12)].spacing(3)
+    let key = |colour: Color, name: &str| {
+        row![
+            text("■").size(12).color(colour),
+            muted(name.to_string()).size(12)
+        ]
+        .spacing(3)
     };
     let mut legend = row![].spacing(10);
     if app.stock {
@@ -2113,6 +2122,26 @@ pub(crate) fn uncut_legend(app: &App) -> Option<Element<'_, Message>> {
     }
     if amber {
         legend = legend.push(key(Color::from_rgb8(240, 158, 35), "0.1–0.5 mm left"));
+    }
+    if let Some(feeds) = feeds {
+        let rgb = |c: [u8; 4]| Color::from_rgb8(c[0], c[1], c[2]);
+        legend = match feeds {
+            Some((slowest, fastest)) if fastest > slowest => legend
+                .push(key(
+                    rgb(crate::tooth_load::colour(0.)),
+                    &format!("feed {slowest:.0} mm/min"),
+                ))
+                .push(key(
+                    rgb(crate::tooth_load::colour(1.)),
+                    &format!("feed {fastest:.0} mm/min"),
+                )),
+            Some((feed, _)) => legend.push(key(
+                rgb(crate::tooth_load::colour(0.)),
+                &format!("feed {feed:.0} mm/min"),
+            )),
+            None => legend,
+        }
+        .push(key(Color::from_rgb8(226, 149, 38), "rapid"));
     }
     Some(legend.into())
 }
