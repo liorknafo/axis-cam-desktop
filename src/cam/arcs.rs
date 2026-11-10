@@ -254,7 +254,37 @@ fn grow(facets: &HashMap<usize, Facet>, at: &Corners, seed: usize) -> Option<Vec
             }
         }
     }
-    best.map(|(_, _, members)| members)
+    best.map(|(_, _, members)| close(facets, at, members))
+}
+/// `members`, a round wall grown on round (`grow`), with every facet of
+/// `facets` that meets them at a corner seen from above, at any height, and
+/// whose corners lie on their circle (to `fit`'s 0.005 mm and 0.01 % of its
+/// radius), and so on round: the same round wall over and under a gap in
+/// it (a relief groove across a half hole), which a drill enters from its
+/// top. Taken in one pass without refitting, so a thread's crests over each
+/// other a turn apart cost a pass, not a search; together they go all the
+/// way round and are no arc.
+fn close(facets: &HashMap<usize, Facet>, at: &Corners, mut members: Vec<usize>) -> Vec<usize> {
+    let Some((c, r, _)) = fit(facets, &members) else {
+        return members;
+    };
+    let on = |f: &Facet| {
+        (f.xy.iter()).all(|p| ((p.0 - c[0]).hypot(p.1 - c[1]) - r).abs() <= 0.005 + r * 1e-4)
+    };
+    let mut seen: HashSet<usize> = members.iter().copied().collect();
+    let mut from = members.clone();
+    while let Some(m) = from.pop() {
+        for p in &facets[&m].xy {
+            for &n in at.get(&key(*p)).into_iter().flatten() {
+                if seen.insert(n) && on(&facets[&n]) {
+                    members.push(n);
+                    from.push(n);
+                }
+            }
+        }
+    }
+    members.sort_unstable();
+    members
 }
 /// `members` of `facets` (by corner `at`), on round from each facet taken
 /// to the next it meets at a corner while their corners fit one circle
@@ -1417,5 +1447,48 @@ pub(crate) mod tests {
         );
         tool.p.insert("diameter".into(), "9.9".into());
         assert!(generate(&setup, &op, &tool, &mesh).is_ok());
+    }
+    #[test]
+    fn a_half_hole_a_relief_groove_crosses_is_one_arc_from_its_top() {
+        // The notched block's R5 half hole, crossed by a relief to R6 from
+        // Z4 to Z6 (review, LIO-361): a click on a facet of either band
+        // picks both, from the part's top down to its bottom.
+        let notch = |r: f64| {
+            [
+                (-20., 0., 0.),
+                (-r, 0., -1.),
+                (r, 0., 0.),
+                (20., 0., 0.),
+                (20., 20., 0.),
+                (-20., 20., 0.),
+            ]
+        };
+        let mut tris = slab(&[&notch(5.)], 4., 0., false, true);
+        tris.extend(slab(&[&notch(6.)], 2., 4., false, false));
+        tris.extend(slab(&[&notch(5.)], 4., 6., true, false));
+        let mesh = mesh::normalize(tris).unwrap();
+        let (setup, mut op, _) = fixture(Strategy::Drill);
+        let g = Geometry::new(&setup, &mesh);
+        let centre = [0f32, g.bounds.min[1]];
+        let on_arc = |c: [f32; 2]| ((c[0] - centre[0]).hypot(c[1] - centre[1]) - 5.).abs() < 0.1;
+        let bands = walls_where(&setup, &mesh, on_arc);
+        // Two bands of 36 facets, each its own surface.
+        assert_eq!(bands.len(), 72, "{bands:?}");
+        for &id in &bands {
+            let a = arc_at(&setup, &mesh, id).unwrap();
+            assert_eq!(a.walls, bands);
+            assert!((a.top - g.bounds.max[2]).abs() < 0.01, "{a:?}");
+            assert!((a.bottom - g.bounds.min[2]).abs() < 0.01, "{a:?}");
+        }
+        // Picked, it is one Ø10 hole from the part's top.
+        picking(&mut op, &mesh, &bands);
+        let found = holes(&setup, &op, &mesh).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            (found[0].top - g.bounds.max[2]).abs() < 0.01,
+            "{:?}",
+            found[0]
+        );
+        assert!((found[0].diameter - 10.).abs() < 0.01, "{:?}", found[0]);
     }
 }
