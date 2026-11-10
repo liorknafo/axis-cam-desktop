@@ -6189,11 +6189,16 @@ impl App {
                     // round its centre (`cam::arcs`). A click on it drops it.
                     // So does one whose whole hole is read as round about
                     // another centre (a slot so short it is nearly round).
-                    // A thread's hole is round about its axis, as its every
-                    // wall is: no arc is looked for (along its hundreds of
-                    // crests, a look took seconds).
-                    let arc = (drill && wall && drop.is_none() && threaded.is_none())
-                        .then(|| cam::arcs::arc_at(&setup, mesh, n));
+                    // A thread's hole (`threaded`) is round about its axis,
+                    // and a thread's own wall is its hole's, never an arc
+                    // (`cam::arcs::thread_wall`): no arc is looked for there,
+                    // which along a thread's hundreds of crests took minutes.
+                    let arc = (drill
+                        && wall
+                        && drop.is_none()
+                        && threaded.is_none()
+                        && !cam::arcs::thread_wall(&setup, mesh, n))
+                    .then(|| cam::arcs::arc_at(&setup, mesh, n));
                     let no_round = found.is_err()
                         || (!this.is_empty() && round.first().is_none_or(|r| r.is_none()))
                         || matches!(
