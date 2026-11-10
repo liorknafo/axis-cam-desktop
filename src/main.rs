@@ -6533,6 +6533,21 @@ impl App {
                                     s.p.insert("name".into(), format!("Centre drill {thread}"));
                                 }
                             }
+                            // One gear for them all: the slowest of their
+                            // speeds, and its feed.
+                            let speed =
+                                |o: &Operation, k: &str| num(&o.p, k).unwrap_or(f32::INFINITY);
+                            if let Some(slow) = (spots.iter())
+                                .min_by(|a, b| speed(a, "rpm").total_cmp(&speed(b, "rpm")))
+                                .map(|o| {
+                                    (get(&o.p, "rpm").to_string(), get(&o.p, "feed").to_string())
+                                })
+                            {
+                                for s in &mut spots {
+                                    s.p.insert("rpm".into(), slow.0.clone());
+                                    s.p.insert("feed".into(), slow.1.clone());
+                                }
+                            }
                             ops.extend(spots);
                             ops.extend(rest);
                         }

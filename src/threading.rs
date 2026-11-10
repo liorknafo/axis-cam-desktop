@@ -138,13 +138,23 @@ pub fn add(doc: &Document, si: usize, mesh: &Mesh) -> Result<Added, String> {
             machine,
         );
         selection(&mut hole);
-        // Named for what the hand does, short enough for the browser's 20
-        // letters (LIO-411).
-        let drill_name = format!("{name} · tap drill Ø{}", trim(tap_drill));
-        let drill_name = if drill_name.chars().count() <= 20 || !hand {
+        // On a hand mill named for what the hand does, by the drill it
+        // takes, short enough for the browser's 20 letters (LIO-411).
+        let size = drill
+            .and_then(|t| num(&t.p, "diameter"))
+            .unwrap_or(tap_drill);
+        let drill_name = [
+            format!("{name} · tap drill Ø{}", trim(size)),
+            format!("{name} · drill Ø{}", trim(size)),
+            format!("{name} · Ø{}", trim(size)),
+        ]
+        .into_iter()
+        .find(|n| n.chars().count() <= 20)
+        .unwrap_or_else(|| format!("{name} · Ø{}", trim(size)));
+        let drill_name = if hand {
             drill_name
         } else {
-            format!("{name} · drill Ø{}", trim(tap_drill))
+            format!("{name} · tap drill")
         };
         hole.p.insert("name".into(), drill_name);
         hole.p.insert(THREAD_NAME.into(), name.clone());
@@ -754,7 +764,8 @@ mod tests {
         let m6 = added
             .ops
             .iter()
-            .find(|o| o.name() == "M6×1 · thread")
+            // Named a tap on a hand mill since LIO-411.
+            .find(|o| o.name() == "M6×1 · tap")
             .unwrap();
         assert!(m6.tapping());
         assert!(!m6.tool.is_empty());
