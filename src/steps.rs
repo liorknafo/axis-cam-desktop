@@ -5757,6 +5757,18 @@ pub(crate) mod tests {
         let window = iced::Size::new(1024., 700.);
         (a.window_width, a.window_height) = (window.width, window.height);
         send(&mut a, GuideAction::Go(first + 1));
+        if let Ok(dir) = std::env::var("AXIS_RENDER_DIR") {
+            let dir = std::path::Path::new(&dir);
+            render(&a, (1024, 700), &dir.join("thread-pass-1024.png"));
+            let mut w = lathe_app("Diameter", |_| {});
+            (w.window_width, w.window_height) = (1440., 900.);
+            for (name, at) in [("thread-setup", first - 1), ("thread-pass", first + 1)] {
+                send(&mut w, GuideAction::Go(at));
+                render(&w, (1440, 900), &dir.join(format!("{name}-1440.png")));
+            }
+            send(&mut w, GuideAction::Go(first + 8));
+            render(&w, (1440, 900), &dir.join("thread-try-1440.png"));
+        }
         let t = texts(&a);
         assert!(
             t.iter()
@@ -5773,11 +5785,13 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>()
         };
         let back = at("◀ Back")[0];
-        let keys = ["cross slide", "top slide", "spindle"];
+        // The numbered rows' keys (the dial's title above also says "top
+        // slide"): in order down the column.
+        let keys = ["cross slide", "spindle"];
         let mut last = 0.;
         for key in keys {
             let r = *at(key)
-                .last()
+                .first()
                 .unwrap_or_else(|| panic!("{key} in {seen:?}"));
             assert!(r.y + r.height + 14. <= back.y, "{key} {r:?} over {back:?}");
             assert!(r.y >= last, "{key} in order");

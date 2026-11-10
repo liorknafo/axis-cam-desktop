@@ -4021,8 +4021,12 @@ pub(crate) mod tests {
         let (doc, mesh) = sample("Diameter");
         let guide = build(&doc, &mesh, 0).unwrap();
         let names: Vec<&str> = guide.sections.iter().map(|s| s.name.as_str()).collect();
+        // A thread's section is named for its thread (LIO-415).
         let ops: Vec<String> = (doc.setups[0].operations.iter())
-            .map(|o| o.name().to_string())
+            .map(|o| match o.name() {
+                "Turn · Thread" => "Thread M40×1.5".to_string(),
+                n => n.to_string(),
+            })
             .collect();
         assert_eq!(names[0], "Set up");
         assert_eq!(
@@ -4044,8 +4048,9 @@ pub(crate) mod tests {
         );
         assert_eq!(of(3), ["Drill"]);
         assert_eq!(of(4), ["Touch", "Groove"]);
-        assert_eq!(of(5)[..2], ["Touch", "Thread pass"]);
-        assert_eq!(of(5).len(), 9);
+        // Set up once before the passes, tried after them (LIO-415, LIO-413).
+        assert_eq!(of(5)[..3], ["Touch", "Set up the thread", "Thread pass"]);
+        assert_eq!((of(5).len(), of(5).last().copied()), (11, Some("Try")));
         assert_eq!(of(6), ["Touch", "Part off"]);
         assert_eq!(of(7), ["HandOver"]);
         let counts: Vec<usize> = guide.sections.iter().map(|s| s.count).collect();
@@ -4637,7 +4642,11 @@ pub(crate) mod tests {
         let of = |i: usize| kinds(&guide, guide.sections[i].steps.clone());
         // No turning tool, so no Zero; the tap is its own section.
         assert_eq!(of(0), ["Hold"]);
-        assert_eq!([of(1), of(2), of(3)], [["Drill"], ["Tap"], ["HandOver"]]);
+        // The tap ends tried with a screw (LIO-413).
+        assert_eq!(
+            [of(1), of(2), of(3)],
+            [vec!["Drill"], vec!["Tap", "Try"], vec!["HandOver"]]
+        );
         assert_eq!(guide.sections[2].count, 1);
         assert!(guide.sections[2].minutes > 1.);
         let Some(LatheStep::TailTap {
@@ -4713,7 +4722,8 @@ pub(crate) mod tests {
         let of = |i: usize| kinds(&guide, guide.sections[i].steps.clone());
         // The Zero is the turning tool's; the die has no Touch, no Thread pass.
         assert_eq!(of(0), ["Hold", "Zero"]);
-        assert_eq!(of(2), ["Die"]);
+        // Then tried with the nut (LIO-413).
+        assert_eq!(of(2), ["Die", "Try"]);
         assert!(
             !lathe_steps(&guide)
                 .iter()
@@ -4776,7 +4786,10 @@ pub(crate) mod tests {
         doc.setups[0].p.insert("stock_diameter".into(), "16".into());
         let guide = build(&doc, &mesh, 0).unwrap();
         assert_eq!(kinds(&guide, guide.sections[0].steps.clone()), ["Hold"]);
-        assert_eq!(kinds(&guide, guide.sections[1].steps.clone()), ["Die"]);
+        assert_eq!(
+            kinds(&guide, guide.sections[1].steps.clone()),
+            ["Die", "Try"]
+        );
     }
 
     #[test]

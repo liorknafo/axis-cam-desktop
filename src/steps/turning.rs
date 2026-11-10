@@ -2785,8 +2785,10 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     chip(format!("gearbox {}", mm(*pitch))),
                     chip("half-nuts stay closed"),
                 ]),
-                dials(vec![
-                    dial_box(
+                // At a narrow window the top slide's number is in its row:
+                // no dial, so the four motions are in view (LIO-415).
+                dials(
+                    vec![dial_box(
                         p,
                         top,
                         if top.out {
@@ -2798,9 +2800,12 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                             format!("pass {index}: in to {}", t.total)
                         },
                         dial_size(p, 2.)
-                    ),
-                    top_angle(*angle, top.out),
-                ]),
+                    ),]
+                    .into_iter()
+                    .chain([top_angle(*angle, top.out)])
+                    .filter(|_| !narrow)
+                    .collect()
+                ),
                 line(
                     narrow,
                     Some(1),
