@@ -2925,12 +2925,12 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Manual(11)),
         ),
         (_, "dro_matrix") => (
-            "Yes when the DRO has matrix holes: type a grid in once and it leads to each hole. The Steps page then gives a Drill's grid of holes as one pattern.",
+            "Yes (the default) when the DRO has matrix holes: type a grid in once and it leads to each hole. The Steps page then gives a Drill's grid of holes as one pattern. No for a DRO without them.",
             "",
             None,
         ),
         (_, "dro_arc") => (
-            "Yes when the DRO has arc holes: type a circle of holes in once and it leads to each hole. The Steps page then gives a Drill's holes on a circle as one pattern.",
+            "Yes (the default) when the DRO has arc holes: type a circle of holes in once and it leads to each hole. The Steps page then gives a Drill's holes on a circle as one pattern. No for a DRO without them.",
             "",
             None,
         ),

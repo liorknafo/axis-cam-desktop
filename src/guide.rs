@@ -788,7 +788,9 @@ fn reordered<T: Clone>(v: &[T], order: &[usize]) -> Vec<T> {
 pub enum Pattern {
     /// `columns` holes a row and `rows` rows: `first` the first hole,
     /// `pitch` along a row and between the rows, the rows at `angle`. The
-    /// DRO's order: row by row from the first hole, each row the same way.
+    /// order: row by row from the first hole, back and forth, each row the
+    /// opposite way from the one before, so that square to the axes every
+    /// move to the next hole is along one axis (LIO-405).
     Grid {
         first: [f32; 2],
         columns: usize,
@@ -814,15 +816,88 @@ const ON_PATTERN: f32 = 0.02;
 fn hundredths(v: f32) -> f32 {
     (v * 100.).round() / 100. + 0.
 }
+/// How far a hole may be from where the numbers as shown put it, mm.
+const SHOWN_OFF: f32 = 0.05;
+/// The pattern of `holes` (centres and depths, work coordinates) the DRO
+/// leads to (`pattern`), when all of them go to the same Z to 0.01.
+// ponytail: the DRO's order of the holes is not known (row by row each the
+// same way, or back and forth), so holes of unequal depth go one by one,
+// lest the DRO's hole N get another hole's depth (LIO-403). Lift it when the
+// owner's DRO order is known.
+fn level_pattern(holes: &[[f32; 3]], grids: bool, arcs: bool) -> Option<(Pattern, Vec<usize>)> {
+    let z = hundredths(holes.first()?[2]);
+    if holes.iter().any(|h| hundredths(h[2]) != z) {
+        return None;
+    }
+    let xy: Vec<[f32; 2]> = holes.iter().map(|h| [h[0], h[1]]).collect();
+    pattern(&xy, grids, arcs)
+}
+/// Where the DRO puts each hole of `p`, in its order, from its numbers as
+/// shown: each hole a pitch, or an angle between holes, on from the last.
+fn places(p: &Pattern) -> Vec<[f32; 2]> {
+    match *p {
+        Pattern::Grid {
+            first,
+            columns,
+            rows,
+            pitch,
+            angle,
+        } => {
+            let (s, c) = angle.to_radians().sin_cos();
+            (0..rows)
+                .flat_map(|r| {
+                    (0..columns).map(move |k| {
+                        let k = if r % 2 == 1 { columns - 1 - k } else { k };
+                        let (u, v) = (k as f32 * pitch[0], r as f32 * pitch[1]);
+                        [first[0] + u * c - v * s, first[1] + u * s + v * c]
+                    })
+                })
+                .collect()
+        }
+        Pattern::Arc {
+            centre,
+            diameter,
+            count,
+            first,
+            step,
+            ..
+        } => (0..count)
+            .map(|j| {
+                let t = (first + j as f32 * step).to_radians();
+                [
+                    centre[0] + diameter / 2. * t.cos(),
+                    centre[1] + diameter / 2. * t.sin(),
+                ]
+            })
+            .collect(),
+    }
+}
 /// The one pattern the hole centres `holes` (work coordinates) make all
 /// together, of those the DRO has (`grids`, `arcs`), with the holes'
-/// indices in the DRO's order; None for fewer than three holes. A grid is
-/// taken first: four holes on a square's corners are both.
+/// indices in the DRO's order; None for fewer than three holes, or when the
+/// numbers as shown put a hole more than 0.05 mm off (LIO-402). Four holes
+/// on a square are a grid and a circle: the grid when square to the axes,
+/// else the circle, a bolt circle of four (LIO-402).
 pub fn pattern(holes: &[[f32; 2]], grids: bool, arcs: bool) -> Option<(Pattern, Vec<usize>)> {
     if holes.len() < 3 {
         return None;
     }
-    (grids.then(|| grid(holes)).flatten()).or_else(|| arcs.then(|| arc(holes)).flatten())
+    let shown = |found: Option<(Pattern, Vec<usize>)>| {
+        found.filter(|(p, order)| {
+            (places(p).iter().zip(order))
+                .all(|(q, &h)| (q[0] - holes[h][0]).hypot(q[1] - holes[h][1]) <= SHOWN_OFF)
+        })
+    };
+    let as_grid = if grids { shown(grid(holes)) } else { None };
+    let as_arc = if arcs { shown(arc(holes)) } else { None };
+    match (as_grid, as_arc) {
+        (
+            Some((Pattern::Grid { angle, .. }, _)),
+            Some(round @ (Pattern::Arc { full: true, .. }, _)),
+        ) if angle != 0. => Some(round),
+        (Some(found), _) => Some(found),
+        (None, found) => found,
+    }
 }
 /// `holes` as one grid: its rows along the direction of a pair of holes,
 /// the longest pairs first, as their direction is the truest.
@@ -933,20 +1008,43 @@ fn grid_along(holes: &[[f32; 2]], u: [f32; 2]) -> Option<(Pattern, Vec<usize>)> 
     if (0..n).any(|h| off(h) > ON_PATTERN) {
         return None;
     }
+    // Back and forth: the odd rows the other way (LIO-405).
+    // ponytail: no setting for the DRO's order; add one if the owner's DRO
+    // goes each row from the same end.
     let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by_key(|&h| (k[h], i[h]));
-    let pattern = Pattern::Grid {
-        first: first.map(hundredths),
-        columns: c,
-        rows: r,
-        pitch: [len(pa), across].map(hundredths),
-        angle: hundredths(pa[1].atan2(pa[0]).to_degrees()),
+    order.sort_by_key(|&h| (k[h], if k[h] % 2 == 1 { c - 1 - i[h] } else { i[h] }));
+    // Square to the axes within 0.02° reads 0 (LIO-402).
+    let turned = pa[1].atan2(pa[0]).to_degrees();
+    let angle = if turned.abs() <= 0.02 {
+        0.
+    } else {
+        hundredths(turned)
+    };
+    // A lone line along Y is one hole a row, the rows up it: a DRO whose
+    // matrix holes take no angle does it so (LIO-402).
+    let pattern = if r == 1 && (turned - 90.).abs() <= 0.02 {
+        Pattern::Grid {
+            first: first.map(hundredths),
+            columns: 1,
+            rows: c,
+            pitch: [0., hundredths(len(pa))],
+            angle: 0.,
+        }
+    } else {
+        Pattern::Grid {
+            first: first.map(hundredths),
+            columns: c,
+            rows: r,
+            pitch: [len(pa), across].map(hundredths),
+            angle,
+        }
     };
     Some((pattern, order))
 }
 /// `holes` as one arc: on the circle that fits them best, at even angles,
-/// all the way round or along part of it (at least 10° from the first to
-/// the last, not a line).
+/// all the way round or along part of it (at least four holes, as any three
+/// lie on some circle (LIO-402), and 10° from the first to the last, not a
+/// line).
 fn arc(holes: &[[f32; 2]]) -> Option<(Pattern, Vec<usize>)> {
     let n = holes.len();
     // The algebraic (Kåsa) fit, about the holes' middle.
@@ -966,10 +1064,12 @@ fn arc(holes: &[[f32; 2]]) -> Option<(Pattern, Vec<usize>)> {
     let (cu, cv) = ((r1 * vv - r2 * uv) / det, (r2 * uu - r1 * uv) / det);
     let radius = (cu * cu + cv * cv + (uu + vv) / n as f64).sqrt() as f32;
     let centre = [(m[0] + cu) as f32, (m[1] + cv) as f32];
-    // Each hole's angle, 0 to 360, a hair under 0 taken as 0.
+    // Each hole's angle, 0 to 360; one under 0 by no more than a hole may
+    // be off its place is taken as 0.
+    let hair = (ON_PATTERN / radius.max(ON_PATTERN)).to_degrees();
     let angle = |p: [f32; 2]| {
         let a = (p[1] - centre[1]).atan2(p[0] - centre[0]).to_degrees();
-        if a < -0.005 { a + 360. } else { a.max(0.) }
+        if a < -hair { a + 360. } else { a.max(0.) }
     };
     let mut by: Vec<usize> = (0..n).collect();
     by.sort_by(|a, b| angle(holes[*a]).total_cmp(&angle(holes[*b])));
@@ -989,7 +1089,7 @@ fn arc(holes: &[[f32; 2]]) -> Option<(Pattern, Vec<usize>)> {
         ),
     ];
     tries.into_iter().find_map(|(full, start, step)| {
-        if !full && step * ((n - 1) as f32) < 10. {
+        if !full && (n < 4 || step * ((n - 1) as f32) < 10.) {
             return None;
         }
         let order: Vec<usize> = (0..n).map(|j| by[(start + j) % n]).collect();
@@ -1262,9 +1362,10 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
     let zero = crate::post::datum(setup, stock, mesh)?;
     let work = |b: Bounds| b.translated(zero.map(|v| -v));
     let dro = get(&machine.p, "dro_comp") == "Yes";
-    // The DRO's own hole functions (LIO-399); No when not set.
-    let grids = get(&machine.p, "dro_matrix") == "Yes";
-    let arcs = get(&machine.p, "dro_arc") == "Yes";
+    // The DRO's own hole functions (LIO-399).
+    // Yes unless set to No, so a pattern needs nothing set up.
+    let grids = get(&machine.p, "dro_matrix") != "No";
+    let arcs = get(&machine.p, "dro_arc") != "No";
     let tool_time = num(&machine.p, "tool_time").unwrap_or(0.);
 
     // Set up.
@@ -1513,8 +1614,7 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                     .collect();
                 // ponytail: one pattern an operation, all its holes or none;
                 // several would need the holes split into patterns first.
-                let xy: Vec<[f32; 2]> = holes.iter().map(|h| [h[0], h[1]]).collect();
-                let found = pattern(&xy, grids, arcs);
+                let found = level_pattern(&holes, grids, arcs);
                 let (holes, mouths, uncentred, pattern) = match found {
                     Some((pattern, order)) => {
                         steps.push(Step::Pattern {
@@ -2226,7 +2326,7 @@ pub(crate) mod tests {
             .collect()
     }
     /// `cols` × `rows` holes from `first`, `pitch` apart, the rows at
-    /// `angle`° from +X, row by row.
+    /// `angle`° from +X, row by row back and forth.
     pub(crate) fn grid_at(
         first: [f32; 2],
         cols: usize,
@@ -2234,15 +2334,13 @@ pub(crate) mod tests {
         pitch: [f32; 2],
         angle: f32,
     ) -> Vec<[f32; 2]> {
-        let (s, c) = angle.to_radians().sin_cos();
-        (0..rows)
-            .flat_map(|r| {
-                (0..cols).map(move |k| {
-                    let (u, v) = (k as f32 * pitch[0], r as f32 * pitch[1]);
-                    [first[0] + u * c - v * s, first[1] + u * s + v * c]
-                })
-            })
-            .collect()
+        places(&Pattern::Grid {
+            first,
+            columns: cols,
+            rows,
+            pitch,
+            angle,
+        })
     }
     /// `n` holes on the circle Ø`d` round `centre`, from `first`° each
     /// `step`° on counter-clockwise.
@@ -2253,12 +2351,14 @@ pub(crate) mod tests {
         first: f32,
         step: f32,
     ) -> Vec<[f32; 2]> {
-        (0..n)
-            .map(|j| {
-                let t = (first + j as f32 * step).to_radians();
-                [centre[0] + d / 2. * t.cos(), centre[1] + d / 2. * t.sin()]
-            })
-            .collect()
+        places(&Pattern::Arc {
+            centre,
+            diameter: d,
+            count: n,
+            first,
+            step,
+            full: false,
+        })
     }
     #[test]
     fn grids_and_arcs_of_holes_are_found_to_the_hundredth_in_the_dros_order() {
@@ -2298,24 +2398,39 @@ pub(crate) mod tests {
             assert_eq!(found(&holes, true, true), want);
             assert_eq!(found(&holes, false, true), None);
         }
-        // A row of four, upright: a grid of one row.
-        let row = grid_at([5., 5.], 4, 1, [12.5, 0.], 90.);
-        // Its noise turns it a hair, which the hundredths show.
-        let Some(Pattern::Grid {
-            first,
-            columns: 4,
-            rows: 1,
-            pitch,
-            angle,
-        }) = found(&row, true, false)
-        else {
-            panic!()
-        };
-        let near = |a: f32, b: f32| (a - b).abs() <= 0.02;
-        assert!(near(first[0], 5.) && near(first[1], 5.), "{first:?}");
-        assert!(
-            near(pitch[0], 12.5) && pitch[1] == 0. && near(angle, 90.),
-            "{pitch:?} {angle}"
+        // A line of four along Y: 1 hole a row × 4 rows at 0° (LIO-402);
+        // along X: 4 × 1; slanted: a row at its angle.
+        let up = grid_at([5., 5.], 1, 4, [0., 12.5], 0.);
+        assert_eq!(
+            found(&up, true, false),
+            grid([5., 5.], 1, 4, [0., 12.5], 0.)
+        );
+        let along = grid_at([5., 5.], 4, 1, [12.5, 0.], 0.);
+        assert_eq!(
+            found(&along, true, false),
+            grid([5., 5.], 4, 1, [12.5, 0.], 0.)
+        );
+        let slant = grid_at([5., 5.], 4, 1, [12.5, 0.], 60.);
+        assert_eq!(
+            found(&slant, true, false),
+            grid([5., 5.], 4, 1, [12.5, 0.], 60.)
+        );
+        // Square to the axes within 0.02° reads 0.00° (LIO-402).
+        let hair = grid_at([10., 20.], 4, 3, [15., 10.], 0.015);
+        assert_eq!(
+            found(&hair, true, true),
+            grid([10., 20.], 4, 3, [15., 10.], 0.)
+        );
+        // Back and forth: one axis between holes one after the other
+        // (LIO-405). The jumble above checks the order as made.
+        let order = grid_at([0., 0.], 4, 3, [10., 10.], 0.);
+        for w in order.windows(2) {
+            let moved = (0..2).filter(|&k| (w[0][k] - w[1][k]).abs() > 1e-3).count();
+            assert_eq!(moved, 1, "{w:?}");
+        }
+        assert_eq!(
+            (order[3], order[4], order[7], order[8]),
+            ([30., 0.], [30., 10.], [0., 10.], [0., 20.])
         );
         // A bolt circle of six, and an arc of four over 90°.
         let bolts = circle_at([50., 40.], 80., 6, 15., 60.);
@@ -2373,15 +2488,56 @@ pub(crate) mod tests {
         // short; three in a line unevenly.
         let ragged = [[0., 0.], [10., 0.], [25., 3.], [7., 19.]];
         let short = &grid_at([0., 0.], 3, 3, [10., 10.], 0.)[..8];
+        // Three holes in an isosceles triangle: on a circle, but three
+        // prove no arc short of all the way round (LIO-402). A pitch that is
+        // no whole hundredth adds up: 31 holes over 100 mm end 0.1 off.
+        let isosceles = [[0., 0.], [20., 0.], [10., 5.]];
+        let thirds = grid_at([0., 0.], 31, 1, [100. / 30., 0.], 0.);
         for holes in [
             &ragged[..],
             &ragged[..2],
             &ragged[..1],
             short,
             &[[0., 0.], [10., 0.], [25., 0.]][..],
+            &isosceles[..],
+            &thirds[..],
         ] {
             assert_eq!(found(holes, true, true), None, "{holes:?}");
         }
+        // Three all the way round are an arc.
+        let three = circle_at([0., 0.], 40., 3, 90., 120.);
+        assert_eq!(
+            found(&three, true, true),
+            arc([0., 0.], 40., 3, 90., 120., true)
+        );
+        // Four on a circle at 0°, 90°, 180°, 270°: a bolt circle of four,
+        // not a grid turned 45° (LIO-402); a grid when the DRO has no arcs.
+        let four = circle_at([0., 0.], 50., 4, 0., 90.);
+        assert_eq!(
+            found(&four, true, true),
+            arc([0., 0.], 50., 4, 0., 90., true)
+        );
+        // (In the grid's order, not the circle's.)
+        assert!(matches!(
+            pattern(&four, true, false),
+            Some((Pattern::Grid { angle, .. }, _)) if (angle.abs() - 45.).abs() < 0.05
+        ));
+    }
+    #[test]
+    fn a_pattern_is_used_only_when_every_hole_goes_to_the_same_depth() {
+        let at = |z: &[f32]| -> Vec<[f32; 3]> {
+            (grid_at([0., 0.], 3, 2, [10., 10.], 0.).iter().zip(z))
+                .map(|(p, z)| [p[0], p[1], *z])
+                .collect()
+        };
+        let level = at(&[-12.; 6]);
+        assert!(level_pattern(&level, true, true).is_some());
+        // One hole shallower: the DRO's hole N might be another depth (LIO-403).
+        let shallow = at(&[-12., -12., -8., -12., -12., -12.]);
+        assert_eq!(level_pattern(&shallow, true, true), None);
+        // Within the hundredth shown is the same depth.
+        let close = at(&[-12., -12.001, -12., -12., -12.002, -12.]);
+        assert!(level_pattern(&close, true, true).is_some());
     }
     /// A 120 × 90 × 10 plate with Ø6 holes through at `at` (its middle at
     /// 0), drilled Ø6 on a manual mill whose DRO has matrix holes (`grids`)
@@ -2468,13 +2624,11 @@ pub(crate) mod tests {
             panic!()
         };
         assert!(pattern.is_some());
-        // Row by row from the first hole, each from left to right.
+        // Row by row from the first hole, back and forth (LIO-405).
         assert_eq!(holes.len(), 12);
         for (j, h) in holes.iter().enumerate() {
-            let want = [
-                first[0] + (j % 4) as f32 * 20.,
-                first[1] + (j / 4) as f32 * 15.,
-            ];
+            let col = if (j / 4) % 2 == 1 { 3 - j % 4 } else { j % 4 };
+            let want = [first[0] + col as f32 * 20., first[1] + (j / 4) as f32 * 15.];
             assert!((h[0] - want[0]).hypot(h[1] - want[1]) < 0.02, "{j} {h:?}");
         }
         // Without the DRO's matrix holes: hole by hole, as before.
@@ -2537,7 +2691,9 @@ pub(crate) mod tests {
         // The 15 mm step is one row on each of its two levels (LIO-366); the
         // Face's tool is still in, so only the DRO is set (LIO-368).
         assert_eq!(of(2), ["Comp", "Pass", "Pass", "Check"]);
-        assert_eq!(of(3), ["Tool", "Holes", "Check"]);
+        // The four holes on a 96 x 56 rectangle are a 2 x 2 grid, which the
+        // DRO's matrix holes (on by default, LIO-399) take: a Pattern first.
+        assert_eq!(of(3), ["Tool", "Pattern", "Holes", "Check"]);
         assert_eq!(of(4), ["HandOver"]);
         let counts: Vec<usize> = guide.sections.iter().map(|s| s.count).collect();
         assert_eq!(counts, [0, 0, 2, 4, 0]);
@@ -2621,9 +2777,10 @@ pub(crate) mod tests {
         let guide = build(&doc, &mesh, 0).unwrap();
         assert_eq!(
             kinds(&guide, 0..guide.steps.len()),
+            // The holes are a 2 x 2 grid: a Pattern before them (LIO-399).
             [
-                "Hold", "Zero", "Face", "Comp", "Pass", "Pass", "Check", "Tool", "Holes", "Check",
-                "HandOver"
+                "Hold", "Zero", "Face", "Comp", "Pass", "Pass", "Check", "Tool", "Pattern",
+                "Holes", "Check", "HandOver"
             ]
         );
         let Step::Hold {
@@ -2674,7 +2831,7 @@ pub(crate) mod tests {
         close(*remove, 2.);
         // The first tool picks up Z on the untouched top.
         close(top.unwrap(), 0.);
-        assert_eq!(guide.steps[10], Step::HandOver { next: Some(1) });
+        assert_eq!(guide.steps[11], Step::HandOver { next: Some(1) });
         // The Step's floor is closed: not a squaring Box. The Face's tool
         // is still in: only the DRO's diameter and sides (LIO-368).
         assert_eq!(
@@ -3301,7 +3458,8 @@ pub(crate) mod tests {
     fn the_holes_are_centres_and_depths_in_work_coordinates() {
         let (doc, mesh) = job("Yes");
         let guide = build(&doc, &mesh, 0).unwrap();
-        let Step::Holes { op, holes, .. } = &guide.steps[8] else {
+        // After the Tool and the holes' Pattern (LIO-399).
+        let Step::Holes { op, holes, .. } = &guide.steps[9] else {
             panic!()
         };
         assert_eq!((*op, holes.len()), (2, 4));
@@ -3468,18 +3626,19 @@ pub(crate) mod tests {
         let guide = build(&doc, &mesh, 0).unwrap();
         assert_eq!(place(&doc, &guide), 0);
         let id = doc.setups[0].id.clone();
-        doc.guide.insert(id.clone(), 7);
+        // One step on for the holes' Pattern since LIO-399.
+        doc.guide.insert(id.clone(), 8);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("job.axis.json");
         crate::storage::save(&path, &doc).unwrap();
         let mut doc = crate::storage::load(&path).unwrap();
-        assert_eq!(doc.guide.get(&id), Some(&7));
-        assert_eq!(place(&doc, &guide), 7);
-        // Without the Step the setup has 7 steps: the place is the last.
+        assert_eq!(doc.guide.get(&id), Some(&8));
+        assert_eq!(place(&doc, &guide), 8);
+        // Without the Step the setup has 8 steps: the place is the last.
         doc.setups[0].operations.remove(1);
         let guide = build(&doc, &mesh, 0).unwrap();
-        assert_eq!(guide.steps.len(), 7);
-        assert_eq!(place(&doc, &guide), 6);
+        assert_eq!(guide.steps.len(), 8);
+        assert_eq!(place(&doc, &guide), 7);
         // A project saved without places loads with none.
         let mut json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
