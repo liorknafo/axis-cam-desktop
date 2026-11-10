@@ -3399,7 +3399,7 @@ fn pattern_screen<'a>(
     Element<'a, Message>,
     Column<'a, Message>,
 ) {
-    let (holes, dro): (Vec<[f32; 2]>, Vec<usize>) = match p.guide().steps.get(p.at + 1) {
+    let (holes, called): (Vec<[f32; 2]>, Vec<usize>) = match p.guide().steps.get(p.at + 1) {
         Some(Step::Holes { holes, numbers, .. }) => (
             holes.iter().map(|h| [h[0], h[1]]).collect(),
             numbers.clone(),
@@ -3407,7 +3407,7 @@ fn pattern_screen<'a>(
         _ => (vec![], vec![]),
     };
     // Out of the DRO's order round the circle, one axis a move (LIO-406).
-    let out_of_order = dro.iter().enumerate().any(|(j, n)| *n != j + 1);
+    let out_of_order = called.iter().enumerate().any(|(j, n)| *n != j + 1);
     let one_axis = (holes.windows(2))
         .filter(|w| crate::guide::one_axis(w[0], w[1]))
         .count();
@@ -3553,7 +3553,7 @@ fn pattern_screen<'a>(
     let left = p.drawing(
         0,
         stock,
-        vec![Shape::Pattern(pattern.clone(), holes, r, dro)],
+        vec![Shape::Pattern(pattern.clone(), holes, r, called)],
         Fill,
     );
     (title.into(), sub, left, right)
