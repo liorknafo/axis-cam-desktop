@@ -4100,7 +4100,14 @@ pub(crate) mod tests {
                     .1
             };
             let back = find("◀ Back");
-            for start in ["Then the DRO leads", "first hole"] {
+            // The closing line: the bolt circle's calls each hole up, as it
+            // is drilled out of the DRO's order (LIO-406).
+            let closing = if grids {
+                "Then the DRO leads"
+            } else {
+                "Call up each hole"
+            };
+            for start in [closing, "first hole"] {
                 let r = find(start);
                 assert!(r.y + r.height < back.y, "{start} {r:?} over {back:?}");
             }
