@@ -29136,6 +29136,64 @@ soft_max = 180.0
         assert_eq!(names(&a), ["Big vise"]);
         assert_eq!(crate::ui::fitting_holders(&a, "Clamp").len(), 0);
     }
+    /// On the lathe sample's Work page (LIO-387, LIO-388): the round bar is
+    /// named by its diameter; a Turn being edited is drawn in the cut's
+    /// orange and redrawn as its diameter and Z end change; one that reaches
+    /// into the part shows red. The drawings land in the test's directory.
+    #[test]
+    fn a_turn_being_edited_is_drawn_on_the_round_bar_and_red_into_the_part() {
+        let mut a = crate::steps::tests::lathe_app("Diameter", |_| {});
+        let _ = a.update(Message::Page(Page::Work));
+        let _ = a.update(Message::SelectOp(1));
+        let view = crate::ui::scene_viewport(&a).unwrap();
+        let (setup, stock) = (&a.doc.setups[0], a.known_stock(0).0.unwrap());
+        assert_eq!(
+            view.stock_label(setup, stock, stock.dimensions()),
+            "Stock  Ø50.2 × 100.0 mm bar"
+        );
+        let dir = a.test_dir.as_ref().unwrap().path().to_path_buf();
+        // The orange and the red pixels of a shot, and the shot.
+        let shot = |a: &App, name: &str| {
+            let path = dir.join(format!("{name}.png"));
+            render_png(a, WINDOW, &path);
+            let png = std::fs::read(path).unwrap();
+            let mut reader = png::Decoder::new(std::io::Cursor::new(png.clone()))
+                .read_info()
+                .unwrap();
+            let mut buf = vec![0; reader.output_buffer_size()];
+            let info = reader.next_frame(&mut buf).unwrap();
+            let px = (info.color_type.samples()) as usize;
+            let rgb: Vec<_> = (buf[..info.buffer_size()].chunks(px))
+                .map(|p| (p[0] as i32, p[1] as i32, p[2] as i32))
+                .collect();
+            // The translucent orange over the part and the page; the tan
+            // stock, fainter, is not.
+            let orange = (rgb.iter())
+                .filter(|(r, g, b)| *r > 120 && r - g > 25 && g - b > 15)
+                .count();
+            let red = (rgb.iter())
+                .filter(|(r, g, b)| *r > 150 && *g < 90 && *b < 90)
+                .count();
+            (orange, red, png)
+        };
+        let edit = |a: &mut App, k: &'static str, v: &str| {
+            let _ = a.update(Message::Edit(crate::Target::Operation, k, v.into()));
+        };
+        let (orange, red, before) = shot(&a, "outside");
+        // The Outside's ring, Ø50.2 down to Ø40 over 65 mm, is a large orange.
+        assert!(orange > 3000, "orange {orange}");
+        for (k, v, was) in [("diameter", "44", "40"), ("z_end", "-30", "-65")] {
+            edit(&mut a, k, v);
+            let (o, _, png) = shot(&a, k);
+            assert_ne!(png, before, "{k}");
+            assert!(o < orange, "{k}: {o} vs {orange}");
+            edit(&mut a, k, was);
+        }
+        // Into the Ø35 part: red.
+        edit(&mut a, "diameter", "30");
+        let (_, into, _) = shot(&a, "into");
+        assert!(into > red + 300, "red {into} vs {red}");
+    }
     /// A Box being edited is drawn in the 3D view, and changes with each of
     /// its six fields; a new one faces the stock's top down to the part
     /// (LIO-373). The drawings land in the test's directory.

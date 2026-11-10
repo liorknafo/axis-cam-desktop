@@ -584,6 +584,8 @@ On a lathe setup the ribbon offers only **Turn** and **Drill**; Turn is dimmed a
 | Part off | Z (the blade's side toward the part) | One plunge by hand to 0.5 mm past the centre. The bar left in the chuck goes from the stock |
 | Thread | Outside or inside, major diameter, pitch, Z end, passes | Passes at the gearbox's pitch, each fed in further |
 
+**In the 3D view.** While a Turn or a lathe Drill is selected, before it is generated, the 3D view draws what it removes on the bar as a turned solid in the cut's orange, worked out by the same planning as the cut from the material the operations before it leave: an Outside's or a Bore's ring to the diameter and Z end, the slice a Face takes off, a groove's or a part off's ring, a thread's band, a chamfer's edge, a drill's hole. It is redrawn as each field changes; where the cut reaches into the part it shows red, before Generate. A round bar is drawn as a cylinder and named by its diameter ("Stock Ø50.2 × 100.0 mm bar"), in the browser's pictures too.
+
 **Drill** is the same Drill as on the CNC with no hole selection: it drills on the centre line from the tailstock to a depth, pecking every diameter, with a centre drill first. Its depth is measured from where the drill first touches the end plus its 118° point.
 
 **Pass rules.**

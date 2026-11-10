@@ -2261,7 +2261,9 @@ pub(crate) fn stock_picture(app: &App, si: usize, end: bool) -> Option<widget::i
             .chain(&stock.max)
             .for_each(|v| v.to_bits().hash(&mut hasher)),
     }
-    (si, end).hash(&mut hasher);
+    // A fresh round bar standing along Z is drawn round (LIO-387).
+    let bar = get(&setup.p, "stock_source") == "fresh" && crate::stock::is_round(setup);
+    (si, end, bar).hash(&mut hasher);
     for b in &jaws {
         b.bounds
             .min
@@ -2283,6 +2285,7 @@ pub(crate) fn stock_picture(app: &App, si: usize, end: bool) -> Option<widget::i
                 .filter(|_| end);
             crate::viewport::stock_triangles(&v, &surface, frame, since).collect()
         }
+        None if bar => crate::viewport::bar_triangles(stock, crate::viewport::BLOCK),
         None => crate::viewport::box_triangles(stock, crate::viewport::BLOCK),
     };
     for b in &jaws {
@@ -2466,6 +2469,7 @@ pub(crate) fn scene_viewport(app: &App) -> Option<Viewport<'_>> {
         },
         holding: holding_boxes(app),
         first_setup: app.doc.setups.first(),
+        tools: &app.doc.tools,
         framed: framed_holding(app),
         leftover: leftover_view(app),
         live: app.live_tool(),
@@ -5421,11 +5425,15 @@ fn zero_note(app: &App) -> Element<'_, Message> {
         return column![].into();
     };
     let size = stock.dimensions();
+    let mm = crate::post::exact_mm;
+    // A round bar standing along Z by its diameter and length (LIO-387).
+    let dims = if si == 0 && crate::stock::is_round(setup) {
+        format!("Ø{} × {}", mm(size[0].min(size[1])), mm(size[2]))
+    } else {
+        format!("{} × {} × {}", mm(size[0]), mm(size[1]), mm(size[2]))
+    };
     let from = format!(
-        "{} × {} × {} mm{}",
-        crate::post::exact_mm(size[0]),
-        crate::post::exact_mm(size[1]),
-        crate::post::exact_mm(size[2]),
+        "{dims} mm{}",
         match (si, known) {
             (0, _) => "",
             (_, true) => ", as the earlier setups leave it",
@@ -13847,6 +13855,7 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,

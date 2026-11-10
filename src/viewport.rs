@@ -216,6 +216,9 @@ pub type Ghost = ([f32; 2], Result<(f32, f32), String>);
 pub struct Viewport<'a> {
     pub setup: Option<&'a Setup>,
     pub operation: Option<&'a Operation>,
+    /// The tool library: a Turn's or a lathe Drill's cut is drawn from its
+    /// tool and those of the operations before it (LIO-388). Empty draws none.
+    pub tools: &'a [crate::model::Tool],
     pub mesh: &'a Mesh,
     pub simulation: Option<&'a crate::simulation::Simulation>,
     pub sample: bool,
@@ -620,6 +623,40 @@ impl Viewport<'_> {
             }
         }
         bounds
+    }
+    /// Whether the stock the view shows for `setup`, its box `stock` (mm),
+    /// is a round bar standing along Z (LIO-387): the setup's own Round bar
+    /// or Relative round bar when it starts fresh, or the box a later setup
+    /// takes over while that is still the job's first bar: square across Z.
+    /// ponytail: a bar a mill flatted evenly on all four sides reads round
+    /// too; ask the earlier setups' cuts if that matters.
+    fn standing_bar(&self, setup: &Setup, stock: crate::mesh::Bounds) -> bool {
+        if crate::model::get(&setup.p, "stock_source") == "fresh" {
+            return stock::is_round(setup);
+        }
+        let d = stock.dimensions();
+        self.leftover.is_some()
+            && (d[0] - d[1]).abs() < 1e-3
+            && self.first_setup.is_some_and(stock::is_round)
+    }
+    /// What the label over the view says of the stock `d` (its box's size,
+    /// mm) of `setup`: a bar by its diameter and length (LIO-387).
+    pub(crate) fn stock_label(
+        &self,
+        setup: &Setup,
+        stock: crate::mesh::Bounds,
+        d: [f32; 3],
+    ) -> String {
+        if self.simulation.is_none() && !self.stock_is_known(setup) {
+            "Remaining stock · generate preview".into()
+        } else if stock::round_bar(setup) && crate::model::get(&setup.p, "stock_source") == "fresh"
+        {
+            format!("Stock  Ø{:.1} × {:.1} mm bar", d[1].min(d[2]), d[0])
+        } else if self.standing_bar(setup, stock) {
+            format!("Stock  Ø{:.1} × {:.1} mm bar", d[0].min(d[1]), d[2])
+        } else {
+            format!("Stock  {:.1} × {:.1} × {:.1} mm", d[0], d[1], d[2])
+        }
     }
     /// The stock the view shows for its setup: the box a later setup starts
     /// from when that is known (`leftover`), else the setup's own.
@@ -1125,8 +1162,18 @@ impl Viewport<'_> {
             self.sample,
             self.simulation.map(|s| (s.id.as_str(), s.revision))
         );
+        // A Box's fields change what is drawn of its cut; a Turn's, those
+        // of the lathe operations before it and their tools too (LIO-388).
+        let lathe = (self.setup.filter(|s| crate::lathe::is_lathe(&s.machine))).map(|s| {
+            let ops: Vec<_> = (s.operations.iter())
+                .map(|o| (&o.p, o.enabled, &o.tool))
+                .collect();
+            (ops, self.tools.iter().map(|t| &t.p).collect::<Vec<_>>())
+        });
         let key = format!(
-            "{key}|{:?}|{:?}|{}",
+            "{key}|{:?}|{:?}|{:?}|{:?}|{}",
+            self.operation.map(|o| &o.p),
+            lathe,
             self.shown_a(),
             self.thin.faces.first().map(std::ptr::from_ref),
             self.thin.faces.len()
@@ -1606,6 +1653,17 @@ impl Viewport<'_> {
                 };
                 let (a, b) = (ring(stock.stock.min[0]), ring(stock.stock.max[0]));
                 prism_solid([&a, &b], true, cut.as_ref(), project)
+            } else if self.standing_bar(setup, stock.stock) {
+                // A round bar along Z (LIO-387): a cylinder, lit round.
+                let (centre, r) = stock::bar(stock.stock);
+                let (z0, z1) = (stock.stock.min[2], stock.stock.max[2]);
+                turned_solid(
+                    &[[z0, z1, 0., r]],
+                    centre,
+                    stock.display_scale,
+                    cut.as_ref(),
+                    project,
+                )
             } else {
                 box_solid(
                     stock.stock.scaled(stock.display_scale),
@@ -1726,6 +1784,44 @@ impl Viewport<'_> {
             draw(&walls, &BOX_WALL, &hidden, &mut solid);
             if let Some(b) = shown.into {
                 draw(&solid_of(b), &LOST, &depths, &mut solid);
+            }
+        }
+        // A Turn or a lathe Drill being edited (LIO-388): what it removes, a
+        // turned solid in the Box's cut colour, seen through the part when it
+        // cuts from the axis out (a drill, a bore), which the part hides;
+        // where it reaches into the part, red, seen through the part.
+        if self.simulation.is_none()
+            && let (Some(setup), Some(op)) = (self.setup, self.operation)
+            && crate::lathe::is_lathe(&setup.machine)
+            && let Some(at) = setup.operations.iter().position(|o| o.id == op.id)
+            && let Some(shown) = crate::turn::shown(setup, at, self.tools, self.mesh)
+        {
+            let scale = self.mesh.display_scale();
+            let project = |v: [f32; 3]| (screen(v), p.depth(v));
+            let cut_solid = turned_solid(&shown.cut, [0., 0.], scale, cut.as_ref(), project);
+            let seen = vec![f32::NEG_INFINITY; depths.len()];
+            raster_solid(
+                &BOX_CUT,
+                &mut rgba,
+                if shown.inside { &seen } else { &depths },
+                (w, h),
+                &cut_solid,
+                ratio,
+                p.scale,
+                &mut solid,
+            );
+            if !shown.into.is_empty() {
+                let into = turned_solid(&shown.into, [0., 0.], scale, cut.as_ref(), project);
+                raster_solid(
+                    &LOST,
+                    &mut rgba,
+                    &seen,
+                    (w, h),
+                    &into,
+                    ratio,
+                    p.scale,
+                    &mut solid,
+                );
             }
         }
         if let Some((tip, radius, stickout)) = self.live {
@@ -2187,15 +2283,7 @@ impl<'a> Viewport<'a> {
                 Color::from_rgb8(185, 128, 41),
             );
             frame.fill_text(Text {
-                content: if self.simulation.is_none() && !self.stock_is_known(setup) {
-                    "Remaining stock · generate preview".into()
-                } else if stock::round_bar(setup)
-                    && crate::model::get(&setup.p, "stock_source") == "fresh"
-                {
-                    format!("Stock  Ø{:.1} × {:.1} mm bar", d[1].min(d[2]), d[0])
-                } else {
-                    format!("Stock  {:.1} × {:.1} × {:.1} mm", d[0], d[1], d[2])
-                },
+                content: self.stock_label(setup, stock.stock, d),
                 position: Point::new(35., 16.),
                 color: Color::from_rgb8(123, 84, 27),
                 size: 12.into(),
@@ -3351,6 +3439,33 @@ pub(crate) fn box_triangles(
     .map(|t| (t, shade(&t, base)))
     .collect()
 }
+/// The faces of the round bar standing along Z whose box is `b` (mm,
+/// `stock::bar`), in `base` shaded as `box_triangles` shades a box (LIO-387).
+pub(crate) fn bar_triangles(
+    b: crate::mesh::Bounds,
+    base: [f32; 3],
+) -> Vec<([[f32; 3]; 3], [u8; 4])> {
+    const SIDES: usize = 48;
+    let (c, r) = stock::bar(b);
+    let at = |i: usize, z: f32| {
+        let a = std::f32::consts::TAU * i as f32 / SIDES as f32;
+        [c[0] + r * a.cos(), c[1] + r * a.sin(), z]
+    };
+    let (z0, z1) = (b.min[2], b.max[2]);
+    let (low, high) = ([c[0], c[1], z0], [c[0], c[1], z1]);
+    (0..SIDES)
+        .flat_map(|i| {
+            let j = i + 1;
+            [
+                [at(i, z0), at(j, z0), at(j, z1)],
+                [at(i, z0), at(j, z1), at(i, z1)],
+                [high, at(i, z1), at(j, z1)],
+                [low, at(j, z0), at(i, z0)],
+            ]
+        })
+        .map(|t| (t, shade(&t, base)))
+        .collect()
+}
 /// The pixel size of the setup browser's stock pictures: twice the size they
 /// are shown at, for smooth edges.
 pub(crate) const PICTURE: (u32, u32) = (128, 96);
@@ -3791,6 +3906,163 @@ fn prism_solid(
     }
     solid
 }
+/// How a face of a turned solid (`turned_solid`) is lit: a light from the
+/// front, left and above, so that its sides shade round. Kept in the face's
+/// tone, `LIT` and up (`raster_solid`).
+fn lit_tone(n: [f32; 3]) -> u8 {
+    const LIGHT: [f32; 3] = [-0.42, -0.62, 0.66];
+    let d: f32 = (0..3).map(|k| n[k] * LIGHT[k]).sum();
+    LIT + ((0.55 + 0.45 * d.max(0.)).clamp(0., 1.) * 100.).round() as u8
+}
+/// The first tone of a lit face: `LIT + 100 × light`.
+const LIT: u8 = 100;
+/// A solid of revolution about the Z axis through `centre` (mm, the
+/// setup's frame) as `raster_solid` draws it: the union of the rings
+/// `cells` (`[z0, z1, r0, r1]`), only its outside faces, each lit by its
+/// normal (`lit_tone`) so that it reads round; the circles where its outline
+/// steps by more than a hair, and its sides' edges on the outline. Its
+/// points are scaled by `scale` and projected by `project`; what `cut`
+/// leaves of it, its cut face open.
+fn turned_solid(
+    cells: &[[f32; 4]],
+    centre: [f32; 2],
+    scale: f32,
+    cut: Option<&Plane>,
+    project: impl Fn([f32; 3]) -> (Point, f32),
+) -> SolidBox {
+    const SIDES: usize = 48;
+    // A step in the outline narrower than this has no circle drawn: a
+    // chamfer's or a drill point's thin rings read as a slope.
+    const STEP: f32 = 0.3;
+    let mut solid = SolidBox {
+        faces: vec![],
+        edges: vec![],
+    };
+    let mut zs: Vec<f32> = cells.iter().flat_map(|c| [c[0], c[1]]).collect();
+    zs.sort_by(f32::total_cmp);
+    zs.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+    // The radii the cells cover between each two levels, merged.
+    let spans: Vec<Vec<[f32; 2]>> = zs
+        .windows(2)
+        .map(|w| {
+            let mid = (w[0] + w[1]) / 2.;
+            let mut rs: Vec<[f32; 2]> = (cells.iter())
+                .filter(|c| c[0] <= mid && mid <= c[1] && c[3] > c[2])
+                .map(|c| [c[2], c[3]])
+                .collect();
+            rs.sort_by(|a, b| a[0].total_cmp(&b[0]));
+            let mut merged: Vec<[f32; 2]> = vec![];
+            for r in rs {
+                match merged.last_mut() {
+                    Some(m) if r[0] <= m[1] + 1e-4 => m[1] = m[1].max(r[1]),
+                    _ => merged.push(r),
+                }
+            }
+            merged
+        })
+        .collect();
+    let angle = |i: f32| std::f32::consts::TAU * i / SIDES as f32;
+    let at = |r: f32, i: usize, z: f32| {
+        let a = angle(i as f32);
+        [centre[0] + r * a.cos(), centre[1] + r * a.sin(), z].map(|v| v * scale)
+    };
+    let mut face = |points: &[[f32; 3]], tone: u8| {
+        let points = match cut {
+            Some(cut) => cut.clip(points),
+            None => points.to_vec(),
+        };
+        if points.len() >= 3 {
+            solid
+                .faces
+                .push((points.into_iter().map(&project).collect(), tone));
+        }
+    };
+    let mut edges: Vec<([f32; 3], [f32; 3])> = vec![];
+    // The sides: outside each covered radius range, and inside it off the axis.
+    for (w, rs) in zs.windows(2).zip(&spans) {
+        for [a, b] in rs {
+            for (r, out) in [(*b, 1.), (*a, -1.)] {
+                if r < 1e-4 {
+                    continue;
+                }
+                let mut facing = vec![];
+                for i in 0..SIDES {
+                    let quad = [
+                        at(r, i, w[0]),
+                        at(r, i + 1, w[0]),
+                        at(r, i + 1, w[1]),
+                        at(r, i, w[1]),
+                    ];
+                    let m = angle(i as f32 + 0.5);
+                    face(&quad, lit_tone([out * m.cos(), out * m.sin(), 0.]));
+                    let area: f32 = (0..4)
+                        .map(|k| {
+                            let (p, q) = (project(quad[k]).0, project(quad[(k + 1) % 4]).0);
+                            p.x * q.y - q.x * p.y
+                        })
+                        .sum();
+                    facing.push(area > 0.);
+                }
+                // The outline: where the sides turn from the camera.
+                for i in 0..SIDES {
+                    if facing[i] != facing[(i + SIDES - 1) % SIDES] {
+                        edges.push((at(r, i, w[0]), at(r, i, w[1])));
+                    }
+                }
+            }
+        }
+    }
+    // The ends: at each level, the radii covered on one side of it only.
+    let none: Vec<[f32; 2]> = vec![];
+    for (k, &z) in zs.iter().enumerate() {
+        let below = if k > 0 { &spans[k - 1] } else { &none };
+        let above = spans.get(k).unwrap_or(&none);
+        let has = |rs: &[[f32; 2]], r: f32| rs.iter().any(|q| q[0] < r && r < q[1]);
+        let mut radii: Vec<f32> = below
+            .iter()
+            .chain(above)
+            .flat_map(|q| [q[0], q[1]])
+            .collect();
+        radii.sort_by(f32::total_cmp);
+        radii.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+        for q in radii.windows(2) {
+            let mid = (q[0] + q[1]) / 2.;
+            let (lo, hi) = (has(below, mid), has(above, mid));
+            if lo == hi {
+                continue;
+            }
+            let up = if lo { 1. } else { -1. };
+            for i in 0..SIDES {
+                face(
+                    &[
+                        at(q[0], i, z),
+                        at(q[1], i, z),
+                        at(q[1], i + 1, z),
+                        at(q[0], i + 1, z),
+                    ],
+                    lit_tone([0., 0., up]),
+                );
+            }
+            if q[1] - q[0] >= STEP {
+                for r in [q[0], q[1]].into_iter().filter(|r| *r > 1e-4) {
+                    for i in 0..SIDES {
+                        edges.push((at(r, i, z), at(r, i + 1, z)));
+                    }
+                }
+            }
+        }
+    }
+    for (a, b) in edges {
+        let kept = match cut {
+            Some(cut) => cut.clip_segment(a, b),
+            None => Some((a, b)),
+        };
+        if let Some((a, b)) = kept {
+            solid.edges.push((project(a), project(b)));
+        }
+    }
+    solid
+}
 /// Composite only the nearest surface of a box; use both surfaces and part
 /// depth to distinguish visible edges from dashed hidden edges.
 #[allow(clippy::too_many_arguments)]
@@ -3850,6 +4122,10 @@ fn raster_solid(
     for (index, z) in near.iter().enumerate() {
         if z.is_finite() && *z >= part_depth[index] - 0.001 {
             let tint = match tones[index] {
+                // A turned solid's face, lit by its normal (`lit_tone`).
+                t if t >= LIT => {
+                    look.faces[0].map(|c| (c as f32 * f32::from(t - LIT) / 100.) as u8)
+                }
                 0 | 1 => look.faces[0],
                 2 | 4 => look.faces[1],
                 _ => look.faces[2],
@@ -4738,6 +5014,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -4900,6 +5177,7 @@ mod tests {
                 progress: None,
                 holding: vec![],
                 first_setup: None,
+                tools: &[],
                 framed: vec![],
                 leftover: None,
                 live: None,
@@ -4982,6 +5260,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -5074,6 +5353,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -5150,6 +5430,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -5243,6 +5524,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -5323,6 +5605,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -5459,6 +5742,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -5581,6 +5865,7 @@ mod tests {
                 progress: None,
                 holding: vec![],
                 first_setup: None,
+                tools: &[],
                 framed: vec![],
                 leftover: None,
                 live: None,
@@ -5633,6 +5918,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -5728,6 +6014,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover,
             live: None,
@@ -5816,6 +6103,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -5962,6 +6250,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -6075,6 +6364,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -6151,6 +6441,7 @@ mod tests {
             progress: None,
             holding,
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -6269,6 +6560,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -6340,6 +6632,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -6407,6 +6700,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -6466,6 +6760,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -6523,6 +6818,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -6594,6 +6890,7 @@ mod tests {
             progress: None,
             holding: vec![],
             first_setup: None,
+            tools: &[],
             framed: vec![],
             leftover: None,
             live: None,
@@ -6792,6 +7089,7 @@ mod tests {
             show_paths: false,
             progress: None,
             first_setup: None,
+            tools: &[],
             framed: holding.clone(),
             holding,
             leftover: None,
