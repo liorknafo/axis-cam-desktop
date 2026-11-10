@@ -2005,6 +2005,25 @@ pub fn holes(
     ids: &std::collections::HashSet<usize>,
     mesh: &Mesh,
 ) -> Result<Vec<Hole>, String> {
+    read_holes(setup, ids, mesh, false)
+}
+/// The whole holes the selected walls among `ids` pick, as `holes` reads
+/// them, passing over a wall that picks none (part of a round wall a Drill
+/// takes as an arc, `cam::arcs`) rather than refusing the selection.
+pub fn whole_holes(
+    setup: &Setup,
+    ids: &std::collections::HashSet<usize>,
+    mesh: &Mesh,
+) -> Vec<Hole> {
+    read_holes(setup, ids, mesh, true).unwrap_or_default()
+}
+/// `holes`, or `whole_holes` when `lenient`.
+fn read_holes(
+    setup: &Setup,
+    ids: &std::collections::HashSet<usize>,
+    mesh: &Mesh,
+    lenient: bool,
+) -> Result<Vec<Hole>, String> {
     let selected: Walls = (ids.iter().copied())
         .filter(|&id| is_wall(setup, mesh, id))
         .collect();
@@ -2023,7 +2042,11 @@ pub fn holes(
         match walls_of(&g, &spans, id) {
             Ok((path, walls)) if walls.iter().all(|w| ids.contains(w)) => {
                 covered.extend(&walls);
-                found.push(hole(&g, &spans, path, walls)?);
+                match hole(&g, &spans, path, walls) {
+                    Ok(h) => found.push(h),
+                    Err(_) if lenient => {}
+                    Err(e) => return Err(e),
+                }
             }
             Ok((path, _)) => {
                 let (x, y) = extent(&path).0;
@@ -2034,7 +2057,9 @@ pub fn holes(
             Err(e) => waiting.push((id, e)),
         }
     }
-    if let Some((_, e)) = waiting.into_iter().find(|(id, _)| !covered.contains(id)) {
+    if let Some((_, e)) = waiting.into_iter().find(|(id, _)| !covered.contains(id))
+        && !lenient
+    {
         return Err(e);
     }
     Ok(found)

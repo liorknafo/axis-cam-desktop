@@ -503,28 +503,7 @@ pub fn arc_at(setup: &Setup, mesh: &Mesh, id: usize) -> Result<Arc, NoArc> {
     }
     let at = corners(&facets);
     let members = grow(&facets, &at, id).ok_or(NoArc::NotRound)?;
-    let a = whole_arc(across(setup, mesh, &g), &facets, &facets, &at, members)?;
-    if on_thread(&crate::thread::holes_in_setup(setup, mesh), &a) {
-        return Err(NoArc::NotRound);
-    }
-    Ok(a)
-}
-/// Whether arc `a` is a crest of one of the modeled `threads` (along Z):
-/// round its axis, between its minor and major diameters (to 0.05 mm), and
-/// over part of its length (between its flanks' highest and lowest
-/// corners; a crest may run on past them, out to a face). Its hole's wall,
-/// drilled as that hole, not an arc. Known by the thread, not by the hole
-/// a wall of it picks: a thread's walls past a leaning flank pick none by
-/// themselves (`pocket::LEANING`). Any other arc round its axis (a slot's
-/// end narrower or wider than the thread, or wholly over or under it past
-/// solid stock) is its own.
-fn on_thread(threads: &[crate::thread::Thread], a: &Arc) -> bool {
-    threads.iter().any(|t| {
-        (t.centre[0] - a.centre[0]).hypot(t.centre[1] - a.centre[1]) <= 0.05
-            && (t.minor / 2. - 0.05..=t.major / 2. + 0.05).contains(&a.r)
-            && a.bottom < t.from.max(t.to)
-            && a.top > t.from.min(t.to)
-    })
+    whole_arc(across(setup, mesh, &g), &facets, &facets, &at, members)
 }
 /// The arcs a Drill drills among the surfaces `ids` (its selection), as
 /// `setup` places the part: each run of selected upright facets on one
@@ -568,14 +547,28 @@ pub fn drilled_arcs(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc
     if found.is_empty() {
         return found;
     }
-    // A modeled thread's crests, arcs round its axis, are its hole's
-    // (`on_thread`). A whole round hole a wall of the arc picks, round the
-    // arc's centre, is drilled as that hole (each such hole read once). One
-    // round another centre (a slot so short it reads as round) leaves the
-    // arc its own.
+    // A whole round hole the selection reads as, round the arc's centre,
+    // that holds all the arc's walls is drilled as that hole: a modeled
+    // thread's crests are many arcs round its axis, and a wall of a thread
+    // past a leaning flank picks no hole by itself (`pocket::LEANING`), but
+    // its picked hole's walls read as the hole together. So is a whole round
+    // hole a wall of the arc picks (each such hole read once). One round
+    // another centre (a slot so short it reads as round) leaves the arc its
+    // own.
     let threaded = Geometry::with_threads(setup, mesh);
-    found.retain(|a| !on_thread(&threaded.threads, a));
     let rims = super::rims(&threaded);
+    let read: Vec<(HashSet<usize>, Hole)> = (crate::pocket::whole_holes(setup, ids, mesh))
+        .into_iter()
+        .filter_map(|h| {
+            let round = super::drill_hole(&threaded, &h, &rims, false)?;
+            Some((h.walls.iter().copied().collect(), round))
+        })
+        .collect();
+    found.retain(|a| {
+        !read.iter().any(|(walls, round)| {
+            same_centre(round, a) && a.walls.iter().all(|w| walls.contains(w))
+        })
+    });
     let mut whole: HashSet<usize> = HashSet::new();
     found.retain(|a| {
         if a.walls.iter().any(|w| whole.contains(w)) {
@@ -1424,47 +1417,5 @@ pub(crate) mod tests {
         );
         tool.p.insert("diameter".into(), "9.9".into());
         assert!(generate(&setup, &op, &tool, &mesh).is_ok());
-    }
-    #[test]
-    fn only_an_arc_along_a_threads_length_is_its_crest() {
-        // An M8×1.25 tapped into the underside, Z0 to Z8, and slots whose
-        // ends are round the same axis over it, past solid stock.
-        let thread = crate::thread::Thread {
-            axis: 2,
-            centre: [10., 5.],
-            from: 0.,
-            to: 8.,
-            internal: true,
-            right_hand: true,
-            pitch: 1.25,
-            angle: 60.,
-            major: 8.,
-            minor: 6.65,
-            tapered: false,
-            spec: None,
-        };
-        let arc = |r: f32, bottom: f32, top: f32| Arc {
-            centre: [10., 5.],
-            r,
-            walls: vec![0],
-            span: 120.,
-            middle: 0.,
-            top,
-            bottom,
-            sagitta: 0.01,
-        };
-        let threads = [thread];
-        // Crests along the thread, at its minor diameter and at its ends:
-        // its hole's.
-        assert!(on_thread(&threads, &arc(3.33, 2., 6.)));
-        assert!(on_thread(&threads, &arc(3.33, -0.4, 1.)));
-        assert!(on_thread(&threads, &arc(3.95, 7.2, 8.3)));
-        // Slot ends over it, narrower than the thread just past its end,
-        // as wide as it 0.5 mm past it, and far over it; and an arc wider
-        // than the thread: their own.
-        assert!(!on_thread(&threads, &arc(3., 8.5, 9.)));
-        assert!(!on_thread(&threads, &arc(3.5, 8.5, 9.)));
-        assert!(!on_thread(&threads, &arc(3.5, 14., 20.)));
-        assert!(!on_thread(&threads, &arc(5., 2., 6.)));
     }
 }

@@ -457,43 +457,25 @@ pub fn detect(triangles: &[[[f32; 3]; 3]]) -> Vec<Thread> {
                 }
                 sectors.iter().filter(|s| **s).count() >= 18
             };
-            // A hole's ring is read in stretches along the axis that no
-            // face of the part closing its bore parts (`stretches`): a hole
-            // tapped from both faces of a web is two threads, and faces
-            // round the axis past a web or floor (a coaxial slot's rounded
-            // lip over a tapped hole) are none of its. A stud's axis runs
-            // through its solid core, where faces inside it (a cross hole's
-            // walls, an axial bore's floor) part no thread round it: its
-            // ring is read whole.
-            let inside = |ring: &[&Flank]| {
-                let facing: f32 = (ring.iter())
-                    .map(|f| {
-                        let off = [f.at[0] - at[0], f.at[1] - at[1]];
-                        (f.toward[0] * off[0] + f.toward[1] * off[1]).signum()
-                    })
-                    .sum();
-                facing < 0.
-            };
-            let threads = rings
+            if let Some(thread) = rings
                 .iter()
                 .filter(|ring| ring.len() >= LEAST && around(ring))
-                .map(|ring| {
-                    let parts = if inside(ring) {
-                        stretches(ring, |f| f.index, axis, at, 0.8 * dist(ring[0]), triangles)
-                    } else {
-                        vec![ring.clone()]
-                    };
-                    (parts.into_iter())
-                        .filter(|s| s.len() >= LEAST && around(s))
-                        .filter_map(|s| {
-                            let members: Vec<_> =
-                                s.iter().map(|f| (f.index, f.up, f.lean)).collect();
-                            read(axis, at, &members, triangles, &pitches)
-                        })
-                        .collect::<Vec<_>>()
+                .filter_map(|ring| {
+                    read(
+                        axis,
+                        at,
+                        &ring
+                            .iter()
+                            .map(|f| (f.index, f.up, f.lean))
+                            .collect::<Vec<_>>(),
+                        triangles,
+                        &pitches,
+                    )
                 })
-                .find(|threads| !threads.is_empty());
-            found.extend(threads.unwrap_or_default());
+                .next()
+            {
+                found.push(thread);
+            }
         }
     }
     found.sort_by(|a, b| {
@@ -505,88 +487,6 @@ pub fn detect(triangles: &[[[f32; 3]; 3]]) -> Vec<Thread> {
     found
 }
 
-/// A hole's flank triangles `ring` (by `index` into `triangles`) round the
-/// axis through `at` along `axis`, in stretches along the axis that no face
-/// of the part parts: one that closes the hole's bore between two of them
-/// (a blind hole's floor, a web of solid stock, even with a narrow passage
-/// through it) does. The bore is sampled at twelve points round the axis at
-/// radius `bore`, inside the thread's minor diameter; a face across nine or
-/// more of them in the gap closes it. A clearance groove, a plain bore as
-/// wide as the thread's, or a cross bore leaves it open, and they are one.
-/// Not for a stud's: its axis runs through its solid core.
-fn stretches<T: Copy>(
-    ring: &[T],
-    index: impl Fn(&T) -> usize,
-    axis: usize,
-    at: [f32; 2],
-    bore: f32,
-    triangles: &[[[f32; 3]; 3]],
-) -> Vec<Vec<T>> {
-    let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
-    // Off the seams of faces fanned round the axis.
-    let points: Vec<[f32; 2]> = (0..12)
-        .map(|k| {
-            let turn = (k as f32 * 30. + 7.).to_radians();
-            [at[0] + bore * turn.cos(), at[1] + bore * turn.sin()]
-        })
-        .collect();
-    // Where a face crosses the bore: its height there, and which point.
-    let across: Vec<(f32, usize)> = (triangles.iter())
-        .flat_map(|t| {
-            let (a, b) = (
-                [t[1][u] - t[0][u], t[1][v] - t[0][v]],
-                [t[2][u] - t[0][u], t[2][v] - t[0][v]],
-            );
-            let det = a[0] * b[1] - a[1] * b[0];
-            (points.iter().enumerate()).filter_map(move |(k, q)| {
-                if det.abs() < 1e-9 {
-                    return None;
-                }
-                let p = [q[0] - t[0][u], q[1] - t[0][v]];
-                let (s, w) = (
-                    (p[0] * b[1] - p[1] * b[0]) / det,
-                    (a[0] * p[1] - a[1] * p[0]) / det,
-                );
-                (s > 0. && w > 0. && s + w < 1.).then(|| {
-                    let z =
-                        t[0][axis] + s * (t[1][axis] - t[0][axis]) + w * (t[2][axis] - t[0][axis]);
-                    (z, k)
-                })
-            })
-        })
-        .collect();
-    // Whether faces close the bore from `top` to `low`. A face at either end
-    // counts: a hole's floor is where its thread's last flank ends.
-    let closed = |top: f32, low: f32| {
-        let mut hit = [false; 12];
-        for &(z, k) in &across {
-            if z >= top - 1e-3 && z <= low + 1e-3 {
-                hit[k] = true;
-            }
-        }
-        hit.iter().filter(|h| **h).count() >= 9
-    };
-    let span = |f: &T| {
-        let t = &triangles[index(f)];
-        t.iter()
-            .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), p| {
-                (a.min(p[axis]), b.max(p[axis]))
-            })
-    };
-    let mut sorted = ring.to_vec();
-    sorted.sort_by(|a, b| span(a).0.total_cmp(&span(b).0));
-    let mut out: Vec<Vec<T>> = vec![];
-    let mut top = f32::NEG_INFINITY;
-    for f in sorted {
-        let (low, high) = span(&f);
-        if out.is_empty() || (low > top && closed(top, low)) {
-            out.push(vec![]);
-        }
-        out.last_mut().unwrap().push(f);
-        top = top.max(high);
-    }
-    out
-}
 /// The thread round the axis through `at` along `axis` whose flank
 /// triangles are `members` (index, faces up the axis, lean): its pitch and
 /// hand, sizes, extent and standard size; none when its vertices make no
@@ -885,87 +785,6 @@ pub(crate) mod tests {
             (t.major - 6.).abs() < 0.1 && (t.minor - 4.917).abs() < 0.15,
             "{t:?}"
         );
-    }
-    /// A face across the axis at height `z`, past the thread's major
-    /// diameter: a hole's floor, or a web's face.
-    fn across(z: f32) -> Vec<[[f32; 3]; 3]> {
-        vec![
-            [[-6., -6., z], [6., -6., z], [6., 6., z]],
-            [[-6., -6., z], [6., 6., z], [-6., 6., z]],
-        ]
-    }
-    /// A face across the axis at height `z` from radius `r` out, past the
-    /// thread's major diameter: a web with a passage of radius `r` through it.
-    fn annulus(z: f32, r: f32) -> Vec<[[f32; 3]; 3]> {
-        let at = |k: usize, r: f32| {
-            let turn = (k as f32 * 15.).to_radians();
-            [r * turn.cos(), r * turn.sin(), z]
-        };
-        (0..24)
-            .flat_map(|k| {
-                [
-                    [at(k, r), at(k, 6.), at(k + 1, 6.)],
-                    [at(k, r), at(k + 1, 6.), at(k + 1, r)],
-                ]
-            })
-            .collect()
-    }
-    /// An M8×1.25 along Z round the origin from `from` to `to`.
-    fn m8(from: f32, to: f32) -> Vec<[[f32; 3]; 3]> {
-        (modeled([0., 0.], 8., 1.25, 60., true, true, to - from, 0.).into_iter())
-            .map(|t| t.map(|p| [p[0], p[1], p[2] + from]))
-            .collect()
-    }
-    #[test]
-    fn a_thread_stops_at_solid_stock_and_goes_on_past_a_groove() {
-        let read = |parts: Vec<Vec<[[f32; 3]; 3]>>| -> Vec<(f32, f32, Option<&str>)> {
-            let found = detect(&parts.concat());
-            found
-                .iter()
-                .map(|t| (t.from, t.to, t.spec.map(|s| s.name)))
-                .collect()
-        };
-        let near = |got: &[(f32, f32, Option<&str>)], want: &[(f32, f32)]| {
-            got.len() == want.len()
-                && got.iter().zip(want).all(|(g, w)| {
-                    (g.0 - w.0).abs() < 0.3 && (g.1 - w.1).abs() < 0.3 && g.2 == Some("M8×1.25")
-                })
-        };
-        // Tapped Z0-8 into a blind floor at Z8; over a 0.5 mm web, a
-        // coaxial slot's rounded lip at its flank angle, Z8.5-9.1 (LIO-361):
-        // the thread is Z0-8, an M8, and the lip no thread.
-        let got = read(vec![m8(0., 8.), across(8.), across(8.5), m8(8.5, 9.1)]);
-        assert!(near(&got, &[(0., 8.)]), "{got:?}");
-        // The same over a 0.5 mm web with a Ø2 passage through it on the
-        // axis: the web still closes the bore.
-        let got = read(vec![
-            m8(0., 8.),
-            annulus(8., 1.),
-            annulus(8.5, 1.),
-            m8(8.5, 9.1),
-        ]);
-        assert!(near(&got, &[(0., 8.)]), "{got:?}");
-        // Tapped Z0-20 with a clearance groove at Z8-10, the axis open
-        // through it: one thread, Z0-20.
-        let grooved: Vec<_> = (m8(0., 20.).into_iter())
-            .filter(|t| t.iter().all(|p| p[2] <= 8. || p[2] >= 10.))
-            .collect();
-        let got = read(vec![grooved]);
-        assert!(near(&got, &[(0., 20.)]), "{got:?}");
-        // Tapped from both faces of a 1 mm web: two threads.
-        let got = read(vec![m8(0., 8.), across(8.), across(9.), m8(9., 17.)]);
-        assert!(near(&got, &[(0., 8.), (9., 17.)]), "{got:?}");
-        // A stud Z0-20 with a clearance groove at Z8-10, and an axial
-        // Ø2 bore from its top whose floor crosses its axis at Z9, in the
-        // groove: the bore parts no thread round the stud's solid core, which
-        // is one thread, Z0-20, its whole length for the lathe.
-        let stud = modeled([0., 0.], 8., 1.25, 60., true, false, 20., 0.);
-        let grooved: Vec<_> = (stud.into_iter())
-            .filter(|t| t.iter().all(|p| p[2] <= 8. || p[2] >= 10.))
-            .chain(across(9.))
-            .collect();
-        let got = read(vec![grooved]);
-        assert!(near(&got, &[(0., 20.)]), "{got:?}");
     }
     #[test]
     fn left_hand_fine_and_small_threads_read_true() {
