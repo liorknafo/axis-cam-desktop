@@ -31,6 +31,9 @@ const JAW: Color = Color::from_rgb(0.80, 0.82, 0.85);
 const DONE: Color = Color::from_rgb(0.50, 0.55, 0.60);
 /// The pixels of the 3D pictures, twice the size they are shown at.
 const PICTURE: (u32, u32) = (960, 640);
+/// The size of a Tool step's picture: square, as the tool stands up off
+/// the stock and the panel is about as high as it is wide (LIO-379).
+const TOOL_PICTURE: (u32, u32) = (900, 900);
 /// The views a drawing can be: from above (X, Y), from the front (X, Z) and
 /// from the right (Y, Z).
 const VIEWS: [[usize; 2]; 3] = [[0, 1], [0, 2], [1, 2]];
@@ -67,11 +70,13 @@ pub struct Shown {
     side: Option<turning::Side>,
 }
 /// A size drawn on a picture: a dimension line from `a` to `b` (picture
-/// pixels), or with `leader` an arrow onto `a` from `b`, labelled.
+/// pixels), with extension lines to them from the feature's points `ext`,
+/// or with `leader` an arrow onto `a` from `b`, labelled.
 #[derive(Debug, Clone)]
 struct Dim {
     a: Point,
     b: Point,
+    ext: Option<[Point; 2]>,
     label: String,
     leader: bool,
 }
@@ -222,17 +227,27 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
         let tall = solid(&[&vise[..], &parallels].concat());
         picture(0, &tall)
     };
-    // The sizes each operation leaves, on the picture after it.
+    // The sizes each operation leaves, on the picture after it, placed on
+    // the triangles that picture is made of.
+    let jaw = solid(&jaws);
     let mut dims = vec![vec![]];
     for (j, d) in guide.done.iter().enumerate() {
         let measures = measures(doc, &guide, d, boxes[j].max[2] + zero[2]);
-        let ends: Vec<[f32; 3]> = measures.iter().flat_map(|m| [m.from, m.to]).collect();
-        let points = viewport::picture_points(&stock[j + 1], PICTURE, &ends);
+        let ends: Vec<[f32; 3]> = (measures.iter())
+            .flat_map(|m| {
+                let [ea, eb] = m.ext.unwrap_or([m.from, m.to]);
+                [m.from, m.to, ea, eb]
+            })
+            .collect();
+        let mut seen = stock[j + 1].clone();
+        seen.extend(jaw.iter().copied());
+        let points = viewport::picture_points(&seen, PICTURE, &ends);
         dims.push(
-            (measures.iter().zip(points.chunks(2)))
+            (measures.iter().zip(points.chunks(4)))
                 .map(|(m, p)| Dim {
                     a: p[0],
                     b: p[1],
+                    ext: m.ext.map(|_| [p[2], p[3]]),
                     label: format!("{} {}", m.axis, mm(m.value)),
                     leader: m.leader,
                 })
@@ -241,7 +256,6 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
     }
     // A new tool on the stock before its operation, standing on the
     // highest top left (LIO-376).
-    let jaw = solid(&jaws);
     let tools = (guide.steps.iter())
         .map(|step| {
             let Step::Tool {
@@ -267,7 +281,7 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
                 spot, *diameter, flutes, stickout, point, centre,
             ));
             triangles.extend(jaw.iter().copied());
-            viewport::stock_picture(&triangles, PICTURE)
+            viewport::stock_picture(&triangles, TOOL_PICTURE)
         })
         .collect();
     let side = crate::lathe::is_lathe(&setup.machine).then(|| turning::side(doc, mesh, &guide));
@@ -316,7 +330,9 @@ pub(crate) fn touch_spot(triangles: &[([[f32; 3]; 3], [u8; 4])]) -> Option<[f32;
 /// A size the Check screen gives to measure (LIO-370): `value` mm along
 /// `axis` ("X", "Y", "Z" or "Ø"), said by `words` as a caliper or depth
 /// gauge reads it, and drawn on the picture from `from` to `to` (stock
-/// frame, mm): a dimension line, or with `leader` an arrow onto `from`.
+/// frame, mm): a dimension line, off the stock, with extension lines from
+/// the feature's points `ext` (LIO-379), or with `leader` an arrow onto
+/// `from`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Measure {
     pub axis: &'static str,
@@ -324,6 +340,7 @@ pub(crate) struct Measure {
     pub words: Vec<String>,
     pub from: [f32; 3],
     pub to: [f32; 3],
+    pub ext: Option<[[f32; 3]; 2]>,
     pub leader: bool,
 }
 /// The sizes operation `op` of the guide (its `done` entry `d`) was to
@@ -371,18 +388,33 @@ pub(crate) fn measures(
                 };
                 let mut b = a;
                 (a[k], b[k]) = (lo[k], hi[k]);
-                wall.get_or_insert(if open[k][0] { b } else { a });
+                // From the cut's end on that side: a wall's top, or an open
+                // side's face where the floor meets it.
+                let mut ext = [a, b];
+                for (end, e) in ext.iter_mut().enumerate() {
+                    e[o] = if o == 0 { hi[0] } else { lo[1] };
+                    e[2] = if open[k][end] { lo[2] } else { top };
+                }
+                // The depth beside it, a further step off, so that the two
+                // do not meet at the wall's corner.
+                let (mut at, edge) = if open[k][0] { (b, ext[1]) } else { (a, ext[0]) };
+                at[o] += if o == 0 { OFF } else { -OFF };
+                wall.get_or_insert((at, edge));
                 out.push(Measure {
                     axis: AXES[k],
                     value: hi[k] - lo[k],
                     words: vec!["wide".into(), from],
                     from: a,
                     to: b,
+                    ext: Some(ext),
                     leader: false,
                 });
             }
-            // Down from where that width meets the wall.
-            let at = wall.unwrap_or([s.max[0] + OFF, s.min[1] - OFF, top]);
+            // Down from where that width meets the wall, beside the wall.
+            let (at, edge) = wall.unwrap_or({
+                let at = [s.max[0] + OFF, s.min[1] - OFF, top];
+                (at, [hi[0], lo[1], top])
+            });
             let words = if open[2][0] {
                 vec!["through".into()]
             } else {
@@ -397,6 +429,7 @@ pub(crate) fn measures(
                 words,
                 from: at,
                 to: [at[0], at[1], lo[2]],
+                ext: Some([edge, [edge[0], edge[1], lo[2]]]),
                 leader: false,
             });
         }
@@ -435,6 +468,7 @@ pub(crate) fn measures(
                 words: vec![count],
                 from: at,
                 to: up,
+                ext: None,
                 leader: true,
             });
             let deep: Vec<f32> = (holes.iter().zip(mouths)).map(|(h, m)| m - h[2]).collect();
@@ -451,6 +485,7 @@ pub(crate) fn measures(
                 words,
                 from: at,
                 to: [at[0], at[1], at[2] - deep[0]],
+                ext: None,
                 leader: false,
             });
         }
@@ -459,7 +494,7 @@ pub(crate) fn measures(
     out
 }
 /// How far off the stock a size is drawn, mm.
-const OFF: f32 = 12.;
+const OFF: f32 = 16.;
 /// A DRO number: two decimals, a true minus, never −0.00.
 fn dro(v: f32) -> String {
     let v = if v.abs() < 0.005 { 0. } else { v };
@@ -776,7 +811,8 @@ fn arrow(f: &mut canvas::Frame, a: Point, b: Point, c: Color, w: f32) {
         return;
     }
     let (ux, uy) = (dx / l, dy / l);
-    let head = 9_f32.min(l);
+    // A heavier line, a larger head.
+    let head = (3.6 * w).max(9.).min(l);
     let base = Point::new(b.x - ux * head, b.y - uy * head);
     f.stroke(&canvas::Path::line(a, base), stroke(c, w));
     let tip = canvas::Path::new(|p| {
@@ -1204,8 +1240,103 @@ impl canvas::Program<Message> for Drawing<'_> {
         vec![state.0.draw(renderer, bounds.size(), |f| self.paint(f))]
     }
 }
-/// The sizes `dims` drawn over a picture of `PICTURE` pixels shown as wide
-/// and high as it fits in the canvas, centred (an image's `Contain`).
+/// Where `dims` fall on a canvas of `size` showing a picture of `PICTURE`
+/// pixels as wide and high as it fits, centred (an image's `Contain`): each
+/// one's ends, its extension lines' feature ends and its label's tag. A tag
+/// sits beside its line on the side away from the picture's middle, clear of
+/// the line, and is pushed on out until it covers no tag before it and no
+/// dimension line (LIO-379: "Y 15" and "Z 9.5" lay on each other at the
+/// step's corner).
+fn dim_tags(dims: &[Dim], size: Size) -> Vec<(Point, Point, Option<[Point; 2]>, Rectangle)> {
+    let (w, h) = (PICTURE.0 as f32, PICTURE.1 as f32);
+    let k = (size.width / w).min(size.height / h);
+    let (ox, oy) = ((size.width - w * k) / 2., (size.height - h * k) / 2.);
+    let at = |p: Point| Point::new(ox + p.x * k, oy + p.y * k);
+    let centre = Point::new(size.width / 2., size.height / 2.);
+    // Every dimension line as drawn, a short one with its arrows outside.
+    let lines: Vec<(Point, Point)> = (dims.iter())
+        .map(|d| {
+            let (a, b) = (at(d.a), at(d.b));
+            let (dx, dy) = (b.x - a.x, b.y - a.y);
+            let l = dx.hypot(dy).max(1.);
+            if d.leader || l >= SHORT {
+                (a, b)
+            } else {
+                let (ux, uy) = (dx / l * OUTSIDE, dy / l * OUTSIDE);
+                (
+                    Point::new(a.x - ux, a.y - uy),
+                    Point::new(b.x + ux, b.y + uy),
+                )
+            }
+        })
+        .collect();
+    let crosses = |r: &Rectangle, (a, b): (Point, Point)| {
+        let n = ((b.x - a.x).hypot(b.y - a.y) / 2.).ceil().max(1.) as usize;
+        (0..=n).any(|i| {
+            let t = i as f32 / n as f32;
+            let q = Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+            q.x > r.x - 3.
+                && q.x < r.x + r.width + 3.
+                && q.y > r.y - 3.
+                && q.y < r.y + r.height + 3.
+        })
+    };
+    let mut out: Vec<(Point, Point, Option<[Point; 2]>, Rectangle)> = vec![];
+    for d in dims {
+        let (a, b) = (at(d.a), at(d.b));
+        let (tw, th) = (d.label.chars().count() as f32 * 9.5 + 12., 26.);
+        // The way out from the line, and where the tag's middle starts.
+        let (n, from) = if d.leader {
+            let (dx, dy) = (b.x - a.x, b.y - a.y);
+            let l = dx.hypot(dy).max(1.);
+            ((dx / l, dy / l), b)
+        } else {
+            let mid = Point::new((a.x + b.x) / 2., (a.y + b.y) / 2.);
+            let (dx, dy) = (b.x - a.x, b.y - a.y);
+            let l = dx.hypot(dy).max(1.);
+            let mut n = (-dy / l, dx / l);
+            if n.0 * (mid.x - centre.x) + n.1 * (mid.y - centre.y) < 0. {
+                n = (-n.0, -n.1);
+            }
+            (n, mid)
+        };
+        // Half the tag across the line, and a gap.
+        let reach = n.0.abs() * tw / 2. + n.1.abs() * th / 2. + 8.;
+        let tag = |out: f32| {
+            let c = Point::new(from.x + n.0 * out, from.y + n.1 * out);
+            Rectangle {
+                x: (c.x - tw / 2.).clamp(0., (size.width - tw).max(0.)),
+                y: (c.y - th / 2.).clamp(0., (size.height - th).max(0.)),
+                width: tw,
+                height: th,
+            }
+        };
+        let clear = |r: &Rectangle| {
+            (out.iter()).all(|(.., o)| {
+                r.x + r.width + 4. <= o.x
+                    || o.x + o.width + 4. <= r.x
+                    || r.y + r.height + 4. <= o.y
+                    || o.y + o.height + 4. <= r.y
+            }) && lines.iter().all(|l| !crosses(r, *l))
+        };
+        let mut placed = tag(reach);
+        for step in 1..60 {
+            if clear(&placed) {
+                break;
+            }
+            placed = tag(reach + 4. * step as f32);
+        }
+        out.push((a, b, d.ext.map(|e| e.map(at)), placed));
+    }
+    out
+}
+/// A dimension line shorter than this (px) has its arrows outside it,
+/// `OUTSIDE` long.
+const SHORT: f32 = 56.;
+const OUTSIDE: f32 = 22.;
+/// The sizes `dims` drawn over a picture of `PICTURE` pixels (`dim_tags`):
+/// each a dimension line with its two arrowheads and its extension lines
+/// from the feature, or a leader, and its label on a white tag.
 struct Dims<'a>(&'a [Dim]);
 impl canvas::Program<Message> for Dims<'_> {
     type State = ();
@@ -1218,41 +1349,81 @@ impl canvas::Program<Message> for Dims<'_> {
         _: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         let mut f = canvas::Frame::new(renderer, bounds.size());
-        let (w, h) = (PICTURE.0 as f32, PICTURE.1 as f32);
-        let k = (bounds.width / w).min(bounds.height / h);
-        let (ox, oy) = ((bounds.width - w * k) / 2., (bounds.height - h * k) / 2.);
-        let at = |p: Point| Point::new(ox + p.x * k, oy + p.y * k);
-        let centre = Point::new(bounds.width / 2., bounds.height / 2.);
-        for d in self.0 {
-            let (a, b) = (at(d.a), at(d.b));
-            let label = if d.leader {
+        let thin = Color { a: 0.9, ..ACCENT };
+        // A line on a white halo, to read over the stock's faces.
+        let line = |f: &mut canvas::Frame, a: Point, b: Point, w: f32| {
+            f.stroke(
+                &canvas::Path::line(a, b),
+                stroke(
+                    Color {
+                        a: 0.7,
+                        ..Color::WHITE
+                    },
+                    w + 2.,
+                ),
+            );
+            f.stroke(&canvas::Path::line(a, b), stroke(ACCENT, w));
+        };
+        for (d, (a, b, ext, tag)) in self.0.iter().zip(dim_tags(self.0, bounds.size())) {
+            if d.leader {
+                line(&mut f, b, a, 2.);
                 arrow(&mut f, b, a, ACCENT, 2.5);
-                Point::new(b.x + 8., b.y - 10.)
             } else {
-                let mid = Point::new((a.x + b.x) / 2., (a.y + b.y) / 2.);
-                arrow(&mut f, mid, a, ACCENT, 2.5);
-                arrow(&mut f, mid, b, ACCENT, 2.5);
-                // Square off the line, on the side away from the picture's
-                // middle, so two sizes at one corner do not cover each other.
+                // Extension lines from the feature, a gap off it and a
+                // little past the dimension line.
+                for (e, end) in ext.into_iter().flatten().zip([a, b]) {
+                    let (dx, dy) = (end.x - e.x, end.y - e.y);
+                    let l = dx.hypot(dy);
+                    if l > 4. {
+                        let (ux, uy) = (dx / l, dy / l);
+                        let from = Point::new(e.x + ux * 3., e.y + uy * 3.);
+                        let past = Point::new(end.x + ux * 7., end.y + uy * 7.);
+                        f.stroke(&canvas::Path::line(from, past), stroke(thin, 1.4));
+                    }
+                }
                 let (dx, dy) = (b.x - a.x, b.y - a.y);
                 let l = dx.hypot(dy).max(1.);
-                let (mut nx, mut ny) = (-dy / l, dx / l);
-                if nx * (mid.x - centre.x) + ny * (mid.y - centre.y) < 0. {
-                    (nx, ny) = (-nx, -ny);
+                let (ux, uy) = (dx / l, dy / l);
+                line(&mut f, a, b, 2.);
+                if l >= SHORT {
+                    let mid = Point::new((a.x + b.x) / 2., (a.y + b.y) / 2.);
+                    arrow(&mut f, mid, a, ACCENT, 2.);
+                    arrow(&mut f, mid, b, ACCENT, 2.);
+                } else {
+                    // Too short for its arrows: they come in from outside
+                    // the extension lines, as on a drawing.
+                    let (oa, ob) = (
+                        Point::new(a.x - ux * OUTSIDE, a.y - uy * OUTSIDE),
+                        Point::new(b.x + ux * OUTSIDE, b.y + uy * OUTSIDE),
+                    );
+                    line(&mut f, oa, a, 2.);
+                    line(&mut f, ob, b, 2.);
+                    arrow(&mut f, oa, a, ACCENT, 2.);
+                    arrow(&mut f, ob, b, ACCENT, 2.);
                 }
-                let width = d.label.chars().count() as f32 * 9.5;
-                Point::new(mid.x + nx * 26. - width * (1. - nx) / 2., mid.y + ny * 22.)
+            }
+            // From the tag to its line when it was pushed off it.
+            let tc = Point::new(tag.x + tag.width / 2., tag.y + tag.height / 2.);
+            let anchor = if d.leader {
+                b
+            } else {
+                Point::new((a.x + b.x) / 2., (a.y + b.y) / 2.)
             };
+            if (tc.x - anchor.x).hypot(tc.y - anchor.y) > tag.width.max(tag.height) {
+                f.stroke(&canvas::Path::line(anchor, tc), stroke(thin, 1.));
+            }
             // On a white tag, to read over the stock.
-            let width = d.label.chars().count() as f32 * 9.5 + 12.;
-            let tag = canvas::Path::rounded_rectangle(
-                Point::new(label.x - 6., label.y - 13.),
-                Size::new(width, 26.),
-                5.into(),
+            let r = canvas::Path::rounded_rectangle(tag.position(), tag.size(), 5.into());
+            f.fill(&r, Color::WHITE);
+            f.stroke(&r, stroke(ACCENT, 1.5));
+            write(
+                &mut f,
+                d.label.clone(),
+                Point::new(tag.x + 6., tc.y),
+                ACCENT,
+                17.,
+                Align::Left,
             );
-            f.fill(&tag, Color::WHITE);
-            f.stroke(&tag, stroke(ACCENT, 1.5));
-            write(&mut f, d.label.clone(), label, ACCENT, 17., Align::Left);
         }
         vec![f.into_geometry()]
     }
@@ -1287,7 +1458,9 @@ fn gear<'a>(rpm: f32) -> Element<'a, Message> {
     .into()
 }
 /// The tool seen from above with the edge the DRO's compensation shows on
-/// X and Y.
+/// X and Y: as large as its panel allows (LIO-379: a 60 px circle), shaded,
+/// its four cutting edges, and each compensated side a heavy arrow from the
+/// centre to the rim with the side named past it.
 struct CompPicture([i8; 2]);
 impl canvas::Program<Message> for CompPicture {
     type State = ();
@@ -1300,37 +1473,76 @@ impl canvas::Program<Message> for CompPicture {
         _: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         let mut f = canvas::Frame::new(renderer, bounds.size());
-        let (c, r) = (Point::new(bounds.width / 2., bounds.height / 2. + 4.), 30.);
+        // Room round it for the labels.
+        let r = (bounds.width.min(bounds.height) * 0.32).clamp(24., 170.);
+        let c = Point::new(bounds.width / 2., bounds.height / 2.);
         let body = canvas::Path::circle(c, r);
-        f.fill(&body, Color { a: 0.25, ..TOOL });
-        f.stroke(&body, stroke(TOOL, 1.6));
-        f.fill(&canvas::Path::circle(c, 2.5), TOOL);
+        // Lit from the top left, as the 3D pictures are.
+        f.fill(
+            &body,
+            canvas::gradient::Linear::new(
+                Point::new(c.x - r, c.y - r),
+                Point::new(c.x + r, c.y + r),
+            )
+            .add_stop(0., Color::from_rgb8(226, 233, 242))
+            .add_stop(1., Color::from_rgb8(150, 166, 188)),
+        );
+        // The four cutting edges, curving out from the centre.
+        for q in 0..4 {
+            let a = std::f32::consts::FRAC_PI_2 * q as f32;
+            let at = |t: f32, da: f32| {
+                Point::new(c.x + t * r * (a + da).cos(), c.y + t * r * (a + da).sin())
+            };
+            let flute = canvas::Path::new(|p| {
+                p.move_to(at(0.12, 0.));
+                p.quadratic_curve_to(at(0.6, 0.55), at(1., 0.35));
+            });
+            f.stroke(
+                &flute,
+                stroke(Color::from_rgb8(92, 108, 132), (r / 40.).max(1.5)),
+            );
+        }
+        f.stroke(
+            &body,
+            stroke(Color::from_rgb8(70, 86, 110), (r / 50.).max(2.)),
+        );
+        f.fill(&canvas::Path::circle(c, (r / 14.).max(3.)), INK);
+        let w = (r / 22.).clamp(2.5, 7.);
+        let size = (r / 5.).clamp(15., 30.);
         let [x, y] = self.0.map(f32::from);
-        if x != 0. {
-            let to = Point::new(c.x + x * r, c.y);
-            arrow(&mut f, c, to, ACCENT, 2.);
-            let align = if x < 0. { Align::Right } else { Align::Left };
+        for (k, v) in [(0, x), (1, y)] {
+            if v == 0. {
+                continue;
+            }
+            // Screen y grows down: +Y is up.
+            let (dx, dy) = if k == 0 { (v, 0.) } else { (0., -v) };
+            let rim = Point::new(c.x + dx * r, c.y + dy * r);
+            arrow(&mut f, c, rim, ACCENT, w);
+            f.fill(&canvas::Path::circle(rim, w * 1.2), ACCENT);
+            let sign = if v > 0. { "+" } else { "−" };
+            let past = Point::new(rim.x + dx * size * 0.8, rim.y + dy * size * 0.9);
+            let align = match (k, v > 0.) {
+                (0, true) => Align::Left,
+                (0, false) => Align::Right,
+                _ => Align::Center,
+            };
             write(
                 &mut f,
-                format!("X {}", if x > 0. { "+" } else { "−" }),
-                Point::new(to.x + x * 8., c.y),
+                format!("{} {sign}", AXES[k]),
+                past,
                 ACCENT,
-                15.,
+                size,
                 align,
             );
         }
-        if y != 0. {
-            let to = Point::new(c.x, c.y - y * r);
-            arrow(&mut f, c, to, ACCENT, 2.);
-            write(
-                &mut f,
-                format!("Y {}", if y > 0. { "+" } else { "−" }),
-                Point::new(c.x + 6., to.y - y * 10.),
-                ACCENT,
-                15.,
-                Align::Left,
-            );
-        }
+        write(
+            &mut f,
+            "seen from above",
+            Point::new(c.x, (c.y + r + size * 2.2).min(bounds.height - 10.)),
+            MUTED,
+            13.,
+            Align::Center,
+        );
         vec![f.into_geometry()]
     }
 }
@@ -1650,29 +1862,35 @@ fn setups(app: &App) -> Element<'_, Message> {
         }
         let on = s.id == app.doc.active;
         let msg = Message::Guide(GuideAction::Open(si));
-        let b = button(column![bold(s.name(), 13), muted(s.machine.name())].spacing(2))
-            .width(Fill)
-            .padding([8, 10])
-            .on_press(msg.clone())
-            .style(move |_, status| button::Style {
-                background: Some(
-                    if on {
-                        crate::ui::BG
-                    } else if matches!(status, button::Status::Hovered) {
-                        HOVER_BUTTON
-                    } else {
-                        Color::WHITE
-                    }
-                    .into(),
-                ),
-                text_color: INK,
-                border: Border {
-                    color: if on { BLUE } else { LINE },
-                    width: 1.,
-                    radius: 6.into(),
-                },
-                ..Default::default()
-            });
+        // The machine under the name only when the name does not say it.
+        let named = s.name().starts_with(s.machine.name());
+        let b = button(
+            column![bold(s.name(), 13)]
+                .push((!named).then(|| muted(s.machine.name())))
+                .spacing(2),
+        )
+        .width(Fill)
+        .padding([8, 10])
+        .on_press(msg.clone())
+        .style(move |_, status| button::Style {
+            background: Some(
+                if on {
+                    crate::ui::BG
+                } else if matches!(status, button::Status::Hovered) {
+                    HOVER_BUTTON
+                } else {
+                    Color::WHITE
+                }
+                .into(),
+            ),
+            text_color: INK,
+            border: Border {
+                color: if on { BLUE } else { LINE },
+                width: 1.,
+                radius: 6.into(),
+            },
+            ..Default::default()
+        });
         c = c.push(HelpButton::new(b, &msg, s.name()).width(Fill));
     }
     let active = app.doc.index();
@@ -1851,8 +2069,13 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
         .push(space().width(Fill))
         .push(bold(progress(g, s, at, app.guide_item), 14).color(ACCENT));
     let top = row![
+        // A setup named as its machine says it once (LIO-382).
         bold(
-            format!("{} on the {}", setup.name(), setup.machine.name()),
+            if setup.name().starts_with(setup.machine.name()) {
+                format!("{} · steps", setup.name())
+            } else {
+                format!("{} on the {}", setup.name(), setup.machine.name())
+            },
             16
         ),
         muted(format!(
@@ -2074,19 +2297,17 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     .unwrap_or_default(),
             );
             // The stock as it is with the tool to scale on the spot to
-            // touch, ringed (LIO-376), beside the gear.
+            // touch, ringed (LIO-376), filling the panel with the gear in its
+            // corner (LIO-379: beside the gear it was a third as wide).
             let picture = p.shown.tools.get(p.at).cloned().flatten();
-            let left = row![
-                gear(*rpm),
-                match picture {
-                    Some(_) => Page::image(picture, Fill),
-                    None => space().width(Fill).into(),
-                }
-            ]
-            .spacing(12)
-            .align_y(Alignment::Center)
-            .height(Fill)
-            .into();
+            let left = match picture {
+                Some(_) => iced::widget::stack![
+                    Page::image(picture, Fill),
+                    container(gear(*rpm)).align_left(Fill).align_top(Fill)
+                ]
+                .into(),
+                None => container(gear(*rpm)).center(Fill).into(),
+            };
             match top {
                 Some(_) => ("Tool".into(), "put it in, set the gear", left, right),
                 None => ("Gear".into(), "same tool, set the gear", left, right),
@@ -2812,9 +3033,15 @@ pub(super) fn frame<'a>(
 ) -> Element<'a, Message> {
     let body = row![
         container(left).width(FillPortion(11)).height(Fill),
-        container(scrollable(right.spacing(10)).height(Fill))
-            .width(FillPortion(9))
+        // Clear of the scrollbar, as the other pages are (LIO-382).
+        container(
+            scrollable(
+                (right.spacing(10)).padding(iced::Padding::ZERO.right(crate::ui::SCROLLBAR_GUTTER)),
+            )
             .height(Fill)
+        )
+        .width(FillPortion(9))
+        .height(Fill)
     ]
     .spacing(18)
     .height(Fill);
@@ -2918,6 +3145,9 @@ fn never_lines(
     }
     out
 }
+/// The most a pass lifts off the floor to return (`cam::boxed`: 0.2 mm),
+/// with room for rounding.
+const LIFT: f32 = 0.25;
 /// The screen of a Pass `step`.
 fn pass<'a>(
     p: &Page<'a>,
@@ -2998,11 +3228,19 @@ fn pass<'a>(
             );
             tags.push("feed".into());
         } else if t.axis == 2 && (t.centre - cut.min[2]).abs() < 0.005 {
-            // Down to the pass's level: how much deeper it cuts.
-            tags.push(format!("{} deeper", mm(cut.max[2] - cut.min[2])));
-            if t.feed {
-                tags.push("plunge".into());
+            if last[2].is_some_and(|v| v > t.centre && v - t.centre < LIFT) {
+                // Down again after the lift off the floor (LIO-382).
+                tags.push("back to the level".into());
+            } else {
+                // Down to the pass's level: how much deeper it cuts.
+                tags.push(format!("{} deeper", mm(cut.max[2] - cut.min[2])));
+                if t.feed {
+                    tags.push("plunge".into());
+                }
             }
+        } else if t.axis == 2 && last[2].is_some_and(|v| t.centre > v && t.centre - v < LIFT) {
+            // Up off the floor so the return does not rub (LIO-176, LIO-382).
+            tags.push("off the floor".into());
         } else if t.axis < 2 && t.feed {
             tags.push("feed, cuts".into());
         } else if t.axis < 2
@@ -3540,6 +3778,11 @@ pub(crate) mod tests {
         };
         let t = texts(&a);
         assert!(t.contains(&format!("Pass 1 of {of}")), "{t:?}");
+        // The setup carries its machine's name: said once in the title and
+        // once in the list (LIO-382; "Manual Mill on the Manual Mill").
+        assert!(t.iter().any(|s| s == "Manual Mill · steps"), "{t:?}");
+        assert_eq!(t.iter().filter(|s| *s == "Manual Mill").count(), 1, "{t:?}");
+        assert!(!t.iter().any(|s| s.contains(" on the ")), "{t:?}");
         assert!(t.contains(&format!("pass 1/{of}")), "{t:?}");
         // Every readout's number, the cut's with its direction, in order.
         let shown: Vec<usize> = (targets.iter())
@@ -3619,6 +3862,29 @@ pub(crate) mod tests {
         };
         assert_eq!(labels(2), ["Y 15", "Z 9.5"]);
         assert_eq!(labels(3), ["Ø 4", "Z 42"]);
+        // The labels' tags overlap neither each other nor any dimension
+        // line, in the picture's panel at 1440 × 900 and at 1024 × 700
+        // (LIO-379: "Z 9.5" lay on "Y 15"); the step's sizes have extension
+        // lines from the step.
+        assert!(shown.dims[2].iter().all(|d| d.ext.is_some()));
+        for size in [Size::new(640., 600.), Size::new(420., 470.)] {
+            for i in [2, 3] {
+                let placed = dim_tags(&shown.dims[i], size);
+                for (n, (a, b, _, r)) in placed.iter().enumerate() {
+                    for (m, (.., o)) in placed.iter().enumerate() {
+                        let on = (0..=20).any(|t| {
+                            let t = t as f32 / 20.;
+                            let q = Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+                            q.x > o.x && q.x < o.x + o.width && q.y > o.y && q.y < o.y + o.height
+                        });
+                        assert!(!on, "{size:?} {i}: tag {m} on line {n}");
+                        if m != n {
+                            assert!(r.intersection(o).is_none(), "{size:?} {i}: {r:?} {o:?}");
+                        }
+                    }
+                }
+            }
+        }
     }
     #[test]
     fn a_new_tool_is_drawn_to_scale_on_the_highest_top() {
@@ -3832,6 +4098,12 @@ pub(crate) mod tests {
             // second goes back along it, with no room to come off a wall.
             if n % 2 == 1 {
                 assert!(t.iter().any(|s| s.contains("feed, cuts")), "{t:?}");
+                // Its lift off the floor and back down say so; it was a
+                // bare Z, then "1 deeper" (LIO-382).
+                for tag in ["off the floor", "back to the level"] {
+                    assert_eq!(t.iter().filter(|s| *s == tag).count(), 1, "{tag} {t:?}");
+                }
+                assert!(!t.iter().any(|s| s.ends_with(" deeper")), "{t:?}");
             }
         }
         // The open-ended Step drops outside the stock, and the Step closed
