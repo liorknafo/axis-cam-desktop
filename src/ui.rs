@@ -9716,16 +9716,14 @@ fn job_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, M
     if let Some(said) = &c.reattach_said {
         col = col.push(note(said.clone()));
     }
-    // The line under the view, how to turn it: short, a hover card on the
-    // switcher's left; narrow, the switcher is on its right.
-    let foot = |title: &str, line: String| -> Option<Element<'a, Message>> {
+    // The line under the view, how to turn it: short, it is left out;
+    // narrow, the switcher is on its right. It wraps rather than end in an
+    // ellipsis (LIO-398).
+    let foot = |line: String| -> Option<Element<'a, Message>> {
+        let line = text(line).size(12).color(MUTED);
         match (fit.short, fit.narrow) {
-            (false, false) => Some(hint(title, line, 110)),
-            (false, true) => Some(
-                row![hint(title, line, 60), job_views(app)]
-                    .spacing(8)
-                    .into(),
-            ),
+            (false, false) => Some(line.into()),
+            (false, true) => Some(row![line.width(Fill), job_views(app)].spacing(8).into()),
             (true, false) => None,
             (true, true) => Some(row![space().width(Fill), job_views(app)].into()),
         }
@@ -9733,15 +9731,12 @@ fn job_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, M
     match stock {
         Some(view) => {
             col = col.push(container(view).height(Fill).width(Fill));
-            col = col.extend(foot(
-                "Job",
-                format!(
+            col = col.extend(foot(format!(
                     "{}Drag to orbit · right-drag to pan · scroll to zoom. The machine's tool is red while a tool run cuts, and the stock is cut away where it goes.",
                     (app.doc.active_setup().and_then(crate::indexed::label))
                         .map(|a| format!("{} at {a} · ", app.doc.setup().name()))
                         .unwrap_or_default()
-                ),
-            ));
+                )));
             if let Some(line) = uncut_line(app) {
                 col = col.push(hint("Completeness", line, fit.chars(110)));
             }
@@ -10863,6 +10858,19 @@ fn op_row<'a>(
             ..Font::DEFAULT
         })
         .wrapping(Wrapping::None);
+    // The count after the name is shown whole or not at all (LIO-398). The
+    // toggle, name, count and time share what the row leaves beside the
+    // mark and the buttons: the Operations column less 198 px (its padding
+    // and scroll bar, the row's, the mark, Start here, ⋯ and the gaps;
+    // narrow, 190). Widths are estimated from the characters, wide side.
+    let time_text = time.unwrap_or_default();
+    let room = fit.program() - if fit.narrow { 190. } else { 198. };
+    let wide = |s: &str, px: f32| s.chars().count() as f32 * px;
+    let counted = steps.as_ref().is_some_and(|(_, _, note)| {
+        let name = format!("{n}. {}", ellipsize(&o.name, 30));
+        open.is_none()
+            && 16. + wide(&name, 6.8) + 4. + wide(note, 4.8) + wide(&time_text, 5.6) <= room
+    });
     // A skipped one says how in place of its time.
     let time: Element<'a, Message> = match skipped {
         Some(how) => container(
@@ -10884,11 +10892,10 @@ fn op_row<'a>(
             ..Default::default()
         })
         .into(),
-        None => text(time.unwrap_or_default())
+        // As wide as it is, so that the name and count get the rest.
+        None => text(time_text)
             .size(11)
             .color(MUTED)
-            .width(if fit.narrow { 84 } else { 96 })
-            .align_x(Alignment::End)
             .wrapping(Wrapping::None)
             .into(),
     };
@@ -10901,7 +10908,7 @@ fn op_row<'a>(
         named = named
             .push(HelpButton::new(toggle, &m, note.clone()))
             .push(name)
-            .push(text(note).size(10).color(MUTED).wrapping(Wrapping::None));
+            .push(counted.then(|| text(note).size(10).color(MUTED).wrapping(Wrapping::None)));
     } else {
         named = named.push(name);
     }
@@ -11049,7 +11056,7 @@ fn step_list<'a>(
     line: Option<u32>,
     fit: Fit,
 ) -> Element<'a, Message> {
-    use crate::run::{Action as R, StepStage as S, clock};
+    use crate::run::{Action as R, StepStage as S, clock, step_clock};
     let oi = os.op;
     let stages = run.step_stages(oi, shown.stage, line);
     // The plan's seconds scaled to the operation's estimate over the steps
@@ -11171,7 +11178,7 @@ fn step_list<'a>(
             )
             .width(Fill)
             .clip(true),
-            text(clock(seconds(&r)))
+            text(step_clock(seconds(&r)))
                 .size(11)
                 .color(MUTED)
                 .wrapping(Wrapping::None),

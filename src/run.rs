@@ -4016,6 +4016,16 @@ pub fn clock(seconds: f32) -> String {
     }
 }
 
+/// A step's time in the Operations list: `clock`, but "<1 s" under a
+/// second, where the clock would say "0:00" (LIO-398).
+pub fn step_clock(seconds: f32) -> String {
+    if seconds < 1. {
+        "<1 s".into()
+    } else {
+        clock(seconds)
+    }
+}
+
 /// The seconds the driver takes over each block of tool run `p`'s program
 /// from operation `k` on, or None when it cannot start there: its moves
 /// planned `LOOK_AHEAD` ahead, as the driver feeds them, waiting for the
@@ -4301,6 +4311,11 @@ mod tests {
             [
                 "0:00", "0:09", "1:00", "1:01", "59:59", "1:00:00", "1:02:05"
             ]
+        );
+        // A step under a second says so (LIO-398).
+        assert_eq!(
+            [0.4, 0.99, 1., 9.4].map(step_clock),
+            ["<1 s", "<1 s", "0:01", "0:09"]
         );
     }
 

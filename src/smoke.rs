@@ -5213,6 +5213,81 @@ flood = { pin = 8 }
         move_to_shot(&mut a, &shot, "07-rotary-move-to", &["62", "42", "2", "90"]);
     }
 
+    /// LIO-398: an operation's count of steps ("5 levels") is shown whole
+    /// or not at all, at 1440 × 900 and 1120 × 690, and the hint under the
+    /// Job view is whole on screen at 1440 × 900, not cut with "…".
+    #[test]
+    fn the_operations_counts_are_whole_and_the_job_hint_is_on_screen() {
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        zero(&mut a);
+        check_run_pictured(&mut a, dir.path(), 0);
+        let notes: Vec<String> = (run_of(&a).steps.iter())
+            .filter(|s| s.steps.len() > 1)
+            .map(|s| format!("{} {}", s.steps.len(), s.kind().1.to_lowercase()))
+            .collect();
+        assert!(!notes.is_empty());
+        // A text cut by its row is laid out narrower than it is alone.
+        let whole = |s: &str, window| {
+            let alone = iced::widget::text(s.to_string()).size(10).into();
+            crate::ui::probe::placed(alone, window)[0].1.width
+        };
+        for (w, h) in [(1440., 900.), (1120., 690.)] {
+            let window = iced::Size::new(w, h);
+            let _ = a.update(Message::Resized(window));
+            let placed = crate::ui::probe::placed(a.view(), window);
+            let mut shown = 0;
+            for (t, note) in placed.iter().filter(|(t, _)| notes.contains(t)) {
+                shown += 1;
+                assert!(
+                    note.width >= whole(t, window) - 0.5,
+                    "{w} x {h}: \"{t}\" is cut to {note:?}"
+                );
+                // Nor does it run under the row's time, right of it.
+                let time = (placed.iter())
+                    .filter(|(s, b)| {
+                        s.contains(':')
+                            && b.x > note.x
+                            && (b.center_y() - note.center_y()).abs() < 8.
+                    })
+                    .map(|(_, b)| b.x)
+                    .fold(f32::INFINITY, f32::min);
+                assert!(
+                    note.x + note.width <= time,
+                    "{w} x {h}: \"{t}\" at {note:?} runs under the time at x {time}"
+                );
+            }
+            assert!(w < 1440. || shown > 0, "1440 x 900 has room for a count");
+        }
+        let window = iced::Size::new(1440., 900.);
+        let _ = a.update(Message::Resized(window));
+        let (_, hint) = (crate::ui::probe::placed(a.view(), window).into_iter())
+            .find(|(t, _)| t.starts_with("Drag to orbit"))
+            .expect("the Job view's hint");
+        assert!(
+            hint.x >= 0.
+                && hint.y >= 0.
+                && hint.x + hint.width <= window.width
+                && hint.y + hint.height <= window.height,
+            "{hint:?}"
+        );
+        let texts = crate::ui::probe::texts(a.view(), window);
+        assert!(
+            texts.iter().any(|t| t.starts_with("Drag to orbit")
+                && t.ends_with("and the stock is cut away where it goes.")),
+            "{texts:?}"
+        );
+    }
+
     /// `shot` of the Control page with Move to open and `targets` typed
     /// (X, Y, Z, A), then Move to closed with the fields emptied.
     fn move_to_shot(a: &mut App, shot: &dyn Fn(&mut App, &str), name: &str, targets: &[&str]) {

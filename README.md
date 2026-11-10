@@ -1258,9 +1258,9 @@ bar, at once when that machine is connected, or when you press
    tool is at the clearance, a step ends and the next begins. A step is
    called **Level n · Z −6.50** when its level feed moves all cut at one Z,
    **Hole n** in a Drill, otherwise **Pass n**, with its estimated time (its
-   share of the operation's). An operation that does not turn A and has
-   more than one step has **▸** before its name, with how many ("38
-   levels"): **▾** unfolds them under its row, one line each, long runs of
+   share of the operation's; "<1 s" under a second). An operation that does
+   not turn A and has more than one step has **▸** before its name, with how
+   many ("38 levels") where the row has room for the words whole: **▾** unfolds them under its row, one line each, long runs of
    them folded into one line ("Levels 1–12 · done · 0:51") so that the
    column does not scroll. Click a step to pick it, Shift-click another to
    pick the steps between; under them, while the machine stands still and
