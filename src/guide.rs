@@ -330,16 +330,18 @@ pub enum LatheStep {
         reach: f32,
     },
     /// With `tool` (the first turning tool, which cuts outside): touch the
-    /// end → zero the carriage dial; measure the bar (`planned` Ø;
-    /// `measured` under `key` once typed); when `cross`, touch it → zero
-    /// the cross dial. A setup with only inside tools (a boring bar) does
-    /// not touch the bar's outside: its sections touch the hole.
+    /// end → zero the carriage dial; when `measure`, measure the bar
+    /// (`planned` Ø; `measured` under `key` once typed); when `cross`, touch
+    /// it → zero the cross dial. A setup with only inside tools (a boring
+    /// bar) neither touches nor measures the bar's outside: its sections
+    /// touch the hole (LIO-203).
     Zero {
         tool: String,
         key: String,
         planned: f32,
         measured: Option<f32>,
         cross: bool,
+        measure: bool,
     },
     /// Before an operation's cuts, with `tool` at `rpm`: with `top`, swing
     /// the top slide to that angle (a thread) and zero its dial on the
@@ -1453,6 +1455,8 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
             planned: bar,
             measured: bar_measured,
             cross: !inside(op),
+            // The measured bar is what the outside's touches read from.
+            measure: turns.iter().any(|o| !inside(o)),
         }));
         zeroes.carriage = Some((op.tool.clone(), end));
     }
@@ -3149,6 +3153,7 @@ pub(crate) mod tests {
                 planned: 50.2,
                 measured: None,
                 cross: true,
+                measure: true,
             })
         );
         // Face: 1.00 on the top slide, then the carriage zeroed on the new end.
@@ -3520,14 +3525,14 @@ pub(crate) mod tests {
         );
         let guide = build(&doc, &mesh, 0).unwrap();
         // No turning tool: the Zero step uses the first Turn's tool, the
-        // boring bar, which touches the end and has the bar measured but
-        // does not touch its outside.
+        // boring bar, which touches the end and neither touches nor measures
+        // the bar's outside, as nothing reads it (LIO-203; it was measured).
         let of = |g: &Guide, i: usize| kinds(g, g.sections[i].steps.clone());
         assert_eq!(of(&guide, 0), ["Hold", "Zero"]);
         let bar_tool = doc.setups[0].operations[1].tool.clone();
         assert!(matches!(
             &guide.steps[1],
-            Step::Lathe(LatheStep::Zero { tool, cross: false, planned, .. })
+            Step::Lathe(LatheStep::Zero { tool, cross: false, measure: false, planned, .. })
                 if *tool == bar_tool && (*planned - 50.2).abs() < 1e-4
         ));
         assert_eq!(of(&guide, 1), ["Drill"]);

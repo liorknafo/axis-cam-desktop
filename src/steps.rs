@@ -3017,7 +3017,12 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             );
         }
     };
-    frame(title, sub, left, right, next, p.at > 0 || p.item > 0)
+    // The lathe's numbers take half the card at a narrow window (LIO-389).
+    let split = match &g.steps[p.at] {
+        Step::Lathe(_) => turning::split(p),
+        _ => (11, 9),
+    };
+    framed(title, sub, left, right, next, p.at > 0 || p.item > 0, split)
 }
 /// A step's screen: its caption, the pictures, which grow with the room
 /// the page has, and the numbers, which scroll when they do not fit; Back
@@ -3031,8 +3036,20 @@ pub(super) fn frame<'a>(
     next: Option<(String, Message)>,
     back: bool,
 ) -> Element<'a, Message> {
+    framed(title, sub, left, right, next, back, (11, 9))
+}
+/// `frame`, the pictures and the numbers sharing the card's width as `split`.
+fn framed<'a>(
+    title: String,
+    sub: &str,
+    left: Element<'a, Message>,
+    right: Column<'a, Message>,
+    next: Option<(String, Message)>,
+    back: bool,
+    (pictures, numbers): (u16, u16),
+) -> Element<'a, Message> {
     let body = row![
-        container(left).width(FillPortion(11)).height(Fill),
+        container(left).width(FillPortion(pictures)).height(Fill),
         // Clear of the scrollbar, as the other pages are (LIO-382).
         container(
             scrollable(
@@ -3040,14 +3057,14 @@ pub(super) fn frame<'a>(
             )
             .height(Fill)
         )
-        .width(FillPortion(9))
+        .width(FillPortion(numbers))
         .height(Fill)
     ]
     .spacing(18)
     .height(Fill);
     let foot = row![
-        space().width(FillPortion(11)),
-        container(buttons(next, back)).width(FillPortion(9))
+        space().width(FillPortion(pictures)),
+        container(buttons(next, back)).width(FillPortion(numbers))
     ]
     .spacing(18);
     column![
@@ -5063,7 +5080,7 @@ pub(crate) mod tests {
         shot(&mut a, "20a-bore-pass-1", fifth - 4, 0);
         let measure = nth(&a, 0, |l| matches!(l, L::Measure { .. }));
         shot(&mut a, "22-bore-measure", measure, 0);
-        // Only inside tools: the Zero touches the end and measures the bar.
+        // Only inside tools: the Zero touches the end only (LIO-203).
         let zero = nth(&a, 0, |l| matches!(l, L::Zero { .. }));
         shot(&mut a, "21-zero-bore-first", zero, 1);
         // An inside thread: the top slide wound out, away from the axis.
