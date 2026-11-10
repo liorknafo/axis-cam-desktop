@@ -5898,6 +5898,16 @@ impl App {
                             .insert("silhouette_extend".into(), model::outline_extend_for(d));
                     }
                 }
+                // A new Box faces the stock's top down to the part (LIO-373).
+                if strategy == Strategy::Box
+                    && let Some(mesh) = self.part_mesh()
+                    && let (Some(stock), _) = self.known_stock(self.doc.index())
+                    && let Some(b) = cam::top_box(self.doc.setup(), mesh, stock)
+                {
+                    for (k, v) in model::BOX_FIELDS.iter().zip(b) {
+                        operation.p.insert((*k).into(), format!("{v:.2}"));
+                    }
+                }
                 // A drill on the manual mill is centre drilled first.
                 let centring = centre::wants_centre(&operation, &self.doc.tools, machine)
                     .then(|| centre::centring(&self.doc, self.doc.setup(), &operation, None));
