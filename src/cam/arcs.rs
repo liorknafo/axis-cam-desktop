@@ -257,22 +257,49 @@ fn grow(facets: &HashMap<usize, Facet>, at: &Corners, seed: usize) -> Option<Vec
     best.map(|(_, _, members)| close(facets, at, members))
 }
 /// `members`, a round wall grown on round (`grow`), with every facet of
-/// `facets` over or under them seen from above, at any height: each whose
-/// corners seen from above are all corners of theirs. That is the same
-/// round wall past a gap in it (a relief groove across a half hole), which
-/// a drill enters from its top, and a thread's crests over each other a
-/// turn apart. A facet going on past them (a slot's tangent side) has a
-/// corner of its own and is not taken. One look through their corners' facets,
-/// with no circle fitted.
+/// `facets` over or under it at any height: met at a corner seen from
+/// above, and on to the next, while its corners lie on the arc's circle (to
+/// `fit`'s 0.005 mm and 0.01 % of its radius) and within the arc's span
+/// round it (to `SAME`). That is the same round wall past a gap in it (a
+/// relief groove across a half hole), however finely it is cut there,
+/// which a drill enters from its top, and a thread's crests over each other
+/// a turn apart. A facet going on past the arc (a slot's tangent side) has
+/// a corner past its end and is not taken. No facet past the span is
+/// looked on from, so the work stays within it.
 fn close(facets: &HashMap<usize, Facet>, at: &Corners, mut members: Vec<usize>) -> Vec<usize> {
-    let keys: HashSet<(i64, i64)> = (members.iter())
-        .flat_map(|m| facets[m].xy.iter().map(|p| key(*p)))
-        .collect();
+    let Some((c, r, _)) = fit(facets, &members) else {
+        return members;
+    };
+    use std::f64::consts::{PI, TAU};
+    let angle = |p: &(f64, f64)| (p.1 - c[1]).atan2(p.0 - c[0]);
+    // Angles round the centre, from the arc's middle (its corners' mean
+    // direction), in (−π, π]: an arc short of a whole turn is within them.
+    let (sx, sy) = (members.iter().flat_map(|m| facets[m].xy.iter()))
+        .map(angle)
+        .fold((0., 0.), |(x, y): (f64, f64), t| (x + t.cos(), y + t.sin()));
+    let middle = sy.atan2(sx);
+    let from_middle = |p: &(f64, f64)| (angle(p) - middle + PI).rem_euclid(TAU) - PI;
+    let (low, high) = (members.iter().flat_map(|m| facets[m].xy.iter()))
+        .map(from_middle)
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), t| {
+            (a.min(t), b.max(t))
+        });
+    let slack = SAME / r;
+    let within = |f: &Facet| {
+        f.xy.iter().all(|p| {
+            ((p.0 - c[0]).hypot(p.1 - c[1]) - r).abs() <= 0.005 + r * 1e-4
+                && (low - slack..=high + slack).contains(&from_middle(p))
+        })
+    };
     let mut seen: HashSet<usize> = members.iter().copied().collect();
-    for k in &keys {
-        for &n in at.get(k).into_iter().flatten() {
-            if seen.insert(n) && facets[&n].xy.iter().all(|p| keys.contains(&key(*p))) {
-                members.push(n);
+    let mut from = members.clone();
+    while let Some(m) = from.pop() {
+        for p in &facets[&m].xy {
+            for &n in at.get(&key(*p)).into_iter().flatten() {
+                if seen.insert(n) && within(&facets[&n]) {
+                    members.push(n);
+                    from.push(n);
+                }
             }
         }
     }
@@ -1447,43 +1474,47 @@ pub(crate) mod tests {
     fn a_half_hole_a_relief_groove_crosses_is_one_arc_from_its_top() {
         // The notched block's R5 half hole, crossed by a relief to R6 from
         // Z4 to Z6 (review, LIO-361): a click on a facet of either band
-        // picks both, from the part's top down to its bottom.
-        let notch = |r: f64| {
-            [
-                (-20., 0., 0.),
-                (-r, 0., -1.),
-                (r, 0., 0.),
-                (20., 0., 0.),
-                (20., 20., 0.),
-                (-20., 20., 0.),
-            ]
+        // picks both, from the part's top down to its bottom, whether the
+        // bands are cut alike or one twice as finely as the other.
+        let notch = |r: f64, n: usize| {
+            let mut corners = vec![(-20., 0., 0.)];
+            corners.extend((0..=n).map(|k| {
+                let t = std::f64::consts::PI * (1. - k as f64 / n as f64);
+                (r * t.cos(), r * t.sin(), 0.)
+            }));
+            corners.extend([(20., 0., 0.), (20., 20., 0.), (-20., 20., 0.)]);
+            corners
         };
-        let mut tris = slab(&[&notch(5.)], 4., 0., false, true);
-        tris.extend(slab(&[&notch(6.)], 2., 4., false, false));
-        tris.extend(slab(&[&notch(5.)], 4., 6., true, false));
-        let mesh = mesh::normalize(tris).unwrap();
-        let (setup, mut op, _) = fixture(Strategy::Drill);
-        let g = Geometry::new(&setup, &mesh);
-        let centre = [0f32, g.bounds.min[1]];
-        let on_arc = |c: [f32; 2]| ((c[0] - centre[0]).hypot(c[1] - centre[1]) - 5.).abs() < 0.1;
-        let bands = walls_where(&setup, &mesh, on_arc);
-        // Two bands of 36 facets, each its own surface.
-        assert_eq!(bands.len(), 72, "{bands:?}");
-        for &id in &bands {
-            let a = arc_at(&setup, &mesh, id).unwrap();
-            assert_eq!(a.walls, bands);
-            assert!((a.top - g.bounds.max[2]).abs() < 0.01, "{a:?}");
-            assert!((a.bottom - g.bounds.min[2]).abs() < 0.01, "{a:?}");
+        for (below, above) in [(36, 36), (36, 72), (72, 36)] {
+            let mut tris = slab(&[&notch(5., below)], 4., 0., false, true);
+            tris.extend(slab(&[&notch(6., 36)], 2., 4., false, false));
+            tris.extend(slab(&[&notch(5., above)], 4., 6., true, false));
+            let mesh = mesh::normalize(tris).unwrap();
+            let (setup, mut op, _) = fixture(Strategy::Drill);
+            let g = Geometry::new(&setup, &mesh);
+            let centre = [0f32, g.bounds.min[1]];
+            let on_arc =
+                |c: [f32; 2]| ((c[0] - centre[0]).hypot(c[1] - centre[1]) - 5.).abs() < 0.1;
+            let bands = walls_where(&setup, &mesh, on_arc);
+            // Each band's facets its own surfaces.
+            assert_eq!(bands.len(), below + above, "{bands:?}");
+            for &id in &bands {
+                let a = arc_at(&setup, &mesh, id).unwrap();
+                assert_eq!(a.walls, bands, "{below}/{above}");
+                assert!((a.top - g.bounds.max[2]).abs() < 0.01, "{a:?}");
+                assert!((a.bottom - g.bounds.min[2]).abs() < 0.01, "{a:?}");
+                assert!((a.span - 180.).abs() < 0.01, "{a:?}");
+            }
+            // Picked, it is one Ø10 hole from the part's top.
+            picking(&mut op, &mesh, &bands);
+            let found = holes(&setup, &op, &mesh).unwrap();
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert!(
+                (found[0].top - g.bounds.max[2]).abs() < 0.01,
+                "{:?}",
+                found[0]
+            );
+            assert!((found[0].diameter - 10.).abs() < 0.01, "{:?}", found[0]);
         }
-        // Picked, it is one Ø10 hole from the part's top.
-        picking(&mut op, &mesh, &bands);
-        let found = holes(&setup, &op, &mesh).unwrap();
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert!(
-            (found[0].top - g.bounds.max[2]).abs() < 0.01,
-            "{:?}",
-            found[0]
-        );
-        assert!((found[0].diameter - 10.).abs() < 0.01, "{:?}", found[0]);
     }
 }
