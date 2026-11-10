@@ -29246,7 +29246,11 @@ soft_max = 180.0
         let _ = a.update(Message::AddSetup);
         assert_eq!((a.doc.setups.len(), a.page), (n, Page::Machines));
         // One CNC machine beside the hand ones: that one.
-        let want = (a.doc.machines.iter()).find(|m| !hand(m)).unwrap().id.clone();
+        let want = (a.doc.machines.iter())
+            .find(|m| !hand(m))
+            .unwrap()
+            .id
+            .clone();
         a.doc.machines.retain(|m| hand(m) || m.id == want);
         let want = (a.doc.machines.iter()).find(|m| m.id == want).unwrap();
         let want = want.name().to_string();
