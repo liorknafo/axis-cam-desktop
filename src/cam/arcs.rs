@@ -257,29 +257,22 @@ fn grow(facets: &HashMap<usize, Facet>, at: &Corners, seed: usize) -> Option<Vec
     best.map(|(_, _, members)| close(facets, at, members))
 }
 /// `members`, a round wall grown on round (`grow`), with every facet of
-/// `facets` that meets them at a corner seen from above, at any height, and
-/// whose corners lie on their circle (to `fit`'s 0.005 mm and 0.01 % of its
-/// radius), and so on round: the same round wall over and under a gap in
-/// it (a relief groove across a half hole), which a drill enters from its
-/// top. Taken in one pass without refitting, so a thread's crests over each
-/// other a turn apart cost a pass, not a search; together they go all the
-/// way round and are no arc.
+/// `facets` over or under them seen from above, at any height: each whose
+/// corners seen from above are all corners of theirs. That is the same
+/// round wall past a gap in it (a relief groove across a half hole), which
+/// a drill enters from its top, and a thread's crests over each other a
+/// turn apart. A facet going on past them (a slot's tangent side) has a
+/// corner of its own and is not taken. One look through their corners' facets,
+/// with no circle fitted.
 fn close(facets: &HashMap<usize, Facet>, at: &Corners, mut members: Vec<usize>) -> Vec<usize> {
-    let Some((c, r, _)) = fit(facets, &members) else {
-        return members;
-    };
-    let on = |f: &Facet| {
-        (f.xy.iter()).all(|p| ((p.0 - c[0]).hypot(p.1 - c[1]) - r).abs() <= 0.005 + r * 1e-4)
-    };
+    let keys: HashSet<(i64, i64)> = (members.iter())
+        .flat_map(|m| facets[m].xy.iter().map(|p| key(*p)))
+        .collect();
     let mut seen: HashSet<usize> = members.iter().copied().collect();
-    let mut from = members.clone();
-    while let Some(m) = from.pop() {
-        for p in &facets[&m].xy {
-            for &n in at.get(&key(*p)).into_iter().flatten() {
-                if seen.insert(n) && on(&facets[&n]) {
-                    members.push(n);
-                    from.push(n);
-                }
+    for k in &keys {
+        for &n in at.get(k).into_iter().flatten() {
+            if seen.insert(n) && facets[&n].xy.iter().all(|p| keys.contains(&key(*p))) {
+                members.push(n);
             }
         }
     }
@@ -1173,13 +1166,15 @@ pub(crate) mod tests {
     #[test]
     fn a_short_slots_round_ends_are_picked_however_short_its_sides() {
         // Slots 10 mm wide with R5 ends round X±L/2 Y0, their straight sides
-        // L long, down to 0.25 mm (the reviewer's 1 mm and 0.25 mm slots,
-        // rounds 3 and 4): each end is a 180° arc from any of its facets,
+        // L long, down to 0.15 mm (the reviewer's 1 mm and 0.25 mm slots,
+        // rounds 3 and 4; 0.2 and 0.15 mm, whose sides' far corners are
+        // within 0.005 mm of an end's circle, LIO-361's): each end is a 180°
+        // arc from any of its facets, without its sides,
         // though the slot reads as a whole round hole round X0 (to 2 % of
         // its radius), since its ends are round other centres. (Shorter
         // than 0.1 mm, its ends' centres are within 0.05 mm of its middle,
         // where two holes are one: a click picks the whole hole.)
-        for length in [4f64, 1., 0.5, 0.25] {
+        for length in [4f64, 1., 0.5, 0.25, 0.2, 0.15] {
             let h = length / 2.;
             let mesh = mesh::normalize(slot(length)).unwrap();
             let (setup, mut op, _) = fixture(Strategy::Drill);
