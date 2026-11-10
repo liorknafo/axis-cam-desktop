@@ -1285,12 +1285,8 @@ fn paint_pattern(
         arrow(f, mid, n, ACCENT, 2.);
         tag(f, mid, out, label);
     };
-    // The order: hole to hole, onto the next row dashed.
-    let row = match pattern {
-        Pattern::Grid { columns, .. } => *columns,
-        Pattern::Arc { .. } => usize::MAX,
-    };
-    for (j, w) in pts.windows(2).enumerate() {
+    // The order: hole to hole, a grid back and forth (LIO-405).
+    for w in pts.windows(2) {
         let (dx, dy) = (w[1].x - w[0].x, w[1].y - w[0].y);
         let l = dx.hypot(dy);
         if l < 2. * rs + 10. {
@@ -1299,14 +1295,7 @@ fn paint_pattern(
         let (ux, uy) = (dx / l * (rs + 4.), dy / l * (rs + 4.));
         let a = Point::new(w[0].x + ux, w[0].y + uy);
         let b = Point::new(w[1].x - ux, w[1].y - uy);
-        if (j + 1) % row == 0 {
-            f.stroke(
-                &canvas::Path::line(a, b),
-                dashed(Color { a: 0.6, ..TOOL }, 1.4),
-            );
-        } else {
-            arrow(f, a, b, Color { a: 0.85, ..TOOL }, 2.);
-        }
+        arrow(f, a, b, Color { a: 0.85, ..TOOL }, 2.);
     }
     let outward: Vec<[f32; 2]> = match *pattern {
         Pattern::Grid {
@@ -1328,7 +1317,8 @@ fn paint_pattern(
                 );
             }
             if rows > 1 {
-                let to = pts[columns];
+                // Hole 1's neighbour in the second row, which runs back.
+                let to = pts[2 * columns - 1];
                 size(f, pts[0], to, back(ua), format!("rows {}", dro(pitch[1])));
             }
             if angle.abs() >= 0.005 {
@@ -2793,9 +2783,32 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 Shape::Hole([h[0], h[1], stock.max[2]], cone(n, h), n + 1, lit(n, i))
             }));
             let h = holes.get(i).copied().unwrap_or([0.; 3]);
+            // An axis where the hole before left it stays, locked, and is no
+            // step: the steps are what moves (LIO-405). Hole 1 moves both.
+            let before = i.checked_sub(1).and_then(|j| holes.get(j));
+            let stays = |k: usize| before.is_some_and(|b| (b[k] - h[k]).abs() <= 0.005);
+            let moving: Vec<usize> = (0..2).filter(|&k| !stays(k)).collect();
+            // The depth's step, after the axes that move.
+            let z = moving.len();
             // X and Y: the centre, or 0 on the DRO's hole of a pattern with
             // the centre small beside it (LIO-399).
             let xy = |k: usize| {
+                if stays(k) {
+                    return readout(
+                        Readout {
+                            order: None,
+                            lead: None,
+                            axis: AXES[k].into(),
+                            value: "stays".into(),
+                            lock: None,
+                            tags: vec!["leave it locked".into()],
+                            lit: Lit::Done,
+                            big: false,
+                        },
+                        None,
+                    );
+                }
+                let n = moving.iter().position(|&m| m == k).unwrap_or(k);
                 let (value, tags) = match pattern {
                     Some(_) => (
                         dro(0.),
@@ -2808,16 +2821,16 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 };
                 readout(
                     Readout {
-                        order: Some(k as u8 + 1),
+                        order: Some(n as u8 + 1),
                         lead: None,
                         axis: AXES[k].into(),
                         value,
                         lock: Some(AXES[k].into()),
                         tags,
-                        lit: lit(k, p.app.guide_reached),
+                        lit: lit(n, p.app.guide_reached),
                         big: false,
                     },
-                    Some(Message::Guide(GuideAction::Reached(k))),
+                    Some(Message::Guide(GuideAction::Reached(n))),
                 )
             };
             let tapping = p.setup.operations.get(*op).is_some_and(|o| o.tapping());
@@ -2890,16 +2903,16 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     xy(1),
                     readout(
                         Readout {
-                            order: Some(3),
+                            order: Some(z as u8 + 1),
                             lead: None,
                             axis: "turns".into(),
                             value: format!("{:.1}", turns),
                             lock: None,
                             tags: vec![format!("{} deep", mm(depth)), "½ back every turn".into(),],
-                            lit: lit(2, p.app.guide_reached),
+                            lit: lit(z, p.app.guide_reached),
                             big: true
                         },
-                        Some(Message::Guide(GuideAction::Reached(2)))
+                        Some(Message::Guide(GuideAction::Reached(z)))
                     ),
                     tiles(
                         (1..=holes.len()).map(|n| (n.to_string(), None)).collect(),
@@ -2952,7 +2965,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     xy(1),
                     readout(
                         Readout {
-                            order: Some(3),
+                            order: Some(z as u8 + 1),
                             lead: None,
                             axis: "Z".into(),
                             value: dro(h[2]),
@@ -2972,10 +2985,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             .chain(cone)
                             .chain(pecking)
                             .collect(),
-                            lit: lit(2, p.app.guide_reached),
+                            lit: lit(z, p.app.guide_reached),
                             big: false
                         },
-                        Some(Message::Guide(GuideAction::Reached(2)))
+                        Some(Message::Guide(GuideAction::Reached(z)))
                     ),
                     tiles(
                         (1..=holes.len()).map(|n| (n.to_string(), None)).collect(),
@@ -3401,11 +3414,14 @@ fn pattern_screen<'a>(
             .width(Fill)
             .into()
     };
-    let mut said = vec![chip(p.tool_name(op, 2. * r))];
-    if same {
-        said.push(warn_chip("the same pattern: start the DRO again at hole 1"));
-    }
-    let (title, sub, kind, numbers) = match *pattern {
+    // The tool is in the header; the screen keeps its room for the numbers
+    // (LIO-404).
+    let said = same.then(|| {
+        chips(vec![warn_chip(
+            "the same pattern: start the DRO again at hole 1",
+        )])
+    });
+    let (title, sub, kind, numbers, then) = match *pattern {
         Pattern::Grid {
             first,
             columns,
@@ -3418,13 +3434,15 @@ fn pattern_screen<'a>(
             let mut c = vec![
                 typed("first hole X", dro(first[0]), None),
                 typed("first hole Y", dro(first[1]), None),
-                typed("pitch along a row", dro(pitch[0]), span(0, columns)),
             ];
+            if columns > 1 {
+                c.push(typed("pitch along a row", dro(pitch[0]), span(0, columns)));
+            }
             if rows > 1 {
                 c.push(typed("pitch between rows", dro(pitch[1]), span(1, rows)));
             }
             c.push(typed(
-                "holes: a row × rows",
+                "holes in a row × rows",
                 format!("{columns} × {rows}"),
                 None,
             ));
@@ -3433,11 +3451,18 @@ fn pattern_screen<'a>(
                 degrees(angle),
                 Some("counter-clockwise".into()),
             ));
+            // Square to the axes, back and forth: one axis a move (LIO-405).
+            let then = if angle == 0. {
+                "Then the DRO leads to each hole, moving one axis at a time: move it to 0.00."
+            } else {
+                "Then the DRO leads to each hole: move X and Y to 0.00."
+            };
             (
                 "Matrix holes",
                 "type the grid into the DRO",
                 "the DRO's matrix holes",
                 c,
+                then,
             )
         }
         Pattern::Arc {
@@ -3464,11 +3489,12 @@ fn pattern_screen<'a>(
                 ),
                 typed("holes", count.to_string(), Some(round.into())),
                 typed("first hole from +X", degrees(first), None),
-                typed("last hole from +X", degrees(last), None),
+                // The angle between holes is the other way to say the last
+                // hole's: three rows fit at 1024 x 700 (LIO-404).
                 typed(
-                    "between holes",
-                    degrees(step),
-                    Some("counter-clockwise".into()),
+                    "last hole from +X",
+                    degrees(last),
+                    Some(format!("or {} between holes", degrees(step))),
                 ),
             ];
             (
@@ -3476,17 +3502,21 @@ fn pattern_screen<'a>(
                 "type the arc into the DRO",
                 "the DRO's arc holes",
                 c,
+                "Then the DRO leads to each hole: move X and Y to 0.00.",
             )
         }
     };
-    let mut right = column![chips(said), label(format!("Type into {kind}"))];
+    let mut right = column![]
+        .push(said)
+        .push(label(format!("Type into {kind}")));
     let mut numbers = numbers.into_iter();
     while let Some(a) = numbers.next() {
         let b = numbers.next().unwrap_or_else(|| space().width(Fill).into());
         right = right.push(row![a, b].spacing(8));
     }
-    let right =
-        right.push(muted("Then the DRO leads to each hole: move X and Y to 0.00.").size(13));
+    // The DRO's order may not be ours: every hole is drilled alike
+    // (LIO-403, LIO-405).
+    let right = right.push(muted(format!("{then} If the DRO takes the holes in another order, follow it: every hole is drilled alike.")).size(13));
     let stock = p.before(op);
     let left = p.drawing(
         0,
@@ -3837,7 +3867,8 @@ pub(crate) mod tests {
                 assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
             }
         };
-        // Hole 2's readouts: X and Y 0 on the DRO's hole 2, its centre beside.
+        // Hole 2's readouts: an axis that moves reads 0 on the DRO's hole 2,
+        // its centre beside; one that stays says so (LIO-405).
         let hole_2 = |a: &mut App, at: usize| {
             send(a, GuideAction::Go(at + 1));
             send(a, GuideAction::Next);
@@ -3846,6 +3877,10 @@ pub(crate) mod tests {
             };
             let t = texts(a);
             for k in 0..2 {
+                if (holes[1][k] - holes[0][k]).abs() < 0.005 {
+                    assert_eq!(after(&t, AXES[k]), ["stays", "leave it locked"]);
+                    continue;
+                }
                 let tag = format!(
                     "on the DRO's hole 2 · {}\u{a0}{}",
                     AXES[k],
@@ -3878,7 +3913,7 @@ pub(crate) mod tests {
                 "15.00",
                 "span 30.00",
                 "4 × 3",
-                "holes: a row × rows",
+                "holes in a row × rows",
                 "0.00°",
             ],
         );
@@ -3901,14 +3936,113 @@ pub(crate) mod tests {
                 "full circle",
                 "30.00°",
                 "330.00°",
-                "60.00°",
+                "or 60.00° between holes",
             ],
         );
         hole_2(&mut a, at[1]);
     }
-    /// The Pattern screen and hole 2's Holes screen of the plate's grid and
-    /// of its bolt circle, at 1440 × 900 and 1024 × 700, into
-    /// `AXIS_RENDER_DIR`.
+    /// The Holes screen of a grid, back and forth (LIO-405): each hole asks
+    /// only for the axis that moves, the other "stays"; hole 1 and a bolt
+    /// circle's holes move both; a plain Drill's hole on the Y of the one
+    /// before keeps Y.
+    #[test]
+    fn a_hole_asks_only_for_the_axis_that_moves() {
+        use crate::guide::tests::{plate_circle, plate_grid};
+        // The numbered steps of the screen: the axis after each disc.
+        let steps = |a: &App| -> Vec<(String, String)> {
+            let t = texts(a);
+            (0..t.len().saturating_sub(1))
+                .filter(|&i| ["1", "2", "3"].contains(&t[i].as_str()))
+                .filter(|&i| ["X", "Y", "Z"].contains(&t[i + 1].as_str()))
+                .map(|i| (t[i].clone(), t[i + 1].clone()))
+                .collect()
+        };
+        let pairs = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+            v.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        };
+        let mut a = pattern_app(&plate_grid(), true, false, false);
+        let holes = patterns(&a)[0] + 1;
+        send(&mut a, GuideAction::Go(holes));
+        assert_eq!(steps(&a), pairs(&[("1", "X"), ("2", "Y"), ("3", "Z")]));
+        // Hole 2: X, then Z; Y stays. Hole 5, up onto the second row: Y.
+        a.guide_item = 1;
+        assert_eq!(steps(&a), pairs(&[("1", "X"), ("2", "Z")]));
+        assert_eq!(after(&texts(&a), "Y"), ["stays", "leave it locked"]);
+        a.guide_item = 4;
+        assert_eq!(steps(&a), pairs(&[("1", "Y"), ("2", "Z")]));
+        assert_eq!(after(&texts(&a), "X"), ["stays", "leave it locked"]);
+        // Tapping X lights Z, the next step.
+        send(&mut a, GuideAction::Reached(0));
+        assert_eq!(a.guide_reached, 1);
+        // A bolt circle moves both, but between two holes on one X or Y
+        // (150° and 210° on this one) that one stays, as on any Drill.
+        let mut a = pattern_app(&plate_circle(), false, true, false);
+        let at = patterns(&a)[0] + 1;
+        let Step::Holes { holes, .. } = &guide(&a).steps[at] else {
+            panic!()
+        };
+        let holes = holes.clone();
+        send(&mut a, GuideAction::Go(at));
+        for item in 0..6 {
+            a.guide_item = item;
+            let stays = |k: usize| item > 0 && (holes[item][k] - holes[item - 1][k]).abs() < 0.005;
+            let mut want = vec![];
+            for k in (0..2).filter(|&k| !stays(k)) {
+                want.push(((want.len() + 1).to_string(), AXES[k].to_string()));
+            }
+            want.push(((want.len() + 1).to_string(), "Z".to_string()));
+            assert_eq!(steps(&a), want, "hole {}", item + 1);
+            assert_eq!(stays(0) || stays(1), item == 3, "hole {}", item + 1);
+        }
+        // A plain Drill, no pattern: a hole on the Y of the one before keeps Y.
+        let mut a = app_with("Yes", |doc| {
+            for k in ["dro_matrix", "dro_arc"] {
+                doc.setups[0].machine.p.insert(k.into(), "No".into());
+            }
+        });
+        let at = (guide(&a).steps.iter())
+            .position(|s| matches!(s, Step::Holes { pattern: None, .. }))
+            .unwrap();
+        let Step::Holes { holes, .. } = &guide(&a).steps[at] else {
+            panic!()
+        };
+        let same_y = (1..holes.len())
+            .find(|&i| (holes[i][1] - holes[i - 1][1]).abs() < 0.005)
+            .expect("two holes one after the other on one Y");
+        send(&mut a, GuideAction::Go(at));
+        a.guide_item = same_y;
+        assert_eq!(after(&texts(&a), "Y"), ["stays", "leave it locked"]);
+    }
+    /// LIO-404: at 1024 x 700 every number of the Arc holes screen and its
+    /// closing line are above the buttons, with nothing to scroll.
+    #[test]
+    fn the_arc_holes_screen_fits_at_1024_by_700() {
+        use crate::guide::tests::{plate_circle, plate_grid};
+        let window = iced::Size::new(1024., 700.);
+        for (holes, grids) in [(plate_circle(), false), (plate_grid(), true)] {
+            let mut a = pattern_app(&holes, grids, !grids, false);
+            (a.window_width, a.window_height) = (window.width, window.height);
+            let at = patterns(&a)[0];
+            send(&mut a, GuideAction::Go(at));
+            let seen = crate::ui::probe::placed(a.view(), window);
+            let find = |start: &str| {
+                (seen.iter())
+                    .find(|(t, _)| t.starts_with(start))
+                    .unwrap_or_else(|| panic!("{start} in {seen:?}"))
+                    .1
+            };
+            let back = find("◀ Back");
+            for start in ["Then the DRO leads", "first hole"] {
+                let r = find(start);
+                assert!(r.y + r.height < back.y, "{start} {r:?} over {back:?}");
+            }
+        }
+    }
+    /// The Pattern screen and the Holes screens of holes 2, 5 and 1 of the
+    /// plate's grid and of its bolt circle, at 1440 × 900 and 1024 × 700,
+    /// into `AXIS_RENDER_DIR`.
     #[test]
     #[ignore]
     fn render_the_hole_patterns() {
@@ -3922,8 +4056,11 @@ pub(crate) mod tests {
                 (a.window_width, a.window_height) = (w as f32, h as f32);
                 at(&mut a, step, 0);
                 render(&a, (w, h), &dir.join(format!("{name}-pattern-{w}.png")));
-                at(&mut a, step + 1, 1);
-                render(&a, (w, h), &dir.join(format!("{name}-holes-{w}.png")));
+                for hole in [2, 5, 1] {
+                    at(&mut a, step + 1, hole - 1);
+                    let file = format!("{name}-holes-{hole}-{w}.png");
+                    render(&a, (w, h), &dir.join(file));
+                }
             }
         }
     }

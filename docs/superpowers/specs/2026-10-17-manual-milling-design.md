@@ -35,7 +35,7 @@ Power feed, a DRO connection (the app does not read the DRO), arcs or two axes m
 | `hand_rapid` | How fast the user moves an axis off the cut, mm/min | `1500` |
 | `turn_x`, `turn_y`, `turn_z` | mm per handwheel turn on each axis | `5`, `5`, `2.5` |
 | `dro_comp` | `Yes` when the DRO has tool-radius compensation | `Yes` |
-| `dro_matrix`, `dro_arc` | `Yes` when the DRO has matrix holes (a grid) or arc holes, which it leads to once the pattern is typed in (LIO-399, §3 Hole patterns); absent reads `No` | absent |
+| `dro_matrix`, `dro_arc` | `Yes` when the DRO has matrix holes (a grid) or arc holes, which it leads to once the pattern is typed in (LIO-399, §3 Hole patterns); `No` only for a DRO without them, absent reads `Yes` | absent (`Yes`) |
 | `edge_finder` | Diameter of the edge finder the Zero step uses, mm; its radius is taken off each face touched | `10` |
 | `pass_time` | Seconds to reset, set and lock the axes for one pass | `20` |
 | `tool_time` | Minutes to change a tool and pick up the zero again | `3` |
@@ -130,11 +130,12 @@ The guide is split into **one section per cutting operation**, between a **Set u
 
 ### Hole patterns (LIO-399)
 
-With `dro_matrix` or `dro_arc` on, `guide::pattern` looks at a (non-boring) Drill's hole centres in work coordinates, all together, and finds one grid or one arc, within 0.02 mm, rounded to 0.01:
+With `dro_matrix` or `dro_arc` on (both are, unless set to `No`), `guide::pattern` looks at a (non-boring) Drill's hole centres in work coordinates, all together, when every hole goes to the same Z to 0.01 (LIO-403: the DRO's order is not known), and finds one grid or one arc, within 0.02 mm, rounded to 0.01; it is used only when the numbers as shown (pitch, angle between holes) rebuild every hole within 0.05 mm (LIO-402):
 
-- **Grid.** Each pair of holes gives a direction to try, the longest pairs first; the holes' positions along it and across it rank into columns and rows (values within 0.2 mm one rank), which must fill a full grid, and a least-squares fit of the two pitches, square to each other, must place every hole within 0.02 mm. One row of three or more is a grid. The rows run along the pitch nearer X, toward +X (+Y when upright, within 0.1°), the rows after the first counter-clockwise of them; the DRO's order is row by row from the first hole, each row the same way.
-- **Arc.** An algebraic (Kåsa) circle fit, then even angles: all the way round from the hole at the least angle from +X, else from the hole after the widest gap, counter-clockwise, at least 10° from the first to the last, every hole within 0.02 mm of its place.
-- A grid is tried first when the DRO has both: four holes on a square are a grid there, an arc on a DRO with arc holes only.
+- **Grid.** Each pair of holes gives a direction to try, the longest pairs first; the holes' positions along it and across it rank into columns and rows (values within 0.2 mm one rank), which must fill a full grid, and a least-squares fit of the two pitches, square to each other, must place every hole within 0.02 mm. One row of three or more is a grid; a lone line along Y is 1 × N at 0°, and an angle within 0.02° of 0 reads 0 (LIO-402). The rows run along the pitch nearer X, toward +X, the rows after the first counter-clockwise of them; the DRO's order is row by row from the first hole, back and forth, so that square to the axes each move is along one axis (LIO-405).
+- **Arc.** An algebraic (Kåsa) circle fit, then even angles: all the way round from the hole at the least angle from +X, else (four holes or more) from the hole after the widest gap, counter-clockwise, at least 10° from the first to the last, every hole within 0.02 mm of its place.
+- When the holes are both a grid and a full circle (four on a square), the grid when square to the axes, else the circle (LIO-402).
+- The Holes screen asks only for the axes that move from the hole before; an axis that stays is shown muted, "stays · leave it locked", and is no step (LIO-405).
 - `Step::Holes` carries the `pattern` and its holes, mouths and `uncentred` flags in the DRO's order; a `Step::Pattern { op, pattern, same }` comes before it, `same` when the operation before used the same pattern (a centre drill before its drill).
 - **The Pattern screen** gives the numbers two to a row, each the ways DROs differ (diameter and radius; the last hole's angle and the angle between holes; pitch and span), and draws the pattern on the part from above: the holes numbered in the DRO's order, hole 1 in the accent, arrows from hole to hole, the pitches off hole 1, or the circle, its centre and the angle from +X to hole 1 outside it.
 - Not in this version: several patterns in one Drill, Boring passes, anything for the AI planner.
