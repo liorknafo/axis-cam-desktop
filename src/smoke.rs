@@ -14001,6 +14001,82 @@ soft_max = 180.0
         let _ = a.view();
     }
 
+    /// Small things of the CNC flow (LIO-396): a status line's problem that
+    /// an edit put right is cleared; the G-code pane's lines end clear of
+    /// its scrollbar; the wizard's review says "3-axis" once; no "-0.0 min"
+    /// and no "1 earlier operations".
+    #[test]
+    fn a_fixed_problem_leaves_the_status_line_and_the_gcode_pane_shows_its_lines_ends() {
+        let mut a = app();
+        let (mut doc, mesh) = crate::post::fixture::job();
+        doc.active = doc.setups[0].id.clone();
+        a.doc = doc;
+        a.imported_mesh = Some(mesh);
+        let _ = a.update(Message::SelectOp(1));
+        let edit = |a: &mut App, k: &'static str, v: &str| {
+            let _ = a.update(Message::Edit(Target::Operation, k, v.into()));
+        };
+        edit(&mut a, "rpm", "99999");
+        let _ = a.update(Message::Generate);
+        assert!(
+            a.status.starts_with("Spindle speed is above"),
+            "{}",
+            a.status
+        );
+        // An edit that leaves it keeps it; one that puts it right clears it.
+        edit(&mut a, "name", "Pocket 2");
+        assert!(
+            a.status.starts_with("Spindle speed is above"),
+            "{}",
+            a.status
+        );
+        edit(&mut a, "rpm", "8000");
+        assert!(!a.status.contains("Spindle speed"), "{}", a.status);
+        // The G-code pane: a line longer than the pane wraps clear of the
+        // scrollbar, which would cover its end.
+        let long = format!("(Work zero: {} end)", "word ".repeat(300));
+        a.post = Some(std::sync::Arc::new(crate::post::JobPost {
+            errors: vec![],
+            setups: vec![crate::post::SetupPost {
+                setup: 0,
+                name: a.doc.setups[0].name().into(),
+                result: Ok(vec![crate::post::Program {
+                    file_name: "part.ngc".into(),
+                    lines: 1,
+                    tools: vec![],
+                    operations: vec![],
+                    text: long.clone(),
+                }]),
+                run: None,
+            }],
+        }));
+        a.page = Page::Post;
+        let (_, line) = (crate::ui::probe::placed(a.view(), WINDOW).into_iter())
+            .find(|(t, _)| t.starts_with("(Work zero:"))
+            .expect("the program's text");
+        let pane = (crate::ui::probe::scrollables(a.view(), WINDOW).into_iter())
+            .map(|(_, b)| b)
+            .find(|b| b.x <= line.x && line.x < b.x + b.width && b.y <= line.y)
+            .unwrap();
+        assert!(
+            line.x + line.width <= pane.x + pane.width - crate::ui::SCROLLBAR_GUTTER + 0.5,
+            "{line:?} in {pane:?}"
+        );
+        // The wizard's review of a 3-axis machine.
+        let _ = a.update(Message::NewMachine);
+        let _ = a.update(Message::WizardStep(4));
+        assert!(
+            page_texts(&a).iter().any(|t| t == "3-axis · LinuxCNC"),
+            "{:?}",
+            page_texts(&a)
+        );
+        assert_eq!(crate::ui::minutes(-2.), "0.0");
+        assert_eq!(crate::ui::minutes(90.), "1.5");
+        assert_eq!(
+            crate::ui::plural(1, "earlier operation"),
+            "1 earlier operation"
+        );
+    }
     /// NC review lists a failing operation once, as one issue, the four
     /// after it in one line, and opens it at its Tool tab (LIO-394).
     #[test]
