@@ -157,14 +157,17 @@ pub enum Step {
     /// mouth, where a tap's turns are counted from. A centre drill's Z is
     /// its pilot's tip. By hole, whether a twist drill starts it on a flat
     /// face, with nothing before it to centre it (`uncentred`). With a
-    /// `pattern` the DRO leads to (LIO-399), the holes are in the DRO's
-    /// order and each is reached when X and Y read 0.
+    /// `pattern` the DRO leads to (LIO-399), each is reached when X and Y
+    /// read 0, and `numbers` are the DRO's hole numbers in the order
+    /// drilled: an arc's mirrored holes are taken one axis a move, out of
+    /// the DRO's order round the circle (LIO-406). Without, 1, 2, 3…
     Holes {
         op: usize,
         holes: Vec<[f32; 3]>,
         mouths: Vec<f32>,
         uncentred: Vec<bool>,
         pattern: Option<Pattern>,
+        numbers: Vec<usize>,
     },
     /// What to type into the DRO for the holes of `op`, which are all one
     /// `pattern`; `same` when the operation before used the same one (a
@@ -776,6 +779,54 @@ pub(crate) fn opened(
 }
 fn holes(plan: &Plan, zero: [f32; 3]) -> Vec<[f32; 3]> {
     holes_of(&plan.moves, zero)
+}
+/// Within this, mm, two holes share an X or a Y: the move between them is
+/// along one axis.
+const SAME_AXIS: f32 = 0.005;
+/// Whether the move between `a` and `b` is along one axis.
+pub(crate) fn one_axis(a: [f32; 2], b: [f32; 2]) -> bool {
+    (0..2).any(|k| (a[k] - b[k]).abs() <= SAME_AXIS)
+}
+/// The order to drill an arc's holes `at` (centres in the DRO's order, round
+/// the circle), as indices of `at`: from hole 1, next the hole left that
+/// shares this one's Y (a move along X), else its X, the nearer of two,
+/// else the nearest left. Used only when it has more one-axis moves than
+/// going round (LIO-406).
+// ponytail: the DRO is taken to count counter-clockwise from its first
+// hole; if the owner's counts the other way the numbers mirror, and every
+// hole is still drilled once.
+fn drill_order(at: &[[f32; 2]]) -> Vec<usize> {
+    let moves = |o: &[usize]| {
+        (o.windows(2))
+            .filter(|w| one_axis(at[w[0]], at[w[1]]))
+            .count()
+    };
+    let round: Vec<usize> = (0..at.len()).collect();
+    let mut order = vec![0];
+    let mut left: Vec<usize> = (1..at.len()).collect();
+    while let Some(&here) = order.last()
+        && !left.is_empty()
+    {
+        let p = at[here];
+        let near = |j: usize| (at[j][0] - p[0]).hypot(at[j][1] - p[1]);
+        let rank = |j: usize| match (at[j][1] - p[1]).abs() <= SAME_AXIS {
+            true => 0,
+            false if (at[j][0] - p[0]).abs() <= SAME_AXIS => 1,
+            false => 2,
+        };
+        let pick = (0..left.len())
+            .min_by(|&a, &b| {
+                let (a, b) = (left[a], left[b]);
+                rank(a).cmp(&rank(b)).then(near(a).total_cmp(&near(b)))
+            })
+            .unwrap_or(0);
+        order.push(left.remove(pick));
+    }
+    if moves(&order) > moves(&round) {
+        order
+    } else {
+        round
+    }
 }
 /// `v` in `order`.
 fn reordered<T: Clone>(v: &[T], order: &[usize]) -> Vec<T> {
@@ -1615,13 +1666,25 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                 // ponytail: one pattern an operation, all its holes or none;
                 // several would need the holes split into patterns first.
                 let found = level_pattern(&holes, grids, arcs);
+                let mut numbers: Vec<usize> = (1..=holes.len()).collect();
                 let (holes, mouths, uncentred, pattern) = match found {
-                    Some((pattern, order)) => {
+                    Some((pattern, round)) => {
                         steps.push(Step::Pattern {
                             op: oi,
                             pattern: pattern.clone(),
                             same: last_pattern.as_ref() == Some(&pattern),
                         });
+                        // An arc's mirrored holes one axis a move (LIO-406).
+                        let drilled = match pattern {
+                            Pattern::Arc { .. } => {
+                                let at: Vec<[f32; 2]> =
+                                    round.iter().map(|&j| [holes[j][0], holes[j][1]]).collect();
+                                drill_order(&at)
+                            }
+                            Pattern::Grid { .. } => (0..round.len()).collect(),
+                        };
+                        numbers = drilled.iter().map(|j| j + 1).collect();
+                        let order: Vec<usize> = drilled.iter().map(|&j| round[j]).collect();
                         (
                             reordered(&holes, &order),
                             reordered(&mouths, &order),
@@ -1638,6 +1701,7 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                     mouths,
                     uncentred,
                     pattern,
+                    numbers,
                 });
                 steps.push(Step::Check { op: oi });
             }
@@ -2522,6 +2586,60 @@ pub(crate) mod tests {
             pattern(&four, true, false),
             Some((Pattern::Grid { angle, .. }, _)) if (angle.abs() - 45.).abs() < 0.05
         ));
+    }
+    #[test]
+    fn mirrored_arc_holes_are_taken_one_axis_a_move() {
+        let order =
+            |at: &[[f32; 2]]| -> Vec<usize> { drill_order(at).iter().map(|j| j + 1).collect() };
+        let moves = |at: &[[f32; 2]]| {
+            let o = drill_order(at);
+            (o.windows(2))
+                .filter(|w| one_axis(at[w[0]], at[w[1]]))
+                .count()
+        };
+        // Six on Ø60 from 30°: 30, 150, 210, 330, then 270, 90.
+        let six = circle_at([0., 0.], 60., 6, 30., 60.);
+        assert_eq!(order(&six), [1, 3, 4, 6, 5, 2]);
+        assert_eq!(moves(&six), 4);
+        // Four at 0°, 90°, 180°, 270°: across, then the other pair.
+        let four = circle_at([0., 0.], 50., 4, 0., 90.);
+        assert_eq!(order(&four), [1, 3, 2, 4]);
+        assert_eq!(moves(&four), 2);
+        // Four from 45° (one axis a move already) and five from 17° (no
+        // mirrored pair) go round as before.
+        assert_eq!(order(&circle_at([0., 0.], 50., 4, 45., 90.)), [1, 2, 3, 4]);
+        assert_eq!(
+            order(&circle_at([0., 0.], 50., 5, 17., 72.)),
+            [1, 2, 3, 4, 5]
+        );
+        // Part of a circle with a mirrored pair (60° and 120°): one after
+        // the other.
+        let part = circle_at([0., 0.], 50., 4, 60., 30.);
+        let o = order(&part);
+        let (a, b) = (
+            o.iter().position(|&n| n == 1),
+            o.iter().position(|&n| n == 3),
+        );
+        assert_eq!(b.unwrap().abs_diff(a.unwrap()), 1, "{o:?}");
+    }
+    #[test]
+    fn a_bolt_circle_is_drilled_with_the_dros_numbers_beside_the_order() {
+        let (doc, mesh) = pattern_job(&plate_circle(), false, true, false);
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let Some(Step::Holes { holes, numbers, .. }) =
+            guide.steps.iter().find(|s| matches!(s, Step::Holes { .. }))
+        else {
+            panic!()
+        };
+        assert_eq!(numbers, &[1, 3, 4, 6, 5, 2]);
+        // Each hole is the DRO's hole of its number, round from 30°.
+        for (h, n) in holes.iter().zip(numbers) {
+            let t = (30. + 60. * (*n as f32 - 1.)).to_radians();
+            assert!(
+                (h[0] - 30. * t.cos()).hypot(h[1] - 30. * t.sin()) < 0.05,
+                "{n} {h:?}"
+            );
+        }
     }
     #[test]
     fn a_pattern_is_used_only_when_every_hole_goes_to_the_same_depth() {

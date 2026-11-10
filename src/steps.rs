@@ -882,7 +882,7 @@ enum Shape {
     /// their radius, in the top view: the holes numbered and their order,
     /// hole 1 marked, the pitches or the circle with its centre and first
     /// angle.
-    Pattern(Pattern, Vec<[f32; 2]>, f32),
+    Pattern(Pattern, Vec<[f32; 2]>, f32, Vec<usize>),
     /// A word at a point.
     Word([f32; 3], String, Color),
     /// A solid block, such as a parallel under the stock.
@@ -1140,7 +1140,9 @@ impl Drawing<'_> {
                         Align::Left,
                     );
                 }
-                Shape::Pattern(pattern, holes, r) => paint_pattern(f, p, s, pattern, holes, *r),
+                Shape::Pattern(pattern, holes, r, numbers) => {
+                    paint_pattern(f, p, s, pattern, holes, *r, numbers)
+                }
                 Shape::Word(q, s, c) => write(f, s.clone(), p3(*q), *c, 13., Align::Left),
                 Shape::Round(q, r, label) => {
                     let at = p3(*q);
@@ -1241,6 +1243,7 @@ fn paint_pattern(
     pattern: &Pattern,
     holes: &[[f32; 2]],
     r: f32,
+    numbers: &[usize],
 ) {
     if holes.is_empty() {
         return;
@@ -1420,7 +1423,8 @@ fn paint_pattern(
         );
         let n = on(*c, out, rs + (if one { 15. } else { 12. }) * k);
         let (ink, size) = if one { (ACCENT, 20.) } else { (INK, 16.) };
-        write(f, (j + 1).to_string(), n, ink, size * k, Align::Center);
+        let number = numbers.get(j).copied().unwrap_or(j + 1);
+        write(f, number.to_string(), n, ink, size * k, Align::Center);
     }
 }
 impl canvas::Program<Message> for Drawing<'_> {
@@ -2759,7 +2763,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             mouths,
             uncentred,
             pattern,
+            numbers,
         } => {
+            // The DRO's number of each hole, drilled in this order (LIO-406).
+            let number = |n: usize| numbers.get(n).copied().unwrap_or(n + 1);
             let stock = p.before(*op);
             let i = p.item.min(holes.len().saturating_sub(1));
             let r = p
@@ -2780,7 +2787,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 })
             };
             shapes.extend(holes.iter().enumerate().map(|(n, h)| {
-                Shape::Hole([h[0], h[1], stock.max[2]], cone(n, h), n + 1, lit(n, i))
+                Shape::Hole([h[0], h[1], stock.max[2]], cone(n, h), number(n), lit(n, i))
             }));
             let h = holes.get(i).copied().unwrap_or([0.; 3]);
             // An axis where the hole before left it stays, locked, and is no
@@ -2813,7 +2820,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     Some(_) => (
                         dro(0.),
                         vec![
-                            format!("on the DRO's hole {}", i + 1),
+                            format!("on the DRO's hole {}", number(i)),
                             format!("{}\u{a0}{}", AXES[k], dro(h[k])),
                         ],
                     ),
@@ -2915,7 +2922,9 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                         Some(Message::Guide(GuideAction::Reached(z)))
                     ),
                     tiles(
-                        (1..=holes.len()).map(|n| (n.to_string(), None)).collect(),
+                        (0..holes.len())
+                            .map(|n| (number(n).to_string(), None))
+                            .collect(),
                         i
                     ),
                 ];
@@ -2991,7 +3000,9 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                         Some(Message::Guide(GuideAction::Reached(z)))
                     ),
                     tiles(
-                        (1..=holes.len()).map(|n| (n.to_string(), None)).collect(),
+                        (0..holes.len())
+                            .map(|n| (number(n).to_string(), None))
+                            .collect(),
                         i
                     ),
                 ];
@@ -3388,10 +3399,18 @@ fn pattern_screen<'a>(
     Element<'a, Message>,
     Column<'a, Message>,
 ) {
-    let holes: Vec<[f32; 2]> = match p.guide().steps.get(p.at + 1) {
-        Some(Step::Holes { holes, .. }) => holes.iter().map(|h| [h[0], h[1]]).collect(),
-        _ => vec![],
+    let (holes, called): (Vec<[f32; 2]>, Vec<usize>) = match p.guide().steps.get(p.at + 1) {
+        Some(Step::Holes { holes, numbers, .. }) => (
+            holes.iter().map(|h| [h[0], h[1]]).collect(),
+            numbers.clone(),
+        ),
+        _ => (vec![], vec![]),
     };
+    // Out of the DRO's order round the circle, one axis a move (LIO-406).
+    let out_of_order = called.iter().enumerate().any(|(j, n)| *n != j + 1);
+    let one_axis = (holes.windows(2))
+        .filter(|w| crate::guide::one_axis(w[0], w[1]))
+        .count();
     let r = (p.tool(op).and_then(|t| num(&t.p, "diameter"))).unwrap_or(4.) / 2.;
     // Smaller at a narrow window, where the numbers get half the card.
     let size = if p.app.window_width < 1200. { 34 } else { 40 };
@@ -3462,7 +3481,7 @@ fn pattern_screen<'a>(
                 "type the grid into the DRO",
                 "the DRO's matrix holes",
                 c,
-                then,
+                then.to_string(),
             )
         }
         Pattern::Arc {
@@ -3502,7 +3521,14 @@ fn pattern_screen<'a>(
                 "type the arc into the DRO",
                 "the DRO's arc holes",
                 c,
-                "Then the DRO leads to each hole: move X and Y to 0.00.",
+                if out_of_order {
+                    format!(
+                        "Call up each hole on the DRO in the order shown: {one_axis} of the {} moves are along one axis. Move to 0.00.",
+                        holes.len().saturating_sub(1)
+                    )
+                } else {
+                    "Then the DRO leads to each hole: move X and Y to 0.00.".into()
+                },
             )
         }
     };
@@ -3515,13 +3541,19 @@ fn pattern_screen<'a>(
         right = right.push(row![a, b].spacing(8));
     }
     // The DRO's order may not be ours: every hole is drilled alike
-    // (LIO-403, LIO-405).
-    let right = right.push(muted(format!("{then} If the DRO takes the holes in another order, follow it: every hole is drilled alike.")).size(13));
+    // (LIO-403, LIO-405); an arc out of its order calls each hole up.
+    let after = if out_of_order {
+        String::new()
+    } else {
+        " If the DRO takes the holes in another order, follow it: every hole is drilled alike."
+            .into()
+    };
+    let right = right.push(muted(format!("{then}{after}")).size(13));
     let stock = p.before(op);
     let left = p.drawing(
         0,
         stock,
-        vec![Shape::Pattern(pattern.clone(), holes, r)],
+        vec![Shape::Pattern(pattern.clone(), holes, r, called)],
         Fill,
     );
     (title.into(), sub, left, right)
@@ -3872,7 +3904,7 @@ pub(crate) mod tests {
         let hole_2 = |a: &mut App, at: usize| {
             send(a, GuideAction::Go(at + 1));
             send(a, GuideAction::Next);
-            let Step::Holes { holes, .. } = &guide(a).steps[at + 1] else {
+            let Step::Holes { holes, numbers, .. } = &guide(a).steps[at + 1] else {
                 panic!()
             };
             let t = texts(a);
@@ -3881,8 +3913,10 @@ pub(crate) mod tests {
                     assert_eq!(after(&t, AXES[k]), ["stays", "leave it locked"]);
                     continue;
                 }
+                // The DRO's number of the hole drilled second (LIO-406).
                 let tag = format!(
-                    "on the DRO's hole 2 · {}\u{a0}{}",
+                    "on the DRO's hole {} · {}\u{a0}{}",
+                    numbers[1],
                     AXES[k],
                     dro(holes[1][k])
                 );
@@ -3994,7 +4028,14 @@ pub(crate) mod tests {
             }
             want.push(((want.len() + 1).to_string(), "Z".to_string()));
             assert_eq!(steps(&a), want, "hole {}", item + 1);
-            assert_eq!(stays(0) || stays(1), item == 3, "hole {}", item + 1);
+            // Drilled 1, 3, 4, 6, 5, 2: all but the first and 6 to 5 keep
+            // an axis (LIO-406).
+            assert_eq!(
+                stays(0) || stays(1),
+                ![0, 4].contains(&item),
+                "hole {}",
+                item + 1
+            );
         }
         // A plain Drill, no pattern: a hole on the Y of the one before keeps Y.
         let mut a = app_with("Yes", |doc| {
@@ -4015,6 +4056,31 @@ pub(crate) mod tests {
         a.guide_item = same_y;
         assert_eq!(after(&texts(&a), "Y"), ["stays", "leave it locked"]);
     }
+    /// LIO-406: the second hole drilled of the bolt circle is the DRO's
+    /// hole 3, Y staying; the Pattern screen says how many moves keep an axis.
+    #[test]
+    fn a_bolt_circle_names_each_hole_by_the_dros_number() {
+        use crate::guide::tests::plate_circle;
+        let mut a = pattern_app(&plate_circle(), false, true, false);
+        let at = patterns(&a)[0];
+        send(&mut a, GuideAction::Go(at));
+        let t = texts(&a);
+        assert!(
+            t.iter().any(|s| s.starts_with(
+                "Call up each hole on the DRO in the order shown: 4 of the 5 moves are along one axis."
+            )),
+            "{t:?}"
+        );
+        send(&mut a, GuideAction::Go(at + 1));
+        send(&mut a, GuideAction::Next);
+        let t = texts(&a);
+        assert!(t.contains(&"HOLE 2 OF 6".to_string()), "{t:?}");
+        assert_eq!(after(&t, "Y"), ["stays", "leave it locked"]);
+        assert!(
+            t.iter().any(|s| s.starts_with("on the DRO's hole 3 · X")),
+            "{t:?}"
+        );
+    }
     /// LIO-404: at 1024 x 700 every number of the Arc holes screen and its
     /// closing line are above the buttons, with nothing to scroll.
     #[test]
@@ -4034,15 +4100,22 @@ pub(crate) mod tests {
                     .1
             };
             let back = find("◀ Back");
-            for start in ["Then the DRO leads", "first hole"] {
+            // The closing line: the bolt circle's calls each hole up, as it
+            // is drilled out of the DRO's order (LIO-406).
+            let closing = if grids {
+                "Then the DRO leads"
+            } else {
+                "Call up each hole"
+            };
+            for start in [closing, "first hole"] {
                 let r = find(start);
                 assert!(r.y + r.height < back.y, "{start} {r:?} over {back:?}");
             }
         }
     }
-    /// The Pattern screen and the Holes screens of holes 2, 5 and 1 of the
-    /// plate's grid and of its bolt circle, at 1440 × 900 and 1024 × 700,
-    /// into `AXIS_RENDER_DIR`.
+    /// The Pattern screen and the Holes screens of the 2nd, 5th and 1st
+    /// hole drilled of the plate's grid and of its bolt circle, at
+    /// 1440 × 900 and 1024 × 700, into `AXIS_RENDER_DIR`.
     #[test]
     #[ignore]
     fn render_the_hole_patterns() {
