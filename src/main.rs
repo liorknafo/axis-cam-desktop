@@ -1227,6 +1227,9 @@ pub struct App {
     /// The page the status line was last set on: on another page it is an
     /// earlier event's, and the footer shows it as such.
     pub status_page: Page,
+    /// The status line reports a problem the checks found (Generate's): an
+    /// edit after which the checks no longer find it clears it (LIO-396).
+    pub status_problem: bool,
     pub audit_report: Vec<AuditRow>,
     /// The field whose help the F1 key pinned (`ui::view` draws it), and
     /// whether its card is open to its More… text and its animation paused.
@@ -2143,6 +2146,7 @@ impl App {
             confirm_delete_setup: false,
             confirm_delete_op: false,
             status_page: Page::Home,
+            status_problem: false,
             typed_last: None,
             pending: None,
             icons,
@@ -3314,6 +3318,18 @@ impl App {
                 })
             })
             .unwrap_or_default()
+    }
+    /// Whether the checks still find the problem the status line reports.
+    fn problem_stands(&self) -> bool {
+        let mut now = self.job_issues();
+        now.extend(
+            self.doc
+                .active_setup()
+                .map(|s| s.issues())
+                .unwrap_or_default(),
+        );
+        now.extend(self.op_issues());
+        now.iter().any(|i| self.status.contains(i.as_str()))
     }
     pub fn job_issues(&self) -> Vec<String> {
         let mut issues = self.doc.issues();
@@ -5406,6 +5422,7 @@ impl App {
     }
     fn update(&mut self, message: Message) -> Task<Message> {
         let before = self.status.clone();
+        let problem = std::mem::take(&mut self.status_problem);
         let (selected, page) = (self.selected, self.page);
         let edit = match message {
             Message::Edit(target, ..) => Some((target, self.edited(target))),
@@ -5423,6 +5440,15 @@ impl App {
                 Task::none()
             }
         };
+        // A problem the status line still reports, which an edit that says
+        // nothing of its own has put right, is cleared (LIO-396).
+        if self.status == before {
+            self.status_problem |= problem;
+            if self.status_problem && edit.is_some() && !self.problem_stands() {
+                self.status.clear();
+                self.status_problem = false;
+            }
+        }
         if let Some((target, before)) = edit {
             let after = self.edited(target);
             self.typed_last = Some(LastEdit { before, after });
@@ -6575,6 +6601,7 @@ impl App {
                 issues.extend(self.op_issues());
                 if !issues.is_empty() {
                     self.status = issues[0].clone();
+                    self.status_problem = true;
                 } else if !self.is_sample() {
                     self.playing = false;
                     self.simulation = None;
@@ -6636,11 +6663,11 @@ impl App {
                             ui::fixtures(ui::Note::Preview, ui::modelled(self))
                         };
                         self.status = format!(
-                            "{} preview ready: {} levels, {:.1} min estimated. Inherits stock after {} earlier operations across setups. Sampled removal; {} {next}",
+                            "{} preview ready: {} levels, {:.1} min estimated. Inherits stock after {} across setups. Sampled removal; {} {next}",
                             plan.strategy.name(),
                             plan.levels,
                             plan.duration / 60.,
-                            sim.preceding,
+                            ui::plural(sim.preceding, "earlier operation"),
                             fixtures
                         );
                         self.simulation = Some(sim);
@@ -6712,13 +6739,13 @@ impl App {
                                     Ok(sim) => (
                                         true,
                                         format!(
-                                            "Generated {} moves · {:.1} min · inherits stock after {} operations{}",
+                                            "Generated {} moves · {:.1} min · inherits stock after {}{}",
                                             sim.plan.moves.len(),
                                             sim.plan.duration / 60.,
-                                            sim.preceding,
+                                            ui::plural(sim.preceding, "operation"),
                                             match sim.air {
                                                 Some(air) if air.nothing => " · cuts nothing on the stock it starts from".to_string(),
-                                                Some(air) => format!(" · air taken out, {:.1} min saved", air.saved / 60.),
+                                                Some(air) => format!(" · air taken out, {} min saved", ui::minutes(air.saved)),
                                                 None => String::new(),
                                             }
                                         ),
@@ -6741,6 +6768,7 @@ impl App {
                 let issues = self.job_issues();
                 if !issues.is_empty() {
                     self.status = format!("{} configuration issue(s). {}", issues.len(), issues[0]);
+                    self.status_problem = true;
                 } else if self.doc.setup().is_repositioned() || !self.is_sample() {
                     self.status="Configuration checked. Select a supported operation and generate its cumulative stock preview.".into()
                 } else {

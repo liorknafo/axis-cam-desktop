@@ -2555,14 +2555,22 @@ fn workspace(app: &App) -> Element<'_, Message> {
                         Some(s) => Element::from(
                             row![
                                 muted("Work zero:").wrapping(Wrapping::None),
-                                button(
-                                    text(format!("{} · Change", get(&s.p, "origin")))
-                                        .size(12)
-                                        .wrapping(Wrapping::None)
-                                )
-                                .padding([2, 6])
-                                .on_press(Message::SetupStep("Work zero"))
-                                .style(|_, status| flat(false, status)),
+                                // A lathe's zero is fixed (LIO-386, LIO-392).
+                                if lathe::is_lathe(&s.machine) {
+                                    Element::from(
+                                        muted("the free end, on the axis").wrapping(Wrapping::None),
+                                    )
+                                } else {
+                                    button(
+                                        text(format!("{} · Change", get(&s.p, "origin")))
+                                            .size(12)
+                                            .wrapping(Wrapping::None),
+                                    )
+                                    .padding([2, 6])
+                                    .on_press(Message::SetupStep("Work zero"))
+                                    .style(|_, status| flat(false, status))
+                                    .into()
+                                },
                                 muted(format!(
                                     "{}{}{}",
                                     s.offset().map_or(String::new(), |o| format!("{o} / ")),
@@ -2973,14 +2981,14 @@ fn scene_panels(
         if let Some(sim) = app.active_simulation().filter(|_| !folded) {
             playback = playback.push(
                 muted(format!(
-                    "{} · Spindle {} · Stock after {} earlier operations{}",
+                    "{} · Spindle {} · Stock after {}{}",
                     sim.plan.milling_direction,
                     if sim.plan.spindle_clockwise {
                         "CW"
                     } else {
                         "CCW"
                     },
-                    sim.preceding,
+                    plural(sim.preceding, "earlier operation"),
                     sim.plan
                         .rest_top
                         .map_or(String::new(), |z| format!(" · Cutting start Z {z:.2} mm"))
@@ -2997,7 +3005,7 @@ fn scene_panels(
                     .color(WARN)
                 } else {
                     muted(format!(
-                        "Air taken out: {} stretch{} ({:.0} mm of feed) replaced by rapids{}, {:.1} min saved",
+                        "Air taken out: {} stretch{} ({:.0} mm of feed) replaced by rapids{}, {} min saved",
                         air.stretches,
                         if air.stretches == 1 { "" } else { "es" },
                         air.air,
@@ -3006,7 +3014,7 @@ fn scene_panels(
                             1 => ", 1 link lowered to just over the stock".into(),
                             n => format!(", {n} links lowered to just over the stock"),
                         },
-                        air.saved / 60.
+                        minutes(air.saved)
                     ))
                     .size(12)
                 });
@@ -7649,7 +7657,7 @@ fn wizard(app: &App) -> Element<'_, Message> {
                 .push(note("Save this profile to your local library. Assign it to a setup, or add a manual setup, to cut on it."));
         }
         _ => {
-            form=form.push(bold(m.name(),18)).push(muted(format!("{}-axis · {} · {}",m.axes(),get(p,"mode"),get(p,"controller")))).push(muted(format!("Travel: {} × {} × {} {}",get(p,"x"),get(p,"y"),get(p,"z"),get(p,"units")))).push(muted(format!("Spindle: {} rpm · Feed: {} {}/min",get(p,"rpm"),get(p,"feed"),get(p,"units")))).push(muted(format!("Post: {} · {} · G64 P{} · dwell {} s", post_setting(p, "post_tool_length"), post_setting(p, "post_retract"), post_setting(p, "post_blend"), post_setting(p, "post_dwell")))).push(warnings(m.issues())).push(note("Save this profile to your local library. Assign it to a setup to capture this version of its settings."));
+            form=form.push(bold(m.name(),18)).push(muted(machine_kind(m))).push(muted(format!("Travel: {} × {} × {} {}",get(p,"x"),get(p,"y"),get(p,"z"),get(p,"units")))).push(muted(format!("Spindle: {} rpm · Feed: {} {}/min",get(p,"rpm"),get(p,"feed"),get(p,"units")))).push(muted(format!("Post: {} · {} · G64 P{} · dwell {} s", post_setting(p, "post_tool_length"), post_setting(p, "post_retract"), post_setting(p, "post_blend"), post_setting(p, "post_dwell")))).push(warnings(m.issues())).push(note("Save this profile to your local library. Assign it to a setup to capture this version of its settings."));
         }
     }
     let mut actions = row![
@@ -13376,6 +13384,21 @@ fn tool_details(tool: &Tool) -> String {
     )
 }
 /// "1 setup", "2 setups".
+/// `seconds` in minutes to 0.1, never "-0.0" (LIO-396).
+pub(crate) fn minutes(seconds: f32) -> String {
+    format!("{:.1}", (seconds / 6.).round() / 10. + 0.)
+}
+/// A CNC machine's axes and controller, with its motion when the axes do
+/// not say it ("3-axis" once, LIO-396).
+fn machine_kind(m: &Machine) -> String {
+    let (axes, mode) = (format!("{}-axis", m.axes()), get(&m.p, "mode"));
+    let controller = get(&m.p, "controller");
+    if mode == axes {
+        format!("{axes} · {controller}")
+    } else {
+        format!("{axes} · {mode} · {controller}")
+    }
+}
 pub(crate) fn plural(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }
@@ -14870,18 +14893,25 @@ fn post(app: &App) -> Element<'_, Message> {
             .color(Color::from_rgb8(150, 176, 190)),
         );
     }
-    let code = container(scrollable(code).height(Fill))
-        .padding(22)
-        .width(Fill)
-        .height(Fill)
-        .style(|_| container::Style {
-            background: Some(Color::from_rgb8(29, 43, 55).into()),
-            border: Border {
-                radius: 5.into(),
-                ..Default::default()
-            },
+    // Lines wrap clear of the scrollbar, which would cover their ends (LIO-396).
+    let code = container(
+        scrollable(container(code).padding(iced::Padding {
+            right: SCROLLBAR_GUTTER,
             ..Default::default()
-        });
+        }))
+        .height(Fill),
+    )
+    .padding(22)
+    .width(Fill)
+    .height(Fill)
+    .style(|_| container::Style {
+        background: Some(Color::from_rgb8(29, 43, 55).into()),
+        border: Border {
+            radius: 5.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
     container(
         column![
             page_header(page.title, page.intro),
