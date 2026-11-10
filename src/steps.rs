@@ -5565,7 +5565,8 @@ pub(crate) mod tests {
             ],
         );
         let thread = nth(&a, 2, |l| matches!(l, L::ThreadPass { .. }));
-        send(&mut a, GuideAction::Go(thread - 3));
+        // The set-up step sits between the Touch and pass 1 (LIO-415).
+        send(&mut a, GuideAction::Go(thread - 4));
         shows(
             &a,
             &[
@@ -5586,13 +5587,16 @@ pub(crate) mod tests {
                 "gearbox 1.5",
                 "pass 3: in to 0.64",
                 "0.64",
-                "half-nuts",
-                "close",
+                // The motions in order, the half-nuts named once (LIO-415).
+                "spindle",
+                "forward",
+                "OUT",
+                "half-nuts stay closed",
                 "back to its zero",
                 "8 passes",
             ],
         );
-        assert!(!has(&a, "try the nut, then a spring pass"));
+        assert!(!has(&a, "close"));
         let last = nth(&a, 7, |l| matches!(l, L::ThreadPass { .. }));
         send(&mut a, GuideAction::Go(last));
         shows(
@@ -5601,9 +5605,11 @@ pub(crate) mod tests {
                 "Thread pass 8 of 8",
                 "pass 8: in to 1.04",
                 "0.905 toward the axis",
-                "try the nut, then a spring pass",
             ],
         );
+        // Then tried with the nut, its own step (LIO-413).
+        send(&mut a, GuideAction::Go(last + 1));
+        shows(&a, &["Try", "the M40×1.5 nut", "spring pass"]);
         let part = nth(&a, 0, |l| matches!(l, L::Plunge { part_off: true, .. }));
         send(&mut a, GuideAction::Go(part));
         shows(
@@ -5722,6 +5728,74 @@ pub(crate) mod tests {
         let face = nth(&a, 0, |l| matches!(l, L::Face { .. }));
         send(&mut a, GuideAction::Go(face));
         assert!(!has(&a, "on centre height"));
+    }
+    /// LIO-415, LIO-413: a single-point thread is set up once before its
+    /// first pass; each pass is the motions in order, in view at 1024 x 700;
+    /// the section names the thread; it ends tried with the nut. A die's
+    /// thread ends tried with the nut too.
+    #[test]
+    fn a_thread_is_set_up_once_cut_in_motions_and_tried_with_the_nut() {
+        let mut a = lathe_app("Diameter", |_| {});
+        let first = nth(&a, 0, |l| matches!(l, L::ThreadPass { .. }));
+        send(&mut a, GuideAction::Go(first - 1));
+        shows(
+            &a,
+            &[
+                "Set up the thread",
+                "gearbox",
+                "1.5",
+                "half-nuts",
+                "close",
+                "29.5°",
+            ],
+        );
+        assert!(
+            texts(&a).iter().any(|t| t == "Thread M40×1.5"),
+            "{:?}",
+            texts(&a)
+        );
+        let window = iced::Size::new(1024., 700.);
+        (a.window_width, a.window_height) = (window.width, window.height);
+        send(&mut a, GuideAction::Go(first + 1));
+        let t = texts(&a);
+        assert!(
+            t.iter()
+                .any(|s| s.ends_with(" on the dial") && s.contains(" turn")),
+            "{t:?}"
+        );
+        assert!(!t.iter().any(|s| s.contains(" t + ")), "{t:?}");
+        // Every numbered step in order, above the column's foot.
+        let seen = crate::ui::probe::placed(a.view(), window);
+        let at = |label: &str| {
+            (seen.iter())
+                .filter(|(t, _)| t == label)
+                .map(|(_, r)| *r)
+                .collect::<Vec<_>>()
+        };
+        let back = at("◀ Back")[0];
+        let keys = ["cross slide", "top slide", "spindle"];
+        let mut last = 0.;
+        for key in keys {
+            let r = *at(key)
+                .last()
+                .unwrap_or_else(|| panic!("{key} in {seen:?}"));
+            assert!(r.y + r.height + 14. <= back.y, "{key} {r:?} over {back:?}");
+            assert!(r.y >= last, "{key} in order");
+            last = r.y;
+        }
+        let out = at("OUT")[0];
+        assert!(
+            out.y + out.height + 14. <= back.y && out.y > last,
+            "{out:?}"
+        );
+        // A die's thread is tried with the nut.
+        let (doc, mesh) = crate::guide::tests::die_sample();
+        let g = crate::guide::build(&doc, &mesh, 0).unwrap();
+        assert!(
+            g.steps.iter().any(|s| matches!(s, Step::Lathe(L::Try { what, spring: false, .. }) if what.ends_with(" nut"))),
+            "{:?}",
+            g.steps
+        );
     }
     #[test]
     fn a_stop_on_the_pictures_is_the_number_on_the_carriage_dial() {
