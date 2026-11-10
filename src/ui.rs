@@ -12934,18 +12934,23 @@ fn account_panel(app: &App) -> Element<'_, Message> {
                         .spacing(5),
                     );
                 }
-                if !app.settings.model.is_empty() {
-                    c = if app.account_busy {
-                        c.push(muted("Checking the connection…"))
-                    } else {
-                        c.push(secondary("Check connection", Message::CheckConnection).width(Fill))
-                    };
+                if !app.settings.model.is_empty() && app.account_busy {
+                    c = c.push(muted("Checking the connection…"));
                 }
             }
             if note_above {
                 c = c.push(note(app.account_note.clone()));
             }
-            c = c.push(secondary("Sign out", Message::SignOut).width(Fill));
+            // Check connection shares Sign out's row, so the planner's
+            // pictures box below stays in view at 1440 × 900 (LIO-397).
+            let check = (*granted && !app.settings.model.is_empty() && !app.account_busy)
+                .then(|| secondary("Check connection", Message::CheckConnection).width(Fill));
+            c = c.push(
+                row![]
+                    .push(check)
+                    .push(secondary("Sign out", Message::SignOut).width(Fill))
+                    .spacing(8),
+            );
         }
     }
     if app.usage_limit {
@@ -13011,7 +13016,7 @@ pub(crate) fn stage_text(stage: crate::planner::Progress, model: &str) -> String
 const GOOD: Color = Color::from_rgb(0.15, 0.51, 0.36);
 const WARN: Color = Color::from_rgb8(166, 101, 32);
 pub(crate) const SENT_TO_OPENAI: &str = "Sent to OpenAI: the part's dimensions and feature list, your tools, machine limits, the project material (its name, group, hardness, notes and cutting data), stock size, the sizes and positions of setup 1's vise jaws or clamps and their clearance gap (not their names), the sizes of every vise and clamp in your workholding library (sizes only, never their names or notes), and the app's check reports and tool answers while the model works. The CAD file, file paths, the project title and your setup names are not sent. What you type in the chat with the planner is sent too, and, when you ask for a change, the current plan's setups and operations, with their names.";
-pub(crate) const PICTURES_SENT: &str = " With the box below ticked, pictures the app draws of the part, the stock and setup 1's vise or clamps, with surface and hole labels, are sent too, and, when the model asks, pictures of its own toolpaths.";
+pub(crate) const PICTURES_SENT: &str = " With the box above ticked, pictures the app draws of the part, the stock and setup 1's vise or clamps, with surface and hole labels, are sent too, and, when the model asks, pictures of its own toolpaths.";
 /// What the timeline says when OpenAI refused a request carrying `what`
 /// and the run sends it again without: the line under the request while
 /// the run goes, and the words that end the request's line when it is
@@ -13058,7 +13063,8 @@ fn planner_controls(app: &App) -> Element<'_, Message> {
         c = c.push(row![mark, item].spacing(8));
     }
     let pictures = !app.settings.plan_pictures_off;
-    c = c.push(muted(sent_to_openai(pictures)));
+    // The box comes before the long text about what is sent, so it is in
+    // view without scrolling the card (LIO-397).
     // A run keeps the choice it started with, so the box waits for it.
     let running = matches!(app.planner, crate::Planner::Running(_));
     c = c.push(help::wrap(
@@ -13069,13 +13075,11 @@ fn planner_controls(app: &App) -> Element<'_, Message> {
         Help::text("Pictures for the AI planner", PICTURES_HELP).more(PICTURES_HELP_MORE),
         widget::tooltip::Position::Top,
     ));
+    c = c.push(muted(sent_to_openai(pictures)));
     if !ready {
         c = c.push(muted(
             "Plan becomes available when every item above is met.",
         ));
-    }
-    if app.undo.is_some() {
-        c = c.push(secondary("Undo applied plan", Message::UndoPlan).width(Fill));
     }
     c.into()
 }
@@ -14378,16 +14382,18 @@ fn running_view(app: &App, stage: crate::planner::Progress) -> Element<'_, Messa
     if pictures {
         pinned = pinned.push(muted("Click a picture to see it at full size."));
     }
-    let mut scrolled = column![].spacing(14);
+    // The overview picture sits beside the timeline, so both are in view
+    // (LIO-397).
+    let mut scrolled = row![].spacing(24);
     if let Some(overview) = &app.plan_overview {
         let mut picture = column![bold("The AI starts with this picture", 15)].spacing(6);
         if let Some(handle) = &overview.thumb {
             picture = picture.push(thumbnail(handle.clone(), 240, PlanPicture::Overview));
         }
-        scrolled = scrolled.push(picture.push(muted(overview.line.clone())));
+        scrolled = scrolled.push(picture.push(muted(overview.line.clone())).width(240));
     }
     if let Some(rows) = timeline_view(app, false) {
-        scrolled = scrolled.push(rows);
+        scrolled = scrolled.push(container(rows).width(Fill));
     }
     let mut c = column![pinned].spacing(14);
     if let Some(enlarged) = enlarged_view(app) {
@@ -14561,7 +14567,27 @@ pub(crate) fn plan_side(app: &App) -> Element<'_, Message> {
             .height(Fill)
             .into();
     }
-    scrollable(container(plan_result(app)).padding(iced::Padding::default().right(14)))
+    // After Apply, Undo heads the page where the plan was shown (LIO-397).
+    let undo = app.undo.is_some().then(|| {
+        container(
+            row![
+                column![
+                    bold("Plan applied", 15),
+                    muted("Undo puts back the setups and operations from before the plan; the applied job, with your edits since, goes to History first.")
+                ]
+                .spacing(4)
+                .width(Fill),
+                secondary("Undo applied plan", Message::UndoPlan)
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center),
+        )
+        .padding(16)
+        .width(Fill)
+        .style(panel_style)
+    });
+    let side = column![].push(undo).push(plan_result(app)).spacing(12);
+    scrollable(container(side).padding(iced::Padding::default().right(14)))
         .id("planner-result")
         .height(Fill)
         .width(Fill)
@@ -14572,7 +14598,11 @@ fn ai(app: &App) -> Element<'_, Message> {
         column![
             page_header(
                 "AI machining planner",
-                "Sign in with ChatGPT, then let the planner propose and check a complete job."
+                if matches!(app.account, crate::Account::SignedIn { .. }) {
+                    "The planner proposes a complete job and checks it; nothing changes until you apply it."
+                } else {
+                    "Sign in with ChatGPT, then let the planner propose and check a complete job."
+                }
             ),
             row![
                 container(scrollable(
