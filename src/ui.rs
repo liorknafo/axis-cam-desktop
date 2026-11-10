@@ -3925,33 +3925,50 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             }
         }
         "Box" => {
-            c = c.push(note("The block to remove, in the setup's frame from the work zero. Passes run along the longer side."));
+            // The pick first: one click on the face fills the numbers, which
+            // are there to adjust (LIO-401).
+            if app.part_mesh().is_some() && !app.is_sample() {
+                let picked = o.surfaces.as_ref().is_some_and(|s| !s.ids.is_empty());
+                c = c
+                    .push(section("From the part"))
+                    .push(note("Click the face this cut leaves: a floor facing up, or a wall facing sideways. One click fills the numbers below. Drag to orbit."))
+                    .push(
+                        btn(
+                            if app.picking {
+                                "Finish picking"
+                            } else {
+                                "Pick the face on the part"
+                            },
+                            Message::PickMode,
+                            app.picking,
+                        )
+                        .width(Fill),
+                    );
+                if let Some(why) = &app.box_refused {
+                    c = c.push(caution("No box from that face", vec![why.clone()]));
+                }
+                if picked {
+                    c = c.push(
+                        row![
+                            muted("1 face picked").width(Fill),
+                            secondary("Fill again from the face", Message::BoxFromFace)
+                        ]
+                        .spacing(9)
+                        .align_y(Alignment::Center),
+                    );
+                }
+                c = c
+                    .push(section("The block"))
+                    .push(note("The numbers follow the picked face: change them only to adjust. In the setup's frame from the work zero; passes run along the longer side."));
+            } else {
+                c = c.push(note("The block to remove, in the setup's frame from the work zero. Passes run along the longer side."));
+            }
             for (a, b) in [
                 (("x_min", "X min · mm"), ("x_max", "X max · mm")),
                 (("y_min", "Y min · mm"), ("y_max", "Y max · mm")),
                 (("z_top", "Z top · mm"), ("z_bottom", "Z bottom · mm")),
             ] {
                 c = c.push(row![checks.field(p, a.0, a.1), checks.field(p, b.0, b.1)].spacing(9));
-            }
-            if app.part_mesh().is_some() && !app.is_sample() {
-                let count = o.surfaces.as_ref().map_or(0, |s| s.ids.len());
-                c = c
-                    .push(section("From the part"))
-                    .push(note("Pick one flat face: a floor facing up, or a wall facing sideways. Drag to orbit, then click Finish picking."))
-                    .push(
-                        btn(
-                            if app.picking {
-                                "Finish picking"
-                            } else {
-                                "Select face on part"
-                            },
-                            Message::PickMode,
-                            app.picking,
-                        )
-                        .width(Fill),
-                    )
-                    .push(muted(format!("{} selected", plural(count, "face"))))
-                    .push(secondary("From selected face", Message::BoxFromFace).width(Fill));
             }
         }
         "Turn" => {

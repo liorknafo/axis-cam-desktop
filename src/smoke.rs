@@ -30398,6 +30398,13 @@ soft_max = 180.0
             assert_eq!(crate::ui::issue_tab(issue), tab, "{issue}");
         }
     }
+    /// LIO-401: a Box is made by one click on the face it leaves, nothing
+    /// typed. (It took three steps before: "Select face on part", the click,
+    /// then "From selected face".) Adding it starts the pick on its tab; a
+    /// click fills the six numbers; a slanted face says why and changes
+    /// nothing; another face replaces the first; "Fill again" follows a
+    /// change of the stock. With `AXIS_RENDER_DIR` set, the Work page after
+    /// the click is drawn there at 1440 x 900.
     #[test]
     fn the_box_tab_fills_its_fields_from_the_picked_face() {
         let mut a = imported_app();
@@ -30406,59 +30413,46 @@ soft_max = 180.0
         a.doc.active = a.doc.setups[0].id.clone();
         let _ = a.update(Message::Edit(Target::Setup, "stock_top", "10".into()));
         let _ = a.update(Message::AddOp(Strategy::Box));
-        let _ = a.update(Message::Tab("Box".into()));
-        shows(
-            &a,
-            &["From the part", "From selected face", "0 faces selected"],
-        );
-        assert!(
-            crate::ui::probe::clicks(a.view(), iced::Size::new(WINDOW.width, 2400.))
-                .iter()
-                .any(|m| matches!(m, Message::BoxFromFace))
-        );
+        assert!(a.picking && a.tab == "Box", "{} {}", a.picking, a.tab);
+        shows(&a, &["From the part", "Finish picking", "The block"]);
+        lacks(&a, &["From selected face", "Fill again from the face"]);
+        // The pick is above the six numbers.
+        let texts = page_texts(&a);
+        let at = |label: &str| {
+            (texts.iter().position(|t| t == label)).unwrap_or_else(|| panic!("{label}: {texts:?}"))
+        };
+        assert!(at("From the part") < at("X min · mm"));
         let fields = |a: &App| -> Vec<String> {
             crate::model::BOX_FIELDS
                 .iter()
                 .map(|k| get(&a.operation().unwrap().p, k).to_string())
                 .collect()
         };
-        let before = fields(&a);
-        // No face yet: the message, and the fields stay.
-        let _ = a.update(Message::BoxFromFace);
-        assert_eq!(a.status, crate::manual::ONE_FACE);
-        assert_eq!(fields(&a), before);
-        // Picking stays on the Box tab, and a click replaces the face before it.
-        let _ = a.update(Message::PickMode);
-        assert!(a.picking && a.tab == "Box");
         let mesh = a.imported_mesh.as_ref().unwrap();
-        let top = mesh
-            .surfaces
-            .iter()
-            .enumerate()
+        let flats: Vec<(usize, f32)> = (mesh.surfaces.iter().enumerate())
             .filter(|(_, s)| s.normal[2] > 0.99999)
-            .max_by(|(_, a), (_, b)| a.center[2].total_cmp(&b.center[2]))
-            .unwrap()
-            .0;
+            .map(|(i, s)| (i, s.center[2]))
+            .collect();
+        let top_z = flats.iter().map(|f| f.1).fold(f32::MIN, f32::max);
+        let top = flats.iter().find(|f| f.1 == top_z).unwrap().0;
+        // The floors under the top, highest first.
+        let mut floors: Vec<(usize, f32)> = flats
+            .iter()
+            .copied()
+            .filter(|f| f.1 < top_z - 0.5)
+            .collect();
+        floors.sort_by(|a, b| b.1.total_cmp(&a.1));
         let chamfer = mesh
             .surfaces
             .iter()
             .position(|s| s.normal[2] > 0.5 && s.normal[2] < 0.9)
             .unwrap();
-        let picked = |a: &App| {
-            a.operation()
-                .unwrap()
-                .surfaces
-                .as_ref()
-                .unwrap()
-                .ids
-                .clone()
-        };
-        let _ = a.update(Message::Surface(chamfer));
+        let picked =
+            |a: &App| (a.operation().unwrap().surfaces.as_ref()).map_or(vec![], |s| s.ids.clone());
+        // One click on the top fills the box: under 10 mm of stock, the whole
+        // stock above it.
         let _ = a.update(Message::Surface(top));
         assert_eq!(picked(&a), vec![top]);
-        shows(&a, &["1 face selected"]);
-        // The block's top, under 10 mm of stock: the whole stock above it.
-        let _ = a.update(Message::BoxFromFace);
         let stock = a.known_stock(0).0.unwrap();
         let zero = crate::post::datum(a.doc.setup(), stock, a.part_mesh().unwrap()).unwrap();
         let whole: Vec<String> = [
@@ -30474,11 +30468,37 @@ soft_max = 180.0
         assert_eq!(fields(&a), whole);
         assert_eq!(a.status, "Box filled from the selected face.");
         assert_eq!(a.op_issues(), Vec::<String>::new());
-        // A slanted face is refused, and the fields stay.
+        shows(&a, &["1 face picked", "Fill again from the face"]);
+        if let Ok(dir) = std::env::var("AXIS_RENDER_DIR") {
+            let size = iced::Size::new(1440., 900.);
+            let _ = a.update(Message::Resized(size));
+            render_png(
+                &a,
+                size,
+                &std::path::Path::new(&dir).join("box-one-click.png"),
+            );
+        }
+        // A slanted face says why, on the tab too, and changes nothing.
         let _ = a.update(Message::Surface(chamfer));
-        let _ = a.update(Message::BoxFromFace);
         assert_eq!(a.status, crate::manual::ONE_FACE);
-        assert_eq!(fields(&a), whole);
+        assert_eq!((fields(&a), picked(&a)), (whole.clone(), vec![top]));
+        shows(&a, &["No box from that face"]);
+        // After the stock changes, Fill again gives the new numbers.
+        let _ = a.update(Message::Edit(Target::Setup, "stock_top", "12".into()));
+        let _ = a.update(Message::BoxFromFace);
+        assert_eq!(fields(&a)[..4], whole[..4]);
+        assert_eq!(fields(&a)[4..], ["0", "-12"]);
+        lacks(&a, &["No box from that face"]);
+        // A click on a floor below replaces the top's numbers.
+        let floor = (floors.iter())
+            .map(|f| f.0)
+            .find(|&f| {
+                let _ = a.update(Message::Surface(f));
+                picked(&a) == vec![f]
+            })
+            .expect("a floor that makes a box");
+        assert_ne!(fields(&a), whole);
+        assert_eq!(picked(&a), vec![floor]);
     }
 
     /// Each number field of each operation, its tool, its setup and its

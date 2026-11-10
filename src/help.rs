@@ -1186,7 +1186,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "",
         ),
         BoxFromFace => (
-            "Fill the six Box fields from the part face selected on this operation: a floor facing up, or a wall facing sideways. A floor is grown to the stock's edge or the next part material above it. A wall is cut from the wall out to the stock's edge. The numbers are in the setup's frame from the work zero.",
+            "Fill the six Box fields again from the face picked on this operation, after the stock or the work zero changed; a click on a face fills them at once. A floor is grown to the stock's edge or the next part material above it. A wall is cut from the wall out to the stock's edge. The numbers are in the setup's frame from the work zero.",
             "",
         ),
         PickPinHoles => (
