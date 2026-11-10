@@ -1676,6 +1676,31 @@ impl Viewport<'_> {
                 );
             }
         }
+        // A Box being edited (LIO-373): its cut, translucent; the sides and
+        // floor it keeps, solid; where it reaches into the part, red.
+        if let (Some(setup), Some(op), Some(stock)) =
+            (self.setup, self.operation, self.resolved_stock())
+            && let Some(shown) = crate::cam::box_shown(setup, op, self.mesh, stock.stock)
+        {
+            let scale = self.mesh.display_scale();
+            let project = |v: [f32; 3]| (screen(v), p.depth(v));
+            let solids = (shown.walls.iter().map(|w| (*w, &BOX_WALL)))
+                .chain(std::iter::once((shown.cut, &BOX_CUT)))
+                .chain(shown.into.map(|b| (b, &LOST)));
+            for (b, look) in solids {
+                let solid_box = box_solid(b.scaled(scale), cut.as_ref(), project);
+                raster_solid(
+                    look,
+                    &mut rgba,
+                    &depths,
+                    (w, h),
+                    &solid_box,
+                    ratio,
+                    p.scale,
+                    &mut solid,
+                );
+            }
+        }
         if let Some((tip, radius, stickout)) = self.live {
             // The machine's tool, in red, depth-tested like the simulated one.
             // A little wider, so that it shows over the simulated tool when
@@ -3511,6 +3536,22 @@ const STOCK: Look = Look {
     hidden_edge: [162, 129, 77],
     open: 0.30,
     behind: 0.12,
+};
+/// What a Box being edited cuts: translucent orange.
+const BOX_CUT: Look = Look {
+    faces: [[246, 150, 70], [226, 126, 46], [236, 138, 58]],
+    edge: [176, 78, 18],
+    hidden_edge: [214, 146, 96],
+    open: 0.65,
+    behind: 0.45,
+};
+/// The sides and floor a Box keeps: the stock to leave, steel blue.
+const BOX_WALL: Look = Look {
+    faces: [[136, 174, 216], [108, 146, 194], [122, 160, 206]],
+    edge: [46, 76, 118],
+    hidden_edge: [108, 138, 170],
+    open: 0.75,
+    behind: 0.5,
 };
 /// Jaws and clamps: solid neutral grey blocks.
 const HOLDING: Look = Look {

@@ -970,6 +970,89 @@ fn swept(t: &[[f32; 3]; 3], centres: [[f32; 2]; 2], r: f32, z: [f32; 2]) -> bool
         .fold(f32::INFINITY, f32::min);
     nearest < r - FACETS
 }
+/// The block a new Box starts as (LIO-373): the whole top of the stock `s`
+/// (the box the setup starts from) down to the part's highest face, the
+/// stock to leave then kept over it, in work coordinates (`BOX_FIELDS`
+/// order). None when no stock stands over the part.
+pub(crate) fn top_box(setup: &Setup, mesh: &Mesh, s: Bounds) -> Option<[f32; 6]> {
+    let zero = crate::post::datum(setup, s, mesh).ok()?;
+    let top = crate::simulation::part_box(setup, mesh).max[2];
+    (top < s.max[2] - 0.01).then(|| {
+        [
+            s.min[0] - zero[0],
+            s.max[0] - zero[0],
+            s.min[1] - zero[1],
+            s.max[1] - zero[1],
+            s.max[2] - zero[2],
+            top - zero[2],
+        ]
+    })
+}
+/// What the 3D view draws of a Box being edited (LIO-373), in the setup's
+/// frame (mm): what it cuts, the slabs its closed sides and floor keep (the
+/// stock to leave, at least 1.5 mm thick so that they show), and where the
+/// cut reaches into the part.
+pub(crate) struct BoxShown {
+    pub cut: Bounds,
+    pub walls: Vec<Bounds>,
+    pub into: Option<Bounds>,
+}
+/// `BoxShown` of `op`, a Box on the manual mill of `setup` whose stock is
+/// `s` (the box the setup starts from); None for anything else or a box
+/// that cuts nothing.
+pub(crate) fn box_shown(setup: &Setup, op: &Operation, mesh: &Mesh, s: Bounds) -> Option<BoxShown> {
+    if op.strategy != Strategy::Box || !crate::manual::is_manual(&setup.machine) {
+        return None;
+    }
+    let zero = crate::post::datum(setup, s, mesh).ok()?;
+    let (low, high) = box_block(op, zero).ok()?;
+    let allowance = number(op, "allowance").unwrap_or(0.).max(0.);
+    let open = open_sides(low, high, &s);
+    let (lo, hi) = box_cut(low, high, &s, allowance);
+    if (0..3).any(|k| lo[k] >= hi[k]) {
+        return None;
+    }
+    let cut = Bounds { min: lo, max: hi };
+    let thick = allowance.max(1.5);
+    let mut walls = vec![];
+    for (k, sides) in open.iter().enumerate() {
+        // The top is never kept.
+        for (side, open) in sides.iter().enumerate().take(if k == 2 { 1 } else { 2 }) {
+            if *open {
+                continue;
+            }
+            let mut w = cut;
+            if side == 0 {
+                (w.min[k], w.max[k]) = (lo[k] - thick, lo[k]);
+            } else {
+                (w.min[k], w.max[k]) = (hi[k], hi[k] + thick);
+            }
+            walls.push(w);
+        }
+    }
+    // Where the part's triangles reach into the cut, a hair inside it so
+    // that a face the box only touches does not count. ponytail: the part
+    // is transformed on each draw; cache it per setup if a large part lags.
+    let inner = Bounds {
+        min: lo.map(|v| v + 0.01),
+        max: hi.map(|v| v - 0.01),
+    };
+    let into = (Geometry::new(setup, mesh).triangles.iter())
+        .filter(|t| meets(&t.p, &inner))
+        .map(|t| Bounds {
+            min: std::array::from_fn(|k| {
+                t.p.iter().map(|q| q[k]).fold(f32::MAX, f32::min).max(lo[k])
+            }),
+            max: std::array::from_fn(|k| {
+                t.p.iter().map(|q| q[k]).fold(f32::MIN, f32::max).min(hi[k])
+            }),
+        })
+        .reduce(|a, b| Bounds {
+            min: std::array::from_fn(|k| a.min[k].min(b.min[k])),
+            max: std::array::from_fn(|k| a.max[k].max(b.max[k])),
+        });
+    Some(BoxShown { cut, walls, into })
+}
 /// A Box on a manual mill: the block `x_min`..`z_bottom`, in the setup's work
 /// frame (`post::datum` on the stock the setup starts from), cleared in rows
 /// along its longer side, every move along one axis. Its sides on or beyond

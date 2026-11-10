@@ -11515,7 +11515,7 @@ flood = { pin = 8 }
         crate::steps::tests::build(&mut a);
         a.smoke_manual_check();
         let texts = page_texts(&a);
-        for want in ["Big mill", "Set up", "Face", "Hold"] {
+        for want in ["Manual Mill", "Set up", "Face", "Hold"] {
             assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
         }
     }
@@ -14109,8 +14109,9 @@ soft_max = 180.0
         assert!(page.ready && page.problems().is_empty());
         assert!(matches!(page.cards[0].1, NcCard::Manual));
         assert!(matches!(page.cards[1].1, NcCard::Programs(_)));
-        let line = "Big mill: manual mill, no G-code — follow the steps on the MACHINE page.";
-        assert_eq!(crate::manual::no_gcode("Big mill"), line);
+        // The manual setup is named as its machine (LIO-371).
+        let line = "Manual Mill: manual mill, no G-code — follow the steps on the MACHINE page.";
+        assert_eq!(crate::manual::no_gcode("Manual Mill"), line);
         assert!(page_texts(&a).iter().any(|t| t == line));
     }
     #[test]
@@ -29127,6 +29128,52 @@ soft_max = 180.0
         assert_eq!(names(&a), ["Big vise"]);
         assert_eq!(crate::ui::fitting_holders(&a, "Clamp").len(), 0);
     }
+    /// A Box being edited is drawn in the 3D view, and changes with each of
+    /// its six fields; a new one faces the stock's top down to the part
+    /// (LIO-373). The drawings land in the test's directory.
+    #[test]
+    fn a_box_is_drawn_as_it_is_edited_and_a_new_one_faces_the_top() {
+        let mut a = crate::steps::tests::app_with("Yes", |doc| doc.setups[0].operations.clear());
+        let _ = a.update(Message::SelectSetup(0));
+        let _ = a.update(Message::AddOp(crate::model::Strategy::Box));
+        let oi = a.selected.unwrap();
+        let o = a.doc.setups[0].operations[oi].clone();
+        let f = |k: &str| crate::model::num(&o.p, k).unwrap();
+        // The 124 × 120 stock's top, from its front-left corner, down to
+        // the part's top.
+        let mesh = a.part_mesh().unwrap().clone();
+        let part = crate::simulation::part_box(&a.doc.setups[0], &mesh);
+        let stock = a.known_stock(0).0.unwrap();
+        assert_eq!([f("x_min"), f("y_min"), f("z_top")], [0., 0., 0.]);
+        assert_eq!([f("x_max"), f("y_max")], [124., 120.]);
+        assert!((f("z_bottom") - (part.max[2] - stock.max[2])).abs() < 0.01);
+        assert!(f("z_bottom") < 0.);
+        crate::simulation::prepare(&a.doc, &mesh, 0, oi).unwrap();
+        // Drawn, and drawn again for each field.
+        let dir = a.test_dir.as_ref().unwrap().path().to_path_buf();
+        let shot = |a: &App, name: &str| {
+            let path = dir.join(format!("{name}.png"));
+            render_png(a, WINDOW, &path);
+            std::fs::read(path).unwrap()
+        };
+        let before = shot(&a, "box");
+        for (k, v) in [
+            ("x_min", "20"),
+            ("x_max", "100"),
+            ("y_min", "10"),
+            ("y_max", "60"),
+            ("z_top", "-1"),
+            ("z_bottom", "-8"),
+        ] {
+            let was = crate::model::get(&a.doc.setups[0].operations[oi].p, k).to_string();
+            let _ = a.update(Message::Edit(crate::Target::Operation, k, v.into()));
+            assert_ne!(shot(&a, k), before, "{k}");
+            let _ = a.update(Message::Edit(crate::Target::Operation, k, was));
+        }
+        // A CNC operation draws no box.
+        let cnc = &a.doc.setups[1];
+        assert!(crate::cam::box_shown(cnc, &cnc.operations[0], &mesh, stock).is_none());
+    }
     #[test]
     fn add_manual_setup_shows_with_a_manual_machine_and_inserts_the_setup() {
         let mut a = app();
@@ -29138,9 +29185,18 @@ soft_max = 180.0
         let old = a.doc.active.clone();
         let _ = a.update(Message::AddManualSetup);
         assert_eq!(a.doc.setups.len(), 2);
-        assert_eq!(a.doc.setups[0].name(), "Big mill");
+        // Named as its machine, and opened (LIO-371): it was left closed.
+        assert_eq!(a.doc.setups[0].name(), "Manual Mill");
         assert_eq!(a.doc.setups[1].id, old);
-        assert_eq!(a.doc.active, old);
+        assert_eq!(a.doc.active, a.doc.setups[0].id);
+        // No work offset in its browser row nor in the view's header.
+        let t = crate::ui::probe::texts(a.view(), WINDOW);
+        assert!(t.iter().any(|s| s == "Manual Mill · 3-axis"), "{t:?}");
+        assert!(
+            !t.iter()
+                .any(|s| s.starts_with("G54 / ") || s.starts_with("G55")),
+            "{t:?}"
+        );
         assert_eq!(a.page, Page::Work);
         assert_eq!(a.selected, None);
         // Without a manual machine the press says so and changes nothing.
@@ -29212,9 +29268,9 @@ soft_max = 180.0
         let old = a.doc.active.clone();
         let _ = a.update(Message::AddLatheSetup);
         assert_eq!(a.doc.setups.len(), 2);
-        assert_eq!(a.doc.setups[0].name(), "Lathe");
+        assert_eq!(a.doc.setups[0].name(), "Manual Lathe");
         assert_eq!(a.doc.setups[1].id, old);
-        assert_eq!(a.doc.active, old);
+        assert_eq!(a.doc.active, a.doc.setups[0].id);
         assert_eq!(a.page, Page::Work);
         assert_eq!(a.selected, None);
         assert!(a.status.contains("Lathe setup added"), "{}", a.status);
@@ -29627,7 +29683,9 @@ soft_max = 180.0
             ],
         );
         lacks(&a, &["Pass direction · degrees", "Tolerance · mm"]);
-        let _ = a.update(Message::Edit(Target::Operation, "x_max", "-5".into()));
+        // Under X min, wherever the new box starts (LIO-373).
+        let x_min = crate::model::num(&a.operation().unwrap().p, "x_min").unwrap();
+        let _ = a.update(Message::Edit(Target::Operation, "x_max", (x_min - 5.).to_string()));
         let _ = a.update(Message::Tab("Box".into()));
         let checks = crate::ui::op_checks(&a);
         assert_eq!(

@@ -4797,6 +4797,20 @@ impl App {
         self.guide_item = 0;
         self.guide_clock.0 = Instant::now();
     }
+    /// The hand setup `added` (its index) opened on the Work page, as Add
+    /// setup's is (LIO-371), or why it could not be added.
+    fn open_added(&mut self, added: Result<usize, String>, kind: &str) {
+        match added {
+            Ok(at) => {
+                self.doc.active = self.doc.setups[at].id.clone();
+                self.stop_selection();
+                self.page = Page::Work;
+                self.touch();
+                self.status = format!("{kind} setup added before the CNC setups.");
+            }
+            Err(e) => self.status = e,
+        }
+    }
     /// Operation `oi` of setup `si` opened in MANUFACTURE at the tab
     /// `problem` is on.
     fn open_issue(&mut self, si: usize, oi: usize, problem: &str) -> Task<Message> {
@@ -5884,6 +5898,16 @@ impl App {
                             .insert("silhouette_extend".into(), model::outline_extend_for(d));
                     }
                 }
+                // A new Box faces the stock's top down to the part (LIO-373).
+                if strategy == Strategy::Box
+                    && let Some(mesh) = self.part_mesh()
+                    && let (Some(stock), _) = self.known_stock(self.doc.index())
+                    && let Some(b) = cam::top_box(self.doc.setup(), mesh, stock)
+                {
+                    for (k, v) in model::BOX_FIELDS.iter().zip(b) {
+                        operation.p.insert((*k).into(), format!("{v:.2}"));
+                    }
+                }
                 // A drill on the manual mill is centre drilled first.
                 let centring = centre::wants_centre(&operation, &self.doc.tools, machine)
                     .then(|| centre::centring(&self.doc, self.doc.setup(), &operation, None));
@@ -6705,22 +6729,14 @@ impl App {
                     self.status = "Choose the machine for the first setup.".into();
                 }
             }
-            Message::AddManualSetup => match self.doc.add_manual_setup() {
-                Ok(()) => {
-                    self.stop_selection();
-                    self.touch();
-                    self.status = "Manual setup added before the CNC setups.".into();
-                }
-                Err(e) => self.status = e,
-            },
-            Message::AddLatheSetup => match self.doc.add_lathe_setup() {
-                Ok(()) => {
-                    self.stop_selection();
-                    self.touch();
-                    self.status = "Lathe setup added before the CNC setups.".into();
-                }
-                Err(e) => self.status = e,
-            },
+            Message::AddManualSetup => {
+                let added = self.doc.add_manual_setup();
+                self.open_added(added, "Manual");
+            }
+            Message::AddLatheSetup => {
+                let added = self.doc.add_lathe_setup();
+                self.open_added(added, "Lathe");
+            }
             Message::DuplicateSetup => {
                 let s = self.doc.setup().duplicate(&self.doc.next_offset());
                 let ids: Vec<(String, String)> = (self.doc.setup().operations.iter())

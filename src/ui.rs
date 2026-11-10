@@ -323,6 +323,16 @@ pub(crate) fn primary<'a>(label: impl Into<String>, msg: Message) -> HelpButton<
         });
     HelpButton::new(b, &action, label)
 }
+/// The speeds a hand machine with gears runs at, as the speed's pick list
+/// offers them; None for a CNC machine and a variable drive, whose speed
+/// is a number (LIO-372).
+pub(crate) fn speed_options(machine: &crate::model::Machine) -> Option<Vec<String>> {
+    let gears = crate::manual::gears(machine);
+    (crate::manual::is_hand(machine)
+        && crate::manual::variable(machine).is_none()
+        && !gears.is_empty())
+    .then(|| gears.iter().map(|g| g.to_string()).collect())
+}
 /// The Holding step's field for the gap the checks keep round the modelled
 /// jaws and clamps, saved as `holding_gap`: its label says what it does.
 pub(crate) const HOLDING_GAP_LABEL: &str = "Checked gap to jaws and clamps · mm";
@@ -1788,9 +1798,10 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
             container(
                 column![
                     bold(ellipsize(s.name(), SETUP_NAME_CHARS), 12).wrapping(Wrapping::None),
+                    // A hand machine's setup has no work offset (LIO-371).
                     muted(format!(
                         "{} · {}-axis",
-                        get(&s.p, "offset"),
+                        s.offset().unwrap_or(s.machine.name()),
                         s.machine.axes()
                     ))
                     .size(12)
@@ -2488,8 +2499,8 @@ fn workspace(app: &App) -> Element<'_, Message> {
                                 .on_press(Message::SetupStep("Work zero"))
                                 .style(|_, status| flat(false, status)),
                                 muted(format!(
-                                    "{} / {}{}",
-                                    get(&s.p, "offset"),
+                                    "{}{}{}",
+                                    s.offset().map_or(String::new(), |o| format!("{o} / ")),
                                     app.doc.holding_label(s),
                                     crate::indexed::label(s)
                                         .map(|a| format!(" / {a}"))
@@ -3197,23 +3208,33 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
     match app.tab.as_str() {
         "Tool" => {
             c = c.push(section("Cutter"));
-            // The operation offers the tools of the types it cuts with (a
-            // lathe's, those that fit the lathe), and the one it has.
+            // The operation offers the tools of the types it cuts with that
+            // are on the setup's machine, and the one it has (LIO-372).
             let offered: Vec<_> = (app.doc.tools.iter())
-                .filter(|tool| {
-                    o.tool == tool.id || (o.takes(tool, machine) && (!lathe || tool.fits(machine)))
-                })
+                .filter(|tool| o.tool == tool.id || (o.takes(tool, machine) && tool.fits(machine)))
                 .collect();
-            if !offered.iter().any(|tool| o.takes(tool, machine)) {
+            if !offered
+                .iter()
+                .any(|tool| o.takes(tool, machine) && tool.fits(machine))
+            {
                 let types: Vec<String> = (o.tool_types(machine).iter())
                     .map(|k| k.to_lowercase())
                     .collect();
+                let elsewhere = (app.doc.tools.iter()).any(|tool| o.takes(tool, machine));
                 c = c.push(
-                    muted(format!(
-                        "{} cuts with a {}: add one in the tool library.",
-                        o.strategy.name(),
-                        types.join(" or ")
-                    ))
+                    muted(if elsewhere {
+                        format!(
+                            "No {} is on {}: tick it under Machines in the tool library.",
+                            types.join(" or "),
+                            machine.name()
+                        )
+                    } else {
+                        format!(
+                            "{} cuts with a {}: add one in the tool library.",
+                            o.strategy.name(),
+                            types.join(" or ")
+                        )
+                    })
                     .size(12),
                 );
             }
@@ -3279,7 +3300,18 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     c = c.push(muted(format!("No recommended speed and feed. {why}")).size(12))
                 }
             }
-            c = c.push(checks.field(p, "rpm", "Spindle speed · rpm"));
+            // A machine with gears takes one of them; a variable drive any
+            // speed in its range (LIO-372).
+            c = c.push(match speed_options(machine) {
+                Some(gears) => {
+                    let gears: Vec<&str> = gears.iter().map(String::as_str).collect();
+                    choice(p, "rpm", "Spindle speed · rpm", &gears, t)
+                }
+                None => checks.field(p, "rpm", "Spindle speed · rpm"),
+            });
+            if let Some((a, b)) = crate::manual::variable(machine) {
+                c = c.push(muted(format!("The drive runs {a}–{b} rpm.")).size(12));
+            }
             if o.strategy.imported_preview()
                 && !matches!(o.strategy, Strategy::Box | Strategy::Turn)
                 && !lathe
@@ -3305,6 +3337,17 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 c = c.push(muted("Feed: the carriage power feed, or by hand.").size(12));
             } else {
                 c = c.push(checks.field(p, "feed", "Cutting feed · mm/min"));
+                if crate::manual::is_manual(machine)
+                    && let Some(hand) = num(&machine.p, "hand_feed")
+                {
+                    c = c.push(
+                        muted(format!(
+                            "At most the hand feed, {} mm/min.",
+                            crate::envelope::mm(hand)
+                        ))
+                        .size(12),
+                    );
+                }
             }
             if crate::tooth_load::offered(o.strategy, machine) {
                 let follows = crate::tooth_load::follows(o, machine);
@@ -4704,7 +4747,7 @@ pub(crate) fn setup_step_done(app: &App, step: &str) -> bool {
     match step {
         "Machine" => s.machine.issues().is_empty(),
         "Work zero" => {
-            !get(&s.p, "offset").is_empty()
+            s.offset().is_none_or(|o| !o.is_empty())
                 && (crate::post::references(get(&s.p, "origin")).is_some()
                     || crate::indexed::ORIGINS.contains(&get(&s.p, "origin")))
                 && crate::post::pins_issue(s).is_none()
@@ -4914,10 +4957,26 @@ fn setup_zero<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
         }
         grid = grid.push(line);
     }
+    // A hand machine runs no program and has no work offset (LIO-371).
+    let what = if crate::lathe::is_lathe(&s.machine) {
+        "Where the lathe's dials are zeroed: the point every dial number on the Steps page counts from. The 3D view marks it with a cross."
+    } else if crate::manual::is_manual(&s.machine) {
+        "Where the DRO's zero is: the point you pick up with the edge finder, which every DRO number on the Steps page counts from. The 3D view marks it with a cross."
+    } else {
+        "Where the program's X0 Y0 Z0 is: the point you touch off or probe on the machine. The 3D view marks it with a cross."
+    };
+    let offset: Element<_> = match s.offset() {
+        Some(_) => choice(
+            p,
+            "offset",
+            "Work offset",
+            &["G54", "G55", "G56", "G57", "G58", "G59"],
+            t,
+        ),
+        None => column![].into(),
+    };
     c.push(section("Work zero"))
-        .push(muted(
-            "Where the program's X0 Y0 Z0 is: the point you touch off or probe on the machine. The 3D view marks it with a cross.",
-        ))
+        .push(muted(what))
         .push(faces)
         .push(muted(if model {
             "Model origin is the part file's own 0,0,0. Pick a spot below to put the zero on the stock instead."
@@ -4927,13 +4986,7 @@ fn setup_zero<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
         .push(grid)
         .push(rotary_zeros(s, origin))
         .push(bar_zeros(s, origin))
-        .push(choice(
-            p,
-            "offset",
-            "Work offset",
-            &["G54", "G55", "G56", "G57", "G58", "G59"],
-            t,
-        ))
+        .push(offset)
         .push(pins_block(app, s))
         .push(zero_note(app))
 }
@@ -14935,6 +14988,65 @@ pub(crate) mod probe {
 mod tests {
     use crate::model::Strategy;
     use std::path::Path;
+
+    /// The cutter list and the speed of an operation on the manual mill
+    /// offer only what the mill has (LIO-372).
+    #[test]
+    fn a_manual_operation_offers_the_mills_tools_and_its_gears() {
+        use crate::{Message, Target};
+        let mut a = crate::steps::tests::app("Yes");
+        let window = iced::Size::new(1440., 900.);
+        let listed = |a: &mut crate::App, si: usize, oi: usize| {
+            let _ = a.update(Message::SelectSetup(si));
+            let _ = a.update(Message::SelectOp(oi));
+            let _ = a.update(Message::Tab("Tool".into()));
+            crate::ui::probe::texts(a.view(), window)
+        };
+        // The Step lists the tools on the mill, and only them; then, given
+        // a CNC tool, that one too.
+        let mill = a.doc.setups[0].machine.clone();
+        for own in [None, Some(0)] {
+            if let Some(i) = own {
+                let id = a.doc.tools[i].id.clone();
+                a.doc.setups[0].operations[1].tool = id;
+            }
+            let t = listed(&mut a, 0, 1);
+            let o = a.doc.setups[0].operations[1].clone();
+            for tool in &a.doc.tools {
+                let label = super::tool_label(tool);
+                if a.doc
+                    .tools
+                    .iter()
+                    .filter(|u| super::tool_label(u) == label)
+                    .count()
+                    > 1
+                {
+                    continue;
+                }
+                let want = o.tool == tool.id || (o.takes(tool, &mill) && tool.fits(&mill));
+                assert_eq!(t.contains(&label), want, "{label} in {t:?}");
+            }
+        }
+        // A CNC operation does not list the mill's end mill.
+        let t = listed(&mut a, 1, 0);
+        assert!(!t.contains(&super::tool_label(&a.doc.tools[3])), "{t:?}");
+        // The mill's speed is one of its gears; choosing one sets it.
+        assert_eq!(
+            super::speed_options(&mill).unwrap(),
+            ["90", "150", "250", "400", "640", "1000", "1600"]
+        );
+        let _ = listed(&mut a, 0, 1);
+        let _ = a.update(Message::Edit(Target::Operation, "rpm", "400".into()));
+        assert_eq!(
+            crate::model::get(&a.doc.setups[0].operations[1].p, "rpm"),
+            "400"
+        );
+        // A variable drive and a CNC machine take a number.
+        let mut drive = mill.clone();
+        drive.p.insert("speeds".into(), "100-2000".into());
+        assert_eq!(super::speed_options(&drive), None);
+        assert_eq!(super::speed_options(&a.doc.setups[1].machine), None);
+    }
 
     /// The simulation strip's progress, to a tenth under 10% (LIO-326).
     #[test]

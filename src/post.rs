@@ -2746,7 +2746,9 @@ fn walk<'a>(
     settings: Settings,
 ) -> Result<Walk<'a>, Vec<String>> {
     let setup = &doc.setups[si];
-    let offset = get(&setup.p, "offset").to_string();
+    // A hand machine's setup has no work offset (LIO-371); its moves are
+    // walked, for the holding check, as if in G54: it writes no program.
+    let offset = setup.offset().unwrap_or("G54").to_string();
     let mut errors = vec![];
     let settings = settings(&setup.machine).map_err(|e| errors.extend(e)).ok();
     if !OFFSETS.contains(&offset.as_str()) {
