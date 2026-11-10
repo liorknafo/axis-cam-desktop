@@ -864,7 +864,7 @@ pub(crate) mod tests {
     }
     /// The solid of `loops` (`dxf`) `thickness` mm thick from Z `z`, less
     /// its top (`top` false) or its bottom (`bottom` false).
-    fn slab(
+    pub(crate) fn slab(
         loops: &[&[(f64, f64, f64)]],
         thickness: f32,
         z: f32,

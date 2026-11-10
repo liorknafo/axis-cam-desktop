@@ -2924,6 +2924,16 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "",
             Some(Manual(11)),
         ),
+        (_, "dro_matrix") => (
+            "Yes when the DRO has matrix holes: type a grid in once and it leads to each hole. The Steps page then gives a Drill's grid of holes as one pattern.",
+            "",
+            None,
+        ),
+        (_, "dro_arc") => (
+            "Yes when the DRO has arc holes: type a circle of holes in once and it leads to each hole. The Steps page then gives a Drill's holes on a circle as one pattern.",
+            "",
+            None,
+        ),
         (_, "edge_finder") => (
             "The diameter of the edge finder that picks up the work zero, in mm. The Zero step takes its radius off each face it touches.",
             "",

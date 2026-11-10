@@ -7440,14 +7440,22 @@ fn wizard(app: &App) -> Element<'_, Message> {
                 .push(note("Manual lathe — no G-code; MACHINE shows the steps."));
         }
         "Manual mill" => {
+            form = form.push(choice(
+                p,
+                "dro_comp",
+                "DRO tool radius compensation",
+                &["Yes", "No"],
+                t,
+            ));
+            // The DRO's own hole functions, No until set (LIO-399).
+            for (key, label) in [
+                ("dro_matrix", "DRO has matrix holes (a grid)"),
+                ("dro_arc", "DRO has arc holes"),
+            ] {
+                let on = if get(p, key) == "Yes" { "Yes" } else { "No" };
+                form = form.push(choice_value(p, on, key, label, &["Yes", "No"], t));
+            }
             form = form
-                .push(choice(
-                    p,
-                    "dro_comp",
-                    "DRO tool radius compensation",
-                    &["Yes", "No"],
-                    t,
-                ))
                 .push(field(p, "edge_finder", "Edge finder diameter · mm", t))
                 .push(field(p, "pass_time", "Time per pass · s", t))
                 .push(field(p, "tool_time", "Time per tool change · min", t))
