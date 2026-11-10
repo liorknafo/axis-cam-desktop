@@ -1085,6 +1085,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Check each setup and export LinuxCNC G-code or a setup sheet. Speeds and feeds outside the project material's cutting data are listed as warnings and never block export. A UC100 machine takes no G-code file: Run on the machine runs its setup from MACHINE.",
             "Checks cover generation, machine limits, rapids into material and holder clearance, and, in a setup that models a vise or clamps, the jaws or clamps as boxes with a clearance gap over every program move, links, approaches and retracts included; parallels, bolts, the table, the machine body and other fixtures are not checked.",
         ),
+        OpenIssue(..) => (
+            "Open this operation on the Work page, at the tab with the setting the problem is about.",
+            "",
+        ),
         RunOnMachine(_) => (
             "Open the MACHINE workspace with this setup picked in the run bar, once you Connect if the machine is not connected yet. The UC100 runs the setup directly, one tool run at a time, after the same checks as export; no G-code file is written.",
             "",

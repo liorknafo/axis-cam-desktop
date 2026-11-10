@@ -2765,9 +2765,17 @@ fn walk<'a>(
     }
     let mut ops = vec![];
     let mut simulations = vec![];
+    // The operations that only wait for one that failed before them, and
+    // that failure: said once, under its cause (LIO-394).
+    let mut waiting: Vec<&str> = vec![];
+    let mut cause = "";
     for (oi, result) in sims {
         let op = &setup.operations[*oi];
         match result {
+            Err(e) if e.starts_with(crate::simulation::WAITS) => {
+                waiting.push(op.name());
+                cause = &e[crate::simulation::WAITS.len()..];
+            }
             Err(e) => errors.push(format!("{}: {e}", op.name())),
             Ok(sim) => match op_state(
                 doc,
@@ -2783,6 +2791,13 @@ fn walk<'a>(
                 Err(e) => errors.extend(e),
             },
         }
+    }
+    if !waiting.is_empty() {
+        errors.push(waiting_line(
+            &waiting,
+            // A cause in this setup is listed above; one before it is said here.
+            (!cause.starts_with(&format!("{} / ", setup.name()))).then_some(cause),
+        ));
     }
     let zero = simulations.first().and_then(|sim| {
         datum(setup, sim.plan.stock, mesh)
@@ -2815,6 +2830,27 @@ fn walk<'a>(
         groups,
         tools,
     })
+}
+/// The one line for the operations `waiting` for a failure (LIO-394): "4
+/// later operations wait for it: …" under a cause listed in their setup, or
+/// with `earlier`, a failure in an earlier setup, that failure before it.
+pub(crate) fn waiting_line(waiting: &[&str], earlier: Option<&str>) -> String {
+    let n = waiting.len();
+    let (later, verb) = match (earlier, n) {
+        (None, 1) => ("later operation", "waits"),
+        (None, _) => ("later operations", "wait"),
+        (Some(_), 1) => ("operation", "waits"),
+        (Some(_), _) => ("operations", "wait"),
+    };
+    let line = format!("{n} {later} {verb} for it: {}.", waiting.join(", "));
+    match earlier {
+        Some(cause) => format!("{}. {line}", cause.trim_end_matches('.')),
+        None => line,
+    }
+}
+/// Whether a setup's problem is a `waiting_line`, not a cause of its own.
+pub(crate) fn is_waiting(problem: &str) -> bool {
+    problem.contains(" wait for it: ") || problem.contains(" waits for it: ")
 }
 /// The runs of `ops` that make one program each (`Walk::groups`): touch-off
 /// mode splits them at every change of tool, a tool table not at all.
@@ -5017,6 +5053,72 @@ M2
         crate::simulation::sequence(doc, mesh, None, |s, o, r| results[s].push((o, r)));
         prepare(doc, mesh, si, &results[si]).unwrap().remove(0)
     }
+    /// An operation that fails is listed once and the operations after it,
+    /// which only wait for it, in one line; two causes are each listed once;
+    /// a later setup that waits says the failure once (LIO-394).
+    #[test]
+    fn a_failure_is_listed_once_and_the_operations_after_it_wait_in_one_line() {
+        let (mut doc, mesh) = fixture::job();
+        let limit = crate::envelope::mm(num(&doc.setups[0].machine.p, "rpm").unwrap());
+        let too_fast = |doc: &mut Document, oi: usize| {
+            doc.setups[0].operations[oi]
+                .p
+                .insert("rpm".into(), "99999".into());
+            format!(
+                "{}: Spindle speed is above the machine's limit, {limit} rpm.",
+                doc.setups[0].operations[oi].name()
+            )
+        };
+        let names = |doc: &Document, ois: &[usize]| -> Vec<String> {
+            (ois.iter())
+                .map(|&oi| doc.setups[0].operations[oi].name().to_string())
+                .collect()
+        };
+        let pocket = too_fast(&mut doc, 1);
+        let later = names(&doc, &[2, 3, 4, 5]);
+        assert_eq!(
+            errors(&post_job(&doc, &mesh)),
+            [
+                pocket.clone(),
+                format!("4 later operations wait for it: {}.", later.join(", "))
+            ]
+        );
+        let drilling = too_fast(&mut doc, 3);
+        let later = names(&doc, &[2, 4, 5]);
+        assert_eq!(
+            errors(&post_job(&doc, &mesh)),
+            [
+                pocket,
+                drilling,
+                format!("3 later operations wait for it: {}.", later.join(", "))
+            ]
+        );
+        // A later setup: the failure before it, then its operations.
+        let (mut doc, mesh) = fixture::flipped_job();
+        doc.setups[0].operations[0]
+            .p
+            .insert("rpm".into(), "99999".into());
+        let job = post_job(&doc, &mesh);
+        let flipped: Vec<&str> = (doc.setups[1].operations.iter())
+            .filter(|o| o.enabled)
+            .map(|o| o.name())
+            .collect();
+        let cause = format!(
+            "{} / {}: Spindle speed is above the machine's limit, {} rpm.",
+            doc.setups[0].name(),
+            doc.setups[0].operations[0].name(),
+            crate::envelope::mm(num(&doc.setups[0].machine.p, "rpm").unwrap())
+        );
+        assert_eq!(
+            job.setups[1].result.as_ref().unwrap_err(),
+            &[waiting_line(&flipped, Some(&cause))]
+        );
+        assert!(job.setups[1].result.as_ref().unwrap_err()[0].starts_with(&cause));
+        assert_eq!(
+            waiting_line(&["A"], None),
+            "1 later operation waits for it: A."
+        );
+    }
     #[test]
     fn all_six_strategies_post_and_replay_exactly() {
         let (doc, mesh) = fixture::job();
@@ -6404,7 +6506,8 @@ M2
         );
         refused(
             &|d| d.setups[0].operations[1].surfaces = None,
-            "Cannot inherit",
+            // The operations after it are said once, as waiting (LIO-394).
+            " for it: ",
         );
         refused(
             &|d| {

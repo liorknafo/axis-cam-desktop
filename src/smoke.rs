@@ -13974,6 +13974,42 @@ soft_max = 180.0
         let _ = a.view();
     }
 
+    /// NC review lists a failing operation once, as one issue, the four
+    /// after it in one line, and opens it at its Tool tab (LIO-394).
+    #[test]
+    fn the_nc_review_lists_a_failure_once_and_opens_its_operation() {
+        let mut a = app();
+        let (mut doc, mesh) = crate::post::fixture::job();
+        doc.setups[0].operations[1]
+            .p
+            .insert("rpm".into(), "99999".into());
+        a.post = Some(std::sync::Arc::new(crate::post::post_job(&doc, &mesh)));
+        a.doc = doc;
+        a.page = Page::Post;
+        let pocket = a.doc.setups[0].operations[1].name().to_string();
+        let seen = page_texts(&a);
+        shows(
+            &a,
+            &[
+                "1 issue",
+                &format!("• {pocket}: Spindle speed is above the machine's limit, 12000 rpm."),
+            ],
+        );
+        assert_eq!(
+            (seen.iter()).filter(|t| t.contains("wait for it")).count(),
+            1,
+            "{seen:?}"
+        );
+        let open = (crate::ui::probe::clicks(a.view(), WINDOW).into_iter())
+            .find(|m| matches!(m, Message::OpenIssue(..)))
+            .expect("Open beside the issue");
+        assert!(matches!(&open, Message::OpenIssue(0, 1, _)), "{open:?}");
+        let _ = a.update(open);
+        assert_eq!(
+            (a.page, a.selected, a.tab.as_str()),
+            (Page::Work, Some(1), "Tool")
+        );
+    }
     /// NC review hands a UC100 setup on to MACHINE, picked in the Run panel
     /// once Connect opens the machine (LIO-142).
     #[test]

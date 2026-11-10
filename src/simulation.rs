@@ -1163,6 +1163,10 @@ pub fn part_box(setup: &Setup, mesh: &Mesh) -> Bounds {
         .bounds
         .scaled(1. / mesh.display_scale())
 }
+/// The start of the error of an operation that only waits for an earlier
+/// operation or setup that failed; the failure follows it.
+pub const WAITS: &str =
+    "Cannot inherit remaining stock because an earlier operation/setup failed: ";
 /// `sequence_with`, also telling `begin` as each setup begins, before its
 /// operations, the box it starts from (`leftover_box`): None for the first
 /// setup and when an earlier operation or setup failed, because the stock
@@ -1289,13 +1293,27 @@ pub fn sequence_walk(
                             .map(|posed| (posed.plan, posed.turns, None))
                     })
             };
-            let result=plan.and_then(|(plan, turns, air)| {
-                if let Some(reason)=&blocked {return Err(format!("Cannot inherit remaining stock because an earlier operation/setup failed: {reason}"));}
-                let mut sim=Simulation::new(plan);
-                sim.volume=volume.clone();sim.initial_volume=volume.clone();sim.frame=Some(frame);sim.turns=turns;sim.preceding=preceding;sim.source=source;sim.air=air;
+            let result = plan.and_then(|(plan, turns, air)| {
+                if let Some(reason) = &blocked {
+                    return Err(format!("{WAITS}{reason}"));
+                }
+                let mut sim = Simulation::new(plan);
+                sim.volume = volume.clone();
+                sim.initial_volume = volume.clone();
+                sim.frame = Some(frame);
+                sim.turns = turns;
+                sim.preceding = preceding;
+                sim.source = source;
+                sim.air = air;
                 // The feed changed along the path to hold the force on a tooth.
                 crate::tooth_load::hold(&mut sim, doc, &setup.machine, op)?;
-                if let Some((previous,stock))=&grid&& *previous==frame && stock.bounds==sim.plan.stock {sim.stock=stock.clone();sim.initial_stock=stock.clone();}
+                if let Some((previous, stock)) = &grid
+                    && *previous == frame
+                    && stock.bounds == sim.plan.stock
+                {
+                    sim.stock = stock.clone();
+                    sim.initial_stock = stock.clone();
+                }
                 Ok(sim)
             });
             match &result {

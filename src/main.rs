@@ -415,6 +415,9 @@ pub enum Message {
     /// A row of the operation audit's report: opens its operation, at the
     /// tab its line names.
     AuditRow(usize),
+    /// A problem of the NC review page (setup, operation, its message): opens
+    /// the operation at the tab the message names (LIO-394).
+    OpenIssue(usize, usize, String),
     /// An action of the Run panel on the Control page.
     Run(run::Action),
     /// NC review's Run on the machine for a UC100 setup: the MACHINE
@@ -5658,6 +5661,11 @@ impl App {
             Message::AuditRow(i) => {
                 if let Some(row) = self.audit_report.get(i).cloned() {
                     return self.open_issue(row.setup, row.operation, &row.detail);
+                }
+            }
+            Message::OpenIssue(si, oi, problem) => {
+                if (self.doc.setups.get(si)).is_some_and(|s| oi < s.operations.len()) {
+                    return self.open_issue(si, oi, &problem);
                 }
             }
             Message::SetupEditor => {
