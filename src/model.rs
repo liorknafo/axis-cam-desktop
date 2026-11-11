@@ -4264,12 +4264,44 @@ fn label(k: &str) -> String {
 }
 /// The six fields of a Box's block, by key.
 pub const BOX_FIELDS: [&str; 6] = ["x_min", "x_max", "y_min", "y_max", "z_top", "z_bottom"];
-/// `n` mm to a tenth, without a trailing ".0".
+impl Document {
+    /// Each operation the app named, old defaults too, named again by what
+    /// it cuts (LIO-426); a typed name stays.
+    pub fn follow_default_names(&mut self) {
+        let tools = self.tools.clone();
+        for o in self.setups.iter_mut().flat_map(|s| s.operations.iter_mut()) {
+            if o.named_by_default() {
+                let name = o.default_name(&tools);
+                o.p.insert("name".into(), name.clone());
+                o.p.insert("auto_name".into(), name);
+            }
+        }
+    }
+}
+/// `n` mm to a tenth, without a trailing ".0", its minus the app's "−".
 fn mm(n: f32) -> String {
     let s = format!("{n:.1}");
-    s.strip_suffix(".0").map_or(s.clone(), str::to_string)
+    let s = s.strip_suffix(".0").map_or(s.clone(), str::to_string);
+    s.replace('-', "−")
 }
 impl Operation {
+    /// Whether its name is one the app gave, not one typed (LIO-426): none,
+    /// the one it was last given, or an old default (`Strategy::name`,
+    /// "Turn · <kind>"). A Thread, a centre drilling and what a Thread
+    /// brought keep the names they were given.
+    pub fn named_by_default(&self) -> bool {
+        if self.is_thread()
+            || crate::centre::centres(self).is_some()
+            || !get(&self.p, crate::threading::THREAD_OF).is_empty()
+        {
+            return false;
+        }
+        let name = self.name();
+        name.is_empty()
+            || name == get(&self.p, "auto_name")
+            || Strategy::ALL.iter().any(|s| name == s.name())
+            || (name.strip_prefix("Turn · ")).is_some_and(|k| crate::lathe::TURN_KINDS.contains(&k))
+    }
     /// What the operation cuts, from its main numbers (LIO-426): its tile's
     /// word first, "Drill Ø5", "Box 60 × 40 × 12 deep", "Outside Ø16 to
     /// Z -30", "Bore Ø20 × 15 deep", "Face 1 off", "Groove 3 wide at Z -12",
