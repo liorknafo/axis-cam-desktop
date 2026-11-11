@@ -1505,6 +1505,94 @@ fn nearest(polygon: &[[f32; 3]]) -> Option<(f32, f32)> {
     Some(best)
 }
 
+/// The lathe cuts taken from the part by one click on a face (LIO-424).
+/// ponytail: Chamfer keeps its numbers; a cone's edge and size when asked.
+pub const PICKED: [&str; 5] = ["Outside", "Bore", "Face", "Groove", "Part off"];
+/// What to click for a cut of `kind`, on its tab and in the status line.
+pub fn pick_prompt(kind: &str) -> &'static str {
+    match kind {
+        "Outside" => {
+            "Click a round outside face of the part: the Outside turns to its diameter, up to its end toward the chuck."
+        }
+        "Bore" => {
+            "Click the wall of a hole on the axis: the Bore opens to its diameter, to its depth."
+        }
+        "Face" => {
+            "Click the part's end face toward the free end of the bar: the Face takes the bar down to it."
+        }
+        "Groove" => {
+            "Click the floor of a groove: its Z, width and bottom diameter fill the Groove."
+        }
+        "Part off" => "Click the part's end face toward the chuck: the blade parts it there.",
+        _ => "",
+    }
+}
+/// The fields of a lathe cut of `kind` taken from the part's face `ids` (one
+/// smooth face, `Mesh::region_of`), in work coordinates (LIO-424):
+/// Outside a round outside face, its diameter and Z end at its end toward
+/// the chuck; Bore a hole's wall round the axis, its diameter and depth;
+/// Face the end face toward the free end, how much to face off; Groove a
+/// groove's floor, its left side's Z, width and bottom diameter; Part off
+/// the end face toward the chuck, its Z. Else why the face makes none.
+/// ponytail: a round face is any face round the axis; a Groove's floor is
+/// not checked to lie between larger diameters.
+pub fn cut_from_face(
+    setup: &Setup,
+    mesh: &Mesh,
+    ids: &[usize],
+    kind: &str,
+) -> Result<Vec<(&'static str, String)>, String> {
+    let stock = stock::resolve(setup, Some(mesh))?.stock;
+    let (mut r, mut z) = ([f32::INFINITY, 0f32], [f32::INFINITY, f32::NEG_INFINITY]);
+    r[1] = f32::NEG_INFINITY;
+    // Twice the area, and its share along the axis and out from it.
+    let (mut area, mut along, mut out) = (0f32, 0f32, 0f32);
+    let geometry = Geometry::new(setup, mesh);
+    for t in (geometry.triangles.iter()).filter(|t| t.feature.is_some_and(|f| ids.contains(&f))) {
+        let [a, b, c] = t.p;
+        let (u, v) = (
+            [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+            [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
+        );
+        let n = [
+            u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0],
+        ];
+        let m = [(a[0] + b[0] + c[0]) / 3., (a[1] + b[1] + c[1]) / 3.];
+        let radial = m[0].hypot(m[1]).max(1e-6);
+        area += (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        along += n[2];
+        out += (n[0] * m[0] + n[1] * m[1]) / radial;
+        for p in t.p {
+            let d = p[0].hypot(p[1]);
+            (r[0], r[1]) = (r[0].min(d), r[1].max(d));
+            (z[0], z[1]) = (z[0].min(p[2]), z[1].max(p[2]));
+        }
+    }
+    if area <= 0. {
+        return Err(pick_prompt(kind).to_string());
+    }
+    let text = |v: f32| ((v * 1000.).round() / 1000.).to_string();
+    let flat = along.abs() > 0.99 * area && z[1] - z[0] < 0.01;
+    let round = out.abs() > 0.97 * area && r[1] - r[0] < 0.05;
+    let (z0, z1) = (work_z(stock, z[0]), work_z(stock, z[1]));
+    Ok(match kind {
+        "Outside" if round && out > 0. => vec![("diameter", text(2. * r[1])), ("z_end", text(z0))],
+        "Bore" if round && out < 0. => vec![("diameter", text(2. * r[0])), ("z_end", text(z0))],
+        "Face" if flat && along > 0. => vec![
+            ("face_off", text((-z1).max(0.))),
+            ("to_diameter", text(if r[0] > 0.5 { 2. * r[0] } else { 0. })),
+        ],
+        "Groove" if round && out > 0. => vec![
+            ("z", text(z0)),
+            ("width", text(z1 - z0)),
+            ("diameter", text(2. * r[1])),
+        ],
+        "Part off" if flat && along < 0. => vec![("z", text(z0))],
+        _ => return Err(format!("That face makes no {kind}. {}", pick_prompt(kind))),
+    })
+}
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

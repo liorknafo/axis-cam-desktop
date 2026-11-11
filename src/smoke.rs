@@ -5878,6 +5878,112 @@ flood = { pin = 8 }
         let (_, lines, ok, _) = crate::ui::run_check(&c).unwrap();
         assert!(!ok && !lines.is_empty());
     }
+    /// The first face of the part on `a`'s setup whose every corner `keep`
+    /// takes (setup frame, mm).
+    fn face_where(a: &App, keep: impl Fn([f32; 3]) -> bool) -> usize {
+        let g = crate::cam::Geometry::new(a.doc.setup(), a.part_mesh().unwrap());
+        let mut all = std::collections::BTreeMap::new();
+        for t in &g.triangles {
+            if let Some(f) = t.feature {
+                *all.entry(f).or_insert(true) &= t.p.iter().all(|p| keep(*p));
+            }
+        }
+        all.into_iter().find(|(_, ok)| *ok).expect("a face").0
+    }
+    /// A lathe cut is taken from the part by one click, as a Box is: adding
+    /// it starts the pick on its tab, a click fills it, a face that makes
+    /// none says why and changes nothing, and a job of clicks has its Steps
+    /// (LIO-424).
+    #[test]
+    fn a_lathe_cut_is_filled_by_one_click_on_the_part() {
+        use crate::turn::tests::tube;
+        let r = |p: [f32; 3]| p[0].hypot(p[1]);
+        let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+        let click = |a: &mut App, id: usize| {
+            let _ = a.update(Message::Viewport(crate::viewport::Event::PickSurface(id)));
+        };
+        let field = |a: &App, k: &str| num(&a.operation().unwrap().p, k).unwrap();
+        let z_span = |a: &App| {
+            let g = crate::cam::Geometry::new(a.doc.setup(), a.part_mesh().unwrap());
+            (g.triangles.iter().flat_map(|t| t.p)).fold([f32::MAX, f32::MIN], |z, p| {
+                [z[0].min(p[2]), z[1].max(p[2])]
+            })
+        };
+        // A Ø30 body with a Ø16 pin 20 long, its end 2 mm in from the bar's.
+        let mut part = tube(0., 15., 0., 30.);
+        part.extend(tube(0., 8., 30., 50.));
+        let mut a = lathe_job_app(50., part, -52., |_| {});
+        let [low, high] = z_span(&a);
+        // Outside: the pick starts on its tab; the pin gives Ø16 to its
+        // shoulder, the body Ø30 to the part's end.
+        let _ = a.update(Message::AddTurn("Outside"));
+        assert_eq!((a.tab.as_str(), a.picking), ("Turn", true));
+        let prompt = crate::turn::pick_prompt("Outside");
+        assert!(a.status.ends_with(prompt), "{}", a.status);
+        shows(&a, &[prompt, "Finish picking"]);
+        let pin = face_where(&a, |p| near(r(p), 8.));
+        click(&mut a, pin);
+        assert_eq!((field(&a, "diameter"), field(&a, "z_end")), (16., -22.));
+        let body = face_where(&a, |p| near(r(p), 15.));
+        click(&mut a, body);
+        assert_eq!((field(&a, "diameter"), field(&a, "z_end")), (30., -52.));
+        // A flat face: refused with the reason, the numbers as they were.
+        let end = face_where(&a, |p| near(p[2], high));
+        click(&mut a, end);
+        assert_eq!(field(&a, "diameter"), 30.);
+        assert!(
+            a.status.starts_with("That face makes no Outside."),
+            "{}",
+            a.status
+        );
+        shows(&a, &["No Outside from that face"]);
+        click(&mut a, pin);
+        // Face: the pin's end, 2 mm in from the bar's.
+        let _ = a.update(Message::AddTurn("Face"));
+        click(&mut a, end);
+        assert_eq!((field(&a, "face_off"), field(&a, "to_diameter")), (2., 0.));
+        // Part off: the part's end toward the chuck.
+        let _ = a.update(Message::AddTurn("Part off"));
+        let back = face_where(&a, |p| near(p[2], low));
+        click(&mut a, back);
+        assert_eq!(field(&a, "z"), -52.);
+        // Made only by clicks, the job has its Steps.
+        let face = a.doc.setup().operations[1].clone();
+        let outside = a.doc.setup().operations[0].clone();
+        a.doc.setup_mut().operations = vec![face, outside];
+        assert!(
+            crate::guide::build(&a.doc, a.part_mesh().unwrap(), 0).is_ok(),
+            "{:?}",
+            crate::guide::build(&a.doc, a.part_mesh().unwrap(), 0).err()
+        );
+        // Bore: a sleeve's bore wall, Ø10 through.
+        let mut b = lathe_job_app(50., tube(5., 15., 0., 30.), -32., |_| {});
+        let _ = b.update(Message::AddTurn("Bore"));
+        let wall = face_where(&b, |p| near(r(p), 5.));
+        click(&mut b, wall);
+        assert_eq!((field(&b, "diameter"), field(&b, "z_end")), (10., -32.));
+        // Groove: a Ø24 floor 4 wide between Ø30 lands.
+        let mut part = tube(0., 15., 0., 10.);
+        part.extend(tube(0., 12., 10., 14.));
+        part.extend(tube(0., 15., 14., 30.));
+        let mut c = lathe_job_app(50., part, -32., |_| {});
+        let _ = c.update(Message::AddTurn("Groove"));
+        let floor = face_where(&c, |p| near(r(p), 12.));
+        click(&mut c, floor);
+        assert_eq!(
+            (field(&c, "z"), field(&c, "width"), field(&c, "diameter")),
+            (-22., 4., 24.)
+        );
+        // The example project: no pick, as before.
+        let mut d = app();
+        with_lathe(&mut d);
+        let _ = d.update(Message::AddLatheSetup);
+        let lathe = (d.doc.setups.iter()).position(|s| crate::lathe::is_lathe(&s.machine));
+        let _ = d.update(Message::SelectSetup(lathe.unwrap()));
+        let _ = d.update(Message::AddTurn("Outside"));
+        assert!(!d.picking);
+        lacks(&d, &["Pick the face on the part"]);
+    }
     /// LIO-419: Thread is a tile on every machine and the browser has no
     /// "+ Add threading".
     #[test]
