@@ -5814,6 +5814,70 @@ flood = { pin = 8 }
         );
         lathe_job_app(50., part, -60., edit)
     }
+    /// What stops a setup is one sentence, in the operation's editor and
+    /// once in the panel; never beside "checks passed", and no "generated"
+    /// or "holding" on a hand machine (LIO-425).
+    #[test]
+    fn what_stops_a_setup_is_said_once_in_the_editor_and_once_in_the_panel() {
+        let mut a = stud_app(|_| {});
+        // The checks run in place, not in the background.
+        a.smoke_dir = a.test_dir.as_ref().map(|d| d.path().to_path_buf());
+        let _ = a.update(Message::AddThreading);
+        let all = a.doc.setup().operations.clone();
+        assert_eq!(all.len(), 2, "the blank, then the Thread");
+        // The Thread alone: its blank is not turned.
+        a.doc.setup_mut().operations.retain(|o| o.is_thread());
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.refresh_left_stock();
+        let _ = a.refresh_ready();
+        let (_, lines, ok, _) = crate::ui::run_check(&a).unwrap();
+        assert!(!ok);
+        let name = a.operation().unwrap().name().to_string();
+        let sentence = (lines.iter())
+            .find(|l| l.starts_with(&format!("{name}: ")))
+            .unwrap_or_else(|| panic!("{lines:?}"))
+            .clone();
+        let texts = page_texts(&a);
+        assert_eq!(
+            texts.iter().filter(|t| t.ends_with(&sentence)).count(),
+            2,
+            "{sentence}: {texts:?}"
+        );
+        for gone in [
+            "Configuration checks passed",
+            "could not be generated",
+            "Holding not checked",
+        ] {
+            assert!(!texts.iter().any(|t| t.contains(gone)), "{gone}: {texts:?}");
+        }
+        // With the blank turned first, the checks pass.
+        a.doc.setup_mut().operations = all;
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.refresh_left_stock();
+        let _ = a.refresh_ready();
+        let (heading, _, ok, _) = crate::ui::run_check(&a).unwrap();
+        assert!(ok, "{heading}");
+        shows(&a, &["Configuration checks passed"]);
+        // A CNC operation that cannot be generated: its editor says what
+        // is wrong, not that the checks passed; the panel says it too.
+        let mut c = imported_app();
+        let dir = tempfile::tempdir().unwrap();
+        c.smoke_dir = Some(dir.path().to_path_buf());
+        c.page = Page::Work;
+        c.doc.setup_mut().operations[0].tool = "gone".into();
+        let _ = c.update(Message::SelectOp(0));
+        let _ = c.refresh_left_stock();
+        let _ = c.refresh_ready();
+        let texts = page_texts(&c);
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t.contains("Configuration checks passed"))
+        );
+        assert!(!texts.iter().any(|t| t.contains("could not be generated")));
+        let (_, lines, ok, _) = crate::ui::run_check(&c).unwrap();
+        assert!(!ok && !lines.is_empty());
+    }
     /// LIO-419: Thread is a tile on every machine and the browser has no
     /// "+ Add threading".
     #[test]
@@ -17965,13 +18029,12 @@ soft_max = 180.0
         let found = a.left_stock.uncut.clone().unwrap().unwrap();
         assert!(found.regions.len() > 1 && found.faces.iter().any(|f| *f));
         let _ = a.view();
-        // An operation that cannot be generated: not checked, and why.
+        // An operation that cannot be generated: the check waits on it, in
+        // one short line; its own check says what is wrong (LIO-425, was
+        // "Completeness not checked: … could not be generated.").
         a.doc.setups[1].operations[0].tool = "gone".into();
         let _ = a.refresh_left_stock();
-        assert_eq!(
-            line(&a),
-            "Completeness not checked: Flipped / Facing could not be generated."
-        );
+        assert_eq!(line(&a), "Completeness waits on Flipped / Facing.");
         let _ = a.view();
         // The example is not simulated: nothing is said.
         let mut sample = app();
