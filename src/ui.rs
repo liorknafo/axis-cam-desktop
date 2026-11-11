@@ -544,6 +544,10 @@ pub(crate) fn op_checks(app: &App) -> Vec<Check> {
         .into_iter()
         .map(|text| Check::new(text, true))
         .collect();
+    // A new operation asks for its pick, with no error yet (LIO-427).
+    if app.new_op_line().is_some() {
+        checks.retain(|c| c.text != crate::model::NOTHING_PICKED);
+    }
     if let Some(o) = app.operation()
         && let Some(SpeedFeed::Out(problems)) = app.doc.speed_feed(app.doc.setup(), o)
     {
@@ -3388,6 +3392,11 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             o.strategy.availability()
         )));
     }
+    // A new operation: what to click on the part, or that it cuts the
+    // whole part, as the status line says (LIO-427).
+    if let Some(line) = app.new_op_line() {
+        c = c.push(note(line));
+    }
     let p = &o.p;
     let t = Target::Operation;
     let machine = &app.doc.setup().machine;
@@ -4502,7 +4511,11 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
     }
     // Under the form, scrolling with it: the checks no field on the open tab
     // shows. Pinned, they could take the whole height and leave none to it.
-    c = c.push(checks_summary(checks, app.warning_details));
+    // Not "checks passed" while a new operation asks for its pick (LIO-427).
+    let asking = app.new_op_line().is_some() && o.needs_surfaces();
+    if !(asking && checks.list.is_empty()) {
+        c = c.push(checks_summary(checks, app.warning_details));
+    }
     if let Some((heading, lines)) = holding_warning(app) {
         c = c.push(caution(heading, lines));
     }

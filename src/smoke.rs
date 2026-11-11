@@ -23082,6 +23082,84 @@ soft_max = 180.0
         assert!(a.simulation.is_none());
         let _ = a.view();
     }
+    /// A new operation that needs a place on the part opens on the tab that
+    /// picks it, picking, saying what to click there and in the status line,
+    /// with no error until another tab is opened; one that cuts the whole
+    /// part says so; the example project is as it was (LIO-427).
+    #[test]
+    fn a_new_operation_opens_on_its_pick_and_says_what_to_click_not_an_error() {
+        let errors = |a: &App| {
+            (page_texts(a).iter())
+                .any(|t| t.contains("stops Generate") || t.contains("stop Generate"))
+        };
+        let fresh = |s: Strategy| {
+            let mut a = imported_app();
+            a.doc.setup_mut().operations.clear();
+            a.selected = None;
+            let _ = a.update(Message::AddOp(s));
+            assert_eq!(a.operation().unwrap().strategy, s);
+            a
+        };
+        for s in [
+            Strategy::Face,
+            Strategy::Pocket,
+            Strategy::Drill,
+            Strategy::Chamfer,
+            Strategy::Groove,
+        ] {
+            let mut a = fresh(s);
+            assert_eq!(a.tab, "Geometry", "{s:?}");
+            assert!(a.picking, "{s:?}");
+            let line = a.new_op_line().expect("what to click");
+            assert!(line.starts_with("Click "), "{line}");
+            assert_eq!(a.status, format!("Added {}. {line}", s.name()));
+            shows(&a, &[line]);
+            assert!(!errors(&a), "{s:?}");
+            // Another tab without a pick: the error, as before.
+            let _ = a.update(Message::Tab("Heights".into()));
+            assert!(a.new_op_line().is_none());
+            assert!(errors(&a), "{s:?}");
+        }
+        // One click on the floor, or the top face, and nothing is wrong.
+        for (s, floor) in [(Strategy::Pocket, true), (Strategy::Face, false)] {
+            let mut a = fresh(s);
+            let mesh = a.imported_mesh.as_ref().unwrap();
+            let placement = crate::stock::Placement::new(mesh, a.doc.active_setup());
+            let z = |c| placement.transform(c)[2];
+            let level = (mesh.surfaces.iter().enumerate()).filter(|(_, f)| f.normal[2] > 0.999999);
+            let id = if floor {
+                level
+                    .filter(|(_, f)| {
+                        z(f.center) < placement.bounds.max[2] - 0.1
+                            && z(f.center) > placement.bounds.min[2] + 0.1
+                    })
+                    .max_by(|(_, a), (_, b)| a.area.total_cmp(&b.area))
+            } else {
+                level.max_by(|(_, a), (_, b)| z(a.center).total_cmp(&z(b.center)))
+            }
+            .unwrap()
+            .0;
+            let _ = a.update(Message::Viewport(crate::viewport::Event::PickSurface(id)));
+            assert_eq!(a.op_issues(), Vec::<String>::new(), "{s:?}");
+            assert!(a.new_op_line().is_none());
+        }
+        // The whole part: on the first tab, no pick, one line.
+        for s in [Strategy::Contour, Strategy::Parallel, Strategy::Waterline] {
+            let a = fresh(s);
+            assert_eq!(a.tab, "Tool", "{s:?}");
+            assert!(!a.picking, "{s:?}");
+            let line = "Cuts the whole part. Pick faces only to limit it.";
+            assert_eq!(a.new_op_line(), Some(line));
+            assert_eq!(a.status, format!("Added {}. {line}", s.name()));
+            shows(&a, &[line]);
+        }
+        // The example project: as before.
+        let mut a = app();
+        let _ = a.update(Message::AddOp(Strategy::Pocket));
+        assert_eq!(a.tab, "Tool");
+        assert!(!a.picking && a.new_op_line().is_none());
+        assert!(a.status.ends_with("Choose a tool and machining geometry."));
+    }
     #[test]
     fn imported_pocket_selection_playback_direction_and_reopen_work_end_to_end() {
         let mut a = imported_app();

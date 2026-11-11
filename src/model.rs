@@ -216,6 +216,8 @@ impl std::fmt::Display for Strategy {
         write!(f, "{}", self.name())
     }
 }
+/// What an operation that needs a place on the part says with none picked.
+pub const NOTHING_PICKED: &str = "Select at least one machining feature or surface.";
 pub const FEATURES: [&str; 9] = [
     "Top rim face",
     "Pocket floor",
@@ -2173,7 +2175,7 @@ impl Operation {
             && self.geometry.is_empty()
             && self.surfaces.as_ref().is_none_or(|s| s.ids.is_empty())
         {
-            e.push("Select at least one machining feature or surface.".into())
+            e.push(NOTHING_PICKED.into())
         }
         if self
             .geometry
