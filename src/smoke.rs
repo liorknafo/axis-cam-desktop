@@ -23605,6 +23605,61 @@ soft_max = 180.0
         // Whole in the browser, never cut with "…".
         shows(&b, &["Outside Ø16 to Z −30"]);
     }
+    /// A drilling's name counts its holes, so two of one size on other
+    /// holes read apart; a Contour says its side; a Box with no size yet is
+    /// the bare word (LIO-426).
+    #[test]
+    fn a_drilling_counts_its_holes_and_a_box_without_a_size_is_the_word() {
+        use crate::model::{Operation, Strategy, Tool};
+        let drill = Tool::new("Drill 5", "Drill", "5");
+        let mut o = Operation::new(Strategy::Drill, drill.id.clone());
+        let tools = vec![drill];
+        assert_eq!(o.default_name(&tools), "Drill Ø5");
+        o.p.insert("hole_count".into(), "2".into());
+        assert_eq!(o.default_name(&tools), "Drill Ø5 · 2 holes");
+        o.p.insert("hole_count".into(), "4".into());
+        assert_eq!(o.default_name(&tools), "Drill Ø5 · 4 holes");
+        let mut b = Operation::new(Strategy::Box, String::new());
+        for (k, v) in [
+            ("x_min", "0"),
+            ("x_max", "-535"),
+            ("y_min", "0"),
+            ("y_max", "30"),
+            ("z_top", "0"),
+            ("z_bottom", "-20"),
+        ] {
+            b.p.insert(k.into(), v.into());
+        }
+        assert_eq!(b.default_name(&tools), "Box");
+        b.p.insert("x_max".into(), "60".into());
+        assert_eq!(b.default_name(&tools), "Box 60 × 30 × 20 deep");
+        let mut c = Operation::new(Strategy::Contour, String::new());
+        c.p.insert("side".into(), "Outside".into());
+        assert_eq!(c.default_name(&tools), "Contour · outside");
+        // On the part: a Drill of the top face's openings counts them.
+        let mut a = imported_app();
+        a.doc.setup_mut().operations.clear();
+        a.selected = None;
+        let _ = a.update(Message::AddOp(Strategy::Drill));
+        if a.operation().is_none() {
+            let _ = a.update(Message::SaveTool);
+        }
+        let mesh = a.imported_mesh.as_ref().unwrap();
+        let placement = crate::stock::Placement::new(mesh, a.doc.active_setup());
+        let top = (mesh.surfaces.iter().enumerate())
+            .filter(|(_, s)| s.normal[2].abs() > 0.99999)
+            .max_by(|(_, x), (_, y)| {
+                placement.transform(x.center)[2].total_cmp(&placement.transform(y.center)[2])
+            })
+            .unwrap()
+            .0;
+        let _ = a.update(Message::Viewport(crate::viewport::Event::PickSurface(top)));
+        let name = a.operation().unwrap().name().to_string();
+        assert!(
+            name.starts_with("Drill Ø") && (name.ends_with(" hole") || name.ends_with(" holes")),
+            "{name}"
+        );
+    }
     /// An operation saved with an old default name ("Drilling", "Turn ·
     /// Outside") reads by the new rule when the project opens, in the
     /// browser and the Steps header alike; a typed name stays (LIO-426).
@@ -23868,6 +23923,10 @@ soft_max = 180.0
         let mut a = imported_app();
         a.doc.setup_mut().operations.clear();
         a.selected = None;
+        // Counted from before the Drill is added: its name counts its holes
+        // when it is added or edited, the views after it keep that (LIO-426).
+        let runs = || crate::DRILL_HOLE_RUNS.with(|n| n.get());
+        let none = runs();
         let _ = a.update(Message::AddOp(Strategy::Drill));
         let _ = a.update(Message::Tab("Geometry".into()));
         let faces: Vec<_> = a
@@ -23881,15 +23940,15 @@ soft_max = 180.0
             .map(|(id, _)| id)
             .collect();
         assert!(faces.len() >= 2, "{faces:?}");
-        let runs = || crate::DRILL_HOLE_RUNS.with(|n| n.get());
         // Nothing selected is an answer too, kept like any other.
-        let none = runs();
         for _ in 0..3 {
             let _ = a.view();
         }
-        assert_eq!(runs() - none, 1);
-        let _ = a.update(Message::Surface(faces[0]));
+        // At most once: the empty selection's answer may be kept already,
+        // worked out for the part's earlier Drill when its name was given.
+        assert!(runs() - none <= 1, "{}", runs() - none);
         let before = runs();
+        let _ = a.update(Message::Surface(faces[0]));
         // The planner page and the playback redraw many times a second.
         for _ in 0..5 {
             let _ = a.view();

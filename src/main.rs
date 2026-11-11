@@ -3075,6 +3075,23 @@ impl App {
         }
         // A centre drilling's holes are the drill's it centres.
         centre::sync(&mut self.doc);
+        // A Drill's holes on the active setup, counted for its name (LIO-426).
+        let counts: Vec<(usize, usize)> = match &self.imported_mesh {
+            Some(mesh) if !self.is_sample() && self.doc.active_setup().is_some() => {
+                let setup = self.doc.setup();
+                (setup.operations.iter().enumerate())
+                    .filter(|(_, o)| o.strategy == Strategy::Drill && !o.on_centre(&setup.machine))
+                    .filter_map(|(i, o)| {
+                        let holes = self.drill_holes(o, mesh);
+                        holes.as_ref().as_ref().ok().map(|h| (i, h.len()))
+                    })
+                    .collect()
+            }
+            _ => vec![],
+        };
+        for (i, n) in counts {
+            (self.doc.setup_mut().operations[i].p).insert("hole_count".into(), n.to_string());
+        }
         // A name the app gave follows the numbers; a typed one stays (LIO-426).
         self.doc.follow_default_names();
         // Where picks made by this edit are, kept with the edit itself.

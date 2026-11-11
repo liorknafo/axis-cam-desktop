@@ -4313,9 +4313,24 @@ impl Operation {
             Strategy::Drill => {
                 let d =
                     (tools.iter().find(|t| t.id == self.tool)).and_then(|t| num(&t.p, "diameter"));
-                d.map(|d| format!("Drill Ø{}", mm(d)))
+                // With its holes' count when known, so two drillings of
+                // one size on other holes read apart (LIO-426).
+                let holes = match n("hole_count").map(|c| c as usize) {
+                    Some(1) => " · 1 hole".to_string(),
+                    Some(c) if c > 1 => format!(" · {c} holes"),
+                    _ => String::new(),
+                };
+                d.map(|d| format!("Drill Ø{}{holes}", mm(d)))
             }
+            Strategy::Contour => match get(&self.p, "side") {
+                "" => None,
+                side => Some(format!("Contour · {}", side.to_lowercase())),
+            },
+            // ponytail: the bare word for Face, Adaptive, Pocket, the
+            // finishing passes, Groove and Chamfer: what would tell them
+            // apart (a depth, a face) is the part's geometry, not a field.
             Strategy::Box => match BOX_FIELDS.map(&n) {
+                // The bare word until its block has a size (LIO-426).
                 [
                     Some(x0),
                     Some(x1),
@@ -4323,7 +4338,7 @@ impl Operation {
                     Some(y1),
                     Some(top),
                     Some(bottom),
-                ] => Some(format!(
+                ] if x1 > x0 && y1 > y0 && top > bottom => Some(format!(
                     "Box {} × {} × {} deep",
                     mm(x1 - x0),
                     mm(y1 - y0),
