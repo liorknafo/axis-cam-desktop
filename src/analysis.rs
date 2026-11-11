@@ -1661,6 +1661,10 @@ pub struct Precondition {
     /// What to do when it is not met.
     pub hint: String,
 }
+/// What the planner says when the first setup it reads (`planning`: the
+/// hand setups before the first CNC one left out) is on a hand machine,
+/// which is so when no setup is on a CNC.
+pub const HAND_ONLY: &str = "The planner starts from a CNC setup today.";
 /// What must be in place before a plan can be requested or checked.
 pub fn preconditions(doc: &Document, mesh: Option<&Mesh>) -> Vec<Precondition> {
     let line = |label, problem: Option<String>| Precondition {
@@ -1674,6 +1678,11 @@ pub fn preconditions(doc: &Document, mesh: Option<&Mesh>) -> Vec<Precondition> {
     let doc = &*planning(doc);
     let setup = match doc.setups.first() {
         None => Some("Create setup 1 with your machine and stock.".to_string()),
+        // ponytail: said plainly until a job on the hand machines alone is
+        // planned (LIO-430, its item 3).
+        Some(setup1) if crate::manual::is_hand(&setup1.machine) => {
+            Some(HAND_ONLY.to_string())
+        }
         Some(setup1) => crate::post::PostSettings::for_machine(&setup1.machine)
             .err()
             .and_then(|e| e.into_iter().next())
