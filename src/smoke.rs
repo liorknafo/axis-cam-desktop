@@ -30851,6 +30851,37 @@ soft_max = 180.0
             assert_eq!((a.page, a.doc.index()), (Page::Work, si));
         }
     }
+    /// A job on the hand machines alone: the planner says plainly that it
+    /// starts from a CNC setup, on the manual mill and on the lathe; a CNC
+    /// job is as before (LIO-430, item 3).
+    #[test]
+    fn the_planner_says_it_starts_from_a_cnc_setup() {
+        let setup1 = |a: &App| {
+            crate::analysis::preconditions(&a.doc, a.part_mesh())
+                .into_iter()
+                .find(|p| p.label.starts_with("Setup 1"))
+                .unwrap()
+        };
+        let cnc = imported_app();
+        assert_ne!(setup1(&cnc).hint, crate::analysis::HAND_ONLY);
+        for hand in [
+            crate::manual::is_manual as fn(&crate::model::Machine) -> bool,
+            crate::lathe::is_lathe,
+        ] {
+            let mut a = imported_app();
+            with_manual(&mut a);
+            with_lathe(&mut a);
+            let _ = a.update(Message::AddManualSetup);
+            let _ = a.update(Message::AddLatheSetup);
+            a.doc.setups.retain(|s| hand(&s.machine));
+            a.doc.active = a.doc.setups[0].id.clone();
+            let line = setup1(&a);
+            assert!(!line.ok);
+            assert_eq!(line.hint, crate::analysis::HAND_ONLY);
+            a.page = Page::Ai;
+            shows(&a, &[crate::analysis::HAND_ONLY]);
+        }
+    }
     /// The sample app with a lathe in the library and a lathe tool of each type.
     fn with_lathe(a: &mut App) {
         a.doc.machines.push(crate::lathe::defaults());

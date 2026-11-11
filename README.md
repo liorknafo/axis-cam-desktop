@@ -1419,6 +1419,8 @@ If OpenAI's model list is empty or cannot be loaded, the app keeps the saved mod
 
 ## Plan a job with AI
 
+A job whose setups are all on the manual mill and the lathe cannot be planned yet: its Setup 1 line says "The planner starts from a CNC setup today." (LIO-430).
+
 **AI planner → Plan this job** asks the selected model for a complete job and checks it before you see it. It needs an imported part that is a closed solid; setup 1 complete as you have it (a name, a work offset, a 3-axis LinuxCNC or UC100 machine, stock, and rotations that are multiples of 90°; a UC100 machine's profile must load); a project material chosen from the material library that has cutting data (the checklist says to choose one, or to add cutting data to the chosen one on the Materials page); a tool library with unique tool numbers; and a ChatGPT sign-in with plan usage. The checklist on the page shows what is missing; the part's closed surface is checked when you click Plan.
 
 What happens after the click:
