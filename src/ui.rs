@@ -886,6 +886,8 @@ fn thread_icon<'a>(size: f32) -> widget::Svg<'a> {
 fn op_icon<'a>(app: &App, o: &Operation, size: f32) -> widget::Svg<'a> {
     if o.is_thread() {
         thread_icon(size)
+    } else if o.strategy == Strategy::Turn {
+        turn_icon(app, get(&o.p, "turn_kind"), size)
     } else {
         icon(app, o.strategy, size)
     }
@@ -1436,43 +1438,43 @@ fn ribbon(app: &App) -> Element<'_, Message> {
     .spacing(2)
     .align_x(Alignment::Center);
     groups = groups.push(setup).push(rule::vertical(1));
-    let manual_setup = app
-        .doc
-        .active_setup()
-        .is_some_and(|s| manual::is_manual(&s.machine));
-    let lathe_setup = app
-        .doc
-        .active_setup()
-        .is_some_and(|s| lathe::is_lathe(&s.machine));
-    let all = &Strategy::ALL;
-    for (label, group) in [
-        (
-            "2D MILLING",
-            &[&all[0..5], &[Strategy::Chamfer][..]].concat()[..],
-        ),
-        ("UNDERCUT", &all[13..14]),
-        ("3D FINISHING", &all[5..8]),
-        ("MULTI-AXIS", &all[8..11]),
-        ("MANUAL", &all[11..12]),
-        ("LATHE", &all[12..13]),
-    ] {
+    let machine = app.doc.active_setup().map(|s| &s.machine);
+    for (label, group) in ribbon_tiles(machine) {
         let mut buttons = Row::new().spacing(1);
-        for s in group {
-            let s = *s;
-            // Why the strategy is dimmed on the active setup's machine.
-            let reason = if lathe_setup {
-                (!matches!(s, Strategy::Turn | Strategy::Drill)).then_some(lathe::ONLY_TURN)
-            } else if s == Strategy::Turn {
-                Some(lathe::TURN_ON_MILL)
-            } else if s == Strategy::Box {
-                (!manual_setup).then_some(manual::BOX_ON_CNC)
-            } else if s == Strategy::Indexed {
-                // A pointer to indexed setups, not an operation to add.
-                Some(crate::indexed::POINTER)
-            } else {
-                (manual_setup && s != Strategy::Drill).then_some(manual::ONE_AXIS)
+        for tile in group {
+            let s = match tile {
+                Tile::Op(s) => s,
+                // Thread, the one place a thread is added (LIO-419).
+                Tile::Thread => {
+                    let tile = button(
+                        column![thread_icon(29.), text("Thread").size(12)]
+                            .spacing(4)
+                            .align_x(Alignment::Center),
+                    )
+                    .padding([5, 5])
+                    .on_press(Message::AddThreading)
+                    .style(button::text);
+                    buttons = buttons.push(HelpButton::new(tile, &Message::AddThreading, "Thread"));
+                    continue;
+                }
+                // A lathe cut: a Turn of that kind (LIO-421).
+                Tile::Cut(kind) => {
+                    let m = Message::AddTurn(kind);
+                    let tile = button(
+                        column![turn_icon(app, kind, 29.), text(kind).size(12)]
+                            .spacing(4)
+                            .align_x(Alignment::Center),
+                    )
+                    .padding([5, 5])
+                    .on_press(m.clone())
+                    .style(button::text);
+                    buttons = buttons.push(HelpButton::new(tile, &m, kind));
+                    continue;
+                }
             };
-            let available = reason.is_none() && (app.is_sample() || s.imported_preview());
+            // Only what the machine runs is shown (LIO-421); a CNC strategy
+            // this build cannot preview on an imported part stays, dimmed.
+            let available = app.is_sample() || s.imported_preview();
             // An unavailable strategy is dimmed: the icon at low opacity and
             // the label in a light grey, with its reason in the hover help.
             let glyph = icon(app, s, 29.).opacity(if available { 1. } else { DIMMED });
@@ -1492,30 +1494,17 @@ fn ribbon(app: &App) -> Element<'_, Message> {
                 .align_x(Alignment::Center),
             )
             .padding([5, 5])
-            .on_press(match (available, reason) {
-                (true, _) => Message::AddOp(s),
-                (false, Some(_)) => Message::Noop,
-                (false, None) => Message::Page(Page::Audit),
+            .on_press(if available {
+                Message::AddOp(s)
+            } else {
+                Message::Page(Page::Audit)
             })
             .style(button::text);
-            buttons = buttons.push(match (available, reason) {
-                (true, _) => HelpButton::new(tile, &Message::AddOp(s), s.name()),
-                (false, Some(reason)) => HelpButton::dimmed(tile, s, reason),
-                (false, None) => HelpButton::unavailable(tile, s),
+            buttons = buttons.push(if available {
+                HelpButton::new(tile, &Message::AddOp(s), s.name())
+            } else {
+                HelpButton::unavailable(tile, s)
             });
-            // Thread beside Drill, on every machine: the one place a thread
-            // is added (LIO-419).
-            if s == Strategy::Drill {
-                let tile = button(
-                    column![thread_icon(29.), text("Thread").size(12)]
-                        .spacing(4)
-                        .align_x(Alignment::Center),
-                )
-                .padding([5, 5])
-                .on_press(Message::AddThreading)
-                .style(button::text);
-                buttons = buttons.push(HelpButton::new(tile, &Message::AddThreading, "Thread"));
-            }
         }
         groups = groups
             .push(
@@ -1544,6 +1533,64 @@ fn ribbon(app: &App) -> Element<'_, Message> {
         .width(Fill)
         .style(panel_style)
         .into()
+}
+/// A toolbar tile: a strategy, Thread, or a lathe cut (a Turn of a kind).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Tile {
+    Op(Strategy),
+    Thread,
+    Cut(&'static str),
+}
+/// The toolbar's groups on `machine`: what it runs, and only that
+/// (LIO-421). With no setup, the CNC mill's.
+pub(crate) fn ribbon_tiles(
+    machine: Option<&crate::model::Machine>,
+) -> Vec<(&'static str, Vec<Tile>)> {
+    use Strategy::*;
+    use Tile::*;
+    if machine.is_some_and(lathe::is_lathe) {
+        let cuts = ["Face", "Outside", "Bore", "Groove", "Chamfer", "Part off"];
+        let tiles = cuts.into_iter().map(Cut).chain([Thread, Op(Drill)]);
+        return vec![("LATHE", tiles.collect())];
+    }
+    if machine.is_some_and(manual::is_manual) {
+        return vec![("MANUAL MILL", vec![Op(Box), Op(Drill), Thread])];
+    }
+    vec![
+        (
+            "2D MILLING",
+            vec![
+                Op(Face),
+                Op(Adaptive),
+                Op(Pocket),
+                Op(Contour),
+                Op(Drill),
+                Thread,
+                Op(Chamfer),
+            ],
+        ),
+        ("UNDERCUT", vec![Op(Groove)]),
+        (
+            "3D FINISHING",
+            vec![Op(Parallel), Op(Waterline), Op(Scallop)],
+        ),
+        ("MULTI-AXIS", vec![Op(Rotary), Op(FiveAxis)]),
+    ]
+}
+/// A lathe cut's icon (LIO-421): Outside is the Turn's, Thread the Thread's.
+fn turn_icon<'a>(app: &App, kind: &str, size: f32) -> widget::Svg<'a> {
+    let bytes: &'static [u8] = match kind {
+        "Face" => include_bytes!("../assets/op-lathe-face.svg"),
+        "Bore" => include_bytes!("../assets/op-lathe-bore.svg"),
+        "Groove" => include_bytes!("../assets/op-lathe-groove.svg"),
+        "Chamfer" => include_bytes!("../assets/op-lathe-chamfer.svg"),
+        "Part off" => include_bytes!("../assets/op-lathe-partoff.svg"),
+        "Thread" => return thread_icon(size),
+        _ => return icon(app, Strategy::Turn, size),
+    };
+    svg(svg::Handle::from_memory(bytes))
+        .width(size)
+        .height(size)
 }
 /// Room kept at the right of a scrolled column for its scrollbar, which
 /// Iced's `scrollable` draws over the content: the bar is 10 wide.
@@ -3287,6 +3334,9 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
     // A Thread is a Thread everywhere (LIO-419).
     let title = if o.is_thread() {
         "Thread"
+    } else if o.strategy == Strategy::Turn {
+        // The lathe cut, as its tile says (LIO-421).
+        get(&o.p, "turn_kind")
     } else {
         o.strategy.name()
     };
@@ -4603,14 +4653,8 @@ fn turn_fields<'a>(o: &'a Operation, checks: &mut Checks) -> Element<'a, Message
         if named == "Custom" {
             c = c.push(muted("Custom: not a standard size; type its diameter and pitch.").size(12));
         }
-    } else {
-        // A thread is added with Thread (LIO-419).
-        let kinds: Vec<&str> = (lathe::TURN_KINDS.iter())
-            .copied()
-            .filter(|k| *k != "Thread")
-            .collect();
-        c = c.push(choice(p, "turn_kind", "Kind", &kinds, t));
     }
+    // No Kind list: the cut is the tile that was pressed (LIO-421).
     c = c.push(note(
         "Z 0 is the free end of the bar, negative toward the chuck. Sizes are diameters.",
     ));

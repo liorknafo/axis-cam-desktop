@@ -264,6 +264,8 @@ pub enum Message {
     PutBackEdit,
     Title(String),
     AddOp(Strategy),
+    /// A lathe cut from its toolbar tile: a Turn of this kind (LIO-421).
+    AddTurn(&'static str),
     DuplicateOp,
     RemoveOp,
     /// The operation editor's Delete: asks before `RemoveOp`, as a setup's
@@ -5432,6 +5434,7 @@ impl App {
     pub fn resume_label(&self) -> Option<String> {
         Some(match &self.pending.as_ref()?.1 {
             Message::AddOp(s) => format!("Save and continue to {}", s.name()),
+            Message::AddTurn(kind) => format!("Save and continue to {kind}"),
             Message::AddSetup => "Save and create first setup".into(),
             _ => return None,
         })
@@ -5561,6 +5564,7 @@ impl App {
                     | Message::PreviewStep
                     | Message::Edit(Target::Setup, _, _)
                     | Message::AddOp(_)
+                    | Message::AddTurn(_)
                     | Message::DuplicateOp
                     | Message::RemoveOp
                     | Message::AskRemoveOp
@@ -5947,7 +5951,13 @@ impl App {
                 self.doc.title = v;
                 self.touch()
             }
-            Message::AddOp(strategy) => {
+            m @ (Message::AddOp(_) | Message::AddTurn(_)) => {
+                let (strategy, kind) = match m {
+                    Message::AddTurn(kind) => (Strategy::Turn, Some(kind)),
+                    Message::AddOp(s) => (s, None),
+                    _ => unreachable!(),
+                };
+                let added = kind.unwrap_or(strategy.name());
                 if !self.is_sample() && !strategy.imported_preview() {
                     self.stop_selection();
                     self.status = strategy.availability().into();
@@ -5956,6 +5966,9 @@ impl App {
                 }
                 let machine = &self.doc.setup().machine;
                 let mut operation = Operation::for_machine(strategy, String::new(), machine);
+                if let Some(kind) = kind {
+                    operation.set_turn_kind(kind);
+                }
                 // The first tool of the operation's first type, else of
                 // another type it takes (`Operation::tool_types`).
                 let types = operation.tool_types(machine);
@@ -5988,12 +6001,10 @@ impl App {
                     }
                     self.tool_draft = draft;
                     self.page = Page::Tools;
-                    self.pending = Some((Page::Tools, Message::AddOp(strategy)));
+                    self.pending = Some((Page::Tools, m));
                     self.status = format!(
-                        "{} needs a {}. Create one: saving it adds {}.",
-                        strategy.name(),
+                        "{added} needs a {}. Create one: saving it adds {added}.",
                         kind.to_lowercase(),
-                        strategy.name()
                     );
                     return Task::none();
                 };
@@ -6055,10 +6066,7 @@ impl App {
                 self.page = Page::Work;
                 self.picking = false;
                 self.touch();
-                self.status = format!(
-                    "Added {}. Choose a tool and machining geometry.",
-                    strategy.name()
-                );
+                self.status = format!("Added {added}. Choose a tool and machining geometry.");
                 if let Some((named, missing)) = centred {
                     self.status.push(' ');
                     self.status

@@ -114,18 +114,6 @@ impl<'a> HelpButton<'a> {
             help: unavailable_help(strategy),
         }
     }
-    /// A ribbon tile for a strategy the active setup's machine cannot run:
-    /// the hover help is the machine's `reason`.
-    pub fn dimmed(
-        button: widget::Button<'a, Message>,
-        strategy: Strategy,
-        reason: &'static str,
-    ) -> Self {
-        Self {
-            button,
-            help: dimmed_help(strategy, reason),
-        }
-    }
     pub fn width(mut self, width: impl Into<Length>) -> Self {
         self.button = self.button.width(width);
         self
@@ -146,13 +134,6 @@ pub fn unavailable_help(strategy: Strategy) -> Help {
     )
     .more(strategy.help())
     .animated(Diagram::Operation(strategy))
-}
-/// The hover help of a strategy dimmed by the machine: its reason, and under
-/// More… what the strategy does.
-pub fn dimmed_help(strategy: Strategy, reason: &'static str) -> Help {
-    Help::text(format!("{} (unavailable)", strategy.name()), reason)
-        .more(strategy.help())
-        .animated(Diagram::Operation(strategy))
 }
 impl<'a> From<HelpButton<'a>> for Element<'a, Message> {
     fn from(b: HelpButton<'a>) -> Self {
@@ -1103,7 +1084,8 @@ pub fn command(m: &Message, label: String) -> Help {
         ),
         AddSetup => (
             "Add another machining position with its own machine, stock, work offset and operations. Use a new setup when you reclamp, flip or reorient the part. Without a setup, choose or configure your machine first.",
-            "",
+            // Indexed is no toolbar tile: it is said here (LIO-421).
+            crate::indexed::POINTER,
         ),
         AddManualSetup => (
             "Add a setup on the manual mill before the CNC setups, for the cuts the big mill makes first. Put first, it takes the stock, orientation, zero and holding of the old first setup, which then starts from the stock it leaves.",
@@ -1204,6 +1186,30 @@ pub fn command(m: &Message, label: String) -> Help {
         AddCentring => (
             "Add a centre drilling just before this drill, on its holes: a 60° centre drill of the library, its cone opened to each hole's size (its body's when the hole is wider), so the drill finds the centre instead of walking on the flat face.",
             "Its holes follow the drill's, and deleting the drill deletes it. The library's centre drill whose pilot goes down the narrowest hole and whose body reaches the widest; with none, it is added without a tool and the status says which to add.",
+        ),
+        AddTurn("Face") => (
+            "Add a Face on the lathe: the end of the bar faced square, a little taken off, from the outside in to the centre or to a diameter.",
+            "",
+        ),
+        AddTurn("Outside") => (
+            "Add an Outside turn on the lathe: the bar turned down to a diameter, from its end to a Z, in passes.",
+            "",
+        ),
+        AddTurn("Bore") => (
+            "Add a Bore on the lathe: a drilled hole on the centre opened with the boring bar to a diameter, to a Z, in passes.",
+            "",
+        ),
+        AddTurn("Groove") => (
+            "Add a Groove on the lathe: the grooving tool plunged to a diameter, at a Z, over a width.",
+            "",
+        ),
+        AddTurn("Chamfer") => (
+            "Add a Chamfer on the lathe: a 45° chamfer of a size on the end's outside or inside edge, or on a shoulder.",
+            "",
+        ),
+        AddTurn("Part off") => (
+            "Add a Part off on the lathe: the parting blade cuts the part free of the bar at a Z.",
+            "",
         ),
         AddThreading => (
             "Add a Thread operation for each thread size modeled on the part that this setup reaches and that has none yet, with what it needs before it: its tap drill (and on the manual mill one centre drilling), or on the lathe the blank turned to size or the tap drill. With none left, one Thread to fill by hand. Deleting a Thread deletes what it brought.",
@@ -4895,6 +4901,12 @@ mod tests {
             PlacePins,
             AddPinDrilling,
             AddThreading,
+            AddTurn("Face"),
+            AddTurn("Outside"),
+            AddTurn("Bore"),
+            AddTurn("Groove"),
+            AddTurn("Chamfer"),
+            AddTurn("Part off"),
             AddNeededTool,
             AddHoleStages,
             AddCentring,
@@ -5091,13 +5103,6 @@ mod tests {
             .collect();
         for s in Strategy::ALL {
             cards.push((format!("unavailable:{s:?}"), unavailable_help(s)));
-            for reason in [
-                crate::manual::ONE_AXIS,
-                crate::lathe::ONLY_TURN,
-                crate::lathe::TURN_ON_MILL,
-            ] {
-                cards.push((format!("dimmed:{s:?}:{reason}"), dimmed_help(s, reason)));
-            }
             let b = HelpButton::operation(
                 widget::button("x"),
                 s,
