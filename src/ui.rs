@@ -1448,10 +1448,59 @@ fn first_setup(app: &App) -> Panel<'_> {
         foot: None,
     }
 }
+/// The one "+ Add setup", in the toolbar and the browser (LIO-422): with
+/// one machine or none in the library a button (`AddSetup`); with more, the
+/// question of which, each machine by name and kind, the active setup's
+/// first. Its hover help points to indexed setups (`indexed::POINTER`).
+fn add_setup(app: &App, wide: bool) -> Element<'_, Message> {
+    const LABEL: &str = "+ Add setup";
+    let choices = setup_choices(app);
+    if choices.len() < 2 {
+        return if wide {
+            secondary(LABEL, Message::AddSetup).width(Fill).into()
+        } else {
+            btn(LABEL, Message::AddSetup, false).into()
+        };
+    }
+    let labels: Vec<String> = choices.iter().map(|(l, _)| l.clone()).collect();
+    let list = pick_list(labels, None::<String>, move |label| {
+        let id = (choices.iter())
+            .find(|(l, _)| *l == label)
+            .map(|(_, id)| id.clone());
+        Message::AddSetupOn(id.unwrap_or_default())
+    })
+    .placeholder(LABEL)
+    .text_size(12)
+    .padding([5, 8])
+    .style(choice_style);
+    let list = if wide {
+        list.width(Fill)
+    } else {
+        list.width(130)
+    };
+    help::wrap(
+        list,
+        help::command(&Message::AddSetup, LABEL.into()),
+        widget::tooltip::Position::Bottom,
+    )
+}
+/// What "+ Add setup" offers: each machine of the library as (its name and
+/// kind, its id), the active setup's first (LIO-422).
+pub(crate) fn setup_choices(app: &App) -> Vec<(String, String)> {
+    let active = app.doc.active_setup().map(|s| s.machine.id.as_str());
+    let mut machines: Vec<&crate::model::Machine> = app.doc.machines.iter().collect();
+    machines.sort_by_key(|m| Some(m.id.as_str()) != active);
+    (machines.into_iter())
+        .map(|m| {
+            let kind = if manual::is_hand(m) { "by hand" } else { "CNC" };
+            (format!("{} · {kind}", m.name()), m.id.clone())
+        })
+        .collect()
+}
 fn ribbon(app: &App) -> Element<'_, Message> {
     let mut groups = Row::new().spacing(9).align_y(Alignment::Center);
     let setup = column![
-        btn("+ Setup", Message::AddSetup, false),
+        add_setup(app, false),
         btn(
             "Edit setup",
             Message::SetupEditor,
@@ -2091,15 +2140,7 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
     if let Some(block) = uncut_block(app) {
         tree = tree.push(block);
     }
-    tree = tree
-        .push(space().height(6))
-        .push(secondary("+ Add setup", Message::AddSetup).width(Fill));
-    if app.doc.machines.iter().any(manual::is_manual) {
-        tree = tree.push(secondary("+ Add manual setup", Message::AddManualSetup).width(Fill));
-    }
-    if app.doc.machines.iter().any(lathe::is_lathe) {
-        tree = tree.push(secondary("+ Add lathe setup", Message::AddLatheSetup).width(Fill));
-    }
+    tree = tree.push(space().height(6)).push(add_setup(app, true));
     let footer = column![
         rule::horizontal(1),
         muted("PROJECT UNITS"),

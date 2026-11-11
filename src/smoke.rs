@@ -30270,16 +30270,70 @@ soft_max = 180.0
         let cnc = &a.doc.setups[1];
         assert!(crate::cam::box_shown(cnc, &cnc.operations[0], &mesh, stock).is_none());
     }
+    /// One "+ Add setup", in the toolbar and the browser, both the same: a
+    /// button with one machine, the machines to choose from with more, the
+    /// active setup's first (LIO-422).
+    #[test]
+    fn one_add_setup_asks_which_machine() {
+        let mut a = app();
+        a.doc.machines.truncate(1);
+        let adds = |a: &App| {
+            (crate::ui::probe::clicks(a.view(), WINDOW).iter())
+                .filter(|m| matches!(m, Message::AddSetup))
+                .count()
+        };
+        let both = |a: &App| page_texts(a).iter().filter(|t| *t == "+ Add setup").count();
+        // One machine: a button in each place, adding at once.
+        assert_eq!(crate::ui::setup_choices(&a).len(), 1);
+        // The probe clicks each button at many points.
+        assert!(both(&a) == 2 && adds(&a) > 0);
+        lacks(&a, &["+ Setup", "+ Add manual setup", "+ Add lathe setup"]);
+        // A CNC mill, a manual mill and a lathe: the three, CNC first while
+        // its setup is open; no button adds a setup without asking.
+        with_manual(&mut a);
+        with_lathe(&mut a);
+        let labels: Vec<String> = (crate::ui::setup_choices(&a).into_iter())
+            .map(|(l, _)| l)
+            .collect();
+        assert_eq!(labels.len(), 3, "{labels:?}");
+        assert!(labels[0].ends_with(" · CNC"), "{labels:?}");
+        assert_eq!(
+            labels.iter().filter(|l| l.ends_with(" · by hand")).count(),
+            2
+        );
+        // (The list's "+ Add setup" is its placeholder, which the probe
+        // does not read as a text.)
+        assert_eq!(adds(&a), 0);
+        lacks(&a, &["+ Add manual setup", "+ Add lathe setup"]);
+        // On the manual mill's setup its machine comes first.
+        let manual = (a.doc.machines.iter()).find(|m| crate::manual::is_manual(m));
+        let manual = manual.unwrap().id.clone();
+        let _ = a.update(Message::AddSetupOn(manual.clone()));
+        assert_eq!(crate::ui::setup_choices(&a)[0].1, manual);
+        // The CNC choice gives what "+ Add setup" gave.
+        let cnc = a.doc.machines[0].id.clone();
+        let n = a.doc.setups.len();
+        let _ = a.update(Message::AddSetupOn(cnc.clone()));
+        assert_eq!(a.doc.setups.len(), n + 1);
+        assert_eq!(a.doc.setup().machine.id, cnc);
+    }
     #[test]
     fn add_manual_setup_shows_with_a_manual_machine_and_inserts_the_setup() {
         let mut a = app();
+        // One "+ Add setup" (LIO-422): the manual mill is chosen in it, and
+        // gives what "+ Add manual setup" gave.
         lacks(&a, &["+ Add manual setup"]);
         with_manual(&mut a);
-        shows(&a, &["+ Add manual setup"]);
-        let clicks = crate::ui::probe::clicks(a.view(), WINDOW);
-        assert!(clicks.iter().any(|m| matches!(m, Message::AddManualSetup)));
+        lacks(&a, &["+ Add manual setup"]);
+        let id = (a.doc.machines.iter()).find(|m| crate::manual::is_manual(m));
+        let id = id.unwrap().id.clone();
+        assert!(
+            crate::ui::setup_choices(&a)
+                .iter()
+                .any(|(l, i)| *i == id && l.ends_with(" · by hand"))
+        );
         let old = a.doc.active.clone();
-        let _ = a.update(Message::AddManualSetup);
+        let _ = a.update(Message::AddSetupOn(id));
         assert_eq!(a.doc.setups.len(), 2);
         // Named as its machine, and opened (LIO-371): it was left closed.
         assert_eq!(a.doc.setups[0].name(), "Manual Mill");
@@ -30465,15 +30519,15 @@ soft_max = 180.0
     #[test]
     fn add_lathe_setup_shows_with_a_lathe_and_inserts_the_setup() {
         let mut a = app();
-        lacks(&a, &["+ Add lathe setup"]);
+        // One "+ Add setup" (LIO-422): the lathe is chosen in it, and gives
+        // what "+ Add lathe setup" gave.
         a.doc.machines.push(crate::manual::defaults());
-        lacks(&a, &["+ Add lathe setup"]);
         with_lathe(&mut a);
-        shows(&a, &["+ Add lathe setup"]);
-        // Not clicked: the setup's own NC review ▶ (LIO-423) puts it under
-        // the browser's fold, which scrolls to it.
+        lacks(&a, &["+ Add lathe setup"]);
+        let id = (a.doc.machines.iter()).find(|m| crate::lathe::is_lathe(m));
+        let id = id.unwrap().id.clone();
         let old = a.doc.active.clone();
-        let _ = a.update(Message::AddLatheSetup);
+        let _ = a.update(Message::AddSetupOn(id));
         assert_eq!(a.doc.setups.len(), 2);
         assert_eq!(a.doc.setups[0].name(), "Manual Lathe");
         assert_eq!(a.doc.setups[1].id, old);
