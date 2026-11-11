@@ -2582,6 +2582,11 @@ impl App {
             }
         }
     }
+    /// Whether the active setup is on a hand machine (the manual mill or
+    /// the lathe): no program, its way to the machine is Steps (LIO-423).
+    pub fn on_hand(&self) -> bool {
+        (self.doc.active_setup()).is_some_and(|s| manual::is_hand(&s.machine))
+    }
     pub fn can_pick(&self) -> bool {
         self.operation().is_some_and(|o| {
             // A lathe drills on its centre and turns by numbers: nothing to pick.

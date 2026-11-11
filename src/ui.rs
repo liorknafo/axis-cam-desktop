@@ -1189,6 +1189,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
             // MANUFACTURE previews and posts.
             text(if app.page == Page::Control {
                 "mm  |  UC100 machine control"
+            } else if app.on_hand() {
+                // No post on a hand machine (LIO-423).
+                "mm"
             } else {
                 "mm  |  Bounded mesh previews · LinuxCNC 3-axis and indexed A post"
             })
@@ -1518,7 +1521,10 @@ fn ribbon(app: &App) -> Element<'_, Message> {
             )
             .push(rule::vertical(1));
     }
-    groups = groups.push(space().width(Fill)).push(
+    // A hand setup's way to the machine is its Steps (LIO-423).
+    let actions = if app.on_hand() {
+        column![btn("Steps ▶", steps_of(app.doc.index()), false)]
+    } else {
         column![
             btn("Generate all", Message::GenerateAll, false),
             btn(
@@ -1526,10 +1532,13 @@ fn ribbon(app: &App) -> Element<'_, Message> {
                 Message::Page(Page::Post),
                 app.page == Page::Post
             ),
-            muted("ACTIONS").size(10)
         ]
-        .align_x(Alignment::Center)
-        .spacing(2),
+    };
+    groups = groups.push(space().width(Fill)).push(
+        actions
+            .push(muted("ACTIONS").size(10))
+            .align_x(Alignment::Center)
+            .spacing(2),
     );
     container(groups)
         .padding([8, 14])
@@ -1595,6 +1604,10 @@ fn turn_icon<'a>(app: &App, kind: &str, size: f32) -> widget::Svg<'a> {
     svg(svg::Handle::from_memory(bytes))
         .width(size)
         .height(size)
+}
+/// Opens setup `si`'s Steps page.
+fn steps_of(si: usize) -> Message {
+    Message::Guide(crate::GuideAction::Open(si))
 }
 /// Room kept at the right of a scrolled column for its scrollbar, which
 /// Iced's `scrollable` draws over the content: the bar is 10 wide.
@@ -1894,7 +1907,7 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
                     // and its name is the machine's: say what it is
                     // (LIO-382).
                     muted(if crate::manual::is_hand(&s.machine) {
-                        "hand-fed · no G-code".to_string()
+                        "worked by hand".to_string()
                     } else {
                         format!(
                             "{} · {}-axis",
@@ -1942,15 +1955,16 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
                 container(muted(format!("{} · v{}", s.machine.name(), s.machine.version)).size(12))
                     .padding([0, 16]),
             );
-            if manual::is_hand(&s.machine) {
-                tree = tree.push(
-                    container(
-                        secondary("Steps ▶", Message::Guide(crate::GuideAction::Open(si)))
-                            .width(Fill),
-                    )
-                    .padding([0, 10]),
-                );
-            }
+            // Every setup's way to the machine, as the last tab under the
+            // view names it (LIO-423).
+            let (label, m) = if manual::is_hand(&s.machine) {
+                ("Steps ▶", steps_of(si))
+            } else if get(&s.machine.p, "controller") == "UC100" {
+                ("Review & run ▶", Message::Page(Page::Post))
+            } else {
+                ("NC review ▶", Message::Page(Page::Post))
+            };
+            tree = tree.push(container(secondary(label, m).width(Fill)).padding([0, 10]));
             let checks = app.current_ready();
             for (i, o) in s.operations.iter().enumerate() {
                 let selected = app.selected == Some(i) && app.page == Page::Work;
@@ -2740,30 +2754,33 @@ fn workspace(app: &App) -> Element<'_, Message> {
     // A UC100 machine takes no G-code file: its setups run from MACHINE.
     let uc100 =
         (app.doc.active_setup()).is_some_and(|s| get(&s.machine.p, "controller") == "UC100");
-    let workflow = container(
-        row![
-            btn("01  Setup", Message::SetupEditor, app.selected.is_none()),
-            btn(
-                "02  Operations",
-                Message::OperationsStep,
-                app.selected.is_some()
-            ),
-            btn("03  Preview", Message::PreviewStep, false),
-            btn(
+    let tabs = row![
+        btn("01  Setup", Message::SetupEditor, app.selected.is_none()),
+        btn(
+            "02  Operations",
+            Message::OperationsStep,
+            app.selected.is_some()
+        ),
+    ];
+    // A hand setup has no preview to export: its third is its Steps (LIO-423).
+    let tabs = if app.on_hand() {
+        tabs.push(btn("03  Steps", steps_of(app.doc.index()), false))
+    } else {
+        tabs.push(btn("03  Preview", Message::PreviewStep, false))
+            .push(btn(
                 if uc100 {
                     "04  Review & run"
                 } else {
                     "04  NC review"
                 },
                 Message::Page(Page::Post),
-                false
-            )
-        ]
-        .spacing(2),
-    )
-    .width(Fill)
-    .padding([5, 8])
-    .style(panel_style);
+                false,
+            ))
+    };
+    let workflow = container(tabs.spacing(2))
+        .width(Fill)
+        .padding([5, 8])
+        .style(panel_style);
     column![heading, middle, workflow]
         .height(Fill)
         .width(Fill)
@@ -2975,6 +2992,8 @@ fn scene_panels(
             bold(
                 if app.is_sample() {
                     "SAMPLE MOTION"
+                } else if app.on_hand() {
+                    "CHECK"
                 } else if imported_facing {
                     "OPERATION SIMULATION"
                 } else {
@@ -3200,7 +3219,14 @@ fn scene_panels(
             .align_y(Alignment::Center);
         if imported_facing {
             // The inspector's Generate is the region's filled command.
-            empty = empty.push(secondary("Generate & play", Message::Play));
+            empty = empty.push(secondary(
+                if app.on_hand() {
+                    "Play the cut"
+                } else {
+                    "Generate & play"
+                },
+                Message::Play,
+            ));
         } else if app.is_sample() && app.operation().is_some_and(|o| o.enabled) {
             empty = empty.push(secondary("Generate sample preview", Message::Generate));
         }
@@ -4525,6 +4551,8 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
         primary(
             if app.is_sample() {
                 "Generate sample preview"
+            } else if app.on_hand() {
+                "Show the cut"
             } else if o.strategy.imported_preview() {
                 "Generate operation preview"
             } else {
@@ -5176,9 +5204,9 @@ fn setup_machine<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message
             .width(Fill),
         )
         .push(muted(if crate::lathe::is_lathe(&s.machine) {
-            "Manual lathe, no G-code. The dials' zero is in the Work zero step."
+            "Manual lathe, worked by hand. The dials' zero is in the Work zero step."
         } else if crate::manual::is_manual(&s.machine) {
-            "Manual mill, no G-code. The DRO's zero is in the Work zero step."
+            "Manual mill, worked by hand. The DRO's zero is in the Work zero step."
         } else {
             "The work zero and its offset (G54–G59) are in the Work zero step."
         }))
@@ -13857,6 +13885,19 @@ pub(crate) enum Note {
 /// The whole text of a note that says what is checked of the fixtures, for the
 /// active setup: what comes before the words of `fixtures`, then those.
 pub(crate) fn fixture_note(app: &App, note: Note) -> String {
+    // A hand machine has no program to export or collide: say what is
+    // checked of the cut (LIO-423).
+    if app.on_hand() && matches!(note, Note::Panel | Note::Playback) {
+        let what = if modelled(app) {
+            "Checked: the cut against the part and the vise jaws or clamps."
+        } else {
+            "Checked: the cut against the part."
+        };
+        return match note {
+            Note::Playback => format!("Show the cut, or Play the cut. {what}"),
+            _ => what.into(),
+        };
+    }
     let before = match note {
         Note::Preview | Note::Panel => "",
         Note::Facing => "Selections use connected planar regions of the imported mesh. ",
