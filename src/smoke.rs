@@ -5855,7 +5855,7 @@ flood = { pin = 8 }
         assert!(
             page_texts(&a)
                 .iter()
-                .any(|t| t.starts_with("✓ Thread M6×1"))
+                .any(|t| t.starts_with("✓ Thread M6×1 · 2× hole"))
         );
         // Again: one Thread to fill, no duplicate.
         let n = a.doc.setups[0].operations.len();

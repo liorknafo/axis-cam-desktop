@@ -875,6 +875,8 @@ fn section<'a>(title: impl Into<String>) -> Element<'a, Message> {
 fn icon<'a>(app: &App, s: Strategy, size: f32) -> widget::Svg<'a> {
     svg(app.icons[s.index()].clone()).width(size).height(size)
 }
+/// What a Thread is, under its name (LIO-419).
+const THREAD_ABOUT: &str = "Thread cuts a thread to its size: on the CNC a thread mill goes round each hole, on the manual mill a tap is turned by hand, on the lathe a threading tool, a die or a tap cuts it. It brings what it needs before it (the tap drill, a centre drilling, the blank turned to size) and takes them when deleted.";
 /// The Thread operation's icon (LIO-419).
 fn thread_icon<'a>(size: f32) -> widget::Svg<'a> {
     let handle = svg::Handle::from_memory(include_bytes!("../assets/op-thread.svg").as_slice());
@@ -2218,9 +2220,16 @@ fn threads_block(app: &App) -> Option<Element<'_, Message>> {
         block = block.push(match planned(t) {
             Some(i) => Element::from(
                 button(
-                    text(format!("✓ Thread {} · {n}× {line}", t.name()))
-                        .size(12)
-                        .color(BLUE),
+                    // The size once (LIO-419).
+                    text(format!(
+                        "✓ Thread {} · {n}× {}",
+                        t.name(),
+                        line.strip_prefix(t.name().as_str())
+                            .unwrap_or(line)
+                            .trim_start()
+                    ))
+                    .size(12)
+                    .color(BLUE),
                 )
                 .padding(0)
                 .style(button::text)
@@ -3319,8 +3328,10 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
     // The strategy's explanation and availability, behind a disclosure that
     // stays as it was left.
     let open = app.settings.layout.strategy_help_open;
-    c = c.push(about(format!("About {}", o.strategy.name()), open));
-    if open {
+    c = c.push(about(format!("About {title}"), open));
+    if open && o.is_thread() {
+        c = c.push(note(THREAD_ABOUT));
+    } else if open {
         c = c.push(note(format!(
             "{}\n\n{}",
             o.strategy.help(),
