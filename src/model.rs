@@ -1699,6 +1699,15 @@ impl Operation {
         } else {
             self.strategy.tabs()
         };
+        // A Thread's own tab in place of the Drill's Cycle and the Turn's
+        // Turn (LIO-419).
+        if self.is_thread() {
+            for t in tabs.iter_mut() {
+                if *t == "Cycle" || *t == "Turn" {
+                    *t = "Thread";
+                }
+            }
+        }
         // A hand machine's Drill has no linking moves: no Linking (LIO-410).
         if self.strategy == Strategy::Drill && crate::manual::is_hand(m) {
             tabs.retain(|t| *t != "Linking");
@@ -1777,6 +1786,14 @@ impl Operation {
     /// A Drill operation that threads its holes, by either cycle.
     pub fn threads(&self) -> bool {
         self.thread_milling() || self.tapping()
+    }
+    /// A Thread operation (LIO-419): a Drill that threads its holes, or a
+    /// Turn of kind Thread.
+    // ponytail: shown as Thread, stored as before (Drill + cycle, Turn +
+    // kind), so saved projects and the planner's proposals stay valid; a
+    // Strategy::Thread of its own if the two forms ever part.
+    pub fn is_thread(&self) -> bool {
+        self.threads() || (self.strategy == Strategy::Turn && get(&self.p, "turn_kind") == "Thread")
     }
     /// A Drill operation that reams its holes (`REAMING`).
     pub fn reaming(&self) -> bool {
@@ -7189,7 +7206,9 @@ mod manual_setups {
             let (_, _, op) = turn_of(kind);
             let passes = ["Outside", "Bore", "Thread"].contains(&kind);
             assert_eq!(op.tabs(&m).contains(&"Passes"), passes, "{kind}");
-            assert_eq!(op.tabs(&m)[..2], ["Tool", "Turn"], "{kind}");
+            // A Thread's own tab since LIO-419.
+            let second = if kind == "Thread" { "Thread" } else { "Turn" };
+            assert_eq!(op.tabs(&m)[..2], ["Tool", second], "{kind}");
         }
         // The other strategies keep theirs.
         let cnc = Machine::new(3);

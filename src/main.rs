@@ -5788,6 +5788,19 @@ impl App {
             }
             Message::Edit(target, k, v) => match target {
                 Target::Operation => {
+                    // A thread's size from the list sets its diameter and
+                    // pitch; Custom leaves them to type (LIO-416).
+                    if k == "thread_size" {
+                        if let Some(spec) = crate::thread::spec(&v)
+                            && let Some(o) = self.operation_mut()
+                        {
+                            let text = |x: f32| ((x * 1000.).round() / 1000.).to_string();
+                            o.p.insert("diameter".into(), text(spec.major));
+                            o.p.insert("pitch".into(), text(spec.pitch));
+                            self.touch();
+                        }
+                        return Task::none();
+                    }
                     // A Turn's kind brings its own fields, speed and tool.
                     if k == "turn_kind"
                         && lathe::tool_for(&v).is_some()
@@ -6079,14 +6092,21 @@ impl App {
             Message::RemoveOp => {
                 if let Some(i) = self.selected {
                     let gone = self.doc.setup_mut().operations.remove(i);
-                    // Its centre drillings go with it.
+                    // Its centre drillings go with it, and what a Thread
+                    // brought (its tap drill, the blank's turn) with theirs
+                    // (LIO-419).
                     let ops = &mut self.doc.setup_mut().operations;
-                    let before = ops[..i.min(ops.len())]
-                        .iter()
-                        .filter(|o| centre::centres(o) == Some(gone.id.as_str()))
-                        .count();
-                    ops.retain(|o| centre::centres(o) != Some(gone.id.as_str()));
-                    let i = i - before;
+                    let mut gone_ids = vec![gone.id.clone()];
+                    let brought = |o: &Operation, ids: &[String]| {
+                        let by = [centre::centres(o), Some(get(&o.p, threading::THREAD_OF))];
+                        by.into_iter()
+                            .flatten()
+                            .any(|id| ids.iter().any(|g| g == id))
+                    };
+                    while let Some(k) = ops.iter().position(|o| brought(o, &gone_ids)) {
+                        gone_ids.push(ops.remove(k).id);
+                    }
+                    let i = i.min(ops.len());
                     self.selected = if self.doc.setup().operations.is_empty() {
                         None
                     } else {
@@ -6501,12 +6521,16 @@ impl App {
             Message::AddThreading => {
                 let si = self.doc.index();
                 let Some(mesh) = self.part_mesh() else {
+                    self.status = "Load the part first: a Thread is cut on the part's holes or its turned diameter.".into();
                     return Task::none();
                 };
                 match threading::add(&self.doc, si, mesh) {
                     Ok(added) => {
                         let ids: std::collections::HashSet<String> =
                             added.ops.iter().map(|o| o.id.clone()).collect();
+                        let first = (added.ops.iter())
+                            .find(|o| o.is_thread())
+                            .map(|o| o.id.clone());
                         self.doc.setups[si].operations.extend(added.ops);
                         // On the manual mill each tap drill is centre drilled.
                         let (centrings, said) = centre::needed(&self.doc, si, self.part_mesh());
@@ -6551,9 +6575,17 @@ impl App {
                             ops.extend(spots);
                             ops.extend(rest);
                         }
+                        // The first Thread selected, its editor open
+                        // (LIO-419).
+                        self.selected = (self.doc.setups[si].operations.iter())
+                            .position(|o| Some(&o.id) == first.as_ref());
+                        self.tab = "Thread".into();
+                        self.page = Page::Work;
+                        self.picking = false;
                         self.touch();
                         self.status = added.status;
-                        if manual::is_manual(&self.doc.setups[si].machine) {
+                        if manual::is_manual(&self.doc.setups[si].machine) && !added.done.is_empty()
+                        {
                             let mut missing = added.missing;
                             if spotless {
                                 missing.insert(0, "a centre drill".into());

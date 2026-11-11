@@ -634,13 +634,14 @@ pub(crate) fn op_checks(app: &App) -> Vec<Check> {
 /// pin holes only drills; the lathe and the manual mill drill and tap by
 /// hand; a CNC drills and mills (helically, or a thread) but does not tap;
 /// a CNC and the manual mill ream and bore.
-fn drill_cycles(pin_holes: bool, machine: &Machine) -> Vec<&'static str> {
+pub(crate) fn drill_cycles(pin_holes: bool, machine: &Machine) -> Vec<&'static str> {
     DRILL_CYCLES
         .into_iter()
         .enumerate()
         .filter(|&(i, cycle)| match cycle {
             _ if i < 4 => true,
-            TAPPING => !pin_holes && manual::is_hand(machine),
+            // A thread is added with Thread (LIO-419).
+            TAPPING | THREAD_MILLING => false,
             REAMING | BORING => !pin_holes && !lathe::is_lathe(machine),
             _ => !pin_holes && !manual::is_hand(machine),
         })
@@ -873,6 +874,21 @@ fn section<'a>(title: impl Into<String>) -> Element<'a, Message> {
 }
 fn icon<'a>(app: &App, s: Strategy, size: f32) -> widget::Svg<'a> {
     svg(app.icons[s.index()].clone()).width(size).height(size)
+}
+/// What a Thread is, under its name (LIO-419).
+const THREAD_ABOUT: &str = "Thread cuts a thread to its size: on the CNC a thread mill goes round each hole, on the manual mill a tap is turned by hand, on the lathe a threading tool, a die or a tap cuts it. It brings what it needs before it (the tap drill, a centre drilling, the blank turned to size) and takes them when deleted.";
+/// The Thread operation's icon (LIO-419).
+fn thread_icon<'a>(size: f32) -> widget::Svg<'a> {
+    let handle = svg::Handle::from_memory(include_bytes!("../assets/op-thread.svg").as_slice());
+    svg(handle).width(size).height(size)
+}
+/// An operation's icon: a Thread's own, else its strategy's.
+fn op_icon<'a>(app: &App, o: &Operation, size: f32) -> widget::Svg<'a> {
+    if o.is_thread() {
+        thread_icon(size)
+    } else {
+        icon(app, o.strategy, size)
+    }
 }
 
 /// The footer's status: the whole sentences that fit one line
@@ -1487,6 +1503,19 @@ fn ribbon(app: &App) -> Element<'_, Message> {
                 (false, Some(reason)) => HelpButton::dimmed(tile, s, reason),
                 (false, None) => HelpButton::unavailable(tile, s),
             });
+            // Thread beside Drill, on every machine: the one place a thread
+            // is added (LIO-419).
+            if s == Strategy::Drill {
+                let tile = button(
+                    column![thread_icon(29.), text("Thread").size(12)]
+                        .spacing(4)
+                        .align_x(Alignment::Center),
+                )
+                .padding([5, 5])
+                .on_press(Message::AddThreading)
+                .style(button::text);
+                buttons = buttons.push(HelpButton::new(tile, &Message::AddThreading, "Thread"));
+            }
         }
         groups = groups
             .push(
@@ -1878,11 +1907,14 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
                 let mark = op_mark(app, checks, i);
                 let (glyph, color) = (mark.glyph(), mark.color());
                 let content = row![
-                    icon(app, o.strategy, 23.),
+                    op_icon(app, o, 23.),
                     container(
-                        text(ellipsize(o.name(), OP_NAME_CHARS))
-                            .size(12)
-                            .wrapping(Wrapping::None)
+                        text(ellipsize(
+                            &crate::threading::shown_name(o, &app.doc.tools),
+                            OP_NAME_CHARS
+                        ))
+                        .size(12)
+                        .wrapping(Wrapping::None)
                     )
                     .width(Fill)
                     .clip(true),
@@ -2172,23 +2204,47 @@ fn threads_block(app: &App) -> Option<Element<'_, Message>> {
             None => lines.push((line, 1)),
         }
     }
+    // Information only: each thread, and its Thread operation when it has
+    // one, a click selecting it (LIO-419).
+    let planned = |t: &crate::thread::Thread| {
+        (setup.operations.iter()).position(|o| {
+            crate::threading::size_of(o, &app.doc.tools).as_deref() == Some(t.name().as_str())
+        })
+    };
     let mut block = column![muted("THREADS").size(12)].spacing(4);
     for (line, n) in &lines {
-        block = block.push(muted(format!("• {n}× {line}")).size(12));
-    }
-    let addable = if lathe {
-        crate::lathe::thread_from_part(setup, mesh).is_some()
-    } else {
-        found.iter().any(|t| t.internal && t.axis == 2)
-    };
-    if addable {
-        block = block.push(secondary("+ Add threading", Message::AddThreading).width(Fill));
+        let t = found
+            .iter()
+            .find(|t| line.starts_with(&t.label()))
+            .unwrap_or(&found[0]);
+        block = block.push(match planned(t) {
+            Some(i) => Element::from(
+                button(
+                    // The size once (LIO-419).
+                    text(format!(
+                        "✓ Thread {} · {n}× {}",
+                        t.name(),
+                        line.strip_prefix(t.name().as_str())
+                            .unwrap_or(line)
+                            .trim_start()
+                    ))
+                    .size(12)
+                    .color(BLUE),
+                )
+                .padding(0)
+                .style(button::text)
+                .on_press(Message::SelectOp(i)),
+            ),
+            None => muted(format!("• {n}× {line} · no operation yet"))
+                .size(12)
+                .into(),
+        });
     }
     Some(help::wrap(
         container(block).padding([4, 10]),
         Help::text(
             "Threads",
-            "The threads modeled in the part, found from its shape: size, hand, inside (a hole) or outside, and how long. Add threading drills each threaded hole that opens upwards to its tap drill and then threads it: thread milling on the CNC, tapping by hand on the manual mill.",
+            "The threads modeled in the part, found from its shape: size, hand, inside (a hole) or outside, and how long, and whether each has its Thread operation (click it to open it). Add one with Thread in the toolbar.",
         )
         .more(
             "Only modeled threads are found: a hole drawn plain at a tap-drill size is a plain hole (choose its thread in a Drill's Thread). Outside threads are cut on the lathe or with a die. The tools come from the library; an operation whose tool is missing is added without one, and the status line says which tool to add.",
@@ -3228,9 +3284,15 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Panel<'a> {
 /// The editor, placing `checks` at their fields as it draws them.
 fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Panel<'a> {
     // Pinned: the operation's identity and its tabs, in rows of one width.
+    // A Thread is a Thread everywhere (LIO-419).
+    let title = if o.is_thread() {
+        "Thread"
+    } else {
+        o.strategy.name()
+    };
     let identity = row![
-        icon(app, o.strategy, 30.),
-        column![bold(o.strategy.name(), 17), muted("Operation parameters")]
+        op_icon(app, o, 30.),
+        column![bold(title, 17), muted("Operation parameters")]
             .spacing(2)
             .width(Fill),
         fold(app, Side::Inspector)
@@ -3266,8 +3328,10 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
     // The strategy's explanation and availability, behind a disclosure that
     // stays as it was left.
     let open = app.settings.layout.strategy_help_open;
-    c = c.push(about(format!("About {}", o.strategy.name()), open));
-    if open {
+    c = c.push(about(format!("About {title}"), open));
+    if open && o.is_thread() {
+        c = c.push(note(THREAD_ABOUT));
+    } else if open {
         c = c.push(note(format!(
             "{}\n\n{}",
             o.strategy.help(),
@@ -3278,7 +3342,14 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
     let t = Target::Operation;
     let machine = &app.doc.setup().machine;
     let lathe = lathe::is_lathe(machine);
-    match app.tab.as_str() {
+    // A Thread's tab is the Drill's Cycle or the Turn's Turn, its own
+    // fields only (LIO-419).
+    let tab = match (app.tab.as_str(), o.strategy) {
+        ("Thread", Strategy::Turn) => "Turn",
+        ("Thread", _) => "Cycle",
+        (t, _) => t,
+    };
+    match tab {
         "Tool" => {
             c = c.push(section("Cutter"));
             // The operation offers the tools of the types it cuts with that
@@ -4194,8 +4265,19 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             ));
         }
         "Cycle" => {
-            let cycles = drill_cycles(o.drills_pin_holes(), machine);
-            c = c.push(choice(p, "cycle", "Drilling cycle", &cycles, t));
+            if o.threads() {
+                // How this machine cuts it (LIO-419).
+                c = c.push(note(if o.tapping() && lathe {
+                    "Tapped from the tailstock, by hand."
+                } else if o.tapping() {
+                    "Tapped by hand, the spindle holding the tap square."
+                } else {
+                    "Thread milled: a thread mill goes round each hole and up a pitch a turn."
+                }));
+            } else {
+                let cycles = drill_cycles(o.drills_pin_holes(), machine);
+                c = c.push(choice(p, "cycle", "Drilling cycle", &cycles, t));
+            }
             if o.helical() {
                 c = c
                     .push(checks.field(p, "stepdown", "Stepdown per turn · mm"))
@@ -4504,10 +4586,31 @@ fn chamfer_geometry<'a>(o: &'a Operation, checks: &mut Checks) -> Element<'a, Me
 fn turn_fields<'a>(o: &'a Operation, checks: &mut Checks) -> Element<'a, Message> {
     let p = &o.p;
     let t = Target::Operation;
-    let mut c =
-        Column::new()
-            .spacing(12)
-            .push(choice(p, "turn_kind", "Kind", &lathe::TURN_KINDS, t));
+    let mut c = Column::new().spacing(12);
+    if o.is_thread() {
+        // The thread's size from the standard list, or Custom (LIO-416).
+        let d = num(p, "diameter").unwrap_or(0.);
+        let pitch = num(p, "pitch").unwrap_or(0.);
+        let named = (crate::thread::SPECS.iter())
+            .find(|s| (s.major - d).abs() < 0.05 && (s.pitch - pitch).abs() < 1e-3)
+            .map_or("Custom", |s| s.name);
+        let sizes: Vec<&str> = (crate::thread::SPECS.iter())
+            .filter(|s| !s.tapered)
+            .map(|s| s.name)
+            .chain(["Custom"])
+            .collect();
+        c = c.push(choice_value(p, named, "thread_size", "Thread", &sizes, t));
+        if named == "Custom" {
+            c = c.push(muted("Custom: not a standard size; type its diameter and pitch.").size(12));
+        }
+    } else {
+        // A thread is added with Thread (LIO-419).
+        let kinds: Vec<&str> = (lathe::TURN_KINDS.iter())
+            .copied()
+            .filter(|k| *k != "Thread")
+            .collect();
+        c = c.push(choice(p, "turn_kind", "Kind", &kinds, t));
+    }
     c = c.push(note(
         "Z 0 is the free end of the bar, negative toward the chuck. Sizes are diameters.",
     ));
@@ -4586,10 +4689,29 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
                 .push(checks.field(p, "allowance", "Stock to leave · mm"))
                 .push(note("Equal passes down to the diameter plus the stock to leave, then the finish pass."))
                 .into(),
-            "Thread" => c
-                .push(checks.hinted(p, "passes", "Passes", "Auto"))
-                .push(note("Leave Passes empty for the usual number for the pitch."))
-                .into(),
+            "Thread" => {
+                // What Auto takes: how many passes, each top-slide reading
+                // from the touch (LIO-416).
+                let pitch = num(p, "pitch").unwrap_or(0.);
+                let n = num(p, "passes")
+                    .map(|v| v as usize)
+                    .filter(|n| *n > 0)
+                    .unwrap_or_else(|| crate::turn::thread_passes(pitch));
+                let outside = get(p, "thread_side") != "Inside";
+                let depth = crate::turn::thread_depth(outside, pitch);
+                let angle = crate::guide::top_angle(60.);
+                let readings: Vec<String> = crate::turn::thread_infeeds(depth, n)
+                    .iter()
+                    .map(|d| format!("{:.2}", crate::guide::top_travel(*d, angle)))
+                    .collect();
+                c.push(checks.hinted(p, "passes", "Passes", "Auto"))
+                    .push(note("Leave Passes empty for the usual number for the pitch."))
+                    .push(note(format!(
+                        "{n} passes, the top slide at {angle}° in to: {}.",
+                        readings.join(", ")
+                    )))
+                    .into()
+            }
             _ => c.into(),
         };
     }
@@ -13385,7 +13507,7 @@ pub(crate) fn preview_totals(outcome: &crate::planner::Outcome) -> Vec<String> {
 /// already give it ("Flat end mill · Ø10", not "… Ø10 · Ø10 mm").
 /// A lathe tool has no diameter: its label says what tells it apart
 /// ("Turning tool · right hand · R0.4", "Parting blade · 3 wide").
-fn tool_label(tool: &Tool) -> String {
+pub(crate) fn tool_label(tool: &Tool) -> String {
     let name = tool.name();
     let p = &tool.p;
     let lathe = match get(p, "type") {
@@ -13397,7 +13519,7 @@ fn tool_label(tool: &Tool) -> String {
         "Boring bar" => Some(format!("from Ø{}", get(p, "min_bore"))),
         "Grooving tool" | "Parting blade" => Some(format!("{} wide", get(p, "width"))),
         "Threading tool" => Some(format!("{}°", get(p, "thread_angle"))),
-        "Die" => Some(get(p, "thread").to_string()),
+        "Die" | "Tap" => Some(get(p, "thread").to_string()),
         _ => None,
     };
     if let Some(detail) = lathe {

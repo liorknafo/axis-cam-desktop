@@ -1763,7 +1763,8 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
             other => return Err(format!("{} does not run on a manual mill.", other.name())),
         }
         sections.push(Section {
-            name: op.name().into(),
+            // A Thread as a Thread (LIO-419).
+            name: crate::threading::shown_name(op, &doc.tools),
             op: Some(oi),
             steps: first..steps.len(),
             count,
@@ -2308,7 +2309,7 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
                 ),
             }
         } else {
-            op.name().into()
+            crate::threading::shown_name(op, &doc.tools)
         };
         sections.push(Section {
             name,

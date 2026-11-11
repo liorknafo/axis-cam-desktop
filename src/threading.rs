@@ -1,5 +1,10 @@
-//! Add threading: the operations that make a setup's threaded holes, each
-//! thread size its own pair, on the machine the setup runs on. The holes
+//! Thread: the operation that cuts a thread, added from the toolbar's
+//! Thread tile (LIO-419), with what it needs before it (`THREAD_OF`): one
+//! for each modelled thread size the setup reaches that has none yet, else
+//! one to fill by hand. Stored as a Drill of cycle Tapping or Thread
+//! milling, or a Turn of kind Thread, and shown everywhere as a Thread.
+//! The mill's threaded holes, each thread size its own pair, on the machine
+//! the setup runs on. The holes
 //! are drilled to their tap drill, then threaded: thread milled on a CNC,
 //! tapped by hand on the manual mill. Tools come from the library; a pair
 //! whose tool is missing is still added, without it, and the status says
@@ -26,11 +31,93 @@ pub struct Added {
 /// drill's diameter: what it needs when its tool is missing (LIO-412).
 pub const THREAD_NAME: &str = "thread_name";
 pub const TAP_DRILL: &str = "tap_drill";
+/// The key of an operation a Thread brought before it (its tap drill, the
+/// blank's turn): the Thread's id. It goes when the Thread is deleted.
+pub const THREAD_OF: &str = "thread_of";
+/// The size a Thread operation cuts ("M6×1"), None for another operation
+/// or a Thread with no size yet.
+pub fn size_of(op: &Operation, tools: &[Tool]) -> Option<String> {
+    if !op.is_thread() {
+        return None;
+    }
+    let name = get(&op.p, THREAD_NAME);
+    if !name.is_empty() {
+        return Some(name.into());
+    }
+    let tool = tools.iter().find(|t| t.id == op.tool);
+    if op.strategy == Strategy::Turn {
+        if let Some(spec) = tool.and_then(crate::lathe::die_spec) {
+            return Some(spec.name.into());
+        }
+        let d = num(&op.p, "diameter")?;
+        return Some(crate::guide::thread_label(d, num(&op.p, "pitch")?));
+    }
+    if let Some(spec) = tool.and_then(Tool::tap_spec) {
+        return Some(spec.name.into());
+    }
+    Some(get(&op.p, "thread"))
+        .filter(|t| !t.is_empty() && *t != FROM_MODEL)
+        .map(String::from)
+}
+/// What the browser and the Steps page call an operation: a Thread as
+/// "Thread M6×1" when its name is still the kind's default (LIO-419);
+/// else its name.
+pub fn shown_name(op: &Operation, tools: &[Tool]) -> String {
+    let defaults = ["", "Drilling", "Turn · Thread", "Thread"];
+    match size_of(op, tools) {
+        Some(size) if defaults.contains(&op.name()) => format!("Thread {size}"),
+        _ => op.name().into(),
+    }
+}
+/// A Thread to fill by hand: its holes picked, its size from the list.
+fn empty(setup: &crate::model::Setup) -> Added {
+    let machine = &setup.machine;
+    let mut op = if crate::lathe::is_lathe(machine) {
+        let mut op = Operation::for_machine(Strategy::Turn, String::new(), machine);
+        op.set_turn_kind("Thread");
+        op
+    } else {
+        let mut op = Operation::for_machine(Strategy::Drill, String::new(), machine);
+        let hand = crate::manual::is_hand(machine);
+        op.p.insert(
+            "cycle".into(),
+            if hand { TAPPING } else { THREAD_MILLING }.into(),
+        );
+        op.p.insert("thread".into(), FROM_MODEL.into());
+        op.p.insert("thread_hand".into(), FROM_MODEL.into());
+        op
+    };
+    op.p.insert("name".into(), "Thread".into());
+    let what = if crate::lathe::is_lathe(machine) {
+        "choose its size on the Thread tab"
+    } else {
+        "pick its holes on the Geometry tab and choose its size on the Thread tab"
+    };
+    Added {
+        ops: vec![op],
+        status: format!("Added a Thread to {}: {what}.", setup.name()),
+        done: vec![],
+        missing: vec![],
+    }
+}
 /// What a threading operation needs when it has no tool: "an M6×1 tap",
 /// "a Ø5 drill" (LIO-412).
 pub fn needs(op: &Operation) -> Option<String> {
     if crate::centre::centres(op).is_some() {
         return Some("a centre drill".into());
+    }
+    // A lathe thread: a threading tool for its pitch, or a die (LIO-412).
+    if op.strategy == Strategy::Turn && op.is_thread() {
+        let pitch = num(&op.p, "pitch")?;
+        let label = crate::guide::thread_label(num(&op.p, "diameter")?, pitch);
+        return Some(if get(&op.p, "thread_side") == "Inside" {
+            format!("a threading tool for a {} mm pitch", trim(pitch))
+        } else {
+            format!(
+                "a threading tool for a {} mm pitch, or an {label} die",
+                trim(pitch)
+            )
+        });
     }
     let name = get(&op.p, THREAD_NAME);
     if name.is_empty() {
@@ -44,7 +131,13 @@ pub fn needs(op: &Operation) -> Option<String> {
 /// The tool `op` needs (`needs`), for `machine`, numbered `number`.
 pub fn needed_tool(op: &Operation, machine: &Machine, number: u32) -> Option<Tool> {
     let name = get(&op.p, THREAD_NAME);
-    let mut t = if crate::centre::centres(op).is_some() {
+    let mut t = if op.strategy == Strategy::Turn && op.is_thread() {
+        let pitch = num(&op.p, "pitch")?;
+        let mut t = Tool::lathe("Threading tool", "Threading tool");
+        let (lo, hi) = (pitch.min(0.5), pitch.max(3.));
+        t.p.insert("pitches".into(), format!("{}-{}", trim(lo), trim(hi)));
+        t
+    } else if crate::centre::centres(op).is_some() {
         let mut t = Tool::new("Centre drill A2.5×6.3", crate::model::CENTRE_DRILL, "6.3");
         t.set_type(crate::model::CENTRE_DRILL);
         t
@@ -60,8 +153,10 @@ pub fn needed_tool(op: &Operation, machine: &Machine, number: u32) -> Option<Too
         t.set_type("Drill");
         t
     };
-    for (k, v) in [("length", "30"), ("stickout", "45")] {
-        t.p.insert(k.into(), v.into());
+    if !t.is_lathe() {
+        for (k, v) in [("length", "30"), ("stickout", "45")] {
+            t.p.insert(k.into(), v.into());
+        }
     }
     t.p.insert("number".into(), number.to_string());
     if crate::manual::is_hand(machine) {
@@ -73,7 +168,10 @@ pub fn needed_tool(op: &Operation, machine: &Machine, number: u32) -> Option<Too
 /// that it survives the status line's cut (LIO-412), then what was added in
 /// the order the hand does it (LIO-411).
 pub fn hand_status(setup: &str, done: &[String], missing: &[String]) -> String {
-    let what = format!("centre drill, then drill and tap {}.", done.join(", "));
+    let what = format!(
+        "one centre drilling, then {}, each after its tap drill.",
+        done.join(", ")
+    );
     match missing.len() {
         0 => format!("Added to {setup}: {what}"),
         n => format!(
@@ -100,13 +198,18 @@ pub fn add(doc: &Document, si: usize, mesh: &Mesh) -> Result<Added, String> {
     if crate::lathe::is_lathe(machine) {
         return lathe(doc, setup, mesh);
     }
-    let groups = groups(setup, mesh);
+    // Each size once: one that has its Thread already is left (LIO-419).
+    let have: Vec<String> = (setup.operations.iter())
+        .filter_map(|o| size_of(o, &doc.tools))
+        .collect();
+    let groups: Vec<Group> = (groups(setup, mesh).into_iter())
+        .filter(|g| {
+            let name = g.holes[0].thread.as_ref().map(|t| t.name());
+            name.is_none_or(|n| !have.contains(&n))
+        })
+        .collect();
     if groups.is_empty() {
-        return Err(if crate::thread::in_setup(setup, mesh).is_empty() {
-            "The part has no modeled thread.".into()
-        } else {
-            "No threaded hole opens upwards in this setup: add a setup with its face up.".into()
-        });
+        return Ok(empty(setup));
     }
     let hand = crate::manual::is_hand(machine);
     let mut ops = vec![];
@@ -145,24 +248,12 @@ pub fn add(doc: &Document, si: usize, mesh: &Mesh) -> Result<Added, String> {
             machine,
         );
         selection(&mut hole);
-        // On a hand mill named for what the hand does, by the drill it
-        // takes, short enough for the browser's 20 letters (LIO-411).
+        // Named one way for every size, by the drill it takes, under the
+        // Thread it is for (LIO-411, LIO-419).
         let size = drill
             .and_then(|t| num(&t.p, "diameter"))
             .unwrap_or(tap_drill);
-        let drill_name = [
-            format!("{name} · tap drill Ø{}", trim(size)),
-            format!("{name} · drill Ø{}", trim(size)),
-            format!("{name} · Ø{}", trim(size)),
-        ]
-        .into_iter()
-        .find(|n| n.chars().count() <= 20)
-        .unwrap_or_else(|| format!("{name} · Ø{}", trim(size)));
-        let drill_name = if hand {
-            drill_name
-        } else {
-            format!("{name} · tap drill")
-        };
+        let drill_name = format!("Tap drill Ø{}", trim(size));
         hole.p.insert("name".into(), drill_name);
         hole.p.insert(THREAD_NAME.into(), name.clone());
         hole.p.insert(TAP_DRILL.into(), trim(tap_drill));
@@ -206,10 +297,8 @@ pub fn add(doc: &Document, si: usize, mesh: &Mesh) -> Result<Added, String> {
             machine,
         );
         selection(&mut thread);
-        thread.p.insert(
-            "name".into(),
-            format!("{name} · {}", if hand { "tap" } else { "thread" }),
-        );
+        thread.p.insert("name".into(), format!("Thread {name}"));
+        hole.p.insert(THREAD_OF.into(), thread.id.clone());
         thread.p.insert(THREAD_NAME.into(), name.clone());
         thread.p.insert(
             "cycle".into(),
@@ -242,18 +331,13 @@ pub fn add(doc: &Document, si: usize, mesh: &Mesh) -> Result<Added, String> {
                 )
             });
         }
-        done.push(format!("{}× {name}", g.holes.len()));
+        done.push(format!("Thread {name} ({}×)", g.holes.len()));
         let _ = g.rim;
         ops.push(hole);
         ops.push(thread);
     }
     let mut status = format!(
-        "Added {} to {}: {}.",
-        if hand {
-            "drilling and tapping"
-        } else {
-            "drilling and thread milling"
-        },
+        "Added to {}: {}, each after its tap drill.",
         setup.name(),
         done.join(", ")
     );
@@ -278,8 +362,9 @@ pub fn add(doc: &Document, si: usize, mesh: &Mesh) -> Result<Added, String> {
 /// library has one, else a threading tool whose pitches hold it.
 fn lathe(doc: &Document, setup: &crate::model::Setup, mesh: &Mesh) -> Result<Added, String> {
     let machine = &setup.machine;
-    let fields = crate::lathe::thread_from_part(setup, mesh)
-        .ok_or("The part has no thread on the lathe's axis.")?;
+    let Some(fields) = crate::lathe::thread_from_part(setup, mesh) else {
+        return Ok(empty(setup));
+    };
     let value = |k: &str| {
         fields
             .iter()
@@ -302,6 +387,20 @@ fn lathe(doc: &Document, setup: &crate::model::Setup, mesh: &Mesh) -> Result<Add
             && t.thread_pitches()
                 .is_some_and(|(lo, hi)| pitch >= lo - 1e-4 && pitch <= hi + 1e-4)
     });
+    let label = crate::guide::thread_label(major, pitch);
+    // The size has its Thread already: one to fill by hand (LIO-419).
+    if (setup.operations.iter()).any(|o| size_of(o, &doc.tools).as_deref() == Some(&label)) {
+        return Ok(empty(setup));
+    }
+    let z_end = value("z_end").parse::<f32>().unwrap_or(0.);
+    // An inside thread with a tap of its size: drilled, then tapped from the
+    // tailstock (LIO-414).
+    let tap = (!outside)
+        .then(|| tools(&doc.tools, machine).find(|t| t.tap_spec().is_some_and(|s| s.name == label)))
+        .flatten();
+    if let Some(tap) = tap {
+        return Ok(lathe_tap(doc, setup, tap, &label, -z_end));
+    }
     let tool = die.or(single);
     let mut op = Operation::for_machine(
         Strategy::Turn,
@@ -312,16 +411,41 @@ fn lathe(doc: &Document, setup: &crate::model::Setup, mesh: &Mesh) -> Result<Add
     for (k, v) in &fields {
         op.p.insert((*k).into(), v.clone());
     }
+    op.p.insert("name".into(), format!("Thread {label}"));
+    // An outside thread on a bar larger than it: its blank turned to the
+    // thread's diameter first, unless the setup turns it already (LIO-414).
+    let bar = num(&setup.p, "stock_diameter").unwrap_or(0.);
+    let turned = (setup.operations.iter()).any(|o| {
+        o.strategy == Strategy::Turn
+            && get(&o.p, "turn_kind") == "Outside"
+            && num(&o.p, "diameter").is_some_and(|d| d <= major + 0.05)
+    });
+    let mut ops = vec![];
+    let mut blank = String::new();
+    if outside && bar > major + 0.05 && !turned {
+        let turning = tools(&doc.tools, machine).find(|t| get(&t.p, "type") == "Turning tool");
+        let mut outer = Operation::for_machine(
+            Strategy::Turn,
+            turning.map(|t| t.id.clone()).unwrap_or_default(),
+            machine,
+        );
+        outer.set_turn_kind("Outside");
+        outer.p.insert("diameter".into(), trim(major));
+        outer.p.insert("z_end".into(), trim(z_end));
+        outer
+            .p
+            .insert("name".into(), format!("Outside Ø{} · blank", trim(major)));
+        outer.p.insert(THREAD_OF.into(), op.id.clone());
+        ops.push(outer);
+        blank = format!("turn the blank to Ø{}, then ", trim(major));
+    }
     let mut status = format!(
-        "Added a thread to {}: Ø{} × {} {}, {}.",
+        "Added to {}: {blank}thread {label} {}.",
         setup.name(),
-        trim(major),
-        trim(pitch),
-        if outside { "outside" } else { "inside" },
         match (die, single) {
-            (Some(d), _) => format!("cut with {} by hand", d.name()),
-            (None, Some(t)) => format!("single point with {}", t.name()),
-            _ => "no tool yet".into(),
+            (Some(d), _) => format!("with {}, by hand", d.name()),
+            (None, Some(t)) => format!("with {}", t.name()),
+            _ => "(no tool yet)".into(),
         }
     );
     if tool.is_none() {
@@ -335,12 +459,68 @@ fn lathe(doc: &Document, setup: &crate::model::Setup, mesh: &Mesh) -> Result<Add
             }
         ));
     }
+    ops.push(op);
     Ok(Added {
-        ops: vec![op],
+        ops,
         status,
         done: vec![],
         missing: vec![],
     })
+}
+/// An inside thread on the lathe with `tap` of its `label`: a Drill on the
+/// centre to its tap drill, `depth` of thread and the tap's lead and point
+/// deep, then the Tapping `depth` deep (LIO-414).
+fn lathe_tap(
+    doc: &Document,
+    setup: &crate::model::Setup,
+    tap: &Tool,
+    label: &str,
+    depth: f32,
+) -> Added {
+    let machine = &setup.machine;
+    let spec = tap.tap_spec();
+    let tap_drill = spec.map_or(0., |s| s.tap_drill);
+    let pitch = spec.map_or(1., |s| s.pitch);
+    let drill = tap_drill_tool(&doc.tools, machine, tap_drill, f32::INFINITY);
+    let mut thread = Operation::for_machine(Strategy::Drill, tap.id.clone(), machine);
+    thread.p.insert("cycle".into(), TAPPING.into());
+    thread.p.insert("depth".into(), trim(depth));
+    thread.p.insert("name".into(), format!("Thread {label}"));
+    thread.p.insert(THREAD_NAME.into(), label.into());
+    let size = drill
+        .and_then(|t| num(&t.p, "diameter"))
+        .unwrap_or(tap_drill);
+    let mut hole = Operation::for_machine(
+        Strategy::Drill,
+        drill.map(|t| t.id.clone()).unwrap_or_default(),
+        machine,
+    );
+    let lead = crate::cam::tap_lead(tap) * pitch;
+    hole.p.insert(
+        "depth".into(),
+        format!("{:.1}", depth + lead + 0.3 * size + 0.5),
+    );
+    hole.p
+        .insert("name".into(), format!("Tap drill Ø{}", trim(size)));
+    hole.p.insert(THREAD_NAME.into(), label.into());
+    hole.p.insert(TAP_DRILL.into(), trim(tap_drill));
+    hole.p.insert(THREAD_OF.into(), thread.id.clone());
+    let missing = if drill.is_none() {
+        format!(" A Ø{} drill is missing.", trim(tap_drill))
+    } else {
+        String::new()
+    };
+    Added {
+        ops: vec![hole, thread],
+        status: format!(
+            "Added to {}: drill Ø{}, then thread {label} with {}.{missing}",
+            setup.name(),
+            trim(size),
+            tap.name()
+        ),
+        done: vec![],
+        missing: vec![],
+    }
 }
 /// The threaded holes of `setup` opening up its faces, by face and thread
 /// size and hand: each face a plane of surfaces facing up, read as a Drill
@@ -540,25 +720,23 @@ mod tests {
                 .find(|t| t.id == o.tool)
                 .map(|t| t.name().to_string())
         };
-        assert_eq!(tool_of("M6×1 · tap drill").as_deref(), Some("Ø5 drill"));
-        assert_eq!(
-            tool_of("M8×1.25 · tap drill").as_deref(),
-            Some("Ø6.8 drill")
-        );
-        assert_eq!(tool_of("M6×1 · thread").as_deref(), Some("Thread mill Ø4"));
+        assert_eq!(tool_of("Tap drill Ø5").as_deref(), Some("Ø5 drill"));
+        assert_eq!(tool_of("Tap drill Ø6.8").as_deref(), Some("Ø6.8 drill"));
+        assert_eq!(tool_of("Thread M6×1").as_deref(), Some("Thread mill Ø4"));
         // M5's Ø4.1 bore takes the Ø3.15 mill; no Ø4.2 drill: it is said.
         assert_eq!(
-            tool_of("M5×0.8 · thread").as_deref(),
+            tool_of("Thread M5×0.8").as_deref(),
             Some("Thread mill Ø3.15")
         );
-        assert_eq!(tool_of("M5×0.8 · tap drill"), None);
+        assert_eq!(tool_of("Tap drill Ø4.2"), None);
         assert!(added.status.contains("a Ø4.2 drill"), "{}", added.status);
         // The ops it adds generate: the M6 pair, in a job of its own.
         let mut job = doc.clone();
         job.setups[0].operations = added
             .ops
             .iter()
-            .filter(|o| o.name().starts_with("M6×1"))
+            // The M6 Thread and its tap drill (named so since LIO-419).
+            .filter(|o| o.name() == "Thread M6×1" || o.name() == "Tap drill Ø5")
             .cloned()
             .collect();
         let mut results = vec![];
@@ -710,7 +888,8 @@ mod tests {
         doc.setups[0].operations = added
             .ops
             .into_iter()
-            .filter(|o| o.name().starts_with("M6×1"))
+            // The M6 Thread and its tap drill (named so since LIO-419).
+            .filter(|o| o.name() == "Thread M6×1" || o.name() == "Tap drill Ø5")
             .collect();
         for o in &mut doc.setups[0].operations {
             o.p.insert("rpm".into(), "12000".into());
@@ -772,7 +951,7 @@ mod tests {
             .ops
             .iter()
             // Named a tap on a hand mill since LIO-411.
-            .find(|o| o.name() == "M6×1 · tap")
+            .find(|o| o.name() == "Thread M6×1")
             .unwrap();
         assert!(m6.tapping());
         assert!(!m6.tool.is_empty());

@@ -5434,7 +5434,7 @@ flood = { pin = 8 }
         let _ = a.view();
         render_png(&a, size, &out.join("2-threading-added.png"));
         // Generate the job, then show the M6 thread.
-        let m6 = names.iter().position(|n| n == "M6×1 · thread").unwrap();
+        let m6 = names.iter().position(|n| n == "Thread M6×1").unwrap();
         let _ = a.update(Message::SelectOp(m6));
         let _ = a.update(Message::Tab("Cycle".into()));
         let _ = a.update(Message::Generate);
@@ -5648,7 +5648,7 @@ flood = { pin = 8 }
         a.page = Page::Work;
         let _ = a.update(Message::AddThreading);
         let m6 = (a.doc.setup().operations.iter())
-            .position(|o| o.name() == "M6×1 · thread")
+            .position(|o| o.name() == "Thread M6×1")
             .unwrap();
         let _ = a.update(Message::SelectOp(m6));
         let _ = a.update(Message::Tab("Cycle".into()));
@@ -5776,6 +5776,243 @@ flood = { pin = 8 }
         }
         a
     }
+    /// A lathe job on the Work page: `part` in a Ø`bar` bar (`turn::tests::job`),
+    /// `edit` made to it.
+    fn lathe_job_app(
+        bar: f32,
+        part: Vec<[[f32; 3]; 3]>,
+        bottom: f32,
+        edit: impl FnOnce(&mut crate::model::Document),
+    ) -> App {
+        let (mut doc, mesh) = crate::turn::tests::job(bar, 100., part, bottom);
+        (doc.setups[0].machine.p).insert("cross_reads".into(), "Diameter".into());
+        edit(&mut doc);
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        a.test_dir = Some(dir);
+        doc.file = Some(ModelFile {
+            name: "part.stl".into(),
+            path: std::path::PathBuf::from("part.stl"),
+            format: "stl".into(),
+            bytes: 1,
+            thickness: None,
+        });
+        doc.active = doc.setups[0].id.clone();
+        a.doc = doc;
+        a.imported_mesh = Some(mesh);
+        a.page = Page::Work;
+        a
+    }
+    /// A Ø30 body with an M16 × 2 stud on it, in a Ø50 bar, on the lathe.
+    fn stud_app(edit: impl FnOnce(&mut crate::model::Document)) -> App {
+        use crate::{thread::tests::modeled, turn::tests::tube};
+        let mut part = tube(0., 15., 0., 30.);
+        part.extend(
+            modeled([0., 0.], 16., 2., 60., true, false, 20., 0.)
+                .iter()
+                .map(|t| t.map(|p| [p[0], p[1], p[2] + 30.])),
+        );
+        lathe_job_app(50., part, -60., edit)
+    }
+    /// LIO-419: Thread is a tile on every machine and the browser has no
+    /// "+ Add threading".
+    #[test]
+    fn thread_is_a_tile_on_every_machine_and_the_browser_adds_none() {
+        let mut cnc = threaded_app();
+        cnc.page = Page::Work;
+        let mut manual = manual_threaded_app(false);
+        manual.page = Page::Work;
+        for a in [cnc, manual, stud_app(|_| {})] {
+            shows(&a, &["Thread"]);
+            lacks(&a, &["+ Add threading"]);
+        }
+    }
+    /// LIO-419: one press adds a Thread for each size with its tap drill and
+    /// one centre drilling before it; a second adds one Thread to fill and no
+    /// duplicate; a deleted Thread takes what it brought; the THREADS list
+    /// says which have their Thread.
+    #[test]
+    fn the_thread_tile_adds_a_thread_per_size_with_what_it_needs_and_takes_it_when_deleted() {
+        use crate::threading::{THREAD_OF, size_of};
+        let mut a = manual_threaded_app(false);
+        a.page = Page::Work;
+        let sizes = |a: &App| -> Vec<String> {
+            (a.doc.setups[0].operations.iter())
+                .filter_map(|o| size_of(o, &a.doc.tools))
+                .collect()
+        };
+        assert_eq!(sizes(&a), ["M6×1", "M8×1.25", "M5×0.8"]);
+        let ops = &a.doc.setups[0].operations;
+        for (i, o) in ops.iter().enumerate().filter(|(_, o)| o.is_thread()) {
+            let drill = (ops.iter())
+                .position(|d| crate::model::get(&d.p, THREAD_OF) == o.id)
+                .expect("its tap drill");
+            assert!(drill < i, "{}", o.name());
+        }
+        assert_eq!(a.operation().map(|o| o.is_thread()), Some(true));
+        assert_eq!(a.tab, "Thread");
+        shows(&a, &["Thread", "Operation parameters"]);
+        assert!(
+            page_texts(&a)
+                .iter()
+                .any(|t| t.starts_with("✓ Thread M6×1 · 2× hole"))
+        );
+        // Again: one Thread to fill, no duplicate.
+        let n = a.doc.setups[0].operations.len();
+        let _ = a.update(Message::AddThreading);
+        let ops = &a.doc.setups[0].operations;
+        assert_eq!(ops.len(), n + 1);
+        let added = a.operation().unwrap();
+        assert!(added.is_thread() && added.name() == "Thread" && added.surfaces.is_none());
+        assert_eq!(sizes(&a), ["M6×1", "M8×1.25", "M5×0.8"]);
+        // Deleting the M6 Thread takes its tap drill and its centre drilling.
+        let m6 = ops.iter().position(|o| o.name() == "Thread M6×1").unwrap();
+        let id = ops[m6].id.clone();
+        let drill = (ops.iter())
+            .find(|d| crate::model::get(&d.p, THREAD_OF) == id)
+            .unwrap()
+            .id
+            .clone();
+        let _ = a.update(Message::SelectOp(m6));
+        let _ = a.update(Message::RemoveOp);
+        let ops = &a.doc.setups[0].operations;
+        assert!(!ops.iter().any(|o| o.id == id || o.id == drill));
+        assert!(
+            !ops.iter()
+                .any(|o| crate::centre::centres(o) == Some(drill.as_str()))
+        );
+        assert!(
+            page_texts(&a)
+                .iter()
+                .any(|t| t.contains("M6×1") && t.ends_with("no operation yet"))
+        );
+    }
+    /// LIO-419: with no modelled thread, one Thread to fill; a Thread's
+    /// editor is titled Thread with a Thread tab; a plain Drill offers no
+    /// threading cycle.
+    #[test]
+    fn a_part_with_no_thread_gets_one_thread_to_fill_by_hand() {
+        let mut a = imported_app();
+        a.page = Page::Work;
+        let _ = a.update(Message::AddThreading);
+        let o = a.operation().expect("a Thread selected");
+        assert!(o.is_thread() && o.name() == "Thread", "{}", a.status);
+        let tabs = o.tabs(&a.doc.setup().machine);
+        assert!(
+            tabs.contains(&"Thread") && !tabs.contains(&"Cycle"),
+            "{tabs:?}"
+        );
+        shows(&a, &["Thread"]);
+        let cycles = crate::ui::drill_cycles(false, &a.doc.setup().machine);
+        assert!(
+            !cycles.contains(&crate::model::TAPPING)
+                && !cycles.contains(&crate::model::THREAD_MILLING)
+        );
+        let cycles = crate::ui::drill_cycles(false, &crate::manual::defaults());
+        assert!(!cycles.contains(&crate::model::TAPPING));
+    }
+    /// LIO-414, LIO-416, LIO-412: on the lathe the stud's Thread brings the
+    /// blank's turn (not when one turns it), the Steps page shows it, its
+    /// size list sets diameter and pitch, the Passes tab lists Auto's passes;
+    /// with no tool it names both ways.
+    #[test]
+    fn a_lathe_thread_brings_its_blank_and_lists_its_size_and_passes() {
+        let mut a = stud_app(|_| {});
+        let _ = a.update(Message::AddThreading);
+        let names: Vec<String> = (a.doc.setups[0].operations.iter())
+            .map(|o| o.name().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            ["Outside Ø16 · blank", "Thread M16×2"],
+            "{}",
+            a.status
+        );
+        assert!(a.status.contains("turn the blank to Ø16"), "{}", a.status);
+        crate::steps::tests::build(&mut a);
+        assert!(
+            matches!(a.guide, Some((_, Ok(_)))),
+            "{:?}",
+            a.guide.as_ref().map(|g| g.1.as_ref().err())
+        );
+        // Its size from the list; another pitch is Custom.
+        let _ = a.update(Message::Tab("Thread".into()));
+        let _ = a.update(Message::Edit(
+            crate::Target::Operation,
+            "thread_size",
+            "M12×1.75".into(),
+        ));
+        let o = a.operation().unwrap();
+        assert_eq!(
+            (
+                crate::model::get(&o.p, "diameter"),
+                crate::model::get(&o.p, "pitch")
+            ),
+            ("12", "1.75")
+        );
+        let _ = a.update(Message::Edit(
+            crate::Target::Operation,
+            "pitch",
+            "1.6".into(),
+        ));
+        assert!(
+            page_texts(&a)
+                .iter()
+                .any(|t| t.starts_with("Custom: not a standard size"))
+        );
+        let _ = a.update(Message::Tab("Passes".into()));
+        assert!(
+            page_texts(&a)
+                .iter()
+                .any(|t| t.contains(" passes, the top slide at 29.5° in to: "))
+        );
+        // An Outside to Ø16 there already: only the Thread.
+        let mut a = stud_app(|doc| {
+            crate::turn::tests::add(doc, "Outside", &[("diameter", "16"), ("z_end", "-20")])
+        });
+        let _ = a.update(Message::AddThreading);
+        let threads = (a.doc.setups[0].operations.iter())
+            .filter(|o| crate::model::get(&o.p, "turn_kind") == "Outside")
+            .count();
+        assert_eq!(threads, 1, "{}", a.status);
+        // No die and no threading tool: the Tool tab names both.
+        let mut a = stud_app(|doc| {
+            doc.tools
+                .retain(|t| !["Die", "Threading tool"].contains(&crate::model::get(&t.p, "type")))
+        });
+        let _ = a.update(Message::AddThreading);
+        let _ = a.update(Message::Tab("Tool".into()));
+        shows(
+            &a,
+            &["Needs a threading tool for a 2 mm pitch, or an M16×2 die"],
+        );
+    }
+    /// LIO-414, LIO-416: an inside thread with its tap in the library is
+    /// drilled and tapped; the tap is shown as its Thread.
+    #[test]
+    fn a_lathe_hole_with_its_tap_is_drilled_and_tapped_as_a_thread() {
+        let part = crate::thread::tests::modeled([0., 0.], 8., 1.25, 60., true, true, 20., 0.);
+        let mut a = lathe_job_app(30., part, -40., |doc| {
+            let lathe = doc.setups[0].machine.id.clone();
+            let mut tap = crate::model::Tool::new("M8 tap", "Tap", "8");
+            tap.set_type("Tap");
+            tap.p.insert("thread".into(), "M8×1.25".into());
+            tap.p.insert("machines".into(), lathe.clone());
+            doc.tools.push(tap);
+            for t in &mut doc.tools {
+                if crate::model::get(&t.p, "type") == "Drill" {
+                    t.p.insert("diameter".into(), "6.8".into());
+                }
+            }
+        });
+        let _ = a.update(Message::AddThreading);
+        let ops = &a.doc.setups[0].operations;
+        let names: Vec<&str> = ops.iter().map(|o| o.name()).collect();
+        assert_eq!(names, ["Tap drill Ø6.8", "Thread M8×1.25"], "{}", a.status);
+        assert!(ops[1].tapping() && !ops[0].tapping());
+        let tool = a.doc.tools.iter().find(|t| t.id == ops[1].tool).unwrap();
+        assert_eq!(crate::ui::tool_label(tool), "M8 tap · M8×1.25");
+    }
     /// The guide's step of the M6 tapping.
     fn m6_tap_step(a: &App) -> usize {
         use crate::guide::Step;
@@ -5786,7 +6023,7 @@ flood = { pin = 8 }
             .steps
             .iter()
             .position(|s| {
-                matches!(s, Step::Holes { op, .. } if ops[*op].tapping() && ops[*op].name().starts_with("M6"))
+                matches!(s, Step::Holes { op, .. } if ops[*op].tapping() && ops[*op].name().contains("M6"))
             })
             .expect("a Tap step")
     }
@@ -5912,11 +6149,11 @@ flood = { pin = 8 }
                 .any(|s| s.starts_with("through: turn until it runs free")),
             "{t:?}"
         );
-        let m5 = op_step(&a, "M5×0.8 · tap");
+        let m5 = op_step(&a, "Thread M5×0.8");
         let t = texts_at(&mut a, m5);
         assert!(t.iter().any(|s| s.starts_with("mark the tap ")), "{t:?}");
         let tap = (a.doc.setups[0].operations.iter())
-            .find(|o| o.name() == "M6×1 · tap")
+            .find(|o| o.name() == "Thread M6×1")
             .unwrap();
         assert!(!tap.tabs(&a.doc.setups[0].machine).contains(&"Linking"));
     }
@@ -5931,7 +6168,7 @@ flood = { pin = 8 }
             assert!(n.chars().count() <= 20, "{n} in {names:?}");
         }
         assert!(
-            names.contains(&"M6×1 · tap drill Ø5") && names.contains(&"M6×1 · tap"),
+            names.contains(&"Tap drill Ø5") && names.contains(&"Thread M6×1"),
             "{names:?}"
         );
         let (shown, _) = a.guide_at().unwrap();
@@ -5941,8 +6178,9 @@ flood = { pin = 8 }
             .count();
         assert_eq!(tools, 1, "one Tool screen for the centre drill");
         assert!(
+            // Named Thread since LIO-419.
             a.status
-                .starts_with("Added to Manual Mill: centre drill, then drill and tap 2× M6×1"),
+                .starts_with("Added to Manual Mill: one centre drilling, then Thread M6×1 (2×)"),
             "{}",
             a.status
         );
@@ -5955,7 +6193,7 @@ flood = { pin = 8 }
         let first = a.status.split(". ").next().unwrap_or_default().to_string();
         assert!(first.contains("missing"), "{}", a.status);
         let tap = (a.doc.setups[0].operations.iter())
-            .position(|o| o.name() == "M6×1 · tap")
+            .position(|o| o.name() == "Thread M6×1")
             .unwrap();
         let _ = a.update(Message::Page(Page::Work));
         let _ = a.update(Message::SelectOp(tap));
@@ -5992,12 +6230,12 @@ flood = { pin = 8 }
         let t = texts_at(&mut a, check);
         assert!(t.iter().any(|s| s == "M6×1 screw"), "{t:?}");
         assert!(!t.iter().any(|s| s == "Ø"), "{t:?}");
-        let drill = op_step(&a, "M6×1 · tap drill Ø5");
+        let drill = op_step(&a, "Tap drill Ø5");
         let under = |t: &Vec<String>| t.iter().any(|s| s.contains("under the stock"));
         assert!(under(&texts_at(&mut a, drill)));
         a.doc.setups[0].p.insert("stock_bottom".into(), "10".into());
         crate::steps::tests::build(&mut a);
-        let drill = op_step(&a, "M6×1 · tap drill Ø5");
+        let drill = op_step(&a, "Tap drill Ø5");
         assert!(!under(&texts_at(&mut a, drill)));
     }
     /// Renders tapping on the manual mill to `$AXIS_RENDER_DIR` (default

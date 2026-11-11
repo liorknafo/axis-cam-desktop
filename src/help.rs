@@ -1206,7 +1206,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "Its holes follow the drill's, and deleting the drill deletes it. The library's centre drill whose pilot goes down the narrowest hole and whose body reaches the widest; with none, it is added without a tool and the status says which to add.",
         ),
         AddThreading => (
-            "Add, for each thread size of the setup's threaded holes that open upwards, a Drill of its tap drill and then its thread: Thread milling with a thread mill on the CNC, Tapping by hand on the manual mill, where the holes are all centre drilled first. Tools come from the library; the status says which are missing.",
+            "Add a Thread operation for each thread size modeled on the part that this setup reaches and that has none yet, with what it needs before it: its tap drill (and on the manual mill one centre drilling), or on the lathe the blank turned to size or the tap drill. With none left, one Thread to fill by hand. Deleting a Thread deletes what it brought.",
             "",
         ),
         AddNeededTool => (
