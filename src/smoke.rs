@@ -5920,7 +5920,8 @@ flood = { pin = 8 }
         assert_eq!((a.tab.as_str(), a.picking), ("Turn", true));
         let prompt = crate::turn::pick_prompt("Outside");
         assert!(a.status.ends_with(prompt), "{}", a.status);
-        shows(&a, &[prompt, "Finish picking"]);
+        // "Stop picking", the same word on every operation (LIO-428).
+        shows(&a, &[prompt, "Stop picking"]);
         let pin = face_where(&a, |p| near(r(p), 8.));
         click(&mut a, pin);
         assert_eq!((field(&a, "diameter"), field(&a, "z_end")), (16., -22.));
@@ -5982,7 +5983,7 @@ flood = { pin = 8 }
         let _ = d.update(Message::SelectSetup(lathe.unwrap()));
         let _ = d.update(Message::AddTurn("Outside"));
         assert!(!d.picking);
-        lacks(&d, &["Pick the face on the part"]);
+        lacks(&d, &["Pick on the part"]);
     }
     /// LIO-419: Thread is a tile on every machine and the browser has no
     /// "+ Add threading".
@@ -20776,7 +20777,8 @@ soft_max = 180.0
         assert!((h.diameter - 6.).abs() < 0.01 && !h.through);
         assert!((h.top - h.bottom - 5.).abs() < 0.01, "{h:?}");
         let bottom = h.bottom;
-        let row = "✓ Ø6.00 (opening Ø6.00) · X-10.00 Y0.00 · depth 5.00 mm · blind · remove";
+        // "Remove", as on every line (LIO-428).
+        let row = "✓ Ø6.00 (opening Ø6.00) · X-10.00 Y0.00 · depth 5.00 mm · blind · Remove";
         shows(&a, &["1 hole to drill", row]);
         // With a Ø6 drill it raises nothing and drills it.
         let mut drill = crate::model::Tool::new("T9 Drill 6", "Drill", "6");
@@ -20949,9 +20951,10 @@ soft_max = 180.0
         // shown does not stand them up.
         let texts = page_texts(&a);
         assert!(
-            !texts.iter().any(|t| t.contains("rim face selected")
-                || t.contains("rim faces selected")
-                || t.starts_with("✓ Surface")),
+            // In LIO-428's words: no face picked, none listed as a wall.
+            !texts.iter().any(|t| t.ends_with(" face picked")
+                || t.ends_with(" faces picked")
+                || t.starts_with("✓ Wall")),
             "{texts:?}"
         );
         assert!(texts.iter().any(|t| t.contains("180° arc")), "{texts:?}");
@@ -20998,7 +21001,8 @@ soft_max = 180.0
         assert_eq!(holes.len(), 1);
         let h = &holes[0];
         assert!(h.through && (h.diameter - 10.).abs() < 0.01, "{h:?}");
-        let row = "✓ Ø10.00 (opening Ø10.00) · X0.00 Y-10.00 · depth 10.00 mm · through · 180° arc · remove";
+        // "Remove", as on every line (LIO-428).
+        let row = "✓ Ø10.00 (opening Ø10.00) · X0.00 Y-10.00 · depth 10.00 mm · through · 180° arc · Remove";
         shows(&a, &["1 hole to drill", row, crate::ui::ARC_ENGAGEMENT]);
         // With a Ø10 drill it raises nothing and drills down through there.
         let mut drill = crate::model::Tool::new("T9 Drill 10", "Drill", "10");
@@ -21155,8 +21159,14 @@ soft_max = 180.0
         let _ = a.update(Message::Surface(dome));
         assert_eq!(picked(&a), whole);
         let texts = page_texts(&a);
-        assert!(texts.iter().any(|t| t == "1 face selected"), "{texts:?}");
-        assert!(texts.iter().any(|t| t.starts_with("✓ Face ")), "{texts:?}");
+        // Named by what it is, in LIO-428's words.
+        assert!(texts.iter().any(|t| t == "1 face picked"), "{texts:?}");
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("✓ ") && t.ends_with(" · Remove")),
+            "{texts:?}"
+        );
         let setup = a.doc.setup();
         let op = &setup.operations[0];
         assert!(
@@ -21169,7 +21179,8 @@ soft_max = 180.0
         // centred on the axis).
         let ring = half_ball_surface(&a, |r, z| r < 0.01 && (z - 4.).abs() < 0.01);
         let _ = a.update(Message::Surface(ring));
-        assert!(page_texts(&a).iter().any(|t| t == "2 faces selected"));
+        // "picked", as on every operation (LIO-428).
+        assert!(page_texts(&a).iter().any(|t| t == "2 faces picked"));
         // A click on another triangle of the dome drops it, and only it.
         let other = *whole.iter().find(|&&id| id != dome).unwrap();
         let _ = a.update(Message::Surface(other));
@@ -21197,7 +21208,7 @@ soft_max = 180.0
         let mut ids = a.operation().unwrap().surfaces.clone().unwrap().ids;
         ids.sort();
         assert_eq!(ids, a.imported_mesh.as_ref().unwrap().region_of(dome));
-        assert!(page_texts(&a).iter().any(|t| t == "1 face selected"));
+        assert!(page_texts(&a).iter().any(|t| t == "1 face picked"));
     }
     /// The window halfway through finishing two half balls apart, both
     /// picked, the right one first: /tmp/half-ball-app/two-{parallel,
@@ -23334,6 +23345,117 @@ soft_max = 180.0
         assert_eq!(a.tab, "Tool");
         assert!(!a.picking && a.new_op_line().is_none());
         assert!(a.status.ends_with("Choose a tool and machining geometry."));
+    }
+    /// Picking speaks one language (LIO-428): a picked face is named by
+    /// what it is, never by the mesh's number; the count, the buttons and
+    /// the line's Remove are the same words on Face, Pocket, Drill and the
+    /// Box; how picks are read and what is not checked are under About.
+    #[test]
+    fn picking_speaks_one_language_on_every_operation() {
+        let numbered = |t: &str| {
+            (t.split("Surface ").skip(1)).any(|r| r.starts_with(|c: char| c.is_ascii_digit()))
+        };
+        let check = |a: &App, what: &str| {
+            let texts = page_texts(a);
+            assert!(!texts.iter().any(|t| numbered(t)), "{what}: {texts:?}");
+            assert!(
+                texts
+                    .iter()
+                    .any(|t| t == "1 face picked" || t == "1 hole picked"),
+                "{what}: {texts:?}"
+            );
+            // On the tabs; the strip under the view says what is checked.
+            let strip = a.playback_reason();
+            for word in ["tessellated", "not implemented", "demonstration geometry"] {
+                assert!(
+                    !texts.iter().any(|t| t.contains(word) && *t != strip),
+                    "{what}: {word}: {texts:?}"
+                );
+            }
+            assert!(
+                texts
+                    .iter()
+                    .any(|t| t == "Stop picking" || t == "Pick on the part"),
+                "{what}: {texts:?}"
+            );
+            lacks(
+                a,
+                &[
+                    "Finish picking",
+                    "Select surfaces on part",
+                    "Clear surface selection",
+                    "Pick the face on the part",
+                ],
+            );
+        };
+        // The part's top face, and its widest floor below the top.
+        let top = |a: &App| {
+            let mesh = a.imported_mesh.as_ref().unwrap();
+            let placement = crate::stock::Placement::new(mesh, a.doc.active_setup());
+            (mesh.surfaces.iter().enumerate())
+                .filter(|(_, s)| s.normal[2].abs() > 0.99999)
+                .max_by(|(_, a), (_, b)| {
+                    placement.transform(a.center)[2].total_cmp(&placement.transform(b.center)[2])
+                })
+                .unwrap()
+                .0
+        };
+        let floor = |a: &App| {
+            let mesh = a.imported_mesh.as_ref().unwrap();
+            let placement = crate::stock::Placement::new(mesh, a.doc.active_setup());
+            let z = |c| placement.transform(c)[2];
+            (mesh.surfaces.iter().enumerate())
+                .filter(|(_, s)| {
+                    s.normal[2].abs() > 0.999999
+                        && z(s.center) < placement.bounds.max[2] - 0.1
+                        && z(s.center) > placement.bounds.min[2] + 0.1
+                })
+                .max_by(|(_, a), (_, b)| a.area.total_cmp(&b.area))
+                .unwrap()
+                .0
+        };
+        let add = |a: &mut App, s: Strategy| {
+            let _ = a.update(Message::AddOp(s));
+            if a.operation().is_none() {
+                let _ = a.update(Message::SaveTool);
+            }
+        };
+        let pick = |a: &mut App, id: usize| {
+            let _ = a.update(Message::Viewport(crate::viewport::Event::PickSurface(id)));
+        };
+        for (s, on_floor) in [
+            (Strategy::Face, false),
+            (Strategy::Pocket, true),
+            (Strategy::Drill, false),
+        ] {
+            let mut a = imported_app();
+            a.doc.setup_mut().operations.clear();
+            a.selected = None;
+            add(&mut a, s);
+            let id = if on_floor { floor(&a) } else { top(&a) };
+            pick(&mut a, id);
+            check(&a, s.name());
+            let texts = page_texts(&a);
+            let named = (texts.iter()).find(|t| t.starts_with("✓ ") && t.ends_with(" · Remove"));
+            let named = named.unwrap_or_else(|| panic!("{s:?}: {texts:?}"));
+            let want = if on_floor {
+                "✓ Floor "
+            } else {
+                "✓ Top face · "
+            };
+            assert!(named.starts_with(want), "{s:?}: {named}");
+            shows(&a, &["Clear all"]);
+        }
+        // The Box on the manual mill.
+        let mut a = imported_app();
+        with_big_cutter(&mut a);
+        let _ = a.update(Message::AddManualSetup);
+        let m = (a.doc.setups.iter()).position(|s| crate::manual::is_manual(&s.machine));
+        let _ = a.update(Message::SelectSetup(m.unwrap()));
+        add(&mut a, Strategy::Box);
+        let id = top(&a);
+        pick(&mut a, id);
+        check(&a, "Box");
     }
     #[test]
     fn imported_pocket_selection_playback_direction_and_reopen_work_end_to_end() {
@@ -31225,7 +31347,7 @@ soft_max = 180.0
         let _ = a.update(Message::Edit(Target::Setup, "stock_top", "10".into()));
         let _ = a.update(Message::AddOp(Strategy::Box));
         assert!(a.picking && a.tab == "Box", "{} {}", a.picking, a.tab);
-        shows(&a, &["From the part", "Finish picking", "The block"]);
+        shows(&a, &["From the part", "Stop picking", "The block"]);
         lacks(&a, &["From selected face", "Fill again from the face"]);
         // The pick is above the six numbers.
         let texts = page_texts(&a);
@@ -31345,7 +31467,7 @@ soft_max = 180.0
         let _ = a.update(Message::PickMode);
         assert!(!a.picking);
         lacks(&a, &[note]);
-        shows(&a, &["Pick the face on the part"]);
+        shows(&a, &["Pick on the part"]);
         // Another operation and back: no note.
         let _ = a.update(Message::PickMode);
         let _ = a.update(Message::Surface(chamfer));

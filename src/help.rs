@@ -1228,7 +1228,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "",
         ),
         PickMode => (
-            "Select geometry on the current part. Click a surface to toggle it, drag to orbit, and click Finish picking when done. For a Box: click a face of the part, and the Box removes the stock that covers it, a floor cut from above, a wall from the side. Imported Facing/Pocket selections are connected planar mesh regions, not exact CAD faces.",
+            "Select geometry on the current part. Click a surface to toggle it, drag to orbit, and click Stop picking when done. For a Box: click a face of the part, and the Box removes the stock that covers it, a floor cut from above, a wall from the side. Imported Facing/Pocket selections are connected planar mesh regions, not exact CAD faces.",
             "",
         ),
         Generate => (

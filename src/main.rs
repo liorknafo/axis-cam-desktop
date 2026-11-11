@@ -283,7 +283,7 @@ pub enum Message {
     ClearSurfaces,
     BoxFromFace,
     PickMode,
-    /// "Pick holes on the part" (and "Finish picking") in the Work zero step.
+    /// "Pick holes on the part" (and "Stop picking") in the Work zero step.
     PickPinHoles,
     /// A click on the part's surface while picking the pin holes.
     PinHoleSurface(usize),
@@ -2658,16 +2658,7 @@ impl App {
         if o.needs_surfaces() {
             let unpicked =
                 o.geometry.is_empty() && o.surfaces.as_ref().is_none_or(|s| s.ids.is_empty());
-            return (unpicked && self.can_pick()).then_some(match o.strategy {
-                Strategy::Face => "Click a flat face on the part: it is faced down to.",
-                Strategy::Pocket | Strategy::Adaptive => {
-                    "Click the pocket's floor on the part, or a hole."
-                }
-                Strategy::Drill => "Click a hole on the part.",
-                Strategy::Chamfer => "Click the level face whose edges are chamfered.",
-                Strategy::Groove => "Click the wall of the bore the groove goes in.",
-                _ => "Click a face on the part.",
-            });
+            return (unpicked && self.can_pick()).then_some(ui::pick_line(o));
         }
         matches!(
             o.strategy,
@@ -6912,7 +6903,7 @@ impl App {
                 if let Some(pick) = turned {
                     match pick {
                         Some(pick) => self.fill_turn(pick),
-                        None => self.status = "Pick the face on the part first.".into(),
+                        None => self.status = "Pick on the part first.".into(),
                     }
                     return Task::none();
                 }
