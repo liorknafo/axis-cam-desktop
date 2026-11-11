@@ -23097,6 +23097,10 @@ soft_max = 180.0
             a.doc.setup_mut().operations.clear();
             a.selected = None;
             let _ = a.update(Message::AddOp(s));
+            // With no cutter for it the tool offered is saved, which adds it.
+            if a.operation().is_none() {
+                let _ = a.update(Message::SaveTool);
+            }
             assert_eq!(a.operation().unwrap().strategy, s);
             a
         };
