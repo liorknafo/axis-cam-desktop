@@ -1410,6 +1410,10 @@ pub struct App {
     /// shown on its tab while it picks (LIO-401); any edit clears it
     /// (LIO-408).
     pub box_refused: Option<(String, String)>,
+    /// The operation just added, until another tab is opened, another
+    /// operation or setup is selected or Generate is pressed: it says what
+    /// to click rather than an error (LIO-427).
+    pub fresh: Option<String>,
     /// "Pick holes on the part" in the Work zero step: a click on the part
     /// chooses or removes the hole it is in for the fixture pins, while
     /// that step of a setup on the pins is open (`picking_pin_holes`).
@@ -2108,6 +2112,7 @@ impl App {
             paths: true,
             picking: false,
             box_refused: None,
+            fresh: None,
             picking_pins: false,
             placing_pins: false,
             pin_aim: None,
@@ -2588,6 +2593,31 @@ impl App {
                         && o.strategy.imported_preview()
                         && self.imported_mesh.is_some()))
         })
+    }
+    /// What a new operation says on its tab and in the status line before
+    /// anything else is done to it (LIO-427): what to click on the part,
+    /// or that it cuts the whole part. None in the example project.
+    pub fn new_op_line(&self) -> Option<&'static str> {
+        let o = (self.operation()).filter(|o| self.fresh.as_deref() == Some(o.id.as_str()))?;
+        if o.needs_surfaces() {
+            let unpicked =
+                o.geometry.is_empty() && o.surfaces.as_ref().is_none_or(|s| s.ids.is_empty());
+            return (unpicked && self.can_pick()).then_some(match o.strategy {
+                Strategy::Face => "Click a flat face on the part: it is faced down to.",
+                Strategy::Pocket | Strategy::Adaptive => {
+                    "Click the pocket's floor on the part, or a hole."
+                }
+                Strategy::Drill => "Click a hole on the part.",
+                Strategy::Chamfer => "Click the level face whose edges are chamfered.",
+                Strategy::Groove => "Click the wall of the bore the groove goes in.",
+                _ => "Click a face on the part.",
+            });
+        }
+        matches!(
+            o.strategy,
+            Strategy::Contour | Strategy::Parallel | Strategy::Waterline | Strategy::Scallop
+        )
+        .then_some("Cuts the whole part. Pick faces only to limit it.")
     }
     fn operation_mut(&mut self) -> Option<&mut Operation> {
         let selected = self.selected;
@@ -3420,6 +3450,10 @@ impl App {
         }
         if !operation.strategy.imported_preview() {
             return operation.strategy.availability().into();
+        }
+        // A new operation asks for its pick here too (LIO-427).
+        if let Some(line) = self.new_op_line().filter(|_| operation.needs_surfaces()) {
+            return line.into();
         }
         if let Some(issue) = self.op_issues().first() {
             return issue.clone();
@@ -5682,6 +5716,7 @@ impl App {
             }
             Message::SelectSetup(i) => {
                 self.box_refused = None;
+                self.fresh = None;
                 // An operation's preview is generated for the setup it is in.
                 if i != self.doc.index()
                     && self
@@ -5701,6 +5736,7 @@ impl App {
             }
             Message::SelectOp(i) => {
                 self.box_refused = None;
+                self.fresh = None;
                 if self
                     .generating
                     .as_ref()
@@ -5773,6 +5809,11 @@ impl App {
             }
             Message::Tab(t) => {
                 self.box_refused = None;
+                // Another tab: a new operation left unfinished shows its
+                // errors (LIO-427).
+                if t != self.tab {
+                    self.fresh = None;
+                }
                 // A Box with no face yet picks on its tab, as when added
                 // (LIO-408).
                 let unpicked_box = t == "Box"
@@ -6066,7 +6107,20 @@ impl App {
                 self.page = Page::Work;
                 self.picking = false;
                 self.touch();
-                self.status = format!("Added {added}. Choose a tool and machining geometry.");
+                // An operation that needs a place on the part opens on the
+                // tab that picks it, picking; one that cuts the whole part
+                // says so. The tab and the status line say the same (LIO-427).
+                if !self.is_sample() {
+                    if self.can_pick() && self.operation().is_some_and(|o| o.needs_surfaces()) {
+                        let _ = self.update(Message::Tab("Geometry".into()));
+                    }
+                    self.fresh = self.operation().map(|o| o.id.clone());
+                }
+                let next = self.new_op_line();
+                self.status = format!(
+                    "Added {added}. {}",
+                    next.unwrap_or("Choose a tool and machining geometry.")
+                );
                 if let Some((named, missing)) = centred {
                     self.status.push(' ');
                     self.status
@@ -6772,6 +6826,7 @@ impl App {
                 }
             }
             Message::Generate => {
+                self.fresh = None;
                 let mut issues = self.doc.setup().issues();
                 issues.extend(self.op_issues());
                 if !issues.is_empty() {
@@ -6894,6 +6949,7 @@ impl App {
                 }
             }
             Message::GenerateAll => {
+                self.fresh = None;
                 if !self.is_sample() {
                     self.audit_report.clear();
                     let Some(mesh) = self.imported_mesh.clone() else {

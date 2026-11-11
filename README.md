@@ -199,7 +199,7 @@ Open **Start → Explore example project** first. This loads the housing, sample
 
 1. Open **Machine library → New machine profile**, complete the wizard and save. Assign the profile to the current setup.
 2. Click **Edit setup** and go through its **Machine**, **Stock**, **Position** and **Holding** steps to configure the work offset, origin, material, stock, part position and workholding.
-3. Choose an operation from the ribbon. Set the cutter and feeds/speeds; a warning on the Tool tab shows when they are outside the project material's cutting data (see **Materials**).
+3. Choose an operation from the ribbon. On an imported part one that needs a place on the part (Face, Pocket, Adaptive, Drill, Chamfer, Groove) opens on its Geometry tab with picking on, saying what to click there and in the status line ("Click the pocket's floor on the part, or a hole."), with no error until another tab is opened or Generate is pressed; one that cuts the whole part (Contour, Parallel, Waterline, Scallop) opens on Tool and says "Cuts the whole part. Pick faces only to limit it." (LIO-427). Set the cutter and feeds/speeds; a warning on the Tool tab shows when they are outside the project material's cutting data (see **Materials**).
 4. Open **Geometry**. Select sample features from the list or click them in the viewport. Drag still orbits the model.
 5. Set Heights, Passes/Cycle, Orientation when applicable, and Linking.
 6. Click **Generate sample preview**, then **Play**. Previews are invalidated when job parameters change.
