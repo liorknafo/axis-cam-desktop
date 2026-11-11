@@ -30120,8 +30120,10 @@ soft_max = 180.0
         // row's second line says what it is, not the machine's name again
         // and "3-axis" (LIO-382); the CNC setup's is unchanged. Its Machine
         // step speaks of the DRO's zero, not of G54–G59.
+        // No G-code said on a hand setup's page (LIO-423): it was
+        // "hand-fed · no G-code".
         let t = crate::ui::probe::texts(a.view(), WINDOW);
-        assert!(t.iter().any(|s| s == "hand-fed · no G-code"), "{t:?}");
+        assert!(t.iter().any(|s| s == "worked by hand"), "{t:?}");
         assert!(!t.iter().any(|s| s == "Manual Mill · 3-axis"), "{t:?}");
         assert!(t.iter().any(|s| s.starts_with("G54 · ")), "{t:?}");
         let _ = a.update(Message::SetupStep("Machine"));
@@ -30130,7 +30132,8 @@ soft_max = 180.0
             &a,
             &[
                 "Manual Mill · v1",
-                "Manual mill, no G-code. The DRO's zero is in the Work zero step.",
+                // Was "Manual mill, no G-code. …" (LIO-423).
+                "Manual mill, worked by hand. The DRO's zero is in the Work zero step.",
             ],
         );
         lacks(
@@ -30203,6 +30206,78 @@ soft_max = 180.0
         assert_eq!(a.doc.setup().machine.name(), want);
         assert!(!hand(&a.doc.setup().machine));
     }
+    /// A hand setup's page speaks of a hand machine: no Generate, NC
+    /// review, Preview tab, G-code, post or collision. Its way to the
+    /// machine is Steps, under it in the browser, in the tabs and in
+    /// ACTIONS, as a CNC setup's is NC review (LIO-423).
+    #[test]
+    fn a_hand_setups_page_offers_its_steps_and_no_program_words() {
+        let bad = |a: &App| -> Vec<String> {
+            (page_texts(a).into_iter())
+                .filter(|t| {
+                    let w = t.to_lowercase();
+                    ["Generate", "NC review", "Preview", "G-code"]
+                        .iter()
+                        .any(|x| t.contains(x))
+                        || w.contains("collision")
+                        || w.split(|c: char| !c.is_alphanumeric()).any(|x| x == "post")
+                })
+                .collect()
+        };
+        let opens = |a: &App, m: &Message| {
+            (crate::ui::probe::clicks(a.view(), WINDOW).iter())
+                .filter(|c| format!("{c:?}") == format!("{m:?}"))
+                .count()
+        };
+        let mut a = imported_app();
+        with_big_cutter(&mut a);
+        with_lathe(&mut a);
+        a.page = Page::Work;
+        // The CNC setup: as before, with its button under it.
+        shows(
+            &a,
+            &[
+                "NC review ▶",
+                "03  Preview",
+                "04  NC review",
+                "Generate all",
+            ],
+        );
+        let post = Message::Page(Page::Post);
+        assert!(opens(&a, &post) >= 3);
+        // The manual mill with a Box, and the lathe with an Outside: on
+        // every tab, and with no operation selected.
+        let _ = a.update(Message::AddManualSetup);
+        let _ = a.update(Message::AddLatheSetup);
+        for (hand, add) in [
+            (
+                crate::manual::is_manual as fn(&crate::model::Machine) -> bool,
+                Message::AddOp(Strategy::Box),
+            ),
+            (crate::lathe::is_lathe, Message::AddTurn("Outside")),
+        ] {
+            let si = (a.doc.setups.iter())
+                .position(|s| hand(&s.machine))
+                .unwrap();
+            let _ = a.update(Message::SelectSetup(si));
+            a.selected = None;
+            let steps = Message::Guide(crate::GuideAction::Open(si));
+            shows(&a, &["Steps ▶", "03  Steps"]);
+            lacks(&a, &["NC review ▶", "Generate all"]);
+            // Under the setup, the tab and ACTIONS.
+            assert!(opens(&a, &steps) >= 3, "{:?}", a.doc.setup().name());
+            assert_eq!(opens(&a, &post), 0);
+            assert_eq!(bad(&a), Vec::<String>::new(), "no operation");
+            let _ = a.update(add);
+            a.picking = false;
+            let tabs = a.operation().unwrap().tabs(&a.doc.setup().machine);
+            for tab in tabs {
+                let _ = a.update(Message::Tab(tab.into()));
+                assert_eq!(bad(&a), Vec::<String>::new(), "{tab}");
+            }
+            shows(&a, &["Show the cut", "CHECK"]);
+        }
+    }
     /// The sample app with a lathe in the library and a lathe tool of each type.
     fn with_lathe(a: &mut App) {
         a.doc.machines.push(crate::lathe::defaults());
@@ -30226,8 +30301,8 @@ soft_max = 180.0
         lacks(&a, &["+ Add lathe setup"]);
         with_lathe(&mut a);
         shows(&a, &["+ Add lathe setup"]);
-        let clicks = crate::ui::probe::clicks(a.view(), WINDOW);
-        assert!(clicks.iter().any(|m| matches!(m, Message::AddLatheSetup)));
+        // Not clicked: the setup's own NC review ▶ (LIO-423) puts it under
+        // the browser's fold, which scrolls to it.
         let old = a.doc.active.clone();
         let _ = a.update(Message::AddLatheSetup);
         assert_eq!(a.doc.setups.len(), 2);
