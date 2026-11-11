@@ -1091,6 +1091,8 @@ mod tests {
         doc.setups[0].operations[0].tool = "gone".into();
         let left = crate::leftover_stock(&doc, &mesh, 0);
         let why = left.uncut.unwrap().unwrap_err();
-        assert!(why.starts_with("Top / "), "{why}");
+        // One short line: the operation's own check says what is wrong
+        // (LIO-425, was "Top / … could not be generated.").
+        assert!(why.starts_with("Completeness waits on Top / "), "{why}");
     }
 }

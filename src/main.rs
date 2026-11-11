@@ -1064,8 +1064,10 @@ fn leftover_stock(doc: &Document, mesh: &mesh::Mesh, key: u64) -> LeftStock {
     let after = after.into_inner();
     let job = last.into_inner();
     let uncut = Some(match (broken, &job) {
+        // One short line: the operation's own check says what is wrong
+        // (LIO-425).
         (Some((si, oi)), _) => Err(format!(
-            "{} / {} could not be generated.",
+            "Completeness waits on {} / {}.",
             doc.setups[si].name(),
             doc.setups[si].operations[oi].name()
         )),

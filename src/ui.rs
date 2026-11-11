@@ -544,9 +544,26 @@ pub(crate) fn op_checks(app: &App) -> Vec<Check> {
         .into_iter()
         .map(|text| Check::new(text, true))
         .collect();
+    // What stops the setup that is this operation's, in the sentence the
+    // panel and the Steps page say: never "checks passed" beside it (LIO-425).
+    if let (Some(i), Some(o), Some(r)) = (app.selected, app.operation(), app.current_ready()) {
+        let hand = manual::is_hand(&app.doc.setup().machine);
+        let names = [
+            o.name().to_string(),
+            crate::threading::shown_name(o, &app.doc.tools),
+        ];
+        for line in refusal_lines(r, i, hand) {
+            let own = (names.iter()).find_map(|n| line.strip_prefix(&format!("{n}: ")));
+            if let Some(rest) = own
+                && !checks.iter().any(|c| c.text == rest || c.text == line)
+            {
+                checks.push(Check::new(line, true));
+            }
+        }
+    }
     // A new operation asks for its pick, with no error yet (LIO-427).
     if app.new_op_line().is_some() {
-        checks.retain(|c| c.text != crate::model::NOTHING_PICKED);
+        checks.retain(|c| !c.text.ends_with(crate::model::NOTHING_PICKED));
     }
     if let Some(o) = app.operation()
         && let Some(SpeedFeed::Out(problems)) = app.doc.speed_feed(app.doc.setup(), o)
@@ -2131,7 +2148,7 @@ pub(crate) fn uncut_line(app: &App) -> Option<String> {
             }
         }
         Some((_, false)) => "Checking completeness again…".into(),
-        Some((Err(why), true)) => format!("Completeness not checked: {why}"),
+        Some((Err(why), true)) => why.clone(),
         Some((Ok(found), true)) if !found.any() => {
             "Every face of the part is cut by the job.".into()
         }
@@ -7018,7 +7035,8 @@ pub(crate) fn mark_help(
             let Some(r) = checks else {
                 return format!("{head} The example's sample paths cannot be run.");
             };
-            let lines = refusal_lines(r, i);
+            let hand = manual::is_hand(&app.doc.setup().machine);
+            let lines = refusal_lines(r, i, hand);
             let mut help = format!("{head} {by} will refuse {name}");
             if lines.is_empty() {
                 help.push('.');
@@ -7043,13 +7061,19 @@ pub(crate) fn mark_help(
 /// panel's words: the operation's own workholding lines first, then the
 /// setup's, then the other problems, none twice. Holding not checked for a
 /// problem listed too names its operation, last, instead of repeating it.
-fn refusal_lines(r: &crate::run::Ready, i: usize) -> Vec<String> {
+/// On a hand machine (`hand`) a problem is said as itself, never as
+/// "Holding not checked: …" (LIO-425).
+fn refusal_lines(r: &crate::run::Ready, i: usize, hand: bool) -> Vec<String> {
     let own = r.held.iter().filter(|h| h.operation == Some(i));
     let setup_wide = r.held.iter().filter(|h| h.operation.is_none());
     let mut lines: Vec<String> = vec![];
     for problem in own.chain(setup_wide).map(|h| &h.message).chain(&r.problems) {
-        if !lines.contains(problem) {
-            lines.push(problem.clone());
+        let problem = match problem.strip_prefix("Holding not checked: ") {
+            Some(it) if hand => it.trim_end_matches('.').to_string() + ".",
+            _ => problem.clone(),
+        };
+        if !lines.contains(&problem) {
+            lines.push(problem);
         }
     }
     let listed = lines.clone();
@@ -7088,7 +7112,7 @@ mod refusal_tests {
         };
         let r = ready(&crate::post::not_checked(&[problem.into()]));
         assert_eq!(
-            refusal_lines(&r, 0),
+            refusal_lines(&r, 0, false),
             [
                 problem,
                 "Holding not checked until the Facing problem is fixed."
@@ -7096,7 +7120,9 @@ mod refusal_tests {
         );
         // Holding not checked for another reason is kept as it is.
         let other = "Holding not checked: Drill: Select holes first.";
-        assert_eq!(refusal_lines(&ready(other), 0), [other, problem]);
+        assert_eq!(refusal_lines(&ready(other), 0, false), [other, problem]);
+        // On a hand machine the problem is said once, as itself (LIO-425).
+        assert_eq!(refusal_lines(&r, 0, true), [problem]);
     }
 }
 /// What the simulation panel says of the selected operation's setup above
@@ -7134,7 +7160,7 @@ pub(crate) fn run_check(app: &App) -> Option<(String, Vec<String>, bool, bool)> 
         }
     };
     let mark = op_mark(app, Some(r), i);
-    let lines = refusal_lines(r, i);
+    let lines = refusal_lines(r, i, manual::is_hand(&setup.machine));
     let machine = "The machine's position and the work zero are checked on the Control page.";
     let (heading, lines, ok) = match mark {
         OpMark::Suppressed => return None,
