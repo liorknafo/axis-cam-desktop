@@ -2089,11 +2089,11 @@ fn problem<'a>(app: &'a App, e: &str) -> Element<'a, Message> {
         .find_map(|(i, o)| Some((i, o.name(), e.strip_prefix(&format!("{}: ", o.name()))?)));
     let (label, action) = match named {
         Some((i, name, rest)) => (
-            format!("Open {name} in MANUFACTURE ▶"),
+            format!("Open {name} in planning ▶"),
             GuideAction::Fix(Some(i), rest.to_string()),
         ),
         None => (
-            "Open the setup in MANUFACTURE ▶".to_string(),
+            "Open the setup in planning ▶".to_string(),
             GuideAction::Fix(None, e.to_string()),
         ),
     };
@@ -2132,7 +2132,9 @@ fn setups(app: &App) -> Element<'_, Message> {
         Some(s) if crate::lathe::is_lathe(&s.machine) => "Manual lathe",
         _ => "Manual mill",
     };
-    let mut c = column![bold(title, 16), muted("Setups")].spacing(8);
+    // The one way back, top left (LIO-429).
+    let back = crate::ui::secondary(crate::ui::BACK, Message::SelectSetup(app.doc.index()));
+    let mut c = column![back, bold(title, 16), muted("Setups")].spacing(8);
     for (si, s) in app.doc.setups.iter().enumerate() {
         if !manual::is_hand(&s.machine) {
             continue;
@@ -4887,7 +4889,8 @@ pub(crate) mod tests {
             "{:?}",
             texts(&a)
         );
-        assert!(has(&a, "Open Step in MANUFACTURE ▶"), "{:?}", texts(&a));
+        // "planning", not MANUFACTURE (LIO-429).
+        assert!(has(&a, "Open Step in planning ▶"), "{:?}", texts(&a));
         let Some(Err(e)) = a.current_guide().cloned() else {
             panic!()
         };
@@ -4901,11 +4904,7 @@ pub(crate) mod tests {
         );
         // No operation: the button opens the setup on the Work page.
         let mut a = app_with("Yes", |doc| doc.setups[0].operations.clear());
-        assert!(
-            has(&a, "Open the setup in MANUFACTURE ▶"),
-            "{:?}",
-            texts(&a)
-        );
+        assert!(has(&a, "Open the setup in planning ▶"), "{:?}", texts(&a));
         a.selected = Some(0);
         let _ = a.update(Message::Guide(GuideAction::Fix(None, String::new())));
         assert_eq!((a.page, a.selected), (Page::Work, None));
@@ -5140,7 +5139,7 @@ pub(crate) mod tests {
             key,
             Err("It broke.".into()),
         )));
-        assert!(has(&a, "It broke.") && has(&a, "Open the setup in MANUFACTURE ▶"));
+        assert!(has(&a, "It broke.") && has(&a, "Open the setup in planning ▶"));
         a.guide = built;
         // The setup card in MANUFACTURE opens it.
         a.page = Page::Work;

@@ -1813,10 +1813,10 @@ fn guide_help(a: &crate::GuideAction) -> (&'static str, &'static str) {
             "",
         ),
         Fix(Some(_), _) => (
-            "Open the operation that stops the steps in MANUFACTURE, at the tab the problem is on.",
+            "Open the operation that stops the steps in planning, at the tab the problem is on.",
             "",
         ),
-        Fix(None, _) => ("Open this setup in MANUFACTURE to fix it.", ""),
+        Fix(None, _) => ("Open this setup in planning to fix it.", ""),
         Beat(_) | Built(..) => ("Show the steps of this manual setup.", ""),
         CrossReads(crate::lathe::Reads::Diameter) => (
             "The diameter went down by the dial's reading: the cross-slide dial reads the diameter. Saved to this lathe in the library and in every setup on it; the cross-slide numbers then show.",
