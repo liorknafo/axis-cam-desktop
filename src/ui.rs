@@ -9157,12 +9157,15 @@ pub(crate) fn run_line(
             ("Cutting ".into(), INK),
             (p.ops[op].name.clone(), INK),
             (
+                // Where the job is, as the Steps page says it (LIO-431).
                 format!(
-                    "{step} · tool run {} of {} · operation {} of {} · block {} of {blocks}",
-                    i + 1,
-                    programs.len(),
+                    " · Setup {} of {} · operation {} of {}{step} · tool run {} of {} · block {} of {blocks}",
+                    run.setup + 1,
+                    app.doc.setups.len(),
                     op + 1,
                     p.ops.len(),
+                    i + 1,
+                    programs.len(),
                     block + 1
                 ),
                 MUTED,

@@ -1347,7 +1347,7 @@ fn dial_size(p: &Page<'_>, n: f32) -> f32 {
 }
 /// Whether the window is narrow: the lathe's numbers then take half the card
 /// (`split`) and its readouts' keys only their width (LIO-389).
-fn narrow(p: &Page<'_>) -> bool {
+pub(super) fn narrow(p: &Page<'_>) -> bool {
     p.app.window_width < 1200.
 }
 /// How the side view and the numbers share a lathe screen's card, as
