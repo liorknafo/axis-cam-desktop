@@ -23119,6 +23119,8 @@ soft_max = 180.0
             assert_eq!(a.status, format!("Added {}. {line}", s.name()));
             shows(&a, &[line]);
             assert!(!errors(&a), "{s:?}");
+            // Nor under the view.
+            lacks(&a, &[crate::model::NOTHING_PICKED]);
             // Another tab without a pick: the error, as before.
             let _ = a.update(Message::Tab("Heights".into()));
             assert!(a.new_op_line().is_none());

@@ -3451,6 +3451,10 @@ impl App {
         if !operation.strategy.imported_preview() {
             return operation.strategy.availability().into();
         }
+        // A new operation asks for its pick here too (LIO-427).
+        if let Some(line) = self.new_op_line().filter(|_| operation.needs_surfaces()) {
+            return line.into();
+        }
         if let Some(issue) = self.op_issues().first() {
             return issue.clone();
         }
