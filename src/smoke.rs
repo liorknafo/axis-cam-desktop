@@ -30119,41 +30119,6 @@ soft_max = 180.0
         assert_eq!(a.doc.setup().machine.name(), want);
         assert!(!hand(&a.doc.setup().machine));
     }
-    #[test]
-    fn the_ribbon_dims_all_but_box_and_drill_on_a_manual_setup() {
-        let mut a = app();
-        with_manual(&mut a);
-        let sent = |a: &App| crate::ui::probe::clicks(a.view(), WINDOW);
-        let adds = |a: &App, s: Strategy| {
-            sent(a)
-                .iter()
-                .any(|m| matches!(m, Message::AddOp(x) if *x == s))
-        };
-        let reasons = |a: &App, reason: &str| {
-            let (_, cards) = laid(a).run(Helps::default()).expect("the view");
-            cards.iter().filter(|c| c.body == reason).count()
-        };
-        let (one_axis, box_on_cnc) = (crate::manual::ONE_AXIS, crate::manual::BOX_ON_CNC);
-        assert!(adds(&a, Strategy::Face) && adds(&a, Strategy::Drill));
-        assert!(!adds(&a, Strategy::Box));
-        assert_eq!(reasons(&a, one_axis), 0);
-        assert_eq!(reasons(&a, box_on_cnc), 1);
-        let _ = a.update(Message::AddManualSetup);
-        a.doc.active = a.doc.setups[0].id.clone();
-        assert!(!adds(&a, Strategy::Face));
-        assert!(!adds(&a, Strategy::FiveAxis));
-        assert!(adds(&a, Strategy::Drill) && adds(&a, Strategy::Box));
-        // The ten dimmed tiles each say why; Box and Drill are not dimmed,
-        // and Indexed points to indexed setups.
-        assert_eq!(reasons(&a, one_axis), Strategy::ALL.len() - 4);
-        assert_eq!(reasons(&a, crate::indexed::POINTER), 1);
-        assert_eq!(reasons(&a, box_on_cnc), 0);
-        // Back on the CNC setup only Box is dimmed.
-        a.doc.active = a.doc.setups[1].id.clone();
-        assert!(adds(&a, Strategy::Face) && !adds(&a, Strategy::Box));
-        assert_eq!(reasons(&a, one_axis), 0);
-        assert_eq!(reasons(&a, box_on_cnc), 1);
-    }
     /// The sample app with a lathe in the library and a lathe tool of each type.
     fn with_lathe(a: &mut App) {
         a.doc.machines.push(crate::lathe::defaults());
@@ -30261,56 +30226,135 @@ soft_max = 180.0
         let _ = a.update(Message::Edit(Target::Setup, "origin", wrong[0].clone()));
         assert!(crate::ui::setup_step_done(&a, "Work zero"));
     }
+    /// The toolbar shows what the active setup's machine runs, and only
+    /// that, each tile pressable (LIO-421). Replaces the tests of the dimmed
+    /// tiles: every machine had all fifteen, the others dimmed with a reason.
     #[test]
-    fn the_ribbon_has_a_lathe_group_and_enables_only_turn_and_drill_on_a_lathe_setup() {
+    fn the_ribbon_shows_what_the_setups_machine_runs() {
         let mut a = app();
+        with_manual(&mut a);
         with_lathe(&mut a);
-        let sent = |a: &App| crate::ui::probe::clicks(a.view(), WINDOW);
-        let adds = |a: &App, s: Strategy| {
-            sent(a)
-                .iter()
-                .any(|m| matches!(m, Message::AddOp(x) if *x == s))
+        let tiles = |a: &App| -> Vec<String> {
+            (crate::ui::probe::clicks(a.view(), WINDOW).into_iter())
+                .filter_map(|m| match m {
+                    Message::AddOp(s) => Some(format!("{s:?}")),
+                    Message::AddTurn(k) => Some(format!("lathe {k}")),
+                    Message::AddThreading => Some("Thread".into()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
         };
-        let reasons = |a: &App, reason: &str| {
+        // The probe clicks a grid: one entry per tile.
+        let tiles = |a: &App| {
+            let mut t = tiles(a);
+            t.dedup();
+            t
+        };
+        let dimmed = |a: &App| {
             let (_, cards) = laid(a).run(Helps::default()).expect("the view");
-            cards.iter().filter(|c| c.body == reason).count()
+            (cards.iter())
+                .filter(|c| c.title.contains("(unavailable)"))
+                .count()
         };
-        let (only_turn, turn_on_mill) = (crate::lathe::ONLY_TURN, crate::lathe::TURN_ON_MILL);
-        shows(&a, &["LATHE", "MANUAL"]);
-        // On a CNC setup Turn is dimmed and says so; everything else as before.
-        assert!(!adds(&a, Strategy::Turn) && adds(&a, Strategy::Face));
-        assert_eq!(reasons(&a, turn_on_mill), 1);
-        assert_eq!(reasons(&a, only_turn), 0);
-        let _ = a.update(Message::AddLatheSetup);
-        a.doc.active = a.doc.setups[0].id.clone();
-        for s in Strategy::ALL {
-            assert_eq!(
-                adds(&a, s),
-                matches!(s, Strategy::Turn | Strategy::Drill),
-                "{s:?}"
-            );
-        }
-        // The twelve others each say why.
-        assert_eq!(reasons(&a, only_turn), Strategy::ALL.len() - 2);
-        assert_eq!(reasons(&a, turn_on_mill), 0);
-        // Back on the CNC setup.
-        a.doc.active = a.doc.setups[1].id.clone();
-        assert!(adds(&a, Strategy::Face) && !adds(&a, Strategy::Turn));
-        assert_eq!(reasons(&a, only_turn), 0);
-        assert_eq!(reasons(&a, turn_on_mill), 1);
-        // And on the manual mill.
-        a.doc.machines.push(crate::manual::defaults());
+        let cnc = [
+            "Face",
+            "Adaptive",
+            "Pocket",
+            "Contour",
+            "Drill",
+            "Thread",
+            "Chamfer",
+            "Groove",
+            "Parallel",
+            "Waterline",
+            "Scallop",
+            "Rotary",
+            "FiveAxis",
+        ];
+        assert_eq!(tiles(&a), cnc);
+        assert_eq!(dimmed(&a), 0);
+        lacks(&a, &["Indexed", "MANUAL MILL", "LATHE"]);
+        // The manual mill: Box, Drill, Thread.
         let _ = a.update(Message::AddManualSetup);
-        a.doc.active = a
-            .doc
-            .setups
-            .iter()
-            .find(|s| crate::manual::is_manual(&s.machine))
-            .unwrap()
-            .id
-            .clone();
-        assert!(!adds(&a, Strategy::Turn) && adds(&a, Strategy::Box));
-        assert_eq!(reasons(&a, turn_on_mill), 1);
+        a.doc.active = a.doc.setups[0].id.clone();
+        a.selected = None;
+        assert_eq!(tiles(&a), ["Box", "Drill", "Thread"]);
+        assert_eq!(dimmed(&a), 0);
+        shows(&a, &["MANUAL MILL"]);
+        // The lathe: a tile per cut, then Thread and Drill.
+        let _ = a.update(Message::AddLatheSetup);
+        let lathe = (a.doc.setups.iter()).find(|s| crate::lathe::is_lathe(&s.machine));
+        a.doc.active = lathe.unwrap().id.clone();
+        a.selected = None;
+        assert_eq!(
+            tiles(&a),
+            [
+                "lathe Face",
+                "lathe Outside",
+                "lathe Bore",
+                "lathe Groove",
+                "lathe Chamfer",
+                "lathe Part off",
+                "Thread",
+                "Drill"
+            ]
+        );
+        assert_eq!(dimmed(&a), 0);
+        // Selecting a setup of another machine changes the toolbar.
+        a.doc.active = a.doc.setups.last().unwrap().id.clone();
+        assert_eq!(tiles(&a), cnc);
+        // With no setup: the CNC mill's.
+        assert_eq!(crate::ui::ribbon_tiles(None)[0].0, "2D MILLING");
+    }
+    /// Each lathe tile adds a Turn of its cut with that cut's tool; the
+    /// editor is titled by the cut and has no Kind list (LIO-421).
+    #[test]
+    fn each_lathe_tile_adds_its_cut_with_its_tool_and_no_kind_list() {
+        let mut a = app();
+        on_the_lathe(&mut a);
+        for kind in ["Face", "Outside", "Bore", "Groove", "Chamfer", "Part off"] {
+            let _ = a.update(Message::AddTurn(kind));
+            let op = a.operation().unwrap().clone();
+            assert_eq!(
+                (op.strategy, get(&op.p, "turn_kind")),
+                (Strategy::Turn, kind)
+            );
+            let tool = (a.doc.tools.iter()).find(|t| t.id == op.tool).unwrap();
+            assert_eq!(
+                get(&tool.p, "type"),
+                crate::lathe::tool_for(kind).unwrap(),
+                "{kind}"
+            );
+            assert!(
+                a.status.starts_with(&format!("Added {kind}.")),
+                "{}",
+                a.status
+            );
+            assert_eq!(a.op_issues(), Vec::<String>::new(), "{kind}");
+            let _ = a.update(Message::Tab("Turn".into()));
+            lacks(&a, &["Kind"]);
+            let texts = page_texts(&a);
+            let at = texts
+                .iter()
+                .position(|t| t == "Operation parameters")
+                .unwrap();
+            assert_eq!(texts[at - 1], kind);
+        }
+        // With no tool of the cut's type: the tools page, and saving adds it.
+        let mut b = app();
+        b.doc.machines.push(crate::lathe::defaults());
+        let _ = b.update(Message::AddLatheSetup);
+        b.doc.active = b.doc.setups[0].id.clone();
+        let _ = b.update(Message::AddTurn("Part off"));
+        assert_eq!(b.page, Page::Tools);
+        assert!(
+            b.status.contains("Part off needs a parting blade"),
+            "{}",
+            b.status
+        );
+        let _ = b.update(Message::SaveTool);
+        let op = &b.doc.setups[0].operations[0];
+        assert_eq!(get(&op.p, "turn_kind"), "Part off");
     }
     #[test]
     fn adding_a_turn_on_the_lathe_takes_a_turning_tool_and_a_gear_and_the_kind_changes_both() {
@@ -30444,8 +30488,9 @@ soft_max = 180.0
             "{e:?}"
         );
     }
+    // No Kind chooser any more: the cut is its tile (LIO-421).
     #[test]
-    fn the_turn_editor_has_a_kind_chooser_and_the_fields_of_each_kind() {
+    fn the_turn_editor_has_the_fields_of_each_kind() {
         let mut a = imported_app();
         on_the_lathe(&mut a);
         // The imported block is no turned part: a new lathe setup's bar now
@@ -30461,7 +30506,8 @@ soft_max = 180.0
         }
         let _ = a.update(Message::AddOp(Strategy::Turn));
         let _ = a.update(Message::Tab("Turn".into()));
-        shows(&a, &["Kind", "Diameter · mm", "Z end · mm"]);
+        shows(&a, &["Diameter · mm", "Z end · mm"]);
+        lacks(&a, &["Kind"]);
         lacks(&a, &["Take off the end · mm", "Pitch · mm"]);
         let _ = a.update(Message::Tab("Passes".into()));
         shows(
