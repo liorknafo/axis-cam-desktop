@@ -1244,7 +1244,7 @@ struct Reading {
     /// (turns × a turn + the reading): "6.00"; wound out, the turns and
     /// what the collar reads, "2 t out, 2.20", as it counts down.
     total: String,
-    /// "1 t + 2.00", "2 t out, 2.20".
+    /// "1 turn + 2.00", "2 t out, 2.20".
     short: String,
     /// "1 turn + 2.00", "2 turns out, reads 2.20".
     long: String,
@@ -1276,7 +1276,8 @@ fn reading(p: &Page<'_>, d: &Dial) -> Reading {
                 short: if *t == 0 {
                     reading.clone()
                 } else {
-                    format!("{t} t + {reading}")
+                    // One way everywhere: "3 turns + 4.0" (LIO-426).
+                    format!("{turns} + {reading}")
                 },
                 long: if *t == 0 {
                     reading.clone()
@@ -2117,7 +2118,12 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             {
                 cross_tags.push(format!("from the {} measured", dia(m)));
             }
+            // The carriage as the cross slide: the number big, the dial's
+            // turns under it, so "3 turns + 4.0" fits at 1024 (LIO-426).
             let mut carriage_tags = vec![];
+            if at.at.is_some() {
+                carriage_tags.push(format!("{} on the dial", at.long));
+            }
             if let Some(off) = feed_off {
                 carriage_tags.push(format!("◀ feed off at {}", reading(p, off).short));
                 carriage_tags.push("last 1 mm by hand".into());
@@ -2169,7 +2175,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     narrow,
                     Some(3),
                     "carriage",
-                    big(at.short.clone(), lit(2, item)),
+                    big(at.total.clone(), lit(2, item)),
                     carriage_tags,
                     lit(2, item),
                     reached(2),
@@ -2767,16 +2773,14 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 ACCENT,
                 Align::Center,
             ));
-            let mut left = column![
+            // The Try screen after the last pass says to try the nut
+            // (LIO-426: no chip for it here).
+            let left = column![
                 view(bar, marks),
                 note("the half-nuts stay closed through every pass".into())
             ]
-            .spacing(4);
-            if index == of {
-                // The last pass is set short of the depth, never past it.
-                left = left.push(chips(vec![warn_chip("try the nut, then a spring pass")]));
-            }
-            let left = left.into();
+            .spacing(4)
+            .into();
             let t = reading(p, top);
             let right = column![
                 chips(vec![

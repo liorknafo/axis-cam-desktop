@@ -3071,6 +3071,21 @@ impl App {
         }
         // A centre drilling's holes are the drill's it centres.
         centre::sync(&mut self.doc);
+        // A name the app gave follows the numbers; a typed one stays (LIO-426).
+        let tools = self.doc.tools.clone();
+        for o in self
+            .doc
+            .setups
+            .iter_mut()
+            .flat_map(|s| s.operations.iter_mut())
+        {
+            let given = get(&o.p, "auto_name");
+            if o.name().is_empty() || (!given.is_empty() && o.name() == given) {
+                let name = o.default_name(&tools);
+                o.p.insert("name".into(), name.clone());
+                o.p.insert("auto_name".into(), name);
+            }
+        }
         // Where picks made by this edit are, kept with the edit itself.
         self.record_picks();
         self.sync_turns();
@@ -6051,7 +6066,8 @@ impl App {
                     Message::AddOp(s) => (s, None),
                     _ => unreachable!(),
                 };
-                let added = kind.unwrap_or(strategy.name());
+                // The tile's word (LIO-426).
+                let added = kind.unwrap_or(strategy.short());
                 if !self.is_sample() && !strategy.imported_preview() {
                     self.stop_selection();
                     self.status = strategy.availability().into();
@@ -6063,6 +6079,8 @@ impl App {
                 if let Some(kind) = kind {
                     operation.set_turn_kind(kind);
                 }
+                // Named by what it cuts until a name is typed (LIO-426).
+                operation.p.insert("name".into(), String::new());
                 // The first tool of the operation's first type, else of
                 // another type it takes (`Operation::tool_types`).
                 let types = operation.tool_types(machine);

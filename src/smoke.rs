@@ -23296,7 +23296,8 @@ soft_max = 180.0
             assert!(a.picking, "{s:?}");
             let line = a.new_op_line().expect("what to click");
             assert!(line.starts_with("Click "), "{line}");
-            assert_eq!(a.status, format!("Added {}. {line}", s.name()));
+            // The tile's word (LIO-426).
+            assert_eq!(a.status, format!("Added {}. {line}", s.short()));
             shows(&a, &[line]);
             assert!(!errors(&a), "{s:?}");
             // Nor under the view.
@@ -23336,7 +23337,8 @@ soft_max = 180.0
             assert!(!a.picking, "{s:?}");
             let line = "Cuts the whole part. Pick faces only to limit it.";
             assert_eq!(a.new_op_line(), Some(line));
-            assert_eq!(a.status, format!("Added {}. {line}", s.name()));
+            // The tile's word (LIO-426).
+            assert_eq!(a.status, format!("Added {}. {line}", s.short()));
             shows(&a, &[line]);
         }
         // The example project: as before.
@@ -23456,6 +23458,85 @@ soft_max = 180.0
         let id = top(&a);
         pick(&mut a, id);
         check(&a, "Box");
+    }
+    /// One word per operation (LIO-426): the tile's word is the editor's
+    /// title and the first word of the operation's name, which says what it
+    /// cuts and follows its numbers until a name is typed.
+    #[test]
+    fn an_operation_has_one_word_and_a_name_that_says_what_it_cuts() {
+        let title = |a: &App| {
+            let texts = page_texts(a);
+            let at = texts
+                .iter()
+                .position(|t| t == "Operation parameters")
+                .unwrap();
+            texts[at - 1].clone()
+        };
+        let add = |a: &mut App, m: Message| {
+            let _ = a.update(m);
+            if a.operation().is_none() || a.page == Page::Tools {
+                let _ = a.update(Message::SaveTool);
+            }
+        };
+        let name = |a: &App| a.operation().unwrap().name().to_string();
+        let mut a = imported_app();
+        a.doc.setup_mut().operations.clear();
+        a.selected = None;
+        for s in [
+            Strategy::Face,
+            Strategy::Adaptive,
+            Strategy::Pocket,
+            Strategy::Contour,
+            Strategy::Drill,
+            Strategy::Chamfer,
+            Strategy::Groove,
+        ] {
+            add(&mut a, Message::AddOp(s));
+            assert_eq!(title(&a), s.short(), "{s:?}");
+            assert!(name(&a).starts_with(s.short()), "{s:?}: {}", name(&a));
+            assert!(
+                a.status.starts_with(&format!("Added {}.", s.short())),
+                "{}",
+                a.status
+            );
+        }
+        // A Drill is named by its drill; another drill, another name.
+        let drills: Vec<(String, f32)> = (a.doc.tools.iter())
+            .filter(|t| get(&t.p, "type") == "Drill")
+            .filter_map(|t| Some((t.id.clone(), num(&t.p, "diameter")?)))
+            .collect();
+        add(&mut a, Message::AddOp(Strategy::Drill));
+        let first = name(&a);
+        let other = (drills.iter()).find(|(id, _)| *id != a.operation().unwrap().tool);
+        if let Some((id, d)) = other {
+            let _ = a.update(Message::Edit(Target::Operation, "tool", id.clone()));
+            assert_ne!(name(&a), first);
+            assert!(
+                name(&a).starts_with(&format!("Drill Ø{}", d)),
+                "{}",
+                name(&a)
+            );
+        }
+        // A typed name stays.
+        let _ = a.update(Message::Edit(Target::Operation, "name", "Mine".into()));
+        let _ = a.update(Message::Edit(
+            Target::Operation,
+            "tool",
+            drills[0].0.clone(),
+        ));
+        assert_eq!(name(&a), "Mine");
+        // A lathe cut: its word on the tile, the title, the tab and the name,
+        // which follows its numbers.
+        let mut b = stud_app(|_| {});
+        add(&mut b, Message::AddTurn("Outside"));
+        assert_eq!(title(&b), "Outside");
+        assert!(b.status.starts_with("Added Outside."), "{}", b.status);
+        shows(&b, &["Outside"]);
+        let _ = b.update(Message::Edit(Target::Operation, "diameter", "16".into()));
+        let _ = b.update(Message::Edit(Target::Operation, "z_end", "-30".into()));
+        assert_eq!(name(&b), "Outside Ø16 to Z -30");
+        // Whole in the browser, never cut with "…".
+        shows(&b, &["Outside Ø16 to Z -30"]);
     }
     #[test]
     fn imported_pocket_selection_playback_direction_and_reopen_work_end_to_end() {

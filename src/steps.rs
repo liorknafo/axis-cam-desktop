@@ -1301,7 +1301,7 @@ fn screw_try<'a>(p: &Page<'a>, op: usize) -> Option<Element<'a, Message>> {
     Some(readout(
         Readout {
             order: None,
-            lead: Some("try".into()),
+            lead: None,
             axis: String::new(),
             value: format!("{} screw", spec.name),
             lock: None,
@@ -3348,8 +3348,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 crate::fault::canvas(Dims(dims)).width(Fill).height(Fill)
             ]
             .into();
+            // "try" once: the heading says it, the readout names the screw
+            // (LIO-426).
             let sub = if tapped {
-                "try the thread"
+                "try it"
             } else {
                 "measure what it left"
             };
@@ -5507,11 +5509,13 @@ pub(crate) mod tests {
                 "cross slide · 1 turn +",
                 "in to 6.00 (Ø44.20)",
                 "carriage · 3 turns +",
-                "stop at 3 t + 4.0",
+                // One way everywhere: "3 turns + 4.0", was "3 t + 4.0" (LIO-426).
+                "stop at 3 turns + 4.0",
                 "6.00",
                 "1 turn + 2.00 on the dial",
-                "3 t + 4.0",
-                "◀ feed off at 3 t + 3.0",
+                // The carriage as the cross slide: its number, its turns under it.
+                "3 turns + 4.0 on the dial",
+                "◀ feed off at 3 turns + 3.0",
                 "last 1 mm by hand",
                 "Pass done ▶",
             ],
@@ -5563,7 +5567,7 @@ pub(crate) mod tests {
             &[
                 "Groove",
                 "carriage · 2 turns +",
-                "blade's left side at 2 t + 5.0",
+                "blade's left side at 2 turns + 5.0",
                 "cross slide · 1 turn +",
                 "in 4.00 → Ø36.00",
                 "from the touch on Ø40.00",
@@ -5820,7 +5824,7 @@ pub(crate) mod tests {
     #[test]
     fn a_stop_on_the_pictures_is_the_number_on_the_carriage_dial() {
         // Faced 1 mm: the shoulder at Z −65 is 64 from the new end, where
-        // the carriage dial was zeroed, and the dial stops at 3 t + 4.0 = 64.
+        // the carriage dial was zeroed, and the dial stops at 3 turns + 4.0 = 64.
         let a = lathe_app("Diameter", |_| {});
         let g = guide(&a);
         let (carriage, thread) = (g.steps.iter())
@@ -5836,7 +5840,7 @@ pub(crate) mod tests {
             turning::from_end("shoulder", carriage),
             "shoulder 64 from the end"
         );
-        // The thread to Z −40 stops 39 from the new end: 1 t + 19.0.
+        // The thread to Z −40 stops 39 from the new end: 1 turn + 19.0.
         let thread = thread.unwrap();
         assert_eq!(
             turning::from_end("thread stops", thread),
@@ -5869,7 +5873,7 @@ pub(crate) mod tests {
             "{t:?}"
         );
         // The carriage is known all the same.
-        shows(&a, &["stop at 3 t + 4.0"]);
+        shows(&a, &["stop at 3 turns + 4.0"]);
     }
     use crate::lathe;
     #[test]
