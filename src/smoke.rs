@@ -5986,6 +5986,64 @@ flood = { pin = 8 }
         assert!(!d.picking);
         lacks(&d, &["Pick on the part"]);
     }
+    /// The Steps page lists the setup's operations in its left panel, under
+    /// the setup picker, a press going to that section, with no row of
+    /// chips over the screen; its header says where the job is in the Run
+    /// page's words (LIO-431). The threaded plate at 1024 × 700.
+    #[test]
+    fn the_steps_page_lists_its_operations_on_the_left_and_says_where_the_job_is() {
+        use crate::GuideAction;
+        let window = iced::Size::new(1024., 700.);
+        let mut a = manual_threaded_app(false);
+        let _ = a.update(Message::Resized(window));
+        let si = a.doc.index();
+        let _ = a.update(Message::Guide(GuideAction::Open(si)));
+        crate::steps::tests::build(&mut a);
+        let n = a
+            .current_guide()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .guide
+            .sections
+            .len();
+        assert!(n >= 10, "{n} sections");
+        let sections = |area: iced::Rectangle| -> std::collections::BTreeSet<usize> {
+            (crate::ui::probe::presses(a.view(), window, area, 6.).into_iter())
+                .filter_map(|(_, m)| match m {
+                    Message::Guide(GuideAction::Section(i)) => Some(i),
+                    _ => None,
+                })
+                .collect()
+        };
+        let left = iced::Rectangle::new(iced::Point::ORIGIN, iced::Size::new(240., window.height));
+        let right = iced::Rectangle::new(
+            iced::Point::new(240., 0.),
+            iced::Size::new(window.width - 240., window.height),
+        );
+        // In the left panel: the first sections, in sight; the rest scroll.
+        assert!(sections(left).contains(&0), "{:?}", sections(left));
+        // No row of chips over the screen.
+        assert_eq!(sections(right), Default::default());
+        // Where the job is.
+        let texts = crate::ui::probe::texts(a.view(), window);
+        let place = format!("Setup {} of {}", si + 1, a.doc.setups.len());
+        assert!(texts.iter().any(|t| t.starts_with(&place)), "{texts:?}");
+        // A press on a line goes to that section: an operation's.
+        let g = &a.current_guide().unwrap().as_ref().unwrap().guide;
+        let k = (g.sections.iter()).rposition(|x| x.op.is_some()).unwrap();
+        let _ = a.update(Message::Guide(GuideAction::Section(k)));
+        let g = &a.current_guide().unwrap().as_ref().unwrap().guide;
+        let at = crate::guide::place(&a.doc, g);
+        assert_eq!(crate::steps::section_of(g, at), k);
+        let texts = crate::ui::probe::texts(a.view(), window);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with(&place) && t.contains(" · operation ")),
+            "{texts:?}"
+        );
+    }
     /// LIO-419: Thread is a tile on every machine and the browser has no
     /// "+ Add threading".
     #[test]

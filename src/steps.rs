@@ -665,11 +665,22 @@ fn readout<'a>(r: Readout, msg: Option<Message>) -> Element<'a, Message> {
             .align_y(Alignment::Center),
         );
     }
-    if !r.tags.is_empty() {
-        tags = tags.push(text(r.tags.join(" · ")).size(12).color(MUTED));
+    // A long tag goes under the value, not squeezed beside it a word a
+    // line (LIO-431).
+    let said = r.tags.join(" · ");
+    let under = said.chars().count() > 30;
+    if !said.is_empty() && !under {
+        tags = tags.push(text(said.clone()).size(12).color(MUTED));
     }
     line = line.push(tags);
-    let face = boxed(line.padding([4, 12]), now).width(Fill);
+    let body: Element<'a, Message> = if under {
+        column![line, text(said).size(12).color(MUTED)]
+            .spacing(2)
+            .into()
+    } else {
+        line.into()
+    };
+    let face = boxed(container(body).padding([4, 12]), now).width(Fill);
     match msg {
         Some(m) => tap(face, Some(m), "Reached"),
         None => face.into(),
@@ -1297,19 +1308,27 @@ fn screw_try<'a>(p: &Page<'a>, op: usize) -> Option<Element<'a, Message>> {
     } else {
         format!("it goes in {} by hand", mm(thread))
     };
-    Some(readout(
+    // At a narrow window the tag goes under the value, as the lathe's
+    // readouts put theirs, not squeezed beside it (LIO-431).
+    let narrow = turning::narrow(p);
+    let face = readout(
         Readout {
             order: None,
             lead: None,
             axis: String::new(),
             value: format!("{} screw", spec.name),
             lock: None,
-            tags: vec![goes],
+            tags: if narrow { vec![] } else { vec![goes.clone()] },
             lit: Lit::Next,
             big: true,
         },
         None,
-    ))
+    );
+    Some(if narrow {
+        column![face, muted(goes).size(12)].spacing(4).into()
+    } else {
+        face
+    })
 }
 /// `Shape::Pattern` in the top view, `at` from mm to the canvas at `s` px
 /// a mm: the order the DRO goes in as arrows from hole to hole (dashed onto
@@ -2165,6 +2184,14 @@ fn setups(app: &App) -> Element<'_, Message> {
             });
         c = c.push(HelpButton::new(b, &msg, &label).width(Fill));
     }
+    // The setup's operations, as the Run page lists them, a press going to
+    // that section; the row of chips over the screen is gone (LIO-431).
+    if let Some(Ok(shown)) = app.current_guide()
+        && shown.guide.setup == app.doc.index()
+    {
+        c = c.push(space().height(8)).push(muted("Operations"));
+        c = c.push(operations(app, shown));
+    }
     // The CNC machines, for the Control page without a CNC setup.
     let cnc_machines: Vec<_> = (app.doc.machines.iter())
         .filter(|m| crate::model::get(&m.p, "controller") == "UC100")
@@ -2181,7 +2208,8 @@ fn setups(app: &App) -> Element<'_, Message> {
             );
         }
     }
-    container(c)
+    // Room at the right for the scrollbar.
+    container(scrollable(c.padding(iced::Padding::ZERO.right(12))).spacing(4))
         .padding(14)
         .width(210)
         .height(Fill)
@@ -2189,7 +2217,7 @@ fn setups(app: &App) -> Element<'_, Message> {
         .into()
 }
 /// The section a step is in.
-fn section_of(g: &Guide, at: usize) -> usize {
+pub(crate) fn section_of(g: &Guide, at: usize) -> usize {
     (g.sections.iter())
         .position(|s| s.steps.contains(&at))
         .unwrap_or(0)
@@ -2248,54 +2276,6 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
         item: app.guide_item,
         setup,
     };
-    // The bar of sections.
-    let mut bar = row![].spacing(6);
-    for (i, s) in g.sections.iter().enumerate() {
-        let done = s.steps.end <= at;
-        let now = i == here;
-        // Numbered from 1 (LIO-377).
-        let mark = if done {
-            "✓".to_string()
-        } else {
-            (i + 1).to_string()
-        };
-        let mut face = row![disc(mark, now, 20.), text(section_name(app, g, s)).size(13)]
-            .spacing(6)
-            .align_y(Alignment::Center);
-        let small = if now {
-            progress(g, s, at, app.guide_item)
-        } else if s.count > 0 && !done {
-            counted(setup, s)
-        } else {
-            String::new()
-        };
-        if !small.is_empty() {
-            face = face.push(text(small).size(12).color(if now { ACCENT } else { MUTED }));
-        }
-        let ink = if done && !now { DONE } else { INK };
-        let msg = Message::Guide(GuideAction::Section(i));
-        let b = button(face)
-            .padding([5, 10])
-            .on_press(msg.clone())
-            .style(move |_, status| button::Style {
-                background: Some(
-                    if matches!(status, button::Status::Hovered) {
-                        HOVER_BUTTON
-                    } else {
-                        Color::WHITE
-                    }
-                    .into(),
-                ),
-                text_color: ink,
-                border: Border {
-                    color: if now { ACCENT } else { LINE },
-                    width: if now { 2. } else { 1. },
-                    radius: 8.into(),
-                },
-                ..Default::default()
-            });
-        bar = bar.push(HelpButton::new(b, &msg, s.name.clone()));
-    }
     // The header of the section the place is in.
     let s = &g.sections[here];
     let mut header = row![
@@ -2326,7 +2306,7 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
     header = header
         .push(row(tags).spacing(6))
         .push(space().width(Fill))
-        .push(bold(progress(g, s, at, app.guide_item), 14).color(ACCENT));
+        .push(bold(place(app, g, here, at), 14).color(ACCENT));
     let top = row![
         // A setup named as its machine says it once (LIO-382).
         bold(
@@ -2337,22 +2317,89 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
             },
             16
         ),
-        muted(format!(
-            "~{} min · tap a section to jump to it",
-            g.minutes.ceil()
-        ))
-        .size(13)
+        muted(format!("~{} min", g.minutes.ceil())).size(13)
     ]
     .spacing(12)
     .align_y(Alignment::Center);
-    column![
-        top,
-        bar.wrap().vertical_spacing(6),
-        header,
-        container(screen(&page)).height(Fill)
-    ]
-    .spacing(12)
-    .into()
+    column![top, header, container(screen(&page)).height(Fill)]
+        .spacing(12)
+        .into()
+}
+/// The setup's sections as a list, each its state mark, number, name, what
+/// is left of it and its time; a press goes to it (LIO-431).
+fn operations<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
+    let g = &shown.guide;
+    let at = crate::guide::place(&app.doc, g);
+    let here = section_of(g, at);
+    let setup = &app.doc.setups[g.setup];
+    let mut list = Column::new().spacing(4);
+    for (i, s) in g.sections.iter().enumerate() {
+        let done = s.steps.end <= at;
+        let now = i == here;
+        // Numbered from 1 (LIO-377).
+        let mark = if done {
+            "✓".to_string()
+        } else {
+            (i + 1).to_string()
+        };
+        let small = if now {
+            progress(g, s, at, app.guide_item)
+        } else if s.count > 0 && !done {
+            counted(setup, s)
+        } else {
+            String::new()
+        };
+        // The name, what is left of it under it, as the Run page's lines.
+        let mut words = column![text(section_name(app, g, s)).size(13)].spacing(1);
+        if !small.is_empty() {
+            words = words.push(text(small).size(12).color(if now { ACCENT } else { MUTED }));
+        }
+        let face = row![disc(mark, now, 20.), words]
+            .spacing(6)
+            .align_y(Alignment::Center);
+        let ink = if done && !now { DONE } else { INK };
+        let msg = Message::Guide(GuideAction::Section(i));
+        let b = button(face)
+            .padding([5, 10])
+            .on_press(msg.clone())
+            .style(move |_, status| button::Style {
+                background: Some(
+                    if matches!(status, button::Status::Hovered) {
+                        HOVER_BUTTON
+                    } else {
+                        Color::WHITE
+                    }
+                    .into(),
+                ),
+                text_color: ink,
+                border: Border {
+                    color: if now { ACCENT } else { LINE },
+                    width: if now { 2. } else { 1. },
+                    radius: 8.into(),
+                },
+                ..Default::default()
+            });
+        list = list.push(HelpButton::new(b.width(Fill), &msg, s.name.clone()).width(Fill));
+    }
+    list.into()
+}
+/// Where the job is, in the Run page's words (LIO-431): "Setup 2 of 3 ·
+/// operation 2 of 4", then the hole or pass of the section.
+fn place(app: &App, g: &Guide, here: usize, at: usize) -> String {
+    let s = &g.sections[here];
+    let mut said = format!("Setup {} of {}", g.setup + 1, app.doc.setups.len());
+    let ops: Vec<usize> = (g.sections.iter().enumerate())
+        .filter(|(_, x)| x.op.is_some())
+        .map(|(i, _)| i)
+        .collect();
+    if let Some(k) = ops.iter().position(|i| *i == here) {
+        said += &format!(" · operation {} of {}", k + 1, ops.len());
+    }
+    let p = progress(g, s, at, app.guide_item);
+    if !p.is_empty() {
+        said += &format!(" · {p}");
+    }
+    said
 }
 /// The command that ends a step: "Pass done ▶", "Section done ▶" on the
 /// last step of an operation's section, else "Next ▶".
@@ -5091,7 +5138,14 @@ pub(crate) mod tests {
         send(&mut a, GuideAction::Next);
         send(&mut a, GuideAction::Next);
         let t = texts(&a);
-        assert_eq!(t.iter().filter(|s| *s == "pass 2/2").count(), 2, "{t:?}");
+        // The list says it on its line, the header after where the job is
+        // (LIO-431).
+        assert_eq!(t.iter().filter(|s| *s == "pass 2/2").count(), 1, "{t:?}");
+        assert!(
+            t.iter()
+                .any(|s| s.starts_with("Setup 1 of ") && s.ends_with(" · pass 2/2")),
+            "{t:?}"
+        );
         // The sections ahead show their counts, the next setup is last.
         // Each with what it counts (LIO-377).
         assert!(t.contains(&"Holes".to_string()) && t.contains(&"4 holes".to_string()));
