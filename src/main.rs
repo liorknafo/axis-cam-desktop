@@ -5001,6 +5001,20 @@ impl App {
         }
         Task::batch([setup, operation])
     }
+    /// Scrolls the Steps page's left panel so the place's section is in view
+    /// (LIO-431). ponytail: by its share of the sections, not its pixel row.
+    fn snap_steps_list(&self) -> Task<Message> {
+        let Some(Ok(shown)) = self.current_guide() else {
+            return Task::none();
+        };
+        let g = &shown.guide;
+        let here = steps::section_of(g, guide::place(&self.doc, g));
+        let y = here as f32 / g.sections.len().saturating_sub(1).max(1) as f32;
+        iced::widget::operation::snap_to(
+            steps::OPERATIONS_LIST,
+            iced::widget::scrollable::RelativeOffset { x: 0., y },
+        )
+    }
     fn guide_action(&mut self, action: GuideAction) -> Task<Message> {
         match action {
             GuideAction::Built(key, result) => {
@@ -9186,7 +9200,10 @@ impl App {
             Message::Close(id) => return self.request_close(id),
             Message::Exported(p) => self.status = format!("Exported {}", p.display()),
             Message::ExportError(e) => self.status = format!("Export failed: {e}"),
-            Message::Guide(action) => return self.guide_action(action),
+            Message::Guide(action) => {
+                let task = self.guide_action(action);
+                return Task::batch([task, self.snap_steps_list()]);
+            }
             Message::LeftStock(found) => {
                 self.left_job = None;
                 // A job edited while it ran gets a run of its own at the next pause.

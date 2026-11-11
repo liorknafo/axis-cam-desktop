@@ -2209,12 +2209,16 @@ fn setups(app: &App) -> Element<'_, Message> {
         }
     }
     // Room at the right for the scrollbar.
-    container(scrollable(c.padding(iced::Padding::ZERO.right(12))).spacing(4))
-        .padding(14)
-        .width(210)
-        .height(Fill)
-        .style(card)
-        .into()
+    container(
+        scrollable(c.padding(iced::Padding::ZERO.right(12)))
+            .id(OPERATIONS_LIST)
+            .spacing(4),
+    )
+    .padding(14)
+    .width(210)
+    .height(Fill)
+    .style(card)
+    .into()
 }
 /// The section a step is in.
 pub(crate) fn section_of(g: &Guide, at: usize) -> usize {
@@ -2325,6 +2329,9 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
         .spacing(12)
         .into()
 }
+/// The left panel's scrollable: scrolled so that the place's section is in
+/// view whenever the place moves (`App::snap_steps_list`, LIO-431).
+pub(crate) const OPERATIONS_LIST: &str = "steps-operations";
 /// The setup's sections as a list, each its state mark, number, name, what
 /// is left of it and its time; a press goes to it (LIO-431).
 fn operations<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
@@ -2350,7 +2357,17 @@ fn operations<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
             String::new()
         };
         // The name, what is left of it under it, as the Run page's lines.
-        let mut words = column![text(section_name(app, g, s)).size(13)].spacing(1);
+        // A section done takes one line, so twelve mostly fit (LIO-431).
+        let name = text(section_name(app, g, s)).size(13);
+        let name: Element<_> = if done && !now {
+            container(name.wrapping(text::Wrapping::None))
+                .width(Fill)
+                .clip(true)
+                .into()
+        } else {
+            name.into()
+        };
+        let mut words = column![name].spacing(1);
         if !small.is_empty() {
             words = words.push(text(small).size(12).color(if now { ACCENT } else { MUTED }));
         }
