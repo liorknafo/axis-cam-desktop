@@ -7,7 +7,6 @@ use crate::{
     guide::{Guide, Limits, Pattern, Section, Step, Target},
     help::HelpButton,
     holding::Gripped,
-    manual,
     mesh::{Bounds, Mesh},
     model::{Document, Setup, Strategy, Tool, get, num},
     ui::{BLUE, BUTTON_EDGE, HOVER_BUTTON, INK, LINE, MUTED, WARNING, bold, muted, primary},
@@ -2135,55 +2134,36 @@ fn setups(app: &App) -> Element<'_, Message> {
     // The one way back, top left (LIO-429).
     let back = crate::ui::secondary(crate::ui::BACK, Message::SelectSetup(app.doc.index()));
     let mut c = column![back, bold(title, 16), muted("Setups")].spacing(8);
+    // The one setup picker, as the Run page's: the job's setups in its
+    // order, each with how it runs (LIO-431).
     for (si, s) in app.doc.setups.iter().enumerate() {
-        if !manual::is_hand(&s.machine) {
-            continue;
-        }
         let on = s.id == app.doc.active;
         let msg = Message::Guide(GuideAction::Open(si));
-        // The machine under the name only when the name does not say it.
-        let named = s.name().starts_with(s.machine.name());
-        let b = button(
-            column![bold(s.name(), 13)]
-                .push((!named).then(|| muted(s.machine.name())))
-                .spacing(2),
-        )
-        .width(Fill)
-        .padding([8, 10])
-        .on_press(msg.clone())
-        .style(move |_, status| button::Style {
-            background: Some(
-                if on {
-                    crate::ui::BG
-                } else if matches!(status, button::Status::Hovered) {
-                    HOVER_BUTTON
-                } else {
-                    Color::WHITE
-                }
-                .into(),
-            ),
-            text_color: INK,
-            border: Border {
-                color: if on { BLUE } else { LINE },
-                width: 1.,
-                radius: 6.into(),
-            },
-            ..Default::default()
-        });
-        c = c.push(HelpButton::new(b, &msg, s.name()).width(Fill));
-    }
-    let active = app.doc.index();
-    let cnc = (app.doc.setups.iter().enumerate())
-        .filter(|(_, s)| !manual::is_hand(&s.machine))
-        .min_by_key(|(si, _)| (*si < active, *si));
-    if let Some((si, s)) = cnc {
-        c = c.push(space().height(8)).push(muted("CNC")).push(
-            crate::ui::secondary(
-                format!("{} ▶", s.name()),
-                Message::Guide(GuideAction::Open(si)),
-            )
-            .width(Fill),
-        );
+        let label = crate::ui::job_setup_label(si, s);
+        let b = button(column![bold(label.clone(), 13)].spacing(2))
+            .width(Fill)
+            .padding([8, 10])
+            .on_press(msg.clone())
+            .style(move |_, status| button::Style {
+                background: Some(
+                    if on {
+                        crate::ui::BG
+                    } else if matches!(status, button::Status::Hovered) {
+                        HOVER_BUTTON
+                    } else {
+                        Color::WHITE
+                    }
+                    .into(),
+                ),
+                text_color: INK,
+                border: Border {
+                    color: if on { BLUE } else { LINE },
+                    width: 1.,
+                    radius: 6.into(),
+                },
+                ..Default::default()
+            });
+        c = c.push(HelpButton::new(b, &msg, &label).width(Fill));
     }
     // The CNC machines, for the Control page without a CNC setup.
     let cnc_machines: Vec<_> = (app.doc.machines.iter())
@@ -4688,7 +4668,12 @@ pub(crate) mod tests {
         // The setup carries its machine's name: said once in the title and
         // once in the list (LIO-382; "Manual Mill on the Manual Mill").
         assert!(t.iter().any(|s| s == "Manual Mill · steps"), "{t:?}");
-        assert_eq!(t.iter().filter(|s| *s == "Manual Mill").count(), 1, "{t:?}");
+        // In the list it is "1 Manual Mill · by hand", as the Run page's (LIO-431).
+        assert_eq!(
+            t.iter().filter(|s| *s == "1 Manual Mill · by hand").count(),
+            1,
+            "{t:?}"
+        );
         assert!(!t.iter().any(|s| s.contains(" on the ")), "{t:?}");
         assert!(t.contains(&format!("pass 1/{of}")), "{t:?}");
         // Every readout's number, the cut's with its direction, in order.

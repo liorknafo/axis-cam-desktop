@@ -3281,7 +3281,8 @@ flood = { pin = 8 }
         shows(
             &a,
             &[
-                &format!("Start Drilling at hole {}", hole + 1),
+                // The drilling named by its drill (LIO-426).
+                &format!("Start Drill Ø4 at hole {}", hole + 1),
                 "starts here",
             ],
         );
@@ -12173,7 +12174,8 @@ flood = { pin = 8 }
         crate::steps::tests::build(&mut a);
         a.smoke_manual_check();
         let texts = page_texts(&a);
-        for want in ["Manual Mill", "Set up", "Face", "Hold"] {
+        // The setup as the one setup picker names it (LIO-431).
+        for want in ["1 Manual Mill · by hand", "Set up", "Face", "Hold"] {
             assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
         }
     }
@@ -30881,6 +30883,40 @@ soft_max = 180.0
             a.page = Page::Ai;
             shows(&a, &[crate::analysis::HAND_ONLY]);
         }
+    }
+    /// The MACHINE page picks a setup the same way on a CNC and a hand
+    /// setup (LIO-431): the job's setups in its order, each with how it
+    /// runs; a hand setup's page has no controller.
+    #[test]
+    fn the_machine_page_picks_setups_the_same_way_and_a_hand_page_has_no_controller() {
+        let mut a = app();
+        with_manual(&mut a);
+        let _ = a.update(Message::AddManualSetup);
+        let labels: Vec<String> = (a.doc.setups.iter().enumerate())
+            .map(|(si, s)| crate::ui::job_setup_label(si, s))
+            .collect();
+        assert_eq!(labels[0], "1 Manual Mill · by hand");
+        assert!(
+            labels[1].starts_with("2 ") && labels[1].ends_with(" · CNC"),
+            "{labels:?}"
+        );
+        let _ = a.update(Message::Guide(crate::GuideAction::Open(0)));
+        let shown: Vec<&str> = labels.iter().map(String::as_str).collect();
+        shows(&a, &shown);
+        lacks(
+            &a,
+            &[
+                "CNC",
+                "Controller configuration",
+                "mm  |  UC100 machine control",
+            ],
+        );
+        shows(&a, &["mm  |  Manual Mill · by hand"]);
+        // Picking the CNC setup there opens its page, as the Run page's
+        // picker does for a setup it does not run.
+        let sent = crate::ui::probe::clicks(a.view(), WINDOW);
+        let open = Message::Guide(crate::GuideAction::Open(1));
+        assert!(sent.iter().any(|m| format!("{m:?}") == format!("{open:?}")));
     }
     /// The sample app with a lathe in the library and a lathe tool of each type.
     fn with_lathe(a: &mut App) {
