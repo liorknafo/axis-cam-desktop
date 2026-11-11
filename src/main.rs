@@ -328,6 +328,10 @@ pub enum Message {
     /// Inserts a setup on the first lathe, with a round bar in a chuck,
     /// before the CNC setups.
     AddLatheSetup,
+    /// A setup on the library's machine of this id, chosen from the one
+    /// "+ Add setup" (LIO-422): placed and named as `AddSetup`,
+    /// `AddManualSetup` or `AddLatheSetup` would.
+    AddSetupOn(String),
     DuplicateSetup,
     RemoveSetup,
     MoveSetup(isize),
@@ -7140,6 +7144,21 @@ impl App {
                 let part = self.part_mesh().filter(|_| !self.is_sample()).cloned();
                 let added = self.doc.add_lathe_setup(part.as_ref());
                 self.open_added(added, "Lathe");
+            }
+            Message::AddSetupOn(id) => {
+                let Some(machine) = (self.doc.machines.iter()).find(|m| m.id == id).cloned() else {
+                    return Task::none();
+                };
+                if manual::is_manual(&machine) {
+                    let added = self.doc.add_manual_setup_on(Some(&id));
+                    self.open_added(added, "Manual");
+                } else if crate::lathe::is_lathe(&machine) {
+                    let part = self.part_mesh().filter(|_| !self.is_sample()).cloned();
+                    let added = self.doc.add_lathe_setup_on(part.as_ref(), Some(&id));
+                    self.open_added(added, "Lathe");
+                } else {
+                    self.create_setup(machine);
+                }
             }
             Message::DuplicateSetup => {
                 let s = self.doc.setup().duplicate(&self.doc.next_offset());

@@ -4049,7 +4049,13 @@ impl Document {
     /// orientation, zero and holding of the old first setup, which then
     /// starts from the stock it leaves. Its index.
     pub fn add_manual_setup(&mut self) -> Result<usize, String> {
-        let Some(machine) = self.machines.iter().find(|m| crate::manual::is_manual(m)) else {
+        self.add_manual_setup_on(None)
+    }
+    /// `add_manual_setup` on the library's manual mill `id` (LIO-422), or
+    /// its first one.
+    pub fn add_manual_setup_on(&mut self, id: Option<&str>) -> Result<usize, String> {
+        let chosen = |m: &&Machine| crate::manual::is_manual(m) && id.is_none_or(|id| m.id == id);
+        let Some(machine) = self.machines.iter().find(chosen) else {
             return Err("Add a manual machine to the library first.".into());
         };
         let at = self
@@ -4086,7 +4092,17 @@ impl Document {
     /// that the part's turning axis is the one the user chose) and the old
     /// first setup starts from the bar it leaves. Its index.
     pub fn add_lathe_setup(&mut self, part: Option<&crate::mesh::Mesh>) -> Result<usize, String> {
-        let Some(machine) = self.machines.iter().find(|m| crate::lathe::is_lathe(m)) else {
+        self.add_lathe_setup_on(part, None)
+    }
+    /// `add_lathe_setup` on the library's lathe `id` (LIO-422), or its
+    /// first one.
+    pub fn add_lathe_setup_on(
+        &mut self,
+        part: Option<&crate::mesh::Mesh>,
+        id: Option<&str>,
+    ) -> Result<usize, String> {
+        let chosen = |m: &&Machine| crate::lathe::is_lathe(m) && id.is_none_or(|id| m.id == id);
+        let Some(machine) = self.machines.iter().find(chosen) else {
             return Err("Add a lathe to the library first.".into());
         };
         let machine = machine.clone();
