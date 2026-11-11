@@ -182,6 +182,13 @@ fn outlined(deletes: bool, status: button::Status) -> button::Style {
 }
 /// A drop-down list drawn like a text field (`field_style`): Iced's own fill
 /// for it is the tint of a disabled control.
+/// "+ Add setup"'s list: its words in the text's colour, not the
+/// placeholder's grey that reads as switched off (LIO-429).
+pub(crate) fn add_setup_style(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
+    let mut style = choice_style(theme, status);
+    style.placeholder_color = style.text_color;
+    style
+}
 pub(crate) fn choice_style(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
     let mut style = pick_list::default(theme, status);
     style.background = theme.extended_palette().background.base.color.into();
@@ -229,7 +236,8 @@ fn bar_btn<'a>(label: &str, msg: Message, active: bool) -> HelpButton<'a> {
 /// machine moves it stays on MACHINE.
 /// On the dark MACHINE bar (`dark`) it is smaller, with light text.
 fn switcher(app: &App, dark: bool) -> Element<'_, Message> {
-    const WORKSPACES: [&str; 2] = ["MANUFACTURE", "MACHINE"];
+    // "planning" everywhere (LIO-429): it was MANUFACTURE.
+    const WORKSPACES: [&str; 2] = ["PLANNING", "MACHINE"];
     let font = Font {
         weight: iced::font::Weight::Bold,
         ..Font::DEFAULT
@@ -242,7 +250,7 @@ fn switcher(app: &App, dark: bool) -> Element<'_, Message> {
                 MUTED
             }))
             .padding([7, 12]),
-            muted("Manufacture opens when the machine stops.").color(if dark {
+            muted("Planning opens when the machine stops.").color(if dark {
                 ON_DARK
             } else {
                 MUTED
@@ -277,7 +285,7 @@ fn switcher(app: &App, dark: bool) -> Element<'_, Message> {
             picker,
             Help::text(
                 "Workspace",
-                "MANUFACTURE plans the job: the part, setups, operations, the libraries, the AI planner and the NC review. MACHINE drives the CNC through the UC100: connect, jog, zero, probe and run a setup, and set up its profile. While the machine moves (a tool run, held or paused, a probe, a jog or homing) only MACHINE is open.",
+                "PLANNING plans the job: the part, setups, operations, the libraries, the AI planner and the NC review. MACHINE drives the CNC through the UC100: connect, jog, zero, probe and run a setup, and set up its profile. While the machine moves (a tool run, held or paused, a probe, a jog or homing) only MACHINE is open.",
             ),
             widget::tooltip::Position::Bottom,
         );
@@ -293,7 +301,7 @@ fn switcher(app: &App, dark: bool) -> Element<'_, Message> {
             .align_y(Alignment::Center),
         Help::text(
             "Workspace",
-            "MANUFACTURE plans the job: the part, setups, operations, the libraries, the AI planner and the NC review. MACHINE drives the CNC through the UC100: connect, jog, zero, probe and run a setup, and set up its profile. While the machine moves (a tool run, held or paused, a probe, a jog or homing) only MACHINE is open.",
+            "PLANNING plans the job: the part, setups, operations, the libraries, the AI planner and the NC review. MACHINE drives the CNC through the UC100: connect, jog, zero, probe and run a setup, and set up its profile. While the machine moves (a tool run, held or paused, a probe, a jog or homing) only MACHINE is open.",
         ),
         // Beside it, not over the list it opens.
         widget::tooltip::Position::Right,
@@ -1231,7 +1239,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
     } else {
         column![machine_bar(app)]
     };
-    if manufacture && app.page != Page::Home && !app.doc.setups.is_empty() {
+    // The operations toolbar keeps to the planning page (LIO-429): the
+    // libraries and the AI planner have their title and the way back.
+    if manufacture && app.page == Page::Work && !app.doc.setups.is_empty() {
         layout = layout.push(ribbon(app));
     }
     let page = container(layout.push(body).push(foot))
@@ -1472,7 +1482,7 @@ fn add_setup(app: &App, wide: bool) -> Element<'_, Message> {
     .placeholder(LABEL)
     .text_size(12)
     .padding([5, 8])
-    .style(choice_style);
+    .style(add_setup_style);
     let list = if wide {
         list.width(Fill)
     } else {
@@ -7522,13 +7532,17 @@ pub(crate) fn stock_note(app: &App) -> Option<&'static str> {
     let (stock, current) = app.known_stock(app.doc.index());
     (stock.is_some() && !current).then_some(ORIGINAL_STOCK)
 }
+/// The one way back to the planning page, top of every page reached from it
+/// (LIO-429).
+pub(crate) const BACK: &str = "← Back to planning";
+/// A page's head: the way back top left, above its title (LIO-429), as on
+/// the Steps page.
 fn page_header<'a>(title: &str, subtitle: &str) -> Element<'a, Message> {
-    row![
-        column![bold(title, 26), muted(subtitle)].spacing(5),
-        space().width(Fill),
-        secondary("← Back to machining", Message::Page(Page::Work))
+    column![
+        secondary(BACK, Message::Page(Page::Work)),
+        column![bold(title, 26), muted(subtitle)].spacing(5)
     ]
-    .align_y(Alignment::Center)
+    .spacing(10)
     .into()
 }
 fn machines(app: &App) -> Element<'_, Message> {
@@ -7537,11 +7551,8 @@ fn machines(app: &App) -> Element<'_, Message> {
             "Machine library",
             "Saved locally. Each setup keeps a snapshot of its assigned profile."
         ),
-        row![
-            primary("+ New machine profile", Message::NewMachine),
-            secondary("+ Jingyan CNC4030 + rotary", Message::AddRotaryMachine)
-        ]
-        .spacing(8),
+        // One way to add (LIO-429): the preset is offered in the wizard.
+        row![primary("+ New machine", Message::NewMachine)].spacing(8),
         space().height(5)
     ]
     .spacing(18);
@@ -7677,7 +7688,13 @@ fn wizard(app: &App) -> Element<'_, Message> {
     let mut form = column![bold(steps[step], 22)].spacing(16);
     match steps[step] {
         "Identity" => {
+            // What "+ New machine" starts from: a preset, or the fields
+            // below (LIO-429).
             form = form
+                .push(secondary(
+                    "Start from a preset: Jingyan CNC4030 + rotary",
+                    Message::AddRotaryMachine,
+                ))
                 .push(field(p, "name", "Machine name", t))
                 .push(choice_value(
                     p,
@@ -8607,7 +8624,7 @@ fn machine_bar(app: &App) -> Element<'_, Message> {
             project_note(app),
             match &app.project_path {
                 Some(p) => p.display().to_string(),
-                None => "save it from MANUFACTURE: Save or Save as… there choose the file.".into(),
+                None => "save it from PLANNING: Save or Save as… there choose the file.".into(),
             }
         ),
     );
@@ -9090,7 +9107,7 @@ pub(crate) fn run_line(
     if run_setups(&app.doc, &c.machine_id).is_empty() {
         return (
             plain(
-                "No setup uses this machine: in MANUFACTURE, choose it as a setup's machine to run that setup here.",
+                "No setup uses this machine: in PLANNING, choose it as a setup's machine to run that setup here.",
             ),
             vec![],
         );
@@ -13207,23 +13224,20 @@ fn holder_summary(h: &crate::holding::Holder) -> String {
         other => other.to_string(),
     }
 }
+/// The kinds of workholding a new entry can be (LIO-429).
+const HOLDER_KINDS: [&str; 6] = [
+    "Vise",
+    "Clamp",
+    "Chuck",
+    "V-block",
+    "Soft jaws",
+    "Collet block",
+];
 pub(crate) fn workholding(app: &App) -> Element<'_, Message> {
     let mut list = column![
         bold("Workholding library", 17),
-        row![
-            // Two equal choices: neither is the panel's one filled command.
-            secondary("+ New vise", Message::NewHolder("Vise")),
-            secondary("+ New clamp", Message::NewHolder("Clamp")),
-            secondary("+ New chuck", Message::NewHolder("Chuck"))
-        ]
-        .spacing(8),
-        // A round part's holdings (`round_hold`).
-        row![
-            secondary("+ New V-block", Message::NewHolder("V-block")),
-            secondary("+ New soft jaws", Message::NewHolder("Soft jaws")),
-            secondary("+ New collet block", Message::NewHolder("Collet block"))
-        ]
-        .spacing(8)
+        // One "+ New", the kind its first field (LIO-429).
+        secondary("+ New workholding", Message::NewHolder("Vise"))
     ]
     .spacing(12);
     for h in &app.doc.workholding {
@@ -13248,7 +13262,26 @@ pub(crate) fn workholding(app: &App) -> Element<'_, Message> {
         "Collet block" => ("Collet block definition", &COLLET_BLOCK_FIELDS),
         _ => ("Workholding definition", &[]),
     };
-    let mut form = column![bold(title, 21), field(p, "name", "Name", t)].spacing(14);
+    let mut form = column![bold(title, 21)].spacing(14);
+    // A new entry's kind is its first field (LIO-429).
+    if !app.doc.workholding.iter().any(|h| h.id == draft.id) {
+        let kinds: Vec<String> = HOLDER_KINDS.iter().map(|k| k.to_string()).collect();
+        form = form.push(
+            column![
+                muted("Kind"),
+                pick_list(kinds, Some(draft.kind().to_string()), |k: String| {
+                    let kind = (HOLDER_KINDS.iter()).find(|x| **x == k).copied();
+                    Message::NewHolder(kind.unwrap_or("Vise"))
+                })
+                .width(Fill)
+                .padding([7, 9])
+                .text_size(13)
+                .style(choice_style)
+            ]
+            .spacing(5),
+        );
+    }
+    form = form.push(field(p, "name", "Name", t));
     if draft.kind() == "Chuck" {
         form = form.push(choice(p, "jaws", "Jaws", &["3", "4"], t));
     }
@@ -15480,7 +15513,7 @@ fn generation_progress(app: &App) -> Option<Element<'_, Message>> {
     )
 }
 fn operation_audit(app: &App) -> Element<'_, Message> {
-    let mut c=column![bold("Operation support & job checks",24),note("Available means an imported-mesh preview is implemented and regression-tested within the scope below. Their moves can be exported as LinuxCNC 3-axis programs after checks for limits, rapids into material and holder clearance, and, in a setup that models a vise or clamps, for the jaws and clamps as boxes with a clearance gap. Parallels, bolts, the table, the machine body and other fixtures are not checked. A sample animation does not establish operation support."),row![primary("Check all enabled operations",Message::GenerateAll),secondary("Back to machining",Message::Page(Page::Work))].spacing(12)].spacing(14).max_width(1020);
+    let mut c=column![bold("Operation support & job checks",24),note("Available means an imported-mesh preview is implemented and regression-tested within the scope below. Their moves can be exported as LinuxCNC 3-axis programs after checks for limits, rapids into material and holder clearance, and, in a setup that models a vise or clamps, for the jaws and clamps as boxes with a clearance gap. Parallels, bolts, the table, the machine body and other fixtures are not checked. A sample animation does not establish operation support."),row![primary("Check all enabled operations",Message::GenerateAll),secondary(BACK,Message::Page(Page::Work))].spacing(12)].spacing(14).max_width(1020);
     if let Some(generating) = generation_progress(app) {
         c = c.push(generating);
     }

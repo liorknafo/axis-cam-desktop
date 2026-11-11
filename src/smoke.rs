@@ -30188,12 +30188,16 @@ soft_max = 180.0
         let mut a = app();
         a.page = Page::Workholding;
         a.doc.workholding = crate::holding::starters();
-        shows(&a, &["+ New chuck"]);
+        // One "+ New workholding" (LIO-429): a chuck is a kind in it.
+        shows(&a, &["+ New workholding"]);
         assert!(
             crate::ui::probe::clicks(a.view(), WINDOW)
                 .iter()
-                .any(|m| matches!(m, Message::NewHolder("Chuck")))
+                .any(|m| matches!(m, Message::NewHolder("Vise")))
         );
+        // The new entry's Kind list sends the kind chosen.
+        let _ = a.update(Message::NewHolder("Vise"));
+        shows(&a, &["Kind"]);
         let _ = a.update(Message::NewHolder("Chuck"));
         assert_eq!(a.holder_draft.kind(), "Chuck");
         shows(
@@ -30774,6 +30778,77 @@ soft_max = 180.0
                 assert_eq!(bad(&a), Vec::<String>::new(), "{tab}");
             }
             shows(&a, &["Show the cut", "CHECK"]);
+        }
+    }
+    /// One way to add to each library, the operations toolbar on the planning
+    /// page only, and one way back, "← Back to planning", the Steps page's
+    /// too (LIO-429).
+    #[test]
+    fn the_libraries_add_one_way_and_every_page_has_the_way_back() {
+        let tiles = |a: &App| {
+            (crate::ui::probe::clicks(a.view(), WINDOW).iter())
+                .filter(|m| {
+                    matches!(
+                        m,
+                        Message::AddOp(_) | Message::AddTurn(_) | Message::AddThreading
+                    )
+                })
+                .count()
+        };
+        let mut a = app();
+        a.page = Page::Work;
+        assert!(tiles(&a) > 0);
+        for page in [
+            Page::Tools,
+            Page::Materials,
+            Page::Workholding,
+            Page::Machines,
+            Page::Ai,
+        ] {
+            a.page = page;
+            assert_eq!(tiles(&a), 0, "{page:?}");
+            shows(&a, &[crate::ui::BACK]);
+            lacks(&a, &["← Back to machining"]);
+            // Top left, above the page's title.
+            let placed = crate::ui::probe::placed(a.view(), WINDOW);
+            let (_, at) = (placed.iter()).find(|(t, _)| t == crate::ui::BACK).unwrap();
+            assert!(at.x < WINDOW.width / 3., "{page:?}: {at:?}");
+            if page != Page::Ai {
+                let news = (page_texts(&a).into_iter()).filter(|t| t.starts_with("+ New"));
+                assert_eq!(news.count(), 1, "{page:?}");
+            }
+        }
+        // "+ Add setup"'s words are in the text's colour, not greyed out.
+        let style = crate::ui::add_setup_style(
+            &iced::Theme::Light,
+            iced::widget::pick_list::Status::Active,
+        );
+        assert_eq!(style.placeholder_color, style.text_color);
+        // A new workholding entry opens with its kind to choose.
+        let _ = a.update(Message::NewHolder("Vise"));
+        shows(&a, &["Kind", "+ New workholding"]);
+        let _ = a.update(Message::NewHolder("Chuck"));
+        assert_eq!(a.holder_draft.kind(), "Chuck");
+        // The Steps page of a manual mill and of a lathe: Back to planning,
+        // on that setup.
+        with_manual(&mut a);
+        with_lathe(&mut a);
+        let _ = a.update(Message::AddManualSetup);
+        let _ = a.update(Message::AddLatheSetup);
+        for hand in [
+            crate::manual::is_manual as fn(&crate::model::Machine) -> bool,
+            crate::lathe::is_lathe,
+        ] {
+            let si = (a.doc.setups.iter())
+                .position(|s| hand(&s.machine))
+                .unwrap();
+            let _ = a.update(Message::Guide(crate::GuideAction::Open(si)));
+            shows(&a, &[crate::ui::BACK]);
+            let back = Message::SelectSetup(si);
+            let sent = crate::ui::probe::clicks(a.view(), WINDOW);
+            assert!(sent.iter().any(|m| format!("{m:?}") == format!("{back:?}")));
+            let _ = a.update(back);
+            assert_eq!((a.page, a.doc.index()), (Page::Work, si));
         }
     }
     /// The sample app with a lathe in the library and a lathe tool of each type.
