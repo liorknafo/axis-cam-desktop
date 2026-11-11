@@ -1212,13 +1212,16 @@ pub fn view(app: &App) -> Element<'_, Message> {
             status_line(app),
             // What the open workspace works with: MACHINE drives the UC100,
             // MANUFACTURE previews and posts.
-            text(if app.page == Page::Control {
-                "mm  |  UC100 machine control"
+            text(if app.page == Page::Control && app.on_hand() {
+                // The machine, not a controller it has not (LIO-431).
+                format!("mm  |  {} · by hand", app.doc.setup().machine.name())
+            } else if app.page == Page::Control {
+                "mm  |  UC100 machine control".to_string()
             } else if app.on_hand() {
                 // No post on a hand machine (LIO-423).
-                "mm"
+                "mm".to_string()
             } else {
-                "mm  |  Bounded mesh previews · LinuxCNC 3-axis and indexed A post"
+                "mm  |  Bounded mesh previews · LinuxCNC 3-axis and indexed A post".to_string()
             })
             .size(12)
             .color(MUTED)
@@ -8596,22 +8599,27 @@ fn state_pill<'a>(c: &crate::control::Connection) -> Element<'a, Message> {
 /// the one on the page (LIO-274).
 fn machine_bar(app: &App) -> Element<'_, Message> {
     let fit = Fit::of(app);
-    let mut bar = row![
-        bold("AXIS", 19).color(Color::WHITE),
-        switcher(app, true),
-        bar_btn("Control", Message::ControlSetup(false), !app.machine_setup),
-        bar_btn(
-            if fit.narrow {
-                "Configuration"
-            } else {
-                "Controller configuration"
-            },
-            Message::ControlSetup(true),
-            app.machine_setup
-        ),
-    ]
-    .spacing(12)
-    .align_y(Alignment::Center);
+    let mut bar = row![bold("AXIS", 19).color(Color::WHITE), switcher(app, true),]
+        .spacing(12)
+        .align_y(Alignment::Center);
+    // A hand setup's page has no controller (LIO-431).
+    if !app.on_hand() {
+        bar = bar
+            .push(bar_btn(
+                "Control",
+                Message::ControlSetup(false),
+                !app.machine_setup,
+            ))
+            .push(bar_btn(
+                if fit.narrow {
+                    "Configuration"
+                } else {
+                    "Controller configuration"
+                },
+                Message::ControlSetup(true),
+                app.machine_setup,
+            ));
+    }
     let file = Help::text(
         "Project file",
         format!(
@@ -9071,16 +9079,16 @@ pub(crate) fn run_setups<'a>(doc: &'a Document, machine_id: &str) -> Vec<(usize,
         .filter(|(_, x)| x.machine.id == machine_id && !crate::manual::is_hand(&x.machine))
         .collect()
 }
-/// A setup as the run bar names it.
-fn setup_label(si: usize, x: &Setup) -> String {
-    format!(
-        "{}. {}{}",
-        si + 1,
-        x.name(),
-        crate::indexed::label(x)
-            .map(|a| format!(" · {a}"))
-            .unwrap_or_default()
-    )
+/// A setup as the one setup picker of the MACHINE page names it, the same
+/// on the Run page and the Steps page (LIO-431): its place in the job, its
+/// name and how it runs, "1 Manual Mill · by hand", "2 Top side · CNC".
+pub(crate) fn job_setup_label(si: usize, x: &Setup) -> String {
+    let how = if crate::manual::is_hand(&x.machine) {
+        "by hand"
+    } else {
+        "CNC"
+    };
+    format!("{} {} · {how}", si + 1, x.name())
 }
 
 /// What the run bar says: the line of what comes next, is being cut, or
@@ -9216,10 +9224,17 @@ pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
     let state = s.state.as_ref();
     let fit = Fit::of(app);
     let msg = |on: bool, a: R| on.then_some(Message::Run(a));
-    let setups = run_setups(&app.doc, &c.machine_id);
+    // The job's setups, all of them in the job's order, as the Steps page
+    // lists them (LIO-431): this machine's run here, the others open their
+    // own page.
+    let runs = run_setups(&app.doc, &c.machine_id);
+    let setups: Vec<(usize, &Setup)> = app.doc.setups.iter().enumerate().collect();
     let picked = c.run.as_ref().map(|r| r.setup);
-    let labels: Vec<String> = setups.iter().map(|(si, x)| setup_label(*si, x)).collect();
+    let labels: Vec<String> = (setups.iter())
+        .map(|(si, x)| job_setup_label(*si, x))
+        .collect();
     let index: Vec<usize> = setups.iter().map(|(si, _)| *si).collect();
+    let here: Vec<usize> = runs.iter().map(|(si, _)| *si).collect();
     let current = picked
         .and_then(|p| index.iter().position(|&si| si == p))
         .map(|k| labels[k].clone());
@@ -9238,7 +9253,11 @@ pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
         help::wrap(
             pick_list(labels, current, move |l: String| {
                 let k = options.iter().position(|o| *o == l).unwrap_or(0);
-                Message::Run(R::Setup(index[k]))
+                if here.contains(&index[k]) {
+                    Message::Run(R::Setup(index[k]))
+                } else {
+                    Message::Guide(crate::GuideAction::Open(index[k]))
+                }
             })
             .placeholder("Pick a setup")
             .text_size(13)
