@@ -2589,9 +2589,54 @@ impl App {
     pub fn on_hand(&self) -> bool {
         (self.doc.active_setup()).is_some_and(|s| manual::is_hand(&s.machine))
     }
+    /// Fills the selected lathe cut from the part's face `pick` (LIO-424):
+    /// a face that makes none says why on its tab and changes nothing.
+    fn fill_turn(&mut self, pick: surface::Selection) {
+        let Some(kind) = self.operation().map(|o| get(&o.p, "turn_kind").to_string()) else {
+            return;
+        };
+        let found = match self.part_mesh() {
+            Some(mesh) => crate::turn::cut_from_face(self.doc.setup(), mesh, &pick.ids, &kind),
+            None => Err("Load the part first.".into()),
+        };
+        match found {
+            Ok(fields) => {
+                let said: Vec<String> = fields.iter().map(|(k, v)| format!("{k} {v}")).collect();
+                if let Some(o) = self.operation_mut() {
+                    for (k, v) in fields {
+                        o.p.insert(k.into(), v);
+                    }
+                    o.surfaces = Some(pick);
+                    o.preview = false;
+                }
+                self.box_refused = None;
+                self.touch();
+                self.status = format!("{kind} filled from the face: {}.", said.join(", "));
+            }
+            Err(error) => {
+                self.status = error.clone();
+                let id = self.operation().map(|o| o.id.clone()).unwrap_or_default();
+                self.box_refused = Some((id, error));
+            }
+        }
+    }
+    /// Whether the selected lathe cut is one taken from the part by a click
+    /// (`turn::PICKED`), on an imported part (LIO-424).
+    fn picks_turn(&self) -> bool {
+        !self.is_sample()
+            && self.doc.file.is_some()
+            && self.imported_mesh.is_some()
+            && self.operation().is_some_and(|o| {
+                o.strategy == Strategy::Turn
+                    && crate::turn::PICKED.contains(&get(&o.p, "turn_kind"))
+            })
+    }
     pub fn can_pick(&self) -> bool {
+        if self.picks_turn() {
+            return true;
+        }
         self.operation().is_some_and(|o| {
-            // A lathe drills on its centre and turns by numbers: nothing to pick.
+            // A lathe drills on its centre: nothing to pick.
             !o.on_centre(&self.doc.setup().machine)
                 && o.strategy != Strategy::Turn
                 && (self.is_sample()
@@ -5830,7 +5875,13 @@ impl App {
                         o.strategy == Strategy::Box
                             && o.surfaces.as_ref().is_none_or(|s| s.ids.is_empty())
                     });
-                self.picking = (t == "Geometry" || unpicked_box) && self.can_pick();
+                // So does a lathe cut on its Turn tab (LIO-424).
+                let unpicked_turn = t == "Turn"
+                    && self.picks_turn()
+                    && (self.operation())
+                        .is_some_and(|o| o.surfaces.as_ref().is_none_or(|s| s.ids.is_empty()));
+                self.picking =
+                    (t == "Geometry" || unpicked_box || unpicked_turn) && self.can_pick();
                 if self.picking {
                     self.playing = false;
                     self.simulation = None;
@@ -6145,6 +6196,13 @@ impl App {
                     self.picking = true;
                     self.status = "Added Box. Click a face of the part: the Box removes the stock that covers it. A floor is cut from above, a wall from the side.".into();
                 }
+                // A lathe cut on a part starts its pick, as a Box does (LIO-424).
+                if self.picks_turn() {
+                    let kind = get(&self.operation().unwrap().p, "turn_kind").to_string();
+                    self.tab = "Turn".into();
+                    self.picking = true;
+                    self.status = format!("Added {added}. {}", crate::turn::pick_prompt(&kind));
+                }
             }
             Message::DuplicateOp => {
                 if let Some(i) = self.selected {
@@ -6218,6 +6276,20 @@ impl App {
                 self.touch()
             }
             Message::Surface(n) => {
+                // A lathe cut takes the smooth face clicked, and fills at
+                // once (LIO-424).
+                if self.picks_turn() {
+                    if let Some(mesh) = self.imported_mesh.as_ref()
+                        && n < mesh.surfaces.len()
+                    {
+                        let pick = surface::Selection {
+                            mesh_fingerprint: mesh.fingerprint.clone(),
+                            ids: mesh.region_of(n),
+                        };
+                        self.fill_turn(pick);
+                    }
+                    return Task::none();
+                }
                 if self.doc.file.is_none()
                     || !self.operation().is_some_and(|o| {
                         o.strategy.imported_preview()
@@ -6815,8 +6887,11 @@ impl App {
                     self.simulation = None;
                     self.progress = 0.;
                 }
-                // A Box is picked on its own tab.
-                if self.operation().is_none_or(|o| o.strategy != Strategy::Box) {
+                // A Box and a lathe cut are picked on their own tab.
+                if self
+                    .operation()
+                    .is_none_or(|o| !matches!(o.strategy, Strategy::Box | Strategy::Turn))
+                {
                     self.tab = "Geometry".into();
                 }
             }
@@ -6826,6 +6901,17 @@ impl App {
                 let picked = (self.operation())
                     .filter(|o| o.strategy == Strategy::Box)
                     .map(|o| o.surfaces.clone());
+                // A lathe cut too (LIO-424).
+                let turned = (self.operation())
+                    .filter(|o| o.strategy == Strategy::Turn)
+                    .map(|o| o.surfaces.clone());
+                if let Some(pick) = turned {
+                    match pick {
+                        Some(pick) => self.fill_turn(pick),
+                        None => self.status = "Pick the face on the part first.".into(),
+                    }
+                    return Task::none();
+                }
                 match picked {
                     Some(Some(pick)) => self.fill_box(pick),
                     Some(None) => self.status = manual::ONE_FACE.into(),

@@ -4172,6 +4172,42 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             }
         }
         "Turn" => {
+            // A lathe cut taken from the part: the pick first, the numbers
+            // under it to adjust (LIO-424), as the Box's.
+            let kind = get(&o.p, "turn_kind");
+            if crate::turn::PICKED.contains(&kind) && app.part_mesh().is_some() && !app.is_sample()
+            {
+                c = c
+                    .push(section("From the part"))
+                    .push(note(crate::turn::pick_prompt(kind)))
+                    .push(if app.picking {
+                        Element::from(btn("Finish picking", Message::PickMode, true).width(Fill))
+                    } else {
+                        secondary("Pick the face on the part", Message::PickMode)
+                            .width(Fill)
+                            .into()
+                    });
+                if let Some((id, why)) = &app.box_refused
+                    && app.picking
+                    && *id == o.id
+                {
+                    c = c.push(caution(
+                        format!("No {kind} from that face"),
+                        vec![why.clone()],
+                    ));
+                }
+                if o.surfaces.as_ref().is_some_and(|s| !s.ids.is_empty()) {
+                    c = c.push(
+                        row![
+                            muted("1 face picked").width(Fill),
+                            secondary("Fill again from the face", Message::BoxFromFace)
+                        ]
+                        .spacing(9)
+                        .align_y(Alignment::Center),
+                    );
+                }
+                c = c.push(section("The cut"));
+            }
             c = c.push(turn_fields(o, checks));
         }
         "Groove" => {
