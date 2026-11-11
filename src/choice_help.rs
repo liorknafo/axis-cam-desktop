@@ -540,7 +540,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
         ),
         ("chamfer_source", "Selected edges") => (
             "The cone's side runs along the edges of the faces you pick: a level face's outline and hole mouths, or one edge when you also pick the wall beside it.",
-            "Pick on the part with Select surfaces on part. Edges narrows which edges of the level faces are broken. Edges are sized by the chamfer's width.",
+            "Pick the level faces on the part. Edges narrows which edges of the level faces are broken. Edges are sized by the chamfer's width.",
         ),
         ("chamfer_source", "Line") => (
             "The cone's side runs along a straight line given by its ends and its height in work coordinates. It needs no part, for flanks at a depth.",

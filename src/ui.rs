@@ -1675,6 +1675,80 @@ fn turn_icon<'a>(app: &App, kind: &str, size: f32) -> widget::Svg<'a> {
 fn steps_of(si: usize) -> Message {
     Message::Guide(crate::GuideAction::Open(si))
 }
+/// What to click on the part for `o`, in one line: on its tab and, while it
+/// is new, in the status line (LIO-427, LIO-428).
+pub(crate) fn pick_line(o: &Operation) -> &'static str {
+    match o.strategy {
+        Strategy::Face => "Click a flat face on the part: it is faced down to.",
+        Strategy::Pocket | Strategy::Adaptive | Strategy::Contour => {
+            "Click the pocket's floor on the part, or a hole."
+        }
+        Strategy::Drill => "Click a hole on the part.",
+        Strategy::Chamfer => "Click the level face whose edges are chamfered.",
+        Strategy::Groove => "Click the wall of the bore the groove goes in.",
+        _ => "Click a face on the part.",
+    }
+}
+/// `n` mm to a tenth, without a trailing ".0".
+fn mm(n: f32) -> String {
+    let s = format!("{n:.1}");
+    s.strip_suffix(".0").map_or(s.clone(), str::to_string)
+}
+/// A picked face named by what it is (LIO-428), in the setup's frame:
+/// "Top face · 120 × 80", "Floor 8 deep · 60 × 40", "Bottom face · …",
+/// "Wall · 40 × 20" (its length and height), "Sloped face · 120 mm²",
+/// "Curved face · 300 mm²". `ids` are the surfaces of one face.
+fn face_name(app: &App, mesh: &crate::mesh::Mesh, ids: &[usize]) -> String {
+    let g = crate::cam::Geometry::new(app.doc.setup(), mesh);
+    let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+    let (mut sum, mut area) = ([0f32; 3], 0f32);
+    for t in (g.triangles.iter()).filter(|t| t.feature.is_some_and(|f| ids.contains(&f))) {
+        let [a, b, c] = t.p;
+        let (u, v) = (
+            [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+            [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
+        );
+        let n = [
+            u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0],
+        ];
+        for k in 0..3 {
+            sum[k] += n[k];
+        }
+        area += (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        for p in t.p {
+            for k in 0..3 {
+                (lo[k], hi[k]) = (lo[k].min(p[k]), hi[k].max(p[k]));
+            }
+        }
+    }
+    let length = (sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]).sqrt();
+    if area <= 0. {
+        return "Face".into();
+    }
+    let up = sum[2] / length;
+    let size = |a: usize, b: usize| format!("{} × {}", mm(hi[a] - lo[a]), mm(hi[b] - lo[b]));
+    let square_mm = format!("{} mm²", mm(area / 2.));
+    if length < 0.999 * area {
+        return format!("Curved face · {square_mm}");
+    }
+    let top = g.bounds.max[2];
+    if up > 0.999 {
+        if top - hi[2] < 0.01 {
+            format!("Top face · {}", size(0, 1))
+        } else {
+            format!("Floor {} deep · {}", mm(top - hi[2]), size(0, 1))
+        }
+    } else if up < -0.999 {
+        format!("Bottom face · {}", size(0, 1))
+    } else if up.abs() < 0.001 {
+        let along = (hi[0] - lo[0]).hypot(hi[1] - lo[1]);
+        format!("Wall · {} × {}", mm(along), mm(hi[2] - lo[2]))
+    } else {
+        format!("Sloped face · {square_mm}")
+    }
+}
 /// Room kept at the right of a scrolled column for its scrollbar, which
 /// Iced's `scrollable` draws over the content: the bar is 10 wide.
 pub(crate) const SCROLLBAR_GUTTER: f32 = 14.;
@@ -3466,16 +3540,11 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
     // The strategy's explanation and availability, behind a disclosure that
     // stays as it was left.
     let open = app.settings.layout.strategy_help_open;
-    c = c.push(about(format!("About {title}"), open));
-    if open && o.is_thread() {
-        c = c.push(note(THREAD_ABOUT));
-    } else if open {
-        c = c.push(note(format!(
-            "{}\n\n{}",
-            o.strategy.help(),
-            o.strategy.availability()
-        )));
-    }
+    // The tab's notes on how its picks are read and what is not checked,
+    // shown under About (LIO-428): the body is built first, then put under it.
+    let above = c;
+    let mut c = Column::new().spacing(13);
+    let mut notes: Vec<String> = vec![];
     // A new operation: what to click on the part, or that it cuts the
     // whole part, as the status line says (LIO-427).
     if let Some(line) = app.new_op_line() {
@@ -3773,16 +3842,21 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 } else if o.strategy == Strategy::Chamfer && !o.needs_surfaces() {
                     // A line needs no pick: its fields are below.
                 } else if !o.needs_surfaces() && o.strategy.imported_preview() {
-                    c = c.push(note("Uses the current imported model in this setup. No demonstration geometry or saved sample features are used."));
+                    // Nothing to pick (LIO-428: no note about the code).
                 } else if o.strategy.imported_preview() {
-                    c = c.push(note(if o.strategy == Strategy::Chamfer { "Click a level face of your part, one facing up: its outline and the mouths of its holes are the edges to chamfer. Click it again to drop it. To break only one edge, also click the wall beside it: only the edge the level face shares with that wall is chamfered. Amber = hover; blue = selected. Click Finish picking when done." } else if o.strategy == Strategy::Groove { "Click the wall of the bore the groove goes in: the whole hole is picked, its walls blue. For a groove round a boss, click every face of the boss's outside wall instead. Amber = hover. Click Finish picking when done." } else if o.strategy == Strategy::Drill { "While picking, every round hole of the part is outlined in teal with the diameter it drills. Click a hole (its outline, its wall or inside it) to drill it: its outline turns blue. Click it again to drop it. Click part of a round wall where there is no whole hole (a half hole on the part's edge, a slot's round end, a round corner) to drill its whole circle round its centre. Or click a horizontal rim face: every round opening in it is drilled. The diameter filter can restrict the holes. Amber = hover." } else if matches!(o.strategy, Strategy::Pocket | Strategy::Contour) { "Click the recessed pocket floor on your part: its outline defines the walls, and holes in the floor preserve islands. Or pick a whole hole: hold the pointer over it until its outline shows, then click the outline or the hole's wall. Its outline is cut down to its floor, or through the part if nothing is under it. Picked holes' outlines are blue; click one again to drop the hole. In a Pocket, a sloped face with no hole past it (a ramp, a dome, a fillet) is picked whole and cleared in steps no taller than the stepdown on slopes. Amber = hover; blue = selected. Click Finish picking when done." } else if o.strategy == Strategy::Adaptive { "Click the recessed pocket floor on your part. Its outline defines the walls; holes in the floor preserve islands. Or pick a whole hole: hold the pointer over it until its outline shows, then click the outline or the hole's wall. Its outline is cleared down to its floor, or through the part if nothing is under it; one too narrow for the cutter has only the stock over it cleared, down to its rim. Picked holes' outlines are blue; click one again to drop the hole. Or click a sloped face (a ramp, a dome, a fillet): the whole face is picked, and the stock over it is cleared in steps no taller than the stepdown on slopes, for a finishing pass. Floors, holes and sloped faces picked together are cleared as one pocket, each to its own height. Amber = hover; blue = selected. Click Finish picking when done." } else if crate::picks_faces(o) { "Click any face of your part, flat or curved: the whole face, up to its sharp edges, is picked. Click it again to drop it. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." } else { "Click a planar surface on your part. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." }));
+                    // What to click, in one line; how a click is read goes
+                    // under About (LIO-428).
+                    if app.new_op_line().is_none() {
+                        c = c.push(note(pick_line(o)));
+                    }
+                    notes.push((if o.strategy == Strategy::Chamfer { "Click a level face of your part, one facing up: its outline and the mouths of its holes are the edges to chamfer. Click it again to drop it. To break only one edge, also click the wall beside it: only the edge the level face shares with that wall is chamfered. Amber = hover; blue = selected. Click Stop picking when done." } else if o.strategy == Strategy::Groove { "Click the wall of the bore the groove goes in: the whole hole is picked, its walls blue. For a groove round a boss, click every face of the boss's outside wall instead. Amber = hover. Click Stop picking when done." } else if o.strategy == Strategy::Drill { "While picking, every round hole of the part is outlined in teal with the diameter it drills. Click a hole (its outline, its wall or inside it) to drill it: its outline turns blue. Click it again to drop it. Click part of a round wall where there is no whole hole (a half hole on the part's edge, a slot's round end, a round corner) to drill its whole circle round its centre. Or click a horizontal rim face: every round opening in it is drilled. The diameter filter can restrict the holes. Amber = hover." } else if matches!(o.strategy, Strategy::Pocket | Strategy::Contour) { "Click the recessed pocket floor on your part: its outline defines the walls, and holes in the floor preserve islands. Or pick a whole hole: hold the pointer over it until its outline shows, then click the outline or the hole's wall. Its outline is cut down to its floor, or through the part if nothing is under it. Picked holes' outlines are blue; click one again to drop the hole. In a Pocket, a sloped face with no hole past it (a ramp, a dome, a fillet) is picked whole and cleared in steps no taller than the stepdown on slopes. Amber = hover; blue = selected. Click Stop picking when done." } else if o.strategy == Strategy::Adaptive { "Click the recessed pocket floor on your part. Its outline defines the walls; holes in the floor preserve islands. Or pick a whole hole: hold the pointer over it until its outline shows, then click the outline or the hole's wall. Its outline is cleared down to its floor, or through the part if nothing is under it; one too narrow for the cutter has only the stock over it cleared, down to its rim. Picked holes' outlines are blue; click one again to drop the hole. Or click a sloped face (a ramp, a dome, a fillet): the whole face is picked, and the stock over it is cleared in steps no taller than the stepdown on slopes, for a finishing pass. Floors, holes and sloped faces picked together are cleared as one pocket, each to its own height. Amber = hover; blue = selected. Click Stop picking when done." } else if crate::picks_faces(o) { "Click any face of your part, flat or curved: the whole face, up to its sharp edges, is picked. Click it again to drop it. Amber = hover; blue = selected. Drag to orbit, then click Stop picking." } else { "Click a planar surface on your part. Amber = hover; blue = selected. Drag to orbit, then click Stop picking." }).to_string());
                     if app.imported_mesh.is_some() {
                         c = c.push(
                             btn(
                                 if app.picking {
-                                    "Finish picking"
+                                    "Stop picking"
                                 } else {
-                                    "Select surfaces on part"
+                                    "Pick on the part"
                                 },
                                 Message::PickMode,
                                 app.picking,
@@ -3846,19 +3920,13 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     };
                     let walls = selection.is_some_and(|s| s.ids.iter().any(|&id| wall(id)));
                     // Floors are surfaces; holes are listed by their walls.
-                    if faces {
-                        c = c.push(muted(format!("{} selected", plural(count, "face"))));
-                    } else if !picks_holes {
-                        c = c.push(muted(format!("{} selected", plural(count, "surface"))));
-                    } else if drill {
-                        if count > 0 {
-                            c = c.push(muted(format!("{} selected", plural(count, "rim face"))));
-                        }
-                    } else if count > 0 || !walls {
-                        c = c.push(muted(format!(
-                            "{} selected",
-                            plural(count, "floor surface")
-                        )));
+                    // The same words on every operation (LIO-428).
+                    if faces
+                        || !picks_holes
+                        || (drill && count > 0)
+                        || (!drill && (count > 0 || !walls))
+                    {
+                        c = c.push(muted(format!("{} picked", plural(count, "face"))));
                     }
                     if let (true, false, Some(selected), Some(mesh)) =
                         (walls, drill, selection, &app.imported_mesh)
@@ -3866,10 +3934,8 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     {
                         match &*app.pocket_holes(o, mesh) {
                             Ok(holes) => {
-                                c = c.push(muted(format!(
-                                    "{} picked by their walls",
-                                    plural(holes.len(), "hole")
-                                )));
+                                c = c
+                                    .push(muted(format!("{} picked", plural(holes.len(), "hole"))));
                                 for (i, h) in holes.iter().enumerate().take(64) {
                                     let (x, y) = h.centre();
                                     let (w, d) = h.size();
@@ -3898,7 +3964,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                                     }
                                     c = c.push(
                                         btn(
-                                            format!("✓ Hole X{x:.2} Y{y:.2} · {w:.2} × {d:.2} mm · {depth} · remove"),
+                                            format!("✓ Hole X{x:.2} Y{y:.2} · {w:.2} × {d:.2} mm · {depth} · Remove"),
                                             Message::DropHole(i),
                                             true,
                                         )
@@ -3926,15 +3992,14 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                                 None => listed.push((face, id, surface.area)),
                             }
                         }
-                        for (face, id, area) in listed.into_iter().take(64) {
+                        for (face, id, _) in listed.into_iter().take(64) {
+                            // Named by what it is, not by the mesh's number (LIO-428).
+                            let ids: Vec<usize> = (selected.ids.iter().copied())
+                                .filter(|&s| face_of(s).unwrap_or(s) == face)
+                                .collect();
                             c = c.push(
                                 btn(
-                                    format!(
-                                        "✓ Face {} · {:.1} {}² · remove",
-                                        face + 1,
-                                        area / mesh.display_scale().powi(2),
-                                        mesh.units
-                                    ),
+                                    format!("✓ {} · Remove", face_name(app, mesh, &ids)),
                                     Message::Surface(id),
                                     true,
                                 )
@@ -3945,15 +4010,10 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         && selected.matches(mesh)
                     {
                         for &id in selected.ids.iter().filter(|&&id| !wall(id)).take(64) {
-                            if let Some(surface) = mesh.surfaces.get(id) {
+                            if mesh.surfaces.get(id).is_some() {
                                 c = c.push(
                                     btn(
-                                        format!(
-                                            "✓ Surface {} · {:.1} {}² · remove",
-                                            id + 1,
-                                            surface.area / mesh.display_scale().powi(2),
-                                            mesh.units
-                                        ),
+                                        format!("✓ {} · Remove", face_name(app, mesh, &[id])),
                                         Message::Surface(id),
                                         true,
                                     )
@@ -3963,7 +4023,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         }
                     }
                     if selection.is_some() {
-                        c = c.push(secondary("Clear surface selection", Message::ClearSurfaces));
+                        c = c.push(secondary("Clear all", Message::ClearSurfaces));
                     }
                     if o.strategy == Strategy::Drill {
                         c = c.push(checks.field(
@@ -4018,7 +4078,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                                         if let Some(a) = &h.arc {
                                             c = c.push(
                                                 btn(
-                                                    format!("✓ {said} · remove"),
+                                                    format!("✓ {said} · Remove"),
                                                     Message::Surface(a.walls[0]),
                                                     true,
                                                 )
@@ -4029,7 +4089,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                                         c = c.push(match by_walls(h) {
                                             Some(i) => Element::from(
                                                 btn(
-                                                    format!("✓ {said} · remove"),
+                                                    format!("✓ {said} · Remove"),
                                                     Message::DropHole(i),
                                                     true,
                                                 )
@@ -4046,7 +4106,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                             }
                         }
                     }
-                    c = c.push(note(match o.strategy {
+                    notes.push(match o.strategy {
                         Strategy::Adaptive => "Adaptive clearing works on the same geometry as Pocket: the selected recessed flat floors, with the walls and islands of the part, each picked hole's outline (cut down to the highest of the part under it, or through the part with the breakthrough; one too narrow for the cutter has only the stock over it cleared, down to its rim), and sloped faces cleared in steps. Vertical access only; overhanging geometry is rejected. The path keeps the cutter's side load near the optimal load, so it can take a deep stepdown. It inherits the stock left by all earlier enabled operations and setups.".to_string(),
                         Strategy::Pocket => "Pocket uses offset contours of the selected floor triangles, including islands, and of each picked hole's outline. Supports open, vertical-wall pockets with a flat floor; overhanging geometry is rejected. A picked hole is cut down to the highest of the part under it, or through the part with the breakthrough; one too narrow for the cutter has only the stock over it cleared, down to its rim. Simulation inherits the stock left by all earlier enabled operations and setups.".to_string(),
                         Strategy::Contour => "Inside contour offsets only the walls and islands of this floor, or the wall of each picked hole. It does not clear the interior. The floor must be flat and accessible along setup Z; overhangs are rejected.".to_string(),
@@ -4055,7 +4115,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         Strategy::Parallel => "Parallel finishing cuts only where the cutter touches a picked face. The rest of the part still holds the cutter up, so it never cuts into a face it was not given; where a picked face meets one that is not, the cutter stops at the corner between them, which keeps its radius.".to_string(),
                         Strategy::Waterline => "Waterline finishing cuts each level's loop only where the face nearest the cutter is a picked one, and goes no lower than the lowest picked face. Where a picked face meets one that is not, the cutter finishes up to the corner between them. The rest of the part still keeps the cutter out, so it never cuts into a face it was not given.".to_string(),
                         _ => fixture_note(app, Note::Facing),
-                    }));
+                    });
                 } else {
                     c = c.push(note("This operation is unavailable for imported parts. Open Operation support for its status."));
                 }
@@ -4076,9 +4136,9 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     .push(
                         btn(
                             if app.picking {
-                                "Finish picking"
+                                "Stop picking"
                             } else {
-                                "Select in sample viewport"
+                                "Pick on the part"
                             },
                             Message::PickMode,
                             app.picking,
@@ -4086,7 +4146,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         .width(Fill),
                     )
                     .push(muted(format!(
-                        "{} selected",
+                        "{} picked",
                         plural(o.geometry.len(), "feature")
                     )));
             } else if o.strategy != Strategy::Chamfer || o.needs_surfaces() {
@@ -4175,9 +4235,9 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     .push(note("Click a face of the part: the Box removes the stock that covers it. A floor is cut from above, a wall from the side. One click fills the numbers below. Drag to orbit."))
                     // Outlined as a button when picking is off (LIO-408).
                     .push(if app.picking {
-                        Element::from(btn("Finish picking", Message::PickMode, true).width(Fill))
+                        Element::from(btn("Stop picking", Message::PickMode, true).width(Fill))
                     } else {
-                        secondary("Pick the face on the part", Message::PickMode)
+                        secondary("Pick on the part", Message::PickMode)
                             .width(Fill)
                             .into()
                     });
@@ -4222,9 +4282,9 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     .push(section("From the part"))
                     .push(note(crate::turn::pick_prompt(kind)))
                     .push(if app.picking {
-                        Element::from(btn("Finish picking", Message::PickMode, true).width(Fill))
+                        Element::from(btn("Stop picking", Message::PickMode, true).width(Fill))
                     } else {
-                        secondary("Pick the face on the part", Message::PickMode)
+                        secondary("Pick on the part", Message::PickMode)
                             .width(Fill)
                             .into()
                     });
@@ -4551,7 +4611,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 c = c.push(checks.field(p, "ramp_angle", "Ramp angle · degrees"));
             }
             c = c.push(note("Profile ramp descends around the contour it enters at 25% feed, then completes the loop at depth. Plunge feeds straight down at 25% feed and requires a plunge-capable cutter. Between contours the tool stays down: it follows the contour just cut, then steps across at most 1.5 stepovers along a line clear of every wall and island; otherwise it retracts to clearance and enters again."));
-            c = c.push(note(fixture_note(app, Note::Pocket)));
+            notes.push(fixture_note(app, Note::Pocket));
         }
         "Linking" if !app.is_sample() && o.faces_outline() => {
             c = c.push(checks.field(p, "ramp_angle", "Entry ramp angle · degrees"));
@@ -4566,7 +4626,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 ));
             }
             c = c.push(note("Each level enters on the pass round the outline's edge: from beside the stock where that edge runs off it, otherwise ramping down round the edge at the entry ramp angle (a loop too short for that plunges). The rows then start and end where that pass cut. With Keep tool down the cutter feeds to the next row at depth when it is near and the way stays inside the outline; otherwise it lifts just over the level before, or to clearance where the way leaves the outline, and feeds down where the edge pass cut. Entries and depth changes feed at 25% of cutting feed."));
-            c = c.push(note(fixtures(Note::Pocket, modelled(app))));
+            notes.push(fixtures(Note::Pocket, modelled(app)).to_string());
         }
         "Linking" if !app.is_sample() && o.strategy == Strategy::Face => {
             if facing_setting(p, "facing_pattern") == FACING_PATTERNS[0] {
@@ -4586,7 +4646,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             } else {
                 c = c.push(note("One way uses the selected Climb or Conventional direction. It retracts to clearance for each return and starts each depth at the first row. Switch Passes → Pass pattern to Both ways for keep-down links and continuation from the previous endpoint."));
             }
-            c = c.push(note(fixture_note(app, Note::Entry)));
+            notes.push(fixture_note(app, Note::Entry));
         }
         "Linking" if !app.is_sample() && o.strategy == Strategy::Adaptive => {
             c = c.push(choice_value(
@@ -4601,10 +4661,10 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 c = c.push(checks.field(p, "ramp_angle", "Helix ramp angle · degrees"));
             }
             c = c.push(note("Where the cutter cannot come in from the side it enters the material with a Helix at the ramp angle, or a straight Plunge that needs a plunge-capable cutter. Where there is no room for a helix, as in a hole hardly wider than the cutter, a Helix entry ramps down round the wall at the ramp angle instead, as a Pocket's profile ramp does; it never plunges. Where the floor runs off the stock, or earlier cuts opened it, the cutter comes in from the side with no entry. Between passes the tool stays down through cleared area where the move is short; otherwise it lifts just above the level before (inside the pocket) or to clearance."));
-            c = c.push(note(fixtures(Note::Pocket, modelled(app))));
+            notes.push(fixtures(Note::Pocket, modelled(app)).to_string());
         }
         "Linking" if !app.is_sample() && o.strategy.imported_preview() => {
-            c = c.push(note(fixture_note(app, Note::Separate)));
+            notes.push(fixture_note(app, Note::Separate));
         }
         "Linking" => {
             if o.strategy == Strategy::Drill {
@@ -4629,6 +4689,23 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
         }
         _ => {}
     }
+    if tab == "Passes" && !app.is_sample() && o.strategy == Strategy::Pocket {
+        notes.push(fixture_note(app, Note::Passes));
+    }
+    let mut out = above.push(about(format!("About {title}"), open));
+    if open {
+        let mut said = if o.is_thread() {
+            THREAD_ABOUT.to_string()
+        } else {
+            format!("{}\n\n{}", o.strategy.help(), o.strategy.availability())
+        };
+        for n in notes {
+            said.push_str("\n\n");
+            said.push_str(&n);
+        }
+        out = out.push(note(said));
+    }
+    let mut c = out.push(c);
     // Under the form, scrolling with it: the checks no field on the open tab
     // shows. Pinned, they could take the whole height and leave none to it.
     // Not "checks passed" while a new operation asks for its pick (LIO-427).
@@ -5125,7 +5202,7 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
     if !app.is_sample() && s == Strategy::Face {
         c = c.push(note("The preview supports flat end mills and face mills on the highest planar face. Continuous cutter sweeps preserve removed stock; fully cleared top layers are skipped automatically. This does not establish machining accuracy or collision clearance."));
     } else if !app.is_sample() && s == Strategy::Pocket {
-        c = c.push(note(fixture_note(app, Note::Passes)));
+        // Its note is under About (LIO-428).
     } else {
         c = c.push(checks.field(p, "tolerance", "Tolerance · mm"));
     }
@@ -5581,7 +5658,7 @@ fn pins_block<'a>(app: &'a App, s: &'a Setup) -> Element<'a, Message> {
     c = c.push(
         btn(
             if app.picking_pin_holes() {
-                "Finish picking"
+                "Stop picking"
             } else {
                 "Pick holes on the part"
             },
