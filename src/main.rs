@@ -1950,6 +1950,8 @@ impl App {
         // A blank workspace has the starter materials and workholding too.
         doc.adopt_materials();
         doc.adopt_holders();
+        // Old default names read as the new ones (LIO-426).
+        doc.follow_default_names();
         // The owner's threading tools; never in tests.
         if !isolated {
             doc.adopt_tools();
@@ -2265,6 +2267,8 @@ impl App {
         self.clamps_draft = None;
         self.typed_last = None;
         self.doc = doc;
+        // Old default names read as the new ones (LIO-426).
+        self.doc.follow_default_names();
         if !self.is_sample() {
             self.doc.sync_stock_sources();
         }
@@ -3071,6 +3075,8 @@ impl App {
         }
         // A centre drilling's holes are the drill's it centres.
         centre::sync(&mut self.doc);
+        // A name the app gave follows the numbers; a typed one stays (LIO-426).
+        self.doc.follow_default_names();
         // Where picks made by this edit are, kept with the edit itself.
         self.record_picks();
         self.sync_turns();
@@ -6051,7 +6057,6 @@ impl App {
                     Message::AddOp(s) => (s, None),
                     _ => unreachable!(),
                 };
-                let added = kind.unwrap_or(strategy.name());
                 if !self.is_sample() && !strategy.imported_preview() {
                     self.stop_selection();
                     self.status = strategy.availability().into();
@@ -6063,6 +6068,13 @@ impl App {
                 if let Some(kind) = kind {
                     operation.set_turn_kind(kind);
                 }
+                // Named by what it cuts until a name is typed (LIO-426).
+                operation.p.insert("name".into(), String::new());
+                // The tile's word: a lathe cut's own (LIO-426).
+                let added = match strategy {
+                    Strategy::Turn => get(&operation.p, "turn_kind").to_string(),
+                    s => s.short().to_string(),
+                };
                 // The first tool of the operation's first type, else of
                 // another type it takes (`Operation::tool_types`).
                 let types = operation.tool_types(machine);

@@ -1754,10 +1754,9 @@ fn face_name(app: &App, mesh: &crate::mesh::Mesh, ids: &[usize]) -> String {
 pub(crate) const SCROLLBAR_GUTTER: f32 = 14.;
 /// The browser's mark column: wide enough for the widest mark, "✓·".
 const MARK_WIDTH: f32 = 22.;
-/// How many characters of an operation's or a setup's name the browser shows
-/// before an ellipsis; the clipped row is the net for wide letters. The full
-/// name is in the row's hover help.
-const OP_NAME_CHARS: usize = 20;
+/// How many characters of a setup's name the browser shows before an
+/// ellipsis; the clipped row is the net for wide letters. The full name is
+/// in the row's hover help. An operation's name is never cut (LIO-426).
 const SETUP_NAME_CHARS: usize = 14;
 /// `name` cut to `max` characters, ending in "…" when it was longer. Iced
 /// 0.14 text has no ellipsis of its own.
@@ -2113,16 +2112,13 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
                 let (glyph, color) = (mark.glyph(), mark.color());
                 let content = row![
                     op_icon(app, o, 23.),
+                    // Never cut with "…": it fits or takes two lines (LIO-426).
                     container(
-                        text(ellipsize(
-                            &crate::threading::shown_name(o, &app.doc.tools),
-                            OP_NAME_CHARS
-                        ))
-                        .size(12)
-                        .wrapping(Wrapping::None)
+                        text(crate::threading::shown_name(o, &app.doc.tools))
+                            .size(12)
+                            .wrapping(Wrapping::WordOrGlyph)
                     )
-                    .width(Fill)
-                    .clip(true),
+                    .width(Fill),
                     container(text(glyph).size(13).color(color))
                         .width(MARK_WIDTH)
                         .align_x(iced::alignment::Horizontal::Right)
@@ -3461,9 +3457,10 @@ pub(crate) fn inspector(app: &App) -> Element<'_, Message> {
 }
 /// A tab of the operation inspector: its label centred, so that a row of
 /// them, each a `FillPortion`, reads as one width.
-fn tab<'a>(label: &'static str, active: bool) -> HelpButton<'a> {
+/// `shown` is its word on the tab when it is not `label` (a lathe cut's).
+fn tab<'a>(label: &'static str, shown: &'a str, active: bool) -> HelpButton<'a> {
     let msg = Message::Tab(label.to_string());
-    let b = button(text(label).size(11).align_x(Alignment::Center).width(Fill))
+    let b = button(text(shown).size(11).align_x(Alignment::Center).width(Fill))
         .on_press(msg.clone())
         .padding([7, 2])
         .style(move |_, st| flat(active, st));
@@ -3500,7 +3497,8 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
         // The lathe cut, as its tile says (LIO-421).
         get(&o.p, "turn_kind")
     } else {
-        o.strategy.name()
+        // The tile's word (LIO-426).
+        o.strategy.short()
     };
     let identity = row![
         op_icon(app, o, 30.),
@@ -3517,7 +3515,12 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
     for chunk in all.chunks(if all.len() > 5 { 3 } else { all.len().max(1) }) {
         let mut r = Row::new().spacing(1);
         for t in chunk {
-            r = r.push(tab(t, app.tab == *t));
+            // A lathe cut's own tab is called by the cut (LIO-426).
+            let shown = match *t {
+                "Turn" if o.strategy == Strategy::Turn => get(&o.p, "turn_kind"),
+                _ => t,
+            };
+            r = r.push(tab(t, shown, app.tab == *t));
         }
         tabs = tabs.push(r)
     }

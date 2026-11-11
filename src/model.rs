@@ -4264,6 +4264,97 @@ fn label(k: &str) -> String {
 }
 /// The six fields of a Box's block, by key.
 pub const BOX_FIELDS: [&str; 6] = ["x_min", "x_max", "y_min", "y_max", "z_top", "z_bottom"];
+impl Document {
+    /// Each operation the app named, old defaults too, named again by what
+    /// it cuts (LIO-426); a typed name stays.
+    pub fn follow_default_names(&mut self) {
+        let tools = self.tools.clone();
+        for o in self.setups.iter_mut().flat_map(|s| s.operations.iter_mut()) {
+            if o.named_by_default() {
+                let name = o.default_name(&tools);
+                o.p.insert("name".into(), name.clone());
+                o.p.insert("auto_name".into(), name);
+            }
+        }
+    }
+}
+/// `n` mm to a tenth, without a trailing ".0", its minus the app's "−".
+fn mm(n: f32) -> String {
+    let s = format!("{n:.1}");
+    let s = s.strip_suffix(".0").map_or(s.clone(), str::to_string);
+    s.replace('-', "−")
+}
+impl Operation {
+    /// Whether its name is one the app gave, not one typed (LIO-426): none,
+    /// the one it was last given, or an old default (`Strategy::name`,
+    /// "Turn · <kind>"). A Thread, a centre drilling and what a Thread
+    /// brought keep the names they were given.
+    pub fn named_by_default(&self) -> bool {
+        if self.is_thread()
+            || crate::centre::centres(self).is_some()
+            || !get(&self.p, crate::threading::THREAD_OF).is_empty()
+        {
+            return false;
+        }
+        let name = self.name();
+        name.is_empty()
+            || name == get(&self.p, "auto_name")
+            || Strategy::ALL.iter().any(|s| name == s.name())
+            || (name.strip_prefix("Turn · ")).is_some_and(|k| crate::lathe::TURN_KINDS.contains(&k))
+    }
+    /// What the operation cuts, from its main numbers (LIO-426): its tile's
+    /// word first, "Drill Ø5", "Box 60 × 40 × 12 deep", "Outside Ø16 to
+    /// Z -30", "Bore Ø20 × 15 deep", "Face 1 off", "Groove 3 wide at Z -12",
+    /// "Part off at Z -45"; the word alone where no number says more.
+    pub fn default_name(&self, tools: &[Tool]) -> String {
+        let n = |k: &str| num(&self.p, k);
+        let word = self.strategy.short();
+        let named = match self.strategy {
+            Strategy::Drill => {
+                let d =
+                    (tools.iter().find(|t| t.id == self.tool)).and_then(|t| num(&t.p, "diameter"));
+                d.map(|d| format!("Drill Ø{}", mm(d)))
+            }
+            Strategy::Box => match BOX_FIELDS.map(&n) {
+                [
+                    Some(x0),
+                    Some(x1),
+                    Some(y0),
+                    Some(y1),
+                    Some(top),
+                    Some(bottom),
+                ] => Some(format!(
+                    "Box {} × {} × {} deep",
+                    mm(x1 - x0),
+                    mm(y1 - y0),
+                    mm(top - bottom)
+                )),
+                _ => None,
+            },
+            Strategy::Turn => {
+                let kind = get(&self.p, "turn_kind");
+                match kind {
+                    "Outside" => n("diameter")
+                        .zip(n("z_end"))
+                        .map(|(d, z)| format!("Outside Ø{} to Z {}", mm(d), mm(z))),
+                    "Bore" => n("diameter")
+                        .zip(n("z_end"))
+                        .map(|(d, z)| format!("Bore Ø{} × {} deep", mm(d), mm(-z))),
+                    "Face" => n("face_off").map(|f| format!("Face {} off", mm(f))),
+                    "Groove" => n("width")
+                        .zip(n("z"))
+                        .map(|(w, z)| format!("Groove {} wide at Z {}", mm(w), mm(z))),
+                    "Part off" => n("z").map(|z| format!("Part off at Z {}", mm(z))),
+                    "Chamfer" => n("size").map(|s| format!("Chamfer {}", mm(s))),
+                    _ => None,
+                }
+                .or_else(|| (!kind.is_empty()).then(|| kind.to_string()))
+            }
+            _ => None,
+        };
+        named.unwrap_or_else(|| word.to_string())
+    }
+}
 /// The operation editor's text fields, by key: the ones a check's message
 /// names by its `label`.
 const OPERATION_FIELDS: [&str; 75] = [

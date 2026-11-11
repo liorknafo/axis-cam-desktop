@@ -6800,10 +6800,11 @@ flood = { pin = 8 }
         zeroed(&mut a);
         check_run(&mut a, 0);
         let has = |a: &App, text: &str| problems(a).iter().any(|p| p.contains(text));
-        assert!(has(&a, "Facing: uses mist coolant"), "{:?}", problems(&a));
+        // Names by the tile's word (LIO-426), were "Facing", "Drilling".
+        assert!(has(&a, "Face: uses mist coolant"), "{:?}", problems(&a));
         let p = run_of(&a).checked().unwrap()[0].clone();
         let names: Vec<&str> = p.ops.iter().map(|o| o.name.as_str()).collect();
-        assert_eq!(names, ["Facing", "Pocket", "Contour"]);
+        assert_eq!(names, ["Face", "Pocket", "Contour"]);
         assert!(p.starts.iter().all(Result::is_ok), "{:?}", p.starts);
         // The program from the Pocket: the tool change's safe start, then
         // the same blocks as the whole program, with nothing of the Facing.
@@ -6966,7 +6967,7 @@ flood = { pin = 8 }
         );
         let steps = work_zero_steps(&a, conn(&a)).unwrap().join("\n");
         assert!(
-            steps.contains("This run starts at Pocket (tool run 1), taking Facing as cut")
+            steps.contains("This run starts at Pocket (tool run 1), taking Face as cut")
                 && steps.contains("at Z-4 (the stock top was Z0)")
                 && steps.contains("pinches a sheet of paper on the floor there")
                 && steps.contains("4. Set Z-4: that point becomes Z-4. X and Y stay as they are"),
@@ -7050,7 +7051,8 @@ flood = { pin = 8 }
         assert!(conn(&a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
         let steps = work_zero_steps(&a, conn(&a)).unwrap().join("\n");
         assert!(
-            steps.contains("taking Facing, Pocket, Contour as cut")
+            // Names by the tile's word (LIO-426), were "Facing", "Drilling".
+            steps.contains("taking Face, Pocket, Contour as cut")
                 && steps.contains("Load T3")
                 && steps.contains("Zero Z on the stock top and Probe Z are off")
                 && !steps.contains("Zero all"),
@@ -17700,7 +17702,8 @@ soft_max = 180.0
         let lines = crate::ui::holding_lines(&a);
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
-            lines[0].starts_with("Facing: the cut could tip the stock out of the vise: about 191 N, 39 mm above the top of the jaws' contact, which is 2.9 mm high"),
+            // Names by the tile's word (LIO-426), were "Facing", "Drilling".
+            lines[0].starts_with("Face: the cut could tip the stock out of the vise: about 191 N, 39 mm above the top of the jaws' contact, which is 2.9 mm high"),
             "{lines:?}"
         );
         assert_eq!(crate::ui::held(&a), Held::Mixed);
@@ -18141,7 +18144,8 @@ soft_max = 180.0
         // "Completeness not checked: … could not be generated.").
         a.doc.setups[1].operations[0].tool = "gone".into();
         let _ = a.refresh_left_stock();
-        assert_eq!(line(&a), "Completeness waits on Flipped / Facing.");
+        // Names by the tile's word (LIO-426), were "Facing", "Drilling".
+        assert_eq!(line(&a), "Completeness waits on Flipped / Face.");
         let _ = a.view();
         // The example is not simulated: nothing is said.
         let mut sample = app();
@@ -19276,10 +19280,12 @@ soft_max = 180.0
         assert!(holding_lines(&a).is_empty(), "{:?}", holding_lines(&a));
         let margins = holding_margins(&a);
         assert_eq!(margins.len(), 2, "{margins:?}");
-        assert!(margins[0].starts_with("Facing: holds ×"), "{margins:?}");
+        // Names by the tile's word (LIO-426), were "Facing", "Drilling".
+        assert!(margins[0].starts_with("Face: holds ×"), "{margins:?}");
         assert_eq!(
             margins[1],
-            "Drilling: no cutting force sideways or up to hold against."
+            // Names by the tile's word (LIO-426), were "Facing", "Drilling".
+            "Drill Ø4: no cutting force sideways or up to hold against."
         );
         assert_eq!(op_mark(&a, a.current_ready(), 0), OpMark::Ready);
         // Gripped 1 mm deep, the facing cut tips the stock out of the jaws.
@@ -19288,10 +19294,10 @@ soft_max = 180.0
         let lines = holding_lines(&a);
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
-            lines[0].starts_with("Facing: the cut could tip the stock out of the vise"),
+            lines[0].starts_with("Face: the cut could tip the stock out of the vise"),
             "{lines:?}"
         );
-        assert!(holding_margins(&a)[0].starts_with("Facing: only ×"));
+        assert!(holding_margins(&a)[0].starts_with("Face: only ×"));
         assert_eq!(op_mark(&a, a.current_ready(), 0), OpMark::Collides);
         assert_eq!(op_mark(&a, a.current_ready(), 1), OpMark::Generated);
     }
@@ -19378,7 +19384,8 @@ soft_max = 180.0
             .map(|p| p.split(':').next().unwrap())
             .collect();
         assert!(
-            named.contains(&"Pocket") && named.contains(&"Facing"),
+            // Names by the tile's word (LIO-426), were "Facing", "Drilling".
+            named.contains(&"Pocket") && named.contains(&"Face"),
             "{problems:?}"
         );
         // Why the setup cannot be held first: the operations cut away the
@@ -23296,7 +23303,8 @@ soft_max = 180.0
             assert!(a.picking, "{s:?}");
             let line = a.new_op_line().expect("what to click");
             assert!(line.starts_with("Click "), "{line}");
-            assert_eq!(a.status, format!("Added {}. {line}", s.name()));
+            // The tile's word (LIO-426).
+            assert_eq!(a.status, format!("Added {}. {line}", s.short()));
             shows(&a, &[line]);
             assert!(!errors(&a), "{s:?}");
             // Nor under the view.
@@ -23336,7 +23344,8 @@ soft_max = 180.0
             assert!(!a.picking, "{s:?}");
             let line = "Cuts the whole part. Pick faces only to limit it.";
             assert_eq!(a.new_op_line(), Some(line));
-            assert_eq!(a.status, format!("Added {}. {line}", s.name()));
+            // The tile's word (LIO-426).
+            assert_eq!(a.status, format!("Added {}. {line}", s.short()));
             shows(&a, &[line]);
         }
         // The example project: as before.
@@ -23456,6 +23465,150 @@ soft_max = 180.0
         let id = top(&a);
         pick(&mut a, id);
         check(&a, "Box");
+    }
+    /// One word per operation (LIO-426): the tile's word is the editor's
+    /// title and the first word of the operation's name, which says what it
+    /// cuts and follows its numbers until a name is typed.
+    #[test]
+    fn an_operation_has_one_word_and_a_name_that_says_what_it_cuts() {
+        let title = |a: &App| {
+            let texts = page_texts(a);
+            let at = texts
+                .iter()
+                .position(|t| t == "Operation parameters")
+                .unwrap();
+            texts[at - 1].clone()
+        };
+        let add = |a: &mut App, m: Message| {
+            let _ = a.update(m);
+            if a.operation().is_none() || a.page == Page::Tools {
+                let _ = a.update(Message::SaveTool);
+            }
+        };
+        let name = |a: &App| a.operation().unwrap().name().to_string();
+        let mut a = imported_app();
+        a.doc.setup_mut().operations.clear();
+        a.selected = None;
+        for s in [
+            Strategy::Face,
+            Strategy::Adaptive,
+            Strategy::Pocket,
+            Strategy::Contour,
+            Strategy::Drill,
+            Strategy::Chamfer,
+            Strategy::Groove,
+        ] {
+            add(&mut a, Message::AddOp(s));
+            assert_eq!(title(&a), s.short(), "{s:?}");
+            assert!(name(&a).starts_with(s.short()), "{s:?}: {}", name(&a));
+            assert!(
+                a.status.starts_with(&format!("Added {}.", s.short())),
+                "{}",
+                a.status
+            );
+        }
+        // A Drill is named by its drill; another drill, another name.
+        let drills: Vec<(String, f32)> = (a.doc.tools.iter())
+            .filter(|t| get(&t.p, "type") == "Drill")
+            .filter_map(|t| Some((t.id.clone(), num(&t.p, "diameter")?)))
+            .collect();
+        add(&mut a, Message::AddOp(Strategy::Drill));
+        let first = name(&a);
+        let other = (drills.iter()).find(|(id, _)| *id != a.operation().unwrap().tool);
+        if let Some((id, d)) = other {
+            let _ = a.update(Message::Edit(Target::Operation, "tool", id.clone()));
+            assert_ne!(name(&a), first);
+            assert!(
+                name(&a).starts_with(&format!("Drill Ø{}", d)),
+                "{}",
+                name(&a)
+            );
+        }
+        // A typed name stays.
+        let _ = a.update(Message::Edit(Target::Operation, "name", "Mine".into()));
+        let _ = a.update(Message::Edit(
+            Target::Operation,
+            "tool",
+            drills[0].0.clone(),
+        ));
+        assert_eq!(name(&a), "Mine");
+        // A lathe cut: its word on the tile, the title, the tab and the name,
+        // which follows its numbers.
+        let mut b = stud_app(|_| {});
+        add(&mut b, Message::AddTurn("Outside"));
+        assert_eq!(title(&b), "Outside");
+        assert!(b.status.starts_with("Added Outside."), "{}", b.status);
+        shows(&b, &["Outside"]);
+        let _ = b.update(Message::Edit(Target::Operation, "diameter", "16".into()));
+        let _ = b.update(Message::Edit(Target::Operation, "z_end", "-30".into()));
+        assert_eq!(name(&b), "Outside Ø16 to Z −30");
+        // Whole in the browser, never cut with "…".
+        shows(&b, &["Outside Ø16 to Z −30"]);
+    }
+    /// An operation saved with an old default name ("Drilling", "Turn ·
+    /// Outside") reads by the new rule when the project opens, in the
+    /// browser and the Steps header alike; a typed name stays (LIO-426).
+    #[test]
+    fn old_default_names_read_as_the_new_ones() {
+        let names = |a: &App| -> Vec<String> {
+            (a.doc.setup().operations.iter())
+                .map(|o| o.name().to_string())
+                .collect()
+        };
+        // A CNC job saved with the old names, one of them typed.
+        let mut a = imported_app();
+        a.page = Page::Work;
+        for o in a.doc.setup_mut().operations.iter_mut() {
+            o.p.insert("name".into(), o.strategy.name().into());
+            o.p.remove("auto_name");
+        }
+        let drill = (a.doc.setup().operations.iter()).position(|o| o.strategy == Strategy::Drill);
+        let drill = drill.unwrap();
+        let typed = (0..a.doc.setup().operations.len())
+            .find(|i| *i != drill)
+            .unwrap();
+        a.doc.setup_mut().operations[typed]
+            .p
+            .insert("name".into(), "My own".into());
+        let doc = a.doc.clone();
+        a.replace_document(doc, None);
+        a.page = Page::Work;
+        let now = names(&a);
+        assert_eq!(now[typed], "My own");
+        assert!(now[drill].starts_with("Drill Ø"), "{now:?}");
+        for (i, n) in now.iter().enumerate().filter(|(i, _)| *i != typed) {
+            let s = a.doc.setup().operations[i].strategy;
+            assert!(n.starts_with(s.short()), "{n} for {s:?}");
+        }
+        shows(&a, &[now[drill].as_str()]);
+        // A lathe cut saved as "Turn · Outside".
+        let mut b = stud_app(|_| {});
+        let _ = b.update(Message::AddTurn("Outside"));
+        let _ = b.update(Message::Edit(Target::Operation, "diameter", "16".into()));
+        let _ = b.update(Message::Edit(Target::Operation, "z_end", "-20".into()));
+        let o = &mut b.doc.setup_mut().operations[0];
+        o.p.insert("name".into(), "Turn · Outside".into());
+        o.p.remove("auto_name");
+        let (doc, mesh) = (b.doc.clone(), b.imported_mesh.clone());
+        b.replace_document(doc, None);
+        // Its part, as a project opened with its model loads it.
+        b.imported_mesh = mesh;
+        b.page = Page::Work;
+        assert_eq!(names(&b), ["Outside Ø16 to Z −20"]);
+        shows(&b, &["Outside Ø16 to Z −20"]);
+        // Its steps built in place, not in the background.
+        b.smoke_dir = b.test_dir.as_ref().map(|d| d.path().to_path_buf());
+        let _ = b.update(Message::Guide(crate::GuideAction::Open(0)));
+        let _ = b.refresh_guide();
+        let texts = page_texts(&b);
+        assert!(
+            texts.iter().any(|t| t.contains("Outside Ø16 to Z −20")),
+            "{texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("Turn · Outside")),
+            "{texts:?}"
+        );
     }
     #[test]
     fn imported_pocket_selection_playback_direction_and_reopen_work_end_to_end() {
