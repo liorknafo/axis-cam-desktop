@@ -31147,11 +31147,11 @@ soft_max = 180.0
             assert_eq!((a.page, a.doc.index()), (Page::Work, si));
         }
     }
-    /// A job on the hand machines alone: the planner says plainly that it
-    /// starts from a CNC setup, on the manual mill and on the lathe; a CNC
-    /// job is as before (LIO-430, item 3).
+    /// A job on the hand machines alone, on the manual mill or on the
+    /// lathe, meets the planner's setup 1 line as a CNC job does (LIO-430,
+    /// items 1-2; it said "starts from a CNC setup" before).
     #[test]
-    fn the_planner_says_it_starts_from_a_cnc_setup() {
+    fn the_planner_takes_a_job_on_the_hand_machines_alone() {
         let setup1 = |a: &App| {
             crate::analysis::preconditions(&a.doc, a.part_mesh())
                 .into_iter()
@@ -31159,7 +31159,7 @@ soft_max = 180.0
                 .unwrap()
         };
         let cnc = imported_app();
-        assert_ne!(setup1(&cnc).hint, crate::analysis::HAND_ONLY);
+        assert_eq!(setup1(&cnc).label, "Setup 1: a machine and stock");
         for hand in [
             crate::manual::is_manual as fn(&crate::model::Machine) -> bool,
             crate::lathe::is_lathe,
@@ -31172,10 +31172,7 @@ soft_max = 180.0
             a.doc.setups.retain(|s| hand(&s.machine));
             a.doc.active = a.doc.setups[0].id.clone();
             let line = setup1(&a);
-            assert!(!line.ok);
-            assert_eq!(line.hint, crate::analysis::HAND_ONLY);
-            a.page = Page::Ai;
-            shows(&a, &[crate::analysis::HAND_ONLY]);
+            assert!(line.ok, "{}", line.hint);
         }
     }
     /// The MACHINE page picks a setup the same way on a CNC and a hand
@@ -31313,6 +31310,14 @@ soft_max = 180.0
             "{texts:?}"
         );
         assert!(texts.iter().any(|t| t == "Machine library") && texts.iter().any(|t| t == "Tools"));
+        // With no setup the footer is "mm", as on the Start page: the old
+        // previews-and-post note is gone (LIO-433, item 6).
+        assert!(a.doc.active_setup().is_none());
+        assert!(texts.iter().any(|t| t == "mm"), "{texts:?}");
+        assert!(
+            !texts.iter().any(|t| t.contains("Bounded mesh")),
+            "{texts:?}"
+        );
         // An import the dialog was left without a file opens the path field.
         let _ = a.update(Message::FileImported(None));
         assert!(a.import_path_open, "{}", a.status);
