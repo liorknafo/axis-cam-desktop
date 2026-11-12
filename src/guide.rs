@@ -226,6 +226,18 @@ pub enum Step {
         never: Limits,
         turns_per_minute: f32,
     },
+    /// A full-width capsule pass, the exact plan's one-axis centre readings.
+    Slot {
+        op: usize,
+        index: usize,
+        of: usize,
+        z: f32,
+        top: f32,
+        a: [f32; 2],
+        b: [f32; 2],
+        targets: Vec<Target>,
+        entry_clear: bool,
+    },
     /// The stock after the operation.
     Check { op: usize },
     /// The stock leaves for setup `next` (none for the last setup).
@@ -1499,7 +1511,7 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
         doc,
         mesh,
         si,
-        "Add a Box or Drill operation to see the steps.",
+        "Add a Box, Slot or Drill operation to see the steps.",
     )?;
     let stock = done[0].1.stock;
     let zero = crate::post::datum(setup, stock, mesh)?;
@@ -1808,6 +1820,92 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                     pattern,
                     numbers,
                 });
+                steps.push(Step::Check { op: oi });
+            }
+            Strategy::Slot => {
+                sides([0; 2], &mut steps);
+                if comp_on {
+                    steps.push(Step::Comp {
+                        op: oi,
+                        comp: [0; 2],
+                        diameter,
+                    });
+                }
+                let boxes = doc
+                    .holding_boxes(setup, held)
+                    .map_err(|e| format!("{}: workholding cannot be checked: {e}", op.name()))?;
+                let gap = crate::holding::gap(setup).unwrap_or_default();
+                if let Some(hit) =
+                    crate::holding::hits(&plan, &boxes, gap + crate::post::blend(machine)).first()
+                {
+                    return Err(crate::holding::message(op.name(), hit, gap, zero));
+                }
+                let slot = crate::slot::Slot::read(op, zero)?;
+                let pass_ends: Vec<usize> = plan
+                    .moves
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| m.cutting_pass)
+                    .map(|(i, _)| i)
+                    .collect();
+                count = pass_ends.len();
+                let mut start = 0;
+                for (i, &end) in pass_ends.iter().enumerate() {
+                    let stop = if i + 1 == pass_ends.len() {
+                        plan.moves.len()
+                    } else {
+                        (end + 2).min(plan.moves.len())
+                    };
+                    let mut targets = vec![];
+                    if i == 0 {
+                        // First put Z above the stock, independent of wherever
+                        // the operator left the axes before starting the plan.
+                        targets.push(Target {
+                            order: 1,
+                            axis: 2,
+                            centre: plan.moves[0].from[2] - zero[2],
+                            shown: plan.moves[0].from[2] - zero[2],
+                            edge: false,
+                            feed: false,
+                            lock: [false; 3],
+                        });
+                    }
+                    for m in plan.moves[start..stop]
+                        .iter()
+                        .filter(|m| m.motion != Motion::Dwell)
+                    {
+                        let axis = moved(m)?;
+                        let v = m.to[axis] - zero[axis];
+                        targets.push(Target {
+                            order: (targets.len() + 1) as u8,
+                            axis,
+                            centre: v,
+                            shown: v,
+                            edge: false,
+                            feed: m.motion == Motion::Feed,
+                            lock: std::array::from_fn(|k| m.cutting_pass && k != axis),
+                        });
+                    }
+                    steps.push(Step::Slot {
+                        op: oi,
+                        index: i + 1,
+                        of: count,
+                        z: plan.moves[end].to[2] - zero[2],
+                        top: plan.rest_top.unwrap_or(stock.max[2]) - zero[2],
+                        a: [slot.a[0] - zero[0], slot.a[1] - zero[1]],
+                        b: [slot.b[0] - zero[0], slot.b[1] - zero[1]],
+                        targets,
+                        entry_clear: get(
+                            &doc.tools
+                                .iter()
+                                .find(|t| t.id == op.tool)
+                                .ok_or("Slot tool missing")?
+                                .p,
+                            "center_cutting",
+                        ) != "Yes",
+                    });
+                    start = stop;
+                }
                 steps.push(Step::Check { op: oi });
             }
             Strategy::Corner => {
@@ -2594,6 +2692,7 @@ pub(crate) mod tests {
                 Step::Comp { .. } => "Comp",
                 Step::Pass { .. } => "Pass",
                 Step::Corner { .. } => "Corner",
+                Step::Slot { .. } => "Slot",
                 Step::Face { .. } => "Face",
                 Step::Square { .. } => "Square",
                 Step::Holes { .. } => "Holes",

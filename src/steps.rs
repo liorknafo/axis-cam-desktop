@@ -2239,7 +2239,8 @@ pub(crate) fn section_of(g: &Guide, at: usize) -> usize {
 fn progress(g: &Guide, s: &Section, at: usize, item: usize) -> String {
     use crate::guide::LatheStep as L;
     match &g.steps[at] {
-        Step::Pass { index, of, .. }
+        Step::Slot { index, of, .. }
+        | Step::Pass { index, of, .. }
         | Step::Lathe(L::Pass { index, of, .. } | L::ThreadPass { index, of, .. }) => {
             format!("pass {index}/{of}")
         }
@@ -2440,7 +2441,8 @@ fn place(app: &App, g: &Guide, here: usize, at: usize) -> String {
 fn next_label(g: &Guide, at: usize, item: usize) -> String {
     let s = &g.sections[section_of(g, at)];
     match &g.steps[at] {
-        Step::Pass { .. }
+        Step::Slot { .. }
+        | Step::Pass { .. }
         | Step::Lathe(crate::guide::LatheStep::Pass { .. })
         | Step::Lathe(crate::guide::LatheStep::ThreadPass { .. }) => "Pass done ▶".into(),
         Step::Corner { .. } => "Walk done ▶".into(),
@@ -2956,6 +2958,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 right,
             )
         }
+        step @ Step::Slot { .. } => slot_screen(p, step),
         step @ Step::Pass { .. } => pass(p, step),
         step @ Step::Corner { .. } => corner(p, step),
         Step::Pattern { op, pattern, same } => pattern_screen(p, *op, pattern, *same),
@@ -4432,6 +4435,82 @@ impl canvas::Program<Message> for CornerDetail {
     }
 }
 
+/// Slot instructions are read directly from the validated Plan, centres
+/// with compensation off. The stock picture is its simulated swept cut.
+fn slot_screen<'a>(
+    p: &Page<'a>,
+    step: &'a Step,
+) -> (
+    String,
+    &'static str,
+    Element<'a, Message>,
+    Column<'a, Message>,
+) {
+    let Step::Slot {
+        op,
+        index,
+        of,
+        z,
+        top,
+        a,
+        b,
+        targets,
+        entry_clear,
+    } = step
+    else {
+        unreachable!()
+    };
+    let mut rows = column![].spacing(6);
+    for (i, t) in targets.iter().enumerate() {
+        let tag = if t.axis == 2 && t.feed {
+            "feed down · 25% feed"
+        } else if t.feed {
+            "feed slot · lock other axes"
+        } else if t.axis == 2 {
+            "lift / set Z clear"
+        } else {
+            "position above stock"
+        };
+        rows = rows.push(readout(
+            Readout {
+                order: Some(t.order),
+                lead: None,
+                axis: AXES[t.axis].into(),
+                value: dro(t.shown),
+                lock: None,
+                tags: vec![tag.into()],
+                lit: lit(i, p.item),
+                big: false,
+            },
+            Some(Message::Guide(GuideAction::Reached(i))),
+        ));
+    }
+    let operation = p.setup.operations.get(*op);
+    let feed = operation.and_then(|o| num(&o.p, "feed")).unwrap_or(0.);
+    let rpm = operation.and_then(|o| num(&o.p, "rpm")).unwrap_or(0.);
+    let radius = p
+        .guide()
+        .done
+        .get(p.done(*op))
+        .map_or(0., |d| d.plan.radius);
+    let right=column![
+        chips(vec![chip(p.tool_name(*op,2.*radius)),chip(format!("{rpm:.0} rpm")),chip(format!("Feed {feed:.0} · entry {:.0} mm/min",feed*0.25))]),
+        warn_chip("DRO comp OFF · tool centres"),
+        label(format!("Pass {index} of {of} · Z {}",dro(*z))),
+        muted(format!("Material starts at Z {}. Centre line X {} Y {} → X {} Y {}.",dro(*top),dro(a[0]),dro(a[1]),dro(b[0]),dro(b[1]))).size(13),
+        muted(if *entry_clear {"Entry was proven clear for the full diameter to final depth."}else{"Use the confirmed center-cutting slot drill. Feed down at 25% cutting feed; clear chips at each return."}).size(13),
+        muted("Feed the full-width slot in the indicated direction. Take up backlash before feeding and lock the other axes. Lift before returning to the entry. Verify parallels, table and breakthrough clearance below the part; these are unmodeled.").size(13),
+        scrollable(rows).height(Fill)
+    ].spacing(9);
+    let left = p.picture(p.done(*op), Fill);
+    (
+        "Slot".into(),
+        "one straight cutter-centre sweep per depth",
+        left,
+        right,
+    )
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -5745,6 +5824,57 @@ pub(crate) mod tests {
         let id = a.doc.setups[0].id.clone();
         a.doc.guide.insert(id, at);
         a.guide_item = item;
+    }
+    #[test]
+    #[ignore = "private adapter acceptance; headless only"]
+    fn render_manual_capsule_adapter_steps() {
+        let (mut doc, mesh, dir) = crate::slot::tests::adapter();
+        doc.active = doc.setups[2].id.clone();
+        let mut a = App::from_workspace(dir.join("render-state.axis.json"), None);
+        a.doc = doc;
+        a.imported_mesh = Some(mesh);
+        a.page = crate::Page::Control;
+        a.window_width = 1440.;
+        a.window_height = 1000.;
+        build(&mut a);
+        let guide = a.guide_at().unwrap().0.guide.clone();
+        let mut text = String::new();
+        for op in 7..15 {
+            for last in [false, true] {
+                let indices = guide
+                    .steps
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| matches!(s,Step::Slot{op:o,..} if *o==op).then_some(i))
+                    .collect::<Vec<_>>();
+                let at = if last {
+                    *indices.last().unwrap()
+                } else {
+                    indices[0]
+                };
+                a.doc.guide.insert(a.doc.setups[2].id.clone(), at);
+                a.guide_item = 0;
+                let strings = crate::ui::probe::texts(a.view(), Size::new(1440., 1000.));
+                assert!(
+                    strings.iter().any(|s| s.contains("DRO comp OFF")),
+                    "{strings:?}"
+                );
+                text += &format!(
+                    "OP {op} {}\n{}\n",
+                    if last { "last" } else { "first" },
+                    strings.join("\n")
+                );
+                render(
+                    &a,
+                    (1440, 1000),
+                    &dir.join(format!(
+                        "steps-{op:02}-{}.png",
+                        if last { "last" } else { "first" }
+                    )),
+                );
+            }
+        }
+        std::fs::write(dir.join("rendered-steps.txt"), text).unwrap();
     }
     /// The Steps page at 1280 × 800, one PNG per kind of step, in
     /// /tmp/manual-steps.

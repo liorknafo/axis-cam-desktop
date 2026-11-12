@@ -636,6 +636,9 @@ pub struct ToolReport {
     pub flutes: u32,
     pub flute_length: f32,
     pub stickout: f32,
+    /// Explicit capability for a manual Slot's plunge. Missing is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub center_cutting: Option<bool>,
     /// A chamfer mill's included tip angle, degrees.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tip_angle: Option<f32>,
@@ -1998,6 +2001,19 @@ fn describe(
                         num(&t.p, "length")?
                     },
                     stickout: num(&t.p, "stickout")?,
+                    center_cutting: if machines
+                        .iter()
+                        .any(|m| crate::manual::is_manual(m) && t.fits(m))
+                        && get(&t.p, "type") == "Flat end mill"
+                    {
+                        match get(&t.p, "center_cutting") {
+                            "Yes" => Some(true),
+                            "No" => Some(false),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    },
                     tip_angle: (get(&t.p, "type") == "Chamfer mill")
                         .then(|| t.tip_angle())
                         .flatten(),

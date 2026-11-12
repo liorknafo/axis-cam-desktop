@@ -1645,7 +1645,10 @@ pub(crate) fn ribbon_tiles(
         return vec![("LATHE", tiles.collect())];
     }
     if machine.is_some_and(manual::is_manual) {
-        return vec![("MANUAL MILL", vec![Op(Box), Op(Drill), Thread, Op(Corner)])];
+        return vec![(
+            "MANUAL MILL",
+            vec![Op(Box), Op(Slot), Op(Drill), Thread, Op(Corner)],
+        )];
     }
     vec![
         (
@@ -1699,6 +1702,7 @@ pub(crate) fn pick_line(o: &Operation) -> &'static str {
         Strategy::Chamfer => "Click the level face whose edges are chamfered.",
         Strategy::Groove => "Click the wall of the bore the groove goes in.",
         Strategy::Corner => "Click a rounded outside corner of the part.",
+        Strategy::Slot => "Click a capsule slot floor or rounded end.",
         _ => "Click a face on the part.",
     }
 }
@@ -4249,6 +4253,32 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 ));
             }
         }
+        "Slot" => {
+            c = c.push(note(crate::slot::HELP));
+            if app.part_mesh().is_some() && !app.is_sample() {
+                c = c.push(if app.picking {
+                    Element::from(btn("Stop picking", Message::PickMode, true).width(Fill))
+                } else {
+                    secondary("Pick on the part", Message::PickMode)
+                        .width(Fill)
+                        .into()
+                });
+            }
+            c = c.push(choice(p, "slot_axis", "Slot axis", &["X", "Y"], t));
+            for (a, b) in [
+                (("slot_x", "Centre X · mm"), ("slot_y", "Centre Y · mm")),
+                (
+                    ("slot_length", "Overall length · mm"),
+                    ("slot_width", "Overall width · mm"),
+                ),
+                (("z_top", "Z top · mm"), ("z_bottom", "Z bottom · mm")),
+            ] {
+                c = c.push(row![checks.field(p, a.0, a.1), checks.field(p, b.0, b.1)].spacing(9));
+            }
+            c=c.push(choice(p,"through","Through stock", &["No","Yes"],t))
+                .push(checks.field(p,"breakthrough","Breakthrough beyond stock bottom · mm"))
+                .push(note("Blind: bottom is the floor before floor stock to leave. Through: bottom is the stock's back face; breakthrough extends below it. Check clearance below the part: parallels and table are unmodeled."));
+        }
         "Box" => {
             // The pick first: one click on the face fills the numbers, which
             // are there to adjust (LIO-401).
@@ -4461,7 +4491,9 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 .push(checks.field(p, "bottom", "Bottom offset · mm"));
         }
         "Heights" => {
-            c = c.push(note(if o.strategy == Strategy::Box {
+            c = c.push(note(if o.strategy == Strategy::Slot {
+                "Clearance and retract are above the original stock top. Slot contains the work-coordinate top, bottom and Through settings; earlier cuts determine the actual material start."
+            } else if o.strategy == Strategy::Box {
                 "Clearance and retract are measured above the stock top. The block's own depths are set in Box."
             } else if !app.is_sample() && o.strategy == Strategy::Face {
                 "Facing uses remaining stock to skip fully cleared top layers. Bottom offset sets the target relative to the selected plane; it must not cut below the highest model feature. Clearance/retract retain their original stock reference."
@@ -4491,10 +4523,12 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             ] {
                 // A Box's depths are its own, a pin hole's the pins'.
                 let own = match k {
-                    "top" => o.strategy != Strategy::Box,
+                    "top" => !matches!(o.strategy, Strategy::Box | Strategy::Slot),
                     "bottom" => {
-                        !matches!(o.strategy, Strategy::Box | Strategy::Chamfer)
-                            && !o.drills_pin_holes()
+                        !matches!(
+                            o.strategy,
+                            Strategy::Box | Strategy::Chamfer | Strategy::Slot
+                        ) && !o.drills_pin_holes()
                     }
                     _ => true,
                 };
@@ -5119,6 +5153,12 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
             }
             _ => c.into(),
         };
+    }
+    if s == Strategy::Slot {
+        return c.push(checks.field(p,"allowance","Wall stock to leave · mm"))
+            .push(checks.field(p,"axial_allowance","Floor stock to leave · mm (blind only)"))
+            .push(checks.field(p,"stepdown","Maximum stepdown · mm"))
+            .push(note("Use a cutter matching width minus twice wall stock to leave. Entry feeds down at 25% feed. It requires a confirmed center-cutting tool or a proven full-diameter entry clear to the final depth. Flutes must reach from the original stock top, including breakthrough." )).into();
     }
     if s == Strategy::Box {
         return c
@@ -13073,6 +13113,15 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
                 form = form.push(field(p, k, l, t));
             }
         }
+    }
+    if get(p, "type") == "Flat end mill" {
+        form = form.push(choice(
+            p,
+            "center_cutting",
+            "Center cutting (verify actual tool)",
+            &["Unknown", "Yes", "No"],
+            t,
+        ));
     }
     if get(p, "type") == "Chamfer mill" {
         form = form

@@ -746,6 +746,36 @@ impl RestStock {
             bar_x: volume.bar_x,
         }
     }
+    /// Conservative full-diameter entry proof. One previous flat sweep or
+    /// vertical drilled cylinder must contain the entire entry. A drill's
+    /// tip alone is insufficient: its cone must reach full entry diameter.
+    pub fn entry_cleared(&self, xy: [f32; 2], radius: f32, bottom: f32, top: f32) -> bool {
+        self.all.iter().any(|c| {
+            if c.frame != self.current {
+                return false;
+            }
+            let (a, b) = (c.a, c.b);
+            let vertical = a[0] == b[0] && a[1] == b[1];
+            let level = a[2] == b[2] && c.shape == CutterShape::Flat;
+            if !vertical && !level {
+                return false;
+            }
+            let d = [b[0] - a[0], b[1] - a[1]];
+            let l = d[0] * d[0] + d[1] * d[1];
+            let t = if l == 0. {
+                0.
+            } else {
+                (((xy[0] - a[0]) * d[0] + (xy[1] - a[1]) * d[1]) / l).clamp(0., 1.)
+            };
+            let reach = (xy[0] - a[0] - t * d[0]).hypot(xy[1] - a[1] - t * d[1]) + radius;
+            let rise = match c.shape {
+                CutterShape::Flat => 0.,
+                CutterShape::Drill => c.shape.rise().unwrap() * reach,
+                _ => return false,
+            };
+            reach <= c.radius && a[2].min(b[2]) + rise <= bottom && a[2].max(b[2]) + c.flute >= top
+        })
+    }
     /// Whether `p` (current frame) lies in the stock as it began: its box,
     /// or the round bar in it.
     pub fn in_stock(&self, p: [f32; 3]) -> bool {
