@@ -116,32 +116,60 @@ pub fn load(path: &Path) -> Result<Faces, String> {
     Ok((super::mesh::stl(&bytes)?, super::mesh::stl_faces(&bytes)))
 }
 
+/// A read of a file's first bytes, shared by every import of that path
+/// while it has not answered: its outcome once it has.
+type Pending = std::sync::Arc<(Mutex<Option<Result<(), String>>>, std::sync::Condvar)>;
+/// The reads that have not answered yet, by path. However often an import of
+/// a held file is retried, it waits on the one read already outstanding, so
+/// no more than one thread per path waits on macOS.
+static READS: Mutex<Vec<(PathBuf, Pending)>> = Mutex::new(Vec::new());
+
+fn reads() -> MutexGuard<'static, Vec<(PathBuf, Pending)>> {
+    READS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Whether this process can read `path`, found by reading its first bytes on
 /// a thread of its own and waiting at most `timeout` for them. A read macOS
-/// holds until someone answers its folder-permission prompt is left to finish
-/// on that thread: nothing is remembered, so the next import tries afresh.
+/// holds until someone answers its folder-permission prompt is left to
+/// finish on that thread, and a retry meanwhile waits on it; once it has
+/// answered nothing is remembered, so the next import reads afresh.
 fn readable(path: &Path, timeout: Duration) -> Result<(), String> {
     let name = path.file_name().map_or_else(
         || path.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
     );
-    let (send, receive) = std::sync::mpsc::channel();
-    let owned = path.to_path_buf();
-    std::thread::Builder::new()
-        .name("step-read-check".into())
-        .spawn(move || {
-            let read = fs::File::open(&owned).and_then(|mut f| f.read(&mut [0; 64]));
-            let _ = send.send(read);
-        })
-        .map_err(|e| format!("{name} could not be read: {e}."))?;
-    match receive.recv_timeout(timeout) {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(unreadable(&name, &e)),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(waiting(&name, timeout)),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err(format!("{name} could not be read."))
+    let read = {
+        let mut pending = reads();
+        match pending.iter().find(|(p, _)| p == path) {
+            Some((_, read)) => read.clone(),
+            None => {
+                let read = Pending::default();
+                let (owned, shared, named) = (path.to_path_buf(), read.clone(), name.clone());
+                std::thread::Builder::new()
+                    .name("step-read-check".into())
+                    .spawn(move || {
+                        let outcome = fs::File::open(&owned)
+                            .and_then(|mut f| f.read(&mut [0; 64]))
+                            .map(|_| ())
+                            .map_err(|e| unreadable(&named, &e));
+                        *shared.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+                        shared.1.notify_all();
+                        reads().retain(|(_, r)| !std::sync::Arc::ptr_eq(r, &shared));
+                    })
+                    .map_err(|e| format!("{name} could not be read: {e}."))?;
+                pending.push((path.to_path_buf(), read.clone()));
+                read
+            }
         }
-    }
+    };
+    let (outcome, answered) = &*read;
+    let outcome = outcome.lock().unwrap_or_else(|e| e.into_inner());
+    let (outcome, _) = answered
+        .wait_timeout_while(outcome, timeout, |o| o.is_none())
+        .unwrap_or_else(|e| e.into_inner());
+    outcome
+        .clone()
+        .unwrap_or_else(|| Err(waiting(&name, timeout)))
 }
 
 /// The settings pane that gives an app a protected folder (Documents,
@@ -355,10 +383,34 @@ mod tests {
         }
         assert!(took >= Duration::from_millis(300) && took < Duration::from_secs(20));
         assert!(locked(&running).is_empty());
+        // Retried while it is still held: each retry waits on the one read
+        // already outstanding instead of leaving another thread behind.
+        for _ in 0..5 {
+            let again = convert(
+                &running,
+                &dir.path().join("no-converter"),
+                &path,
+                Duration::from_millis(50),
+                Duration::from_secs(60),
+            );
+            assert_eq!(
+                again.unwrap_err(),
+                waiting("adapter-plate.step", Duration::from_millis(50))
+            );
+        }
+        assert_eq!(reads().iter().filter(|(p, _)| p == &path).count(), 1);
 
         // Permission given: the held read answers (the check's thread ends)
         // and the file can be read.
         drop(fs::OpenOptions::new().write(true).open(&path).unwrap());
+        let start = Instant::now();
+        while reads().iter().any(|(p, _)| p == &path) {
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "the read never ended"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         fs::remove_file(&path).unwrap();
         let triangle = dir.path().join("triangle.stl");
         let mut stl = vec![0u8; 80];

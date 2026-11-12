@@ -20763,6 +20763,44 @@ soft_max = 180.0
         assert_eq!(a.doc.title, "other");
         assert!(a.doc.setup().operations[0].surfaces.is_none());
     }
+    /// Renders a project whose STEP could not be read when it opened (a FIFO
+    /// holds the read as macOS does while it asks for the folder,
+    /// LIO-444), at the smallest window and the default one, to
+    /// `$AXIS_RENDER_DIR` (default /tmp/unreadable).
+    #[test]
+    #[ignore]
+    fn picture_unreadable_step() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/unreadable".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, mut file) = block_app(dir.path());
+        file.name = "adapter-plate.step".into();
+        file.path = dir.path().join(&file.name);
+        file.format = "step".into();
+        a.doc.file = Some(file.clone());
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&file.path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let loaded = first_message(a.restore_model());
+        let _ = a.update(loaded);
+        assert!(a.imported_mesh.is_none());
+        assert!(page_texts(&a).iter().any(|s| s == "Reimport model"));
+        for (name, size) in [("smallest", crate::MIN_WINDOW), ("default", crate::WINDOW)] {
+            render_png(&a, size, &out.join(format!("{name}.png")));
+        }
+        drop(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&file.path)
+                .unwrap(),
+        );
+    }
     /// Renders the application bar with Reimport model, and the status after
     /// a reimport of a changed file, to `$AXIS_RENDER_DIR` (default
     /// /tmp/reimport).

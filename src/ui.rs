@@ -2934,7 +2934,19 @@ fn no_scene(app: &App) -> Element<'_, Message> {
     if app.doc.file.is_some() && !app.import_busy {
         imports = imports.push(secondary("Reimport model", Message::Reimport));
     }
-    container(column![bold(if app.import_busy { "Loading geometry…" } else if !app.doc.has_model() { "Import your part" } else { "Model preview unavailable" },25),muted(app.doc.file.as_ref().map(|f|f.name.clone()).unwrap_or_default()),note(app.import_error.clone().unwrap_or_else(|| "Import STEP, STP, 3MF, STL, OBJ or DXF to view your model. Geometry loads in the background; a STEP conversion may take up to two minutes.".into())),imports,secondary("Start screen",Message::Page(Page::Home))].spacing(20).max_width(380)).center(Fill).into()
+    let body = column![bold(if app.import_busy { "Loading geometry…" } else if !app.doc.has_model() { "Import your part" } else { "Model preview unavailable" },25),muted(app.doc.file.as_ref().map(|f|f.name.clone()).unwrap_or_default()),note(app.import_error.clone().unwrap_or_else(|| "Import STEP, STP, 3MF, STL, OBJ or DXF to view your model. Geometry loads in the background; a STEP conversion may take up to two minutes.".into())),imports,secondary("Start screen",Message::Page(Page::Home))].spacing(20).max_width(380);
+    // Scrolled when the window is too short for it: a long reason (a file
+    // macOS has not let the app read, LIO-444) must keep its end and the
+    // buttons under it in reach. The bar (`scrollable` draws it over the
+    // content) gets a margin of its own.
+    container(scrollable(container(body).center_x(Fill).padding(
+        iced::Padding {
+            right: 14.,
+            ..iced::Padding::ZERO
+        },
+    )))
+    .center(Fill)
+    .into()
 }
 /// The section's controls under the 3D view while it is on: the axis it is
 /// square to or the face it goes through, the slider that moves it across
