@@ -3145,6 +3145,10 @@ fn scene_panels(
             space().width(Fill),
             muted(if app.is_sample() {
                 "Illustrative motion".to_string()
+            } else if app.on_hand() && run_check(app).is_some_and(|r| r.3) {
+                // One state at once: not "Checked" beside "Checking"
+                // (LIO-435).
+                String::new()
             } else {
                 fixture_note(app, Note::Panel)
             })
@@ -4351,6 +4355,13 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     "Drills on the centre line from the tailstock, in from the free end.",
                 ))
                 .push(checks.field(p, "depth", "Depth · mm"));
+        }
+        // A hand Drill: only what its screens use, the Z it drills to
+        // (LIO-435).
+        "Heights" if o.strategy == Strategy::Drill && manual::is_hand(machine) => {
+            c = c
+                .push(note("Each hole's depth comes from the part. Bottom offset raises the Z the drill goes down to on the DRO."))
+                .push(checks.field(p, "bottom", "Bottom offset · mm"));
         }
         "Heights" => {
             c = c.push(note(if o.strategy == Strategy::Box {
@@ -14125,16 +14136,17 @@ pub(crate) enum Note {
 pub(crate) fn fixture_note(app: &App, note: Note) -> String {
     // A hand machine has no program to export or collide: say what is
     // checked of the cut (LIO-423).
-    if app.on_hand() && matches!(note, Note::Panel | Note::Playback) {
-        let what = if modelled(app) {
+    // What is checked is said once, in the panel (LIO-435).
+    if app.on_hand() && note == Note::Playback {
+        return "Show the cut, or Play the cut.".into();
+    }
+    if app.on_hand() && note == Note::Panel {
+        return if modelled(app) {
             "Checked: the cut against the part and the vise jaws or clamps."
         } else {
             "Checked: the cut against the part."
-        };
-        return match note {
-            Note::Playback => format!("Show the cut, or Play the cut. {what}"),
-            _ => what.into(),
-        };
+        }
+        .into();
     }
     let before = match note {
         Note::Preview | Note::Panel => "",
