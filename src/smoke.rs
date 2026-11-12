@@ -6044,6 +6044,64 @@ flood = { pin = 8 }
             "{texts:?}"
         );
     }
+    /// The manual mill's small leftovers (LIO-435): what is checked is said
+    /// once and never beside "Checking"; a hand Drill's Heights tab has only
+    /// the bottom offset its screens use, a hand tap none; the Hold screen's
+    /// size key is one text at 1024 × 700.
+    #[test]
+    fn a_hand_setup_says_its_check_once_and_asks_only_for_heights_it_uses() {
+        let mut a = manual_threaded_app(false);
+        a.page = Page::Work;
+        let machine = a.doc.setup().machine.clone();
+        let ops = a.doc.setup().operations.clone();
+        let tap = ops.iter().position(|o| o.tapping()).unwrap();
+        let drill = (ops.iter())
+            .position(|o| {
+                o.strategy == Strategy::Drill && !o.tapping() && crate::centre::centres(o).is_none()
+            })
+            .unwrap();
+        assert!(!ops[tap].tabs(&machine).contains(&"Heights"));
+        let _ = a.update(Message::SelectOp(drill));
+        let _ = a.update(Message::Tab("Heights".into()));
+        lacks(
+            &a,
+            &["Clearance above stock · mm", "Retract above stock · mm"],
+        );
+        shows(&a, &["Bottom offset · mm"]);
+        let texts = page_texts(&a);
+        let checked = texts.iter().filter(|t| t.contains("Checked:")).count();
+        assert!(checked <= 1, "{texts:?}");
+        if texts.iter().any(|t| t.starts_with("Checking")) {
+            assert_eq!(checked, 0, "{texts:?}");
+        }
+        // A Box keeps its clearance; a CNC Drill's Heights are as they were.
+        let mut b = imported_app();
+        with_big_cutter(&mut b);
+        let _ = b.update(Message::AddManualSetup);
+        let m = (b.doc.setups.iter()).position(|s| crate::manual::is_manual(&s.machine));
+        let _ = b.update(Message::SelectSetup(m.unwrap()));
+        let _ = b.update(Message::AddOp(Strategy::Box));
+        let _ = b.update(Message::Tab("Heights".into()));
+        shows(&b, &["Clearance above stock · mm"]);
+        let mut c = imported_app();
+        c.page = Page::Work;
+        let d = (c.doc.setup().operations.iter()).position(|o| o.strategy == Strategy::Drill);
+        let _ = c.update(Message::SelectOp(d.unwrap()));
+        let _ = c.update(Message::Tab("Heights".into()));
+        shows(
+            &c,
+            &["Clearance above stock · mm", "Retract above stock · mm"],
+        );
+        // The Hold screen at 1024 × 700: "X × Y × Z" whole.
+        let window = iced::Size::new(1024., 700.);
+        let _ = a.update(Message::Resized(window));
+        let si = a.doc.index();
+        let _ = a.update(Message::Guide(crate::GuideAction::Open(si)));
+        crate::steps::tests::build(&mut a);
+        let _ = a.update(Message::Guide(crate::GuideAction::Section(0)));
+        let texts = crate::ui::probe::texts(a.view(), window);
+        assert!(texts.iter().any(|t| t == "X × Y × Z"), "{texts:?}");
+    }
     /// LIO-419: Thread is a tile on every machine and the browser has no
     /// "+ Add threading".
     #[test]

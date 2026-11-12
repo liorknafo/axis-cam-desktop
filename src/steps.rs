@@ -2497,11 +2497,13 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 readout(
                     Readout {
                         order: None,
-                        lead: None,
+                        // The key before the size, one text that does not
+                        // wrap at 1024 × 700 (LIO-435).
+                        lead: Some("X × Y × Z".into()),
                         axis: String::new(),
                         value: format!("{} × {} × {}", mm(d[0]), mm(d[1]), mm(d[2])),
                         lock: None,
-                        tags: vec!["X × Y × Z".into()],
+                        tags: vec![],
                         lit: Lit::Next,
                         big: false
                     },

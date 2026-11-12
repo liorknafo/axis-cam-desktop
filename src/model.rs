@@ -1713,6 +1713,11 @@ impl Operation {
         // A hand machine's Drill has no linking moves: no Linking (LIO-410).
         if self.strategy == Strategy::Drill && crate::manual::is_hand(m) {
             tabs.retain(|t| *t != "Linking");
+            // A hand tap's screens give X, Y and turns: no height to set
+            // (LIO-435).
+            if self.tapping() {
+                tabs.retain(|t| *t != "Heights");
+            }
         }
         // Only the kinds that cut in several passes have Passes.
         if self.strategy == Strategy::Turn
