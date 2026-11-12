@@ -809,8 +809,9 @@ fn near_arc(a: &Arc) -> [[f32; 2]; 3] {
     [-0.6f32, 0., 0.6].map(|k| {
         let t = a.middle + k * half;
         // Half way out from the chord across the arc's ends at `t`, when
-        // the arc goes less than half round; else 0.8 of the radius.
-        let out = if half < std::f32::consts::FRAC_PI_2 {
+        // the arc goes less than half round; else 0.8 of the radius. A
+        // slot's end measures half round to a few 0.00001° either way.
+        let out = if half < std::f32::consts::FRAC_PI_2 - 0.01 {
             (a.r * half.cos() / (k * half).cos() + a.r) / 2.
         } else {
             0.8 * a.r
@@ -827,25 +828,36 @@ fn near_arc(a: &Arc) -> [[f32; 2]; 3] {
 /// floor is cut. None when the part comes inside the circle over the floor
 /// (a drill as wide as it would cut the part).
 pub fn arc_hole(g: &Geometry, a: &Arc) -> Option<Hole> {
-    let floor = (near_arc(a).into_iter())
-        .flat_map(|p| {
-            (g.triangles.iter())
-                .filter_map(move |t| plane_height(&t.p, p))
-                .filter(|h| *h < a.top - 0.01)
-        })
-        .fold(f32::NEG_INFINITY, f32::max);
-    let bottom = if floor.is_finite() {
-        floor
-    } else {
-        g.bounds.min[2]
+    let hole = |points: [[f32; 2]; 3]| {
+        let floor = (points.into_iter())
+            .flat_map(|p| {
+                (g.triangles.iter())
+                    .filter_map(move |t| plane_height(&t.p, p))
+                    .filter(|h| *h < a.top - 0.01)
+            })
+            .fold(f32::NEG_INFINITY, f32::max);
+        let bottom = if floor.is_finite() {
+            floor
+        } else {
+            g.bounds.min[2]
+        };
+        let hole = bore_at(g, a.centre, a.r, a.sagitta, a.top, bottom, None)?;
+        // The part inside the circle over the floor narrows the bore: a
+        // drill as wide as the circle would cut it, and a narrower one at
+        // the centre would not reach the arc.
+        (hole.diameter >= 2. * (a.r - a.sagitta) - 0.05).then_some(hole)
     };
-    let mut hole = bore_at(g, a.centre, a.r, a.sagitta, a.top, bottom, None)?;
-    // The part inside the circle over the floor narrows the bore: a drill as
-    // wide as the circle would cut it, and a narrower one at the centre
-    // would not reach the arc.
-    if hole.diameter < 2. * (a.r - a.sagitta) - 0.05 {
-        return None;
-    }
+    // A blind counterbore's end over a narrower hole (a slot's end, round
+    // the same centre): inside its circle the floor may be only a ring by
+    // its wall, the narrower hole's mouth inside it. So when the floor
+    // found away from the wall gives no hole, the floor by the wall,
+    // just inside its facets, is the one (LIO-440).
+    let by_wall = near_arc(a).map(|p| {
+        let (dx, dy) = (p[0] - a.centre[0], p[1] - a.centre[1]);
+        let out = (a.r - 2. * a.sagitta - 0.05).max(0.) / dx.hypot(dy).max(1e-6);
+        [a.centre[0] + dx * out, a.centre[1] + dy * out]
+    });
+    let mut hole = hole(near_arc(a)).or_else(|| hole(by_wall))?;
     hole.arc = Some(a.clone());
     Some(hole)
 }
@@ -1980,11 +1992,71 @@ pub(crate) mod tests {
             assert!(h.through && (h.diameter - 10.).abs() < 0.01, "{h:?}");
         }
     }
+    /// A 40 x 30 plate 20 mm thick with a slot through it 9 mm wide and over
+    /// it a counterbore 10 mm wide and 10 mm deep, both with their round
+    /// ends round X ±2.5 Y0: the counterbore's floor only a 0.5 mm ring.
+    fn counterbored_slot() -> Vec<[[f32; 3]; 3]> {
+        let outer: &[(f64, f64, f64)] = &[
+            (-20., -15., 0.),
+            (20., -15., 0.),
+            (20., 15., 0.),
+            (-20., 15., 0.),
+        ];
+        let stadium = |r: f64| [(-2.5, -r, 0.), (2.5, -r, 1.), (2.5, r, 0.), (-2.5, r, 1.)];
+        let (slot, bore) = (stadium(4.5), stadium(5.));
+        let mut tris = slab(&[outer, &slot], 10., 0., false, true);
+        tris.extend(slab(&[outer, &bore], 10., 10., true, false));
+        let ring = slab(&[&bore, &slot], 1., 9., true, false);
+        tris.extend(
+            ring.into_iter()
+                .filter(|t| t.iter().all(|p| (p[2] - 10.).abs() < 1e-4)),
+        );
+        tris
+    }
+    #[test]
+    fn a_drill_lists_each_round_end_of_a_counterbore_over_a_slot_as_a_blind_hole() {
+        let mesh = mesh::normalize(counterbored_slot()).unwrap();
+        let (setup, mut op, _) = fixture(Strategy::Drill);
+        let floor = Geometry::new(&setup, &mesh).bounds.min[2] + 10.;
+        let found = crate::find_holes(&setup, &mesh);
+        let mut ends: Vec<&Hole> = found.arcs.iter().map(|(_, h)| h).collect();
+        ends.sort_by(|a, b| {
+            a.diameter
+                .total_cmp(&b.diameter)
+                .then(a.center[0].total_cmp(&b.center[0]))
+        });
+        assert_eq!(ends.len(), 4, "{ends:?}");
+        for (h, (d, x)) in ends
+            .iter()
+            .zip([(9f32, -2.5f32), (9., 2.5), (10., -2.5), (10., 2.5)])
+        {
+            assert!(
+                (h.diameter - d).abs() < 0.01
+                    && (h.center[0] - x).abs() < 0.01
+                    && h.center[1].abs() < 0.01,
+                "{ends:?}"
+            );
+            assert_eq!(h.through, d < 9.5, "{h:?}");
+            assert!(h.through || (h.bottom - floor).abs() < 0.01, "{h:?}");
+        }
+        // A click on each picks it, as listed.
+        for (a, h) in &found.arcs {
+            picking(&mut op, &mesh, &a.walls);
+            let picked = holes(&setup, &op, &mesh).unwrap();
+            assert_eq!(picked.len(), 1, "{picked:?}");
+            assert!(
+                (picked[0].diameter - h.diameter).abs() < 0.01,
+                "{h:?} {picked:?}"
+            );
+            assert_eq!(picked[0].through, h.through, "{picked:?}");
+        }
+    }
     /// The spindle adapter plate (github.com/liorknafo/spindle-adapter) as
     /// the STEP helper meshes it, at `AXIS_PLATE_STL`: its holes are found
     /// in under a second in a release build, where four M8 threads made it
     /// an hour (LIO-434), its four M8 holes where the drawing has them and
-    /// each round end of its four slots apart.
+    /// each round end of its four slots and of the four blind counterbores
+    /// over them apart (LIO-440).
     #[test]
     #[ignore]
     fn the_spindle_plates_holes_are_found_in_a_second() {
@@ -1994,6 +2066,7 @@ pub(crate) mod tests {
         let started = std::time::Instant::now();
         let found = crate::find_holes(&setup, &mesh);
         let took = started.elapsed().as_secs_f32();
+        eprintln!("the plate's holes found in {took:.2} s");
         assert!(cfg!(debug_assertions) || took < 1., "{took} s");
         // The plate is centred: model X 0..134, Y 0..88.
         let model = |c: [f32; 2]| [c[0] + 67., c[1] + 44.];
@@ -2009,33 +2082,52 @@ pub(crate) mod tests {
         for (c, e) in m8.iter().zip(expected) {
             assert!((c[0] - e[0]).hypot(c[1] - e[1]) < 0.005, "{m8:?}");
         }
-        assert_eq!(found.arcs.len(), 8);
-        // A Drill picking each hole, as a click on it picks it: in a second.
+        assert_eq!(found.arcs.len(), 16);
+        // A Drill picking each hole, as a click on it picks it: in a second,
+        // the hole it was listed as.
         let (_, mut op, _) = fixture(Strategy::Drill);
         let picks = (found.holes.iter().zip(&found.round))
-            .filter(|(_, r)| r.is_some())
-            .map(|(h, _)| h.walls.clone())
-            .chain(found.arcs.iter().map(|(a, _)| a.walls.clone()));
-        for walls in picks {
+            .filter_map(|(h, r)| Some((h.walls.clone(), r.as_ref()?.diameter)))
+            .chain(
+                found
+                    .arcs
+                    .iter()
+                    .map(|(a, h)| (a.walls.clone(), h.diameter)),
+            );
+        for (walls, diameter) in picks {
             picking(&mut op, &mesh, &walls);
             let started = std::time::Instant::now();
             let picked = holes(&setup, &op, &mesh).unwrap();
             let took = started.elapsed().as_secs_f32();
             assert!(cfg!(debug_assertions) || took < 1., "{took} s");
             assert_eq!(picked.len(), 1, "{picked:?}");
+            assert!(
+                (picked[0].diameter - diameter).abs() < 0.05,
+                "{diameter} {picked:?}"
+            );
         }
+        // Model Z: the back face at 0, the counterbores' floor at 10.
+        let floor = Geometry::new(&setup, &mesh).bounds.min[2] + 10.;
+        let (mut slots, mut bores) = (0, 0);
         for (_, h) in &found.arcs {
             let c = model(h.center);
             let slot = [[14.15, 28.6], [14.15, 74.4], [119.85, 28.6], [119.85, 74.4]];
-            assert!(
-                h.through
-                    && (h.diameter - 8.).abs() < 0.01
-                    && slot
-                        .iter()
-                        .any(|s| ((c[0] - s[0]).abs() - 2.5).abs() < 0.005
-                            && (c[1] - s[1]).abs() < 0.005),
-                "{c:?} {h:?}"
-            );
+            let end = slot
+                .iter()
+                .any(|s| ((c[0] - s[0]).abs() - 2.5).abs() < 0.005 && (c[1] - s[1]).abs() < 0.005);
+            assert!(end, "{c:?} {h:?}");
+            if h.through && (h.diameter - 8.).abs() < 0.01 {
+                slots += 1;
+            } else {
+                assert!(
+                    !h.through
+                        && (h.diameter - 13.).abs() < 0.01
+                        && (h.bottom - floor).abs() < 0.01,
+                    "{c:?} {h:?}"
+                );
+                bores += 1;
+            }
         }
+        assert_eq!((slots, bores), (8, 8));
     }
 }
