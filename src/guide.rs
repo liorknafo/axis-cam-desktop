@@ -2653,6 +2653,211 @@ pub(crate) mod tests {
             full: false,
         })
     }
+    /// The reported three-setup sequence, without depending on a user file.
+    pub(crate) fn squared_job() -> (Document, Mesh) {
+        let bounds = Bounds {
+            min: [0.; 3],
+            max: [134., 88., 20.],
+        };
+        let tris = crate::viewport::box_triangles(bounds, [0.7; 3])
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        let mesh = crate::mesh::normalize(tris).unwrap();
+        let mut doc = Document::default();
+        let machine = manual::defaults();
+        let mut tool = Tool::new("Square mill", "Flat end mill", "10");
+        for (k, v) in [
+            ("length", "25"),
+            ("stickout", "35"),
+            ("holder", "32"),
+            ("flutes", "3"),
+            ("machines", &machine.id),
+        ] {
+            tool.p.insert(k.into(), v.into());
+        }
+        let mut holder = crate::holding::starters()
+            .into_iter()
+            .find(|h| h.kind() == "Vise")
+            .unwrap();
+        holder.p.insert("machines".into(), machine.id.clone());
+        holder.p.insert("jaw_width".into(), "100".into());
+        doc.workholding = vec![holder.clone()];
+        doc.machines = vec![machine.clone()];
+        for (si, rx) in ["90", "-90", "0"].into_iter().enumerate() {
+            let mut setup = crate::model::Setup::new(machine.clone(), "G54");
+            for (k, v) in [
+                ("rx", rx),
+                ("origin", "Stock top center"),
+                ("holding", "Vise"),
+                ("holder", &holder.id),
+                ("vise_axis", "Y"),
+                ("vise_grip", if si == 2 { "8" } else { "30" }),
+                ("stock_left", "3"),
+                ("stock_right", "3"),
+                ("stock_front", "0"),
+                ("stock_back", "0"),
+                ("stock_top", "3"),
+                ("stock_bottom", "3"),
+            ] {
+                setup.p.insert(k.into(), v.into());
+            }
+            if si > 0 {
+                setup
+                    .p
+                    .insert("stock_source".into(), doc.setups[si - 1].id.clone());
+            }
+            let block = if si < 2 {
+                [-70., 70., -10., 10., 0., -3.]
+            } else {
+                [67., 90., -44., 44., 0., -20.]
+            };
+            setup.operations = vec![boxed(
+                "Square edge",
+                &tool.id,
+                block,
+                &[
+                    ("allowance", "0"),
+                    ("stepover", "40"),
+                    ("stepdown", "0.5"),
+                    ("rpm", "1600"),
+                    ("feed", "120"),
+                ],
+            )];
+            doc.setups.push(setup);
+        }
+        doc.tools = vec![tool];
+        doc.active = doc.setups[2].id.clone();
+        (doc, mesh)
+    }
+    /// Check actual continuous sweeps on both finished planes, through the
+    /// full blank thickness and length: no ledge within the 8 mm jaw band.
+    fn squared_acceptance(doc: &Document, mesh: &Mesh) {
+        for (si, expected) in [[140., 20., 94.], [140., 20., 91.], [140., 88., 20.]]
+            .into_iter()
+            .enumerate()
+        {
+            let walked = simulate(doc, mesh, si, "empty").unwrap();
+            let plan = &walked.done[0].1;
+            let setup = &doc.setups[si];
+            let frame = crate::volume::Frame::new(setup, mesh);
+            let part = simulation::part_box(setup, mesh);
+            let bands = crate::holding::Bands::new(&walked.before, frame, part);
+            let held = crate::holding::held_by(doc, setup, plan.stock, Some(&bands));
+            let removed = crate::rest::Removed::new(&walked.before, frame);
+            let issues = crate::holding::holdable(
+                si,
+                &crate::holding::layout(setup).unwrap(),
+                doc.holder(get(&setup.p, "holder")).unwrap(),
+                held,
+                Some(&removed),
+                None,
+                &|_, _| String::new(),
+            );
+            assert!(issues.is_empty(), "{issues:?}");
+            let guide = build(doc, mesh, si).unwrap();
+            let Step::Hold { stock, .. } = guide.steps[0] else {
+                panic!()
+            };
+            for (v, want) in stock.dimensions().into_iter().zip(expected) {
+                assert!((v - want).abs() < 0.005, "setup {}: {stock:?}", si + 1);
+            }
+            eprintln!(
+                "setup {} remaining envelope {:?}; jaw band {:?}; holding accepted",
+                si + 1,
+                stock.dimensions(),
+                held.band.dimensions()
+            );
+            if si == 2 {
+                let b = plan.stock;
+                let mut samples = 0;
+                for i in 0..=140 {
+                    for j in 0..=80 {
+                        let x = b.min[0] + b.dimensions()[0] * i as f32 / 140.;
+                        let z = part.min[2] + part.dimensions()[2] * j as f32 / 80.;
+                        for (face, sign) in [(part.min[1], -1.), (part.max[1], 1.)] {
+                            assert!(
+                                removed.at([x, face + sign * 0.02, z]),
+                                "uncut ledge at {x}, {face}, {z}"
+                            );
+                            assert!(
+                                !removed.at([x, face - sign * 0.02, z]),
+                                "gouged contact at {x}, {face}, {z}"
+                            );
+                            samples += 2;
+                        }
+                    }
+                }
+                eprintln!(
+                    "{samples} continuous-sweep point checks, 1 mm along X and 0.25 mm through thickness; ±0.02 mm of both finished sides"
+                );
+            }
+        }
+    }
+    #[test]
+    fn squared_edges_regrip_on_finished_sides() {
+        let (doc, mesh) = squared_job();
+        squared_acceptance(&doc, &mesh);
+    }
+    #[test]
+    fn partially_squared_edge_still_rejects_a_stepped_jaw_contact() {
+        let (mut doc, mesh) = squared_job();
+        for (k, v) in [("y_min", "-5"), ("y_max", "5")] {
+            doc.setups[0].operations[0].p.insert(k.into(), v.into());
+        }
+        let w = simulate(&doc, &mesh, 2, "empty").unwrap();
+        let s = &doc.setups[2];
+        let f = crate::volume::Frame::new(s, &mesh);
+        let bands = crate::holding::Bands::new(&w.before, f, simulation::part_box(s, &mesh));
+        let held = crate::holding::held_by(&doc, s, w.done[0].1.stock, Some(&bands));
+        let issues = crate::holding::holdable(
+            2,
+            &crate::holding::layout(s).unwrap(),
+            doc.holder(get(&s.p, "holder")).unwrap(),
+            held,
+            Some(&crate::rest::Removed::new(&w.before, f)),
+            None,
+            &|_, _| String::new(),
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|s| s.contains("removed the material the jaws grip")),
+            "{issues:?}"
+        );
+    }
+    #[test]
+    #[ignore = "private saved-project acceptance: AXIS_REGRIP_FIXTURE"]
+    fn saved_squared_edge_regrip() {
+        let dir = std::path::PathBuf::from(std::env::var_os("AXIS_REGRIP_FIXTURE").unwrap());
+        let mut doc = crate::storage::load(&dir.join("adapter-plate.axis.json")).unwrap();
+        doc.file.as_mut().unwrap().path = dir.join("adapter-plate.step");
+        let mesh = crate::mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
+        for expanded in [false, true] {
+            let mut trial = doc.clone();
+            if expanded {
+                for setup in &mut trial.setups[..2] {
+                    for (k, v) in [
+                        ("x_min", "-71"),
+                        ("x_max", "71"),
+                        ("y_min", "-11"),
+                        ("y_max", "11"),
+                    ] {
+                        setup.operations[0].p.insert(k.into(), v.into());
+                    }
+                }
+            }
+            eprintln!(
+                "PRIVATE ACCEPTANCE: {}",
+                if expanded {
+                    "expanded X ±71 / Y ±11 bounds"
+                } else {
+                    "original X ±70 / Y ±10 bounds"
+                }
+            );
+            squared_acceptance(&trial, &mesh);
+        }
+    }
     #[test]
     fn grids_and_arcs_of_holes_are_found_to_the_hundredth_in_the_dros_order() {
         // Out of order and up to 0.002 off, as a mesh's centres are.
