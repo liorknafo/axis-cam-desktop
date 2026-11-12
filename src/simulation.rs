@@ -153,6 +153,11 @@ pub struct Plan {
     pub moves: Vec<Move>,
     pub stock: Bounds,
     pub radius: f32,
+    /// How far from its axis the cutter takes the stock away, when that is
+    /// past `radius`, its body's: a tap's thread form, out to the root of
+    /// the thread modelled in its holes (LIO-448). None for most plans
+    /// (`cut_radius`).
+    pub form: Option<f32>,
     pub flute_length: f32,
     pub tool_length: f32,
     pub holder_radius: f32,
@@ -199,6 +204,10 @@ pub struct Stop {
     pub size: Option<f32>,
 }
 impl Plan {
+    /// How far from its axis the cutter takes the stock away (`form`).
+    pub fn cut_radius(&self) -> f32 {
+        self.form.unwrap_or(self.radius)
+    }
     /// Whether this is a lathe plan: its moves are a side view (X the
     /// tool's distance from the spindle axis, Y 0, Z along the axis) and its
     /// cuts are its `rings`.
@@ -588,6 +597,7 @@ fn generate_plan(
         moves: vec![],
         stock: stock.stock,
         radius,
+        form: None,
         flute_length,
         tool_length,
         holder_radius,
@@ -1091,13 +1101,13 @@ impl Simulation {
                 // volume and its cutter history only.
                 if own && self.plan.strategy != Strategy::Groove {
                     self.stock
-                        .cut_shape(from, to, self.plan.radius, self.plan.shape);
+                        .cut_shape(from, to, self.plan.cut_radius(), self.plan.shape);
                 }
                 if let (Some(volume), Some(frame)) = (&mut self.volume, frame) {
                     volume.cut(
                         from,
                         to,
-                        self.plan.radius,
+                        self.plan.cut_radius(),
                         self.plan.flute_length,
                         self.plan.shape,
                         frame,

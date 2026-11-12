@@ -448,6 +448,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
         moves: cut.moves,
         stock,
         radius: radius.max(0.05),
+        form: None,
         flute_length: reach,
         tool_length: num(&tool.p, "stickout")
             .filter(|v| *v >= reach)

@@ -1268,6 +1268,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
             moves: vec![],
             stock: job.stock,
             radius: job.radius,
+            form: None,
             flute_length: job.flute_length,
             tool_length: job.tool_length,
             holder_radius: job.holder_radius,
@@ -3465,7 +3466,7 @@ mod tests {
         for (n, stock) in stocks.iter().enumerate() {
             let gouged = crate::plan_check::PartGrid::in_job(stock, &doc, &mesh).gouged(stock);
             assert_eq!(gouged.0, 0, "after operation {}: gouged {gouged:?}", n + 1);
-            let uncut = crate::uncut::uncut(stock, &doc.setups[0], &mesh);
+            let uncut = crate::uncut::uncut(stock, &doc.setups, &mesh);
             left.push(
                 (mesh.faces.iter().enumerate())
                     .filter(on_ramp)

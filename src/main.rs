@@ -1083,7 +1083,7 @@ fn leftover_stock(doc: &Document, mesh: &mesh::Mesh, key: u64) -> LeftStock {
             doc.setups[si].operations[oi].name()
         )),
         (None, None) => Err("No operation has cut the stock yet.".into()),
-        (None, Some(stock)) => Ok(Arc::new(uncut::uncut(stock, &doc.setups[0], mesh))),
+        (None, Some(stock)) => Ok(Arc::new(uncut::uncut(stock, &doc.setups, mesh))),
     });
     // A setup starts from the very stock the one before it leaves: each is
     // meshed once. ponytail: in the run the holding checks wait for; a run

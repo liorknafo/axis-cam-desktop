@@ -2703,7 +2703,7 @@ pub fn check_steps(
                     .filter(|m| m.motion == crate::simulation::Motion::Feed)
                 {
                     if let Some(frame) = sim.frame_at(m.a) {
-                        let (r, flute) = (plan.radius, plan.flute_length);
+                        let (r, flute) = (plan.cut_radius(), plan.flute_length);
                         volume.cut(m.from, m.to, r, flute, plan.shape, frame, sim.source);
                     }
                 }
@@ -2720,7 +2720,7 @@ pub fn check_steps(
             for m in moves {
                 for b in before.iter_mut().filter(|b| b.op <= *oi) {
                     b.stock
-                        .cut_shape(m.from, m.to, sim.plan.radius, sim.plan.shape);
+                        .cut_shape(m.from, m.to, sim.plan.cut_radius(), sim.plan.shape);
                 }
             }
             sim.plan = cut_plan(&sim.plan, &found.steps, steps);

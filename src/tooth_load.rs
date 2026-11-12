@@ -643,6 +643,7 @@ pub fn nominal(
         moves,
         stock,
         radius: r,
+        form: None,
         flute_length: cut.flute,
         tool_length: cut.flute,
         holder_radius: r,

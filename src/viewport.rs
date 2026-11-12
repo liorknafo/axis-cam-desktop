@@ -6005,7 +6005,7 @@ mod tests {
         // A face 100 mm long whose first 45 mm the job cuts: just over half
         // of it is under stock, but only that part is drawn magenta.
         let (mesh, setup, [a, _, _], stock) = crate::uncut::half_cut_face();
-        let uncut = crate::uncut::uncut(&stock, &setup, &mesh);
+        let uncut = crate::uncut::uncut(&stock, std::slice::from_ref(&setup), &mesh);
         let view = Viewport {
             setup: Some(&setup),
             operation: None,
@@ -6064,7 +6064,7 @@ mod tests {
         cut.a[2] += 0.2;
         cut.b[2] += 0.2;
         std::sync::Arc::make_mut(&mut stock.cuts).push(cut);
-        let mixed = crate::uncut::uncut(&stock, &setup, &mesh);
+        let mixed = crate::uncut::uncut(&stock, std::slice::from_ref(&setup), &mesh);
         let mixed_view = Viewport {
             uncut: &mixed.faces,
             uncut_pieces: &mixed.pieces,

@@ -386,9 +386,9 @@ pub struct PartGrid {
 }
 impl PartGrid {
     /// `geometry`, `threads` and `stock` must all be in setup 1's frame.
-    /// The band round each thread, out to its major diameter and a cell on,
+    /// The band round each thread, out to its root (`Thread::root`) and a cell on,
     /// is never deep: a thread's teeth are finer than the cells, and
-    /// threading it (a tap drill past its crests, a thread mill to its
+    /// threading it (a tap drill past its crests, a tap or thread mill to its
     /// roots) removes cells there that are the part's.
     pub(crate) fn new(
         stock: &Volume,
@@ -444,7 +444,8 @@ impl PartGrid {
                         let p = stock.point([x, y, z], 0.5);
                         deep[i] = !threads.iter().any(|t| {
                             let (u, v) = ((t.axis + 1) % 3, (t.axis + 2) % 3);
-                            (p[u] - t.centre[0]).hypot(p[v] - t.centre[1]) <= t.major / 2. + margin
+                            (p[u] - t.centre[0]).hypot(p[v] - t.centre[1])
+                                <= t.root.max(t.major) / 2. + margin
                                 && p[t.axis] >= t.from - t.pitch - margin
                                 && p[t.axis] <= t.to + t.pitch + margin
                         });
@@ -4151,7 +4152,7 @@ mod totem {
         );
         // What stays under stock: the tips of wedges under 1 mm wide between
         // walls at an angle, a sloped relief and the logo's finest strokes.
-        let uncut = crate::uncut::uncut(&last.unwrap(), &doc.setups[0], &mesh);
+        let uncut = crate::uncut::uncut(&last.unwrap(), &doc.setups, &mesh);
         assert!(uncut.share < 0.015, "{:.2}% uncut", uncut.share * 100.);
         assert!(out.total_minutes < 400., "{} min", out.total_minutes);
     }

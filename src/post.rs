@@ -4036,6 +4036,7 @@ pub(crate) mod fixture {
                 max: [10., 10., 10.],
             },
             radius: 5.,
+            form: None,
             flute_length: 25.,
             tool_length: 35.,
             holder_radius: 16.,

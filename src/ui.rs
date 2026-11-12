@@ -2281,14 +2281,17 @@ pub(crate) fn uncut_line(app: &App) -> Option<String> {
             "Every face of the part is cut by the job.".into()
         }
         Some((Ok(found), true)) if app.show_uncut => format!(
-            "Magenta faces are still under stock after the whole job: {:.0}% of the part's surface. Amber faces have 0.1–0.5 mm left: stock to leave or a shallow recess, {:.0}%.",
-            found.share * 100.,
-            found.thin.share * 100.
+            "Magenta faces are still under stock after the whole job: {} of the part's surface. Amber faces have 0.1–0.5 mm left: stock to leave or a shallow recess, {}.",
+            crate::uncut::amount(&found.regions, found.share),
+            crate::uncut::amount(&found.thin.regions, found.thin.share)
         ),
         Some((Ok(found), true)) => format!(
-            "{:.0}% of the part's surface is still under stock after the whole job ({:.0}% with 0.1–0.5 mm left); Show uncut faces is off.",
-            (found.share + found.thin.share) * 100.,
-            found.thin.share * 100.
+            "{} of the part's surface is still under stock after the whole job ({} with 0.1–0.5 mm left); Show uncut faces is off.",
+            crate::uncut::amount(
+                &[&found.regions[..], &found.thin.regions[..]].concat(),
+                found.share + found.thin.share
+            ),
+            crate::uncut::percent(found.thin.share)
         ),
     })
 }
@@ -2478,10 +2481,8 @@ fn uncut_block(app: &App) -> Option<Element<'_, Message>> {
         Some((Ok(found), _)) if !found.regions.is_empty() => {
             block = block.push(
                 text(format!(
-                    "{} region{}, {:.0}% of the part's surface, magenta in the 3D view:",
-                    found.regions.len(),
-                    if found.regions.len() == 1 { "" } else { "s" },
-                    found.share * 100.
+                    "{} of the part's surface, magenta in the 3D view:",
+                    crate::uncut::amount(&found.regions, found.share)
                 ))
                 .size(12)
                 .color(if current {
@@ -2506,8 +2507,8 @@ fn uncut_block(app: &App) -> Option<Element<'_, Message>> {
     {
         block = block.push(
             muted(format!(
-                "Amber: {:.0}% has 0.1–0.5 mm left.",
-                found.thin.share * 100.
+                "Amber: {} has 0.1–0.5 mm left.",
+                crate::uncut::amount(&found.thin.regions, found.thin.share)
             ))
             .size(12),
         );
@@ -2519,7 +2520,7 @@ fn uncut_block(app: &App) -> Option<Element<'_, Message>> {
             "The faces of the part that the stock left after every setup still covers: what the job has not machined yet. Until every enabled operation generates, completeness is not checked.",
         )
         .more(
-            "Each face is sampled 0.5 mm and 0.1 mm outside itself against the simulated cuts. Magenta means over 0.5 mm of stock remains; amber means 0.1–0.5 mm remains after the whole job. Smaller residuals count as cut to allow for cutter margins, mesh chords and fine finishing scallops. Positions are in setup 1's axes from the part's -X/-Y/bottom corner, in mm.",
+            "Each face is sampled 0.5 mm and 0.1 mm outside itself against the simulated cuts. Magenta means over 0.5 mm of stock remains; amber means 0.1–0.5 mm remains after the whole job. Smaller residuals count as cut to allow for cutter margins, mesh chords and fine finishing scallops. A tap cuts a modelled thread's full form, out to its root, from its lead up; a region on a hole's thread says when no tap or thread mill cuts it, or how far short they stop. Positions are in setup 1's axes from the part's -X/-Y/bottom corner, in mm.",
         ),
         widget::tooltip::Position::Right,
     ))
