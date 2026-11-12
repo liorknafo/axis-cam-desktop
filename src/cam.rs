@@ -1151,6 +1151,16 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         } else {
             (hi[c], lo[c])
         };
+        // On an open far side, sweep past the stock face rather than
+        // ending tangent to it. Tangency leaves float-sized ribbons after
+        // reorientation and cannot prove a planar, full-thickness face for
+        // a later regrip. Closed walls keep their exact allowance. Include
+        // the overrun in the bands so no row exceeds the set stepover.
+        let to = if side[usize::from(toward > 0.)] {
+            to + toward * 0.01
+        } else {
+            to
+        };
         (steps(from, to, width).into_iter())
             .map(|edge| edge - toward * r)
             .collect()
@@ -7341,10 +7351,13 @@ pub(crate) mod tests {
         assert!(plan.spindle_clockwise);
         let rows: Vec<f32> = cuts(&plan).iter().map(|m| m.to[1]).collect();
         // The 80 mm split into the fewest equal bands of at most 17.5: five
-        // of 16, each row's +Y edge on its band's far side, the last on the
-        // stock's +Y face, so its centre is inside it by the radius (LIO-366;
+        // of 16.002, each row's +Y edge on its band's far side, the last
+        // 0.01 mm past the stock's +Y face (LIO-366;
         // it was on the face, cutting only on its right: a climb cut).
-        assert_eq!(rows, [-36.5, -20.5, -4.5, 11.5, 27.5]);
+        for (row, want) in rows.iter().zip([-36.498, -20.496, -4.494, 11.508, 27.51]) {
+            assert!((row - want).abs() < 0.0001, "{rows:?}");
+        }
+        assert_eq!(rows.len(), 5);
         assert!(
             rows.windows(2)
                 .all(|w| w[1] > w[0] && w[1] - w[0] <= 17.5 + 1e-4)
@@ -7555,7 +7568,7 @@ pub(crate) mod tests {
         let top = boxed_plan([-100., 100., -100., 100., 0., -2.], &fields).unwrap();
         let edges: Vec<f32> = cuts(&top).iter().map(|m| m.to[1] + 12.5).collect();
         assert_eq!(edges.len(), 11);
-        let band = 80. / 11.;
+        let band = 80.01 / 11.;
         for (i, e) in edges.iter().enumerate() {
             assert!(
                 (e - (-40. + band * (i + 1) as f32)).abs() < 1e-3,

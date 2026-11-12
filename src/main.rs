@@ -2804,7 +2804,7 @@ impl App {
         };
         let mesh = self.part_mesh();
         let part = mesh.map(|mesh| simulation::part_box(&self.doc.setups[si], mesh));
-        let suggested = {
+        let (suggested, contact_issues) = {
             // Knowing the part, as the export does, to tell stock cut free
             // from it.
             let with_part = |volume, frame| match mesh {
@@ -2831,7 +2831,21 @@ impl App {
                 after: after.as_ref(),
                 part,
             };
-            request.suggest_on(&refs, || self.known_stock(si).0, bands, known)
+            let suggested = request.suggest_on(&refs, || self.known_stock(si).0, bands, known);
+            // Tool clearance alone does not establish material to grip.
+            let issues = match &suggested {
+                Some((stock, Ok(layout @ holding::Layout::Vise { .. }))) => holding::holdable(
+                    si,
+                    layout,
+                    &request.holder,
+                    holding::gripped(layout, &request.holder, *stock, bands),
+                    removed.as_ref(),
+                    None,
+                    &|_, _| String::new(),
+                ),
+                _ => vec![],
+            };
+            (suggested, issues)
         };
         let Some((stock, suggested)) = suggested else {
             self.status = "No layout suggested: this setup's stock is not known yet. Load the part and check the stock settings.".into();
@@ -2871,7 +2885,11 @@ impl App {
             }
             _ => opening.as_deref(),
         };
-        let message = holding::summary(&layout, refs.len(), clashing, failed, note);
+        let mut message = holding::summary(&layout, refs.len(), clashing, failed, note);
+        for issue in contact_issues {
+            message.push(' ');
+            message.push_str(&issue);
+        }
         if changed {
             self.touch();
         }

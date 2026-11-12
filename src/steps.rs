@@ -689,7 +689,9 @@ fn readout<'a>(r: Readout, msg: Option<Message>) -> Element<'a, Message> {
 }
 /// The tiles of a section's passes or holes: done, now, next.
 fn tiles<'a>(labels: Vec<(String, Option<Message>)>, at: usize) -> Element<'a, Message> {
+    let mut lines = column![].spacing(6);
     let mut line = row![].spacing(6);
+    let count = labels.len();
     for (i, (s, msg)) in labels.into_iter().enumerate() {
         let state = lit(i, at);
         let face = container(
@@ -717,8 +719,14 @@ fn tiles<'a>(labels: Vec<(String, Option<Message>)>, at: usize) -> Element<'a, M
             ..Default::default()
         });
         line = line.push(container(tap(face, msg, "Pass")).width(FillPortion(1)));
+        // At most three readable depth/row labels per line, even on the
+        // narrow Steps pane. Keep every pass directly selectable.
+        if (i + 1) % 3 == 0 || i + 1 == count {
+            lines = lines.push(line);
+            line = row![].spacing(6);
+        }
     }
-    line.into()
+    lines.into()
 }
 /// Back (dimmed when there is no step before) and the step's own command,
 /// large enough to tap with a glove on.
@@ -2454,6 +2462,37 @@ fn next_label(g: &Guide, at: usize, item: usize) -> String {
         _ => "Next ▶".into(),
     }
 }
+/// The saved limit, or the largest generated layer for Auto, with the
+/// configured feed. Face and Square condense the moves into final limits,
+/// so their screen must still carry the cutting conditions.
+fn milling_limits<'a>(p: &Page<'a>, op: usize) -> Element<'a, Message> {
+    let plan = &p.guide().done[p.done(op)].plan;
+    let set = num(&p.setup.operations[op].p, "stepdown");
+    let mut levels: Vec<f32> = plan
+        .moves
+        .iter()
+        .filter(|m| m.cutting_pass)
+        .map(|m| m.to[2])
+        .collect();
+    levels.sort_by(|a, b| b.total_cmp(a));
+    levels.dedup_by(|a, b| (*a - *b).abs() < 0.0001);
+    let mut previous = plan.rest_top.unwrap_or(plan.stock.max[2]);
+    let mut largest = 0f32;
+    for z in levels {
+        largest = largest.max(previous - z);
+        previous = z;
+    }
+    let down = set.unwrap_or_else(|| up(largest));
+    let feed = num(&p.setup.operations[op].p, "feed").unwrap_or(0.);
+    muted(format!(
+        "Maximum stepdown {} mm{} · feed {} mm/min",
+        mm(down),
+        if set.is_none() { " (Auto)" } else { "" },
+        mm(feed)
+    ))
+    .size(13)
+    .into()
+}
 fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
     let g = p.guide();
     let next = Some((
@@ -2523,13 +2562,14 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                         axis: String::new(),
                         value: format!("{} × {} × {}", mm(d[0]), mm(d[1]), mm(d[2])),
                         lock: None,
-                        tags: vec![],
+                        tags: vec!["remaining material envelope".into()],
                         lit: Lit::Next,
                         big: false
                     },
                     None
                 ),
             ];
+            let right = right.push(muted("Dimensions bound the remaining stock; earlier pockets and recesses remain as cut.").size(13));
             // The caption follows the holding (LIO-375).
             let sub = match (vise, get(&p.setup.p, "holding")) {
                 (Some(_), _) => "where it goes in the vise",
@@ -2814,7 +2854,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 chip(format!("{} rpm", rpm.round()))
             ]),]
             .extend(pick_up(*top, false))
-            .push(label("Face down to"))
+            .push(label("Final facing depth"))
             .push(readout(
                 Readout {
                     order: None,
@@ -2828,10 +2868,16 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 },
                 None,
             ))
-            .push(muted("Your passes, your stepdown.").size(13));
+            .push(milling_limits(p, *op))
+            .push(
+                muted(
+                    "Work down in layers to this final depth; start each layer clear of the stock.",
+                )
+                .size(13),
+            );
             (
                 "Face".into(),
-                "the only screen: tool and depth",
+                "tool, cutting limits and final depth",
                 left,
                 right,
             )
@@ -2926,8 +2972,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             let right = column![chips(vec![
                 chip(p.named(id, *diameter)),
                 chip(format!("{} rpm", rpm.round())),
-                chip(format!("down to Z {}", dro(*down_to)))
+                chip(format!("final floor Z {}", dro(*down_to)))
             ]),]
+            .push(milling_limits(p, *op))
+            .push(muted("Reach the final floor in depth layers; this is not a full-height side cut. Start each layer clear of the stock and feed conventionally along the wall.").size(13))
             .extend(pick_up(*top, false))
             .extend(dro_tool(*diameter, *comp, 70.))
             .push(label("Cut the side to"))
@@ -2953,7 +3001,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             ));
             (
                 "Square".into(),
-                "the only screen: one side to a number",
+                "cutting limits and final side position",
                 left,
                 right,
             )
@@ -4635,6 +4683,204 @@ pub(crate) mod tests {
             .filter(|(_, s)| matches!(s, Step::Pattern { .. }))
             .map(|(i, _)| i)
             .collect()
+    }
+    #[test]
+    fn layout_suggestion_reports_inherited_contact_as_well_as_clearance() {
+        for stepped in [false, true] {
+            let (mut doc, mesh) = crate::guide::tests::squared_job();
+            if stepped {
+                for (k, v) in [("y_min", "-5"), ("y_max", "5")] {
+                    doc.setups[0].operations[0].p.insert(k.into(), v.into());
+                }
+            }
+            let mut generated = vec![];
+            let mut before = None;
+            let mut bands = None;
+            crate::simulation::sequence(&doc, &mesh, Some((2, 0)), |si, oi, result| {
+                if si == 2 {
+                    let sim = result.unwrap();
+                    bands = crate::post::bands(&doc.setups[2], &mesh, &sim);
+                    before = sim.initial_volume.clone().zip(sim.frame);
+                    generated.push((oi, Some(sim.plan)));
+                }
+            });
+            let mut a = app("Yes");
+            doc.file = a.doc.file.clone();
+            a.doc = doc;
+            a.imported_mesh = Some(mesh);
+            a.place_layout(2, &generated, bands.as_ref(), before.as_ref());
+            assert_eq!(
+                a.status.contains("cannot be held in the vise"),
+                stepped,
+                "{}",
+                a.status
+            );
+        }
+    }
+    #[test]
+    fn forty_five_passes_have_readable_separate_tiles() {
+        let labels = (0..45)
+            .map(|n| {
+                (
+                    format!("−1.50 · {}", n + 1),
+                    Some(Message::Guide(GuideAction::Go(n))),
+                )
+            })
+            .collect();
+        let placed = crate::ui::probe::placed(tiles(labels, 44), Size::new(320., 2000.));
+        assert_eq!(placed.len(), 45);
+        for (i, (_, b)) in placed.iter().enumerate() {
+            assert!(
+                b.height <= 20. && b.x >= 0. && b.x + b.width <= 320.,
+                "{b:?}"
+            );
+            for (_, other) in &placed[..i] {
+                assert!(b.intersection(other).is_none(), "{b:?} overlaps {other:?}");
+            }
+        }
+        let labels = (0..45)
+            .map(|n| {
+                (
+                    format!("−1.50 · {}", n + 1),
+                    Some(Message::Guide(GuideAction::Go(n))),
+                )
+            })
+            .collect();
+        let last = placed.last().unwrap().1;
+        let presses =
+            crate::ui::probe::presses(tiles(labels, 44), Size::new(320., 2000.), last, 15.);
+        assert!(
+            presses
+                .iter()
+                .any(|(_, m)| matches!(m, Message::Guide(GuideAction::Go(44))))
+        );
+    }
+    #[test]
+    fn condensed_face_and_square_show_saved_cutting_limits() {
+        let mut a = app_with("Yes", |doc| {
+            doc.setups[0].operations[0]
+                .p
+                .insert("stepdown".into(), "0.5".into());
+            doc.setups[0].operations[0]
+                .p
+                .insert("feed".into(), "120".into());
+        });
+        let face = guide(&a)
+            .steps
+            .iter()
+            .position(|s| matches!(s, Step::Face { .. }))
+            .unwrap();
+        send(&mut a, GuideAction::Go(face));
+        assert!(has(&a, "Maximum stepdown 0.5 mm · feed 120 mm/min"));
+        let mut a = app_with("Yes", |doc| {
+            let mill = doc.tools[3].id.clone();
+            doc.setups[0].operations = vec![crate::guide::tests::boxed(
+                "Square",
+                &mill,
+                [123., 500., -500., 500., 0., -20.],
+                &[("allowance", "0"), ("stepdown", "0.5"), ("feed", "120")],
+            )];
+        });
+        let square = guide(&a)
+            .steps
+            .iter()
+            .position(|s| matches!(s, Step::Square { .. }))
+            .unwrap();
+        send(&mut a, GuideAction::Go(square));
+        assert!(has(&a, "Maximum stepdown 0.5 mm · feed 120 mm/min"));
+        assert!(
+            texts(&a)
+                .iter()
+                .any(|s| s.contains("not a full-height side cut"))
+        );
+        a.window_width = 1024.;
+        let placed = crate::ui::probe::placed(a.view(), Size::new(1024., 700.));
+        let (_, bounds) = placed
+            .iter()
+            .find(|(s, _)| s == "Maximum stepdown 0.5 mm · feed 120 mm/min")
+            .unwrap();
+        assert!(
+            bounds.y + bounds.height < 580.,
+            "cutting limit below the fold: {bounds:?}"
+        );
+    }
+    #[test]
+    #[ignore = "private saved-project render: AXIS_REGRIP_FIXTURE and AXIS_RENDER_DIR"]
+    fn render_saved_squared_regrip_steps() {
+        let fixture = std::path::PathBuf::from(std::env::var_os("AXIS_REGRIP_FIXTURE").unwrap());
+        let dir = std::path::PathBuf::from(std::env::var_os("AXIS_RENDER_DIR").unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut doc = crate::storage::load(&fixture.join("adapter-plate.axis.json")).unwrap();
+        doc.file.as_mut().unwrap().path = fixture.join("adapter-plate.step");
+        let mesh = crate::mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
+        let mut a = app("Yes");
+        a.doc = doc;
+        a.imported_mesh = Some(mesh);
+        a.left_stock = crate::leftover_stock(&a.doc, a.part_mesh().unwrap(), a.left_key().unwrap());
+        let checks = crate::holding_checks(
+            &a.doc,
+            a.part_mesh().unwrap(),
+            &a.left_stock,
+            a.holding_key().unwrap(),
+        );
+        let held = checks.setups[2].as_ref().unwrap();
+        assert!(
+            !held
+                .problems
+                .iter()
+                .any(|p| p.contains("cannot be held in the vise")),
+            "{:?}",
+            held.problems
+        );
+        eprintln!("cached Setup 3 Holding problems: {:?}", held.problems);
+        for (si, expected) in [(1, [140., 20., 91.]), (2, [140., 88., 20.])] {
+            let (Some(stock), known) = a.known_stock(si) else {
+                panic!("unknown inherited stock")
+            };
+            assert!(known);
+            for (v, want) in stock.dimensions().into_iter().zip(expected) {
+                assert!((v - want).abs() < 0.005, "cached badge {stock:?}");
+            }
+            eprintln!(
+                "verified cached stock badge setup {}: {:?}",
+                si + 1,
+                stock.dimensions()
+            );
+        }
+        for si in 0..3 {
+            a.doc.active = a.doc.setups[si].id.clone();
+            build(&mut a);
+            let g = guide(&a);
+            let mut screens = vec![(format!("setup-{}-holding", si + 1), 0)];
+            if let Some(i) = g
+                .steps
+                .iter()
+                .position(|s| matches!(s, Step::Face { .. } | Step::Square { .. }))
+            {
+                screens.push((format!("setup-{}-cut", si + 1), i));
+            }
+            if si == 2 {
+                let seat = a.doc.setups[si]
+                    .operations
+                    .iter()
+                    .position(|o| o.name().contains("Seat"))
+                    .unwrap();
+                let last = g
+                    .steps
+                    .iter()
+                    .rposition(|s| matches!(s,Step::Pass{op,..} if *op==seat))
+                    .unwrap();
+                screens.push(("seat-last-pass".into(), last));
+            }
+            for (name, i) in screens {
+                send(&mut a, GuideAction::Go(i));
+                for (w, h) in [(1280, 800), (1024, 700)] {
+                    a.window_width = w as f32;
+                    render(&a, (w, h), &dir.join(format!("{name}-{w}.png")));
+                }
+                std::fs::write(dir.join(format!("{name}.txt")), texts(&a).join("\n")).unwrap();
+            }
+        }
     }
     #[test]
     fn the_pattern_and_holes_screens_say_what_to_type_and_each_hole_reads_zero() {
