@@ -5756,7 +5756,7 @@ impl App {
                 doc.adopt_materials();
                 doc.adopt_holders();
                 self.replace_document(doc, None);
-                self.status = "Blank project created. Saved machines, tools, materials and workholding are available; your previous project is in History.".into();
+                self.status = "Blank project created. Saved machines, tools, materials and workholding are available; your previous project is in Project history.".into();
             }
             Message::ResumeProject => {
                 self.page = Page::Work;
@@ -7048,8 +7048,9 @@ impl App {
                             ui::fixtures(ui::Note::Preview, ui::modelled(self))
                         };
                         self.status = format!(
-                            "{} preview ready: {} levels, {:.1} min estimated. Inherits stock after {} across setups. Sampled removal; {} {next}",
-                            plan.strategy.name(),
+                            // One word with the panel and its tab (LIO-438).
+                            "{} simulation ready: {} levels, {:.1} min estimated. Inherits stock after {} across setups. Sampled removal; {} {next}",
+                            plan.strategy.short(),
                             plan.levels,
                             plan.duration / 60.,
                             ui::plural(sim.preceding, "earlier operation"),
@@ -8356,7 +8357,11 @@ impl App {
             }
             Message::FileImported(None) => {
                 self.import_busy = false;
-                self.status = "Import cancelled.".into();
+                // A path typed or pasted, reached from inside the import
+                // (LIO-433): the field opens when no file was chosen.
+                self.import_path_open = true;
+                self.status = "No file chosen. Type or paste the model's path in the field above, or press Import model… again.".into();
+                return iced::widget::operation::focus(ui::IMPORT_PATH_FIELD);
             }
             Message::ModelRestored(file, result) => {
                 // Loaded for a file the project no longer has (another DXF
@@ -8428,7 +8433,7 @@ impl App {
                 let history = self.state_path.with_file_name("history");
                 self.replace_document(d, (!p.starts_with(&history)).then_some(p));
                 self.status = with_notes(
-                    "Project opened. Your previous workspace is in History.",
+                    "Project opened. Your previous project is in Project history.",
                     &notes,
                 );
                 return self.restore_model();
@@ -9126,7 +9131,7 @@ impl App {
                 self.page = Page::Work;
                 self.touch();
                 self.status = format!(
-                    "Plan applied. The previous job is in History; Undo is in AI planner. Review each operation, then export from NC review.{restored}"
+                    "Plan applied. The previous job is in Project history; Undo is in AI planner. Review each operation, then export from NC review.{restored}"
                 );
             }
             Message::PutBackEdit => {
@@ -9164,7 +9169,7 @@ impl App {
                     return Task::none();
                 };
                 let mut status = String::from(
-                    "The setups from before the plan are restored. The applied job is in History.",
+                    "The setups from before the plan are restored. The applied job is in Project history.",
                 );
                 // Only what Apply replaced comes back: tools, machines, the
                 // title and the material edited since then stay. A tool

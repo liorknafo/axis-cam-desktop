@@ -981,9 +981,10 @@ fn leading_sentences(s: &str, limit: usize) -> &str {
 /// The header's line on the automatic save of the workspace.
 pub fn workspace_note(app: &App) -> String {
     match (&app.save_error, app.dirty) {
-        (Some(e), _) => format!("Workspace not saved: {e}"),
-        (None, true) => "Saving workspace…".into(),
-        (None, false) => "Workspace saved locally".into(),
+        // The project, not a "workspace" (LIO-433).
+        (Some(e), _) => format!("Not kept on this PC: {e}"),
+        (None, true) => "Saving…".into(),
+        (None, false) => "Kept on this PC".into(),
     }
 }
 /// Which file the project is saved in, and whether it has changes since.
@@ -1011,7 +1012,7 @@ pub fn project_note(app: &App) -> String {
                 shown
             }
         }
-        None => "No project file yet".into(),
+        None => "Kept on this PC · no project file yet".into(),
     }
 }
 /// In place of a page that could not be drawn (`fault`): what went wrong,
@@ -1081,12 +1082,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 ),
                 widget::tooltip::Position::Bottom
             ),
-            bar_btn("Import model", Message::Import, false),
-            bar_btn(
-                "Import from path…",
-                Message::ImportPathOpen(!app.import_path_open),
-                app.import_path_open,
-            ),
+            // One import button; a typed path is reached from inside it
+            // (LIO-433).
+            bar_btn("Import model…", Message::Import, false),
         ]
         .spacing(4)
         .align_y(Alignment::Center);
@@ -1097,7 +1095,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         }
         brand.push(
             files
-                .push(bar_btn("Open", Message::OpenProject, false))
+                .push(bar_btn("Open project…", Message::OpenProject, false))
                 .push(bar_btn("Save", Message::SaveProject, false))
                 .push(bar_btn("Save as…", Message::SaveProjectAs, false)),
         )
@@ -1110,7 +1108,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     };
     let where_saved = match &app.project_path {
         Some(p) => p.display().to_string(),
-        None => "Use Save or Save as… to choose the file this project is kept in. Until then it lives only in the workspace.".into(),
+        None => "Use Save or Save as… to choose the file this project is kept in. Until then it is kept on this PC only.".into(),
     };
     // The notes keep to one line on the right; a narrow window cuts off
     // their end, never the label after them.
@@ -1124,22 +1122,18 @@ pub fn view(app: &App) -> Element<'_, Message> {
             Help::text("Project file", where_saved),
             widget::tooltip::Position::Bottom,
         ),
-        space().width(10),
-        text(workspace_note(app))
-            .size(12)
-            .wrapping(Wrapping::None)
-            .color(Color::from_rgb8(183, 204, 222)),
+        // One thing about saving: the file's note, or a save that failed
+        // (LIO-433).
+        app.save_error.as_ref().map(|_| {
+            text(format!("  ·  {}", workspace_note(app)))
+                .size(12)
+                .wrapping(Wrapping::None)
+                .color(Color::from_rgb8(183, 204, 222))
+        }),
     ]
     .align_y(Alignment::Center);
-    let brand = brand
-        .push(container(notes).width(Fill).clip(true))
-        .push(space().width(10))
-        .push(
-            text("NATIVE PROTOTYPE")
-                .size(10)
-                .wrapping(Wrapping::None)
-                .color(Color::from_rgb8(228, 193, 122)),
-        );
+    // No developer's note (LIO-433).
+    let brand = brand.push(container(notes).width(Fill).clip(true));
     let brand = container(brand)
         .padding([8, 18])
         .style(|_| container::Style {
@@ -1220,6 +1214,14 @@ pub fn view(app: &App) -> Element<'_, Message> {
             } else if app.on_hand() {
                 // No post on a hand machine (LIO-423).
                 "mm".to_string()
+            } else if let Some(s) = app.doc.active_setup().filter(|_| app.page != Page::Home) {
+                // The machine and what it runs, in the user's words (LIO-433).
+                match get(&s.machine.p, "controller") {
+                    "UC100" => format!("mm  |  {} · runs from MACHINE", s.machine.name()),
+                    _ => format!("mm  |  {} · LinuxCNC program", s.machine.name()),
+                }
+            } else if app.page == Page::Home {
+                "mm".to_string()
             } else {
                 "mm  |  Bounded mesh previews · LinuxCNC 3-axis and indexed A post".to_string()
             })
@@ -1281,10 +1283,15 @@ fn start_screen(app: &App) -> Element<'_, Message> {
     let intro = column![
         muted("YOUR NEXT MACHINING PROJECT"),
         bold("Start with your part.", 36),
-        text("Create a blank project, open saved work, or explore the example when you want a guided tour.").size(16),
+        text("Import the model to make a project from it, open saved work, or explore the example when you want a guided tour.").size(16),
         space().height(12),
-        primary("+ New blank project", Message::NewProject),
-        secondary("Open a saved project…", Message::OpenProject),
+        // The part first; the same names as the top bar (LIO-433).
+        primary(if app.import_busy { "Loading model…" } else { "Import model…" }, Message::Import),
+        row![
+            secondary("New project", Message::NewProject),
+            secondary("Open project…", Message::OpenProject)
+        ]
+        .spacing(8),
         space().height(12),
         rule::horizontal(1),
         muted("LEARN THE WORKFLOW"),
@@ -1329,13 +1336,8 @@ fn start_screen(app: &App) -> Element<'_, Message> {
     recent = recent.push(rule::horizontal(1)).push(muted("REUSABLE LIBRARIES"))
         .push(muted(format!("{} · {}",plural(app.doc.machines.len(),"saved machine"),plural(app.doc.tools.len(),"saved tool"))))
         .push(note("New projects keep your saved libraries. The previous project is archived before you start again."));
-    recent = recent.push(secondary("Browse project history…", Message::OpenHistory));
-    if app.last_archived.is_some() {
-        recent = recent.push(secondary(
-            "Recover previous project",
-            Message::RecoverPrevious,
-        ));
-    }
+    // One name for the older projects (LIO-433).
+    recent = recent.push(secondary("Project history…", Message::OpenHistory));
     // A short screen's window (LIO-315) scrolls it, never squeezes it. The
     // bar is embedded: only while it shows does it take `SCROLLBAR_GUTTER`
     // beside the content, never the card's edge (LIO-327); at full size
@@ -1414,13 +1416,10 @@ fn import_path_bar(app: &App) -> Element<'_, Message> {
 fn blank_project(app: &App) -> Element<'_, Message> {
     let mut body = column![
         muted("NEW PROJECT"),
-        bold("Your workspace is empty.", 32),
+        bold("Your project is empty.", 32),
         text("Import a model to start planning your machining job.").size(16),
         space().height(8),
-        row![
-            primary(if app.import_busy { "Loading model…" } else { "Import your first model" }, Message::Import),
-            secondary("Import from path…", Message::ImportPathOpen(true)),
-        ].spacing(8),
+        primary(if app.import_busy { "Loading model…" } else { "Import model…" }, Message::Import),
         muted("STEP / STP · 3MF · STL · OBJ · DXF"),
         space().height(16),
         section("Build your job in order"),
@@ -1428,7 +1427,7 @@ fn blank_project(app: &App) -> Element<'_, Message> {
         text("2   Configure a machine and create the first setup.").size(14),
         text("3   Set stock and workholding, then add tools and operations.").size(14),
         space().height(12),
-        row![secondary("New machine profile",Message::NewMachine),secondary("Saved machines",Message::Page(Page::Machines)),secondary("Tool library",Message::Page(Page::Tools))].spacing(8),
+        row![secondary("+ New machine",Message::NewMachine),secondary("Machine library",Message::Page(Page::Machines)),secondary("Tools",Message::Page(Page::Tools))].spacing(8),
         note("No sample geometry, setups or operations have been added. Saved machines, tools, materials and workholding are available when you need them.")
     ].spacing(13).max_width(730);
     if app.last_archived.is_some() {
@@ -1455,7 +1454,7 @@ fn first_setup(app: &App) -> Panel<'_> {
         body: column![
             text("Your model is ready to view. Choose the machine and workholding for its first machining position.").size(14),
             primary("Create first setup",Message::AddSetup).width(Fill),
-            secondary(if app.doc.machines.is_empty() {"New machine profile"} else {"Open machine library"},if app.doc.machines.is_empty(){Message::NewMachine}else{Message::Page(Page::Machines)}).width(Fill),
+            secondary(if app.doc.machines.is_empty() {"+ New machine"} else {"Machine library"},if app.doc.machines.is_empty(){Message::NewMachine}else{Message::Page(Page::Machines)}).width(Fill),
             note("Each setup starts with zero operations. Add another setup when the part needs to be flipped, indexed or reclamped.")
         ].spacing(18).into(),
         foot: None,
@@ -2929,11 +2928,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
 }
 /// What the workspace shows in place of the 3D view without a part.
 fn no_scene(app: &App) -> Element<'_, Message> {
-    let mut imports = row![
-        primary("Import model", Message::Import),
-        secondary("Import from path…", Message::ImportPathOpen(true))
-    ]
-    .spacing(8);
+    let mut imports = row![primary("Import model…", Message::Import)].spacing(8);
     // The project's file failed to load, or is loading: loaded again once
     // it is put back or fixed.
     if app.doc.file.is_some() && !app.import_busy {
@@ -12888,7 +12883,7 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
     if app.doc.tools.is_empty() && app.tool_draft.name().is_empty() {
         return container(
             column![
-                page_header("Tool library", "Save cutters you actually use."),
+                page_header("Tools", "Save cutters you actually use."),
                 space().height(40),
                 bold("No tools yet", 28),
                 // An operation waiting for a cutter has its draft already
@@ -13992,14 +13987,14 @@ pub(crate) fn apply_note(doc: &crate::model::Document, job: &crate::model::Docum
         )
     };
     format!(
-        "Applying replaces the {} of setup 1{removed}; the plan has {}. Setup 1 keeps its name, machine, stock, work zero and fixture. The previous job is kept in History and can be undone here.",
+        "Applying replaces the {} of setup 1{removed}; the plan has {}. Setup 1 keeps its name, machine, stock, work zero and fixture. The previous job is kept in Project history and can be undone here.",
         plural(first, "operation"),
         plural(job.setups.len(), "setup"),
     )
 }
 /// What Apply does with a change asked of the planner: the job becomes the
 /// preview, which kept what the request did not mention.
-pub(crate) const CHANGE_NOTE: &str = "Applying makes the changes listed above; everything else stays as it is. The previous job is kept in History and can be undone here.";
+pub(crate) const CHANGE_NOTE: &str = "Applying makes the changes listed above; everything else stays as it is. The previous job is kept in Project history and can be undone here.";
 /// The planner's workholding note on a setup's card, saying where it goes:
 /// setup 1's ends its notes on Apply, in place of an earlier planner note
 /// that is unchanged; a later setup's are its notes.
