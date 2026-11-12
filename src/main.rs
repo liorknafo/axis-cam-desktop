@@ -5053,7 +5053,8 @@ impl App {
                 Some(tabs) if !tabs.contains(&tab) => tabs.get(1).copied().unwrap_or(tab),
                 _ => tab,
             };
-            let _ = self.update(Message::Tab(tab.into()));
+            // Kept, as `AddOp` keeps its tab's (LIO-442).
+            return Task::batch([setup, operation, self.update(Message::Tab(tab.into()))]);
         }
         Task::batch([setup, operation])
     }
@@ -6262,9 +6263,13 @@ impl App {
                 // An operation that needs a place on the part opens on the
                 // tab that picks it, picking; one that cuts the whole part
                 // says so. The tab and the status line say the same (LIO-427).
+                // Kept: the tab's update may start the search for the part's
+                // holes off the window's thread, and a dropped task never
+                // runs it (LIO-442).
+                let mut opened = Task::none();
                 if !self.is_sample() {
                     if self.can_pick() && self.operation().is_some_and(|o| o.needs_surfaces()) {
-                        let _ = self.update(Message::Tab("Geometry".into()));
+                        opened = self.update(Message::Tab("Geometry".into()));
                     }
                     self.fresh = self.operation().map(|o| o.id.clone());
                 }
@@ -6304,6 +6309,7 @@ impl App {
                     self.picking = true;
                     self.status = format!("Added {added}. {}", crate::turn::pick_prompt(&kind));
                 }
+                return opened;
             }
             Message::DuplicateOp => {
                 if let Some(i) = self.selected {
