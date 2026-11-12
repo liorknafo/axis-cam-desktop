@@ -23145,6 +23145,12 @@ soft_max = 180.0
             .unwrap()
             .1;
         assert!(label.x <= crate::MIN_WINDOW.width, "{label:?}");
+        // MACHINE's bar says it once too, as the planning page does
+        // (LIO-433): it also said "Kept on this PC" after it.
+        a.page = Page::Control;
+        let texts = page_texts(&a);
+        let kept = texts.iter().filter(|t| t.contains("Kept on this PC"));
+        assert_eq!(kept.count(), 1, "{texts:?}");
     }
     /// On a screen narrower than the least window the window opens as wide
     /// as the screen (`least_window`), and there every page, MACHINE's
