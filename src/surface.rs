@@ -365,7 +365,7 @@ pub fn issues(operation: &Operation, setup: &Setup, mesh: Option<&Mesh>) -> Vec<
     // select no surfaces.
     if matches!(
         operation.strategy,
-        crate::model::Strategy::Box | crate::model::Strategy::Turn
+        crate::model::Strategy::Box | crate::model::Strategy::Turn | crate::model::Strategy::Slot
     ) || operation.on_centre(&setup.machine)
     {
         return vec![];

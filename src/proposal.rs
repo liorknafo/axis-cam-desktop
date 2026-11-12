@@ -192,6 +192,9 @@ pub struct ProposedOp {
     /// proposal for a job without a manual mill has none.
     #[serde(default, rename = "box", skip_serializing_if = "Option::is_none")]
     pub block: Option<ProposedBox>,
+    /// A manual round-ended slot, in work coordinates. Omitted in CNC-only schemas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<ProposedSlot>,
     /// A Turn's kind and settings, or a lathe Drill's depth (`kind` Drill);
     /// null for every other operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -260,6 +263,20 @@ pub struct ProposedBox {
     pub z_bottom: f32,
     /// Null: 0.5.
     pub allowance: Option<f32>,
+}
+/// A manual slot's editable nominal geometry; the tool must match its
+/// width less twice the operation's radial allowance. Floor allowance and
+/// breakthrough use the common axial_allowance and breakthrough fields.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposedSlot {
+    pub x: f32,
+    pub y: f32,
+    pub length: f32,
+    pub width: f32,
+    pub axis: String,
+    pub z_top: f32,
+    pub z_bottom: f32,
 }
 /// A lathe setup's round bar, mm: the part on its axis, its top `free_end`
 /// (null: `FREE_END`) below the bar's free end.
@@ -418,6 +435,7 @@ pub fn schema_full(edit: bool, rotary: bool, hands: Hands) -> Value {
     let mut strategies: Vec<&str> = STRATEGIES.iter().map(|(name, _)| *name).collect();
     if manual {
         strategies.push("Box");
+        strategies.push("Slot");
     }
     if hands.lathe {
         strategies.push("Turn");
@@ -488,6 +506,11 @@ pub fn schema_full(edit: bool, rotary: bool, hands: Hands) -> Value {
             "allowance": optional(),
         })), {"type": "null"}]});
         before_coolant(&mut operation, "box");
+        operation["properties"]["slot"] = json!({"anyOf": [object(json!({
+            "x": number(), "y": number(), "length": number(), "width": number(),
+            "axis": choice(&["X", "Y"], false), "z_top": number(), "z_bottom": number(),
+        })), {"type":"null"}]});
+        before_coolant(&mut operation, "slot");
     }
     if hands.lathe {
         let mut kinds = crate::lathe::TURN_KINDS.to_vec();
@@ -827,6 +850,7 @@ fn operation(
         .find(|(name, _)| *name == p.strategy)
         .map(|(_, s)| *s)
         .or((hands.mill && p.strategy == "Box").then_some(Strategy::Box))
+        .or((hands.mill && p.strategy == "Slot").then_some(Strategy::Slot))
         .or((hands.lathe && p.strategy == "Turn").then_some(Strategy::Turn));
     let lathe = crate::lathe::is_lathe(on);
     let centre = lathe && strategy == Some(Strategy::Drill);
@@ -859,13 +883,14 @@ fn operation(
             p.strategy,
             machine(on)
         )),
+        Some(Strategy::Slot) if !manual => wrong.push(crate::slot::ON_CNC.into()),
         Some(Strategy::Box) if !manual => wrong.push(format!(
             "Box is for a manual mill only; {} is not one. Use Face, Pocket or Contour here, or put the Box in a setup on the manual mill.",
             machine(on)
         )),
-        Some(Strategy::Box | Strategy::Drill) | None => {}
+        Some(Strategy::Box | Strategy::Slot | Strategy::Drill) | None => {}
         Some(_) if manual => wrong.push(format!(
-            "{} cannot run on the manual mill ({}): it takes only Box and Drill.",
+            "{} cannot run on the manual mill ({}): it takes only Box, Slot and Drill.",
             p.strategy,
             machine(on)
         )),
@@ -936,6 +961,30 @@ fn operation(
             }
         }
         (None, false) => {}
+    }
+    match (&p.slot, strategy) {
+        (None, Some(Strategy::Slot)) => wrong.push(
+            "A Slot needs `slot`: centre, length, width, axis and depth in work coordinates."
+                .into(),
+        ),
+        (Some(_), Some(s)) if s != Strategy::Slot => {
+            wrong.push("slot is for a Slot only; set it to null for other strategies.".into())
+        }
+        (Some(v), _)
+            if ![v.x, v.y, v.length, v.width, v.z_top, v.z_bottom]
+                .iter()
+                .all(|n| n.is_finite())
+                || v.width <= 0.
+                || v.length <= v.width
+                || v.z_bottom >= v.z_top
+                || !["X", "Y"].contains(&v.axis.as_str()) =>
+        {
+            wrong.push(
+                "Slot needs finite sizes, length > width > 0, bottom < top, and axis X or Y."
+                    .into(),
+            )
+        }
+        _ => {}
     }
     match (&p.block, strategy) {
         (None, Some(Strategy::Box)) => {
@@ -1422,6 +1471,33 @@ fn operation(
         }
         // Set after the match: the kind's own fields.
         Strategy::Turn => {}
+        Strategy::Slot => {
+            let v = p.slot.clone().unwrap_or_default();
+            for (key, value) in [
+                "slot_x",
+                "slot_y",
+                "slot_length",
+                "slot_width",
+                "z_top",
+                "z_bottom",
+            ]
+            .into_iter()
+            .zip([v.x, v.y, v.length, v.width, v.z_top, v.z_bottom])
+            {
+                set(key, value.to_string());
+            }
+            set("slot_axis", v.axis);
+            set("allowance", p.radial_allowance.unwrap_or(0.).to_string());
+            set(
+                "axial_allowance",
+                p.axial_allowance.unwrap_or(0.).to_string(),
+            );
+            set(
+                "through",
+                if p.through == Some(true) { "Yes" } else { "No" }.into(),
+            );
+            set("breakthrough", p.breakthrough.unwrap_or(0.).to_string());
+        }
         Strategy::Box => {
             let b = p.block.clone().unwrap_or_default();
             for (key, value) in crate::model::BOX_FIELDS
@@ -1693,6 +1769,7 @@ fn described(op: &Operation, tools: &[Tool], on: &crate::model::Machine) -> Opti
         .find(|(_, s)| *s == op.strategy)
         .map(|(name, _)| *name)
         .or((op.strategy == Strategy::Box).then_some("Box"))
+        .or((op.strategy == Strategy::Slot).then_some("Slot"))
         .or((op.strategy == Strategy::Turn).then_some("Turn"))?;
     let centre = op.on_centre(on);
     let tool = tools.iter().find(|t| t.id == op.tool)?.number()?;
@@ -1866,6 +1943,23 @@ fn described(op: &Operation, tools: &[Tool], on: &crate::model::Machine) -> Opti
             p.hole_diameter = value("hole_diameter").filter(|d| *d > 0.);
         }
         Strategy::Chamfer => p.chamfer = Some(described_chamfer(op)),
+        Strategy::Slot => {
+            p.surfaces.clear();
+            p.slot = Some(ProposedSlot {
+                x: value("slot_x")?,
+                y: value("slot_y")?,
+                length: value("slot_length")?,
+                width: value("slot_width")?,
+                axis: get(&op.p, "slot_axis").into(),
+                z_top: value("z_top")?,
+                z_bottom: value("z_bottom")?,
+            });
+            p.stepdown = value("stepdown");
+            p.radial_allowance = value("allowance");
+            p.axial_allowance = value("axial_allowance");
+            p.breakthrough = value("breakthrough");
+            p.through = Some(get(&op.p, "through") == "Yes");
+        }
         Strategy::Box => {
             let [x_min, x_max, y_min, y_max, z_top, z_bottom] =
                 crate::model::BOX_FIELDS.map(|k| value(k).unwrap_or(0.));
@@ -3388,6 +3482,7 @@ pub(crate) mod tests {
             spring_pass: None,
             chamfer: None,
             block: None,
+            slot: None,
             turn: None,
             coolant: "Flood".into(),
             reason: "test".into(),
@@ -7245,5 +7340,79 @@ pub(crate) mod tests {
         file.bytes = 1;
         let _ = mesh;
         crate::storage::save(&out.join("lathe.json"), &doc).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod capsule_tests {
+    use super::*;
+    #[test]
+    fn manual_slot_schema_and_edit_roundtrip_preserve_all_geometry_and_depths() {
+        let (doc, mesh, report) = super::tests::with_mill();
+        let mut plan = super::tests::milled(&report);
+        plan.setups[0].operations = vec![ProposedOp {
+            strategy: "Slot".into(),
+            name: "Manual capsule".into(),
+            tool: 9,
+            surfaces: vec![],
+            slot: Some(ProposedSlot {
+                x: 12.,
+                y: -7.,
+                length: 37.,
+                width: 32.,
+                axis: "X".into(),
+                z_top: 0.,
+                z_bottom: -2.5,
+            }),
+            rpm: 1600.,
+            feed: 150.,
+            stepdown: Some(0.5),
+            radial_allowance: Some(0.),
+            axial_allowance: Some(0.2),
+            through: Some(false),
+            breakthrough: Some(0.),
+            coolant: "Off".into(),
+            ..ProposedOp::default()
+        }];
+        let built = build(&doc, &mesh, &report, &plan).unwrap();
+        let op = &built.setups[0].operations[0];
+        assert_eq!(op.strategy, Strategy::Slot);
+        let got = described(op, &built.tools, &built.setups[0].machine).unwrap();
+        let want = &plan.setups[0].operations[0];
+        assert_eq!(got.slot, want.slot);
+        assert_eq!(got.stepdown, want.stepdown);
+        assert_eq!(got.axial_allowance, want.axial_allowance);
+        assert_eq!(got.through, want.through);
+        assert_eq!(got.breakthrough, want.breakthrough);
+        for edit in [false, true] {
+            let schema = schema_full(
+                edit,
+                false,
+                Hands {
+                    mill: true,
+                    lathe: false,
+                },
+            );
+            let props =
+                &schema["properties"]["setups"]["items"]["properties"]["operations"]["items"];
+            assert!(
+                props["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("slot"))
+            );
+            assert_eq!(
+                props["properties"]["slot"]["anyOf"][0]["additionalProperties"],
+                false
+            );
+            let cnc = schema_full(edit, false, Hands::default());
+            assert!(cnc["properties"]["setups"]["items"]["properties"]["operations"]["items"]["properties"].get("slot").is_none());
+        }
+        let mut bad = plan.clone();
+        bad.setups[0].operations[0].slot.as_mut().unwrap().axis = "45".into();
+        assert!(build(&doc, &mesh, &report, &bad).is_err());
+        let mut missing = plan.clone();
+        missing.setups[0].operations[0].slot = None;
+        assert!(build(&doc, &mesh, &report, &missing).is_err());
     }
 }

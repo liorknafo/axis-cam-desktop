@@ -447,6 +447,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
         Strategy::Groove => crate::groove::generate(setup, op, tool, mesh),
         Strategy::Chamfer => crate::chamfer::generate(setup, op, tool, mesh),
         Strategy::Corner => crate::corner::generate(setup, op, tool, mesh),
+        Strategy::Slot => crate::slot::generate(setup, op, tool, mesh),
         _ => Err(op.strategy.availability().into()),
     }
 }
@@ -901,6 +902,15 @@ const FACETS: f32 = 0.01;
 /// part with ends round to the cutter, a slot's, is not cut where the box
 /// around the sweep would be.
 pub(crate) fn swept(t: &[[f32; 3]; 3], centres: [[f32; 2]; 2], r: f32, z: [f32; 2]) -> bool {
+    swept_with_slack(t, centres, r, z, FACETS)
+}
+pub(crate) fn swept_with_slack(
+    t: &[[f32; 3]; 3],
+    centres: [[f32; 2]; 2],
+    r: f32,
+    z: [f32; 2],
+    slack: f32,
+) -> bool {
     // The triangle between the heights (Sutherland–Hodgman), in XY.
     let mut poly: Vec<[f32; 3]> = t.to_vec();
     for (plane, above) in [(z[0], true), (z[1], false)] {
@@ -969,7 +979,7 @@ pub(crate) fn swept(t: &[[f32; 3]; 3], centres: [[f32; 2]; 2], r: f32, z: [f32; 
                 .flat_map(|&q| (0..n).map(move |i| to_edge(q, pts[i], pts[(i + 1) % n]))),
         )
         .fold(f32::INFINITY, f32::min);
-    nearest < r - FACETS
+    nearest < r - slack
 }
 /// The block a new Box starts as (LIO-373): the whole top of the stock `s`
 /// (the box the setup starts from) down to the part's highest face, the

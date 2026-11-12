@@ -56,6 +56,7 @@ mod settings;
 mod setup;
 mod sheet;
 mod simulation;
+mod slot;
 mod smoke;
 mod step;
 mod steps;
@@ -2010,6 +2011,7 @@ impl App {
             include_bytes!("../assets/op-13.svg"),
             include_bytes!("../assets/op-14.svg"),
             include_bytes!("../assets/op-15.svg"),
+            include_bytes!("../assets/op-16.svg"),
         ]
         .iter()
         .map(|b| iced::widget::svg::Handle::from_memory(b.to_vec()))
@@ -2676,7 +2678,10 @@ impl App {
                 && (self.is_sample()
                     || (self.doc.file.is_some()
                         && (o.needs_surfaces()
-                            || matches!(o.strategy, Strategy::Box | Strategy::Corner))
+                            || matches!(
+                                o.strategy,
+                                Strategy::Box | Strategy::Corner | Strategy::Slot
+                            ))
                         && o.strategy.imported_preview()
                         && self.imported_mesh.is_some()))
         })
@@ -2686,7 +2691,7 @@ impl App {
     /// or that it cuts the whole part. None in the example project.
     pub fn new_op_line(&self) -> Option<&'static str> {
         let o = (self.operation()).filter(|o| self.fresh.as_deref() == Some(o.id.as_str()))?;
-        if o.needs_surfaces() || o.strategy == Strategy::Corner {
+        if o.needs_surfaces() || matches!(o.strategy, Strategy::Corner | Strategy::Slot) {
             let unpicked =
                 o.geometry.is_empty() && o.surfaces.as_ref().is_none_or(|s| s.ids.is_empty());
             return (unpicked && self.can_pick()).then_some(ui::pick_line(o));
@@ -5978,6 +5983,14 @@ impl App {
                             o.strategy == Strategy::Corner
                                 && o.surfaces.as_ref().is_none_or(|s| s.ids.is_empty())
                         }));
+                let unpicked_box = unpicked_box
+                    || (t == "Slot"
+                        && !self.is_sample()
+                        && self.part_mesh().is_some()
+                        && self.operation().is_some_and(|o| {
+                            o.strategy == Strategy::Slot
+                                && o.surfaces.as_ref().is_none_or(|s| s.ids.is_empty())
+                        }));
                 // So does a lathe cut on its Turn tab (LIO-424).
                 let unpicked_turn = (t == "Turn" || t == "Drill")
                     && self.picks_turn()
@@ -6308,6 +6321,15 @@ impl App {
                     self.tab = "Box".into();
                     self.picking = true;
                     self.status = "Added Box. Click a face of the part: the Box removes the stock that covers it. A floor is cut from above, a wall from the side.".into();
+                }
+                if strategy == Strategy::Slot
+                    && !self.is_sample()
+                    && self.part_mesh().is_some()
+                    && self.can_pick()
+                {
+                    self.tab = "Slot".into();
+                    self.picking = true;
+                    self.status = "Added Slot. Pick a capsule floor or rounded end, then check the sizes and depths.".into();
                 }
                 // Round corners starts its pick on its tab (LIO-443).
                 if strategy == Strategy::Corner
@@ -6717,6 +6739,42 @@ impl App {
                     self.status = said;
                     return Task::none();
                 }
+                if self
+                    .operation()
+                    .is_some_and(|o| o.strategy == Strategy::Slot)
+                {
+                    let selection = surface::Selection {
+                        mesh_fingerprint: fingerprint,
+                        ids: vec![n],
+                    };
+                    let result = self
+                        .known_stock(self.doc.index())
+                        .0
+                        .ok_or_else(|| "Resolve the setup stock before picking a slot.".to_string())
+                        .and_then(|stock| {
+                            // Use the stock immediately before the edited operation.
+                            let mut here = setup.clone();
+                            if let Some(o) = self.operation() {
+                                let check =
+                                    slot::pick_setup(&self.doc, mesh, self.doc.index(), &o.id)?;
+                                here = check;
+                            }
+                            slot::from_face(&here, mesh, &selection, stock)
+                        });
+                    match result {
+                        Ok(fields) => {
+                            if let Some(o) = self.operation_mut() {
+                                o.p.extend(fields);
+                                o.surfaces = Some(selection);
+                                o.geometry.clear();
+                            }
+                            self.touch();
+                            self.status = "Picked Slot. Check the matching cutter, Center cutting capability, top, bottom and Through before showing the cut.".into();
+                        }
+                        Err(e) => self.status = e,
+                    }
+                    return Task::none();
+                }
                 // A Box takes one face, and a click on it fills the box at
                 // once; a face that makes none says why and changes nothing
                 // (LIO-401).
@@ -7072,7 +7130,7 @@ impl App {
                 if self.operation().is_none_or(|o| {
                     !matches!(
                         o.strategy,
-                        Strategy::Box | Strategy::Turn | Strategy::Corner
+                        Strategy::Box | Strategy::Turn | Strategy::Corner | Strategy::Slot
                     ) && !o.on_centre(machine)
                 }) {
                     self.tab = "Geometry".into();
