@@ -688,45 +688,7 @@ pub fn thread_wall(setup: &Setup, mesh: &Mesh, id: usize) -> bool {
 /// of a whole round hole the selection picks by its walls (as a selected
 /// part of a hole's walls is, or of a modeled thread's).
 pub fn drilled_arcs(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc> {
-    let g = Geometry::new(setup, mesh);
-    let facets = facets(&g, |id| ids.contains(&id));
-    if facets.len() < 3 {
-        return vec![];
-    }
-    let at = corners(&facets);
-    let wide = across(setup, mesh, &g);
-    // A modeled thread's own walls (`own_walls`) are its hole's: no arc
-    // starts from them (grown along a thread's hundreds of crests, one took
-    // minutes), though one may grow on through them. Other walls start arcs
-    // as on main.
-    let threads = crate::thread::holes_in_setup(setup, mesh);
-    // The part's upright facets, for where a curve goes on past an arc.
-    let mut all: Option<(HashMap<usize, Facet>, Corners)> = None;
-    let mut seeds: Vec<usize> = facets.keys().copied().collect();
-    seeds.sort_unstable();
-    let (mut done, mut found) = (HashSet::new(), vec![]);
-    done.extend(own_walls(&g, &threads, |id| ids.contains(&id)));
-    for seed in seeds {
-        if done.contains(&seed) {
-            continue;
-        }
-        done.insert(seed);
-        let Some(members) = grow(&facets, &at, seed) else {
-            continue;
-        };
-        done.extend(members.iter().copied());
-        if arc(&facets, members.clone()).is_err() {
-            continue;
-        }
-        let (every, by_corner) = all.get_or_insert_with(|| {
-            let every = self::facets(&g, |_| true);
-            let by_corner = corners(&every);
-            (every, by_corner)
-        });
-        if let Ok(a) = whole_arc(wide, &facets, every, by_corner, members) {
-            found.push(a);
-        }
-    }
+    let mut found = arcs_among(setup, mesh, ids);
     if found.is_empty() {
         return found;
     }
@@ -755,6 +717,60 @@ pub fn drilled_arcs(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc
         }
         !round
     });
+    found
+}
+/// The arcs among the surfaces `ids`, as `setup` places the part: each run
+/// of them on one circle that goes part of the way round it, round a hole
+/// (`drilled_arcs` less its check against whole round holes, for walls of
+/// holes known not to be round: a slot's or a counterbore's round ends).
+pub fn arcs_among(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc> {
+    let g = Geometry::new(setup, mesh);
+    let facets = facets(&g, |id| ids.contains(&id));
+    if facets.len() < 3 {
+        return vec![];
+    }
+    let at = corners(&facets);
+    let wide = across(setup, mesh, &g);
+    // A modeled thread's own walls (`own_walls`) are its hole's: no arc
+    // starts from them (grown along a thread's hundreds of crests, one took
+    // minutes), though one may grow on through them. Other walls start arcs
+    // as on main.
+    let threads = crate::thread::holes_in_setup(setup, mesh);
+    // The part's upright facets, for where a curve goes on past an arc.
+    let mut all: Option<(HashMap<usize, Facet>, Corners)> = None;
+    let mut seeds: Vec<usize> = facets.keys().copied().collect();
+    seeds.sort_unstable();
+    let (mut done, mut found) = (HashSet::new(), vec![]);
+    done.extend(own_walls(&g, &threads, |id| ids.contains(&id)));
+    // Nor from any wall wholly in a thread's band: a picked thread's whole
+    // hole selects all of them, and arcs grown from those took minutes a
+    // click (LIO-434).
+    let banded = Geometry {
+        threads: threads.clone(),
+        ..Geometry::new(setup, mesh)
+    };
+    done.extend(crate::pocket::thread_band_walls(&banded));
+    for seed in seeds {
+        if done.contains(&seed) {
+            continue;
+        }
+        done.insert(seed);
+        let Some(members) = grow(&facets, &at, seed) else {
+            continue;
+        };
+        done.extend(members.iter().copied());
+        if arc(&facets, members.clone()).is_err() {
+            continue;
+        }
+        let (every, by_corner) = all.get_or_insert_with(|| {
+            let every = self::facets(&g, |_| true);
+            let by_corner = corners(&every);
+            (every, by_corner)
+        });
+        if let Ok(a) = whole_arc(wide, &facets, every, by_corner, members) {
+            found.push(a);
+        }
+    }
     found
 }
 /// Whether the centre of the arc `a` is over the stock `setup` holds
@@ -1948,5 +1964,78 @@ pub(crate) mod tests {
         assert!(own_walls(&g, &g.threads, |id| id == wall[0]).is_empty());
         assert!(!thread_wall(&setup, &mesh, wall[0]));
         assert!(!own_walls(&g, &g.threads, |id| id != wall[0]).is_empty());
+    }
+    #[test]
+    fn a_drill_lists_each_round_end_of_a_slot_to_pick() {
+        let mesh = mesh::normalize(slot(10.)).unwrap();
+        let (setup, _, _) = fixture(Strategy::Drill);
+        let found = crate::find_holes(&setup, &mesh);
+        let mut ends: Vec<[f32; 2]> = found.arcs.iter().map(|(_, h)| h.center).collect();
+        ends.sort_by(|a, b| a[0].total_cmp(&b[0]));
+        assert_eq!(ends.len(), 2, "{ends:?}");
+        for (end, x) in ends.iter().zip([-5f32, 5.]) {
+            assert!((end[0] - x).abs() < 0.01 && end[1].abs() < 0.01, "{ends:?}");
+        }
+        for (_, h) in &found.arcs {
+            assert!(h.through && (h.diameter - 10.).abs() < 0.01, "{h:?}");
+        }
+    }
+    /// The spindle adapter plate (github.com/liorknafo/spindle-adapter) as
+    /// the STEP helper meshes it, at `AXIS_PLATE_STL`: its holes are found
+    /// in under a second in a release build, where four M8 threads made it
+    /// an hour (LIO-434), its four M8 holes where the drawing has them and
+    /// each round end of its four slots apart.
+    #[test]
+    #[ignore]
+    fn the_spindle_plates_holes_are_found_in_a_second() {
+        let file = std::env::var("AXIS_PLATE_STL").expect("AXIS_PLATE_STL");
+        let mesh = crate::mesh::load_with(std::path::Path::new(&file), None).unwrap();
+        let (setup, _, _) = fixture(Strategy::Drill);
+        let started = std::time::Instant::now();
+        let found = crate::find_holes(&setup, &mesh);
+        let took = started.elapsed().as_secs_f32();
+        assert!(cfg!(debug_assertions) || took < 1., "{took} s");
+        // The plate is centred: model X 0..134, Y 0..88.
+        let model = |c: [f32; 2]| [c[0] + 67., c[1] + 44.];
+        let mut m8: Vec<[f32; 2]> = found
+            .round
+            .iter()
+            .flatten()
+            .map(|h| model(h.center))
+            .collect();
+        m8.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+        let expected = [[17.8, 16.35], [17.8, 40.85], [116.2, 16.35], [116.2, 40.85]];
+        assert_eq!(m8.len(), 4, "{m8:?}");
+        for (c, e) in m8.iter().zip(expected) {
+            assert!((c[0] - e[0]).hypot(c[1] - e[1]) < 0.005, "{m8:?}");
+        }
+        assert_eq!(found.arcs.len(), 8);
+        // A Drill picking each hole, as a click on it picks it: in a second.
+        let (_, mut op, _) = fixture(Strategy::Drill);
+        let picks = (found.holes.iter().zip(&found.round))
+            .filter(|(_, r)| r.is_some())
+            .map(|(h, _)| h.walls.clone())
+            .chain(found.arcs.iter().map(|(a, _)| a.walls.clone()));
+        for walls in picks {
+            picking(&mut op, &mesh, &walls);
+            let started = std::time::Instant::now();
+            let picked = holes(&setup, &op, &mesh).unwrap();
+            let took = started.elapsed().as_secs_f32();
+            assert!(cfg!(debug_assertions) || took < 1., "{took} s");
+            assert_eq!(picked.len(), 1, "{picked:?}");
+        }
+        for (_, h) in &found.arcs {
+            let c = model(h.center);
+            let slot = [[14.15, 28.6], [14.15, 74.4], [119.85, 28.6], [119.85, 74.4]];
+            assert!(
+                h.through
+                    && (h.diameter - 8.).abs() < 0.01
+                    && slot
+                        .iter()
+                        .any(|s| ((c[0] - s[0]).abs() - 2.5).abs() < 0.005
+                            && (c[1] - s[1]).abs() < 0.005),
+                "{c:?} {h:?}"
+            );
+        }
     }
 }

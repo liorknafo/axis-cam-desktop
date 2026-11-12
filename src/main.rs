@@ -1603,6 +1603,10 @@ impl std::fmt::Debug for PartHoles {
 pub struct FoundHoles {
     pub holes: Vec<pocket::Hole>,
     pub round: Vec<Option<cam::Hole>>,
+    /// The round ends of the holes that are not round (a slot's, a
+    /// counterbore's), each with the hole a Drill drills for it
+    /// (`cam::arcs::arc_hole`): a Drill shows and picks each (LIO-434).
+    pub arcs: Vec<(cam::arcs::Arc, cam::Hole)>,
 }
 /// Whether a click on a wall of the part picks its whole hole in `op`: a
 /// Pocket, an Adaptive clearing, a Contour, a Drill of the part's holes
@@ -1624,7 +1628,25 @@ pub(crate) fn picks_faces(op: &Operation) -> bool {
 pub(crate) fn find_holes(setup: &model::Setup, mesh: &mesh::Mesh) -> FoundHoles {
     let holes = pocket::part_holes(setup, mesh);
     let round = cam::drill_holes_of(setup, mesh, &holes);
-    FoundHoles { holes, round }
+    let walls: std::collections::HashSet<usize> = (holes.iter().zip(&round))
+        .filter(|(_, r)| r.is_none())
+        .flat_map(|(h, _)| h.walls.iter().copied())
+        .collect();
+    let g = cam::Geometry::new(setup, mesh);
+    let mut arcs: Vec<(cam::arcs::Arc, cam::Hole)> = (cam::arcs::arcs_among(setup, mesh, &walls)
+        .into_iter())
+    .filter(|a| cam::arcs::on_stock(setup, mesh, a))
+    .filter_map(|a| Some((a.clone(), cam::arcs::arc_hole(&g, &a)?)))
+    .collect();
+    // A counterbore's end over its slot's, round one centre, is one hole to
+    // a drill, read by its narrowest bore as a round counterbore is.
+    let narrower = |h: &cam::Hole, o: &cam::Hole| {
+        (o.center[0] - h.center[0]).hypot(o.center[1] - h.center[1]) <= 0.05
+            && o.diameter < h.diameter - 0.05
+    };
+    let all: Vec<cam::Hole> = arcs.iter().map(|(_, h)| h.clone()).collect();
+    arcs.retain(|(_, h)| !all.iter().any(|o| narrower(h, o)));
+    FoundHoles { holes, round, arcs }
 }
 /// What a generation off the window's thread makes (`App::generate`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4501,10 +4523,12 @@ impl App {
             return found.holes.iter().map(outline).collect();
         }
         // What the Drill drills: by its walls or in a selected rim face.
-        let drilled: Vec<[f32; 2]> = self
+        let drilled: Vec<([f32; 2], f32)> = self
             .part_mesh()
             .and_then(|mesh| self.drill_holes(op, mesh).as_ref().as_ref().ok().cloned())
-            .map_or(vec![], |holes| holes.iter().map(|h| h.center).collect());
+            .map_or(vec![], |holes| {
+                holes.iter().map(|h| (h.center, h.diameter)).collect()
+            });
         let near = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) <= 0.05;
         // A counterbore and its bore are one hole to a drill, read alike:
         // the widest outline stands for it.
@@ -4522,12 +4546,32 @@ impl App {
             }
             seen.push(round.center);
             let mut o = outline(h);
-            o.picked = drilled.iter().any(|&c| near(c, round.center));
+            o.picked = drilled.iter().any(|&(c, _)| near(c, round.center));
             // The largest drill in 0.1 mm steps it takes, as drills come:
             // never a size the drill check then refuses.
             let d = cam::largest_drill(round);
             o.label = Some(format!("Ø{}", crate::post::exact_mm(d)));
             out.push(o);
+        }
+        // Each round end of a hole that is not round (a slot's), drawn as the
+        // circle drilled for it; a click on it picks its arc (`pick_arc`).
+        for (a, h) in &found.arcs {
+            let r = h.diameter / 2.;
+            out.push(viewport::HoleOutline {
+                loops: vec![
+                    (0..64)
+                        .map(|k| {
+                            let t = k as f32 * std::f32::consts::TAU / 64.;
+                            [h.center[0] + r * t.cos(), h.center[1] + r * t.sin()]
+                        })
+                        .collect(),
+                ],
+                z: h.top,
+                walls: a.walls.clone(),
+                picked: (drilled.iter())
+                    .any(|&(c, d)| near(c, h.center) && (d - h.diameter).abs() < 0.05),
+                label: Some(format!("Ø{}", crate::post::exact_mm(cam::largest_drill(h)))),
+            });
         }
         out
     }

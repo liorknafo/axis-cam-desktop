@@ -1828,7 +1828,7 @@ fn walls_of(
 /// The surfaces a click on wall `id` adds or removes in a Pocket or Contour:
 /// the walls of its hole, checked as `holes` cuts it.
 pub fn hole_walls(setup: &Setup, mesh: &Mesh, id: usize) -> Result<Vec<usize>, String> {
-    let g = crate::cam::Geometry::new(setup, mesh);
+    let g = crate::cam::Geometry::with_threads(setup, mesh);
     let spans = spans(&g);
     let (path, walls) = walls_of(&g, &spans, id)?;
     hole(&g, &spans, path, walls).map(|h| h.walls)
@@ -1837,9 +1837,13 @@ pub fn hole_walls(setup: &Setup, mesh: &Mesh, id: usize) -> Result<Vec<usize>, S
 /// (`hole_walls`), once each: what the 3D view outlines for a Pocket or a
 /// Contour, so that a hole is picked by its outline as well as by a wall.
 pub fn part_holes(setup: &Setup, mesh: &Mesh) -> Vec<Hole> {
-    let g = crate::cam::Geometry::new(setup, mesh);
+    let g = crate::cam::Geometry::with_threads(setup, mesh);
     let spans = spans(&g);
-    let mut seen = std::collections::HashSet::new();
+    // A modeled thread's walls, thousands each read from a section of the
+    // whole part, took an hour on a plate of four M8 threads (LIO-434): no
+    // hole is looked for from them. Its hole is found from its plain walls,
+    // else from the thread itself (below).
+    let mut seen = thread_band_walls(&g);
     let mut found: Vec<Hole> = vec![];
     for id in 0..mesh.surfaces.len() {
         if seen.contains(&id) || !is_wall(setup, mesh, id) {
@@ -1858,7 +1862,79 @@ pub fn part_holes(setup: &Setup, mesh: &Mesh) -> Vec<Hole> {
             }
         }
     }
+    // A thread with no hole found from a plain wall: its own (`thread_hole`).
+    for t in &g.threads {
+        let centre = (t.centre[0] as f64, t.centre[1] as f64);
+        let outlined = |h: &Hole| {
+            let loops: Vec<Polygon> = h.outline.clone().into();
+            loops.iter().any(|l| crate::cam::encloses(l, centre))
+        };
+        if found.iter().any(outlined) {
+            continue;
+        }
+        if let Ok(h) = thread_hole(&g, t) {
+            found.push(h);
+        }
+    }
     found
+}
+/// The surfaces wholly in the bands of the modeled threads of `g`
+/// (`of_thread`), its flanks' too: no hole (`part_holes`) or arc
+/// (`cam::arcs`) is looked for from them.
+pub(crate) fn thread_band_walls(g: &crate::cam::Geometry) -> std::collections::HashSet<usize> {
+    let (mut on, mut off) = (Walls::new(), Walls::new());
+    for t in &g.triangles {
+        if let Some(id) = t.feature {
+            if g.threads.iter().any(|th| of_thread(&t.p, th)) {
+                on.insert(id);
+            } else {
+                off.insert(id);
+            }
+        }
+    }
+    on.difference(&off).copied().collect()
+}
+/// The upright surfaces of the modeled thread `t` in `g` (its crests and
+/// roots): those wholly in its band (`of_thread`).
+fn thread_walls(g: &crate::cam::Geometry, t: &crate::thread::Thread) -> Walls {
+    let (mut on, mut off) = (Walls::new(), Walls::new());
+    for tri in &g.triangles {
+        if let Some(id) = tri.feature {
+            if of_thread(&tri.p, t) && facing(&tri.p) < WALL {
+                on.insert(id);
+            } else {
+                off.insert(id);
+            }
+        }
+    }
+    on.difference(&off).copied().collect()
+}
+/// The hole of the modeled thread `t` in `g`, its walls `thread_walls`: its
+/// bore, the circle of its minor diameter round its axis, read at the
+/// thread's middle. A thread cut right up to the face its hole opens in has
+/// no plain wall to find its hole from, nor do its crests (their outline
+/// runs over its flanks, `LEANING`).
+fn thread_hole(g: &crate::cam::Geometry, t: &crate::thread::Thread) -> Result<Hole, String> {
+    let r = (t.minor / 2. - 0.05) as f64;
+    let path: Polygon = (0..64)
+        .map(|k| {
+            let a = k as f64 * std::f64::consts::TAU / 64.;
+            (
+                t.centre[0] as f64 + r * a.cos(),
+                t.centre[1] as f64 + r * a.sin(),
+            )
+        })
+        .collect();
+    hole_at(g, (t.from + t.to) / 2., path, thread_walls(g, t))
+}
+/// Whether triangle `p` is of the modeled thread `t` along Z: its corners
+/// in the thread's band round its axis, within its length.
+fn of_thread(p: &[[f32; 3]; 3], t: &crate::thread::Thread) -> bool {
+    p.iter().all(|q| {
+        let r = (q[0] - t.centre[0]).hypot(q[1] - t.centre[1]);
+        (t.minor / 2. - 0.05..=t.major / 2. + 0.05).contains(&r)
+            && (t.from - t.pitch..=t.to + t.pitch).contains(&q[2])
+    })
 }
 /// Why a wall picks no hole when its outline crosses a sloping face: a
 /// chamfer's, a fillet's, a cone's (`hole_near` looks past it).
@@ -2011,9 +2087,20 @@ pub fn holes(
     if selected.is_empty() {
         return Ok(vec![]);
     }
-    let g = crate::cam::Geometry::new(setup, mesh);
+    let g = crate::cam::Geometry::with_threads(setup, mesh);
     let spans = spans(&g);
     let (mut found, mut covered, mut waiting) = (vec![], Walls::new(), vec![]);
+    // A modeled thread picked (most of its walls: a Drill takes the arcs
+    // its crests make out first) is its hole (`thread_hole`), as
+    // `part_holes` lists it: read alone, a crest's outline runs over the
+    // flanks (`LEANING`), or rings a sliver of it.
+    for t in &g.threads {
+        let walls = thread_walls(&g, t);
+        if 2 * walls.iter().filter(|w| ids.contains(w)).count() > walls.len() {
+            covered.extend(&walls);
+            found.push(thread_hole(&g, t)?);
+        }
+    }
     for &id in &selected {
         if covered.contains(&id) {
             continue;
@@ -2068,7 +2155,10 @@ fn hole(
     path: Polygon,
     walls: Walls,
 ) -> Result<Hole, String> {
-    let z = level(spans, &walls)?;
+    hole_at(g, level(spans, &walls)?, path, walls)
+}
+/// The hole with outline `path` and `walls`, read at the height `z` (`hole`).
+fn hole_at(g: &crate::cam::Geometry, z: f32, path: Polygon, walls: Walls) -> Result<Hole, String> {
     let (low, high) = extent(&path);
     // Just inside the walls, at the height they were picked at, a hole is
     // empty: a ray up from there crosses the part's faces an even number of
@@ -2128,9 +2218,12 @@ fn hole(
     // The floors under the outline: each face's (not a wall's) highest over
     // the outline's inside. A faceted wall's facets lean a few degrees, and
     // one leaning in is kept clear of as the part over the hole.
+    // A modeled thread's flanks are no floor (`g.threads`): each was one,
+    // and a plate's four M8 threads took minutes to read (LIO-434). The
+    // part over the hole still has them.
     let mut floors: Vec<f32> = vec![];
     for t in &near {
-        if facing(&t.p) < WALL {
+        if facing(&t.p) < WALL || g.threads.iter().any(|th| of_thread(&t.p, th)) {
             continue;
         }
         let mut p = below(&t.p, z);
