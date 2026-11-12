@@ -1250,7 +1250,15 @@ struct Reading {
     long: String,
 }
 fn reading(p: &Page<'_>, d: &Dial) -> Reading {
-    let (turn, div) = collar(&p.setup.machine, d.slide);
+    reading_on(&p.setup.machine, d)
+}
+/// What dial `d` reads on `machine`, as a screen shows it: its total the
+/// big number (LIO-437: the Passes tab prints this very text).
+pub(crate) fn dial_total(machine: &crate::model::Machine, d: &Dial) -> String {
+    reading_on(machine, d).total
+}
+fn reading_on(machine: &crate::model::Machine, d: &Dial) -> Reading {
+    let (turn, div) = collar(machine, d.slide);
     let k = places(turn, div);
     match &d.reading {
         Ok((t, r)) if d.out => {

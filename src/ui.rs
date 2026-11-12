@@ -5005,31 +5005,28 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
                 // the Steps' own passes when they are built (from the
                 // touch on the blank as it is left), else the plan's.
                 let machine = &app.doc.setup().machine;
-                let built: Option<Vec<f32>> = (app.current_guide())
+                // The very text each pass's screen gives its top slide, from
+                // that pass's own dial (LIO-437): no second calculation.
+                let built: Option<Vec<String>> = (app.current_guide())
                     .and_then(|g| g.as_ref().ok())
                     .filter(|s| s.guide.setup == app.doc.index())
                     .map(|s| {
                         (s.guide.steps.iter())
                             .filter_map(|st| match st {
                                 crate::guide::Step::Lathe(
-                                    crate::guide::LatheStep::ThreadPass { op, infeed, .. },
-                                ) if Some(*op) == app.selected => Some(*infeed),
+                                    crate::guide::LatheStep::ThreadPass { op, top, .. },
+                                ) if Some(*op) == app.selected => {
+                                    Some(crate::steps::dial_total(machine, top))
+                                }
                                 _ => None,
                             })
                             .collect()
                     })
-                    .filter(|v: &Vec<f32>| !v.is_empty());
-                // Only the Steps' own readings, as the dial reads them: no
-                // number from the plan first that could change under the
-                // reader when they are worked out (LIO-437).
+                    .filter(|v: &Vec<String>| !v.is_empty());
+                // Only the Steps' own readings: no number from the plan first
+                // that could change under the reader (LIO-437).
                 let said = match built {
-                    Some(infeeds) => {
-                        let readings: Vec<String> = (infeeds.iter())
-                            .map(|i| {
-                                let t = crate::guide::top_travel(*i, angle);
-                                format!("{:.2}", lathe::nearest(machine, lathe::Slide::Top, t))
-                            })
-                            .collect();
+                    Some(readings) => {
                         format!(
                             "{} passes, the top slide at {angle}° in to: {}.",
                             readings.len(),

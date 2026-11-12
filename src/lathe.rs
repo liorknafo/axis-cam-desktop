@@ -339,24 +339,6 @@ pub fn reads(m: &Machine, slide: Slide, reading: f32, out: bool) -> Option<f32> 
 /// `distance` rounded down to the `slide`'s division (in the user's terms,
 /// as `dial` takes it): the farthest a dial can be set without going past
 /// it. `distance` itself when the dial is not usable.
-/// `distance` to the nearest division of `slide`'s dial, as its dial reads
-/// it (LIO-437); as it is when the dial is not set.
-pub fn nearest(m: &Machine, slide: Slide, distance: f32) -> f32 {
-    let (turn_key, div_key) = slide.keys();
-    let turn = num(&m.p, turn_key).filter(|v| *v > 0.);
-    let div = num(&m.p, div_key).filter(|v| *v >= 1. && v.fract() == 0.);
-    let per = match (slide, cross_reads(m)) {
-        (Slide::Cross, Some("Radius")) => 2.,
-        _ => 1.,
-    };
-    match (turn, div) {
-        (Some(turn), Some(div)) => {
-            let step = turn as f64 / div as f64 * per;
-            ((distance as f64 / step).round() * step) as f32
-        }
-        _ => distance,
-    }
-}
 pub fn floor(m: &Machine, slide: Slide, distance: f32) -> f32 {
     let (turn_key, div_key) = slide.keys();
     let turn = num(&m.p, turn_key).filter(|v| *v > 0.);

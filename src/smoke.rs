@@ -6167,7 +6167,7 @@ flood = { pin = 8 }
             let _ = a.update(Message::Guide(GuideAction::Go(at)));
             let texts = page_texts(&a);
             assert!(
-                texts.iter().any(|t| t.contains(&readings[k])),
+                texts.iter().any(|t| *t == readings[k]), // the very number of the screen (LIO-437)
                 "{}: {texts:?}",
                 readings[k]
             );
