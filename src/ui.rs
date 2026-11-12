@@ -8681,12 +8681,7 @@ fn machine_bar(app: &App) -> Element<'_, Message> {
     let file = Help::text(
         "Project file",
         format!(
-            "{}{}: {}",
-            if fit.narrow {
-                format!("{} · ", workspace_note(app))
-            } else {
-                String::new()
-            },
+            "{}: {}",
             project_note(app),
             match &app.project_path {
                 Some(p) => p.display().to_string(),
@@ -8712,8 +8707,9 @@ fn machine_bar(app: &App) -> Element<'_, Message> {
             widget::tooltip::Position::Bottom,
         ))
     };
-    // Narrow, the workspace's note is on the title's hover unless saving failed.
-    if !fit.narrow || app.save_error.is_some() {
+    // One thing about saving, as on the planning page: the file's note, and
+    // this one only when a save failed (LIO-433).
+    if app.save_error.is_some() {
         bar = bar.push(text(workspace_note(app)).size(11).color(ON_DARK));
     }
     if let Some(c) = &app.control {
