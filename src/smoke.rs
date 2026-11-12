@@ -6132,6 +6132,14 @@ flood = { pin = 8 }
                 .cloned()
         };
         assert_eq!(first_section(&a).as_deref(), Some("From the part"));
+        // Before the Steps are worked out the tab gives no reading of its
+        // own, so none can change under the reader (LIO-437).
+        let _ = a.update(Message::Tab("Passes".into()));
+        assert!(
+            page_texts(&a)
+                .iter()
+                .any(|t| t.ends_with("once the Steps have worked them out."))
+        );
         // The Steps built, the planning page reads their passes.
         let _ = a.update(Message::Guide(GuideAction::Open(0)));
         crate::steps::tests::build(&mut a);
@@ -6346,7 +6354,8 @@ flood = { pin = 8 }
         assert!(
             page_texts(&a)
                 .iter()
-                .any(|t| t.contains(" passes, the top slide at 29.5° in to: "))
+                // The Steps' readings show once they are worked out (LIO-437).
+                .any(|t| t.contains(" passes, the top slide at 29.5°"))
         );
         // An Outside to Ø16 there already: only the Thread.
         let mut a = stud_app(|doc| {

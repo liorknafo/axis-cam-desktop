@@ -5005,8 +5005,6 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
                     .map(|v| v as usize)
                     .filter(|n| *n > 0)
                     .unwrap_or_else(|| crate::turn::thread_passes(pitch));
-                let outside = get(p, "thread_side") != "Inside";
-                let depth = crate::turn::thread_depth(outside, pitch);
                 let angle = crate::guide::top_angle(60.);
                 // The readings the Steps give, worked out once (LIO-437):
                 // the Steps' own passes when they are built (from the
@@ -5026,27 +5024,30 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
                             .collect()
                     })
                     .filter(|v: &Vec<f32>| !v.is_empty());
-                // The Steps' passes are set already: their travel as the
-                // dial reads it; the plan's are set as the Steps set them.
-                let travels: Vec<f32> = match built {
-                    Some(infeeds) => (infeeds.iter())
-                        .map(|i| crate::guide::top_travel(*i, angle))
-                        .collect(),
-                    None => {
-                        let infeeds = crate::turn::thread_infeeds(depth, n);
-                        crate::guide::thread_travels(machine, &infeeds, angle)
+                // Only the Steps' own readings, as the dial reads them: no
+                // number from the plan first that could change under the
+                // reader when they are worked out (LIO-437).
+                let said = match built {
+                    Some(infeeds) => {
+                        let readings: Vec<String> = (infeeds.iter())
+                            .map(|i| {
+                                let t = crate::guide::top_travel(*i, angle);
+                                format!("{:.2}", lathe::nearest(machine, lathe::Slide::Top, t))
+                            })
+                            .collect();
+                        format!(
+                            "{} passes, the top slide at {angle}° in to: {}.",
+                            readings.len(),
+                            readings.join(", ")
+                        )
                     }
+                    None => format!(
+                        "{n} passes, the top slide at {angle}°: its readings show here once the Steps have worked them out."
+                    ),
                 };
-                let n = travels.len();
-                let readings: Vec<String> = (travels.into_iter())
-                    .map(|t| format!("{:.2}", lathe::nearest(machine, lathe::Slide::Top, t)))
-                    .collect();
                 c.push(checks.hinted(p, "passes", "Passes", "Auto"))
                     .push(note("Leave Passes empty for the usual number for the pitch."))
-                    .push(note(format!(
-                        "{n} passes, the top slide at {angle}° in to: {}.",
-                        readings.join(", ")
-                    )))
+                    .push(note(said))
                     .into()
             }
             _ => c.into(),
