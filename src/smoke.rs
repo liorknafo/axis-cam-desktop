@@ -7015,7 +7015,8 @@ flood = { pin = 8 }
         assert!(has(&a, "Face: uses mist coolant"), "{:?}", problems(&a));
         let p = run_of(&a).checked().unwrap()[0].clone();
         let names: Vec<&str> = p.ops.iter().map(|o| o.name.as_str()).collect();
-        assert_eq!(names, ["Face", "Pocket", "Contour"]);
+        // Contour says its side (LIO-426).
+        assert_eq!(names, ["Face", "Pocket", "Contour · outside"]);
         assert!(p.starts.iter().all(Result::is_ok), "{:?}", p.starts);
         // The program from the Pocket: the tool change's safe start, then
         // the same blocks as the whole program, with nothing of the Facing.
@@ -7263,7 +7264,8 @@ flood = { pin = 8 }
         let steps = work_zero_steps(&a, conn(&a)).unwrap().join("\n");
         assert!(
             // Names by the tile's word (LIO-426), were "Facing", "Drilling".
-            steps.contains("taking Face, Pocket, Contour as cut")
+            // Contour says its side (LIO-426).
+            steps.contains("taking Face, Pocket, Contour · outside as cut")
                 && steps.contains("Load T3")
                 && steps.contains("Zero Z on the stock top and Probe Z are off")
                 && !steps.contains("Zero all"),
@@ -16157,7 +16159,7 @@ soft_max = 180.0
             lines[1],
             (
                 false,
-                "Setup 1 · Contour: Not checked. The operation has no spindle speed or feed."
+                "Setup 1 · Contour · outside: Not checked. The operation has no spindle speed or feed."
                     .into()
             )
         );
@@ -18996,6 +18998,8 @@ soft_max = 180.0
     }
     #[test]
     fn the_status_and_the_notes_say_what_is_checked_only_where_workholding_is_modelled() {
+        // The strip says "Show the cut, or Play the cut." on every machine
+        // (LIO-438), was "Generate the operation preview, or press …".
         use crate::ui::{Note, fixture_note, fixtures};
         const NOTES: [Note; 8] = [
             Note::Preview,
@@ -19033,7 +19037,7 @@ soft_max = 180.0
             ),
             (
                 Note::Playback,
-                "Generate the operation preview, or press Generate & play. Stock uses adaptive surface meshing and inherits earlier cuts; collision checking is not implemented.",
+                "Show the cut, or Play the cut. Stock uses adaptive surface meshing and inherits earlier cuts; collision checking is not implemented.",
             ),
         ];
         let dir = tempfile::tempdir().unwrap();
@@ -19052,7 +19056,7 @@ soft_max = 180.0
         }
         assert_eq!(
             a.playback_reason(),
-            "Generate the operation preview, or press Generate & play. Stock uses adaptive surface meshing and inherits earlier cuts; collision checks beyond the modelled vise jaws and clamps are not implemented."
+            "Show the cut, or Play the cut. Stock uses adaptive surface meshing and inherits earlier cuts; collision checks beyond the modelled vise jaws and clamps are not implemented."
         );
         assert_eq!(
             fixture_note(&a, Note::Passes),
@@ -19105,7 +19109,7 @@ soft_max = 180.0
         );
         assert_eq!(
             a.playback_reason(),
-            "Generate the operation preview, or press Generate & play. Stock uses adaptive surface meshing and inherits earlier cuts; collision checking is not implemented."
+            "Show the cut, or Play the cut. Stock uses adaptive surface meshing and inherits earlier cuts; collision checking is not implemented."
         );
         // None keeps the old wording too.
         a.doc.setups[0].p.insert("holding".into(), "None".into());
@@ -23226,7 +23230,7 @@ soft_max = 180.0
             };
             let has = |words: &str| texts.iter().any(|(t, _)| t.contains(words));
             (
-                y("OPERATION SIMULATION").unwrap(),
+                y("SIMULATION").unwrap(),
                 has("total removed"),
                 has(" · Spindle "),
                 has("Hide details"),
@@ -23256,7 +23260,7 @@ soft_max = 180.0
             .iter()
             .find(|(t, _)| t.contains("stock surface") || t.contains("finest cell"))
             .map_or(String::new(), |(t, _)| t.clone());
-        (top("OPERATION SIMULATION"), top("Drag to orbit"), stock)
+        (top("SIMULATION"), top("Drag to orbit"), stock)
     }
     /// While Play runs, every frame meshes the stock again in the background:
     /// the strip and the 3D view stand still through it, a quick update says
@@ -27756,6 +27760,8 @@ soft_max = 180.0
     }
     #[test]
     fn preview_rows_show_the_strategy_and_the_values_that_will_run() {
+        // Each operation by its tile's word, as the editor and the list say
+        // it (LIO-438): was "Facing", "Parallel finishing".
         use crate::proposal::tests::{block, good, op};
         let (doc, mesh, report) = block();
         let mut proposal = good(&report);
@@ -27785,7 +27791,7 @@ soft_max = 180.0
         assert_eq!(
             lines(0),
             [
-                "Facing · “Face by planner” · T1 Flat 10 · 1.3 min",
+                "Face · “Face by planner” · T1 Flat 10 · 1.3 min",
                 "8000 rpm · 1000 mm/min · coolant Flood · facing area stock silhouette · stepdown 2 mm · stepover 40% · bottom offset 0.5 mm",
                 "The planner's reason: Because.",
             ]
@@ -27812,7 +27818,7 @@ soft_max = 180.0
         assert_eq!(
             lines(4)[..2],
             [
-                "Parallel finishing · “Parallel by planner” · T1 Flat 10 · 1.3 min",
+                "Parallel · “Parallel by planner” · T1 Flat 10 · 1.3 min",
                 "8000 rpm · 1000 mm/min · coolant Flood · surface stepover 0.8 mm · tolerance 0.02 mm",
             ]
         );
@@ -31014,7 +31020,7 @@ soft_max = 180.0
             &a,
             &[
                 "NC review ▶",
-                "03  Preview",
+                "03  Simulation",
                 "04  NC review",
                 "Generate all",
             ],
@@ -31189,6 +31195,62 @@ soft_max = 180.0
         let sent = crate::ui::probe::clicks(a.view(), WINDOW);
         let open = Message::Guide(crate::GuideAction::Open(1));
         assert!(sent.iter().any(|m| format!("{m:?}") == format!("{open:?}")));
+    }
+    /// The CNC page speaks as the hand pages do (LIO-438): Show the cut and
+    /// Play the cut on every machine, one word for the panel and its tab, one
+    /// name for Generate all on a page whose way back is top left, the
+    /// planner's operations by their tiles' words and its page "AI planner".
+    #[test]
+    fn the_cnc_page_speaks_as_the_hand_pages_do() {
+        let mut a = imported_app();
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(0));
+        shows(&a, &["Show the cut", "SIMULATION", "03  Simulation"]);
+        lacks(
+            &a,
+            &[
+                "Generate operation preview",
+                "Generate & play",
+                "03  Preview",
+                "OPERATION SIMULATION",
+            ],
+        );
+        // The manual mill and the lathe: the same two buttons.
+        with_big_cutter(&mut a);
+        with_lathe(&mut a);
+        let _ = a.update(Message::AddManualSetup);
+        let m = (a.doc.setups.iter()).position(|s| crate::manual::is_manual(&s.machine));
+        let _ = a.update(Message::SelectSetup(m.unwrap()));
+        let _ = a.update(Message::AddOp(Strategy::Box));
+        shows(&a, &["Show the cut", "Play the cut"]);
+        let _ = a.update(Message::AddLatheSetup);
+        let l = (a.doc.setups.iter()).position(|s| crate::lathe::is_lathe(&s.machine));
+        let _ = a.update(Message::SelectSetup(l.unwrap()));
+        let _ = a.update(Message::AddTurn("Outside"));
+        shows(&a, &["Show the cut", "Play the cut"]);
+        // Generate all's page: the way back first, then Job checks.
+        a.page = Page::Audit;
+        let texts = page_texts(&a);
+        let back = texts.iter().position(|t| t == crate::ui::BACK).unwrap();
+        let title = texts.iter().position(|t| t == "Job checks").unwrap();
+        assert!(back < title, "{texts:?}");
+        lacks(
+            &a,
+            &[
+                "Check all enabled operations",
+                "Operation support & job checks",
+            ],
+        );
+        // The planner's preview and its page.
+        for s in [Strategy::Face, Strategy::Drill, Strategy::Adaptive] {
+            let mut op = crate::model::Operation::new(s, String::new());
+            op.p.insert("name".into(), "x".into());
+            let line = crate::ui::operation_lines(&op, "T1 Flat 10", 1., "")[0].clone();
+            assert!(line.starts_with(&format!("{} · ", s.short())), "{line}");
+        }
+        a.page = Page::Ai;
+        shows(&a, &["AI planner"]);
+        lacks(&a, &["AI machining planner"]);
     }
     /// The sample app with a lathe in the library and a lathe tool of each type.
     fn with_lathe(a: &mut App) {

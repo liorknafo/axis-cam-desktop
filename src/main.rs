@@ -3080,11 +3080,16 @@ impl App {
         }
         // A centre drilling's holes are the drill's it centres.
         centre::sync(&mut self.doc);
-        // A Drill's holes on the active setup, counted for its name (LIO-426).
+        // A Drill's holes, counted for its name when they are picked
+        // (LIO-426): only then, so that an edit, an undo or another setup
+        // opened never renames a Drill the user did not touch (LIO-438).
         let counts: Vec<(usize, usize)> = match &self.imported_mesh {
-            Some(mesh) if !self.is_sample() && self.doc.active_setup().is_some() => {
+            Some(mesh)
+                if self.picking && !self.is_sample() && self.doc.active_setup().is_some() =>
+            {
                 let setup = self.doc.setup();
                 (setup.operations.iter().enumerate())
+                    .filter(|(i, _)| self.selected == Some(*i))
                     .filter(|(_, o)| o.strategy == Strategy::Drill && !o.on_centre(&setup.machine))
                     .filter_map(|(i, o)| {
                         let holes = self.drill_holes(o, mesh);
