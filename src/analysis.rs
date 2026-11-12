@@ -1661,10 +1661,6 @@ pub struct Precondition {
     /// What to do when it is not met.
     pub hint: String,
 }
-/// What the planner says when the first setup it reads (`planning`: the
-/// hand setups before the first CNC one left out) is on a hand machine,
-/// which is so when no setup is on a CNC.
-pub const HAND_ONLY: &str = "The planner starts from a CNC setup today.";
 /// What must be in place before a plan can be requested or checked.
 pub fn preconditions(doc: &Document, mesh: Option<&Mesh>) -> Vec<Precondition> {
     let line = |label, problem: Option<String>| Precondition {
@@ -1678,10 +1674,14 @@ pub fn preconditions(doc: &Document, mesh: Option<&Mesh>) -> Vec<Precondition> {
     let doc = &*planning(doc);
     let setup = match doc.setups.first() {
         None => Some("Create setup 1 with your machine and stock.".to_string()),
-        // ponytail: said plainly until a job on the hand machines alone is
-        // planned (LIO-430, its item 3).
+        // A job on the hand machines alone is planned too (LIO-430): it
+        // makes no program, so no post or CNC limits are asked of it.
         Some(setup1) if crate::manual::is_hand(&setup1.machine) => {
-            Some(HAND_ONLY.to_string())
+            crate::stock::resolve(setup1, mesh).err().or_else(|| {
+                up_axis(setup1).is_none().then(|| {
+                    "Setup 1 must be square to the part: use rotations that are multiples of 90°.".into()
+                })
+            })
         }
         Some(setup1) => crate::post::PostSettings::for_machine(&setup1.machine)
             .err()
@@ -1705,7 +1705,7 @@ pub fn preconditions(doc: &Document, mesh: Option<&Mesh>) -> Vec<Precondition> {
     };
     vec![
         line("Imported part", part),
-        line("Setup 1: 3-axis LinuxCNC or UC100 machine and stock", setup),
+        line("Setup 1: a machine and stock", setup),
         line("Material", material),
         line("Tool library", tools),
     ]
@@ -1967,14 +1967,15 @@ fn describe(
         part_size: mesh.dimensions.map(r2),
         material: material_report(doc)?,
         machine: machine_report(&setup1.machine)?,
-        machines: if machines.len() > 1 {
+        // A job on a hand machine alone lists it too (LIO-430).
+        machines: if machines.len() > 1 || crate::manual::is_hand(&setup1.machine) {
             (machines.iter().enumerate())
                 .map(|(i, m)| machine_entry(i + 1, m))
                 .collect::<Result<_, _>>()?
         } else {
             vec![]
         },
-        work_zero: (machines.len() > 1)
+        work_zero: (machines.len() > 1 || crate::manual::is_hand(&setup1.machine))
             .then(|| work_zero(setup1, mesh))
             .flatten(),
         tools: doc
@@ -2254,10 +2255,7 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(
             unmet,
-            [(
-                "Setup 1: 3-axis LinuxCNC or UC100 machine and stock",
-                problem.to_string()
-            )]
+            [("Setup 1: a machine and stock", problem.to_string())]
         );
         doc.setups[0].p.insert("vise_axis".into(), "Y".into());
         assert!(report(&doc, &mesh).is_ok());
@@ -2567,10 +2565,7 @@ pub(crate) mod tests {
         assert!(unmet(&doc, Some(&mesh)).is_empty());
         assert_eq!(
             unmet(&doc, None),
-            vec![
-                "Imported part",
-                "Setup 1: 3-axis LinuxCNC or UC100 machine and stock"
-            ]
+            vec!["Imported part", "Setup 1: a machine and stock"]
         );
         let mut other = doc.clone();
         other.setups[0]

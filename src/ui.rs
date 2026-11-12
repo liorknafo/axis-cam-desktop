@@ -1220,10 +1220,10 @@ pub fn view(app: &App) -> Element<'_, Message> {
                     "UC100" => format!("mm  |  {} · runs from MACHINE", s.machine.name()),
                     _ => format!("mm  |  {} · LinuxCNC program", s.machine.name()),
                 }
-            } else if app.page == Page::Home {
-                "mm".to_string()
             } else {
-                "mm  |  Bounded mesh previews · LinuxCNC 3-axis and indexed A post".to_string()
+                // No setup yet, or the Start page: no machine to name
+                // (LIO-433).
+                "mm".to_string()
             })
             .size(12)
             .color(MUTED)

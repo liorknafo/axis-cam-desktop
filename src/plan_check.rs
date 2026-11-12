@@ -3490,6 +3490,50 @@ mod tests {
             refused.problems
         );
     }
+    /// A job on the manual mill alone is planned and checked the way a
+    /// hand setup is checked today, with no G-code checks (LIO-430): a Box
+    /// facing the top and the hand drill's holes pass.
+    #[test]
+    fn a_job_on_the_manual_mill_alone_is_planned() {
+        use crate::proposal::tests::{drilled_by_hand, facing_box, milled, with_mill};
+        let (mut doc, mesh, _) = with_mill();
+        doc.add_manual_setup().unwrap();
+        doc.setups.retain(|s| crate::manual::is_manual(&s.machine));
+        doc.active = doc.setups[0].id.clone();
+        let report = crate::analysis::report(&doc, &mesh).unwrap();
+        assert_eq!(report.machines.len(), 1, "{:?}", report.machines);
+        let drill = drilled_by_hand(&report).setups.pop().unwrap().operations;
+        let mut plan = milled(&report);
+        plan.setups.truncate(1);
+        plan.setups[0].machine = Some(1);
+        plan.setups[0].operations = vec![facing_box()];
+        plan.setups[0].operations.extend(drill);
+        let (c, _) = check(&doc, &mesh, &report, &plan);
+        assert!(c.passed, "{:?}", c.problems);
+    }
+    /// A job on the lathe alone is planned and checked the same way
+    /// (LIO-430): the lathe faces and turns to Ø30, sized to its own bar.
+    #[test]
+    fn a_job_on_the_lathe_alone_is_planned() {
+        let (mut doc, mesh, _) = crate::proposal::tests::with_lathe();
+        doc.add_lathe_setup(Some(&mesh)).unwrap();
+        doc.setups.retain(|s| crate::lathe::is_lathe(&s.machine));
+        doc.active = doc.setups[0].id.clone();
+        let report = crate::analysis::report(&doc, &mesh).unwrap();
+        assert_eq!(report.machines.len(), 1, "{:?}", report.machines);
+        let mut plan = crate::proposal::tests::turned(&report);
+        plan.setups.truncate(1);
+        plan.setups[0].machine = Some(1);
+        // The face and the turn to Ø30: this setup's own bar leaves less
+        // to face than the fixture's, so its later Z's would not fit.
+        plan.setups[0].operations.retain(|o| o.strategy == "Turn");
+        plan.setups[0].operations.truncate(2);
+        if let Some(t) = plan.setups[0].operations[0].turn.as_mut() {
+            t.face_off = Some(0.5);
+        }
+        let (c, _) = check(&doc, &mesh, &report, &plan);
+        assert!(c.passed, "{:?}", c.problems);
+    }
     #[test]
     fn a_planned_manual_facing_in_front_passes_and_the_model_gets_its_minutes_and_zeros() {
         use crate::proposal::tests::{milled, with_mill};
