@@ -1,6 +1,7 @@
 //! Separate process isolates CAD conversion from the GUI and enforces a timeout.
 use std::{
     fs,
+    io::Read,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{Mutex, MutexGuard},
@@ -47,6 +48,12 @@ pub fn skip_without_helper() -> bool {
 }
 
 const TIMEOUT: Duration = Duration::from_secs(120);
+/// How long reading the first bytes of the file may take before the import
+/// stops and says why. A local file answers in milliseconds; a read that
+/// takes longer is most likely waiting on macOS asking whether the app may
+/// open files in that folder (LIO-444), which the converter would wait on
+/// for the whole `TIMEOUT`.
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The converters being waited for, which `kill_running` ends. A converter is
 /// registered here from its start until it has exited, so that a process that
@@ -105,18 +112,108 @@ fn poll(running: &Running, pid: u32) -> Poll {
 /// them (`mesh::stl_faces`).
 pub type Faces = (Vec<[[f32; 3]; 3]>, Option<Vec<u32>>);
 pub fn load(path: &Path) -> Result<Faces, String> {
-    let bytes = convert(&RUNNING, &helper()?, path, TIMEOUT)?;
+    let bytes = convert(&RUNNING, &helper()?, path, READ_TIMEOUT, TIMEOUT)?;
     Ok((super::mesh::stl(&bytes)?, super::mesh::stl_faces(&bytes)))
 }
 
-// Split from `load` so a test can run a stand-in converter under a short timeout,
-// registered in a slot of its own.
+/// A read of a file's first bytes, shared by every import of that path
+/// while it has not answered: its outcome once it has.
+type Pending = std::sync::Arc<(Mutex<Option<Result<(), String>>>, std::sync::Condvar)>;
+/// The reads that have not answered yet, by path. However often an import of
+/// a held file is retried, it waits on the one read already outstanding, so
+/// no more than one thread per path waits on macOS.
+static READS: Mutex<Vec<(PathBuf, Pending)>> = Mutex::new(Vec::new());
+
+fn reads() -> MutexGuard<'static, Vec<(PathBuf, Pending)>> {
+    READS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether this process can read `path`, found by reading its first bytes on
+/// a thread of its own and waiting at most `timeout` for them. A read macOS
+/// holds until someone answers its folder-permission prompt is left to
+/// finish on that thread, and a retry meanwhile waits on it; once it has
+/// answered nothing is remembered, so the next import reads afresh.
+fn readable(path: &Path, timeout: Duration) -> Result<(), String> {
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let read = {
+        let mut pending = reads();
+        match pending.iter().find(|(p, _)| p == path) {
+            Some((_, read)) => read.clone(),
+            None => {
+                let read = Pending::default();
+                let (owned, shared, named) = (path.to_path_buf(), read.clone(), name.clone());
+                std::thread::Builder::new()
+                    .name("step-read-check".into())
+                    .spawn(move || {
+                        let outcome = fs::File::open(&owned)
+                            .and_then(|mut f| f.read(&mut [0; 64]))
+                            .map(|_| ())
+                            .map_err(|e| unreadable(&named, &e));
+                        *shared.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+                        shared.1.notify_all();
+                        reads().retain(|(_, r)| !std::sync::Arc::ptr_eq(r, &shared));
+                    })
+                    .map_err(|e| format!("{name} could not be read: {e}."))?;
+                pending.push((path.to_path_buf(), read.clone()));
+                read
+            }
+        }
+    };
+    let (outcome, answered) = &*read;
+    let outcome = outcome.lock().unwrap_or_else(|e| e.into_inner());
+    let (outcome, _) = answered
+        .wait_timeout_while(outcome, timeout, |o| o.is_none())
+        .unwrap_or_else(|e| e.into_inner());
+    outcome
+        .clone()
+        .unwrap_or_else(|| Err(waiting(&name, timeout)))
+}
+
+/// The settings pane that gives an app a protected folder (Documents,
+/// Desktop, Downloads, iCloud Drive, a removable or network volume).
+#[cfg(target_os = "macos")]
+const FILES_AND_FOLDERS: &str = "System Settings › Privacy & Security › Files and Folders";
+
+/// Why a read that has not answered within `timeout` waits.
+fn waiting(name: &str, timeout: Duration) -> String {
+    let secs = timeout.as_secs_f32();
+    #[cfg(target_os = "macos")]
+    return format!(
+        "{name} could not be read within {secs} s. macOS is probably asking whether AXIS CAM Studio may open files in its folder: click Allow in that prompt, or turn the folder on for AXIS CAM Studio in {FILES_AND_FOLDERS}. Then reimport the model."
+    );
+    #[cfg(not(target_os = "macos"))]
+    format!(
+        "{name} could not be read within {secs} s: the drive or network folder that holds it is not answering. Once it does, reimport the model."
+    )
+}
+
+/// Why a read failed; on macOS a refused folder permission (EPERM) names
+/// where to give it.
+fn unreadable(name: &str, e: &std::io::Error) -> String {
+    #[cfg(target_os = "macos")]
+    if e.raw_os_error() == Some(libc::EPERM) {
+        return format!(
+            "macOS did not let AXIS CAM Studio read {name}. Turn its folder on for AXIS CAM Studio in {FILES_AND_FOLDERS}, then reimport the model."
+        );
+    }
+    format!("{name} could not be read: {e}.")
+}
+
+// Split from `load` so a test can run a stand-in converter under short
+// timeouts, registered in a slot of its own.
 fn convert(
     running: &Running,
     helper: &Path,
     path: &Path,
+    read_timeout: Duration,
     timeout: Duration,
 ) -> Result<Vec<u8>, String> {
+    // Before the converter starts: it would wait on the same read for the
+    // whole `timeout` and be reported as a slow conversion.
+    readable(path, read_timeout)?;
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
     let bundled = executable.components().any(|p| p.as_os_str() == "Contents");
     let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
@@ -192,7 +289,7 @@ mod tests {
         let path = dir.path().join("converter.sh");
         fs::write(&path, script).unwrap();
         let start = Instant::now();
-        let result = convert(running, Path::new("/bin/sh"), &path, timeout)
+        let result = convert(running, Path::new("/bin/sh"), &path, READ_TIMEOUT, timeout)
             .and_then(|bytes| super::super::mesh::stl(&bytes));
         (result, start.elapsed())
     }
@@ -239,6 +336,129 @@ mod tests {
         );
         // Returned when the timeout passed, not when the 60 s sleep ended.
         assert!(took >= Duration::from_millis(300) && took < Duration::from_secs(20));
+    }
+
+    /// A file whose read macOS holds while its folder-permission prompt is
+    /// open, stood in for by a FIFO, whose open waits for a writer the same
+    /// way: the import stops after the short read timeout, without starting
+    /// the converter, and says why. Once the read answers (permission
+    /// given), the next import of the same path converts it.
+    #[test]
+    fn a_file_that_cannot_be_read_yet_is_reported_soon_and_converts_once_it_can() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("adapter-plate.step");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let running = Running::default();
+        let start = Instant::now();
+        // A converter that does not exist: had it been started, the error
+        // would say it could not be.
+        let result = convert(
+            &running,
+            &dir.path().join("no-converter"),
+            &path,
+            Duration::from_millis(300),
+            Duration::from_secs(60),
+        );
+        let took = start.elapsed();
+        let message = result.unwrap_err();
+        assert_eq!(
+            message,
+            waiting("adapter-plate.step", Duration::from_millis(300))
+        );
+        assert!(message.starts_with("adapter-plate.step could not be read within 0.3 s"));
+        assert!(message.ends_with("reimport the model."), "{message}");
+        if cfg!(target_os = "macos") {
+            assert!(
+                message.contains(
+                    "click Allow in that prompt, or turn the folder on for AXIS CAM Studio in System Settings › Privacy & Security › Files and Folders"
+                ),
+                "{message}"
+            );
+        }
+        assert!(took >= Duration::from_millis(300) && took < Duration::from_secs(20));
+        assert!(locked(&running).is_empty());
+        // Retried while it is still held: each retry waits on the one read
+        // already outstanding instead of leaving another thread behind.
+        for _ in 0..5 {
+            let again = convert(
+                &running,
+                &dir.path().join("no-converter"),
+                &path,
+                Duration::from_millis(50),
+                Duration::from_secs(60),
+            );
+            assert_eq!(
+                again.unwrap_err(),
+                waiting("adapter-plate.step", Duration::from_millis(50))
+            );
+        }
+        assert_eq!(reads().iter().filter(|(p, _)| p == &path).count(), 1);
+
+        // Permission given: the held read answers (the check's thread ends)
+        // and the file can be read.
+        drop(fs::OpenOptions::new().write(true).open(&path).unwrap());
+        let start = Instant::now();
+        while reads().iter().any(|(p, _)| p == &path) {
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "the read never ended"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fs::remove_file(&path).unwrap();
+        let triangle = dir.path().join("triangle.stl");
+        let mut stl = vec![0u8; 80];
+        stl.extend(1u32.to_le_bytes());
+        stl.extend([0u8; 12]);
+        for x in [0f32, 0., 0., 1., 0., 0., 0., 1., 0.] {
+            stl.extend(x.to_le_bytes());
+        }
+        stl.extend([0u8; 2]);
+        fs::write(&triangle, stl).unwrap();
+        fs::write(&path, format!("cat '{}' > \"$1\"", triangle.display())).unwrap();
+        let bytes = convert(
+            &running,
+            Path::new("/bin/sh"),
+            &path,
+            Duration::from_millis(300),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert_eq!(
+            super::super::mesh::stl(&bytes).unwrap(),
+            vec![[[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]]]
+        );
+    }
+
+    /// A read macOS refused (the prompt answered Don't Allow, or the folder
+    /// turned off) names where to allow it; any other error is passed on.
+    #[test]
+    fn a_refused_read_names_where_to_allow_it() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            unreadable("part.step", &std::io::Error::from_raw_os_error(libc::EPERM)),
+            "macOS did not let AXIS CAM Studio read part.step. Turn its folder on for AXIS CAM Studio in System Settings › Privacy & Security › Files and Folders, then reimport the model."
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone.step");
+        let message = convert(
+            &Running::default(),
+            Path::new("/bin/sh"),
+            &missing,
+            READ_TIMEOUT,
+            Duration::from_secs(60),
+        )
+        .unwrap_err();
+        assert!(
+            message.starts_with("gone.step could not be read: No such file or directory"),
+            "{message}"
+        );
     }
 
     #[test]
