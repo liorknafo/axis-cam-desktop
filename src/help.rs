@@ -1167,6 +1167,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Remove this operation's saved surface selections so you can choose new surfaces on the current part.",
             "",
         ),
+        AllCorners => (
+            "Pick every rounded outside corner of the part for Round corners: each quarter round between a wall along X and one along Y, as this setup holds the part. Click a corner afterwards to drop it.",
+            "",
+        ),
         BoxFromFace => (
             "Fill the six Box fields again from the face picked on this operation, after the stock or the work zero changed; a click on a face fills them at once. A floor is grown to the stock's edge or the next part material above it. A wall is cut from the wall out to the stock's edge. The numbers are in the setup's frame from the work zero.",
             "",
@@ -4899,6 +4903,7 @@ mod tests {
             MoveOp(1),
             PickMode,
             BoxFromFace,
+            AllCorners,
             PickPinHoles,
             PlacePins,
             AddPinDrilling,

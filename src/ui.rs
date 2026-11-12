@@ -1645,7 +1645,7 @@ pub(crate) fn ribbon_tiles(
         return vec![("LATHE", tiles.collect())];
     }
     if machine.is_some_and(manual::is_manual) {
-        return vec![("MANUAL MILL", vec![Op(Box), Op(Drill), Thread])];
+        return vec![("MANUAL MILL", vec![Op(Box), Op(Drill), Thread, Op(Corner)])];
     }
     vec![
         (
@@ -1698,6 +1698,7 @@ pub(crate) fn pick_line(o: &Operation) -> &'static str {
         Strategy::Drill => "Click a hole on the part.",
         Strategy::Chamfer => "Click the level face whose edges are chamfered.",
         Strategy::Groove => "Click the wall of the bore the groove goes in.",
+        Strategy::Corner => "Click a rounded outside corner of the part.",
         _ => "Click a face on the part.",
     }
 }
@@ -4295,6 +4296,68 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 c = c.push(row![checks.field(p, a.0, a.1), checks.field(p, b.0, b.1)].spacing(9));
             }
         }
+        // Round corners: its corners picked on the part (LIO-443).
+        "Corners" => {
+            let corners = app
+                .part_mesh()
+                .filter(|_| !app.is_sample())
+                .map(|mesh| crate::corner::picked(app.doc.setup(), mesh, o));
+            c = c
+                .push(section("From the part"))
+                .push(note("Click the round face of each corner to round: all its facets are picked, blue. Click it again to drop it. Or pick every rounded outside corner at once. Drag to orbit."));
+            if app.part_mesh().is_some() && !app.is_sample() {
+                c = c
+                    .push(if app.picking {
+                        Element::from(btn("Stop picking", Message::PickMode, true).width(Fill))
+                    } else {
+                        secondary("Pick on the part", Message::PickMode)
+                            .width(Fill)
+                            .into()
+                    })
+                    .push(secondary("Pick all outside corners", Message::AllCorners).width(Fill));
+            }
+            match corners {
+                Some(Ok(found)) => {
+                    c = c.push(section(format!(
+                        "{} corner{} picked",
+                        found.len(),
+                        if found.len() == 1 { "" } else { "s" }
+                    )));
+                    let zero = app
+                        .known_stock(app.doc.index())
+                        .0
+                        .zip(app.part_mesh())
+                        .and_then(|(s, mesh)| crate::post::datum(app.doc.setup(), s, mesh).ok());
+                    for (i, k) in found.iter().enumerate() {
+                        let at = match zero {
+                            Some(z) => format!(
+                                " · centre X{:.2} Y{:.2}",
+                                k.centre[0] - z[0],
+                                k.centre[1] - z[1]
+                            ),
+                            None => String::new(),
+                        };
+                        c = c.push(muted(format!(
+                            "{}. {} · R{} · {} deep{at}",
+                            i + 1,
+                            k.place(),
+                            mm(k.r),
+                            mm(k.top - k.bottom)
+                        )));
+                    }
+                }
+                Some(Err(e)) => c = c.push(caution("No corners", vec![e])),
+                None => {}
+            }
+            // Conventional: counter-clockwise round the part with the
+            // spindle clockwise, clockwise with it counter-clockwise.
+            let way = if facing_setting(p, "spindle_rotation") == "Counterclockwise (CCW)" {
+                "clockwise round the part, conventional with the spindle counter-clockwise (M4)"
+            } else {
+                "counter-clockwise round the part, conventional with the spindle clockwise (M3)"
+            };
+            c = c.push(note(format!("The end mill's side walks round each corner in DRO steps, one axis at a time, {way}: each step leaves at most the scallop set under Passes, filed to the line after. Stock past the round is taken first in bands no wider than the stepover.")));
+        }
         // A Thread asks for the part first too (LIO-437).
         "Turn" if o.is_thread() => {
             c = c
@@ -5063,6 +5126,14 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
             .push(checks.field(p, "stepover", "Stepover · % tool diameter"))
             .push(checks.hinted(p, "stepdown", "Maximum stepdown · mm", "Auto"))
             .push(note("Stock to leave stays on every side that touches the part, for the CNC to finish; 0 makes the cut final. Leave the stepdown empty for Auto."))
+            .into();
+    }
+    if s == Strategy::Corner {
+        return c
+            .push(checks.field(p, "scallop", "Scallop left between steps · mm"))
+            .push(checks.field(p, "stepover", "Band before the last walk · % tool diameter"))
+            .push(checks.hinted(p, "stepdown", "Maximum stepdown · mm", "Auto"))
+            .push(note("The smaller the scallop, the more steps round each corner; 0.05 mm files off in a few strokes. Stock standing more than a band off the round is taken in walks a band apart first. Leave the stepdown empty for Auto."))
             .into();
     }
     if s == Strategy::Chamfer {

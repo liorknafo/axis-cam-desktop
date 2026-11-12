@@ -31559,11 +31559,11 @@ soft_max = 180.0
         assert_eq!(tiles(&a), cnc);
         assert_eq!(dimmed(&a), 0);
         lacks(&a, &["Indexed", "MANUAL MILL", "LATHE"]);
-        // The manual mill: Box, Drill, Thread.
+        // The manual mill: Box, Drill, Thread, Corner (LIO-443).
         let _ = a.update(Message::AddManualSetup);
         a.doc.active = a.doc.setups[0].id.clone();
         a.selected = None;
-        assert_eq!(tiles(&a), ["Box", "Drill", "Thread"]);
+        assert_eq!(tiles(&a), ["Box", "Drill", "Thread", "Corner"]);
         assert_eq!(dimmed(&a), 0);
         shows(&a, &["MANUAL MILL"]);
         // The lathe: a tile per cut, then Thread and Drill.
@@ -32107,7 +32107,7 @@ soft_max = 180.0
                 Some("Tool"),
             ),
             (
-                "The big mill cuts one axis at a time: use Box or Drill.",
+                "The big mill cuts one axis at a time: use Box, Drill or Corner.",
                 None,
             ),
             ("Box runs on a manual mill.", None),
@@ -32564,5 +32564,272 @@ soft_max = 180.0
         // (LIO-361): here 2.2 million circle fits, about 59,000 since.
         let cost = fits() - before;
         assert!(cost < 200_000, "{cost} circle fits");
+    }
+
+    /// The adapter plate face up in the vise on the manual mill (LIO-443),
+    /// imported, with its Round corners taken off: no operation yet.
+    fn plate_app() -> App {
+        let mut a = app();
+        let (doc, mesh) = crate::corner::tests::plate_job("Y");
+        a.doc = doc;
+        a.doc.setups[0].operations.clear();
+        a.doc.file = Some(ModelFile {
+            name: "adapter-plate.stl".into(),
+            path: "adapter-plate.stl".into(),
+            format: "stl".into(),
+            bytes: 1,
+            thickness: None,
+        });
+        a.imported_mesh = Some(mesh);
+        a.selected = None;
+        a.page = Page::Work;
+        a
+    }
+    #[test]
+    fn round_corners_is_picked_on_the_part_by_a_click_or_all_at_once_and_walked_on_the_steps() {
+        use crate::{GuideAction, guide::Step};
+        let mut a = plate_app();
+        // On the manual mill's toolbar.
+        let tiles = crate::ui::ribbon_tiles(Some(&a.doc.setups[0].machine));
+        assert!(
+            tiles[0].1.contains(&crate::ui::Tile::Op(Strategy::Corner)),
+            "{tiles:?}"
+        );
+        let _ = a.update(Message::AddOp(Strategy::Corner));
+        assert_eq!(a.tab, "Corners");
+        assert!(a.picking);
+        assert!(
+            a.status.contains("Click a rounded outside corner"),
+            "{}",
+            a.status
+        );
+        let texts = page_texts(&a);
+        assert!(
+            texts.iter().any(|t| t == "Pick all outside corners"),
+            "{texts:?}"
+        );
+        // A click on a facet of the back left corner picks the whole corner;
+        // again drops it.
+        let (setup, mesh) = (a.doc.setup().clone(), a.part_mesh().unwrap().clone());
+        let corners = crate::corner::all(&setup, &mesh);
+        assert_eq!(corners.len(), 4);
+        let back_left = &corners[1];
+        let _ = a.update(Message::Surface(back_left.walls[4]));
+        assert_eq!(a.status, "Picked the back left (X− Y+) corner, R5.");
+        let picked = |a: &App| {
+            let mut ids = a
+                .operation()
+                .unwrap()
+                .surfaces
+                .as_ref()
+                .unwrap()
+                .ids
+                .clone();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(picked(&a), back_left.walls);
+        let texts = page_texts(&a);
+        assert!(texts.iter().any(|t| t == "1 corner picked"), "{texts:?}");
+        assert!(
+            texts.iter().any(|t| t
+                .starts_with("1. back left (X− Y+) · R5 · 20 deep · centre X−62.00 Y39.00")
+                || t.starts_with("1. back left (X− Y+) · R5 · 20 deep · centre X-62.00 Y39.00")),
+            "{texts:?}"
+        );
+        let _ = a.update(Message::Surface(back_left.walls[0]));
+        assert_eq!(a.status, "Dropped the back left (X− Y+) corner, R5.");
+        assert!(picked(&a).is_empty());
+        // A flat wall is no corner, and says what to click.
+        let wall = (0..mesh.surfaces.len())
+            .find(|&i| {
+                crate::pocket::is_wall(&setup, &mesh, i)
+                    && !corners.iter().any(|c| c.walls.contains(&i))
+            })
+            .unwrap();
+        let _ = a.update(Message::Surface(wall));
+        assert_eq!(a.status, crate::corner::NOT_A_CORNER);
+        // All four at once.
+        let _ = a.update(Message::AllCorners);
+        assert_eq!(a.status, "Picked all 4 rounded outside corners: R5.");
+        assert_eq!(
+            picked(&a).len(),
+            corners.iter().map(|c| c.walls.len()).sum::<usize>()
+        );
+        let texts = page_texts(&a);
+        assert!(texts.iter().any(|t| t == "4 corners picked"), "{texts:?}");
+        // The way round follows the spindle.
+        let ccw = "clockwise round the part, conventional with the spindle counter-clockwise (M4)";
+        assert!(!page_texts(&a).iter().any(|t| t.contains(ccw)));
+        let spin = |a: &mut App, way: &str| {
+            let o = &mut a.doc.setup_mut().operations[0];
+            o.p.insert("spindle_rotation".into(), way.into());
+        };
+        spin(&mut a, "Counterclockwise (CCW)");
+        assert!(
+            page_texts(&a).iter().any(|t| t.contains(ccw)),
+            "{:?}",
+            page_texts(&a)
+        );
+        spin(&mut a, "Clockwise (CW)");
+        // The scallop and the stepdown under Passes.
+        let _ = a.update(Message::Tab("Passes".into()));
+        let texts = page_texts(&a);
+        assert!(
+            texts.iter().any(|t| t == "Scallop left between steps · mm"),
+            "{texts:?}"
+        );
+        // The Steps: a walk screen with its numbers, then the File screen.
+        let _ = a.update(Message::Guide(GuideAction::Open(0)));
+        crate::steps::tests::build(&mut a);
+        let g = a.current_guide().unwrap().as_ref().unwrap().guide.clone();
+        let walk = g
+            .steps
+            .iter()
+            .position(|s| matches!(s, Step::Corner { .. }))
+            .unwrap();
+        let _ = a.update(Message::Guide(GuideAction::Go(walk)));
+        let texts = page_texts(&a);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.to_lowercase() == "corner 1 of 4 · back right (x+ y+) · r5"),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|t| t == "Walk done ▶"), "{texts:?}");
+        assert!(
+            texts.iter().any(|t| t == "DRO comp off: centres"),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("X only ever down, Y only ever up")),
+            "{texts:?}"
+        );
+        let Step::Corner { targets, .. } = &g.steps[walk] else {
+            unreachable!()
+        };
+        let first_feed = targets.iter().find(|t| t.feed).unwrap();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.ends_with(&crate::steps::tests::dro_of(first_feed.centre))),
+            "{texts:?}"
+        );
+        let file = g
+            .steps
+            .iter()
+            .position(|s| matches!(s, Step::Check { .. }))
+            .unwrap();
+        let _ = a.update(Message::Guide(GuideAction::Go(file)));
+        let texts = page_texts(&a);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t == "file the scallops to the line · the most left between two steps"),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|t| t == "File"), "{texts:?}");
+        // The most left, rounded up to the DRO's hundredths: a bound still.
+        let most = (g.steps.iter())
+            .filter_map(|s| match s {
+                Step::Corner {
+                    offset, scallop, ..
+                } if *offset == 0. => Some(*scallop),
+                _ => None,
+            })
+            .fold(0., f32::max);
+        assert!(most > 0.04 && most < 0.05, "{most}");
+        assert!(texts.iter().any(|t| t == "0.05"), "{texts:?}");
+    }
+    /// Pictures of Round corners on the adapter plate (LIO-443): the
+    /// Corners tab with all four picked, the 3D view with the toolpath, a
+    /// walk's screen and the File screen, as PNGs in `$AXIS_RENDER_DIR`
+    /// (default /tmp/round-corners). With `$AXIS_PLATE` the plate's own STL
+    /// instead of the outline made here.
+    #[test]
+    #[ignore]
+    fn render_round_corners_on_the_adapter_plate() {
+        use crate::{GuideAction, guide::Step};
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/round-corners".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let mut a = plate_app();
+        if let Ok(path) = std::env::var("AXIS_PLATE") {
+            let mesh = crate::mesh::load(std::path::Path::new(&path)).unwrap();
+            a.imported_mesh = Some(mesh);
+        }
+        let size = iced::Size::new(1600., 1000.);
+        let _ = a.update(Message::AddOp(Strategy::Corner));
+        let started = std::time::Instant::now();
+        let _ = a.update(Message::AllCorners);
+        let pick_time = started.elapsed();
+        let _ = a.update(Message::Camera("ISO"));
+        let _ = a.view();
+        render_png(&a, size, &out.join("1-corners-tab.png"));
+        let _ = a.update(Message::Tab("Passes".into()));
+        let _ = a.view();
+        render_png(&a, size, &out.join("2-passes-tab.png"));
+        let started = std::time::Instant::now();
+        let _ = a.update(Message::Guide(GuideAction::Open(0)));
+        crate::steps::tests::build(&mut a);
+        let steps_time = started.elapsed();
+        let g = a.current_guide().unwrap().as_ref().unwrap().guide.clone();
+        let mut said = format!(
+            "{}\npick all: {pick_time:?}; steps: {steps_time:?}\n",
+            a.status
+        );
+        for (i, s) in g.steps.iter().enumerate() {
+            if let Step::Corner {
+                index,
+                corner,
+                offset,
+                z,
+                scallop,
+                points,
+                targets,
+                ..
+            } = s
+            {
+                said += &format!(
+                    "walk {index}: corner {corner} offset {offset} z {z} scallop {scallop:.4} readings {} targets {}\n",
+                    points.len(),
+                    targets.len()
+                );
+                if *index <= 2
+                    || *index + 1
+                        == g.steps
+                            .iter()
+                            .filter(|s| matches!(s, Step::Corner { .. }))
+                            .count()
+                {
+                    let _ = a.update(Message::Guide(GuideAction::Go(i)));
+                    for _ in 0..6 {
+                        let _ = a.update(Message::Guide(GuideAction::Reached(a.guide_item)));
+                    }
+                    let _ = a.view();
+                    render_png(&a, size, &out.join(format!("3-walk-{index}.png")));
+                    for t in targets {
+                        said += &format!(
+                            "  {} {:.2}{}\n",
+                            ["X", "Y", "Z"][t.axis],
+                            t.centre,
+                            if t.feed { " feed" } else { "" }
+                        );
+                    }
+                }
+            }
+        }
+        let file = g
+            .steps
+            .iter()
+            .position(|s| matches!(s, Step::Check { .. }))
+            .unwrap();
+        let _ = a.update(Message::Guide(GuideAction::Go(file)));
+        let _ = a.view();
+        render_png(&a, size, &out.join("4-file.png"));
+        std::fs::write(out.join("said.txt"), said).unwrap();
     }
 }

@@ -8,6 +8,7 @@ mod choice_diagram;
 mod choice_help;
 mod chuck;
 mod control;
+mod corner;
 mod dxf;
 mod envelope;
 mod facing;
@@ -282,6 +283,8 @@ pub enum Message {
     DropHole(usize),
     ClearSurfaces,
     BoxFromFace,
+    /// Round corners: pick every rounded outside corner of the part (LIO-443).
+    AllCorners,
     PickMode,
     /// "Pick holes on the part" (and "Stop picking") in the Work zero step.
     PickPinHoles,
@@ -2006,6 +2009,7 @@ impl App {
             include_bytes!("../assets/op-12.svg"),
             include_bytes!("../assets/op-13.svg"),
             include_bytes!("../assets/op-14.svg"),
+            include_bytes!("../assets/op-15.svg"),
         ]
         .iter()
         .map(|b| iced::widget::svg::Handle::from_memory(b.to_vec()))
@@ -2671,7 +2675,8 @@ impl App {
                 && o.strategy != Strategy::Turn
                 && (self.is_sample()
                     || (self.doc.file.is_some()
-                        && (o.needs_surfaces() || o.strategy == Strategy::Box)
+                        && (o.needs_surfaces()
+                            || matches!(o.strategy, Strategy::Box | Strategy::Corner))
                         && o.strategy.imported_preview()
                         && self.imported_mesh.is_some()))
         })
@@ -2681,7 +2686,7 @@ impl App {
     /// or that it cuts the whole part. None in the example project.
     pub fn new_op_line(&self) -> Option<&'static str> {
         let o = (self.operation()).filter(|o| self.fresh.as_deref() == Some(o.id.as_str()))?;
-        if o.needs_surfaces() {
+        if o.needs_surfaces() || o.strategy == Strategy::Corner {
             let unpicked =
                 o.geometry.is_empty() && o.surfaces.as_ref().is_none_or(|s| s.ids.is_empty());
             return (unpicked && self.can_pick()).then_some(ui::pick_line(o));
@@ -5964,6 +5969,15 @@ impl App {
                         o.strategy == Strategy::Box
                             && o.surfaces.as_ref().is_none_or(|s| s.ids.is_empty())
                     });
+                // So does a Round corners on its Corners tab (LIO-443).
+                let unpicked_box = unpicked_box
+                    || (t == "Corners"
+                        && !self.is_sample()
+                        && self.part_mesh().is_some()
+                        && self.operation().is_some_and(|o| {
+                            o.strategy == Strategy::Corner
+                                && o.surfaces.as_ref().is_none_or(|s| s.ids.is_empty())
+                        }));
                 // So does a lathe cut on its Turn tab (LIO-424).
                 let unpicked_turn = (t == "Turn" || t == "Drill")
                     && self.picks_turn()
@@ -6294,6 +6308,16 @@ impl App {
                     self.tab = "Box".into();
                     self.picking = true;
                     self.status = "Added Box. Click a face of the part: the Box removes the stock that covers it. A floor is cut from above, a wall from the side.".into();
+                }
+                // Round corners starts its pick on its tab (LIO-443).
+                if strategy == Strategy::Corner
+                    && !self.is_sample()
+                    && self.part_mesh().is_some()
+                    && self.can_pick()
+                {
+                    self.tab = "Corners".into();
+                    self.picking = true;
+                    self.status = "Added Round corners. Click a rounded outside corner of the part, or Pick all outside corners.".into();
                 }
                 // A lathe cut on a part starts its pick, as a Box does (LIO-424).
                 if self.picks_turn() {
@@ -6642,6 +6666,55 @@ impl App {
                             self.status += " It is still drilled: a selected rim face (or another wall of it) holds it. Remove that face to drop it.";
                         }
                     }
+                    return Task::none();
+                }
+                // Round corners takes a rounded outside corner: all its
+                // facets, added or dropped together (LIO-443).
+                if self
+                    .operation()
+                    .is_some_and(|o| o.strategy == Strategy::Corner)
+                {
+                    let found = if cam::arcs::thread_wall(&setup, mesh, n) {
+                        Err(corner::NOT_A_CORNER.to_string())
+                    } else {
+                        match cam::arcs::outside_arc_at(&setup, mesh, n) {
+                            Ok(a) => corner::Corner::from_arc(&a),
+                            Err(cam::arcs::NoArc::Inside) => Err("That round is a hole's wall, not an outside corner: click the round face of a corner of the part.".to_string()),
+                            Err(_) => Err(corner::NOT_A_CORNER.to_string()),
+                        }
+                    };
+                    let c = match found {
+                        Ok(c) => c,
+                        Err(e) => {
+                            self.status = e;
+                            return Task::none();
+                        }
+                    };
+                    let mut said = String::new();
+                    if let Some(o) = self.operation_mut() {
+                        let selected = o.surfaces.get_or_insert_with(|| surface::Selection {
+                            mesh_fingerprint: fingerprint.clone(),
+                            ids: vec![],
+                        });
+                        if selected.mesh_fingerprint != fingerprint {
+                            selected.mesh_fingerprint = fingerprint;
+                            selected.ids.clear();
+                        }
+                        let had = selected.ids.contains(&n);
+                        selected.ids.retain(|id| !c.walls.contains(id));
+                        if !had {
+                            selected.ids.extend(c.walls.iter().copied());
+                        }
+                        o.geometry.clear();
+                        said = format!(
+                            "{} the {} corner, R{}.",
+                            if had { "Dropped" } else { "Picked" },
+                            c.place(),
+                            crate::envelope::mm(c.r)
+                        );
+                    }
+                    self.touch();
+                    self.status = said;
                     return Task::none();
                 }
                 // A Box takes one face, and a click on it fills the box at
@@ -6997,13 +7070,43 @@ impl App {
                 // A Box and a lathe cut are picked on their own tab.
                 let machine = &self.doc.setup().machine;
                 if self.operation().is_none_or(|o| {
-                    !matches!(o.strategy, Strategy::Box | Strategy::Turn) && !o.on_centre(machine)
+                    !matches!(
+                        o.strategy,
+                        Strategy::Box | Strategy::Turn | Strategy::Corner
+                    ) && !o.on_centre(machine)
                 }) {
                     self.tab = "Geometry".into();
                 }
             }
             // Fills the Box again from its face, after the stock or the zero
             // changed (LIO-401).
+            Message::AllCorners => {
+                let Some(mesh) = self.imported_mesh.as_ref() else {
+                    return Task::none();
+                };
+                let found = corner::all(self.doc.setup(), mesh);
+                let fingerprint = mesh.fingerprint.clone();
+                if found.is_empty() {
+                    self.status = "The part has no rounded outside corner between a wall along X and one along Y, as this setup holds it.".into();
+                    return Task::none();
+                }
+                let mut radii: Vec<String> =
+                    found.iter().map(|c| crate::envelope::mm(c.r)).collect();
+                radii.dedup();
+                if let Some(o) = self.operation_mut() {
+                    o.surfaces = Some(surface::Selection {
+                        mesh_fingerprint: fingerprint,
+                        ids: found.iter().flat_map(|c| c.walls.iter().copied()).collect(),
+                    });
+                    o.geometry.clear();
+                }
+                self.touch();
+                self.status = format!(
+                    "Picked all {} rounded outside corners: R{}.",
+                    found.len(),
+                    radii.join(", R")
+                );
+            }
             Message::BoxFromFace => {
                 let picked = (self.operation())
                     .filter(|o| o.strategy == Strategy::Box)

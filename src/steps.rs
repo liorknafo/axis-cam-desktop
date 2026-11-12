@@ -2244,6 +2244,7 @@ fn progress(g: &Guide, s: &Section, at: usize, item: usize) -> String {
             format!("pass {index}/{of}")
         }
         Step::Holes { holes, .. } => format!("hole {}/{}", item + 1, holes.len()),
+        Step::Corner { index, of, .. } => format!("walk {index}/{of}"),
         Step::Bore {
             index, of, holes, ..
         } if holes.len() > 1 => format!("pass {index}/{of} · hole {}/{}", item + 1, holes.len()),
@@ -2258,6 +2259,14 @@ fn counted(setup: &Setup, s: &Section) -> String {
     let hole =
         s.op.and_then(|op| setup.operations.get(op))
             .is_some_and(|o| o.strategy == Strategy::Drill && !o.boring());
+    let corners = (s.op.and_then(|op| setup.operations.get(op)))
+        .is_some_and(|o| o.strategy == Strategy::Corner);
+    if corners {
+        return match s.count {
+            1 => "1 walk".into(),
+            n => format!("{n} walks"),
+        };
+    }
     match (s.count, hole) {
         (1, true) => "1 hole".into(),
         (1, false) => "1 pass".into(),
@@ -2434,6 +2443,7 @@ fn next_label(g: &Guide, at: usize, item: usize) -> String {
         Step::Pass { .. }
         | Step::Lathe(crate::guide::LatheStep::Pass { .. })
         | Step::Lathe(crate::guide::LatheStep::ThreadPass { .. }) => "Pass done ▶".into(),
+        Step::Corner { .. } => "Walk done ▶".into(),
         Step::Holes { holes, .. } | Step::Bore { holes, .. } if item + 1 < holes.len() => {
             "Hole done ▶".into()
         }
@@ -2947,6 +2957,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             )
         }
         step @ Step::Pass { .. } => pass(p, step),
+        step @ Step::Corner { .. } => corner(p, step),
         Step::Pattern { op, pattern, same } => pattern_screen(p, *op, pattern, *same),
         Step::Holes {
             op,
@@ -3391,9 +3402,14 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             // A tapped hole is tried with a screw (LIO-413).
             let tried = o.filter(|o| o.tapping()).and_then(|_| screw_try(p, *op));
             let tapped = tried.is_some();
-            let right = match tried {
-                Some(row) => column![label("By hand"), row],
-                None => column![label("Measure")].extend(rows),
+            // Round corners: the scallops filed to the line (LIO-443).
+            let filed = o
+                .filter(|o| o.strategy == Strategy::Corner)
+                .map(|_| corner_check(p, *op));
+            let right = match (tried, filed) {
+                (Some(row), _) => column![label("By hand"), row],
+                (None, Some(rows)) => column![label("By hand")].extend(rows),
+                (None, None) => column![label("Measure")].extend(rows),
             }
             .push(chips(c))
             .push(label("Before"))
@@ -3408,8 +3424,11 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             // (LIO-426).
             // A thread is tried, named as on the lathe: "Try · the thread"
             // (LIO-437).
+            let corners = o.is_some_and(|o| o.strategy == Strategy::Corner);
             let (title, sub) = if tapped {
                 ("Try", "the thread")
+            } else if corners {
+                ("File", "the scallops to the line")
             } else {
                 ("Check", "measure what it left")
             };
@@ -4005,6 +4024,414 @@ fn pass<'a>(
     )
 }
 
+/// An upper bound `v` (mm) as the DRO's hundredths show it, rounded up so
+/// that it is still one: 0.0412 is "0.05", not "0.04".
+fn up(v: f32) -> f32 {
+    (v * 100. - 1e-4).ceil() / 100.
+}
+/// The Check screen's rows for a Round corners `op` (LIO-443): each corner's
+/// scallops filed to the line, and the round tried with a radius gauge.
+fn corner_check<'a>(p: &Page<'a>, op: usize) -> Vec<Element<'a, Message>> {
+    // The most each corner's last walk left, by corner.
+    let mut corners: Vec<(usize, &'static str, f32, f32)> = vec![];
+    for s in &p.guide().steps {
+        if let Step::Corner {
+            op: o,
+            corner,
+            place,
+            radius,
+            offset,
+            scallop,
+            ..
+        } = s
+            && *o == op
+            && *offset == 0.
+        {
+            match corners.iter_mut().find(|c| c.0 == *corner) {
+                Some(c) => c.3 = c.3.max(*scallop),
+                None => corners.push((*corner, place, *radius, *scallop)),
+            }
+        }
+    }
+    let most = corners.iter().map(|c| c.3).fold(0., f32::max);
+    let mut rows = vec![readout(
+        Readout {
+            order: None,
+            lead: None,
+            axis: "≤".into(),
+            value: dro(up(most).max(0.01)),
+            lock: None,
+            tags: vec![
+                "file the scallops to the line".into(),
+                "the most left between two steps".into(),
+            ],
+            lit: Lit::Next,
+            big: true,
+        },
+        None,
+    )];
+    for (n, place, r, _) in corners {
+        rows.push(readout(
+            Readout {
+                order: Some(u8::try_from(n).unwrap_or(u8::MAX)),
+                lead: None,
+                axis: "R".into(),
+                value: mm(r),
+                lock: None,
+                tags: vec![place.to_string(), "try it with a radius gauge".into()],
+                lit: Lit::Next,
+                big: false,
+            },
+            None,
+        ));
+    }
+    rows.push(
+        muted("File along the round, not across it, until the gauge shows no light; the steps' corners stand out the most, half way along each step.")
+            .size(13)
+            .into(),
+    );
+    rows
+}
+/// The screen of a Round corners walk (LIO-443): the corner close up from
+/// above with the walk on it and the tool where it is, the whole stock
+/// with the corner's place, and the DRO numbers in order.
+fn corner<'a>(
+    p: &Page<'a>,
+    step: &'a Step,
+) -> (
+    String,
+    &'static str,
+    Element<'a, Message>,
+    Column<'a, Message>,
+) {
+    let Step::Corner {
+        op,
+        index,
+        of,
+        corner,
+        corners,
+        place,
+        radius,
+        centre,
+        offset,
+        z,
+        level,
+        levels,
+        scallop,
+        points,
+        targets,
+        never,
+        turns_per_minute,
+    } = step
+    else {
+        unreachable!()
+    };
+    let op = *op;
+    let g = p.guide();
+    let r = g.done.get(p.done(op)).map_or(0., |d| d.plan.radius);
+    let stock = p.before(op);
+    // Where the tool is after each number, from the first X and Y.
+    let mut at = [f32::NAN; 3];
+    let mut places = vec![];
+    for t in targets.iter() {
+        at[t.axis] = t.centre;
+        places.push(at);
+    }
+    let i = p.item.min(targets.len().saturating_sub(1));
+    let now = places.get(i).copied().unwrap_or([0.; 3]);
+    let start = places
+        .iter()
+        .zip(targets.iter())
+        .find(|(_, t)| t.axis == 2 && t.lock[2])
+        .map_or(now, |(q, _)| *q);
+    // The walk's moves in XY, from where it goes down to where it leaves.
+    let down = targets
+        .iter()
+        .position(|t| t.axis == 2 && t.lock[2])
+        .unwrap_or(0);
+    let path: Vec<[f32; 2]> = (places[down..].iter())
+        .filter(|q| q[2] <= z + 0.001)
+        .map(|q| [q[0], q[1]])
+        .collect();
+    let quarter = (0..4)
+        .find(|&q| crate::corner::WHERE[q] == *place)
+        .unwrap_or(0);
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    (p.key, p.at, p.item).hash(&mut h);
+    let detail = crate::fault::canvas(CornerDetail {
+        key: h.finish(),
+        centre: *centre,
+        radius: *radius,
+        offset: *offset,
+        quarter,
+        tool: r,
+        path,
+        at: (now[0].is_finite() && now[1].is_finite()).then_some([now[0], now[1]]),
+    })
+    .width(Fill)
+    .height(FillPortion(3));
+    let mut shapes = p.cut_before(op);
+    shapes.extend(never_lines(g, op, stock, *never, r, VIEWS[0]));
+    if let Some(first) = points.first() {
+        shapes.push(Shape::Tool(start, r, Some([first[0], first[1], start[2]])));
+    }
+    let left = column![detail, p.drawing(0, stock, shapes, FillPortion(2))]
+        .spacing(6)
+        .into();
+    // Which way each axis goes on the walk: the way to come to every number.
+    let way = |k: usize| {
+        let (a, b) = (points.first().map(|q| q[k]), points.last().map(|q| q[k]));
+        match (a, b) {
+            (Some(a), Some(b)) if b > a => 1,
+            (Some(a), Some(b)) if b < a => -1,
+            _ => 0,
+        }
+    };
+    let arrows = [["◀", "▶"], ["▼", "▲"], ["▼", "▲"]];
+    let feeds: Vec<usize> = (0..targets.len()).filter(|&i| targets[i].feed).collect();
+    let (first_feed, last_feed) = (feeds.first().copied(), feeds.last().copied());
+    let steps_total = feeds.len().saturating_sub(2);
+    let mut rows = vec![];
+    for (i, t) in targets.iter().enumerate() {
+        let mut tags: Vec<String> = vec![];
+        let next_same = targets
+            .get(i + 1)
+            .is_some_and(|n| n.axis == t.axis && !n.feed && !t.feed);
+        let after_same = i > 0 && targets[i - 1].axis == t.axis && !targets[i - 1].feed && !t.feed;
+        let mut value = dro(t.centre);
+        if t.feed {
+            let from = places
+                .get(i.wrapping_sub(1))
+                .map_or(t.centre, |q| q[t.axis]);
+            let arrow = arrows[t.axis][usize::from(t.centre > from)];
+            value = format!("{arrow} {value}");
+            if Some(i) == first_feed {
+                tags.push("feed in to the round's start".into());
+            } else if Some(i) == last_feed {
+                tags.push("feed out, clear of the stock".into());
+            } else {
+                let k = feeds.iter().position(|&f| f == i).unwrap_or(0);
+                tags.push(format!("step {k} of {steps_total}"));
+            }
+        } else if t.axis == 2 && t.lock[2] {
+            tags.push("down beside the stock".into());
+            tags.push(format!("level {level} of {levels}"));
+        } else if t.axis == 2 && i + 1 == targets.len() {
+            tags.push("up, clear".into());
+        } else if t.axis == 2 {
+            tags.push("over the top".into());
+        } else if next_same {
+            tags.push(format!("{} mm short", mm(crate::corner::TAKE_UP)));
+        } else if after_same {
+            let arrow = arrows[t.axis][usize::from(way(t.axis) > 0)];
+            tags.push(format!("on to it {arrow}: backlash taken up"));
+        } else {
+            tags.push("clear of the stock".into());
+        }
+        rows.push(readout(
+            Readout {
+                order: Some(t.order),
+                lead: None,
+                axis: AXES[t.axis].into(),
+                value,
+                lock: t.lock[2].then(|| "Z".to_string()),
+                tags,
+                lit: lit(i, p.item),
+                big: false,
+            },
+            Some(Message::Guide(GuideAction::Reached(i))),
+        ));
+    }
+    let o = p.setup.operations.get(op);
+    let rpm = o.and_then(|o| num(&o.p, "rpm")).unwrap_or(0.);
+    let feed = o.and_then(|o| num(&o.p, "feed")).unwrap_or(0.);
+    let mut c = vec![
+        chip(p.tool_name(op, 2. * r)),
+        chip(format!("{} rpm", rpm.round())),
+        chip(format!("{} mm/min", feed.round())),
+        warn_chip("DRO comp off: centres"),
+    ];
+    if *turns_per_minute > 0. {
+        c.push(chip(format!(
+            "about {} turns a minute",
+            mm((turns_per_minute * 10.).round() / 10.)
+        )));
+    }
+    // Which way round the part the walk goes, seen from above, by its ends
+    // about the round's centre: counter-clockwise with the spindle
+    // clockwise.
+    let round_left = match (points.first(), points.last()) {
+        (Some(a), Some(b)) => {
+            (a[0] - centre[0]) * (b[1] - centre[1]) - (a[1] - centre[1]) * (b[0] - centre[0]) > 0.
+        }
+        _ => true,
+    };
+    let way_words = |k: usize| match way(k) {
+        1 => format!("{} only ever up", AXES[k]),
+        -1 => format!("{} only ever down", AXES[k]),
+        _ => format!("{} stays", AXES[k]),
+    };
+    let what = if *offset > 0. {
+        format!(
+            "{} mm off the round: takes the stock down for the last walk, at most {} mm between steps",
+            mm(*offset),
+            mm(up(*scallop))
+        )
+    } else {
+        format!(
+            "on the round: at most {} mm stands between two steps, filed to the line after",
+            dro(up(*scallop))
+        )
+    };
+    let right = column![
+        chips(c),
+        label(format!("Corner {corner} of {corners} · {place} · R{}", mm(*radius))),
+        muted(format!("Walk {index} of {of} at Z {}, {what}.", dro(*z))).size(13),
+        muted(format!(
+            "Conventional with the spindle {}: round the part {}, {}, {}. Come to every number that way, so the backlash stays taken up, and keep the quill locked.",
+            if round_left { "clockwise (M3)" } else { "counter-clockwise (M4)" },
+            if round_left { "counter-clockwise" } else { "clockwise" },
+            way_words(0),
+            way_words(1)
+        ))
+        .size(13),
+        label("Move in this order"),
+    ]
+    .extend(rows);
+    (
+        format!("Walk {index} of {of}"),
+        "one screen per walk round a corner",
+        left,
+        right,
+    )
+}
+/// A Round corners' corner close up from above (LIO-443): the part's
+/// round and its walls, the line a band keeps off it, the walk's moves one
+/// axis at a time, and the tool where it is.
+struct CornerDetail {
+    key: u64,
+    centre: [f32; 2],
+    radius: f32,
+    offset: f32,
+    quarter: usize,
+    tool: f32,
+    path: Vec<[f32; 2]>,
+    at: Option<[f32; 2]>,
+}
+impl CornerDetail {
+    fn paint(&self, f: &mut canvas::Frame) {
+        let (c, r, rc) = (self.centre, self.radius, self.tool);
+        let quarter = std::f32::consts::FRAC_PI_2;
+        let unit = |t: f32| {
+            let a = quarter * self.quarter as f32 + t;
+            [a.cos(), a.sin()]
+        };
+        let (u0, u1) = (unit(0.), unit(quarter));
+        // What it shows: the walk with the tool round it, and the round.
+        let (mut lo, mut hi) = ([c[0] - r, c[1] - r], [c[0] + r, c[1] + r]);
+        for q in &self.path {
+            for k in 0..2 {
+                lo[k] = lo[k].min(q[k] - rc);
+                hi[k] = hi[k].max(q[k] + rc);
+            }
+        }
+        let size = f.size();
+        let pad = 24.;
+        let span = [(hi[0] - lo[0]).max(1.), (hi[1] - lo[1]).max(1.)];
+        let s = ((size.width - 2. * pad) / span[0]).min((size.height - 2. * pad) / span[1]);
+        let ox = (size.width - span[0] * s) / 2.;
+        let oy = size.height - (size.height - span[1] * s) / 2.;
+        let p = |q: [f32; 2]| Point::new(ox + (q[0] - lo[0]) * s, oy - (q[1] - lo[1]) * s);
+        let off = |q: [f32; 2], by: f32, u: [f32; 2]| [q[0] + by * u[0], q[1] + by * u[1]];
+        // The part: its two walls back from the round, and the round.
+        let far = span[0].max(span[1]) * 2.;
+        let part = canvas::Path::new(|b| {
+            b.move_to(p(off(off(c, r, u0), -far, u1)));
+            for i in 0..=32 {
+                let u = unit(quarter * i as f32 / 32.);
+                b.line_to(p([c[0] + r * u[0], c[1] + r * u[1]]));
+            }
+            b.line_to(p(off(off(c, r, u1), -far, u0)));
+            b.line_to(p(off(off(c, -far, u0), -far, u1)));
+            b.close();
+        });
+        f.fill(&part, PART);
+        f.stroke(&part, stroke(INK, 1.5));
+        // A band's line, outside the round.
+        if self.offset > 0. {
+            let line = canvas::Path::new(|b| {
+                for i in 0..=32 {
+                    let u = unit(quarter * i as f32 / 32.);
+                    let q = p([
+                        c[0] + (r + self.offset) * u[0],
+                        c[1] + (r + self.offset) * u[1],
+                    ]);
+                    if i == 0 { b.move_to(q) } else { b.line_to(q) }
+                }
+            });
+            f.stroke(&line, dashed(MUTED, 1.2));
+        }
+        // The round's centre and radius.
+        f.fill(&canvas::Path::circle(p(c), 2.5), INK);
+        write(
+            f,
+            format!("R{}", mm(r)),
+            p(off(c, r * 0.5, unit(quarter / 2.))),
+            INK,
+            13.,
+            Align::Center,
+        );
+        // The walk: its moves, each a reading.
+        if let Some(first) = self.path.first() {
+            let walk = canvas::Path::new(|b| {
+                b.move_to(p(*first));
+                for q in &self.path[1..] {
+                    b.line_to(p(*q));
+                }
+            });
+            f.stroke(&walk, stroke(ACCENT, 1.6));
+            for q in &self.path {
+                f.fill(&canvas::Path::circle(p(*q), 2.), ACCENT);
+            }
+            if let (Some(a), Some(b)) = (self.path.first(), self.path.get(1)) {
+                arrow(f, p(*a), p(*b), ACCENT, 2.);
+            }
+        }
+        if let Some(at) = self.at {
+            let body = canvas::Path::circle(p(at), rc * s);
+            f.fill(&body, Color { a: 0.2, ..TOOL });
+            f.stroke(&body, stroke(TOOL, 1.6));
+            f.fill(&canvas::Path::circle(p(at), 2.5), TOOL);
+        }
+        write(
+            f,
+            "seen from above · tool centres",
+            Point::new(8., 10.),
+            MUTED,
+            12.,
+            Align::Left,
+        );
+    }
+}
+impl canvas::Program<Message> for CornerDetail {
+    type State = (canvas::Cache, Cell<u64>);
+    fn draw(
+        &self,
+        state: &Self::State,
+        renderer: &iced::Renderer,
+        _: &Theme,
+        bounds: Rectangle,
+        _: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        if state.1.get() != self.key {
+            state.0.clear();
+            state.1.set(self.key);
+        }
+        vec![state.0.draw(renderer, bounds.size(), |f| self.paint(f))]
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -4037,6 +4464,10 @@ pub(crate) mod tests {
     }
     pub(crate) fn app(dro: &str) -> App {
         app_with(dro, |_| {})
+    }
+    /// A number as the DRO readouts show it.
+    pub(crate) fn dro_of(v: f32) -> String {
+        dro(v)
     }
     /// Builds the active setup's guide in line, as the background run does.
     pub(crate) fn build(a: &mut App) {
