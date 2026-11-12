@@ -2907,7 +2907,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
     let tabs = if app.on_hand() {
         tabs.push(btn("03  Steps", steps_of(app.doc.index()), false))
     } else {
-        tabs.push(btn("03  Preview", Message::PreviewStep, false))
+        tabs.push(btn("03  Simulation", Message::PreviewStep, false))
             .push(btn(
                 if uc100 {
                     "04  Review & run"
@@ -3135,9 +3135,8 @@ fn scene_panels(
                     "SAMPLE MOTION"
                 } else if app.on_hand() {
                     "CHECK"
-                } else if imported_facing {
-                    "OPERATION SIMULATION"
                 } else {
+                    // One word on a CNC setup, as its tab (LIO-438).
                     "SIMULATION"
                 },
                 12
@@ -3365,11 +3364,8 @@ fn scene_panels(
         if imported_facing {
             // The inspector's Generate is the region's filled command.
             empty = empty.push(secondary(
-                if app.on_hand() {
-                    "Play the cut"
-                } else {
-                    "Generate & play"
-                },
+                // The same words on every machine (LIO-438).
+                "Play the cut",
                 Message::Play,
             ));
         } else if app.is_sample() && app.operation().is_some_and(|o| o.enabled) {
@@ -4780,10 +4776,9 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
         primary(
             if app.is_sample() {
                 "Generate sample preview"
-            } else if app.on_hand() {
+            } else if app.on_hand() || o.strategy.imported_preview() {
+                // The same words on every machine (LIO-438).
                 "Show the cut"
-            } else if o.strategy.imported_preview() {
-                "Generate operation preview"
             } else {
                 "Unavailable · see Operation support"
             },
@@ -13683,7 +13678,8 @@ pub(crate) fn operation_lines(
         Strategy::Contour if get(p, "side") == "Inside" => "Contour, inside floor",
         Strategy::Contour if get(p, "side") == crate::model::CONTOUR_HOLES => "Contour, holes",
         Strategy::Contour => "Contour, outside",
-        s => s.name(),
+        // The tile's word (LIO-438).
+        s => s.short(),
     };
     // The post rounds the spindle speed to a whole number.
     let mut values = vec![
@@ -14223,7 +14219,7 @@ pub(crate) fn fixture_note(app: &App, note: Note) -> String {
             "Use stepover up to 50%. Finishing passes repeat the wall/island contours at the requested allowance. Earlier cuts determine the cutting start. A small additional margin (max of 0.02 mm or 1% of cutter radius) covers polygon rounding; "
         }
         Note::Playback => {
-            "Generate the operation preview, or press Generate & play. Stock uses adaptive surface meshing and inherits earlier cuts; "
+            "Show the cut, or Play the cut. Stock uses adaptive surface meshing and inherits earlier cuts; "
         }
     };
     format!("{before}{}", fixtures(note, modelled(app)))
@@ -15192,7 +15188,7 @@ fn ai(app: &App) -> Element<'_, Message> {
     container(
         column![
             page_header(
-                "AI machining planner",
+                "AI planner",
                 if matches!(app.account, crate::Account::SignedIn { .. }) {
                     "The planner proposes a complete job and checks it; nothing changes until you apply it."
                 } else {
@@ -15378,6 +15374,17 @@ pub(crate) fn nc_page(app: &App) -> NcPage<'_> {
 }
 /// The operation of setup `name` a problem of the NC review is about, and
 /// the message after its name: what opens it there (LIO-394).
+/// "Open Pocket in planning ▶", for the operation `m` opens (LIO-438).
+fn open_label(app: &App, m: &Message) -> String {
+    match m {
+        Message::OpenIssue(si, oi, _) => (app.doc.setups.get(*si))
+            .and_then(|s| s.operations.get(*oi))
+            .map_or("Open in planning ▶".to_string(), |o| {
+                format!("Open {} in planning ▶", o.name())
+            }),
+        _ => "Open in planning ▶".to_string(),
+    }
+}
 pub(crate) fn nc_issue(app: &App, name: &str, problem: &str) -> Option<Message> {
     let si = app.doc.setups.iter().position(|s| s.name() == name)?;
     let ops = app.doc.setups[si].operations.iter().enumerate();
@@ -15401,10 +15408,14 @@ fn nc_problems<'a>(app: &App, name: &str, problems: &[String]) -> Element<'a, Me
     let causes = causes.into_iter().map(|cause| {
         let line = caution_line(format!("• {cause}"));
         match nc_issue(app, name, cause) {
-            Some(open) => row![container(line).width(Fill), secondary("Open", open)]
-                .spacing(8)
-                .align_y(iced::Alignment::Center)
-                .into(),
+            // The Steps page's words for the same way (LIO-438).
+            Some(open) => row![
+                container(line).width(Fill),
+                secondary(open_label(app, &open), open.clone())
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .into(),
             None => line.into(),
         }
     });
@@ -15606,7 +15617,15 @@ fn generation_progress(app: &App) -> Option<Element<'_, Message>> {
     )
 }
 fn operation_audit(app: &App) -> Element<'_, Message> {
-    let mut c=column![bold("Operation support & job checks",24),note("Available means an imported-mesh preview is implemented and regression-tested within the scope below. Their moves can be exported as LinuxCNC 3-axis programs after checks for limits, rapids into material and holder clearance, and, in a setup that models a vise or clamps, for the jaws and clamps as boxes with a clearance gap. Parallels, bolts, the table, the machine body and other fixtures are not checked. A sample animation does not establish operation support."),row![primary("Check all enabled operations",Message::GenerateAll),secondary(BACK,Message::Page(Page::Work))].spacing(12)].spacing(14).max_width(1020);
+    // Back top left; one name, "Generate all"; the job's checks first,
+    // what each operation supports under its own heading (LIO-438).
+    let mut c = column![
+        secondary(BACK, Message::Page(Page::Work)),
+        bold("Job checks", 24),
+        row![primary("Generate all", Message::GenerateAll)].spacing(12)
+    ]
+    .spacing(14)
+    .max_width(1020);
     if let Some(generating) = generation_progress(app) {
         c = c.push(generating);
     }
@@ -15644,13 +15663,18 @@ fn operation_audit(app: &App) -> Element<'_, Message> {
             widget::tooltip::Position::Bottom,
         ));
     }
+    // What each operation supports, under its own heading, in a user's
+    // words (LIO-438).
+    c = c.push(bold("What each operation supports", 20)).push(note(
+        "An operation marked Available shows its cut on an imported part and can be sent to the machine once its checks pass: limits, rapids into the stock, the holder, and the vise jaws or clamps when the setup has them. Parallels, bolts, the table and the machine body are not checked.",
+    ));
     for strategy in Strategy::ALL {
         c = c.push(
             container(
                 row![
                     icon(app, strategy, 32.),
                     column![
-                        bold(strategy.name(), 15),
+                        bold(strategy.short(), 15),
                         text(strategy.availability()).size(12)
                     ]
                     .spacing(5)
