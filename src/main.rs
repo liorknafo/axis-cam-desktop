@@ -1633,19 +1633,14 @@ pub(crate) fn find_holes(setup: &model::Setup, mesh: &mesh::Mesh) -> FoundHoles 
         .flat_map(|(h, _)| h.walls.iter().copied())
         .collect();
     let g = cam::Geometry::new(setup, mesh);
-    let mut arcs: Vec<(cam::arcs::Arc, cam::Hole)> = (cam::arcs::arcs_among(setup, mesh, &walls)
+    // Each end of a blind counterbore over a slot's end, round the same
+    // centre, is a hole of its own to drill: wider, and only down to its
+    // floor (LIO-440).
+    let arcs: Vec<(cam::arcs::Arc, cam::Hole)> = (cam::arcs::arcs_among(setup, mesh, &walls)
         .into_iter())
     .filter(|a| cam::arcs::on_stock(setup, mesh, a))
     .filter_map(|a| Some((a.clone(), cam::arcs::arc_hole(&g, &a)?)))
     .collect();
-    // A counterbore's end over its slot's, round one centre, is one hole to
-    // a drill, read by its narrowest bore as a round counterbore is.
-    let narrower = |h: &cam::Hole, o: &cam::Hole| {
-        (o.center[0] - h.center[0]).hypot(o.center[1] - h.center[1]) <= 0.05
-            && o.diameter < h.diameter - 0.05
-    };
-    let all: Vec<cam::Hole> = arcs.iter().map(|(_, h)| h.clone()).collect();
-    arcs.retain(|(_, h)| !all.iter().any(|o| narrower(h, o)));
     FoundHoles { holes, round, arcs }
 }
 /// What a generation off the window's thread makes (`App::generate`).
