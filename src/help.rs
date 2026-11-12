@@ -1810,6 +1810,10 @@ fn guide_help(a: &crate::GuideAction) -> (&'static str, &'static str) {
             "Jump to this section: where you left it, else its first step.",
             "",
         ),
+        Resume => (
+            "Go back to the step these steps had got to before they opened at the operation picked in planning.",
+            "",
+        ),
         Reached(_) => (
             "The DRO reads this number: light the next one. The app does not read the DRO.",
             "",
@@ -5096,6 +5100,7 @@ mod tests {
             crate::GuideAction::Back,
             crate::GuideAction::Go(0),
             crate::GuideAction::Section(0),
+            crate::GuideAction::Resume,
             crate::GuideAction::Reached(0),
             crate::GuideAction::Open(0),
             crate::GuideAction::Fix(Some(0), String::new()),

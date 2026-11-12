@@ -6513,7 +6513,7 @@ flood = { pin = 8 }
         crate::ui::probe::texts(a.view(), iced::Size::new(1280., 800.))
     }
     /// LIO-410: a hand tap has its own screen before it (spindle off, no
-    /// gear, no Z pick-up), its depth said as a hand follows it, and no
+    /// gear; its Z pick-up came with LIO-449), its depth said as a hand follows it, and no
     /// speeds, feeds or Linking in the editor.
     #[test]
     fn a_hand_tap_is_put_in_with_the_spindle_off_and_its_depth_followed_by_hand() {
@@ -6547,6 +6547,45 @@ flood = { pin = 8 }
             .find(|o| o.name() == "Thread M6×1")
             .unwrap();
         assert!(!tap.tabs(&a.doc.setups[0].machine).contains(&"Linking"));
+    }
+    /// LIO-449: the tap picks up Z on the top when it goes in, so that
+    /// each hole starts with the tap turned back out and Z up to a safe
+    /// reading before X and Y move.
+    #[test]
+    fn a_hand_tap_picks_up_z_and_each_hole_lifts_to_a_safe_z() {
+        use crate::guide::Step;
+        let mut a = manual_threaded_app(false);
+        let at = m6_tap_step(&a);
+        let (shown, _) = a.guide_at().unwrap();
+        let Step::TapIn { top: Some(top), .. } = shown.guide.steps[at - 1] else {
+            panic!("{:?}", shown.guide.steps[at - 1]);
+        };
+        let t = texts_at(&mut a, at - 1);
+        let z = t.iter().position(|s| s == "Z").expect("a Z row");
+        assert_eq!(t[z + 1], crate::steps::tests::dro_of(top), "{t:?}");
+        assert!(
+            t.iter()
+                .any(|s| s.contains("touch the top with the tap's tip")),
+            "{t:?}"
+        );
+        let holes = match &shown.guide.steps[at] {
+            Step::Holes { holes, .. } => holes.len(),
+            s => panic!("{s:?}"),
+        };
+        for item in 0..holes {
+            let _ = a.update(Message::Guide(crate::GuideAction::Go(at)));
+            a.guide_item = item;
+            let t = crate::ui::probe::texts(a.view(), iced::Size::new(1280., 800.));
+            let up = t.iter().position(|s| s == "up to").expect("the lift");
+            assert_eq!(t[up + 1], "Z", "{t:?}");
+            assert!(
+                t.iter()
+                    .any(|s| s.starts_with("turn the tap back out first")),
+                "{t:?}"
+            );
+            let turns = t.iter().position(|s| s == "turns").unwrap();
+            assert!(up < turns, "{t:?}");
+        }
     }
     /// LIO-411: the centre drill goes in once; names fit the browser.
     #[test]
@@ -31559,11 +31598,11 @@ soft_max = 180.0
         assert_eq!(tiles(&a), cnc);
         assert_eq!(dimmed(&a), 0);
         lacks(&a, &["Indexed", "MANUAL MILL", "LATHE"]);
-        // The manual mill: Box, Drill, Thread, Corner (LIO-443).
+        // The manual mill: Box, Slot (LIO-445), Drill, Thread, Corner (LIO-443).
         let _ = a.update(Message::AddManualSetup);
         a.doc.active = a.doc.setups[0].id.clone();
         a.selected = None;
-        assert_eq!(tiles(&a), ["Box", "Drill", "Thread", "Corner"]);
+        assert_eq!(tiles(&a), ["Box", "Slot", "Drill", "Thread", "Corner"]);
         assert_eq!(dimmed(&a), 0);
         shows(&a, &["MANUAL MILL"]);
         // The lathe: a tile per cut, then Thread and Drill.
