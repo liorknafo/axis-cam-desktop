@@ -14613,7 +14613,8 @@ soft_max = 180.0
                 let _ = a.update(Message::Resized(size));
                 let laid = laid_out(a, size);
                 let words = (laid.texts.iter())
-                    .find(|(t, _)| t.starts_with("mm  |"))
+                    // The Start page's footer is "mm" alone (LIO-433).
+                    .find(|(t, _)| t == "mm" || t.starts_with("mm  |"))
                     .unwrap_or_else(|| panic!("{what} at {size:?}: no status bar"))
                     .1;
                 if words.y + words.height > size.height + 0.5 {
@@ -14770,7 +14771,7 @@ soft_max = 180.0
             let _ = a.update(Message::Resized(size));
             let laid = laid_out(&a, size);
             let heading = (laid.texts.iter())
-                .find(|(t, _)| t == "Your workspace is empty.")
+                .find(|(t, _)| t == "Your project is empty.")
                 .unwrap()
                 .1;
             let (shown, content) = *(laid.scrolls.iter())
@@ -23129,23 +23130,21 @@ soft_max = 180.0
         a.dirty = true;
         let wide = laid_out_texts(&a, iced::Size::new(1920., 1080.));
         let least = laid_out_texts(&a, crate::MIN_WINDOW);
-        for words in ["NATIVE PROTOTYPE", "Saving workspace…"] {
-            let find = |texts: &[(String, iced::Rectangle)]| {
-                (texts.iter())
-                    .find(|(t, _)| t == words)
-                    .unwrap_or_else(|| panic!("no {words:?}"))
-                    .1
-            };
-            assert_eq!(find(&least).height, find(&wide).height, "{words}");
-        }
+        // One note about saving, no developer's label (LIO-433).
+        lacks(&a, &["NATIVE PROTOTYPE", "Saving workspace…"]);
+        let words = "Kept on this PC · no project file yet";
+        let find = |texts: &[(String, iced::Rectangle)]| {
+            (texts.iter())
+                .find(|(t, _)| t == words)
+                .unwrap_or_else(|| panic!("no {words:?}"))
+                .1
+        };
+        assert_eq!(find(&least).height, find(&wide).height, "{words}");
         let label = (least.iter())
-            .find(|(t, _)| t == "NATIVE PROTOTYPE")
+            .find(|(t, _)| t == "Kept on this PC · no project file yet")
             .unwrap()
             .1;
-        assert!(
-            label.x + label.width <= crate::MIN_WINDOW.width,
-            "{label:?}"
-        );
+        assert!(label.x <= crate::MIN_WINDOW.width, "{label:?}");
     }
     /// On a screen narrower than the least window the window opens as wide
     /// as the screen (`least_window`), and there every page, MACHINE's
@@ -23172,7 +23171,8 @@ soft_max = 180.0
             let _ = a.update(Message::Resized(size));
             let laid = laid_out(&a, size);
             let (words, right) = (laid.texts.iter())
-                .find(|(t, _)| t.starts_with("mm  |"))
+                // The Start page's footer is "mm" alone (LIO-433).
+                .find(|(t, _)| t == "mm" || t.starts_with("mm  |"))
                 .unwrap_or_else(|| panic!("{page:?}: no units and post text"));
             assert!(
                 right.x + right.width <= size.width - 14. + 0.5 && right.height < 20.,
@@ -23984,7 +23984,8 @@ soft_max = 180.0
         let _ = a.update(Message::Edit(Target::Setup, "stock_top", "10".into()));
         let _ = a.update(Message::Generate);
         assert!(!a.operation().unwrap().preview);
-        assert!(a.status.contains("preview ready"), "{}", a.status);
+        // "simulation", as the panel and its tab say (LIO-438).
+        assert!(a.status.contains("simulation ready"), "{}", a.status);
         let _ = a.update(Message::Plan);
         assert!(matches!(a.planner, crate::Planner::Idle));
         let document = serde_json::from_str(&serde_json::to_string(&a.doc).unwrap()).unwrap();
@@ -24598,7 +24599,11 @@ soft_max = 180.0
         let dir = tempfile::tempdir().unwrap();
         let mut a = fresh_app(&dir);
         a.replace_document(Document::sample(), None);
-        assert_eq!(crate::ui::project_note(&a), "No project file yet");
+        // The project, not the workspace (LIO-433).
+        assert_eq!(
+            crate::ui::project_note(&a),
+            "Kept on this PC · no project file yet"
+        );
         // The first Save asks where: the dialog is open.
         let _ = a.update(Message::SaveProject);
         assert!(a.save_busy);
@@ -24700,7 +24705,8 @@ soft_max = 180.0
         assert_eq!(a.save_error.as_deref(), Some(error.as_str()));
         assert_eq!(
             crate::ui::workspace_note(&a),
-            format!("Workspace not saved: {error}")
+            // The project kept on this PC, not a "workspace" (LIO-433).
+            format!("Not kept on this PC: {error}")
         );
         let _ = a.view();
         // A different error is a new thing to say.
@@ -24716,9 +24722,9 @@ soft_max = 180.0
         a.persist();
         assert!(!a.dirty && a.save_error.is_none());
         assert!(good.exists());
-        assert_eq!(crate::ui::workspace_note(&a), "Workspace saved locally");
+        assert_eq!(crate::ui::workspace_note(&a), "Kept on this PC");
         a.dirty = true;
-        assert_eq!(crate::ui::workspace_note(&a), "Saving workspace…");
+        assert_eq!(crate::ui::workspace_note(&a), "Saving…");
         let _ = a.view();
     }
     /// Plays a whole sign-in: the browser result, then the save step's result.
@@ -26258,7 +26264,8 @@ soft_max = 180.0
         let archived = crate::storage::load(&history[0]).unwrap();
         assert_eq!(json(&archived.setups), json(&before.setups));
         assert!(a.last_archived.is_none());
-        assert!(a.status.contains("History"), "{}", a.status);
+        // One name, "Project history" (LIO-433).
+        assert!(a.status.contains("Project history"), "{}", a.status);
         // Work done after Apply: a tool, a machine, the title and the material.
         let _ = a.update(Message::NewTool);
         let _ = a.update(Message::Edit(Target::Tool, "name", "Spot drill".into()));
@@ -26289,7 +26296,7 @@ soft_max = 180.0
         assert!(history.contains(&applied), "the applied job is in History");
         assert!(
             a.status.starts_with(
-                "The setups from before the plan are restored. The applied job is in History."
+                "The setups from before the plan are restored. The applied job is in Project history."
             ),
             "{}",
             a.status
@@ -28246,7 +28253,7 @@ soft_max = 180.0
         assert!(a.undo.is_none());
         assert!(
             a.status.starts_with(
-                "The setups from before the plan are restored. The applied job is in History."
+                "The setups from before the plan are restored. The applied job is in Project history."
             ) && a.status.ends_with(&format!(" {discarded}")),
             "{}",
             a.status
@@ -31261,6 +31268,68 @@ soft_max = 180.0
         shows(&a, &["AI planner"]);
         lacks(&a, &["AI machining planner"]);
     }
+    /// The Start page and the top bar call each command by one name, Start
+    /// begins with the part, one import button, the project not a
+    /// "workspace", no developer's notes (LIO-433).
+    #[test]
+    fn the_start_page_and_the_top_bar_call_each_command_by_one_name() {
+        let mut a = app();
+        let check = |a: &App, page: &str| {
+            let texts = page_texts(a);
+            for want in ["New project", "Open project…", "Import model…"] {
+                assert!(
+                    texts.iter().any(|t| t == want),
+                    "{page}: {want} in {texts:?}"
+                );
+            }
+            for gone in [
+                "Import from path…",
+                "Open a saved project…",
+                "+ New blank project",
+                "Import your first model",
+            ] {
+                assert!(!texts.iter().any(|t| t == gone), "{page}: {gone}");
+            }
+            assert!(
+                !texts
+                    .iter()
+                    .any(|t| t.to_lowercase().contains("workspace") || t.contains("PROTOTYPE")),
+                "{page}: {texts:?}"
+            );
+            texts
+        };
+        // The Start page: the part first, one Project history, no Recover.
+        a.page = Page::Home;
+        a.last_archived = Some(Default::default());
+        let texts = check(&a, "Start");
+        assert_eq!(texts.iter().filter(|t| *t == "Project history…").count(), 1);
+        assert!(!texts.iter().any(|t| t == "Recover previous project"));
+        // The empty project, after New project: its own words.
+        let _ = a.update(Message::NewProject);
+        a.page = Page::Work;
+        let texts = check(&a, "empty project");
+        assert!(
+            texts.iter().any(|t| t == "Your project is empty."),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|t| t == "Machine library") && texts.iter().any(|t| t == "Tools"));
+        // An import the dialog was left without a file opens the path field.
+        let _ = a.update(Message::FileImported(None));
+        assert!(a.import_path_open, "{}", a.status);
+        // The Start page's main button's model makes the project.
+        let b = imported_app();
+        assert!(b.doc.file.is_some() && b.part_mesh().is_some());
+        // The CNC footer names its machine and post in a user's words.
+        let mut c = imported_app();
+        c.page = Page::Work;
+        let footer = (page_texts(&c).into_iter())
+            .find(|t| t.starts_with("mm  |  "))
+            .unwrap();
+        assert!(
+            footer.ends_with(" · LinuxCNC program") || footer.ends_with(" · runs from MACHINE"),
+            "{footer}"
+        );
+    }
     /// The sample app with a lathe in the library and a lathe tool of each type.
     fn with_lathe(a: &mut App) {
         a.doc.machines.push(crate::lathe::defaults());
@@ -31761,7 +31830,8 @@ soft_max = 180.0
         let _ = a.update(Message::Edit(Target::Operation, "diameter", "40".into()));
         let _ = a.update(Message::Generate);
         assert!(
-            a.status.starts_with("Turning preview ready"),
+            // The tile's word and "simulation" (LIO-426, LIO-438).
+            a.status.starts_with("Turn simulation ready"),
             "{}",
             a.status
         );
