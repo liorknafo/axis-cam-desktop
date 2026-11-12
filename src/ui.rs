@@ -4337,7 +4337,14 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 Some(Err(e)) => c = c.push(caution("No corners", vec![e])),
                 None => {}
             }
-            c = c.push(note("The end mill's side walks round each corner in DRO steps, one axis at a time, counter-clockwise round the part (conventional): each step leaves at most the scallop set under Passes, filed to the line after. Stock past the round is taken first in bands no wider than the stepover."));
+            // Conventional: counter-clockwise round the part with the
+            // spindle clockwise, clockwise with it counter-clockwise.
+            let way = if facing_setting(p, "spindle_rotation") == "Counterclockwise (CCW)" {
+                "clockwise round the part, conventional with the spindle counter-clockwise (M4)"
+            } else {
+                "counter-clockwise round the part, conventional with the spindle clockwise (M3)"
+            };
+            c = c.push(note(format!("The end mill's side walks round each corner in DRO steps, one axis at a time, {way}: each step leaves at most the scallop set under Passes, filed to the line after. Stock past the round is taken first in bands no wider than the stepover.")));
         }
         // A Thread asks for the part first too (LIO-437).
         "Turn" if o.is_thread() => {

@@ -32595,6 +32595,20 @@ soft_max = 180.0
         );
         let texts = page_texts(&a);
         assert!(texts.iter().any(|t| t == "4 corners picked"), "{texts:?}");
+        // The way round follows the spindle.
+        let ccw = "clockwise round the part, conventional with the spindle counter-clockwise (M4)";
+        assert!(!page_texts(&a).iter().any(|t| t.contains(ccw)));
+        let spin = |a: &mut App, way: &str| {
+            let o = &mut a.doc.setup_mut().operations[0];
+            o.p.insert("spindle_rotation".into(), way.into());
+        };
+        spin(&mut a, "Counterclockwise (CCW)");
+        assert!(
+            page_texts(&a).iter().any(|t| t.contains(ccw)),
+            "{:?}",
+            page_texts(&a)
+        );
+        spin(&mut a, "Clockwise (CW)");
         // The scallop and the stepdown under Passes.
         let _ = a.update(Message::Tab("Passes".into()));
         let texts = page_texts(&a);
@@ -32654,6 +32668,17 @@ soft_max = 180.0
             "{texts:?}"
         );
         assert!(texts.iter().any(|t| t == "File"), "{texts:?}");
+        // The most left, rounded up to the DRO's hundredths: a bound still.
+        let most = (g.steps.iter())
+            .filter_map(|s| match s {
+                Step::Corner {
+                    offset, scallop, ..
+                } if *offset == 0. => Some(*scallop),
+                _ => None,
+            })
+            .fold(0., f32::max);
+        assert!(most > 0.04 && most < 0.05, "{most}");
+        assert!(texts.iter().any(|t| t == "0.05"), "{texts:?}");
     }
     /// Pictures of Round corners on the adapter plate (LIO-443): the
     /// Corners tab with all four picked, the 3D view with the toolpath, a

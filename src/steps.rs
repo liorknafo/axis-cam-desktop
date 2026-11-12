@@ -4024,6 +4024,11 @@ fn pass<'a>(
     )
 }
 
+/// An upper bound `v` (mm) as the DRO's hundredths show it, rounded up so
+/// that it is still one: 0.0412 is "0.05", not "0.04".
+fn up(v: f32) -> f32 {
+    (v * 100. - 1e-4).ceil() / 100.
+}
 /// The Check screen's rows for a Round corners `op` (LIO-443): each corner's
 /// scallops filed to the line, and the round tried with a radius gauge.
 fn corner_check<'a>(p: &Page<'a>, op: usize) -> Vec<Element<'a, Message>> {
@@ -4054,7 +4059,7 @@ fn corner_check<'a>(p: &Page<'a>, op: usize) -> Vec<Element<'a, Message>> {
             order: None,
             lead: None,
             axis: "≤".into(),
-            value: dro(most.max(0.01)),
+            value: dro(up(most).max(0.01)),
             lock: None,
             tags: vec![
                 "file the scallops to the line".into(),
@@ -4271,12 +4276,12 @@ fn corner<'a>(
         format!(
             "{} mm off the round: takes the stock down for the last walk, at most {} mm between steps",
             mm(*offset),
-            mm(*scallop)
+            mm(up(*scallop))
         )
     } else {
         format!(
             "on the round: at most {} mm stands between two steps, filed to the line after",
-            dro(*scallop)
+            dro(up(*scallop))
         )
     };
     let right = column![

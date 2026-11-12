@@ -660,7 +660,9 @@ pub fn walks(
             .map(|&a| {
                 let h = if a > 0. {
                     // A band's steps are taken by the next walk: coarser.
-                    (0.2 * set.band).clamp(set.scallop, 0.5)
+                    // A fifth of the band, up to 0.5 mm, never finer than
+                    // the scallop asked for.
+                    (0.2 * set.band).min(0.5).max(set.scallop)
                 } else {
                     set.scallop
                 };
@@ -1572,6 +1574,29 @@ pub(crate) mod tests {
         let e = crate::guide::build(&doc, &mesh, 0).unwrap_err();
         assert!(e.contains("hits the vise jaw"), "{e}");
         assert!(e.contains("stand clear of the vise's jaws"), "{e}");
+    }
+    #[test]
+    fn every_allowed_scallop_plans() {
+        let mesh = adapter();
+        let setup = setup("3");
+        let tool = end_mill("10");
+        let mut op = corner_op(&mesh, &tool, all_ids(&setup, &mesh));
+        for h in ["0.01", "0.05", "0.5", "0.6", "1"] {
+            op.p.insert("scallop".into(), h.into());
+            let (_, walks) = walks(&setup, &op, &tool, &mesh).unwrap();
+            let h: f64 = h.parse().unwrap();
+            assert!(
+                walks.iter().all(|w| w.stair.scallop <= h.max(0.5) + 1e-9),
+                "{h}"
+            );
+            assert!(
+                walks
+                    .iter()
+                    .filter(|w| w.offset == 0.)
+                    .all(|w| w.stair.scallop <= h + 1e-9),
+                "{h}"
+            );
+        }
     }
     #[test]
     fn the_settings_are_checked() {
