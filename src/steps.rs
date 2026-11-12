@@ -4253,6 +4253,15 @@ fn corner<'a>(
             mm((turns_per_minute * 10.).round() / 10.)
         )));
     }
+    // Which way round the part the walk goes, seen from above, by its ends
+    // about the round's centre: counter-clockwise with the spindle
+    // clockwise.
+    let round_left = match (points.first(), points.last()) {
+        (Some(a), Some(b)) => {
+            (a[0] - centre[0]) * (b[1] - centre[1]) - (a[1] - centre[1]) * (b[0] - centre[0]) > 0.
+        }
+        _ => true,
+    };
     let way_words = |k: usize| match way(k) {
         1 => format!("{} only ever up", AXES[k]),
         -1 => format!("{} only ever down", AXES[k]),
@@ -4275,7 +4284,9 @@ fn corner<'a>(
         label(format!("Corner {corner} of {corners} · {place} · R{}", mm(*radius))),
         muted(format!("Walk {index} of {of} at Z {}, {what}.", dro(*z))).size(13),
         muted(format!(
-            "Conventional, round the part counter-clockwise: {}, {}. Come to every number that way, so the backlash stays taken up, and keep the quill locked.",
+            "Conventional with the spindle {}: round the part {}, {}, {}. Come to every number that way, so the backlash stays taken up, and keep the quill locked.",
+            if round_left { "clockwise (M3)" } else { "counter-clockwise (M4)" },
+            if round_left { "counter-clockwise" } else { "clockwise" },
             way_words(0),
             way_words(1)
         ))

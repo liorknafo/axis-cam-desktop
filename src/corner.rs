@@ -206,11 +206,70 @@ fn segment(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
     };
     (p[0] - a[0] - t * dx).hypot(p[1] - a[1] - t * dy)
 }
-/// The most material, mm, a tool of radius `rc` whose centre walks `path`
-/// leaves standing proud of the part's round of radius `r` about `c` over
-/// quarter `q`, from `from` to `to` radians on: at each point of the round,
-/// how much farther than `rc` the path is. Negative where the tool would
-/// cut into the round. `samples` points over the stretch.
+/// How far along the ray from `a` in the unit direction `n` the first point
+/// within `rc` of the segment `p`–`q` is (the capsule a tool of radius `rc`
+/// sweeps along it); 0 when `a` is in it, None when the ray misses it.
+fn ray_capsule(a: [f64; 2], n: [f64; 2], p: [f64; 2], q: [f64; 2], rc: f64) -> Option<f64> {
+    let disc = |c: [f64; 2]| {
+        let v = [a[0] - c[0], a[1] - c[1]];
+        let b = v[0] * n[0] + v[1] * n[1];
+        let k = v[0] * v[0] + v[1] * v[1] - rc * rc;
+        if k <= 0. {
+            return Some(0.);
+        }
+        let d = b * b - k;
+        let t = -b - d.max(0.).sqrt();
+        (d >= 0. && t >= 0.).then_some(t)
+    };
+    // The band along the segment, in its own frame: along it 0..l, across
+    // it −rc..rc.
+    let l = (q[0] - p[0]).hypot(q[1] - p[1]);
+    let band = (l > 1e-12).then(|| {
+        let d = [(q[0] - p[0]) / l, (q[1] - p[1]) / l];
+        let m = [-d[1], d[0]];
+        let v = [a[0] - p[0], a[1] - p[1]];
+        let o = [v[0] * d[0] + v[1] * d[1], v[0] * m[0] + v[1] * m[1]];
+        let w = [n[0] * d[0] + n[1] * d[1], n[0] * m[0] + n[1] * m[1]];
+        let (mut lo, mut hi) = (0f64, f64::INFINITY);
+        for (k, (a, b)) in [(0., l), (-rc, rc)].into_iter().enumerate() {
+            if w[k].abs() < 1e-15 {
+                if o[k] < a || o[k] > b {
+                    return None;
+                }
+            } else {
+                let (t1, t2) = ((a - o[k]) / w[k], (b - o[k]) / w[k]);
+                lo = lo.max(t1.min(t2));
+                hi = hi.min(t1.max(t2));
+            }
+        }
+        (lo <= hi).then_some(lo)
+    });
+    [disc(p), disc(q), band.flatten()]
+        .into_iter()
+        .flatten()
+        .reduce(f64::min)
+}
+/// At the point `t` radians round quarter `q` of the part's round of
+/// radius `r` about `c`: how much material a tool of radius `rc` whose
+/// centre walks `path` leaves standing proud of the round there, measured
+/// out along the round's normal to where the tool's sweep starts (the
+/// scallop's height there); and how far the path is from that point less
+/// `rc`, negative where the tool would cut into the round.
+fn left_at(c: [f64; 2], r: f64, rc: f64, q: usize, path: &[[f64; 2]], t: f64) -> (f64, f64) {
+    let n = unit(q, t);
+    let a = [c[0] + r * n[0], c[1] + r * n[1]];
+    let height = (path.windows(2))
+        .filter_map(|w| ray_capsule(a, n, w[0], w[1], rc))
+        .fold(f64::INFINITY, f64::min);
+    let gap = (path.windows(2))
+        .map(|w| segment(a, w[0], w[1]))
+        .fold(f64::INFINITY, f64::min)
+        - rc;
+    (height, gap)
+}
+/// The most material `left_at` finds proud of the round from `from` to `to`
+/// radians round quarter `q`, at `samples` points over it, and the least
+/// gap.
 fn left(
     c: [f64; 2],
     r: f64,
@@ -222,35 +281,53 @@ fn left(
 ) -> (f64, f64) {
     let (mut most, mut least) = (f64::NEG_INFINITY, f64::INFINITY);
     for k in 0..=samples {
-        let u = unit(q, from + (to - from) * k as f64 / samples as f64);
-        let a = [c[0] + r * u[0], c[1] + r * u[1]];
-        let d = (path.windows(2))
-            .map(|w| segment(a, w[0], w[1]))
-            .fold(f64::INFINITY, f64::min)
-            - rc;
-        most = most.max(d);
-        least = least.min(d);
+        let (h, g) = left_at(
+            c,
+            r,
+            rc,
+            q,
+            path,
+            from + (to - from) * k as f64 / samples as f64,
+        );
+        most = most.max(h);
+        least = least.min(g);
     }
     (most, least)
 }
-/// The most material `left` leaves over the whole quarter, to within no
-/// more than it says: the distance to the path changes by at most the
-/// distance along the round, so the most sampled every `d` mm along it is
-/// at most `d / 2` under the true one, which is added. And the least, as
-/// sampled.
+/// The most material `left_at` leaves proud of the round over the whole
+/// quarter, and the least gap. The scallops peak where two cuts' edges
+/// meet, between two samples: each sample higher than both its neighbours
+/// is followed to its peak between them (the height rises to a peak and
+/// falls past it), to a ten-millionth of a radian.
 fn bound(c: [f64; 2], r: f64, rc: f64, q: usize, path: &[[f64; 2]]) -> (f64, f64) {
-    let length = r * std::f64::consts::FRAC_PI_2;
-    let samples = (length / 0.0005).ceil().clamp(2000., 200_000.) as usize;
-    let (most, least) = left(
-        c,
-        r,
-        rc,
-        q,
-        path,
-        (0., std::f64::consts::FRAC_PI_2),
-        samples,
-    );
-    (most + length / samples as f64 / 2., least)
+    let quarter = std::f64::consts::FRAC_PI_2;
+    let samples = (r * quarter / 0.002).ceil().clamp(2000., 50_000.) as usize;
+    let at = |k: usize| quarter * k as f64 / samples as f64;
+    let heights: Vec<(f64, f64)> = (0..=samples)
+        .map(|k| left_at(c, r, rc, q, path, at(k)))
+        .collect();
+    let least = heights.iter().map(|h| h.1).fold(f64::INFINITY, f64::min);
+    let mut most = heights
+        .iter()
+        .map(|h| h.0)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let height = |t: f64| left_at(c, r, rc, q, path, t).0;
+    for k in 1..samples {
+        if heights[k].0 < heights[k - 1].0 || heights[k].0 < heights[k + 1].0 {
+            continue;
+        }
+        let (mut lo, mut hi) = (at(k - 1), at(k + 1));
+        while hi - lo > 1e-7 {
+            let (m1, m2) = (lo + (hi - lo) / 3., hi - (hi - lo) / 3.);
+            if height(m1) < height(m2) {
+                lo = m1;
+            } else {
+                hi = m2;
+            }
+        }
+        most = most.max(height((lo + hi) / 2.));
+    }
+    (most, least)
 }
 /// One walk round a corner: the tool centre's readings in order (work X,
 /// Y), from the first on the start wall's line to the last on the end
@@ -590,11 +667,38 @@ pub fn walks(
                 stair(cw, r as f64, rc as f64, q, a as f64, h as f64)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // Conventional: counter-clockwise round the part with the spindle
+        // clockwise (M3), the other way with it counter-clockwise (M4).
+        let stairs: Vec<Stair> = if b.plan.spindle_clockwise {
+            stairs
+        } else {
+            (stairs.into_iter())
+                .map(|mut s| {
+                    s.points.reverse();
+                    s
+                })
+                .collect()
+        };
         let stock_frame = |p: [f64; 2]| [p[0] as f32 + zero[0], p[1] as f32 + zero[1]];
-        // Into the first reading along the start wall's normal, out of the
-        // last along the end wall's, each from or to clear of the stock.
-        let e = if u0[0] != 0. { 0 } else { 1 };
-        let o = 1 - e;
+        // Into the first reading along its wall's normal, out of the last
+        // along the other wall's, each from or to clear of the stock: `e`
+        // the axis in along, toward `-sign_in`, `o` the axis out along.
+        let start_axis = if u0[0] != 0. { 0 } else { 1 };
+        let (e, sign_in, o, sign_out) = if b.plan.spindle_clockwise {
+            (
+                start_axis,
+                u0[start_axis],
+                1 - start_axis,
+                u1[1 - start_axis],
+            )
+        } else {
+            (
+                1 - start_axis,
+                u1[1 - start_axis],
+                start_axis,
+                u0[start_axis],
+            )
+        };
         // Always some way: a walk's first and last moves are its way in and
         // out (`read`).
         let beyond = |k: usize, sign: f32, at: f32| {
@@ -613,9 +717,9 @@ pub fn walks(
                 stock_frame(*stair.points.last().unwrap()),
             );
             let mut start = first;
-            start[e] = beyond(e, u0[e], first[e]);
+            start[e] = beyond(e, sign_in, first[e]);
             let mut end = last;
-            end[o] = beyond(o, u1[o], last[o]);
+            end[o] = beyond(o, sign_out, last[o]);
             let through = material(setup, capsule(start, first, rc), &s, bottom, s.max[2])
                 || material(setup, capsule(last, end, rc), &s, bottom, s.max[2]);
             let band = if a > 0. {
@@ -688,9 +792,9 @@ pub fn walks(
         for (stair, &a) in stairs.iter().zip(&offsets) {
             let mut path: Vec<[f32; 2]> = stair.points.iter().map(|p| stock_frame(*p)).collect();
             let mut start = path[0];
-            start[e] = beyond(e, u0[e], path[0][e]);
+            start[e] = beyond(e, sign_in, path[0][e]);
             let mut end = *path.last().unwrap();
-            end[o] = beyond(o, u1[o], end[o]);
+            end[o] = beyond(o, sign_out, end[o]);
             path.insert(0, start);
             path.push(end);
             for w in path.windows(2) {
@@ -730,7 +834,7 @@ pub fn walks(
                 let (first, last) = (points[0], *points.last().unwrap());
                 let walk_o = (last[o] - first[o]).signum();
                 let mut at = [0f32; 3];
-                at[e] = beyond(e, u0[e], first[e]);
+                at[e] = beyond(e, sign_in, first[e]);
                 at[o] = first[o] - walk_o * TAKE_UP;
                 at[2] = b.retract;
                 b.push(at, Motion::Rapid, false, rapid)?;
@@ -744,7 +848,7 @@ pub fn walks(
                     at[1] = p[1];
                     b.push(at, Motion::Feed, true, feed)?;
                 }
-                at[o] = beyond(o, u1[o], last[o]);
+                at[o] = beyond(o, sign_out, last[o]);
                 b.push(at, Motion::Feed, true, feed)?;
                 at[2] = b.clearance;
                 b.push(at, Motion::Rapid, false, rapid)?;
@@ -761,7 +865,6 @@ pub fn walks(
         }
     }
     b.plan.milling_direction = "Conventional";
-    b.plan.spindle_clockwise = true;
     b.plan.target = deepest;
     b.plan.levels = levels_total;
     b.plan.rest_top = rest_top;
@@ -1360,6 +1463,115 @@ pub(crate) mod tests {
             .end
             - 1;
         assert!(matches!(guide.steps[last], Step::Check { op: 0 }));
+    }
+    /// The most material the tool sweeping `path` leaves proud of the round,
+    /// by brute force: along each of `rays` normals out of it, stepped out
+    /// 0.0005 mm at a time to the first point within `rc` of the path, then
+    /// halved down to it. Independent of `ray_capsule`.
+    fn brute(c: [f64; 2], r: f64, rc: f64, q: usize, path: &[[f64; 2]], rays: usize) -> f64 {
+        let inside = |p: [f64; 2]| {
+            path.windows(2)
+                .map(|w| segment(p, w[0], w[1]))
+                .fold(f64::INFINITY, f64::min)
+                <= rc
+        };
+        let mut most: f64 = 0.;
+        for k in 0..=rays {
+            let n = unit(q, std::f64::consts::FRAC_PI_2 * k as f64 / rays as f64);
+            let at = |t: f64| [c[0] + (r + t) * n[0], c[1] + (r + t) * n[1]];
+            let mut t = 0.;
+            while !inside(at(t)) {
+                t += 0.0005;
+                assert!(t < 5., "the ray at {k} meets no cut");
+            }
+            let (mut lo, mut hi) = ((t - 0.0005f64).max(0.), t);
+            if !inside(at(lo)) {
+                for _ in 0..30 {
+                    let mid = (lo + hi) / 2.;
+                    if inside(at(mid)) { hi = mid } else { lo = mid }
+                }
+            } else {
+                hi = lo;
+            }
+            most = most.max(hi);
+        }
+        most
+    }
+    #[test]
+    fn the_scallop_is_the_height_left_along_the_rounds_normal_checked_by_brute_force() {
+        // R5 with Ø10, Ø6 and Ø1 cutters (the Ø1 left 0.053 mm under the
+        // nearest-distance measure), about a centre off the hundredths.
+        for (rc, q) in [(5., 0), (3., 1), (0.5, 2), (0.5, 0)] {
+            let c = [-61.997, 38.993];
+            let s = stair(c, 5., rc, q, 0., 0.05).unwrap();
+            let found = brute(c, 5., rc, q, &s.points, 20_000);
+            assert!(found <= 0.05 + 1e-6, "Ø{} q{q}: {found}", 2. * rc);
+            assert!(
+                found <= s.scallop + 1e-6,
+                "Ø{} q{q}: {found} over the {} said",
+                2. * rc,
+                s.scallop
+            );
+            assert!(
+                s.scallop - found < 1e-3,
+                "Ø{} q{q}: {} said, {found} found",
+                2. * rc,
+                s.scallop
+            );
+        }
+    }
+    #[test]
+    fn a_counter_clockwise_spindle_walks_the_other_way_round_still_conventional() {
+        let mesh = adapter();
+        let setup = setup("3");
+        let tool = end_mill("10");
+        let mut op = corner_op(&mesh, &tool, all_ids(&setup, &mesh));
+        let (_, cw) = walks(&setup, &op, &tool, &mesh).unwrap();
+        op.p.insert("spindle_rotation".into(), "Counterclockwise (CCW)".into());
+        let (plan, ccw) = walks(&setup, &op, &tool, &mesh).unwrap();
+        assert!(!plan.spindle_clockwise);
+        assert_eq!(plan.milling_direction, "Conventional");
+        for m in &plan.moves {
+            assert!(
+                (0..3).filter(|&k| m.from[k] != m.to[k]).count() <= 1,
+                "{m:?}"
+            );
+        }
+        assert_eq!(cw.len(), ccw.len());
+        for (a, b) in cw.iter().zip(&ccw) {
+            let mut back = a.stair.points.clone();
+            back.reverse();
+            assert_eq!(back, b.stair.points);
+        }
+        // At the back right corner: in along Y from the back, X then only
+        // ever up, Y only ever down, out along X to the right.
+        let w = &ccw[0];
+        let feeds: Vec<&Move> = plan.moves[w.moves.clone()]
+            .iter()
+            .filter(|m| m.cutting_pass)
+            .collect();
+        let (first, last) = (feeds[0], feeds[feeds.len() - 1]);
+        assert!(
+            first.to[1] < first.from[1] && first.to[0] == first.from[0],
+            "{first:?}"
+        );
+        assert!(
+            last.to[0] > last.from[0] && last.to[1] == last.from[1],
+            "{last:?}"
+        );
+        for m in &feeds[1..feeds.len() - 1] {
+            assert!(m.to[0] >= m.from[0] && m.to[1] <= m.from[1], "{m:?}");
+        }
+    }
+    #[test]
+    fn steps_refuse_walks_into_the_jaws_and_say_where() {
+        let (mut doc, mesh) = plate_job("X");
+        doc.workholding[0]
+            .p
+            .insert("max_opening".into(), "200".into());
+        let e = crate::guide::build(&doc, &mesh, 0).unwrap_err();
+        assert!(e.contains("hits the vise jaw"), "{e}");
+        assert!(e.contains("stand clear of the vise's jaws"), "{e}");
     }
     #[test]
     fn the_settings_are_checked() {

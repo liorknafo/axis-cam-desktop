@@ -31496,11 +31496,11 @@ soft_max = 180.0
         assert_eq!(tiles(&a), cnc);
         assert_eq!(dimmed(&a), 0);
         lacks(&a, &["Indexed", "MANUAL MILL", "LATHE"]);
-        // The manual mill: Box, Drill, Thread.
+        // The manual mill: Box, Drill, Thread, Corner (LIO-443).
         let _ = a.update(Message::AddManualSetup);
         a.doc.active = a.doc.setups[0].id.clone();
         a.selected = None;
-        assert_eq!(tiles(&a), ["Box", "Drill", "Thread"]);
+        assert_eq!(tiles(&a), ["Box", "Drill", "Thread", "Corner"]);
         assert_eq!(dimmed(&a), 0);
         shows(&a, &["MANUAL MILL"]);
         // The lathe: a tile per cut, then Thread and Drill.

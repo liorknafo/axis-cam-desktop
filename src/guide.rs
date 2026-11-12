@@ -1821,6 +1821,18 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                         diameter,
                     });
                 }
+                // Walks that reach into the vise or the clamps are no steps
+                // to follow: said, as the planning page says them (LIO-443).
+                if let Ok(boxes) = doc.holding_boxes(setup, held) {
+                    let gap = crate::holding::gap(setup).unwrap_or_default();
+                    let reach = gap + crate::post::blend(machine);
+                    if let Some(hit) = crate::holding::hits(&plan, &boxes, reach).first() {
+                        return Err(format!(
+                            "{} Hold the part so that the corners to round stand clear of the vise's jaws or the clamps.",
+                            crate::holding::message(op.name(), hit, gap, zero)
+                        ));
+                    }
+                }
                 let corners = crate::corner::picked(setup, mesh, op)?;
                 let walks = crate::corner::read(&plan, &corners, zero);
                 count = walks.len();
