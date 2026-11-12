@@ -163,3 +163,14 @@ finds PID81426 no longer present; this agent never quit or relaunched it.
 | `/Users/liorknafo/Library/Application Support/AXIS CAM Studio/workspace.json` | `cfd07e21ec423c7165efe5fee632d20bce322f64ff67ead503bb25cd6e3f862f` | `0b9d4c6bdf22d50b0f909625d57110771ad4f309beae8bdbecc735a4c76287ac` |
 
 Headless toolbar/AddOp/Surface/edit test passed; clippy with `-D warnings` passed.
+
+## Independent review
+
+Both required stages returned ACCEPT at implementation head `30069e0`:
+GPT-6.1 Sol/high (evidence `/tmp/astra-sVCplc/evidence`) and GPT-6 Astra/high
+(evidence `/tmp/astra-capsule-stage2-6cj0jK/evidence`). Both independently reran
+the real sequence, OCCT, regression probes and all sixteen headless renders.
+The second review's minor follow-up is fixed: the static Slot Steps picture is
+explicitly labeled “Stock before this operation”. Fresh headless renders verify
+the caption; planning, geometry, stock and move generation are unchanged.
+Physical tool and unmodeled clearance limits remain operator responsibilities.

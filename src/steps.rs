@@ -4436,7 +4436,7 @@ impl canvas::Program<Message> for CornerDetail {
 }
 
 /// Slot instructions are read directly from the validated Plan, centres
-/// with compensation off. The stock picture is its simulated swept cut.
+/// with compensation off. The picture shows stock before the operation.
 fn slot_screen<'a>(
     p: &Page<'a>,
     step: &'a Step,
@@ -4502,7 +4502,13 @@ fn slot_screen<'a>(
         muted("Feed the full-width slot in the indicated direction. Take up backlash before feeding and lock the other axes. Lift before returning to the entry. Verify parallels, table and breakthrough clearance below the part; these are unmodeled.").size(13),
         scrollable(rows).height(Fill)
     ].spacing(9);
-    let left = p.picture(p.done(*op), Fill);
+    let left = column![
+        muted("Stock before this operation").size(13),
+        p.picture(p.done(*op), Fill)
+    ]
+    .spacing(8)
+    .height(Fill)
+    .into();
     (
         "Slot".into(),
         "one straight cutter-centre sweep per depth",
