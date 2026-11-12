@@ -32404,6 +32404,22 @@ soft_max = 180.0
         );
     }
 
+    /// A Drill added from the toolbar opens picking on its Geometry tab, and
+    /// the part's holes are then worked out off the window's thread: the
+    /// task that does it comes back from the press, not dropped with the
+    /// tab's (LIO-442).
+    #[test]
+    fn a_drill_added_hands_back_the_search_for_the_parts_holes() {
+        let units = |inline: bool| {
+            let mut a = pocket_app(crate::pocket::hole_plate(false));
+            a.generate_inline = inline;
+            let task = a.update(Message::AddOp(Strategy::Drill));
+            assert!(a.picking && a.tab == "Geometry", "{}", a.tab);
+            assert_eq!(a.finding_holes(), !inline);
+            task.units()
+        };
+        assert_eq!(units(false), units(true) + 1);
+    }
     /// A click on a modeled thread's flank or crest in a Drill picks its
     /// hole as the hole's outline does, the Drill drills it at the
     /// thread's centre, and a click again drops it (LIO-358).
