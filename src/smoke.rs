@@ -20689,6 +20689,31 @@ soft_max = 180.0
         let _ = a.update(Message::ModelReimported(other, Ok((file.clone(), mesh))));
         assert!(a.import_busy);
     }
+    /// A project whose part could not be read when it opened (macOS still
+    /// asking for its folder, LIO-444) shows why with Reimport model, and
+    /// Reimport model brings the part in once the file reads, no restart.
+    #[test]
+    fn reimporting_a_part_that_could_not_be_read_when_the_project_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, file) = block_app(dir.path());
+        let _ = a.restore_model();
+        let why = "block.stl could not be read within 10 s. Then reimport the model.";
+        let _ = a.update(Message::ModelRestored(file.clone(), Err(why.into())));
+        assert!(a.imported_mesh.is_none());
+        assert_eq!(a.import_error.as_deref(), Some(why));
+        assert!(!a.import_busy);
+        let _ = a.update(Message::Reimport);
+        assert!(a.import_busy);
+        let mesh = crate::mesh::load(&file.path).unwrap();
+        let _ = a.update(Message::ModelReimported(
+            file.clone(),
+            Ok((file.clone(), mesh)),
+        ));
+        assert!(a.imported_mesh.is_some());
+        assert_eq!(a.import_error, None);
+        assert!(!a.import_busy);
+        assert!(a.status.starts_with("Model reimported."), "{}", a.status);
+    }
     /// Import model choosing the project's own file is a reimport: the
     /// picks found again, the title kept; another file is a new part.
     #[test]

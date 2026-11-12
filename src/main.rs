@@ -8455,6 +8455,9 @@ impl App {
                 match result {
                     Ok((file, mesh)) => {
                         self.doc.file = Some(file);
+                        // Why the part was missing, from a failed restore
+                        // (LIO-444): it is in now.
+                        self.import_error = None;
                         self.take_model(mesh, true);
                     }
                     Err(e) => {
