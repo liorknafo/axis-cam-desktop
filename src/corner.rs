@@ -1574,6 +1574,29 @@ pub(crate) mod tests {
         let e = crate::guide::build(&doc, &mesh, 0).unwrap_err();
         assert!(e.contains("hits the vise jaw"), "{e}");
         assert!(e.contains("stand clear of the vise's jaws"), "{e}");
+        // A vise that does not open to the stock, or a holder no longer in
+        // the library, cannot be checked: no Steps either, and why.
+        let (doc, mesh) = plate_job("X");
+        let e = crate::guide::build(&doc, &mesh, 0).unwrap_err();
+        assert!(
+            e.contains("the workholding cannot be checked against the walks"),
+            "{e}"
+        );
+        assert!(e.contains("opens to 120 mm"), "{e}");
+        let (mut doc, mesh) = plate_job("Y");
+        doc.workholding.clear();
+        let e = crate::guide::build(&doc, &mesh, 0).unwrap_err();
+        assert!(
+            e.contains("the workholding cannot be checked against the walks"),
+            "{e}"
+        );
+        // The vise across Y, the ends out of it: the Steps are built; and
+        // with no workholding modelled, as any manual setup's.
+        let (mut doc, mesh) = plate_job("Y");
+        assert!(crate::guide::build(&doc, &mesh, 0).is_ok());
+        doc.setups[0].p.insert("holding".into(), "None".into());
+        let built = crate::guide::build(&doc, &mesh, 0);
+        assert!(built.is_ok(), "{:?}", built.err());
     }
     #[test]
     fn every_allowed_scallop_plans() {
