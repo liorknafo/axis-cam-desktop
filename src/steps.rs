@@ -19,6 +19,7 @@ use iced::{
     widget::{Column, button, canvas, column, container, image, row, scrollable, space, text},
 };
 use std::cell::Cell;
+pub(crate) use turning::dial_total;
 
 const ACCENT: Color = Color::from_rgb(0.91, 0.35, 0.05);
 const TOOL: Color = Color::from_rgb(0.18, 0.50, 0.93);
@@ -5390,6 +5391,46 @@ pub(crate) mod tests {
     /// Ø50.2 bar, faced, turned to Ø40, drilled, grooved, threaded and
     /// parted off) with its cross dial reading `reads` ("" = not known),
     /// `edit` made to it, on MACHINE with its guide built.
+    /// LIO-437: a lathe Thread's Passes tab prints the very readings its
+    /// pass screens give, a halfway one (0.91, pass 6) included.
+    #[test]
+    fn the_passes_tab_gives_the_thread_pass_screens_own_readings() {
+        use crate::guide::LatheStep as L;
+        let mut a = lathe_app("Diameter", |_| {});
+        let g = guide(&a);
+        let passes: Vec<(usize, usize)> = (g.steps.iter().enumerate())
+            .filter_map(|(i, s)| match s {
+                Step::Lathe(L::ThreadPass { op, .. }) => Some((i, *op)),
+                _ => None,
+            })
+            .collect();
+        assert!(!passes.is_empty());
+        let mut screens = vec![];
+        for (at, _) in &passes {
+            send(&mut a, GuideAction::Go(*at));
+            screens.push(texts(&a));
+        }
+        a.page = crate::Page::Work;
+        let _ = a.update(Message::SelectOp(passes[0].1));
+        let _ = a.update(Message::Tab("Passes".into()));
+        let note = (texts(&a).into_iter())
+            .find(|t| t.contains(" passes, the top slide at "))
+            .unwrap();
+        let readings: Vec<String> = (note.split(" in to: ").nth(1).unwrap())
+            .trim_end_matches('.')
+            .split(", ")
+            .map(str::to_string)
+            .collect();
+        assert_eq!(readings.len(), passes.len(), "{note}");
+        for (k, reading) in readings.iter().enumerate() {
+            assert!(
+                screens[k].iter().any(|t| t == reading),
+                "pass {}: {reading} in {:?}",
+                k + 1,
+                screens[k]
+            );
+        }
+    }
     pub(crate) fn lathe_app(reads: &str, edit: impl FnOnce(&mut Document)) -> App {
         let (doc, mesh) = crate::guide::tests::sample(reads);
         lathe_app_of(doc, mesh, edit)
