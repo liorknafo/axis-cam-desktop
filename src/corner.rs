@@ -1,0 +1,1376 @@
+//! Round corners on the manual mill (LIO-443): a part's rounded outside
+//! vertical corners, each a quarter round between a wall along X and one
+//! along Y, cut by the side of an end mill walked round the round in small
+//! DRO steps, one axis at a time, as a DRO's arc function steps it. The
+//! scallops left between the steps are then filed to the line.
+//!
+//! The tool centre stays on or outside the round offset by the cutter's
+//! radius: each step goes from one point on that offset round to the next
+//! by the two one-axis moves whose corner lies outside it, so no move comes
+//! nearer the part than the round. The steps are as long as leave at most
+//! the operation's scallop between them. The walk goes round the part
+//! counter-clockwise seen from above (conventional with the spindle
+//! clockwise, the cutter pushed against the feed, as a manual mill's
+//! backlash wants), each axis moving one way only, so the backlash is taken
+//! up once, before the walk.
+use crate::{
+    cam::{Builder, Geometry, ON, arcs, meets, number, swept},
+    mesh::{Bounds, Mesh},
+    model::{Fields, Operation, Setup, Tool, get, num},
+    simulation::{Motion, Move, Plan},
+};
+use std::collections::HashSet;
+
+pub const AVAILABILITY: &str =
+    "Available · rounded outside corners walked in DRO steps on a manual mill";
+pub const HELP: &str = "Round a part's outside vertical corners on the manual mill: the end mill's side walks round each corner in DRO steps, one axis at a time; the scallops are filed to the line after. Click a rounded corner, or pick all.";
+/// Why Round corners is refused on a CNC.
+pub const ON_CNC: &str =
+    "Round corners runs on a manual mill: a CNC cuts a corner's round with a Contour.";
+/// What a pick that is no rounded outside corner says.
+pub const NOT_A_CORNER: &str = "That is no rounded outside corner: click the round face of a corner of the part, where two upright walls meet.";
+/// What a Round corners with nothing picked says.
+pub const NONE_PICKED: &str = "Pick the rounded corners to cut: click the round face of each on the part, or Pick all outside corners.";
+/// A new Round corners' settings: a slow gear and the hand feed's pace
+/// for a cut on the side, the scallop the issue asks for, a stepover for
+/// the walks that take the stock off before the last, and Auto stepdown.
+pub const DEFAULTS: [(&str, &str); 5] = [
+    ("rpm", "640"),
+    ("feed", "120"),
+    ("scallop", "0.05"),
+    ("stepover", "40"),
+    ("stepdown", ""),
+];
+/// Each quarter's corner by where it is on the part, quarter `q` facing
+/// the way 45° + 90°·q does.
+pub const WHERE: [&str; 4] = [
+    "back right (X+ Y+)",
+    "back left (X− Y+)",
+    "front left (X− Y−)",
+    "front right (X+ Y−)",
+];
+/// The DRO's resolution: every reading is a hundredth.
+const READ: f64 = 0.01;
+/// The most steps a walk round one corner takes: one a degree.
+const MAX_STEPS: usize = 90;
+/// How far clear of the stock the tool goes down beside it, mm.
+const CLEAR: f32 = 2.;
+/// How far short of the walk's first reading on the axis the walk moves
+/// along first the tool stops, to come to it the way the walk goes and so
+/// take up the backlash (mm).
+pub const TAKE_UP: f32 = 1.;
+/// How much a Corner's round may differ from a quarter, and its start from
+/// a wall along X or Y, degrees.
+const SQUARE: f32 = 1.;
+
+/// What is wrong with a Round corners' settings.
+pub fn setting_issues(p: &Fields) -> Vec<String> {
+    let mut e = vec![];
+    if !num(p, "scallop").is_some_and(|v| (0.01..=1.).contains(&v)) {
+        e.push("Scallop must be 0.01–1 mm: the DRO reads a hundredth.".into());
+    }
+    if !num(p, "stepover").is_some_and(|v| (10. ..=100.).contains(&v)) {
+        e.push("Stepover must be 10–100 % of the tool's diameter.".into());
+    }
+    if !get(p, "stepdown").trim().is_empty() && !num(p, "stepdown").is_some_and(|v| v > 0.) {
+        e.push("Stepdown must be positive, or empty for Auto.".into());
+    }
+    e
+}
+
+/// A rounded outside vertical corner, as `setup` places the part (mm).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Corner {
+    pub centre: [f32; 2],
+    pub r: f32,
+    /// Which quarter round its centre it is: from 90°·q to 90°·(q + 1),
+    /// the way the walk goes.
+    pub quarter: usize,
+    pub top: f32,
+    pub bottom: f32,
+    /// The surfaces of its facets.
+    pub walls: Vec<usize>,
+}
+impl Corner {
+    /// The corner `a` is, when it is a quarter round from a wall along X or
+    /// Y to one along the other.
+    pub(crate) fn from_arc(a: &arcs::Arc) -> Result<Corner, String> {
+        let span = a.span;
+        let start = a.middle.to_degrees() - span / 2.;
+        let q = (start / 90.).round();
+        if (span - 90.).abs() > SQUARE || (start - 90. * q).abs() > SQUARE {
+            return Err(format!(
+                "The round at X{:.2} Y{:.2} goes {span:.0}° round from {start:.0}°: Round corners rounds a square corner, a quarter round between a wall along X and one along Y.",
+                a.centre[0], a.centre[1]
+            ));
+        }
+        Ok(Corner {
+            centre: a.centre,
+            r: a.r,
+            quarter: (q as i32).rem_euclid(4) as usize,
+            top: a.top,
+            bottom: a.bottom,
+            walls: a.walls.clone(),
+        })
+    }
+    /// Where on the part it is, in words.
+    pub fn place(&self) -> &'static str {
+        WHERE[self.quarter]
+    }
+}
+/// The unit vector `t` radians on from the start of quarter `q`.
+fn unit(q: usize, t: f64) -> [f64; 2] {
+    let a = std::f64::consts::FRAC_PI_2 * q as f64 + t;
+    [a.cos(), a.sin()]
+}
+/// Unit vectors to the start and the end of quarter `q`, exact.
+fn ends(q: usize) -> ([f32; 2], [f32; 2]) {
+    const AXES: [[f32; 2]; 4] = [[1., 0.], [0., 1.], [-1., 0.], [0., -1.]];
+    (AXES[q % 4], AXES[(q + 1) % 4])
+}
+/// The corners among the surfaces `ids`, in the order cut: round the part
+/// counter-clockwise from its back right one. A round that is no square
+/// corner's says why.
+pub fn among(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Result<Vec<Corner>, String> {
+    let mut found = arcs::outside_arcs_among(setup, mesh, ids)
+        .iter()
+        .map(Corner::from_arc)
+        .collect::<Result<Vec<_>, _>>()?;
+    found.sort_by(|a, b| {
+        (a.quarter.cmp(&b.quarter))
+            .then(a.centre[0].total_cmp(&b.centre[0]))
+            .then(a.centre[1].total_cmp(&b.centre[1]))
+    });
+    Ok(found)
+}
+/// Every square rounded outside corner of the part (`among` over all its
+/// upright faces); rounds that are no square corner's are left out.
+pub fn all(setup: &Setup, mesh: &Mesh) -> Vec<Corner> {
+    let mut found: Vec<Corner> = arcs::outside_arcs_among(setup, mesh, &arcs::upright(setup, mesh))
+        .iter()
+        .filter_map(|a| Corner::from_arc(a).ok())
+        .collect();
+    found.sort_by(|a, b| {
+        (a.quarter.cmp(&b.quarter))
+            .then(a.centre[0].total_cmp(&b.centre[0]))
+            .then(a.centre[1].total_cmp(&b.centre[1]))
+    });
+    found
+}
+/// The corners `op` rounds: those its picked surfaces make.
+pub fn picked(setup: &Setup, mesh: &Mesh, op: &Operation) -> Result<Vec<Corner>, String> {
+    let Some(selection) = op.surfaces.as_ref().filter(|s| !s.ids.is_empty()) else {
+        return Err(NONE_PICKED.into());
+    };
+    if !selection.matches(mesh) {
+        return Err(
+            "The model geometry changed. Pick the corners again on the current part.".into(),
+        );
+    }
+    let ids: HashSet<usize> = selection.ids.iter().copied().collect();
+    let found = among(setup, mesh, &ids)?;
+    if found.is_empty() {
+        return Err(NONE_PICKED.into());
+    }
+    Ok(found)
+}
+
+/// `v` on the DRO's hundredths, rounded away from `c` (either way when on
+/// it): a point so rounded off a round about `c` is no nearer to it.
+fn outward(v: f64, c: f64) -> f64 {
+    let d = v - c;
+    let at = v / READ;
+    let n = if d > 1e-9 {
+        (at - 1e-6).ceil()
+    } else if d < -1e-9 {
+        (at + 1e-6).floor()
+    } else {
+        at.round()
+    };
+    n * READ
+}
+/// The corner between `a` and `b` that a one-axis move then another one
+/// make, the one farther from `c`: outside the round both are on.
+fn outer(c: [f64; 2], a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
+    let (p, q) = ([b[0], a[1]], [a[0], b[1]]);
+    let d = |p: [f64; 2]| (p[0] - c[0]).hypot(p[1] - c[1]);
+    if d(p) >= d(q) { p } else { q }
+}
+fn segment(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let l = dx * dx + dy * dy;
+    let t = if l == 0. {
+        0.
+    } else {
+        (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l).clamp(0., 1.)
+    };
+    (p[0] - a[0] - t * dx).hypot(p[1] - a[1] - t * dy)
+}
+/// The most material, mm, a tool of radius `rc` whose centre walks `path`
+/// leaves standing proud of the part's round of radius `r` about `c` over
+/// quarter `q`, from `from` to `to` radians on: at each point of the round,
+/// how much farther than `rc` the path is. Negative where the tool would
+/// cut into the round. `samples` points over the stretch.
+fn left(
+    c: [f64; 2],
+    r: f64,
+    rc: f64,
+    q: usize,
+    path: &[[f64; 2]],
+    (from, to): (f64, f64),
+    samples: usize,
+) -> (f64, f64) {
+    let (mut most, mut least) = (f64::NEG_INFINITY, f64::INFINITY);
+    for k in 0..=samples {
+        let u = unit(q, from + (to - from) * k as f64 / samples as f64);
+        let a = [c[0] + r * u[0], c[1] + r * u[1]];
+        let d = (path.windows(2))
+            .map(|w| segment(a, w[0], w[1]))
+            .fold(f64::INFINITY, f64::min)
+            - rc;
+        most = most.max(d);
+        least = least.min(d);
+    }
+    (most, least)
+}
+/// The most material `left` leaves over the whole quarter, to within no
+/// more than it says: the distance to the path changes by at most the
+/// distance along the round, so the most sampled every `d` mm along it is
+/// at most `d / 2` under the true one, which is added. And the least, as
+/// sampled.
+fn bound(c: [f64; 2], r: f64, rc: f64, q: usize, path: &[[f64; 2]]) -> (f64, f64) {
+    let length = r * std::f64::consts::FRAC_PI_2;
+    let samples = (length / 0.0005).ceil().clamp(2000., 200_000.) as usize;
+    let (most, least) = left(
+        c,
+        r,
+        rc,
+        q,
+        path,
+        (0., std::f64::consts::FRAC_PI_2),
+        samples,
+    );
+    (most + length / samples as f64 / 2., least)
+}
+/// One walk round a corner: the tool centre's readings in order (work X,
+/// Y), from the first on the start wall's line to the last on the end
+/// wall's, each next one a move along one axis.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stair {
+    pub points: Vec<[f64; 2]>,
+    /// The most it leaves standing proud of the round (`left`).
+    pub scallop: f64,
+}
+/// The point `t` radians round quarter `q` of the round of radius `rho`
+/// about `c`, on the DRO's hundredths, outward.
+fn on(c: [f64; 2], rho: f64, q: usize, t: f64) -> [f64; 2] {
+    let u = unit(q, t);
+    [
+        outward(c[0] + rho * u[0], c[0]),
+        outward(c[1] + rho * u[1], c[1]),
+    ]
+}
+/// The angles of the steps round quarter `q` (0 to π/2) that each leave
+/// at most `h` proud of the round of radius `r` (`left` over that step
+/// alone, which is never less than over the whole walk), each as long as
+/// it may be; None when that takes more than `MAX_STEPS`.
+fn angles(c: [f64; 2], r: f64, rc: f64, q: usize, h: f64) -> Option<Vec<f64>> {
+    let rho = r + rc;
+    let quarter = std::f64::consts::FRAC_PI_2;
+    let step = |a: f64, b: f64| {
+        let (p, n) = (on(c, rho, q, a), on(c, rho, q, b));
+        left(c, r, rc, q, &[p, outer(c, p, n), n], (a, b), 24).0
+    };
+    let mut at = vec![0.];
+    let mut t = 0.;
+    while t < quarter - 1e-9 {
+        if at.len() > MAX_STEPS {
+            return None;
+        }
+        let next = if step(t, quarter) <= h {
+            quarter
+        } else {
+            let (mut lo, mut hi) = (t, quarter);
+            for _ in 0..40 {
+                let mid = (lo + hi) / 2.;
+                if step(t, mid) <= h {
+                    lo = mid
+                } else {
+                    hi = mid
+                }
+            }
+            lo
+        };
+        if next - t < 1e-4 {
+            return None;
+        }
+        t = next;
+        at.push(t);
+    }
+    Some(at)
+}
+/// The walk round quarter `q` of a round of radius `r` about `c` (work
+/// coordinates, mm) by a tool of radius `rc` whose centre keeps `offset`
+/// outside the round offset by `rc`, in as few steps as leave at most
+/// `scallop` proud of the round `offset` outside the part's; the steps
+/// then made as even as that number allows. Every reading on the DRO's
+/// hundredths, rounded outward. Refused when the scallop takes more than
+/// `MAX_STEPS` steps.
+pub fn stair(
+    c: [f64; 2],
+    r: f64,
+    rc: f64,
+    q: usize,
+    offset: f64,
+    scallop: f64,
+) -> Result<Stair, String> {
+    let r = r + offset;
+    let rho = r + rc;
+    let walk = |angles: &[f64]| {
+        let mut points = vec![on(c, rho, q, angles[0])];
+        for w in angles.windows(2) {
+            let (p, n) = (*points.last().unwrap(), on(c, rho, q, w[1]));
+            for v in [outer(c, p, n), n] {
+                if *points.last().unwrap() != v {
+                    points.push(v);
+                }
+            }
+        }
+        points
+    };
+    let too_many = || {
+        format!(
+            "A scallop of {scallop} mm takes more than {MAX_STEPS} steps round an R{} corner: allow a larger scallop.",
+            r - offset
+        )
+    };
+    // Rounding to the DRO's hundredths may leave a little more than each
+    // step was worked out to: then the steps are worked out again to less.
+    let mut h = scallop;
+    for _ in 0..8 {
+        let first = angles(c, r, rc, q, h).ok_or_else(too_many)?;
+        let n = first.len();
+        // The least that still takes that many steps: the steps even.
+        let (mut lo, mut hi, mut best) = (0.25 * h, h, first);
+        for _ in 0..20 {
+            let mid = (lo + hi) / 2.;
+            match angles(c, r, rc, q, mid) {
+                Some(a) if a.len() <= n => {
+                    hi = mid;
+                    best = a;
+                }
+                _ => lo = mid,
+            }
+        }
+        let points = walk(&best);
+        let (most, _) = bound(c, r, rc, q, &points);
+        if most <= scallop + 1e-9 {
+            return Ok(Stair {
+                points,
+                scallop: most.max(0.),
+            });
+        }
+        h *= 0.8;
+    }
+    Err(too_many())
+}
+
+/// One walk of a Round corners' plan: round corner `corner` (of the plan's
+/// corners, in order), `offset` outside the round, at work Z `z`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Walk {
+    pub corner: usize,
+    pub offset: f32,
+    pub z: f32,
+    pub level: usize,
+    pub levels: usize,
+    /// The walk's readings (work X, Y) and what it leaves.
+    pub stair: Stair,
+    /// Its moves in the plan: from the first after the walk before up to
+    /// its last, the tool up at clearance.
+    pub moves: std::ops::Range<usize>,
+}
+/// The round-the-part fields `generate` needs of `op` and the material.
+struct Settings {
+    scallop: f32,
+    band: f32,
+    stepdown: Option<f32>,
+}
+fn settings(op: &Operation, r: f32) -> Result<Settings, String> {
+    if let Some(e) = setting_issues(&op.p).into_iter().next() {
+        return Err(e);
+    }
+    Ok(Settings {
+        scallop: number(op, "scallop")?,
+        band: number(op, "stepover")? / 100. * 2. * r,
+        stepdown: if get(&op.p, "stepdown").trim().is_empty() {
+            None
+        } else {
+            Some(number(op, "stepdown")?)
+        },
+    })
+}
+/// A closed outline of the ring between radii `a` and `b` about `c` over
+/// quarter `q` (setup frame), for `rest::Reach`.
+fn ring(c: [f32; 2], a: f32, b: f32, q: usize) -> Vec<(f64, f64)> {
+    const SIDES: usize = 24;
+    let point = |r: f32, t: f64| {
+        let u = unit(q, t);
+        (c[0] as f64 + r as f64 * u[0], c[1] as f64 + r as f64 * u[1])
+    };
+    let quarter = std::f64::consts::FRAC_PI_2;
+    // Out past the arc's chords on the outside.
+    let b = b / (quarter / 2. / SIDES as f64).cos() as f32;
+    let mut out: Vec<(f64, f64)> = (0..=SIDES)
+        .map(|i| point(b, quarter * i as f64 / SIDES as f64))
+        .collect();
+    out.extend(
+        (0..=SIDES)
+            .rev()
+            .map(|i| point(a, quarter * i as f64 / SIDES as f64)),
+    );
+    out
+}
+/// Whether the stock as the setup's earlier operations left it has
+/// material between `bottom` and `top` in the outline `area` (setup frame);
+/// with none of them, whether `area` meets the stock box `s`.
+fn material(setup: &Setup, area: Vec<(f64, f64)>, s: &Bounds, bottom: f32, top: f32) -> bool {
+    let (mut lo, mut hi) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+    for p in &area {
+        for (k, v) in [p.0 as f32, p.1 as f32].into_iter().enumerate() {
+            (lo[k], hi[k]) = (lo[k].min(v), hi[k].max(v));
+        }
+    }
+    if (0..2).any(|k| hi[k] <= s.min[k] + ON || lo[k] >= s.max[k] - ON) {
+        return false;
+    }
+    setup.preview_remaining.is_none()
+        || crate::rest::start_over(setup, &crate::rest::Reach::new(&[area]), bottom, top, 0.)
+            > bottom + ON
+}
+/// The capsule a tool of radius `r` sweeps from `a` to `b` (setup frame).
+fn capsule(a: [f32; 2], b: [f32; 2], r: f32) -> Vec<(f64, f64)> {
+    let heading = (b[1] - a[1]).atan2(b[0] - a[0]) as f64;
+    let mut out = vec![];
+    for (p, from) in [
+        (b, heading - std::f64::consts::FRAC_PI_2),
+        (a, heading + std::f64::consts::FRAC_PI_2),
+    ] {
+        for i in 0..=12 {
+            let t = from + std::f64::consts::PI * i as f64 / 12.;
+            out.push((
+                p[0] as f64 + r as f64 * t.cos(),
+                p[1] as f64 + r as f64 * t.sin(),
+            ));
+        }
+    }
+    out
+}
+/// Equal steps of at most `by` from `from` (left out) down to exactly `to`.
+fn down(from: f32, to: f32, by: f32) -> Vec<f32> {
+    let n = ((from - to) / by - 0.0001).ceil().clamp(1., 10_000.) as usize;
+    (1..=n)
+        .map(|i| {
+            if i == n {
+                to
+            } else {
+                from - (from - to) * i as f32 / n as f32
+            }
+        })
+        .collect()
+}
+/// A Round corners on a manual mill: for each picked corner, from the
+/// top of the material down to the corner's foot in levels no deeper than
+/// the stepdown, at each level walks round it from outside in, a band no
+/// wider than the stepover each, the last on the round itself (`stair`).
+/// A walk with no material left in its band is left out, but for the last.
+/// Each walk: up at clearance over the start wall's line, out clear of the
+/// stock; along the walk's second axis to a millimetre short of its first
+/// reading, then on to it, so the backlash is taken up the way the walk
+/// goes; down beside the stock; in along the wall's normal to the first
+/// reading; the steps; out along the end wall's normal clear of the stock;
+/// up. Every move is checked against the part.
+pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
+    Ok(walks(setup, op, tool, mesh)?.0)
+}
+/// `generate`'s plan and its walks, in order.
+pub fn walks(
+    setup: &Setup,
+    op: &Operation,
+    tool: &Tool,
+    mesh: &Mesh,
+) -> Result<(Plan, Vec<Walk>), String> {
+    if !crate::manual::is_manual(&setup.machine) {
+        return Err(ON_CNC.into());
+    }
+    let mut b = Builder::new(setup, op, tool, mesh)?;
+    if get(&tool.p, "type") != "Flat end mill" {
+        return Err("Round corners needs a flat end mill.".into());
+    }
+    let (s, rc) = (b.plan.stock, b.plan.radius);
+    let set = settings(op, rc)?;
+    let zero = crate::post::datum(setup, s, mesh)?;
+    let corners = picked(setup, mesh, op)?;
+    let geometry = Geometry::new(setup, mesh);
+    let pause = num(&setup.machine.p, "pass_time")
+        .filter(|t| *t >= 0.)
+        .unwrap_or(0.);
+    let (rapid, feed) = (b.rapid, b.feed);
+    let mut walks = vec![];
+    let mut levels_total = 0;
+    let mut deepest = f32::INFINITY;
+    let mut rest_top: Option<f32> = None;
+    for (ci, corner) in corners.iter().enumerate() {
+        let (c, r, q) = (corner.centre, corner.r, corner.quarter);
+        let (u0, u1) = ends(q);
+        let bottom = corner.bottom.max(s.min[2]);
+        if bottom >= s.max[2] - ON {
+            return Err(format!(
+                "The {} corner is at the stock's top: there is nothing to round.",
+                corner.place()
+            ));
+        }
+        // How far the stock reaches out past the round: to the stock box's
+        // corner off it.
+        let far = [
+            if u0[0] + u1[0] > 0. {
+                s.max[0]
+            } else {
+                s.min[0]
+            },
+            if u0[1] + u1[1] > 0. {
+                s.max[1]
+            } else {
+                s.min[1]
+            },
+        ];
+        let thick = ((far[0] - c[0]).hypot(far[1] - c[1]) - r).max(0.);
+        // Outside in: bands no wider than the stepover, the last on the
+        // round; one that finds no material left is not walked.
+        let n = ((thick - 0.001) / set.band).ceil().max(1.) as usize;
+        let top_of = |a: f32, w: f32| {
+            crate::rest::start_over(
+                setup,
+                &crate::rest::Reach::new(&[ring(c, r + a, r + a + w, q)]),
+                bottom,
+                s.max[2],
+                0.,
+            )
+        };
+        let mut offsets: Vec<f32> = (1..n)
+            .rev()
+            .map(|k| thick * k as f32 / n as f32)
+            .filter(|&a| {
+                material(
+                    setup,
+                    ring(c, r + a, r + a + 2. * rc, q),
+                    &s,
+                    bottom,
+                    s.max[2],
+                )
+            })
+            .collect();
+        offsets.push(0.);
+        // The levels: from the highest material outside the round.
+        let top = top_of(0.05, thick + 2. * rc).max(bottom + ON);
+        if top < s.max[2] - 0.0001 {
+            rest_top = Some(rest_top.map_or(top, |t: f32| t.max(top)));
+        }
+        // The stairs, in work coordinates.
+        let cw = [(c[0] - zero[0]) as f64, (c[1] - zero[1]) as f64];
+        let stairs = offsets
+            .iter()
+            .map(|&a| {
+                let h = if a > 0. {
+                    // A band's steps are taken by the next walk: coarser.
+                    (0.2 * set.band).clamp(set.scallop, 0.5)
+                } else {
+                    set.scallop
+                };
+                stair(cw, r as f64, rc as f64, q, a as f64, h as f64)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let stock_frame = |p: [f64; 2]| [p[0] as f32 + zero[0], p[1] as f32 + zero[1]];
+        // Into the first reading along the start wall's normal, out of the
+        // last along the end wall's, each from or to clear of the stock.
+        let e = if u0[0] != 0. { 0 } else { 1 };
+        let o = 1 - e;
+        // Always some way: a walk's first and last moves are its way in and
+        // out (`read`).
+        let beyond = |k: usize, sign: f32, at: f32| {
+            if sign > 0. {
+                (s.max[k] + rc + CLEAR).max(at + CLEAR)
+            } else {
+                (s.min[k] - rc - CLEAR).min(at - CLEAR)
+            }
+        };
+        // How wide the widest cut is: the whole diameter where the way in or
+        // out goes through stock, else a band.
+        let mut width: f32 = 0.;
+        for (stair, &a) in stairs.iter().zip(&offsets) {
+            let (first, last) = (
+                stock_frame(stair.points[0]),
+                stock_frame(*stair.points.last().unwrap()),
+            );
+            let mut start = first;
+            start[e] = beyond(e, u0[e], first[e]);
+            let mut end = last;
+            end[o] = beyond(o, u1[o], last[o]);
+            let through = material(setup, capsule(start, first, rc), &s, bottom, s.max[2])
+                || material(setup, capsule(last, end, rc), &s, bottom, s.max[2]);
+            let band = if a > 0. {
+                thick / n as f32
+            } else {
+                thick.min(set.band)
+            };
+            width = width.max(if through {
+                2. * rc
+            } else {
+                (band + 0.5).min(2. * rc)
+            });
+        }
+        let stepdown = match set.stepdown {
+            Some(d) => d,
+            None => {
+                let rpm = number(op, "rpm").ok().filter(|n| *n > 0.);
+                let flutes = num(&tool.p, "flutes").filter(|z| *z >= 1.);
+                let (Some(rpm), Some(flutes)) = (rpm, flutes) else {
+                    return Err(
+                        "An automatic stepdown needs a positive rpm and the tool's flutes.".into(),
+                    );
+                };
+                crate::forces::power_stepdown(
+                    &setup.machine,
+                    setup.job_material.as_ref(),
+                    2. * rc,
+                    width,
+                    feed,
+                    rpm,
+                    flutes,
+                )
+                .min(b.plan.flute_length)
+            }
+        };
+        if !(stepdown > 0. && stepdown <= b.plan.flute_length) {
+            return Err("Use a stepdown within the flute length.".into());
+        }
+        // On the DRO's hundredths, but the last, the corner's foot.
+        let levels: Vec<f32> = down(top, bottom, stepdown)
+            .into_iter()
+            .map(|z| {
+                if z <= bottom + ON {
+                    bottom
+                } else {
+                    ((z - zero[2]) / READ as f32).ceil() * READ as f32 + zero[2]
+                }
+            })
+            .collect();
+        levels_total += levels.len();
+        deepest = deepest.min(bottom);
+        // Every feed checked against the part, from the deepest level up:
+        // the tool's side and its end.
+        let near = Bounds {
+            min: [
+                c[0] - r - thick - 4. * rc - CLEAR,
+                c[1] - r - thick - 4. * rc - CLEAR,
+                bottom,
+            ],
+            max: [
+                c[0] + r + thick + 4. * rc + CLEAR,
+                c[1] + r + thick + 4. * rc + CLEAR,
+                s.max[2],
+            ],
+        };
+        let part: Vec<&[[f32; 3]; 3]> = (geometry.triangles.iter())
+            .filter(|t| meets(&t.p, &near))
+            .map(|t| &t.p)
+            .collect();
+        for (stair, &a) in stairs.iter().zip(&offsets) {
+            let mut path: Vec<[f32; 2]> = stair.points.iter().map(|p| stock_frame(*p)).collect();
+            let mut start = path[0];
+            start[e] = beyond(e, u0[e], path[0][e]);
+            let mut end = *path.last().unwrap();
+            end[o] = beyond(o, u1[o], end[o]);
+            path.insert(0, start);
+            path.push(end);
+            for w in path.windows(2) {
+                let lo = [w[0][0].min(w[1][0]), w[0][1].min(w[1][1])];
+                let hi = [w[0][0].max(w[1][0]), w[0][1].max(w[1][1])];
+                let cut = Bounds {
+                    min: [lo[0] - rc, lo[1] - rc, bottom + ON],
+                    max: [hi[0] + rc, hi[1] + rc, s.max[2]],
+                };
+                if let Some(t) = part
+                    .iter()
+                    .find(|t| meets(t, &cut) && swept(t, [lo, hi], rc, [cut.min[2], cut.max[2]]))
+                {
+                    let at: [f32; 3] = std::array::from_fn(|k| {
+                        (t.iter().map(|p| p[k]).sum::<f32>() / 3.) - zero[k]
+                    });
+                    return Err(format!(
+                        "Round corners cuts into the part at X{:.2}, Y{:.2}, Z{:.2}, walking the {} corner{}.",
+                        at[0],
+                        at[1],
+                        at[2],
+                        corner.place(),
+                        if a > 0. {
+                            format!(" {} mm off the round", crate::envelope::mm(a))
+                        } else {
+                            String::new()
+                        }
+                    ));
+                }
+            }
+        }
+        // The walks: each level, outside in.
+        for (li, &z) in levels.iter().enumerate() {
+            for (stair, &a) in stairs.iter().zip(&offsets) {
+                let first_move = b.plan.moves.len();
+                let points: Vec<[f32; 2]> = stair.points.iter().map(|p| stock_frame(*p)).collect();
+                let (first, last) = (points[0], *points.last().unwrap());
+                let walk_o = (last[o] - first[o]).signum();
+                let mut at = [0f32; 3];
+                at[e] = beyond(e, u0[e], first[e]);
+                at[o] = first[o] - walk_o * TAKE_UP;
+                at[2] = b.retract;
+                b.push(at, Motion::Rapid, false, rapid)?;
+                at[o] = first[o];
+                b.push(at, Motion::Rapid, false, rapid)?;
+                at[2] = z;
+                b.push(at, Motion::Rapid, false, rapid)?;
+                b.dwell(pause);
+                for p in &points {
+                    at[0] = p[0];
+                    at[1] = p[1];
+                    b.push(at, Motion::Feed, true, feed)?;
+                }
+                at[o] = beyond(o, u1[o], last[o]);
+                b.push(at, Motion::Feed, true, feed)?;
+                at[2] = b.clearance;
+                b.push(at, Motion::Rapid, false, rapid)?;
+                walks.push(Walk {
+                    corner: ci,
+                    offset: a,
+                    z: z - zero[2],
+                    level: li + 1,
+                    levels: levels.len(),
+                    stair: stair.clone(),
+                    moves: first_move..b.plan.moves.len(),
+                });
+            }
+        }
+    }
+    b.plan.milling_direction = "Conventional";
+    b.plan.spindle_clockwise = true;
+    b.plan.target = deepest;
+    b.plan.levels = levels_total;
+    b.plan.rest_top = rest_top;
+    let plan = b.finish()?;
+    Ok((plan, walks))
+}
+/// The walks of a Round corners' `plan` (`walks`), read back from its
+/// moves: each from the first move after the walk before to its climb to
+/// clearance; its corner the picked one nearest its first reading; its
+/// offset that reading's distance from the round offset by the tool, and
+/// its readings and scallop worked out again from its feeds.
+pub fn read(plan: &Plan, corners: &[Corner], zero: [f32; 3]) -> Vec<Walk> {
+    let mut out = vec![];
+    let mut start = 0;
+    let rc = plan.radius;
+    let moves = &plan.moves;
+    let mut i = 0;
+    while i < moves.len() {
+        let m = &moves[i];
+        // A walk ends where the tool climbs from a cut.
+        let climbs = m.motion == Motion::Rapid
+            && m.to[2] > m.from[2]
+            && i > 0
+            && moves[..i]
+                .iter()
+                .rev()
+                .find(|m| m.motion != Motion::Dwell)
+                .is_some_and(|m| m.cutting_pass);
+        if climbs {
+            let walk: &[Move] = &moves[start..=i];
+            let feeds: Vec<&Move> = walk.iter().filter(|m| m.cutting_pass).collect();
+            if let Some(first) = feeds.first() {
+                let z = first.to[2];
+                // The feeds' ends but the way in's start and the way out's end.
+                // On the DRO's hundredths, as they were worked out.
+                let hundredth = |v: f32| ((v as f64) / READ).round() * READ;
+                let mut points: Vec<[f64; 2]> = feeds
+                    .iter()
+                    .map(|m| [hundredth(m.to[0] - zero[0]), hundredth(m.to[1] - zero[1])])
+                    .collect();
+                points.pop();
+                let p0 = points.first().copied().unwrap_or_default();
+                let near = (0..corners.len()).min_by(|&a, &b| {
+                    let d = |k: usize| {
+                        let c = corners[k].centre;
+                        ((c[0] - zero[0]) as f64 - p0[0]).hypot((c[1] - zero[1]) as f64 - p0[1])
+                            - (corners[k].r + rc) as f64
+                    };
+                    d(a).abs().total_cmp(&d(b).abs())
+                });
+                if let Some(ci) = near {
+                    let k = &corners[ci];
+                    let c = [
+                        (k.centre[0] - zero[0]) as f64,
+                        (k.centre[1] - zero[1]) as f64,
+                    ];
+                    let d = (p0[0] - c[0]).hypot(p0[1] - c[1]) - (k.r + rc) as f64;
+                    let offset = ((d / READ).round() * READ).max(0.) as f32;
+                    let offset = if offset < 0.02 { 0. } else { offset };
+                    let r = k.r as f64 + offset as f64;
+                    let (scallop, _) = bound(c, r, rc as f64, k.quarter, &points);
+                    out.push(Walk {
+                        corner: ci,
+                        offset,
+                        z: z - zero[2],
+                        level: 0,
+                        levels: 0,
+                        stair: Stair {
+                            points,
+                            scallop: scallop.max(0.),
+                        },
+                        moves: start..i + 1,
+                    });
+                }
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    // The levels of each corner's walks, by their Z.
+    for ci in 0..corners.len() {
+        let mut zs: Vec<f32> = out.iter().filter(|w| w.corner == ci).map(|w| w.z).collect();
+        zs.sort_by(|a, b| b.total_cmp(a));
+        zs.dedup_by(|a, b| (*a - *b).abs() < 0.001);
+        for w in out.iter_mut().filter(|w| w.corner == ci) {
+            w.level = zs.iter().position(|z| (z - w.z).abs() < 0.001).unwrap_or(0) + 1;
+            w.levels = zs.len();
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::model::{Strategy, Tool};
+
+    /// A `w` × `h` × `t` plate, its four vertical corners rounded `r` in
+    /// `n` facets each, its bottom at Z 0 and its middle on X 0 Y 0; with
+    /// `square` its +X +Y corner left square instead.
+    pub(crate) fn plate(w: f32, h: f32, t: f32, r: f32, n: usize, square: bool) -> Mesh {
+        let (x, y) = (w / 2. - r, h / 2. - r);
+        let mut outline: Vec<[f32; 2]> = vec![];
+        for (q, c) in [[x, y], [-x, y], [-x, -y], [x, -y]].into_iter().enumerate() {
+            if square && q == 0 {
+                outline.push([w / 2., h / 2.]);
+                continue;
+            }
+            for i in 0..=n {
+                let a = std::f32::consts::FRAC_PI_2 * (q as f32 + i as f32 / n as f32);
+                outline.push([c[0] + r * a.cos(), c[1] + r * a.sin()]);
+            }
+        }
+        let mut tris = vec![];
+        let m = outline.len();
+        for i in 0..m {
+            let (a, b) = (outline[i], outline[(i + 1) % m]);
+            // Top and bottom, a fan from the middle (the outline is convex).
+            tris.push([[0., 0., t], [a[0], a[1], t], [b[0], b[1], t]]);
+            tris.push([[0., 0., 0.], [b[0], b[1], 0.], [a[0], a[1], 0.]]);
+            // The wall, facing out.
+            tris.push([[a[0], a[1], 0.], [b[0], b[1], 0.], [b[0], b[1], t]]);
+            tris.push([[a[0], a[1], 0.], [b[0], b[1], t], [a[0], a[1], t]]);
+        }
+        crate::mesh::normalize(tris).unwrap()
+    }
+    /// The adapter plate's outline: 134 × 88 × 20, R5 corners.
+    pub(crate) fn adapter() -> Mesh {
+        plate(134., 88., 20., 5., 12, false)
+    }
+    pub(crate) fn end_mill(d: &str) -> Tool {
+        let mut tool = Tool::new(&format!("End mill {d}"), "Flat end mill", d);
+        for (k, v) in [("length", "25"), ("stickout", "40"), ("flutes", "3")] {
+            tool.p.insert(k.into(), v.into());
+        }
+        tool
+    }
+    /// The plate face up on the manual mill, `margin` mm of stock round its
+    /// sides, the work zero on the stock top's centre.
+    pub(crate) fn setup(margin: &str) -> Setup {
+        let mut setup = Setup::new(crate::manual::defaults(), "G54");
+        for side in ["left", "right", "front", "back"] {
+            setup.p.insert(format!("stock_{side}"), margin.into());
+        }
+        for side in ["top", "bottom"] {
+            setup.p.insert(format!("stock_{side}"), "0".into());
+        }
+        setup.p.insert("origin".into(), "Stock top center".into());
+        setup
+    }
+    pub(crate) fn corner_op(mesh: &Mesh, tool: &Tool, ids: Vec<usize>) -> Operation {
+        let mut op = Operation::new(Strategy::Corner, tool.id.clone());
+        op.surfaces = Some(crate::surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids,
+        });
+        op
+    }
+    fn all_ids(setup: &Setup, mesh: &Mesh) -> Vec<usize> {
+        all(setup, mesh).into_iter().flat_map(|c| c.walls).collect()
+    }
+
+    #[test]
+    fn readings_round_away_from_the_centre_to_hundredths() {
+        assert_eq!(outward(10.001, 0.), 10.01);
+        assert_eq!(outward(-10.001, 0.), -10.01);
+        assert_eq!(outward(10.0, 0.), 10.0);
+        assert!((outward(3.4567, 5.) - 3.45).abs() < 1e-9);
+        assert!((outward(62.0, 62.0) - 62.0).abs() < 1e-9);
+    }
+    #[test]
+    fn the_outer_l_corner_is_outside_the_round() {
+        let c = [0., 0.];
+        let (a, b) = ([10., 0.], [0., 10.]);
+        assert_eq!(outer(c, a, b), [10., 10.]);
+        let (a, b) = ([-10., 0.], [0., -10.]);
+        assert_eq!(outer(c, a, b), [-10., -10.]);
+    }
+    #[test]
+    fn a_stair_leaves_at_most_the_scallop_and_never_gouges() {
+        // R5 with a Ø10 cutter, 0.05 mm, in every quarter, about a centre
+        // off the hundredths.
+        for q in 0..4 {
+            let c = [61.997, -38.993];
+            let s = stair(c, 5., 5., q, 0., 0.05).unwrap();
+            assert!(s.scallop <= 0.05 + 1e-9, "{q}: {}", s.scallop);
+            // Checked again, finer: nothing over the scallop, nothing cut
+            // into the round (the tool's edge never nearer than R).
+            let (most, least) = left(
+                c,
+                5.,
+                5.,
+                q,
+                &s.points,
+                (0., std::f64::consts::FRAC_PI_2),
+                20_000,
+            );
+            assert!(most <= 0.05 + 1e-6, "{q}: {most}");
+            assert!(least >= -1e-9, "{q}: gouges {least}");
+            // Every reading on a hundredth, every move along one axis.
+            for p in &s.points {
+                for v in p {
+                    assert!(((v / READ).round() * READ - v).abs() < 1e-6, "{v}");
+                }
+            }
+            for w in s.points.windows(2) {
+                let moved = (0..2).filter(|&k| (w[0][k] - w[1][k]).abs() > 1e-9).count();
+                assert_eq!(moved, 1, "{w:?}");
+            }
+            // Every point is on or outside the round offset by the tool.
+            for p in &s.points {
+                assert!((p[0] - c[0]).hypot(p[1] - c[1]) >= 10. - 1e-9, "{p:?}");
+            }
+            // From the start wall's line to the end wall's.
+            let (u0, u1) = ends(q);
+            let (first, last) = (s.points[0], *s.points.last().unwrap());
+            for k in 0..2 {
+                if u0[k] == 0. {
+                    assert!((first[k] - c[k]).abs() <= 0.005, "{q} {first:?}");
+                }
+                if u1[k] == 0. {
+                    assert!((last[k] - c[k]).abs() <= 0.005, "{q} {last:?}");
+                }
+            }
+        }
+    }
+    #[test]
+    fn each_axis_moves_one_way_round_the_walk() {
+        for q in 0..4 {
+            let s = stair([0., 0.], 5., 5., q, 0., 0.05).unwrap();
+            for k in 0..2 {
+                let signs: HashSet<i32> = (s.points.windows(2))
+                    .map(|w| {
+                        (w[1][k] - w[0][k]).signum() as i32
+                            * i32::from((w[1][k] - w[0][k]).abs() > 1e-9)
+                    })
+                    .filter(|s| *s != 0)
+                    .collect();
+                assert_eq!(signs.len(), 1, "{q} axis {k}: {signs:?}");
+            }
+        }
+        // Counter-clockwise round the part: at the back right corner X goes
+        // down and Y up.
+        let s = stair([0., 0.], 5., 5., 0, 0., 0.05).unwrap();
+        let (first, last) = (s.points[0], *s.points.last().unwrap());
+        assert!(last[0] < first[0] && last[1] > first[1]);
+    }
+    #[test]
+    fn a_finer_scallop_takes_more_steps_and_a_smaller_cutter_more_still() {
+        let count =
+            |rc: f64, h: f64| (stair([0., 0.], 5., rc, 0, 0., h).unwrap().points.len() - 1) / 2;
+        let (coarse, fine) = (count(5., 0.2), count(5., 0.05));
+        assert!(coarse < fine, "{coarse} {fine}");
+        // Ø10 on R5: about eight steps for 0.05 mm, as worked out by hand.
+        assert!((6..=10).contains(&fine), "{fine}");
+        assert!(count(2., 0.05) > fine);
+        // Too fine for 90 steps: said.
+        let e = stair([0., 0.], 50., 5., 0, 0., 0.0001).unwrap_err();
+        assert!(e.contains("allow a larger scallop"), "{e}");
+    }
+    #[test]
+    fn an_offset_walk_keeps_its_offset_off_the_round() {
+        let s = stair([0., 0.], 5., 5., 0, 2., 0.2).unwrap();
+        let (_, least) = left(
+            [0., 0.],
+            7.,
+            5.,
+            0,
+            &s.points,
+            (0., std::f64::consts::FRAC_PI_2),
+            4000,
+        );
+        assert!(least >= -1e-9, "{least}");
+        let (_, least) = left(
+            [0., 0.],
+            5.,
+            5.,
+            0,
+            &s.points,
+            (0., std::f64::consts::FRAC_PI_2),
+            4000,
+        );
+        assert!(least >= 2. - 1e-6, "{least}");
+    }
+    #[test]
+    fn the_four_r5_corners_of_the_adapter_plate_are_found_and_nothing_else() {
+        let mesh = adapter();
+        let setup = setup("3");
+        let found = all(&setup, &mesh);
+        assert_eq!(found.len(), 4, "{found:?}");
+        // The setup puts the part's bottom-left corner of its box at the
+        // stock's: the plate's middle is 70, 47 mm in from it.
+        for (k, c) in found.iter().enumerate() {
+            assert_eq!(c.quarter, k);
+            assert!((c.r - 5.).abs() < 0.01, "{c:?}");
+            assert!((c.top - c.bottom - 20.).abs() < 0.01, "{c:?}");
+        }
+        // A click on one facet of a corner picks that corner.
+        let one = &found[2];
+        let a = arcs::outside_arc_at(&setup, &mesh, one.walls[3]).unwrap();
+        assert_eq!(a.walls, one.walls);
+        let picked = among(&setup, &mesh, &a.walls.iter().copied().collect()).unwrap();
+        assert_eq!(picked, vec![one.clone()]);
+        // A hole's round wall is no outside corner.
+        assert_eq!(
+            arcs::outside_arc_at(
+                &setup,
+                &mesh,
+                (0..mesh.surfaces.len())
+                    .find(
+                        |&i| !one.walls.contains(&i) && !found.iter().any(|c| c.walls.contains(&i))
+                    )
+                    .unwrap()
+            )
+            .map(|_| ()),
+            Err(arcs::NoArc::NotRound)
+        );
+        // A square corner is no rounded one; a flat wall is no corner.
+        let square = plate(134., 88., 20., 5., 12, true);
+        assert_eq!(all(&setup, &square).len(), 3);
+    }
+    #[test]
+    fn the_adapter_plates_corners_are_cut_in_one_axis_moves_clear_of_the_part() {
+        let mesh = adapter();
+        let setup = setup("3");
+        let tool = end_mill("10");
+        let op = corner_op(&mesh, &tool, all_ids(&setup, &mesh));
+        let (plan, walks) = walks(&setup, &op, &tool, &mesh).unwrap();
+        for m in &plan.moves {
+            assert!(
+                (0..3).filter(|&k| m.from[k] != m.to[k]).count() <= 1,
+                "{m:?}"
+            );
+        }
+        // Four corners, each to the full 20 mm.
+        let corners: HashSet<usize> = walks.iter().map(|w| w.corner).collect();
+        assert_eq!(corners.len(), 4);
+        assert!((plan.target - plan.stock.min[2]).abs() < 0.001);
+        // Each walk leaves at most the scallop on the round; the last at
+        // each level is on the round.
+        for w in walks.iter().filter(|w| w.offset == 0.) {
+            assert!(w.stair.scallop <= 0.05 + 1e-6, "{w:?}");
+        }
+        // With 3 mm of stock off each side, the stock's corner stands
+        // 6.3 mm off the round: a band first, then the round.
+        assert!(walks.iter().any(|w| w.offset > 0.));
+        // The plan's walks read back from its moves as made.
+        let zero = crate::post::datum(&setup, plan.stock, &mesh).unwrap();
+        let back = read(&plan, &picked(&setup, &mesh, &op).unwrap(), zero);
+        assert_eq!(back.len(), walks.len());
+        for (a, b) in back.iter().zip(&walks) {
+            assert_eq!(a.corner, b.corner);
+            assert_eq!(a.stair.points.len(), b.stair.points.len());
+            for (p, q) in a.stair.points.iter().zip(&b.stair.points) {
+                assert!(
+                    (p[0] - q[0]).abs() < 1e-6 && (p[1] - q[1]).abs() < 1e-6,
+                    "{p:?} {q:?}"
+                );
+            }
+            assert!(
+                (a.offset - b.offset).abs() < 0.02,
+                "{} {}",
+                a.offset,
+                b.offset
+            );
+            assert!((a.z - b.z).abs() < 0.001);
+            assert_eq!((a.level, a.levels), (b.level, b.levels));
+            if b.offset == 0. {
+                assert!((a.stair.scallop - b.stair.scallop).abs() < 1e-6);
+            }
+        }
+    }
+    #[test]
+    fn a_stepdown_past_the_flutes_is_refused() {
+        let mesh = adapter();
+        let setup = setup("3");
+        let tool = end_mill("10");
+        let mut op = corner_op(&mesh, &tool, all_ids(&setup, &mesh));
+        op.p.insert("stepdown".into(), "30".into());
+        let e = generate(&setup, &op, &tool, &mesh).unwrap_err();
+        assert!(e.contains("stepdown within the flute length"), "{e}");
+        op.p.insert("stepdown".into(), "10".into());
+        let (plan, walks) = walks(&setup, &op, &tool, &mesh).unwrap();
+        // 20 mm in two levels of 10 at each corner.
+        assert!(walks.iter().all(|w| w.levels == 2), "{walks:?}");
+        assert_eq!(plan.levels, 8);
+    }
+    #[test]
+    fn a_walk_that_would_cut_the_part_is_refused() {
+        // The plate with a lug standing off its back right corner, in the
+        // way of the walk round it.
+        let plate = adapter();
+        let mut tris: Vec<[[f32; 3]; 3]> = plate
+            .faces
+            .iter()
+            .map(|f| [f.points[0], f.points[1], f.points[2]])
+            .collect();
+        let (x0, x1, y0, y1, z0, z1) = (67.5f32, 68.5, 44.5, 45.5, 0., 20.);
+        let c = |x: f32, y: f32, z: f32| [x, y, z];
+        for (a, b, cc, d) in [
+            (c(x0, y0, z1), c(x1, y0, z1), c(x1, y1, z1), c(x0, y1, z1)),
+            (c(x0, y1, z0), c(x1, y1, z0), c(x1, y0, z0), c(x0, y0, z0)),
+            (c(x0, y0, z0), c(x1, y0, z0), c(x1, y0, z1), c(x0, y0, z1)),
+            (c(x1, y0, z0), c(x1, y1, z0), c(x1, y1, z1), c(x1, y0, z1)),
+            (c(x1, y1, z0), c(x0, y1, z0), c(x0, y1, z1), c(x1, y1, z1)),
+            (c(x0, y1, z0), c(x0, y0, z0), c(x0, y0, z1), c(x0, y1, z1)),
+        ] {
+            tris.push([a, b, cc]);
+            tris.push([a, cc, d]);
+        }
+        let mesh = crate::mesh::normalize(tris).unwrap();
+        let setup = setup("3");
+        let tool = end_mill("10");
+        let op = corner_op(&mesh, &tool, all_ids(&setup, &mesh));
+        let e = generate(&setup, &op, &tool, &mesh).unwrap_err();
+        assert!(
+            e.starts_with("Round corners cuts into the part at X"),
+            "{e}"
+        );
+        assert!(e.contains("back right"), "{e}");
+    }
+    #[test]
+    fn round_corners_runs_on_the_manual_mill_only() {
+        let mesh = adapter();
+        let mut setup = setup("3");
+        let tool = end_mill("10");
+        let op = corner_op(&mesh, &tool, all_ids(&setup, &mesh));
+        setup.machine = crate::model::Machine::new(3);
+        assert_eq!(generate(&setup, &op, &tool, &mesh).unwrap_err(), ON_CNC);
+        let issues = op.issues(&setup.machine, std::slice::from_ref(&tool), &[]);
+        assert!(issues.iter().any(|i| i == ON_CNC), "{issues:?}");
+    }
+    #[test]
+    fn nothing_picked_says_what_to_pick() {
+        let mesh = adapter();
+        let setup = setup("3");
+        let tool = end_mill("10");
+        let op = corner_op(&mesh, &tool, vec![]);
+        assert_eq!(
+            generate(&setup, &op, &tool, &mesh).unwrap_err(),
+            NONE_PICKED
+        );
+    }
+    /// The adapter plate face up on the manual mill, in the 100 mm vise
+    /// across `across` (its jaws on the ±Y sides for "Y"), gripping 8 mm, 3
+    /// mm of stock round it, the work zero on the stock top's centre, its
+    /// four corners rounded with a Ø10 end mill.
+    pub(crate) fn plate_job(across: &str) -> (crate::model::Document, Mesh) {
+        let mesh = adapter();
+        let mut doc = crate::model::Document::default();
+        let machine = crate::manual::defaults();
+        let mut tool = end_mill("10");
+        tool.p.insert("machines".into(), machine.id.clone());
+        doc.machines.push(machine);
+        doc.workholding = crate::holding::starters();
+        let manual = doc.machines[0].id.clone();
+        doc.workholding[0].p.insert("machines".into(), manual);
+        let vise = doc.workholding[0].id.clone();
+        doc.add_manual_setup().unwrap();
+        let ids = all_ids(&setup("3"), &mesh);
+        let s = &mut doc.setups[0];
+        for (k, v) in [
+            ("holding", "Vise"),
+            ("holder", vise.as_str()),
+            ("vise_axis", across),
+            ("vise_grip", "8"),
+            ("holding_gap", "2"),
+            ("origin", "Stock top center"),
+            ("stock_type", "Relative size box"),
+            ("stock_source", "fresh"),
+            ("offset", "G54"),
+        ] {
+            s.p.insert(k.into(), v.into());
+        }
+        for side in ["left", "right", "front", "back"] {
+            s.p.insert(format!("stock_{side}"), "3".into());
+        }
+        for side in ["top", "bottom"] {
+            s.p.insert(format!("stock_{side}"), "0".into());
+        }
+        s.operations = vec![corner_op(&mesh, &tool, ids)];
+        doc.tools.push(tool);
+        doc.active = doc.setups[0].id.clone();
+        (doc, mesh)
+    }
+    #[test]
+    fn the_plates_corners_clear_the_vise_jaws_across_y_and_not_across_x() {
+        // Across X (a vise that opens to 200 mm) the jaws' 100 mm width
+        // covers the corners.
+        for (across, clear) in [("Y", true), ("X", false)] {
+            let (mut doc, mesh) = plate_job(across);
+            doc.workholding[0]
+                .p
+                .insert("max_opening".into(), "200".into());
+            let setup = &doc.setups[0];
+            let plan = generate(setup, &setup.operations[0], &doc.tools[0], &mesh).unwrap();
+            let boxes = doc
+                .holding_boxes(setup, crate::holding::Gripped::whole(plan.stock))
+                .unwrap();
+            let hits = crate::holding::hits(&plan, &boxes, 2.);
+            assert_eq!(hits.is_empty(), clear, "across {across}: {hits:?}");
+        }
+    }
+    #[test]
+    fn the_plates_steps_walk_each_corner_by_numbers_and_end_filed() {
+        use crate::guide::{Step, build};
+        let (doc, mesh) = plate_job("Y");
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let walks: Vec<&Step> = guide
+            .steps
+            .iter()
+            .filter(|s| matches!(s, Step::Corner { .. }))
+            .collect();
+        assert!(walks.len() >= 4, "{}", walks.len());
+        // The section counts its walks.
+        let section = guide.sections.iter().find(|s| s.op == Some(0)).unwrap();
+        assert_eq!(section.count, walks.len());
+        let mut seen = HashSet::new();
+        for (k, w) in walks.iter().enumerate() {
+            let Step::Corner {
+                index,
+                of,
+                corner,
+                corners,
+                radius,
+                centre,
+                offset,
+                z,
+                scallop,
+                points,
+                targets,
+                ..
+            } = w
+            else {
+                unreachable!()
+            };
+            assert_eq!((*index, *of, *corners), (k + 1, walks.len(), 4));
+            seen.insert(*corner);
+            assert!((radius - 5.).abs() < 0.01);
+            // Work coordinates: the corners' centres at ±62, ±39.
+            assert!(
+                (centre[0].abs() - 62.).abs() < 0.01 && (centre[1].abs() - 39.).abs() < 0.01,
+                "{centre:?}"
+            );
+            assert!(*z < 0. && *z >= -20.001);
+            if *offset == 0. {
+                assert!(*scallop <= 0.05 + 1e-6, "{scallop}");
+            }
+            // Each target moves one axis to a hundredth; the walk's feeds
+            // are the readings, then out.
+            for t in targets {
+                assert!(
+                    ((t.centre * 100.).round() / 100. - t.centre).abs() < 2e-3,
+                    "{t:?}"
+                );
+                assert!(!t.edge && t.shown == t.centre);
+            }
+            let feeds: Vec<&crate::guide::Target> = targets.iter().filter(|t| t.feed).collect();
+            assert_eq!(feeds.len(), points.len() + 1);
+            for (t, p) in feeds.iter().zip(points) {
+                assert!((t.centre - p[t.axis]).abs() < 1e-3, "{t:?} {p:?}");
+            }
+            // Down once to the level, locked, before the first feed.
+            let down = targets
+                .iter()
+                .position(|t| t.axis == 2 && t.lock[2])
+                .unwrap();
+            assert!((targets[down].centre - z).abs() < 1e-3);
+            assert!(down < targets.iter().position(|t| t.feed).unwrap());
+            // The backlash taken up: the axis read before going down is
+            // first a millimetre short, then on it, the way the walk goes.
+            let (a, b) = (&targets[down - 2], &targets[down - 1]);
+            let along = if (points[0][0] - points.last().unwrap()[0]).abs() > 0.5
+                && (points[0][1] - points.last().unwrap()[1]).abs() > 0.5
+            {
+                b.axis
+            } else {
+                unreachable!()
+            };
+            if a.axis == along {
+                let way = (points.last().unwrap()[along] - points[0][along]).signum();
+                assert!(
+                    ((b.centre - a.centre) - way * TAKE_UP).abs() < 1e-3,
+                    "{a:?} {b:?}"
+                );
+            }
+        }
+        assert_eq!(seen.len(), 4);
+        // Then the scallops are filed.
+        let last = guide
+            .sections
+            .iter()
+            .find(|s| s.op == Some(0))
+            .unwrap()
+            .steps
+            .end
+            - 1;
+        assert!(matches!(guide.steps[last], Step::Check { op: 0 }));
+    }
+    #[test]
+    fn the_settings_are_checked() {
+        let mut p = Fields::new();
+        for (k, v) in DEFAULTS {
+            p.insert(k.into(), v.into());
+        }
+        assert!(setting_issues(&p).is_empty());
+        p.insert("scallop".into(), "0.001".into());
+        p.insert("stepover".into(), "5".into());
+        p.insert("stepdown".into(), "-1".into());
+        assert_eq!(setting_issues(&p).len(), 3);
+    }
+}

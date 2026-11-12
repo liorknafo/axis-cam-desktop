@@ -41,6 +41,10 @@ pub enum Strategy {
     /// Chamfer milling (`chamfer`): a chamfer mill's side along a line or
     /// picked edges.
     Chamfer,
+    /// Round corners (`corner`): an end mill's side walked round a part's
+    /// rounded outside vertical corners on the manual mill, in DRO steps one
+    /// axis at a time, the scallops between them filed off (LIO-443).
+    Corner,
 }
 impl Strategy {
     pub fn imported_preview(self) -> bool {
@@ -57,6 +61,7 @@ impl Strategy {
                 | Self::Turn
                 | Self::Groove
                 | Self::Chamfer
+                | Self::Corner
         )
     }
     pub fn needs_surfaces(self) -> bool {
@@ -98,9 +103,10 @@ impl Strategy {
             Self::Chamfer => {
                 "Available · a chamfer mill's side along a line or picked edges: V flanks at depth, edge chamfers, deburring, copied round an axis"
             }
+            Self::Corner => crate::corner::AVAILABILITY,
         }
     }
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::Face,
         Self::Adaptive,
         Self::Pocket,
@@ -116,6 +122,7 @@ impl Strategy {
         Self::Turn,
         Self::Groove,
         Self::Chamfer,
+        Self::Corner,
     ];
     pub fn index(self) -> usize {
         Self::ALL.iter().position(|s| *s == self).unwrap()
@@ -137,6 +144,7 @@ impl Strategy {
             "Turning",
             "Internal groove",
             "Chamfer milling",
+            "Round corners",
         ][self.index()]
     }
     pub fn short(self) -> &'static str {
@@ -156,6 +164,7 @@ impl Strategy {
             "Turn",
             "Groove",
             "Chamfer",
+            "Corner",
         ][self.index()]
     }
     pub fn help(self) -> &'static str {
@@ -175,6 +184,7 @@ impl Strategy {
             "Turn the bar on a manual lathe: face the end, turn or bore a diameter, chamfer, groove, thread or part off. Choose the kind and its sizes in lathe coordinates.",
             "Mill a groove below the mouth of a bore, like a circlip groove, with a keyseat cutter: pick the bore's wall, then set the groove's diameter, width and where it lies. Pick a boss's outside wall for a groove round it.",
             "Run a chamfer mill's side along picked edges or a line: edge chamfers, deburring, or V flanks at a depth. Size it by the chamfer's width or the tip's depth, and copy it round an axis.",
+            crate::corner::HELP,
         ][self.index()]
     }
     pub fn features(self) -> &'static [usize] {
@@ -183,13 +193,16 @@ impl Strategy {
             Self::Face | Self::Indexed => &[0, 1],
             Self::Adaptive | Self::Pocket => &[1],
             Self::Contour => &[2, 3],
-            Self::Box | Self::Turn | Self::Groove | Self::Chamfer => &[],
+            Self::Box | Self::Turn | Self::Groove | Self::Chamfer | Self::Corner => &[],
             _ => &[0, 1, 2, 4],
         }
     }
     pub fn tabs(self) -> Vec<&'static str> {
         if self == Self::Box {
             return vec!["Tool", "Box", "Heights", "Passes"];
+        }
+        if self == Self::Corner {
+            return vec!["Tool", "Corners", "Heights", "Passes"];
         }
         if self == Self::Turn {
             return vec!["Tool", "Turn", "Passes"];
@@ -1619,6 +1632,11 @@ impl Operation {
                 p.insert(k.into(), v.into());
             }
         }
+        if s == Strategy::Corner {
+            for (k, v) in crate::corner::DEFAULTS {
+                p.insert((*k).into(), (*v).into());
+            }
+        }
         if s == Strategy::Groove {
             for (k, v) in crate::groove::DEFAULTS {
                 p.insert((*k).into(), (*v).into());
@@ -1639,7 +1657,11 @@ impl Operation {
             }
         }
         let geometry = match s {
-            Strategy::Box | Strategy::Turn | Strategy::Groove | Strategy::Chamfer => vec![],
+            Strategy::Box
+            | Strategy::Turn
+            | Strategy::Groove
+            | Strategy::Chamfer
+            | Strategy::Corner => vec![],
             Strategy::Drill => vec![5, 6, 7, 8],
             Strategy::Face | Strategy::Indexed => vec![0],
             Strategy::Contour => vec![2],
@@ -2339,11 +2361,19 @@ impl Operation {
             e.push("Clearance must be above retract height.".into())
         }
         let s = self.strategy;
-        if manual::is_manual(m) && !matches!(s, Strategy::Box | Strategy::Drill | Strategy::Turn) {
-            e.push("The big mill cuts one axis at a time: use Box or Drill.".into())
+        if manual::is_manual(m)
+            && !matches!(
+                s,
+                Strategy::Box | Strategy::Drill | Strategy::Turn | Strategy::Corner
+            )
+        {
+            e.push("The big mill cuts one axis at a time: use Box, Drill or Corner.".into())
         }
         if s == Strategy::Box && !manual::is_manual(m) {
             e.push(manual::BOX_ON_CNC.into())
+        }
+        if s == Strategy::Corner && !manual::is_manual(m) {
+            e.push(crate::corner::ON_CNC.into())
         }
         // A hand machine says so above (one axis at a time, or turning only).
         if s == Strategy::Groove {
@@ -2481,6 +2511,9 @@ impl Operation {
             }
             if s == Strategy::Box {
                 e.extend(self.box_issues(tool));
+            }
+            if s == Strategy::Corner {
+                e.extend(crate::corner::setting_issues(&self.p));
             }
             if s == Strategy::Turn {
                 e.extend(self.turn_issues(tool, m));
@@ -7050,7 +7083,7 @@ mod manual_setups {
     }
     #[test]
     fn box_is_the_twelfth_strategy_with_its_name_and_help() {
-        assert_eq!(Strategy::ALL.len(), 15);
+        assert_eq!(Strategy::ALL.len(), 16);
         assert_eq!(Strategy::Box.index(), 11);
         for s in Strategy::ALL {
             assert!(!s.name().is_empty() && !s.short().is_empty() && !s.help().is_empty());
@@ -7100,12 +7133,16 @@ mod manual_setups {
             op.p.insert("rpm".into(), "640".into());
             op.p.insert("feed".into(), "100".into());
             let issues = box_issues(&m, &tools, &op);
-            let refused = issues
-                .contains(&"The big mill cuts one axis at a time: use Box or Drill.".to_string());
+            let refused = issues.contains(
+                &"The big mill cuts one axis at a time: use Box, Drill or Corner.".to_string(),
+            );
             // A Turn is refused in its own words.
             assert_eq!(
                 refused,
-                !matches!(s, Strategy::Box | Strategy::Drill | Strategy::Turn),
+                !matches!(
+                    s,
+                    Strategy::Box | Strategy::Drill | Strategy::Turn | Strategy::Corner
+                ),
                 "{s:?}"
             );
             assert_eq!(

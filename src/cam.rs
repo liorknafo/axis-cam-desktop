@@ -197,7 +197,7 @@ pub(crate) struct Builder {
     pub(crate) retract: f32,
     retract_margin: f32,
     /// Rapid rate, mm/min: the hand rapid on a manual mill.
-    rapid: f32,
+    pub(crate) rapid: f32,
     /// A manual mill moves one axis at a time (`push`).
     single_axis: bool,
 }
@@ -343,7 +343,7 @@ impl Builder {
         Ok(())
     }
     /// A stop of `seconds` where the tool is; none for 0.
-    fn dwell(&mut self, seconds: f32) {
+    pub(crate) fn dwell(&mut self, seconds: f32) {
         if seconds > 0. {
             let end = self.plan.duration + seconds;
             self.plan.moves.push(Move {
@@ -446,6 +446,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
         Strategy::Box => boxed(setup, op, tool, mesh),
         Strategy::Groove => crate::groove::generate(setup, op, tool, mesh),
         Strategy::Chamfer => crate::chamfer::generate(setup, op, tool, mesh),
+        Strategy::Corner => crate::corner::generate(setup, op, tool, mesh),
         _ => Err(op.strategy.availability().into()),
     }
 }
@@ -861,7 +862,7 @@ pub(crate) fn box_cut(
 }
 /// Whether triangle `t` meets box `b`: no separating axis among the box's
 /// faces, the triangle's plane and the nine edge crossings.
-fn meets(t: &[[f32; 3]; 3], b: &Bounds) -> bool {
+pub(crate) fn meets(t: &[[f32; 3]; 3], b: &Bounds) -> bool {
     let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
     let cross = |a: [f32; 3], b: [f32; 3]| {
         [
@@ -899,7 +900,7 @@ const FACETS: f32 = 0.01;
 /// (less `FACETS`) of the rectangle. The sweep's corners are round, so a
 /// part with ends round to the cutter, a slot's, is not cut where the box
 /// around the sweep would be.
-fn swept(t: &[[f32; 3]; 3], centres: [[f32; 2]; 2], r: f32, z: [f32; 2]) -> bool {
+pub(crate) fn swept(t: &[[f32; 3]; 3], centres: [[f32; 2]; 2], r: f32, z: [f32; 2]) -> bool {
     // The triangle between the heights (Sutherland–Hodgman), in XY.
     let mut poly: Vec<[f32; 3]> = t.to_vec();
     for (plane, above) in [(z[0], true), (z[1], false)] {
@@ -7089,7 +7090,7 @@ pub(crate) mod tests {
                 .iter()
                 .filter(|s| s.imported_preview())
                 .count(),
-            11
+            12
         );
     }
     /// FNV-1a over every bit of every move, and the move count and duration.

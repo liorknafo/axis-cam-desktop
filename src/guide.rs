@@ -197,6 +197,35 @@ pub enum Step {
         holes: Vec<[f32; 3]>,
         mouths: Vec<f32>,
     },
+    /// One walk of a Round corners (1-based `index` of `of`), round corner
+    /// `corner` of `corners` (1-based), at `place` on the part, of radius
+    /// `radius` about `centre` (work X, Y), `offset` outside the round (0:
+    /// on it, the last walk there), at work Z `z`, level `level` of
+    /// `levels`. `targets` are its DRO numbers in order, tool centres (the
+    /// DRO's compensation off): the way to the start clear of the stock,
+    /// the backlash taken up, down, in, the steps, out and up; `points` the
+    /// walk's readings from the first on the round's start to its last; it
+    /// leaves at most `scallop` proud of the round (or of the line `offset`
+    /// out).
+    Corner {
+        op: usize,
+        index: usize,
+        of: usize,
+        corner: usize,
+        corners: usize,
+        place: &'static str,
+        radius: f32,
+        centre: [f32; 2],
+        offset: f32,
+        z: f32,
+        level: usize,
+        levels: usize,
+        scallop: f32,
+        points: Vec<[f32; 2]>,
+        targets: Vec<Target>,
+        never: Limits,
+        turns_per_minute: f32,
+    },
     /// The stock after the operation.
     Check { op: usize },
     /// The stock leaves for setup `next` (none for the last setup).
@@ -1587,6 +1616,8 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
         // a gear with the DRO when it changes too, else the DRO alone (its
         // diameter and sides; nothing with its compensation off), or none.
         let tap = op.tapping();
+        // The DRO's compensation this tool and gear leave on, when on.
+        let comp_on = matches!(set, Some((t, s, Some(c))) if t == tool && s == rpm && c != [0; 2]);
         let mut sides = |comp: [i8; 2], steps: &mut Vec<Step>| {
             // A tap is turned by hand: its own screen, no gear, no Z
             // pick-up (LIO-410).
@@ -1777,6 +1808,81 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                     pattern,
                     numbers,
                 });
+                steps.push(Step::Check { op: oi });
+            }
+            Strategy::Corner => {
+                // Tool centres, as the walk is worked out: the compensation
+                // off, said so when the operation before left it on.
+                sides([0; 2], &mut steps);
+                if comp_on {
+                    steps.push(Step::Comp {
+                        op: oi,
+                        comp: [0; 2],
+                        diameter,
+                    });
+                }
+                let corners = crate::corner::picked(setup, mesh, op)?;
+                let walks = crate::corner::read(&plan, &corners, zero);
+                count = walks.len();
+                for (k, w) in walks.iter().enumerate() {
+                    let c = &corners[w.corner];
+                    let moves = &plan.moves[w.moves.clone()];
+                    let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+                    for m in moves.iter().filter(|m| m.motion == Motion::Feed) {
+                        for p in [m.from, m.to] {
+                            for k in 0..3 {
+                                (lo[k], hi[k]) = (lo[k].min(p[k]), hi[k].max(p[k]));
+                            }
+                        }
+                    }
+                    let legs: Vec<&Move> =
+                        moves.iter().filter(|m| m.motion != Motion::Dwell).collect();
+                    let mut targets = vec![];
+                    for (i, m) in legs.iter().enumerate() {
+                        let axis = moved(m)?;
+                        let centre = m.to[axis] - zero[axis];
+                        let down =
+                            axis == 2 && m.to[2] < m.from[2] && (m.to[2] - lo[2]).abs() < 1e-4;
+                        targets.push(Target {
+                            order: u8::try_from(i + 1).unwrap_or(u8::MAX),
+                            axis,
+                            centre,
+                            shown: centre,
+                            edge: false,
+                            feed: m.motion == Motion::Feed,
+                            // The quill locked at the level for the walk.
+                            lock: [false, false, down],
+                        });
+                    }
+                    let feed = moves.iter().find(|m| m.motion == Motion::Feed);
+                    steps.push(Step::Corner {
+                        op: oi,
+                        index: k + 1,
+                        of: walks.len(),
+                        corner: w.corner + 1,
+                        corners: corners.len(),
+                        place: c.place(),
+                        radius: c.r,
+                        centre: [c.centre[0] - zero[0], c.centre[1] - zero[1]],
+                        offset: w.offset,
+                        z: w.z,
+                        level: w.level,
+                        levels: w.levels,
+                        scallop: w.stair.scallop as f32,
+                        points: (w.stair.points.iter())
+                            .map(|p| [p[0] as f32, p[1] as f32])
+                            .collect(),
+                        targets,
+                        never: Limits {
+                            x: [lo[0] - r - zero[0], hi[0] + r - zero[0]],
+                            y: [lo[1] - r - zero[1], hi[1] + r - zero[1]],
+                            z: lo[2] - zero[2],
+                        },
+                        turns_per_minute: feed.map_or(0., |m| {
+                            manual::turns(machine, moved(m).unwrap_or(0), m.feed)
+                        }),
+                    });
+                }
                 steps.push(Step::Check { op: oi });
             }
             other => return Err(format!("{} does not run on a manual mill.", other.name())),
@@ -2469,6 +2575,7 @@ pub(crate) mod tests {
                 Step::TapIn { .. } => "TapIn",
                 Step::Comp { .. } => "Comp",
                 Step::Pass { .. } => "Pass",
+                Step::Corner { .. } => "Corner",
                 Step::Face { .. } => "Face",
                 Step::Square { .. } => "Square",
                 Step::Holes { .. } => "Holes",

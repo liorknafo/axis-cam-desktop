@@ -34,6 +34,9 @@ pub enum NoArc {
     /// It curves round the part, not round a hole (a boss, a rounded
     /// outside corner).
     Outside,
+    /// It curves round a hole, not round the part: asked for an outside
+    /// round (`outside_arc_at`).
+    Inside,
     /// It goes all the way round: a whole hole, read as one.
     Whole,
 }
@@ -272,8 +275,12 @@ fn grow_from(facets: &HashMap<usize, Facet>, at: &Corners, mut members: Vec<usiz
 }
 /// The arc `members` of `facets` make: its circle, how far round it goes,
 /// its middle, its heights and sagitta. `NoArc::Outside` when it curves
-/// round the part, `NoArc::Whole` when it goes all the way round.
-fn arc(facets: &HashMap<usize, Facet>, members: Vec<usize>) -> Result<Arc, NoArc> {
+/// round the part, `NoArc::Whole` when it goes all the way round. With
+/// `outside` the other way round: an arc round the part (a rounded outside
+/// corner, a boss), `NoArc::Inside` for one round a hole; its middle is
+/// then the side the part's material is away from, and its sagitta how
+/// far inside `r` its chords come all the same.
+fn arc(facets: &HashMap<usize, Facet>, members: Vec<usize>, outside: bool) -> Result<Arc, NoArc> {
     let (c, r, _) = fit(facets, &members).ok_or(NoArc::NotRound)?;
     let tau = std::f64::consts::TAU;
     // A hole's wall faces its centre: its normal, out of the part, points in.
@@ -286,7 +293,10 @@ fn arc(facets: &HashMap<usize, Facet>, members: Vec<usize>) -> Result<Arc, NoArc
         f.normal[0] as f64 * (c[0] - mid.0) + f.normal[1] as f64 * (c[1] - mid.1) > 0.
     };
     let concave = members.iter().filter(|m| inward(&facets[m])).count();
-    if concave * 2 <= members.len() {
+    if outside && concave * 2 >= members.len() {
+        return Err(NoArc::Inside);
+    }
+    if !outside && concave * 2 <= members.len() {
         return Err(NoArc::Outside);
     }
     // Each facet's stretch of the round, then their union.
@@ -472,8 +482,9 @@ fn whole_arc(
     all: &HashMap<usize, Facet>,
     at: &Corners,
     members: Vec<usize>,
+    outside: bool,
 ) -> Result<Arc, NoArc> {
-    let a = arc(facets, members)?;
+    let a = arc(facets, members, outside)?;
     if a.r > across || !(a.walls.len() > 4 || alike(facets, &a.walls, a.r as f64)) {
         return Err(NoArc::NotRound);
     }
@@ -486,6 +497,14 @@ fn whole_arc(
 /// The arc of a round wall of the part that surface `id` is a facet of, as
 /// `setup` places it: the facets on round from it on the circle it is on.
 pub fn arc_at(setup: &Setup, mesh: &Mesh, id: usize) -> Result<Arc, NoArc> {
+    arc_at_by(setup, mesh, id, false)
+}
+/// `arc_at` for a round that curves round the part: a rounded outside
+/// corner (`corner`). `NoArc::Inside` for a round wall of a hole.
+pub fn outside_arc_at(setup: &Setup, mesh: &Mesh, id: usize) -> Result<Arc, NoArc> {
+    arc_at_by(setup, mesh, id, true)
+}
+fn arc_at_by(setup: &Setup, mesh: &Mesh, id: usize, outside: bool) -> Result<Arc, NoArc> {
     let g = Geometry::new(setup, mesh);
     let facets = facets(&g, |_| true);
     if !facets.contains_key(&id) {
@@ -493,7 +512,14 @@ pub fn arc_at(setup: &Setup, mesh: &Mesh, id: usize) -> Result<Arc, NoArc> {
     }
     let at = corners(&facets);
     let members = grow(&facets, &at, id).ok_or(NoArc::NotRound)?;
-    whole_arc(across(setup, mesh, &g), &facets, &facets, &at, members)
+    whole_arc(
+        across(setup, mesh, &g),
+        &facets,
+        &facets,
+        &at,
+        members,
+        outside,
+    )
 }
 /// Whether facet `f` lies round modeled thread `t`'s axis: its corners seen
 /// from above as far from the axis as each other (to `fit`'s 0.005 mm and
@@ -724,6 +750,22 @@ pub fn drilled_arcs(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc
 /// (`drilled_arcs` less its check against whole round holes, for walls of
 /// holes known not to be round: a slot's or a counterbore's round ends).
 pub fn arcs_among(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc> {
+    arcs_among_by(setup, mesh, ids, false)
+}
+/// The arcs among the surfaces `ids` that curve round the part: rounded
+/// outside corners and bosses (`arcs_among` the other way round).
+pub fn outside_arcs_among(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc> {
+    arcs_among_by(setup, mesh, ids, true)
+}
+/// The upright faces of the part as `setup` places it (mesh surfaces that
+/// lean less than about 1° from vertical): where every outside round is
+/// looked for (`outside_arcs_among`).
+pub fn upright(setup: &Setup, mesh: &Mesh) -> HashSet<usize> {
+    facets(&Geometry::new(setup, mesh), |_| true)
+        .into_keys()
+        .collect()
+}
+fn arcs_among_by(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>, outside: bool) -> Vec<Arc> {
     let g = Geometry::new(setup, mesh);
     let facets = facets(&g, |id| ids.contains(&id));
     if facets.len() < 3 {
@@ -759,7 +801,7 @@ pub fn arcs_among(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc> 
             continue;
         };
         done.extend(members.iter().copied());
-        if arc(&facets, members.clone()).is_err() {
+        if arc(&facets, members.clone(), outside).is_err() {
             continue;
         }
         let (every, by_corner) = all.get_or_insert_with(|| {
@@ -767,7 +809,7 @@ pub fn arcs_among(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>) -> Vec<Arc> 
             let by_corner = corners(&every);
             (every, by_corner)
         });
-        if let Ok(a) = whole_arc(wide, &facets, every, by_corner, members) {
+        if let Ok(a) = whole_arc(wide, &facets, every, by_corner, members, outside) {
             found.push(a);
         }
     }
