@@ -7276,8 +7276,11 @@ flood = { pin = 8 }
         run_until(&mut a, 60., "the first cuts", |r| {
             r.carving.as_ref().is_some_and(|c| c.version > 0)
         });
-        // The tick's job, which tests do not run to its end, gives way.
+        // The tick's job, which tests do not run to its end, gives way,
+        // and its start with it: else a mesh asked for within
+        // RUN_MESH_EVERY of it is put off and gives no task (LIO-436).
         a.run_mesh_job = None;
+        a.run_mesh_started = None;
         assert!(a.locked());
         if crate::gpu_mesh::shared().is_some() {
             // Meshed while the machine moves, by the mesher's thread.
