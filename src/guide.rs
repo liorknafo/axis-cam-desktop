@@ -1961,13 +1961,13 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                     let legs: Vec<&Move> =
                         moves.iter().filter(|m| m.motion != Motion::Dwell).collect();
                     let mut targets = vec![];
-                    for (i, m) in legs.iter().enumerate() {
+                    for m in &legs {
                         let axis = moved(m)?;
                         let centre = m.to[axis] - zero[axis];
                         let down =
                             axis == 2 && m.to[2] < m.from[2] && (m.to[2] - lo[2]).abs() < 1e-4;
                         targets.push(Target {
-                            order: u8::try_from(i + 1).unwrap_or(u8::MAX),
+                            order: 0,
                             axis,
                             centre,
                             shown: centre,
@@ -1976,6 +1976,63 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                             // The quill locked at the level for the walk.
                             lock: [false, false, down],
                         });
+                    }
+                    // Each walk's screen stands alone: Z up above the stock,
+                    // then X and Y where it goes down, said even when the
+                    // walk before left the tool there already (LIO-447:
+                    // walk 9 of the adapter plate went down with no X).
+                    let down = targets.iter().position(|t| t.axis == 2 && t.lock[2]);
+                    if let (Some(down), Some(start)) = (down, legs.first().map(|m| m.from)) {
+                        let said: Vec<usize> = (targets[..down].iter()).map(|t| t.axis).collect();
+                        let first_z = said.iter().position(|&k| k == 2);
+                        let mut ahead = vec![];
+                        for axis in [2, 0, 1] {
+                            // Z must come before X and Y are set; X and Y
+                            // before the tool goes down.
+                            let needed = if axis == 2 {
+                                first_z.is_none_or(|i| said[..i].iter().any(|&k| k < 2))
+                            } else {
+                                !said.contains(&axis)
+                            };
+                            if needed {
+                                let centre = start[axis] - zero[axis];
+                                ahead.push(Target {
+                                    order: 0,
+                                    axis,
+                                    centre,
+                                    shown: centre,
+                                    edge: false,
+                                    feed: false,
+                                    lock: [false; 3],
+                                });
+                            }
+                        }
+                        targets.splice(0..0, ahead);
+                    }
+                    for (i, t) in targets.iter_mut().enumerate() {
+                        t.order = u8::try_from(i + 1).unwrap_or(u8::MAX);
+                    }
+                    let points: Vec<[f32; 2]> = (w.stair.points.iter())
+                        .map(|p| [p[0] as f32, p[1] as f32])
+                        .collect();
+                    let s = plan.stock;
+                    if let Some(why) = crate::corner::walk_problem(
+                        &targets,
+                        &points,
+                        w.z,
+                        (
+                            [s.min[0] - zero[0], s.min[1] - zero[1]],
+                            [s.max[0] - zero[0], s.max[1] - zero[1]],
+                            s.max[2] - zero[2],
+                        ),
+                        plan.radius,
+                    ) {
+                        return Err(crate::corner::broken(
+                            op.name(),
+                            (k + 1, walks.len()),
+                            c.place(),
+                            &why,
+                        ));
                     }
                     let feed = moves.iter().find(|m| m.motion == Motion::Feed);
                     steps.push(Step::Corner {
@@ -1992,9 +2049,7 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                         level: w.level,
                         levels: w.levels,
                         scallop: w.stair.scallop as f32,
-                        points: (w.stair.points.iter())
-                            .map(|p| [p[0] as f32, p[1] as f32])
-                            .collect(),
+                        points,
                         targets,
                         never: Limits {
                             x: [lo[0] - r - zero[0], hi[0] + r - zero[0]],

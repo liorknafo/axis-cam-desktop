@@ -4511,8 +4511,10 @@ fn corner<'a>(
         .iter()
         .position(|t| t.axis == 2 && t.lock[2])
         .unwrap_or(0);
+    // Only numbers: the Steps refuse a walk that goes down with no X or
+    // Y (LIO-447), and a drawing would fail on one.
     let path: Vec<[f32; 2]> = (places[down..].iter())
-        .filter(|q| q[2] <= z + 0.001)
+        .filter(|q| q[2] <= z + 0.001 && q.iter().all(|v| v.is_finite()))
         .map(|q| [q[0], q[1]])
         .collect();
     let quarter = (0..4)
@@ -4563,10 +4565,15 @@ fn corner<'a>(
         let after_same = i > 0 && targets[i - 1].axis == t.axis && !targets[i - 1].feed && !t.feed;
         let mut value = dro(t.centre);
         if t.feed {
+            // The way it moves from the number before (LIO-447: never
+            // against a number not known, which pointed walk 9's first
+            // feed the wrong way).
             let from = places
                 .get(i.wrapping_sub(1))
-                .map_or(t.centre, |q| q[t.axis]);
-            let arrow = arrows[t.axis][usize::from(t.centre > from)];
+                .map(|q| q[t.axis])
+                .filter(|v| v.is_finite());
+            let rises = from.map_or(way(t.axis) > 0, |from| t.centre > from);
+            let arrow = arrows[t.axis][usize::from(rises)];
             value = format!("{arrow} {value}");
             if Some(i) == first_feed {
                 tags.push("feed in to the round's start".into());
@@ -4582,7 +4589,7 @@ fn corner<'a>(
         } else if t.axis == 2 && i + 1 == targets.len() {
             tags.push("up, clear".into());
         } else if t.axis == 2 {
-            tags.push("over the top".into());
+            tags.push("up, above the stock".into());
         } else if next_same {
             tags.push(format!("{} mm short", mm(crate::corner::TAKE_UP)));
         } else if after_same {

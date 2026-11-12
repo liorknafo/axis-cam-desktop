@@ -562,6 +562,21 @@ impl PartGrid {
 /// The operations to name, given the deep part cells each one removed: none
 /// while the total is under `GOUGE_CELLS`, and then every operation that
 /// removed some.
+/// The problem setup `si`'s Steps refused (`why`) for a Round corners walk
+/// that cannot be followed (LIO-447): with the operation its name starts.
+fn broken_steps(setup: &crate::model::Setup, si: usize, why: &str) -> Problem {
+    Problem {
+        setup: si + 1,
+        operation: (setup.operations.iter())
+            .position(|o| {
+                o.strategy == crate::model::Strategy::Corner
+                    && why.starts_with(&format!("{}:", o.name()))
+            })
+            .map(|oi| oi + 1),
+        stage: "steps",
+        message: proposal::clip(why, 300),
+    }
+}
 fn gouging_operations(removed: &[usize]) -> Vec<usize> {
     if removed.iter().sum::<usize>() < GOUGE_CELLS {
         return vec![];
@@ -1466,6 +1481,12 @@ fn run(
                     stage: "workholding",
                     message: crate::guide::NOT_CLEAR.into(),
                 }),
+                // A Round corners walk whose DRO numbers cannot be followed
+                // (LIO-447): not a number, no safe X and Y to go down at,
+                // or against the walk's one way.
+                Err(why) if why.contains(crate::corner::BROKEN) => {
+                    export.push(broken_steps(&job_doc.setups[si], si, &why))
+                }
                 Ok(guide) => {
                     for step in &guide.steps {
                         if let crate::guide::Step::Holes { op, uncentred, .. } = step
@@ -3840,6 +3861,25 @@ mod totem {
             tests::{aluminium, hold, op},
         },
     };
+    /// A Round corners walk the Steps cannot follow is a problem of its
+    /// operation, not a green check (LIO-447).
+    #[test]
+    fn a_corner_walk_the_steps_refuse_is_a_problem() {
+        let (doc, _) = crate::corner::tests::plate_job("Y");
+        let setup = &doc.setups[0];
+        let name = setup.operations[0].name().to_string();
+        let why = crate::corner::broken(
+            &name,
+            (9, 16),
+            crate::corner::WHERE[2],
+            "it goes down with no X to go down at",
+        );
+        assert!(why.contains(crate::corner::BROKEN));
+        let p = super::broken_steps(setup, 0, &why);
+        assert_eq!((p.setup, p.operation, p.stage), (1, Some(1), "steps"));
+        assert!(p.message.contains("walk 9 of 16"), "{}", p.message);
+        assert!(p.message.contains("no X"), "{}", p.message);
+    }
     #[test]
     #[ignore]
     fn the_totem_case_machines_from_both_sides() {
