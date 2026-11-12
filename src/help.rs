@@ -1212,7 +1212,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "",
         ),
         AddThreading => (
-            "Add a Thread operation for each thread size modeled on the part that this setup reaches and that has none yet, with what it needs before it: its tap drill (and on the manual mill one centre drilling), or on the lathe the blank turned to size or the tap drill. With none left, one Thread to fill by hand. Deleting a Thread deletes what it brought.",
+            "Add a Thread operation for each thread size modeled on the part that this setup reaches and that has none yet, with what it needs before it: its tap drill (and on the manual mill a centre drilling), or on the lathe the blank turned to size or the tap drill. With none left, one Thread to fill by hand. Deleting a Thread deletes what it brought.",
             "",
         ),
         AddNeededTool => (
@@ -1533,7 +1533,9 @@ pub fn command(m: &Message, label: String) -> Help {
                     "Turn" => {
                         "Choose what to turn and set its sizes: Z 0 is the free end, diameters are diameters."
                     }
-                    "Centre" => "Set how deep the drill goes on the lathe's centre line.",
+                    "Drill" => {
+                        "Set how deep the drill goes on the lathe's centre line, or click the bore on the part."
+                    }
                     "Linking" => {
                         "Control how the tool enters a cut and moves between cutting passes."
                     }
@@ -4837,7 +4839,7 @@ mod tests {
             "Passes",
             "Linking",
             "Turn",
-            "Centre",
+            "Drill",
             "Other",
         ] {
             commands.push((tab.into(), Tab(tab.into())));

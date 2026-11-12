@@ -2184,14 +2184,6 @@ fn setups(app: &App) -> Element<'_, Message> {
             });
         c = c.push(HelpButton::new(b, &msg, &label).width(Fill));
     }
-    // The setup's operations, as the Run page lists them, a press going to
-    // that section; the row of chips over the screen is gone (LIO-431).
-    if let Some(Ok(shown)) = app.current_guide()
-        && shown.guide.setup == app.doc.index()
-    {
-        c = c.push(space().height(8)).push(muted("Operations"));
-        c = c.push(operations(app, shown));
-    }
     // The CNC machines, for the Control page without a CNC setup.
     let cnc_machines: Vec<_> = (app.doc.machines.iter())
         .filter(|m| crate::model::get(&m.p, "controller") == "UC100")
@@ -2208,17 +2200,33 @@ fn setups(app: &App) -> Element<'_, Message> {
             );
         }
     }
-    // Room at the right for the scrollbar.
-    container(
-        scrollable(c.padding(iced::Padding::ZERO.right(12)))
-            .id(OPERATIONS_LIST)
-            .spacing(4),
-    )
-    .padding(14)
-    .width(210)
-    .height(Fill)
-    .style(card)
-    .into()
+    // The setup's operations, as the Run page lists them, a press going to
+    // that section; the row of chips over the screen is gone (LIO-431).
+    // Only the list scrolls: Back and the setups stay in view.
+    if let Some(Ok(shown)) = app.current_guide()
+        && shown.guide.setup == app.doc.index()
+    {
+        c = c.push(space().height(8)).push(muted("Operations"));
+        // Room at the right for the scrollbar.
+        c = c.push(
+            scrollable(container(operations(app, shown)).padding(iced::Padding::ZERO.right(12)))
+                .id(OPERATIONS_LIST)
+                .spacing(4)
+                .height(Fill),
+        );
+    }
+    container(c)
+        .padding(14)
+        .width(210)
+        .height(Fill)
+        .style(card)
+        .into()
+}
+/// Section `i`'s number among the setup's operations, from 1; None for one
+/// that is no operation (Set up, the hand-over).
+fn op_number(g: &Guide, i: usize) -> Option<usize> {
+    g.sections.get(i)?.op?;
+    Some(g.sections[..=i].iter().filter(|s| s.op.is_some()).count())
 }
 /// The section a step is in.
 pub(crate) fn section_of(g: &Guide, at: usize) -> usize {
@@ -2283,7 +2291,11 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
     // The header of the section the place is in.
     let s = &g.sections[here];
     let mut header = row![
-        disc((here + 1).to_string(), true, 26.),
+        disc(
+            op_number(g, here).map_or("•".to_string(), |k| k.to_string()),
+            true,
+            26.
+        ),
         bold(section_name(app, g, s), 17)
     ]
     .spacing(10)
@@ -2344,10 +2356,12 @@ fn operations<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
         let done = s.steps.end <= at;
         let now = i == here;
         // Numbered from 1 (LIO-377).
+        // Numbered as the Run page numbers operations; Set up and the hand
+        // over carry a mark (LIO-431).
         let mark = if done {
             "✓".to_string()
         } else {
-            (i + 1).to_string()
+            op_number(g, i).map_or("•".to_string(), |k| k.to_string())
         };
         let small = if now {
             progress(g, s, at, app.guide_item)
@@ -2357,16 +2371,9 @@ fn operations<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
             String::new()
         };
         // The name, what is left of it under it, as the Run page's lines.
-        // A section done takes one line, so twelve mostly fit (LIO-431).
-        let name = text(section_name(app, g, s)).size(13);
-        let name: Element<_> = if done && !now {
-            container(name.wrapping(text::Wrapping::None))
-                .width(Fill)
-                .clip(true)
-                .into()
-        } else {
-            name.into()
-        };
+        // A name is never cut (LIO-426): a section done wraps as the
+        // current one does, a size smaller (LIO-431).
+        let name = text(section_name(app, g, s)).size(if done && !now { 12 } else { 13 });
         let mut words = column![name].spacing(1);
         if !small.is_empty() {
             words = words.push(text(small).size(12).color(if now { ACCENT } else { MUTED }));
@@ -3384,7 +3391,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             let tried = o.filter(|o| o.tapping()).and_then(|_| screw_try(p, *op));
             let tapped = tried.is_some();
             let right = match tried {
-                Some(row) => column![label("Try"), row],
+                Some(row) => column![label("By hand"), row],
                 None => column![label("Measure")].extend(rows),
             }
             .push(chips(c))
@@ -3398,12 +3405,14 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             .into();
             // "try" once: the heading says it, the readout names the screw
             // (LIO-426).
-            let sub = if tapped {
-                "try it"
+            // A thread is tried, named as on the lathe: "Try · the thread"
+            // (LIO-437).
+            let (title, sub) = if tapped {
+                ("Try", "the thread")
             } else {
-                "measure what it left"
+                ("Check", "measure what it left")
             };
-            ("Check".into(), sub, left, right)
+            (title.into(), sub, left, right)
         }
         Step::Lathe(step) => turning::screen(p, step),
         Step::HandOver { next: to } if p.shown.side.is_some() => {
@@ -5676,7 +5685,8 @@ pub(crate) mod tests {
         );
         // Then tried with the nut, its own step (LIO-413).
         send(&mut a, GuideAction::Go(last + 1));
-        shows(&a, &["Try", "the M40×1.5 nut", "spring pass"]);
+        // The screen named Try, the nut by its name (LIO-437).
+        shows(&a, &["Try", "M40×1.5 nut", "spring pass"]);
         let part = nth(&a, 0, |l| matches!(l, L::Plunge { part_off: true, .. }));
         send(&mut a, GuideAction::Go(part));
         shows(
@@ -5687,6 +5697,13 @@ pub(crate) mod tests {
                 "centre",
                 "in until the part drops",
             ],
+        );
+        // The carriage as a pass shows it: the distance, its turns under it
+        // (LIO-437).
+        assert!(
+            texts(&a).iter().any(|t| t.ends_with(" on the dial")),
+            "{:?}",
+            texts(&a)
         );
         send(&mut a, GuideAction::Next);
         let minutes = format!("lathe ~{} min", guide(&a).minutes.ceil());

@@ -1697,7 +1697,8 @@ impl Operation {
     /// The editor's tabs for this operation on machine `m`.
     pub fn tabs(&self, m: &Machine) -> Vec<&'static str> {
         let mut tabs = if self.on_centre(m) {
-            vec!["Tool", "Centre", "Cycle"]
+            // Its own tab by its word, not "Centre" (LIO-437).
+            vec!["Tool", "Drill", "Cycle"]
         } else {
             self.strategy.tabs()
         };
@@ -7897,7 +7898,7 @@ mod manual_setups {
         // Snapped to a gear of the lathe.
         assert!(num(&op.p, "rpm").is_some_and(|rpm| crate::manual::on_gear(&m, rpm)));
         assert_eq!(op.issues(&m, &tools, &[]), Vec::<String>::new());
-        assert_eq!(op.tabs(&m), vec!["Tool", "Centre", "Cycle"]);
+        assert_eq!(op.tabs(&m), vec!["Tool", "Drill", "Cycle"]);
         // No selection is asked of it, and none is taken.
         let mut selected = op.clone();
         selected.geometry = vec![5];
@@ -7916,7 +7917,7 @@ mod manual_setups {
         );
         assert_eq!(
             crate::ui::issue_tab(crate::lathe::DRILL_ON_CENTRE),
-            Some("Centre")
+            Some("Drill")
         );
         // The depth is a positive number that the drill's flutes cover.
         for depth in ["0", "-5", "", "deep"] {

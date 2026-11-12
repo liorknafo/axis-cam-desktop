@@ -532,6 +532,25 @@ pub enum LatheStep {
 }
 /// A thread's name: the standard size of `major` × `pitch` ("M16×2"), else
 /// "M16.5×1.5".
+/// The top slide's travel for each thread pass of `infeeds`, worked out once
+/// for the Steps and the Passes tab (LIO-437): the last set to the slide's
+/// division below its travel, never deeper than planned; the passes before
+/// it never past that, so the readings never go back.
+pub fn thread_travels(machine: &Machine, infeeds: &[f32], angle: f32) -> Vec<f32> {
+    let deepest = infeeds.last().map_or(0., |d| {
+        lathe::floor(machine, Slide::Top, mm(top_travel(*d, angle)))
+    });
+    let n = infeeds.len();
+    (infeeds.iter().enumerate())
+        .map(|(i, d)| {
+            if i + 1 == n {
+                deepest
+            } else {
+                mm(top_travel(*d, angle)).min(deepest)
+            }
+        })
+        .collect()
+}
 pub fn thread_label(major: f32, pitch: f32) -> String {
     (crate::thread::SPECS.iter())
         .find(|s| (s.major - major).abs() < 0.05 && (s.pitch - pitch).abs() < 1e-3)
@@ -2252,18 +2271,10 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
                 let infeeds: Vec<f32> = (along.iter())
                     .map(|m| mm(if inside { m.to[0] - r0 } else { r0 - m.to[0] }.max(0.)))
                     .collect();
-                // The last pass is set to the top slide's division below
-                // its travel, never deeper than planned; the passes before
-                // it never past that, so the readings never go back.
-                let deepest = infeeds.last().map_or(0., |d| {
-                    lathe::floor(machine, Slide::Top, mm(top_travel(*d, angle)))
-                });
+                let travels = thread_travels(machine, &infeeds, angle);
+                let deepest = travels.last().copied().unwrap_or(0.);
                 for (i, infeed) in infeeds.iter().enumerate() {
-                    let travel = if i + 1 == n {
-                        deepest
-                    } else {
-                        mm(top_travel(*infeed, angle)).min(deepest)
-                    };
+                    let travel = travels[i];
                     let top = zeroes.wound(Slide::Top, travel, inside);
                     // What the top slide set there feeds in.
                     let infeed = if i + 1 == n {

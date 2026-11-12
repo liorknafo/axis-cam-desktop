@@ -6102,6 +6102,100 @@ flood = { pin = 8 }
         let texts = crate::ui::probe::texts(a.view(), window);
         assert!(texts.iter().any(|t| t == "X × Y × Z"), "{texts:?}");
     }
+    /// The lathe's second pass (LIO-437): the Thread's Passes tab and its
+    /// Steps give the same readings; every lathe cut's own tab starts with
+    /// "From the part", the Thread and the Drill too, a click on a bore
+    /// filling the Drill's depth; the Drill's tab is "Drill"; the thread's
+    /// check is a Try screen on the lathe as on the mill.
+    #[test]
+    fn the_lathe_says_its_thread_once_and_asks_for_the_part_first() {
+        use crate::GuideAction;
+        use crate::guide::{LatheStep, Step};
+        let mut a = stud_app(|_| {});
+        // The checks and the steps in place, not in the background.
+        a.smoke_dir = a.test_dir.as_ref().map(|d| d.path().to_path_buf());
+        let _ = a.update(Message::AddThreading);
+        let thread = (a.doc.setup().operations.iter())
+            .position(|o| o.is_thread())
+            .unwrap();
+        let _ = a.update(Message::SelectOp(thread));
+        let _ = a.update(Message::Tab("Thread".into()));
+        let first_section = |a: &App| {
+            let texts = page_texts(a);
+            let at = texts
+                .iter()
+                .position(|t| t == "Operation parameters")
+                .unwrap();
+            texts[at..]
+                .iter()
+                .find(|t| *t == "From the part" || *t == "The cut")
+                .cloned()
+        };
+        assert_eq!(first_section(&a).as_deref(), Some("From the part"));
+        // The Steps built, the planning page reads their passes.
+        let _ = a.update(Message::Guide(GuideAction::Open(0)));
+        crate::steps::tests::build(&mut a);
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(thread));
+        let _ = a.update(Message::Tab("Passes".into()));
+        let note = (page_texts(&a).into_iter())
+            .find(|t| t.contains(" passes, the top slide at "))
+            .unwrap();
+        let readings: Vec<String> = (note.split(" in to: ").nth(1).unwrap())
+            .trim_end_matches('.')
+            .split(", ")
+            .map(str::to_string)
+            .collect();
+        let _ = a.update(Message::Guide(GuideAction::Open(0)));
+        let passes: Vec<usize> = {
+            let g = &a.current_guide().unwrap().as_ref().unwrap().guide;
+            (g.steps.iter().enumerate())
+                .filter(|(_, s)| matches!(s, Step::Lathe(LatheStep::ThreadPass { .. })))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        assert_eq!(passes.len(), readings.len(), "{readings:?}");
+        for (k, at) in passes.into_iter().enumerate() {
+            let _ = a.update(Message::Guide(GuideAction::Go(at)));
+            let texts = page_texts(&a);
+            assert!(
+                texts.iter().any(|t| t.contains(&readings[k])),
+                "{}: {texts:?}",
+                readings[k]
+            );
+        }
+        // The Try screen: named Try, "try" not said again.
+        let g = &a.current_guide().unwrap().as_ref().unwrap().guide;
+        let tried = (g.steps.iter()).position(|s| matches!(s, Step::Lathe(LatheStep::Try { .. })));
+        let _ = a.update(Message::Guide(GuideAction::Go(tried.unwrap())));
+        let texts = page_texts(&a);
+        assert!(texts.iter().any(|t| t == "Try"), "{texts:?}");
+        let tries = (texts.iter())
+            .filter(|t| t.to_lowercase().contains("try"))
+            .count();
+        assert_eq!(tries, 1, "{texts:?}");
+        // The lathe Drill: Tool, Drill, Cycle; the part first; a click on
+        // the sleeve's bore fills its depth.
+        let mut b = lathe_job_app(
+            50.,
+            crate::turn::tests::tube(5., 15., 0., 30.),
+            -32.,
+            |_| {},
+        );
+        let _ = b.update(Message::AddOp(Strategy::Drill));
+        let tabs = b.operation().unwrap().tabs(&b.doc.setup().machine);
+        assert_eq!(tabs, ["Tool", "Drill", "Cycle"]);
+        assert_eq!((b.tab.as_str(), b.picking), ("Drill", true));
+        assert_eq!(first_section(&b).as_deref(), Some("From the part"));
+        let wall = face_where(&b, |p| (p[0].hypot(p[1]) - 5.).abs() < 0.01);
+        let _ = b.update(Message::Viewport(crate::viewport::Event::PickSurface(wall)));
+        assert_eq!(
+            num(&b.operation().unwrap().p, "depth"),
+            Some(32.),
+            "{}",
+            b.status
+        );
+    }
     /// LIO-419: Thread is a tile on every machine and the browser has no
     /// "+ Add threading".
     #[test]
@@ -6468,7 +6562,7 @@ flood = { pin = 8 }
         assert!(
             // Named Thread since LIO-419.
             a.status
-                .starts_with("Added to Manual Mill: one centre drilling, then Thread M6×1 (2×)"),
+                .starts_with("Added to Manual Mill: Thread M6×1 (2×)"),
             "{}",
             a.status
         );
@@ -31571,7 +31665,8 @@ soft_max = 180.0
                 .tabs(&a.doc.setup().machine)
                 .contains(&"Passes")
         );
-        for tab in ["Tool", "Turn", "Passes", "Centre"] {
+        // The lathe Drill's tab is "Drill" (LIO-437), was "Centre".
+        for tab in ["Tool", "Turn", "Passes", "Drill"] {
             let _ = a.update(Message::Tab(tab.into()));
             let _view = a.view();
         }
@@ -31631,8 +31726,9 @@ soft_max = 180.0
         a.doc.tools.push(drill);
         let _ = a.update(Message::AddOp(Strategy::Drill));
         let tabs = a.operation().unwrap().tabs(&a.doc.setup().machine);
-        assert_eq!(tabs, vec!["Tool", "Centre", "Cycle"]);
-        let _ = a.update(Message::Tab("Centre".into()));
+        // "Drill", was "Centre" (LIO-437).
+        assert_eq!(tabs, vec!["Tool", "Drill", "Cycle"]);
+        let _ = a.update(Message::Tab("Drill".into()));
         shows(&a, &["Depth · mm"]);
         let _ = a.update(Message::Tab("Cycle".into()));
         shows(&a, &["Drilling cycle"]);
