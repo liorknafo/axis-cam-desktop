@@ -722,7 +722,7 @@ pub(crate) fn issue_tab(issue: &str) -> Option<&'static str> {
             } else if issue.starts_with("The box must be") {
                 Some("Box")
             } else if issue == lathe::DRILL_ON_CENTRE {
-                Some("Centre")
+                Some("Drill")
             } else {
                 None
             };
@@ -4292,6 +4292,17 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 c = c.push(row![checks.field(p, a.0, a.1), checks.field(p, b.0, b.1)].spacing(9));
             }
         }
+        // A Thread asks for the part first too (LIO-437).
+        "Turn" if o.is_thread() => {
+            c = c
+                .push(section("From the part"))
+                .push(note(
+                    "Fills the thread from the one modelled on the part: its side, size and end.",
+                ))
+                .push(secondary("Fill from the part", Message::ThreadFromPart).width(Fill))
+                .push(section("The cut"))
+                .push(turn_fields(o, checks));
+        }
         "Turn" => {
             // A lathe cut taken from the part: the pick first, the numbers
             // under it to adjust (LIO-424), as the Box's.
@@ -4349,7 +4360,27 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 .push(checks.field(p, "hole_diameter", "Bore diameter · mm (0: the bore picked)"))
                 .push(note("The keyseat head goes down the bore's axis to the groove, arcs out to its diameter, circles once (twice with a spring pass), arcs back to the axis and comes up it. A groove wider than the head takes as many passes along the axis as cover it. The head must fit down the bore, its neck must clear the bore while it cuts, and it must reach the groove's far edge below its shank. Round a boss it goes down outside it."));
         }
-        "Centre" => {
+        // The lathe Drill's own tab, by its word; the pick first (LIO-437).
+        "Drill" => {
+            if app.part_mesh().is_some() && !app.is_sample() {
+                c = c
+                    .push(section("From the part"))
+                    .push(note(crate::turn::pick_prompt("Drill")))
+                    .push(if app.picking {
+                        Element::from(btn("Stop picking", Message::PickMode, true).width(Fill))
+                    } else {
+                        secondary("Pick on the part", Message::PickMode)
+                            .width(Fill)
+                            .into()
+                    });
+                if let Some((id, why)) = &app.box_refused
+                    && app.picking
+                    && *id == o.id
+                {
+                    c = c.push(caution("No Drill from that face", vec![why.clone()]));
+                }
+                c = c.push(section("The cut"));
+            }
             c = c
                 .push(note(
                     "Drills on the centre line from the tailstock, in from the free end.",
@@ -4948,7 +4979,6 @@ fn turn_fields<'a>(o: &'a Operation, checks: &mut Checks) -> Element<'a, Message
                     .spacing(9),
                 )
                 .push(checks.field(p, "z_end", "Z end · mm"));
-            c = c.push(secondary("From the part", Message::ThreadFromPart).width(Fill));
         }
         _ => {}
     }
@@ -4983,9 +5013,38 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
                 let outside = get(p, "thread_side") != "Inside";
                 let depth = crate::turn::thread_depth(outside, pitch);
                 let angle = crate::guide::top_angle(60.);
-                let readings: Vec<String> = crate::turn::thread_infeeds(depth, n)
-                    .iter()
-                    .map(|d| format!("{:.2}", crate::guide::top_travel(*d, angle)))
+                // The readings the Steps give, worked out once (LIO-437):
+                // the Steps' own passes when they are built (from the
+                // touch on the blank as it is left), else the plan's.
+                let machine = &app.doc.setup().machine;
+                let built: Option<Vec<f32>> = (app.current_guide())
+                    .and_then(|g| g.as_ref().ok())
+                    .filter(|s| s.guide.setup == app.doc.index())
+                    .map(|s| {
+                        (s.guide.steps.iter())
+                            .filter_map(|st| match st {
+                                crate::guide::Step::Lathe(
+                                    crate::guide::LatheStep::ThreadPass { op, infeed, .. },
+                                ) if Some(*op) == app.selected => Some(*infeed),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .filter(|v: &Vec<f32>| !v.is_empty());
+                // The Steps' passes are set already: their travel as the
+                // dial reads it; the plan's are set as the Steps set them.
+                let travels: Vec<f32> = match built {
+                    Some(infeeds) => (infeeds.iter())
+                        .map(|i| crate::guide::top_travel(*i, angle))
+                        .collect(),
+                    None => {
+                        let infeeds = crate::turn::thread_infeeds(depth, n);
+                        crate::guide::thread_travels(machine, &infeeds, angle)
+                    }
+                };
+                let n = travels.len();
+                let readings: Vec<String> = (travels.into_iter())
+                    .map(|t| format!("{:.2}", lathe::nearest(machine, lathe::Slide::Top, t)))
                     .collect();
                 c.push(checks.hinted(p, "passes", "Passes", "Auto"))
                     .push(note("Leave Passes empty for the usual number for the pitch."))

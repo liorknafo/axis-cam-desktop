@@ -168,8 +168,10 @@ pub fn needed_tool(op: &Operation, machine: &Machine, number: u32) -> Option<Too
 /// that it survives the status line's cut (LIO-412), then what was added in
 /// the order the hand does it (LIO-411).
 pub fn hand_status(setup: &str, done: &[String], missing: &[String]) -> String {
+    // What is listed: a centre drilling and a tap drilling before each
+    // thread.
     let what = format!(
-        "one centre drilling, then {}, each after its tap drill.",
+        "{}, a centre drilling and a tap drilling before each.",
         done.join(", ")
     );
     match missing.len() {

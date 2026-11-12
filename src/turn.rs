@@ -1524,6 +1524,7 @@ pub fn pick_prompt(kind: &str) -> &'static str {
             "Click the floor of a groove: its Z, width and bottom diameter fill the Groove."
         }
         "Part off" => "Click the part's end face toward the chuck: the blade parts it there.",
+        "Drill" => "Click the wall of the bore on the axis: the drill goes to its end.",
         _ => "",
     }
 }
@@ -1590,6 +1591,8 @@ pub fn cut_from_face(
             ("diameter", text(2. * r[1])),
         ],
         "Part off" if flat && along < 0. => vec![("z", text(z0))],
+        // The lathe Drill: to the bore's end, from the free end (LIO-437).
+        "Drill" if round && out < 0. => vec![("depth", text(-z0))],
         _ => return Err(format!("That face makes no {kind}. {}", pick_prompt(kind))),
     })
 }

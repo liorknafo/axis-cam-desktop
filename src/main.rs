@@ -2600,7 +2600,11 @@ impl App {
     /// Fills the selected lathe cut from the part's face `pick` (LIO-424):
     /// a face that makes none says why on its tab and changes nothing.
     fn fill_turn(&mut self, pick: surface::Selection) {
-        let Some(kind) = self.operation().map(|o| get(&o.p, "turn_kind").to_string()) else {
+        // A lathe Drill is filled as a cut too (LIO-437).
+        let Some(kind) = self.operation().map(|o| match o.strategy {
+            Strategy::Drill => "Drill".to_string(),
+            _ => get(&o.p, "turn_kind").to_string(),
+        }) else {
             return;
         };
         let found = match self.part_mesh() {
@@ -2635,8 +2639,9 @@ impl App {
             && self.doc.file.is_some()
             && self.imported_mesh.is_some()
             && self.operation().is_some_and(|o| {
-                o.strategy == Strategy::Turn
-                    && crate::turn::PICKED.contains(&get(&o.p, "turn_kind"))
+                (o.strategy == Strategy::Turn
+                    && crate::turn::PICKED.contains(&get(&o.p, "turn_kind")))
+                    || o.on_centre(&self.doc.setup().machine)
             })
     }
     pub fn can_pick(&self) -> bool {
@@ -4924,7 +4929,14 @@ impl App {
     /// while the machine moves: the page is for the manual mill beside it,
     /// and editing, which would build it again, is locked then.
     fn refresh_guide(&mut self) -> Task<Message> {
-        if !self.steps_page() {
+        // A lathe Thread's Passes tab lists the Steps' own readings: they
+        // are worked out for it too (LIO-437).
+        let thread_passes = self.page == Page::Work
+            && self.tab == "Passes"
+            && self
+                .operation()
+                .is_some_and(|o| o.is_thread() && o.strategy == Strategy::Turn);
+        if !self.steps_page() && !thread_passes {
             return Task::none();
         }
         let Some(key) = self.guide_key() else {
@@ -5908,7 +5920,7 @@ impl App {
                             && o.surfaces.as_ref().is_none_or(|s| s.ids.is_empty())
                     });
                 // So does a lathe cut on its Turn tab (LIO-424).
-                let unpicked_turn = t == "Turn"
+                let unpicked_turn = (t == "Turn" || t == "Drill")
                     && self.picks_turn()
                     && (self.operation())
                         .is_some_and(|o| o.surfaces.as_ref().is_none_or(|s| s.ids.is_empty()));
@@ -6236,8 +6248,15 @@ impl App {
                 }
                 // A lathe cut on a part starts its pick, as a Box does (LIO-424).
                 if self.picks_turn() {
-                    let kind = get(&self.operation().unwrap().p, "turn_kind").to_string();
-                    self.tab = "Turn".into();
+                    // The lathe Drill on its own tab (LIO-437).
+                    let (kind, tab) = match strategy {
+                        Strategy::Drill => ("Drill".to_string(), "Drill"),
+                        _ => (
+                            get(&self.operation().unwrap().p, "turn_kind").to_string(),
+                            "Turn",
+                        ),
+                    };
+                    self.tab = tab.into();
                     self.picking = true;
                     self.status = format!("Added {added}. {}", crate::turn::pick_prompt(&kind));
                 }
@@ -6926,10 +6945,10 @@ impl App {
                     self.progress = 0.;
                 }
                 // A Box and a lathe cut are picked on their own tab.
-                if self
-                    .operation()
-                    .is_none_or(|o| !matches!(o.strategy, Strategy::Box | Strategy::Turn))
-                {
+                let machine = &self.doc.setup().machine;
+                if self.operation().is_none_or(|o| {
+                    !matches!(o.strategy, Strategy::Box | Strategy::Turn) && !o.on_centre(machine)
+                }) {
                     self.tab = "Geometry".into();
                 }
             }

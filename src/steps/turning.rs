@@ -2558,10 +2558,11 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     narrow,
                     Some(1),
                     "carriage",
-                    big(at.short, lit(0, item)),
+                    // As a pass shows the carriage (LIO-437).
+                    big(at.total.clone(), lit(0, item)),
                     vec![
-                        format!("the point {} short", mm(*size)),
-                        "of the corner, lock it".into(),
+                        format!("{} on the dial", at.long),
+                        format!("the point {} short of the corner, lock it", mm(*size)),
                     ],
                     lit(0, item),
                     reached(0),
@@ -2670,8 +2671,12 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     narrow,
                     Some(1),
                     "carriage",
-                    big(reading(p, c).short, Lit::Now),
-                    vec!["left side of the blade".into(), "then lock it".into()],
+                    // As a pass shows the carriage (LIO-437).
+                    big(reading(p, c).total, Lit::Now),
+                    vec![
+                        format!("{} on the dial", reading(p, c).long),
+                        "left side of the blade, then lock it".into(),
+                    ],
                     Lit::Now,
                     None,
                 ));
@@ -2947,12 +2952,13 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             let left = view(bar, marks);
             let mut right = column![
                 chips(vec![tool_chip(p, &p.setup.operations[*op].tool)]),
-                label("Try it"),
+                // "Try" said once, by the screen's name (LIO-437).
+                label("By hand"),
                 line(
                     narrow,
                     None,
-                    "try",
-                    big(format!("the {what}"), Lit::Now),
+                    "",
+                    big(what.clone(), Lit::Now),
                     vec!["it goes on by hand".into()],
                     Lit::Now,
                     None,
@@ -2972,7 +2978,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     None,
                 ));
             }
-            ("Try".into(), "the thread with what goes on it", left, right)
+            ("Try".into(), "the thread", left, right)
         }
     }
 }
