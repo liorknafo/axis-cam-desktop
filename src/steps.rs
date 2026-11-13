@@ -2948,17 +2948,22 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     ]
                 ),
             ];
-            // Z on the top, for each hole's lift to a safe Z (LIO-449).
+            // Z on the top, for each hole's lift to a safe Z (LIO-449). In
+            // a wrench the DRO follows the centre, not the tap: the tap and
+            // wrench come out by hand before each move.
             let right = match top {
-                Some(top) => right.push(row(
-                    3,
-                    "Z",
-                    &dro(*top),
-                    vec![
-                        "touch the top with the tap's tip, or the centre's point".into(),
-                        "set Z".into(),
-                    ],
-                )),
+                Some(top) => right
+                    .push(row(
+                        3,
+                        "Z",
+                        &dro(*top),
+                        vec![
+                            "in the chuck: touch the top with the tap's tip".into(),
+                            "in a wrench: with the centre's point".into(),
+                            "set Z".into(),
+                        ],
+                    ))
+                    .push(muted(WRENCH_LIFT).size(13)),
                 None => right,
             };
             let left = p.picture(p.done(*op), Fill);
@@ -3927,6 +3932,9 @@ fn safe_z(p: &Page<'_>, op: usize) -> f32 {
         .unwrap_or(f32::NEG_INFINITY)
         .max(highest + SAFE_ABOVE))
 }
+/// A tap in a wrench on a centre (LIO-449): Z is the centre's point, which
+/// the DRO follows; the tap is in the hole, not on the quill.
+const WRENCH_LIFT: &str = "In a wrench, Z is the centre's point, not the tap's tip: before each move to a hole, turn the tap out, lift it and the wrench clear of the stock by hand, then raise the centre.";
 /// What holds the stock, in a hole page's words.
 fn holder(p: &Page<'_>) -> &'static str {
     if !p.shown.vise.is_empty() {
@@ -3944,6 +3952,7 @@ fn lift<'a>(p: &Page<'a>, op: usize, tapping: bool) -> Element<'a, Message> {
     let mut tags = vec![];
     if tapping {
         tags.push("turn the tap back out first".to_string());
+        tags.push("in a wrench: lift the tap and wrench out by hand, then the centre".into());
     }
     tags.push(format!("clear of the stock and {}", holder(p)));
     tags.push("before X and Y move".into());

@@ -6563,11 +6563,15 @@ flood = { pin = 8 }
         let t = texts_at(&mut a, at - 1);
         let z = t.iter().position(|s| s == "Z").expect("a Z row");
         assert_eq!(t[z + 1], crate::steps::tests::dro_of(top), "{t:?}");
-        assert!(
-            t.iter()
-                .any(|s| s.contains("touch the top with the tap's tip")),
-            "{t:?}"
-        );
+        // Both ways of holding the tap: its tip in the chuck; in a wrench,
+        // the centre's point, the tap lifted out by hand before each move.
+        for want in [
+            "in the chuck: touch the top with the tap's tip",
+            "in a wrench: with the centre's point",
+            "In a wrench, Z is the centre's point, not the tap's tip",
+        ] {
+            assert!(t.iter().any(|s| s.contains(want)), "{want}: {t:?}");
+        }
         let holes = match &shown.guide.steps[at] {
             Step::Holes { holes, .. } => holes.len(),
             s => panic!("{s:?}"),
@@ -6580,7 +6584,10 @@ flood = { pin = 8 }
             assert_eq!(t[up + 1], "Z", "{t:?}");
             assert!(
                 t.iter()
-                    .any(|s| s.starts_with("turn the tap back out first")),
+                    .any(|s| s.starts_with("turn the tap back out first")
+                        && s.contains(
+                            "in a wrench: lift the tap and wrench out by hand, then the centre"
+                        )),
                 "{t:?}"
             );
             let turns = t.iter().position(|s| s == "turns").unwrap();
