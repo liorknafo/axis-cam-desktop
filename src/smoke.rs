@@ -2405,6 +2405,53 @@ flood = { pin = 8 }
         );
     }
 
+    /// LIO-457: a project without the connected machine still draws it as
+    /// it jogs, in every orientation; and a profile draft kept for its
+    /// unsaved changes says A's direction by the orientation saved since.
+    #[test]
+    fn the_control_page_keeps_the_connected_orientation() {
+        use crate::orient::{KEY, Orient};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        idle(&mut a);
+        let id = conn(&a).machine_id.clone();
+        // A profile draft with an unsaved change.
+        a.open_profile(false);
+        fn draft(a: &mut App) -> &mut crate::setup::Draft {
+            match &mut a.profile_draft {
+                Some((_, Ok(d))) => d,
+                _ => panic!("no profile draft"),
+            }
+        }
+        let d = draft(&mut a);
+        d.edit(crate::setup::Edit::Number(
+            "axes.x.max_velocity".into(),
+            "900".into(),
+        ));
+        assert!(d.dirty());
+        // The machine turned round and saved, the profile opened again.
+        a.page = Page::Machines;
+        let _ = a.update(Message::EditMachine(id.clone()));
+        a.machine_draft.p.insert(KEY.into(), "Left".into());
+        let _ = a.update(Message::SaveMachine);
+        a.open_profile(false);
+        let d = draft(&mut a);
+        assert!(d.dirty(), "the unsaved change is kept");
+        assert_eq!(d.orient, Orient::Left);
+        assert!(crate::setup::a_direction(d.orient).contains("toward −Y, the back"));
+        // A project without this machine opened: the drawing keeps the
+        // connected orientation, whichever it is.
+        let mut other = a.doc.clone();
+        other.machines.retain(|m| m.id != id);
+        other.setups.clear();
+        a.replace_document(other, None);
+        assert!(a.doc.machines.iter().all(|m| m.id != id));
+        for o in [Orient::Right, Orient::Left, Orient::Away, Orient::Toward] {
+            a.control.as_mut().unwrap().orient = o;
+            assert_eq!(crate::ui::machine_model(&a, conn(&a)).figures.orient, o);
+        }
+    }
+
     /// LIO-457: a setup whose snapshot of the machine points +X otherwise
     /// than the connected machine would have the program header and the
     /// Control page name the stock's sides differently: it does not run

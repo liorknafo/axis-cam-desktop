@@ -3400,6 +3400,10 @@ impl App {
         };
         if again || !keep {
             self.profile_draft = Some((m.id.clone(), setup::Draft::open(&m)));
+        } else if let Some((_, Ok(d))) = &mut self.profile_draft {
+            // A draft kept for its unsaved changes says A's direction by
+            // the machine as it is now (LIO-457).
+            d.orient = orient::Orient::of(&m);
         }
     }
     /// Saves the profile being edited. A connected machine is reconnected

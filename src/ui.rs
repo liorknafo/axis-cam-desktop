@@ -10464,6 +10464,12 @@ pub(crate) fn machine_model<'a>(
         crate::machine_view::Figures::JINGYAN,
         crate::machine_view::Figures::of,
     );
+    // The connected machine's orientation, the jog pad's (LIO-457), also when
+    // the project open has no copy of it.
+    let figures = crate::machine_view::Figures {
+        orient: c.orient,
+        ..figures
+    };
     let (envelope, assumed) = crate::machine_view::MachineView::envelope(&c.config, figures.travel);
     crate::machine_view::MachineView {
         figures,
