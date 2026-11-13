@@ -4900,6 +4900,92 @@ flood = { pin = 8 }
             .collect()
     }
 
+    /// On the shop tablet (1280 × 800, LIO-460) every button and field of
+    /// the MACHINE page is a finger tall and wide, in every tab: from a
+    /// place a press does something, up and down and to the sides, as far
+    /// as the same press does the same.
+    #[test]
+    fn on_the_tablet_every_machine_button_is_a_finger_tall() {
+        use crate::ui::{ControlTab, FINGER, probe};
+        crate::ui::TOUCH.with(|t| t.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let window = iced::Size::new(1280., 800.);
+        let _ = a.update(Message::Resized(window));
+        // The extent of what a press at `at` does, along one line through it.
+        let reach = |a: &App, at: iced::Point, said: &str, across: bool| -> f32 {
+            let line = if across {
+                iced::Rectangle::new(
+                    iced::Point::new(at.x - 80., at.y),
+                    iced::Size::new(160., 1.),
+                )
+            } else {
+                iced::Rectangle::new(
+                    iced::Point::new(at.x, at.y - 80.),
+                    iced::Size::new(1., 160.),
+                )
+            };
+            let same: Vec<f32> = (probe::presses(a.view(), window, line, 1.).into_iter())
+                .filter(|(_, m)| format!("{m:?}") == said)
+                .map(|(p, _)| if across { p.x } else { p.y })
+                .collect();
+            let mid = if across { at.x } else { at.y };
+            let (mut lo, mut hi) = (mid, mid);
+            while same.contains(&(lo - 1.)) {
+                lo -= 1.;
+            }
+            while same.contains(&(hi + 1.)) {
+                hi += 1.;
+            }
+            hi - lo + 1.
+        };
+        let mut small = vec![];
+        for tab in [
+            ControlTab::Job,
+            ControlTab::Machine,
+            ControlTab::WorkZero,
+            ControlTab::Probe,
+            ControlTab::Mdi,
+        ] {
+            let _ = a.update(Message::ControlTab(tab));
+            let mut seen: Vec<String> = vec![];
+            let page = iced::Rectangle::with_size(window);
+            for (at, m) in probe::presses(a.view(), window, page, 6.) {
+                let said = format!("{m:?}");
+                // Leaving a jog button stops the jog wherever the pointer is;
+                // a slider says another value at each point of it.
+                if seen.contains(&said)
+                    || ["JogRelease", "JogSpeed", "FeedOverride"]
+                        .iter()
+                        .any(|w| said.contains(w))
+                {
+                    continue;
+                }
+                seen.push(said.clone());
+                let (high, wide) = (reach(&a, at, &said, false), reach(&a, at, &said, true));
+                if high < FINGER - 1. || wide < FINGER - 1. {
+                    small.push(format!("{tab:?} {said}: {wide} × {high}"));
+                }
+            }
+            for f in probe::fields(a.view(), window) {
+                if f.height < FINGER - 1. {
+                    small.push(format!("{tab:?} field at {f:?}"));
+                }
+            }
+        }
+        assert!(
+            small.is_empty(),
+            "smaller than a finger:
+{}",
+            small.join(
+                "
+"
+            )
+        );
+    }
+
     /// A step's hover card leaves the steps after it to be clicked: with
     /// Hole 1's card open, each hole below still picks itself (LIO-312).
     #[test]
