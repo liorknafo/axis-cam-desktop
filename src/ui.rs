@@ -7937,8 +7937,8 @@ fn wizard(app: &App) -> Element<'_, Message> {
                 .spacing(8)
             };
             form = form.push(three(travel));
-            if !crate::lathe::is_lathe(m) {
-                // Which way + is on the table (LIO-457).
+            if !manual::is_hand(m) {
+                // Which way + is on the table (LIO-457): a CNC's.
                 let o = crate::orient::Orient::from_fields(p);
                 form = form
                     .push(choice_value(

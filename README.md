@@ -835,7 +835,13 @@ unit), the jog pad and the arrow keys, the probing grids (the stock top seen
 from above, back at the top), and the sides and corners that touch-off,
 probing, the program header and the plan checks name ("touch off the
 back-right corner") all follow it. The setup editor's work zeros keep the
-part's own names as the screen shows it (Stock top front-left is −X −Y).
+part's own names as the screen shows it (Stock top front-left is −X −Y). A
+setup whose snapshot of the machine has another orientation than the Machine
+library does not run until it is assigned the machine again; a project opened,
+or an edit put back, while the machine is connected takes the connected
+machine's orientation into its copies of it, as it takes the profile's travel.
+The setting is a CNC's: a manual mill or lathe keeps the usual orientation, its
+Steps drawn and said from the operator's side and its DRO set to count that way.
 
 Once the machine is Idle, the Control page has everything needed before a job:
 

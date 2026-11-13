@@ -64,8 +64,13 @@ impl Dir {
 }
 
 impl Orient {
-    /// Machine `m`'s.
+    /// Machine `m`'s. A machine worked by hand is always the usual one: its
+    /// Steps are drawn and said from the operator's side as the screen
+    /// shows them, and its DRO sets its own counting direction.
     pub fn of(m: &Machine) -> Self {
+        if crate::manual::is_hand(m) {
+            return Orient::Right;
+        }
         Self::from_fields(&m.p)
     }
 
@@ -348,6 +353,10 @@ mod tests {
         assert_eq!(Orient::of(&m), Orient::Left);
         m.p.insert(KEY.into(), "sideways".into());
         assert_eq!(Orient::of(&m), Orient::Right);
+        // A hand machine keeps the usual one, whatever the field says.
+        let mut hand = crate::manual::defaults();
+        hand.p.insert(KEY.into(), "Left".into());
+        assert_eq!(Orient::of(&hand), Orient::Right);
         for o in ALL {
             m.p.insert(KEY.into(), o.label().into());
             assert_eq!(Orient::of(&m), o);

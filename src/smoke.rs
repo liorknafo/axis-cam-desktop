@@ -2354,6 +2354,57 @@ flood = { pin = 8 }
         run_of(a).problems(conn(a), &a.doc)
     }
 
+    /// LIO-457: a project opened while a turned machine is connected, whose
+    /// copies of that machine were saved before the setting (the usual
+    /// orientation), takes the connected machine's: the 3D machine, the jog
+    /// pad, the words and the run checks stay in one frame, and it runs.
+    #[test]
+    fn a_project_opened_while_connected_takes_the_machines_orientation() {
+        use crate::orient::{KEY, Orient};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        let id = conn(&a).machine_id.clone();
+        // An older copy of the project: no orientation anywhere.
+        let older = a.doc.clone();
+        assert!(older.machines.iter().all(|m| !m.p.contains_key(KEY)));
+        // The machine turned round and saved while connected.
+        a.page = Page::Machines;
+        let _ = a.update(Message::EditMachine(id.clone()));
+        a.machine_draft.p.insert(KEY.into(), "Left".into());
+        let _ = a.update(Message::SaveMachine);
+        assert_eq!(conn(&a).orient, Orient::Left);
+        // The older project opened, its part loaded again.
+        let mesh = a.imported_mesh.clone();
+        a.replace_document(older, None);
+        a.imported_mesh = mesh;
+        let of = |m: &Machine| Orient::of(m);
+        assert!(
+            a.doc
+                .machines
+                .iter()
+                .filter(|m| m.id == id)
+                .all(|m| of(m) == Orient::Left)
+        );
+        assert!(
+            a.doc
+                .setups
+                .iter()
+                .filter(|s| s.machine.id == id)
+                .all(|s| of(&s.machine) == Orient::Left)
+        );
+        assert_eq!(conn(&a).orient, Orient::Left);
+        let view = crate::ui::machine_model(&a, conn(&a));
+        assert_eq!(view.figures.orient, Orient::Left);
+        a.page = Page::Control;
+        check_run(&mut a, 0);
+        assert!(
+            !problems(&a).iter().any(|p| p.contains("+X pointing")),
+            "{:?}",
+            problems(&a)
+        );
+    }
+
     /// LIO-457: a setup whose snapshot of the machine points +X otherwise
     /// than the connected machine would have the program header and the
     /// Control page name the stock's sides differently: it does not run
