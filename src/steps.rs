@@ -666,6 +666,17 @@ fn drawn(m: &Measure) -> bool {
 /// How far off the stock a size is drawn, mm.
 const OFF: f32 = 16.;
 /// A DRO number: two decimals, a true minus, never −0.00.
+/// What a halved axis is set to at its + face, said from what the DRO
+/// reads there (LIO-451): "½" when `set` is half of `reads`, else "½ − 1.5"
+/// or "½ + 1.5", when the touches are not either side of the zero alike.
+fn halving(set: f32, reads: f32) -> String {
+    let off = set - reads / 2.;
+    if off.abs() < 0.005 {
+        "½".into()
+    } else {
+        format!("½ {} {}", if off > 0. { "+" } else { "−" }, mm(off.abs()))
+    }
+}
 fn dro(v: f32) -> String {
     let v = if v.abs() < 0.005 { 0. } else { v };
     format!("{v:.2}").replace('-', "−")
@@ -2896,7 +2907,12 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     Some(f) => {
                         shapes.push(Shape::Finder(at[k], from, format!("{} 0", AXES[k])));
                         from[k] = 1.;
-                        let read = format!("{} {} → ½", AXES[k], dro(f.reads));
+                        let read = format!(
+                            "{} {} → {}",
+                            AXES[k],
+                            dro(f.reads),
+                            halving(touch[k], f.reads)
+                        );
                         shapes.push(Shape::Finder(f.at, from, read));
                     }
                     None => {
@@ -2942,13 +2958,12 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 // One row for the + face: what the DRO reads there first,
                 // a check, under it; then half of that, or more or less
                 // when the touches are not either side of the zero alike.
-                let off = touch[k] - f.reads / 2.;
                 let reads = format!("reads about {} first, a check", dro(f.reads));
-                let (how, then) = if off.abs() < 0.005 {
+                let half = halving(touch[k], f.reads);
+                let (how, then) = if half == "½" {
                     ("½", "press ½ or set half of it".to_string())
                 } else {
-                    let sign = if off > 0. { "+" } else { "−" };
-                    ("set", format!("set half of it {sign} {}", mm(off.abs())))
+                    ("set", format!("set half of it {}", &half["½ ".len()..]))
                 };
                 todo.push((
                     format!("{} → {how}", touching(sides[k][1], f.at)),
@@ -6069,6 +6084,49 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!(after(&rows, "touch the back face → ½"), ["Y", "65.00"]);
+    }
+    #[test]
+    fn the_drawing_and_the_row_say_the_same_halving() {
+        // Half the reading; or more or less, the same in both (LIO-451).
+        assert_eq!(halving(72.5, 145.), "½");
+        assert_eq!(halving(72., 147.), "½ − 1.5");
+        assert_eq!(halving(75., 147.), "½ + 1.5");
+    }
+    /// The Zero pages after an earlier setup cut a notch in the +X face's
+    /// top, and cut that face back 3 mm (touches not either side of the
+    /// zero alike), at 1440 × 1000 and 1024 × 700, into `AXIS_RENDER_DIR`.
+    #[test]
+    #[ignore]
+    fn render_the_zero_after_earlier_cuts() {
+        let dir = std::path::PathBuf::from(std::env::var("AXIS_RENDER_DIR").unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, cut) in [
+            ("notch", [67., 80., -10., 10., 0., -12.]),
+            ("cut-back-plus", [67., 80., -50., 50., 0., -16.]),
+            ("cut-back-minus", [-80., -67., -50., 50., 0., -16.]),
+        ] {
+            let (mut doc, mesh) = crate::guide::tests::after_a_cut(cut);
+            doc.file = Some(crate::model::ModelFile {
+                name: "squared.3mf".into(),
+                path: "squared.3mf".into(),
+                format: "3mf".into(),
+                bytes: 1,
+                thickness: None,
+            });
+            let temp = tempfile::tempdir().unwrap();
+            let mut a = App::from_workspace(temp.path().join("workspace.json"), None);
+            a.test_dir = Some(temp);
+            a.doc = doc;
+            a.imported_mesh = Some(mesh);
+            a.page = Page::Control;
+            build(&mut a);
+            let id = a.doc.active.clone();
+            a.doc.guide.insert(id, 1);
+            for (w, h) in [(1440, 1000), (1024, 700)] {
+                (a.window_width, a.window_height) = (w as f32, h as f32);
+                render(&a, (w, h), &dir.join(format!("zero-{name}-{w}.png")));
+            }
+        }
     }
     #[test]
     fn a_pass_shows_its_number_and_its_readouts_in_order() {

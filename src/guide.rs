@@ -1433,9 +1433,31 @@ fn contact(
     let solid = |d: f32, z: f32| -> Vec<f32> {
         (0..ACROSS).map(across).filter(|&a| has(d, a, z)).collect()
     };
+    // Where the finder touches what it meets: the middle of the widest
+    // unbroken run of it (the one nearer the middle when two are as
+    // wide), so never in a gap an earlier cut left in the face (LIO-451);
+    // round when all it meets spans less than half the stock's width.
     let met = |found: &[f32]| {
+        let gap = 1.5 * width / ACROSS as f32;
+        let middle = (stock.min[o] + stock.max[o]) / 2.;
+        let mut best = (found[0], found[0]);
+        let mut run = best;
+        for &a in &found[1..] {
+            if a - run.1 > gap {
+                run = (a, a);
+            } else {
+                run.1 = a;
+            }
+            let wider = run.1 - run.0 > best.1 - best.0 + gap / 3.;
+            let as_wide = (run.1 - run.0 - (best.1 - best.0)).abs() <= gap / 3.;
+            let nearer =
+                ((run.0 + run.1) / 2. - middle).abs() < ((best.0 + best.1) / 2. - middle).abs();
+            if wider || (as_wide && nearer) {
+                best = run;
+            }
+        }
         let (first, last) = (found[0], found[found.len() - 1]);
-        ((first + last) / 2., last - first < width / 2.)
+        ((best.0 + best.1) / 2., last - first < width / 2.)
     };
     // The heights tried, top first, none in the jaws: the top, then a
     // whole number of millimetres under it.
@@ -4092,6 +4114,100 @@ pub(crate) mod tests {
             .insert("edge_finder".into(), "0".into());
         let error = build(&doc, &mesh, 0).unwrap_err();
         assert!(error.contains("edge finder"), "{error}");
+    }
+    /// `squared_job`'s manual setup twice (LIO-451): the first cuts the
+    /// Box `cut` (x_min, x_max, y_min, y_max, z_top, z_bottom, work) into
+    /// a fresh block, the second, with the zero at the top's centre, only
+    /// faces 0.5 off its other end, so that its Zero touches what the
+    /// first left.
+    pub(crate) fn after_a_cut(cut: [f32; 6]) -> (Document, Mesh) {
+        let (mut doc, mesh) = squared_job();
+        let mut first = doc.setups[2].clone();
+        first.id = "earlier".into();
+        for (k, v) in [
+            ("stock_source", "fresh"),
+            ("stock_top", "0"),
+            ("stock_bottom", "0"),
+            ("vise_grip", "6"),
+            ("name", "Earlier cut"),
+            ("origin", "Stock top center"),
+        ] {
+            first.p.insert(k.into(), v.into());
+        }
+        let fields = [
+            ("allowance", "0"),
+            ("stepover", "40"),
+            ("stepdown", "2"),
+            ("rpm", "1000"),
+            ("feed", "100"),
+        ];
+        first.operations = vec![boxed("Earlier cut", &doc.tools[0].id, cut, &fields)];
+        let mut later = first.duplicate("G54");
+        later.p.insert("name".into(), "Zero after it".into());
+        // Outside the part's 134, on the side away from the cut.
+        let side = if cut[0] > 0. {
+            [-80., -67.]
+        } else {
+            [67., 80.]
+        };
+        later.operations = vec![boxed(
+            "Face",
+            &doc.tools[0].id,
+            [side[0], side[1], -50., 50., 0., -0.5],
+            &fields,
+        )];
+        doc.active = later.id.clone();
+        doc.setups = vec![first, later];
+        (doc, mesh)
+    }
+    #[test]
+    fn a_halved_axis_is_never_touched_in_a_notch_an_earlier_setup_cut() {
+        // A notch 20 wide and 12 deep in the middle of the +X face's top.
+        let (doc, mesh) = after_a_cut([67., 80., -10., 10., 0., -12.]);
+        let walked = simulate(&doc, &mesh, 1, "").unwrap();
+        let guide = build(&doc, &mesh, 1).unwrap();
+        let Step::Zero { far, touch, .. } = &guide.steps[1] else {
+            panic!("{:?}", guide.steps[1])
+        };
+        let f = far[0].unwrap();
+        // On the +X face, at the top, beside the notch, where there is
+        // material just inside it.
+        close(f.at[0], 70.);
+        close(f.at[2], 0.);
+        assert!(f.at[1].abs() > 10., "{f:?}");
+        let frame = crate::volume::Frame::new(&doc.setups[1], &mesh);
+        let rest = crate::rest::RestStock::new(&walked.before, frame);
+        let removed = rest.removed_in(walked.done[0].1.stock);
+        let mut p: [f32; 3] = std::array::from_fn(|k| f.at[k] + guide.zero[k]);
+        (p[0], p[2]) = (p[0] - 0.2, p[2] - 0.2);
+        assert!(rest.in_stock(p) && !removed.at(p), "{f:?} {p:?}");
+        // Both faces whole: half the reading.
+        close(f.reads, 150.);
+        close(touch[0], 75.);
+    }
+    #[test]
+    fn halved_touches_not_either_side_of_the_zero_alike_say_how_far_from_half() {
+        // The +X face cut back 3 mm for 16 mm down, into the jaws: the
+        // finder touches it at 67, the −X face at −70; the DRO reads 147
+        // and is set to 72, half less 1.5. Mirrored on −X, half plus 1.5.
+        for (cut, near, far_x, set) in [
+            ([67., 80., -50., 50., 0., -16.], -70., 67., 72.),
+            ([-80., -67., -50., 50., 0., -16.], -67., 70., 75.),
+        ] {
+            let (doc, mesh) = after_a_cut(cut);
+            let guide = build(&doc, &mesh, 1).unwrap();
+            let zero = &guide.steps[1];
+            let Step::Zero { at, far, touch, .. } = zero else {
+                panic!("{zero:?}")
+            };
+            let f = far[0].unwrap();
+            close(at[0][0], near);
+            close(f.at[0], far_x);
+            close(f.reads, 147.);
+            close(touch[0], set);
+            // The DRO reads 0 at the zero with the faces where touched.
+            close(dro_at_zero(zero, 0, [near, far_x]), 0.);
+        }
     }
     /// What a DRO shows at the work zero after the Zero step's touches on
     /// axis `k` (X or Y) of `zero`, for a blank whose faces are where
