@@ -1739,7 +1739,7 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
         ),
         ProbeEdges => (
             "Probe corner, Probe edge or Probe centre, by the work zero of the setup picked in the run bar. From above the stock top it touches the top, then the sides at the spots the program header names, and sets the X, Y and Z work zero exactly where the program has it. Anything touched on the way, a miss, Stop or E-stop ends it with nothing set.",
-            "With the probe above the stock top where Z0 is touched off, it touches the top, then the sides at the spots the program header names, 1 mm to 10 mm below the top (less on low stock), allowing for the tip's radius, and sets the X, Y and Z work zero exactly where the program has it: on the top or the bottom, and for Model origin from the front-left corner. A side whose first touch was off its spot is touched again on it.",
+            "With the probe above the stock top where Z0 is touched off, it touches the top, then the sides at the spots the program header names, 1 mm to 10 mm below the top (less on low stock), allowing for the tip's radius, and sets the X, Y and Z work zero exactly where the program has it: on the top or the bottom, and for Model origin from the stock's −X −Y corner by default, where the Probe from grid names it on this machine. A side whose first touch was off its spot is touched again on it.",
         ),
         TouchOff => (
             "With the tool tip on the stock top over the spot the steps name, set the work position there to the program's: X0 Y0 Z0 for a zero on the top, the stock's height in Z for one on the bottom, the corner's coordinates for Model origin.",

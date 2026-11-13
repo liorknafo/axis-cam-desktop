@@ -363,7 +363,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("origin", "Model origin") => (
-            "Program zero is the imported file's own 0,0,0, placed with this setup's rotation and translation. With the probe, Probe corner on the Control page finds it from the front-left corner of the stock top, set off from it as the program has it. Check that the point can be located on the machine before choosing it.",
+            "Program zero is the imported file's own 0,0,0, placed with this setup's rotation and translation. With the probe, Probe corner on the Control page finds it from the stock top's −X −Y corner (front-left as drawn), set off from it as the program has it. Check that the point can be located on the machine before choosing it.",
             "The LinuxCNC program lists the part's box in work coordinates and, while no earlier setup has cut it, the stock top's Z, to touch off on a part wall or that stock top.",
         ),
         ("origin", "A axis at stock end") => (
