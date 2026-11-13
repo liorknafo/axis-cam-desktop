@@ -448,14 +448,15 @@ Arguments are JSON. Values that were `&'static str` in a message are enums in th
       - **Toggle, `remove`:** ids not in the picks are skipped (`no_change`). For each other id, one click is sent. It must leave that id unpicked; otherwise it is undone in full and reported.
       - **Toggle, `replace`:** `clear_picks`, then `add`.
     - **Undoing a click** is a transaction over everything a click can write, not a repair of one operation. A click goes through `touch()`, which re-links centre drillings to their drills (`main.rs` ~3171), and through `update()`, which drops the operation's pick-review note (`Document::pick_checks`, ~5851).
-      - Before each click the engine keeps a clone of the whole `Document`, which holds every operation, the linked centre drillings and `pick_checks`. It also keeps the `App` fields a click writes: `project_dirty`, `status`, `status_problem`, `typed_last`, `box_refused`, the selection, and the picking mode.
+      - Before each click the engine keeps a clone of the whole `Document`, which holds every operation, the linked centre drillings and `pick_checks`. It also keeps the `App` fields a click writes: `project_dirty`, `status`, `status_problem`, `status_page` (which page the status line belongs to; `update()` sets it when the status changes, ~5889), `typed_last`, `box_refused`, the selection, the tab, and the picking mode.
       - Undoing puts all of them back. The `Document` is then equal, as a serialized value, to what it was before the click.
       - The derived state the click cleared (the simulation, the audit report, a generation) is not restored; it is rebuilt as after any edit and waited for (`pending()`).
       - An undone click is inside the command's ownership window and leaves no difference, so it adds no change-log entry.
- (ids, and the holes or corners the app lists for them) with the mesh fingerprint they belong to, and what each id did. Picking is turned on when it is off, and set back afterwards.
+    - **The result** returns the operation's picks afterwards (ids, and the holes or corners the app lists for them) with the mesh fingerprint they belong to, and what each id did.
+    - **Picking mode is temporary.** Picking is turned on when it is off, and set back afterwards. Turning it on (`PickMode`) also opens the operation's Geometry tab (or its Box, Slot, Corners, Turn or Drill tab) and stops playback. When the command ends, the tab is set back to the one that was open. Playback (`playing`, `progress`) stays stopped, like the simulation reset of any edit.
     - **Tests:**
       - Toggle: several ids from one corner, one hole and one region in one call; the same `add` sent twice (`no_change`); `remove` of an id that is not picked (`no_change`); `remove` of one face of a picked corner;
-      - Undo: a Drill with a linked centre drilling and a pick-review note; `add` with a chamfer face of a hole already picked. The click is undone, and the whole `Document` (the Drill's 24 faces, the centre drilling's picks, the note) equals what it was before;
+      - Undo: a Drill with a linked centre drilling and a pick-review note; `add` with a chamfer face of a hole already picked. The click is undone. The whole `Document` (the Drill's 24 faces, the centre drilling's picks, the note) equals what it was before, and so do `status`, `status_page` and the tab;
       - Fill: Slot, Box and a lathe Turn given two ids (refused, nothing changed), `add` (refused), one id with `replace` (filled), the same again (`no_change`), and `clear_picks`.
   - `pick_pin_holes {ids}`, `clear_pin_holes`, `place_pins {x, y}`.
 - **Generate:** `generate`, `generate_all`, `cancel_generation`.
@@ -654,3 +655,7 @@ Four milestones, each with its own Linear issue and PR.
    - reading Steps whose guide must be built is a heavy read;
    - picking is split into toggle and fill. It is driven by real clicks checked against what they did, not by a copied grouping function, and fill operations take one face with `replace` only.
 9. **gpt-6-astra, REJECT.** Its one finding was taken: undoing a click restores the whole `Document` and the `App` fields a click writes. A test covers the linked centre drilling and the pick-review note.
+10. **gpt-6-astra, ACCEPT.** Its three minor points were taken:
+    - `status_page` and the tab are restored with an undone click;
+    - the temporary picking mode sets the tab back, and playback stays stopped;
+    - the picks result paragraph is repaired.
