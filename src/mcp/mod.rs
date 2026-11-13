@@ -8,11 +8,17 @@
 //! - `engine`: the tools, carried out against that `App`.
 //! - `class`: what each `Message` is to an agent, with no wildcard.
 //! - `commands`: the commands `execute` runs.
+//! - `state`: the work state's snapshots, the revisions and their change
+//!   log, the external events, and the machinist's records.
 pub mod class;
 pub mod commands;
 pub mod engine;
 pub mod protocol;
 pub mod runner;
+pub mod state;
+
+#[cfg_attr(not(test), allow(unused_imports))]
+pub use state::{NOT_WORK_STATE, WORK_STATE};
 
 /// `axis-cam --mcp [--session <id>]`, given the arguments after `--mcp`:
 /// serves MCP on stdin and stdout until stdin ends, in a new headless

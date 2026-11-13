@@ -1323,7 +1323,7 @@ fn table() -> Vec<Command> {
         cmd("box_from_face", "operation").sends(|| Message::BoxFromFace).on_operation().effect("The Box's six fields from its picked face."),
         cmd("pick_all_corners", "operation").sends(|| Message::AllCorners).on_operation().effect("Every rounded outside corner picked for Round corners."),
         cmd("edit_field", "operation")
-            .text("Sets one field of an operation, a setup, or the machine, tool, material or holder draft, as typing in the editor does. The machine's controller fields (uc100_profile, uc100_connection, pi_*) are the user's.")
+            .text("Sets one field of an operation, a setup, or the machine, tool, material or holder draft, as typing in the editor does. The machine's controller fields (uc100_profile, uc100_connection, pi_*) and a lathe's cross-slide dial reading (cross_reads) are the user's.")
             .params(|| {
                 vec![
                     ("target", choice_param(&names(&EDIT_TARGETS)), true),
@@ -1341,6 +1341,11 @@ fn table() -> Vec<Command> {
                 let key = string(ctx, "key")?;
                 if class::machine_key(&key) {
                     return refused(format!("The field {key}: {}", class::MACHINE));
+                }
+                // The lathe's cross-slide dial reading is the machinist's
+                // record (`state::Records`).
+                if key == "cross_reads" {
+                    return refused(format!("The field {key}: {}", class::SHOP_FLOOR));
                 }
                 Ok(())
             })
@@ -2933,8 +2938,11 @@ mod tests {
         fn app(&self) -> &App {
             &self.app
         }
+        fn app_mut(&mut self) -> &mut App {
+            &mut self.app
+        }
         fn send(&mut self, message: Message) {
-            let task = self.app.update(message);
+            let task = self.app.update_by_agent(message);
             self.run(task);
         }
         fn run(&mut self, task: Task<Message>) {
@@ -3390,6 +3398,51 @@ mod tests {
         }
     }
 
+    /// Every allowed command, with each of its examples, on a job whose
+    /// setup holds the machinist's records: none changes them (the guard
+    /// in `engine` would fail it), and those that replace the project are
+    /// let through.
+    #[test]
+    fn no_allowed_command_changes_the_machinists_records() {
+        for c in all_commands() {
+            for example in c.example_args() {
+                let mut d = direct();
+                let doc = &mut d.app.doc;
+                let id = doc.setups[0].id.clone();
+                doc.guide.insert(id.clone(), 1);
+                doc.measured
+                    .insert(crate::guide::measure_key(&id, "zero"), 40.);
+                doc.setups[0]
+                    .machine
+                    .p
+                    .insert("cross_reads".into(), "Diameter".into());
+                for m in &mut doc.machines {
+                    m.p.insert("cross_reads".into(), "Diameter".into());
+                }
+                d.app
+                    .machine_draft
+                    .p
+                    .insert("cross_reads".into(), "Diameter".into());
+                std::fs::write(d.folder.join("part.stl"), "solid x\nendsolid x\n").unwrap();
+                crate::storage::save(&d.folder.join("job.axis.json"), &d.app.doc).unwrap();
+                let mut args = filled(&d, &example);
+                if c.name == "import_model" {
+                    args = json!({"path": d.folder.join("part.stl").display().to_string()});
+                }
+                let r = match run(&mut d, c.name, args.clone()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let reason = r["reason"].as_str().unwrap_or_default();
+                assert!(
+                    !reason.starts_with(crate::mcp::state::PROGRESS),
+                    "{} {args}: {r}",
+                    c.name
+                );
+            }
+        }
+    }
+
     #[test]
     fn every_command_has_help_and_a_schema() {
         let fallback = crate::help::command(&Message::Noop, String::new()).body;
@@ -3464,6 +3517,12 @@ mod tests {
                 "{key}"
             );
         }
+        let dial = json!({"target": "machine", "key": "cross_reads", "value": "Radius"});
+        let r = run(&mut d, "edit_field", dial).unwrap();
+        assert!(
+            r["reason"].as_str().unwrap().ends_with(class::SHOP_FLOOR),
+            "{r}"
+        );
         // With no machine connected the stops have nothing to stop.
         assert_eq!(
             run(&mut d, "estop", json!({})).unwrap()["outcome"],

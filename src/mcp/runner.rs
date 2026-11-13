@@ -9,6 +9,10 @@
 //! `Tick` at the window's rate (`App::ticks_fast`). Tasks run on a
 //! multi-thread tokio runtime (`iced_runtime::task::into_stream`); their
 //! window and widget actions have no window to act on and are dropped.
+//!
+//! What the engine sends is the agent's (`App::update_by_agent`), and so are
+//! the messages of the work it starts: a task carries who started it. A
+//! `Tick` and the work it starts are the app's own.
 use super::engine::{Agent, Backend, Reply};
 use crate::{App, Message};
 use iced::Task;
@@ -101,8 +105,12 @@ struct Request {
 /// What the session's thread is woken by.
 enum Event {
     Request(Request),
-    /// A message a task produced, boxed: a `Message` is large.
-    Output(Box<Message>),
+    /// A message a task produced, boxed: a `Message` is large; and whether
+    /// the agent started the task.
+    Output(Box<Message>, bool),
+    /// A message from the window's own handlers: the tests' user.
+    #[cfg(test)]
+    User(Box<Message>),
     /// The client has gone: the session is saved and the thread ends.
     Stop,
 }
@@ -141,6 +149,12 @@ impl Runner {
         if let Err(mpsc::SendError(Event::Request(r))) = self.events.send(Event::Request(request)) {
             (r.reply)(Err("The headless session has stopped.".into()));
         }
+    }
+    /// Sends `message` as the user's click in a window would: not the
+    /// agent's.
+    #[cfg(test)]
+    pub fn user(&self, message: Message) {
+        let _ = self.events.send(Event::User(Box::new(message)));
     }
     /// A tool call's answer, waited for.
     #[cfg(test)]
@@ -235,7 +249,7 @@ impl Host {
             ticked: false,
             stopping: false,
         };
-        host.update(Message::ResumeProject);
+        host.update(Message::ResumeProject, false);
         host
     }
     /// The event loop: calls, task messages and ticks, and after each the
@@ -308,21 +322,29 @@ impl Host {
                     reply(Err(format!("The app failed while doing this: {fault}")));
                 }
             }
-            Event::Output(message) => self.update(*message),
+            Event::Output(message, by_agent) => self.update(*message, by_agent),
+            #[cfg(test)]
+            Event::User(message) => self.update(*message, false),
             Event::Stop => self.stopping = true,
         }
     }
-    fn update(&mut self, message: Message) {
+    /// Sends `message` to the `App`, as the agent's or not, and runs the
+    /// work it starts as started by the same.
+    fn update(&mut self, message: Message, by_agent: bool) {
         let tick = matches!(message, Message::Tick);
-        let task = self.app.update(message);
-        self.pump(task);
+        let task = if by_agent {
+            self.app.update_by_agent(message)
+        } else {
+            self.app.update(message)
+        };
+        self.pump(task, by_agent);
         self.ticked = tick;
     }
-    /// Runs `task` on the runtime, its messages sent back to this thread.
-    /// A task with no work in it, as `Tick` mostly returns (a batch of
-    /// `Task::none`), is not run: it would count as running a moment
-    /// after every `Tick`.
-    fn pump(&self, task: Task<Message>) {
+    /// Runs `task` on the runtime, its messages sent back to this thread
+    /// with who started it. A task with no work in it, as `Tick` mostly
+    /// returns (a batch of `Task::none`), is not run: it would count as
+    /// running a moment after every `Tick`.
+    fn pump(&self, task: Task<Message>, by_agent: bool) {
         use futures_util::StreamExt;
         if task.units() == 0 {
             return;
@@ -337,7 +359,7 @@ impl Host {
             let _running = running;
             while let Some(action) = stream.next().await {
                 if let iced_runtime::Action::Output(message) = action {
-                    let _ = events.send(Event::Output(Box::new(message)));
+                    let _ = events.send(Event::Output(Box::new(message), by_agent));
                 }
             }
         });
@@ -352,7 +374,7 @@ impl Host {
         let now = Instant::now();
         if now >= self.tick_due(waiting) {
             self.last_tick = now;
-            self.update(Message::Tick);
+            self.update(Message::Tick, false);
         }
     }
 }
@@ -360,11 +382,14 @@ impl Backend for Host {
     fn app(&self) -> &App {
         &self.app
     }
+    fn app_mut(&mut self) -> &mut App {
+        &mut self.app
+    }
     fn send(&mut self, message: Message) {
-        self.update(message)
+        self.update(message, true)
     }
     fn run(&mut self, task: Task<Message>) {
-        self.pump(task);
+        self.pump(task, true);
         self.ticked = false;
     }
     fn quiet(&mut self) -> bool {
@@ -602,6 +627,42 @@ mod tests {
             .map(|s| s["outcome"].as_str().unwrap())
             .collect();
         assert_eq!(outcomes, ["done", "no_change", "done"]);
+        runner.stop();
+    }
+
+    /// The user's edit in the window while the agent's generation runs:
+    /// the generation is dropped, and the agent is told the job changed by
+    /// both, the edit named. Then an edit with no window open is the user's.
+    #[test]
+    fn a_user_edit_during_the_agents_window_is_named() {
+        use crate::{Target, mcp::state::Entry};
+        let dir = tempfile::tempdir().unwrap();
+        let runner = slow_session(dir.path(), std::time::Duration::from_secs(20));
+        let start = runner.call("inspect", json!({})).unwrap();
+        let revision = start["revision"].as_u64().unwrap();
+        let pick = json!({"command": "select_operation", "args": {"operation": 0}});
+        assert_eq!(runner.call("execute", pick).unwrap()["outcome"], "done");
+        let generate = json!({"command": "generate", "wait_s": 0.2});
+        let first = runner.call("execute", generate).unwrap();
+        assert_eq!(first["outcome"], "still_running", "{first}");
+        let id = first["command_id"].as_str().unwrap();
+        runner.user(Message::Edit(Target::Operation, "feed", "555".into()));
+        let done = runner
+            .call("wait", json!({"command_id": id, "wait_s": 15}))
+            .unwrap();
+        assert_ne!(done["outcome"], "still_running", "{done}");
+        let theirs: Vec<Entry> = serde_json::from_value(done["user_changed"].clone()).unwrap();
+        let [e] = &theirs[..] else { panic!("{done}") };
+        assert_eq!(e.source, crate::mcp::state::Source::Mixed);
+        assert_eq!(e.events, ["user: edit_field operation feed"]);
+        assert!(e.revision > revision);
+        // With no window open, a read finds the user's next edit.
+        runner.user(Message::Title("Renamed by hand".into()));
+        let read = runner.call("inspect", json!({})).unwrap();
+        let theirs: Vec<Entry> = serde_json::from_value(read["user_changed"].clone()).unwrap();
+        let [e] = &theirs[..] else { panic!("{read}") };
+        assert_eq!(e.source, crate::mcp::state::Source::User);
+        assert_eq!(read["project"]["title"], "Renamed by hand");
         runner.stop();
     }
 }

@@ -1586,6 +1586,9 @@ pub struct App {
     signing_out: Option<std::sync::Arc<openai::Client>>,
     /// G-code exports started and not yet reported (folder choice and write).
     gcode_exports: usize,
+    /// Who changes the job, for an MCP agent (LIO-470): the revision, the
+    /// change log and the external events (`mcp::state`).
+    pub(crate) mcp: mcp::state::Tracker,
     /// The folder a test app is rooted in, removed when the app is dropped.
     #[cfg(test)]
     test_dir: Option<tempfile::TempDir>,
@@ -2225,6 +2228,7 @@ impl App {
             closing: None,
             signing_out: None,
             gcode_exports: 0,
+            mcp: Default::default(),
             #[cfg(test)]
             test_dir: None,
             #[cfg(test)]
@@ -2307,7 +2311,11 @@ impl App {
     /// (`control::travel_from_profile`). Whether any changed.
     fn travel_from(&mut self, id: &str, cfg: &uc100::config::MachineConfig) -> bool {
         let draft = control::travel_into(&mut self.machine_draft, id, cfg);
-        control::travel_from_profile(&mut self.doc, id, cfg) | draft
+        let changed = control::travel_from_profile(&mut self.doc, id, cfg) | draft;
+        if changed {
+            self.external("machine: travel from the UC100 profile");
+        }
+        changed
     }
     fn replace_document(&mut self, doc: Document, path: Option<PathBuf>) {
         // What is being generated is the old project's.
@@ -2996,6 +3004,7 @@ impl App {
         }
         self.generation_epoch += 1;
         let epoch = self.generation_epoch;
+        self.mcp_generation(epoch);
         let progress = std::sync::Arc::new(progress::Progress::default());
         self.generating = Some(Generating {
             epoch,
@@ -5209,6 +5218,9 @@ impl App {
             self.doc.guide.insert(setup.id.clone(), at);
             self.dirty = true;
             self.last_edit = Instant::now();
+            // Only the machinist moves it, also when the Steps page they
+            // entered is applied once its guide is built.
+            self.external("user: step guide moved");
         }
         self.guide_item = 0;
         self.guide_clock.0 = Instant::now();
@@ -5867,7 +5879,17 @@ impl App {
             now.saved() == e.after.saved()
         })
     }
+    /// Handles `message`, from the window or from the engine: what comes
+    /// from the window is counted as an external event for an MCP agent
+    /// (`mcp::state`), unless it is view-only; the engine sends its own
+    /// with `update_by_agent`.
     fn update(&mut self, message: Message) -> Task<Message> {
+        self.mcp_arrive(&message);
+        let task = self.update_turn(message);
+        self.mcp_leave();
+        task
+    }
+    fn update_turn(&mut self, message: Message) -> Task<Message> {
         let before = self.status.clone();
         let problem = std::mem::take(&mut self.status_problem);
         let (selected, page) = (self.selected, self.page);
@@ -7979,6 +8001,7 @@ impl App {
             }
             Message::Setup(setup::Msg::Revert) => self.open_profile(true),
             Message::Setup(setup::Msg::UseCalibration) => {
+                let mut used = false;
                 if let (Some(c), Some((id, Ok(d)))) = (&self.control, &mut self.profile_draft)
                     && c.machine_id == *id
                     && let Some(Ok(v)) = c.calibrated()
@@ -7988,6 +8011,10 @@ impl App {
                         format!("axes.{axis}.steps_per_unit"),
                         setup::steps_text(v),
                     ));
+                    used = true;
+                }
+                if used {
+                    self.external("machine: calibration used in the controller profile");
                 }
             }
             Message::Setup(setup::Msg::Save) => return self.save_profile(),
@@ -8258,6 +8285,7 @@ impl App {
                     o.p.insert("coolant".into(), "Off".into());
                     names.push(o.name().to_string());
                 }
+                self.external("machine: coolant set to Off for the run");
                 self.touch();
                 self.status = format!("Coolant set to Off: {}.", names.join(", "));
                 return self.recheck_run();
@@ -8329,6 +8357,9 @@ impl App {
                             c.rotary = control::Rotary::of(&m);
                             // Its travel is the connected profile's (LIO-344).
                             synced = control::travel_into(&mut m, &c.machine_id, &c.config);
+                        }
+                        if synced {
+                            self.external("machine: travel from the UC100 profile");
                         }
                         if let Some(i) = self.doc.machines.iter().position(|x| x.id == m.id) {
                             self.doc.machines[i] = m;
@@ -9368,10 +9399,15 @@ impl App {
                     .and_then(|c| Some((c.machine_id.clone(), c.recorded.take()?)))
                 {
                     self.record_pins(&id, at);
+                    self.external("machine: pin reference recorded");
                 }
                 if let Some((id, keep)) = (self.control.as_mut())
                     .and_then(|c| Some((c.machine_id.clone(), c.rotary_keep.take()?)))
                 {
+                    self.external(match keep {
+                        control::RotaryKeep::Centreline(..) => "machine: rotary centreline saved",
+                        control::RotaryKeep::Stale(_) => "machine: rotary centreline marked stale",
+                    });
                     self.keep_rotary(&id, keep);
                 }
                 if self.status == LOCKED && !self.locked() {

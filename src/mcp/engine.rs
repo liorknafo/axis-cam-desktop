@@ -10,7 +10,15 @@
 //! `failed`, or `cancelled`), or when its `wait_s` is up, with
 //! `still_running` and the `command_id` that `wait` and `cancel` take.
 //! Reads, `wait`, `cancel` and the machine's stops are answered meanwhile.
+//!
+//! A window's edges are where the work state is snapshotted (`state`): a
+//! difference found when it opens is the user's, one found when it closes
+//! the agent's, or mixed when external events came during it. Every result
+//! carries the `revision`, what the command `changed`, and what the user
+//! changed since the agent was last told (`user_changed`). A command may
+//! not change the machinist's records unless the machinist did meanwhile.
 use super::commands::{self, Ctx, Expect, Problem};
+use super::state::{self, Change, Entry, Records};
 use crate::{App, Message};
 use iced::Task;
 use serde::Serialize;
@@ -23,10 +31,13 @@ use std::{
 /// What the engine needs of the side that owns the `App`.
 pub trait Backend {
     fn app(&self) -> &App;
-    /// Sends `message` to the `App` as a click would, and runs the work
-    /// it starts.
+    fn app_mut(&mut self) -> &mut App;
+    /// Sends `message` to the `App` as a click would, marked as the
+    /// agent's (`App::update_by_agent`), and runs the work it starts, whose
+    /// messages are the agent's too.
     fn send(&mut self, message: Message);
-    /// Runs `task` as the `App`'s own tasks run, its messages sent to it.
+    /// Runs `task` as the `App`'s own tasks run, its messages sent to it
+    /// as the agent's.
     fn run(&mut self, task: Task<Message>);
     /// The backend has nothing of its own still to come: no task running,
     /// no message waiting, and a `Tick` since the last message.
@@ -76,6 +87,11 @@ pub fn tools() -> Value {
     });
     let id =
         json!({"type": "string", "description": "The command_id a still_running result gave."});
+    let if_revision = json!({
+        "type": "integer",
+        "minimum": 0,
+        "description": "Run only if the job is still at this revision (from the last result); otherwise the outcome is conflict, with what changed.",
+    });
     json!([
         {
             "name": "inspect",
@@ -111,13 +127,14 @@ pub fn tools() -> Value {
         {
             "name": "execute",
             "title": "Run a command",
-            "description": "Runs one command as the user's click would, waits for its work, and says what happened: `outcome` done, no_change, refused, busy, failed or still_running (with a command_id for wait and cancel), with `reason`, the status line, the selection and the work still pending.",
+            "description": "Runs one command as the user's click would, waits for its work, and says what happened: `outcome` done, no_change, refused, busy, failed, conflict or still_running (with a command_id for wait and cancel), with `reason`, the status line, the selection, the work still pending, the job's `revision`, what the command `changed`, and what the user changed meanwhile (`user_changed`).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "A name from list_commands."},
                     "args": {"type": "object", "description": "The command's arguments (describe_command gives their schema)."},
                     "wait_s": wait,
+                    "if_revision": if_revision,
                 },
                 "required": ["command"],
             },
@@ -139,6 +156,7 @@ pub fn tools() -> Value {
                     },
                     "stop_on_error": {"type": "boolean"},
                     "wait_s": wait,
+                    "if_revision": if_revision,
                 },
                 "required": ["steps"],
             },
@@ -193,6 +211,8 @@ pub enum Outcome {
     StillRunning,
     /// Its generation was cancelled (`cancel`).
     Cancelled,
+    /// The job is no longer at the call's `if_revision`; nothing was sent.
+    Conflict,
 }
 
 /// The selection, its page and tab, as `inspect` and every result give it.
@@ -225,6 +245,13 @@ pub struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub backend: &'static str,
+    /// The job's revision (`state::Log`).
+    pub revision: u64,
+    /// What the command changed: the items of its window's entry.
+    pub changed: Vec<Change>,
+    /// For a conflict: the entries since the call's `if_revision`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<Entry>,
     /// The status line after the command.
     pub status: String,
     /// The status line reports a problem the checks found.
@@ -242,6 +269,9 @@ impl Report {
             command_id: None,
             reason,
             backend: b.kind(),
+            revision: app.mcp.log.revision,
+            changed: vec![],
+            entries: vec![],
             status: app.status.clone(),
             status_problem: app.status_problem,
             selection: Selection::of(app),
@@ -300,6 +330,7 @@ fn inspect(b: &impl Backend) -> Value {
         "project": {
             "title": doc.title,
             "file": app.project_path.as_ref().map(|p| p.display().to_string()),
+            "revision": app.mcp.log.revision,
             "saved": app.project_path.is_some() && !app.project_dirty,
             "dirty": app.project_dirty,
             "model": model,
@@ -399,6 +430,25 @@ fn describe_command(args: &Value) -> Result<Value, String> {
 fn refuse(b: &impl Backend, why: String) -> Answer {
     Ok(Report::of(b, Outcome::Refused, Some(why)).json())
 }
+/// A `conflict` result: the job moved on from `revision`.
+fn conflict(b: &impl Backend, revision: u64) -> Answer {
+    let log = &b.app().mcp.log;
+    let why = format!(
+        "Nothing was done: the job changed since revision {revision} and is at revision {} now. Read what changed (entries), then call again with if_revision {}.",
+        log.revision, log.revision
+    );
+    let mut report = Report::of(b, Outcome::Conflict, Some(why));
+    report.entries = log.since(revision).cloned().collect();
+    Ok(report.json())
+}
+/// A call's `if_revision`: None when it has none.
+fn if_revision(args: &Value) -> Result<Option<u64>, String> {
+    match args.get("if_revision") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => (v.as_u64().map(Some))
+            .ok_or_else(|| "`if_revision` is a revision number from a result.".into()),
+    }
+}
 
 /// An ownership window: the agent command whose work is settling. It
 /// opens when the command's messages are sent and closes only when the
@@ -410,6 +460,9 @@ struct Window {
     status: String,
     expect: Option<Expect>,
     cancelled: bool,
+    /// The machinist's records when it opened: None for a command that
+    /// replaces the project, which brings its own.
+    records: Option<Records>,
 }
 /// A call answered when a command's window closes, or when its time is up.
 struct Waiter {
@@ -452,6 +505,9 @@ pub struct Agent {
     batch: Option<Batch>,
     held: Vec<Held>,
     started: bool,
+    /// The answers given, each stamped with the revision and what the user
+    /// changed (`flush`) as it goes; a read's or a list's is not.
+    outbox: Vec<(Reply, Answer, bool)>,
 }
 impl Agent {
     pub fn new() -> Agent {
@@ -492,6 +548,7 @@ impl Agent {
             return;
         }
         self.answer(b, tool, args, deadline, reply);
+        self.flush(b);
     }
     fn answer(
         &mut self,
@@ -501,15 +558,42 @@ impl Agent {
         deadline: Instant,
         reply: Reply,
     ) {
+        // A read takes a snapshot only while no window is open: a wait
+        // cannot take the user's work for the agent's.
+        if self.window.is_none() && matches!(tool, "inspect" | "wait" | "cancel") {
+            b.app_mut().mcp_outside();
+        }
         match tool {
-            "inspect" => reply(Ok(inspect(b))),
-            "list_commands" => reply(Ok(list_commands(&args))),
-            "describe_command" => reply(describe_command(&args)),
+            "inspect" => self.give(reply, Ok(inspect(b))),
+            "list_commands" => self.give_plain(reply, Ok(list_commands(&args))),
+            "describe_command" => self.give_plain(reply, describe_command(&args)),
             "execute" => self.execute(b, &args, deadline, reply),
             "batch" => self.batch(b, &args, deadline, reply),
             "wait" => self.wait(&args, deadline, reply),
             "cancel" => self.cancel(b, &args, deadline, reply),
-            _ => reply(Err(format!("There is no tool {tool}."))),
+            _ => self.give_plain(reply, Err(format!("There is no tool {tool}."))),
+        }
+    }
+    /// Gives `answer` to `reply`, stamped with the revision and what the
+    /// user changed when it goes (`flush`).
+    fn give(&mut self, reply: Reply, answer: Answer) {
+        self.outbox.push((reply, answer, true));
+    }
+    /// Gives `answer` to `reply` as it is: it is not about the job.
+    fn give_plain(&mut self, reply: Reply, answer: Answer) {
+        self.outbox.push((reply, answer, false));
+    }
+    /// Sends the answers given. Each result about the job gets the
+    /// revision and the `user` and `mixed` entries since the agent was
+    /// last told, which it is now (`state::Log::report`).
+    fn flush(&mut self, b: &mut impl Backend) {
+        for (reply, mut answer, stamp) in std::mem::take(&mut self.outbox) {
+            if stamp && let Ok(Value::Object(result)) = &mut answer {
+                let log = &mut b.app_mut().mcp.log;
+                result.insert("revision".into(), json!(log.revision));
+                result.insert("user_changed".into(), json!(log.report()));
+            }
+            reply(answer);
         }
     }
 
@@ -521,6 +605,11 @@ impl Agent {
         let now = Instant::now();
         if !self.started {
             self.started = settled;
+            if self.started {
+                // Where the change log starts, or what changed since the
+                // last agent worked on this `App`.
+                b.app_mut().mcp_outside();
+            }
             for h in std::mem::take(&mut self.held) {
                 if self.started || h.deadline <= now {
                     self.answer(b, &h.tool, h.args, h.deadline, h.reply);
@@ -538,7 +627,8 @@ impl Agent {
             .partition(|w| w.deadline <= now);
         self.waiters = waiting;
         for w in due {
-            (w.reply)(Ok(still_running(b, &w.id)));
+            let answer = Ok(still_running(b, &w.id));
+            self.give(w.reply, answer);
         }
         if self
             .batch
@@ -547,6 +637,7 @@ impl Agent {
         {
             self.finish_batch(b);
         }
+        self.flush(b);
     }
 
     fn busy(&self, b: &impl Backend) -> Option<Answer> {
@@ -567,10 +658,10 @@ impl Agent {
             .and_then(commands::find)
             .is_some_and(|c| c.group == "machine");
         if !stop && let Some(busy) = self.busy(b) {
-            return reply(busy);
+            return self.give(reply, busy);
         }
         match self.start(b, args) {
-            Start::Now(answer) => reply(answer),
+            Start::Now(answer) => self.give(reply, answer),
             Start::Opened(id) => self.waiters.push(Waiter {
                 id,
                 deadline,
@@ -580,7 +671,8 @@ impl Agent {
     }
 
     /// Checks a command and sends it: an answer at once when nothing was
-    /// sent (refused, no_change, an error) or for the stops, else a window.
+    /// sent (refused, no_change, conflict, an error) or for the stops, else
+    /// a window. The window opens with a snapshot, in the turn that sends.
     fn start(&mut self, b: &mut impl Backend, args: &Value) -> Start {
         let Some(name) = args.get("command").and_then(Value::as_str) else {
             return Start::Now(Err(
@@ -599,6 +691,23 @@ impl Agent {
             Some(a @ Value::Object(_)) => a,
             Some(_) => return Start::Now(Err("`args` must be an object.".into())),
         };
+        let expected = match if_revision(args) {
+            Ok(r) => r,
+            Err(e) => return Start::Now(Err(e)),
+        };
+        // The machine's stops open no window: they must go at once, and
+        // leave the job alone.
+        let windowed = c.group != "machine";
+        if windowed {
+            // What changed since the last window closed is the user's,
+            // and an `if_revision` counts it.
+            b.app_mut().mcp_outside();
+            if let Some(r) = expected
+                && r != b.app().mcp.log.revision
+            {
+                return Start::Now(conflict(b, r));
+            }
+        }
         if b.app().locked() && !c.while_locked {
             return Start::Now(refuse(b, LOCKED.into()));
         }
@@ -638,13 +747,15 @@ impl Agent {
         self.count += 1;
         let id = format!("{}-{}", c.name, self.count);
         let status = b.app().status.clone();
+        let records = (windowed && !state::REPLACES_PROJECT.contains(&c.name))
+            .then(|| Records::of(&b.app().doc));
         for message in dispatch.messages {
             b.send(message);
         }
         if let Some(task) = dispatch.task {
             b.run(task);
         }
-        if c.group == "machine" {
+        if !windowed {
             let report = Report::of(b, Outcome::Done, None).with_id(&id).json();
             self.results.insert(id, report.clone());
             return Start::Now(Ok(report));
@@ -655,17 +766,49 @@ impl Agent {
             status,
             expect,
             cancelled: false,
+            records,
         });
         Start::Opened(id)
     }
 
-    /// Closes the window: its effect checked, its result kept and given to
-    /// the calls waiting for it, and a batch's next step started.
+    /// Closes the window: the machinist's records guarded, the closing
+    /// snapshot taken, its effect checked, its result kept and given to the
+    /// calls waiting for it, and a batch's next step started.
     fn close(&mut self, b: &mut impl Backend) {
         let Some(w) = self.window.take() else {
             return;
         };
-        let (outcome, reason) = if w.cancelled {
+        // The machinist's records: put back when the agent's path changed
+        // them, theirs when they worked meanwhile.
+        let (mut restored, mut theirs) = (vec![], vec![]);
+        if let Some(before) = &w.records {
+            let app = b.app_mut();
+            let changed = before.changed(&Records::of(&app.doc));
+            if !changed.is_empty() {
+                let names: Vec<String> = (changed.iter())
+                    .map(|r| state::record_name(&app.doc, r))
+                    .collect();
+                if app.mcp_events().is_empty() {
+                    before.put_back(&mut app.doc, &changed);
+                    app.dirty = true;
+                    app.last_edit = Instant::now();
+                    restored = names;
+                } else {
+                    theirs = names;
+                }
+            }
+        }
+        let entry = b.app_mut().mcp_close();
+        let (outcome, reason) = if !restored.is_empty() {
+            (
+                Outcome::Failed,
+                Some(format!(
+                    "{}: {}. It was put back.",
+                    state::PROGRESS,
+                    restored.join(", ")
+                )),
+            )
+        } else if w.cancelled {
             (
                 Outcome::Cancelled,
                 Some("Cancelled at the agent's request.".to_string()),
@@ -687,14 +830,30 @@ impl Agent {
                 }
             }
         };
-        let report = Report::of(b, outcome, reason).with_id(&w.id).json();
+        let mut report = Report::of(b, outcome, reason).with_id(&w.id);
+        if let Some(entry) = entry {
+            if !entry.events.is_empty() {
+                report.notes.push(format!(
+                    "Changed by others while this command worked: {}.",
+                    entry.events.join("; ")
+                ));
+            }
+            report.changed = entry.changed;
+        }
+        if !theirs.is_empty() {
+            report.notes.push(format!(
+                "The machinist changed {} meanwhile; kept as theirs.",
+                theirs.join(", ")
+            ));
+        }
+        let report = report.json();
         self.results.insert(w.id.clone(), report.clone());
-        let (theirs, others): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiters)
+        let (mine, others): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiters)
             .into_iter()
             .partition(|x| x.id == w.id);
         self.waiters = others;
-        for x in theirs {
-            (x.reply)(Ok(report.clone()));
+        for x in mine {
+            self.give(x.reply, Ok(report.clone()));
         }
         if let Some(batch) = &mut self.batch
             && batch.running.as_ref().is_some_and(|(_, id)| *id == w.id)
@@ -707,10 +866,11 @@ impl Agent {
 
     fn wait(&mut self, args: &Value, deadline: Instant, reply: Reply) {
         let Some(id) = args.get("command_id").and_then(Value::as_str) else {
-            return reply(Err("`command_id` is missing.".into()));
+            return self.give_plain(reply, Err("`command_id` is missing.".into()));
         };
         if let Some(result) = self.results.get(id) {
-            return reply(Ok(result.clone()));
+            let result = result.clone();
+            return self.give(reply, Ok(result));
         }
         if self.window.as_ref().is_some_and(|w| w.id == id) {
             let id = id.to_string();
@@ -720,30 +880,38 @@ impl Agent {
                 reply,
             });
         }
-        reply(Err(format!("There is no command {id} in this session.")))
+        self.give_plain(
+            reply,
+            Err(format!("There is no command {id} in this session.")),
+        )
     }
 
     fn cancel(&mut self, b: &mut impl Backend, args: &Value, deadline: Instant, reply: Reply) {
         let Some(id) = args.get("command_id").and_then(Value::as_str) else {
-            return reply(Err("`command_id` is missing.".into()));
+            return self.give_plain(reply, Err("`command_id` is missing.".into()));
         };
         if let Some(result) = self.results.get(id) {
-            return reply(Ok(json!({
+            let answer = json!({
                 "cancelled": false,
                 "command_id": id,
                 "reason": "It had finished; this is its result.",
                 "result": result,
-            })));
+            });
+            return self.give(reply, Ok(answer));
         }
         if !self.window.as_ref().is_some_and(|w| w.id == id) {
-            return reply(Err(format!("There is no command {id} in this session.")));
+            return self.give_plain(
+                reply,
+                Err(format!("There is no command {id} in this session.")),
+            );
         }
         if b.app().generating.is_none() {
-            return reply(Ok(json!({
+            let answer = json!({
                 "cancelled": false,
                 "command_id": id,
                 "reason": "Only a generation can be cancelled, and this command's work is not one: wait for it.",
-            })));
+            });
+            return self.give(reply, Ok(answer));
         }
         b.send(Message::CancelGenerate);
         if let Some(w) = &mut self.window {
@@ -763,10 +931,24 @@ impl Agent {
             .and_then(Value::as_array)
             .filter(|s| !s.is_empty())
         else {
-            return reply(Err("`steps` must be a list of {command, args}.".into()));
+            return self.give_plain(
+                reply,
+                Err("`steps` must be a list of {command, args}.".into()),
+            );
         };
         if let Some(busy) = self.busy(b) {
-            return reply(busy);
+            return self.give(reply, busy);
+        }
+        match if_revision(args) {
+            Err(e) => return self.give_plain(reply, Err(e)),
+            Ok(Some(r)) => {
+                b.app_mut().mcp_outside();
+                if r != b.app().mcp.log.revision {
+                    let answer = conflict(b, r);
+                    return self.give(reply, answer);
+                }
+            }
+            Ok(None) => {}
         }
         self.batch = Some(Batch {
             steps: steps.clone(),
@@ -848,9 +1030,8 @@ impl Agent {
         } else {
             "done"
         };
-        (batch.reply)(Ok(
-            json!({"outcome": outcome, "backend": b.kind(), "steps": steps}),
-        ));
+        let answer = json!({"outcome": outcome, "backend": b.kind(), "steps": steps});
+        self.give(batch.reply, Ok(answer));
     }
 }
 
