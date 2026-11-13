@@ -3443,7 +3443,8 @@ pub fn lower(
 /// null; a `lift` move's Z is the larger of `lift` (in machine Z, `+ o[2]`
 /// unless `lift.machine`) and `at[2]`. `at` is then the target. That is
 /// `lower` exactly, but for a move to where the tool already is, which the
-/// tablet may drop.
+/// tablet may drop. A tool run with a `start` (a setup in the chuck) is
+/// `lower` only from there, and starts from nowhere else.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TabletSetup {
@@ -3473,9 +3474,26 @@ pub struct TabletRun {
     /// (`Run::step_lift`): a work Z, or a machine Z when `machine` (a
     /// machine that retracts to machine Z 0).
     pub lift: Lift,
+    /// On a setup in the chuck, where the machine must stand for Cycle
+    /// Start (LIO-482); null elsewhere, where it starts from anywhere.
+    pub start: Option<TabletStart>,
     pub actions: Vec<TabletLine>,
     /// Its operations' steps, in order.
     pub steps: Vec<TabletStep>,
+}
+
+/// Where a tool run on a setup in the chuck starts from: the tool at the
+/// lift (`TabletRun::lift`) over the first point it comes down onto, A at
+/// the angle it cuts that point at. Work X, Y and A, made machine ones as
+/// a move's target is. From there its way in is straight down, which the
+/// computer checked clear of the jaws (`run::way_out`); from anywhere else
+/// only the computer can check it, so the tablet refuses Cycle Start
+/// until X, Y, Z and A are there.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TabletStart {
+    pub x: f64,
+    pub y: f64,
+    pub a: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -3594,16 +3612,20 @@ pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> Tabl
             return out;
         }
     };
-    // ponytail: the way in past the chuck's jaws is checked from where the
-    // machine stands (`way_out`), which the tablet cannot do (LIO-482).
-    if programs.iter().any(|p| p.chuck.is_some()) {
-        out.problems = vec!["The stock is held in the chuck: the way in past its jaws is checked from where the machine stands, which only the computer can do. Run this setup from the computer.".into()];
-        return out;
-    }
     out.work_offset = programs.first().map_or(String::new(), |p| p.offset.clone());
     let count = programs.len();
     for (i, p) in programs.iter().enumerate() {
         let blocks = &p.blocks;
+        let start = match p.chuck {
+            None => None,
+            Some(_) => match tablet_start(doc, mesh, si, p) {
+                Ok(s) => Some(s),
+                Err(why) => {
+                    (out.problems, out.tool_runs) = (why, vec![]);
+                    return out;
+                }
+            },
+        };
         // From nowhere (NaN), so that no move is dropped as already there,
         // and each axis kept where the tool is comes out NaN.
         let lowered = match lower_blocks(
@@ -3730,11 +3752,71 @@ pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> Tabl
                 z: run.step_lift().expect("running"),
                 machine: p.settings.machine_home,
             },
+            start,
             actions,
             steps,
         });
     }
     out
+}
+
+/// The `TabletStart` of program `p` of setup `si`, in the chuck: over its
+/// first point at the height of its first retract, A at the last index
+/// before it comes down (A 0 without one), checked as Cycle Start checks
+/// the way in from there (`way_out`) at the setup's own work zero on the
+/// machine; why not when that way is refused.
+///
+/// ponytail: checked at the work zero the setup puts on the machine
+/// (`AtAngle::machine_zero`), which only a machine that retracts to
+/// machine Z 0 reads (where that is over the part). The computer's live
+/// checks of the work zero (`rotary_problems`) are the tablet's to make
+/// before it runs (LIO-476).
+fn tablet_start(doc: &Document, mesh: &Mesh, si: usize, p: &Checked) -> Result<TabletStart, Vec<String>> {
+    let blocks = &p.blocks;
+    let end = (blocks.iter())
+        .position(|b| matches!(b, Block::Descend { .. }))
+        .map_or(blocks.len(), |i| i + 1);
+    let over = blocks[..end].iter().find_map(|b| match b {
+        Block::Approach { xy, .. } => Some(*xy),
+        _ => None,
+    });
+    let a = blocks[..end].iter().rev().find_map(|b| match b {
+        Block::Index { a, .. } => Some(*a as f64),
+        _ => None,
+    });
+    let Some(xy) = over else {
+        return Err(vec!["The tool run has no first point to start over. Check the setup again.".into()]);
+    };
+    // The work offset that puts the work zero where the setup has it on
+    // the machine; without it, any: only machine Z 0 depends on it.
+    let offset = match doc.at_angle(si, 0., mesh).ok().and_then(|at| Some((at, at.machine_zero?))) {
+        Some((at, zero)) => std::array::from_fn(|k| match k {
+            0..3 => (zero[k] - at.zero[k] + p.datum[k]) as f64,
+            _ => 0.,
+        }),
+        None if p.settings.machine_home => return Err(vec![
+            "Where the machine's Z 0 is over the stock is not known, so the way in past the chuck's jaws cannot be checked for the tablet: record the rotary unit's geometry in the Machine library, or run this setup from the computer.".into(),
+        ]),
+        None => [0.; 6],
+    };
+    let work = |k: usize| xy[k] as f64 - p.datum[k] as f64;
+    let at = TabletStart {
+        x: work(0),
+        y: work(1),
+        a: a.unwrap_or(0.),
+    };
+    let top = match p.settings.machine_home {
+        true => 0.,
+        false => clearance_plane(blocks) as f64 - p.datum[2] as f64 + offset[2],
+    };
+    let start = [at.x + offset[0], at.y + offset[1], top, at.a + offset[3], 0., 0.];
+    match way_out(p, blocks, offset, start) {
+        Ok(leave) if leave == Leave::default() => Ok(at),
+        _ => Err(vec![format!(
+            "From over its first point (X {:.3} Y {:.3}) at the retract height with A at {:.3}°, the way down onto it is not clear of the chuck, so the tablet has nowhere to start it from. Run this setup from the computer.",
+            at.x, at.y, at.a
+        )]),
+    }
 }
 
 /// How a run leaves where the machine is before its approach (LIO-213),
@@ -4493,7 +4575,7 @@ pub(crate) fn tablet_fixture(profile: &std::path::Path) -> (Document, Mesh) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::post::{OpState, blocks, fixture};
     use crate::simulation::{Motion, Plan};
@@ -4568,6 +4650,54 @@ mod tests {
         }
     }
 
+    /// What the tablet makes of tool run `r` with the live work offset `o`,
+    /// from where the machine is, `at` (`TabletSetup`).
+    pub(crate) fn tablet_job(r: &TabletRun, o: [f64; 6], mut at: [f64; 6]) -> Vec<Located> {
+        let lift = r.lift.z + if r.lift.machine { 0. } else { o[2] };
+        let mut out = vec![];
+        for l in &r.actions {
+            let action = match &l.action {
+                TabletAction::Move {
+                    target,
+                    feed,
+                    lift: up,
+                } => {
+                    let mut to: [f64; 6] =
+                        std::array::from_fn(|k| target[k].map_or(at[k], |v| v + o[k]));
+                    if *up {
+                        to[2] = lift.max(at[2]);
+                    }
+                    if to == at {
+                        continue;
+                    }
+                    at = to;
+                    Do::Move {
+                        target: to,
+                        feed: *feed,
+                    }
+                }
+                TabletAction::Dwell { seconds } => Do::Dwell { seconds: *seconds },
+                TabletAction::Spindle { state, rpm } => Do::Spindle {
+                    state: *state,
+                    rpm: *rpm,
+                },
+                TabletAction::Coolant { flood, mist } => Do::Coolant {
+                    flood: *flood,
+                    mist: *mist,
+                },
+                TabletAction::Pause { reason } => Do::Pause {
+                    reason: reason.clone(),
+                },
+                TabletAction::End => Do::End,
+            };
+            out.push(Located {
+                line: l.line,
+                action,
+            });
+        }
+        out
+    }
+
     /// One facing tool run: down to Z5, across at F600, a 1 s dwell.
     /// The tool runs a tablet file carries (LIO-475), read back from it:
     /// made into machine coordinates as `TabletSetup` tells the tablet to,
@@ -4603,61 +4733,16 @@ mod tests {
         );
         assert_eq!(s.tool_runs[1].tool.label, "T3 Drill 4");
         let programs = programs(&doc, &mesh, 0).unwrap();
-        // What the tablet does with the live work offset `o`, from `at`.
-        let made = |r: &TabletRun, o: [f64; 6], mut at: [f64; 6]| -> Vec<Located> {
-            let lift = r.lift.z + if r.lift.machine { 0. } else { o[2] };
-            let mut out = vec![];
-            for l in &r.actions {
-                let action = match &l.action {
-                    TabletAction::Move {
-                        target,
-                        feed,
-                        lift: up,
-                    } => {
-                        let mut to: [f64; 6] =
-                            std::array::from_fn(|k| target[k].map_or(at[k], |v| v + o[k]));
-                        if *up {
-                            to[2] = lift.max(at[2]);
-                        }
-                        if to == at {
-                            continue;
-                        }
-                        at = to;
-                        Do::Move {
-                            target: to,
-                            feed: *feed,
-                        }
-                    }
-                    TabletAction::Dwell { seconds } => Do::Dwell { seconds: *seconds },
-                    TabletAction::Spindle { state, rpm } => Do::Spindle {
-                        state: *state,
-                        rpm: *rpm,
-                    },
-                    TabletAction::Coolant { flood, mist } => Do::Coolant {
-                        flood: *flood,
-                        mist: *mist,
-                    },
-                    TabletAction::Pause { reason } => Do::Pause {
-                        reason: reason.clone(),
-                    },
-                    TabletAction::End => Do::End,
-                };
-                out.push(Located {
-                    line: l.line,
-                    action,
-                });
-            }
-            out
-        };
         let offset = [120., 90., -35., 0., 0., 0.];
         for (r, p) in s.tool_runs.iter().zip(&programs) {
-            assert!(!r.lift.machine);
+            // Not in the chuck: it starts from anywhere.
+            assert!(!r.lift.machine && r.start.is_none());
             let plane = clearance_plane(&p.blocks) as f64 - p.datum[2] as f64;
             assert!((r.lift.z - plane).abs() < 1e-9, "{} {plane}", r.lift.z);
             // Below the lift and above it (a tool change leaves Z high).
             for start in [[-5., -7., -30., 0., 0., 0.], [3., 4., -1., 0., 0., 0.]] {
                 assert_eq!(
-                    made(r, offset, start),
+                    tablet_job(r, offset, start),
                     lower(p, 0, offset, start).unwrap(),
                     "{}",
                     r.name
