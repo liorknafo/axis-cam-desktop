@@ -38,9 +38,6 @@ pub struct Draft {
     /// in the profile. Not in the file, whose sections the driver reads;
     /// a profile opened with that tick already on has it.
     pub a_direction: bool,
-    /// Which way the machine's X and Y point, for the sides A's direction
-    /// is checked by.
-    pub orient: crate::orient::Orient,
 }
 
 /// The A axis' commissioning step for its direction (LIO-210): +A turns the
@@ -93,10 +90,7 @@ impl Draft {
         }
         let original =
             std::fs::read_to_string(path).map_err(|e| format!("Cannot read {path}: {e}"))?;
-        Ok(Self {
-            orient: crate::orient::Orient::of(m),
-            ..Self::from_text(m.id.clone(), path.into(), original)?
-        })
+        Self::from_text(m.id.clone(), path.into(), original)
     }
 
     /// A profile given as text, which is `path`'s content.
@@ -120,7 +114,6 @@ impl Draft {
             checked: Err(String::new()),
             note: None,
             a_direction: false,
-            orient: Default::default(),
         };
         d.a_direction = d.has("axes.a") && d.flag(PINOUT) == Some(true);
         d.check();
@@ -167,10 +160,9 @@ impl Draft {
             Edit::Flag(path, on)
                 if path == PINOUT && on && self.has("axes.a") && !self.a_direction =>
             {
-                self.note = Some(format!(
-                    "Check A's direction first: jog A+, see that the top of the part moves toward {}, and tick that under the A axis.",
-                    self.orient.y_words(false)
-                ));
+                // The side is said by the check itself, drawn by the machine
+                // as it is now (LIO-457): a kept note never names a stale one.
+                self.note = Some("Check A's direction first: jog A+, see that the top of the part moves the way the check under the A axis says, and tick it.".into());
             }
             Edit::Flag(path, on) => {
                 let (parent, key) = split(&path);
@@ -179,10 +171,7 @@ impl Draft {
                 if path == "axes.a.reversed" && self.a_direction {
                     self.a_direction = false;
                     self.put("commissioning", "pinout_verified", false.into());
-                    self.note = Some(format!(
-                        "A's direction changed: jog A+ and check that the top of the part moves toward {}, then tick the pins and polarity again.",
-                        self.orient.y_words(false)
-                    ));
+                    self.note = Some("A's direction changed: jog A+ and check that the top of the part moves the way the check under the A axis says, then tick the pins and polarity again.".into());
                 }
             }
             Edit::ADirection(on) => {
@@ -601,6 +590,16 @@ fn form<'a>(app: &'a App, d: &'a Draft) -> Element<'a, Message> {
         .control
         .as_ref()
         .filter(|c| c.machine_id == d.machine_id);
+    // Which way the machine's X and Y point, as it is now (LIO-457): the
+    // connected machine's, else the library's.
+    let orient = here.map(|c| c.orient).unwrap_or_else(|| {
+        app.doc
+            .machines
+            .iter()
+            .find(|m| m.id == d.machine_id)
+            .map(crate::orient::Orient::of)
+            .unwrap_or_default()
+    });
     let stopped = here.is_none_or(|c| c.stopped());
     let save = (d.blocker().is_none() && stopped).then_some(Message::Setup(Msg::Save));
     let mut head = column![
@@ -750,7 +749,7 @@ fn form<'a>(app: &'a App, d: &'a Draft) -> Element<'a, Message> {
             body = body
                 .push(
                     checkbox(d.a_direction)
-                        .label(a_direction(d.orient))
+                        .label(a_direction(orient))
                         .on_toggle(|b| edit(Edit::ADirection(b)))
                         .text_size(12),
                 )
@@ -1604,7 +1603,12 @@ order = \"X\"\n";
         assert!(!d.a_direction);
         d.edit(Edit::Flag(PINOUT.into(), true));
         assert_eq!(d.flag(PINOUT), Some(false));
-        assert!(d.note.as_ref().unwrap().contains("toward −Y, the front"));
+        assert!(
+            d.note
+                .as_ref()
+                .unwrap()
+                .contains("the way the check under the A axis says")
+        );
         d.edit(Edit::ADirection(true));
         // The form's own gate stays shut until both are ticked.
         d.edit(Edit::Flag(PINOUT.into(), true));

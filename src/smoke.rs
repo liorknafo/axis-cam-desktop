@@ -2410,35 +2410,11 @@ flood = { pin = 8 }
     /// unsaved changes says A's direction by the orientation saved since.
     #[test]
     fn the_control_page_keeps_the_connected_orientation() {
-        use crate::orient::{KEY, Orient};
+        use crate::orient::Orient;
         let dir = tempfile::tempdir().unwrap();
         let mut a = uc100_app(dir.path());
         idle(&mut a);
         let id = conn(&a).machine_id.clone();
-        // A profile draft with an unsaved change.
-        a.open_profile(false);
-        fn draft(a: &mut App) -> &mut crate::setup::Draft {
-            match &mut a.profile_draft {
-                Some((_, Ok(d))) => d,
-                _ => panic!("no profile draft"),
-            }
-        }
-        let d = draft(&mut a);
-        d.edit(crate::setup::Edit::Number(
-            "axes.x.max_velocity".into(),
-            "900".into(),
-        ));
-        assert!(d.dirty());
-        // The machine turned round and saved, the profile opened again.
-        a.page = Page::Machines;
-        let _ = a.update(Message::EditMachine(id.clone()));
-        a.machine_draft.p.insert(KEY.into(), "Left".into());
-        let _ = a.update(Message::SaveMachine);
-        a.open_profile(false);
-        let d = draft(&mut a);
-        assert!(d.dirty(), "the unsaved change is kept");
-        assert_eq!(d.orient, Orient::Left);
-        assert!(crate::setup::a_direction(d.orient).contains("toward −Y, the back"));
         // A project without this machine opened: the drawing keeps the
         // connected orientation, whichever it is.
         let mut other = a.doc.clone();
@@ -2450,6 +2426,55 @@ flood = { pin = 8 }
             a.control.as_mut().unwrap().orient = o;
             assert_eq!(crate::ui::machine_model(&a, conn(&a)).figures.orient, o);
         }
+    }
+
+    /// LIO-457: the Controller configuration of a machine with A, kept open
+    /// with unsaved changes and a warning showing while the machine is
+    /// turned round in the Machine library, says A's direction by the
+    /// machine as it is now when it is shown again, without being opened
+    /// again; the kept changes stay and no kept text names the old side.
+    #[test]
+    fn the_profile_kept_open_says_a_by_the_machine_as_it_is_now() {
+        use crate::orient::KEY;
+        use crate::setup::Edit;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), &crate::control::rotary_profile());
+        a.page = Page::Control;
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        let _ = a.update(Message::ControlSetup(true));
+        // An unsaved change, and the pins ticked before A's direction: the
+        // warning shows.
+        setup_edit(
+            &mut a,
+            Edit::Number("axes.x.max_velocity".into(), "900".into()),
+        );
+        setup_edit(
+            &mut a,
+            Edit::Flag("commissioning.pinout_verified".into(), true),
+        );
+        let shown = |a: &App| {
+            crate::ui::probe::texts(crate::setup::view(a), iced::Size::new(1600., 4000.)).join("\n")
+        };
+        let before = shown(&a);
+        assert!(before.contains("Check A's direction first"), "{before}");
+        assert!(before.contains("toward −Y, the front"), "{before}");
+        // Turned round in the Machine library and saved.
+        let id = conn(&a).machine_id.clone();
+        a.page = Page::Machines;
+        let _ = a.update(Message::EditMachine(id));
+        a.machine_draft.p.insert(KEY.into(), "Left".into());
+        let _ = a.update(Message::SaveMachine);
+        // Back to MACHINE, the configuration still open: not opened again.
+        a.page = Page::Control;
+        assert!(draft(&a).dirty(), "the unsaved change is kept");
+        let after = shown(&a);
+        assert!(after.contains("Check A's direction first"), "{after}");
+        assert!(after.contains("toward −Y, the back"), "{after}");
+        assert!(!after.contains("−Y, the front"), "{after}");
     }
 
     /// LIO-457: a setup whose snapshot of the machine points +X otherwise
