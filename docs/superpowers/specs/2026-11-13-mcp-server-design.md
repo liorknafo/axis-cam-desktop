@@ -255,7 +255,7 @@ Tests cover a failed save (path not writable), an invalid library draft, a selec
 
 A checkpoint belongs to one project: the project the app had when it was taken.
 - Its **project identity** is a new `Document::project_id`, a UUID given to a project when it is created and kept in its file. Old files get one when they load.
-- `restore_checkpoint` is refused if the change log has a project replacement after the checkpoint (`new_project`, `open_sample`, `open_project`, `resume_project`, `recover_previous_project`, the user's own New or Open), or if the current `project_id` is not the checkpoint's: "This checkpoint belongs to another project (<title>). Open that project first."
+- `restore_checkpoint` is refused if the change log has a project replacement after the checkpoint (`new_project`, `open_sample`, `open_project`, `resume_project`, `recover_previous_project`, the user's own New or Open), or if the current `project_id` is not the checkpoint's: "Another project was opened or started since this checkpoint, so it can no longer be restored. Take a new checkpoint in the project you are working on."
 - So a restore always keeps the **current** project's step and measurement records, and those are the same project's.
 - Test: save A with guide step 7 and a measurement, checkpoint, `new_project`, restore. The restore is refused, and the new project is unchanged. Open A again (a project replacement), and the restore is still refused. Take a new checkpoint to go back within it.
 
@@ -588,3 +588,4 @@ Four milestones, each with its own Linear issue and PR.
 5. **gpt-6.1-sol, REJECT.** Both findings were taken:
    - checkpoints belong to one project (`project_id`), and a restore across a project replacement is refused;
    - reads check freshness by fingerprint at their start and their end, independent of ownership windows.
+6. **gpt-6.1-sol, ACCEPT.** Its one minor point was taken: the refusal of a cross-project restore now says the checkpoint can no longer be restored, instead of "open that project first".
