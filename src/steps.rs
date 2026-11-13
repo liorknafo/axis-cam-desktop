@@ -494,7 +494,12 @@ pub(crate) fn measures(
             } else {
                 0.
             };
-            let end = through.unwrap_or(point);
+            // A cut shallower than that point never reaches the full
+            // diameter: measured to its tip, said so.
+            let short = through.is_none()
+                && point > 0.
+                && (holes.iter().zip(mouths)).any(|(h, m)| m - (h[2] + point) < 0.005);
+            let end = through.unwrap_or(if short { 0. } else { point });
             let deep: Vec<f32> = (holes.iter().zip(mouths))
                 .map(|(h, m)| m - (h[2] + end))
                 .collect();
@@ -505,6 +510,10 @@ pub(crate) fn measures(
                 Some(_) => vec![
                     "through".to_string(),
                     "check it breaks out at the back".to_string(),
+                ],
+                None if short => vec![
+                    "deep from the mouth to the point's tip".to_string(),
+                    "the full Ø is not reached".to_string(),
                 ],
                 None if point > 0. => vec![
                     "deep from the mouth".to_string(),
@@ -6607,7 +6616,7 @@ pub(crate) mod tests {
     /// The Check page's depth of a drilled hole on the manual mill
     /// (LIO-450): `mesh` drilled with a Ø`size` drill, through with 2.5 of
     /// breakthrough or blind, from a stock whose top is the part's.
-    fn drilled_depth(mesh: &Mesh, size: &str, through: bool) -> Measure {
+    fn drilled_depth(mesh: &Mesh, size: &str, through: bool, bottom: &str) -> Measure {
         use crate::cam::boring::tests::{drill, drilling, job};
         let manual = crate::manual::defaults();
         let mut tool = drill(size);
@@ -6616,6 +6625,7 @@ pub(crate) mod tests {
         for (k, v) in [
             ("through", if through { "Yes" } else { "No" }),
             ("breakthrough", "2.5"),
+            ("bottom", bottom),
             ("rpm", "640"),
             ("feed", "60"),
         ] {
@@ -6641,13 +6651,14 @@ pub(crate) mod tests {
     #[test]
     fn a_through_holes_check_says_through_and_the_thickness_not_the_tips_depth() {
         let mesh = crate::cam::boring::tests::ring(6.8, 30., 18.5);
-        let deep = drilled_depth(&mesh, "6.8", true);
+        let deep = drilled_depth(&mesh, "6.8", true, "0");
         assert!((deep.value - 18.5).abs() < 0.01, "{deep:?}");
         assert_eq!(deep.words, ["through", "check it breaks out at the back"]);
     }
     /// A blind hole's Check gives its depth from the mouth to its full
     /// diameter, the drill's 118° point below it left out (LIO-450): a Ø8
-    /// hole 8 deep, its drill-point floor 2.4 lower.
+    /// hole 8 deep, its drill-point floor 2.4 lower; and to the tip, saying
+    /// so, when the cut is too shallow to reach the full diameter.
     #[test]
     fn a_blind_holes_check_gives_its_full_diameter_depth_without_the_point() {
         let point = 4. * crate::simulation::POINT_RISE;
@@ -6660,11 +6671,23 @@ pub(crate) mod tests {
             (0., 2. - point),
         ];
         let mesh = crate::mesh::normalize(crate::cam::tests::revolved(&section)).unwrap();
-        let deep = drilled_depth(&mesh, "8", false);
+        let deep = drilled_depth(&mesh, "8", false, "0");
         assert!((deep.value - 8.).abs() < 0.01, "{deep:?}");
         assert_eq!(
             deep.words,
             ["deep from the mouth", "to the full Ø, not the point"]
+        );
+        // Stopped 9.4 over the floor, 1 into the stock: the point only, its
+        // full Ø never reached; measured to its tip, down, not −1.4.
+        let deep = drilled_depth(&mesh, "8", false, "9.4");
+        assert!((deep.value - 1.).abs() < 0.01, "{deep:?}");
+        assert!(deep.to[2] < deep.from[2], "{deep:?}");
+        assert_eq!(
+            deep.words,
+            [
+                "deep from the mouth to the point's tip",
+                "the full Ø is not reached"
+            ]
         );
     }
     /// Steps entered from planning (LIO-449): at the start of the operation
