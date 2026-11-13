@@ -9271,12 +9271,12 @@ impl App {
                     c.refresh();
                     // "Connecting to <machine>…" until the driver reports a
                     // state, then "Connected to <machine>: <state>" following
-                    // it until another message replaces it.
-                    let connecting = self
-                        .status
-                        .strip_prefix("Connecting to ")
-                        .map(|name| name.trim_end_matches('…'));
-                    let name = connecting.or_else(|| {
+                    // it until another message replaces it. A note said after
+                    // "Connecting to <machine>…" (its travel, LIO-463) stays
+                    // after the first state until the state changes.
+                    let connecting = (self.status.strip_prefix("Connecting to "))
+                        .and_then(|rest| rest.rsplit_once('…'));
+                    let name = connecting.map(|(name, _)| name).or_else(|| {
                         let rest = (self.status.strip_prefix("Connected to "))
                             .or_else(|| self.status.strip_prefix(NO_LINK))?;
                         Some(rest.rsplit_once(": ")?.0)
@@ -9295,7 +9295,16 @@ impl App {
                             State::Disconnected => format!(
                                 "Lost the connection to {name}; see the log in the Control page's Machine tab."
                             ),
-                            s => format!("Connected to {name}: {}", s.label()),
+                            s => {
+                                let now = format!("Connected to {name}: {}", s.label());
+                                match connecting {
+                                    Some((_, note)) if !note.is_empty() => format!("{now}.{note}"),
+                                    _ if self.status.starts_with(&format!("{now}. ")) => {
+                                        self.status.clone()
+                                    }
+                                    _ => now,
+                                }
+                            }
                         };
                     }
                 }
