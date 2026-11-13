@@ -540,9 +540,11 @@ fn round_thread(f: &Facet, t: &crate::thread::Thread) -> bool {
 /// 0.05 mm), and within a pitch of its ends along its axis. Where a thread
 /// runs out at a face its last roots go on past its flanks, a hair outside
 /// its band (the adapter plate's M8 roots at R4.0673, relieved past its
-/// major diameter, its band to R4.0669, LIO-481): they are its own. A wall
-/// round another centre or radius is not, nor one going on past its end (a
-/// rounded corner standing on it, as wide as its root).
+/// major diameter, its band to R4.0669, LIO-481): they are its own, facing
+/// its axis as a hole's walls do. A wall round another centre or radius is
+/// not, nor one going on past its end, nor one facing away from its axis
+/// (a rounded outside corner standing on it, as wide as its root, however
+/// short).
 fn run_out(
     g: &Geometry,
     threads: &[crate::thread::Thread],
@@ -563,11 +565,22 @@ fn run_out(
                 (t.minor / 2. - 0.05) as f64,
                 (t.root.max(t.major) / 2. + 0.05) as f64,
             );
+            // Facing the axis, as a hole's roots do: its normal, out of the
+            // part, points at it.
+            let n = f.xy.len() as f64;
+            let mid = (
+                f.xy.iter().map(|p| p.0).sum::<f64>() / n,
+                f.xy.iter().map(|p| p.1).sum::<f64>() / n,
+            );
+            let to = (t.centre[0] as f64 - mid.0, t.centre[1] as f64 - mid.1);
+            let facing =
+                (f.normal[0] as f64 * to.0 + f.normal[1] as f64 * to.1) > 0.9 * to.0.hypot(to.1);
             near >= lo
                 && far <= hi
                 && far - near <= 0.005 + far * 1e-4
                 && f.low >= t.from - t.pitch
                 && f.high <= t.to + t.pitch
+                && facing
         })
     };
     // Each surface's corners, and the surfaces at each corner, by `key`
@@ -1882,9 +1895,9 @@ pub(crate) mod tests {
         // took seconds a search, minutes grown on through its own walls. A
         // modelled M8 thread, Z0 to 10, its root as modelled Ø8.16, and over
         // its top end a root running on round its axis from R4.04 to R4.07
-        // in steps each round it to 0.005 mm: the root is the thread's. A
-        // wall standing on it 6 mm high at its radius (a rounded corner),
-        // and one round another centre joined to it, are not.
+        // in steps each round it to 0.005 mm, facing it: the root is the
+        // thread's. A wall standing on it 6 mm high at its radius, and one
+        // round another centre joined to it, are not.
         let mut tris = crate::thread::tests::modeled([0., 0.], 8., 1.25, 60., true, true, 10., 0.);
         let quad = |tris: &mut Vec<[[f32; 3]; 3]>, a: [f32; 2], b: [f32; 2], z: [f32; 2]| {
             let [p, q, r, s] = [
@@ -1893,8 +1906,8 @@ pub(crate) mod tests {
                 [b[0], b[1], z[1]],
                 [a[0], a[1], z[1]],
             ];
-            tris.push([p, q, r]);
-            tris.push([p, r, s]);
+            tris.push([p, r, q]);
+            tris.push([p, s, r]);
         };
         let round = |i: usize, r: f32| {
             let t = (i as f32 * 7.5).to_radians();
@@ -1998,6 +2011,46 @@ pub(crate) mod tests {
         let op = crate::corner::tests::corner_op(&mesh, &tool, ids.iter().copied().collect());
         let picked = crate::corner::picked(&setup, &mesh, &op);
         assert!(picked.is_ok(), "{picked:#?}");
+    }
+    #[test]
+    fn a_short_outside_corner_on_a_threads_relieved_root_is_no_run_out_of_it() {
+        // LIO-481 review: a modelled M12×1.75 thread, Z0 to 12, its root
+        // running out over its top 0.2 mm from R6.04 to R6.08, facing its
+        // axis; on its top end an R6.08 quarter-round outside corner 1 mm
+        // high, facing away, the root meeting its foot. Within a pitch of
+        // the thread's end and at its root, but no wall of the thread's:
+        // picked, or found among all, it is a rounded corner.
+        let mut tris = crate::thread::tests::modeled([0., 0.], 12., 1.75, 60., true, true, 12., 0.);
+        let p = |angle: f32, r: f32, z: f32| {
+            let a = angle.to_radians();
+            [r * a.cos(), r * a.sin(), z]
+        };
+        for i in 0..16 {
+            let (u, v) = (45. + i as f32 * 5.625, 45. + (i + 1) as f32 * 5.625);
+            let (ru, rv) = (6.04 + i as f32 * 0.0025, 6.04 + (i + 1) as f32 * 0.0025);
+            let (a, b) = (p(u, ru, 11.8), p(v, rv, 11.8));
+            let (c, d) = (p(v, rv, 12.), p(u, ru, 12.));
+            tris.push([a, c, b]);
+            tris.push([a, d, c]);
+        }
+        for i in 24..48 {
+            let (u, v) = (i as f32 * 3.75, (i + 1) as f32 * 3.75);
+            let (a, b, c, d) = (
+                p(u, 6.08, 12.),
+                p(v, 6.08, 12.),
+                p(v, 6.08, 13.),
+                p(u, 6.08, 13.),
+            );
+            tris.push([a, b, c]);
+            tris.push([a, c, d]);
+        }
+        let mesh = mesh::normalize(tris).unwrap();
+        let (setup, _, _) = fixture(Strategy::Drill);
+        assert_eq!(crate::thread::holes_in_setup(&setup, &mesh).len(), 1);
+        let found = outside_arcs_among(&setup, &mesh, &upright(&setup, &mesh));
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!((found[0].r - 6.08).abs() < 0.01, "{found:#?}");
+        assert_eq!(crate::corner::all(&setup, &mesh).len(), 1);
     }
     #[test]
     fn an_obrounds_ends_over_a_modeled_thread_are_no_walls_of_it() {
