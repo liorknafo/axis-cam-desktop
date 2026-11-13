@@ -267,6 +267,7 @@ impl Builder {
                 stops: vec![],
                 keep_air: vec![],
                 corner_walks: vec![],
+                slot_passes: vec![],
                 display_scale: stock.display_scale,
                 duration: 0.,
                 target: top,

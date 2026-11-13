@@ -260,7 +260,8 @@ pub enum Step {
         never: Limits,
         turns_per_minute: f32,
     },
-    /// A full-width capsule pass, the exact plan's one-axis centre readings.
+    /// A Slot's pass, the exact plan's one-axis centre readings: a sweep
+    /// along its centre line, or a walk round it (LIO-455).
     Slot {
         op: usize,
         index: usize,
@@ -271,6 +272,19 @@ pub enum Step {
         b: [f32; 2],
         targets: Vec<Target>,
         entry_clear: bool,
+        /// What the pass does, with its level, its offset from the centre
+        /// line, what it leaves on the walls, the most its steps leave and
+        /// its readings (`slot::Pass`).
+        pass: crate::slot::Kind,
+        level: usize,
+        levels: usize,
+        offset: f32,
+        left: f32,
+        scallop: f32,
+        points: Vec<[f32; 2]>,
+        /// The round ends' radius as cut, and the tool's radius.
+        radius: f32,
+        tool: f32,
     },
     /// The stock after the operation.
     Check { op: usize },
@@ -2223,21 +2237,21 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                     return Err(crate::holding::message(op.name(), hit, gap, zero));
                 }
                 let slot = crate::slot::Slot::read(op, zero)?;
-                let pass_ends: Vec<usize> = plan
-                    .moves
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, m)| m.cutting_pass)
-                    .map(|(i, _)| i)
-                    .collect();
-                count = pass_ends.len();
-                let mut start = 0;
-                for (i, &end) in pass_ends.iter().enumerate() {
-                    let stop = if i + 1 == pass_ends.len() {
-                        plan.moves.len()
-                    } else {
-                        (end + 2).min(plan.moves.len())
-                    };
+                let entry_clear = get(
+                    &doc.tools
+                        .iter()
+                        .find(|t| t.id == op.tool)
+                        .ok_or("Slot tool missing")?
+                        .p,
+                    "center_cutting",
+                ) != "Yes";
+                let radius = slot.width / 2. - num(&op.p, "allowance").unwrap_or(0.);
+                let passes = &plan.slot_passes;
+                if passes.is_empty() {
+                    return Err(format!("{}: the Slot's passes are missing.", op.name()));
+                }
+                count = passes.len();
+                for (i, pass) in passes.iter().enumerate() {
                     let mut targets = vec![];
                     if i == 0 {
                         // First put Z above the stock, independent of wherever
@@ -2252,14 +2266,14 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                             lock: [false; 3],
                         });
                     }
-                    for m in plan.moves[start..stop]
+                    for m in plan.moves[pass.moves.clone()]
                         .iter()
                         .filter(|m| m.motion != Motion::Dwell)
                     {
                         let axis = moved(m)?;
                         let v = m.to[axis] - zero[axis];
                         targets.push(Target {
-                            order: (targets.len() + 1) as u8,
+                            order: u8::try_from(targets.len() + 1).unwrap_or(u8::MAX),
                             axis,
                             centre: v,
                             shown: v,
@@ -2272,21 +2286,22 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                         op: oi,
                         index: i + 1,
                         of: count,
-                        z: plan.moves[end].to[2] - zero[2],
+                        z: pass.z,
                         top: plan.rest_top.unwrap_or(stock.max[2]) - zero[2],
                         a: [slot.a[0] - zero[0], slot.a[1] - zero[1]],
                         b: [slot.b[0] - zero[0], slot.b[1] - zero[1]],
                         targets,
-                        entry_clear: get(
-                            &doc.tools
-                                .iter()
-                                .find(|t| t.id == op.tool)
-                                .ok_or("Slot tool missing")?
-                                .p,
-                            "center_cutting",
-                        ) != "Yes",
+                        entry_clear,
+                        pass: pass.kind,
+                        level: pass.level,
+                        levels: pass.levels,
+                        offset: pass.offset,
+                        left: pass.left,
+                        scallop: pass.scallop,
+                        points: pass.points.clone(),
+                        radius,
+                        tool: plan.radius,
                     });
-                    start = stop;
                 }
                 steps.push(Step::Check { op: oi });
             }

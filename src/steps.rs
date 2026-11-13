@@ -50,7 +50,7 @@ pub struct Shown {
     part: [Vec<Vec<[f32; 2]>>; 3],
     /// The stock box before each operation, then after the last, in work
     /// coordinates (`simulation::leftover_box`).
-    boxes: Vec<Bounds>,
+    pub(crate) boxes: Vec<Bounds>,
     /// The vise jaws or clamps, in work coordinates, from the stock's
     /// bottom up (`holding::shown`).
     jaws: Vec<Bounds>,
@@ -583,8 +583,10 @@ pub(crate) fn measures(
             let Ok(slot) = crate::slot::Slot::read(op, zero) else {
                 return out;
             };
-            let r = d.plan.radius;
-            let k = usize::from((slot.b[1] - slot.a[1]).abs() > (slot.b[0] - slot.a[0]).abs());
+            // The slot as cut: its own width less the stock to leave, also
+            // when a narrower cutter walked it (LIO-455).
+            let r = slot.width / 2. - crate::cam::number(op, "allowance").unwrap_or(0.);
+            let k = slot.axis();
             let o = 1 - k;
             let c: [f32; 2] = std::array::from_fn(|i| (slot.a[i] + slot.b[i]) / 2.);
             // The material the slot starts in: the row's top.
@@ -642,6 +644,28 @@ pub(crate) fn measures(
                 ext: None,
                 leader: false,
             });
+            // A narrower cutter stepped the round ends (LIO-455): their
+            // radius, and the most the steps leave, listed.
+            if let Some(f) =
+                (d.plan.slot_passes.iter()).find(|p| p.kind == crate::slot::Kind::Finish)
+            {
+                let at = [slot.b[0], slot.b[1], row];
+                out.push(Measure {
+                    axis: "R",
+                    value: r,
+                    words: vec![
+                        "each round end, with a radius gauge".into(),
+                        format!(
+                            "at most {} standing between two steps: file or leave",
+                            dro((f.scallop * 100. - 1e-4).ceil() / 100.)
+                        ),
+                    ],
+                    from: at,
+                    to: at,
+                    ext: None,
+                    leader: false,
+                });
+            }
             // Where it is: its centre on the DRO, listed, not drawn.
             for i in 0..2 {
                 let at = [c[0], c[1], row];
@@ -5045,8 +5069,135 @@ impl canvas::Program<Message> for CornerDetail {
     }
 }
 
+/// A Slot's outline close up from above (LIO-455): the slot as cut, the
+/// line a pass leaves on its walls, the pass's moves one axis at a time,
+/// and the tool where it is.
+struct SlotDetail {
+    key: u64,
+    a: [f32; 2],
+    b: [f32; 2],
+    radius: f32,
+    left: f32,
+    tool: f32,
+    path: Vec<[f32; 2]>,
+    at: Option<[f32; 2]>,
+}
+impl SlotDetail {
+    /// The capsule `r` about the segment `a`–`b`, as points round it.
+    fn capsule(&self, r: f32) -> Vec<[f32; 2]> {
+        let (a, b) = (self.a, self.b);
+        let heading = (b[1] - a[1]).atan2(b[0] - a[0]);
+        let mut out = vec![];
+        for (c, from) in [
+            (b, heading - std::f32::consts::FRAC_PI_2),
+            (a, heading + std::f32::consts::FRAC_PI_2),
+        ] {
+            for i in 0..=32 {
+                let t = from + std::f32::consts::PI * i as f32 / 32.;
+                out.push([c[0] + r * t.cos(), c[1] + r * t.sin()]);
+            }
+        }
+        out
+    }
+    fn paint(&self, f: &mut canvas::Frame) {
+        let (r, rc) = (self.radius, self.tool);
+        let margin = r * 0.6 + 2.;
+        let lo = [
+            self.a[0].min(self.b[0]) - r - margin,
+            self.a[1].min(self.b[1]) - r - margin,
+        ];
+        let hi = [
+            self.a[0].max(self.b[0]) + r + margin,
+            self.a[1].max(self.b[1]) + r + margin,
+        ];
+        let size = f.size();
+        let pad = 24.;
+        let span = [(hi[0] - lo[0]).max(1.), (hi[1] - lo[1]).max(1.)];
+        let s = ((size.width - 2. * pad) / span[0]).min((size.height - 2. * pad) / span[1]);
+        let ox = (size.width - span[0] * s) / 2.;
+        let oy = size.height - (size.height - span[1] * s) / 2.;
+        let p = |q: [f32; 2]| Point::new(ox + (q[0] - lo[0]) * s, oy - (q[1] - lo[1]) * s);
+        // The part round the slot, and the slot as cut.
+        let block = canvas::Path::rectangle(p([lo[0], hi[1]]), Size::new(span[0] * s, span[1] * s));
+        f.fill(&block, PART);
+        let outline = |r: f32| {
+            let points = self.capsule(r);
+            canvas::Path::new(move |b| {
+                b.move_to(p(points[0]));
+                for q in &points[1..] {
+                    b.line_to(p(*q));
+                }
+                b.close();
+            })
+        };
+        let slot = outline(r);
+        f.fill(&slot, Color::WHITE);
+        f.stroke(&slot, stroke(INK, 1.5));
+        // What the pass leaves on the walls.
+        if self.left > 0.001 && self.left < r {
+            f.stroke(&outline(r - self.left), dashed(MUTED, 1.2));
+        }
+        // The ends' centres and radius.
+        for c in [self.a, self.b] {
+            f.fill(&canvas::Path::circle(p(c), 2.5), INK);
+        }
+        let axis = usize::from((self.b[1] - self.a[1]).abs() > (self.b[0] - self.a[0]).abs());
+        let mut label = self.b;
+        label[1 - axis] += r * 0.55;
+        write(f, format!("R{}", mm(r)), p(label), INK, 13., Align::Center);
+        // The pass: its moves, each a reading.
+        if let Some(first) = self.path.first() {
+            let walk = canvas::Path::new(|b| {
+                b.move_to(p(*first));
+                for q in &self.path[1..] {
+                    b.line_to(p(*q));
+                }
+            });
+            f.stroke(&walk, stroke(ACCENT, 1.6));
+            for q in &self.path {
+                f.fill(&canvas::Path::circle(p(*q), 1.6), ACCENT);
+            }
+            if let Some(b) = self.path.iter().find(|q| **q != *first) {
+                arrow(f, p(*first), p(*b), ACCENT, 2.);
+            }
+        }
+        if let Some(at) = self.at {
+            let body = canvas::Path::circle(p(at), rc * s);
+            f.fill(&body, Color { a: 0.2, ..TOOL });
+            f.stroke(&body, stroke(TOOL, 1.6));
+            f.fill(&canvas::Path::circle(p(at), 2.5), TOOL);
+        }
+        write(
+            f,
+            "seen from above · tool centres",
+            Point::new(8., 10.),
+            MUTED,
+            12.,
+            Align::Left,
+        );
+    }
+}
+impl canvas::Program<Message> for SlotDetail {
+    type State = (canvas::Cache, Cell<u64>);
+    fn draw(
+        &self,
+        state: &Self::State,
+        renderer: &iced::Renderer,
+        _: &Theme,
+        bounds: Rectangle,
+        _: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        if state.1.get() != self.key {
+            state.0.clear();
+            state.1.set(self.key);
+        }
+        vec![state.0.draw(renderer, bounds.size(), |f| self.paint(f))]
+    }
+}
+
 /// Slot instructions are read directly from the validated Plan, centres
-/// with compensation off. The picture shows stock before the operation.
+/// with compensation off. The picture shows the slot close up with the
+/// pass on it, and the stock before the operation.
 fn slot_screen<'a>(
     p: &Page<'a>,
     step: &'a Step,
@@ -5056,6 +5207,7 @@ fn slot_screen<'a>(
     Element<'a, Message>,
     Column<'a, Message>,
 ) {
+    use crate::slot::Kind;
     let Step::Slot {
         op,
         index,
@@ -5066,29 +5218,105 @@ fn slot_screen<'a>(
         b,
         targets,
         entry_clear,
+        pass,
+        level,
+        levels,
+        offset,
+        left,
+        scallop,
+        points,
+        radius,
+        tool,
     } = step
     else {
         unreachable!()
     };
+    let walk = !matches!(pass, Kind::Sweep);
+    // Whether a walk round the slot follows this sweep at its level, or the
+    // tool lifts (a cutter so near the slot's width that only the finish
+    // walks round it).
+    let walk_follows = matches!(
+        p.guide().steps.get(p.at + 1),
+        Some(Step::Slot {
+            pass: Kind::Outline { .. },
+            ..
+        })
+    );
+    let axis = usize::from((b[1] - a[1]).abs() > (b[0] - a[0]).abs());
+    // Where the tool is after each number: a walk starts where the sweep
+    // left it, at the far end's centre.
+    let start = if walk {
+        [b[0], b[1], f32::NAN]
+    } else {
+        [f32::NAN; 3]
+    };
+    let mut at = start;
+    let mut places = vec![];
+    for t in targets.iter() {
+        at[t.axis] = t.centre;
+        places.push(at);
+    }
+    let feeds: Vec<usize> = (0..targets.len())
+        .filter(|&i| targets[i].feed && targets[i].axis < 2)
+        .collect();
+    // The steps round the ends: feeds that are neither a straight side nor
+    // the way out to the outline or back.
+    let before = |i: usize| *places.get(i.wrapping_sub(1)).unwrap_or(&start);
+    let side = |i: usize| {
+        let t = &targets[i];
+        let from = before(i)[t.axis];
+        t.axis == axis
+            && (from - t.centre).abs() >= (b[axis] - a[axis]).abs() - 0.02
+            && (b[axis] - a[axis]).abs() > 0.02
+    };
+    let steps_total = feeds
+        .iter()
+        .filter(|&&i| !side(i) && Some(&i) != feeds.first())
+        .filter(|&&i| !(matches!(pass, Kind::Finish) && Some(&i) == feeds.last()))
+        .count();
+    let arrows = [["◀", "▶"], ["▼", "▲"], ["▼", "▲"]];
     let mut rows = column![].spacing(6);
+    let mut step_no = 0;
     for (i, t) in targets.iter().enumerate() {
+        let from = Some(before(i)[t.axis]).filter(|v| v.is_finite());
+        let mut value = dro(t.shown);
         let tag = if t.axis == 2 && t.feed {
-            "feed down · 25% feed"
+            if walk {
+                "feed down beside the centre · 25% feed".to_string()
+            } else {
+                "feed down · 25% feed".to_string()
+            }
+        } else if t.feed && !walk {
+            "feed slot · lock other axes".to_string()
         } else if t.feed {
-            "feed slot · lock other axes"
+            if let Some(from) = from {
+                value = format!("{} {value}", arrows[t.axis][usize::from(t.centre > from)]);
+            }
+            if Some(&i) == feeds.first() && !matches!(pass, Kind::Finish) {
+                "out to the end's tip".to_string()
+            } else if matches!(pass, Kind::Finish) && Some(&i) == feeds.last() {
+                "back to the centre, off the wall".to_string()
+            } else if matches!(pass, Kind::Finish) && Some(&i) == feeds.first() {
+                "out to the end's tip".to_string()
+            } else if side(i) {
+                "straight side".to_string()
+            } else {
+                step_no += 1;
+                format!("step {step_no} of {steps_total}")
+            }
         } else if t.axis == 2 {
-            "lift / set Z clear"
+            "lift / set Z clear".to_string()
         } else {
-            "position above stock"
+            "position above stock".to_string()
         };
         rows = rows.push(readout(
             Readout {
                 order: Some(t.order),
                 lead: None,
                 axis: AXES[t.axis].into(),
-                value: dro(t.shown),
+                value,
                 lock: None,
-                tags: vec![tag.into()],
+                tags: vec![tag],
                 lit: lit(i, p.item),
                 big: false,
             },
@@ -5098,30 +5326,151 @@ fn slot_screen<'a>(
     let operation = p.setup.operations.get(*op);
     let feed = operation.and_then(|o| num(&o.p, "feed")).unwrap_or(0.);
     let rpm = operation.and_then(|o| num(&o.p, "rpm")).unwrap_or(0.);
-    let radius = p
-        .guide()
-        .done
-        .get(p.done(*op))
-        .map_or(0., |d| d.plan.radius);
-    let right=column![
-        chips(vec![chip(p.tool_name(*op,2.*radius)),chip(format!("{rpm:.0} rpm")),chip(format!("Feed {feed:.0} · entry {:.0} mm/min",feed*0.25))]),
+    let narrow = 2. * tool < 2. * radius - 0.0001;
+    let clockwise = match (points.first(), points.get(points.len() / 4)) {
+        (Some(s), Some(q)) => {
+            let c = *b;
+            (s[0] - c[0]) * (q[1] - c[1]) - (s[1] - c[1]) * (q[0] - c[0]) < 0.
+        }
+        _ => true,
+    };
+    let what = match pass {
+        Kind::Sweep if narrow => format!(
+            "Level {level} of {levels}: clear the middle along the centre line, X {} Y {} → X {} Y {}.",
+            dro(a[0]),
+            dro(a[1]),
+            dro(b[0]),
+            dro(b[1])
+        ),
+        Kind::Sweep => format!(
+            "Centre line X {} Y {} → X {} Y {}.",
+            dro(a[0]),
+            dro(a[1]),
+            dro(b[0]),
+            dro(b[1])
+        ),
+        Kind::Outline { index: i, of: n } if i < n => format!(
+            "Level {level} of {levels}: step out round the slot, the tool's centre {} mm off the centre line ({i} of {n} walks).",
+            mm(*offset)
+        ),
+        Kind::Outline { .. } => format!(
+            "Level {level} of {levels}: walk the outline, {} mm left on the walls for the finish.",
+            mm(*left)
+        ),
+        Kind::Finish => format!(
+            "Finish the outline at size on the floor: the cutter's side takes the last {} mm off the whole wall. The round ends come out R{} with at most {} mm standing between two steps; file or leave it.",
+            mm(crate::slot::FINISH.min(*offset)),
+            mm(*radius),
+            dro((*scallop * 100. - 1e-4).ceil() / 100.)
+        ),
+    };
+    let mut right = column![
+        chips(vec![
+            chip(p.tool_name(*op, 2. * tool)),
+            chip(format!("{rpm:.0} rpm")),
+            chip(format!("Feed {feed:.0} · entry {:.0} mm/min", feed * 0.25))
+        ]),
         warn_chip("DRO comp OFF · tool centres"),
-        label(format!("Pass {index} of {of} · Z {}",dro(*z))),
-        muted(format!("Material starts at Z {}. Centre line X {} Y {} → X {} Y {}.",dro(*top),dro(a[0]),dro(a[1]),dro(b[0]),dro(b[1]))).size(13),
-        muted(if *entry_clear {"Entry was proven clear for the full diameter to final depth."}else{"Use the confirmed center-cutting slot drill. Feed down at 25% cutting feed; clear chips at each return."}).size(13),
-        muted("Feed the full-width slot in the indicated direction. Take up backlash before feeding and lock the other axes. Lift before returning to the entry. Verify parallels, table and breakthrough clearance below the part; these are unmodeled.").size(13),
-        scrollable(rows).height(Fill)
-    ].spacing(9);
-    let left = column![
-        muted("Stock before this operation").size(13),
-        p.picture(p.done(*op), Fill)
+        label(format!("Pass {index} of {of} · Z {}", dro(*z))),
+        muted(what).size(13),
     ]
-    .spacing(8)
-    .height(Fill)
-    .into();
+    .spacing(9);
+    if !walk {
+        right = right
+            .push(muted(format!("Material starts at Z {}.", dro(*top))).size(13))
+            .push(muted(if *entry_clear {"Entry was proven clear for the full diameter to final depth."} else if narrow {"Use the confirmed center-cutting end mill. Feed down at 25% cutting feed."} else {"Use the confirmed center-cutting slot drill. Feed down at 25% cutting feed; clear chips at each return."}).size(13))
+            .push(muted(if narrow && walk_follows {"Feed along the centre line in the indicated direction, the backlash taken up and the other axes locked. Stay down at the far end: the walk round the slot follows at this level. Verify parallels, table and breakthrough clearance below the part; these are unmodeled."} else if narrow {"Feed along the centre line in the indicated direction, the backlash taken up and the other axes locked. Lift at the far end: the outline is walked once, at size, after the last level. Verify parallels, table and breakthrough clearance below the part; these are unmodeled."} else {"Feed the slot in the indicated direction. Take up backlash before feeding and lock the other axes. Lift before returning to the entry. Verify parallels, table and breakthrough clearance below the part; these are unmodeled."}).size(13));
+    } else {
+        let ends: Vec<String> = [*b, *a]
+            .iter()
+            .map(|c| {
+                let along = (c[axis] - (a[axis] + b[axis]) / 2.).signum();
+                let tip = if axis == 0 { 0. } else { 90. } + if along > 0. { 0. } else { 180. };
+                let (from, to) = if clockwise {
+                    (tip + 90., tip - 90.)
+                } else {
+                    (tip - 90., tip + 90.)
+                };
+                let norm = |d: f32| (d + 180.).rem_euclid(360.) - 180.;
+                format!(
+                    "X {} Y {}: R {} to the tool's centre (the wall R{} less the Ø{} tool), from {}° {} to {}°",
+                    dro(c[0]),
+                    dro(c[1]),
+                    dro(*radius - *left - *tool),
+                    mm(*radius - *left),
+                    mm(2. * tool),
+                    norm(from),
+                    if clockwise { "clockwise" } else { "counter-clockwise" },
+                    norm(to)
+                )
+            })
+            .collect();
+        right = right.push(
+            muted(format!(
+                "Round the slot {} from the tip of the end at X {} Y {} and back to it: the sides straight, the round ends in steps one axis at a time ({} mm at most between two steps). Conventional with the spindle {}. Each axis turns round at the ends and sides: come to every number the way its arrow points, past the backlash, and keep the quill locked.",
+                if clockwise { "clockwise" } else { "counter-clockwise" },
+                dro(points.first().map_or(b[0], |q| q[0])),
+                dro(points.first().map_or(b[1], |q| q[1])),
+                dro((*scallop * 100. - 1e-4).ceil() / 100.),
+                if clockwise { "clockwise (M3)" } else { "counter-clockwise (M4)" },
+            ))
+            .size(13),
+        );
+        if get(&p.setup.machine.p, "dro_arc") != "No" {
+            right = right.push(
+                muted(format!(
+                    "Or step each round end on the DRO's arc function, inside the arc, angles from +X counter-clockwise: {}; {}.",
+                    ends[0], ends[1]
+                ))
+                .size(13),
+            );
+        }
+    }
+    let right = right.push(scrollable(rows).height(Fill));
+    let left = if walk || narrow {
+        let i = p.item.min(targets.len().saturating_sub(1));
+        let now = places.get(i).copied().unwrap_or([f32::NAN; 3]);
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        (p.key, p.at, p.item).hash(&mut h);
+        let path: Vec<[f32; 2]> = if walk { points.clone() } else { vec![*a, *b] };
+        let detail = crate::fault::canvas(SlotDetail {
+            key: h.finish(),
+            a: *a,
+            b: *b,
+            radius: *radius,
+            left: if walk { *left } else { 0. },
+            tool: *tool,
+            path,
+            at: (now[0].is_finite() && now[1].is_finite()).then_some([now[0], now[1]]),
+        })
+        .width(Fill)
+        .height(FillPortion(3));
+        column![
+            detail,
+            muted("Stock before this operation").size(13),
+            p.picture(p.done(*op), FillPortion(2))
+        ]
+        .spacing(6)
+        .height(Fill)
+        .into()
+    } else {
+        column![
+            muted("Stock before this operation").size(13),
+            p.picture(p.done(*op), Fill)
+        ]
+        .spacing(8)
+        .height(Fill)
+        .into()
+    };
     (
         "Slot".into(),
-        "one straight cutter-centre sweep per depth",
+        match pass {
+            Kind::Sweep if narrow => "the centre line, then round it, a pass a screen",
+            Kind::Sweep => "one straight cutter-centre sweep per depth",
+            Kind::Outline { .. } => "round the slot, a pass a screen",
+            Kind::Finish => "the outline at size, full depth",
+        },
         left,
         right,
     )
@@ -7017,6 +7366,186 @@ pub(crate) mod tests {
                     )),
                 );
             }
+        }
+        std::fs::write(dir.join("rendered-steps.txt"), text).unwrap();
+    }
+    /// A sweep says what comes after it (LIO-455 review): with a walk round
+    /// the slot at its level, stay down; with a cutter so near the slot's
+    /// width that only the finish walks round it, lift.
+    #[test]
+    fn a_slot_sweep_says_whether_to_stay_down_or_lift() {
+        for (width, length, stays) in [("16.5", "21.5", true), ("12.2", "17.2", false)] {
+            let mesh = crate::mesh::normalize(crate::slot::tests::counterbore(
+                (60., 50., 20.),
+                length.parse().unwrap(),
+                width.parse().unwrap(),
+                2.,
+                false,
+            ))
+            .unwrap();
+            let mut doc = crate::slot::tests::job(
+                &mesh,
+                "12",
+                &[
+                    ("slot_width", width),
+                    ("slot_length", length),
+                    ("z_top", "0"),
+                    ("z_bottom", "-2"),
+                    ("through", "No"),
+                    ("stepdown", "1"),
+                ],
+            );
+            doc.active = doc.setups[0].id.clone();
+            doc.file = Some(crate::model::ModelFile {
+                name: "counterbore.stl".into(),
+                path: std::path::PathBuf::from("counterbore.stl"),
+                format: "stl".into(),
+                bytes: 1,
+                thickness: None,
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+            a.doc = doc;
+            a.imported_mesh = Some(mesh);
+            a.page = crate::Page::Control;
+            build(&mut a);
+            let guide = a.guide_at().unwrap().0.guide.clone();
+            let at = (guide.steps.iter())
+                .position(|s| {
+                    matches!(
+                        s,
+                        Step::Slot {
+                            pass: crate::slot::Kind::Sweep,
+                            ..
+                        }
+                    )
+                })
+                .unwrap();
+            let id = a.doc.setups[0].id.clone();
+            a.doc.guide.insert(id, at);
+            a.guide_item = 0;
+            let t = texts(&a);
+            let has = |w: &str| t.iter().any(|s| s.contains(w));
+            assert_eq!(has("Stay down at the far end"), stays, "{width}: {t:?}");
+            assert_eq!(has("Lift at the far end"), !stays, "{width}: {t:?}");
+        }
+    }
+    /// The redesigned adapter's counterbores with a Ø12 (LIO-455): its
+    /// Steps pages rendered from a private copy of the STEP, the tool, a
+    /// level's sweep and walk, the finish and the Check, at the first
+    /// reading and part way round a walk.
+    #[test]
+    #[ignore = "requires the private copy of the redesigned adapter STEP (AXIS_LIO455_FIXTURE)"]
+    fn render_redesigned_adapter_counterbore_steps() {
+        let (mut doc, mesh, dir) = crate::slot::tests::redesigned();
+        doc.active = doc.setups[0].id.clone();
+        if let Err(e) = shown(&doc, &mesh, 0) {
+            panic!("{e}");
+        }
+        let mut a = App::from_workspace(dir.join("render-state.axis.json"), None);
+        a.doc = doc;
+        a.imported_mesh = Some(mesh);
+        a.page = crate::Page::Control;
+        a.window_width = 1440.;
+        a.window_height = 1000.;
+        build(&mut a);
+        let guide = a.guide_at().unwrap().0.guide.clone();
+        let id = a.doc.setups[0].id.clone();
+        let find = |f: &dyn Fn(&Step) -> bool| {
+            guide
+                .steps
+                .iter()
+                .position(f)
+                .unwrap_or_else(|| panic!("no such step in {:#?}", guide.steps.len()))
+        };
+        use crate::slot::Kind;
+        let pages = [
+            ("01-tool", find(&|s| matches!(s, Step::Tool { .. })), 0),
+            (
+                "02-level-1-sweep",
+                find(&|s| {
+                    matches!(
+                        s,
+                        Step::Slot {
+                            op: 0,
+                            pass: Kind::Sweep,
+                            level: 1,
+                            ..
+                        }
+                    )
+                }),
+                0,
+            ),
+            (
+                "03-level-1-outline",
+                find(&|s| {
+                    matches!(
+                        s,
+                        Step::Slot {
+                            op: 0,
+                            pass: Kind::Outline { .. },
+                            level: 1,
+                            ..
+                        }
+                    )
+                }),
+                0,
+            ),
+            (
+                "04-level-1-outline-walking",
+                find(&|s| {
+                    matches!(
+                        s,
+                        Step::Slot {
+                            op: 0,
+                            pass: Kind::Outline { .. },
+                            level: 1,
+                            ..
+                        }
+                    )
+                }),
+                9,
+            ),
+            (
+                "05-finish",
+                find(&|s| {
+                    matches!(
+                        s,
+                        Step::Slot {
+                            op: 0,
+                            pass: Kind::Finish,
+                            ..
+                        }
+                    )
+                }),
+                0,
+            ),
+            (
+                "06-finish-walking",
+                find(&|s| {
+                    matches!(
+                        s,
+                        Step::Slot {
+                            op: 0,
+                            pass: Kind::Finish,
+                            ..
+                        }
+                    )
+                }),
+                30,
+            ),
+            ("07-check", find(&|s| matches!(s, Step::Check { op: 0 })), 0),
+        ];
+        let mut text = String::new();
+        for (name, at, item) in pages {
+            a.doc.guide.insert(id.clone(), at);
+            a.guide_item = item;
+            let strings = crate::ui::probe::texts(a.view(), Size::new(1440., 1000.));
+            text += &format!(
+                "PAGE {name} (step {at}, item {item})\n{}\n\n",
+                strings.join("\n")
+            );
+            render(&a, (1440, 1000), &dir.join(format!("{name}.png")));
         }
         std::fs::write(dir.join("rendered-steps.txt"), text).unwrap();
     }

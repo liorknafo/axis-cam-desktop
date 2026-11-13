@@ -1,5 +1,8 @@
-//! Manual round-ended slots. A matching flat slot drill sweeps one straight
-//! centre line; the same Plan drives stock, holding and the operator's Steps.
+//! Manual round-ended slots. A flat slot drill as wide as the slot sweeps
+//! one straight centre line; a narrower one (LIO-455) sweeps the centre
+//! line, steps out round it and walks the outline, its round ends in DRO
+//! steps as a Round corners walks, then finishes the outline at size. The
+//! same Plan drives stock, holding and the operator's Steps.
 use crate::{
     cam::{self, Builder, Geometry, number},
     mesh::{Bounds, Mesh},
@@ -8,8 +11,8 @@ use crate::{
     surface::Selection,
 };
 
-pub const HELP: &str = "Cut a round-ended counterbore or through slot on the manual mill with a matching flat slot drill. Pick its floor or rounded end, then check the editable sizes and depths. Tool centres move along X or Y; DRO compensation stays off.";
-pub const DEFAULTS: [(&str, &str); 14] = [
+pub const HELP: &str = "Cut a round-ended counterbore or through slot on the manual mill. A narrower end mill than the slot also walks its outline, the ends in DRO steps. Pick its floor or rounded end, then check the sizes and depths. Tool centres move along X or Y; DRO comp off.";
+pub const DEFAULTS: [(&str, &str); 15] = [
     ("slot_x", "0"),
     ("slot_y", "0"),
     ("slot_length", "18"),
@@ -22,10 +25,53 @@ pub const DEFAULTS: [(&str, &str); 14] = [
     ("allowance", "0"),
     ("axial_allowance", "0"),
     ("stepdown", "0.5"),
+    ("scallop", "0.05"),
     ("rpm", "640"),
     ("feed", "120"),
 ];
 pub const ON_CNC: &str = "Slot runs on a manual mill; use Pocket on a CNC.";
+/// What a narrower cutter's levels leave on the walls for the finishing
+/// outline, radially (mm, LIO-455).
+pub const FINISH: f32 = 0.2;
+/// The widest step out from one pass to the next, a share of the cutter's
+/// diameter: the passes overlap, so the floor has no ridges (LIO-455).
+pub const STEP_OVER: f32 = 0.9;
+/// The scallop a Slot leaves between its round ends' steps when the
+/// operation has none set (made before LIO-455), mm.
+pub const SCALLOP: f32 = 0.05;
+
+/// What one pass of a Slot does (LIO-455).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// Down at the slot's one end and along its centre line.
+    Sweep,
+    /// Round the slot between the centre line and the outline, `index` of
+    /// `of` such walks a level, the last of them the outline.
+    Outline { index: usize, of: usize },
+    /// The outline at size, from the floor up the whole wall.
+    Finish,
+}
+/// One pass of a Slot's plan, as the Steps give it (LIO-455).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pass {
+    pub kind: Kind,
+    /// Work Z it cuts at.
+    pub z: f32,
+    pub level: usize,
+    pub levels: usize,
+    /// How far the tool's centre goes out from the centre line round the
+    /// ends (0 for the sweep), mm.
+    pub offset: f32,
+    /// What it leaves on the walls: 0 at size, mm.
+    pub left: f32,
+    /// The most its round ends' steps leave standing between two steps
+    /// (0 for the sweep), mm.
+    pub scallop: f32,
+    /// The tool centre's readings round it in order (work X, Y).
+    pub points: Vec<[f32; 2]>,
+    /// Its moves in the plan.
+    pub moves: std::ops::Range<usize>,
+}
 
 #[derive(Debug, Clone)]
 pub struct Slot {
@@ -72,6 +118,18 @@ impl Slot {
             max: [self.b[0] + radius, self.b[1] + radius, top],
         }
     }
+    /// The axis it runs along: 0 for X, 1 for Y.
+    pub fn axis(&self) -> usize {
+        usize::from((self.b[1] - self.a[1]).abs() > (self.b[0] - self.a[0]).abs())
+    }
+}
+/// The scallop `p` asks its round ends' steps to leave at most, mm.
+pub fn scallop(p: &Fields) -> f32 {
+    if get(p, "scallop").trim().is_empty() {
+        SCALLOP
+    } else {
+        num(p, "scallop").unwrap_or(f32::NAN)
+    }
 }
 pub fn setting_issues(p: &Fields) -> Vec<String> {
     let op = Operation {
@@ -90,10 +148,53 @@ pub fn setting_issues(p: &Fields) -> Vec<String> {
     if !num(p, "stepdown").is_some_and(|v| v > 0.) {
         e.push("Slot stepdown must be positive.".into());
     }
+    if !(0.01..=1.).contains(&scallop(p)) {
+        e.push("Scallop must be 0.01–1 mm: the DRO reads a hundredth.".into());
+    }
     if !["Yes", "No"].contains(&get(p, "through")) {
         e.push("Choose blind or through for the slot.".into());
     }
     e
+}
+
+/// The tool centre's closed walk round the inside of a slot (work
+/// coordinates, mm) whose round ends are `half` about `a` and `b` along
+/// `axis`, a tool of radius `rc` leaving `left` on the walls: from the
+/// tip of `b`'s end, clockwise seen from above (conventional with the
+/// spindle clockwise; `clockwise` false the other way), the two sides
+/// straight, the ends in DRO steps leaving at most `scallop` (LIO-455).
+/// Returns the readings and the most any step leaves.
+#[allow(clippy::too_many_arguments)]
+fn outline(
+    a: [f64; 2],
+    b: [f64; 2],
+    axis: usize,
+    half: f64,
+    rc: f64,
+    left: f64,
+    scallop: f64,
+    clockwise: bool,
+) -> Result<(Vec<[f64; 2]>, f64), String> {
+    let mut points: Vec<[f64; 2]> = vec![];
+    let mut most: f64 = 0.;
+    for (c, q) in [
+        (b, (axis + 3) % 4),
+        (a, (axis + 2) % 4),
+        (a, (axis + 1) % 4),
+        (b, axis),
+    ] {
+        let s = crate::corner::inside_stair(c, half, rc, q, left, scallop)?;
+        most = most.max(s.scallop);
+        for p in s.points.into_iter().rev() {
+            if points.last() != Some(&p) {
+                points.push(p);
+            }
+        }
+    }
+    if !clockwise {
+        points.reverse();
+    }
+    Ok((points, most))
 }
 
 pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
@@ -111,11 +212,28 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     let slot = Slot::read(op, zero)?;
     let leave = number(op, "allowance")?;
     let axial = number(op, "axial_allowance")?;
-    let diameter = 2. * b.plan.radius;
-    if (diameter - (slot.width - 2. * leave)).abs() > 0.0001 {
+    let rc = b.plan.radius;
+    // The round ends' radius as cut: the slot's less the stock to leave.
+    let half = slot.width / 2. - leave;
+    let diameter = 2. * rc;
+    if half <= 0. {
+        return Err("The stock to leave on the walls is as wide as the slot.".into());
+    }
+    if diameter > 2. * half + 0.0001 {
         return Err(format!(
-            "Slot needs a cutter matching its width after stock to leave ({} mm). Smaller cutters do not finish the round ends; larger cutters overcut them.",
-            slot.width - 2. * leave
+            "The Ø{} cutter is wider than the slot after stock to leave ({} mm): it would overcut the round ends. Use a matching or narrower cutter.",
+            crate::envelope::mm(diameter),
+            crate::envelope::mm(2. * half)
+        ));
+    }
+    let matching = (diameter - 2. * half).abs() <= 0.0001;
+    // How far a narrower cutter's centre goes out from the centre line to
+    // cut the walls at size.
+    let reach = half - rc;
+    if !matching && f64::from(reach) < crate::corner::READ {
+        return Err(format!(
+            "The cutter is within 0.02 mm of the slot's width after stock to leave ({} mm): use the matching cutter, or one at least 0.02 mm narrower.",
+            crate::envelope::mm(2. * half)
         ));
     }
     let through = get(&op.p, "through") == "Yes";
@@ -138,7 +256,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     if target >= slot.top {
         return Err("Floor stock to leave leaves no slot depth.".into());
     }
-    let cut = slot.bounds(b.plan.radius, target, stock.max[2]);
+    let cut = slot.bounds(half, target, stock.max[2]);
     if (0..2).any(|k| cut.min[k] < stock.min[k] - 0.001 || cut.max[k] > stock.max[k] + 0.001) {
         return Err("Keep the complete round-ended slot inside the stock.".into());
     }
@@ -168,17 +286,69 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     let entry_clear = setup
         .preview_remaining
         .as_ref()
-        .is_some_and(|rest| rest.entry_cleared(slot.a, b.plan.radius, target, stock.max[2]));
+        .is_some_and(|rest| rest.entry_cleared(slot.a, rc, target, stock.max[2]));
     if get(&tool.p, "center_cutting") != "Yes" && !entry_clear {
         return Err("Slot entry cuts material: confirm Center cutting = Yes on the actual tool, or first clear/pre-drill the entire cutter diameter to the final depth. A tool name or two flutes is not proof.".into());
     }
-    check_part(setup, mesh, &slot, b.plan.radius, target, stock.max[2])?;
     let count = (((top - target) / down) - 0.00001).ceil().max(1.) as usize;
     if count > cam::CEILING / 10 {
         return Err(cam::too_many("slot levels"));
     }
+    // A narrower cutter's walks round the slot (LIO-455), in work
+    // coordinates: out from the centre line in steps no wider than
+    // `STEP_OVER` of the cutter, the last `FINISH` short of the walls, each
+    // done at every level; then the outline at size, once, at the floor.
+    let axis = slot.axis();
+    let clockwise = b.plan.spindle_clockwise;
+    let work = |p: [f32; 2]| [f64::from(p[0] - zero[0]), f64::from(p[1] - zero[1])];
+    let (aw, bw) = (work(slot.a), work(slot.b));
+    let fine = f64::from(scallop(&op.p));
+    // Steps a walk leaves for the next to take: coarser than the finish's
+    // as a rule, but never deeper than a tenth of the cutter's radius,
+    // whatever scallop the finish is given, so that the next walk's sweep
+    // (at most `STEP_OVER` of the diameter out) overlaps it and the floor
+    // between them is cut.
+    let coarse = (0.1 * f64::from(rc)).min(0.1);
+    let mut walks: Vec<(f32, f32, Vec<[f64; 2]>, f64)> = vec![];
+    let mut finish = None;
+    if !matching {
+        let rough = reach - FINISH.min(reach);
+        if f64::from(rough) >= crate::corner::READ {
+            let n = (rough / (STEP_OVER * diameter) - 0.0001).ceil().max(1.) as usize;
+            for i in 1..=n {
+                let offset = rough * i as f32 / n as f32;
+                let left = reach - offset;
+                let (points, most) = outline(
+                    aw,
+                    bw,
+                    axis,
+                    f64::from(half),
+                    f64::from(rc),
+                    f64::from(left),
+                    coarse,
+                    clockwise,
+                )?;
+                walks.push((offset, left, points, most));
+            }
+        }
+        finish = Some(outline(
+            aw,
+            bw,
+            axis,
+            f64::from(half),
+            f64::from(rc),
+            0.,
+            fine,
+            clockwise,
+        )?);
+    }
+    let world = |p: [f64; 2]| [p[0] as f32 + zero[0], p[1] as f32 + zero[1]];
+    let shown = |p: &[[f64; 2]]| p.iter().map(|p| [p[0] as f32, p[1] as f32]).collect();
+    let pause = num(&setup.machine.p, "pass_time").unwrap_or(0.).max(0.);
+    let mut passes = vec![];
     for i in 1..=count {
         let z = (top - i as f32 * down).max(target);
+        let first = b.plan.moves.len();
         // Return clear above the original stock. Descend at quarter feed,
         // including an already cleared entry, never rapid into uncertain stock.
         b.push(
@@ -193,25 +363,146 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
             false,
             b.feed * 0.25,
         )?;
-        b.dwell(num(&setup.machine.p, "pass_time").unwrap_or(0.).max(0.));
+        b.dwell(pause);
         b.push([slot.b[0], slot.b[1], z], Motion::Feed, true, b.feed)?;
+        let sweep = b.plan.moves.len();
+        for (j, (offset, left, points, most)) in walks.iter().enumerate() {
+            let start = b.plan.moves.len();
+            for p in points {
+                let p = world(*p);
+                b.push([p[0], p[1], z], Motion::Feed, true, b.feed)?;
+            }
+            passes.push(Pass {
+                kind: Kind::Outline {
+                    index: j + 1,
+                    of: walks.len(),
+                },
+                z: z - zero[2],
+                level: i,
+                levels: count,
+                offset: *offset,
+                left: *left,
+                scallop: *most as f32,
+                points: shown(points),
+                moves: start..b.plan.moves.len(),
+            });
+        }
+        b.push(
+            [b.pos[0], b.pos[1], b.retract],
+            Motion::Rapid,
+            false,
+            b.rapid,
+        )?;
+        // The lift ends the level's last pass.
+        if let Some(last) = passes.last_mut().filter(|p| p.level == i) {
+            last.moves.end = b.plan.moves.len();
+        }
+        let end = if walks.is_empty() {
+            b.plan.moves.len()
+        } else {
+            sweep
+        };
+        passes.insert(
+            passes.len() - walks.len(),
+            Pass {
+                kind: Kind::Sweep,
+                z: z - zero[2],
+                level: i,
+                levels: count,
+                offset: 0.,
+                left: reach,
+                scallop: 0.,
+                points: vec![
+                    [slot.a[0] - zero[0], slot.a[1] - zero[1]],
+                    [slot.b[0] - zero[0], slot.b[1] - zero[1]],
+                ],
+                moves: first..end,
+            },
+        );
+    }
+    if let Some((points, most)) = &finish {
+        // Down beside the far end's centre, where every level has cleared
+        // to the floor; the outline at size, the cutter's side the whole
+        // wall; back to the centre off the wall, and up.
+        let start = b.plan.moves.len();
         b.push(
             [slot.b[0], slot.b[1], b.retract],
             Motion::Rapid,
             false,
             b.rapid,
         )?;
+        b.push(
+            [slot.b[0], slot.b[1], target],
+            Motion::Feed,
+            false,
+            b.feed * 0.25,
+        )?;
+        b.dwell(pause);
+        for p in points {
+            let p = world(*p);
+            b.push([p[0], p[1], target], Motion::Feed, true, b.feed)?;
+        }
+        b.push([slot.b[0], slot.b[1], target], Motion::Feed, false, b.feed)?;
+        passes.push(Pass {
+            kind: Kind::Finish,
+            z: target - zero[2],
+            level: count,
+            levels: count,
+            offset: reach,
+            left: 0.,
+            scallop: *most as f32,
+            points: shown(points),
+            moves: start..b.plan.moves.len(),
+        });
     }
     b.push(
-        [slot.b[0], slot.b[1], b.clearance],
+        [b.pos[0], b.pos[1], b.clearance],
         Motion::Rapid,
         false,
         b.rapid,
     )?;
+    if let Some(last) = passes.last_mut() {
+        last.moves.end = b.plan.moves.len();
+    }
+    // Every tool centre the plan feeds through stays within this of the
+    // centre line, so its cutter stays within the capsule this wide; that
+    // capsule is what is proven clear of the part.
+    let envelope = b
+        .plan
+        .moves
+        .iter()
+        .filter(|m| m.motion == Motion::Feed)
+        .flat_map(|m| [m.from, m.to])
+        .map(|p| off_line([p[0], p[1]], slot.a, slot.b))
+        .fold(0f32, f32::max)
+        + rc;
+    if envelope > half + 0.0001 {
+        return Err("The slot's walk reaches past its round ends. Check centre, width, length and cutter diameter.".into());
+    }
+    check_part(setup, mesh, &slot, envelope, target, stock.max[2])?;
     b.plan.target = target;
     b.plan.levels = count;
-    b.plan.milling_direction = "Full-width slot · feed in one direction";
+    b.plan.milling_direction = if matching {
+        "Full-width slot · feed in one direction"
+    } else if clockwise {
+        "Centre sweep, then outlines clockwise · conventional"
+    } else {
+        "Centre sweep, then outlines counter-clockwise · conventional"
+    };
+    b.plan.slot_passes = passes;
     b.finish()
+}
+/// How far `p` is from the segment `a`–`b`.
+fn off_line(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
+    let (p, a, b) = (p.map(f64::from), a.map(f64::from), b.map(f64::from));
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let l = dx * dx + dy * dy;
+    let t = if l == 0. {
+        0.
+    } else {
+        (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l).clamp(0., 1.)
+    };
+    (p[0] - a[0] - t * dx).hypot(p[1] - a[1] - t * dy) as f32
 }
 
 /// Match opposite half-round walls, then permit a click on either rounded
@@ -352,7 +643,10 @@ fn arc_overcut(arc: &cam::arcs::Arc, a: [f32; 2], b: [f32; 2], r: f32) -> f64 {
     let half = (arc.span as f64).to_radians() / 2.;
     let mut worst = f64::NEG_INFINITY;
     for p in [a, b] {
-        let v = [(p[0] - arc.centre[0]) as f64, (p[1] - arc.centre[1]) as f64];
+        let v = [
+            f64::from(p[0]) - f64::from(arc.centre[0]),
+            f64::from(p[1]) - f64::from(arc.centre[1]),
+        ];
         let theta = v[1].atan2(v[0]);
         let delta = (theta - mid + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
             - std::f64::consts::PI;
@@ -450,6 +744,18 @@ fn connected_pair(g: &Geometry, a: [f32; 2], b: [f32; 2], r: f32, bottom: f32, t
     })
 }
 
+/// How far a sweep may seem to reach past the part and still be on it:
+/// 0.03 µm, or where the slot lies far from the setup's origin what single
+/// precision resolves there, a few of its steps (LIO-455: 3 × 10⁻⁵ mm at
+/// X 260 is one step, and an exact slot there read as an overcut). Still
+/// far under the hundredth a DRO reads and any real overcut.
+fn slack(slot: &Slot, r: f32) -> f32 {
+    let far = (slot.a.iter().chain(&slot.b))
+        .map(|v| v.abs())
+        .fold(0f32, f32::max)
+        + r;
+    0.00003f32.max(4. * f32::EPSILON * far)
+}
 /// Continuous part check, including nominal analytic bounds at faceted
 /// semicircles. Mesh error is not a license to translate/oversize a cutter.
 fn check_part(
@@ -464,6 +770,7 @@ fn check_part(
     let arcs = cam::arcs::arcs_among(setup, mesh, &cam::arcs::upright(setup, mesh));
     let cut = slot.bounds(r, target, top);
     let z = [target + 0.0001, top + 0.0001];
+    let slack = slack(slot, r);
     let mut proven = vec![];
     for a in &arcs {
         if a.top <= z[0] || a.bottom >= z[1] {
@@ -479,7 +786,7 @@ fn check_part(
         if !reaches {
             continue;
         }
-        if arc_overcut(a, slot.a, slot.b, r) > 0.00003 {
+        if arc_overcut(a, slot.a, slot.b, r) > f64::from(slack) {
             return Err("The slot's cutter sweep crosses a nominal rounded end of the part. Check centre, length and cutter diameter.".into());
         }
         proven.push(a);
@@ -493,10 +800,13 @@ fn check_part(
         {
             continue;
         }
-        if !cam::swept_with_slack(&t.p, [slot.a, slot.b], r, z, 0.00003) {
+        if !cam::swept_with_slack(&t.p, [slot.a, slot.b], r, z, slack) {
             continue;
         }
-        let mut pieces = vec![t.p.to_vec()];
+        // In double precision throughout (LIO-455): in single precision a
+        // part far from the setup's origin (Y 229) left slivers along the
+        // partitions' shared chord edges, wide enough to be read as part.
+        let mut pieces: Vec<Vec<[f64; 3]>> = vec![t.p.iter().map(|p| p.map(f64::from)).collect()];
         // Only subtract the actual circular segments between a wall chord
         // and its nominal arc. The entire sector, or a globally shrunken
         // cutter, would hide real planar material beside a round boundary.
@@ -505,6 +815,7 @@ fn check_part(
             for a in proven.iter().filter(|a| {
                 (t.p[0][2] - a.top).abs() < 0.0001 || (t.p[0][2] - a.bottom).abs() < 0.0001
             }) {
+                let c = a.centre.map(f64::from);
                 for wall in g
                     .triangles
                     .iter()
@@ -515,10 +826,8 @@ fn check_part(
                         if (u[2] - a.top).abs() > 0.0001 || (v[2] - a.top).abs() > 0.0001 {
                             continue;
                         }
-                        let mid = [
-                            (u[0] + v[0]) / 2. - a.centre[0],
-                            (u[1] + v[1]) / 2. - a.centre[1],
-                        ];
+                        let (u, v) = (u.map(f64::from), v.map(f64::from));
+                        let mid = [(u[0] + v[0]) / 2. - c[0], (u[1] + v[1]) / 2. - c[1]];
                         let distance = mid[0].hypot(mid[1]);
                         let len = (u[0] - v[0]).hypot(u[1] - v[1]);
                         if len < 0.00001 || distance <= 0. {
@@ -528,7 +837,7 @@ fn check_part(
                         let half = (len / 2.).atan2(distance);
                         pieces = pieces
                             .into_iter()
-                            .flat_map(|poly| outside_lens(poly, a.centre, theta, half, distance))
+                            .flat_map(|poly| outside_lens(poly, c, theta, half, distance))
                             .collect();
                     }
                 }
@@ -538,17 +847,18 @@ fn check_part(
             for i in 1..poly.len().saturating_sub(1) {
                 let tri = [poly[0], poly[i], poly[i + 1]];
                 if horizontal {
-                    let area = ((tri[1][0] - tri[0][0]) as f64 * (tri[2][1] - tri[0][1]) as f64
-                        - (tri[1][1] - tri[0][1]) as f64 * (tri[2][0] - tri[0][0]) as f64)
+                    let area = ((tri[1][0] - tri[0][0]) * (tri[2][1] - tri[0][1])
+                        - (tri[1][1] - tri[0][1]) * (tri[2][0] - tri[0][0]))
                         .abs()
                         / 2.;
-                    // Polygon partitions share their chord edge. Single
-                    // precision can leave a zero-area edge as a tiny sliver.
+                    // Polygon partitions share their chord edge: a piece
+                    // along it has no area but for rounding.
                     if area < 0.00001 {
                         continue;
                     }
                 }
-                if cam::swept_with_slack(&tri, [slot.a, slot.b], r, z, 0.00003) {
+                let tri = tri.map(|p| p.map(|v| v as f32));
+                if cam::swept_with_slack(&tri, [slot.a, slot.b], r, z, slack) {
                     return Err("The slot's cutter sweep cuts into the part. Check centre, width, length, floor and stock to leave.".into());
                 }
             }
@@ -560,12 +870,12 @@ fn check_part(
 /// between the chord's angular rays and beyond its chord plane. Analytic
 /// support has already proven the cutter inside the nominal circle there.
 fn outside_lens(
-    poly: Vec<[f32; 3]>,
-    centre: [f32; 2],
-    theta: f32,
-    half: f32,
-    distance: f32,
-) -> Vec<Vec<[f32; 3]>> {
+    poly: Vec<[f64; 3]>,
+    centre: [f64; 2],
+    theta: f64,
+    half: f64,
+    distance: f64,
+) -> Vec<Vec<[f64; 3]>> {
     let lo = theta - half;
     let hi = theta + half;
     let mut inside = poly;
@@ -575,11 +885,9 @@ fn outside_lens(
         ([hi.sin(), -hi.cos()], 0.),
         ([theta.cos(), theta.sin()], distance),
     ] {
-        let clip = |poly: &Vec<[f32; 3]>, keep_inside: bool| {
-            let value = |p: [f32; 3]| {
-                (((p[0] - centre[0]) as f64 * n[0] as f64
-                    + (p[1] - centre[1]) as f64 * n[1] as f64)
-                    - offset as f64)
+        let clip = |poly: &Vec<[f64; 3]>, keep_inside: bool| {
+            let value = |p: [f64; 3]| {
+                ((p[0] - centre[0]) * n[0] + (p[1] - centre[1]) * n[1] - offset)
                     * if keep_inside { 1. } else { -1. }
             };
             let mut out = vec![];
@@ -590,7 +898,7 @@ fn outside_lens(
                     out.push(p);
                 }
                 if (v >= 0.) != (w >= 0.) {
-                    let t = (v / (v - w)) as f32;
+                    let t = v / (v - w);
                     out.push(std::array::from_fn(|k| p[k] + t * (q[k] - p[k])));
                 }
             }

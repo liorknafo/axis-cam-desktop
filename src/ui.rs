@@ -4320,6 +4320,8 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             }
             c=c.push(choice(p,"through","Through stock", &["No","Yes"],t))
                 .push(checks.field(p,"breakthrough","Breakthrough beyond stock bottom · mm"))
+                .push(checks.field(p,"scallop","Scallop left between steps · mm"))
+                .push(note("A cutter narrower than the slot sweeps the centre line, steps out round it and walks the outline each level, the round ends in DRO steps leaving at most the scallop between two; then it finishes the outline at size on the floor."))
                 .push(note("Blind: bottom is the floor before floor stock to leave. Through: bottom is the stock's back face; breakthrough extends below it. Check clearance below the part: parallels and table are unmodeled."));
         }
         "Box" => {
@@ -5201,7 +5203,7 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
         return c.push(checks.field(p,"allowance","Wall stock to leave · mm"))
             .push(checks.field(p,"axial_allowance","Floor stock to leave · mm (blind only)"))
             .push(checks.field(p,"stepdown","Maximum stepdown · mm"))
-            .push(note("Use a cutter matching width minus twice wall stock to leave. Entry feeds down at 25% feed. It requires a confirmed center-cutting tool or a proven full-diameter entry clear to the final depth. Flutes must reach from the original stock top, including breakthrough." )).into();
+            .push(note("Use a cutter as wide as the slot less twice the wall stock to leave (one sweep a level), or one at least 0.02 mm narrower (it also walks the outline). Entry feeds down at 25% feed. It requires a confirmed center-cutting tool or a proven full-diameter entry clear to the final depth. Flutes must reach from the original stock top, including breakthrough." )).into();
     }
     if s == Strategy::Box {
         return c
