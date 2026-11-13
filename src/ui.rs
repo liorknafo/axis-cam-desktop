@@ -255,11 +255,7 @@ fn switcher(app: &App, dark: bool) -> Element<'_, Message> {
             } else {
                 "Planning opens when the machine stops."
             })
-            .color(if dark {
-                ON_DARK
-            } else {
-                MUTED
-            })
+            .color(if dark { ON_DARK } else { MUTED })
         ]
         .spacing(6)
         .align_y(Alignment::Center)
@@ -15648,7 +15644,9 @@ fn post(app: &App) -> Element<'_, Message> {
     };
     summary = summary
         .push(secondary("Export setup sheet (.md)", Message::Export("sheet")).width(Fill))
-        .push(secondary("Save complete project (.json)", Message::SaveProject).width(Fill));
+        .push(secondary("Save complete project (.json)", Message::SaveProject).width(Fill))
+        // The job with its part, for the shop tablet at the machine (LIO-453).
+        .push(secondary("Save for tablet (.axisjob)", Message::SaveForTablet).width(Fill));
     if shown == 0 {
         // An empty dark pane reads as a failed load: say what will be here.
         code = code.push(
