@@ -848,8 +848,11 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
 fn origin_help(value: &str) -> Option<(String, String)> {
     use crate::post::At;
     let (xy, top) = crate::post::stock_zero(value)?;
+    // The work zero's names are the part's own sides as the screen shows
+    // it, X right and Y away: the machine's own words come at the machine.
+    let o = crate::orient::Orient::Right;
     let face = if top { "top" } else { "bottom" };
-    let at = match crate::control::probe_spot(xy).as_str() {
+    let at = match crate::control::probe_spot(o, xy).as_str() {
         "its centre" => format!("the centre of the stock's {face}"),
         spot => format!("{spot} of the stock's {face}"),
     };
@@ -866,10 +869,7 @@ fn origin_help(value: &str) -> Option<(String, String)> {
             let a = 1 - k;
             let near = match xy[a] {
                 At::Mid => "near the middle".to_string(),
-                end => format!(
-                    "near the {}",
-                    crate::post::ENDS[a][usize::from(end == At::Max)]
-                ),
+                end => format!("near the {}", o.end(a, end == At::Max)),
             };
             format!("{axis}0 from {which} {near}")
         };

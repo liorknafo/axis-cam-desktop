@@ -821,11 +821,29 @@ the real machine. A setup that sits on the pins has its block where the pins
 place it, and it is put on them only once X and Y are referenced from pin 1:
 the part is off the pins while they are probed.
 
+**Which way the axes point (LIO-457).** A machine's **+X points** setting
+(Machine library, Travel & spindle) says which way +X goes on the table,
+standing at the machine's front: **Right** (the usual, and every machine saved
+before it), **Left**, **Away from you** or **Toward you**. +Y follows by the
+right-hand rule with Z up, so a part is never mirrored: the frame is only
+turned. Set it the way the machine's own controls count up; the Jingyan
+CNC4030's handheld counts X up going left and Y up toward the front, which is
+**Left** (+Y toward you). The UC100 profile's `reversed` sets which way a
+motor turns for +; this setting sets where + is. The Control page's 3D machine
+(the tool, the travel box, the work zero, the simulator's block and the rotary
+unit), the jog pad and the arrow keys, the probing grids (the stock top seen
+from above, back at the top), and the sides and corners that touch-off,
+probing, the program header and the plan checks name ("touch off the
+back-right corner") all follow it. The setup editor's work zeros keep the
+part's own names as the screen shows it (Stock top front-left is −X −Y).
+
 Once the machine is Idle, the Control page has everything needed before a job:
 
 - **Machine zero and soft limits.** A machine without home switches (the
-  JY5800) does not know where its axes are. Jog X to its left end, Y to its
-  front end (gantry toward you) and Z to the top, then press **Set machine
+  JY5800) does not know where its axes are. Jog X and Y to their minimum ends
+  and Z to the top (on the usual machine X to its left end and Y to its front
+  end, the gantry toward you; the page names the ends from the machine's
+  orientation, below), then press **Set machine
   zero here** (or **X**, **Y**, **Z** for one axis). **Keep the last position**
   takes the position AXIS CAM saved at the last disconnect, for when nothing
   moved the machine since. Until every axis with a soft limit has a machine
@@ -839,8 +857,11 @@ Once the machine is Idle, the Control page has everything needed before a job:
   green "Soft limits on" line needs all three. Every E-stop clears the machine position, so
   set it again after one. **Home** appears when every axis has a home switch;
   an axis with a switch gets its position only by homing.
-- **Jog.** Hold **X−/X+/Y−/Y+/Z+/Z−**, or on this page the arrow keys (X, Y;
-  up is +Y, away from you) and **Page Up/Down** (Z), and let go to stop. A
+- **Jog.** Hold **X−/X+/Y−/Y+/Z+/Z−**, or on this page the arrow keys and
+  **Page Up/Down** (Z), and let go to stop. The pad's buttons and the arrows
+  stand where they move the tool, seen from the front: → moves it right and
+  ↑ away from you, whatever axis and sign that is on the machine (each button
+  says which, as the machine's **+X points** setting gives it). A
   release anywhere, leaving the button, or the window losing focus stops the
   jog too; a jog that a soft limit or E-stop ended needs a new press. Keys
   jog only while the jog pad is on screen (LIO-273): not in the Controller

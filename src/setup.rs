@@ -34,15 +34,24 @@ pub struct Draft {
     /// What the last Save did.
     pub note: Option<String>,
     /// A was jogged A+ and the top of the part seen to move toward −Y
-    /// (`A_DIRECTION`): the pins-and-polarity tick waits for it once A is
+    /// (`a_direction`): the pins-and-polarity tick waits for it once A is
     /// in the profile. Not in the file, whose sections the driver reads;
     /// a profile opened with that tick already on has it.
     pub a_direction: bool,
+    /// Which way the machine's X and Y point, for the sides A's direction
+    /// is checked by.
+    pub orient: crate::orient::Orient,
 }
 
 /// The A axis' commissioning step for its direction (LIO-210): +A turns the
 /// part as the machine's Direction says (LIO-212).
-pub const A_DIRECTION: &str = "Jogged A+ and the top of the part moved the way the machine's Direction in the Machine library says: toward −Y, the front, for Positive (the right-hand rule about +X), toward +Y, the back, for Negative (if it moved the other way, tick Reverse the direction)";
+pub fn a_direction(o: crate::orient::Orient) -> String {
+    format!(
+        "Jogged A+ and the top of the part moved the way the machine's Direction in the Machine library says: toward {}, for Positive (the right-hand rule about +X), toward {}, for Negative (if it moved the other way, tick Reverse the direction)",
+        o.y_words(false),
+        o.y_words(true)
+    )
+}
 
 /// What the Setup view asks.
 #[derive(Debug, Clone)]
@@ -84,7 +93,10 @@ impl Draft {
         }
         let original =
             std::fs::read_to_string(path).map_err(|e| format!("Cannot read {path}: {e}"))?;
-        Self::from_text(m.id.clone(), path.into(), original)
+        Ok(Self {
+            orient: crate::orient::Orient::of(m),
+            ..Self::from_text(m.id.clone(), path.into(), original)?
+        })
     }
 
     /// A profile given as text, which is `path`'s content.
@@ -108,6 +120,7 @@ impl Draft {
             checked: Err(String::new()),
             note: None,
             a_direction: false,
+            orient: Default::default(),
         };
         d.a_direction = d.has("axes.a") && d.flag(PINOUT) == Some(true);
         d.check();
@@ -154,7 +167,10 @@ impl Draft {
             Edit::Flag(path, on)
                 if path == PINOUT && on && self.has("axes.a") && !self.a_direction =>
             {
-                self.note = Some("Check A's direction first: jog A+, see that the top of the part moves toward −Y, the front, and tick that under the A axis.".into());
+                self.note = Some(format!(
+                    "Check A's direction first: jog A+, see that the top of the part moves toward {}, and tick that under the A axis.",
+                    self.orient.y_words(false)
+                ));
             }
             Edit::Flag(path, on) => {
                 let (parent, key) = split(&path);
@@ -163,7 +179,10 @@ impl Draft {
                 if path == "axes.a.reversed" && self.a_direction {
                     self.a_direction = false;
                     self.put("commissioning", "pinout_verified", false.into());
-                    self.note = Some("A's direction changed: jog A+ and check that the top of the part moves toward −Y, the front, then tick the pins and polarity again.".into());
+                    self.note = Some(format!(
+                        "A's direction changed: jog A+ and check that the top of the part moves toward {}, then tick the pins and polarity again.",
+                        self.orient.y_words(false)
+                    ));
                 }
             }
             Edit::ADirection(on) => {
@@ -731,7 +750,7 @@ fn form<'a>(app: &'a App, d: &'a Draft) -> Element<'a, Message> {
             body = body
                 .push(
                     checkbox(d.a_direction)
-                        .label(A_DIRECTION)
+                        .label(a_direction(d.orient))
                         .on_toggle(|b| edit(Edit::ADirection(b)))
                         .text_size(12),
                 )

@@ -6120,27 +6120,30 @@ fn zero_note(app: &App) -> Element<'_, Message> {
     // A hand machine has no probe and no Control page (LIO-386): the Steps
     // page's Zero screen picks the zero up with the edge finder.
     let hand = crate::manual::is_hand(&setup.machine);
-    let mut lines = vec![match (crate::post::touch_off_spots(origin, stock), refs) {
-        (_, Some(_)) if hand => format!(
-            "On the stock this setup starts from ({from}): the Steps page's Zero screen has you touch a side for X and one for Y with the edge finder (both sides of an axis whose zero is at the middle, halving the reading) and the top for Z, and set the DRO so that it reads 0 at this work zero."
-        ),
-        (Some(spots), _) => format!(
-            "On the stock this setup starts from ({from}): touch off {spots}.{}",
-            crate::round_hold::side_note(setup, stock)
-                .map(|note| format!(" {note}"))
-                .unwrap_or_default()
-        ),
-        (None, Some(refs)) => format!(
-            "Model origin is the part file's own 0,0,0. A probe finds it from the stock this setup starts from ({from}): {}. By hand, the program header locates it from the part.",
-            crate::post::probe_spots(refs, stock)
-        ),
-        _ => match crate::indexed::zero_words(origin)
-            .or_else(|| crate::round_hold::zero_words(origin))
-        {
-            Some(words) => format!("On the stock this setup starts from ({from}): {words}"),
-            None => "Choose a work zero.".into(),
+    let o = crate::orient::Orient::of(&setup.machine);
+    let mut lines = vec![
+        match (crate::post::touch_off_spots(o, origin, stock), refs) {
+            (_, Some(_)) if hand => format!(
+                "On the stock this setup starts from ({from}): the Steps page's Zero screen has you touch a side for X and one for Y with the edge finder (both sides of an axis whose zero is at the middle, halving the reading) and the top for Z, and set the DRO so that it reads 0 at this work zero."
+            ),
+            (Some(spots), _) => format!(
+                "On the stock this setup starts from ({from}): touch off {spots}.{}",
+                crate::round_hold::side_note(setup, stock)
+                    .map(|note| format!(" {note}"))
+                    .unwrap_or_default()
+            ),
+            (None, Some(refs)) => format!(
+                "Model origin is the part file's own 0,0,0. A probe finds it from the stock this setup starts from ({from}): {}. By hand, the program header locates it from the part.",
+                crate::post::probe_spots(o, refs, stock)
+            ),
+            _ => match crate::indexed::zero_words(origin)
+                .or_else(|| crate::round_hold::zero_words(origin))
+            {
+                Some(words) => format!("On the stock this setup starts from ({from}): {words}"),
+                None => "Choose a work zero.".into(),
+            },
         },
-    }];
+    ];
     if let Some(refs) = refs.filter(|_| !hand) {
         lines.push(format!(
             "On the Control page, {} sets exactly this work zero, probed from its own spot or, under Probe from, from another corner, edge middle or the centre a probe can reach.",
@@ -7930,6 +7933,23 @@ fn wizard(app: &App) -> Element<'_, Message> {
                 .spacing(8)
             };
             form = form.push(three(travel));
+            if !crate::lathe::is_lathe(m) {
+                // Which way + is on the table (LIO-457).
+                let o = crate::orient::Orient::from_fields(p);
+                form = form
+                    .push(choice_value(
+                        p,
+                        o.label(),
+                        crate::orient::KEY,
+                        "+X points, standing at the machine's front",
+                        &crate::orient::LABELS,
+                        t,
+                    ))
+                    .push(note(format!(
+                        "{}. Y follows by the right-hand rule, so a part is never mirrored. Set it the way the machine's own counts go up: the jog pad and arrow keys, the 3D machine and the sides and corners named for touch-off and probing follow it. On a UC100, the profile's reversed sets which way the motor turns for +.",
+                        o.describe()
+                    )));
+            }
             if manual::is_manual(m) {
                 // In pairs, so that the step fits without scrolling.
                 for pair in [
@@ -10001,7 +10021,12 @@ fn jog_card(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
         col = col.push(angles);
     }
     let (w, h) = fit.jog();
-    let jog = |axis: usize, negative: bool| -> Element<'_, Message> {
+    // A button stands where its jog moves the tool, seen from the front
+    // (`axis` and `negative` the usual machine's: X+ right, Y+ away), and
+    // sends what this machine needs for that (`Orient::jog_like_usual`).
+    let jog = |at_axis: usize, at_negative: bool| -> Element<'_, Message> {
+        let key = jog_key_name(at_axis, at_negative);
+        let (axis, negative) = c.orient.jog_like_usual(at_axis, at_negative);
         if !c.axis(axis) {
             return space().width(w).height(h).into();
         }
@@ -10042,20 +10067,16 @@ fn jog_card(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
                 .on_press(Message::Machine(Action::JogPress(axis, negative)))
                 .on_release(release.clone())
                 .on_exit(release),
-            container(
-                text(jog_key_name(axis, negative))
-                    .size(12)
-                    .color(Color::WHITE),
-            )
-            .padding([3, 8])
-            .style(|_| container::Style {
-                background: Some(Color::from_rgb8(29, 43, 58).into()),
-                border: Border {
-                    radius: 5.into(),
+            container(text(key).size(12).color(Color::WHITE))
+                .padding([3, 8])
+                .style(|_| container::Style {
+                    background: Some(Color::from_rgb8(29, 43, 58).into()),
+                    border: Border {
+                        radius: 5.into(),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            }),
+                }),
             widget::tooltip::Position::Top,
         )
         .gap(4)
@@ -11059,7 +11080,7 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
                         idle(Action::MachineZero(None)),
                         false
                     ),
-                    hint("Work zero", MOVE_THERE_WAITS, fit.chars(60)),
+                    hint("Work zero", move_there_waits(c.orient), fit.chars(60)),
                 ]
                 .spacing(6)
                 .align_y(Alignment::Center),
@@ -11173,8 +11194,8 @@ fn probe_tab(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
                                 && crate::post::stock_zero(&p.origin).is_some();
                             format!(
                                 "Jog the probe above the stock top, over {}, and press {name}: it touches off {}, allowing for the {} mm tip, at {} mm/min, and sets the X, Y and Z work zero on {}{}.",
-                                crate::control::probe_spot(refs),
-                                crate::post::probe_spots(refs, p.stock),
+                                crate::control::probe_spot(c.orient, refs),
+                                crate::post::probe_spots(c.orient, refs, p.stock),
                                 pr.tip.unwrap_or_default(),
                                 pr.feed,
                                 p.origin,
@@ -11209,16 +11230,17 @@ fn probe_tab(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
     // Features found where the tip is, without a setup.
     let feature = |f: Feature| {
         small(
-            f.label(),
+            f.label(c.orient),
             c.feature_blocked(f)
                 .is_none()
                 .then_some(Message::Machine(Action::ProbeFeature(f))),
             c.feature() == Some(f),
         )
     };
+    let [bl, br, fl, fr] = Feature::corners(c.orient);
     let corners = column![
-        row![feature(Feature::CORNERS[0]), feature(Feature::CORNERS[1])].spacing(4),
-        row![feature(Feature::CORNERS[2]), feature(Feature::CORNERS[3])].spacing(4),
+        row![feature(bl), feature(br)].spacing(4),
+        row![feature(fl), feature(fr)].spacing(4),
     ]
     .spacing(4);
     let mut edges = row![].spacing(4);
@@ -11250,7 +11272,7 @@ fn probe_tab(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
             hint(
                 "Feature at the tip",
                 match (why, c.feature()) {
-                    (_, Some(f)) => f.how(),
+                    (_, Some(f)) => f.how(c.orient),
                     (Some(why), None) => why,
                     (None, None) => "Put the tip as each button's card says and press it: the surface, side, corner or centre found becomes work zero in the active work system, on the axes it sets.".into(),
                 },
@@ -11372,9 +11394,9 @@ fn machine_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'
         zero = zero.push(small("Home", idle(Action::Home), false));
     }
     zero = zero.push(muted(if declared.is_empty() {
-        HOME_NOTE
+        HOME_NOTE.to_string()
     } else {
-        MACHINE_ZERO_NOTE
+        machine_zero_note(c.orient)
     }));
     if let Some(pins) = pin_block(c) {
         zero = zero.push(pins);
@@ -12361,15 +12383,23 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
     let setup = app.doc.setups.get(run.setup)?;
     let s = &c.snapshot;
     let mut steps = vec![format!(
-        "Every tool run is cut from this setup's work zero, {} in {}. Before the first Cycle Start, put it on the stock:",
-        p.origin, p.offset
+        "Every tool run is cut from this setup's work zero, {} in {}.{} Before the first Cycle Start, put it on the stock:",
+        p.origin,
+        p.offset,
+        c.orient
+            .turned_note()
+            .map(|n| format!(" {n}"))
+            .unwrap_or_default()
     )];
     steps.push(if (0..3).all(|a| s.referenced[a]) {
         "1. X, Y and Z have a machine position.".into()
     } else if c.home_switches() {
         "1. Optional: Home in the Machine tab, so that the soft limits are on. Without it Cycle Start runs with them off.".into()
     } else {
-        "1. Optional: Set machine zero in the Machine tab, so that the soft limits are on: jog X to its left end, Y to its front end and Z to the top first. Without it Cycle Start runs with them off.".into()
+        format!(
+            "1. Optional: Set machine zero in the Machine tab, so that the soft limits are on: jog {} first. Without it Cycle Start runs with them off.",
+            zero_ends(c.orient, "to")
+        )
     });
     steps.push(if p.offset == format!("G{}", 54 + s.active_wcs) {
         format!("2. {} is the active work system.", p.offset)
@@ -12403,7 +12433,7 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
         } else {
             "the stock top"
         };
-        let spot = match crate::control::probe_spot(refs).as_str() {
+        let spot = match crate::control::probe_spot(c.orient, refs).as_str() {
             "its centre" => "the centre".to_string(),
             spot => spot.to_string(),
         };
@@ -12418,7 +12448,7 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
     } else {
         match (c.touch_off(), crate::post::references(&p.origin)) {
             (Some((_, work)), Some(refs)) => {
-                let spot = match crate::control::probe_spot(refs).as_str() {
+                let spot = match crate::control::probe_spot(c.orient, refs).as_str() {
                     "its centre" => "the centre".to_string(),
                     spot => spot.to_string(),
                 };
@@ -12593,7 +12623,7 @@ fn pin_steps(
     steps.push(match c.touch_off() {
         Some((_, work)) => {
             let spot = crate::post::references(&p.origin).map_or("the stock top".to_string(), |refs| {
-                match crate::control::probe_spot(refs).as_str() {
+                match crate::control::probe_spot(c.orient, refs).as_str() {
                     "its centre" => "the centre of the stock top".to_string(),
                     spot => format!("{spot} of the stock top"),
                 }
@@ -12640,7 +12670,7 @@ fn probe_from_grid<'a>(
     spots: &[([crate::post::At; 2], Result<(), String>)],
 ) -> Element<'a, Message> {
     use crate::control::Action;
-    use crate::post::At::{Max, Mid, Min};
+    use crate::post::At::{Max, Mid};
     let program = c.run_program().ok();
     // The zero's own spot, reachable or not: the one a jaw may stand at.
     let own = program.and_then(|p| crate::post::references(&p.origin));
@@ -12651,23 +12681,24 @@ fn probe_from_grid<'a>(
         .probe_spot
         .filter(|&r| reachable(r))
         .or(own.filter(|&r| reachable(r)));
+    let o = c.orient;
     let name = |refs: [crate::post::At; 2]| match refs {
         [Mid, Mid] => "Centre".to_string(),
         [Mid, _] | [_, Mid] => {
             let k = usize::from(refs[0] == Mid);
-            let s = crate::post::ENDS[k][usize::from(refs[k] == Max)];
+            let s = o.end(k, refs[k] == Max);
             s[..1].to_uppercase() + &s[1..]
         }
         _ => {
-            let s = crate::post::corner_name(refs);
+            let s = o.corner(refs);
             s[..1].to_uppercase() + &s[1..]
         }
     };
     let mut grid = column![].spacing(4);
-    for y in [Max, Mid, Min] {
+    for away in [1, 0, -1] {
         let mut line = row![].spacing(4);
-        for x in [Min, Mid, Max] {
-            let refs = [x, y];
+        for right in [-1, 0, 1] {
+            let refs = o.spot_at(right, away);
             let ok = reachable(refs);
             // Model origin is set off from its spot, not on it.
             let label = match (Some(refs) == own, model) {
@@ -12920,8 +12951,28 @@ fn rotary_tab<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>
     Some(tab_scroll(col))
 }
 const HOME_NOTE: &str = "Home references every axis on its switch. Every E-stop clears the machine position: home again after one.";
-const MOVE_THERE_WAITS: &str = "Move there waits for machine zero: it rises to the top of Z first. Set it here, with X at its left end, Y at its front end and Z at the top (where the simulator starts), or in the Machine tab.";
-const MACHINE_ZERO_NOTE: &str = "Every E-stop clears the machine position: set it again after one. Without home switches, jog X to its left end, Y to its front end (gantry toward you) and Z to the top, then Set machine zero here. Keep the last position takes the position AXIS CAM saved at the last disconnect: only if nothing moved the machine since.";
+/// Where machine zero is on a machine of orientation `o`, after `at`
+/// ("at" or "to"): X and Y at their minimum ends, named where they are on
+/// the table, and Z at the top.
+pub(crate) fn zero_ends(o: crate::orient::Orient, at: &str) -> String {
+    format!(
+        "X {at} its {} end, Y {at} its {} end and Z {at} the top",
+        o.end(0, false),
+        o.end(1, false)
+    )
+}
+fn move_there_waits(o: crate::orient::Orient) -> String {
+    format!(
+        "Move there waits for machine zero: it rises to the top of Z first. Set it here, with {} (where the simulator starts), or in the Machine tab.",
+        zero_ends(o, "at")
+    )
+}
+fn machine_zero_note(o: crate::orient::Orient) -> String {
+    format!(
+        "Every E-stop clears the machine position: set it again after one. Without home switches, jog {}, then Set machine zero here. Keep the last position takes the position AXIS CAM saved at the last disconnect: only if nothing moved the machine since.",
+        zero_ends(o, "to")
+    )
+}
 /// The note under a library editor's fields when its draft is not what the
 /// library holds: `saved` is the entry with the draft's id, if there is one.
 fn unsaved_note(draft: &Fields, saved: Option<&Fields>, what: &str) -> Option<String> {

@@ -10,8 +10,12 @@ use crate::Message;
 use iced::{Color, Point, Rectangle, Renderer, Theme, mouse, widget::canvas};
 use std::cell::RefCell;
 
-// World coordinates are the tool tip's machine coordinates in mm: machine
-// zero is X at the left end, Y at the front end, Z at the top. The sizes
+// World coordinates are the table seen from the front, in mm: X to the
+// right, Y away, Z up, 0 to the travel on each, the tool tip's machine
+// coordinates turned by the machine's orientation (`Orient::world`, the
+// same on the usual machine: zero at X's left end, Y's front end and Z's
+// top). The model is built in them; everything the controller gives in
+// machine coordinates is turned into them. The sizes
 // below are the parts the machine library does not give (LIO-47, ASSUMED
 // from a similar 800 W CNC4030); `Figures` holds the ones it does.
 /// How far the T-slot table reaches past the X and the Y travel, each side.
@@ -34,9 +38,12 @@ const ROD: [f32; 2] = [8., -4.];
 /// height and width (`envelope::FIGURES`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Figures {
+    /// X, Y and Z travel, machine axes.
     pub travel: [f32; 3],
     pub nose_to_table: f32,
     pub gantry: [f32; 2],
+    /// Which way machine X and Y point on the table.
+    pub orient: crate::orient::Orient,
 }
 
 impl Figures {
@@ -45,6 +52,7 @@ impl Figures {
         travel: [390., 280., 55.],
         nose_to_table: 160.,
         gantry: [120., 390.],
+        orient: crate::orient::Orient::Right,
     };
 
     /// Machine `m`'s figures, the Jingyan's for any it does not give.
@@ -62,6 +70,7 @@ impl Figures {
                 f("gantry_height", j.gantry[0]),
                 f("gantry_width", j.gantry[1]),
             ],
+            orient: crate::orient::Orient::of(m),
         }
     }
 }
@@ -517,8 +526,9 @@ fn machine(
             ..f
         },
     };
-    let [x, y, z] = pos;
-    let travel = fig.travel;
+    // The tool tip on the table, seen from the front (machine `pos`).
+    let [x, y, z] = fig.orient.world(pos, fig.travel);
+    let travel = fig.orient.world_travel(fig.travel);
     let tt = table_top(fig, rotary);
     let clearance = rotary.map_or(fig.gantry[0], |r| {
         fig.gantry[0].max(r.unit.centre_height + r.unit.chuck_diameter / 2. + 10.)
@@ -799,14 +809,20 @@ fn machine(
     );
 
     if let Some(rig) = rotary {
-        rotary_solids(&mut m, rig, a);
+        rotary_solids(&mut m, rig, a, |p| fig.orient.world(p, fig.travel));
     }
     m
 }
 
 /// The rotary unit's solids at A `a` (`chuck::Rig::solids`): the chuck
-/// and its jaws turn with A, the head and the tailstock stand still.
-fn rotary_solids(m: &mut Model, rig: &crate::chuck::Rig, a: f32) {
+/// and its jaws turn with A, the head and the tailstock stand still. Its
+/// machine points go on the table through `world`.
+fn rotary_solids(
+    m: &mut Model,
+    rig: &crate::chuck::Rig,
+    a: f32,
+    world: impl Fn([f32; 3]) -> [f32; 3],
+) {
     for (label, prism, _) in rig.solids(a) {
         let (part, finish) = match label.as_str() {
             "chuck body" => ("chuck", CHROME),
@@ -815,6 +831,10 @@ fn rotary_solids(m: &mut Model, rig: &crate::chuck::Rig, a: f32) {
             _ => ("tailstock", ALUMINIUM),
         };
         let [a, b] = &prism.ends;
+        let (a, b): (Vec<_>, Vec<_>) = (
+            a.iter().map(|&p| world(p)).collect(),
+            b.iter().map(|&p| world(p)).collect(),
+        );
         m.prism([a.as_slice(), b.as_slice()], prism.smooth, finish, part);
     }
 }
@@ -1198,6 +1218,20 @@ impl MachineView {
         }
     }
 
+    /// Machine point `p` on the table, as the model is built (`Orient::world`).
+    fn world(&self, p: [f32; 3]) -> [f32; 3] {
+        self.figures.orient.world(p, self.figures.travel)
+    }
+
+    /// A machine box on the table: its corners turned, low and high again.
+    fn world_box(&self, [lo, hi]: [[f32; 3]; 2]) -> [[f32; 3]; 2] {
+        let (a, b) = (self.world(lo), self.world(hi));
+        [
+            std::array::from_fn(|k| a[k].min(b[k])),
+            std::array::from_fn(|k| a[k].max(b[k])),
+        ]
+    }
+
     /// The model and the frame round it: the scale and where the origin
     /// goes, so the machine fits the frame at both ends of its X and Y
     /// travel and the scale holds still while it moves.
@@ -1215,7 +1249,7 @@ impl MachineView {
             let at = machine(&self.figures, end, true, rotary, 0.);
             at.tris.iter().flat_map(|t| t.pts).for_each(&mut grow);
         }
-        let [elo, ehi] = self.envelope;
+        let [elo, ehi] = self.world_box(self.envelope);
         for i in 0..8 {
             grow(std::array::from_fn(|k| {
                 if i >> k & 1 == 0 { elo[k] } else { ehi[k] }
@@ -1229,7 +1263,11 @@ impl MachineView {
         );
         let mut model = machine(&self.figures, self.pos, self.known, rotary, self.a);
         if let Some(b) = self.block {
-            block(&mut model, b, table_top(&self.figures, rotary));
+            block(
+                &mut model,
+                self.world_box(b),
+                table_top(&self.figures, rotary),
+            );
         }
         (model, scale, origin)
     }
@@ -1238,7 +1276,7 @@ impl MachineView {
     fn box_lines(&self) -> Vec<Line> {
         let c = self.box_color();
         let rgb = [c.r, c.g, c.b].map(|v| (v * 255.) as u8);
-        let [lo, hi] = self.envelope;
+        let [lo, hi] = self.world_box(self.envelope);
         let corner = |i: usize| -> [f32; 3] {
             std::array::from_fn(|k| if i >> k & 1 == 0 { lo[k] } else { hi[k] })
         };
@@ -1396,12 +1434,12 @@ impl canvas::Program<Message> for MachineView {
         let green = Color::from_rgb8(39, 130, 93);
         if self.known {
             marks.stroke(
-                &canvas::Path::circle(screen(self.zero), 7.),
+                &canvas::Path::circle(screen(self.world(self.zero)), 7.),
                 canvas::Stroke::default().with_color(green).with_width(2.),
             );
         }
         marks.fill(
-            &canvas::Path::circle(screen(self.pos), 4.),
+            &canvas::Path::circle(screen(self.world(self.pos)), 4.),
             Color::from_rgb8(214, 40, 40),
         );
         // The captions are cut to the view's width (about 6.2 px a character
@@ -1502,6 +1540,79 @@ mod tests {
         let finish = |m: &Model, name: &str| m.tris.iter().find(|t| t.part == name).unwrap().finish;
         assert_ne!(finish(&unset, "spindle"), finish(&home, "spindle"));
         assert_eq!(finish(&unset, "table"), finish(&home, "table"));
+    }
+
+    #[test]
+    fn a_machine_turned_round_is_drawn_as_it_stands_lio_457() {
+        use crate::orient::Orient;
+        let left = Figures {
+            orient: Orient::Left,
+            ..Figures::JINGYAN
+        };
+        let [tx, ty, _] = left.travel;
+        // +X moves the carriage left and +Y the gantry toward the front.
+        let home = machine(&left, [0., 0., 0.], true, None, 0.);
+        let moved = machine(&left, [120., 80., -30.], true, None, 0.);
+        assert!(close(
+            lowest(&moved, "carriage", 0) - lowest(&home, "carriage", 0),
+            -120.
+        ));
+        assert!(close(
+            lowest(&moved, "beam", 1) - lowest(&home, "beam", 1),
+            -80.
+        ));
+        // Machine zero is the right and back end: the usual machine's far
+        // corner, and the table is where it is on the usual machine.
+        let usual_far = plain([tx, ty, 0.], true);
+        assert!(close(
+            lowest(&home, "carriage", 0),
+            lowest(&usual_far, "carriage", 0)
+        ));
+        assert!(close(
+            lowest(&home, "beam", 1),
+            lowest(&usual_far, "beam", 1)
+        ));
+        let table = |m: &Model| part(m, "table").collect::<Vec<_>>();
+        assert_eq!(table(&home), table(&usual_far));
+        // The travel box, the block, the work zero and the tool tip's mark
+        // turn the same way.
+        let view = MachineView {
+            figures: left,
+            pos: [120., 80., -30.],
+            known: true,
+            envelope: [[0., 0., -55.], [tx, ty, 0.]],
+            assumed: false,
+            block: Some([[10., 20., -50.], [60., 50., -40.]]),
+            zero: [10., 20., -40.],
+            rotary: None,
+            a: 0.,
+        };
+        assert_eq!(view.world(view.pos), [tx - 120., ty - 80., -30.]);
+        assert_eq!(view.world(view.zero), [tx - 10., ty - 20., -40.]);
+        assert_eq!(
+            view.world_box(view.block.unwrap()),
+            [[tx - 60., ty - 50., -50.], [tx - 10., ty - 20., -40.]]
+        );
+        assert_eq!(view.world_box(view.envelope), view.envelope);
+        // X running front to back: the travel turns with it.
+        let away = Figures {
+            orient: Orient::Away,
+            ..Figures::JINGYAN
+        };
+        let a0 = machine(&away, [0., 0., 0.], true, None, 0.);
+        let a1 = machine(&away, [50., 0., 0.], true, None, 0.);
+        assert!(close(lowest(&a1, "beam", 1) - lowest(&a0, "beam", 1), 50.));
+        assert!(close(
+            lowest(&a1, "carriage", 0),
+            lowest(&a0, "carriage", 0)
+        ));
+        // The usual machine is drawn as it was.
+        assert_eq!(
+            plain([120., 80., -30.], true).tris.len(),
+            machine(&Figures::JINGYAN, [120., 80., -30.], true, None, 0.)
+                .tris
+                .len()
+        );
     }
 
     #[test]

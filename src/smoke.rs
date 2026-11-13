@@ -10998,6 +10998,7 @@ flood = { pin = 8 }
             travel: [600., 400., 100.],
             nose_to_table: 220.,
             gantry: [180., 700.],
+            orient: crate::orient::Orient::Right,
         };
         for (figures, rotary, name) in [
             (Figures::JINGYAN, None, "plain.png"),
@@ -11022,6 +11023,90 @@ flood = { pin = 8 }
                 .into();
             render_element(element, iced::Size::new(900., 640.), &out.join(name));
         }
+    }
+    /// LIO-457: the Jingyan with its tool tip at the same place on the
+    /// table, as the usual machine and turned round (+X left, +Y toward
+    /// you): the two pictures are the same. Then the Control page of a
+    /// turned machine: its Machine tab (the 3D machine, the jog pad) and its
+    /// Probe tab (the corners).
+    #[test]
+    #[ignore]
+    fn render_a_turned_machine_lio_457() {
+        use crate::machine_view::Figures;
+        use crate::orient::Orient;
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/lio-457-renders".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let [x, y, z] = Figures::JINGYAN.travel;
+        for (orient, pos, zero, block, name) in [
+            (
+                Orient::Right,
+                [80., 60., -10.],
+                [100., 80., -30.],
+                [[100., 80., -50.], [220., 170., -30.]],
+                "1-usual.png",
+            ),
+            (
+                Orient::Left,
+                [x - 80., y - 60., -10.],
+                [x - 100., y - 80., -30.],
+                [[x - 220., y - 170., -50.], [x - 100., y - 80., -30.]],
+                "2-turned.png",
+            ),
+        ] {
+            let view = crate::machine_view::MachineView {
+                figures: Figures {
+                    orient,
+                    ..Figures::JINGYAN
+                },
+                pos,
+                known: true,
+                envelope: [[0., 0., -z], [x, y, 0.]],
+                assumed: false,
+                block: Some(block),
+                zero,
+                rotary: None,
+                a: 0.,
+            };
+            let element: iced::Element<'_, Message> = iced::widget::canvas(view)
+                .width(iced::Fill)
+                .height(iced::Fill)
+                .into();
+            render_element(element, iced::Size::new(900., 640.), &out.join(name));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        idle(&mut a);
+        let id = a.control.as_ref().unwrap().machine_id.clone();
+        let m = a.doc.machines.iter_mut().find(|m| m.id == id).unwrap();
+        m.p.insert(crate::orient::KEY.into(), "Left".into());
+        a.control.as_mut().unwrap().orient = Orient::Left;
+        a.page = Page::Control;
+        let size = iced::Size::new(1600., 1000.);
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Machine));
+        render_png(&a, size, &out.join("3-machine-tab.png"));
+        // The setting in the Machine library.
+        a.page = Page::Machines;
+        let _ = a.update(Message::EditMachine(id));
+        let _ = a.update(Message::WizardStep(1));
+        render_png(&a, size, &out.join("5-setting.png"));
+        // A setup with a probe, its work zero at the stock's -X -Y corner:
+        // the Probe tab's grids, back at the top.
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = edges_app(dir.path(), Some("Stock top front-left"));
+        let m = a.doc.machines.last_mut().unwrap();
+        m.p.insert(crate::orient::KEY.into(), "Left".into());
+        let m = m.clone();
+        for s in &mut a.doc.setups {
+            s.machine = m.clone();
+        }
+        a.control.as_mut().unwrap().orient = Orient::Left;
+        a.page = Page::Control;
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Probe));
+        render_png(&a, size, &out.join("4-probe-tab.png"));
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        render_png(&a, size, &out.join("6-work-zero-tab.png"));
     }
     #[test]
     #[ignore]
@@ -13557,6 +13642,16 @@ soft_max = 180.0
         let _ = a.update(Message::JogKeyUp);
         assert_eq!((held(&a), a.jog_key), (None, None));
         tick_until(&mut a, 3.0, "Idle", |s| s.state == Some(State::Idle));
+        // On a machine turned round (+X left, +Y toward you, LIO-457), →
+        // still moves the tool right, which is X−, and ↑ away, Y−.
+        a.control.as_mut().unwrap().orient = crate::orient::Orient::Left;
+        for (key, sent) in [((0, false), (0, true)), ((1, false), (1, true))] {
+            let _ = a.update(Message::JogKey(key.0, key.1, false));
+            let _ = a.update(Message::JogKeyChecked(key.0, key.1, false));
+            assert_eq!(held(&a), Some(sent), "{key:?}");
+            let _ = a.update(Message::JogKeyUp);
+            tick_until(&mut a, 3.0, "Idle", |s| s.state == Some(State::Idle));
+        }
     }
 
     /// The Controller configuration view hides the jog controls and the run

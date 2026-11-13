@@ -37,6 +37,7 @@ mod model;
 mod ngc;
 mod oauth;
 mod openai;
+mod orient;
 mod picks;
 mod plan_changes;
 mod plan_check;
@@ -8004,6 +8005,8 @@ impl App {
                     && self.jog_pad_shown()
                     && let Some(c) = &mut self.control
                 {
+                    // The key points where the tool goes (`jog_key`).
+                    let (axis, negative) = c.orient.jog_like_usual(axis, negative);
                     c.act(control::Action::JogPress(axis, negative));
                 }
             }
@@ -8268,6 +8271,7 @@ impl App {
                         c.probe = control::probe_settings(&m.p);
                         c.pins = control::pins_settings(&m.p);
                         c.rotary = control::Rotary::of(&m);
+                        c.orient = orient::Orient::of(&m);
                         // Its travel is the connected profile's (LIO-344).
                         synced = control::travel_into(&mut m, &c.machine_id, &c.config);
                     }
@@ -10200,9 +10204,11 @@ pub(crate) fn tab_move(typing: bool, back: bool, jogging: bool) -> TabMove {
         (false, _, false) => TabMove::First,
     }
 }
-/// The axis and direction a jog key moves: the arrows jog X and Y (up is
-/// +Y, away from the operator), Page Up and Page Down jog Z, Home and End
-/// jog A (on a machine without A they move nothing).
+/// The axis and direction a jog key moves on the usual machine: the arrows
+/// move the tool the way they point, seen from the front (up is away from
+/// the operator: X+ and Y+ there), Page Up and Page Down jog Z, Home and
+/// End jog A (on a machine without A they move nothing). A machine whose
+/// X and Y point otherwise turns them (`Orient::jog_like_usual`).
 fn jog_key(key: iced::keyboard::key::Named) -> Option<(usize, bool)> {
     use iced::keyboard::key::Named;
     match key {

@@ -1617,7 +1617,7 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
             "",
         ),
         MachineZero(None) => (
-            "Declare the current position machine zero for X, Y and Z, and A on a machine with one. First jog X to its left end, Y to its front end and Z to the top. The soft limits apply once every limited axis has a machine position, and A jogs and runs only once it has one.",
+            "Declare the current position machine zero for X, Y and Z, and A on a machine with one. First jog X and Y to their low ends (the Machine tab names them) and Z to the top. The soft limits apply once every limited axis has a machine position, and A jogs and runs only once it has one.",
             "",
         ),
         MachineZero(Some(_)) => (
