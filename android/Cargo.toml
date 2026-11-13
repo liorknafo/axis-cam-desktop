@@ -43,8 +43,8 @@ sha2 = "0.10"
 clipper2 = "0.6.0"
 fidget = { version = "=0.4.3", default-features = false, features = ["mesh"] }
 toml_edit = "0.25"
-uc100 = { git = "https://github.com/liorknafo/UC100-driver.git", rev = "35cf9d77103481a6975166a28aef1635d8c69ee1", default-features = false }
-uc100-remote = { git = "https://github.com/liorknafo/uc100-server.git", rev = "8801fe67b1f8c0ecfb011c59d3fed28fd4889e00" }
+uc100 = { git = "https://github.com/liorknafo/UC100-driver.git", rev = "e1fadccf48b93f8bff3200d4ebb71d84a0325f99", default-features = false }
+uc100-remote = { git = "https://github.com/liorknafo/uc100-server.git", rev = "11383de5b7e458b530a6ea2835cfd213ca5b8bfa" }
 wgpu = "27"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
@@ -52,12 +52,6 @@ pollster = "0.4"
 [patch.crates-io]
 # Lets android_main outlive a destroyed activity (iced_android's README).
 android-activity = { git = "https://github.com/Santuzius/android-activity", tag = "iced_android-v0.1.2" }
-
-# The driver lists USB devices with a call nusb has not on Android; the
-# tablet reaches the UC100 through the Pi, so there the list is empty.
-# ponytail: a local copy for the trial; the cfg goes into the driver repo if the port goes ahead.
-[patch."https://github.com/liorknafo/UC100-driver.git"]
-uc100 = { path = "D:/android/uc100-driver" }
 
 [profile.release]
 opt-level = 2
