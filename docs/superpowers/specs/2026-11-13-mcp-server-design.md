@@ -121,40 +121,55 @@ A unit test lists the fields of `App`. Each must be named in `mcp::WORK_STATE` o
 
 A **snapshot** of the work state is a hash of its saved serialization, written straight into the hasher with no string built. Next to the hash it keeps a per-item hash for each setup, operation, library entry and draft, so the change log can say what changed.
 
-Snapshots are taken only at **agent boundaries**, never per message:
-1. when a request arrives, before anything is dispatched;
-2. right after the engine has dispatched a command's messages, in the same UI-thread turn, so no user event is in between;
-3. when the command has settled.
-
-The UI thread therefore pays for a few snapshots per agent command, and nothing while no agent is working. Every write path is covered by comparison, whatever made it: `Tick` writing pin references or rotary measurements, `Guide(Built)`, a draft keystroke, `NewProject`.
+Snapshots are taken only at the edges of agent work, never per message (see *Ownership windows*). The UI thread therefore pays for a few snapshots per agent command, and nothing while no agent is working. A difference between two snapshots catches every write, whatever path made it: `Tick` writing pin references or rotary measurements, `Guide(Built)`, a draft keystroke, `NewProject`. Who made it is decided separately, from recorded events.
 
 **Budget, checked by a release-build benchmark (`cargo test --release -- --ignored mcp_snapshot_bench`, run before each MCP milestone's PR):**
-- a snapshot of a 1 MB project takes at most 15 ms;
+- a full snapshot of a 1 MB project takes at most 15 ms;
 - one at the 20 MB project limit takes at most 250 ms.
 
-If the limit project is over budget, the per-item hashes are kept from the last snapshot and recomputed only for items whose `version` or `id` set changed. The benchmark decides; this is not done up front.
+Every snapshot hashes everything, with no incremental shortcut: setups and operations have no version, and controller writes change a machine without changing its `version`. If the benchmark misses the budget, M1 does not merge until this design is revised.
+
+### Ownership windows
+
+- **An agent command owns a window.** It opens when the engine takes the "before" snapshot and dispatches the command's messages, in one UI-thread turn. It closes only when everything the command started has settled (`pending()` is empty), and then the "after" snapshot is taken.
+- **The window outlives the result.** If the command returns `still_running`, its window stays open: through `wait`, through read-only tools, and through a client reconnect. A new mutating command first waits, within its own `wait_s`, for the open window to close; if it does not, that command is `still_running` too and nothing of it is dispatched. Read-only tools never open or close a window.
+- **Outside windows, no agent work runs.** So any difference found when a window opens, compared with the last window's close, is not the agent's. This also covers edits made while no agent was connected: the last snapshot is kept with the `App` across disconnects, and in `session.json` headless.
+
+### External events
+
+A change is attributed to the user from **events recorded where they happen**, not from the class of the message that carried them. An external event is any of these:
+- **A message from the window's own event handlers** (not from the engine) that is not view-only. It is counted on arrival, whatever its class.
+- **A controller result written into the work state.** The agent has no machine commands, so every such write is the user's work at the machine. The sites that apply queued controller results call `App::external(what)`. These are `Tick`'s `record_pins` and `keep_rotary` (`main.rs` ~9335), `SaveCentreline`, `UseCalibration`, and every other place that takes a result out of `self.control` into the `Document` or a library.
+
+  A test runs each such action on the simulated UC100, queues its result before an agent request, applies it during the request's window, and checks it is reported as the user's and protected from restore.
+- **The completion of async work started by an external event**, matched by the epoch recorded when it started.
 
 ### Revisions and sources
 
-- **Revision.** `revision: u64` goes up by one each time a snapshot differs from the one before it. It never goes down; a checkpoint restore also goes up. Each step appends a change-log entry with the revision, its source, and the items that differ.
-- **The source of a change:**
-  - Between boundary 2 and boundary 3, the change is the agent's, unless a user event arrived in that time. The window counts every non-`Internal` message it did not get from the engine.
-  - If user events did arrive, the entry is `mixed`, and the result names those user actions by their command name, for example "user: edit_field operation feed".
-  - A difference found at boundary 1 (since the agent's last boundary 3) is the `user`'s. This includes changes made while no agent was connected, and the machine's own writes through `Tick`.
-- **Disconnects.** The last snapshot stays with the `App` when the client disconnects, in memory in the window and in `session.json` headless. The next request compares against it at boundary 1, so edits made between agents are seen before any mutation or restore is accepted.
+- **Revision.** `revision: u64` goes up by one each time a snapshot differs from the one before it. It never goes down; a checkpoint restore also goes up. Each step appends a change-log entry with the revision, the items that differ, and a source:
+  - **`agent`:** the difference was found when an ownership window closed, and no external event happened during the window;
+  - **`mixed`:** found when a window closed, with external events during it. The result names them, for example "user: edit_field operation feed; machine: pin reference recorded";
+  - **`user`:** found when a window opened, so it is everything since the last window closed.
 - **Addressing.** Commands address setups and operations by their stable `id`. An index is accepted and turned into the id when the request arrives. A command that acts on "the selected" operation selects it by id in the same UI-thread turn that acts.
-- **Reporting.** Every result lists the `user` and `mixed` entries since the revision last reported to the agent. A wait cannot absorb the user's work: their edits during an agent's `generate_all` make that command's entry `mixed`, and the result says so.
+- **Reporting.** Every result lists the `user` and `mixed` entries since the revision last reported to the agent. A read-only tool takes a snapshot only when no window is open, and reports a `user` entry if one appears. A wait cannot absorb the user's work.
 - **Async results.** A completion for work an agent command started is applied only if its epoch is still current. That is the app's rule for generations today, and it is extended to the layout, import and export results. The expected effect is then checked on the state as it actually is.
-- **Conflict check.** A mutating call may pass `if_revision`. If the revision moved, the call is refused with outcome `conflict` and the entries. Boundary 1 runs first, so a user change made since the last request counts.
-- **Checkpoints and the user's edits.** `restore_checkpoint` is refused when a `user` or `mixed` entry follows the checkpoint, unless it is called with `discard_user_changes: true`. In the window, that also asks the user in a dialog, which they can decline.
+- **Conflict check.** A mutating call may pass `if_revision`. A window-open snapshot is taken first, so a user change since the last request counts. If the revision moved, the call is refused with outcome `conflict` and the entries.
+- **Checkpoints and the user's edits.** `restore_checkpoint` is refused when a `user` or `mixed` entry follows the checkpoint, unless it is called with `discard_user_changes: true`. In the window, that also asks the user in a dialog, which they can decline. The final check is made in the turn that commits (see *Checkpoints*).
 
 ### Shop-floor state is protected
 
-The guide's saved place (`Document::guide`), the measurements (`Document::measured`) and the cross-slide dial readings belong to the machinist.
+The guide's saved place (`Document::guide`), the measurements (`Document::measured`) and the cross-slide dial readings belong to the machinist and to the project they were recorded in.
 
-- The engine keeps them out of every agent command. It compares them before and after.
-- If a command changed them, it puts them back as they were, and the outcome is `failed` with "This would have changed the machinist's progress". A test checks that no allowed command ever triggers this.
-- So an app path the boundary missed (as `Open` → `enter_steps` → `guide_to` was) cannot reach the shop floor.
+- **Commands that replace the project** load the incoming project's records, as they do for the user: `new_project`, `open_sample`, `open_project`, `resume_project` and `recover_previous_project`. `NewProject` archives the outgoing project first, as it does today.
+
+  For the agent, each of these is refused while the current project has unsaved changes, unless it is called with `discard_unsaved: true`. In the window, that also asks the user, as the app's own close does. So the agent cannot drop records the machinist made and never saved.
+- **Every other allowed command** is guarded on the setups that exist both before and after it. Their records must not change during its window. Removing a setup removes its records, as it does for the user.
+  - If a record changed and the window had **no** external event, the agent's path changed it. That is a bug in the boundary. The changed entries are put back to their values before the window, and the outcome is `failed`: "This would have changed the machinist's progress". A test checks that no allowed command triggers this.
+  - If the window **had** external events (the machinist pressed Next or measured a diameter during the agent's wait), nothing is put back. The change is reported as theirs.
+- **Tests:**
+  - `new_project` and `open_project` with populated records, clean and dirty;
+  - a human `Next` and `Measured` during an agent's pending `generate_all`, kept and reported;
+  - `remove_setup` and `duplicate_setup` with records on other setups.
 
 ### Tests
 
@@ -163,9 +178,10 @@ The guide's saved place (`Document::guide`), the measurements (`Document::measur
   - a half-typed clamp positions field;
   - `NewProject`;
   - opening a project whose setups keep the same ids;
-  - a pin reference recorded through `Tick`;
+  - a pin reference recorded through `Tick`, both outside a window and queued before an agent request;
   - an edit made while no agent was connected.
-- A user edit during an agent's `generate_all` makes its result `mixed` and names the edit.
+- A user edit during an agent's `generate_all` makes its entry `mixed` and names the edit.
+- An agent's `suggest_layout` that returns `still_running`, then finishes while the agent calls `inspect` and `wait`, is one `agent` entry. Restoring the checkpoint before it needs no `discard_user_changes`.
 - A stale generation result is not applied after a user edit.
 - An `if_revision` older than a user change gets `conflict`.
 - The `App` field test fails when a field is in neither list.
@@ -246,7 +262,11 @@ It is stored in the session folder (headless) or in memory (live, at most 20).
 
 1. **Validate, changing nothing.**
    - If the checkpoint's model fingerprint is not the loaded mesh's, the model file is loaded into a **candidate** mesh off the UI thread (`mesh::load`, as `restore_model` does, but not into `imported_mesh`). If the file is missing or unreadable, or its fingerprint is not the checkpoint's, the restore is refused, for example: "The model file changed since the checkpoint; restoring it would put picks on a different part." The current mesh is never cleared first. Today's `restore_model` clears it before its load.
-2. **Commit, in one UI-thread turn.** It goes through a new `App::job_replaced(doc, mesh)`, which `replace_document` also uses from now on, so the two cannot drift. In order:
+2. **Check again, then commit, in one UI-thread turn.** The candidate's load takes time, and the user may act meanwhile; a draft edit, for example, moves no epoch. So in the turn that commits, before anything changes:
+   - A snapshot is taken. If it differs from the one taken when the restore began, and an external event happened since, the restore is refused unless it has `discard_user_changes: true`. The change is reported.
+   - If `locked()`, because a run, jog or probe started, it is refused: "The machine is running; the job cannot change until it stops."
+
+   Then it commits, through a new `App::job_replaced(doc, mesh)`, which `replace_document` also uses from now on, so the two cannot drift. In order:
    1. Every piece of derived state is cleared, and the epochs of outstanding work are moved on, so a late result for the old state is dropped:
       - the simulation, playback position and replay;
       - the audit report;
@@ -266,6 +286,7 @@ It is stored in the session folder (headless) or in memory (live, at most 20).
 - A late generation result for B is dropped.
 - After a reimport between checkpoint and restore, the picks and the rendered part are A's.
 - A restore whose model file was deleted or changed is refused, with the document, mesh and revision unchanged.
+- With a slow candidate load: a user tool-draft edit during the load refuses the restore and keeps the edit; a simulated run started during the load refuses it too.
 
 ## Commands
 
@@ -548,3 +569,10 @@ Four milestones, each with its own Linear issue and PR.
    - restore validates the model on a candidate before it commits, and clears all derived state through one `job_replaced`;
    - saved state is compared as serialized values;
    - library saves are checked against shared normalising functions.
+4. **gpt-6.1-sol, REJECT.** All five findings were taken:
+   - **Progress guard:** commands that replace the project are exempt, but refused over unsaved records unless confirmed. Other commands are guarded per surviving setup, and nothing is reverted when the machinist acted during the window.
+   - **Restore:** it checks for user changes and `locked()` again in the turn that commits.
+   - **Who made a change:**
+     - external events are recorded where they happen, including queued controller results applied on `Tick`, not inferred from message classes;
+     - ownership windows last until the agent's work has settled, through `still_running`, reads and reconnects.
+   - **Snapshots:** always full; there is no incremental fallback.
