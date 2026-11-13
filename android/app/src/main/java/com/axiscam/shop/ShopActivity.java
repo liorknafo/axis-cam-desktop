@@ -1,7 +1,10 @@
 package com.axiscam.shop;
 
+import android.Manifest;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.WindowManager;
@@ -17,7 +20,26 @@ public class ShopActivity extends IcedActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        // The notification that says the link stays up (KeepLink). Refused, the link still stays up, unseen.
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[] {Manifest.permission.POST_NOTIFICATIONS}, 0);
+        }
         receive(getIntent());
+    }
+
+    /** Started from here, in front: Android lets no app start one from the background. Again on each return costs nothing. */
+    @Override
+    protected void onResume() {
+        super.onResume();
+        startForegroundService(new Intent(this, KeepLink.class));
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (isFinishing()) {
+            stopService(new Intent(this, KeepLink.class));
+        }
+        super.onDestroy();
     }
 
     @Override

@@ -3,6 +3,13 @@
 
     <!-- The Pi at the machine, over the network (uc100-remote, TCP 7110). -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- KeepLink (LIO-462): the link to the Pi stays up while the owner is in another app.
+         CHANGE_NETWORK_STATE is what Android asks of a "connected device" service on the network. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:allowBackup="false"
@@ -33,6 +40,13 @@
 
             <meta-data android:name="android.app.lib_name" android:value="axis_shop" />
         </activity>
+
+        <!-- stopWithTask: swiping AXIS Shop away from Recents ends the link too. -->
+        <service
+            android:name=".KeepLink"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice"
+            android:stopWithTask="true" />
     </application>
 
 </manifest>
