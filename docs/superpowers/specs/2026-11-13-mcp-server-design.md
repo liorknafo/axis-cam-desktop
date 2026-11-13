@@ -212,7 +212,10 @@ The guide's saved place (`Document::guide`), the measurements (`Document::measur
 Read-only tools work on an owned **`JobSnapshot`**: a clone of the `Document`, the `Arc` of the mesh, the selection and the revision.
 - It is `Send`, which a compile-time assertion checks. `App` itself is not `Send` on macOS, because the controller's `ActivityToken` is held in it, and it never leaves the thread that owns it.
 - In the window, the costly reads (`check_job`, `check_holding`, `part_report`, `view_model`, and `list_surfaces` on a large part) take a snapshot on the UI thread and run on it in a `Task`.
-- A result whose revision is no longer current says so (`"stale": true`).
+- **Freshness is checked by fingerprint, not by revision.** A revision moves only at an ownership window's edges, so it can stay the same while an agent's work is still settling.
+  - A read takes the work-state fingerprint when it takes its snapshot, and again when its result is ready, both on the `App`'s thread. This does not touch the change log or the windows.
+  - If the two differ, the result says `"stale": true` and what changed. `check_job` is then refused as stale rather than returned.
+  - Test: `generate_all` returns `still_running`; `check_job` starts; the user changes a clamp position; the check returns while the window is still open, and it is refused as stale.
 
 ### Outcomes
 
@@ -249,6 +252,12 @@ The status line alone does not tell whether a command worked. Each registry entr
 Tests cover a failed save (path not writable), an invalid library draft, a selection that does not exist, a generation error, and a refused click (a sample-only command on an imported part).
 
 ### Checkpoints
+
+A checkpoint belongs to one project: the project the app had when it was taken.
+- Its **project identity** is a new `Document::project_id`, a UUID given to a project when it is created and kept in its file. Old files get one when they load.
+- `restore_checkpoint` is refused if the change log has a project replacement after the checkpoint (`new_project`, `open_sample`, `open_project`, `resume_project`, `recover_previous_project`, the user's own New or Open), or if the current `project_id` is not the checkpoint's: "This checkpoint belongs to another project (<title>). Open that project first."
+- So a restore always keeps the **current** project's step and measurement records, and those are the same project's.
+- Test: save A with guide step 7 and a measurement, checkpoint, `new_project`, restore. The restore is refused, and the new project is unchanged. Open A again (a project replacement), and the restore is still refused. Take a new checkpoint to go back within it.
 
 A checkpoint holds:
 - the work state: the `Document`, every tracked draft, and the project file path;
@@ -455,7 +464,7 @@ The top bar's AI entry becomes **Agents**. The page has:
 `check_job` runs the plan checks (`plan_check::run`) on the job the user sees, with nothing filled in:
 - A new flag tells `run` to leave a setup without clamp or vise placements as it is. It then reports the missing placement as a problem: "Setup 2 has no clamp positions: use suggest_layout or set_clamps". Today `run` fills such placements even with `planned = false`, and so the check passed on clamps that did not exist (found by the review's probe).
 - Chuck grip and stickout are never filled in either.
-- The result carries the revision it was checked at. If the job changes while it runs, it is refused as stale.
+- The result carries the revision and the fingerprint it was checked at. If the job changes while it runs, by anyone and whether or not a window is open, it is refused as stale (see the freshness rule under *Tools*).
 
 Suggestions are applied only by `suggest_layout`, which is the user's own command.
 
@@ -576,3 +585,6 @@ Four milestones, each with its own Linear issue and PR.
      - external events are recorded where they happen, including queued controller results applied on `Tick`, not inferred from message classes;
      - ownership windows last until the agent's work has settled, through `still_running`, reads and reconnects.
    - **Snapshots:** always full; there is no incremental fallback.
+5. **gpt-6.1-sol, REJECT.** Both findings were taken:
+   - checkpoints belong to one project (`project_id`), and a restore across a project replacement is refused;
+   - reads check freshness by fingerprint at their start and their end, independent of ownership windows.
