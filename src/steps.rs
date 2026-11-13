@@ -6093,8 +6093,9 @@ pub(crate) mod tests {
         assert_eq!(halving(75., 147.), "½ + 1.5");
     }
     /// The Zero pages after an earlier setup cut a notch in the +X face's
-    /// top, and cut that face back 3 mm (touches not either side of the
-    /// zero alike), at 1440 × 1000 and 1024 × 700, into `AXIS_RENDER_DIR`.
+    /// top, cut that face back 3 mm (touches not either side of the zero
+    /// alike) or skimmed it 0.1 mm, at 1440 × 1000 and 1024 × 700, into
+    /// `AXIS_RENDER_DIR`.
     #[test]
     #[ignore]
     fn render_the_zero_after_earlier_cuts() {
@@ -6104,6 +6105,7 @@ pub(crate) mod tests {
             ("notch", [67., 80., -10., 10., 0., -12.]),
             ("cut-back-plus", [67., 80., -50., 50., 0., -16.]),
             ("cut-back-minus", [-80., -67., -50., 50., 0., -16.]),
+            ("skim-plus", [69.9, 80., -50., 50., 0., -16.]),
         ] {
             let (mut doc, mesh) = crate::guide::tests::after_a_cut(cut);
             doc.file = Some(crate::model::ModelFile {

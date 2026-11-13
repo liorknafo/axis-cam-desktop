@@ -1470,6 +1470,21 @@ fn contact(
         }
         (at, last - first < width / 2.)
     };
+    // How far in from the box's face the material is at `a` across it and
+    // height `z`, to 0.01 mm: between `out` (none, or the face) and
+    // `inside` (material), so that a face an earlier cut skimmed back by
+    // less than the samples' depth is touched where it now is (LIO-451).
+    let face = |mut out: f32, mut inside: f32, a: f32, z: f32| {
+        while inside - out > 0.005 {
+            let mid = (out + inside) / 2.;
+            if has(mid, a, z) {
+                inside = mid;
+            } else {
+                out = mid;
+            }
+        }
+        (inside * 100.).round() / 100.
+    };
     // The heights tried, top first, none in the jaws: the top, then a
     // whole number of millimetres under it.
     let pitch = (height / ROWS).ceil().max(1.);
@@ -1486,6 +1501,7 @@ fn contact(
         let round;
         if n == 0 {
             (at[o], round) = met(&found, &|a| has(IN, a, z));
+            at[k] = edge + inward * face(0., IN, at[o], z);
             return Some((at, round));
         }
         let lower = z - UNDER;
@@ -1500,6 +1516,7 @@ fn contact(
             (lower, below)
         };
         (at[o], round) = met(&found, &|a| has(IN, a, z));
+        at[k] = edge + inward * face(0., IN, at[o], z);
         at[2] = z;
         return Some((at, round));
     }
@@ -1524,16 +1541,7 @@ fn contact(
             .collect();
         let round;
         (at[o], round) = met(&lines, &|a| has(nearest, a, z));
-        let (mut out, mut inside) = ((nearest - STEP).max(0.), nearest);
-        while inside - out > 0.005 {
-            let mid = (out + inside) / 2.;
-            if has(mid, at[o], z) {
-                inside = mid;
-            } else {
-                out = mid;
-            }
-        }
-        at[k] = edge + inward * (inside * 100.).round() / 100.;
+        at[k] = edge + inward * face((nearest - STEP).max(0.), nearest, at[o], z);
         if n > 0 {
             at[2] = z;
         }
@@ -4246,6 +4254,59 @@ pub(crate) mod tests {
             close(touch[0], set);
             // The DRO reads 0 at the zero with the faces where touched.
             close(dro_at_zero(zero, 0, [near, far_x]), 0.);
+        }
+    }
+    #[test]
+    fn a_face_an_earlier_cut_skimmed_less_than_the_samples_depth_is_touched_where_it_is() {
+        // Each of the four faces skimmed 0.1 mm for 16 mm down by the
+        // earlier setup: the finder touches it 0.1 in, the DRO reads 0.1
+        // less, and the + face is set to half less or plus 0.05, so that
+        // 0 stays on the plan's zero, where the later steps count from.
+        // 3 mm of stock on every side of the part, so that a skim misses it.
+        let margined = |(mut doc, mesh): (Document, Mesh)| {
+            for setup in &mut doc.setups {
+                for side in ["stock_front", "stock_back"] {
+                    setup.p.insert(side.into(), "3".into());
+                }
+            }
+            (doc, mesh)
+        };
+        let (doc, mesh) = margined(after_a_cut([67., 80., -10., 10., 0., -12.]));
+        let guide = build(&doc, &mesh, 1).unwrap();
+        let Step::Hold { stock, .. } = &guide.steps[0] else {
+            panic!()
+        };
+        let (half_x, half_y) = (stock.max[0], stock.max[1]);
+        for (k, plus) in [(0, true), (0, false), (1, true), (1, false)] {
+            let half = [half_x, half_y][k];
+            let mut cut = [-80., 80., -60., 60., 0., -16.];
+            let (lo, hi) = (2 * k, 2 * k + 1);
+            if plus {
+                cut[lo] = half - 0.1;
+            } else {
+                cut[hi] = -half + 0.1;
+            }
+            let (doc, mesh) = margined(after_a_cut(cut));
+            let guide = build(&doc, &mesh, 1).unwrap();
+            let zero = &guide.steps[1];
+            let Step::Zero { at, far, touch, .. } = zero else {
+                panic!("{zero:?}")
+            };
+            let f = far[k].unwrap();
+            let faces = if plus {
+                [-half, half - 0.1]
+            } else {
+                [-half + 0.1, half]
+            };
+            let said = format!("axis {k} plus {plus}: {zero:?}");
+            assert!((at[k][k] - faces[0]).abs() < 0.006, "{said}");
+            assert!((f.at[k] - faces[1]).abs() < 0.006, "{said}");
+            assert!((f.reads - (2. * half - 0.1 + 10.)).abs() < 0.011, "{said}");
+            let off = touch[k] - f.reads / 2.;
+            let want = if plus { -0.05 } else { 0.05 };
+            assert!((off - want).abs() < 0.006, "{said}");
+            // The DRO reads 0 at the zero with the faces where they are.
+            assert!(dro_at_zero(zero, k, faces).abs() < 0.006, "{said}");
         }
     }
     /// What a DRO shows at the work zero after the Zero step's touches on
