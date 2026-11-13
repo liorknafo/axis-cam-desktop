@@ -32,7 +32,11 @@ MCP client ──stdio──▶ axis-cam --mcp ──loopback TCP + token──�
   - It is written by hand on `serde_json`, because only these few methods are needed.
   - The stdio reader runs on its own thread, so a `cancel` or `estop` is read while another call is still working.
 - Every call is carried out by one **engine**, `mcp::Engine`, against an `App`. It is the same code for the live window's `App` and a headless one.
-- Requests are serialized per `App`. Only one mutating command runs at a time. Read-only tools and the stop commands go ahead of a waiting mutation.
+- **One writing agent per window.** The first MCP session to send a mutating command holds the window's **write lease** until it disconnects; one headless session has only one client anyway.
+  - Other sessions connected to the same window may read and stop the machine. Their mutations are refused: "Another agent is working in this window (<client name>, since <time>)."
+  - The Agents page shows who holds the lease and can take it back.
+  - When the lease changes hands, the checkpoints of the previous holder are dropped, so one agent can never restore over another's work.
+- **One mutation at a time.** Mutations are never queued. A mutating command that arrives while an earlier one's work has not settled is refused at once with outcome `busy`: "Nothing was done; the previous command (<name>, <command_id>) is still running. Call wait, then retry." Read-only tools and the stop commands always go ahead.
 
 ### Instance discovery
 
@@ -76,7 +80,12 @@ A headless session is kept on disk, so a client crash or restart does not lose t
   It is written atomically together with the `Document`, before the result of each command that changed anything is sent. Whatever a result reported is on disk.
 - **One process at a time.** A session folder holds a lock file, `lock`, created exclusively, with the owner's pid and start time. A second `resume_session` of the same id is refused while the owner is alive: "Session <id> is open in another MCP server (pid …)". A lock whose pid is dead is taken over.
 - **Reporting.** `inspect` and every result report the session id, its folder, whether the job is saved to a project file, and the paths of the last saves and exports.
-- **Resuming.** On stdin EOF the session is left on disk. `resume_session {id}` (or `--mcp --session <id>`) continues it. `list_sessions` lists them with their title and last change. Sessions untouched for 30 days are deleted at the next start.
+- **Resuming.** On stdin EOF the session is left on disk. `resume_session {id}` (or `--mcp --session <id>`) continues it. `list_sessions` lists them with their title, last change, whether the job is saved to a project file, and its size.
+- **Deleting.** Sessions are never deleted automatically, because a session may hold the only copy of a job. `delete_session {id}` deletes one.
+  - It is refused for a session that is open (its lock is held).
+  - It is refused for a session with work not saved to a project file, unless it is called with `discard_unsaved: true`.
+  - The Agents page lists the sessions with a Delete button that asks the same.
+  - Test: an unsaved job with an open tool draft survives a restart with the clock moved 31 days on.
 - **Loading.** Startup waits until the saved model is restored (`ModelRestored`) before the first command runs, so the part is loaded.
 
 **The headless runner.** The `App` lives on one dedicated thread, which loops over a channel of events:
@@ -101,7 +110,16 @@ Both backends wait until `App::pending()` is empty, so the window and the headle
 - a scrub catch-up or replay;
 - **edits not yet settled:** `dirty` and the edit pause (`EDIT_PAUSE`) not yet over. The work that a later `Tick` starts counts as pending before it has started.
 
-A command returns when nothing is pending, or after its `wait_s`, which defaults to 120 s and may be at most 600 s. If it runs out of time, its outcome is `still_running` with the pending list. `wait {}` waits again, and `cancel {}` cancels a generation.
+**Every tool call answers within a bounded time**, reads and batches included. That time is its `wait_s`: 25 s by default, at most 50 s. Clients time out on their own, Codex at 60 s by default, so the server answers before them.
+
+- **Long work.** When a call runs out of time, its outcome is `still_running`. Work that was dispatched gets a `command_id`. A costly read is the same: it keeps running and gets an id.
+- **Waiting.** `wait {command_id, wait_s?}` waits again. When the work has finished, it returns the command's final result: `done`, `failed` or `cancelled`, with the same fields as `execute`. Results are kept until the session ends, so a result whose client timed out can still be read.
+- **Batches.** A batch stops dispatching new steps once its time is up. Its result lists each step's outcome, steps after that point are "not run", and the step still working has its `command_id`.
+- **`still_running` means started.** It is used only for work that was dispatched. A command that never started is `busy` or `refused`, and its reason says nothing was done.
+- **`cancel {command_id}`** cancels a generation or a costly read, and its final result is `cancelled`.
+- **`initialize`** answers at once, even while a resumed session is still restoring its model. The first command then simply waits for that work.
+
+Tests use a deliberately slow generation, a slow `check_job` and a slow batch through the copied install commands with each client's default settings. Every call must answer before the client's timeout, and every `wait` must return the final result.
 
 In the window, a pending MCP request makes `Tick` run fast. The engine answers from the UI thread only once `pending()` is empty.
 
@@ -132,7 +150,7 @@ Every snapshot hashes everything, with no incremental shortcut: setups and opera
 ### Ownership windows
 
 - **An agent command owns a window.** It opens when the engine takes the "before" snapshot and dispatches the command's messages, in one UI-thread turn. It closes only when everything the command started has settled (`pending()` is empty), and then the "after" snapshot is taken.
-- **The window outlives the result.** If the command returns `still_running`, its window stays open: through `wait`, through read-only tools, and through a client reconnect. A new mutating command first waits, within its own `wait_s`, for the open window to close; if it does not, that command is `still_running` too and nothing of it is dispatched. Read-only tools never open or close a window.
+- **The window outlives the result.** If the command returns `still_running`, its window stays open: through `wait`, through read-only tools, and through a client reconnect. A new mutating command that arrives while the window is open is refused at once with outcome `busy`; nothing of it is dispatched. Read-only tools never open or close a window.
 - **Outside windows, no agent work runs.** So any difference found when a window opens, compared with the last window's close, is not the agent's. This also covers edits made while no agent was connected: the last snapshot is kept with the `App` across disconnects, and in `session.json` headless.
 
 ### External events
@@ -200,12 +218,14 @@ The guide's saved place (`Document::guide`), the measurements (`Document::measur
 | `list_surfaces {setup?}` | The part's surfaces with id, normal, centre, area and smooth region, and the part report's planes from that setup's orientation. For the built-in sample, its features instead (`model::FEATURES`). |
 | `part_report {}` | `analysis::report` for the part and setup 1. |
 | `check_job {}` | The plan checks on the job **exactly as it is** (below). |
-| `stock_after {setup}` / `check_holding {setup}` / `cutting_data {tool, op?}` / `surface_info {id}` | The planner tools, reading the live job. |
+| `stock_after {setup}` / `cutting_data {tool, op?}` / `surface_info {id}` | The planner tools, reading the live job. |
+| `check_holding {setup}` | The saved holder and placement of the setup, checked **as they are**. For a vise that is its offset, axis and grip; for clamps, their positions; for a lathe, its chuck, grip and stickout. Nothing is substituted. Today's planner tool puts a suggested placement in when the saved one is not usable: the review's probe had a vise saved 10 000 mm off pass as `holds: true` on a 0 mm suggestion. A missing or invalid placement is reported as such. Suggestions come only from `suggest_layout`, which changes the job the user can see. Tests: that misplaced vise fails, a setup with no clamps fails, and a good placement passes, on a mill setup and a lathe setup. |
 | `view_model {view, …}` | `look::draw`, as an MCP image (PNG, base64). |
 | `screenshot {}` | Live: the window. Headless: refused, with a pointer to `view_model`. |
 | `checkpoint {name}` / `restore_checkpoint {name, discard_user_changes?}` / `list_checkpoints {}` | See *Checkpoints*. |
 | `machine_status {}` | See *Machine status*. |
-| `wait {wait_s?}` / `cancel {}` | See *Waiting for work*. |
+| `wait {command_id, wait_s?}` / `cancel {command_id}` | See *Waiting for work*. |
+| `list_sessions {}` / `delete_session {id, discard_unsaved?}` | See *Headless sessions*. |
 | `select_window {pid}` / `list_sessions {}` / `resume_session {id}` | Discovery. |
 | `guide {topic}` | The machining rules the planner's instructions held: stepdowns, cutter choice, holding, chip load and minimum rpm. |
 
@@ -222,7 +242,8 @@ Read-only tools work on an owned **`JobSnapshot`**: a clone of the `Document`, t
 Every `execute` result:
 
 ```
-{ "outcome": "done" | "no_change" | "refused" | "failed" | "still_running" | "conflict",
+{ "outcome": "done" | "no_change" | "refused" | "busy" | "failed" | "still_running" | "cancelled" | "conflict",
+  "command_id": "…",                 // for still_running, and when wait returns the final result
   "reason": "…",                     // why, for anything but done
   "backend": "live" | "headless",
   "revision": 42,
@@ -347,7 +368,16 @@ The engine allows a command only if its class is `Command`. Every `Machine` vari
 
 The refusal reason reads: "This moves the machine or changes what its controller holds, so it is done in the app by the user." These rules are in place in M1, before the live bridge exists.
 
-While the app is `locked()`, which means a run, jog, probe or homing is in progress, mutating commands are refused with "The machine is running; the job cannot change until it stops." Read-only tools, `machine_status` and the four stop commands still work.
+While the app is `locked()`, which means a run, jog, probe or homing is in progress, mutating commands are refused with "The machine is running; the job cannot change until it stops." `machine_status`, the four stop commands, and the **light** reads still work.
+
+**Light and heavy reads.** The app keeps generation and simulation away from the motion driver while it runs. `App::planning_busy()` refuses Cycle Start while such work is under way, and the work is not started while the machine moves (`main.rs` ~3332). Reads that compute toolpaths or stock follow the same rule.
+- **Heavy reads:** `check_job`, `check_holding`, `stock_after`, and `view_model`'s views of the stock after an operation. While the machine is `locked()`, they are refused with "The machine is running; this check simulates toolpaths, so it waits until the run stops."
+- **Counting heavy work.** Every heavy read's worker is counted in `planning_busy()` from when it starts until its thread has actually finished. It is not released when the read is cancelled, timed out or its client disconnects, as the planner's `plan_busy` does today. M4 keeps this count when the planner goes.
+- **Light reads:** everything else, which reads state or draws the part only. They run at any time.
+- **Tests:**
+  - a heavy read started before Cycle Start makes Cycle Start wait, and that holds after the read is cancelled while its worker still runs;
+  - a heavy read asked for during a run is refused;
+  - `inspect` and `machine_status` answer during a run.
 
 ### Machine status
 
@@ -407,7 +437,12 @@ Arguments are JSON. Values that were `&'static str` in a message are enums in th
   - `thread_from_part`, `box_from_face`, `pick_all_corners`.
 - **Fields:** `edit_field`, and `undo_last_edit` (`PutBackEdit`).
 - **Picks:**
-  - `pick_surfaces {ids}` (it turns picking on when it is off), `pick_features {ids}` (the sample's features, `Feature`), `drop_hole {index}`, `clear_picks`;
+  - `pick_surfaces {ids, mode: add|remove|replace}`, `pick_features {ids, mode}` (the sample's features, `Feature`), `drop_hole {index}`, `clear_picks`;
+    - A click on a surface toggles a whole **group**: a smooth region, a hole's walls, or a corner's faces, as the operation's strategy groups them. Two ids from one corner sent one by one therefore pick it and then drop it (found by the review's probe).
+    - So the grouping moves into a pure function, `picks::group_of(op, mesh, id)`, which the click handler also uses. The engine turns the ids into their groups, each once. `add` sends one click for each group not yet picked, `remove` one for each group that is picked, and `replace` clears first, then adds.
+    - The result returns the operation's picks afterwards, as ids grouped as the app groups them, with the mesh fingerprint they belong to.
+    - Picking is turned on when it is off, and set back afterwards.
+    - Tests: several ids from one corner, one hole and one region in one call; the same `add` sent twice (`no_change`); `remove` of an id whose group was not picked (`no_change`).
   - `pick_pin_holes {ids}`, `clear_pin_holes`, `place_pins {x, y}`.
 - **Generate:** `generate`, `generate_all`, `cancel_generation`.
 - **Libraries:**
@@ -548,7 +583,10 @@ Four milestones, each with its own Linear issue and PR.
   - hold, stop and E-stop act on a running simulated job and report what they observed;
   - while the job runs, a planning command is refused and `machine_status` answers.
 - **Removal:** a release build, `cargo tree` without `reqwest` or `jsonwebtoken`, an old `settings.json` opens, and both credential stores are cleared.
-- **Live check:** Claude Code with the server added builds a two-setup job for the STEP fixture in the open window from a one-line request, and its G-code passes the NC review page.
+- **Packaged builds, before M4 removes the planner.** On the packaged macOS app (`/Applications/AXIS CAM Studio.app/Contents/MacOS/axis-cam`) and the packaged Windows `.exe`, each with Claude Code and with Codex added through the commands the Agents page copies, the agent:
+  - builds a two-setup job for the STEP fixture, live in the open window and headless, and its G-code passes the NC review page;
+  - works on the built-in sample, picking features;
+  - browses a manual mill setup's steps without moving the machinist's place.
 
 ## Review history
 
@@ -589,3 +627,12 @@ Four milestones, each with its own Linear issue and PR.
    - checkpoints belong to one project (`project_id`), and a restore across a project replacement is refused;
    - reads check freshness by fingerprint at their start and their end, independent of ownership windows.
 6. **gpt-6.1-sol, ACCEPT.** Its one minor point was taken: the refusal of a cross-project restore now says the checkpoint can no longer be restored, instead of "open that project first".
+7. **gpt-6-astra, REJECT.** All seven findings were taken, and its suggested cuts were made:
+   - **Heavy reads** are refused during a run and counted in `planning_busy()` until their workers finish.
+   - **`check_holding`** checks the saved placement, with nothing substituted.
+   - **Sessions** are never deleted automatically.
+   - **Bounded answers:** every call answers within at most 50 s, under Codex's 60 s default, with `command_id`s and a `wait` that returns final results.
+   - **Picking** works on whole groups, with `add`, `remove` and `replace`.
+   - **`busy`** replaces a queued mutation, and `still_running` means only dispatched work.
+   - **One writing agent per window,** with checkpoints dropped when the lease changes.
+   - **Packaged-build checks** on both clients and both platforms before M4.
