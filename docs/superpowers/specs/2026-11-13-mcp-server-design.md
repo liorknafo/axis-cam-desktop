@@ -107,28 +107,69 @@ In the window, a pending MCP request makes `Tick` run fast. The engine answers f
 
 ## Identity, revisions and concurrency
 
-- **What is tracked.** The engine tracks the **work state**: the `Document` (job and libraries), the open library drafts, the project file path, and the loaded model's fingerprint.
-- **When a change is recorded.** It is not hooked to `touch()`. Some changes never call `touch()`: `NewProject`, opening a project (`replace_document`), and the library-draft edits and their undo. Instead, `App::update` itself:
-  - computes a cheap fingerprint of the work state before and after every message that is not `Internal` and not a view-only command;
-  - does the same after every async completion that applies a result to the job (`Generated`, `GeneratedLayout`, `FileImported`, `ProjectOpened`, `ModelRestored`, `ModelReimported`, `Saved`).
+### The work state and its snapshots
 
-  The fingerprint is a hash of the serialized `Document` and drafts, the project path and the mesh fingerprint. It is computed only while an agent is connected, so the window costs nothing otherwise.
-- **The change log.** When the fingerprint changes, `revision: u64` goes up by one, and an entry is appended to a change log: the revision, its **source**, and what changed (project replaced, setup or operation by id added, removed or edited, draft edited, model changed). The source is one of two:
-  - `agent`: a message the engine dispatched;
-  - `user`: a message the window's own events sent.
+The **work state** is everything the user could lose or see change:
+- the `Document`: job, libraries, the guide's saved place, measurements;
+- every editable draft: `machine_draft`, `tool_draft`, `material_draft`, `holder_draft`, `clamps_draft` and `guide_typed`;
+- the project file path;
+- the loaded model's fingerprint.
 
-  The completion of async work has the source of the message that started it, matched by its epoch. A layout started by the user's holding edit is `user`; a generation the agent started is `agent`.
+`profile_draft` and `pi_code` are the controller's and are not tracked, because the agent cannot touch them.
 
-  Revisions only ever go up, a checkpoint restore included.
-- **Addressing.** Commands address setups and operations by their stable `id` (`"setup": "<id>"`). An index is accepted too and turned into the id when the request arrives. A command that acts on "the selected" operation first selects it by id in the same UI-thread turn. The window handles one message at a time, so a user's click cannot land between selecting and acting.
-- **The user's changes.** The engine keeps the last revision it has reported to the agent. Every result lists the change log's `user` entries since then, even ones made **while** the agent's command was waiting to settle (for example, an edit during a generation). The agent always learns about the user's work, and a wait cannot absorb it.
-- **Async results.** When a completion arrives for work an agent command started, it is applied only if its epoch is still current. This is the app's own rule today for generations; it is extended to the layout, import and export results. The command's expected effect is then checked on the state as it actually is. If a user change landed in between, the outcome is still checked honestly, and the user's entries are listed.
-- **Conflict check.** A mutating call may pass `if_revision`. If any change (from anyone) landed since then, the call is refused with outcome `conflict` and the entries.
-- **Checkpoints and the user's edits.** `restore_checkpoint` is refused when the change log has `user` entries after the checkpoint, unless it is called with `discard_user_changes: true`. In the window, that also asks the user in a dialog, which they can decline.
-- **Tests:**
-  - a user tool-draft edit, `NewProject`, and opening a project whose setups keep the same ids are each reported to the agent;
-  - a user edit during an agent's `generate_all` is listed in that command's result;
-  - a stale generation result is not applied after a user edit.
+A unit test lists the fields of `App`. Each must be named in `mcp::WORK_STATE` or in `mcp::NOT_WORK_STATE` with a reason, so a new draft cannot be missed.
+
+A **snapshot** of the work state is a hash of its saved serialization, written straight into the hasher with no string built. Next to the hash it keeps a per-item hash for each setup, operation, library entry and draft, so the change log can say what changed.
+
+Snapshots are taken only at **agent boundaries**, never per message:
+1. when a request arrives, before anything is dispatched;
+2. right after the engine has dispatched a command's messages, in the same UI-thread turn, so no user event is in between;
+3. when the command has settled.
+
+The UI thread therefore pays for a few snapshots per agent command, and nothing while no agent is working. Every write path is covered by comparison, whatever made it: `Tick` writing pin references or rotary measurements, `Guide(Built)`, a draft keystroke, `NewProject`.
+
+**Budget, checked by a release-build benchmark (`cargo test --release -- --ignored mcp_snapshot_bench`, run before each MCP milestone's PR):**
+- a snapshot of a 1 MB project takes at most 15 ms;
+- one at the 20 MB project limit takes at most 250 ms.
+
+If the limit project is over budget, the per-item hashes are kept from the last snapshot and recomputed only for items whose `version` or `id` set changed. The benchmark decides; this is not done up front.
+
+### Revisions and sources
+
+- **Revision.** `revision: u64` goes up by one each time a snapshot differs from the one before it. It never goes down; a checkpoint restore also goes up. Each step appends a change-log entry with the revision, its source, and the items that differ.
+- **The source of a change:**
+  - Between boundary 2 and boundary 3, the change is the agent's, unless a user event arrived in that time. The window counts every non-`Internal` message it did not get from the engine.
+  - If user events did arrive, the entry is `mixed`, and the result names those user actions by their command name, for example "user: edit_field operation feed".
+  - A difference found at boundary 1 (since the agent's last boundary 3) is the `user`'s. This includes changes made while no agent was connected, and the machine's own writes through `Tick`.
+- **Disconnects.** The last snapshot stays with the `App` when the client disconnects, in memory in the window and in `session.json` headless. The next request compares against it at boundary 1, so edits made between agents are seen before any mutation or restore is accepted.
+- **Addressing.** Commands address setups and operations by their stable `id`. An index is accepted and turned into the id when the request arrives. A command that acts on "the selected" operation selects it by id in the same UI-thread turn that acts.
+- **Reporting.** Every result lists the `user` and `mixed` entries since the revision last reported to the agent. A wait cannot absorb the user's work: their edits during an agent's `generate_all` make that command's entry `mixed`, and the result says so.
+- **Async results.** A completion for work an agent command started is applied only if its epoch is still current. That is the app's rule for generations today, and it is extended to the layout, import and export results. The expected effect is then checked on the state as it actually is.
+- **Conflict check.** A mutating call may pass `if_revision`. If the revision moved, the call is refused with outcome `conflict` and the entries. Boundary 1 runs first, so a user change made since the last request counts.
+- **Checkpoints and the user's edits.** `restore_checkpoint` is refused when a `user` or `mixed` entry follows the checkpoint, unless it is called with `discard_user_changes: true`. In the window, that also asks the user in a dialog, which they can decline.
+
+### Shop-floor state is protected
+
+The guide's saved place (`Document::guide`), the measurements (`Document::measured`) and the cross-slide dial readings belong to the machinist.
+
+- The engine keeps them out of every agent command. It compares them before and after.
+- If a command changed them, it puts them back as they were, and the outcome is `failed` with "This would have changed the machinist's progress". A test checks that no allowed command ever triggers this.
+- So an app path the boundary missed (as `Open` → `enter_steps` → `guide_to` was) cannot reach the shop floor.
+
+### Tests
+
+- Each of these is reported to the agent, with the source that made it:
+  - a user tool-draft edit;
+  - a half-typed clamp positions field;
+  - `NewProject`;
+  - opening a project whose setups keep the same ids;
+  - a pin reference recorded through `Tick`;
+  - an edit made while no agent was connected.
+- A user edit during an agent's `generate_all` makes its result `mixed` and names the edit.
+- A stale generation result is not applied after a user edit.
+- An `if_revision` older than a user change gets `conflict`.
+- The `App` field test fails when a field is in neither list.
+- The release benchmark meets its budget on a 20 MB project.
 
 ## Tools
 
@@ -179,7 +220,12 @@ The status line alone does not tell whether a command worked. Each registry entr
 - **A precondition**, checked before any message is sent: the setup or operation exists, it is the right kind (a lathe setup for `add_turn`), a draft is open, the app is not locked by a run. If it fails, the outcome is `refused`, with a sentence that says what is missing.
 - **An expected effect**, checked after the app has settled. If it holds, the outcome is `done`. If nothing changed and nothing was asked to change, `no_change`. Otherwise `failed`, and the reason is the status line if the command changed it, else a sentence for the command. Examples of expected effects:
   - `add_operation`: one more operation in the setup, now selected.
-  - `save_tool`: the library holds a tool with the draft's id whose contents equal the draft's. The editor stays open, as it does for the user. If it already held exactly that, the outcome is `no_change`. The same applies to `save_machine`, `save_material` and `save_holder`.
+  - `save_tool`, `save_material`, `save_holder` and `save_machine`. A library save changes the draft on its way into the library. Material and holder names are trimmed. A machine save settles a hand machine (`manual::settle`), adds one to `version` when the machine already exists, and drops the centre-line marks (`CENTRE_MARK`, `CENTRE_REF`) when `a_centre_y` or `a_centre_z` changed. So these normalisations move out of the four handlers into pure functions, `Document::saved_tool`, `saved_material`, `saved_holder` and `saved_machine` (`(&self, draft) -> Result<Entry, Vec<String>>`), which the handlers call from now on.
+    - Before sending, the engine computes the expected entry with the same function. An `Err` is `refused`, with the issues.
+    - If the library already holds an entry equal to it, ignoring `version`, the save is not sent, and the outcome is `no_change`. A machine's version is then not raised for nothing.
+    - After sending, `done` means the library holds exactly the expected entry, and the editor stays open, as it does for the user.
+    - The connected machine's save, which also writes the controller's travel, is refused before any of this (see *The machine boundary*).
+    - Tests: a successful save of each kind, an unchanged save (`no_change`, version unchanged), an invalid draft (`refused`), and a machine save that drops the centre marks.
   - `save_project`: the file is written, and the project is not dirty.
   - `generate`: a simulation for the operation at this revision, or a `GenerationFailed` reason.
   - `select_operation`: the selection is that id.
@@ -189,24 +235,37 @@ Tests cover a failed save (path not writable), an invalid library draft, a selec
 ### Checkpoints
 
 A checkpoint holds:
-- the `Document`;
+- the work state: the `Document`, every tracked draft, and the project file path;
 - the selection, the page and the tab;
-- the open library drafts;
-- the project file path;
 - the model file it was taken with (`ModelFile`, with its fingerprint);
 - the revision it was taken at.
 
 It is stored in the session folder (headless) or in memory (live, at most 20).
 
-`App::restore_checkpoint` restores it as a new change, never by rewinding:
+`App::restore_checkpoint` validates first and commits once. A refused restore leaves the current document, mesh, drafts and revision exactly as they were.
 
-1. Outstanding work is cancelled, and its epochs are moved on, so a late generation, layout, mesh or check result for the old state is dropped. This covers the generation, layout, left stock, post check, run check, guide, part holes and meshes.
-2. The `Document`, drafts, selection, page, tab and project path are set back directly. It does not go through `replace_document`, which resets the drafts and the project file.
-3. **The model.** If the checkpoint's model fingerprint is not the loaded mesh's, the model is loaded again through the same path as opening a project (`restore_model`). It is pending until `ModelRestored`, so the picture, picks and checks are of the right part. If the model file on disk no longer matches the checkpoint's fingerprint, the restore is refused: "The model file changed since the checkpoint; restoring it would put picks on a different part."
-4. **Saved or not** is worked out again, never restored. The project is saved only if the project file on disk holds exactly the restored `Document`; otherwise it is dirty.
-5. The revision goes up by one (source `agent`, "checkpoint restored"). An `if_revision` from before the restore is therefore stale.
+1. **Validate, changing nothing.**
+   - If the checkpoint's model fingerprint is not the loaded mesh's, the model file is loaded into a **candidate** mesh off the UI thread (`mesh::load`, as `restore_model` does, but not into `imported_mesh`). If the file is missing or unreadable, or its fingerprint is not the checkpoint's, the restore is refused, for example: "The model file changed since the checkpoint; restoring it would put picks on a different part." The current mesh is never cleared first. Today's `restore_model` clears it before its load.
+2. **Commit, in one UI-thread turn.** It goes through a new `App::job_replaced(doc, mesh)`, which `replace_document` also uses from now on, so the two cannot drift. In order:
+   1. Every piece of derived state is cleared, and the epochs of outstanding work are moved on, so a late result for the old state is dropped:
+      - the simulation, playback position and replay;
+      - the audit report;
+      - the post check (NC review) results;
+      - the left stock and holding checks;
+      - the run check and prepared run programs (marked stale, as an edit marks them);
+      - the guide build, part holes, start and stock meshes, and tooth load;
+      - the generation and layout.
+   2. The `Document` is set, but with the **current** guide place, measurements and dial readings, whatever the checkpoint holds (see *Shop-floor state is protected*). The drafts, selection, page, tab and project path are set, and the candidate mesh if there is one. Unlike `replace_document` today, the drafts and the path are not reset.
+   3. **Saved or not** is worked out after this, never restored. Both are compared as `serde_json::Value`: the restored `Document` as `storage::save` would serialize it, and the project file on disk loaded with `storage::load` and serialized the same way. If they are equal, the project is saved; otherwise it is dirty. With no project file, it is dirty.
+   4. The revision goes up by one (source `agent`, "checkpoint restored"). An `if_revision` from before the restore is therefore stale.
+3. The derived state is rebuilt as after opening a project, and the command waits for it (`pending()`).
 
-Tests: save A, checkpoint, edit and save B, restore. The result shows A with the project dirty, because the disk holds B. The restore has a new revision, and an old `if_revision` gets `conflict`. A late generation result for B is dropped. After a reimport between the checkpoint and the restore, the restored picks and the rendered part are A's.
+**Tests:**
+- Save A, checkpoint, edit and save B, restore. The result shows A dirty, because the disk holds B. It has a new revision, and an old `if_revision` gets `conflict`.
+- Checkpoint A, edit B on the same model and ids, run `generate_all` and the NC review, restore. No B simulation, audit row, NC result or run program is shown; A's are generated afresh.
+- A late generation result for B is dropped.
+- After a reimport between checkpoint and restore, the picks and the rendered part are A's.
+- A restore whose model file was deleted or changed is refused, with the document, mesh and revision unchanged.
 
 ## Commands
 
@@ -237,8 +296,10 @@ The engine allows a command only if its class is `Command`. Every `Machine` vari
   - every `setup::Msg`, which is the UC100 profile editor, including Save and UseCalibration.
 - **Refused, the run:** every `run::Action` except `Hold`, `Stop`, and the two that only fold the Run panel's rows open or shut, `More` and `Steps` (`run_details`). That includes `Setup` (and so `RunOnMachine`), `Check`, `PickStep`, `Next`, `From`, `Skip`, `SkipSteps`, `StartStep`, `StopAfterStep`, `KeepZero`, `KeepToolZ`, `ClearSteps`, `CycleStart`, `Resume`, the reference probes and `CoolantOff`.
 - **The manual mill and lathe Steps (`GuideAction`), sorted by what each does:**
-  - **Allowed, navigation that records nothing.** `Fix(op, problem)` opens the operation or setup editor at the problem; it is the `steps_fix` command. `Open(setup)` shows a setup's steps; it is the `steps_open` command.
-  - **Allowed, browsing.** `inspect {what: "steps", setup, step?}` reads any step of a setup's guide: its text, readouts, holes and pictures. It works in both backends without going to the Control page, and without moving the place.
+  - **Allowed, navigation that records nothing.** `Fix(op, problem)` opens the operation or setup editor at the problem; it is the `steps_fix` command.
+  - **Refused, because it moves the place.** `Open(setup)` enters the steps at the selected operation (`enter_steps` → `apply_steps_entry` → `guide_to`). So does going to the Control page with a manual setup active. For the agent, `goto_page` refuses `Control`; it reads the machine with `machine_status` and the steps with `inspect`.
+  - **Allowed, browsing.** `inspect {what: "steps", setup, step?}` reads any step of a setup's guide: its text, readouts, holes and pictures. It has a cursor of its own: it builds the guide (`guide::build`) on a `JobSnapshot` off the UI thread and reads the step asked for. It never calls `guide_to` and never touches the `App`'s guide state. It works in both backends.
+    - Tests read a step with a cached guide and with one not yet built, with an earlier operation selected. `Document::guide` is unchanged afterwards.
   - **Refused, shop-floor progress.** `Next`, `Back`, `Go`, `Section`, `Resume` and `Reached` move the saved place (`guide_to` writes `Document::guide`). `Measured`, `Typed` and `CrossReads` record calipers and the dial. They are the machinist's record of what was done at the machine, so they stay human.
   - **Internal.** `Built` and `Beat`.
 - **Refused, library changes that reach the controller:**
@@ -299,7 +360,7 @@ Arguments are JSON. Values that were `&'static str` in a message are enums in th
   - `new_project`, `open_sample`, `resume_project`, `recover_previous_project`;
   - `open_project {path}`, `save_project {path?}`;
   - `set_project_title {title}`, `set_project_material {id}`;
-  - `goto_page {page}`. It cannot go to Control in the headless backend, where there is no machine.
+  - `goto_page {page}`, any page but Control (it would move the steps' place) and the planner's.
 - **Part:** `import_model {path}`, `reimport_model`, `dismiss_pick_note`.
 - **Setup:**
   - `select_setup`, `add_setup {machine?}`, `add_manual_setup`, `add_lathe_setup`;
@@ -331,7 +392,7 @@ Arguments are JSON. Values that were `&'static str` in a message are enums in th
   - playback: `play`, `scrub {at}` (it sends `ScrubDone` after, so the stock catches up), `playback_speed {x}`;
   - panels: `toggle_sidebar {side}`, `sidebar_width {side, px}`, `toggle_sim_details`, `toggle_warning_details`, `toggle_about`;
   - Control page: `control_tab {tab}`, `job_view {view}`.
-- **Review:** `open_audit_row {index}`, `open_issue {setup, operation, message}`, `steps_fix {setup, operation?, problem}`, `steps_open {setup}`, and `run_details {more?, steps?}` (the Run panel's fold-outs).
+- **Review:** `open_audit_row {index}`, `open_issue {setup, operation, message}`, `steps_fix {setup, operation?, problem}`, and `run_details {more?, steps?}` (the Run panel's fold-outs).
 - **Export:**
   - `export_gcode {folder}`: `post::write_job`, then `GcodeExported`;
   - `export_setup_sheet {path}`;
@@ -480,3 +541,10 @@ Four milestones, each with its own Linear issue and PR.
    - `session.json` and a session lock;
    - a `Send` `JobSnapshot` and fields collected without layout on the `App`'s own thread;
    - the test-only `fixtures.rs` and the named assertions.
+3. **gpt-6.1-sol, REJECT.** All six findings were taken:
+   - `Open` and the Control page are refused, because they move the guide's place, and the steps are browsed with a cursor of their own;
+   - the machinist's state is protected by a before-and-after guard;
+   - work-state snapshots are taken only at agent boundaries, cover every draft (checked by a field test) and every write path, including `Tick` and disconnects, and have a release budget;
+   - restore validates the model on a candidate before it commits, and clears all derived state through one `job_replaced`;
+   - saved state is compared as serialized values;
+   - library saves are checked against shared normalising functions.
