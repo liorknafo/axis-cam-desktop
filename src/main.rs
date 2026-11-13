@@ -2326,6 +2326,9 @@ impl App {
             self.doc.sync_stock_sources();
         }
         self.travel_from_connected();
+        // A run picked in the old project must not start its programs
+        // (LIO-456): a job sent again keeps its setups' ids.
+        self.run_follows_project();
         // What was worked out for the old project is not even a last result
         // of this one (`stale_ready`, `ui::stock_picture`).
         self.ready = run::Ready::default();
@@ -3133,6 +3136,17 @@ impl App {
         };
         self.doc.sync_turns(mesh);
     }
+    /// A setup being run was checked as it was, and may have been moved
+    /// or, in a project opened since, be gone or changed. Its skips were for
+    /// that setup: it is checked again without them (`recheck_run`), and
+    /// Cycle Start waits for that check.
+    fn run_follows_project(&mut self) {
+        if let Some(run) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
+            run.stale = true;
+            run.follow(&self.doc);
+            run.unskip();
+        }
+    }
     fn touch(&mut self) {
         // A refused face's note belongs to the click before an edit (LIO-408).
         self.box_refused = None;
@@ -3191,13 +3205,7 @@ impl App {
             _ => {}
         }
         self.drop_plan();
-        // A setup being run was checked as it was, and may have been moved.
-        // Its skips were for that setup: it is checked again without them.
-        if let Some(run) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
-            run.stale = true;
-            run.follow(&self.doc);
-            run.unskip();
-        }
+        self.run_follows_project();
         self.dirty = true;
         self.project_dirty = true;
         self.last_edit = Instant::now();
@@ -9263,7 +9271,10 @@ impl App {
                     && inbox.exists()
                 {
                     let dir = self.state_path.parent().unwrap().to_path_buf();
-                    let opened = bundle::open(&inbox, &dir);
+                    let opened = bundle::open(&inbox, &dir).map(|(mut doc, path, notes)| {
+                        bundle::keep_connections(&mut doc, &self.doc);
+                        (doc, path, notes)
+                    });
                     let _ = std::fs::remove_file(&inbox);
                     return self.update(Message::ProjectOpened(Some(opened)));
                 }
@@ -10842,6 +10853,11 @@ fn computer_name() -> String {
     #[cfg(target_os = "macos")]
     if let Some(name) = run("scutil", &["--get", "ComputerName"]) {
         return name;
+    }
+    // Android's hostname is "localhost": the Mac would read "Watching:
+    // localhost controls the machine" (LIO-456).
+    if SHOP {
+        return "Shop tablet".into();
     }
     run("hostname", &[]).unwrap_or_else(|| "AXIS CAM".into())
 }
