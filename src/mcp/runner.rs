@@ -630,6 +630,82 @@ mod tests {
         runner.stop();
     }
 
+    /// Picks in a session: picking comes on, the part's holes for picking
+    /// are worked out off the thread, then the clicks are made; the tab and
+    /// picking are as they were, and the same picks again change nothing.
+    #[test]
+    fn a_session_picks_a_hole_by_two_of_its_walls() {
+        let dir = tempfile::tempdir().unwrap();
+        // `pocket::chamfered_hole` as an STL file, a Pocket of the sample's
+        // setup on it.
+        let mut text = String::from("solid hole\n");
+        for t in crate::pocket::chamfered_hole() {
+            text += "facet normal 0 0 0\nouter loop\n";
+            for p in t {
+                text += &format!("vertex {} {} {}\n", p[0], p[1], p[2]);
+            }
+            text += "endloop\nendfacet\n";
+        }
+        text += "endsolid hole\n";
+        let stl = dir.path().join("hole.stl");
+        std::fs::write(&stl, &text).unwrap();
+        let mut doc = Document::sample();
+        doc.adopt_materials();
+        doc.adopt_holders();
+        doc.sample_model = false;
+        doc.file = Some(crate::model::ModelFile {
+            name: "hole.stl".into(),
+            path: stl.clone(),
+            format: "stl".into(),
+            bytes: text.len() as u64,
+            thickness: None,
+        });
+        let s = &mut doc.setups[0];
+        s.operations.truncate(1);
+        s.operations[0] = crate::model::Operation::new(
+            crate::model::Strategy::Pocket,
+            s.operations[0].tool.clone(),
+        );
+        let user = dir.path().join("user").join("workspace.json");
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        crate::storage::save(&user, &doc).unwrap();
+        let session = Session::open(&dir.path().join("mcp-sessions"), None, &user).unwrap();
+        let runner = Runner::start(session);
+        let start = runner.call("inspect", json!({})).unwrap();
+        assert!(start["project"]["model"].is_object(), "{start}");
+        // The hole's walls as the session's part has them.
+        let mesh = crate::mesh::load(&stl).unwrap();
+        let holes = crate::pocket::part_holes(&doc.setups[0], &mesh);
+        let hole = holes.iter().find(|h| h.walls.len() == 24).unwrap();
+        let call = json!({
+            "command": "pick_surfaces",
+            "args": {"operation": 0, "ids": [hole.walls[0], hole.walls[9]], "mode": "add"},
+        });
+        let picked = runner.call("execute", call.clone()).unwrap();
+        assert_eq!(picked["outcome"], "done", "{picked}");
+        assert_eq!(
+            picked["picks"]["ids"].as_array().unwrap().len(),
+            24,
+            "{picked}"
+        );
+        assert_eq!(
+            picked["picks"]["holes"].as_array().unwrap().len(),
+            1,
+            "{picked}"
+        );
+        let clicks: Vec<&str> = (picked["clicks"].as_array().unwrap().iter())
+            .map(|c| c["did"].as_str().unwrap())
+            .collect();
+        assert_eq!(clicks, ["added", "already picked"], "{picked}");
+        assert_eq!(picked["pending"], json!([]), "{picked}");
+        let read = runner.call("inspect", json!({})).unwrap();
+        assert_eq!(read["selection"]["tab"], "Tool", "{read}");
+        let again = runner.call("execute", call).unwrap();
+        assert_eq!(again["outcome"], "no_change", "{again}");
+        assert_eq!(again["revision"], picked["revision"], "{again}");
+        runner.stop();
+    }
+
     /// The user's edit in the window while the agent's generation runs:
     /// the generation is dropped, and the agent is told the job changed by
     /// both, the edit named. Then an edit with no window open is the user's.

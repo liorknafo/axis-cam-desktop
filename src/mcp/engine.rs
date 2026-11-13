@@ -19,6 +19,7 @@
 //! not change the machinist's records unless the machinist did meanwhile.
 use super::commands::{self, Ctx, Expect, Problem};
 use super::fields;
+use super::pick;
 use super::state::{self, Change, Entry, Records};
 use crate::{App, Message};
 use iced::Task;
@@ -281,6 +282,12 @@ pub struct Report {
     pub status_problem: bool,
     pub selection: Selection,
     pub pending: Vec<&'static str>,
+    /// A pick command's picks afterwards, as the app lists them (`pick`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub picks: Option<Value>,
+    /// What each of a pick command's ids did.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub clicks: Vec<Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
 }
@@ -299,6 +306,8 @@ impl Report {
             status_problem: app.status_problem,
             selection: Selection::of(app),
             pending: b.pending(),
+            picks: None,
+            clicks: vec![],
             notes: vec![],
         }
     }
@@ -444,7 +453,11 @@ fn describe_command(args: &Value) -> Result<Value, String> {
         "requires": c.requires,
         "effect": c.effect,
         "while_machine_runs": c.while_locked,
-        "waits": "for the work it starts to settle (pending empty), up to wait_s",
+        "waits": if c.clicks_checked() {
+            "for picking to come on and the app to settle, then makes each click, checks what it did, and waits for the work they start to settle, up to wait_s"
+        } else {
+            "for the work it starts to settle (pending empty), up to wait_s"
+        },
         "allowed": true,
     }))
 }
@@ -486,6 +499,15 @@ struct Window {
     /// The machinist's records when it opened: None for a command that
     /// replaces the project, which brings its own.
     records: Option<Records>,
+    /// A pick command's clicks: due once picking is on and the app has
+    /// settled, then what they came to.
+    clicks: Option<Clicking>,
+}
+/// A pick command's clicks in its window.
+enum Clicking {
+    /// To make, and the view to set back after them.
+    Due(pick::Job, pick::View),
+    Made(pick::Done),
 }
 /// A call answered when a command's window closes, or when its time is up.
 struct Waiter {
@@ -645,7 +667,15 @@ impl Agent {
                 }
             }
         }
-        if settled && self.window.is_some() {
+        // A pick command's clicks are made once picking is on and the app
+        // has settled, as a user clicks; its window closes after them.
+        let due =
+            (self.window.as_ref()).is_some_and(|w| matches!(w.clicks, Some(Clicking::Due(..))));
+        if due {
+            if b.quiet() && b.app().pending().is_empty() {
+                self.click(b);
+            }
+        } else if settled && self.window.is_some() {
             self.close(b);
         }
         let now = Instant::now();
@@ -772,8 +802,11 @@ impl Agent {
             }
             Ok(Ok(prepared)) => prepared,
         };
-        // Nothing of a command is sent unless all of it may be.
-        if let Err(why) = commands::guard(&dispatch.messages) {
+        // Nothing of a command is sent unless all of it may be: its clicks
+        // too.
+        let clicked = dispatch.clicks.iter().flat_map(pick::Job::messages);
+        let all: Vec<Message> = dispatch.messages.iter().cloned().chain(clicked).collect();
+        if let Err(why) = commands::guard(&all) {
             return Start::Now(refuse(b, why.into()));
         }
         self.count += 1;
@@ -787,6 +820,11 @@ impl Agent {
         if let Some(task) = dispatch.task {
             b.run(task);
         }
+        // Picking on now; the clicks once the app has settled (`poll`).
+        let clicks = (dispatch.clicks).map(|job| {
+            let view = job.begin(b);
+            Clicking::Due(job, view)
+        });
         if !windowed {
             let report = Report::of(b, Outcome::Done, None).with_id(&id).json();
             self.results.insert(id, report.clone());
@@ -799,16 +837,34 @@ impl Agent {
             expect,
             cancelled: false,
             records,
+            clicks,
         });
         Start::Opened(id)
+    }
+
+    /// Makes the open window's pick clicks (`pick::Job::run`), each checked
+    /// and undone in full when it did not do what was asked; the window
+    /// closes once the work they started has settled.
+    fn click(&mut self, b: &mut impl Backend) {
+        let Some(w) = &mut self.window else {
+            return;
+        };
+        if let Some(Clicking::Due(job, view)) = w.clicks.take() {
+            w.clicks = Some(Clicking::Made(job.run(b, &view)));
+        }
     }
 
     /// Closes the window: the machinist's records guarded, the closing
     /// snapshot taken, its effect checked, its result kept and given to the
     /// calls waiting for it, and a batch's next step started.
     fn close(&mut self, b: &mut impl Backend) {
-        let Some(w) = self.window.take() else {
+        let Some(mut w) = self.window.take() else {
             return;
+        };
+        // A pick command's verdict is its clicks', each checked as made.
+        let made = match w.clicks.take() {
+            Some(Clicking::Made(done)) => Some(done),
+            Some(Clicking::Due(..)) | None => None,
         };
         // The machinist's records: put back when the agent's path changed
         // them, theirs when they worked meanwhile.
@@ -845,6 +901,12 @@ impl Agent {
                 Outcome::Cancelled,
                 Some("Cancelled at the agent's request.".to_string()),
             )
+        } else if let Some(done) = &made {
+            match &done.verdict {
+                Ok(None) => (Outcome::Done, None),
+                Ok(Some(why)) => (Outcome::NoChange, Some(why.clone())),
+                Err(why) => (Outcome::Failed, Some(why.clone())),
+            }
         } else {
             match w.expect.as_ref().map_or(Ok(None), |e| e(b.app())) {
                 Ok(None) => (Outcome::Done, None),
@@ -863,6 +925,10 @@ impl Agent {
             }
         };
         let mut report = Report::of(b, outcome, reason).with_id(&w.id);
+        if let Some(done) = made {
+            report.picks = Some(done.picks);
+            report.clicks = done.clicks;
+        }
         if let Some(entry) = entry {
             if !entry.events.is_empty() {
                 report.notes.push(format!(

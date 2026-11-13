@@ -10,12 +10,15 @@
 //! - `commands`: the commands `execute` runs.
 //! - `fields`: the editors' fields, which `list_fields` lists and
 //!   `edit_field` checks its key against.
+//! - `pick`: the picks made by clicks, each checked, and a click undone in
+//!   full.
 //! - `state`: the work state's snapshots, the revisions and their change
 //!   log, the external events, and the machinist's records.
 pub mod class;
 pub mod commands;
 pub mod engine;
 pub mod fields;
+pub mod pick;
 pub mod protocol;
 pub mod runner;
 pub mod state;

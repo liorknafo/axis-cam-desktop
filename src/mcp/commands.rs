@@ -11,6 +11,7 @@
 use super::{
     class::{self, Class},
     fields,
+    pick::{self, Mode},
 };
 use crate::{
     App, GuideAction, Message, Page, Target, control, model::Strategy, run, section, settings,
@@ -104,14 +105,18 @@ enum Build {
     /// what a file dialog's command does after the dialog (a load, a
     /// write), so the event loop keeps taking events meanwhile.
     Work(fn(&Ctx) -> Worked),
+    /// Clicks on the part, each checked for what it did (`pick`).
+    Clicks(fn(&Ctx) -> Result<pick::Job, Problem>),
 }
 
 /// A `Build::Work` builder's result: its messages and its work.
 type Worked = Result<(Vec<Message>, Task<Message>), Problem>;
-/// What a command sends: its messages in order, then its work.
+/// What a command sends: its messages in order, then its work, or its
+/// clicks.
 pub struct Dispatch {
     pub messages: Vec<Message>,
     pub task: Option<Task<Message>>,
+    pub clicks: Option<pick::Job>,
 }
 
 /// A command `execute` runs.
@@ -170,6 +175,15 @@ impl Command {
     fn work(mut self, f: fn(&Ctx) -> Worked) -> Self {
         self.build = Build::Work(f);
         self
+    }
+    fn clicks(mut self, f: fn(&Ctx) -> Result<pick::Job, Problem>) -> Self {
+        self.build = Build::Clicks(f);
+        self
+    }
+    /// Whether it clicks on the part, each click checked for what it did,
+    /// instead of an effect checked once its work has settled.
+    pub fn clicks_checked(&self) -> bool {
+        matches!(self.build, Build::Clicks(_))
     }
     fn help_of(mut self, m: fn() -> Message, label: &'static str) -> Self {
         self.help = Help::Of(m, label);
@@ -273,7 +287,7 @@ impl Command {
     /// What the builder makes, without the precondition.
     fn built(&self, ctx: &Ctx) -> Result<Dispatch, Problem> {
         let mut messages = select_first(self.on, ctx)?;
-        let mut task = None;
+        let (mut task, mut clicks) = (None, None);
         match &self.build {
             Build::Sends(m) => messages.push(m()),
             Build::With(f) => messages.extend(f(ctx)?),
@@ -282,8 +296,13 @@ impl Command {
                 messages.extend(more);
                 task = Some(work);
             }
+            Build::Clicks(f) => clicks = Some(f(ctx)?),
         }
-        Ok(Dispatch { messages, task })
+        Ok(Dispatch {
+            messages,
+            task,
+            clicks,
+        })
     }
     /// Its precondition: what must hold before anything is sent.
     pub fn check(&self, ctx: &Ctx) -> Result<(), Problem> {
@@ -739,12 +758,7 @@ fn names<T>(table: &[(&'static str, T)]) -> Vec<&'static str> {
 
 /// The commands that come with later steps of M1, which some messages are
 /// classified to already: `class` names them, and their tests wait.
-pub const LATER: [(&str, &str); 4] = [
-    ("pick_surfaces", "picking, Step 6"),
-    ("pick_features", "picking, Step 6"),
-    ("pick_pin_holes", "picking, Step 6"),
-    ("place_pins", "picking, Step 6"),
-];
+pub const LATER: [(&str, &str); 0] = [];
 
 /// The user's actions an agent may not run, by name, so `list_commands`
 /// shows them and says why.
@@ -1416,6 +1430,131 @@ fn table() -> Vec<Command> {
             .examples(|| vec![json!({"index": 0})])
             .with(|ctx| Ok(vec![Message::DropHole(index(ctx, "index")?)]))
             .effect("The hole is dropped from the Pocket or Contour."),
+        cmd("pick_surfaces", "picks")
+            .text("Picks the part's surfaces for an operation as clicks on the part do: one click per id, each checked for what it did. A click takes a whole group, as the operation groups faces: a hole's walls (Pocket, Adaptive clearing, Contour, Drill), a rounded corner (Round corners), a whole smooth face (Parallel, Waterline), or the one face. mode add (the default) skips an id already picked, and undoes in full a click that would drop a group already picked (two ids of one corner pick it once); remove drops each picked id's group; replace clears the picks, then adds. A Slot, a Box or a lathe cut takes one face, which fills its fields: send one id with mode replace (clear_picks clears it). Picking is turned on for the clicks and the tab put back after. The result's `picks` are the operation's picks afterwards (ids, the holes, corners or faces they make, the part's fingerprint) and `clicks` what each id did.")
+            .on_operation()
+            .params(|| vec![("ids", ids_param("The part's surface ids to click, in order."), true), ("mode", choice_param(&Mode::NAMES), false)])
+            .examples(|| vec![json!({"ids": [0], "mode": "add"})])
+            .when(|ctx| {
+                let (ids, mode) = (ids_arg(ctx)?, mode_arg(ctx)?);
+                let app = ctx.app;
+                let Some(o) = ctx.op() else {
+                    return refused("No operation is selected: give `operation`, or select one (select_operation).");
+                };
+                if app.is_sample() {
+                    return refused("The example project's part has features, not surfaces: pick them with pick_features.");
+                }
+                let Some(mesh) = app.imported_mesh.as_ref().filter(|_| app.doc.file.is_some()) else {
+                    return refused("No part is imported: import one first (import_model).");
+                };
+                if let Some(n) = ids.iter().find(|&&n| n >= mesh.surfaces.len()) {
+                    return refused(format!("There is no surface {n}: the part's surfaces are 0 to {}.", mesh.surfaces.len().saturating_sub(1)));
+                }
+                if !app.can_pick_op(o) {
+                    let name = crate::threading::shown_name(o, &app.doc.tools);
+                    let bounded = matches!(o.strategy, Strategy::Contour | Strategy::Parallel | Strategy::Waterline);
+                    return refused(if bounded {
+                        format!("{name} cuts the whole part: set its boundary to Selected geometry (edit_field) to pick faces.")
+                    } else {
+                        format!("{name} takes nothing picked on the part.")
+                    });
+                }
+                if app.pick_kind(o) == crate::PickKind::Fill && (mode != Mode::Replace || ids.len() != 1) {
+                    return refused(format!("{:?} takes one face, which fills it; send one id with mode replace, or clear_picks.", o.strategy));
+                }
+                Ok(())
+            })
+            .clicks(|ctx| {
+                Ok(pick::Job::Surfaces { op: op_id(ctx), ids: ids_arg(ctx)?, mode: mode_arg(ctx)? })
+            })
+            .requires("An operation (selected, or `operation`) that takes picks on an imported part.")
+            .effect("Each id clicked and checked; the operation's picks afterwards, and what each id did."),
+        cmd("pick_features", "picks")
+            .text("Picks the example project's features (model::FEATURES: 0 Top rim face, 1 Pocket floor, 2 Pocket walls, 3 Outer profile, 4 Center boss, 5 to 8 the Ø8 holes) for an operation, as clicks on the example part do, each checked. mode add (the default) skips a feature picked already, remove drops it, replace drops the others first. Only the features the operation's strategy takes are accepted. An imported part's surfaces are picked with pick_surfaces.")
+            .on_operation()
+            .params(|| vec![("ids", ids_param("The features to click, by number."), true), ("mode", choice_param(&Mode::NAMES), false)])
+            .examples(|| vec![json!({"ids": [1], "mode": "add"})])
+            .when(|ctx| {
+                let ids = ids_arg(ctx)?;
+                mode_arg(ctx)?;
+                let Some(o) = ctx.op() else {
+                    return refused("No operation is selected: give `operation`, or select one (select_operation).");
+                };
+                if !ctx.app.is_sample() {
+                    return refused("Features are the example project's; an imported part's surfaces are picked with pick_surfaces.");
+                }
+                let takes = o.strategy.features();
+                if let Some(n) = ids.iter().find(|n| !takes.contains(n)) {
+                    let named: Vec<String> = (takes.iter())
+                        .map(|&f| format!("{f} ({})", crate::model::FEATURES[f]))
+                        .collect();
+                    return refused(if named.is_empty() {
+                        format!("{:?} takes no features.", o.strategy)
+                    } else {
+                        format!("{:?} does not take feature {n}; it takes {}.", o.strategy, named.join(", "))
+                    });
+                }
+                Ok(())
+            })
+            .clicks(|ctx| {
+                Ok(pick::Job::Features { op: op_id(ctx), ids: ids_arg(ctx)?, mode: mode_arg(ctx)? })
+            })
+            .requires("An operation of the example project (selected, or `operation`).")
+            .effect("Each feature clicked and checked; the operation's features afterwards."),
+        cmd("pick_pin_holes", "picks")
+            .text("Chooses the part's holes that drop over the fixture pins, for a setup that sits on the pins by the part's own holes (its Work zero step): one click per id, a surface inside the hole (its wall or its end), as Pick holes on the part does in the 3D view. mode add (the default) leaves a hole chosen already as it is, remove takes each id's hole off, replace clears the holes first. The result lists the chosen holes (in the part's own frame) and what each id did.")
+            .on_setup()
+            .params(|| vec![("ids", ids_param("The part's surface ids, each inside a hole that opens on the bottom in this setup."), true), ("mode", choice_param(&Mode::NAMES), false)])
+            .examples(|| vec![json!({"ids": [0], "mode": "add"})])
+            .when(|ctx| {
+                let ids = ids_arg(ctx)?;
+                mode_arg(ctx)?;
+                pins_setup(ctx, false)?;
+                let mesh = ctx.app.imported_mesh.as_ref().map_or(0, |m| m.surfaces.len());
+                if let Some(n) = ids.iter().find(|&&n| n >= mesh) {
+                    return refused(format!("There is no surface {n}: the part's surfaces are 0 to {}.", mesh.saturating_sub(1)));
+                }
+                Ok(())
+            })
+            .clicks(|ctx| {
+                Ok(pick::Job::PinHoles { setup: setup_id(ctx), ids: ids_arg(ctx)?, mode: mode_arg(ctx)? })
+            })
+            .requires("A setup that sits on the pins by the part's holes, on an imported part.")
+            .effect("Each id clicked and checked; the holes chosen for the pins afterwards."),
+        cmd("clear_pin_holes", "picks")
+            .text("Clears the holes chosen for the fixture pins (the Work zero step's Clear the pin holes).")
+            .on_setup()
+            .when(|ctx| pins_setup(ctx, false).map(|_| ()))
+            .with(|_| Ok(vec![Message::Edit(Target::Setup, "pin_holes", String::new())]))
+            .requires("A setup that sits on the pins by the part's holes.")
+            .effect("No hole is chosen for the pins."),
+        cmd("place_pins", "picks")
+            .text("Places the fixture pins in the stock's leftover, for a setup that sits on pins in its leftover (its Work zero step): pin 1 where the click is, at x, y in the setup's plan (mm, as the part is placed), the plate putting the others, as Place the pins on the leftover and a click in the 3D view do. Where they do not fit they stay where they were, and the reason is given.")
+            .on_setup()
+            .params(|| vec![("x", number_param("Pin 1's X in the setup's plan, mm."), true), ("y", number_param("Pin 1's Y in the setup's plan, mm."), true)])
+            .examples(|| vec![json!({"x": 0, "y": 0})])
+            .when(|ctx| {
+                number(ctx, "x")?;
+                number(ctx, "y")?;
+                let si = pins_setup(ctx, true)?;
+                if ctx.app.known_stock(si).0.is_none() {
+                    return refused("The stock this setup starts from is not known yet: set its stock first.");
+                }
+                Ok(())
+            })
+            .clicks(|ctx| {
+                let at = [number(ctx, "x")? as f32, number(ctx, "y")? as f32];
+                Ok(pick::Job::Place { setup: setup_id(ctx), at })
+            })
+            .requires("A setup that sits on pins in the stock's leftover, on an imported part whose stock is known.")
+            .effect("Pin 1 stands there, or the reason it does not fit."),
+        cmd("clear_pin_place", "picks")
+            .text("Clears where the fixture pins stand in the stock's leftover (the Work zero step's Clear the pins' place).")
+            .on_setup()
+            .when(|ctx| pins_setup(ctx, true).map(|_| ()))
+            .with(|_| Ok(vec![Message::Edit(Target::Setup, "pin_place", String::new())]))
+            .requires("A setup that sits on pins in the stock's leftover.")
+            .effect("The pins have no place."),
         // Generate.
         cmd("generate", "generate").sends(|| Message::Generate).on_operation().effect("The operation's simulation, or the reason it could not be generated."),
         cmd("generate_all", "generate").sends(|| Message::GenerateAll).when(|ctx| match ctx.app.doc.active_setup() {
@@ -1891,6 +2030,67 @@ fn selected_operation_arg(ctx: &Ctx) -> Option<(usize, usize)> {
     };
     operation_of(ctx.app, setup, ctx.args.get("operation")?).ok()
 }
+/// The schema of a pick command's ids.
+fn ids_param(description: &str) -> Value {
+    json!({
+        "type": "array",
+        "items": {"type": "integer", "minimum": 0},
+        "minItems": 1,
+        "description": description,
+    })
+}
+/// A pick command's ids, each once, in the order given.
+fn ids_arg(ctx: &Ctx) -> Result<Vec<usize>, Problem> {
+    let Some(given) = arg(ctx, "ids")?.as_array().filter(|a| !a.is_empty()) else {
+        return bad("`ids` must be a list of ids (integers from 0).");
+    };
+    let mut ids: Vec<usize> = vec![];
+    for v in given {
+        let Some(n) = v.as_u64() else {
+            return bad("`ids` must be a list of ids (integers from 0).");
+        };
+        if !ids.contains(&(n as usize)) {
+            ids.push(n as usize);
+        }
+    }
+    Ok(ids)
+}
+/// A pick command's mode: add when not given.
+fn mode_arg(ctx: &Ctx) -> Result<Mode, Problem> {
+    match ctx.args.get("mode") {
+        None | Some(Value::Null) => Ok(Mode::Add),
+        Some(_) => Ok(Mode::of(one_of(ctx, "mode", &Mode::NAMES)?).unwrap_or(Mode::Add)),
+    }
+}
+/// The setup a pin command acts on, by index: one on an imported part that
+/// sits on the pins, by holes in the stock's leftover (`leftover`) or by
+/// the part's own.
+fn pins_setup(ctx: &Ctx, leftover: bool) -> Result<usize, Problem> {
+    let app = ctx.app;
+    let Some(si) = ctx.setup else {
+        return refused("There is no setup: add one first (add_setup).");
+    };
+    if app.is_sample() || app.doc.file.is_none() || app.imported_mesh.is_none() {
+        return refused(
+            "The pins stand in a part's holes or its stock's leftover: import a part first (import_model).",
+        );
+    }
+    let s = &app.doc.setups[si];
+    if !crate::post::sits_on_pins(s) {
+        return refused(
+            "This setup does not sit on the fixture pins: set on_pins to Yes in its Work zero step first (edit_field).",
+        );
+    }
+    match (leftover, crate::post::pins_in_leftover(s)) {
+        (true, false) => refused(
+            "This setup drops over the pins by the part's own holes: choose them with pick_pin_holes.",
+        ),
+        (false, true) => {
+            refused("This setup's pins stand in the stock's leftover: place them with place_pins.")
+        }
+        _ => Ok(si),
+    }
+}
 /// `work` off the `App`'s thread, as the app runs its file work, and its
 /// result as `done`'s message.
 fn off_thread<T: Send + 'static>(
@@ -2097,6 +2297,21 @@ fn recommended(ctx: &Ctx) -> Option<((String, String), String)> {
     Some((fields(o), said))
 }
 
+/// Why a pick command's ids change nothing: in `add` all of them picked,
+/// in `remove` none; `replace` is clicked.
+fn unpicked_already(ctx: &Ctx, picked: &[usize]) -> Option<String> {
+    let ids = ids_arg(ctx).ok()?;
+    match mode_arg(ctx).ok()? {
+        Mode::Add => {
+            (ids.iter().all(|i| picked.contains(i))).then(|| "Every id is picked already.".into())
+        }
+        Mode::Remove => {
+            (ids.iter().all(|i| !picked.contains(i))).then(|| "None of the ids is picked.".into())
+        }
+        Mode::Replace => None,
+    }
+}
+
 /// Why a command is already so, by name: then nothing is sent.
 fn already(name: &str) -> Option<fn(&Ctx) -> Option<String>> {
     let f: fn(&Ctx) -> Option<String> = match name {
@@ -2144,6 +2359,33 @@ fn already(name: &str) -> Option<fn(&Ctx) -> Option<String>> {
             ctx.op()
                 .is_some_and(|o| o.surfaces.as_ref().is_none_or(|s| s.ids.is_empty()))
                 .then(|| "The operation has no picks to clear.".into())
+        },
+        // A toggle's ids all picked already, or none picked to remove:
+        // nothing is clicked. A fill's face is clicked to see.
+        "pick_surfaces" => |ctx| {
+            let o = ctx.op()?;
+            if ctx.app.pick_kind(o) == crate::PickKind::Fill {
+                return None;
+            }
+            let mesh = ctx.app.imported_mesh.as_ref()?;
+            let picked: Vec<usize> = (o.surfaces.as_ref())
+                .filter(|s| s.matches(mesh))
+                .map_or(vec![], |s| s.ids.clone());
+            unpicked_already(ctx, &picked)
+        },
+        "pick_features" => |ctx| {
+            let picked = ctx.op()?.geometry.clone();
+            unpicked_already(ctx, &picked)
+        },
+        "clear_pin_holes" => |ctx| {
+            let s = ctx.app.doc.setups.get(ctx.setup?)?;
+            (crate::post::chosen_pin_holes(s).is_empty())
+                .then(|| "No hole is chosen for the pins.".into())
+        },
+        "clear_pin_place" => |ctx| {
+            let s = ctx.app.doc.setups.get(ctx.setup?)?;
+            (crate::model::get(&s.p, "pin_place").is_empty())
+                .then(|| "The pins have no place.".into())
         },
         "recommend_speeds" => |ctx| {
             let (fields, said) = recommended(ctx)?;
@@ -2561,6 +2803,22 @@ fn effect(name: &str) -> Option<fn(&Ctx) -> Expect> {
                 "No picked hole has that index.",
             )
         },
+        "clear_pin_holes" => |ctx| {
+            let id = setup_id(ctx);
+            holds(
+                move |a| {
+                    setup_in(a, &id).is_some_and(|s| crate::post::chosen_pin_holes(s).is_empty())
+                },
+                "The pin holes were not cleared.",
+            )
+        },
+        "clear_pin_place" => |ctx| {
+            let id = setup_id(ctx);
+            holds(
+                move |a| setup_field(a, &id, "pin_place").is_some_and(|p| p.is_empty()),
+                "The pins' place was not cleared.",
+            )
+        },
         // Generate.
         "generate" => |ctx| {
             let id = op_id(ctx);
@@ -2898,7 +3156,7 @@ pub fn guard(messages: &[Message]) -> Result<(), &'static str> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::mcp::engine::{self, Agent, Backend};
     use std::mem::discriminant;
@@ -2973,7 +3231,7 @@ mod tests {
         }
     }
     /// The sample job, its first operation selected, in a folder of its own.
-    fn direct() -> Direct {
+    pub(crate) fn direct() -> Direct {
         let dir = tempfile::tempdir().unwrap();
         let mut app = App::from_workspace(dir.path().join("workspace.json"), None);
         let mut doc = crate::model::Document::sample();
@@ -3071,7 +3329,8 @@ mod tests {
                 match c.built(&ctx) {
                     Ok(dispatch) => {
                         let outputs = dispatch.task.map(|t| d.outputs(t)).unwrap_or_default();
-                        let messages = dispatch.messages.into_iter().chain(outputs);
+                        let clicks = dispatch.clicks.iter().flat_map(pick::Job::messages);
+                        let messages = dispatch.messages.into_iter().chain(outputs).chain(clicks);
                         all.extend(messages.map(|m| (c.name, m)));
                     }
                     Err(Problem::Args(e) | Problem::Refused(e)) => {
@@ -3358,6 +3617,9 @@ mod tests {
                 | Message::ExportError(_)
                 | Message::ExportGcode
                 | Message::ScrubDone
+                // The 3D view's click, which the pick commands send as the
+                // message it becomes (`Feature`, `Surface`, `PinHoleSurface`).
+                | Message::Viewport(viewport::Event::Pick(_) | viewport::Event::PickSurface(_))
         )
     }
 
@@ -3748,6 +4010,11 @@ mod tests {
                 s.p.insert("stock_type".into(), crate::sheet::SHEET.into());
                 s.p.insert("holddown".into(), "Screws".into());
             }),
+            // A part on the fixture pins, by its own holes and by holes in
+            // its stock's leftover: the Work zero step's pin_holes and
+            // pin_place.
+            Box::new(|d| pinned(d, crate::post::fixture::pinned_flip("rx", true))),
+            Box::new(|d| pinned(d, crate::post::fixture::leftover_flip("rx", None))),
         ];
         for kind in crate::holding::KINDS {
             all.push(Box::new(move |d| {
@@ -3853,9 +4120,7 @@ mod tests {
             assert!(!listed.contains(key), "{key} is listed after all");
         }
         // Keys with a command of their own are listed, with the command.
-        // `pin_holes` and `pin_place` are drawn only for a part on a
-        // machine with pins, which Step 6's pin commands' tests set up.
-        for key in ["origin", "pin_setup"] {
+        for key in ["origin", "pin_setup", "pin_holes", "pin_place"] {
             assert!(listed.contains(key), "{key}");
         }
     }
@@ -3981,12 +4246,17 @@ mod tests {
     #[test]
     fn every_command_has_an_effect_to_check() {
         for c in all_commands() {
-            assert!(c.expect.is_some(), "{} has no expected effect", c.name);
+            // A pick command checks each click as it makes it (`pick`).
+            assert!(
+                c.expect.is_some() != c.clicks_checked(),
+                "{} has no expected effect",
+                c.name
+            );
         }
     }
 
     /// The fixture block imported, its job's material chosen.
-    fn imported() -> Direct {
+    pub(crate) fn imported() -> Direct {
         let mut d = direct();
         let (mut doc, mesh) = crate::post::fixture::job();
         // Its Face alone: the checks after each edit stay quick.
@@ -4004,7 +4274,22 @@ mod tests {
         d.app.dirty = false;
         d
     }
-    fn outcome(r: &Value) -> &str {
+    /// `job` (a `post::fixture` on the fixture pins) in `d`, its second
+    /// setup, the one on the pins, active.
+    pub(crate) fn pinned(
+        d: &mut Direct,
+        (mut doc, mesh): (crate::model::Document, crate::mesh::Mesh),
+    ) {
+        doc.adopt_materials();
+        doc.adopt_holders();
+        doc.active = doc.setups[1].id.clone();
+        d.app.replace_document(doc, None);
+        d.app.imported_mesh = Some(mesh);
+        d.app.page = Page::Work;
+        d.app.selected = None;
+        d.app.dirty = false;
+    }
+    pub(crate) fn outcome(r: &Value) -> &str {
         r["outcome"].as_str().unwrap_or_default()
     }
 

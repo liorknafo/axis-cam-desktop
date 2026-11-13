@@ -100,6 +100,9 @@ pub fn class(m: &Message) -> Class {
         Message::SetupEnd => C("show_stock_after_setup"),
         Message::SetupStep(_) => C("set_setup_step"),
         Message::Tab(_) => C("set_tab"),
+        // The Work zero step's Clear buttons.
+        Message::Edit(Target::Setup, "pin_holes", v) if v.is_empty() => C("clear_pin_holes"),
+        Message::Edit(Target::Setup, "pin_place", v) if v.is_empty() => C("clear_pin_place"),
         Message::Edit(target, key, _) => edit(*target, key),
         Message::PutBackEdit => C("undo_last_edit"),
         Message::Title(_) => C("set_project_title"),

@@ -96,6 +96,14 @@ pub enum Page {
     Post,
     Audit,
 }
+/// What a click on the part does to an operation's picks (`App::pick_kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickKind {
+    /// It adds or drops a whole group: a hole's walls, a corner, a face.
+    Toggle,
+    /// The face fills the operation's fields and replaces its pick.
+    Fill,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     Operation,
@@ -2706,33 +2714,60 @@ impl App {
     /// Whether the selected lathe cut is one taken from the part by a click
     /// (`turn::PICKED`), on an imported part (LIO-424).
     fn picks_turn(&self) -> bool {
+        self.operation().is_some_and(|o| self.turn_picked(o))
+    }
+    /// Whether `o` is a lathe cut taken from the part by a click
+    /// (`turn::PICKED`), or a lathe drill, on an imported part (LIO-424).
+    fn turn_picked(&self, o: &Operation) -> bool {
         !self.is_sample()
             && self.doc.file.is_some()
             && self.imported_mesh.is_some()
-            && self.operation().is_some_and(|o| {
-                (o.strategy == Strategy::Turn
-                    && crate::turn::PICKED.contains(&get(&o.p, "turn_kind")))
-                    || o.on_centre(&self.doc.setup().machine)
-            })
+            && ((o.strategy == Strategy::Turn
+                && crate::turn::PICKED.contains(&get(&o.p, "turn_kind")))
+                || o.on_centre(self.machine_of(o)))
+    }
+    /// The machine of the setup `o` is in: the active setup's when it is in
+    /// none.
+    fn machine_of(&self, o: &Operation) -> &model::Machine {
+        let setups = &self.doc.setups;
+        (setups.iter())
+            .find(|s| s.operations.iter().any(|x| x.id == o.id))
+            .map_or(&self.doc.setup().machine, |s| &s.machine)
+    }
+    /// What a click on the part does to `o`'s picks (LIO-470), as the click
+    /// handler (`Message::Surface`) decides it:
+    /// - **Fill:** the face fills the operation's fields and replaces its
+    ///   pick: a lathe cut or lathe drill taken from the part, a Slot, a Box;
+    /// - **Toggle:** the click adds or drops a whole group (a hole's walls, a
+    ///   corner, a smooth face, a sloped face's steps, or the one face).
+    pub fn pick_kind(&self, o: &Operation) -> PickKind {
+        if self.turn_picked(o) || matches!(o.strategy, Strategy::Slot | Strategy::Box) {
+            PickKind::Fill
+        } else {
+            PickKind::Toggle
+        }
     }
     pub fn can_pick(&self) -> bool {
-        if self.picks_turn() {
+        self.operation().is_some_and(|o| self.can_pick_op(o))
+    }
+    /// Whether operation `o` takes picks on the part (`can_pick` for the
+    /// selected one).
+    pub fn can_pick_op(&self, o: &Operation) -> bool {
+        if self.turn_picked(o) {
             return true;
         }
-        self.operation().is_some_and(|o| {
-            // A lathe drills on its centre: nothing to pick.
-            !o.on_centre(&self.doc.setup().machine)
-                && o.strategy != Strategy::Turn
-                && (self.is_sample()
-                    || (self.doc.file.is_some()
-                        && (o.needs_surfaces()
-                            || matches!(
-                                o.strategy,
-                                Strategy::Box | Strategy::Corner | Strategy::Slot
-                            ))
-                        && o.strategy.imported_preview()
-                        && self.imported_mesh.is_some()))
-        })
+        // A lathe drills on its centre: nothing to pick.
+        !o.on_centre(self.machine_of(o))
+            && o.strategy != Strategy::Turn
+            && (self.is_sample()
+                || (self.doc.file.is_some()
+                    && (o.needs_surfaces()
+                        || matches!(
+                            o.strategy,
+                            Strategy::Box | Strategy::Corner | Strategy::Slot
+                        ))
+                    && o.strategy.imported_preview()
+                    && self.imported_mesh.is_some()))
     }
     /// What a new operation says on its tab and in the status line before
     /// anything else is done to it (LIO-427): what to click on the part,
@@ -6681,9 +6716,15 @@ impl App {
                 self.touch()
             }
             Message::Surface(n) => {
+                // What the click does, as the agent's picks read it too
+                // (`pick_kind`): fill the operation from the face, or add
+                // or drop a whole group.
+                let Some(kind) = self.operation().map(|o| self.pick_kind(o)) else {
+                    return Task::none();
+                };
                 // A lathe cut takes the smooth face clicked, and fills at
                 // once (LIO-424).
-                if self.picks_turn() {
+                if kind == PickKind::Fill && self.picks_turn() {
                     if let Some(mesh) = self.imported_mesh.as_ref()
                         && n < mesh.surfaces.len()
                     {
@@ -6724,6 +6765,55 @@ impl App {
                     crate::stock::Placement::new(mesh, Some(&setup)).rotation()
                         == crate::stock::Placement::new(mesh, Some(self.doc.setup())).rotation()
                 });
+                // A Slot or a Box takes one face, and a click on it fills
+                // the operation at once.
+                if kind == PickKind::Fill {
+                    if self
+                        .operation()
+                        .is_some_and(|o| o.strategy == Strategy::Slot)
+                    {
+                        let selection = surface::Selection {
+                            mesh_fingerprint: fingerprint,
+                            ids: vec![n],
+                        };
+                        let result = self
+                            .known_stock(self.doc.index())
+                            .0
+                            .ok_or_else(|| {
+                                "Resolve the setup stock before picking a slot.".to_string()
+                            })
+                            .and_then(|stock| {
+                                // Use the stock immediately before the edited operation.
+                                let mut here = setup.clone();
+                                if let Some(o) = self.operation() {
+                                    let check =
+                                        slot::pick_setup(&self.doc, mesh, self.doc.index(), &o.id)?;
+                                    here = check;
+                                }
+                                slot::from_face(&here, mesh, &selection, stock)
+                            });
+                        match result {
+                            Ok(fields) => {
+                                if let Some(o) = self.operation_mut() {
+                                    o.p.extend(fields);
+                                    o.surfaces = Some(selection);
+                                    o.geometry.clear();
+                                }
+                                self.touch();
+                                self.status = "Picked Slot. Check the matching cutter, Center cutting capability, top, bottom and Through before showing the cut.".into();
+                            }
+                            Err(e) => self.status = e,
+                        }
+                        return Task::none();
+                    }
+                    // A Box: a face that makes none says why and changes
+                    // nothing (LIO-401).
+                    self.fill_box(surface::Selection {
+                        mesh_fingerprint: fingerprint,
+                        ids: vec![n],
+                    });
+                    return Task::none();
+                }
                 // A Pocket, an inside Contour or a Drill takes a wall as its
                 // hole: every wall of it, added or removed together. A face
                 // that is neither a floor nor a wall (a cone, a chamfer, a
@@ -6989,55 +7079,6 @@ impl App {
                     }
                     self.touch();
                     self.status = said;
-                    return Task::none();
-                }
-                if self
-                    .operation()
-                    .is_some_and(|o| o.strategy == Strategy::Slot)
-                {
-                    let selection = surface::Selection {
-                        mesh_fingerprint: fingerprint,
-                        ids: vec![n],
-                    };
-                    let result = self
-                        .known_stock(self.doc.index())
-                        .0
-                        .ok_or_else(|| "Resolve the setup stock before picking a slot.".to_string())
-                        .and_then(|stock| {
-                            // Use the stock immediately before the edited operation.
-                            let mut here = setup.clone();
-                            if let Some(o) = self.operation() {
-                                let check =
-                                    slot::pick_setup(&self.doc, mesh, self.doc.index(), &o.id)?;
-                                here = check;
-                            }
-                            slot::from_face(&here, mesh, &selection, stock)
-                        });
-                    match result {
-                        Ok(fields) => {
-                            if let Some(o) = self.operation_mut() {
-                                o.p.extend(fields);
-                                o.surfaces = Some(selection);
-                                o.geometry.clear();
-                            }
-                            self.touch();
-                            self.status = "Picked Slot. Check the matching cutter, Center cutting capability, top, bottom and Through before showing the cut.".into();
-                        }
-                        Err(e) => self.status = e,
-                    }
-                    return Task::none();
-                }
-                // A Box takes one face, and a click on it fills the box at
-                // once; a face that makes none says why and changes nothing
-                // (LIO-401).
-                if self
-                    .operation()
-                    .is_some_and(|o| o.strategy == Strategy::Box)
-                {
-                    self.fill_box(surface::Selection {
-                        mesh_fingerprint: fingerprint,
-                        ids: vec![n],
-                    });
                     return Task::none();
                 }
                 // Parallel and Waterline finishing take a whole face, curved or
