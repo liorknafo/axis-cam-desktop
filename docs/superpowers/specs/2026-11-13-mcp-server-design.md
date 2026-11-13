@@ -444,12 +444,18 @@ Arguments are JSON. Values that were `&'static str` in a message are enums in th
       - **Toggle:** everything else. A click adds or drops a whole **group**, as the strategy groups faces: a smooth region, a hole's walls (threaded holes and arcs included), a corner, or a sloped face's steps. Two ids from one corner sent one by one therefore pick it and then drop it (found by the review's probe).
     - **The engine does not copy the grouping.** It sends real clicks and checks what each one did, so it always agrees with the handler:
       - **Fill:** only `mode: replace` with exactly one id is accepted. Several ids, `add` and `remove` are refused before anything changes: "<Strategy> takes one face, which fills it; send one id with mode replace, or clear_picks." A face that fills nothing is `failed`, with the handler's reason, and the pick is unchanged. Removal is `clear_picks`.
-      - **Toggle, `add`:** ids already in the picks are skipped. For each other id, one click is sent, and the picks after it are compared with the picks before it. If the click dropped anything that was picked, because the id belonged to a group already picked, that click is undone: the operation's picks and geometry are put back to before it. The id is reported as "already picked with group …". If it added nothing, its reason is reported.
-      - **Toggle, `remove`:** ids not in the picks are skipped (`no_change`). For each other id, one click is sent. It must leave that id unpicked; otherwise it is undone and reported.
+      - **Toggle, `add`:** ids already in the picks are skipped. For each other id, one click is sent, and the picks after it are compared with the picks before it. If the click dropped anything that was picked, because the id belonged to a group already picked, that click is undone in full (see *Undoing a click*). The id is reported as "already picked with group …". If it added nothing, its reason is reported.
+      - **Toggle, `remove`:** ids not in the picks are skipped (`no_change`). For each other id, one click is sent. It must leave that id unpicked; otherwise it is undone in full and reported.
       - **Toggle, `replace`:** `clear_picks`, then `add`.
-    - **The result** returns the operation's picks afterwards (ids, and the holes or corners the app lists for them) with the mesh fingerprint they belong to, and what each id did. Picking is turned on when it is off, and set back afterwards.
+    - **Undoing a click** is a transaction over everything a click can write, not a repair of one operation. A click goes through `touch()`, which re-links centre drillings to their drills (`main.rs` ~3171), and through `update()`, which drops the operation's pick-review note (`Document::pick_checks`, ~5851).
+      - Before each click the engine keeps a clone of the whole `Document`, which holds every operation, the linked centre drillings and `pick_checks`. It also keeps the `App` fields a click writes: `project_dirty`, `status`, `status_problem`, `typed_last`, `box_refused`, the selection, and the picking mode.
+      - Undoing puts all of them back. The `Document` is then equal, as a serialized value, to what it was before the click.
+      - The derived state the click cleared (the simulation, the audit report, a generation) is not restored; it is rebuilt as after any edit and waited for (`pending()`).
+      - An undone click is inside the command's ownership window and leaves no difference, so it adds no change-log entry.
+ (ids, and the holes or corners the app lists for them) with the mesh fingerprint they belong to, and what each id did. Picking is turned on when it is off, and set back afterwards.
     - **Tests:**
       - Toggle: several ids from one corner, one hole and one region in one call; the same `add` sent twice (`no_change`); `remove` of an id that is not picked (`no_change`); `remove` of one face of a picked corner;
+      - Undo: a Drill with a linked centre drilling and a pick-review note; `add` with a chamfer face of a hole already picked. The click is undone, and the whole `Document` (the Drill's 24 faces, the centre drilling's picks, the note) equals what it was before;
       - Fill: Slot, Box and a lathe Turn given two ids (refused, nothing changed), `add` (refused), one id with `replace` (filled), the same again (`no_change`), and `clear_picks`.
   - `pick_pin_holes {ids}`, `clear_pin_holes`, `place_pins {x, y}`.
 - **Generate:** `generate`, `generate_all`, `cancel_generation`.
@@ -647,3 +653,4 @@ Four milestones, each with its own Linear issue and PR.
 8. **gpt-6-astra, REJECT.** Both findings were taken:
    - reading Steps whose guide must be built is a heavy read;
    - picking is split into toggle and fill. It is driven by real clicks checked against what they did, not by a copied grouping function, and fill operations take one face with `replace` only.
+9. **gpt-6-astra, REJECT.** Its one finding was taken: undoing a click restores the whole `Document` and the `App` fields a click writes. A test covers the linked centre drilling and the pick-review note.
