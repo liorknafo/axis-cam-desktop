@@ -2513,6 +2513,12 @@ fn uncut_block(app: &App) -> Option<Element<'_, Message>> {
             .size(12),
         );
     }
+    // An amber region on a thread says why too (LIO-448).
+    if let Some((Ok(found), _)) = shown {
+        for region in found.thin.regions.iter().filter(|r| r.thread.is_some()) {
+            block = block.push(muted(format!("• Amber: {}", region.line())).size(12));
+        }
+    }
     Some(help::wrap(
         container(block).padding([4, 10]),
         Help::text(
@@ -2520,7 +2526,7 @@ fn uncut_block(app: &App) -> Option<Element<'_, Message>> {
             "The faces of the part that the stock left after every setup still covers: what the job has not machined yet. Until every enabled operation generates, completeness is not checked.",
         )
         .more(
-            "Each face is sampled 0.5 mm and 0.1 mm outside itself against the simulated cuts. Magenta means over 0.5 mm of stock remains; amber means 0.1–0.5 mm remains after the whole job. Smaller residuals count as cut to allow for cutter margins, mesh chords and fine finishing scallops. A tap cuts a modelled thread's full form, out to its root, from its lead up; a region on a hole's thread says when no tap or thread mill cuts it, or how far short they stop. Positions are in setup 1's axes from the part's -X/-Y/bottom corner, in mm.",
+            "Each face is sampled 0.5 mm and 0.1 mm outside itself against the simulated cuts. Magenta means over 0.5 mm of stock remains; amber means 0.1–0.5 mm remains after the whole job. Smaller residuals count as cut to allow for cutter margins, mesh chords and fine finishing scallops. A tap cuts a modelled thread's full form, out to its root, from its lead up. Where no tap or thread mill of a hole's thread size gives it full form, that stretch of the thread is magenta whatever the samples find, and its region says why: no tap of its size, or how far short. Positions are in setup 1's axes from the part's -X/-Y/bottom corner, in mm.",
         ),
         widget::tooltip::Position::Right,
     ))

@@ -8512,11 +8512,12 @@ pub(crate) mod tests {
     /// A 30 × 30 × 18.5 mm block with the adapter plate's M8×1.25 thread
     /// through it, modelled as the plate's is (scripts/m8-tapped-block.json,
     /// SolidCraft 0.40: the root relieved to Ø8.11), on a manual mill with
-    /// no stock round it: drilled Ø6.8 through, then the operations `edit`
-    /// makes of a hand tap (none when it returns false). The document, the
-    /// mesh, the stock the job leaves and its last operation's plan.
+    /// no stock round it: drilled Ø6.8 through, then the operation and the
+    /// M8×1.25 tap `edit` makes of a hand tapping (none when it returns
+    /// false). The document, the mesh, the stock the job leaves and its last
+    /// operation's plan.
     fn m8_block_job(
-        edit: impl Fn(&mut Operation) -> bool,
+        edit: impl Fn(&mut Operation, &mut Tool) -> bool,
     ) -> (crate::model::Document, Mesh, crate::volume::Volume, Plan) {
         let mesh = crate::mesh::load(
             &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/m8-tapped-block.step"),
@@ -8560,9 +8561,10 @@ pub(crate) mod tests {
         thread.p.insert("rpm".into(), "90".into());
         thread.p.insert("feed".into(), "90".into());
         drill.tool = d.id.clone();
+        let tapping = edit(&mut thread, &mut tap);
         doc.tools = vec![d, tap];
         setup.operations.push(drill);
-        if edit(&mut thread) {
+        if tapping {
             setup.operations.push(thread);
         }
         doc.machines = vec![setup.machine.clone()];
@@ -8582,7 +8584,7 @@ pub(crate) mod tests {
         // LIO-448: SolidCraft relieves an M8 thread's root 0.05 mm past the
         // major, a notch P/8 wide. A tap cut to Ø8.000 left its walls under
         // stock: 8 regions on the adapter plate's four holes.
-        let (doc, mesh, stock, plan) = m8_block_job(|_| true);
+        let (doc, mesh, stock, plan) = m8_block_job(|_, _| true);
         let threads = crate::thread::holes_in_setup(&doc.setups[0], &mesh);
         assert_eq!(threads.len(), 1);
         let t = &threads[0];
@@ -8601,50 +8603,67 @@ pub(crate) mod tests {
         assert_eq!(crate::uncut::amount(&left.regions, left.share), "0%");
     }
     #[test]
-    fn an_untapped_or_short_tapped_thread_is_left_and_says_why() {
-        let lines = |left: &crate::uncut::Uncut| -> Vec<String> {
-            left.regions.iter().map(|r| r.line()).collect()
+    fn an_untapped_short_or_wrong_sized_tapped_thread_is_left_and_says_why() {
+        // What the block's job leaves with the tapping `edit` makes, and how
+        // far the full form stops short of the thread's bottom when the tap
+        // goes `depth` down from the top.
+        let job = |edit: &dyn Fn(&mut Operation, &mut Tool) -> bool, depth: f32| {
+            let (doc, mesh, stock, _) = m8_block_job(edit);
+            let t = &crate::thread::holes_in_setup(&doc.setups[0], &mesh)[0];
+            let top = Geometry::new(&doc.setups[0], &mesh).bounds.max[2];
+            let left = crate::uncut::uncut(&stock, &doc.setups, &mesh);
+            (left, top - depth - t.from)
         };
-        // Drilled only: the flanks are left.
-        let (doc, mesh, stock, _) = m8_block_job(|_| false);
-        let left = crate::uncut::uncut(&stock, &doc.setups, &mesh);
-        assert!(!left.regions.is_empty());
-        for r in &left.regions {
-            assert_eq!(
-                r.thread.as_deref(),
-                Some("M8×1.25 thread: no tap or thread mill cuts it"),
-                "{:?}",
-                lines(&left)
+        let check = |left: &crate::uncut::Uncut, why: &str| {
+            let lines: Vec<String> = left.regions.iter().map(|r| r.line()).collect();
+            assert!(!left.regions.is_empty(), "{why}");
+            for r in &left.regions {
+                assert_eq!(r.thread.as_deref(), Some(why), "{lines:?}");
+            }
+            assert!(lines[0].ends_with(&format!(" · {why}")), "{lines:?}");
+            // The summary never says 0% while they are listed.
+            let amount = crate::uncut::amount(&left.regions, left.share);
+            assert!(
+                amount.contains("region") && !amount.ends_with(" 0%"),
+                "{amount}"
             );
-        }
-        assert!(left.share > 0.);
-        // Tapped 10 mm of the thread's 18.3: the full form ends 10 mm down,
-        // its lead under it.
-        let (doc, mesh, stock, _) = m8_block_job(|o| {
-            o.p.insert("thread_depth".into(), "10".into());
-            true
-        });
-        let t = &crate::thread::holes_in_setup(&doc.setups[0], &mesh)[0];
-        let top = crate::cam::Geometry::new(&doc.setups[0], &mesh).bounds.max[2];
-        let short = top - 10. - t.from;
-        let left = crate::uncut::uncut(&stock, &doc.setups, &mesh);
-        assert!(!left.regions.is_empty());
-        let why = format!("M8×1.25 thread: tapped {short:.1} mm short");
-        for r in &left.regions {
-            assert_eq!(
-                r.thread.as_deref(),
-                Some(why.as_str()),
-                "{:?}",
-                lines(&left)
+        };
+        let none = "M8×1.25 thread: no M8×1.25 tap or thread mill cuts it";
+        // Drilled only.
+        check(&job(&|_, _| false, 0.).0, none);
+        // Tapped 10 mm, and 17.8 of the thread's 18.4 (LIO-448 review): the
+        // full form ends that far down, its lead under it, and what is
+        // under it, to the turn it starts in, is left.
+        for depth in [10., 17.8] {
+            let (left, short) = job(
+                &|o, _| {
+                    o.p.insert("thread_depth".into(), depth.to_string());
+                    true
+                },
+                depth,
             );
-            // Only under the full form.
-            assert!(r.bounds.max[2] <= short + 0.3, "{r:?}");
+            assert!(short > 0.5, "{short}");
+            check(
+                &left,
+                &format!("M8×1.25 thread: tapped {short:.1} mm short"),
+            );
+            for r in &left.regions {
+                assert!(r.bounds.max[2] <= short + 1.25, "{depth}: {r:?}");
+            }
         }
-        assert!(
-            lines(&left)[0].ends_with(&format!(" · {why}")),
-            "{:?}",
-            lines(&left)
-        );
+        // A tap of another size or pitch, chosen for the hole, cuts none of
+        // its thread however deep it goes.
+        for size in ["M7×1", "M8×1"] {
+            let (left, _) = job(
+                &|o, tap| {
+                    o.p.insert("thread".into(), size.into());
+                    tap.p.insert("thread".into(), size.into());
+                    true
+                },
+                0.,
+            );
+            check(&left, none);
+        }
     }
     #[test]
     fn a_countersink_is_found_with_its_angle_and_depth() {

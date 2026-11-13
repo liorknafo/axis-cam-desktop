@@ -85,6 +85,9 @@ struct Samples {
     pieces: Vec<Vec<Piece>>,
     found: HashMap<usize, (f32, Tri, Vec<Tri>)>,
     covered: f32,
+    /// The faces of a thread left short (`Short`): its regions are kept
+    /// however small.
+    short: std::collections::HashSet<usize>,
 }
 impl Samples {
     fn new(n: usize) -> Self {
@@ -170,6 +173,15 @@ pub fn uncut(stock: &Volume, setups: &[Setup], mesh: &Mesh) -> Uncut {
         Samples::new(mesh.faces.len()),
         Samples::new(mesh.faces.len()),
     ];
+    // The modelled hole threads the job's taps and thread mills of their
+    // size leave short of full form: their faces there are under stock
+    // whatever the samples find, as the thread is not there (LIO-448).
+    let shorts = shortfalls(
+        (crate::thread::in_setup(setup1, mesh).into_iter()).filter(|t| t.internal),
+        stock,
+        setups,
+        first,
+    );
     let mut total = 0.;
     for (i, face) in mesh.faces.iter().enumerate() {
         let (raw, [a, b, c]) = match face.points[..] {
@@ -190,6 +202,17 @@ pub fn uncut(stock: &Volume, setups: &[Setup], mesh: &Mesh) -> Uncut {
             continue;
         }
         let n = n.map(|x| x / twice);
+        if shorts.iter().any(|s| s.holds([a, b, c])) {
+            let layer = &mut layers[0];
+            total += twice / 2.;
+            layer.covered += twice / 2.;
+            layer.faces[i] = true;
+            layer
+                .found
+                .insert(i, (twice / 2., [a, b, c], vec![[a, b, c]]));
+            layer.short.insert(i);
+            continue;
+        }
         // ponytail: trusts the mesh's winding for which side is outside; a
         // face wound inwards samples the part and reads as under stock.
         // The face in triangles with no edge over `SPLIT`, each sampled in
@@ -268,14 +291,31 @@ pub fn uncut(stock: &Volume, setups: &[Setup], mesh: &Mesh) -> Uncut {
         }
     }
     let [mut thick, mut thin] = layers.map(|layer| coverage(layer, part, total));
-    // A region on a modelled hole thread says why it is left.
-    if thick.regions.iter().chain(&thin.regions).next().is_some() {
-        let threads: Vec<_> = (crate::thread::in_setup(setup1, mesh).into_iter())
-            .filter(|t| t.internal)
-            .collect();
-        for region in thick.regions.iter_mut().chain(&mut thin.regions) {
-            region.thread = thread_note(region, part, &threads, stock, setups, first);
+    // A thread left short is one region, which says why: its faces where
+    // the full form stops, as a faded end is cut, need not share edges.
+    for coverage in [&mut thick, &mut thin] {
+        let mut kept: Vec<(Option<usize>, Region)> = vec![];
+        for mut region in std::mem::take(&mut coverage.regions) {
+            let on = shorts.iter().position(|s| s.covers(&region, part));
+            region.thread = on.map(|k| shorts[k].note.clone());
+            match kept.iter_mut().find(|(k, _)| on.is_some() && *k == on) {
+                Some((_, into)) => {
+                    into.area += region.area;
+                    for k in 0..3 {
+                        into.bounds.min[k] = into.bounds.min[k].min(region.bounds.min[k]);
+                        into.bounds.max[k] = into.bounds.max[k].max(region.bounds.max[k]);
+                    }
+                    for side in region.from {
+                        if !into.from.contains(&side) {
+                            into.from.push(side);
+                        }
+                    }
+                }
+                None => kept.push((on, region)),
+            }
         }
+        coverage.regions = kept.into_iter().map(|(_, r)| r).collect();
+        coverage.regions.sort_by(|a, b| b.area.total_cmp(&a.area));
     }
     Uncut {
         faces: thick.faces,
@@ -293,6 +333,7 @@ fn coverage(samples: Samples, part: Bounds, total: f32) -> Coverage {
         mut pieces,
         found,
         mut covered,
+        short,
     } = samples;
     // Faces under stock that share an edge make one region.
     let mut root: HashMap<usize, usize> = found.keys().map(|i| (*i, *i)).collect();
@@ -361,7 +402,7 @@ fn coverage(samples: Samples, part: Bounds, total: f32) -> Coverage {
     }
     let mut regions = vec![];
     for group in grouped.into_values() {
-        if group.area < SLIVER {
+        if group.area < SLIVER && !group.faces.iter().any(|f| short.contains(f)) {
             covered -= group.area;
             for i in group.faces {
                 faces[i] = false;
@@ -395,27 +436,42 @@ fn coverage(samples: Samples, part: Bounds, total: f32) -> Coverage {
         regions,
     }
 }
-/// Why `region` (its bounds from the part's corner `part.min`, in setup 1's
-/// frame `first`) is left, when it lies on one of the hole `threads` (in
-/// that frame): no tap or thread mill of `setups` cuts the thread, or those
-/// that do give it its full form short of its length. The full form is
-/// what a cut gives over its lowest tip, less a tap's lead, up its flutes
-/// to its highest. None off a thread, or on one cut full length.
-fn thread_note(
-    region: &Region,
-    part: Bounds,
-    threads: &[crate::thread::Thread],
-    stock: &Volume,
-    setups: &[Setup],
-    first: Frame,
-) -> Option<String> {
-    let at = |k: usize| {
-        (
-            region.bounds.min[k] + part.min[k],
-            region.bounds.max[k] + part.min[k],
-        )
-    };
-    let t = threads.iter().find(|t| {
+/// A modelled hole thread (in setup 1's frame) that the job's taps and
+/// thread mills of its size give its full form short of its length.
+struct Short {
+    thread: crate::thread::Thread,
+    /// The stretches along its axis without the full form.
+    gaps: Vec<(f32, f32)>,
+    /// Why: "M8×1.25 thread: tapped 4.2 mm short", "M8×1.25 thread: no
+    /// M8×1.25 tap or thread mill cuts it".
+    note: String,
+}
+/// How short of its length a thread may be cut and still count as full,
+/// mm: the measure of its ends, not a missing turn.
+const SHORT: f32 = 0.05;
+impl Short {
+    /// Whether the face `tri` (setup 1's frame) is one of the thread's, in
+    /// a stretch without its full form: within its root of its axis, its
+    /// middle in a gap.
+    fn holds(&self, tri: Tri) -> bool {
+        let t = &self.thread;
+        let (u, v) = ((t.axis + 1) % 3, (t.axis + 2) % 3);
+        let reach = t.root.max(t.major) / 2. + 0.02;
+        let along = (tri[0][t.axis] + tri[1][t.axis] + tri[2][t.axis]) / 3.;
+        tri.iter()
+            .all(|p| (p[u] - t.centre[0]).hypot(p[v] - t.centre[1]) <= reach)
+            && self.gaps.iter().any(|g| along >= g.0 && along <= g.1)
+    }
+    /// Whether `region` (its bounds from the part's corner `part.min`) lies
+    /// on the thread.
+    fn covers(&self, region: &Region, part: Bounds) -> bool {
+        let t = &self.thread;
+        let at = |k: usize| {
+            (
+                region.bounds.min[k] + part.min[k],
+                region.bounds.max[k] + part.min[k],
+            )
+        };
         let (u, v) = ((t.axis + 1) % 3, (t.axis + 2) % 3);
         let reach = t.root.max(t.major) / 2. + 0.5;
         let (lo, hi) = at(t.axis);
@@ -425,53 +481,91 @@ fn thread_note(
                 let (lo, hi) = at(k);
                 lo >= c - reach && hi <= c + reach
             })
-    })?;
-    let (u, v) = ((t.axis + 1) % 3, (t.axis + 2) % 3);
-    let mut spans = vec![];
-    let mut tapped = false;
-    for c in stock.cuts.iter() {
-        let Some(op) = (setups.get(usize::from(c.source.0)))
-            .and_then(|s| s.operations.get(usize::from(c.source.1)))
-        else {
-            continue;
-        };
-        if !(op.tapping() || op.thread_milling()) {
+    }
+}
+/// The `threads` (holes', in setup 1's frame `first`) that the taps and
+/// thread mills of `setups`, of each one's size and pitch, cut short of
+/// full form, from the cuts that made `stock`. The full form is what a cut
+/// gives over its lowest tip, less a tap's lead, up its flutes to its
+/// highest. A tap or thread mill of another size gives none: the thread
+/// with no other is "not cut".
+fn shortfalls(
+    threads: impl Iterator<Item = crate::thread::Thread>,
+    stock: &Volume,
+    setups: &[Setup],
+    first: Frame,
+) -> Vec<Short> {
+    let mut out = vec![];
+    for t in threads {
+        let (u, v) = ((t.axis + 1) % 3, (t.axis + 2) % 3);
+        let mut spans = vec![];
+        let mut tapped = false;
+        for c in stock.cuts.iter() {
+            let Some(op) = (setups.get(usize::from(c.source.0)))
+                .and_then(|s| s.operations.get(usize::from(c.source.1)))
+            else {
+                continue;
+            };
+            if !(op.tapping() || op.thread_milling()) {
+                continue;
+            }
+            // Its size: the hole's own, or one chosen that matches it.
+            let chosen = crate::model::get(&op.p, "thread");
+            let fits = chosen == crate::model::FROM_MODEL
+                || crate::thread::spec(chosen).is_some_and(|s| {
+                    (s.pitch - t.pitch).abs() < 1e-3 && (s.major - t.major).abs() <= 0.3
+                });
+            if !fits {
+                continue;
+            }
+            let (a, b) = (moved(c.a, c.frame, first), moved(c.b, c.frame, first));
+            let up = c.frame.transfer_vector([0., 0., 1.], first)[t.axis];
+            let off = |p: [f32; 3]| (p[u] - t.centre[0]).hypot(p[v] - t.centre[1]);
+            if up.abs() < 0.99 || off(a).max(off(b)) > t.root.max(t.major) / 2. {
+                continue;
+            }
+            tapped |= op.tapping();
+            let lead = c
+                .shape
+                .rise()
+                .map_or(0., |rise| rise * (c.radius - c.shape.flat()).max(0.));
+            let (low, high) = (a[t.axis].min(b[t.axis]), a[t.axis].max(b[t.axis]));
+            spans.push(if up > 0. {
+                (low + lead, high + c.flute)
+            } else {
+                (low - c.flute, high - lead)
+            });
+        }
+        // What of the thread's length the spans leave.
+        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let (mut gaps, mut reached) = (vec![], t.from);
+        for (lo, hi) in &spans {
+            if lo.min(t.to) > reached {
+                gaps.push((reached, lo.min(t.to)));
+            }
+            reached = reached.max(*hi);
+        }
+        if t.to > reached {
+            gaps.push((reached, t.to));
+        }
+        let short: f32 = gaps.iter().map(|g| g.1 - g.0).sum();
+        if short < SHORT {
             continue;
         }
-        let (a, b) = (moved(c.a, c.frame, first), moved(c.b, c.frame, first));
-        let up = c.frame.transfer_vector([0., 0., 1.], first)[t.axis];
-        let off = |p: [f32; 3]| (p[u] - t.centre[0]).hypot(p[v] - t.centre[1]);
-        if up.abs() < 0.99 || off(a).max(off(b)) > t.root.max(t.major) / 2. {
-            continue;
-        }
-        tapped |= op.tapping();
-        let lead = c
-            .shape
-            .rise()
-            .map_or(0., |rise| rise * (c.radius - c.shape.flat()).max(0.));
-        let (low, high) = (a[t.axis].min(b[t.axis]), a[t.axis].max(b[t.axis]));
-        spans.push(if up > 0. {
-            (low + lead, high + c.flute)
+        let name = t.name();
+        let note = if spans.is_empty() {
+            format!("{name} thread: no {name} tap or thread mill cuts it")
         } else {
-            (low - c.flute, high - lead)
+            let how = if tapped { "tapped" } else { "thread milled" };
+            format!("{name} thread: {how} {short:.1} mm short")
+        };
+        out.push(Short {
+            thread: t,
+            gaps,
+            note,
         });
     }
-    let name = t.name();
-    if spans.is_empty() {
-        return Some(format!("{name} thread: no tap or thread mill cuts it"));
-    }
-    // What of the thread's length the spans leave.
-    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let (mut short, mut reached) = (0., t.from);
-    for (lo, hi) in spans {
-        short += (lo.min(t.to) - reached).max(0.);
-        reached = reached.max(hi);
-    }
-    short += (t.to - reached).max(0.);
-    (short >= 0.05).then(|| {
-        let how = if tapped { "tapped" } else { "thread milled" };
-        format!("{name} thread: {how} {short:.1} mm short")
-    })
+    out
 }
 /// `p` in frame `from` as frame `to` sees it.
 fn moved(p: [f32; 3], from: Frame, to: Frame) -> [f32; 3] {
@@ -1242,6 +1336,7 @@ mod tests {
     /// names a folder with copies of its project, adapter-plate.axis.json,
     /// and its part, adapter-plate.step. Its four M8×1.25 holes are drilled
     /// Ø6.8 through and hand tapped through: none of their thread is left.
+    /// Tapped short, each is.
     #[test]
     #[ignore]
     fn the_adapter_plates_tapped_m8_holes_are_cut() {
@@ -1295,6 +1390,35 @@ mod tests {
                     );
                 }
             }
+        }
+        // Tapped 18.1 mm of the 18.5 (LIO-448 review): each hole's thread
+        // (18.34 mm, faded 0.08 inside each face) is left short, as one
+        // region that says so.
+        let mut doc = doc;
+        for op in doc.setups.iter_mut().flat_map(|s| &mut s.operations) {
+            if op.tapping() {
+                op.p.insert("thread_depth".into(), "18.1".into());
+            }
+        }
+        let mut last = None;
+        crate::simulation::sequence_walk(
+            &doc,
+            &mesh,
+            None,
+            |_, _, r| assert!(r.is_ok()),
+            |_, _, v| last = Some(v.clone()),
+            |_, _| {},
+        );
+        let left = super::uncut(last.as_ref().unwrap(), &doc.setups, &mesh);
+        let lines: Vec<String> = left.regions.iter().map(|r| r.line()).collect();
+        eprintln!("{} · {lines:#?}", super::amount(&left.regions, left.share));
+        assert_eq!(left.regions.len(), 4, "{lines:#?}");
+        for r in &left.regions {
+            let why = r.thread.as_deref().unwrap_or_default();
+            assert!(
+                why.starts_with("M8×1.25 thread: tapped 0.") && why.ends_with(" mm short"),
+                "{lines:#?}"
+            );
         }
     }
 }
