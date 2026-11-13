@@ -1433,11 +1433,14 @@ fn contact(
     let solid = |d: f32, z: f32| -> Vec<f32> {
         (0..ACROSS).map(across).filter(|&a| has(d, a, z)).collect()
     };
-    // Where the finder touches what it meets: the middle of the widest
-    // unbroken run of it (the one nearer the middle when two are as
-    // wide), so never in a gap an earlier cut left in the face (LIO-451);
-    // round when all it meets spans less than half the stock's width.
-    let met = |found: &[f32]| {
+    // Where the finder touches what it meets (`found`, samples across the
+    // face with material, which `solid` says of any point across): the
+    // middle of the widest unbroken run of it (the one nearer the middle
+    // when two are as wide), so never in a gap an earlier cut left in the
+    // face; when a cut narrower than the samples' pitch lies at that
+    // middle, the run's sample nearest it (LIO-451). Round when all it
+    // meets spans less than half the stock's width.
+    let met = |found: &[f32], solid: &dyn Fn(f32) -> bool| {
         let gap = 1.5 * width / ACROSS as f32;
         let middle = (stock.min[o] + stock.max[o]) / 2.;
         let mut best = (found[0], found[0]);
@@ -1457,7 +1460,15 @@ fn contact(
             }
         }
         let (first, last) = (found[0], found[found.len() - 1]);
-        ((best.0 + best.1) / 2., last - first < width / 2.)
+        let mut at = (best.0 + best.1) / 2.;
+        if !solid(at) {
+            let run = found.iter().filter(|a| (best.0..=best.1).contains(*a));
+            at = run
+                .copied()
+                .min_by(|a, b| (a - at).abs().total_cmp(&(b - at).abs()))
+                .unwrap_or(at);
+        }
+        (at, last - first < width / 2.)
     };
     // The heights tried, top first, none in the jaws: the top, then a
     // whole number of millimetres under it.
@@ -1474,7 +1485,7 @@ fn contact(
         }
         let round;
         if n == 0 {
-            (at[o], round) = met(&found);
+            (at[o], round) = met(&found, &|a| has(IN, a, z));
             return Some((at, round));
         }
         let lower = z - UNDER;
@@ -1488,7 +1499,7 @@ fn contact(
         } else {
             (lower, below)
         };
-        (at[o], round) = met(&found);
+        (at[o], round) = met(&found, &|a| has(IN, a, z));
         at[2] = z;
         return Some((at, round));
     }
@@ -1512,7 +1523,7 @@ fn contact(
             .map(|(_, a)| *a)
             .collect();
         let round;
-        (at[o], round) = met(&lines);
+        (at[o], round) = met(&lines, &|a| has(nearest, a, z));
         let (mut out, mut inside) = ((nearest - STEP).max(0.), nearest);
         while inside - out > 0.005 {
             let mid = (out + inside) / 2.;
@@ -4162,28 +4173,56 @@ pub(crate) mod tests {
     }
     #[test]
     fn a_halved_axis_is_never_touched_in_a_notch_an_earlier_setup_cut() {
-        // A notch 20 wide and 12 deep in the middle of the +X face's top.
-        let (doc, mesh) = after_a_cut([67., 80., -10., 10., 0., -12.]);
-        let walked = simulate(&doc, &mesh, 1, "").unwrap();
-        let guide = build(&doc, &mesh, 1).unwrap();
-        let Step::Zero { far, touch, .. } = &guide.steps[1] else {
-            panic!("{:?}", guide.steps[1])
-        };
-        let f = far[0].unwrap();
-        // On the +X face, at the top, beside the notch, where there is
-        // material just inside it.
-        close(f.at[0], 70.);
-        close(f.at[2], 0.);
-        assert!(f.at[1].abs() > 10., "{f:?}");
-        let frame = crate::volume::Frame::new(&doc.setups[1], &mesh);
-        let rest = crate::rest::RestStock::new(&walked.before, frame);
-        let removed = rest.removed_in(walked.done[0].1.stock);
-        let mut p: [f32; 3] = std::array::from_fn(|k| f.at[k] + guide.zero[k]);
-        (p[0], p[2]) = (p[0] - 0.2, p[2] - 0.2);
-        assert!(rest.in_stock(p) && !removed.at(p), "{f:?} {p:?}");
-        // Both faces whole: half the reading.
-        close(f.reads, 150.);
-        close(touch[0], 75.);
+        // A notch 20 wide and 12 deep in the middle of the +X face's top;
+        // then also a slot 1.2 wide beside it, narrower than the pitch the
+        // face is sampled at, where the material's middle falls.
+        for slot in [false, true] {
+            let (mut doc, mesh) = after_a_cut([67., 80., -10., 10., 0., -12.]);
+            if slot {
+                let mut tool = doc.tools[0].clone();
+                tool.id = "slot-mill".into();
+                tool.p.insert("diameter".into(), "1.2".into());
+                doc.setups[0].operations.push(boxed(
+                    "Slot",
+                    &tool.id,
+                    [67., 80., 26.088522, 27.288522, 0., -12.],
+                    &[
+                        ("allowance", "0"),
+                        ("stepover", "40"),
+                        ("stepdown", "1"),
+                        ("rpm", "1000"),
+                        ("feed", "40"),
+                    ],
+                ));
+                doc.tools.push(tool);
+            }
+            let walked = simulate(&doc, &mesh, 1, "").unwrap();
+            let guide = build(&doc, &mesh, 1).unwrap();
+            let Step::Zero { far, touch, .. } = &guide.steps[1] else {
+                panic!("{:?}", guide.steps[1])
+            };
+            let f = far[0].unwrap();
+            // On the +X face, at the top, beside the notch, where there is
+            // material just inside it.
+            close(f.at[0], 70.);
+            close(f.at[2], 0.);
+            assert!(f.at[1].abs() > 10., "{f:?}");
+            let frame = crate::volume::Frame::new(&doc.setups[1], &mesh);
+            let rest = crate::rest::RestStock::new(&walked.before, frame);
+            let removed = rest.removed_in(walked.done[0].1.stock);
+            let mut p: [f32; 3] = std::array::from_fn(|k| f.at[k] + guide.zero[k]);
+            (p[0], p[2]) = (p[0] - 0.2, p[2] - 0.2);
+            assert!(
+                rest.in_stock(p) && !removed.at(p),
+                "slot {slot}: {f:?} {p:?}"
+            );
+            if slot {
+                assert!(!(26.08..=27.29).contains(&f.at[1]), "{f:?}");
+            }
+            // Both faces whole: half the reading.
+            close(f.reads, 150.);
+            close(touch[0], 75.);
+        }
     }
     #[test]
     fn halved_touches_not_either_side_of_the_zero_alike_say_how_far_from_half() {
