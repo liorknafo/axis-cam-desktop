@@ -1300,14 +1300,45 @@ fn a_counterbore_far_from_the_setups_origin_is_planned_as_near_it() {
             .unwrap_or_else(|e| panic!("tx {tx} ty {ty}: {e}"));
         assert_eq!(plan.slot_passes.len(), near, "tx {tx} ty {ty}");
     }
-    // A real overcut is still seen out there.
-    let mut far = doc.clone();
-    set(&mut far.setups[0].p, "tx", "21");
-    set(&mut far.setups[0].p, "ty", "179");
-    set(&mut far.setups[0].operations[0].p, "slot_y", "0.01");
-    let s = &far.setups[0];
-    let e = generate(s, &s.operations[0], &far.tools[0], &mesh).unwrap_err();
-    assert!(e.contains("sweep"), "{e}");
+    // A real overcut is still seen out there, as near the origin: the
+    // slot a thousandth off its place or long; a hundredth too wide for the
+    // walked Ø12 (its readings are on the DRO's hundredths, rounded in, so
+    // a thousandth wider still reads 2.25 out and cuts R8.25); a thousandth
+    // too wide with a cutter as wide, which sweeps it.
+    for (tx, ty) in [
+        ("0", "0"),
+        ("21", "179"),
+        ("-289.7", "126.7"),
+        ("194.4", "441.6"),
+    ] {
+        for (key, value, tool) in [
+            ("slot_x", "0.001", "12"),
+            ("slot_x", "-0.001", "12"),
+            ("slot_y", "0.001", "12"),
+            ("slot_y", "-0.001", "12"),
+            ("slot_length", "21.502", "12"),
+            ("slot_width", "16.52", "12"),
+            ("slot_width", "16.502", "16.502"),
+        ] {
+            let mut far = doc.clone();
+            set(&mut far.setups[0].p, "tx", tx);
+            set(&mut far.setups[0].p, "ty", ty);
+            set(&mut far.setups[0].operations[0].p, key, value);
+            if key == "slot_width" {
+                let length = 21.5 + (value.parse::<f32>().unwrap() - 16.5);
+                set(&mut far.setups[0].operations[0].p, "slot_length", length);
+            }
+            set(&mut far.tools[0].p, "diameter", tool);
+            let s = &far.setups[0];
+            let e = generate(s, &s.operations[0], &far.tools[0], &mesh)
+                .err()
+                .unwrap_or_else(|| panic!("tx {tx} ty {ty} {key} {value} Ø{tool}: planned"));
+            assert!(
+                e.contains("sweep") || e.contains("walk reaches past"),
+                "tx {tx} ty {ty} {key} {value} Ø{tool}: {e}"
+            );
+        }
+    }
 }
 
 /// The user's own adapter project, a private copy in `AXIS_ADAPTER_COPY`

@@ -97,8 +97,12 @@ kind, level, offset, what it leaves, its scallop and readings):
   step where the slot lies far from the origin: 0.2 µm at 400 mm. Before
   the fix, 22 of 60 placements of the synthetic 16.5 counterbore between
   X −300 Y 120 and X 308 Y 515 were refused, plus X −260 Y 233.7 as
-  "crossing a round end". After it, none are. A 0.01 mm overcut out there
-  is still refused.
+  "crossing a round end". After it, none are. At the origin and three far
+  placements, every real overcut is still refused:
+  - the slot 0.001 off its place in X or Y, either way;
+  - the slot 0.002 long;
+  - 0.02 too wide for the walked Ø12, whose readings are on hundredths;
+  - 0.002 too wide with a cutter as wide.
 - `the_users_adapter_project_plans_every_slot` (ignored; a private copy of
   the user's project in `AXIS_ADAPTER_COPY`): every operation of every
   setup plans and simulates, the 8 Slots among them, and every setup's
