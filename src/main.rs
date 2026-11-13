@@ -32,6 +32,7 @@ mod look;
 mod machine_view;
 mod manual;
 mod material;
+mod mcp;
 mod mesh;
 mod model;
 mod ngc;
@@ -3371,6 +3372,51 @@ impl App {
         } else {
             None
         }
+    }
+    /// The work still due for the job as it now is, named; empty once it
+    /// has settled. An MCP command waits for it before it answers
+    /// (`mcp::engine`, LIO-470), so its rules stay beside the busy flags:
+    /// - a generation under way (`generating`);
+    /// - an import, reimport, model restore or project open (`import_busy`),
+    ///   a save (`save_busy`) or a G-code export (`gcode_exports`);
+    /// - the NC review (`post_busy`), and the left stock with the holding
+    ///   checks on it (`left_job`);
+    /// - the run check (`ready_job`) and the pictures of its stock
+    ///   (`picturing`);
+    /// - the step guide (`guide_job`), the part's holes (`part_holes_job`),
+    ///   the stock, start and run meshes, and the tooth load;
+    /// - a scrub still to replay (`scrub_pending`) or replaying
+    ///   (`catching_up`);
+    /// - edits not yet settled (`dirty`): the edit pause (`EDIT_PAUSE`) not
+    ///   yet over, or over with the `Tick` that saves the workspace and
+    ///   starts the left stock and run checks still to come, since that work
+    ///   counts before it has started. A workspace that cannot be saved is
+    ///   said on the status line (`save_error`) and does not hold it.
+    pub fn pending(&self) -> Vec<&'static str> {
+        [
+            (self.generating.is_some(), "generation"),
+            (self.import_busy, "model load"),
+            (self.save_busy, "project save"),
+            (self.gcode_exports > 0, "G-code export"),
+            (self.post_busy, "NC review"),
+            (self.left_job.is_some(), "left stock and holding checks"),
+            (self.ready_job.is_some(), "run check"),
+            (self.picturing(), "run stock pictures"),
+            (self.guide_job.is_some(), "step guide"),
+            (self.part_holes_job.is_some(), "part holes"),
+            (self.stock_mesh_job.is_some(), "stock mesh"),
+            (self.start_mesh_job.is_some(), "start stock mesh"),
+            (self.run_mesh_job.is_some(), "run stock mesh"),
+            (self.tooth_load_job.is_some(), "tooth load"),
+            (
+                self.scrub_pending || self.catching_up.is_some(),
+                "playback catch-up",
+            ),
+            (self.dirty && self.save_error.is_none(), "edits settling"),
+        ]
+        .into_iter()
+        .filter_map(|(busy, what)| busy.then_some(what))
+        .collect()
     }
     /// Opens the Control page machine's profile for Setup: again when asked,
     /// for another machine, or when there are no changes to keep.
@@ -10731,6 +10777,11 @@ fn with_notes(status: &str, notes: &[String]) -> String {
 }
 fn main() -> iced::Result {
     let args: Vec<String> = std::env::args().collect();
+    // The MCP server (LIO-470): MCP on standard input and output, on a
+    // headless session; no window opens.
+    if args.get(1).map(String::as_str) == Some("--mcp") {
+        std::process::exit(mcp::main(&args[2..]))
+    }
     if args.get(1).map(String::as_str) == Some("--export-gcode") {
         match export_gcode(args.get(2), args.get(3)) {
             Ok(message) => {

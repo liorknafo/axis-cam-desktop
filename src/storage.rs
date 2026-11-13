@@ -4,9 +4,16 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
 };
+/// Puts the data directory elsewhere (`data_dir`): set only by tests that
+/// run the binary (`tests/mcp_stdio.rs`), so they never touch the user's
+/// workspace. The app never sets it.
+pub const DATA_DIR_VAR: &str = "AXIS_CAM_DATA_DIR";
 /// The OS local data directory, and whether it is missing, so that the shared
-/// temp directory stands in for it.
+/// temp directory stands in for it. `DATA_DIR_VAR`, when set, is used instead.
 pub fn data_dir() -> (PathBuf, bool) {
+    if let Some(dir) = std::env::var_os(DATA_DIR_VAR).filter(|d| !d.is_empty()) {
+        return (PathBuf::from(dir), false);
+    }
     data_dir_or_temp(dirs::data_local_dir())
 }
 fn data_dir_or_temp(local: Option<PathBuf>) -> (PathBuf, bool) {
