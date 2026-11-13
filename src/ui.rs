@@ -5168,7 +5168,7 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
         return c.push(checks.field(p,"allowance","Wall stock to leave · mm"))
             .push(checks.field(p,"axial_allowance","Floor stock to leave · mm (blind only)"))
             .push(checks.field(p,"stepdown","Maximum stepdown · mm"))
-            .push(note("Use a cutter matching width minus twice wall stock to leave. Entry feeds down at 25% feed. It requires a confirmed center-cutting tool or a proven full-diameter entry clear to the final depth. Flutes must reach from the original stock top, including breakthrough." )).into();
+            .push(note("Use a cutter as wide as the slot less twice the wall stock to leave (one sweep a level), or one at least 0.02 mm narrower (it also walks the outline). Entry feeds down at 25% feed. It requires a confirmed center-cutting tool or a proven full-diameter entry clear to the final depth. Flutes must reach from the original stock top, including breakthrough." )).into();
     }
     if s == Strategy::Box {
         return c
