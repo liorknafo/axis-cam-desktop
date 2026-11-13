@@ -767,8 +767,11 @@ fn check_part(
     top: f32,
 ) -> Result<(), String> {
     let g = Geometry::new(setup, mesh);
-    let arcs = cam::arcs::arcs_among(setup, mesh, &cam::arcs::upright(setup, mesh));
     let cut = slot.bounds(r, target, top);
+    // Only an arc with a wall in the cut can be one `reaches` below: seeded
+    // there, each grown whole. Every round of the part, a modelled thread's
+    // hundreds of roots among them, took minutes a slot (LIO-481).
+    let arcs = cam::arcs::arcs_reaching(setup, mesh, &cam::arcs::upright(setup, mesh), &cut);
     let z = [target + 0.0001, top + 0.0001];
     let slack = slack(slot, r);
     let mut proven = vec![];

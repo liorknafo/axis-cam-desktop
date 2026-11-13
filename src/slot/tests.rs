@@ -110,6 +110,81 @@ fn nominal_end_arcs_reject_subfacet_shifts_and_oversize() {
     assert!(arc_overcut(&arc, [-2.501, 0.], [2.499, 0.], 5.) > 0.0009);
     assert!(arc_overcut(&arc, [-2.5, 0.], [2.5, 0.], 5.001) > 0.0009);
 }
+/// The fixture's plate and slot, with four round holes far from the slot
+/// and a modelled M4 thread in one of them: a part of many small faces,
+/// none of them in the slot's way.
+fn busy_plate() -> Mesh {
+    let hole = |x: f64, y: f64, r: f64| vec![(x - r, y, 1.), (x + r, y, 1.)];
+    let holes = [
+        hole(15., 10., 2.5),
+        hole(-15., 10., 2.),
+        hole(-15., -10., 2.),
+        hole(15., -10., 2.),
+    ];
+    let mut loops: Vec<&[(f64, f64, f64)]> = vec![
+        &[
+            (-20., -15., 0.),
+            (20., -15., 0.),
+            (20., 15., 0.),
+            (-20., 15., 0.),
+        ],
+        &[
+            (-2.5, -5., 0.),
+            (2.5, -5., 1.),
+            (2.5, 5., 0.),
+            (-2.5, 5., 1.),
+        ],
+    ];
+    loops.extend(holes.iter().map(Vec::as_slice));
+    let mut tris = crate::cam::arcs::tests::slab(&loops, 8., 0., true, true);
+    tris.extend(crate::thread::tests::modeled(
+        [15., 10.],
+        4.,
+        0.7,
+        60.,
+        true,
+        true,
+        8.,
+        0.,
+    ));
+    crate::mesh::normalize(tris).unwrap()
+}
+#[test]
+fn a_slots_part_check_looks_only_at_the_walls_it_cuts() {
+    // LIO-481: on the adapter plate, with four modelled M8 threads, one
+    // counterbore's part check grew arcs round every wall of the part,
+    // hundreds of thread roots among them, and took ten minutes. It fits as
+    // many circles on a part with far holes and a modelled thread as on the
+    // bare plate, though the whole part's search fits many more.
+    let (s, plain, t, o) = fixture();
+    let busy = busy_plate();
+    assert_eq!(crate::thread::holes_in_setup(&s, &busy).len(), 1);
+    let fits = |m: &Mesh| {
+        cam::arcs::FITS.with(|n| n.set(0));
+        generate(&s, &o, &t, m).unwrap();
+        cam::arcs::FITS.with(|n| n.get())
+    };
+    let alone = fits(&plain);
+    assert_eq!(fits(&busy), alone);
+    cam::arcs::FITS.with(|n| n.set(0));
+    let whole = cam::arcs::arcs_among(&s, &busy, &cam::arcs::upright(&s, &busy));
+    // The slot's two round ends: the holes and the thread go all the way
+    // round.
+    assert_eq!(whole.len(), 2, "{whole:#?}");
+    let everywhere = cam::arcs::FITS.with(|n| n.get());
+    assert!(everywhere > 2 * alone, "{everywhere} vs {alone}");
+    // Its round ends are still proven nominal, and any overcut refused.
+    for (key, value) in [
+        ("slot_x", "0.001"),
+        ("slot_y", "-0.001"),
+        ("slot_length", "15.002"),
+    ] {
+        let mut bad = o.clone();
+        set(&mut bad.p, key, value);
+        let error = generate(&s, &bad, &t, &busy).unwrap_err();
+        assert!(error.contains("sweep"), "{key}={value}: {error}");
+    }
+}
 #[test]
 fn sizes_orientation_allowances_blind_through_and_reach_are_honest() {
     let (s, m, t, o) = fixture();
@@ -1345,7 +1420,10 @@ fn a_counterbore_far_from_the_setups_origin_is_planned_as_near_it() {
 /// (adapter-plate.axis.json and the STEP), never the original: every
 /// operation of every setup plans and simulates, the Slots among them
 /// (LIO-455: setup 4's two upper counterbores, far from its origin, were
-/// refused), and every setup's Steps build.
+/// refused), and every setup's Steps build. Each Slot plans and simulates
+/// in seconds, and the arc search a Slot's pick runs over the whole part
+/// stays off its threads' roots (LIO-481: setup 4's one counterbore took
+/// ten minutes, its picks as long). Run it on a release build.
 #[test]
 #[ignore = "requires a private copy of the user's adapter project (AXIS_ADAPTER_COPY)"]
 fn the_users_adapter_project_plans_every_slot() {
@@ -1356,7 +1434,8 @@ fn the_users_adapter_project_plans_every_slot() {
     doc.file.as_mut().unwrap().path = dir.join("adapter-plate.step");
     let mesh = crate::mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
     let mut failures = vec![];
-    let mut slots = 0;
+    let mut slots = vec![];
+    let mut since = std::time::Instant::now();
     simulation::sequence_with(
         &doc,
         &mesh,
@@ -1364,15 +1443,30 @@ fn the_users_adapter_project_plans_every_slot() {
         |si, oi, r| {
             let op = &doc.setups[si].operations[oi];
             match r {
-                Ok(_) if op.strategy == Strategy::Slot => slots += 1,
+                Ok(_) if op.strategy == Strategy::Slot => {
+                    slots.push((op.name(), since.elapsed().as_secs_f32()));
+                }
                 Ok(_) => {}
                 Err(e) => failures.push(format!("{}/{} {}: {e}", si + 1, oi, op.name())),
             }
+            since = std::time::Instant::now();
         },
         |_, _, _| {},
     );
     assert!(failures.is_empty(), "{failures:#?}");
-    assert_eq!(slots, 8);
+    assert_eq!(slots.len(), 8);
+    eprintln!("{slots:#?}");
+    assert!(slots.iter().all(|(_, s)| *s < 10.), "{slots:#?}");
+    let mut searches = vec![];
+    for s in &doc.setups {
+        cam::arcs::FITS.with(|n| n.set(0));
+        let took = std::time::Instant::now();
+        cam::arcs::arcs_among(s, &mesh, &cam::arcs::upright(s, &mesh));
+        let fits = cam::arcs::FITS.with(|n| n.get());
+        searches.push((s.name(), fits, took.elapsed().as_secs_f32()));
+    }
+    eprintln!("{searches:#?}");
+    assert!(searches.iter().all(|(_, _, s)| *s < 1.), "{searches:#?}");
     for si in 0..doc.setups.len() {
         if let Err(e) = crate::steps::shown(&doc, &mesh, si) {
             panic!("setup {}: {e}", si + 1);

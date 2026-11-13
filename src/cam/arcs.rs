@@ -532,6 +532,70 @@ fn round_thread(f: &Facet, t: &crate::thread::Thread) -> bool {
     let (lo, hi) = ((t.minor / 2. - 0.05) as f64, (t.major / 2. + 0.05) as f64);
     near >= lo && far <= hi && far - near <= 0.005 + far * 1e-4
 }
+/// Adds to `threaded`, the walls of the modeled `threads` of `g`, the
+/// upright facets of `facets` joined to them corner to corner, on and on,
+/// each round a thread's axis as its crests and roots are: its corners as
+/// far from the axis as each other (to `fit`'s 0.005 mm and 0.01 % of
+/// that), between its minor diameter (less 0.05 mm) and the sharp vertex of
+/// its profile's triangle past its major one (an eighth of the triangle's
+/// height: no root is relieved farther). Where a thread runs out at a face
+/// its last roots go on past its flanks, and may lie a hair outside its band
+/// (the adapter plate's M8 roots at R4.0673, its band to R4.0669, LIO-481):
+/// they are its own. A wall round another centre, or another radius, is not.
+fn run_out(
+    g: &Geometry,
+    threads: &[crate::thread::Thread],
+    facets: &HashMap<usize, Facet>,
+    threaded: &mut HashSet<usize>,
+) {
+    if threads.is_empty() {
+        return;
+    }
+    let round = |f: &Facet| {
+        threads.iter().any(|t| {
+            let d: Vec<f64> = (f.xy.iter())
+                .map(|p| (p.0 - t.centre[0] as f64).hypot(p.1 - t.centre[1] as f64))
+                .collect();
+            let (near, far) =
+                (d.iter()).fold((f64::INFINITY, 0f64), |(a, b), &x| (a.min(x), b.max(x)));
+            let sharp = t.pitch / 2. / (t.angle / 2.).to_radians().tan();
+            let (lo, hi) = (
+                (t.minor / 2. - 0.05) as f64,
+                (t.major / 2. + (sharp / 8.).max(0.05)) as f64,
+            );
+            near >= lo && far <= hi && far - near <= 0.005 + far * 1e-4
+        })
+    };
+    // Each surface's corners, and the surfaces at each corner, by `key`
+    // seen from above and to a thousandth in height.
+    let point = |p: &[f32; 3]| {
+        let (x, y) = key((p[0] as f64, p[1] as f64));
+        (x, y, (p[2] as f64 / SAME).round() as i64)
+    };
+    let mut at: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    let mut of: HashMap<usize, Vec<(i64, i64, i64)>> = HashMap::new();
+    for t in &g.triangles {
+        let Some(id) = t.feature else {
+            continue;
+        };
+        for p in &t.p {
+            let k = point(p);
+            at.entry(k).or_default().push(id);
+            of.entry(id).or_default().push(k);
+        }
+    }
+    let mut from: Vec<usize> = threaded.iter().copied().collect();
+    while let Some(id) = from.pop() {
+        for k in of.get(&id).into_iter().flatten() {
+            for &n in at.get(k).into_iter().flatten() {
+                if !threaded.contains(&n) && facets.get(&n).is_some_and(round) {
+                    threaded.insert(n);
+                    from.push(n);
+                }
+            }
+        }
+    }
+}
 /// A corner round an axis: its radius, angle and height.
 type Polar = (f32, f32, f32);
 /// The upright facets of `g` that `keep` keeps and that are a modeled
@@ -766,32 +830,71 @@ pub fn upright(setup: &Setup, mesh: &Mesh) -> HashSet<usize> {
         .collect()
 }
 fn arcs_among_by(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>, outside: bool) -> Vec<Arc> {
+    arcs_from(setup, mesh, ids, None, outside)
+}
+/// The arcs among the surfaces `ids` (`arcs_among`) that have a wall
+/// reaching into `near`: one of its triangles meets the box (`meets`). Each
+/// is grown as `arcs_among` grows it, through every surface of `ids`, but
+/// only from walls in the box: a slot's part check (`slot::check_part`)
+/// looks for the arcs its cutter reaches, not every round on the part
+/// (LIO-481).
+pub fn arcs_reaching(
+    setup: &Setup,
+    mesh: &Mesh,
+    ids: &HashSet<usize>,
+    near: &crate::mesh::Bounds,
+) -> Vec<Arc> {
+    arcs_from(setup, mesh, ids, Some(near), false)
+}
+/// `arcs_among_by`, its seeds the walls with a triangle meeting `near` when
+/// there is one.
+fn arcs_from(
+    setup: &Setup,
+    mesh: &Mesh,
+    ids: &HashSet<usize>,
+    near: Option<&crate::mesh::Bounds>,
+    outside: bool,
+) -> Vec<Arc> {
     let g = Geometry::new(setup, mesh);
     let facets = facets(&g, |id| ids.contains(&id));
     if facets.len() < 3 {
         return vec![];
     }
-    let at = corners(&facets);
-    let wide = across(setup, mesh, &g);
-    // A modeled thread's own walls (`own_walls`) are its hole's: no arc
-    // starts from them (grown along a thread's hundreds of crests, one took
-    // minutes), though one may grow on through them. Other walls start arcs
-    // as on main.
+    // A modeled thread's own walls (`own_walls`), the walls wholly in its
+    // band and the run of its roots and crests on past them (`run_out`) are
+    // its hole's, never an arc's: no arc starts from them, nor grows on
+    // through them. Grown along a thread's hundreds of crests, from one of
+    // them (LIO-361, LIO-434) or from a root where it runs out at a face, a
+    // hair past its band, one took minutes (LIO-481).
     let threads = crate::thread::holes_in_setup(setup, mesh);
-    // The part's upright facets, for where a curve goes on past an arc.
-    let mut all: Option<(HashMap<usize, Facet>, Corners)> = None;
-    let mut seeds: Vec<usize> = facets.keys().copied().collect();
-    seeds.sort_unstable();
-    let (mut done, mut found) = (HashSet::new(), vec![]);
-    done.extend(own_walls(&g, &threads, |id| ids.contains(&id)));
-    // Nor from any wall wholly in a thread's band: a picked thread's whole
-    // hole selects all of them, and arcs grown from those took minutes a
-    // click (LIO-434).
+    let mut threaded = own_walls(&g, &threads, |id| ids.contains(&id));
     let banded = Geometry {
         threads: threads.clone(),
         ..Geometry::new(setup, mesh)
     };
-    done.extend(crate::pocket::thread_band_walls(&banded));
+    threaded.extend(crate::pocket::thread_band_walls(&banded));
+    run_out(&g, &threads, &facets, &mut threaded);
+    let facets: HashMap<usize, Facet> = (facets.into_iter())
+        .filter(|(id, _)| !threaded.contains(id))
+        .collect();
+    if facets.len() < 3 {
+        return vec![];
+    }
+    let at = corners(&facets);
+    let wide = across(setup, mesh, &g);
+    // The part's upright facets, for where a curve goes on past an arc.
+    let mut all: Option<(HashMap<usize, Facet>, Corners)> = None;
+    let mut seeds: Vec<usize> = match near {
+        None => facets.keys().copied().collect(),
+        Some(b) => (g.triangles.iter())
+            .filter(|t| super::meets(&t.p, b))
+            .filter_map(|t| t.feature.filter(|id| facets.contains_key(id)))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect(),
+    };
+    seeds.sort_unstable();
+    let (mut done, mut found) = (HashSet::new(), vec![]);
     for seed in seeds {
         if done.contains(&seed) {
             continue;
@@ -1765,6 +1868,49 @@ pub(crate) mod tests {
             })
             .map(|(id, _)| id)
             .collect()
+    }
+    #[test]
+    fn where_a_thread_runs_out_its_roots_are_its_own() {
+        // LIO-481: where a modelled thread runs out at a face, its last roots
+        // go on past its flanks, a hair outside its band (the adapter
+        // plate's M8 roots at R4.0673, its band to R4.0669): no wall of
+        // theirs was the thread's, and arcs grown from them along its roots
+        // took seconds a search, minutes when they grew on through its own.
+        // Every upright wall of the threaded plate round a thread's axis, at
+        // its roots or crests, is the thread's: picked, none starts an arc.
+        let mesh = mesh::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/threaded-plate.3mf"),
+        )
+        .unwrap();
+        let (setup, _, _) = fixture(Strategy::Drill);
+        let g = Geometry::new(&setup, &mesh);
+        let threads = crate::thread::holes_in_setup(&setup, &mesh);
+        assert_eq!(threads.len(), 4);
+        let round: HashSet<usize> = (facets(&g, |_| true).into_iter())
+            .filter(|(_, f)| {
+                threads.iter().any(|t| {
+                    let d: Vec<f64> = (f.xy.iter())
+                        .map(|p| (p.0 - t.centre[0] as f64).hypot(p.1 - t.centre[1] as f64))
+                        .collect();
+                    let (near, far) =
+                        (d.iter()).fold((f64::INFINITY, 0f64), |(a, b), &x| (a.min(x), b.max(x)));
+                    near >= (t.minor / 2. - 0.05) as f64
+                        && far <= (t.major / 2. + 0.1) as f64
+                        && far - near <= 0.005
+                })
+            })
+            .map(|(id, _)| id)
+            .collect();
+        let mut own = own_walls(&g, &threads, |_| true);
+        own.extend(crate::pocket::thread_band_walls(&Geometry {
+            threads: threads.clone(),
+            ..Geometry::new(&setup, &mesh)
+        }));
+        let past = round.iter().filter(|id| !own.contains(id)).count();
+        assert!(past >= 8, "{past} of {}", round.len());
+        FITS.with(|n| n.set(0));
+        assert!(arcs_among(&setup, &mesh, &round).is_empty());
+        assert_eq!(FITS.with(|n| n.get()), 0);
     }
     #[test]
     fn an_obrounds_ends_over_a_modeled_thread_are_no_walls_of_it() {
