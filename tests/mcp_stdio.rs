@@ -108,6 +108,27 @@ fn the_server_answers_over_stdio() {
             .contains("fly")
     );
 
+    // A command whose work takes a while (an edit settles after a pause)
+    // does not hold up a read sent after it.
+    send(
+        r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"execute","arguments":{"command":"set_project_title","args":{"title":"Slow"},"wait_s":20}}}"#,
+    );
+    send(
+        r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"inspect","arguments":{}}}"#,
+    );
+    let mut order = vec![];
+    while order.len() < 2 {
+        let line = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("an answer within a minute");
+        let v: Value = serde_json::from_str(&line).unwrap();
+        order.push(v);
+    }
+    assert_eq!(order[0]["id"], 8, "the read answers first: {order:?}");
+    let executed = &order[1]["result"]["structuredContent"];
+    assert_eq!(executed["outcome"], "done", "{executed}");
+    assert!(executed["command_id"].is_string());
+
     // Stdin's end ends the server, and the session stays on disk.
     drop(stdin);
     let deadline = std::time::Instant::now() + Duration::from_secs(30);

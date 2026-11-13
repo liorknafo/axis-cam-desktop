@@ -3889,6 +3889,82 @@ impl Document {
             "Used by {list}. Assign another tool to them before deleting this one."
         ))
     }
+    /// The tool library entry `draft` is saved as (Save in the Tool
+    /// library), or why it cannot be: its own issues and a tool number
+    /// another tool has. The Save handler and the MCP engine both use it
+    /// (LIO-470), so what the engine expects is what the save does.
+    pub fn saved_tool(&self, draft: &Tool) -> Result<Tool, Vec<String>> {
+        let mut issues = draft.issues();
+        issues.extend(self.tool_number_issues(draft));
+        if issues.is_empty() {
+            Ok(draft.clone())
+        } else {
+            Err(issues)
+        }
+    }
+    /// The material library entry `draft` is saved as: its name trimmed;
+    /// or why it cannot be (`saved_tool`).
+    pub fn saved_material(
+        &self,
+        draft: &crate::material::Material,
+    ) -> Result<crate::material::Material, Vec<String>> {
+        let mut issues = draft.issues();
+        issues.extend(self.material_name_issues(draft));
+        if !issues.is_empty() {
+            return Err(issues);
+        }
+        let mut saved = draft.clone();
+        saved
+            .p
+            .insert("name".into(), draft.name().trim().to_string());
+        Ok(saved)
+    }
+    /// The workholding entry `draft` is saved as: its name trimmed; or why
+    /// it cannot be (`saved_tool`).
+    pub fn saved_holder(
+        &self,
+        draft: &crate::holding::Holder,
+    ) -> Result<crate::holding::Holder, Vec<String>> {
+        let mut issues = draft.issues();
+        issues.extend(self.holder_name_issues(draft));
+        if !issues.is_empty() {
+            return Err(issues);
+        }
+        let mut saved = draft.clone();
+        saved
+            .p
+            .insert("name".into(), draft.name().trim().to_string());
+        Ok(saved)
+    }
+    /// The machine library entry `draft` is saved as, or why it cannot be
+    /// (`saved_tool`): a hand machine settled (`manual::settle`); the
+    /// centreline's measured marks dropped when its typed centre differs
+    /// from the saved one, since it is no longer the measurement; and one
+    /// more `version` when the library has it already. The connected
+    /// machine's travel is the Save handler's to keep (LIO-344).
+    pub fn saved_machine(&self, draft: &Machine) -> Result<Machine, Vec<String>> {
+        let mut m = draft.clone();
+        if crate::manual::is_hand(&m) {
+            crate::manual::settle(&mut m);
+        }
+        let errors = m.issues();
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        let saved = self.machines.iter().find(|x| x.id == m.id);
+        if saved.is_some_and(|x| {
+            ["a_centre_y", "a_centre_z"]
+                .iter()
+                .any(|k| get(&x.p, k) != get(&m.p, k))
+        }) {
+            m.p.remove(crate::control::CENTRE_MARK);
+            m.p.remove(CENTRE_REF);
+        }
+        if let Some(x) = saved {
+            m.version = x.version + 1;
+        }
+        Ok(m)
+    }
     pub fn tool_number_issues(&self, tool: &Tool) -> Vec<String> {
         // A tool with no name has no "name: " before its message (LIO-393).
         let said = |rest: String| match tool.name().trim() {

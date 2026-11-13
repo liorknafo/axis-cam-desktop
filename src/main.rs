@@ -1589,6 +1589,10 @@ pub struct App {
     /// The folder a test app is rooted in, removed when the app is dropped.
     #[cfg(test)]
     test_dir: Option<tempfile::TempDir>,
+    /// How long each generation off the window's thread waits before it
+    /// works, until it is cancelled: the MCP tests' slow generation.
+    #[cfg(test)]
+    pub(crate) slow_generation: Option<Duration>,
 }
 /// A line of the operation audit's report (`Message::GenerateAll`): the setup
 /// and operation it is about, by index, their names, whether the operation
@@ -2223,6 +2227,8 @@ impl App {
             gcode_exports: 0,
             #[cfg(test)]
             test_dir: None,
+            #[cfg(test)]
+            slow_generation: None,
         }
     }
     fn boot() -> (Self, Task<Message>) {
@@ -3001,6 +3007,17 @@ impl App {
             let made = progress.run(work);
             return self.update(done(epoch, made));
         }
+        #[cfg(test)]
+        let work = {
+            let (slow, cancelled) = (self.slow_generation, progress.clone());
+            move || {
+                let until = Instant::now() + slow.unwrap_or_default();
+                while Instant::now() < until && !cancelled.cancelled() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                work()
+            }
+        };
         Task::perform(
             async move { tokio::task::spawn_blocking(move || progress.run(work)).await },
             move |made| match made {
@@ -8303,46 +8320,33 @@ impl App {
                 if manual::is_hand(&self.machine_draft) {
                     manual::settle(&mut self.machine_draft);
                 }
-                let errors = self.machine_draft.issues();
-                if errors.is_empty() {
-                    let mut m = self.machine_draft.clone();
-                    // A centreline typed over the probed one is no longer
-                    // the measurement.
-                    let saved = self.doc.machines.iter().find(|x| x.id == m.id);
-                    if saved.is_some_and(|x| {
-                        ["a_centre_y", "a_centre_z"]
-                            .iter()
-                            .any(|k| get(&x.p, k) != get(&m.p, k))
-                    }) {
-                        m.p.remove(control::CENTRE_MARK);
-                        m.p.remove(model::CENTRE_REF);
+                match self.doc.saved_machine(&self.machine_draft) {
+                    Ok(mut m) => {
+                        let mut synced = false;
+                        if let Some(c) = self.control.as_mut().filter(|c| c.machine_id == m.id) {
+                            c.probe = control::probe_settings(&m.p);
+                            c.pins = control::pins_settings(&m.p);
+                            c.rotary = control::Rotary::of(&m);
+                            // Its travel is the connected profile's (LIO-344).
+                            synced = control::travel_into(&mut m, &c.machine_id, &c.config);
+                        }
+                        if let Some(i) = self.doc.machines.iter().position(|x| x.id == m.id) {
+                            self.doc.machines[i] = m;
+                        } else {
+                            self.doc.machines.push(m);
+                        }
+                        self.page = Page::Machines;
+                        self.touch();
+                        // Said first: the status line is cut short to fit.
+                        self.status = if synced {
+                            "Machine profile saved, its X, Y and Z travel kept at its UC100 profile's soft limits: change them in Controller configuration. Use Assign to current setup to update an existing setup snapshot."
+                        } else {
+                            "Machine profile saved. Use Assign to current setup to update an existing setup snapshot."
+                        }
+                        .into();
+                        return self.resume();
                     }
-                    let mut synced = false;
-                    if let Some(c) = self.control.as_mut().filter(|c| c.machine_id == m.id) {
-                        c.probe = control::probe_settings(&m.p);
-                        c.pins = control::pins_settings(&m.p);
-                        c.rotary = control::Rotary::of(&m);
-                        // Its travel is the connected profile's (LIO-344).
-                        synced = control::travel_into(&mut m, &c.machine_id, &c.config);
-                    }
-                    if let Some(i) = self.doc.machines.iter().position(|x| x.id == m.id) {
-                        m.version += 1;
-                        self.doc.machines[i] = m;
-                    } else {
-                        self.doc.machines.push(m);
-                    }
-                    self.page = Page::Machines;
-                    self.touch();
-                    // Said first: the status line is cut short to fit.
-                    self.status = if synced {
-                        "Machine profile saved, its X, Y and Z travel kept at its UC100 profile's soft limits: change them in Controller configuration. Use Assign to current setup to update an existing setup snapshot."
-                    } else {
-                        "Machine profile saved. Use Assign to current setup to update an existing setup snapshot."
-                    }
-                    .into();
-                    return self.resume();
-                } else {
-                    self.status = errors.join(" ");
+                    Err(errors) => self.status = errors.join(" "),
                 }
             }
             Message::ToolMachine(id, on) => {
@@ -8378,27 +8382,19 @@ impl App {
                 self.tool_draft = tool;
                 self.page = Page::Tools
             }
-            Message::SaveTool => {
-                let mut issues = self.tool_draft.issues();
-                issues.extend(self.doc.tool_number_issues(&self.tool_draft));
-                if issues.is_empty() {
-                    if let Some(t) = self
-                        .doc
-                        .tools
-                        .iter_mut()
-                        .find(|t| t.id == self.tool_draft.id)
-                    {
-                        *t = self.tool_draft.clone()
+            Message::SaveTool => match self.doc.saved_tool(&self.tool_draft) {
+                Ok(saved) => {
+                    if let Some(t) = self.doc.tools.iter_mut().find(|t| t.id == saved.id) {
+                        *t = saved
                     } else {
-                        self.doc.tools.push(self.tool_draft.clone())
+                        self.doc.tools.push(saved)
                     }
                     self.touch();
                     self.status = "Tool saved to the local library.".into();
                     return self.resume();
-                } else {
-                    self.status = issues.join(" ")
                 }
-            }
+                Err(issues) => self.status = issues.join(" "),
+            },
             Message::DeleteTool(id) => {
                 if let Some(note) = self.doc.tool_in_use_note(&id) {
                     self.status = format!("This tool is not deleted. {note}")
@@ -8423,13 +8419,9 @@ impl App {
                 self.material_draft = material::Material::new("New material");
                 self.page = Page::Materials
             }
-            Message::SaveMaterial => {
-                let mut issues = self.material_draft.issues();
-                issues.extend(self.doc.material_name_issues(&self.material_draft));
-                if issues.is_empty() {
-                    let name = self.material_draft.name().trim().to_string();
-                    self.material_draft.p.insert("name".into(), name);
-                    let saved = self.material_draft.clone();
+            Message::SaveMaterial => match self.doc.saved_material(&self.material_draft) {
+                Ok(saved) => {
+                    self.material_draft = saved.clone();
                     if let Some(m) = self.doc.materials.iter_mut().find(|m| m.id == saved.id) {
                         *m = saved.clone()
                     } else {
@@ -8444,10 +8436,9 @@ impl App {
                     }
                     self.touch();
                     self.status = "Material saved to the library.".into()
-                } else {
-                    self.status = issues.join(" ")
                 }
-            }
+                Err(issues) => self.status = issues.join(" "),
+            },
             Message::DeleteMaterial(id) => {
                 if self.doc.selected_material().is_some_and(|m| m.id == id) {
                     self.status = "This is the project material. Choose another project material before deleting it.".into()
@@ -8492,13 +8483,9 @@ impl App {
                 }
                 self.page = Page::Workholding
             }
-            Message::SaveHolder => {
-                let mut issues = self.holder_draft.issues();
-                issues.extend(self.doc.holder_name_issues(&self.holder_draft));
-                if issues.is_empty() {
-                    let name = self.holder_draft.name().trim().to_string();
-                    self.holder_draft.p.insert("name".into(), name);
-                    let saved = self.holder_draft.clone();
+            Message::SaveHolder => match self.doc.saved_holder(&self.holder_draft) {
+                Ok(saved) => {
+                    self.holder_draft = saved.clone();
                     if let Some(h) = self.doc.workholding.iter_mut().find(|h| h.id == saved.id) {
                         *h = saved
                     } else {
@@ -8506,10 +8493,9 @@ impl App {
                     }
                     self.touch();
                     self.status = "Workholding saved to the library.".into()
-                } else {
-                    self.status = issues.join(" ")
                 }
-            }
+                Err(issues) => self.status = issues.join(" "),
+            },
             Message::DeleteHolder(id) => {
                 let using = self.doc.setups.iter().find(|s| {
                     holding::library_kind(get(&s.p, "holding")).is_some()

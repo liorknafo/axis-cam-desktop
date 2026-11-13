@@ -13,6 +13,7 @@ use crate::{
     App, GuideAction, Message, Page, Target, control, model::Strategy, run, section, settings,
     stock_surface, ui, viewport,
 };
+use iced::Task;
 use serde_json::{Value, json};
 use std::{
     path::{Component, Path, PathBuf},
@@ -53,8 +54,13 @@ fn bad<T>(why: impl Into<String>) -> Result<T, Problem> {
     Err(Problem::Args(why.into()))
 }
 
-/// The effect a command must have: `Err` says what did not happen.
-pub type Expect = Box<dyn Fn(&App) -> Result<(), String>>;
+/// What the effect check found: `Ok(None)` it holds (done), `Ok(Some(why))`
+/// it already held and nothing changed (no_change), `Err(what)` it does not
+/// hold (failed).
+pub type Verdict = Result<Option<String>, String>;
+/// The effect a command must have, checked on the `App` once its work has
+/// settled; made before the command is sent, from the state it starts on.
+pub type Expect = Box<dyn Fn(&App) -> Verdict>;
 
 /// What a command acts on, selected first when the arguments name it.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -79,6 +85,18 @@ enum Help {
 enum Build {
     Sends(fn() -> Message),
     With(fn(&Ctx) -> Result<Vec<Message>, Problem>),
+    /// Messages, and work off the `App`'s thread whose answer is a message:
+    /// what a file dialog's command does after the dialog (a load, a
+    /// write), so the event loop keeps taking events meanwhile.
+    Work(fn(&Ctx) -> Worked),
+}
+
+/// A `Build::Work` builder's result: its messages and its work.
+type Worked = Result<(Vec<Message>, Task<Message>), Problem>;
+/// What a command sends: its messages in order, then its work.
+pub struct Dispatch {
+    pub messages: Vec<Message>,
+    pub task: Option<Task<Message>>,
 }
 
 /// A command `execute` runs.
@@ -100,8 +118,7 @@ pub struct Command {
     build: Build,
     /// Why it is already so, when it is: nothing is sent (`no_change`).
     pub unchanged: Option<fn(&Ctx) -> Option<String>>,
-    /// The effect checked once the work has settled (Step 3 gives every
-    /// command one).
+    /// The effect checked once the work has settled (`effects`).
     pub expect: Option<fn(&Ctx) -> Expect>,
 }
 
@@ -133,6 +150,10 @@ impl Command {
     }
     fn with(mut self, f: fn(&Ctx) -> Result<Vec<Message>, Problem>) -> Self {
         self.build = Build::With(f);
+        self
+    }
+    fn work(mut self, f: fn(&Ctx) -> Worked) -> Self {
+        self.build = Build::Work(f);
         self
     }
     fn help_of(mut self, m: fn() -> Message, label: &'static str) -> Self {
@@ -234,26 +255,29 @@ impl Command {
     pub fn example_args(&self) -> Vec<Value> {
         (self.examples)()
     }
-    /// The messages, without the precondition: what the builder makes.
-    #[cfg(test)]
-    fn built(&self, ctx: &Ctx) -> Result<Vec<Message>, Problem> {
+    /// What the builder makes, without the precondition.
+    fn built(&self, ctx: &Ctx) -> Result<Dispatch, Problem> {
         let mut messages = select_first(self.on, ctx)?;
+        let mut task = None;
         match &self.build {
             Build::Sends(m) => messages.push(m()),
             Build::With(f) => messages.extend(f(ctx)?),
+            Build::Work(f) => {
+                let (more, work) = f(ctx)?;
+                messages.extend(more);
+                task = Some(work);
+            }
         }
-        Ok(messages)
+        Ok(Dispatch { messages, task })
     }
-    /// Checks the precondition, then makes the messages: the selection
+    /// Its precondition: what must hold before anything is sent.
+    pub fn check(&self, ctx: &Ctx) -> Result<(), Problem> {
+        (self.precondition)(ctx)
+    }
+    /// What the command sends, once its precondition holds: the selection
     /// first, then the command's own.
-    pub fn messages(&self, ctx: &Ctx) -> Result<Vec<Message>, Problem> {
-        (self.precondition)(ctx)?;
-        let mut messages = select_first(self.on, ctx)?;
-        match &self.build {
-            Build::Sends(m) => messages.push(m()),
-            Build::With(f) => messages.extend(f(ctx)?),
-        }
-        Ok(messages)
+    pub fn dispatch(&self, ctx: &Ctx) -> Result<Dispatch, Problem> {
+        self.built(ctx)
     }
 }
 
@@ -295,11 +319,7 @@ fn select_first(on: On, ctx: &Ctx) -> Result<Vec<Message>, Problem> {
 pub type Addressed = (Option<usize>, Option<(usize, usize)>);
 /// Resolves what `on` addresses in `args`: the setup and operation the
 /// command acts on, before its precondition runs.
-pub fn resolve(
-    on: On,
-    app: &App,
-    args: &Value,
-) -> Result<Addressed, Problem> {
+pub fn resolve(on: On, app: &App, args: &Value) -> Result<Addressed, Problem> {
     let active = app.doc.setups.iter().position(|s| s.id == app.doc.active);
     match on {
         On::Nothing => Ok((None, None)),
@@ -866,7 +886,14 @@ pub fn all() -> &'static [Command] {
     &REGISTRY
 }
 
-static REGISTRY: LazyLock<Vec<Command>> = LazyLock::new(table);
+static REGISTRY: LazyLock<Vec<Command>> = LazyLock::new(|| {
+    let mut commands = table();
+    for c in &mut commands {
+        c.expect = c.expect.or(effect(c.name));
+        c.unchanged = c.unchanged.or(already(c.name));
+    }
+    commands
+});
 
 #[allow(clippy::too_many_lines)]
 fn table() -> Vec<Command> {
@@ -909,10 +936,12 @@ fn table() -> Vec<Command> {
             })
             .examples(|| vec![json!({"path": "/tmp/job.axis.json"})])
             .when(replaces_project)
-            .with(|ctx| {
+            .work(|ctx| {
                 let path = path_arg(ctx, "path")?;
-                let opened = crate::storage::load_reporting(&path).map(|(d, n)| (d, path, n));
-                Ok(vec![Message::ProjectOpened(Some(opened))])
+                if !path.is_file() {
+                    return refused(format!("There is no project file at {}.", path.display()));
+                }
+                Ok((vec![], off_thread(move || crate::storage::load_reporting(&path).map(|(d, n)| (d, path, n)), |opened| Message::ProjectOpened(Some(opened)))))
             })
             .requires("An absolute path; no unsaved work, or discard_unsaved: true.")
             .effect("The project opened, its part loaded; the old one is in Project history."),
@@ -955,7 +984,7 @@ fn table() -> Vec<Command> {
                 let title = ctx.args["title"].as_str().unwrap_or_default().to_string();
                 Box::new(move |app| {
                     (app.doc.title == title)
-                        .then_some(())
+                        .then_some(None)
                         .ok_or_else(|| "The title was not changed.".into())
                 })
             })
@@ -1035,7 +1064,7 @@ fn table() -> Vec<Command> {
                 let id = si.map(|si| ctx.app.doc.setups[si].id.clone()).unwrap_or_default();
                 Box::new(move |app| {
                     (app.doc.active == id)
-                        .then_some(())
+                        .then_some(None)
                         .ok_or_else(|| "The setup was not made active.".into())
                 })
             })
@@ -1167,7 +1196,7 @@ fn table() -> Vec<Command> {
                     .unwrap_or_default();
                 Box::new(move |app| {
                     (app.operation().is_some_and(|o| o.id == id))
-                        .then_some(())
+                        .then_some(None)
                         .ok_or_else(|| "The operation was not selected.".into())
                 })
             })
@@ -1204,7 +1233,7 @@ fn table() -> Vec<Command> {
                         Some(o.strategy) == strategy && !before.contains(&o.id)
                     });
                     (added && selected && app.doc.active == id)
-                        .then_some(())
+                        .then_some(None)
                         .ok_or_else(|| "No operation was added.".into())
                 })
             })
@@ -1238,7 +1267,10 @@ fn table() -> Vec<Command> {
             .examples(|| vec![json!({"id": "<tool>"})])
             .with(|ctx| Ok(vec![Message::SetOpTool(tool_id(ctx, "id")?)]))
             .effect("The operation cuts with that tool."),
-        cmd("recommend_speeds", "operation").sends(|| Message::RecommendSpeeds).on_operation().effect("The operation's speed and feed from the project material's cutting data."),
+        cmd("recommend_speeds", "operation").sends(|| Message::RecommendSpeeds).on_operation().when(|ctx| match ctx.app.doc.selected_material() {
+            Some(_) => Ok(()),
+            None => refused("The project has no material: choose one first (set_project_material)."),
+        }).effect("The operation's speed and feed from the project material's cutting data."),
         cmd("set_rest_source", "operation")
             .help_of(|| Message::RestSource(String::new()), "")
             .on_operation()
@@ -1421,7 +1453,7 @@ fn table() -> Vec<Command> {
                     "This machine is connected, and saving it changes what its controller holds. {}",
                     class::MACHINE
                 )),
-                _ => Ok(()),
+                _ => saved_machine(ctx).map(|_| ()),
             })
             .requires("A machine draft that is not the connected machine's.")
             .effect("The draft is saved to the library."),
@@ -1446,7 +1478,7 @@ fn table() -> Vec<Command> {
             .examples(|| vec![json!({"id": "<tool>"})])
             .with(|ctx| Ok(vec![Message::EditTool(tool_id(ctx, "id")?)]))
             .effect("The tool editor on that tool."),
-        cmd("save_tool", "libraries").sends(|| Message::SaveTool).effect("The tool draft is saved to the library."),
+        cmd("save_tool", "libraries").sends(|| Message::SaveTool).when(|ctx| saved_tool(ctx).map(|_| ())).requires("A tool draft with no issues.").effect("The tool draft is saved to the library."),
         cmd("delete_tool", "libraries")
             .help_of(|| Message::DeleteTool(String::new()), "")
             .params(|| vec![("id", text_param("A library tool's id."), true)])
@@ -1470,7 +1502,7 @@ fn table() -> Vec<Command> {
             .examples(|| vec![json!({"id": "<material>"})])
             .with(|ctx| Ok(vec![Message::EditMaterial(material_id(ctx, "id")?)]))
             .effect("The material editor on that material."),
-        cmd("save_material", "libraries").sends(|| Message::SaveMaterial).effect("The material draft is saved to the library."),
+        cmd("save_material", "libraries").sends(|| Message::SaveMaterial).when(|ctx| saved_material(ctx).map(|_| ())).requires("A material draft with no issues.").effect("The material draft is saved to the library."),
         cmd("delete_material", "libraries")
             .help_of(|| Message::DeleteMaterial(String::new()), "")
             .params(|| vec![("id", text_param("A library material's id."), true)])
@@ -1490,7 +1522,7 @@ fn table() -> Vec<Command> {
             .examples(|| vec![json!({"id": "<holder>"})])
             .with(|ctx| Ok(vec![Message::EditHolder(holder_id(ctx, "id")?)]))
             .effect("The workholding editor on that entry."),
-        cmd("save_holder", "libraries").sends(|| Message::SaveHolder).effect("The workholding draft is saved to the library."),
+        cmd("save_holder", "libraries").sends(|| Message::SaveHolder).when(|ctx| saved_holder(ctx).map(|_| ())).requires("A workholding draft with no issues.").effect("The workholding draft is saved to the library."),
         cmd("delete_holder", "libraries")
             .help_of(|| Message::DeleteHolder(String::new()), "")
             .params(|| vec![("id", text_param("A workholding entry's id."), true)])
@@ -1601,6 +1633,13 @@ fn table() -> Vec<Command> {
             .help_of(|| Message::Scrub(0.), "")
             .params(|| vec![("at", json!({"type": "number", "minimum": 0, "maximum": 1, "description": "Where in the preview, 0 to 1."}), true)])
             .examples(|| vec![json!({"at": 0.5})])
+            .when(|ctx| {
+                if ctx.app.playback_ready() {
+                    Ok(())
+                } else {
+                    refused("There is no preview to scrub: generate the operation first.")
+                }
+            })
             .with(|ctx| Ok(vec![Message::Scrub(number(ctx, "at")? as f32), Message::ScrubDone]))
             .effect("The preview is at that point, the stock caught up."),
         cmd("playback_speed", "view")
@@ -1692,6 +1731,10 @@ fn table() -> Vec<Command> {
             .locked_ok()
             .params(|| vec![("more", json!({"type": ["integer", "null"], "description": "The operation whose skips open, by index; null closes them."}), false), ("steps", json!({"type": ["integer", "null"], "description": "The operation whose steps unfold, by index; null folds them."}), false)])
             .examples(|| vec![json!({"more": 0}), json!({"steps": null})])
+            .when(|ctx| match ctx.app.control.as_ref().and_then(|c| c.run.as_ref()) {
+                Some(_) => Ok(()),
+                None => refused("No run is open in the Run panel."),
+            })
             .with(|ctx| {
                 let row = |key: &str| -> Result<Option<Option<usize>>, Problem> {
                     match ctx.args.get(key) {
@@ -1721,19 +1764,36 @@ fn table() -> Vec<Command> {
             .help_of(|| Message::ExportGcode, "")
             .params(|| vec![("folder", text_param("The folder the programs go in."), true), overwrite_param()])
             .examples(|| vec![json!({"folder": "/tmp"})])
-            .with(|ctx| {
+            .work(|ctx| {
                 let folder = path_arg(ctx, "folder")?;
                 if !folder.is_dir() {
                     return refused(format!("There is no folder {}.", folder.display()));
                 }
-                let Some(mesh) = ctx.app.part_mesh() else {
+                let Some(mesh) = ctx.app.part_mesh().cloned() else {
                     return refused("Load the imported part before exporting G-code.");
                 };
-                let job = crate::post::post_job(&ctx.app.doc, mesh);
-                for program in job.setups.iter().flat_map(|s| s.programs()) {
-                    may_write(ctx, &folder.join(&program.file_name), None)?;
+                // The programs are named after the job and each setup: a
+                // setup's own name, or its tool runs' names after it.
+                let names: Vec<String> = std::fs::read_dir(&folder)
+                    .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+                    .unwrap_or_default();
+                for si in 0..ctx.app.doc.setups.len() {
+                    let whole = crate::post::file_name(&ctx.app.doc, si, None);
+                    may_write(ctx, &folder.join(&whole), None)?;
+                    let base = whole.trim_end_matches(".ngc");
+                    let part = |n: &&String| n.starts_with(&format!("{base} - ")) && n.ends_with(".ngc");
+                    if let Some(n) = names.iter().find(part).filter(|_| !flag(ctx, "overwrite")) {
+                        return refused(format!(
+                            "{} is there already: call again with overwrite: true to replace it.",
+                            folder.join(n).display()
+                        ));
+                    }
                 }
-                Ok(vec![Message::GcodeExported(Some(crate::post::write_job(&job, &folder)))])
+                let doc = ctx.app.doc.clone();
+                Ok((vec![], off_thread(
+                    move || crate::post::write_job(&crate::post::post_job(&doc, &mesh), &folder),
+                    |written| Message::GcodeExported(Some(written)),
+                )))
             })
             .requires("An imported part; an absolute folder that exists, outside the app's data folder; overwrite: true to replace programs there.")
             .effect("One LinuxCNC program per setup, written after every check passes; nothing is written if one fails."),
@@ -1741,14 +1801,20 @@ fn table() -> Vec<Command> {
             .help_of(|| Message::Export("sheet"), "")
             .params(|| vec![("path", text_param("The Markdown file to write."), true), overwrite_param()])
             .examples(|| vec![json!({"path": "/tmp/sheet.md"})])
-            .with(|ctx| {
+            .work(|ctx| {
                 let path = path_arg(ctx, "path")?;
                 may_write(ctx, &path, None)?;
-                let data = ctx.app.doc.setup_sheet(ctx.app.part_mesh());
-                Ok(vec![match crate::storage::write_atomic(&path, data.as_bytes()) {
-                    Ok(()) => Message::Exported(path),
-                    Err(e) => Message::ExportError(e),
-                }])
+                let (doc, mesh) = (ctx.app.doc.clone(), ctx.app.part_mesh().cloned());
+                Ok((vec![], off_thread(
+                    move || {
+                        let data = doc.setup_sheet(mesh.as_ref());
+                        crate::storage::write_atomic(&path, data.as_bytes()).map(|()| path)
+                    },
+                    |written| match written {
+                        Ok(path) => Message::Exported(path),
+                        Err(e) => Message::ExportError(e),
+                    },
+                )))
             })
             .requires("An absolute path outside the app's data folder; overwrite: true to replace a file.")
             .effect("The setup sheet is written."),
@@ -1767,15 +1833,17 @@ fn table() -> Vec<Command> {
                     Some(_) => Ok(()),
                 }
             })
-            .with(|ctx| {
+            .work(|ctx| {
                 let path = path_arg(ctx, "path")?;
                 may_write(ctx, &path, None)?;
                 let mut doc = ctx.app.doc.clone();
                 if let Some(mesh) = &ctx.app.imported_mesh {
                     crate::picks::record(&mut doc, mesh);
                 }
-                let written = crate::bundle::write(&path, &doc).map(|()| path);
-                Ok(vec![Message::TabletSaved(Some(written))])
+                Ok((vec![], off_thread(
+                    move || crate::bundle::write(&path, &doc).map(|()| path),
+                    |written| Message::TabletSaved(Some(written)),
+                )))
             })
             .requires("An imported part whose file is there; an absolute path outside the app's data folder; overwrite: true to replace a file.")
             .effect("The tablet file is written."),
@@ -1819,6 +1887,21 @@ fn selected_operation_arg(ctx: &Ctx) -> Option<(usize, usize)> {
     };
     operation_of(ctx.app, setup, ctx.args.get("operation")?).ok()
 }
+/// `work` off the `App`'s thread, as the app runs its file work, and its
+/// result as `done`'s message.
+fn off_thread<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+    done: impl FnOnce(Result<T, String>) -> Message + Send + 'static,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(work)
+                .await
+                .unwrap_or_else(|e| Err(format!("The worker failed: {e}")))
+        },
+        done,
+    )
+}
 fn connected(ctx: &Ctx) -> Result<(), Problem> {
     match ctx.app.control {
         Some(_) => Ok(()),
@@ -1830,6 +1913,974 @@ fn side(ctx: &Ctx) -> Result<settings::Side, Problem> {
         "inspector" => settings::Side::Inspector,
         _ => settings::Side::Browser,
     })
+}
+
+/// The library entry the machine draft saves as, or why it is refused.
+fn saved_machine(ctx: &Ctx) -> Result<crate::model::Machine, Problem> {
+    (ctx.app.doc.saved_machine(&ctx.app.machine_draft))
+        .map_err(|e| Problem::Refused(format!("The machine is not saved: {}", e.join(" "))))
+}
+fn saved_tool(ctx: &Ctx) -> Result<crate::model::Tool, Problem> {
+    (ctx.app.doc.saved_tool(&ctx.app.tool_draft))
+        .map_err(|e| Problem::Refused(format!("The tool is not saved: {}", e.join(" "))))
+}
+fn saved_material(ctx: &Ctx) -> Result<crate::material::Material, Problem> {
+    (ctx.app.doc.saved_material(&ctx.app.material_draft))
+        .map_err(|e| Problem::Refused(format!("The material is not saved: {}", e.join(" "))))
+}
+fn saved_holder(ctx: &Ctx) -> Result<crate::holding::Holder, Problem> {
+    (ctx.app.doc.saved_holder(&ctx.app.holder_draft))
+        .map_err(|e| Problem::Refused(format!("The entry is not saved: {}", e.join(" "))))
+}
+/// Two entries as a project saves them.
+fn same<T: serde::Serialize>(a: &T, b: &T) -> bool {
+    serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
+}
+/// The machine `m` with `version`: machines compare without it, so an
+/// unchanged save does not raise it.
+fn versioned(m: &crate::model::Machine, version: u32) -> crate::model::Machine {
+    crate::model::Machine {
+        version,
+        ..m.clone()
+    }
+}
+
+/// An effect that holds when `f` does.
+fn holds(f: impl Fn(&App) -> bool + 'static, fail: impl Into<String>) -> Expect {
+    let fail = fail.into();
+    Box::new(move |app| if f(app) { Ok(None) } else { Err(fail.clone()) })
+}
+/// An effect that holds when what `get` reads changed. Unchanged, it is
+/// `no_change` (`already` says why) unless the status line said something
+/// new, which is then the failure's reason: the app refused.
+fn alters<T: PartialEq + 'static>(
+    ctx: &Ctx,
+    get: impl Fn(&App) -> T + 'static,
+    already: &'static str,
+) -> Expect {
+    let (before, status) = (get(ctx.app), ctx.app.status.clone());
+    Box::new(move |app| {
+        if get(app) != before {
+            Ok(None)
+        } else if app.status != status && !app.status.is_empty() {
+            Err(app.status.clone())
+        } else {
+            Ok(Some(already.into()))
+        }
+    })
+}
+/// An effect that holds when the flag `get` reads turned over.
+fn flips(ctx: &Ctx, get: fn(&App) -> bool) -> Expect {
+    let before = get(ctx.app);
+    holds(move |a| get(a) != before, "It did not change.")
+}
+fn op_in<'a>(app: &'a App, id: &str) -> Option<&'a crate::model::Operation> {
+    (app.doc.setups.iter().flat_map(|s| &s.operations)).find(|o| o.id == id)
+}
+fn setup_in<'a>(app: &'a App, id: &str) -> Option<&'a crate::model::Setup> {
+    app.doc.setups.iter().find(|s| s.id == id)
+}
+fn op_ids(app: &App) -> Vec<String> {
+    (app.doc.setups.iter().flat_map(|s| &s.operations))
+        .map(|o| o.id.clone())
+        .collect()
+}
+/// The targeted operation's id, and the targeted setup's.
+fn op_id(ctx: &Ctx) -> String {
+    ctx.op().map(|o| o.id.clone()).unwrap_or_default()
+}
+fn setup_id(ctx: &Ctx) -> String {
+    (ctx.setup.and_then(|si| ctx.app.doc.setups.get(si)))
+        .map(|s| s.id.clone())
+        .unwrap_or_default()
+}
+fn op_field(app: &App, id: &str, key: &str) -> Option<String> {
+    op_in(app, id).map(|o| crate::model::get(&o.p, key).to_string())
+}
+fn setup_field(app: &App, id: &str, key: &str) -> Option<String> {
+    setup_in(app, id).map(|s| crate::model::get(&s.p, key).to_string())
+}
+fn arg_str(ctx: &Ctx, key: &str) -> String {
+    ctx.args
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+fn arg_path(ctx: &Ctx, key: &str) -> PathBuf {
+    path_arg(ctx, key).unwrap_or_default()
+}
+/// A library draft's field (`edit_field` on a library target).
+fn draft_field(app: &App, target: Target, key: &str) -> String {
+    let p = match target {
+        Target::Machine => &app.machine_draft.p,
+        Target::Tool => &app.tool_draft.p,
+        Target::Material => &app.material_draft.p,
+        Target::Holder => &app.holder_draft.p,
+        Target::Operation | Target::Setup => return String::new(),
+    };
+    crate::model::get(p, key).to_string()
+}
+/// What `edit_field` edits: the target, its operation or setup id, the key.
+fn edited(ctx: &Ctx) -> Option<(Target, String, String)> {
+    let name = ctx.args.get("target")?.as_str()?;
+    let (_, target) = EDIT_TARGETS
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))?;
+    let app = ctx.app;
+    let id = match target {
+        Target::Operation => match ctx.args.get("operation") {
+            Some(v) => {
+                let (si, oi) = operation_of(app, None, v).ok()?;
+                app.doc.setups[si].operations[oi].id.clone()
+            }
+            None => app.operation()?.id.clone(),
+        },
+        Target::Setup => match ctx.args.get("setup") {
+            Some(v) => app.doc.setups[setup_of(app, v).ok()?].id.clone(),
+            None => app.doc.active_setup()?.id.clone(),
+        },
+        _ => String::new(),
+    };
+    Some((*target, id, ctx.args.get("key")?.as_str()?.to_string()))
+}
+fn edited_value(app: &App, (target, id, key): &(Target, String, String)) -> Option<String> {
+    match target {
+        Target::Operation => op_field(app, id, key),
+        Target::Setup => setup_field(app, id, key),
+        _ => Some(draft_field(app, *target, key)),
+    }
+}
+fn edit_value(ctx: &Ctx) -> String {
+    match ctx.args.get("value") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        _ => String::new(),
+    }
+}
+/// The page `goto_page`'s argument names.
+fn page_arg(ctx: &Ctx) -> Option<Page> {
+    let given = arg_str(ctx, "page");
+    PAGES
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(given.trim()))
+        .map(|(_, p)| *p)
+}
+/// Whether `list` (machine ids joined by commas) holds `id`.
+fn lists(list: &str, id: &str) -> bool {
+    list.split(',').any(|m| m.trim() == id)
+}
+/// A file `path` written since `since` (a little earlier, for the file
+/// system's clock).
+fn written_since(path: &Path, since: std::time::SystemTime) -> bool {
+    let since = since - std::time::Duration::from_secs(2);
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .is_ok_and(|t| t >= since)
+}
+fn recommended(ctx: &Ctx) -> Option<((String, String), String)> {
+    let (si, oi) = ctx.operation?;
+    let mut doc = ctx.app.doc.clone();
+    let said = doc.fit_op_speeds(si, oi);
+    let o = &doc.setups[si].operations[oi];
+    let fields = |o: &crate::model::Operation| {
+        (
+            crate::model::get(&o.p, "rpm").to_string(),
+            crate::model::get(&o.p, "feed").to_string(),
+        )
+    };
+    Some((fields(o), said))
+}
+
+/// Why a command is already so, by name: then nothing is sent.
+fn already(name: &str) -> Option<fn(&Ctx) -> Option<String>> {
+    let f: fn(&Ctx) -> Option<String> = match name {
+        "set_project_material" => |ctx| {
+            (ctx.app.doc.material_id == arg_str(ctx, "id"))
+                .then(|| "That is the project's material already.".into())
+        },
+        "goto_page" => {
+            |ctx| (page_arg(ctx) == Some(ctx.app.page)).then(|| "That page is open already.".into())
+        }
+        "set_origin" => |ctx| {
+            (setup_field(ctx.app, &setup_id(ctx), "origin") == Some(arg_str(ctx, "origin")))
+                .then(|| "The setup's work zero is that already.".into())
+        },
+        "set_setup_step" => |ctx| {
+            (ctx.app.setup_step == arg_str(ctx, "step")
+                && ctx.app.selected.is_none()
+                && ctx.app.page == Page::Work)
+                .then(|| "The setup editor shows that step already.".into())
+        },
+        "set_operation_tool" => |ctx| {
+            (ctx.op().is_some_and(|o| o.tool == arg_str(ctx, "id")))
+                .then(|| "The operation cuts with that tool already.".into())
+        },
+        "set_rest_source" => |ctx| {
+            (op_field(ctx.app, &op_id(ctx), "rest_source") == Some(arg_str(ctx, "source")))
+                .then(|| "That is the operation's rest source already.".into())
+        },
+        "set_pin_setup" => |ctx| {
+            let si = setup_of(ctx.app, ctx.args.get("setup")?).ok()?;
+            let want = ctx.app.doc.setups[si].id.clone();
+            (op_field(ctx.app, &op_id(ctx), "pin_setup") == Some(want))
+                .then(|| "The operation makes that setup's pin holes already.".into())
+        },
+        "set_tab" => |ctx| {
+            (ctx.app.tab.eq_ignore_ascii_case(&arg_str(ctx, "tab")) && ctx.app.page == Page::Work)
+                .then(|| "That tab is open already.".into())
+        },
+        "edit_field" => |ctx| {
+            let target = edited(ctx)?;
+            (edited_value(ctx.app, &target) == Some(edit_value(ctx)))
+                .then(|| "The field holds that value already.".into())
+        },
+        "clear_picks" => |ctx| {
+            ctx.op()
+                .is_some_and(|o| o.surfaces.as_ref().is_none_or(|s| s.ids.is_empty()))
+                .then(|| "The operation has no picks to clear.".into())
+        },
+        "recommend_speeds" => |ctx| {
+            let (fields, said) = recommended(ctx)?;
+            let o = ctx.op()?;
+            let now = (
+                crate::model::get(&o.p, "rpm").to_string(),
+                crate::model::get(&o.p, "feed").to_string(),
+            );
+            (now == fields).then(|| {
+                if said.is_empty() {
+                    "The speed and feed are the recommended ones already.".into()
+                } else {
+                    said
+                }
+            })
+        },
+        "stock_detail" => |ctx| {
+            (ctx.app
+                .stock_detail
+                .to_string()
+                .eq_ignore_ascii_case(&arg_str(ctx, "level")))
+            .then(|| "The stock is shown at that detail already.".into())
+        },
+        "playback_speed" => |ctx| {
+            let x = ctx.args.get("x")?.as_f64()? as f32;
+            (ctx.app.speed == x.clamp(0.5, 120.))
+                .then(|| "Playback runs at that speed already.".into())
+        },
+        "control_tab" => |ctx| {
+            let tab = CONTROL_TABS
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(&arg_str(ctx, "tab")))?
+                .1;
+            (ctx.app.control_tab == tab).then(|| "That tab is chosen already.".into())
+        },
+        "job_view" => |ctx| {
+            let top = arg_str(ctx, "view").eq_ignore_ascii_case("top");
+            (ctx.app.control_view
+                == if top {
+                    ui::JobView::Top
+                } else {
+                    ui::JobView::Stock
+                })
+            .then(|| "The Job tab shows the stock so already.".into())
+        },
+        "machine_wizard_step" => |ctx| {
+            (ctx.app.page == Page::Wizard
+                && ctx.args.get("index")?.as_u64()? as usize == ctx.app.wizard_step)
+                .then(|| "The wizard shows that step already.".into())
+        },
+        "save_machine" => |ctx| {
+            let saved = saved_machine(ctx).ok()?;
+            let there = ctx.app.doc.machines.iter().find(|m| m.id == saved.id)?;
+            same(&versioned(&saved, there.version), there)
+                .then(|| "The library holds this machine as the draft has it.".into())
+        },
+        "save_tool" => |ctx| {
+            let saved = saved_tool(ctx).ok()?;
+            let there = ctx.app.doc.tools.iter().find(|t| t.id == saved.id)?;
+            same(&saved, there).then(|| "The library holds this tool as the draft has it.".into())
+        },
+        "save_material" => |ctx| {
+            let saved = saved_material(ctx).ok()?;
+            let there = ctx.app.doc.materials.iter().find(|m| m.id == saved.id)?;
+            (saved == *there).then(|| "The library holds this material as the draft has it.".into())
+        },
+        "save_holder" => |ctx| {
+            let saved = saved_holder(ctx).ok()?;
+            let there = ctx.app.doc.workholding.iter().find(|h| h.id == saved.id)?;
+            (saved == *there).then(|| "The library holds this entry as the draft has it.".into())
+        },
+        _ => return None,
+    };
+    Some(f)
+}
+
+/// The effect each command is checked for once its work has settled
+/// (the spec's *Outcomes*), made from the state it starts on.
+fn effect(name: &str) -> Option<fn(&Ctx) -> Expect> {
+    let f: fn(&Ctx) -> Expect = match name {
+        // Project.
+        "new_project" => |_| {
+            holds(
+                |a| a.doc.setups.is_empty() && a.doc.file.is_none() && !a.doc.sample_model,
+                "No blank project was started.",
+            )
+        },
+        "open_sample" => |_| holds(|a| a.is_sample(), "The example project did not open."),
+        "resume_project" => |_| {
+            holds(
+                |a| a.page == Page::Work && (a.doc.file.is_none() || a.imported_mesh.is_some()),
+                "The project's part could not be loaded.",
+            )
+        },
+        "recover_previous_project" => |ctx| {
+            alters(
+                ctx,
+                |a| serde_json::to_string(&a.doc).unwrap_or_default(),
+                "The project archived last is the one open.",
+            )
+        },
+        "open_project" => |ctx| {
+            let path = arg_path(ctx, "path");
+            holds(
+                move |a| {
+                    let history = a.state_path.with_file_name("history");
+                    let opened = a.project_path.as_deref() == Some(path.as_path())
+                        || (path.starts_with(&history) && a.status.starts_with("Project opened"));
+                    opened && (a.doc.file.is_none() || a.imported_mesh.is_some())
+                },
+                "The project did not open.",
+            )
+        },
+        "save_project" => |ctx| {
+            let path = match ctx.args.get("path") {
+                Some(_) => arg_path(ctx, "path"),
+                None => ctx.app.project_path.clone().unwrap_or_default(),
+            };
+            holds(
+                move |a| {
+                    a.project_path.as_deref() == Some(path.as_path())
+                        && !a.project_dirty
+                        && path.is_file()
+                },
+                "The project was not saved.",
+            )
+        },
+        "set_project_material" => |ctx| {
+            let id = arg_str(ctx, "id");
+            holds(
+                move |a| a.doc.material_id == id,
+                "The project's material did not change.",
+            )
+        },
+        "goto_page" => |ctx| {
+            let page = page_arg(ctx);
+            holds(move |a| Some(a.page) == page, "The page did not open.")
+        },
+        // Part.
+        "import_model" => |ctx| {
+            let name = arg_path(ctx, "path").file_name().map(|n| n.to_os_string());
+            holds(
+                move |a| {
+                    let file = a.doc.file.as_ref();
+                    file.is_some_and(|f| f.path.file_name() == name.as_deref())
+                        && a.imported_mesh.is_some()
+                },
+                "The model was not imported.",
+            )
+        },
+        "reimport_model" => |_| {
+            holds(
+                |a| a.imported_mesh.is_some() && !a.status.starts_with("Reimport failed"),
+                "The model was not loaded again.",
+            )
+        },
+        "dismiss_pick_note" => |ctx| {
+            let id = op_id(ctx);
+            holds(
+                move |a| !a.doc.pick_checks.contains_key(&id),
+                "The note stayed.",
+            )
+        },
+        // Setup.
+        "add_setup" | "add_manual_setup" | "add_lathe_setup" | "duplicate_setup" => |ctx| {
+            let before: Vec<String> = ctx.app.doc.setups.iter().map(|s| s.id.clone()).collect();
+            holds(
+                move |a| a.doc.setups.len() > before.len() && !before.contains(&a.doc.active),
+                "No setup was added.",
+            )
+        },
+        "remove_setup" => |ctx| {
+            let id = setup_id(ctx);
+            holds(
+                move |a| setup_in(a, &id).is_none(),
+                "The setup was not removed.",
+            )
+        },
+        "move_setup" => |ctx| {
+            let (id, from) = (setup_id(ctx), ctx.setup.unwrap_or(0) as i64);
+            let to = from + ctx.args.get("delta").and_then(Value::as_i64).unwrap_or(0);
+            holds(
+                move |a| {
+                    a.doc
+                        .setups
+                        .iter()
+                        .position(|s| s.id == id)
+                        .map(|i| i as i64)
+                        == Some(to)
+                },
+                "The setup did not move there.",
+            )
+        },
+        "flip_setup" | "turn_stock" | "square_to_stock" => |ctx| {
+            let id = setup_id(ctx);
+            alters(
+                ctx,
+                move |a| {
+                    setup_in(a, &id)
+                        .map(|s| ["rx", "ry", "rz"].map(|k| crate::model::get(&s.p, k).to_string()))
+                },
+                "The setup is turned so already.",
+            )
+        },
+        "assign_machine" => |ctx| {
+            let (id, machine) = (setup_id(ctx), arg_str(ctx, "id"));
+            holds(
+                move |a| setup_in(a, &id).is_some_and(|s| s.machine.id == machine),
+                "The setup's machine did not change.",
+            )
+        },
+        "set_origin" => |ctx| {
+            let (id, origin) = (setup_id(ctx), arg_str(ctx, "origin"));
+            holds(
+                move |a| {
+                    setup_field(a, &id, "origin").is_some_and(|o| o.eq_ignore_ascii_case(&origin))
+                },
+                "The work zero did not change.",
+            )
+        },
+        "set_setup_step" => |ctx| {
+            let step = arg_str(ctx, "step");
+            holds(
+                move |a| a.setup_step.eq_ignore_ascii_case(&step) && a.selected.is_none(),
+                "The setup editor did not open on that step.",
+            )
+        },
+        "set_clamps" => |ctx| {
+            let (id, text) = (setup_id(ctx), arg_str(ctx, "text"));
+            holds(
+                move |a| {
+                    setup_field(a, &id, "clamps").as_deref() == Some(text.as_str())
+                        && a.clamps_draft.is_none()
+                },
+                "The clamp positions were not taken.",
+            )
+        },
+        "suggest_layout" => |ctx| {
+            let id = setup_id(ctx);
+            alters(
+                ctx,
+                move |a| setup_in(a, &id).map(|s| s.p.clone()),
+                "The workholding stands where Suggest layout puts it already.",
+            )
+        },
+        "show_stock_after_setup" => {
+            |_| holds(|a| a.setup_end, "The stock after the setup is not shown.")
+        }
+        "open_setup_editor" => |_| {
+            holds(
+                |a| a.selected.is_none() && a.page == Page::Work,
+                "The setup editor did not open.",
+            )
+        },
+        // Operation.
+        "add_turn" => |ctx| {
+            let before = op_ids(ctx.app);
+            let kind = arg_str(ctx, "kind");
+            holds(
+                move |a| {
+                    a.operation().is_some_and(|o| {
+                        !before.contains(&o.id)
+                            && o.strategy == Strategy::Turn
+                            && crate::model::get(&o.p, "turn_kind").eq_ignore_ascii_case(&kind)
+                    })
+                },
+                "No Turn was added.",
+            )
+        },
+        "duplicate_operation" => |ctx| {
+            let before = op_ids(ctx.app);
+            holds(
+                move |a| a.operation().is_some_and(|o| !before.contains(&o.id)),
+                "No copy was added.",
+            )
+        },
+        "remove_operation" => |ctx| {
+            let id = op_id(ctx);
+            holds(
+                move |a| op_in(a, &id).is_none(),
+                "The operation was not removed.",
+            )
+        },
+        "move_operation" => |ctx| {
+            let id = op_id(ctx);
+            let from = ctx.operation.map_or(0, |(_, oi)| oi) as i64;
+            let to = from + ctx.args.get("delta").and_then(Value::as_i64).unwrap_or(0);
+            holds(
+                move |a| {
+                    (a.doc.setups.iter())
+                        .find_map(|s| s.operations.iter().position(|o| o.id == id))
+                        .map(|i| i as i64)
+                        == Some(to)
+                },
+                "The operation did not move there.",
+            )
+        },
+        "toggle_operation" => |ctx| {
+            let id = op_id(ctx);
+            let before = ctx.op().is_some_and(|o| o.enabled);
+            holds(
+                move |a| op_in(a, &id).is_some_and(|o| o.enabled != before),
+                "The operation was not switched.",
+            )
+        },
+        "set_operation_tool" => |ctx| {
+            let (id, tool) = (op_id(ctx), arg_str(ctx, "id"));
+            holds(
+                move |a| op_in(a, &id).is_some_and(|o| o.tool == tool),
+                "The tool did not change.",
+            )
+        },
+        "recommend_speeds" => |ctx| {
+            let id = op_id(ctx);
+            let (want, said) = recommended(ctx).unwrap_or_default();
+            holds(
+                move |a| {
+                    (op_field(a, &id, "rpm"), op_field(a, &id, "feed"))
+                        == (Some(want.0.clone()), Some(want.1.clone()))
+                },
+                if said.is_empty() {
+                    "The speed and feed did not change.".to_string()
+                } else {
+                    said
+                },
+            )
+        },
+        "set_rest_source" => |ctx| {
+            let (id, source) = (op_id(ctx), arg_str(ctx, "source"));
+            holds(
+                move |a| op_field(a, &id, "rest_source").as_deref() == Some(source.as_str()),
+                "The rest source did not change.",
+            )
+        },
+        "set_pin_setup" => |ctx| {
+            let id = op_id(ctx);
+            let want = (ctx.args.get("setup"))
+                .and_then(|v| setup_of(ctx.app, v).ok())
+                .map(|si| ctx.app.doc.setups[si].id.clone())
+                .unwrap_or_default();
+            holds(
+                move |a| op_field(a, &id, "pin_setup").as_deref() == Some(want.as_str()),
+                "The pins' setup did not change.",
+            )
+        },
+        "set_tab" => |ctx| {
+            let tab = arg_str(ctx, "tab");
+            holds(
+                move |a| a.tab.eq_ignore_ascii_case(&tab),
+                "The tab did not open.",
+            )
+        },
+        "add_threading" | "add_hole_stages" | "add_centring" | "add_pin_drilling" => |ctx| {
+            let before = op_ids(ctx.app).len();
+            holds(move |a| op_ids(a).len() > before, "No operation was added.")
+        },
+        "add_needed_tool" => |ctx| {
+            let id = op_id(ctx);
+            let before: Vec<String> = ctx.app.doc.tools.iter().map(|t| t.id.clone()).collect();
+            holds(
+                move |a| {
+                    op_in(a, &id).is_some_and(|o| {
+                        !before.contains(&o.tool) && a.doc.tools.iter().any(|t| t.id == o.tool)
+                    })
+                },
+                "No tool was added for the operation.",
+            )
+        },
+        "thread_from_part" | "box_from_face" => |ctx| {
+            let id = op_id(ctx);
+            alters(
+                ctx,
+                move |a| op_in(a, &id).map(|o| o.p.clone()),
+                "The fields are what the part gives already.",
+            )
+        },
+        "pick_all_corners" => |ctx| {
+            let id = op_id(ctx);
+            alters(
+                ctx,
+                move |a| op_in(a, &id).and_then(|o| o.surfaces.as_ref().map(|s| s.ids.clone())),
+                "Every rounded corner is picked already.",
+            )
+        },
+        "edit_field" => |ctx| {
+            let target = edited(ctx);
+            let want = edit_value(ctx);
+            let before = target.as_ref().and_then(|t| edited_value(ctx.app, t));
+            Box::new(move |a| {
+                let now = target.as_ref().and_then(|t| edited_value(a, t));
+                if now.as_deref() == Some(want.as_str()) || now != before {
+                    Ok(None)
+                } else {
+                    Err("The field kept its value.".into())
+                }
+            })
+        },
+        "undo_last_edit" => |_| holds(|a| a.typed_last.is_none(), "The edit was not undone."),
+        // Picks.
+        "clear_picks" => |ctx| {
+            let id = op_id(ctx);
+            holds(
+                move |a| {
+                    op_in(a, &id)
+                        .is_some_and(|o| o.surfaces.as_ref().is_none_or(|s| s.ids.is_empty()))
+                },
+                "The picks were not cleared.",
+            )
+        },
+        "drop_hole" => |ctx| {
+            let id = op_id(ctx);
+            alters(
+                ctx,
+                move |a| op_in(a, &id).and_then(|o| o.surfaces.as_ref().map(|s| s.ids.clone())),
+                "No picked hole has that index.",
+            )
+        },
+        // Generate.
+        "generate" => |ctx| {
+            let id = op_id(ctx);
+            holds(
+                move |a| {
+                    let made = a.operation().is_some_and(|o| o.id == id)
+                        && (a.simulation.is_some()
+                            || (a.is_sample() && op_in(a, &id).is_some_and(|o| o.preview)));
+                    made && a.generating.is_none() && !a.status_problem
+                },
+                "No toolpath was generated.",
+            )
+        },
+        "generate_all" => |_| {
+            holds(
+                |a| {
+                    a.generating.is_none()
+                        && !a.status_problem
+                        && (a.is_sample() || !a.audit_report.is_empty())
+                },
+                "The operations were not generated.",
+            )
+        },
+        "cancel_generation" => |_| holds(|a| a.generating.is_none(), "The generation goes on."),
+        // Libraries.
+        "new_machine" => |ctx| {
+            let before = ctx.app.machine_draft.id.clone();
+            holds(
+                move |a| a.machine_draft.id != before && a.page == Page::Wizard,
+                "No machine draft was opened.",
+            )
+        },
+        "edit_machine" => |ctx| {
+            let id = arg_str(ctx, "id");
+            holds(
+                move |a| a.machine_draft.id == id,
+                "The machine is not open in the wizard.",
+            )
+        },
+        "machine_wizard_step" => |ctx| {
+            let i = ctx.args.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            holds(
+                move |a| a.wizard_step == i,
+                "The wizard did not go to that step.",
+            )
+        },
+        "save_machine" => |ctx| {
+            let want = saved_machine(ctx).ok();
+            holds(
+                move |a| {
+                    want.as_ref()
+                        .is_some_and(|w| a.doc.machines.iter().any(|m| m.id == w.id && same(m, w)))
+                },
+                "The machine was not saved.",
+            )
+        },
+        "save_tool" => |ctx| {
+            let want = saved_tool(ctx).ok();
+            holds(
+                move |a| {
+                    want.as_ref()
+                        .is_some_and(|w| a.doc.tools.iter().any(|t| t.id == w.id && same(t, w)))
+                },
+                "The tool was not saved.",
+            )
+        },
+        "save_material" => |ctx| {
+            let want = saved_material(ctx).ok();
+            holds(
+                move |a| want.as_ref().is_some_and(|w| a.doc.materials.contains(w)),
+                "The material was not saved.",
+            )
+        },
+        "save_holder" => |ctx| {
+            let want = saved_holder(ctx).ok();
+            holds(
+                move |a| want.as_ref().is_some_and(|w| a.doc.workholding.contains(w)),
+                "The entry was not saved.",
+            )
+        },
+        "delete_machine" => |ctx| {
+            let id = arg_str(ctx, "id");
+            holds(
+                move |a| a.doc.machines.iter().all(|m| m.id != id),
+                "The machine was not deleted.",
+            )
+        },
+        "delete_tool" => |ctx| {
+            let id = arg_str(ctx, "id");
+            holds(
+                move |a| a.doc.tools.iter().all(|t| t.id != id),
+                "The tool was not deleted.",
+            )
+        },
+        "delete_material" => |ctx| {
+            let id = arg_str(ctx, "id");
+            holds(
+                move |a| a.doc.materials.iter().all(|m| m.id != id),
+                "The material was not deleted.",
+            )
+        },
+        "delete_holder" => |ctx| {
+            let id = arg_str(ctx, "id");
+            holds(
+                move |a| a.doc.workholding.iter().all(|h| h.id != id),
+                "The entry was not deleted.",
+            )
+        },
+        "new_tool" => |ctx| {
+            let before = ctx.app.tool_draft.id.clone();
+            holds(
+                move |a| a.tool_draft.id != before && a.page == Page::Tools,
+                "No tool draft was opened.",
+            )
+        },
+        "edit_tool" => |ctx| {
+            let id = arg_str(ctx, "id");
+            holds(
+                move |a| a.tool_draft.id == id,
+                "The tool is not open in its editor.",
+            )
+        },
+        "new_material" => |ctx| {
+            let before = ctx.app.material_draft.id.clone();
+            holds(
+                move |a| a.material_draft.id != before && a.page == Page::Materials,
+                "No material draft was opened.",
+            )
+        },
+        "edit_material" => |ctx| {
+            let id = arg_str(ctx, "id");
+            holds(
+                move |a| a.material_draft.id == id,
+                "The material is not open in its editor.",
+            )
+        },
+        "new_holder" => |ctx| {
+            let (before, kind) = (ctx.app.holder_draft.id.clone(), arg_str(ctx, "kind"));
+            holds(
+                move |a| {
+                    a.holder_draft.id != before && a.holder_draft.kind().eq_ignore_ascii_case(&kind)
+                },
+                "No workholding draft was opened.",
+            )
+        },
+        "edit_holder" => |ctx| {
+            let id = arg_str(ctx, "id");
+            holds(
+                move |a| a.holder_draft.id == id,
+                "The entry is not open in its editor.",
+            )
+        },
+        "tool_machine" => |ctx| {
+            let (id, on) = (arg_str(ctx, "id"), flag(ctx, "checked"));
+            holds(
+                move |a| lists(crate::model::get(&a.tool_draft.p, "machines"), &id) == on,
+                "The tool's machines did not change.",
+            )
+        },
+        "holder_machine" => |ctx| {
+            let (id, on) = (arg_str(ctx, "id"), flag(ctx, "checked"));
+            holds(
+                move |a| lists(crate::model::get(&a.holder_draft.p, "machines"), &id) == on,
+                "The entry's machines did not change.",
+            )
+        },
+        // View.
+        "set_camera" | "orbit_camera" | "pan_camera" | "zoom_camera" => |ctx| {
+            alters(
+                ctx,
+                |a| format!("{:?}", a.camera),
+                "The view looks so already.",
+            )
+        },
+        "section" => |ctx| {
+            alters(
+                ctx,
+                |a| (a.section_on, a.picking_section, format!("{:?}", a.section)),
+                "The section is so already.",
+            )
+        },
+        "toggle_stock" => |ctx| flips(ctx, |a| a.stock),
+        "toggle_uncut" => |ctx| flips(ctx, |a| a.show_uncut),
+        "toggle_paths" => |ctx| flips(ctx, |a| a.paths),
+        "toggle_sim_details" => |ctx| flips(ctx, |a| a.sim_details),
+        "toggle_warning_details" => |ctx| flips(ctx, |a| a.warning_details),
+        "toggle_about" => |ctx| flips(ctx, |a| a.settings.layout.strategy_help_open),
+        "toggle_sidebar" | "sidebar_width" => |ctx| {
+            alters(
+                ctx,
+                |a| a.settings.layout.clone(),
+                "The sidebar is so already.",
+            )
+        },
+        "stock_detail" => |ctx| {
+            let level = arg_str(ctx, "level");
+            holds(
+                move |a| a.stock_detail.to_string().eq_ignore_ascii_case(&level),
+                "The detail did not change.",
+            )
+        },
+        "play" => |ctx| {
+            alters(
+                ctx,
+                |a| (a.playing, a.simulation.is_some()),
+                "Nothing plays.",
+            )
+        },
+        "scrub" => |ctx| {
+            let at = ctx
+                .args
+                .get("at")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.)
+                .clamp(0., 1.) as f32;
+            holds(
+                move |a| (a.progress - at).abs() < 1e-3,
+                "The preview did not move there.",
+            )
+        },
+        "playback_speed" => |ctx| {
+            let x = ctx.args.get("x").and_then(Value::as_f64).unwrap_or(1.) as f32;
+            holds(
+                move |a| a.speed == x.clamp(0.5, 120.),
+                "The speed did not change.",
+            )
+        },
+        "control_tab" => |ctx| {
+            let tab = CONTROL_TABS
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(&arg_str(ctx, "tab")))
+                .map(|(_, t)| *t);
+            holds(
+                move |a| Some(a.control_tab) == tab,
+                "The tab did not change.",
+            )
+        },
+        "job_view" => |ctx| {
+            let top = arg_str(ctx, "view").eq_ignore_ascii_case("top");
+            holds(
+                move |a| {
+                    a.control_view
+                        == if top {
+                            ui::JobView::Top
+                        } else {
+                            ui::JobView::Stock
+                        }
+                },
+                "The view did not change.",
+            )
+        },
+        // Review.
+        "open_audit_row" => |ctx| {
+            let row = (ctx.args.get("index").and_then(Value::as_u64))
+                .and_then(|i| ctx.app.audit_report.get(i as usize))
+                .map(|r| (r.setup, r.operation));
+            holds(
+                move |a| row == Some((a.doc.index(), a.selected.unwrap_or(usize::MAX))),
+                "The row's operation did not open.",
+            )
+        },
+        "open_issue" => |ctx| {
+            let si = ctx
+                .args
+                .get("setup")
+                .and_then(|v| setup_of(ctx.app, v).ok());
+            let at =
+                si.and_then(|si| operation_of(ctx.app, Some(si), ctx.args.get("operation")?).ok());
+            holds(
+                move |a| at == Some((a.doc.index(), a.selected.unwrap_or(usize::MAX))),
+                "The operation did not open.",
+            )
+        },
+        "steps_fix" => |ctx| {
+            let op = (ctx.args.get("operation"))
+                .and_then(|v| operation_of(ctx.app, ctx.setup, v).ok())
+                .map(|(_, oi)| oi);
+            holds(
+                move |a| a.page == Page::Work && a.selected == op,
+                "The editor did not open at the problem.",
+            )
+        },
+        // The Run panel's fold-outs are its view on the Control page: sent
+        // is all there is to it.
+        "run_details" => |_| holds(|_| true, ""),
+        // Export.
+        "export_gcode" => |ctx| {
+            let (folder, since) = (arg_path(ctx, "folder"), std::time::SystemTime::now());
+            holds(
+                move |a| {
+                    let written = std::fs::read_dir(&folder).is_ok_and(|d| {
+                        d.flatten().any(|e| {
+                            e.path().extension().is_some_and(|x| x == "ngc")
+                                && written_since(&e.path(), since)
+                        })
+                    });
+                    written && a.status.starts_with("Exported ")
+                },
+                "No program was written.",
+            )
+        },
+        "export_setup_sheet" => |ctx| {
+            let (path, since) = (arg_path(ctx, "path"), std::time::SystemTime::now());
+            holds(
+                move |a| {
+                    written_since(&path, since)
+                        && a.status == format!("Exported {}", path.display())
+                },
+                "The setup sheet was not written.",
+            )
+        },
+        "save_for_tablet" => |ctx| {
+            let (path, since) = (arg_path(ctx, "path"), std::time::SystemTime::now());
+            holds(
+                move |a| written_since(&path, since) && a.status.starts_with("Saved "),
+                "The tablet file was not written.",
+            )
+        },
+        // The stops are sent at once; what the machine did is M3's
+        // machine_status.
+        "hold" | "stop" | "estop" | "jog_release" => |_| holds(|_| true, ""),
+        _ => return None,
+    };
+    Some(f)
 }
 
 /// Whether every message is one a command may send, else why not.
@@ -1845,28 +2896,64 @@ pub fn guard(messages: &[Message]) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::engine::{self, Backend};
-    use std::{mem::discriminant, time::Instant};
+    use crate::mcp::engine::{self, Agent, Backend};
+    use std::mem::discriminant;
 
-    /// An `App` driven straight, its tasks dropped: the registry's
-    /// messages, refusals and file rules, without a session's thread.
-    struct Direct {
-        app: App,
-        folder: PathBuf,
+    /// An `App` driven straight: each message's tasks run to their end as
+    /// it is sent, so a command's work has settled when its call returns.
+    /// The registry's messages, effects, refusals and file rules, without a
+    /// session's thread.
+    pub(crate) struct Direct {
+        pub(crate) app: App,
+        pub(crate) folder: PathBuf,
+        agent: Option<Agent>,
+        runtime: tokio::runtime::Runtime,
         _dir: tempfile::TempDir,
+    }
+    impl Direct {
+        /// The messages `task` produces, run to its end.
+        fn outputs(&self, task: Task<Message>) -> Vec<Message> {
+            use futures_util::StreamExt;
+            let Some(stream) = iced_runtime::task::into_stream(task) else {
+                return vec![];
+            };
+            self.runtime.block_on(
+                stream
+                    .filter_map(|action| async move {
+                        match action {
+                            iced_runtime::Action::Output(m) => Some(m),
+                            _ => None,
+                        }
+                    })
+                    .collect(),
+            )
+        }
     }
     impl Backend for Direct {
         fn app(&self) -> &App {
             &self.app
         }
         fn send(&mut self, message: Message) {
-            let _ = self.app.update(message);
+            let task = self.app.update(message);
+            self.run(task);
         }
-        fn settle(&mut self, _: Instant) -> bool {
+        fn run(&mut self, task: Task<Message>) {
+            for m in self.outputs(task) {
+                self.send(m);
+            }
+        }
+        /// The edit pause taken as over, and the `Tick` that then saves the
+        /// workspace and starts the checks, run to its end.
+        fn quiet(&mut self) -> bool {
+            let past = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(1));
+            if let Some(past) = past {
+                self.app.last_edit = past;
+            }
+            self.send(Message::Tick);
             true
         }
         fn pending(&self) -> Vec<&'static str> {
-            vec![]
+            self.app.pending()
         }
         fn kind(&self) -> &'static str {
             "headless"
@@ -1894,16 +2981,30 @@ mod tests {
             ok: true,
             detail: String::new(),
         });
+        // Edits settle at once here: the workspace is saved as it changes.
+        app.dirty = false;
         let folder = dir.path().to_path_buf();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         Direct {
             app,
             folder,
+            agent: Some(Agent::new()),
+            runtime,
             _dir: dir,
         }
     }
-    fn run(d: &mut Direct, command: &str, args: Value) -> Result<Value, String> {
-        let call = json!({"command": command, "args": args});
-        engine::call(d, "execute", &call, Instant::now())
+    /// A tool call, answered once its work is done.
+    pub(crate) fn call(d: &mut Direct, tool: &str, args: Value) -> Result<Value, String> {
+        let mut agent = d.agent.take().unwrap();
+        let answer = engine::call_now(&mut agent, d, tool, args);
+        d.agent = Some(agent);
+        answer
+    }
+    pub(crate) fn run(d: &mut Direct, command: &str, args: Value) -> Result<Value, String> {
+        call(d, "execute", json!({"command": command, "args": args}))
     }
     /// The example's placeholders filled from `d`'s libraries and folder.
     fn filled(d: &Direct, example: &Value) -> Value {
@@ -1944,6 +3045,7 @@ mod tests {
     /// The messages of every command's examples, built on the sample.
     fn built(d: &Direct) -> Vec<(&'static str, Message)> {
         std::fs::write(d.folder.join("part.stl"), "solid x\nendsolid x\n").unwrap();
+        crate::storage::save(&d.folder.join("job.axis.json"), &d.app.doc).unwrap();
         let mut all = vec![];
         for c in all_commands() {
             for example in c.example_args() {
@@ -1953,7 +3055,11 @@ mod tests {
                 }
                 let ctx = ctx(d, c, &args);
                 match c.built(&ctx) {
-                    Ok(messages) => all.extend(messages.into_iter().map(|m| (c.name, m))),
+                    Ok(dispatch) => {
+                        let outputs = dispatch.task.map(|t| d.outputs(t)).unwrap_or_default();
+                        let messages = dispatch.messages.into_iter().chain(outputs);
+                        all.extend(messages.map(|m| (c.name, m)));
+                    }
                     Err(Problem::Args(e) | Problem::Refused(e)) => {
                         panic!("{} {args} does not build: {e}", c.name)
                     }
@@ -2583,5 +3689,190 @@ mod tests {
         assert_eq!(opened["outcome"], "done", "{opened}");
         assert_eq!(d.app.doc.title, "Saved title");
         assert_eq!(d.app.project_path.as_deref(), Some(file.as_path()));
+    }
+
+    #[test]
+    fn every_command_has_an_effect_to_check() {
+        for c in all_commands() {
+            assert!(c.expect.is_some(), "{} has no expected effect", c.name);
+        }
+    }
+
+    /// The fixture block imported, its job's material chosen.
+    fn imported() -> Direct {
+        let mut d = direct();
+        let (mut doc, mesh) = crate::post::fixture::job();
+        // Its Face alone: the checks after each edit stay quick.
+        doc.setups[0].operations.truncate(1);
+        doc.adopt_materials();
+        doc.adopt_holders();
+        let aluminium = (doc.materials.iter())
+            .find(|m| m.name() == "Aluminium 6061-T6")
+            .map(|m| m.id.clone())
+            .unwrap();
+        assert!(doc.select_material(&aluminium));
+        d.app.replace_document(doc, None);
+        d.app.imported_mesh = Some(mesh);
+        d.app.selected = Some(0);
+        d.app.dirty = false;
+        d
+    }
+    fn outcome(r: &Value) -> &str {
+        r["outcome"].as_str().unwrap_or_default()
+    }
+
+    #[test]
+    fn outcomes_say_what_happened() {
+        let mut d = direct();
+        // Already so: nothing is sent.
+        let title = d.app.doc.title.clone();
+        let same = run(&mut d, "set_project_title", json!({"title": title})).unwrap();
+        assert_eq!(outcome(&same), "no_change", "{same}");
+        // A missing selection is refused, and nothing changes.
+        d.app.selected = None;
+        let r = run(&mut d, "toggle_operation", json!({})).unwrap();
+        assert_eq!(outcome(&r), "refused");
+        assert!(
+            r["reason"]
+                .as_str()
+                .unwrap()
+                .contains("No operation is selected")
+        );
+        // A save the file system refuses fails, in the app's words.
+        let nowhere = json!({"path": "/no-such-axis-folder/job.axis.json"});
+        let r = run(&mut d, "save_project", nowhere).unwrap();
+        assert_eq!(outcome(&r), "failed", "{r}");
+        assert!(
+            r["reason"].as_str().unwrap().starts_with("Save failed"),
+            "{r}"
+        );
+        assert!(r["command_id"].is_string());
+        assert!(d.app.project_path.is_none());
+        // A generation the checks stop fails with the check's sentence.
+        d.app.selected = Some(0);
+        d.app.doc.setup_mut().operations[0].tool = String::new();
+        let r = run(&mut d, "generate", json!({})).unwrap();
+        assert_eq!(outcome(&r), "failed", "{r}");
+        assert_eq!(r["reason"], d.app.status.as_str());
+        // A tool still in use is not deleted: the app's reason.
+        let used = d.app.doc.setup().operations[1].tool.clone();
+        let r = run(&mut d, "delete_tool", json!({"id": used})).unwrap();
+        assert_eq!(outcome(&r), "failed", "{r}");
+        assert!(
+            r["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("This tool is not deleted")
+        );
+    }
+
+    #[test]
+    fn a_strategy_the_imported_part_has_no_preview_for_is_refused() {
+        let mut d = imported();
+        let before = d.app.doc.setup().operations.len();
+        let r = run(&mut d, "add_operation", json!({"strategy": "Scallop"})).unwrap();
+        assert_eq!(outcome(&r), "refused", "{r}");
+        assert_eq!(d.app.doc.setup().operations.len(), before);
+        let r = run(&mut d, "add_operation", json!({"strategy": "Pocket"})).unwrap();
+        assert_eq!(outcome(&r), "done", "{r}");
+        assert_eq!(d.app.doc.setup().operations.len(), before + 1);
+    }
+
+    #[test]
+    fn library_saves_check_the_entry_they_make() {
+        let mut d = direct();
+        // A tool: a bad draft is refused with its issues; a good one saved,
+        // and saved again it is no change.
+        assert_eq!(
+            outcome(&run(&mut d, "new_tool", json!({})).unwrap()),
+            "done"
+        );
+        let bad = json!({"target": "tool", "key": "diameter", "value": "-1"});
+        run(&mut d, "edit_field", bad).unwrap();
+        let r = run(&mut d, "save_tool", json!({})).unwrap();
+        assert_eq!(outcome(&r), "refused", "{r}");
+        assert!(
+            r["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("The tool is not saved:"),
+            "{r}"
+        );
+        let id = d.app.tool_draft.id.clone();
+        assert!(d.app.doc.tools.iter().all(|t| t.id != id));
+        run(
+            &mut d,
+            "edit_field",
+            json!({"target": "tool", "key": "diameter", "value": "8"}),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome(&run(&mut d, "save_tool", json!({})).unwrap()),
+            "done"
+        );
+        assert!(d.app.doc.tools.iter().any(|t| t.id == id));
+        assert_eq!(
+            outcome(&run(&mut d, "save_tool", json!({})).unwrap()),
+            "no_change"
+        );
+        // A material and a holder: their names trimmed on the way in.
+        run(&mut d, "new_material", json!({})).unwrap();
+        run(
+            &mut d,
+            "edit_field",
+            json!({"target": "material", "key": "name", "value": "  Test alloy "}),
+        )
+        .unwrap();
+        let r = run(&mut d, "save_material", json!({})).unwrap();
+        assert_eq!(outcome(&r), "done", "{r}");
+        assert!(d.app.doc.materials.iter().any(|m| m.name() == "Test alloy"));
+        let holder = d.app.doc.workholding[0].id.clone();
+        run(&mut d, "edit_holder", json!({"id": holder})).unwrap();
+        run(
+            &mut d,
+            "edit_field",
+            json!({"target": "holder", "key": "name", "value": " Test clamp"}),
+        )
+        .unwrap();
+        let r = run(&mut d, "save_holder", json!({})).unwrap();
+        assert_eq!(outcome(&r), "done", "{r}");
+        assert!(
+            d.app
+                .doc
+                .workholding
+                .iter()
+                .any(|h| h.name() == "Test clamp")
+        );
+        // A machine: unchanged it is no change, and its version stays.
+        let machine = d.app.doc.machines[0].id.clone();
+        run(&mut d, "edit_machine", json!({"id": machine})).unwrap();
+        let version = d.app.doc.machines[0].version;
+        assert_eq!(
+            outcome(&run(&mut d, "save_machine", json!({})).unwrap()),
+            "no_change"
+        );
+        assert_eq!(d.app.doc.machines[0].version, version);
+        // A typed centreline is no longer the measured one: its marks go.
+        let mark = |m: &crate::model::Machine| {
+            m.p.contains_key(crate::control::CENTRE_MARK)
+                || m.p.contains_key(crate::model::CENTRE_REF)
+        };
+        for m in [&mut d.app.doc.machines[0], &mut d.app.machine_draft] {
+            m.p.insert("a_centre_y".into(), "5".into());
+            m.p.insert(crate::control::CENTRE_MARK.into(), "1".into());
+            m.p.insert(crate::model::CENTRE_REF.into(), "1".into());
+        }
+        run(
+            &mut d,
+            "edit_field",
+            json!({"target": "machine", "key": "a_centre_y", "value": "7"}),
+        )
+        .unwrap();
+        let r = run(&mut d, "save_machine", json!({})).unwrap();
+        assert_eq!(outcome(&r), "done", "{r}");
+        let saved = &d.app.doc.machines[0];
+        assert_eq!(crate::model::get(&saved.p, "a_centre_y"), "7");
+        assert!(!mark(saved));
+        assert_eq!(saved.version, version + 1);
     }
 }

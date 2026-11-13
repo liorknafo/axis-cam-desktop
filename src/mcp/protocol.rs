@@ -9,8 +9,8 @@
 //! is pointed at standard error before anything runs, so nothing the app
 //! prints can land among the protocol's lines.
 use super::{
-    engine,
-    runner::{Answer, Runner, Session},
+    engine::{self, Answer},
+    runner::{Runner, Session},
 };
 use serde_json::{Value, json};
 use std::{
@@ -31,7 +31,7 @@ Workflow: inspect, import the part, add setups, add operations, pick their surfa
 
 Ids: setups and operations are addressed by `id`. An index from 0, in inspect's order, is accepted too and turned into the id when the call arrives.
 
-Outcomes: every `execute` result has `outcome`: `done` (its effect was checked and holds), `no_change` (it was already so; nothing was sent), `refused` (nothing was done; `reason` says what is missing), `failed` (it was sent and did not take; `reason` gives the app's status line or says what did not happen), or `still_running` (it was sent and its work, listed in `pending`, had not settled within `wait_s`: 25 s by default, at most 50; call inspect until `pending` is empty). The status line alone does not tell whether a command worked; the outcome does.
+Outcomes: every `execute` result has `outcome`: `done` (its effect was checked and holds), `no_change` (it was already so), `refused` (nothing was done; `reason` says what is missing), `busy` (the previous command's work is still settling; nothing was done: call `wait`, then retry), `failed` (it was sent and did not take; `reason` gives the app's status line or says what did not happen), `still_running` (it was sent and its work, listed in `pending`, had not settled within `wait_s`: 25 s by default, at most 50), or `cancelled`. A command that was sent has a `command_id`: `wait {command_id}` gives its final result, and `cancel {command_id}` stops a generation. `batch {steps}` runs commands in order and stops at the first that does not go; it is not all-or-nothing. Reads, `wait`, `cancel` and the stops answer while a command's work settles. The status line alone does not tell whether a command worked; the outcome does.
 
 Session: with no AXIS CAM window to work in, this server runs a headless session of its own, which starts from a copy of the user's workspace (their libraries and last job). It never writes the user's workspace. It is kept on disk in the folder inspect names when the client ends, and `axis-cam --mcp --session <id>` continues it. Every result names its backend.
 
