@@ -1428,6 +1428,10 @@ pub struct App {
     pub save_busy: bool,
     pub last_archived: Option<PathBuf>,
     pub import_error: Option<String>,
+    /// What opening the project noted, said again, first, once its part has
+    /// loaded (`take_model`), whose status would otherwise replace it
+    /// (LIO-464).
+    pub opened_notes: Vec<String>,
     /// Whether the Import from path field shows under the application bar.
     pub import_path_open: bool,
     /// The path typed or pasted into it.
@@ -2200,6 +2204,7 @@ impl App {
             save_busy: false,
             last_archived: None,
             import_error: None,
+            opened_notes: vec![],
             import_path_open: false,
             import_path: String::new(),
             import_path_error: None,
@@ -2577,7 +2582,12 @@ impl App {
         if changed {
             self.touch();
         }
-        self.status = with_notes(&done, &notes);
+        // What opening noted first: the line's only part a tablet shows.
+        let opened = std::mem::take(&mut self.opened_notes);
+        self.status = (opened.into_iter())
+            .chain([with_notes(&done, &notes)])
+            .collect::<Vec<_>>()
+            .join(" ");
     }
     pub fn operation(&self) -> Option<&Operation> {
         self.doc
@@ -8957,7 +8967,10 @@ impl App {
                 match result {
                     Ok(mesh) => self.take_model(mesh, false),
                     Err(e) => {
-                        self.status = format!("Model could not be restored: {e}");
+                        self.status = with_notes(
+                            &format!("Model could not be restored: {e}"),
+                            &std::mem::take(&mut self.opened_notes),
+                        );
                         self.import_error = Some(e);
                     }
                 }
@@ -9023,6 +9036,9 @@ impl App {
                     "Project opened. Your previous project is in Project history.",
                     &notes,
                 );
+                if self.doc.file.is_some() {
+                    self.opened_notes = notes;
+                }
                 if SHOP {
                     return Task::batch([
                         self.restore_model(),

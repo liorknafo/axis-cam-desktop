@@ -21119,6 +21119,28 @@ soft_max = 180.0
         assert!(mesh.surfaces[ids[0]].normal[2] > 0.999);
         assert_eq!(a.status, "Saved model geometry restored.");
     }
+    /// What opening a project noted is still said once its part has loaded
+    /// (LIO-464: the tablet's own profile kept as `.old`).
+    #[test]
+    fn a_projects_opening_notes_outlast_its_part_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, file) = block_app(dir.path());
+        let doc = a.doc.clone();
+        let note = "This tablet's x.toml differed from the file's; it is kept as x.toml.old.";
+        let path = dir.path().join("job.axis.json");
+        let opened = Ok((doc, path, vec![note.to_string()]));
+        let _ = a.update(Message::ProjectOpened(Some(opened)));
+        let mesh = crate::mesh::load(&file.path).unwrap();
+        let _ = a.update(Message::ModelRestored(file.clone(), Ok(mesh)));
+        // First: the tablet has no hover card for the rest of the line.
+        assert!(a.status.starts_with(note), "{}", a.status);
+        assert!(
+            a.status.ends_with("Saved model geometry restored."),
+            "{}",
+            a.status
+        );
+        assert!(a.opened_notes.is_empty());
+    }
     #[test]
     fn a_click_on_a_wall_picks_or_drops_its_whole_hole_in_a_pocket() {
         for strategy in [Strategy::Pocket, Strategy::Adaptive] {
