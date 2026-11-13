@@ -7855,6 +7855,30 @@ flood = { pin = 8 }
         assert_eq!(run_of(&a).checked().map(<[_]>::len), Some(2));
     }
 
+    /// A project opened while a setup is picked to run, such as a job sent
+    /// to the shop tablet again (LIO-456): its setups keep their ids, and
+    /// Cycle Start waits for that setup to be checked in the new project,
+    /// never starting the programs checked in the old one.
+    #[test]
+    fn a_project_opened_checks_the_picked_setup_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        idle(&mut a);
+        check_run(&mut a, 0);
+        assert!(!run_of(&a).stale && run_of(&a).checked().is_some());
+        let mut sent = a.doc.clone();
+        sent.title = "Sent again".into();
+        let path = dir.path().join("tablet.axis.json");
+        let _ = a.update(Message::ProjectOpened(Some(Ok((sent, path, vec![])))));
+        assert_eq!(a.doc.title, "Sent again");
+        assert!(run_of(&a).stale);
+        assert!(
+            (problems(&a).iter()).any(|p| p.contains("changed since the setup was checked")),
+            "{:?}",
+            problems(&a)
+        );
+    }
+
     /// The setup's work zero moved in the project between tool runs (its
     /// origin picked anew, or the stock moved under the same origin), but the
     /// machine's work offset was touched off for the old one: a later tool

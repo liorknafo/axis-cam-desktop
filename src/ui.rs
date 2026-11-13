@@ -8972,6 +8972,7 @@ fn connect_controls(app: &App) -> Column<'_, Message> {
         let connected = app.control.as_ref().filter(|c| c.machine_id == m.id);
         if connected.is_some() {
             col = col.push(muted(match now {
+                "Simulated" if crate::SHOP => "Pi (network) disconnects the simulator and connects to the machine through its Pi.",
                 "Simulated" => "Real (USB) disconnects the simulator and connects to the machine itself.",
                 "USB" => "Simulated disconnects the machine (it is left in E-stop) and connects to the simulator.",
                 _ => "Another connection closes the link to the Pi (a running tool run goes on there) and connects that way.",
@@ -9020,11 +9021,16 @@ fn pi_pairing<'a>(
     let place = if editable {
         row![
             muted("Pi address"),
-            text_input(crate::control::PI_DEFAULT, address)
-                .on_input(Message::PiAddress)
-                .width(Length::Fixed(200.))
-                .padding([5, 8])
-                .size(13),
+            // The typed address, not `address`: with the default shown as
+            // text, emptying the field would put "uc100.local" back (LIO-456).
+            text_input(
+                crate::control::PI_DEFAULT,
+                crate::model::get(&m.p, "uc100_pi")
+            )
+            .on_input(Message::PiAddress)
+            .width(Length::Fixed(200.))
+            .padding([5, 8])
+            .size(13),
         ]
     } else {
         row![muted("Pi address"), text(address).size(13)]

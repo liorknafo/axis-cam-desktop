@@ -31,7 +31,10 @@ pub fn simulated(m: &Machine) -> bool {
 /// The Pi a UC100 machine connects to across the network ("uc100.local",
 /// "host:port"), or None when it connects over USB or to the simulator.
 pub fn pi(m: &Machine) -> Option<&str> {
-    (get(&m.p, "uc100_connection") == PI).then(|| match get(&m.p, "uc100_pi").trim() {
+    let way = get(&m.p, "uc100_connection");
+    // The shop tablet has no USB (LIO-456): a job planned for USB, or for
+    // no connection, reaches its machine through the Pi there.
+    (way == PI || crate::SHOP && way != "Simulated").then(|| match get(&m.p, "uc100_pi").trim() {
         "" => PI_DEFAULT,
         address => address,
     })
