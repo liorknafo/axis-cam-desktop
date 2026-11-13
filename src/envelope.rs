@@ -150,13 +150,16 @@ pub fn issues(m: &Machine) -> Vec<String> {
             ));
         }
     }
-    // The spindle crosses the gantry over the whole X travel.
-    if let Some(((width, _), x)) = clearance(m, "gantry_width").zip(clearance(m, "x"))
-        && width + EPS < x.0
+    // The spindle crosses the gantry over the whole travel of the axis
+    // across the table: X, or Y where X runs front to back (LIO-457).
+    let k = crate::orient::Orient::of(m).across();
+    let (key, axis) = [("x", "X"), ("y", "Y")][k];
+    if let Some(((width, _), travel)) = clearance(m, "gantry_width").zip(clearance(m, key))
+        && width + EPS < travel.0
     {
         e.push(format!(
-            "Gantry clearance width cannot be narrower than the {} mm X travel the spindle crosses it over.",
-            mm(x.0)
+            "Gantry clearance width cannot be narrower than the {} mm {axis} travel the spindle crosses it over.",
+            mm(travel.0)
         ));
     }
     e
@@ -250,8 +253,9 @@ pub struct Stack {
     /// or the stock (a clamp stands over it).
     pub stock_top: f32,
     pub top: f32,
-    /// How far the stock and its workholding reach along X, mm.
-    pub x: Option<[f32; 2]>,
+    /// How far the stock and its workholding reach across the table, left
+    /// to right (`Orient::across`: X, or Y where X runs front to back), mm.
+    pub across: Option<[f32; 2]>,
     /// The setup's Z of the stock's underside, for a stack on a flat table:
     /// a height in the setup's frame is `base` + its Z less this. None for
     /// the stock held on the rotary unit, whose axis is not Z.
@@ -277,6 +281,11 @@ impl Stack {
             let base = doc.index_base(si).unwrap_or(si);
             let unit = doc.rotary_unit(machine)?;
             let (radius, x) = crate::rotary_check::bar_reach(doc, base, mesh)?;
+            // Along X, or its diameter where X runs front to back.
+            let across = match crate::orient::Orient::of(machine).across() {
+                0 => x,
+                _ => [-radius, radius],
+            };
             let stock_top = unit.centre_height + radius;
             // The unit's own chuck and tailstock are fixed: whether they pass
             // under the gantry is the unit's (`a_fit_diameter`), not the stock's.
@@ -285,7 +294,7 @@ impl Stack {
                 base_assumed: false,
                 stock_top,
                 top: stock_top,
-                x: Some(x),
+                across: Some(across),
                 z0: None,
                 what: format!(
                     "the rotary centre {} mm over the table and the stock's {} mm reach from it",
@@ -315,11 +324,15 @@ impl Stack {
         let height = stock.dimensions()[2];
         let stock_top = base + height;
         let mut top = stock_top;
-        let mut x = [stock.min[0], stock.max[0]];
+        let k = crate::orient::Orient::of(machine).across();
+        let mut across = [stock.min[k], stock.max[k]];
         if let Some(holder) = holder {
             for b in crate::holding::boxes(&layout, holder, stock).unwrap_or_default() {
                 top = top.max(base + b.bounds.max[2] - stock.min[2]);
-                x = [x[0].min(b.bounds.min[0]), x[1].max(b.bounds.max[0])];
+                across = [
+                    across[0].min(b.bounds.min[k]),
+                    across[1].max(b.bounds.max[k]),
+                ];
             }
         }
         let taken = if base_assumed {
@@ -339,7 +352,7 @@ impl Stack {
             base_assumed,
             stock_top,
             top,
-            x: Some(x),
+            across: Some(across),
             z0: Some(stock.min[2]),
             what: format!("{on}, the stock's {} mm", mm(height)),
         })
@@ -400,13 +413,18 @@ pub fn problems(
             ),
         ));
     }
-    if let Some(((limit, from), [lo, hi])) = width.zip(stack.x)
+    if let Some(((limit, from), [lo, hi])) = width.zip(stack.across)
         && hi - lo > limit + EPS
     {
+        // The axis across the table and the one along it (LIO-457).
+        let (axis, along) = match crate::orient::Orient::of(machine).across() {
+            0 => ("X", "Y"),
+            _ => ("Y", "X"),
+        };
         out.push((
             None,
             format!(
-                "{name}: the part doesn't fit under the gantry: needs {} mm across X, has {} mm{}. The stock and its jaws or clamps reach {} mm along X; turn it to put its long side along Y.",
+                "{name}: the part doesn't fit under the gantry: needs {} mm across {axis}, has {} mm{}. The stock and its jaws or clamps reach {} mm along {axis}; turn it to put its long side along {along}.",
                 mm(hi - lo),
                 mm(limit),
                 flag(from),
@@ -637,6 +655,70 @@ mod tests {
             "{}",
             found[0].1
         );
+    }
+
+    /// LIO-457: the gantry's width spans the axis across the table: Y on a
+    /// machine whose X runs front to back.
+    #[test]
+    fn the_gantry_width_is_across_the_table_whichever_axis_that_is() {
+        use crate::orient::{KEY, Orient};
+        // X 500 long, Y 200 across, the gantry 250 wide.
+        let mut m = machine("150", "120", "250");
+        m.p.insert("x".into(), "500".into());
+        m.p.insert("y".into(), "200".into());
+        for (o, issue) in [
+            ("Right", Some("the 500 mm X travel")),
+            ("Left", Some("the 500 mm X travel")),
+            ("Away from you", None),
+            ("Toward you", None),
+        ] {
+            m.p.insert(KEY.into(), o.into());
+            let found = issues(&m);
+            match issue {
+                Some(words) => assert!(found.iter().any(|e| e.contains(words)), "{o}: {found:?}"),
+                None => assert!(found.is_empty(), "{o}: {found:?}"),
+            }
+        }
+        m.p.insert("x".into(), "200".into());
+        m.p.insert("y".into(), "500".into());
+        m.p.insert(KEY.into(), "Away from you".into());
+        assert!(
+            issues(&m).iter().any(|e| e.contains("the 500 mm Y travel")),
+            "{:?}",
+            issues(&m)
+        );
+        // A part that fits across one way and not the other: its reach
+        // across X and across Y, and a gantry between the two.
+        // The vise's jaws along X: wider across X than across Y.
+        let (mut doc, mesh) = drilled(machine("1000", "1000", "1000"), Some("25"));
+        doc.setups[0].p.insert("vise_axis".into(), "X".into());
+        let reach = |o: Orient| {
+            let mut d = doc.clone();
+            d.setups[0].machine.p.insert(KEY.into(), o.label().into());
+            let [lo, hi] = Stack::of(&d, &mesh, 0).unwrap().across.unwrap();
+            hi - lo
+        };
+        let (wx, wy) = (reach(Orient::Right), reach(Orient::Away));
+        assert!((wx - wy).abs() > 2., "{wx} {wy}");
+        assert_eq!(reach(Orient::Left), wx);
+        assert_eq!(reach(Orient::Toward), wy);
+        let limit = format!("{}", (wx + wy) / 2.);
+        for o in [Orient::Right, Orient::Left, Orient::Away, Orient::Toward] {
+            let (mut d, mesh) = drilled(machine("1000", "1000", &limit), Some("25"));
+            d.setups[0].p.insert("vise_axis".into(), "X".into());
+            d.setups[0].machine.p.insert(KEY.into(), o.label().into());
+            let found = problems(&d, &mesh, 0, &simulated(&d, &mesh));
+            let wide = if o.across() == 0 { wx > wy } else { wy > wx };
+            let axis = ["X", "Y"][o.across()];
+            assert_eq!(
+                found
+                    .iter()
+                    .any(|(_, e)| e.contains(&format!(" mm across {axis}, has "))),
+                wide,
+                "{o:?}: {found:?}"
+            );
+            assert_eq!(found.len(), usize::from(wide), "{o:?}: {found:?}");
+        }
     }
 
     #[test]

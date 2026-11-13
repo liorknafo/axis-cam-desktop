@@ -1974,7 +1974,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (Target::Machine, "gantry_width") => (
-            "The gantry's inside width between its uprights, along X, in mm. The stock with its jaws or clamps must pass through it; not narrower than the X travel. Empty: not checked.",
+            "The gantry's inside width between its uprights, across the table (along X, or Y where +X points away or toward you), in mm. The stock with its jaws or clamps must pass through it; not narrower than that axis' travel. Empty: not checked.",
             "",
             None,
         ),

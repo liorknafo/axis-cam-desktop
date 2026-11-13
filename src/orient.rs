@@ -167,6 +167,15 @@ impl Orient {
         self.spot_at(if right { 1 } else { -1 }, if back { 1 } else { -1 })
     }
 
+    /// The machine axis (0 X, 1 Y) that runs across the table, left to
+    /// right: the one the gantry's width spans.
+    pub fn across(self) -> usize {
+        match self {
+            Orient::Right | Orient::Left => 0,
+            Orient::Away | Orient::Toward => 1,
+        }
+    }
+
     /// The X and Y travel along the table's width and depth: X's and Y's,
     /// swapped when X runs front to back.
     pub fn world_travel(self, travel: [f32; 3]) -> [f32; 3] {
@@ -330,6 +339,13 @@ mod tests {
         assert_eq!(Orient::Toward.corner([Min, Min]), "back-left");
         assert_eq!(Orient::Left.end(0, false), "right");
         assert_eq!(Orient::Left.end(1, true), "front");
+        for o in ALL {
+            // The axis across is the one going left or right.
+            assert!(
+                matches!(o.dir(o.across(), true), Dir::Left | Dir::Right),
+                "{o:?}"
+            );
+        }
         for o in ALL {
             for back in [false, true] {
                 for right in [false, true] {
