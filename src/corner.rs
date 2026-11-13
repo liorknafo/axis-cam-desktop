@@ -17,7 +17,7 @@ use crate::{
     cam::{Builder, Geometry, ON, arcs, meets, number, swept},
     mesh::{Bounds, Mesh},
     model::{Fields, Operation, Setup, Tool, get, num},
-    simulation::{Motion, Move, Plan},
+    simulation::{Motion, Plan},
 };
 use std::collections::HashSet;
 
@@ -880,7 +880,8 @@ pub fn walks(
     b.plan.target = deepest;
     b.plan.levels = levels_total;
     b.plan.rest_top = rest_top;
-    let plan = b.finish()?;
+    let mut plan = b.finish()?;
+    plan.corner_walks = walks.clone();
     Ok((plan, walks))
 }
 /// What a Round corners whose Steps cannot be followed says, after the
@@ -1081,102 +1082,28 @@ pub struct Round {
     pub offset: f32,
     pub scallop: f32,
 }
-/// The walks of a Round corners' `plan` (`walks`), read back from its
-/// moves: each from the first move after the walk before to its climb to
-/// clearance; its corner the picked one whose walls' lines it starts and
-/// ends on (`on_walls`); its offset that reading's distance from the round
-/// offset by the tool, and
-/// its readings and scallop worked out again from its feeds.
-pub fn read(plan: &Plan, corners: &[Corner], zero: [f32; 3]) -> Vec<Walk> {
-    let mut out = vec![];
-    let mut start = 0;
-    let rc = plan.radius;
-    let moves = &plan.moves;
-    let mut i = 0;
-    while i < moves.len() {
-        let m = &moves[i];
-        // A walk ends where the tool climbs from a cut.
-        let climbs = m.motion == Motion::Rapid
-            && m.to[2] > m.from[2]
-            && i > 0
-            && moves[..i]
-                .iter()
-                .rev()
-                .find(|m| m.motion != Motion::Dwell)
-                .is_some_and(|m| m.cutting_pass);
-        if climbs {
-            let walk: &[Move] = &moves[start..=i];
-            let feeds: Vec<&Move> = walk.iter().filter(|m| m.cutting_pass).collect();
-            if let Some(first) = feeds.first() {
-                let z = first.to[2];
-                // The feeds' ends but the way in's start and the way out's end.
-                // On the DRO's hundredths, as they were worked out.
-                let hundredth = |v: f32| ((v as f64) / READ).round() * READ;
-                let mut points: Vec<[f64; 2]> = feeds
-                    .iter()
-                    .map(|m| [hundredth(m.to[0] - zero[0]), hundredth(m.to[1] - zero[1])])
-                    .collect();
-                points.pop();
-                let p0 = points.first().copied().unwrap_or_default();
-                let pn = points.last().copied().unwrap_or_default();
-                // The corner whose walls' lines the walk starts and ends on,
-                // as far from its centre at both (LIO-447: the circle
-                // nearest the first reading was a neighbour's on the same
-                // side, and drew the wrong corner).
-                let near = (0..corners.len())
-                    .filter_map(|k| {
-                        let c = corners[k].centre;
-                        let c = [(c[0] - zero[0]) as f64, (c[1] - zero[1]) as f64];
-                        on_walls(c, corners[k].quarter, p0, pn).map(|e| (k, e))
-                    })
-                    .min_by(|a, b| a.1.total_cmp(&b.1))
-                    .map(|(k, _)| k);
-                if let Some(ci) = near {
-                    let k = &corners[ci];
-                    let c = [
-                        (k.centre[0] - zero[0]) as f64,
-                        (k.centre[1] - zero[1]) as f64,
-                    ];
-                    let d = (p0[0] - c[0]).hypot(p0[1] - c[1]) - (k.r + rc) as f64;
-                    let offset = ((d / READ).round() * READ).max(0.) as f32;
-                    let offset = if offset < 0.02 { 0. } else { offset };
-                    let r = k.r as f64 + offset as f64;
-                    let (scallop, _) = bound(c, r, rc as f64, k.quarter, &points);
-                    out.push(Walk {
-                        corner: ci,
-                        offset,
-                        z: z - zero[2],
-                        level: 0,
-                        levels: 0,
-                        stair: Stair {
-                            points,
-                            scallop: scallop.max(0.),
-                        },
-                        moves: start..i + 1,
-                    });
-                }
-            }
-            start = i + 1;
-        }
-        i += 1;
-    }
-    // The levels of each corner's walks, by their Z.
-    for ci in 0..corners.len() {
-        let mut zs: Vec<f32> = out.iter().filter(|w| w.corner == ci).map(|w| w.z).collect();
-        zs.sort_by(|a, b| b.total_cmp(a));
-        zs.dedup_by(|a, b| (*a - *b).abs() < 0.001);
-        for w in out.iter_mut().filter(|w| w.corner == ci) {
-            w.level = zs.iter().position(|z| (z - w.z).abs() < 0.001).unwrap_or(0) + 1;
-            w.levels = zs.len();
-        }
-    }
-    out
+/// The offset the Steps say of walk `w` round corner `c` (tool radius
+/// `rc`, work zero `zero`): its first reading's distance out from the round
+/// offset by the tool, on the DRO's hundredths, as the reading is; under
+/// 0.02 none.
+pub fn shown_offset(w: &Walk, c: &Corner, rc: f32, zero: [f32; 3]) -> f32 {
+    let Some(p) = w.stair.points.first() else {
+        return w.offset;
+    };
+    let centre = [
+        (c.centre[0] - zero[0]) as f64,
+        (c.centre[1] - zero[1]) as f64,
+    ];
+    let d = (p[0] - centre[0]).hypot(p[1] - centre[1]) - (c.r + rc) as f64;
+    let offset = ((d / READ).round() * READ).max(0.) as f32;
+    if offset < 0.02 { 0. } else { offset }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::model::{Strategy, Tool};
+    use crate::simulation::Move;
 
     /// A `w` × `h` × `t` plate, its four vertical corners rounded `r` in
     /// `n` facets each, its bottom at Z 0 and its middle on X 0 Y 0; with
@@ -1427,29 +1354,22 @@ pub(crate) mod tests {
         // With 3 mm of stock off each side, the stock's corner stands
         // 6.3 mm off the round: a band first, then the round.
         assert!(walks.iter().any(|w| w.offset > 0.));
-        // The plan's walks read back from its moves as made.
+        // The plan keeps its walks as made, each walk's feeds onto its
+        // readings in its own moves.
+        assert_eq!(plan.corner_walks, walks);
         let zero = crate::post::datum(&setup, plan.stock, &mesh).unwrap();
-        let back = read(&plan, &picked(&setup, &mesh, &op).unwrap(), zero);
-        assert_eq!(back.len(), walks.len());
-        for (a, b) in back.iter().zip(&walks) {
-            assert_eq!(a.corner, b.corner);
-            assert_eq!(a.stair.points.len(), b.stair.points.len());
-            for (p, q) in a.stair.points.iter().zip(&b.stair.points) {
+        for w in &walks {
+            let feeds: Vec<&Move> = (plan.moves[w.moves.clone()].iter())
+                .filter(|m| m.cutting_pass)
+                .collect();
+            assert_eq!(feeds.len(), w.stair.points.len() + 1);
+            for (m, p) in feeds.iter().zip(&w.stair.points) {
+                let at = [(m.to[0] - zero[0]) as f64, (m.to[1] - zero[1]) as f64];
                 assert!(
-                    (p[0] - q[0]).abs() < 1e-6 && (p[1] - q[1]).abs() < 1e-6,
-                    "{p:?} {q:?}"
+                    (at[0] - p[0]).abs() < 1e-3 && (at[1] - p[1]).abs() < 1e-3,
+                    "{at:?} {p:?}"
                 );
-            }
-            assert!(
-                (a.offset - b.offset).abs() < 0.02,
-                "{} {}",
-                a.offset,
-                b.offset
-            );
-            assert!((a.z - b.z).abs() < 0.001);
-            assert_eq!((a.level, a.levels), (b.level, b.levels));
-            if b.offset == 0. {
-                assert!((a.stair.scallop - b.stair.scallop).abs() < 1e-6);
+                assert!((m.to[2] - zero[2] - w.z).abs() < 1e-3);
             }
         }
     }
@@ -2097,21 +2017,8 @@ pub(crate) mod tests {
             doc.setups[0].operations = vec![op];
             let setup = &doc.setups[0];
             let (plan, made) = walks(setup, &setup.operations[0], &doc.tools[0], &mesh).unwrap();
-            let zero = crate::post::datum(setup, plan.stock, &mesh).unwrap();
-            // Read back, each walk is round the corner it was made round,
-            // its offset its own.
-            let back = read(&plan, &corners, zero);
-            assert_eq!(back.len(), made.len());
+            assert_eq!(plan.corner_walks, made);
             assert!(made.iter().any(|w| w.offset > 15.), "{spindle}");
-            for (k, (a, b)) in made.iter().zip(&back).enumerate() {
-                assert_eq!(a.corner, b.corner, "{spindle}: walk {}", k + 1);
-                assert!(
-                    (a.offset - b.offset).abs() < 0.02,
-                    "{spindle}: walk {}",
-                    k + 1
-                );
-                assert!(b.stair.scallop.is_finite(), "{spindle}: walk {}", k + 1);
-            }
             // And the Steps say so, every number finite.
             let guide = crate::guide::build(&doc, &mesh, 0).unwrap();
             let steps: Vec<_> = (guide.steps.iter())
@@ -2133,6 +2040,87 @@ pub(crate) mod tests {
                     "{spindle}: {s:?}"
                 );
             }
+        }
+    }
+    /// A two-height plate (LIO-447 review): 134 × 88 to Z 10 with R5
+    /// corners, then 130 × 84 to Z 20 with R3 corners about the same centres:
+    /// eight corners, two to a centre, at different heights.
+    fn two_height_plate() -> Mesh {
+        let outline = |r: f32| {
+            let mut p = vec![];
+            for (q, c) in [[62., 39.], [-62., 39.], [-62., -39.], [62., -39.]]
+                .into_iter()
+                .enumerate()
+            {
+                for i in 0..=12 {
+                    let a = std::f32::consts::FRAC_PI_2 * (q as f32 + i as f32 / 12.);
+                    p.push([c[0] + r * a.cos(), c[1] + r * a.sin()]);
+                }
+            }
+            p
+        };
+        let (lower, upper) = (outline(5.), outline(3.));
+        let at = |p: [f32; 2], z: f32| [p[0], p[1], z];
+        let mut tris = vec![];
+        for i in 0..lower.len() {
+            let j = (i + 1) % lower.len();
+            let (a, b, c, d) = (lower[i], lower[j], upper[i], upper[j]);
+            tris.push([[0., 0., 0.], at(b, 0.), at(a, 0.)]);
+            tris.push([at(a, 0.), at(b, 0.), at(b, 10.)]);
+            tris.push([at(a, 0.), at(b, 10.), at(a, 10.)]);
+            tris.push([at(a, 10.), at(b, 10.), at(d, 10.)]);
+            tris.push([at(a, 10.), at(d, 10.), at(c, 10.)]);
+            tris.push([at(c, 10.), at(d, 10.), at(d, 20.)]);
+            tris.push([at(c, 10.), at(d, 20.), at(c, 20.)]);
+            tris.push([[0., 0., 20.], at(c, 20.), at(d, 20.)]);
+        }
+        crate::mesh::normalize(tris).unwrap()
+    }
+    #[test]
+    fn corners_about_the_same_centre_at_two_heights_each_keep_their_own_walks() {
+        let mesh = two_height_plate();
+        for spindle in crate::model::SPINDLE_ROTATIONS {
+            let (mut doc, _) = plate_job("Y");
+            let corners = all(&doc.setups[0], &mesh);
+            assert_eq!(corners.len(), 8, "{corners:?}");
+            let ids = corners.iter().flat_map(|c| c.walls.clone()).collect();
+            let mut op = corner_op(&mesh, &doc.tools[0], ids);
+            op.p.insert("stepdown".into(), "10".into());
+            op.p.insert("spindle_rotation".into(), spindle.into());
+            doc.setups[0].operations = vec![op];
+            let setup = &doc.setups[0];
+            let (plan, made) = walks(setup, &setup.operations[0], &doc.tools[0], &mesh).unwrap();
+            assert_eq!(plan.corner_walks, made);
+            // The Steps follow, each walk round the corner it was made
+            // round: its radius, its height, its offset.
+            let guide =
+                crate::guide::build(&doc, &mesh, 0).unwrap_or_else(|e| panic!("{spindle}: {e}"));
+            let steps: Vec<_> = (guide.steps.iter())
+                .filter_map(|s| match s {
+                    crate::guide::Step::Corner {
+                        corner,
+                        radius,
+                        offset,
+                        z,
+                        scallop,
+                        ..
+                    } => Some((*corner, *radius, *offset, *z, *scallop)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(steps.len(), made.len(), "{spindle}");
+            for (k, (w, s)) in made.iter().zip(&steps).enumerate() {
+                let c = &corners[w.corner];
+                assert_eq!(s.0, w.corner + 1, "{spindle}: walk {}", k + 1);
+                assert!((s.1 - c.r).abs() < 1e-3, "{spindle}: walk {}: {s:?}", k + 1);
+                assert!(
+                    (s.2 - w.offset).abs() < 0.02 && s.4.is_finite(),
+                    "{spindle}: {s:?}"
+                );
+                assert!((s.3 - w.z).abs() < 1e-3);
+            }
+            assert!(steps.iter().any(|s| (s.1 - 3.).abs() < 1e-3));
+            assert!(steps.iter().any(|s| (s.1 - 5.).abs() < 1e-3));
         }
     }
     /// Walk 9's numbers as the Steps gave them before LIO-447.

@@ -2906,6 +2906,7 @@ pub fn cut_plan(
         moves: vec![],
         stops: vec![],
         keep_air: vec![],
+        corner_walks: vec![],
         ..plan.clone()
     };
     let mut new = vec![None; plan.moves.len()];

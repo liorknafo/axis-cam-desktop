@@ -32868,10 +32868,7 @@ soft_max = 180.0
             for t in targets.iter().filter(|t| t.feed) {
                 let arrow = [["◀", "▶"], ["▼", "▲"]][t.axis][usize::from(way(t.axis))];
                 let shown = format!("{arrow} {}", dro(t.centre));
-                assert!(
-                    texts.contains(&shown),
-                    "walk {index}: {shown} in {texts:?}"
-                );
+                assert!(texts.contains(&shown), "walk {index}: {shown} in {texts:?}");
             }
             if let Some(dir) = &out {
                 std::fs::create_dir_all(dir).unwrap();

@@ -4042,6 +4042,7 @@ pub(crate) mod fixture {
             neck: None,
             stops: vec![],
             keep_air: vec![],
+            corner_walks: vec![],
             display_scale: 1.,
             duration: 0.,
             target: 9.,

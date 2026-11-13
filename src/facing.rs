@@ -353,6 +353,7 @@ pub(crate) fn outline(f: Outline) -> Result<Plan, String> {
         neck: None,
         stops: vec![],
         keep_air: vec![],
+        corner_walks: vec![],
         display_scale: f.scale,
         duration: 0.,
         target: f.target,

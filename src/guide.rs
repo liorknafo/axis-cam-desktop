@@ -1945,11 +1945,30 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                     ));
                 }
                 let corners = crate::corner::picked(setup, mesh, op)?;
-                let walks = crate::corner::read(&plan, &corners, zero);
+                // The walks as the plan made them, each with its corner.
+                let walks = &plan.corner_walks;
+                if walks.is_empty() {
+                    return Err(format!(
+                        "{}: its walks are not known. {}",
+                        op.name(),
+                        crate::corner::BROKEN
+                    ));
+                }
                 count = walks.len();
                 for (k, w) in walks.iter().enumerate() {
-                    let c = &corners[w.corner];
-                    let moves = &plan.moves[w.moves.clone()];
+                    let at = (k + 1, walks.len());
+                    let (Some(c), Some(moves)) =
+                        (corners.get(w.corner), plan.moves.get(w.moves.clone()))
+                    else {
+                        return Err(format!(
+                            "{}: walk {} of {}: its corner or its moves are not the plan's. {}",
+                            op.name(),
+                            at.0,
+                            at.1,
+                            crate::corner::BROKEN
+                        ));
+                    };
+                    let offset = crate::corner::shown_offset(w, c, plan.radius, zero);
                     let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
                     for m in moves.iter().filter(|m| m.motion == Motion::Feed) {
                         for p in [m.from, m.to] {
@@ -2030,7 +2049,7 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                             radius: c.r,
                             quarter: c.quarter,
                             tool: plan.radius,
-                            offset: w.offset,
+                            offset,
                             scallop: w.stair.scallop as f32,
                         },
                     ) {
@@ -2051,7 +2070,7 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                         place: c.place(),
                         radius: c.r,
                         centre: [c.centre[0] - zero[0], c.centre[1] - zero[1]],
-                        offset: w.offset,
+                        offset,
                         z: w.z,
                         level: w.level,
                         levels: w.levels,
