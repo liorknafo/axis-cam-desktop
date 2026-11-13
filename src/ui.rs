@@ -8797,7 +8797,7 @@ fn machine_bar(app: &App) -> Element<'_, Message> {
             .push(bar_btn(
                 "Control",
                 Message::ControlSetup(false),
-                !app.machine_setup,
+                !app.machine_setup && !app.shop_projects,
             ))
             .push(bar_btn(
                 if fit.narrow {
@@ -8806,8 +8806,16 @@ fn machine_bar(app: &App) -> Element<'_, Message> {
                     "Controller configuration"
                 },
                 Message::ControlSetup(true),
-                app.machine_setup,
+                app.machine_setup && !app.shop_projects,
             ));
+    }
+    // The shop tablet's projects from the computer (LIO-459).
+    if crate::SHOP {
+        bar = bar.push(bar_btn(
+            "Projects",
+            Message::ShowProjects(!app.shop_projects),
+            app.shop_projects,
+        ));
     }
     let file = Help::text(
         "Project file",
@@ -9140,6 +9148,9 @@ fn machine_log(c: &crate::control::Connection) -> Element<'_, Message> {
 /// and feed), always there; one task at a time in the centre's tabs; the
 /// operations on the right. Not connected, the machine to connect to.
 fn control(app: &App) -> Element<'_, Message> {
+    if crate::SHOP && app.shop_projects {
+        return shop_projects(app);
+    }
     // A setup on the manual mill or the lathe shows its steps, with or
     // without the CNC connected.
     if app.steps_page() {
@@ -9199,6 +9210,76 @@ fn control(app: &App) -> Element<'_, Message> {
             .padding(fit.gap())
             .height(Fill),
         )
+        .height(Fill)
+        .into()
+}
+
+/// The shop tablet's projects from the computer (LIO-459): the copies kept
+/// here, newest list first, each opened with a tap; pairing with the
+/// computer once; what the last sync said.
+fn shop_projects(app: &App) -> Element<'_, Message> {
+    let mut col = column![bold("Projects from the computer", 18)].spacing(10);
+    if app.kept.is_empty() {
+        col = col.push(muted(if app.computer.is_some() {
+            "None yet. Save or open a project on the computer, with the computer and this tablet on the same Wi-Fi."
+        } else {
+            "Pair this tablet with the computer below, and its projects come here by themselves."
+        }));
+    }
+    for k in &app.kept {
+        col = col.push(secondary(k.title.clone(), Message::OpenKept(k.key.clone())).width(Fill));
+    }
+    col = col.push(rule::horizontal(1));
+    match &app.computer {
+        Some(link) => {
+            col = col.push(
+                row![
+                    muted(format!("Paired with {} at {}.", link.computer, link.address)),
+                    secondary("Forget", Message::ForgetComputer),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+        }
+        None => {
+            col = col.push(muted(
+                "Pair once: on the computer's Export page click Pair a tablet, then type the 6-digit code it shows. Leave the address empty to find the computer on this Wi-Fi.",
+            ));
+            let pair: Element<'_, Message> = if app.computer_busy {
+                muted("Pairing…").into()
+            } else if app.computer_code.len() == 6 {
+                primary("Pair", Message::PairComputer).into()
+            } else {
+                muted("").into()
+            };
+            col = col.push(
+                row![
+                    muted("Code"),
+                    text_input("123456", &app.computer_code)
+                        .on_input(Message::ComputerCode)
+                        .on_submit(Message::PairComputer)
+                        .width(Length::Fixed(110.))
+                        .padding([5, 8])
+                        .size(14),
+                    muted("Address"),
+                    text_input("found on this Wi-Fi", &app.computer_address)
+                        .on_input(Message::ComputerAddress)
+                        .width(Length::Fixed(200.))
+                        .padding([5, 8])
+                        .size(14),
+                    pair,
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            );
+        }
+    }
+    if !app.sync_note.is_empty() {
+        col = col.push(muted(app.sync_note.clone()));
+    }
+    container(scrollable(container(col).padding(18).width(560).style(panel_style)))
+        .padding(24)
+        .center_x(Fill)
         .height(Fill)
         .into()
 }
@@ -15652,7 +15733,17 @@ fn post(app: &App) -> Element<'_, Message> {
         .push(secondary("Export setup sheet (.md)", Message::Export("sheet")).width(Fill))
         .push(secondary("Save complete project (.json)", Message::SaveProject).width(Fill))
         // The job with its part, for the shop tablet at the machine (LIO-453).
-        .push(secondary("Save for tablet (.axisjob)", Message::SaveForTablet).width(Fill));
+        .push(secondary("Save for tablet (.axisjob)", Message::SaveForTablet).width(Fill))
+        // Or no file at all: a paired tablet on this Wi-Fi gets the open
+        // project and the recent project files itself (LIO-459).
+        .push(secondary("Pair a tablet", Message::PairTablet).width(Fill));
+    if let Some((code, at)) = &app.tablet_code
+        && at.elapsed() < std::time::Duration::from_secs(600)
+    {
+        summary = summary.push(note(format!(
+            "On the tablet, tap Projects and type {code} (it works for 10 minutes). Once paired, the tablet gets this computer's open project and recent project files whenever both are on the same Wi-Fi."
+        )));
+    }
     if shown == 0 {
         // An empty dark pane reads as a failed load: say what will be here.
         code = code.push(

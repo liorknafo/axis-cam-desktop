@@ -18,6 +18,9 @@ pub struct Settings {
     /// The file the project in the workspace was last saved to or opened
     /// from: Save writes there without asking.
     pub project_file: Option<PathBuf>,
+    /// The project files saved or opened lately, newest first, which the
+    /// shop tablet gets over Wi-Fi (`tablet`, LIO-459).
+    pub recent_projects: Vec<PathBuf>,
 }
 /// The browser or the inspector: the sidebars beside the Work page's 3D view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

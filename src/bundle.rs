@@ -22,6 +22,12 @@ pub const EXTENSION: &str = "axisjob";
 /// The project, its part file, and for a STEP part the part converted as
 /// `step::load` reads it: the tablet has no converter (`step::load`).
 pub fn write(path: &Path, doc: &Document) -> Result<(), String> {
+    crate::storage::write_atomic(path, &pack(doc)?)
+}
+
+/// The tablet file `write` writes, in memory: what the computer sends a
+/// tablet over Wi-Fi (`tablet`).
+pub fn pack(doc: &Document) -> Result<Vec<u8>, String> {
     let mut w = zip::ZipWriter::new(Cursor::new(vec![]));
     let opt = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
@@ -64,13 +70,12 @@ pub fn write(path: &Path, doc: &Document) -> Result<(), String> {
             .map_err(|e| format!("Could not read the machine profile {}: {e}", path.display()))?;
         add(&format!("{MACHINE}{name}"), &bytes)?;
     }
-    let zip = w.finish().map_err(|e| e.to_string())?.into_inner();
-    crate::storage::write_atomic(path, &zip)
+    Ok(w.finish().map_err(|e| e.to_string())?.into_inner())
 }
 
 /// The UC100 profile path of every machine in `doc`, the library's and the
 /// setups' copies.
-fn profiles_of(doc: &Document) -> impl Iterator<Item = &str> {
+pub(crate) fn profiles_of(doc: &Document) -> impl Iterator<Item = &str> {
     let setups = doc.setups.iter().map(|s| &s.machine);
     (doc.machines.iter().chain(setups))
         .map(|m| crate::model::get(&m.p, "uc100_profile").trim())
