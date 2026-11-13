@@ -458,6 +458,10 @@ pub(crate) fn measures(
             let Some(h) = holes.first() else {
                 return out;
             };
+            // Each cut starts Top over the material it meets (`rest::start_over`):
+            // the mouths a depth is measured from are that material's top.
+            let air = crate::cam::number(op, "top").unwrap_or(0.).max(0.);
+            let mouths: Vec<f32> = mouths.iter().map(|m| m - air).collect();
             let mouth = mouths.first().copied().unwrap_or(top - zero[2]);
             let at = [h[0] + zero[0], h[1] + zero[1], mouth + zero[2]];
             let up = [at[0], at[1], at[2] + 2. * d.plan.radius.max(6.)];
@@ -6645,7 +6649,13 @@ pub(crate) mod tests {
     /// The Check page's depth of a drilled hole on the manual mill
     /// (LIO-450): `mesh` drilled with a Ø`size` drill, through with 2.5 of
     /// breakthrough or blind, from a stock whose top is the part's.
-    fn drilled(mesh: &Mesh, size: &str, through: bool, bottom: &str) -> (Document, Guide, f32) {
+    fn drilled(
+        mesh: &Mesh,
+        size: &str,
+        through: bool,
+        bottom: &str,
+        air: &str,
+    ) -> (Document, Guide, f32) {
         use crate::cam::boring::tests::{drill, drilling, job};
         let manual = crate::manual::defaults();
         let mut tool = drill(size);
@@ -6655,6 +6665,7 @@ pub(crate) mod tests {
             ("through", if through { "Yes" } else { "No" }),
             ("breakthrough", "2.5"),
             ("bottom", bottom),
+            ("top", air),
             ("rpm", "640"),
             ("feed", "60"),
         ] {
@@ -6668,8 +6679,8 @@ pub(crate) mod tests {
         (doc, g.clone(), top)
     }
     /// `drilled`'s one depth, drawn from the mouth down as far as it says.
-    fn drilled_depth(mesh: &Mesh, size: &str, through: bool, bottom: &str) -> Measure {
-        let (doc, g, top) = drilled(mesh, size, through, bottom);
+    fn drilled_depth(mesh: &Mesh, size: &str, through: bool, bottom: &str, air: &str) -> Measure {
+        let (doc, g, top) = drilled(mesh, size, through, bottom, air);
         let m = measures(&doc, &g, &g.done[0], top);
         let deep = m.into_iter().find(|x| x.axis == "Z").unwrap();
         assert!(
@@ -6684,9 +6695,16 @@ pub(crate) mod tests {
     #[test]
     fn a_through_holes_check_says_through_and_the_thickness_not_the_tips_depth() {
         let mesh = crate::cam::boring::tests::ring(6.8, 30., 18.5);
-        let deep = drilled_depth(&mesh, "6.8", true, "0");
-        assert!((deep.value - 18.5).abs() < 0.01, "{deep:?}");
-        assert_eq!(deep.words, ["through", "check it breaks out at the back"]);
+        // From the stock's top, the cut starting there or 1.5 over it (Top):
+        // the same mouth, drawn from the same height.
+        let mut mouth = None;
+        for air in ["0", "1.5"] {
+            let deep = drilled_depth(&mesh, "6.8", true, "0", air);
+            assert!((deep.value - 18.5).abs() < 0.01, "{air}: {deep:?}");
+            assert_eq!(deep.words, ["through", "check it breaks out at the back"]);
+            let at = *mouth.get_or_insert(deep.from[2]);
+            assert!((deep.from[2] - at).abs() < 0.01, "{air}: {deep:?}");
+        }
     }
     /// A blind hole's Check gives its depth from the mouth to its full
     /// diameter, the drill's 118° point below it left out (LIO-450): a Ø8
@@ -6704,7 +6722,7 @@ pub(crate) mod tests {
             (0., 2. - point),
         ];
         let mesh = crate::mesh::normalize(crate::cam::tests::revolved(&section)).unwrap();
-        let deep = drilled_depth(&mesh, "8", false, "0");
+        let deep = drilled_depth(&mesh, "8", false, "0", "0");
         assert!((deep.value - 8.).abs() < 0.01, "{deep:?}");
         assert_eq!(
             deep.words,
@@ -6712,7 +6730,7 @@ pub(crate) mod tests {
         );
         // Stopped 9.4 over the floor, 1 into the stock: the point only, its
         // full Ø never reached; measured to its tip, down, not −1.4.
-        let deep = drilled_depth(&mesh, "8", false, "9.4");
+        let deep = drilled_depth(&mesh, "8", false, "9.4", "0");
         assert!((deep.value - 1.).abs() < 0.01, "{deep:?}");
         assert!(deep.to[2] < deep.from[2], "{deep:?}");
         assert_eq!(
@@ -6739,7 +6757,7 @@ pub(crate) mod tests {
             (0., 2. - point),
         ];
         let mesh = crate::mesh::normalize(crate::cam::tests::revolved(&section)).unwrap();
-        let (doc, mut g, top) = drilled(&mesh, "8", false, "0");
+        let (doc, mut g, top) = drilled(&mesh, "8", false, "0", "0");
         for st in &mut g.steps {
             if let Step::Holes {
                 holes,
