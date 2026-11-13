@@ -518,9 +518,20 @@ fn shortfalls(
             if !fits {
                 continue;
             }
-            let (a, b) = (moved(c.a, c.frame, first), moved(c.b, c.frame, first));
             let up = c.frame.transfer_vector([0., 0., 1.], first)[t.axis];
             let off = |p: [f32; 3]| (p[u] - t.centre[0]).hypot(p[v] - t.centre[1]);
+            // A lathe's ring turns about its frame's Z axis between Z a[0]
+            // and b[0], out to radius b[1]: all of it the full form when it
+            // reaches the thread's major on the thread's axis.
+            let (a, b) = if c.shape == crate::simulation::CutterShape::Revolve {
+                if c.b[1] < t.major / 2. - 0.05 {
+                    continue;
+                }
+                let at = |z: f32| moved([0., 0., z], c.frame, first);
+                (at(c.a[0]), at(c.b[0]))
+            } else {
+                (moved(c.a, c.frame, first), moved(c.b, c.frame, first))
+            };
             if up.abs() < 0.99 || off(a).max(off(b)) > t.root.max(t.major) / 2. {
                 continue;
             }
@@ -530,6 +541,10 @@ fn shortfalls(
                 .rise()
                 .map_or(0., |rise| rise * (c.radius - c.shape.flat()).max(0.));
             let (low, high) = (a[t.axis].min(b[t.axis]), a[t.axis].max(b[t.axis]));
+            if c.shape == crate::simulation::CutterShape::Revolve {
+                spans.push((low, high));
+                continue;
+            }
             spans.push(if up > 0. {
                 (low + lead, high + c.flute)
             } else {

@@ -5777,6 +5777,75 @@ flood = { pin = 8 }
         }
         a
     }
+    #[test]
+    fn a_lathe_tapped_thread_is_cut_and_one_tapped_short_or_not_says_why() {
+        // LIO-448 review: a lathe's tap is a ring along the spindle, not a
+        // move; a thread it taps full length is cut. The thread is Z 60-80
+        // of the Ø30 bar, 100 long: the tap goes in from its end, Z 100,
+        // as deep as Add threading makes it (40), or 35.
+        let left = |depth: Option<&str>| {
+            let part = crate::thread::tests::modeled([0., 0.], 8., 1.25, 60., true, true, 20., 0.);
+            let mut a = lathe_job_app(30., part, -40., |doc| {
+                crate::turn::tests::with_tap(doc, "M8×1.25", "6.8");
+            });
+            let _ = a.update(Message::AddThreading);
+            // The model's minor is Ø6.65: a Ø6.5 drill stays inside it.
+            for t in &mut a.doc.tools {
+                if crate::model::get(&t.p, "type") == "Drill" {
+                    t.p.insert("diameter".into(), "6.5".into());
+                }
+            }
+            let ops = &mut a.doc.setups[0].operations;
+            match depth {
+                None => ops.retain(|o| !o.tapping()),
+                Some(d) => {
+                    let tap = ops.iter_mut().find(|o| o.tapping()).unwrap();
+                    tap.p.insert("depth".into(), d.into());
+                }
+            }
+            let mesh = a.part_mesh().unwrap().clone();
+            let mut stock = None;
+            crate::simulation::sequence_walk(
+                &a.doc,
+                &mesh,
+                None,
+                |_, _, r| {
+                    r.as_ref().unwrap();
+                },
+                |_, _, v| stock = Some(v.clone()),
+                |_, _| {},
+            );
+            crate::uncut::uncut(&stock.unwrap(), &a.doc.setups, &mesh)
+        };
+        let notes = |u: &crate::uncut::Uncut| -> Vec<Option<String>> {
+            u.regions.iter().map(|r| r.thread.clone()).collect()
+        };
+        // Tapped full length: nothing of the thread is short. What is left
+        // is the bar past the part's end, which the job does not part off,
+        // against the last flank's few mm².
+        let full = left(Some("40"));
+        assert!(
+            full.regions
+                .iter()
+                .all(|r| r.thread.is_none() && r.area < 10.)
+                && full.thin.regions.is_empty(),
+            "{:?} {:?}",
+            full.regions,
+            full.thin.regions
+        );
+        let short = left(Some("35"));
+        assert_eq!(
+            notes(&short),
+            [Some("M8×1.25 thread: tapped 5.0 mm short".to_string())]
+        );
+        let none = left(None);
+        assert_eq!(
+            notes(&none),
+            [Some(
+                "M8×1.25 thread: no M8×1.25 tap or thread mill cuts it".to_string()
+            )]
+        );
+    }
     /// A lathe job on the Work page: `part` in a Ø`bar` bar (`turn::tests::job`),
     /// `edit` made to it.
     fn lathe_job_app(
