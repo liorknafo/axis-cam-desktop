@@ -7235,6 +7235,53 @@ spindle_max_rpm = 24000
         assert!(problems(&c).is_empty(), "{:?}", problems(&c));
     }
 
+    /// LIO-482: the tablet file carries the bar job on the library CNC4030 +
+    /// rotary (in the chuck) with where its tool run starts: over its first
+    /// point at the top of Z, A at its first angle. Jogged there, the
+    /// computer's Cycle Start finds the way in clear, and its job goes
+    /// straight down from there; the tablet's job made from there is that
+    /// job. On the simulated UC100.
+    #[test]
+    fn a_chuck_setup_on_the_tablet_starts_over_its_first_point() {
+        use crate::indexed::tests::prism;
+        let dir = tempfile::tempdir().unwrap();
+        let mesh = prism(30.);
+        let doc = library_bar_job(dir.path(), &mesh, 20., "100", 40., "UC100");
+        // It writes the profile the check reads.
+        let mut c = library_run(dir.path(), &doc, &mesh);
+        let s = crate::run::tablet_runs(&doc, Ok(&mesh), 1);
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
+        let programs = c.run.as_ref().unwrap().checked().unwrap().to_vec();
+        let ([r], [p]) = (&s.tool_runs[..], &programs[..]) else {
+            panic!("{} {}", s.tool_runs.len(), programs.len())
+        };
+        assert_eq!((r.lift.z, r.lift.machine), (0., true));
+        let start = r.start.expect("in the chuck");
+        // A at the first side's angle.
+        assert_eq!(start.a, 0., "{start:?}");
+        let o = c.snapshot.work_offset;
+        go_to(&mut c, [start.x + o[0], start.y + o[1], r.lift.z, start.a + o[3]]);
+        let problems = c.run.as_ref().unwrap().problems(&c, &doc);
+        assert!(problems.is_empty(), "{problems:?}");
+        let here = c.snapshot.machine_pos;
+        let sent = crate::run::lower(p, 0, o, here).unwrap();
+        // Nothing moves before it comes down onto the first point.
+        let moves: Vec<Vec6> = (sent.iter())
+            .filter_map(|l| match l.action {
+                Do::Move { target, .. } => Some(target),
+                _ => None,
+            })
+            .collect();
+        let down = moves.iter().position(|m| m[2] < here[2] - 1.).unwrap();
+        for m in &moves[..=down] {
+            assert!(
+                (0..4).all(|k| k == 2 || (m[k] - here[k]).abs() < 1e-3),
+                "{m:?} from {here:?}"
+            );
+        }
+        assert_eq!(crate::run::tests::tablet_job(r, o, here), sent);
+    }
+
     /// LIO-213: on the library CNC4030 + rotary, a run started from machine
     /// home (X0 Y0 Z0 A0) goes across at the top of Z, clear of the chuck,
     /// and runs to the end on the simulated UC100. From beside the chuck's
