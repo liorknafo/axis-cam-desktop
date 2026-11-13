@@ -363,7 +363,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("origin", "Model origin") => (
-            "Program zero is the imported file's own 0,0,0, placed with this setup's rotation and translation. With the probe, Probe corner on the Control page finds it from the front-left corner of the stock top, set off from it as the program has it. Check that the point can be located on the machine before choosing it.",
+            "Program zero is the imported file's own 0,0,0, placed with this setup's rotation and translation. With the probe, Probe corner on the Control page finds it from the stock top's −X −Y corner (front-left as drawn), set off from it as the program has it. Check that the point can be located on the machine before choosing it.",
             "The LinuxCNC program lists the part's box in work coordinates and, while no earlier setup has cut it, the stock top's Z, to touch off on a part wall or that stock top.",
         ),
         ("origin", "A axis at stock end") => (
@@ -480,14 +480,6 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
         ),
         ("mode", "Simultaneous 5-axis") => (
             "Save coordinated XYZ and two-rotary capability. Tool-axis planning, singularity handling and machine kinematics are not yet available.",
-            "",
-        ),
-        ("direction", "Positive") if matches!(target, Target::Machine) => (
-            "Positive A turns the part by the right-hand rule about +X: the top of the part toward −Y, the front. The indexed setups, the chuck checks, the program header and Find A zero all take it.",
-            "",
-        ),
-        ("direction", "Negative") if matches!(target, Target::Machine) => (
-            "Positive A turns the part the other way: the top of the part toward +Y, the back. The indexed setups, the chuck checks, the program header and Find A zero all take it; the controller's A is not reversed by it.",
             "",
         ),
         ("direction2", "Positive") if matches!(target, Target::Machine) => (
@@ -821,6 +813,15 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
                 }
             )),
             "origin" => origin_help(value).unwrap_or_default(),
+            // The machine's own fields: -Y named where it is (LIO-457).
+            "direction" if matches!(target, Target::Machine) && value == "Positive" => plain(format!(
+                "Positive A turns the part by the right-hand rule about +X: the top of the part toward {}. The indexed setups, the chuck checks, the program header and Find A zero all take it.",
+                crate::orient::Orient::from_fields(p).y_words(false)
+            )),
+            "direction" if matches!(target, Target::Machine) && value == "Negative" => plain(format!(
+                "Positive A turns the part the other way: the top of the part toward {}. The indexed setups, the chuck checks, the program header and Find A zero all take it; the controller's A is not reversed by it.",
+                crate::orient::Orient::from_fields(p).y_words(true)
+            )),
             "speed" => plain(format!(
                 "Play the preview at {value}× the estimated machining rate. This changes playback speed only, not the programmed feed or stock result. Estimates omit acceleration and tool changes."
             )),
@@ -848,8 +849,11 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
 fn origin_help(value: &str) -> Option<(String, String)> {
     use crate::post::At;
     let (xy, top) = crate::post::stock_zero(value)?;
+    // The work zero's names are the part's own sides as the screen shows
+    // it, X right and Y away: the machine's own words come at the machine.
+    let o = crate::orient::Orient::Right;
     let face = if top { "top" } else { "bottom" };
-    let at = match crate::control::probe_spot(xy).as_str() {
+    let at = match crate::control::probe_spot(o, xy).as_str() {
         "its centre" => format!("the centre of the stock's {face}"),
         spot => format!("{spot} of the stock's {face}"),
     };
@@ -866,10 +870,7 @@ fn origin_help(value: &str) -> Option<(String, String)> {
             let a = 1 - k;
             let near = match xy[a] {
                 At::Mid => "near the middle".to_string(),
-                end => format!(
-                    "near the {}",
-                    crate::post::ENDS[a][usize::from(end == At::Max)]
-                ),
+                end => format!("near the {}", o.end(a, end == At::Max)),
             };
             format!("{axis}0 from {which} {near}")
         };

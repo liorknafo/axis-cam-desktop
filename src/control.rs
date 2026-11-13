@@ -698,6 +698,8 @@ enum Step {
 /// work zero is set where the setup's datum is from the faces touched.
 struct Edges {
     refs: [crate::post::At; 2],
+    /// Which way the machine's X and Y point, for the sides it names.
+    orient: crate::orient::Orient,
     /// The work zero is on the stock's bottom, `size[2]` below the top.
     bottom: bool,
     /// The work zero is Model origin, found from the front-left corner.
@@ -778,6 +780,7 @@ impl Edges {
         let corner = |b: [f32; 3]| std::array::from_fn(|a| rel(b[a], a));
         Self {
             refs,
+            orient: Default::default(),
             bottom: crate::post::stock_zero(origin).is_some_and(|(_, top)| !top),
             model: crate::post::stock_zero(origin).is_none(),
             origin: origin.into(),
@@ -944,7 +947,7 @@ impl Edges {
     /// Where the tip should be found, for a message: "its centre", "the
     /// front-left corner", "the middle of the front edge".
     fn spot(&self) -> String {
-        probe_spot(self.refs)
+        probe_spot(self.orient, self.refs)
     }
 
     fn name(&self) -> &'static str {
@@ -1024,18 +1027,15 @@ pub fn probe_name(refs: [crate::post::At; 2]) -> &'static str {
 
 /// Where on the stock top the probing routine for `refs` starts:
 /// "its centre", "the middle of the front edge", "the front-left corner".
-pub fn probe_spot(refs: [crate::post::At; 2]) -> String {
+pub fn probe_spot(o: crate::orient::Orient, refs: [crate::post::At; 2]) -> String {
     use crate::post::At::{Max, Mid};
     match refs {
         [Mid, Mid] => "its centre".into(),
         [Mid, _] | [_, Mid] => {
             let k = usize::from(refs[0] == Mid);
-            format!(
-                "the middle of the {} edge",
-                crate::post::ENDS[k][usize::from(refs[k] == Max)]
-            )
+            format!("the middle of the {} edge", o.end(k, refs[k] == Max))
         }
-        _ => format!("the {} corner", crate::post::corner_name(refs)),
+        _ => format!("the {} corner", o.corner(refs)),
     }
 }
 
@@ -1074,23 +1074,22 @@ impl Feature {
         Feature::Edge(1, true),
         Feature::Edge(1, false),
     ];
-    pub const CORNERS: [Feature; 4] = {
-        use crate::post::At::{Max, Min};
-        [
-            Feature::Corner([Min, Max]),
-            Feature::Corner([Max, Max]),
-            Feature::Corner([Min, Min]),
-            Feature::Corner([Max, Min]),
-        ]
-    };
 
-    /// The button's words: "Z top", "X+", "Front-left", "Bore centre".
-    pub fn label(self) -> String {
+    /// The corners as a grid lays them out on a machine of orientation
+    /// `o`: back-left, back-right, front-left, front-right.
+    pub fn corners(o: crate::orient::Orient) -> [Feature; 4] {
+        [(true, false), (true, true), (false, false), (false, true)]
+            .map(|(back, right)| Feature::Corner(o.corner_at(back, right)))
+    }
+
+    /// The button's words on a machine of orientation `o`: "Z top", "X+",
+    /// "Front-left", "Bore centre".
+    pub fn label(self, o: crate::orient::Orient) -> String {
         match self {
             Feature::Top => "Z top".into(),
             Feature::Edge(k, plus) => format!("{}{}", ["X", "Y"][k], if plus { "+" } else { "−" }),
             Feature::Corner(c) => {
-                let s = crate::post::corner_name(c);
+                let s = o.corner(c);
                 s[..1].to_uppercase() + &s[1..]
             }
             Feature::Bore => "Bore centre".into(),
@@ -1116,23 +1115,24 @@ impl Feature {
         }
     }
 
-    /// Where to put the tip before pressing it, and what it does.
-    pub fn how(self) -> String {
+    /// Where to put the tip before pressing it, and what it does, on a
+    /// machine of orientation `o`.
+    pub fn how(self, o: crate::orient::Orient) -> String {
         match self {
             Feature::Top => "Jog the tip over the surface and press Z top: it probes straight down and sets Z0 where the tip's bottom touches. A 3D probe is not as long as the cutter: touch the cutter off on Z0 after it, with Probe Z or Set Z.".into(),
             Feature::Edge(k, plus) => {
-                let side = crate::post::ENDS[k][usize::from(!plus)];
+                let side = o.end(k, !plus);
                 format!(
                     "Jog the tip beside the {side} side of the part, below its top, and press {}: it probes toward {} and sets {}0 on the side.",
-                    self.label(),
+                    self.label(o),
                     if plus { "+" } else { "−" },
                     ["X", "Y"][k]
                 )
             }
             Feature::Corner(c) => format!(
                 "Jog the tip outside the {} corner, below the top, less than {CORNER_REACH:.0} mm off both sides, and press {}: it steps along each side, probes the other and sets X0 Y0 on the corner.",
-                crate::post::corner_name(c),
-                self.label()
+                o.corner(c),
+                self.label(o)
             ),
             Feature::Bore => "Jog the tip into the bore or pocket, below its top, and press Bore centre: it probes −X, +X at the middle found, −Y and +Y, sets X0 Y0 at the centre and stays there.".into(),
             Feature::Boss => format!(
@@ -1182,6 +1182,8 @@ enum Leg {
 /// A `Feature` probed from where the tip was put (machine mm).
 struct Routine {
     feature: Feature,
+    /// Which way the machine's X and Y point, for the sides it names.
+    orient: crate::orient::Orient,
     purpose: Purpose,
     start: Vec6,
     radius: f64,
@@ -1206,6 +1208,7 @@ impl Routine {
     fn new(feature: Feature, probe: &Probe, start: Vec6) -> Self {
         Self {
             feature,
+            orient: Default::default(),
             purpose: Purpose::Work,
             start,
             radius: probe.tip.unwrap_or_default() / 2.,
@@ -1235,7 +1238,7 @@ impl Routine {
     /// Where to put the tip before pressing its button, and what it does.
     fn how(&self) -> String {
         match self.purpose {
-            Purpose::Work => self.feature.how(),
+            Purpose::Work => self.feature.how(self.orient),
             Purpose::Record(_) => PIN_HOW.replace("{}", "Record the pins' place"),
             Purpose::Reference => PIN_HOW.replace("{}", "Reference X Y from pin 1"),
         }
@@ -1409,6 +1412,7 @@ impl Routine {
 
     /// What was found and set, once every touch is made.
     fn found(&self) -> String {
+        let o = self.orient;
         let w = self.zero();
         let at = |axes: &[usize]| {
             axes.iter()
@@ -1421,12 +1425,12 @@ impl Routine {
             Feature::Edge(k, plus) => format!(
                 "{}0 set on the {} side at machine {}.",
                 ["X", "Y"][k],
-                crate::post::ENDS[k][usize::from(!plus)],
+                o.end(k, !plus),
                 at(&[k])
             ),
             Feature::Corner(c) => format!(
                 "X0 Y0 set on the {} corner at machine {}.",
-                crate::post::corner_name(c),
+                o.corner(c),
                 at(&[0, 1])
             ),
             Feature::Bore => {
@@ -1512,8 +1516,9 @@ impl Calibrate {
         }
     }
 
-    /// Where to put the tip before pressing it, and what it does.
-    pub fn how(self) -> String {
+    /// Where to put the tip before pressing it, and what it does, on a
+    /// machine of orientation `o`.
+    pub fn how(self, o: crate::orient::Orient) -> String {
         match self {
             Calibrate::Centreline => format!(
                 "Put a ground test bar in the chuck, the probe's clip on it, type its diameter, jog the tip over the middle of the bar a few mm above it and {CHUCK_GAP:.0} mm or more out from the jaws, and press {}: it touches the top, goes down beside the bar on both sides, touches the top over the middle found, lifts {TURN_CLEAR:.0} mm over the bar, turns A half a turn and does it again, then turns A back.",
@@ -1524,8 +1529,10 @@ impl Calibrate {
                 self.label()
             ),
             Calibrate::AZero => format!(
-                "Turn A until a flat on the stock (or a jaw face) is about level and on top, jog the tip over its middle a few mm above it and press {}: it touches the flat at the spacing typed either side of the tip along Y, lifts {TURN_CLEAR:.0} mm over the stock, turns A by the slope found (by {DIRECTION_TURN:.0}° or more the first time, to check that +A turns the part the way the machine's Direction says: the top toward −Y, the front, for Positive, toward +Y for Negative; it stops if A turns backwards), and again until the two are level, then zeroes A there.",
-                self.label()
+                "Turn A until a flat on the stock (or a jaw face) is about level and on top, jog the tip over its middle a few mm above it and press {}: it touches the flat at the spacing typed either side of the tip along Y, lifts {TURN_CLEAR:.0} mm over the stock, turns A by the slope found (by {DIRECTION_TURN:.0}° or more the first time, to check that +A turns the part the way the machine's Direction says: the top toward {}, for Positive, toward {} for Negative; it stops if A turns backwards), and again until the two are level, then zeroes A there.",
+                self.label(),
+                o.y_words(false),
+                o.y_words(true)
             ),
         }
     }
@@ -1557,13 +1564,13 @@ const DIRECTION_TURN: f64 = 1.;
 /// Why A zero stops when A turned the flat the wrong way: by `turned` (°)
 /// for a turn of A by `turn` (°), of the other sign than the machine's
 /// Direction (`sign`) gives. With Direction Positive, +A is the right-hand
-/// rule about +X: it turns the top of the part toward −Y, the front of the
-/// machine; with Negative, toward +Y, the back.
-fn a_backwards(turn: f64, turned: f64, sign: f64) -> String {
+/// rule about +X: it turns the top of the part toward −Y (the front on the
+/// usual machine, named by `o`); with Negative, toward +Y.
+fn a_backwards(o: crate::orient::Orient, turn: f64, turned: f64, sign: f64) -> String {
     let (direction, want, got) = if sign < 0. {
-        ("Negative", "+Y, the back", "−Y, the front")
+        ("Negative", o.y_words(true), o.y_words(false))
     } else {
-        ("Positive", "−Y, the front", "+Y, the back")
+        ("Positive", o.y_words(false), o.y_words(true))
     };
     format!(
         "A turns backwards: turning A by {turn:+.3}° turned the flat by {turned:+.3}°: +A turns the top of the part toward {got}. The machine's Direction is {direction}, so +A must turn the top of the part toward {want}, or a flat cut at A 90° lands on the opposite face and the jaw checks at each angle are wrong. Either invert A's direction in the machine's profile (Reverse the direction, in the A axis of Setup), save it and jog A+ to check the top now moves toward {want}; or, if A is wired as it should be, set the machine's Direction to match it in the Machine library. Then find A zero again."
@@ -1660,6 +1667,8 @@ pub fn retract_room(top: f64, centre: f64, diameter: f64) -> (f64, Option<String
 /// degrees).
 struct Turning {
     what: Calibrate,
+    /// Which way the machine's X and Y point, for the sides it names.
+    orient: crate::orient::Orient,
     start: Vec6,
     /// The bar's or stock's radius, as typed.
     radius: f64,
@@ -1885,7 +1894,7 @@ impl Turning {
                     // program commands would turn the part the other way.
                     // The first turn, of `DIRECTION_TURN` or more, tells.
                     if k == 2 && self.sign * turned / turn < 0. {
-                        return Err(a_backwards(turn, turned, self.sign));
+                        return Err(a_backwards(self.orient, turn, turned, self.sign));
                     }
                 }
                 // Level, or as level as one step of A sets it.
@@ -2350,6 +2359,9 @@ const JOB_REACH: Duration = Duration::from_secs(3);
 pub struct Connection {
     driver: Driver,
     pub machine_id: String,
+    /// Which way the machine's X and Y point (`orient`): the jog pad, the
+    /// keys and the sides the probing names follow it.
+    pub orient: crate::orient::Orient,
     pub simulated: bool,
     /// The Pi's address, on a connection across the network (`pi`).
     pub pi: Option<String>,
@@ -2635,6 +2647,7 @@ impl Connection {
             driver,
             config: cfg,
             machine_id: m.id.clone(),
+            orient: crate::orient::Orient::of(m),
             simulated,
             pi: None,
             link: None,
@@ -4355,7 +4368,10 @@ impl Connection {
         let (None, Ok(probe)) = (self.feature_blocked(f), self.probe.clone()) else {
             return;
         };
-        self.routine = Some(Routine::new(f, &probe, self.snapshot.machine_pos));
+        self.routine = Some(Routine {
+            orient: self.orient,
+            ..Routine::new(f, &probe, self.snapshot.machine_pos)
+        });
         self.probed = None;
         self.routine_step();
     }
@@ -4426,7 +4442,7 @@ impl Connection {
                 Leg::Guard(to) => Leg::Guard(self.inside(to)),
                 Leg::Touch(to) => Leg::Touch(self.inside(to)),
             };
-            let name = format!("Probe {}", r.feature.label());
+            let name = format!("Probe {}", r.feature.label(r.orient));
             match self.send_leg(&name, leg, r.feed, now) {
                 Some(sent) => r.sent = Some(sent),
                 None => continue,
@@ -4462,7 +4478,7 @@ impl Connection {
                 self.probed = Some((true, r.found()));
                 let moves = moves_from(now, &back);
                 if !moves.is_empty() {
-                    self.send(job(&format!("Probe {}", r.feature.label()), moves));
+                    self.send(job(&format!("Probe {}", r.feature.label(r.orient)), moves));
                 }
             }
             Purpose::Record(None) => {
@@ -4716,6 +4732,7 @@ impl Connection {
         };
         let a = self.config.axes.get(3);
         self.turning = Some(Turning {
+            orient: self.orient,
             what,
             start,
             radius,
@@ -4747,7 +4764,7 @@ impl Connection {
         let Some(mut r) = self.turning.take() else {
             return;
         };
-        let how = r.what.how();
+        let how = r.what.how(r.orient);
         if let Some((leg, seq)) = r.sent {
             let Some((ok, message, result)) = self.ended(seq) else {
                 self.turning = Some(r);
@@ -5056,9 +5073,12 @@ impl Connection {
         );
         let start = self.snapshot.machine_pos;
         let tip = probe.tip.unwrap_or_default();
-        self.edges = Some(Edges::new(
-            &p.origin, refs, p.stock, p.datum, &p.holds, &probe, tip, start, z,
-        ));
+        self.edges = Some(Edges {
+            orient: self.orient,
+            ..Edges::new(
+                &p.origin, refs, p.stock, p.datum, &p.holds, &probe, tip, start, z,
+            )
+        });
         self.probed = None;
         self.edges_step();
     }
@@ -5797,6 +5817,53 @@ soft_max = 0.0
         let text =
             format!("{LIMITED}[outputs]\nspindle_pwm = {{ pin = 16 }}\nspindle_max_rpm = {rpm}\n");
         std::fs::write(profile, text).unwrap();
+    }
+
+    #[test]
+    fn probing_names_and_lays_out_the_sides_where_they_are_lio_457() {
+        use crate::orient::Orient;
+        use crate::post::At::{Max, Mid, Min};
+        // The corner buttons: back-left, back-right, front-left, front-right.
+        assert_eq!(
+            Feature::corners(Orient::Right),
+            [[Min, Max], [Max, Max], [Min, Min], [Max, Min]].map(Feature::Corner)
+        );
+        assert_eq!(
+            Feature::corners(Orient::Left),
+            [[Max, Min], [Min, Min], [Max, Max], [Min, Max]].map(Feature::Corner)
+        );
+        for o in [Orient::Right, Orient::Left, Orient::Away, Orient::Toward] {
+            let labels = Feature::corners(o).map(|f| f.label(o));
+            assert_eq!(
+                labels,
+                ["Back-left", "Back-right", "Front-left", "Front-right"],
+                "{o:?}"
+            );
+        }
+        // X+ probes toward +X, which is left on a machine turned round: the
+        // tip starts beside the right side.
+        let how = Feature::Edge(0, true).how(Orient::Left);
+        assert!(how.contains("beside the right side"), "{how}");
+        assert!(
+            Feature::Edge(0, true)
+                .how(Orient::Right)
+                .contains("beside the left side")
+        );
+        assert_eq!(
+            probe_spot(Orient::Left, [Min, Min]),
+            "the back-right corner"
+        );
+        assert_eq!(
+            probe_spot(Orient::Left, [Mid, Max]),
+            "the middle of the front edge"
+        );
+        assert_eq!(
+            probe_spot(Orient::Right, [Mid, Max]),
+            "the middle of the back edge"
+        );
+        // A's direction is said by where -Y is.
+        assert!(a_backwards(Orient::Left, 10., -10., 1.).contains("toward −Y, the back"));
+        assert!(a_backwards(Orient::Right, 10., -10., 1.).contains("toward −Y, the front"));
     }
 
     #[test]
@@ -8275,7 +8342,7 @@ spindle_max_rpm = 24000
                 (0..3).all(|a| near(end[a], start[a])),
                 "{c:?} ends at {end:?}"
             );
-            assert!(s.contains(&crate::post::corner_name(c)), "{s}");
+            assert!(s.contains(&crate::orient::Orient::Right.corner(c)), "{s}");
         }
         // A 30 mm bore at X160 Y92, the tip started 5 mm left of its centre
         // and 3 mm behind it: it ends on the centre.
@@ -9367,6 +9434,7 @@ probe = { pin = 13, active_low = true }
             retract: 0.,
         };
         let mut t = Turning {
+            orient: Default::default(),
             what: Calibrate::Centreline,
             start: [40., 141., -27., 0., 0., 0.],
             radius: 10.,
@@ -9471,6 +9539,7 @@ probe = { pin = 13, active_low = true }
             flat: Some(([-t.sin(), t.cos()], 10.)),
         };
         let mut t = Turning {
+            orient: Default::default(),
             what: Calibrate::AZero,
             start: [40., 140., -27., 0., 0., 0.],
             radius: 12.,

@@ -2354,6 +2354,161 @@ flood = { pin = 8 }
         run_of(a).problems(conn(a), &a.doc)
     }
 
+    /// LIO-457: a project opened while a turned machine is connected, whose
+    /// copies of that machine were saved before the setting (the usual
+    /// orientation), takes the connected machine's: the 3D machine, the jog
+    /// pad, the words and the run checks stay in one frame, and it runs.
+    #[test]
+    fn a_project_opened_while_connected_takes_the_machines_orientation() {
+        use crate::orient::{KEY, Orient};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        let id = conn(&a).machine_id.clone();
+        // An older copy of the project: no orientation anywhere.
+        let older = a.doc.clone();
+        assert!(older.machines.iter().all(|m| !m.p.contains_key(KEY)));
+        // The machine turned round and saved while connected.
+        a.page = Page::Machines;
+        let _ = a.update(Message::EditMachine(id.clone()));
+        a.machine_draft.p.insert(KEY.into(), "Left".into());
+        let _ = a.update(Message::SaveMachine);
+        assert_eq!(conn(&a).orient, Orient::Left);
+        // The older project opened, its part loaded again.
+        let mesh = a.imported_mesh.clone();
+        a.replace_document(older, None);
+        a.imported_mesh = mesh;
+        let of = |m: &Machine| Orient::of(m);
+        assert!(
+            a.doc
+                .machines
+                .iter()
+                .filter(|m| m.id == id)
+                .all(|m| of(m) == Orient::Left)
+        );
+        assert!(
+            a.doc
+                .setups
+                .iter()
+                .filter(|s| s.machine.id == id)
+                .all(|s| of(&s.machine) == Orient::Left)
+        );
+        assert_eq!(conn(&a).orient, Orient::Left);
+        let view = crate::ui::machine_model(&a, conn(&a));
+        assert_eq!(view.figures.orient, Orient::Left);
+        a.page = Page::Control;
+        check_run(&mut a, 0);
+        assert!(
+            !problems(&a).iter().any(|p| p.contains("+X pointing")),
+            "{:?}",
+            problems(&a)
+        );
+    }
+
+    /// LIO-457: a project without the connected machine still draws it as
+    /// it jogs, in every orientation; and a profile draft kept for its
+    /// unsaved changes says A's direction by the orientation saved since.
+    #[test]
+    fn the_control_page_keeps_the_connected_orientation() {
+        use crate::orient::Orient;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        idle(&mut a);
+        let id = conn(&a).machine_id.clone();
+        // A project without this machine opened: the drawing keeps the
+        // connected orientation, whichever it is.
+        let mut other = a.doc.clone();
+        other.machines.retain(|m| m.id != id);
+        other.setups.clear();
+        a.replace_document(other, None);
+        assert!(a.doc.machines.iter().all(|m| m.id != id));
+        for o in [Orient::Right, Orient::Left, Orient::Away, Orient::Toward] {
+            a.control.as_mut().unwrap().orient = o;
+            assert_eq!(crate::ui::machine_model(&a, conn(&a)).figures.orient, o);
+        }
+    }
+
+    /// LIO-457: the Controller configuration of a machine with A, kept open
+    /// with unsaved changes and a warning showing while the machine is
+    /// turned round in the Machine library, says A's direction by the
+    /// machine as it is now when it is shown again, without being opened
+    /// again; the kept changes stay and no kept text names the old side.
+    #[test]
+    fn the_profile_kept_open_says_a_by_the_machine_as_it_is_now() {
+        use crate::orient::KEY;
+        use crate::setup::Edit;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), &crate::control::rotary_profile());
+        a.page = Page::Control;
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        let _ = a.update(Message::ControlSetup(true));
+        // An unsaved change, and the pins ticked before A's direction: the
+        // warning shows.
+        setup_edit(
+            &mut a,
+            Edit::Number("axes.x.max_velocity".into(), "900".into()),
+        );
+        setup_edit(
+            &mut a,
+            Edit::Flag("commissioning.pinout_verified".into(), true),
+        );
+        let shown = |a: &App| {
+            crate::ui::probe::texts(crate::setup::view(a), iced::Size::new(1600., 4000.)).join("\n")
+        };
+        let before = shown(&a);
+        assert!(before.contains("Check A's direction first"), "{before}");
+        assert!(before.contains("toward −Y, the front"), "{before}");
+        // Turned round in the Machine library and saved.
+        let id = conn(&a).machine_id.clone();
+        a.page = Page::Machines;
+        let _ = a.update(Message::EditMachine(id));
+        a.machine_draft.p.insert(KEY.into(), "Left".into());
+        let _ = a.update(Message::SaveMachine);
+        // Back to MACHINE, the configuration still open: not opened again.
+        a.page = Page::Control;
+        assert!(draft(&a).dirty(), "the unsaved change is kept");
+        let after = shown(&a);
+        assert!(after.contains("Check A's direction first"), "{after}");
+        assert!(after.contains("toward −Y, the back"), "{after}");
+        assert!(!after.contains("−Y, the front"), "{after}");
+    }
+
+    /// LIO-457: a setup whose snapshot of the machine points +X otherwise
+    /// than the connected machine would have the program header and the
+    /// Control page name the stock's sides differently: it does not run
+    /// until it is assigned the machine again.
+    #[test]
+    fn a_setup_with_another_orientation_than_the_machine_does_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let said = |a: &App| problems(a).iter().any(|p| p.contains("+X pointing"));
+        assert!(!said(&a), "{:?}", problems(&a));
+        // Turned in the Machine library and on the connection, the setup's
+        // snapshot still the usual one.
+        let id = conn(&a).machine_id.clone();
+        let m = a.doc.machines.iter_mut().find(|m| m.id == id).unwrap();
+        m.p.insert(crate::orient::KEY.into(), "Left".into());
+        a.control.as_mut().unwrap().orient = crate::orient::Orient::Left;
+        check_run(&mut a, 0);
+        let p = problems(&a);
+        assert!(
+            p.iter()
+                .any(|p| p.contains("+X pointing right but the Machine library has left")),
+            "{p:?}"
+        );
+        // Assigned again: it runs.
+        let m = a.doc.machines.iter().find(|m| m.id == id).unwrap().clone();
+        a.doc.setups[0].machine = m;
+        check_run(&mut a, 0);
+        assert!(!said(&a), "{:?}", problems(&a));
+    }
+
     /// Ticks until the run satisfies `ok`; fails after `secs`.
     fn run_until(a: &mut App, secs: f64, what: &str, ok: impl Fn(&crate::run::Run) -> bool) {
         let mut deadline = Deadline::new(secs);
@@ -11135,6 +11290,7 @@ flood = { pin = 8 }
             travel: [600., 400., 100.],
             nose_to_table: 220.,
             gantry: [180., 700.],
+            orient: crate::orient::Orient::Right,
         };
         for (figures, rotary, name) in [
             (Figures::JINGYAN, None, "plain.png"),
@@ -11159,6 +11315,90 @@ flood = { pin = 8 }
                 .into();
             render_element(element, iced::Size::new(900., 640.), &out.join(name));
         }
+    }
+    /// LIO-457: the Jingyan with its tool tip at the same place on the
+    /// table, as the usual machine and turned round (+X left, +Y toward
+    /// you): the two pictures are the same. Then the Control page of a
+    /// turned machine: its Machine tab (the 3D machine, the jog pad) and its
+    /// Probe tab (the corners).
+    #[test]
+    #[ignore]
+    fn render_a_turned_machine_lio_457() {
+        use crate::machine_view::Figures;
+        use crate::orient::Orient;
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/lio-457-renders".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let [x, y, z] = Figures::JINGYAN.travel;
+        for (orient, pos, zero, block, name) in [
+            (
+                Orient::Right,
+                [80., 60., -10.],
+                [100., 80., -30.],
+                [[100., 80., -50.], [220., 170., -30.]],
+                "1-usual.png",
+            ),
+            (
+                Orient::Left,
+                [x - 80., y - 60., -10.],
+                [x - 100., y - 80., -30.],
+                [[x - 220., y - 170., -50.], [x - 100., y - 80., -30.]],
+                "2-turned.png",
+            ),
+        ] {
+            let view = crate::machine_view::MachineView {
+                figures: Figures {
+                    orient,
+                    ..Figures::JINGYAN
+                },
+                pos,
+                known: true,
+                envelope: [[0., 0., -z], [x, y, 0.]],
+                assumed: false,
+                block: Some(block),
+                zero,
+                rotary: None,
+                a: 0.,
+            };
+            let element: iced::Element<'_, Message> = iced::widget::canvas(view)
+                .width(iced::Fill)
+                .height(iced::Fill)
+                .into();
+            render_element(element, iced::Size::new(900., 640.), &out.join(name));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        idle(&mut a);
+        let id = a.control.as_ref().unwrap().machine_id.clone();
+        let m = a.doc.machines.iter_mut().find(|m| m.id == id).unwrap();
+        m.p.insert(crate::orient::KEY.into(), "Left".into());
+        a.control.as_mut().unwrap().orient = Orient::Left;
+        a.page = Page::Control;
+        let size = iced::Size::new(1600., 1000.);
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Machine));
+        render_png(&a, size, &out.join("3-machine-tab.png"));
+        // The setting in the Machine library.
+        a.page = Page::Machines;
+        let _ = a.update(Message::EditMachine(id));
+        let _ = a.update(Message::WizardStep(1));
+        render_png(&a, size, &out.join("5-setting.png"));
+        // A setup with a probe, its work zero at the stock's -X -Y corner:
+        // the Probe tab's grids, back at the top.
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = edges_app(dir.path(), Some("Stock top front-left"));
+        let m = a.doc.machines.last_mut().unwrap();
+        m.p.insert(crate::orient::KEY.into(), "Left".into());
+        let m = m.clone();
+        for s in &mut a.doc.setups {
+            s.machine = m.clone();
+        }
+        a.control.as_mut().unwrap().orient = Orient::Left;
+        a.page = Page::Control;
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Probe));
+        render_png(&a, size, &out.join("4-probe-tab.png"));
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        render_png(&a, size, &out.join("6-work-zero-tab.png"));
     }
     #[test]
     #[ignore]
@@ -13714,6 +13954,16 @@ soft_max = 180.0
         let _ = a.update(Message::JogKeyUp);
         assert_eq!((held(&a), a.jog_key), (None, None));
         tick_until(&mut a, 3.0, "Idle", |s| s.state == Some(State::Idle));
+        // On a machine turned round (+X left, +Y toward you, LIO-457), →
+        // still moves the tool right, which is X−, and ↑ away, Y−.
+        a.control.as_mut().unwrap().orient = crate::orient::Orient::Left;
+        for (key, sent) in [((0, false), (0, true)), ((1, false), (1, true))] {
+            let _ = a.update(Message::JogKey(key.0, key.1, false));
+            let _ = a.update(Message::JogKeyChecked(key.0, key.1, false));
+            assert_eq!(held(&a), Some(sent), "{key:?}");
+            let _ = a.update(Message::JogKeyUp);
+            tick_until(&mut a, 3.0, "Idle", |s| s.state == Some(State::Idle));
+        }
     }
 
     /// The Controller configuration view hides the jog controls and the run

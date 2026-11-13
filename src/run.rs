@@ -1714,6 +1714,16 @@ impl Run {
             )),
         }
         e.extend(pin_problems(c, setup, p));
+        // The program header names the sides by the setup's snapshot of the
+        // machine, the Control page by the connected one (LIO-457).
+        let own = crate::orient::Orient::of(&setup.machine);
+        if own != c.orient {
+            e.push(format!(
+                "This setup's snapshot of the machine has +X pointing {} but the Machine library has {}: the program header and the Control page would name the stock's sides differently. Use Assign to current setup there, then check the setup again.",
+                own.label().to_lowercase(),
+                c.orient.label().to_lowercase()
+            ));
+        }
         if let Some(blocks) = blocks
             && limits.iter().all(Option::is_some)
             && unset.is_empty()

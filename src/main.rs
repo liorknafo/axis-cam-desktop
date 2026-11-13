@@ -37,6 +37,7 @@ mod model;
 mod ngc;
 mod oauth;
 mod openai;
+mod orient;
 mod picks;
 mod plan_changes;
 mod plan_check;
@@ -2366,8 +2367,30 @@ impl App {
         let Some(c) = &self.control else {
             return false;
         };
-        let (id, cfg) = (c.machine_id.clone(), c.config.clone());
-        self.travel_from(&id, &cfg)
+        let (id, cfg, o) = (c.machine_id.clone(), c.config.clone(), c.orient);
+        self.travel_from(&id, &cfg) | self.orient_from(&id, o)
+    }
+    /// Machine `id`'s orientation in the library, each setup's copy and the
+    /// machine editor made the connected machine's `o` (LIO-457): a project
+    /// opened, or an edit put back, while it is connected keeps the 3D
+    /// machine, the jog pad, the words and the checks in one frame, as its
+    /// travel is kept at the profile's. Whether any changed.
+    fn orient_from(&mut self, id: &str, o: orient::Orient) -> bool {
+        let setups = self.doc.setups.iter_mut().map(|s| &mut s.machine);
+        let mut changed = false;
+        for m in self
+            .doc
+            .machines
+            .iter_mut()
+            .chain(setups)
+            .chain(std::iter::once(&mut self.machine_draft))
+        {
+            if m.id == id && !manual::is_hand(m) && orient::Orient::of(m) != o {
+                m.p.insert(orient::KEY.into(), o.label().into());
+                changed = true;
+            }
+        }
+        changed
     }
     /// Machine `id`'s X, Y and Z travel, in the library, each setup's copy
     /// and the machine editor, made profile `cfg`'s soft limit spans
@@ -8092,6 +8115,8 @@ impl App {
                     && self.jog_pad_shown()
                     && let Some(c) = &mut self.control
                 {
+                    // The key points where the tool goes (`jog_key`).
+                    let (axis, negative) = c.orient.jog_like_usual(axis, negative);
                     c.act(control::Action::JogPress(axis, negative));
                 }
             }
@@ -8356,6 +8381,7 @@ impl App {
                         c.probe = control::probe_settings(&m.p);
                         c.pins = control::pins_settings(&m.p);
                         c.rotary = control::Rotary::of(&m);
+                        c.orient = orient::Orient::of(&m);
                         // Its travel is the connected profile's (LIO-344).
                         synced = control::travel_into(&mut m, &c.machine_id, &c.config);
                     }
@@ -10400,9 +10426,11 @@ pub(crate) fn tab_move(typing: bool, back: bool, jogging: bool) -> TabMove {
         (false, _, false) => TabMove::First,
     }
 }
-/// The axis and direction a jog key moves: the arrows jog X and Y (up is
-/// +Y, away from the operator), Page Up and Page Down jog Z, Home and End
-/// jog A (on a machine without A they move nothing).
+/// The axis and direction a jog key moves on the usual machine: the arrows
+/// move the tool the way they point, seen from the front (up is away from
+/// the operator: X+ and Y+ there), Page Up and Page Down jog Z, Home and
+/// End jog A (on a machine without A they move nothing). A machine whose
+/// X and Y point otherwise turns them (`Orient::jog_like_usual`).
 fn jog_key(key: iced::keyboard::key::Named) -> Option<(usize, bool)> {
     use iced::keyboard::key::Named;
     match key {
