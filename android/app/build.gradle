@@ -1,0 +1,45 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.axiscam.shop'
+    compileSdk 35
+    buildToolsVersion '35.0.0'
+
+    defaultConfig {
+        applicationId 'com.axiscam.shop'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '0.1.0'
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            // The debug key: installs without a keystore while this is a trial.
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    // IcedActivity, the Java half of iced_android, from Cargo's checkout.
+    sourceSets.main.java.srcDirs += icedAndroidJava()
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+/** The java/ folder of the iced_android crate android/Cargo.toml depends on. */
+def icedAndroidJava() {
+    def metadata = providers.exec {
+        commandLine 'cargo', 'metadata', '--format-version', '1', '--manifest-path', "${rootDir}/Cargo.toml"
+    }.standardOutput.asText.get()
+    def crate = new groovy.json.JsonSlurper().parseText(metadata).packages.find { it.name == 'iced_android' }
+    if (crate == null) {
+        throw new GradleException('iced_android not found in the dependencies of android/Cargo.toml')
+    }
+    return new File(crate.manifest_path).parentFile.toPath().resolve('java').toString()
+}

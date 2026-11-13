@@ -1,0 +1,75 @@
+# The shop tablet build (LIO-452): the same app, src/main.rs, built as the
+# Android library IcedActivity loads, on iced_android's fork of Iced 0.14.
+# Its own workspace, so the fork and the stubs never reach the desktop build.
+# Build: android/build.sh
+[workspace]
+members = ["."]
+
+[package]
+name = "axis-shop"
+version = "0.1.0"
+edition = "2024"
+publish = false
+build = "../build.rs"
+
+[lib]
+name = "axis_shop"
+path = "../src/main.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+# The fork's iced, as iced_android needs. `x11` only satisfies iced's check
+# that a Unix target picks a display server; nothing of it builds for Android.
+iced = { git = "https://github.com/Santuzius/iced", tag = "iced_android-v0.1.2", features = ["advanced", "canvas", "svg", "image", "tokio", "x11"] }
+iced_android = { git = "https://github.com/Santuzius/iced_android", tag = "v0.1.2" }
+# No file dialogs on Android: every dialog answers cancelled.
+rfd = { path = "rfd-stub", package = "rfd-stub" }
+# The rest as the desktop's Cargo.toml has them.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+dirs = "6"
+png = "0.17"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+roxmltree = "0.21"
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "net", "time", "io-util", "sync", "macros"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "stream", "form"] }
+jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
+base64 = "0.23.1"
+getrandom = "0.4.3"
+futures-util = "0.3.34"
+sha2 = "0.10"
+clipper2 = "0.6.0"
+fidget = { version = "=0.4.3", default-features = false, features = ["mesh"] }
+toml_edit = "0.25"
+uc100 = { git = "https://github.com/liorknafo/UC100-driver.git", rev = "35cf9d77103481a6975166a28aef1635d8c69ee1", default-features = false }
+uc100-remote = { git = "https://github.com/liorknafo/uc100-server.git", rev = "8801fe67b1f8c0ecfb011c59d3fed28fd4889e00" }
+wgpu = "27"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+
+[patch.crates-io]
+# Lets android_main outlive a destroyed activity (iced_android's README).
+android-activity = { git = "https://github.com/Santuzius/android-activity", tag = "iced_android-v0.1.2" }
+
+# The driver lists USB devices with a call nusb has not on Android; the
+# tablet reaches the UC100 through the Pi, so there the list is empty.
+# ponytail: a local copy for the trial; the cfg goes into the driver repo if the port goes ahead.
+[patch."https://github.com/liorknafo/UC100-driver.git"]
+uc100 = { path = "D:/android/uc100-driver" }
+
+[profile.release]
+opt-level = 2
+strip = true
+
+# With debug info the APK is 685 MB: more than the emulator can install.
+[profile.dev]
+debug = false
+strip = true
+
+# Keep adaptive meshing responsive in debug builds, as the desktop does.
+[profile.dev.package.fidget-core]
+opt-level = 2
+[profile.dev.package.fidget-mesh]
+opt-level = 2

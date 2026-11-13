@@ -2440,7 +2440,9 @@ fn setups(app: &App) -> Element<'_, Message> {
         _ => "Manual mill",
     };
     // The one way back, top left (LIO-429).
-    let back = crate::ui::secondary(crate::ui::BACK, Message::SelectSetup(app.doc.index()));
+    // None on the shop tablet: planning stays on the computer.
+    let back = (!crate::SHOP)
+        .then(|| crate::ui::secondary(crate::ui::BACK, Message::SelectSetup(app.doc.index())));
     let mut c = column![back, bold(title, 16), muted("Setups")].spacing(8);
     // The one setup picker, as the Run page's: the job's setups in its
     // order, each with how it runs (LIO-431).

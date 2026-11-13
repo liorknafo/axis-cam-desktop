@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- The Pi at the machine, over the network (uc100-remote, TCP 7110). -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:allowBackup="false"
+        android:enableOnBackInvokedCallback="true"
+        android:icon="@android:drawable/sym_def_app_icon"
+        android:label="AXIS Shop"
+        android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar.Fullscreen">
+
+        <!-- configChanges: rotation and the like reach the running app instead of restarting android_main. -->
+        <activity
+            android:name=".ShopActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboard|keyboardHidden|navigation|uiMode|locale|layoutDirection|fontScale"
+            android:exported="true"
+            android:screenOrientation="sensorLandscape"
+            android:windowSoftInputMode="adjustResize|stateHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <meta-data android:name="android.app.lib_name" android:value="axis_shop" />
+        </activity>
+    </application>
+
+</manifest>
