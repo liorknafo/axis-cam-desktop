@@ -474,11 +474,44 @@ pub(crate) fn measures(
                 ext: None,
                 leader: true,
             });
-            let deep: Vec<f32> = (holes.iter().zip(mouths)).map(|(h, m)| m - h[2]).collect();
+            // Through (LIO-450): the material from the mouth to the back,
+            // where the tool's end went Breakthrough past it, less the
+            // bottom offset (`cam::drill` and the finishing cycles). A
+            // chamfer mill's or centre drill's cone never goes through.
+            let cone = (doc.tools.iter().find(|t| t.id == op.tool)).is_some_and(|t| {
+                ["Chamfer mill", crate::model::CENTRE_DRILL].contains(&get(&t.p, "type"))
+            });
+            let through = match crate::cam::breakthrough(op) {
+                Ok((true, past)) if !cone => {
+                    Some(past - crate::cam::number(op, "bottom").unwrap_or(0.))
+                }
+                _ => None,
+            };
+            // Blind, a twist drill's full diameter stops its 118° point
+            // above its tip.
+            let point = if d.plan.shape == crate::simulation::CutterShape::Drill {
+                d.plan.radius * crate::simulation::POINT_RISE
+            } else {
+                0.
+            };
+            let end = through.unwrap_or(point);
+            let deep: Vec<f32> = (holes.iter().zip(mouths))
+                .map(|(h, m)| m - (h[2] + end))
+                .collect();
             let (least, most) = deep
                 .iter()
                 .fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
-            let mut words = vec!["deep from the mouth".to_string()];
+            let mut words = match through {
+                Some(_) => vec![
+                    "through".to_string(),
+                    "check it breaks out at the back".to_string(),
+                ],
+                None if point > 0. => vec![
+                    "deep from the mouth".to_string(),
+                    "to the full Ø, not the point".to_string(),
+                ],
+                None => vec!["deep from the mouth".to_string()],
+            };
             if most - least > 0.005 {
                 words.push(format!("{}–{} by hole", mm(least), mm(most)));
             }
@@ -5896,10 +5929,17 @@ pub(crate) mod tests {
         ] {
             assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
         }
-        // The Holes: 4 of Ø4, 42 deep from their mouths on the faced top.
+        // The Holes: 4 of Ø4, drilled with Through off to the back 42 below
+        // their mouths on the faced top: 40.8 to the full Ø, over the
+        // point (LIO-450).
         send(&mut a, GuideAction::Go(checks[1]));
         let t = texts(&a);
-        for want in ["4.00", "4 holes", "42.00", "deep from the mouth"] {
+        for want in [
+            "4.00",
+            "4 holes",
+            "40.80",
+            "deep from the mouth · to the full Ø, not the point",
+        ] {
             assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
         }
         // Drawn on the pictures after them, inside the picture.
@@ -5916,7 +5956,7 @@ pub(crate) mod tests {
             shown.dims[i].iter().map(|d| d.label.clone()).collect()
         };
         assert_eq!(labels(2), ["Y 15", "Z 9.5"]);
-        assert_eq!(labels(3), ["Ø 4", "Z 42"]);
+        assert_eq!(labels(3), ["Ø 4", "Z 40.8"]);
         // The labels' tags overlap neither each other nor any dimension
         // line, in the picture's panel at 1440 × 900 and at 1024 × 700
         // (LIO-379: "Z 9.5" lay on "Y 15"); the step's sizes have extension
@@ -6564,6 +6604,69 @@ pub(crate) mod tests {
             assert_eq!(shown.dims[1].len(), 3, "{:?}", shown.dims[1]);
         }
     }
+    /// The Check page's depth of a drilled hole on the manual mill
+    /// (LIO-450): `mesh` drilled with a Ø`size` drill, through with 2.5 of
+    /// breakthrough or blind, from a stock whose top is the part's.
+    fn drilled_depth(mesh: &Mesh, size: &str, through: bool) -> Measure {
+        use crate::cam::boring::tests::{drill, drilling, job};
+        let manual = crate::manual::defaults();
+        let mut tool = drill(size);
+        tool.p.insert("machines".into(), manual.id.clone());
+        let mut op = drilling(mesh, &tool, "Drilling");
+        for (k, v) in [
+            ("through", if through { "Yes" } else { "No" }),
+            ("breakthrough", "2.5"),
+            ("rpm", "640"),
+            ("feed", "60"),
+        ] {
+            op.p.insert(k.into(), v.into());
+        }
+        let (mut doc, _) = job(mesh, manual, vec![(tool, op)]);
+        doc.setups[0].p.insert("stock_top".into(), "0".into());
+        let shown = shown(&doc, mesh, 0).unwrap();
+        let g = &shown.guide;
+        let top = shown.boxes[0].max[2] + g.zero[2];
+        let m = measures(&doc, g, &g.done[0], top);
+        let deep = m.into_iter().find(|x| x.axis == "Z").unwrap();
+        // Drawn from the mouth down as far as it says.
+        assert!(
+            (deep.from[2] - deep.to[2] - deep.value).abs() < 0.01,
+            "{deep:?}"
+        );
+        deep
+    }
+    /// A through hole's Check says through, with the material's thickness
+    /// at the hole, not how far the drill's tip went past its back
+    /// (LIO-450): the adapter plate's Ø6.8 through 18.5.
+    #[test]
+    fn a_through_holes_check_says_through_and_the_thickness_not_the_tips_depth() {
+        let mesh = crate::cam::boring::tests::ring(6.8, 30., 18.5);
+        let deep = drilled_depth(&mesh, "6.8", true);
+        assert!((deep.value - 18.5).abs() < 0.01, "{deep:?}");
+        assert_eq!(deep.words, ["through", "check it breaks out at the back"]);
+    }
+    /// A blind hole's Check gives its depth from the mouth to its full
+    /// diameter, the drill's 118° point below it left out (LIO-450): a Ø8
+    /// hole 8 deep, its drill-point floor 2.4 lower.
+    #[test]
+    fn a_blind_holes_check_gives_its_full_diameter_depth_without_the_point() {
+        let point = 4. * crate::simulation::POINT_RISE;
+        let section = [
+            (0., -4.),
+            (12., -4.),
+            (12., 10.),
+            (4., 10.),
+            (4., 2.),
+            (0., 2. - point),
+        ];
+        let mesh = crate::mesh::normalize(crate::cam::tests::revolved(&section)).unwrap();
+        let deep = drilled_depth(&mesh, "8", false);
+        assert!((deep.value - 8.).abs() < 0.01, "{deep:?}");
+        assert_eq!(
+            deep.words,
+            ["deep from the mouth", "to the full Ø, not the point"]
+        );
+    }
     /// Steps entered from planning (LIO-449): at the start of the operation
     /// picked there, saying where the steps had got to, one press from it;
     /// with none picked, where they were left, saying so; the line goes
@@ -6791,6 +6894,53 @@ pub(crate) mod tests {
         let _ = a.update(Message::Guide(GuideAction::Open(2)));
         shot(&a, "entry-resumed");
         std::fs::write(dir.join("lio-449.txt"), said).unwrap();
+    }
+    /// LIO-450 on a private copy of the adapter plate (`AXIS_ADAPTER_COPY`):
+    /// the Ø6.8 drill's Check page says through the 18.5 of the plate under
+    /// the seat, not the 21 its tip goes, as a PNG and its texts.
+    #[test]
+    #[ignore = "private adapter copy: AXIS_ADAPTER_COPY"]
+    fn render_the_adapter_plate_drill_check_lio_450() {
+        let dir = std::path::PathBuf::from(std::env::var_os("AXIS_ADAPTER_COPY").unwrap());
+        let mut doc = crate::storage::load(&dir.join("adapter-plate.axis.json")).unwrap();
+        doc.file.as_mut().unwrap().path = dir.join("adapter-plate.step");
+        let mesh = crate::mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
+        doc.active = doc.setups[2].id.clone();
+        let mut a = App::from_workspace(dir.join("render-state.axis.json"), None);
+        a.doc = doc;
+        a.imported_mesh = Some(mesh);
+        a.window_width = 1440.;
+        a.window_height = 1000.;
+        let id = a.doc.setups[2].id.clone();
+        a.page = crate::Page::Control;
+        build(&mut a);
+        let g = guide(&a);
+        let op = (a.doc.setups[2].operations.iter())
+            .position(|o| o.name().starts_with("Drill 6.8"))
+            .unwrap();
+        let at = (g.steps.iter())
+            .position(|s| matches!(s, Step::Check { op: o } if *o == op))
+            .unwrap();
+        a.doc.guide.insert(id, at);
+        a.guide_item = 0;
+        let t = crate::ui::probe::texts(a.view(), Size::new(1440., 1000.));
+        std::fs::write(dir.join("drill-check.txt"), t.join("\n")).unwrap();
+        render(&a, (1440, 1000), &dir.join("drill-check.png"));
+        let m = (t.iter().position(|s| s == "MEASURE")).unwrap_or_else(|| panic!("{t:?}"));
+        assert_eq!(
+            t[m..m + 7],
+            [
+                "MEASURE",
+                "Ø",
+                "6.80",
+                "4 holes",
+                "Z",
+                "18.50",
+                "through · check it breaks out at the back"
+            ],
+            "{t:?}"
+        );
+        assert!(!t.iter().any(|s| s == "21.00"), "{t:?}");
     }
     /// The Steps page at 1280 × 800, one PNG per kind of step, in
     /// /tmp/manual-steps.
