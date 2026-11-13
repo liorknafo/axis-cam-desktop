@@ -6121,7 +6121,7 @@ fn zero_note(app: &App) -> Element<'_, Message> {
     let hand = crate::manual::is_hand(&setup.machine);
     let mut lines = vec![match (crate::post::touch_off_spots(origin, stock), refs) {
         (_, Some(_)) if hand => format!(
-            "On the stock this setup starts from ({from}): the Steps page's Zero screen has you touch a side for X and one for Y with the edge finder and the top for Z, and set the DRO so that it reads 0 at this work zero."
+            "On the stock this setup starts from ({from}): the Steps page's Zero screen has you touch a side for X and one for Y with the edge finder (both sides of an axis whose zero is at the middle, halving the reading) and the top for Z, and set the DRO so that it reads 0 at this work zero."
         ),
         (Some(spots), _) => format!(
             "On the stock this setup starts from ({from}): touch off {spots}.{}",

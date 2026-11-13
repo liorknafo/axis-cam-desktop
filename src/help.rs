@@ -2955,7 +2955,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (_, "edge_finder") => (
-            "The diameter of the edge finder that picks up the work zero, in mm. The Zero step takes its radius off each face it touches.",
+            "The diameter of the edge finder that picks up the work zero, in mm. The Zero step takes its radius off a face it picks up a zero on; where it halves between two faces for a middle, the radius cancels.",
             "",
             Some(Manual(12)),
         ),
