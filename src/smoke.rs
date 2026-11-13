@@ -13047,6 +13047,26 @@ flood = { pin = 8 }
         assert!(conn(&a).config.axis_enabled(2));
     }
 
+    /// The travel note said on connecting is not taken for the machine's
+    /// name: it follows the first state once, then goes (LIO-463).
+    #[test]
+    fn the_travel_note_is_not_part_of_the_machine_name() {
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), LIMITED);
+        let _ = a.update(Message::Connect);
+        let note = " Its X, Y and Z travel now follow the soft limits in its UC100 profile.";
+        assert_eq!(a.status, format!("Connecting to JY5800…{note}"));
+        tick_until(&mut a, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        let _ = a.update(Message::Tick);
+        assert_eq!(a.status, format!("Connected to JY5800: E-STOP.{note}"));
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle", |s| s.state == Some(State::Idle));
+        assert_eq!(a.status, "Connected to JY5800: Idle");
+    }
+
     /// The machine position of a connected test app.
     fn at(a: &App) -> [f64; 6] {
         conn(a).snapshot.machine_pos
