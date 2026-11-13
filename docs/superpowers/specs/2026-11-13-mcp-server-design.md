@@ -371,12 +371,13 @@ The refusal reason reads: "This moves the machine or changes what its controller
 While the app is `locked()`, which means a run, jog, probe or homing is in progress, mutating commands are refused with "The machine is running; the job cannot change until it stops." `machine_status`, the four stop commands, and the **light** reads still work.
 
 **Light and heavy reads.** The app keeps generation and simulation away from the motion driver while it runs. `App::planning_busy()` refuses Cycle Start while such work is under way, and the work is not started while the machine moves (`main.rs` ~3332). Reads that compute toolpaths or stock follow the same rule.
-- **Heavy reads:** `check_job`, `check_holding`, `stock_after`, and `view_model`'s views of the stock after an operation. While the machine is `locked()`, they are refused with "The machine is running; this check simulates toolpaths, so it waits until the run stops."
+- **Heavy reads:** `check_job`, `check_holding`, `stock_after`, `view_model`'s views of the stock after an operation, and `inspect {what: "steps"}` when the guide it reads has to be built. The manual mill and lathe guides simulate the operations to replay the stock (`guide.rs` `simulate`, ~1319 and ~1555). Reading a guide the app has already built for the current job (`guide_key`) is light. While the machine is `locked()`, they are refused with "The machine is running; this check simulates toolpaths, so it waits until the run stops."
 - **Counting heavy work.** Every heavy read's worker is counted in `planning_busy()` from when it starts until its thread has actually finished. It is not released when the read is cancelled, timed out or its client disconnects, as the planner's `plan_busy` does today. M4 keeps this count when the planner goes.
 - **Light reads:** everything else, which reads state or draws the part only. They run at any time.
 - **Tests:**
   - a heavy read started before Cycle Start makes Cycle Start wait, and that holds after the read is cancelled while its worker still runs;
   - a heavy read asked for during a run is refused;
+  - the same three cases for `inspect {what: "steps"}` on a manual mill and a lathe setup whose guide is not built; a guide already built is read during a run;
   - `inspect` and `machine_status` answer during a run.
 
 ### Machine status
@@ -438,11 +439,18 @@ Arguments are JSON. Values that were `&'static str` in a message are enums in th
 - **Fields:** `edit_field`, and `undo_last_edit` (`PutBackEdit`).
 - **Picks:**
   - `pick_surfaces {ids, mode: add|remove|replace}`, `pick_features {ids, mode}` (the sample's features, `Feature`), `drop_hole {index}`, `clear_picks`;
-    - A click on a surface toggles a whole **group**: a smooth region, a hole's walls, or a corner's faces, as the operation's strategy groups them. Two ids from one corner sent one by one therefore pick it and then drop it (found by the review's probe).
-    - So the grouping moves into a pure function, `picks::group_of(op, mesh, id)`, which the click handler also uses. The engine turns the ids into their groups, each once. `add` sends one click for each group not yet picked, `remove` one for each group that is picked, and `replace` clears first, then adds.
-    - The result returns the operation's picks afterwards, as ids grouped as the app groups them, with the mesh fingerprint they belong to.
-    - Picking is turned on when it is off, and set back afterwards.
-    - Tests: several ids from one corner, one hole and one region in one call; the same `add` sent twice (`no_change`); `remove` of an id whose group was not picked (`no_change`).
+    - **Two kinds of picking.** A click on a surface does one of two things, depending on the operation. The handler's branches (`main.rs` `Message::Surface`, ~6598) decide which, and that choice moves into one function both use, `App::pick_kind(op) -> Toggle | Fill`:
+      - **Fill:** one face fills the operation's fields and replaces its pick. These are the lathe cuts and lathe drills (`picks_turn`), Slot (`slot::from_face`) and Box (`fill_box`).
+      - **Toggle:** everything else. A click adds or drops a whole **group**, as the strategy groups faces: a smooth region, a hole's walls (threaded holes and arcs included), a corner, or a sloped face's steps. Two ids from one corner sent one by one therefore pick it and then drop it (found by the review's probe).
+    - **The engine does not copy the grouping.** It sends real clicks and checks what each one did, so it always agrees with the handler:
+      - **Fill:** only `mode: replace` with exactly one id is accepted. Several ids, `add` and `remove` are refused before anything changes: "<Strategy> takes one face, which fills it; send one id with mode replace, or clear_picks." A face that fills nothing is `failed`, with the handler's reason, and the pick is unchanged. Removal is `clear_picks`.
+      - **Toggle, `add`:** ids already in the picks are skipped. For each other id, one click is sent, and the picks after it are compared with the picks before it. If the click dropped anything that was picked, because the id belonged to a group already picked, that click is undone: the operation's picks and geometry are put back to before it. The id is reported as "already picked with group …". If it added nothing, its reason is reported.
+      - **Toggle, `remove`:** ids not in the picks are skipped (`no_change`). For each other id, one click is sent. It must leave that id unpicked; otherwise it is undone and reported.
+      - **Toggle, `replace`:** `clear_picks`, then `add`.
+    - **The result** returns the operation's picks afterwards (ids, and the holes or corners the app lists for them) with the mesh fingerprint they belong to, and what each id did. Picking is turned on when it is off, and set back afterwards.
+    - **Tests:**
+      - Toggle: several ids from one corner, one hole and one region in one call; the same `add` sent twice (`no_change`); `remove` of an id that is not picked (`no_change`); `remove` of one face of a picked corner;
+      - Fill: Slot, Box and a lathe Turn given two ids (refused, nothing changed), `add` (refused), one id with `replace` (filled), the same again (`no_change`), and `clear_picks`.
   - `pick_pin_holes {ids}`, `clear_pin_holes`, `place_pins {x, y}`.
 - **Generate:** `generate`, `generate_all`, `cancel_generation`.
 - **Libraries:**
@@ -636,3 +644,6 @@ Four milestones, each with its own Linear issue and PR.
    - **`busy`** replaces a queued mutation, and `still_running` means only dispatched work.
    - **One writing agent per window,** with checkpoints dropped when the lease changes.
    - **Packaged-build checks** on both clients and both platforms before M4.
+8. **gpt-6-astra, REJECT.** Both findings were taken:
+   - reading Steps whose guide must be built is a heavy read;
+   - picking is split into toggle and fill. It is driven by real clicks checked against what they did, not by a copied grouping function, and fill operations take one face with `replace` only.
