@@ -87,6 +87,22 @@ kind, level, offset, what it leaves, its scallop and readings):
 - `steps::tests::a_slot_sweep_says_whether_to_stay_down_or_lift` (from review
   1): a sweep followed by a walk says stay down; a cutter so near the width
   that only the finish walks round says lift.
+- `a_counterbore_far_from_the_setups_origin_is_planned_as_near_it` (a
+  real-job finding): the user's project refused setup 4's two upper
+  counterbores (plan Y ≈ 229, the part at tx 21, ty 179) as "cuts into the
+  part". The part check clipped the top face by each round end's chord in
+  single precision, and the slivers it left along the chords (≈1.2 × 10⁻⁵
+  mm², over the 10⁻⁵ filter) read as part. The clipping is now in double
+  precision. The fixed 3 × 10⁻⁵ mm slack now grows with single precision's
+  step where the slot lies far from the origin: 0.2 µm at 400 mm. Before
+  the fix, 22 of 60 placements of the synthetic 16.5 counterbore between
+  X −300 Y 120 and X 308 Y 515 were refused, plus X −260 Y 233.7 as
+  "crossing a round end". After it, none are. A 0.01 mm overcut out there
+  is still refused.
+- `the_users_adapter_project_plans_every_slot` (ignored; a private copy of
+  the user's project in `AXIS_ADAPTER_COPY`): every operation of every
+  setup plans and simulates, the 8 Slots among them, and every setup's
+  Steps build.
 - `corner::tests::an_inside_stair_leaves_at_most_the_scallop_and_never_cuts_past_the_round`:
   R8.25 with a Ø12, at size and 0.2 in, all four quarters, about centres on
   and off the hundredths.

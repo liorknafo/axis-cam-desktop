@@ -643,7 +643,10 @@ fn arc_overcut(arc: &cam::arcs::Arc, a: [f32; 2], b: [f32; 2], r: f32) -> f64 {
     let half = (arc.span as f64).to_radians() / 2.;
     let mut worst = f64::NEG_INFINITY;
     for p in [a, b] {
-        let v = [(p[0] - arc.centre[0]) as f64, (p[1] - arc.centre[1]) as f64];
+        let v = [
+            f64::from(p[0]) - f64::from(arc.centre[0]),
+            f64::from(p[1]) - f64::from(arc.centre[1]),
+        ];
         let theta = v[1].atan2(v[0]);
         let delta = (theta - mid + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
             - std::f64::consts::PI;
@@ -741,6 +744,18 @@ fn connected_pair(g: &Geometry, a: [f32; 2], b: [f32; 2], r: f32, bottom: f32, t
     })
 }
 
+/// How far a sweep may seem to reach past the part and still be on it:
+/// 0.03 µm, or where the slot lies far from the setup's origin what single
+/// precision resolves there, a few of its steps (LIO-455: 3 × 10⁻⁵ mm at
+/// X 260 is one step, and an exact slot there read as an overcut). Still
+/// far under the hundredth a DRO reads and any real overcut.
+fn slack(slot: &Slot, r: f32) -> f32 {
+    let far = (slot.a.iter().chain(&slot.b))
+        .map(|v| v.abs())
+        .fold(0f32, f32::max)
+        + r;
+    0.00003f32.max(4. * f32::EPSILON * far)
+}
 /// Continuous part check, including nominal analytic bounds at faceted
 /// semicircles. Mesh error is not a license to translate/oversize a cutter.
 fn check_part(
@@ -755,6 +770,7 @@ fn check_part(
     let arcs = cam::arcs::arcs_among(setup, mesh, &cam::arcs::upright(setup, mesh));
     let cut = slot.bounds(r, target, top);
     let z = [target + 0.0001, top + 0.0001];
+    let slack = slack(slot, r);
     let mut proven = vec![];
     for a in &arcs {
         if a.top <= z[0] || a.bottom >= z[1] {
@@ -770,7 +786,7 @@ fn check_part(
         if !reaches {
             continue;
         }
-        if arc_overcut(a, slot.a, slot.b, r) > 0.00003 {
+        if arc_overcut(a, slot.a, slot.b, r) > f64::from(slack) {
             return Err("The slot's cutter sweep crosses a nominal rounded end of the part. Check centre, length and cutter diameter.".into());
         }
         proven.push(a);
@@ -784,10 +800,13 @@ fn check_part(
         {
             continue;
         }
-        if !cam::swept_with_slack(&t.p, [slot.a, slot.b], r, z, 0.00003) {
+        if !cam::swept_with_slack(&t.p, [slot.a, slot.b], r, z, slack) {
             continue;
         }
-        let mut pieces = vec![t.p.to_vec()];
+        // In double precision throughout (LIO-455): in single precision a
+        // part far from the setup's origin (Y 229) left slivers along the
+        // partitions' shared chord edges, wide enough to be read as part.
+        let mut pieces: Vec<Vec<[f64; 3]>> = vec![t.p.iter().map(|p| p.map(f64::from)).collect()];
         // Only subtract the actual circular segments between a wall chord
         // and its nominal arc. The entire sector, or a globally shrunken
         // cutter, would hide real planar material beside a round boundary.
@@ -796,6 +815,7 @@ fn check_part(
             for a in proven.iter().filter(|a| {
                 (t.p[0][2] - a.top).abs() < 0.0001 || (t.p[0][2] - a.bottom).abs() < 0.0001
             }) {
+                let c = a.centre.map(f64::from);
                 for wall in g
                     .triangles
                     .iter()
@@ -806,10 +826,8 @@ fn check_part(
                         if (u[2] - a.top).abs() > 0.0001 || (v[2] - a.top).abs() > 0.0001 {
                             continue;
                         }
-                        let mid = [
-                            (u[0] + v[0]) / 2. - a.centre[0],
-                            (u[1] + v[1]) / 2. - a.centre[1],
-                        ];
+                        let (u, v) = (u.map(f64::from), v.map(f64::from));
+                        let mid = [(u[0] + v[0]) / 2. - c[0], (u[1] + v[1]) / 2. - c[1]];
                         let distance = mid[0].hypot(mid[1]);
                         let len = (u[0] - v[0]).hypot(u[1] - v[1]);
                         if len < 0.00001 || distance <= 0. {
@@ -819,7 +837,7 @@ fn check_part(
                         let half = (len / 2.).atan2(distance);
                         pieces = pieces
                             .into_iter()
-                            .flat_map(|poly| outside_lens(poly, a.centre, theta, half, distance))
+                            .flat_map(|poly| outside_lens(poly, c, theta, half, distance))
                             .collect();
                     }
                 }
@@ -829,17 +847,18 @@ fn check_part(
             for i in 1..poly.len().saturating_sub(1) {
                 let tri = [poly[0], poly[i], poly[i + 1]];
                 if horizontal {
-                    let area = ((tri[1][0] - tri[0][0]) as f64 * (tri[2][1] - tri[0][1]) as f64
-                        - (tri[1][1] - tri[0][1]) as f64 * (tri[2][0] - tri[0][0]) as f64)
+                    let area = ((tri[1][0] - tri[0][0]) * (tri[2][1] - tri[0][1])
+                        - (tri[1][1] - tri[0][1]) * (tri[2][0] - tri[0][0]))
                         .abs()
                         / 2.;
-                    // Polygon partitions share their chord edge. Single
-                    // precision can leave a zero-area edge as a tiny sliver.
+                    // Polygon partitions share their chord edge: a piece
+                    // along it has no area but for rounding.
                     if area < 0.00001 {
                         continue;
                     }
                 }
-                if cam::swept_with_slack(&tri, [slot.a, slot.b], r, z, 0.00003) {
+                let tri = tri.map(|p| p.map(|v| v as f32));
+                if cam::swept_with_slack(&tri, [slot.a, slot.b], r, z, slack) {
                     return Err("The slot's cutter sweep cuts into the part. Check centre, width, length, floor and stock to leave.".into());
                 }
             }
@@ -851,12 +870,12 @@ fn check_part(
 /// between the chord's angular rays and beyond its chord plane. Analytic
 /// support has already proven the cutter inside the nominal circle there.
 fn outside_lens(
-    poly: Vec<[f32; 3]>,
-    centre: [f32; 2],
-    theta: f32,
-    half: f32,
-    distance: f32,
-) -> Vec<Vec<[f32; 3]>> {
+    poly: Vec<[f64; 3]>,
+    centre: [f64; 2],
+    theta: f64,
+    half: f64,
+    distance: f64,
+) -> Vec<Vec<[f64; 3]>> {
     let lo = theta - half;
     let hi = theta + half;
     let mut inside = poly;
@@ -866,11 +885,9 @@ fn outside_lens(
         ([hi.sin(), -hi.cos()], 0.),
         ([theta.cos(), theta.sin()], distance),
     ] {
-        let clip = |poly: &Vec<[f32; 3]>, keep_inside: bool| {
-            let value = |p: [f32; 3]| {
-                (((p[0] - centre[0]) as f64 * n[0] as f64
-                    + (p[1] - centre[1]) as f64 * n[1] as f64)
-                    - offset as f64)
+        let clip = |poly: &Vec<[f64; 3]>, keep_inside: bool| {
+            let value = |p: [f64; 3]| {
+                ((p[0] - centre[0]) * n[0] + (p[1] - centre[1]) * n[1] - offset)
                     * if keep_inside { 1. } else { -1. }
             };
             let mut out = vec![];
@@ -881,7 +898,7 @@ fn outside_lens(
                     out.push(p);
                 }
                 if (v >= 0.) != (w >= 0.) {
-                    let t = (v / (v - w)) as f32;
+                    let t = v / (v - w);
                     out.push(std::array::from_fn(|k| p[k] + t * (q[k] - p[k])));
                 }
             }

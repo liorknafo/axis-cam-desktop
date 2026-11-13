@@ -1262,3 +1262,89 @@ fn a_coarse_finish_scallop_leaves_no_floor_between_the_walks() {
         }
     }
 }
+
+/// The adapter's counterbore with the part placed far from the setup's
+/// origin, as the user's fourth setup places the plate (tx 21, ty 179):
+/// the part check must not read single-precision slivers along the round
+/// ends' chords as part (LIO-455: the two upper counterbores were refused
+/// as cutting into the part, the two lower ones with the same sizes not).
+#[test]
+fn a_counterbore_far_from_the_setups_origin_is_planned_as_near_it() {
+    let (doc, mesh) = adapter_counterbore(false);
+    let near = generate(
+        &doc.setups[0],
+        &doc.setups[0].operations[0],
+        &doc.tools[0],
+        &mesh,
+    )
+    .unwrap()
+    .slot_passes
+    .len();
+    // The user's placement, and placements a part check in single
+    // precision refused (it refused 22 of 60 between X −300 Y 120 and
+    // X 308 Y 515 as cutting into the part, and X −260 Y 233.7 as crossing
+    // a round end: one step of single precision there).
+    for (tx, ty) in [
+        ("21", "179"),
+        ("-289.7", "126.7"),
+        ("-73.4", "267.4"),
+        ("60.5", "354.5"),
+        ("194.4", "441.6"),
+        ("-260", "233.7"),
+    ] {
+        let mut far = doc.clone();
+        set(&mut far.setups[0].p, "tx", tx);
+        set(&mut far.setups[0].p, "ty", ty);
+        let s = &far.setups[0];
+        let plan = generate(s, &s.operations[0], &far.tools[0], &mesh)
+            .unwrap_or_else(|e| panic!("tx {tx} ty {ty}: {e}"));
+        assert_eq!(plan.slot_passes.len(), near, "tx {tx} ty {ty}");
+    }
+    // A real overcut is still seen out there.
+    let mut far = doc.clone();
+    set(&mut far.setups[0].p, "tx", "21");
+    set(&mut far.setups[0].p, "ty", "179");
+    set(&mut far.setups[0].operations[0].p, "slot_y", "0.01");
+    let s = &far.setups[0];
+    let e = generate(s, &s.operations[0], &far.tools[0], &mesh).unwrap_err();
+    assert!(e.contains("sweep"), "{e}");
+}
+
+/// The user's own adapter project, a private copy in `AXIS_ADAPTER_COPY`
+/// (adapter-plate.axis.json and the STEP), never the original: every
+/// operation of every setup plans and simulates, the Slots among them
+/// (LIO-455: setup 4's two upper counterbores, far from its origin, were
+/// refused), and every setup's Steps build.
+#[test]
+#[ignore = "requires a private copy of the user's adapter project (AXIS_ADAPTER_COPY)"]
+fn the_users_adapter_project_plans_every_slot() {
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("AXIS_ADAPTER_COPY").expect("set AXIS_ADAPTER_COPY to the private copy"),
+    );
+    let mut doc = crate::storage::load(&dir.join("adapter-plate.axis.json")).unwrap();
+    doc.file.as_mut().unwrap().path = dir.join("adapter-plate.step");
+    let mesh = crate::mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
+    let mut failures = vec![];
+    let mut slots = 0;
+    simulation::sequence_with(
+        &doc,
+        &mesh,
+        None,
+        |si, oi, r| {
+            let op = &doc.setups[si].operations[oi];
+            match r {
+                Ok(_) if op.strategy == Strategy::Slot => slots += 1,
+                Ok(_) => {}
+                Err(e) => failures.push(format!("{}/{} {}: {e}", si + 1, oi, op.name())),
+            }
+        },
+        |_, _, _| {},
+    );
+    assert!(failures.is_empty(), "{failures:#?}");
+    assert_eq!(slots, 8);
+    for si in 0..doc.setups.len() {
+        if let Err(e) = crate::steps::shown(&doc, &mesh, si) {
+            panic!("setup {}: {e}", si + 1);
+        }
+    }
+}
