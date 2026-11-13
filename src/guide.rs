@@ -1578,18 +1578,20 @@ fn contact(
             over
         })
     };
-    // An uncut stock is touched at its face's middle, where a box and a
-    // bar standing up alike stand out farthest; under a clamp, its
-    // material is looked for as a cut one's is.
+    // An uncut or thin stock is touched at its face's middle, where a box
+    // and a bar standing up alike stand out farthest; under a clamp, its
+    // material is looked for as a cut one's is (a thin one's at half its
+    // height).
+    let thin = height <= 2. * IN;
     let middle_clear = !(offs(0., at[2]).iter()).any(|&(_, a0, a1)| a0 < at[o] && at[o] < a1);
-    if before.cuts.is_empty() && middle_clear {
+    if (before.cuts.is_empty() || thin) && middle_clear {
         return Some(Touch {
             at,
             round: false,
             under: vec![],
         });
     }
-    if height.is_nan() || height <= 2. * IN {
+    if height.is_nan() {
         let found: Vec<f32> = (0..ACROSS).map(across).collect();
         return Some(match clear(at[o], &found, &|_| true, 0., at[2]) {
             Ok(a) => {
@@ -1675,10 +1677,14 @@ fn contact(
     // whole number of millimetres under it.
     let pitch = (height / ROWS).ceil().max(1.);
     let low = (stock.min[2] + IN).max(above);
-    let rows: Vec<f32> = std::iter::once(stock.max[2] - IN)
-        .chain((1..).map(|n| stock.max[2] - n as f32 * pitch))
-        .take_while(|z| *z >= low)
-        .collect();
+    let rows: Vec<f32> = if thin {
+        vec![(stock.min[2] + stock.max[2]) / 2.]
+    } else {
+        std::iter::once(stock.max[2] - IN)
+            .chain((1..).map(|n| stock.max[2] - n as f32 * pitch))
+            .take_while(|z| *z >= low)
+            .collect()
+    };
     // The touch at `a` across, `d` in, at height `z` (shown at `shown`),
     // moved clear of the clamps (`clear`); what reads as a round is moved
     // only where its face is as far out as at `a`, to 0.01 mm (a flat
@@ -4638,6 +4644,71 @@ pub(crate) mod tests {
         };
         close(at[1][0], 0.);
         close(far[1].unwrap().at[0], 0.);
+    }
+    #[test]
+    fn a_thin_disc_under_its_clamps_is_not_touched_beside_them_in_the_air() {
+        // A Ø20 disc 0.3 thick, its rim faced, clamped 2 wide over the
+        // lines its front and back are touched on with a Ø1 finder: off
+        // them is air, so Y cannot be found.
+        let (mut doc, _) = job("No");
+        doc.setups.truncate(1);
+        doc.active = doc.setups[0].id.clone();
+        let bounds = Bounds {
+            min: [0.; 3],
+            max: [10., 8., 0.2],
+        };
+        let tris = (crate::viewport::box_triangles(bounds, [0.7; 3]).into_iter())
+            .map(|(t, _)| t)
+            .collect();
+        let mesh = crate::mesh::normalize(tris).unwrap();
+        let mut mill = Tool::new("Rim mill", "Flat end mill", "1");
+        for (k, v) in [
+            ("length", "25"),
+            ("stickout", "35"),
+            ("flutes", "3"),
+            ("machines", &doc.setups[0].machine.id),
+        ] {
+            mill.p.insert(k.into(), v.into());
+        }
+        let face = boxed(
+            "Face rim",
+            &mill.id,
+            [9., 10.1, -2., 2., 0., -0.1],
+            &[
+                ("allowance", "0"),
+                ("stepover", "40"),
+                ("stepdown", "0.1"),
+                ("rpm", "1000"),
+                ("feed", "100"),
+            ],
+        );
+        doc.tools.push(mill);
+        doc.setups[0].operations = vec![face];
+        for (k, v) in [
+            ("stock_type", "Round bar"),
+            ("stock_diameter", "20"),
+            ("stock_length", "0.3"),
+            ("origin", "Stock top center"),
+        ] {
+            doc.setups[0].p.insert(k.into(), v.into());
+        }
+        (doc.setups[0].machine.p).insert("edge_finder".into(), "1".into());
+        on_clamps(&mut doc, "-Y:0;+Y:0", "2");
+        let holder = doc.workholding.last_mut().unwrap();
+        for (k, v) in [("length", "6"), ("height", "2.5"), ("bite", "1.2")] {
+            holder.p.insert(k.into(), v.into());
+        }
+        let why = build(&doc, &mesh, 0).unwrap_err();
+        assert!(why.starts_with(UNDER_CLAMPS), "{why}");
+        // Clamped on X 6 off the lines, Y is touched on them, on the disc.
+        doc.setups[0].p.insert("clamps".into(), "-Y:6;+Y:-6".into());
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let Step::Zero { at, far, .. } = &guide.steps[1] else {
+            panic!()
+        };
+        for p in [at[1], far[1].unwrap().at] {
+            assert!(p[0].hypot(p[1]) <= 10.01, "{p:?}");
+        }
     }
     #[test]
     fn a_narrow_flat_wall_an_earlier_cut_left_is_touched_beside_a_clamp() {
