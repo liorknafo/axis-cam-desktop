@@ -87,7 +87,7 @@ struct Samples {
     covered: f32,
     /// The faces of a thread left short (`Short`): its regions are kept
     /// however small.
-    short: std::collections::HashSet<usize>,
+    short: HashMap<usize, usize>,
 }
 impl Samples {
     fn new(n: usize) -> Self {
@@ -204,12 +204,13 @@ pub fn uncut(stock: &Volume, setups: &[Setup], mesh: &Mesh) -> Uncut {
             continue;
         }
         let n = n.map(|x| x / twice);
-        let held = shorts.iter().find_map(|s| s.holds([a, b, c]));
-        if held == Some(false) {
+        let held =
+            (shorts.iter().enumerate()).find_map(|(k, s)| s.holds([a, b, c]).map(|h| (k, h)));
+        if let Some((_, false)) = held {
             total += twice / 2.;
             continue;
         }
-        if held == Some(true) {
+        if let Some((k, true)) = held {
             let layer = &mut layers[0];
             total += twice / 2.;
             layer.covered += twice / 2.;
@@ -217,7 +218,7 @@ pub fn uncut(stock: &Volume, setups: &[Setup], mesh: &Mesh) -> Uncut {
             layer
                 .found
                 .insert(i, (twice / 2., [a, b, c], vec![[a, b, c]]));
-            layer.short.insert(i);
+            layer.short.insert(i, k);
             continue;
         }
         // ponytail: trusts the mesh's winding for which side is outside; a
@@ -358,10 +359,13 @@ fn coverage(samples: Samples, part: Bounds, total: f32) -> Coverage {
             let mut key = [p[e], p[(e + 1) % 3]].map(|v| v.map(|x| (x * 1000.).round() as i64));
             key.sort_unstable();
             match edges.get(&key) {
-                Some(&other) => {
+                // A thread's faces left short make a region of their own,
+                // not one with the faces round it (`Short`).
+                Some(&other) if short.get(&i) == short.get(&other) => {
                     let (a, b) = (top(&mut root, i), top(&mut root, other));
                     root.insert(a, b);
                 }
+                Some(_) => {}
                 None => {
                     edges.insert(key, i);
                 }
@@ -409,7 +413,7 @@ fn coverage(samples: Samples, part: Bounds, total: f32) -> Coverage {
     }
     let mut regions = vec![];
     for group in grouped.into_values() {
-        if group.area < SLIVER && !group.faces.iter().any(|f| short.contains(f)) {
+        if group.area < SLIVER && !group.faces.iter().any(|f| short.contains_key(f)) {
             covered -= group.area;
             for i in group.faces {
                 faces[i] = false;
@@ -525,6 +529,8 @@ fn shortfalls(
         // How they cut it, the first that does of: tapped, thread milled,
         // threaded on the lathe.
         let mut how = [false; 3];
+        // One of its size that cuts the other hand: how it does.
+        let mut wrong_hand = None;
         let fits = |major: f32, pitch: f32| {
             (pitch - t.pitch).abs() < 1e-3 && (major - t.major).abs() <= 0.3
         };
@@ -540,20 +546,27 @@ fn shortfalls(
             let lathe = op.strategy == crate::model::Strategy::Turn
                 && get("turn_kind") == "Thread"
                 && get("thread_side") == "Inside";
-            let kind = if lathe {
+            // And its hand: a lathe's threading is right hand; a tap's or
+            // thread mill's as chosen, else the model's, or right hand for
+            // a size chosen.
+            let (kind, right_hand) = if lathe {
                 let at = |k: &str| crate::model::num(&op.p, k).unwrap_or(f32::NAN);
                 if !fits(at("diameter"), at("pitch")) {
                     continue;
                 }
-                2
+                (2, true)
             } else if op.tapping() || op.thread_milling() {
                 let chosen = get("thread");
-                if chosen != crate::model::FROM_MODEL
-                    && !crate::thread::spec(chosen).is_some_and(|s| fits(s.major, s.pitch))
-                {
+                let model = chosen == crate::model::FROM_MODEL;
+                if !model && !crate::thread::spec(chosen).is_some_and(|s| fits(s.major, s.pitch)) {
                     continue;
                 }
-                if op.tapping() { 0 } else { 1 }
+                let right_hand = match get("thread_hand") {
+                    "Right hand" => true,
+                    "Left hand" => false,
+                    _ => !model || t.right_hand,
+                };
+                (if op.tapping() { 0 } else { 1 }, right_hand)
             } else {
                 continue;
             };
@@ -573,6 +586,10 @@ fn shortfalls(
                 (moved(c.a, c.frame, first), moved(c.b, c.frame, first))
             };
             if up.abs() < 0.99 || off(a).max(off(b)) > t.root.max(t.major) / 2. {
+                continue;
+            }
+            if right_hand != t.right_hand {
+                wrong_hand = Some((kind, right_hand));
                 continue;
             }
             how[kind] = true;
@@ -605,13 +622,21 @@ fn shortfalls(
         }
         let short: f32 = gaps.iter().map(|g| g.1 - g.0).sum();
         let name = t.name();
-        let note = (short >= SHORT).then(|| {
-            if spans.is_empty() {
+        let hand = |right: bool| if right { "right hand" } else { "left hand" };
+        let verb = |k: usize| ["tapped", "thread milled", "threaded"][k];
+        let note = (short >= SHORT).then(|| match (spans.is_empty(), wrong_hand) {
+            (true, Some((k, right))) => format!(
+                "{name} thread: {} {}; the model's is {}",
+                verb(k),
+                hand(right),
+                hand(t.right_hand)
+            ),
+            (true, None) => {
                 format!("{name} thread: no {name} tap, thread mill or threading tool cuts it")
-            } else {
-                let how = ["tapped", "thread milled", "threaded"]
-                    [how.iter().position(|h| *h).unwrap_or(0)];
-                format!("{name} thread: {how} {short:.1} mm short")
+            }
+            (false, _) => {
+                let k = how.iter().position(|h| *h).unwrap_or(0);
+                format!("{name} thread: {} {short:.1} mm short", verb(k))
             }
         });
         out.push(Short {

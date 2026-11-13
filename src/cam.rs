@@ -8249,6 +8249,45 @@ pub(crate) mod tests {
         assert_eq!(result.err().as_deref(), Some(crate::model::TEETH_ONE_PITCH));
     }
     #[test]
+    fn a_thread_milled_the_other_hand_is_not_counted_as_cut() {
+        // LIO-448 review: the plate's M6 holes are right hand. Milled right
+        // hand, their threads are cut; left hand, they are left, and say so.
+        let m6 = |left: &crate::uncut::Uncut| -> Vec<Option<String>> {
+            (left.regions.iter())
+                .filter(|r| r.thread.as_deref().is_some_and(|w| w.starts_with("M6×1")))
+                .map(|r| r.thread.clone())
+                .collect()
+        };
+        for (hand, want) in [
+            ("From the model", vec![]),
+            ("Right hand", vec![]),
+            (
+                "Left hand",
+                vec![
+                    Some(
+                        "M6×1 thread: thread milled left hand; the model's is right hand"
+                            .to_string()
+                    );
+                    2
+                ],
+            ),
+        ] {
+            let (result, mesh, (doc, stock)) = threaded_doc(
+                Machine::new(3),
+                "4.9",
+                Some("5"),
+                thread_mill_tool("4"),
+                crate::model::THREAD_MILLING,
+                |o| {
+                    o.p.insert("thread_hand".into(), hand.into());
+                },
+            );
+            result.unwrap();
+            let left = crate::uncut::uncut(&stock.unwrap(), &doc.setups, &mesh);
+            assert_eq!(m6(&left), want, "{hand}: {:?}", left.regions);
+        }
+    }
+    #[test]
     fn a_milled_thread_is_no_gouge() {
         // The M6 holes (bore Ø4.9): drilled Ø5, their tap drill, then milled
         // to their roots by a Ø4 thread mill. Both cut cells of the part's
