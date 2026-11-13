@@ -57,6 +57,17 @@ pub struct Vise {
     pub jaw_height: f32,
     pub jaw_thickness: f32,
 }
+/// The second touch of an axis the Zero step halves (LIO-451): where the
+/// edge finder touches the + face (work coordinates, `contact`), whether
+/// what it touches is round there, and what the DRO reads there after
+/// the − face was set to 0: the width between the touches plus the
+/// finder's diameter, a check on the blank, not a number to type.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Far {
+    pub at: [f32; 3],
+    pub round: bool,
+    pub reads: f32,
+}
 #[derive(Debug, Clone, PartialEq)]
 pub enum Step {
     /// The stock box the setup starts from, what the vise or clamps hold,
@@ -67,17 +78,22 @@ pub enum Step {
         vise: Option<Vise>,
     },
     /// The work zero, `corner` on the DRO, picked up with an edge finder of
-    /// diameter `finder` and the DRO's compensation off: X and Y each touch
-    /// one face (`approach`: −1 the − face from outside it, +1 the + face; a
-    /// centre zero touches the − face) and are set there to `touch`, the
-    /// face less or plus the finder's radius; Z touches the top, set to
-    /// `touch[2]`. `at` is where each of X and Y is touched (work
-    /// coordinates, `contact`), which `touch` is set from: on the box's face
-    /// at the top's height when the face reaches it, lower where earlier
-    /// setups cut the top of the face back, and on the outermost material
-    /// above the holding's jaws when that face is only in them; `round`
-    /// whether what it touches is round there (turned), so that the touch
-    /// is true only on its centre line, where it stands out farthest.
+    /// diameter `finder` and the DRO's compensation off. An axis whose zero
+    /// is on a face touches that face (`approach`: −1 the − face from
+    /// outside it, +1 the + face) and is set there to `touch`, the face
+    /// less or plus the finder's radius. An axis whose zero is at the
+    /// middle is halved (LIO-451): it touches its − face (`approach` −1) and
+    /// is set to 0 there, then touches its + face (`far`), where the DRO
+    /// reads about the stock's width plus the finder's diameter, and is set
+    /// there to `touch`, half of that reading, which puts 0 midway whatever
+    /// the blank's real size. Z touches the top, set to `touch[2]`. `at` is
+    /// where each of X and Y is first touched (work coordinates,
+    /// `contact`), which `touch` is set from: on the box's face at the
+    /// top's height when the face reaches it, lower where earlier setups
+    /// cut the top of the face back, and on the outermost material above
+    /// the holding's jaws when that face is only in them; `round` whether
+    /// what it touches is round there (turned), so that the touch is true
+    /// only on its centre line, where it stands out farthest.
     Zero {
         corner: [f32; 3],
         approach: [i8; 2],
@@ -85,6 +101,7 @@ pub enum Step {
         finder: f32,
         at: [[f32; 3]; 2],
         round: [bool; 2],
+        far: [Option<Far>; 2],
     },
     /// Set the gear to `rpm` for the tool `tool` (an id). With `top`, a new
     /// tool: put it in, touch the stock's top with it and set Z to `top`
@@ -1553,6 +1570,8 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
         .filter(|d| *d > 0.)
         .ok_or("Enter the edge finder's diameter on the manual mill.")?;
     let approach = found.0.map(|a| if a == At::Max { 1 } else { -1 });
+    // A zero at the middle is found by halving between both faces.
+    let halve = found.0.map(|a| a == At::Mid);
     // The finder touches clear above what the holding's jaws reach: a
     // vise's grip above where the stock stands, soft jaws' or a collet's
     // above the bar's bottom (a V-block holds a bar from below).
@@ -1563,15 +1582,31 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
         }
         _ => None,
     };
-    let touch = |k: usize, clear: f32| {
-        let above = jaws.map_or(f32::NEG_INFINITY, |top| top + clear);
-        contact(&before, frame, stock, k, approach[k] > 0, above)
+    // Where axis `k` is touched from its + side when `plus`: clear above
+    // the jaws, else just above them.
+    let touch = |k: usize, plus: bool| {
+        let near = |clear: f32| {
+            let above = jaws.map_or(f32::NEG_INFINITY, |top| top + clear);
+            contact(&before, frame, stock, k, plus, above)
+        };
+        near(FINDER_CLEAR)
+            .or_else(|| near(FINDER_LEAST))
+            .ok_or(NOT_CLEAR)
     };
     let mut touched = [([0.; 3], false); 2];
-    for (k, t) in touched.iter_mut().enumerate() {
-        *t = (touch(k, FINDER_CLEAR))
-            .or_else(|| touch(k, FINDER_LEAST))
-            .ok_or(NOT_CLEAR)?;
+    let mut far: [Option<Far>; 2] = [None; 2];
+    for k in 0..2 {
+        touched[k] = touch(k, approach[k] > 0)?;
+        if halve[k] {
+            let (at, round) = touch(k, true)?;
+            far[k] = Some(Far {
+                at: std::array::from_fn(|i| at[i] - zero[i]),
+                round,
+                // Set to 0 with the finder's centre a radius outside the −
+                // face, read with it a radius outside the + face.
+                reads: at[k] - touched[k].0[k] + finder,
+            });
+        }
     }
     let mut steps = vec![
         Step::Hold {
@@ -1587,15 +1622,20 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
         Step::Zero {
             corner: std::array::from_fn(|k| found.1[k] - zero[k]),
             approach,
-            // Set to the face it touches, less or plus the finder's radius.
-            touch: std::array::from_fn(|k| match approach.get(k) {
-                Some(1) => touched[k].0[k] + finder / 2. - zero[k],
-                Some(_) => touched[k].0[k] - finder / 2. - zero[k],
-                None => stock.max[2] - zero[2],
+            // Set to the face it touches, less or plus the finder's radius;
+            // a halved axis at its + face, to where the finder's centre is
+            // there: half the reading when the touches are either side of
+            // the zero alike.
+            touch: std::array::from_fn(|k| match (approach.get(k), far.get(k)) {
+                (_, Some(Some(f))) => f.at[k] + finder / 2.,
+                (Some(1), _) => touched[k].0[k] + finder / 2. - zero[k],
+                (Some(_), _) => touched[k].0[k] - finder / 2. - zero[k],
+                (None, _) => stock.max[2] - zero[2],
             }),
             finder,
             at: std::array::from_fn(|k| std::array::from_fn(|i| touched[k].0[i] - zero[i])),
             round: touched.map(|(_, round)| round),
+            far,
         },
     ];
     let mut sections = vec![Section {
@@ -3582,6 +3622,8 @@ pub(crate) mod tests {
                 // middles, on the top.
                 at: [[0., 60., 0.], [62., 0., 0.]],
                 round: [false, false],
+                // A corner: no axis is halved.
+                far: [None; 2],
             }
         );
         let Step::Face {
@@ -3947,6 +3989,33 @@ pub(crate) mod tests {
             close(touch[2] - at[k][2], 23.);
         }
         assert_eq!(*round, [true, true]);
+        // With the zero on the top's centre, each axis is halved across
+        // the Ø30 (LIO-451): both sides on the centre line, as low, round
+        // both; the DRO reads 30 + Ø10 on the + side and is set to half.
+        let mut job = job;
+        (job.setups[1].p).insert("origin".into(), "Stock top center".into());
+        let guide = build(&job, &mesh, 1).unwrap();
+        let Step::Zero {
+            touch,
+            at,
+            round,
+            far,
+            ..
+        } = &guide.steps[1]
+        else {
+            panic!("{:?}", guide.steps[1])
+        };
+        assert_eq!(*round, [true, true]);
+        for k in 0..2 {
+            let f = far[k].unwrap();
+            assert!(f.round);
+            close(at[k][k], -15.);
+            close(f.at[k], 15.);
+            close(f.at[1 - k], 0.);
+            close(f.at[2], at[k][2]);
+            close(f.reads, 40.);
+            close(touch[k], 20.);
+        }
     }
     #[test]
     fn the_zero_takes_the_edge_finders_radius_off_each_face_it_touches() {
@@ -3957,15 +4026,38 @@ pub(crate) mod tests {
             .machine
             .p
             .insert("edge_finder".into(), "6".into());
-        // 124 × 120 × 47 stock: the back-right corner, the centre, the bottom.
-        for (origin, corner, approach, touch) in [
-            ("Stock top back-right", [0., 0., 0.], [1, 1], [3., 3., 0.]),
-            ("Stock top center", [0., 0., 0.], [-1, -1], [-65., -63., 0.]),
+        // 124 × 120 × 47 stock: the back-right corner, the centre, the
+        // middle of the front edge, the bottom. A middle is halved
+        // (LIO-451): set at the + face to half of what the DRO reads there,
+        // the width plus the finder's diameter.
+        for (origin, corner, approach, touch, reads) in [
+            (
+                "Stock top back-right",
+                [0., 0., 0.],
+                [1, 1],
+                [3., 3., 0.],
+                [None, None],
+            ),
+            (
+                "Stock top center",
+                [0., 0., 0.],
+                [-1, -1],
+                [65., 63., 0.],
+                [Some(130.), Some(126.)],
+            ),
+            (
+                "Stock top front",
+                [0., 0., 0.],
+                [-1, -1],
+                [65., -3., 0.],
+                [Some(130.), None],
+            ),
             (
                 "Stock bottom front-left",
                 [0., 0., 47.],
                 [-1, -1],
                 [-3., -3., 47.],
+                [None, None],
             ),
         ] {
             doc.setups[0].p.insert("origin".into(), origin.into());
@@ -3975,6 +4067,7 @@ pub(crate) mod tests {
                 approach: a,
                 touch: t,
                 finder,
+                far,
                 ..
             } = &guide.steps[1]
             else {
@@ -3985,6 +4078,13 @@ pub(crate) mod tests {
                 close(c[k], corner[k]);
                 close(t[k], touch[k]);
             }
+            for k in 0..2 {
+                match (far[k], reads[k]) {
+                    (Some(f), Some(r)) => close(f.reads, r),
+                    (None, None) => {}
+                    other => panic!("{origin} axis {k}: {other:?}"),
+                }
+            }
         }
         doc.setups[0]
             .machine
@@ -3992,6 +4092,97 @@ pub(crate) mod tests {
             .insert("edge_finder".into(), "0".into());
         let error = build(&doc, &mesh, 0).unwrap_err();
         assert!(error.contains("edge finder"), "{error}");
+    }
+    /// What a DRO shows at the work zero after the Zero step's touches on
+    /// axis `k` (X or Y) of `zero`, for a blank whose faces are where
+    /// `faces` (work coordinates) say, which may differ from the
+    /// drawing's: the edge finder's centre stands a radius outside each
+    /// face touched, the axis is set as the step says, and the reading
+    /// at the work zero is what the DRO then shows there.
+    fn dro_at_zero(zero: &Step, k: usize, faces: [f32; 2]) -> f32 {
+        let Step::Zero {
+            approach,
+            touch,
+            finder,
+            far,
+            ..
+        } = zero
+        else {
+            panic!("{zero:?}")
+        };
+        let r = finder / 2.;
+        // The DRO reads `position - offset`; each set picks the offset.
+        // Halved: 0 on the − face, then the + face set to `touch`, which
+        // replaces it.
+        let offset = match far[k] {
+            Some(_) => (faces[1] + r) - touch[k],
+            None if approach[k] > 0 => (faces[1] + r) - touch[k],
+            None => (faces[0] - r) - touch[k],
+        };
+        -offset
+    }
+    #[test]
+    fn a_centre_zero_is_found_by_halving_between_both_faces() {
+        let (mut doc, mesh) = job("Yes");
+        doc.setups[0].operations.drain(..2);
+        doc.setups[0]
+            .p
+            .insert("origin".into(), "Stock top center".into());
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let zero = &guide.steps[1];
+        let Step::Zero {
+            approach,
+            touch,
+            finder,
+            at,
+            far,
+            ..
+        } = zero
+        else {
+            panic!("{zero:?}")
+        };
+        assert_eq!((*approach, *finder), ([-1, -1], 10.));
+        // The 124 × 120 block: the − faces at −62 and −60, the + faces at
+        // +62 and +60, each touched at the middle of the other axis, on
+        // the top.
+        let far = far.map(Option::unwrap);
+        for (k, half) in [(0, 62.), (1, 60.)] {
+            close(at[k][k], -half);
+            close(far[k].at[k], half);
+            close(at[k][1 - k], 0.);
+            close(far[k].at[1 - k], 0.);
+            close(at[k][2], 0.);
+            close(far[k].at[2], 0.);
+            // The DRO reads the width plus the Ø10 finder there: a check.
+            close(far[k].reads, 2. * half + 10.);
+            // Set to half the reading: the finder's radius cancels.
+            close(touch[k], far[k].reads / 2.);
+        }
+        close(touch[2], 0.);
+        // On the drawing's blank, the DRO reads 0 at the work zero.
+        for k in 0..2 {
+            let half = [62., 60.][k];
+            close(dro_at_zero(zero, k, [-half, half]), 0.);
+        }
+        // A sawn blank 1 mm wider on X, 0.6 mm narrower on Y than drawn,
+        // its middle on the drawing's: halving, with ½ taking half of what
+        // the DRO really reads, still puts 0 on its middle, where one touch
+        // on the − face set to the drawing's half (the step before
+        // LIO-451) is off by half the error.
+        for (k, faces, error) in [(0, [-62.5, 62.5], 0.5), (1, [-59.7, 59.7], -0.3)] {
+            let read = (faces[1] + 5.) - (faces[0] - 5.);
+            let mut halved = zero.clone();
+            let mut one_face = zero.clone();
+            if let Step::Zero { touch, .. } = &mut halved {
+                touch[k] = read / 2.;
+            }
+            if let Step::Zero { touch, far, .. } = &mut one_face {
+                touch[k] = -[62., 60.][k] - 5.;
+                far[k] = None;
+            }
+            close(dro_at_zero(&halved, k, faces), 0.);
+            close(dro_at_zero(&one_face, k, faces), error);
+        }
     }
     #[test]
     fn a_squaring_box_is_one_square_step_cut_to_the_wall() {

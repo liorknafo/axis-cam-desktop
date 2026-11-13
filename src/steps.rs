@@ -2857,15 +2857,25 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             finder,
             at,
             round,
+            far,
             ..
         } => {
             let stock = p.shown.boxes[0];
             let sides = [["left", "right"], ["front", "back"]];
             let side = |k: usize| sides[k][usize::from(approach[k] > 0)];
-            // How far under the top each face is touched: 0 at the top.
-            let under = |k: usize| {
-                let d: f32 = stock.max[2] - at[k][2];
+            // How far under the top a face is touched at `at`: 0 at the top.
+            let under = |at: [f32; 3]| {
+                let d: f32 = stock.max[2] - at[2];
                 if d > 0.5 { d } else { 0. }
+            };
+            // "touch the left face" or "touch left face 3 under top".
+            let touching = |name: &str, at: [f32; 3]| {
+                let d = under(at);
+                if d > 0. {
+                    format!("touch {name} face {} under top", mm(d))
+                } else {
+                    format!("touch the {name} face")
+                }
             };
             // The work Z 0 is on the top, or the top is at a height.
             let top = touch[2].abs() < 0.005;
@@ -2877,17 +2887,30 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 let r = (at[0][0] - centre[0]).abs();
                 shapes.push(Shape::Round(centre, r, format!("Ø{} touched", mm(2. * r))));
             }
+            // A halved axis (LIO-451): 0 on its − face, then half of what
+            // the DRO reads on its + face; else the one face's number.
             for k in 0..2 {
-                let at = at[k];
                 let mut from = [0.; 2];
                 from[k] = f32::from(approach[k].signum());
-                let set = format!("{} {}", AXES[k], dro(touch[k]));
-                shapes.push(Shape::Finder(at, from, set));
+                match far[k] {
+                    Some(f) => {
+                        shapes.push(Shape::Finder(at[k], from, format!("{} 0", AXES[k])));
+                        from[k] = 1.;
+                        let read = format!("{} {} → ½", AXES[k], dro(f.reads));
+                        shapes.push(Shape::Finder(f.at, from, read));
+                    }
+                    None => {
+                        let set = format!("{} {}", AXES[k], dro(touch[k]));
+                        shapes.push(Shape::Finder(at[k], from, set));
+                    }
+                }
             }
-            // Off the middle lines, where a round's finders come in.
+            // Off the middle lines, where the finders of a round or a
+            // halved axis come in: a fifth in from the left, clear of the
+            // back finder's label on a thin stock (LIO-451).
             shapes.push(Shape::Word(
                 [
-                    (stock.min[0] + stock.max[0]) / 2. - 12.,
+                    stock.min[0] + (stock.max[0] - stock.min[0]) * 0.2,
                     stock.min[1] + (stock.max[1] - stock.min[1]) * 0.75,
                     0.,
                 ],
@@ -2898,44 +2921,85 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 },
                 INK,
             ));
-            let rows = (0..3).map(|k| {
-                let what = if k == 2 {
-                    "touch the top → set".to_string()
-                } else if under(k) > 0. {
-                    format!("touch {} face {} under top → set", side(k), mm(under(k)))
-                } else {
-                    format!("touch the {} face → set", side(k))
+            // Each row: what to do, the axis, its number and tags.
+            let mut todo: Vec<(String, usize, f32, Vec<String>)> = vec![];
+            for k in 0..2 {
+                let Some(f) = far[k] else {
+                    todo.push((
+                        format!("{} → set", touching(side(k), at[k])),
+                        k,
+                        touch[k],
+                        vec![],
+                    ));
+                    continue;
                 };
-                readout(
-                    Readout {
-                        order: Some(k as u8 + 1),
-                        lead: Some(what),
-                        axis: AXES[k].into(),
-                        value: dro(touch[k]),
-                        lock: None,
-                        tags: vec![],
-                        lit: lit(k, p.item),
-                        big: false,
-                    },
-                    Some(Message::Guide(GuideAction::Reached(k))),
-                )
-            });
+                todo.push((
+                    format!("{} → set", touching(sides[k][0], at[k])),
+                    k,
+                    0.,
+                    vec![],
+                ));
+                // One row for the + face: what the DRO reads there first,
+                // a check, under it; then half of that, or more or less
+                // when the touches are not either side of the zero alike.
+                let off = touch[k] - f.reads / 2.;
+                let reads = format!("reads about {} first, a check", dro(f.reads));
+                let (how, then) = if off.abs() < 0.005 {
+                    ("½", "press ½ or set half of it".to_string())
+                } else {
+                    let sign = if off > 0. { "+" } else { "−" };
+                    ("set", format!("set half of it {sign} {}", mm(off.abs())))
+                };
+                todo.push((
+                    format!("{} → {how}", touching(sides[k][1], f.at)),
+                    k,
+                    touch[k],
+                    vec![reads, then],
+                ));
+            }
+            todo.push(("touch the top → set".into(), 2, touch[2], vec![]));
+            let rows = todo
+                .into_iter()
+                .enumerate()
+                .map(|(i, (what, k, value, tags))| {
+                    readout(
+                        Readout {
+                            order: Some(i as u8 + 1),
+                            lead: Some(what),
+                            axis: AXES[k].into(),
+                            value: dro(value),
+                            lock: None,
+                            tags,
+                            lit: lit(i, p.item),
+                            big: false,
+                        },
+                        Some(Message::Guide(GuideAction::Reached(i))),
+                    )
+                });
             let mut c = vec![
                 chip(format!("Ø{} edge finder", mm(*finder))),
                 warn_chip("DRO comp off"),
             ];
             // On a round the finder trips farthest out on its centre line,
             // where the drawing puts it; off it the DRO reads short.
-            if round.iter().any(|r| *r) {
+            if round
+                .iter()
+                .chain(far.iter().flatten().map(|f| &f.round))
+                .any(|r| *r)
+            {
                 c.push(warn_chip("round: touch on its centre line"));
             }
             let right = column![chips(c), label("Touch, then set the DRO"),].extend(rows);
-            (
-                "Zero".into(),
-                "pick up the corner",
-                p.drawing(0, stock, shapes, Fill),
-                right,
-            )
+            // A corner is picked up; a middle is found (LIO-451).
+            let sub = match (far[0].is_some(), far[1].is_some()) {
+                (true, true) => "find the centre",
+                (true, false) if approach[1] > 0 => "find the middle of the back edge",
+                (true, false) => "find the middle of the front edge",
+                (false, true) if approach[0] > 0 => "find the middle of the right edge",
+                (false, true) => "find the middle of the left edge",
+                (false, false) => "pick up the corner",
+            };
+            ("Zero".into(), sub, p.drawing(0, stock, shapes, Fill), right)
         }
         Step::Tool {
             op,
@@ -5896,6 +5960,115 @@ pub(crate) mod tests {
         assert_eq!(after(&t, "touch the left face → set"), ["X", "−5.00"]);
         assert_eq!(after(&t, "touch the front face → set"), ["Y", "−5.00"]);
         assert_eq!(after(&t, "touch the top → set"), ["Z", "0.00"]);
+        // A corner is picked up, one face an axis.
+        assert!(has(&a, "pick up the corner"));
+        assert!(
+            !t.iter().any(|s| s.contains("reads") || s.contains('½')),
+            "{t:?}"
+        );
+    }
+    /// The rows of the Zero page from "TOUCH, THEN SET THE DRO" on: each
+    /// row's order (or ✓ when reached), lead, axis, number and tags.
+    fn zero_rows(t: &[String]) -> Vec<String> {
+        let i = (t.iter().position(|s| s == "TOUCH, THEN SET THE DRO")).unwrap();
+        let end = (t.iter().position(|s| s == "◀ Back")).unwrap();
+        t[i + 1..end].to_vec()
+    }
+    #[test]
+    fn a_centre_zero_is_found_by_halving_each_axis_between_its_faces() {
+        // The 124 × 120 block with its zero at the top's centre (LIO-451).
+        let mut a = app_with("Yes", |doc| {
+            doc.setups[0].operations.drain(..2);
+            (doc.setups[0].p).insert("origin".into(), "Stock top center".into());
+        });
+        send(&mut a, GuideAction::Go(1));
+        let t = texts(&a);
+        assert!(has(&a, "find the centre"), "{t:?}");
+        assert!(!has(&a, "pick up the corner"), "{t:?}");
+        // X: 0 on the left, then on the right, where the DRO reads 124 +
+        // Ø10 (a check), ½ makes it 67; then Y the same over 120; then Z on
+        // the top. In order 1 to 5.
+        assert_eq!(
+            zero_rows(&t),
+            [
+                "1",
+                "touch the left face → set",
+                "X",
+                "0.00",
+                "2",
+                "touch the right face → ½",
+                "X",
+                "67.00",
+                "reads about 134.00 first, a check · press ½ or set half of it",
+                "3",
+                "touch the front face → set",
+                "Y",
+                "0.00",
+                "4",
+                "touch the back face → ½",
+                "Y",
+                "65.00",
+                "reads about 130.00 first, a check · press ½ or set half of it",
+                "5",
+                "touch the top → set",
+                "Z",
+                "0.00",
+            ]
+        );
+        // Each row reached in turn is ticked, the next one is lit.
+        for n in 0..5 {
+            send(&mut a, GuideAction::Reached(n));
+            let rows = zero_rows(&texts(&a));
+            let ticks = rows.iter().filter(|s| *s == "✓").count();
+            assert_eq!(ticks, n + 1, "{rows:?}");
+            if n < 4 {
+                assert!(rows.contains(&(n + 2).to_string()), "{rows:?}");
+            }
+        }
+        // The middle of the front edge: X halved, Y on the front face.
+        let mut a = app_with("Yes", |doc| {
+            doc.setups[0].operations.drain(..2);
+            (doc.setups[0].p).insert("origin".into(), "Stock top front".into());
+        });
+        send(&mut a, GuideAction::Go(1));
+        let t = texts(&a);
+        assert!(has(&a, "find the middle of the front edge"), "{t:?}");
+        let rows = zero_rows(&t);
+        assert_eq!(after(&rows, "touch the left face → set"), ["X", "0.00"]);
+        assert_eq!(after(&rows, "touch the right face → ½"), ["X", "67.00"]);
+        assert_eq!(after(&rows, "touch the front face → set"), ["Y", "−5.00"]);
+        assert!(!rows.iter().any(|s| s.contains("back")), "{rows:?}");
+        assert!(rows.contains(&"4".to_string()) && !rows.contains(&"5".to_string()));
+    }
+    #[test]
+    fn a_halved_axis_whose_touches_are_off_centre_says_how_far_from_half() {
+        // The touches' middle 1.5 mm off the zero on X (a face only in the
+        // jaws, touched on what stands out above them): the + face is set
+        // to half the reading less 1.5, not with ½.
+        let mut a = app_with("Yes", |doc| {
+            doc.setups[0].operations.drain(..2);
+            (doc.setups[0].p).insert("origin".into(), "Stock top center".into());
+        });
+        let Some((_, Ok(shown))) = &mut a.guide else {
+            panic!()
+        };
+        let shown = Arc::get_mut(shown).unwrap();
+        let Step::Zero { touch, .. } = &mut shown.guide.steps[1] else {
+            panic!()
+        };
+        touch[0] -= 1.5;
+        send(&mut a, GuideAction::Go(1));
+        let rows = zero_rows(&texts(&a));
+        let i = (rows.iter().position(|s| s == "touch the right face → set")).unwrap();
+        assert_eq!(
+            rows[i + 1..i + 4],
+            [
+                "X",
+                "65.50",
+                "reads about 134.00 first, a check · set half of it − 1.5"
+            ]
+        );
+        assert_eq!(after(&rows, "touch the back face → ½"), ["Y", "65.00"]);
     }
     #[test]
     fn a_pass_shows_its_number_and_its_readouts_in_order() {
@@ -7146,6 +7319,61 @@ pub(crate) mod tests {
         );
         assert!(!t.iter().any(|s| s == "21.00"), "{t:?}");
     }
+    /// LIO-451 on a private copy of the adapter plate (`AXIS_ADAPTER_COPY`):
+    /// each setup's Zero page, first row and the last row lit, as PNGs and
+    /// texts, and every other step of each setup (`later-steps.txt`), so
+    /// that a change to how zero is found can be shown to leave them alone.
+    #[test]
+    #[ignore = "private adapter copy: AXIS_ADAPTER_COPY"]
+    fn render_the_adapter_plate_zero_lio_451() {
+        let dir = std::path::PathBuf::from(std::env::var_os("AXIS_ADAPTER_COPY").unwrap());
+        let mut doc = crate::storage::load(&dir.join("adapter-plate.axis.json")).unwrap();
+        doc.file.as_mut().unwrap().path = dir.join("adapter-plate.step");
+        let mesh = crate::mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
+        let mut a = App::from_workspace(dir.join("render-state.axis.json"), None);
+        a.doc = doc;
+        a.imported_mesh = Some(mesh);
+        a.window_width = 1440.;
+        a.window_height = 1000.;
+        a.page = crate::Page::Control;
+        let (mut said, mut later) = (String::new(), String::new());
+        for si in 0..a.doc.setups.len() {
+            let id = a.doc.setups[si].id.clone();
+            a.doc.active = id.clone();
+            build(&mut a);
+            let g = guide(&a);
+            let at = (g.steps.iter())
+                .position(|s| matches!(s, Step::Zero { .. }))
+                .unwrap();
+            for (i, s) in g.steps.iter().enumerate() {
+                if i != at {
+                    later += &format!("setup {} step {i}: {s:?}\n", si + 1);
+                }
+            }
+            said += &format!("== setup {} {:?}\n", si + 1, g.steps[at]);
+            for item in [0, 9] {
+                a.doc.guide.insert(id.clone(), at);
+                a.guide_item = item;
+                let name = format!("zero-setup-{}-item-{item}", si + 1);
+                let t = crate::ui::probe::texts(a.view(), Size::new(1440., 1000.));
+                said += &format!("-- {name}\n{}\n", t.join(" | "));
+                render(&a, (1440, 1000), &dir.join(format!("{name}.png")));
+            }
+            // The smallest window the app is laid out for: all five rows.
+            a.guide_item = 0;
+            (a.window_width, a.window_height) = (1024., 700.);
+            let t = crate::ui::probe::texts(a.view(), Size::new(1024., 700.));
+            assert!(t.iter().any(|s| s == "touch the top → set"), "{t:?}");
+            render(
+                &a,
+                (1024, 700),
+                &dir.join(format!("zero-setup-{}-1024.png", si + 1)),
+            );
+            (a.window_width, a.window_height) = (1440., 1000.);
+        }
+        std::fs::write(dir.join("zero.txt"), said).unwrap();
+        std::fs::write(dir.join("later-steps.txt"), later).unwrap();
+    }
     /// The Steps page at 1280 × 800, one PNG per kind of step, in
     /// /tmp/manual-steps.
     #[test]
@@ -7351,6 +7579,13 @@ pub(crate) mod tests {
             a.doc.guide.insert(id, step);
             render(&a, (1280, 800), &dir.join(format!("mill-{name}.png")));
         }
+        // Its zero on the top's centre: each axis halved across the Ø30
+        // (LIO-451).
+        (a.doc.setups[1].p).insert("origin".into(), "Stock top center".into());
+        build(&mut a);
+        let id = a.doc.setups[1].id.clone();
+        a.doc.guide.insert(id, 1);
+        render(&a, (1280, 800), &dir.join("mill-zero-centre.png"));
         // The short part in soft jaws: touched on its Ø20 above them.
         let (doc, mesh, report, plan) = crate::guide::tests::short_part_in_soft_jaws();
         let job = crate::proposal::build(&doc, &mesh, &report, &plan).unwrap();
