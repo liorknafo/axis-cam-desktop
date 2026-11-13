@@ -5775,7 +5775,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 [[package]]
 name = "uc100"
 version = "0.1.0"
-source = "git+https://github.com/liorknafo/UC100-driver.git?rev=35cf9d77103481a6975166a28aef1635d8c69ee1#35cf9d77103481a6975166a28aef1635d8c69ee1"
+source = "git+https://github.com/liorknafo/UC100-driver.git?rev=e1fadccf48b93f8bff3200d4ebb71d84a0325f99#e1fadccf48b93f8bff3200d4ebb71d84a0325f99"
 dependencies = [
  "anyhow",
  "clap",
@@ -5793,7 +5793,7 @@ dependencies = [
 [[package]]
 name = "uc100-remote"
 version = "0.1.0"
-source = "git+https://github.com/liorknafo/uc100-server.git?rev=8801fe67b1f8c0ecfb011c59d3fed28fd4889e00#8801fe67b1f8c0ecfb011c59d3fed28fd4889e00"
+source = "git+https://github.com/liorknafo/uc100-server.git?rev=11383de5b7e458b530a6ea2835cfd213ca5b8bfa#11383de5b7e458b530a6ea2835cfd213ca5b8bfa"
 dependencies = [
  "clap",
  "env_logger",
