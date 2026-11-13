@@ -6099,14 +6099,14 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(
             rows[i + 1..i + 4],
-            ["Y", "0.00", "at X −39, clear of the clamps"]
+            ["Y", "0.00", "at X −39.3, clear of the clamps"]
         );
         let i = rows
             .iter()
             .position(|s| s == "touch the back face → ½")
             .unwrap();
         assert!(
-            rows[i + 3].starts_with("at X −39, clear of the clamps · reads about"),
+            rows[i + 3].starts_with("at X −39.3, clear of the clamps · reads about"),
             "{rows:?}"
         );
         // X is touched as without them.
