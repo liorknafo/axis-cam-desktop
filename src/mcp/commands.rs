@@ -8,7 +8,10 @@
 //! Setups and operations are given by id or by index; an index is turned
 //! into the id when the call arrives. A command that acts on the selected
 //! setup or operation selects the one given first, in the same turn.
-use super::class::{self, Class};
+use super::{
+    class::{self, Class},
+    fields,
+};
 use crate::{
     App, GuideAction, Message, Page, Target, control, model::Strategy, run, section, settings,
     stock_surface, ui, viewport,
@@ -31,8 +34,20 @@ pub struct Ctx<'a> {
     pub setup: Option<usize>,
     /// The operation an operation command acts on: (setup, operation).
     pub operation: Option<(usize, usize)>,
+    /// The fields `edit_field` may set, as the editors now draw them
+    /// (`fields::of`), or why they could not be listed. Only `edit_field`
+    /// has them.
+    pub fields: Option<Result<Vec<ui::FieldInfo>, String>>,
 }
 impl Ctx<'_> {
+    /// The fields `edit_field` checks its key against.
+    fn listed(&self) -> Result<&[ui::FieldInfo], Problem> {
+        match &self.fields {
+            Some(Ok(fields)) => Ok(fields),
+            Some(Err(why)) => refused(why.clone()),
+            None => refused("The editor's fields were not listed."),
+        }
+    }
     fn op(&self) -> Option<&crate::model::Operation> {
         let (si, oi) = self.operation?;
         self.app.doc.setups.get(si)?.operations.get(oi)
@@ -40,7 +55,7 @@ impl Ctx<'_> {
 }
 
 /// Why a command is not sent.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Problem {
     /// Its arguments do not read: an error of the call.
     Args(String),
@@ -652,36 +667,6 @@ fn overwrite_param() -> (&'static str, Value, bool) {
         bool_param("Replace a file that is there already."),
         false,
     )
-}
-
-/// A field key typed by the agent, as the `&'static str` an `Edit` carries.
-/// Each key is kept once, a few thousand at most. The key is checked against
-/// the editor's own fields in Step 5 (`list_fields`), which then gives the
-/// field's key instead.
-fn field_key(key: &str) -> Result<&'static str, Problem> {
-    use std::sync::Mutex;
-    static KEYS: Mutex<std::collections::BTreeSet<&'static str>> =
-        Mutex::new(std::collections::BTreeSet::new());
-    let named = !key.is_empty()
-        && key.len() <= 64
-        && key
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-    if !named {
-        return bad(format!(
-            "\"{key}\" is not a field key: keys are lower case letters, digits and _."
-        ));
-    }
-    let mut keys = KEYS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(k) = keys.get(key) {
-        return Ok(k);
-    }
-    if keys.len() >= 4096 {
-        return refused("Too many different field keys were given in this session.");
-    }
-    let k: &'static str = Box::leak(key.to_string().into_boxed_str());
-    keys.insert(k);
-    Ok(k)
 }
 
 /// The tabs an operation editor has, over every strategy.
@@ -1323,20 +1308,20 @@ fn table() -> Vec<Command> {
         cmd("box_from_face", "operation").sends(|| Message::BoxFromFace).on_operation().effect("The Box's six fields from its picked face."),
         cmd("pick_all_corners", "operation").sends(|| Message::AllCorners).on_operation().effect("Every rounded outside corner picked for Round corners."),
         cmd("edit_field", "operation")
-            .text("Sets one field of an operation, a setup, or the machine, tool, material or holder draft, as typing in the editor does. The machine's controller fields (uc100_profile, uc100_connection, pi_*) and a lathe's cross-slide dial reading (cross_reads) are the user's.")
+            .text("Sets one field of an operation, a setup, or the machine, tool, material or holder draft, as typing in the editor does. The key must be one `list_fields` gives for the target as it is now, and a pick list's value one of its choices. The machine's controller fields (uc100_profile, uc100_connection, pi_*) and a lathe's cross-slide dial reading (cross_reads) are the user's.")
             .params(|| {
                 vec![
                     ("target", choice_param(&names(&EDIT_TARGETS)), true),
-                    ("key", text_param("The field's key."), true),
+                    ("key", text_param("The field's key, one `list_fields` gives for the target."), true),
                     ("value", json!({"type": ["string", "number", "boolean"], "description": "The value, as typed."}), true),
                     ("setup", addressed("setup"), false),
                     ("operation", addressed("operation"), false),
                 ]
             })
             .examples(|| vec![json!({"target": "operation", "key": "rpm", "value": "8000"})])
-            // The key and the choices are checked against the editor's own
-            // fields in Step 5 (`list_fields`); here only the machine's
-            // controller fields are refused.
+            // The machine's controller fields and the dial reading are the
+            // user's; any other key must be one the editor draws now, and a
+            // choice one of its choices (`list_fields`, `fields::check`).
             .when(|ctx| {
                 let key = string(ctx, "key")?;
                 if class::machine_key(&key) {
@@ -1347,14 +1332,28 @@ fn table() -> Vec<Command> {
                 if key == "cross_reads" {
                     return refused(format!("The field {key}: {}", class::SHOP_FLOOR));
                 }
-                Ok(())
+                let name = one_of(ctx, "target", &names(&EDIT_TARGETS))?;
+                let target = (EDIT_TARGETS.iter())
+                    .find(|(n, _)| *n == name)
+                    .map_or(Target::Operation, |(_, t)| *t);
+                let value = match arg(ctx, "value")? {
+                    Value::String(s) => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    _ => return bad("`value` is a string, a number or true/false."),
+                };
+                fields::check(ctx.listed()?, target, &key, &value).or_else(refused)
             })
             .with(|ctx| {
                 let name = one_of(ctx, "target", &names(&EDIT_TARGETS))?;
                 let target = (EDIT_TARGETS.iter())
                     .find(|(n, _)| *n == name)
                     .map_or(Target::Operation, |(_, t)| *t);
-                let key = field_key(&string(ctx, "key")?)?;
+                let key = string(ctx, "key")?;
+                let Some(field) = ctx.listed()?.iter().find(|f| f.key == key) else {
+                    return refused(format!("There is no field {key}."));
+                };
+                let key = field.key;
                 let value = match arg(ctx, "value")? {
                     Value::String(s) => s.clone(),
                     Value::Number(n) => n.to_string(),
@@ -3026,7 +3025,12 @@ mod tests {
             .replace("/tmp", &d.folder.display().to_string());
         serde_json::from_str(&text).unwrap()
     }
-    fn ctx<'a>(d: &'a Direct, c: &Command, args: &'a Value) -> Ctx<'a> {
+    fn ctx<'a>(
+        d: &'a Direct,
+        c: &Command,
+        args: &'a Value,
+        fields: Option<Result<Vec<ui::FieldInfo>, String>>,
+    ) -> Ctx<'a> {
         let (setup, operation) = resolve(c.on, &d.app, args).ok().unwrap_or_default();
         Ctx {
             app: &d.app,
@@ -3034,6 +3038,7 @@ mod tests {
             session: Some(&d.folder),
             setup,
             operation,
+            fields,
         }
     }
     /// What tells two messages of one command apart: the variant, and the
@@ -3051,7 +3056,7 @@ mod tests {
         format!("{:?}/{inner}", discriminant(m))
     }
     /// The messages of every command's examples, built on the sample.
-    fn built(d: &Direct) -> Vec<(&'static str, Message)> {
+    fn built(d: &mut Direct) -> Vec<(&'static str, Message)> {
         std::fs::write(d.folder.join("part.stl"), "solid x\nendsolid x\n").unwrap();
         crate::storage::save(&d.folder.join("job.axis.json"), &d.app.doc).unwrap();
         let mut all = vec![];
@@ -3061,7 +3066,8 @@ mod tests {
                 if c.name == "import_model" {
                     args = json!({"path": d.folder.join("part.stl").display().to_string()});
                 }
-                let ctx = ctx(d, c, &args);
+                let fields = (c.name == "edit_field").then(|| fields::of(&mut d.app, &args));
+                let ctx = ctx(d, c, &args, fields);
                 match c.built(&ctx) {
                     Ok(dispatch) => {
                         let outputs = dispatch.task.map(|t| d.outputs(t)).unwrap_or_default();
@@ -3360,7 +3366,7 @@ mod tests {
         let mut d = direct();
         // A project with its file, which Save writes without a path.
         d.app.project_path = Some(d.folder.join("job.axis.json"));
-        let built = built(&d);
+        let built = built(&mut d);
         for m in user_messages() {
             let Class::Command(name) = class::class(&m) else {
                 continue;
@@ -3594,42 +3600,263 @@ mod tests {
         }
         found
     }
-    /// Field keys an `Edit` literal sets that no command sets in this step,
-    /// and why.
-    const KEYS_REFUSED: [(&str, &str); 1] = [(
-        "uc100_profile",
-        "the machine's controller: refused (class::machine_key)",
-    )];
+    /// Where a field was listed: its target, the setup and the operation (by
+    /// index, which two runs of a scene share), and the field.
+    type Listed = (Target, usize, usize, ui::FieldInfo);
+    /// The arguments that address a target's fields at (`si`, `oi`).
+    fn address(d: &Direct, target: Target, si: usize, oi: usize) -> Value {
+        let name = (EDIT_TARGETS.iter().find(|(_, t)| *t == target)).unwrap().0;
+        match target {
+            Target::Setup => json!({"target": name, "setup": si}),
+            Target::Operation => {
+                let id = d.app.doc.setups[si].operations[oi].id.clone();
+                json!({"target": name, "operation": id})
+            }
+            _ => json!({"target": name}),
+        }
+    }
+    /// The fields of every target, as `list_fields` gives them.
+    fn all_fields(d: &mut Direct) -> Vec<Listed> {
+        let mut found = vec![];
+        let mut add = |d: &mut Direct, target: Target, si: usize, oi: usize, args: Value| {
+            for f in fields::of(&mut d.app, &args).unwrap_or_default() {
+                found.push((target, si, oi, f));
+            }
+        };
+        for si in 0..d.app.doc.setups.len() {
+            add(
+                d,
+                Target::Setup,
+                si,
+                0,
+                json!({"target": "setup", "setup": si}),
+            );
+            for oi in 0..d.app.doc.setups[si].operations.len() {
+                let args = address(d, Target::Operation, si, oi);
+                add(d, Target::Operation, si, oi, args);
+            }
+        }
+        for (name, target) in &EDIT_TARGETS[2..] {
+            add(d, *target, 0, 0, json!({"target": name}));
+        }
+        found
+    }
+    /// Every key the fields of `scene` list, and while each of its pick
+    /// lists is set to each choice in turn (a choice brings its own fields: a
+    /// tool's type, a stock's shape, a thread's kind), put back after.
+    fn reached(scene: &dyn Fn(&mut Direct), keys: &mut std::collections::BTreeSet<String>) {
+        let mut d = direct();
+        scene(&mut d);
+        let first = all_fields(&mut d);
+        keys.extend(first.iter().map(|(.., f)| f.key.to_string()));
+        for (target, si, oi, f) in first {
+            for choice in f.choices.iter().flatten() {
+                let edits = |d: &mut Direct, value: &str| {
+                    d.send(Message::SelectSetup(si));
+                    if target == Target::Operation {
+                        d.send(Message::SelectOp(oi));
+                    }
+                    d.send(Message::Edit(target, f.key, value.to_string()));
+                };
+                edits(&mut d, choice);
+                let args = address(&d, target, si, oi);
+                let after = fields::of(&mut d.app, &args).unwrap_or_default();
+                keys.extend(after.iter().map(|f| f.key.to_string()));
+                edits(&mut d, &f.value);
+            }
+        }
+    }
+    /// A part loaded from `format`, not the sample block.
+    fn loaded(d: &mut Direct, format: &str) {
+        d.app.doc.sample_model = false;
+        d.app.doc.file = Some(crate::model::ModelFile {
+            name: format!("part.{format}"),
+            path: PathBuf::from(format!("part.{format}")),
+            format: format.into(),
+            bytes: 1,
+            thickness: None,
+        });
+    }
+    /// Operations of every strategy, of each Drill cycle and of each Turn kind
+    /// in the active setup.
+    fn every_strategy(d: &mut Direct) {
+        use crate::model::{Operation, Strategy};
+        let tool = d.app.doc.tools[0].id.clone();
+        let mut ops: Vec<Operation> = Strategy::ALL
+            .into_iter()
+            .map(|s| Operation::new(s, tool.clone()))
+            .collect();
+        for cycle in [
+            crate::model::THREAD_MILLING,
+            crate::model::TAPPING,
+            crate::model::REAMING,
+            crate::model::BORING,
+        ] {
+            let mut o = Operation::new(Strategy::Drill, tool.clone());
+            o.p.insert("cycle".into(), cycle.into());
+            ops.push(o);
+        }
+        for kind in crate::lathe::TURN_KINDS {
+            let mut o = Operation::new(Strategy::Turn, tool.clone());
+            o.set_turn_kind(kind);
+            ops.push(o);
+        }
+        // A Chamfer along a line, sized by its tip's depth, and a Drill of
+        // the pin holes.
+        let mut line = Operation::new(Strategy::Chamfer, tool.clone());
+        line.p
+            .insert("chamfer_source".into(), crate::chamfer::SOURCES[1].into());
+        line.p
+            .insert("chamfer_size".into(), crate::chamfer::SIZES[1].into());
+        let mut pins = Operation::new(Strategy::Drill, tool);
+        pins.p
+            .insert("holes".into(), crate::model::DRILL_HOLES[1].into());
+        ops.extend([line, pins]);
+        d.app.doc.setup_mut().operations.extend(ops);
+    }
+    /// A fixture: a project made from the sample.
+    type Scene = Box<dyn Fn(&mut Direct)>;
+    /// The scenes the editors' fields are listed on: the sample, and fixtures
+    /// with every kind of setup, an operation of every strategy and a
+    /// draft of every kind, each also as a part loaded from a file.
+    fn scenes() -> Vec<Scene> {
+        let mut all: Vec<Scene> = vec![
+            Box::new(|_| {}),
+            Box::new(every_strategy),
+            Box::new(|d| {
+                for machine in 1..3 {
+                    let id = d.app.doc.machines[machine].id.clone();
+                    run(d, "add_setup", json!({"machine": id})).unwrap();
+                    every_strategy(d);
+                }
+            }),
+            Box::new(|d| {
+                run(d, "add_manual_setup", json!({})).unwrap();
+                every_strategy(d);
+            }),
+            Box::new(|d| {
+                run(d, "add_lathe_setup", json!({})).unwrap();
+                every_strategy(d);
+            }),
+            Box::new(|d| {
+                run(d, "new_machine", json!({})).unwrap();
+                run(d, "new_tool", json!({})).unwrap();
+                run(d, "new_material", json!({})).unwrap();
+            }),
+            Box::new(|d| {
+                let s = d.app.doc.setup_mut();
+                s.p.insert("stock_type".into(), crate::sheet::SHEET.into());
+                s.p.insert("holddown".into(), "Screws".into());
+            }),
+        ];
+        for kind in crate::holding::KINDS {
+            all.push(Box::new(move |d| {
+                run(d, "new_holder", json!({"kind": kind})).unwrap();
+            }));
+        }
+        all
+    }
+    /// Field keys that no fixture lists, and why.
+    const KEYS_UNREACHED: [(&str, &str); 10] = [
+        (
+            "cal_distance",
+            "controller setup: the machine's own (class::MACHINE)",
+        ),
+        (
+            "cal_measured",
+            "controller setup: the machine's own (class::MACHINE)",
+        ),
+        (
+            "measured",
+            "the Control page's rotary calibration: the machine's own",
+        ),
+        (
+            "control_rpm",
+            "the Control page's spindle speed: the machine's own",
+        ),
+        ("mdi_line", "the Control page's MDI line: the machine's own"),
+        (
+            "move_target",
+            "the Control page's Move there: the machine's own",
+        ),
+        (
+            "work_set",
+            "the Control page's Work zero: the machine's own",
+        ),
+        (
+            "rotary_bar",
+            "the Control page's rotary probing: the machine's own",
+        ),
+        (
+            "rotary_spacing",
+            "the Control page's rotary probing: the machine's own",
+        ),
+        (
+            "turn_kind",
+            "chosen when the Turn is added (`add_turn`); no editor field sends it",
+        ),
+    ];
+    /// Keys whose edit is a message of its own, and the command that sends it.
+    const KEYS_COVERED: [(&str, &str); 2] =
+        [("clamps", "set_clamps"), ("machines", "tool_machine")];
 
     #[test]
-    fn every_edit_key_in_the_ui_is_reachable() {
+    fn every_field_key_is_listed_or_covered_by_a_command() {
+        let mut listed = std::collections::BTreeSet::new();
+        for scene in scenes() {
+            reached(scene.as_ref(), &mut listed);
+            // The same as a part loaded from a file, which has more fields.
+            let loaded_part = |d: &mut Direct| {
+                scene(d);
+                loaded(d, "stl");
+            };
+            reached(&loaded_part, &mut listed);
+        }
+        // A DXF part is a flat profile with a thickness of its own.
+        reached(&|d| loaded(d, "dxf"), &mut listed);
         let mut literals = edit_literals(include_str!("../ui.rs"));
         literals.extend(edit_literals(include_str!("../main.rs")));
         assert!(literals.len() >= 10, "{literals:?}");
-        let mut d = direct();
-        for (target, key) in literals {
-            let t = EDIT_TARGETS
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(&target))
-                .map(|(_, t)| *t)
-                .unwrap_or_else(|| panic!("target {target}"));
-            let m = Message::Edit(t, field_key(&key).unwrap(), String::new());
-            match class::class(&m) {
-                Class::Command("edit_field") => {
-                    let args = json!({"target": target.to_lowercase(), "key": key, "value": ""});
-                    let r = run(&mut d, "edit_field", args).unwrap();
-                    assert_ne!(r["outcome"], "refused", "{target}.{key}: {r}");
-                }
-                Class::Command(name) => assert!(
-                    find(name).is_some() || LATER.iter().any(|(n, _)| *n == name),
-                    "{target}.{key} is {name}"
-                ),
-                Class::Machine => assert!(
-                    KEYS_REFUSED.iter().any(|(k, _)| *k == key),
-                    "{target}.{key} is refused without a reason listed"
-                ),
-                c => panic!("{target}.{key} is {c:?}"),
+        let mut wanted: Vec<(String, String)> = crate::help::tests::field_keys()
+            .into_iter()
+            .map(|k| ("help".into(), k))
+            .collect();
+        wanted.extend(literals);
+        let mut missing = vec![];
+        for (from, key) in wanted {
+            // The controller's fields and the dial reading are the user's:
+            // refused, not listed.
+            let user = class::machine_key(&key) || key == "cross_reads";
+            let own = !matches!(
+                class::edit(Target::Setup, &key),
+                Class::Command("edit_field") | Class::Machine
+            );
+            let covered = KEYS_COVERED.iter().any(|(k, _)| *k == key);
+            if user
+                || listed.contains(&key)
+                || own
+                || covered
+                || KEYS_UNREACHED.iter().any(|(k, _)| *k == key)
+            {
+                continue;
             }
+            missing.push(format!("{from}: {key}"));
+        }
+        missing.sort();
+        missing.dedup();
+        assert!(missing.is_empty(), "not listed anywhere: {missing:#?}");
+        for (key, _) in KEYS_UNREACHED {
+            assert!(!listed.contains(key), "{key} is listed after all");
+        }
+        for (key, command) in KEYS_COVERED {
+            assert!(find(command).is_some(), "{key}: no command {command}");
+            assert!(!listed.contains(key), "{key} is listed after all");
+        }
+        // Keys with a command of their own are listed, with the command.
+        // `pin_holes` and `pin_place` are drawn only for a part on a
+        // machine with pins, which Step 6's pin commands' tests set up.
+        for key in ["origin", "pin_setup"] {
+            assert!(listed.contains(key), "{key}");
         }
     }
 
@@ -3708,6 +3935,7 @@ mod tests {
             session: Some(&session),
             setup: None,
             operation: None,
+            fields: None,
         };
         assert!(may_write(&c, &session.join("job.axis.json"), None).is_ok());
         assert!(may_write(&c, &data_folder().join("workspace.json"), None).is_err());
@@ -3903,20 +4131,20 @@ mod tests {
                 .any(|h| h.name() == "Test clamp")
         );
         // A machine: unchanged it is no change, and its version stays.
-        let machine = d.app.doc.machines[0].id.clone();
+        let machine = d.app.doc.machines[1].id.clone();
         run(&mut d, "edit_machine", json!({"id": machine})).unwrap();
-        let version = d.app.doc.machines[0].version;
+        let version = d.app.doc.machines[1].version;
         assert_eq!(
             outcome(&run(&mut d, "save_machine", json!({})).unwrap()),
             "no_change"
         );
-        assert_eq!(d.app.doc.machines[0].version, version);
+        assert_eq!(d.app.doc.machines[1].version, version);
         // A typed centreline is no longer the measured one: its marks go.
         let mark = |m: &crate::model::Machine| {
             m.p.contains_key(crate::control::CENTRE_MARK)
                 || m.p.contains_key(crate::model::CENTRE_REF)
         };
-        for m in [&mut d.app.doc.machines[0], &mut d.app.machine_draft] {
+        for m in [&mut d.app.doc.machines[1], &mut d.app.machine_draft] {
             m.p.insert("a_centre_y".into(), "5".into());
             m.p.insert(crate::control::CENTRE_MARK.into(), "1".into());
             m.p.insert(crate::model::CENTRE_REF.into(), "1".into());
@@ -3929,9 +4157,166 @@ mod tests {
         .unwrap();
         let r = run(&mut d, "save_machine", json!({})).unwrap();
         assert_eq!(outcome(&r), "done", "{r}");
-        let saved = &d.app.doc.machines[0];
+        let saved = &d.app.doc.machines[1];
         assert_eq!(crate::model::get(&saved.p, "a_centre_y"), "7");
         assert!(!mark(saved));
         assert_eq!(saved.version, version + 1);
+    }
+
+    fn fields_of(d: &mut Direct, args: Value) -> Vec<Value> {
+        let r = call(d, "list_fields", args).unwrap();
+        r["fields"].as_array().unwrap().clone()
+    }
+    fn keys_of(fields: &[Value]) -> Vec<String> {
+        fields
+            .iter()
+            .map(|f| f["key"].as_str().unwrap().into())
+            .collect()
+    }
+
+    #[test]
+    fn a_key_the_editor_does_not_draw_is_refused_with_the_keys_that_it_does() {
+        let mut d = direct();
+        let before = d.app.doc.clone();
+        let bad = json!({"target": "operation", "key": "no_such_field", "value": "1"});
+        let r = run(&mut d, "edit_field", bad).unwrap();
+        assert_eq!(outcome(&r), "refused", "{r}");
+        let why = r["reason"].as_str().unwrap();
+        assert!(why.contains("no_such_field"), "{why}");
+        assert!(why.contains("feed") && why.contains("rpm"), "{why}");
+        // The same on every target, and a key of another target is no key.
+        for (target, key) in [
+            ("setup", "feed"),
+            ("machine", "rpm_x"),
+            ("tool", "origin"),
+            ("material", "diameter"),
+            ("holder", "feed"),
+        ] {
+            let args = json!({"target": target, "key": key, "value": "1"});
+            let r = run(&mut d, "edit_field", args).unwrap();
+            assert_eq!(outcome(&r), "refused", "{target}.{key}: {r}");
+        }
+        assert_eq!(
+            serde_json::to_value(&d.app.doc).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_value_off_the_choice_list_is_refused_and_one_on_it_is_set() {
+        let mut d = direct();
+        let fields = fields_of(&mut d, json!({"target": "operation"}));
+        let picked = fields
+            .iter()
+            .find(|f| f["choices"].is_array())
+            .expect("an operation has a pick list");
+        let key = picked["key"].as_str().unwrap();
+        let choices: Vec<&str> = (picked["choices"].as_array().unwrap().iter())
+            .map(|c| c.as_str().unwrap())
+            .collect();
+        let off = json!({"target": "operation", "key": key, "value": "not a choice"});
+        let r = run(&mut d, "edit_field", off).unwrap();
+        assert_eq!(outcome(&r), "refused", "{r}");
+        assert!(r["reason"].as_str().unwrap().contains(choices[0]), "{r}");
+        let other = choices
+            .iter()
+            .find(|c| **c != picked["value"].as_str().unwrap())
+            .expect("a second choice");
+        let on = json!({"target": "operation", "key": key, "value": other});
+        let r = run(&mut d, "edit_field", on).unwrap();
+        assert_eq!(outcome(&r), "done", "{r}");
+        let now = fields_of(&mut d, json!({"target": "operation"}));
+        let now = now.iter().find(|f| f["key"] == key).unwrap();
+        assert_eq!(now["value"], *other);
+    }
+
+    #[test]
+    fn a_listed_key_is_edited_on_any_setup_and_operation() {
+        let mut d = direct();
+        // The text field of an operation that is not the selected one, in
+        // the setup that is not the active one.
+        run(&mut d, "add_setup", json!({})).unwrap();
+        run(&mut d, "select_setup", json!({"setup": 0})).unwrap();
+        let args = json!({"target": "operation", "operation": 1, "key": "rpm", "value": "7777"});
+        let r = run(&mut d, "edit_field", args).unwrap();
+        assert_eq!(outcome(&r), "done", "{r}");
+        assert_eq!(
+            crate::model::get(&d.app.doc.setups[0].operations[1].p, "rpm"),
+            "7777"
+        );
+        let args = json!({"target": "setup", "setup": 1, "key": "name", "value": "Second"});
+        let r = run(&mut d, "edit_field", args).unwrap();
+        assert_eq!(outcome(&r), "done", "{r}");
+        assert_eq!(d.app.doc.setups[1].name(), "Second");
+        // A key with a command of its own is refused with its name.
+        let args = json!({"target": "setup", "key": "origin", "value": "G54"});
+        let r = run(&mut d, "edit_field", args).unwrap();
+        assert_eq!(outcome(&r), "refused", "{r}");
+        assert!(r["reason"].as_str().unwrap().contains("set_origin"), "{r}");
+    }
+
+    #[test]
+    fn list_fields_gives_each_tab_and_changes_nothing_the_user_sees() {
+        let mut d = direct();
+        run(&mut d, "add_setup", json!({})).unwrap();
+        run(&mut d, "select_setup", json!({"setup": 0})).unwrap();
+        d.app.tab = "Passes".into();
+        d.app.setup_step = "Stock";
+        d.app.wizard_step = 2;
+        let shown = |d: &Direct| {
+            (
+                d.app.tab.clone(),
+                d.app.setup_step,
+                d.app.wizard_step,
+                d.app.page,
+                d.app.selected,
+                d.app.doc.active.clone(),
+                serde_json::to_string(&d.app.doc).unwrap(),
+            )
+        };
+        let before = shown(&d);
+        let tabs = crate::model::Strategy::Contour.tabs();
+        let ops = fields_of(&mut d, json!({"target": "operation", "operation": 2}));
+        for tab in tabs {
+            assert!(ops.iter().any(|f| f["tab"] == tab), "{tab}: {ops:?}");
+        }
+        let feed = ops.iter().find(|f| f["key"] == "feed").unwrap();
+        assert_eq!(feed["unit"], "mm/min");
+        assert!(!feed["help"].as_str().unwrap().is_empty());
+        // Another setup's operations and steps, the libraries and the wizard.
+        let setup = fields_of(&mut d, json!({"target": "setup", "setup": 1}));
+        for step in crate::ui::SETUP_STEPS {
+            assert!(setup.iter().any(|f| f["tab"] == step), "{step}");
+        }
+        for target in ["machine", "tool", "material", "holder"] {
+            let list = fields_of(&mut d, json!({"target": target}));
+            assert!(!keys_of(&list).is_empty(), "{target}");
+        }
+        assert_eq!(shown(&d), before);
+        // The user's own window shows what it did: the editor of the open tab.
+        let r = call(
+            &mut d,
+            "list_fields",
+            json!({"target": "operation", "operation": 99}),
+        );
+        assert!(r.is_err() || r.unwrap().get("fields").is_none());
+        assert_eq!(shown(&d), before);
+    }
+
+    #[test]
+    fn the_collector_is_off_after_a_listing_and_the_editor_is_the_same_with_it_off() {
+        let mut d = direct();
+        let window = iced::Size::new(1440., 900.);
+        let _ = d.app.update(Message::Resized(window));
+        let page = |d: &Direct| ui::probe::texts(d.app.view(), window);
+        let once = page(&d);
+        assert!(once.iter().any(|t| t.contains("Feed")), "{once:?}");
+        assert!(!ui::recording());
+        fields_of(&mut d, json!({"target": "operation"}));
+        fields_of(&mut d, json!({"target": "setup"}));
+        assert!(!ui::recording());
+        assert_eq!(page(&d), once);
+        // A listing found while a view was built is not kept.
+        assert_eq!(ui::collecting("x", || {}), vec![]);
     }
 }

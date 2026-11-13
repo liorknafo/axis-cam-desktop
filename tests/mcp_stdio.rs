@@ -75,7 +75,13 @@ fn the_server_answers_over_stdio() {
     let tools: Vec<&str> = (answers["2"]["result"]["tools"].as_array().unwrap().iter())
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    for name in ["inspect", "list_commands", "describe_command", "execute"] {
+    for name in [
+        "inspect",
+        "list_fields",
+        "list_commands",
+        "describe_command",
+        "execute",
+    ] {
         assert!(tools.contains(&name), "{tools:?}");
     }
 

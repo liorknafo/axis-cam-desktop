@@ -18,6 +18,7 @@
 //! changed since the agent was last told (`user_changed`). A command may
 //! not change the machinist's records unless the machinist did meanwhile.
 use super::commands::{self, Ctx, Expect, Problem};
+use super::fields;
 use super::state::{self, Change, Entry, Records};
 use crate::{App, Message};
 use iced::Task;
@@ -98,6 +99,21 @@ pub fn tools() -> Value {
             "title": "Inspect the job",
             "description": "The state as the user would read it: the project (title, project file, part, material, whether it is saved), its setups and their operations by id, the selection with its page and tab, the status line, the work still pending, the backend and the session.",
             "inputSchema": {"type": "object", "properties": {"wait_s": wait}},
+            "annotations": {"readOnlyHint": true},
+        },
+        {
+            "name": "list_fields",
+            "title": "List the editable fields",
+            "description": "Every field the user could type into or pick for a target, as the editor draws it now: key, label, tab (or step), value, choices, unit and a line of help. `edit_field` takes only these keys, and a choice only from its choices. An operation's fields are on every tab it has, and the user's open tab is not changed. A key with `command` is set by that command instead.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "enum": fields::TARGETS.map(|(n, _)| n)},
+                    "setup": {"type": ["string", "integer"], "description": "For a setup (or an operation in it): its id or index; default the active setup."},
+                    "operation": {"type": ["string", "integer"], "description": "For an operation: its id or index in the active setup; default the selected one."},
+                },
+                "required": ["target"],
+            },
             "annotations": {"readOnlyHint": true},
         },
         {
@@ -189,7 +205,14 @@ pub fn tools() -> Value {
 pub fn is_tool(tool: &str) -> bool {
     matches!(
         tool,
-        "inspect" | "list_commands" | "describe_command" | "execute" | "batch" | "wait" | "cancel"
+        "inspect"
+            | "list_fields"
+            | "list_commands"
+            | "describe_command"
+            | "execute"
+            | "batch"
+            | "wait"
+            | "cancel"
     )
 }
 
@@ -560,11 +583,15 @@ impl Agent {
     ) {
         // A read takes a snapshot only while no window is open: a wait
         // cannot take the user's work for the agent's.
-        if self.window.is_none() && matches!(tool, "inspect" | "wait" | "cancel") {
+        if self.window.is_none() && matches!(tool, "inspect" | "list_fields" | "wait" | "cancel") {
             b.app_mut().mcp_outside();
         }
         match tool {
             "inspect" => self.give(reply, Ok(inspect(b))),
+            "list_fields" => {
+                let fields = fields::list(b.app_mut(), &args);
+                self.give(reply, fields)
+            }
             "list_commands" => self.give_plain(reply, Ok(list_commands(&args))),
             "describe_command" => self.give_plain(reply, describe_command(&args)),
             "execute" => self.execute(b, &args, deadline, reply),
@@ -712,6 +739,10 @@ impl Agent {
             return Start::Now(refuse(b, LOCKED.into()));
         }
         let folder = b.session_folder();
+        // `edit_field` checks its key against the fields the editor draws,
+        // which building it for another setup or operation needs the `App`
+        // changed for (`fields::of`).
+        let fields = (c.name == "edit_field").then(|| fields::of(b.app_mut(), command_args));
         let prepared = {
             let app = b.app();
             commands::resolve(c.on, app, command_args).and_then(|(setup, operation)| {
@@ -721,6 +752,7 @@ impl Agent {
                     session: folder.as_deref(),
                     setup,
                     operation,
+                    fields,
                 };
                 // Refused first: a command that may not run is never
                 // reported as already done.

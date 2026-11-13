@@ -27,7 +27,7 @@ AXIS CAM Studio plans machining jobs for a CNC mill, a manual mill and a lathe. 
 
 Start with `inspect`: the project, its setups and their operations (each with a stable `id`), the selection with its page and tab, the status line, the work still pending, and the session.
 
-Workflow: inspect, import the part, add setups, add operations, pick their surfaces, generate_all, check_job, review the NC, save, export. `list_commands {filter?, group?}` lists the commands this server runs now; `describe_command {name}` gives one's help, its `args` schema, what it needs first and the effect it is checked for. Run one with `execute {command, args, wait_s?}`.
+Workflow: inspect, import the part, add setups, add operations, pick their surfaces, generate_all, check_job, review the NC, save, export. `list_commands {filter?, group?}` lists the commands this server runs now; `describe_command {name}` gives one's help, its `args` schema, what it needs first and the effect it is checked for. `list_fields {target, setup?, operation?}` lists the fields `edit_field` takes, with their choices and units. Run one with `execute {command, args, wait_s?}`.
 
 Ids: setups and operations are addressed by `id`. An index from 0, in inspect's order, is accepted too and turned into the id when the call arrives.
 

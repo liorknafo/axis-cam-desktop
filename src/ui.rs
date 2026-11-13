@@ -351,6 +351,131 @@ pub(crate) const FIXTURE_CLEARANCE_LABEL: &str = "Requested fixture clearance ·
 /// The Holding step's section of fields that are recorded on the setup sheet
 /// and in the program header and checked by nothing.
 pub(crate) const SETUP_NOTES_SECTION: &str = "Setup notes · recorded, not checked";
+/// A field the inspector shows, as `collecting` finds it (LIO-470): what an
+/// agent's `list_fields` lists and `edit_field` checks a key against.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FieldInfo {
+    pub(crate) target: Target,
+    pub(crate) key: &'static str,
+    pub(crate) label: String,
+    /// The operation tab, setup step or wizard step it is on.
+    pub(crate) tab: String,
+    pub(crate) value: String,
+    /// The values a pick list offers; None for a text field.
+    pub(crate) choices: Option<Vec<String>>,
+    /// The unit the label names, as in "Feed (mm/min)" or "X travel · mm".
+    pub(crate) unit: Option<String>,
+}
+thread_local! {
+    /// Whether the field helpers record what they draw: a bool check is all
+    /// they cost while it is off.
+    static COLLECTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The tab being built, and the fields found on it.
+    static COLLECTED: std::cell::RefCell<(String, Vec<FieldInfo>)> =
+        const { std::cell::RefCell::new((String::new(), Vec::new())) };
+}
+/// Runs `build`, which draws an editor's `tab` and drops it, with the field
+/// helpers recording, and gives the fields it drew. The editor's elements are
+/// only built: no layout, no renderer, nothing is drawn.
+pub(crate) fn collecting(tab: &str, build: impl FnOnce()) -> Vec<FieldInfo> {
+    /// Switches the collector off again, also when `build` panics.
+    struct Off;
+    impl Drop for Off {
+        fn drop(&mut self) {
+            COLLECTING.with(|c| c.set(false));
+        }
+    }
+    COLLECTED.with(|c| *c.borrow_mut() = (tab.to_string(), Vec::new()));
+    COLLECTING.with(|c| c.set(true));
+    let off = Off;
+    build();
+    drop(off);
+    let mut found = COLLECTED.with(|c| std::mem::take(&mut c.borrow_mut().1));
+    // A field a tab draws twice is one field.
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|f| seen.insert((f.target as u8, f.key, f.tab.clone())));
+    found
+}
+/// The fields of the active setup's selected operation, on every tab it has,
+/// the user's open tab left as it is (LIO-470).
+pub(crate) fn operation_fields(app: &App) -> Vec<FieldInfo> {
+    let Some(o) = app.operation() else {
+        return vec![];
+    };
+    let mut all = vec![];
+    for tab in o.tabs(&app.doc.setup().machine) {
+        let mut checks = Checks::new(app);
+        all.extend(collecting(tab, || {
+            drop(operation_editor_with(app, o, &mut checks, tab))
+        }));
+    }
+    all
+}
+/// The fields of the active setup, on every step of its editor.
+pub(crate) fn setup_fields(app: &App) -> Vec<FieldInfo> {
+    let mut all = vec![];
+    for step in SETUP_STEPS {
+        all.extend(collecting(step, || drop(setup_editor(app, step))));
+    }
+    all
+}
+/// The fields of the machine draft, on every step of the wizard.
+pub(crate) fn machine_fields(app: &App) -> Vec<FieldInfo> {
+    let mut all = vec![];
+    for (at, step) in wizard_steps(&app.machine_draft).into_iter().enumerate() {
+        all.extend(collecting(step, || drop(wizard_at(app, at))));
+    }
+    all
+}
+/// The fields of the tool draft's editor.
+pub(crate) fn tool_fields(app: &App) -> Vec<FieldInfo> {
+    collecting("Tool definition", || drop(tools(app)))
+}
+/// The fields of the material draft's editor.
+pub(crate) fn material_fields(app: &App) -> Vec<FieldInfo> {
+    collecting("Material definition", || drop(materials(app)))
+}
+/// The fields of the workholding draft's editor.
+pub(crate) fn holder_fields(app: &App) -> Vec<FieldInfo> {
+    collecting("Workholding definition", || drop(workholding(app)))
+}
+/// Whether the field helpers are recording (tests).
+#[cfg(test)]
+pub(crate) fn recording() -> bool {
+    COLLECTING.with(|c| c.get())
+}
+/// Records a field of the tab being collected; `info` is not called while
+/// the collector is off.
+fn record(info: impl FnOnce() -> (&'static str, Target, String, String, Option<Vec<String>>)) {
+    if !COLLECTING.with(|c| c.get()) {
+        return;
+    }
+    let (key, target, label, value, choices) = info();
+    COLLECTED.with(|c| {
+        let mut c = c.borrow_mut();
+        let tab = c.0.clone();
+        let unit = unit_of(&label);
+        c.1.push(FieldInfo {
+            target,
+            key,
+            label,
+            tab,
+            value,
+            choices,
+            unit,
+        });
+    });
+}
+/// The unit a field's label names: "(mm/min)" at its end, or what follows
+/// its first " · " up to a comma, as in "X travel · mm".
+fn unit_of(label: &str) -> Option<String> {
+    let unit = match label.strip_suffix(')').and_then(|l| l.rsplit_once('(')) {
+        Some((_, unit)) => unit,
+        None => label.split_once(" · ")?.1.split([',', '·']).next()?,
+    };
+    let unit = unit.trim();
+    (!unit.is_empty() && unit.chars().count() <= 12).then(|| unit.to_string())
+}
 fn field<'a>(
     p: &'a Fields,
     key: &'static str,
@@ -379,6 +504,7 @@ fn hinted_field<'a>(
     target: Target,
     checks: &[&Check],
 ) -> Element<'a, Message> {
+    record(|| (key, target, label.into(), get(p, key).into(), None));
     let mark = checks
         .iter()
         .find(|c| c.error)
@@ -433,6 +559,7 @@ fn choice_value<'a>(
     target: Target,
 ) -> Element<'a, Message> {
     let list: Vec<String> = options.iter().map(|s| s.to_string()).collect();
+    record(|| (key, target, label.into(), value.into(), Some(list.clone())));
     help::wrap(
         column![
             muted(label),
@@ -893,7 +1020,7 @@ fn checks_summary<'a>(checks: &Checks, open: bool) -> Element<'a, Message> {
 pub(crate) fn editor_checks(app: &App) -> Checks {
     let mut checks = Checks::new(app);
     if let Some(o) = app.operation() {
-        drop(operation_editor_with(app, o, &mut checks));
+        drop(operation_editor_with(app, o, &mut checks, &app.tab));
     }
     checks
 }
@@ -3465,7 +3592,7 @@ pub(crate) fn inspector(app: &App) -> Element<'_, Message> {
     } else if let Some(o) = app.operation() {
         operation_editor(app, o)
     } else {
-        setup_editor(app)
+        setup_editor(app, app.setup_step)
     };
     // The body's scrollbar is drawn over its right edge: the content stops
     // short of it, and the fixed parts line up with the content.
@@ -3518,10 +3645,17 @@ fn about<'a>(label: String, open: bool) -> Element<'a, Message> {
 }
 fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Panel<'a> {
     let mut checks = Checks::new(app);
-    operation_editor_with(app, o, &mut checks)
+    operation_editor_with(app, o, &mut checks, &app.tab)
 }
-/// The editor, placing `checks` at their fields as it draws them.
-fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Panel<'a> {
+/// The editor on its `open` tab, placing `checks` at their fields as it draws
+/// them. The tab is an argument, not `App::tab`, so that `fields_of` can draw
+/// each tab in turn and leave the user's open (LIO-470).
+fn operation_editor_with<'a>(
+    app: &'a App,
+    o: &'a Operation,
+    checks: &mut Checks,
+    open_tab: &str,
+) -> Panel<'a> {
     // Pinned: the operation's identity and its tabs, in rows of one width.
     // A Thread is a Thread everywhere (LIO-419).
     let title = if o.is_thread() {
@@ -3553,7 +3687,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 "Turn" if o.strategy == Strategy::Turn => get(&o.p, "turn_kind"),
                 _ => t,
             };
-            r = r.push(tab(t, shown, app.tab == *t));
+            r = r.push(tab(t, shown, open_tab == *t));
         }
         tabs = tabs.push(r)
     }
@@ -3592,7 +3726,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
     let lathe = lathe::is_lathe(machine);
     // A Thread's tab is the Drill's Cycle or the Turn's Turn, its own
     // fields only (LIO-419).
-    let tab = match (app.tab.as_str(), o.strategy) {
+    let tab = match (open_tab, o.strategy) {
         ("Thread", Strategy::Turn) => "Turn",
         ("Thread", _) => "Cycle",
         (t, _) => t,
@@ -5485,7 +5619,8 @@ fn outside_fixed_stock(s: &Setup, resolved: &crate::stock::ResolvedStock) -> boo
             .part_radius
             .is_some_and(|r| r > crate::stock::bar(resolved.stock).1 + 0.001))
 }
-fn setup_editor(app: &App) -> Panel<'_> {
+/// The setup editor on its `open` step (`App::setup_step` in the window).
+fn setup_editor<'a>(app: &'a App, open: &str) -> Panel<'a> {
     let s = app.doc.setup();
     let p = &s.p;
     let t = Target::Setup;
@@ -5493,7 +5628,7 @@ fn setup_editor(app: &App) -> Panel<'_> {
     for pair in SETUP_STEPS.chunks(2) {
         let mut r = Row::new().spacing(1);
         for &step in pair {
-            let on = app.setup_step == step;
+            let on = open == step;
             let mark = if setup_step_done(app, step) {
                 "✓"
             } else {
@@ -5519,7 +5654,7 @@ fn setup_editor(app: &App) -> Panel<'_> {
     ]
     .spacing(12);
     let c = column![field(p, "name", "Setup name", t)].spacing(12);
-    let c = match app.setup_step {
+    let c = match open {
         "Stock" => setup_stock(app, c),
         "Position" => setup_position(app, c),
         "Holding" => setup_holding(app, c),
@@ -5597,6 +5732,8 @@ fn setup_zero<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
     let p = &s.p;
     let t = Target::Setup;
     let origin = get(p, "origin");
+    // Its buttons send Edit; `set_origin` is the command for it (LIO-470).
+    record(|| ("origin", t, "Work zero".into(), origin.into(), None));
     if let Some(base) = app.doc.index_base(app.doc.index()) {
         return c.push(section("Work zero")).push(note(format!(
             "{origin} in {}, as setup {} ({}) has it: A turns the stock about the A centreline and leaves the work zero where it is, so nothing is probed again.",
@@ -5857,6 +5994,15 @@ fn pins_block<'a>(app: &'a App, s: &'a Setup) -> Element<'a, Message> {
         return leftover_pins(app, c, s, mesh, placed, &work).into();
     }
     let chosen = crate::post::chosen_pin_holes(s);
+    record(|| {
+        (
+            "pin_holes",
+            t,
+            "Pin holes".into(),
+            get(&s.p, "pin_holes").into(),
+            None,
+        )
+    });
     c = c.push(section("Pin holes")).push(muted(
         "Choose the part's holes that drop over the pins, as drawn in the part: the round holes it opens on its bottom in this setup, ringed and numbered in the 3D view. Click them here, or Pick holes on the part and click inside each hole in the 3D view (turn the view to see under the part). Which hole takes which pin follows from the plate.",
     ));
@@ -5948,6 +6094,15 @@ fn op_tool_is(app: &App, o: &Operation, kind: &str) -> bool {
 fn pin_hole_drilling<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> {
     let mut c = column![].spacing(8);
     let named = get(&o.p, "pin_setup");
+    record(|| {
+        (
+            "pin_setup",
+            Target::Operation,
+            "Pin setup".into(),
+            named.into(),
+            None,
+        )
+    });
     let mine = (app.doc.setups.iter()).position(|s| s.id == named);
     let Some(si) = mine.filter(|&si| {
         let s = &app.doc.setups[si];
@@ -6059,6 +6214,15 @@ fn leftover_pins<'a>(
         }
         None => {}
     }
+    record(|| {
+        (
+            "pin_place",
+            t,
+            "Pins' place".into(),
+            get(&s.p, "pin_place").into(),
+            None,
+        )
+    });
     if crate::post::leftover_pin(s).is_some() {
         c = c.push(secondary(
             "Clear the pins' place",
@@ -6209,6 +6373,16 @@ fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> 
                 })
                 .collect();
             let chosen = axes[usize::from(crate::stock::lying(s))].clone();
+            record(|| {
+                let ids = axes.iter().map(|a| a.id.clone()).collect();
+                (
+                    "stock_axis",
+                    t,
+                    "The bar".into(),
+                    chosen.id.clone(),
+                    Some(ids),
+                )
+            });
             c = c.push(help::field(
                 column![
                     muted("The bar"),
@@ -6828,6 +7002,16 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
                 })
                 .collect();
             let chosen = axes[usize::from(get(p, "vise_axis") == "Y")].clone();
+            record(|| {
+                let ids = axes.iter().map(|a| a.id.clone()).collect();
+                (
+                    "vise_axis",
+                    t,
+                    "Jaws face".into(),
+                    chosen.id.clone(),
+                    Some(ids),
+                )
+            });
             c.push(help::field(
                 column![
                     muted("Jaws face"),
@@ -7112,6 +7296,16 @@ fn holder_picker<'a>(app: &'a App, kind: &'static str) -> Element<'a, Message> {
         .collect();
     let current = get(&app.doc.setup().p, "holder");
     let chosen = choices.iter().find(|c| c.id == current).cloned();
+    record(|| {
+        let ids = choices.iter().map(|c| c.id.clone()).collect();
+        (
+            "holder",
+            Target::Setup,
+            kind.into(),
+            current.into(),
+            Some(ids),
+        )
+    });
     help::field(
         column![
             muted(kind),
@@ -7864,11 +8058,15 @@ pub(crate) fn wizard_steps(m: &Machine) -> Vec<&'static str> {
     }
 }
 fn wizard(app: &App) -> Element<'_, Message> {
+    wizard_at(app, app.wizard_step)
+}
+/// The machine wizard on step `at` (`App::wizard_step` in the window).
+fn wizard_at(app: &App, at: usize) -> Element<'_, Message> {
     let m = &app.machine_draft;
     let p = &m.p;
     let t = Target::Machine;
     let steps = wizard_steps(m);
-    let step = app.wizard_step.min(steps.len() - 1);
+    let step = at.min(steps.len() - 1);
     let mut nav = Row::new().spacing(8);
     for (i, label) in steps.iter().enumerate() {
         nav = nav.push(btn(

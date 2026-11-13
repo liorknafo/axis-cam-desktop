@@ -8,11 +8,14 @@
 //! - `engine`: the tools, carried out against that `App`.
 //! - `class`: what each `Message` is to an agent, with no wildcard.
 //! - `commands`: the commands `execute` runs.
+//! - `fields`: the editors' fields, which `list_fields` lists and
+//!   `edit_field` checks its key against.
 //! - `state`: the work state's snapshots, the revisions and their change
 //!   log, the external events, and the machinist's records.
 pub mod class;
 pub mod commands;
 pub mod engine;
+pub mod fields;
 pub mod protocol;
 pub mod runner;
 pub mod state;

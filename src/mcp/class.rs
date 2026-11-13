@@ -297,7 +297,7 @@ pub fn class(m: &Message) -> Class {
 /// An edit of a field: the work zero and the pins' setup have commands of
 /// their own, the pin holes and the pins' place are picked (`pick_pin_holes`,
 /// `place_pins`), and a machine's controller fields are refused.
-fn edit(target: Target, key: &str) -> Class {
+pub fn edit(target: Target, key: &str) -> Class {
     match (target, key) {
         (Target::Setup, "origin") => Class::Command("set_origin"),
         (Target::Operation, "pin_setup") => Class::Command("set_pin_setup"),
