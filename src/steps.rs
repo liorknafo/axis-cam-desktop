@@ -460,7 +460,14 @@ pub(crate) fn measures(
             };
             // Each cut starts Top over the material it meets (`rest::start_over`):
             // the mouths a depth is measured from are that material's top.
-            let air = crate::cam::number(op, "top").unwrap_or(0.).max(0.);
+            // Fixture-pin holes start on the face itself, and are blind
+            // whatever Through says (`cam::pin_holes`).
+            let pins = op.drills_pin_holes();
+            let air = if pins {
+                0.
+            } else {
+                crate::cam::number(op, "top").unwrap_or(0.).max(0.)
+            };
             let mouths: Vec<f32> = mouths.iter().map(|m| m - air).collect();
             let mouth = mouths.first().copied().unwrap_or(top - zero[2]);
             let at = [h[0] + zero[0], h[1] + zero[1], mouth + zero[2]];
@@ -487,7 +494,7 @@ pub(crate) fn measures(
                 ["Chamfer mill", crate::model::CENTRE_DRILL].contains(&get(&t.p, "type"))
             });
             let through = match crate::cam::breakthrough(op) {
-                Ok((true, past)) if !cone => {
+                Ok((true, past)) if !cone && !pins => {
                     Some(past - crate::cam::number(op, "bottom").unwrap_or(0.))
                 }
                 _ => None,
@@ -6795,6 +6802,73 @@ pub(crate) mod tests {
         );
         for d in deep {
             assert!((d.from[2] - d.to[2] - d.value).abs() < 0.01, "{d:?}");
+        }
+    }
+    /// A Drill of fixture-pin holes on the manual mill (LIO-450): 7 deep
+    /// for 6 mm pins, from the face, to the full Ø; blind whatever Through
+    /// says and with or without a Top offset, which `cam::pin_holes` uses
+    /// neither of.
+    #[test]
+    fn a_pin_holes_check_gives_its_full_diameter_depth_from_the_face() {
+        use crate::cam::boring::tests::{drill, drilling, job, ring};
+        let mesh = ring(6.8, 30., 18.5);
+        let mut mouth = None;
+        for (air, through) in [("0", "No"), ("1.5", "No"), ("0", "Yes"), ("1.5", "Yes")] {
+            let mut manual = crate::manual::defaults();
+            for (k, v) in [
+                ("pins", "0 0; 50 0"),
+                ("pin_diameter", "4"),
+                ("pin_height", "6"),
+            ] {
+                manual.p.insert(k.into(), v.into());
+            }
+            let mut tool = drill("4.1");
+            tool.p.insert("machines".into(), manual.id.clone());
+            let mut op = drilling(&mesh, &tool, "Drilling");
+            for (k, v) in [
+                ("holes", crate::model::DRILL_HOLES[1]),
+                ("rpm", "640"),
+                ("feed", "60"),
+                ("top", air),
+                ("through", through),
+            ] {
+                op.p.insert(k.into(), v.into());
+            }
+            let (mut doc, _) = job(&mesh, manual, vec![(tool, op)]);
+            let setup = &mut doc.setups[0];
+            for (k, v) in [
+                ("stock_top", "0"),
+                ("stock_left", "20"),
+                ("stock_right", "20"),
+            ] {
+                setup.p.insert(k.into(), v.into());
+            }
+            let frame = crate::volume::Frame::new(setup, &mesh);
+            let points = [[-25., 0., 0.], [25., 0., 0.]].map(|p| frame.unmap(p));
+            let (o, d) = (frame.unmap([0.; 3]), frame.unmap([0., 0., -1.]));
+            let pin = &mut setup.operations[0].p;
+            pin.insert("pin_points".into(), crate::post::pin_holes_text(&points));
+            let axis = format!("{} {} {}", d[0] - o[0], d[1] - o[1], d[2] - o[2]);
+            pin.insert("pin_axis".into(), axis);
+            let shown = shown(&doc, &mesh, 0).unwrap();
+            let g = &shown.guide;
+            let top = shown.boxes[0].max[2] + g.zero[2];
+            let m = measures(&doc, g, &g.done[0], top);
+            let deep = m.iter().find(|x| x.axis == "Z").unwrap();
+            let case = format!("Top {air}, Through {through}");
+            assert!((deep.value - 7.).abs() < 0.01, "{case}: {deep:?}");
+            assert_eq!(
+                deep.words,
+                ["deep from the mouth", "to the full Ø, not the point"],
+                "{case}"
+            );
+            assert!(
+                (deep.from[2] - deep.to[2] - 7.).abs() < 0.01,
+                "{case}: {deep:?}"
+            );
+            // From the face, the same with Top or without.
+            let at = *mouth.get_or_insert(deep.from[2]);
+            assert!((deep.from[2] - at).abs() < 0.01, "{case}: {deep:?}");
         }
     }
     /// Steps entered from planning (LIO-449): at the start of the operation
