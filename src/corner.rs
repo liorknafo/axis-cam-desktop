@@ -906,12 +906,41 @@ pub fn walk_problem(
     points: &[[f32; 2]],
     z: f32,
     (lo, hi, top): ([f32; 2], [f32; 2], f32),
-    rc: f32,
+    round: &Round,
 ) -> Option<String> {
     const EPS: f32 = 1e-3;
     const AXES: [&str; 3] = ["X", "Y", "Z"];
+    let rc = round.tool;
     if points.len() < 2 || points.iter().flatten().any(|v| !v.is_finite()) {
         return Some("its readings are not all numbers".into());
+    }
+    if !(round.offset.is_finite() && round.scallop.is_finite() && z.is_finite()) {
+        return Some("its offset, scallop or level is not a number".into());
+    }
+    // Its own corner's: from one wall's line to the other's, on the round
+    // offset by the tool and the walk's offset at both ends, never inside
+    // the round offset by the tool.
+    let c = round.centre;
+    let reach = round.radius + rc + round.offset;
+    let d = |p: [f32; 2]| (p[0] - c[0]).hypot(p[1] - c[1]);
+    let (first, last) = (points[0], points[points.len() - 1]);
+    let walls = on_walls(
+        [c[0] as f64, c[1] as f64],
+        round.quarter,
+        [first[0] as f64, first[1] as f64],
+        [last[0] as f64, last[1] as f64],
+    );
+    if !walls.is_some_and(|e| e < 0.05)
+        || (d(first) - reach).abs() > 0.02
+        || (d(last) - reach).abs() > 0.02
+    {
+        return Some("its readings are not round its own corner".into());
+    }
+    if let Some(p) = points.iter().find(|p| d(**p) < round.radius + rc - EPS) {
+        return Some(format!(
+            "its reading X {:.2} Y {:.2} cuts into the round",
+            p[0], p[1]
+        ));
     }
     if let Some(t) = targets.iter().find(|t| !t.centre.is_finite()) {
         return Some(format!("its {} number is not a number", AXES[t.axis]));
@@ -1022,10 +1051,41 @@ pub fn walk_problem(
         _ => Some("it does not end up above the stock".into()),
     }
 }
+/// How far a walk from `first` to `last` (work X, Y) is from starting on one
+/// wall's line of the corner about `c` in quarter `q` and ending on the
+/// other's, either way round, as far from `c` at both: None when it starts
+/// or ends on the wrong side of `c` (LIO-447).
+fn on_walls(c: [f64; 2], q: usize, first: [f64; 2], last: [f64; 2]) -> Option<f64> {
+    let (u0, u1) = ends(q);
+    // How far `p` is off the line from `c` along `u`, when on its side.
+    let off = |p: [f64; 2], u: [f32; 2]| {
+        let along = (p[0] - c[0]) * u[0] as f64 + (p[1] - c[1]) * u[1] as f64;
+        let across = (p[0] - c[0]) * -u[1] as f64 + (p[1] - c[1]) * u[0] as f64;
+        (along > 0.).then_some(across.abs())
+    };
+    let d = |p: [f64; 2]| (p[0] - c[0]).hypot(p[1] - c[1]);
+    [(u0, u1), (u1, u0)]
+        .into_iter()
+        .filter_map(|(a, b)| Some(off(first, a)? + off(last, b)? + (d(first) - d(last)).abs()))
+        .min_by(f64::total_cmp)
+}
+/// The corner a walk goes round, as the Steps say it (work X, Y, mm): its
+/// round's centre and radius, quarter, the tool's radius, the walk's offset
+/// out from the round and the scallop it leaves.
+#[derive(Debug, Clone, Copy)]
+pub struct Round {
+    pub centre: [f32; 2],
+    pub radius: f32,
+    pub quarter: usize,
+    pub tool: f32,
+    pub offset: f32,
+    pub scallop: f32,
+}
 /// The walks of a Round corners' `plan` (`walks`), read back from its
 /// moves: each from the first move after the walk before to its climb to
-/// clearance; its corner the picked one nearest its first reading; its
-/// offset that reading's distance from the round offset by the tool, and
+/// clearance; its corner the picked one whose walls' lines it starts and
+/// ends on (`on_walls`); its offset that reading's distance from the round
+/// offset by the tool, and
 /// its readings and scallop worked out again from its feeds.
 pub fn read(plan: &Plan, corners: &[Corner], zero: [f32; 3]) -> Vec<Walk> {
     let mut out = vec![];
@@ -1058,14 +1118,19 @@ pub fn read(plan: &Plan, corners: &[Corner], zero: [f32; 3]) -> Vec<Walk> {
                     .collect();
                 points.pop();
                 let p0 = points.first().copied().unwrap_or_default();
-                let near = (0..corners.len()).min_by(|&a, &b| {
-                    let d = |k: usize| {
+                let pn = points.last().copied().unwrap_or_default();
+                // The corner whose walls' lines the walk starts and ends on,
+                // as far from its centre at both (LIO-447: the circle
+                // nearest the first reading was a neighbour's on the same
+                // side, and drew the wrong corner).
+                let near = (0..corners.len())
+                    .filter_map(|k| {
                         let c = corners[k].centre;
-                        ((c[0] - zero[0]) as f64 - p0[0]).hypot((c[1] - zero[1]) as f64 - p0[1])
-                            - (corners[k].r + rc) as f64
-                    };
-                    d(a).abs().total_cmp(&d(b).abs())
-                });
+                        let c = [(c[0] - zero[0]) as f64, (c[1] - zero[1]) as f64];
+                        on_walls(c, corners[k].quarter, p0, pn).map(|e| (k, e))
+                    })
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(k, _)| k);
                 if let Some(ci) = near {
                     let k = &corners[ci];
                     let c = [
@@ -1872,9 +1937,12 @@ pub(crate) mod tests {
             let Step::Corner {
                 index,
                 place,
+                radius,
+                centre,
                 offset,
                 z,
                 level,
+                scallop,
                 points,
                 targets,
                 ..
@@ -1939,7 +2007,14 @@ pub(crate) mod tests {
                         [stock.max[0] - zero[0], stock.max[1] - zero[1]],
                         top
                     ),
-                    5.
+                    &Round {
+                        centre: *centre,
+                        radius: *radius,
+                        quarter: WHERE.iter().position(|p| p == place).unwrap(),
+                        tool: 5.,
+                        offset: *offset,
+                        scallop: *scallop,
+                    }
                 )
                 .is_none()
             );
@@ -1953,6 +2028,109 @@ pub(crate) mod tests {
                         "Z15.00", "X-77.00", "Y-38.00", "Y-39.00", "Z-10.00", "fX-74.22"
                     ],
                     "{r:?}"
+                );
+            }
+        }
+    }
+    /// A 134 × 88 × 20 plate whose back right is stepped: two R5 outside
+    /// corners facing the same way, about X 62 Y 19 and X 42 Y 39, 20 mm
+    /// apart each way (LIO-447 review). Its outline, counter-clockwise,
+    /// extruded with its top and bottom cut into ears.
+    fn stepped_plate() -> Mesh {
+        let mut p: Vec<[f32; 2]> = vec![[67., -44.], [67., 19.]];
+        for (cx, cy) in [(62., 19.), (42., 39.)] {
+            if cx == 42. {
+                p.extend([[47., 24.], [47., 39.]]);
+            }
+            for i in 1..=12 {
+                let a = std::f32::consts::FRAC_PI_2 * i as f32 / 12.;
+                p.push([cx + 5. * a.cos(), cy + 5. * a.sin()]);
+            }
+        }
+        p.extend([[-67., 44.], [-67., -44.]]);
+        let cross = |a: [f32; 2], b: [f32; 2], c: [f32; 2]| {
+            (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+        };
+        let at = |i: usize, z: f32| [p[i][0], p[i][1], z];
+        let mut tris = vec![];
+        for i in 0..p.len() {
+            let j = (i + 1) % p.len();
+            tris.push([at(i, 0.), at(j, 0.), at(j, 20.)]);
+            tris.push([at(i, 0.), at(j, 20.), at(i, 20.)]);
+        }
+        let mut left: Vec<usize> = (0..p.len()).collect();
+        while left.len() > 2 {
+            let n = left.len();
+            let corner = |e: usize| [left[(e + n - 1) % n], left[e], left[(e + 1) % n]];
+            let ear = (0..n)
+                .find(|&e| {
+                    let [a, b, c] = corner(e);
+                    cross(p[a], p[b], p[c]) > 1e-5
+                        && !left.iter().any(|&k| {
+                            ![a, b, c].contains(&k)
+                                && cross(p[a], p[b], p[k]) >= -1e-5
+                                && cross(p[b], p[c], p[k]) >= -1e-5
+                                && cross(p[c], p[a], p[k]) >= -1e-5
+                        })
+                })
+                .unwrap();
+            let [a, b, c] = corner(ear);
+            tris.push([at(a, 20.), at(b, 20.), at(c, 20.)]);
+            tris.push([at(c, 0.), at(b, 0.), at(a, 0.)]);
+            left.remove(ear);
+        }
+        crate::mesh::normalize(tris).unwrap()
+    }
+    #[test]
+    fn two_corners_facing_the_same_way_each_keep_their_own_walks() {
+        let mesh = stepped_plate();
+        for spindle in crate::model::SPINDLE_ROTATIONS {
+            let (mut doc, _) = plate_job("Y");
+            doc.setups[0].p.insert("vise_offset".into(), "-35".into());
+            let corners = all(&doc.setups[0], &mesh);
+            assert_eq!(corners.len(), 2, "{corners:?}");
+            assert!(corners.iter().all(|c| c.quarter == 0));
+            let ids = corners.iter().flat_map(|c| c.walls.clone()).collect();
+            let mut op = corner_op(&mesh, &doc.tools[0], ids);
+            op.p.insert("stepdown".into(), "10".into());
+            op.p.insert("spindle_rotation".into(), spindle.into());
+            doc.setups[0].operations = vec![op];
+            let setup = &doc.setups[0];
+            let (plan, made) = walks(setup, &setup.operations[0], &doc.tools[0], &mesh).unwrap();
+            let zero = crate::post::datum(setup, plan.stock, &mesh).unwrap();
+            // Read back, each walk is round the corner it was made round,
+            // its offset its own.
+            let back = read(&plan, &corners, zero);
+            assert_eq!(back.len(), made.len());
+            assert!(made.iter().any(|w| w.offset > 15.), "{spindle}");
+            for (k, (a, b)) in made.iter().zip(&back).enumerate() {
+                assert_eq!(a.corner, b.corner, "{spindle}: walk {}", k + 1);
+                assert!(
+                    (a.offset - b.offset).abs() < 0.02,
+                    "{spindle}: walk {}",
+                    k + 1
+                );
+                assert!(b.stair.scallop.is_finite(), "{spindle}: walk {}", k + 1);
+            }
+            // And the Steps say so, every number finite.
+            let guide = crate::guide::build(&doc, &mesh, 0).unwrap();
+            let steps: Vec<_> = (guide.steps.iter())
+                .filter_map(|s| match s {
+                    crate::guide::Step::Corner {
+                        corner,
+                        offset,
+                        scallop,
+                        ..
+                    } => Some((*corner, *offset, *scallop)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(steps.len(), made.len());
+            for (k, (w, s)) in made.iter().zip(&steps).enumerate() {
+                assert_eq!(s.0, w.corner + 1, "{spindle}: walk {}", k + 1);
+                assert!(
+                    (s.1 - w.offset).abs() < 0.02 && s.2.is_finite(),
+                    "{spindle}: {s:?}"
                 );
             }
         }
@@ -1998,8 +2176,17 @@ pub(crate) mod tests {
     fn steps_that_cannot_be_followed_are_named() {
         let bounds = ([-70., -44.], [70., 44.], 0.);
         let (before, points) = walk_9_before();
-        let problem =
-            |targets: &[crate::guide::Target]| walk_problem(targets, &points, -10., bounds, 5.);
+        let front_left = Round {
+            centre: [-62., -39.],
+            radius: 5.,
+            quarter: 2,
+            tool: 5.,
+            offset: 2.22,
+            scallop: 0.48,
+        };
+        let problem = |targets: &[crate::guide::Target]| {
+            walk_problem(targets, &points, -10., bounds, &front_left)
+        };
         // Walk 9 as it was: down with no X.
         let e = problem(&before).unwrap();
         assert!(e.contains("goes down with no X"), "{e}");
@@ -2049,6 +2236,34 @@ pub(crate) mod tests {
         let mut stays = fixed.clone();
         stays.pop();
         assert!(problem(&stays).unwrap().contains("above the stock"));
+        // Said of another corner: a neighbour's on the same side, or the
+        // walk's offset not its own; a scallop not a number (LIO-447).
+        for (other, why) in [
+            (
+                Round {
+                    centre: [-42., -59.],
+                    ..front_left
+                },
+                "not round its own corner",
+            ),
+            (
+                Round {
+                    offset: 0.,
+                    ..front_left
+                },
+                "not round its own corner",
+            ),
+            (
+                Round {
+                    scallop: f32::INFINITY,
+                    ..front_left
+                },
+                "not a number",
+            ),
+        ] {
+            let e = walk_problem(&fixed, &points, -10., bounds, &other).unwrap();
+            assert!(e.contains(why), "{e}");
+        }
     }
     /// The saved adapter plate's Corner (LIO-447), when `AXIS_ADAPTER_PLATE`
     /// names a copy of the project and the build reads STEP: every walk's

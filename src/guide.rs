@@ -2025,7 +2025,14 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                             [s.max[0] - zero[0], s.max[1] - zero[1]],
                             s.max[2] - zero[2],
                         ),
-                        plan.radius,
+                        &crate::corner::Round {
+                            centre: [c.centre[0] - zero[0], c.centre[1] - zero[1]],
+                            radius: c.r,
+                            quarter: c.quarter,
+                            tool: plan.radius,
+                            offset: w.offset,
+                            scallop: w.stair.scallop as f32,
+                        },
                     ) {
                         return Err(crate::corner::broken(
                             op.name(),

@@ -32869,7 +32869,7 @@ soft_max = 180.0
                 let arrow = [["◀", "▶"], ["▼", "▲"]][t.axis][usize::from(way(t.axis))];
                 let shown = format!("{arrow} {}", dro(t.centre));
                 assert!(
-                    texts.iter().any(|s| *s == shown),
+                    texts.contains(&shown),
                     "walk {index}: {shown} in {texts:?}"
                 );
             }
