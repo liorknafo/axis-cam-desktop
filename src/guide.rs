@@ -1945,6 +1945,8 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                     ));
                 }
                 let corners = crate::corner::picked(setup, mesh, op)?;
+                #[cfg(test)]
+                let plan = tests::faulted(op, &plan);
                 // The walks as the plan made them, each with its corner.
                 let walks = &plan.corner_walks;
                 if walks.is_empty() {
@@ -1981,7 +1983,20 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                         moves.iter().filter(|m| m.motion != Motion::Dwell).collect();
                     let mut targets = vec![];
                     for m in &legs {
-                        let axis = moved(m)?;
+                        // A move of no number, or along two axes, is no DRO
+                        // row: refused as the walk's, which the plan checks
+                        // report (LIO-447).
+                        let axis = (m.from.iter().chain(&m.to).all(|v| v.is_finite()))
+                            .then(|| moved(m).ok())
+                            .flatten()
+                            .ok_or_else(|| {
+                                crate::corner::broken(
+                                    op.name(),
+                                    at,
+                                    c.place(),
+                                    "a move of it is not a number or goes along two axes at once",
+                                )
+                            })?;
                         let centre = m.to[axis] - zero[axis];
                         let down =
                             axis == 2 && m.to[2] < m.from[2] && (m.to[2] - lo[2]).abs() < 1e-4;
@@ -2694,6 +2709,25 @@ pub fn place(doc: &Document, guide: &Guide) -> usize {
 pub(crate) mod tests {
     use super::*;
     use crate::model::BOX_FIELDS;
+
+    /// Damage done to the plan a Round corners' Steps are said from, by
+    /// operation id: for tests that the Steps refuse a broken walk and the
+    /// plan checks say so (LIO-447). Keyed by id, so tests running at once
+    /// touch only their own operation.
+    pub(crate) static CORNER_FAULTS: std::sync::Mutex<Vec<(String, Fault)>> =
+        std::sync::Mutex::new(vec![]);
+    /// Damage done to a plan (`CORNER_FAULTS`).
+    pub(crate) type Fault = fn(&mut Plan);
+    /// `plan` with the damage registered for `op`, if any.
+    pub(crate) fn faulted(op: &Operation, plan: &Plan) -> Plan {
+        let mut plan = plan.clone();
+        for (id, fault) in CORNER_FAULTS.lock().unwrap().iter() {
+            if *id == op.id {
+                fault(&mut plan);
+            }
+        }
+        plan
+    }
 
     /// A Box named `name` cutting `b` (x_min, x_max, y_min, y_max, z_top,
     /// z_bottom, work frame) with the tool `tool`.
