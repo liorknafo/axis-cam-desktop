@@ -2759,9 +2759,19 @@ impl Connection {
     }
 
     /// Simulated: sends the blocks and the test bar when they changed since
-    /// last sent.
+    /// last sent. On the Pi only while in control with the link answering
+    /// (the link drops whatever it cannot send, with a note); until then
+    /// nothing counts as sent, so they go again each time control comes.
     fn send_sim_blocks(&mut self) {
         if !self.simulated {
+            return;
+        }
+        if let Driver::Remote(_) = self.driver
+            && !(self.link.as_ref())
+                .is_some_and(|l| l.live && l.state == uc100_remote::LinkState::Controlling)
+        {
+            self.sim_sent.clear();
+            self.sim_bars_sent.clear();
             return;
         }
         let up = self.sim_longer;

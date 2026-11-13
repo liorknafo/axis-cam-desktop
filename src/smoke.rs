@@ -4272,6 +4272,33 @@ flood = { pin = 8 }
         other.shutdown();
     }
 
+    /// The Pi's simulator gets the simulated stock once this computer is in
+    /// control, not before the link is up (LIO-465): a probe down from
+    /// Z -30 touches its top, and no note says it was not sent.
+    #[test]
+    fn the_pis_simulator_gets_the_stock_once_in_control() {
+        use crate::control::Action;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), &probe_profile());
+        plate(&mut a, "1000");
+        a.page = Page::Control;
+        let _server = to_pi(&mut a, dir.path());
+        idle(&mut a);
+        let _ = a.update(Message::Machine(Action::MachineZero(None)));
+        tick_until(&mut a, 3.0, "machine zero", |s| {
+            s.referenced[..3].iter().all(|r| *r)
+        });
+        mdi(&mut a, "G0 X195 Y140 Z-30");
+        let _ = a.update(Message::Machine(Action::ProbeZ));
+        let (ok, message) = probed(&mut a);
+        assert!(ok, "{message}");
+        let notes = &conn(&a).link.as_ref().unwrap().notes;
+        assert!(
+            !notes.iter().any(|n| n.contains("Simulated stock")),
+            "{notes:?}"
+        );
+    }
+
     /// The profile `pi_app` wrote, as the other computer sends it.
     fn conn_profile(dir: &std::path::Path) -> uc100::config::MachineConfig {
         uc100::config::MachineConfig::load(&dir.join("uc100.toml")).unwrap()
