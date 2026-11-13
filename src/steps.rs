@@ -2928,27 +2928,28 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 .map(|(_, b)| Shape::Clamp(*b, "clamp".into()))
                 .collect();
             // The clamps over all of the face axis `k` is touched on at its
-            // + face when `plus`, named.
+            // + face when `plus`, named: that axis is set from its other face
+            // alone. Said in red on the stock just inside the clamps' toes
+            // over the middle of that face.
             let over = |k: usize, plus: bool| blocked[k][usize::from(plus)].as_deref();
-            // A face under clamps: no finder on it, said in red on the
-            // stock just inside the clamps' toes over that face.
-            let finder_at =
-                |shapes: &mut Vec<Shape>, q: [f32; 3], from: [f32; 2], s: String, plus| {
-                    let k = usize::from(from[1] != 0.);
-                    if over(k, plus).is_some() {
-                        let toes =
-                            (clamps.iter()).filter(|(_, b)| b.min[k] < q[k] && b.max[k] > q[k]);
-                        let mut w = q;
-                        w[k] = if plus {
-                            toes.map(|(_, b)| b.min[k]).fold(q[k], f32::min) - 3.
-                        } else {
-                            toes.map(|(_, b)| b.max[k]).fold(q[k], f32::max) + 3.
-                        };
-                        shapes.push(Shape::Word(w, "under a clamp".into(), NEVER));
-                    } else {
-                        shapes.push(Shape::Finder(q, from, s));
+            for k in 0..2 {
+                for plus in [false, true] {
+                    if over(k, plus).is_none() {
+                        continue;
                     }
-                };
+                    let mut w = [0., 0., stock.max[2]];
+                    w[1 - k] = (stock.min[1 - k] + stock.max[1 - k]) / 2.;
+                    let face = if plus { stock.max[k] } else { stock.min[k] };
+                    let toes = (clamps.iter()).filter(|(_, b)| b.min[k] < face && b.max[k] > face);
+                    w[k] = face;
+                    w[k] = if plus {
+                        toes.map(|(_, b)| b.min[k]).fold(w[k], f32::min) - 3.
+                    } else {
+                        toes.map(|(_, b)| b.max[k]).fold(w[k], f32::max) + 3.
+                    };
+                    shapes.push(Shape::Word(w, "under a clamp".into(), NEVER));
+                }
+            }
             // A round touched on X and Y: the diameter the finder meets,
             // its centre where their lines cross.
             if round[0] && round[1] {
@@ -2963,8 +2964,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 from[k] = f32::from(approach[k].signum());
                 match far[k] {
                     Some(f) => {
-                        let zero = format!("{} 0", AXES[k]);
-                        finder_at(&mut shapes, at[k], from, zero, false);
+                        shapes.push(Shape::Finder(at[k], from, format!("{} 0", AXES[k])));
                         from[k] = 1.;
                         let read = format!(
                             "{} {} → {}",
@@ -2972,11 +2972,11 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             dro(f.reads),
                             halving(touch[k], f.reads)
                         );
-                        finder_at(&mut shapes, f.at, from, read, true);
+                        shapes.push(Shape::Finder(f.at, from, read));
                     }
                     None => {
                         let set = format!("{} {}", AXES[k], dro(touch[k]));
-                        finder_at(&mut shapes, at[k], from, set, approach[k] > 0);
+                        shapes.push(Shape::Finder(at[k], from, set));
                     }
                 }
             }
@@ -2998,57 +2998,41 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             ));
             // Each row: what to do, the axis, its number and tags.
             let mut todo: Vec<(String, usize, String, Vec<String>)> = vec![];
-            // A face under clamps: the clamps named, no number (LIO-458).
-            let under = |k: usize, plus: bool, name: &str| {
-                over(k, plus).map(|clamps| {
-                    (
-                        format!("the {name} face is under the {clamps}"),
-                        k,
-                        "—".to_string(),
-                        vec![
-                            "no spot of it clear for the edge finder".to_string(),
-                            "move the clamp along its side".to_string(),
-                        ],
-                    )
-                })
-            };
-            // On clamps, where along a Y face to touch it clear of them:
-            // X is set by then (LIO-458).
+            // On clamps, where along a Y face to touch it clear of them, to
+            // a tenth (a gap between clamps can be narrow): X is set by then
+            // (LIO-458).
             let along = |k: usize, at: [f32; 3]| -> Vec<String> {
                 if k == 1 && !clamps.is_empty() {
-                    vec![format!(
-                        "at about X {}, clear of the clamps",
-                        mm(at[0].round() + 0.)
-                    )]
+                    let x = (at[0] * 10.).round() / 10. + 0.;
+                    vec![format!("at X {}, clear of the clamps", mm(x))]
                 } else {
                     vec![]
                 }
             };
             for k in 0..2 {
                 let Some(f) = far[k] else {
-                    let plus = approach[k] > 0;
-                    todo.push(under(k, plus, side(k)).unwrap_or_else(|| {
-                        (
-                            format!("{} → set", touching(side(k), at[k])),
-                            k,
-                            dro(touch[k]),
-                            along(k, at[k]),
-                        )
-                    }));
+                    // A middle whose other face is under clamps: set from
+                    // this face alone (LIO-458).
+                    let mut tags = along(k, at[k]);
+                    let other = sides[k][usize::from(approach[k] < 0)];
+                    if let Some(names) = over(k, approach[k] < 0) {
+                        tags.push(format!("the {other} face is under the {names}"));
+                        tags.push("set from this face alone, by the stock's size".into());
+                    }
+                    todo.push((
+                        format!("{} → set", touching(side(k), at[k])),
+                        k,
+                        dro(touch[k]),
+                        tags,
+                    ));
                     continue;
                 };
-                todo.push(under(k, false, sides[k][0]).unwrap_or_else(|| {
-                    (
-                        format!("{} → set", touching(sides[k][0], at[k])),
-                        k,
-                        dro(0.),
-                        along(k, at[k]),
-                    )
-                }));
-                if let Some(row) = under(k, true, sides[k][1]) {
-                    todo.push(row);
-                    continue;
-                }
+                todo.push((
+                    format!("{} → set", touching(sides[k][0], at[k])),
+                    k,
+                    dro(0.),
+                    along(k, at[k]),
+                ));
                 // One row for the + face: what the DRO reads there first,
                 // a check, under it; then half of that, or more or less
                 // when the touches are not either side of the zero alike.
@@ -3102,8 +3086,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 c.push(warn_chip("a face is under a clamp"));
             }
             let right = column![chips(c), label("Touch, then set the DRO"),].extend(rows);
-            // A corner is picked up; a middle is found (LIO-451).
-            let sub = match (far[0].is_some(), far[1].is_some()) {
+            // A corner is picked up; a middle is found (LIO-451), from one
+            // face too when the other is under clamps (LIO-458).
+            let middle = [0, 1].map(|k| far[k].is_some() || blocked[k].iter().any(Option::is_some));
+            let sub = match (middle[0], middle[1]) {
                 (true, true) => "find the centre",
                 (true, false) if approach[1] > 0 => "find the middle of the back edge",
                 (true, false) => "find the middle of the front edge",
@@ -6113,21 +6099,21 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(
             rows[i + 1..i + 4],
-            ["Y", "0.00", "at about X −40, clear of the clamps"]
+            ["Y", "0.00", "at X −39, clear of the clamps"]
         );
         let i = rows
             .iter()
             .position(|s| s == "touch the back face → ½")
             .unwrap();
         assert!(
-            rows[i + 3].starts_with("at about X −40, clear of the clamps · reads about"),
+            rows[i + 3].starts_with("at X −39, clear of the clamps · reads about"),
             "{rows:?}"
         );
         // X is touched as without them.
         assert_eq!(after(&rows, "touch the left face → set"), ["X", "0.00"]);
         assert!(!rows.iter().any(|s| s.contains("under")), "{rows:?}");
-        // A strap over the whole front: that face is named under it, with
-        // no number, and the page warns.
+        // A strap over the whole front: that face is named under it, Y is
+        // set on the back alone, and the page warns.
         let mut a = app_with("Yes", |doc| {
             doc.setups[0].operations.drain(..2);
             (doc.setups[0].p).insert("origin".into(), "Stock top center".into());
@@ -6136,19 +6122,25 @@ pub(crate) mod tests {
         send(&mut a, GuideAction::Go(1));
         let t = texts(&a);
         assert!(has(&a, "a face is under a clamp"), "{t:?}");
+        assert!(has(&a, "find the centre"), "{t:?}");
         let rows = zero_rows(&t);
+        let i = rows
+            .iter()
+            .position(|s| s == "touch the back face → set")
+            .unwrap();
         assert_eq!(
-            after(&rows, "the front face is under the clamp on -Y (offset 0)"),
-            ["Y", "—"]
+            rows[i + 1..i + 4],
+            [
+                "Y",
+                "65.00",
+                "at X 0, clear of the clamps · the front face is under the clamp on -Y (offset 0) · set from this face alone, by the stock's size"
+            ]
         );
+        assert!(!rows.iter().any(|s| s.contains("front face →")), "{rows:?}");
         assert!(
-            rows.contains(
-                &"no spot of it clear for the edge finder · move the clamp along its side".into()
-            ),
+            !rows.iter().any(|s| s.contains("Y") && s.contains("½")),
             "{rows:?}"
         );
-        // The back face is touched as ever.
-        assert!(rows.contains(&"touch the back face → ½".into()), "{rows:?}");
         // In the vise, no clamps and no word of them.
         let mut a = app_with("Yes", |doc| {
             doc.setups[0].operations.drain(..2);
@@ -6936,6 +6928,32 @@ pub(crate) mod tests {
         )
         .unwrap();
         render(&a, (1280, 800), &out.join("setup3-zero.png"));
+        // Clamps 55.6 wide at −31.7 and 33.9 on the front, its Box
+        // operations alone: X 0.6 to 1.6 is all of the front clear for the
+        // Ø5 finder, between two of its samples.
+        let mut wide = (a.doc.workholding.iter())
+            .find(|h| h.id == get(&a.doc.setups[2].p, "holder"))
+            .unwrap()
+            .clone();
+        wide.id = "clamp-55.6".into();
+        wide.p.insert("width".into(), "55.6".into());
+        a.doc.workholding.push(wide);
+        let s = &mut a.doc.setups[2];
+        s.operations.truncate(2);
+        s.p.insert("holder".into(), "clamp-55.6".into());
+        s.p.insert("clamps".into(), "-Y:-31.7;-Y:33.9;+Y:0".into());
+        build(&mut a);
+        if let Some((_, Err(e))) = &a.guide {
+            panic!("{e}");
+        }
+        let id = a.doc.setups[2].id.clone();
+        a.doc.guide.insert(id, 1);
+        std::fs::write(
+            out.join("zero-narrow-gap.txt"),
+            format!("{:#?}\n{}", guide(&a).steps[1], texts(&a).join("\n")),
+        )
+        .unwrap();
+        render(&a, (1280, 800), &out.join("setup3-zero-narrow-gap.png"));
         // A face with no stretch clear: the 124 × 120 test block's front
         // under one strap 140 wide (the plate's own cuts would run into
         // such a strap).

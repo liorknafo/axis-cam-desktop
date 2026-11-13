@@ -1469,7 +1469,8 @@ fn run(
             }
         }
         // A manual mill's Zero is picked up with an edge finder above the
-        // jaws: its Steps cannot be followed when nothing stands clear. A
+        // jaws and clear of the clamps: its Steps cannot be followed when
+        // nothing stands clear. A
         // twist drill started on a flat face there walks off its position.
         for si in 0..job_doc.setups.len() {
             if !crate::manual::is_manual(&job_doc.setups[si].machine) {
@@ -1481,6 +1482,14 @@ fn run(
                     operation: None,
                     stage: "workholding",
                     message: crate::guide::NOT_CLEAR.into(),
+                }),
+                // Or its clamps are over all of a face it is touched on
+                // (LIO-458).
+                Err(why) if why.starts_with(crate::guide::UNDER_CLAMPS) => export.push(Problem {
+                    setup: si + 1,
+                    operation: None,
+                    stage: "workholding",
+                    message: why,
                 }),
                 // A Round corners walk whose DRO numbers cannot be followed
                 // (LIO-447): not a number, no safe X and Y to go down at,
