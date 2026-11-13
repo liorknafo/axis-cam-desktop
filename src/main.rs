@@ -186,6 +186,8 @@ const EDIT_PAUSE: Duration = Duration::from_millis(700);
 /// MacBook with larger text leaves. It opens no larger than its screen
 /// (`opening_window`), and on a screen narrower or shorter than `MIN_WINDOW`
 /// leaves it its least size is what the screen does (`least_window`).
+/// The shop tablet build (LIO-452): MACHINE alone, no planning.
+pub(crate) const SHOP: bool = cfg!(target_os = "android");
 pub(crate) const WINDOW: Size = Size::new(1440., 930.);
 pub(crate) const MIN_WINDOW: Size = Size::new(1120., 690.);
 /// What a screen's bars take from its height besides the window's content:
@@ -2226,6 +2228,15 @@ impl App {
                 app.smoke_step = 14;
             }
             app.smoke_arm();
+        }
+        // The shop tablet has no start page: it continues the project, its
+        // part loaded as Continue project would, straight on MACHINE.
+        if SHOP {
+            let model = app.restore_model();
+            return (
+                app,
+                Task::batch([model, Task::done(Message::Page(Page::Control))]),
+            );
         }
         (app, Task::none())
     }
@@ -5965,6 +5976,8 @@ impl App {
             Message::Frame(at) => return self.smoke_frame(at),
             Message::WindowSized(size) => self.smoke_sized(size),
             Message::Noop => {}
+            // The shop tablet makes parts: planning stays on the computer.
+            Message::Page(p) if SHOP && p != Page::Control => {}
             Message::Page(p) => {
                 self.help_animating = false;
                 self.pinned_help = None;
@@ -10666,11 +10679,39 @@ fn main() -> iced::Result {
         );
         std::process::exit(2)
     }
+    run()
+}
+
+/// The shop tablet build's start (LIO-452, android/): IcedActivity loads
+/// this library and calls here.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+fn android_main(app: iced_android::AndroidApp) {
+    // Android has no home folder: `storage::data_dir` is the app's own.
+    if let Some(dir) = app.internal_data_path() {
+        // SAFETY: before any other thread starts.
+        unsafe { std::env::set_var("XDG_DATA_HOME", dir) };
+    }
+    iced_android::init(app);
+    {
+        // The pages ask for the generic sans-serif (bold) and monospace (the
+        // DRO's digits): Android has neither of the desktop's names for them.
+        let mut fonts = iced::advanced::graphics::text::font_system()
+            .write()
+            .expect("font system");
+        let db = fonts.raw().db_mut();
+        db.set_sans_serif_family("Roboto");
+        db.set_monospace_family("Droid Sans Mono");
+    }
+    let _ = run();
+}
+
+fn run() -> iced::Result {
     // The stock mesher's GPU takes a moment to open: open it now, not on the
     // first simulation's stock.
     std::thread::spawn(gpu_mesh::shared);
     fault::install();
-    iced::application(App::boot, App::update, App::view)
+    let app = iced::application(App::boot, App::update, App::view)
         .title(|app: &App| format!("{} — AXIS CAM Studio", app.doc.title))
         .theme(Theme::custom(
             "Axis Light",
@@ -10691,9 +10732,16 @@ fn main() -> iced::Result {
             ..Default::default()
         })
         .position(iced::window::Position::SpecificWith(opening_place))
-        .antialiasing(true)
-        .default_font(iced::Font::with_name("Helvetica Neue"))
-        .run()
+        .antialiasing(true);
+    #[cfg(target_os = "android")]
+    let app = iced_android::fonts()
+        .into_iter()
+        .fold(app.default_font(iced_android::DEFAULT_FONT), |app, font| {
+            app.font(font)
+        });
+    #[cfg(not(target_os = "android"))]
+    let app = app.default_font(iced::Font::with_name("Helvetica Neue"));
+    app.run()
 }
 
 /// The status line's start while the link to the Pi is not answering.

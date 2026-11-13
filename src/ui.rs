@@ -242,7 +242,7 @@ fn switcher(app: &App, dark: bool) -> Element<'_, Message> {
         weight: iced::font::Weight::Bold,
         ..Font::DEFAULT
     };
-    let picker: Element<_> = if app.locked() {
+    let picker: Element<_> = if app.locked() || crate::SHOP {
         row![
             container(text(WORKSPACES[1]).size(14).font(font).color(if dark {
                 ON_DARK
@@ -250,7 +250,12 @@ fn switcher(app: &App, dark: bool) -> Element<'_, Message> {
                 MUTED
             }))
             .padding([7, 12]),
-            muted("Planning opens when the machine stops.").color(if dark {
+            muted(if crate::SHOP {
+                ""
+            } else {
+                "Planning opens when the machine stops."
+            })
+            .color(if dark {
                 ON_DARK
             } else {
                 MUTED
@@ -8948,11 +8953,12 @@ fn connect_controls(app: &App) -> Column<'_, Message> {
         col = col.push(
             row![
                 muted("Connection"),
-                btn(
+                // The shop tablet reaches the UC100 through the Pi alone.
+                (!crate::SHOP).then(|| btn(
                     "Real (USB)",
                     Message::MachineConnection("USB"),
                     now == "USB"
-                ),
+                )),
                 btn(
                     "Simulated",
                     Message::MachineConnection("Simulated"),
