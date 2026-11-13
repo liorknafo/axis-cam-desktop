@@ -437,19 +437,20 @@ pub(crate) fn measures(
         // A thread is tried, not measured (LIO-413).
         Strategy::Drill if op.tapping() => {}
         Strategy::Drill => {
-            let Some((holes, mouths)) = g.steps.iter().find_map(|st| match st {
+            let Some((holes, mouths, numbers)) = g.steps.iter().find_map(|st| match st {
                 Step::Holes {
                     op: o,
                     holes,
                     mouths,
+                    numbers,
                     ..
-                } if *o == d.op => Some((holes, mouths)),
+                } if *o == d.op => Some((holes, mouths, Some(numbers))),
                 Step::Bore {
                     op: o,
                     holes,
                     mouths,
                     ..
-                } if *o == d.op => Some((holes, mouths)),
+                } if *o == d.op => Some((holes, mouths, None)),
                 _ => None,
             }) else {
                 return out;
@@ -495,44 +496,72 @@ pub(crate) fn measures(
                 0.
             };
             // A cut shallower than that point never reaches the full
-            // diameter: measured to its tip, said so.
-            let short = through.is_none()
-                && point > 0.
-                && (holes.iter().zip(mouths)).any(|(h, m)| m - (h[2] + point) < 0.005);
-            let end = through.unwrap_or(if short { 0. } else { point });
-            let deep: Vec<f32> = (holes.iter().zip(mouths))
-                .map(|(h, m)| m - (h[2] + end))
-                .collect();
-            let (least, most) = deep
-                .iter()
-                .fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
-            let mut words = match through {
-                Some(_) => vec![
-                    "through".to_string(),
-                    "check it breaks out at the back".to_string(),
-                ],
-                None if short => vec![
-                    "deep from the mouth to the point's tip".to_string(),
-                    "the full Ø is not reached".to_string(),
-                ],
-                None if point > 0. => vec![
-                    "deep from the mouth".to_string(),
-                    "to the full Ø, not the point".to_string(),
-                ],
-                None => vec!["deep from the mouth".to_string()],
+            // diameter: measured to its tip, said so. Holes of one
+            // operation from mouths at several heights may be either: each
+            // kind its own size, its holes named by their DRO numbers.
+            let n = holes.len().min(mouths.len());
+            let reach = |i: usize| {
+                through.is_some() || point == 0. || mouths[i] - (holes[i][2] + point) >= 0.005
             };
-            if most - least > 0.005 {
-                words.push(format!("{}–{} by hole", mm(least), mm(most)));
+            for full in [true, false] {
+                let these: Vec<usize> = (0..n).filter(|&i| reach(i) == full).collect();
+                let Some(&first) = these.first() else {
+                    continue;
+                };
+                let end = match (through, full) {
+                    (Some(t), _) => t,
+                    (None, true) => point,
+                    (None, false) => 0.,
+                };
+                let deep: Vec<f32> = (these.iter())
+                    .map(|&i| mouths[i] - (holes[i][2] + end))
+                    .collect();
+                let (least, most) = deep
+                    .iter()
+                    .fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
+                let mut words = match through {
+                    Some(_) => vec![
+                        "through".to_string(),
+                        "check it breaks out at the back".to_string(),
+                    ],
+                    None if !full => vec![
+                        "deep from the mouth to the point's tip".to_string(),
+                        "the full Ø is not reached".to_string(),
+                    ],
+                    None if point > 0. => vec![
+                        "deep from the mouth".to_string(),
+                        "to the full Ø, not the point".to_string(),
+                    ],
+                    None => vec!["deep from the mouth".to_string()],
+                };
+                if these.len() < n {
+                    let named: Vec<String> = (these.iter())
+                        .map(|&i| {
+                            numbers
+                                .and_then(|k| k.get(i))
+                                .copied()
+                                .unwrap_or(i + 1)
+                                .to_string()
+                        })
+                        .collect();
+                    let which = if named.len() == 1 { "hole" } else { "holes" };
+                    words.insert(0, format!("{which} {}", named.join(", ")));
+                }
+                if most - least > 0.005 {
+                    words.push(format!("{}–{} by hole", mm(least), mm(most)));
+                }
+                let h = holes[first];
+                let at = [h[0] + zero[0], h[1] + zero[1], mouths[first] + zero[2]];
+                out.push(Measure {
+                    axis: "Z",
+                    value: most,
+                    words,
+                    from: at,
+                    to: [at[0], at[1], at[2] - deep[0]],
+                    ext: None,
+                    leader: false,
+                });
             }
-            out.push(Measure {
-                axis: "Z",
-                value: most,
-                words,
-                from: at,
-                to: [at[0], at[1], at[2] - deep[0]],
-                ext: None,
-                leader: false,
-            });
         }
         // A Slot (LIO-449): its length and width as cut, its floor below
         // the top of the row it is cut into and on the DRO, or through;
@@ -6616,7 +6645,7 @@ pub(crate) mod tests {
     /// The Check page's depth of a drilled hole on the manual mill
     /// (LIO-450): `mesh` drilled with a Ø`size` drill, through with 2.5 of
     /// breakthrough or blind, from a stock whose top is the part's.
-    fn drilled_depth(mesh: &Mesh, size: &str, through: bool, bottom: &str) -> Measure {
+    fn drilled(mesh: &Mesh, size: &str, through: bool, bottom: &str) -> (Document, Guide, f32) {
         use crate::cam::boring::tests::{drill, drilling, job};
         let manual = crate::manual::defaults();
         let mut tool = drill(size);
@@ -6636,9 +6665,13 @@ pub(crate) mod tests {
         let shown = shown(&doc, mesh, 0).unwrap();
         let g = &shown.guide;
         let top = shown.boxes[0].max[2] + g.zero[2];
-        let m = measures(&doc, g, &g.done[0], top);
+        (doc, g.clone(), top)
+    }
+    /// `drilled`'s one depth, drawn from the mouth down as far as it says.
+    fn drilled_depth(mesh: &Mesh, size: &str, through: bool, bottom: &str) -> Measure {
+        let (doc, g, top) = drilled(mesh, size, through, bottom);
+        let m = measures(&doc, &g, &g.done[0], top);
         let deep = m.into_iter().find(|x| x.axis == "Z").unwrap();
-        // Drawn from the mouth down as far as it says.
         assert!(
             (deep.from[2] - deep.to[2] - deep.value).abs() < 0.01,
             "{deep:?}"
@@ -6689,6 +6722,62 @@ pub(crate) mod tests {
                 "the full Ø is not reached"
             ]
         );
+    }
+    /// One Drill's holes from mouths at two heights (LIO-450): those whose
+    /// cut reaches the full Ø give that depth, those too shallow for it
+    /// their tip's, each named by its DRO hole number. The blind Ø8 job
+    /// with a second hole whose mouth is 1 over its tip.
+    #[test]
+    fn a_drills_holes_that_do_and_do_not_reach_the_full_diameter_are_told_apart() {
+        let point = 4. * crate::simulation::POINT_RISE;
+        let section = [
+            (0., -4.),
+            (12., -4.),
+            (12., 10.),
+            (4., 10.),
+            (4., 2.),
+            (0., 2. - point),
+        ];
+        let mesh = crate::mesh::normalize(crate::cam::tests::revolved(&section)).unwrap();
+        let (doc, mut g, top) = drilled(&mesh, "8", false, "0");
+        for st in &mut g.steps {
+            if let Step::Holes {
+                holes,
+                mouths,
+                numbers,
+                ..
+            } = st
+            {
+                let h = holes[0];
+                holes.push([h[0] + 20., h[1], h[2]]);
+                mouths.push(h[2] + 1.);
+                *numbers = vec![1, 2];
+            }
+        }
+        let m = measures(&doc, &g, &g.done[0], top);
+        let deep: Vec<&Measure> = m.iter().filter(|x| x.axis == "Z").collect();
+        assert_eq!(deep.len(), 2, "{m:?}");
+        assert!((deep[0].value - 8.).abs() < 0.01, "{m:?}");
+        assert_eq!(
+            deep[0].words,
+            [
+                "hole 1",
+                "deep from the mouth",
+                "to the full Ø, not the point"
+            ]
+        );
+        assert!((deep[1].value - 1.).abs() < 0.01, "{m:?}");
+        assert_eq!(
+            deep[1].words,
+            [
+                "hole 2",
+                "deep from the mouth to the point's tip",
+                "the full Ø is not reached"
+            ]
+        );
+        for d in deep {
+            assert!((d.from[2] - d.to[2] - d.value).abs() < 0.01, "{d:?}");
+        }
     }
     /// Steps entered from planning (LIO-449): at the start of the operation
     /// picked there, saying where the steps had got to, one press from it;
