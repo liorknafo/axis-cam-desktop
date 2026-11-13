@@ -232,7 +232,8 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
     let jaw = solid(&jaws);
     let mut dims = vec![vec![]];
     for (j, d) in guide.done.iter().enumerate() {
-        let measures = measures(doc, &guide, d, boxes[j].max[2] + zero[2]);
+        let mut measures = measures(doc, &guide, d, boxes[j].max[2] + zero[2]);
+        measures.retain(drawn);
         let ends: Vec<[f32; 3]> = (measures.iter())
             .flat_map(|m| {
                 let [ea, eb] = m.ext.unwrap_or([m.from, m.to]);
@@ -491,9 +492,94 @@ pub(crate) fn measures(
                 leader: false,
             });
         }
+        // A Slot (LIO-449): its length and width as cut, its floor below
+        // the top of the row it is cut into and on the DRO, or through;
+        // then where its centre is.
+        Strategy::Slot => {
+            let Ok(slot) = crate::slot::Slot::read(op, zero) else {
+                return out;
+            };
+            let r = d.plan.radius;
+            let k = usize::from((slot.b[1] - slot.a[1]).abs() > (slot.b[0] - slot.a[0]).abs());
+            let o = 1 - k;
+            let c: [f32; 2] = std::array::from_fn(|i| (slot.a[i] + slot.b[i]) / 2.);
+            // The material the slot starts in: the row's top.
+            let row = d.plan.rest_top.unwrap_or(slot.top);
+            let through = get(&op.p, "through") == "Yes";
+            // A through slot's bottom is the stock's (`slot::generate`).
+            let floor = if through {
+                slot.bottom
+            } else {
+                slot.bottom + crate::cam::number(op, "axial_allowance").unwrap_or(0.)
+            };
+            let point = |along: f32, across: f32, z: f32| {
+                let mut q = [0., 0., z];
+                (q[k], q[o]) = (along, across);
+                q
+            };
+            let (start, end) = (slot.a[k].min(slot.b[k]) - r, slot.a[k].max(slot.b[k]) + r);
+            // The length beside the slot, the width past its end, each with
+            // extension lines from the slot's edge.
+            let side = c[o] - r - 6.;
+            out.push(Measure {
+                axis: AXES[k],
+                value: end - start,
+                words: vec!["long".into(), "end to end".into()],
+                from: point(start, side, row),
+                to: point(end, side, row),
+                ext: Some([point(start, c[o], row), point(end, c[o], row)]),
+                leader: false,
+            });
+            let past = end + 6.;
+            let wall = slot.a[k].max(slot.b[k]);
+            out.push(Measure {
+                axis: AXES[o],
+                value: 2. * r,
+                words: vec!["wide".into()],
+                from: point(past, c[o] - r, row),
+                to: point(past, c[o] + r, row),
+                ext: Some([point(wall, c[o] - r, row), point(wall, c[o] + r, row)]),
+                leader: false,
+            });
+            let words = if through {
+                vec!["through: check the back and deburr".into()]
+            } else {
+                vec![
+                    format!("deep below the row's top Z {}", dro(row - zero[2])),
+                    format!("floor Z {}", dro(floor - zero[2])),
+                ]
+            };
+            out.push(Measure {
+                axis: "Z",
+                value: row - floor,
+                words,
+                from: point(c[k], c[o], row),
+                to: point(c[k], c[o], floor),
+                ext: None,
+                leader: false,
+            });
+            // Where it is: its centre on the DRO, listed, not drawn.
+            for i in 0..2 {
+                let at = [c[0], c[1], row];
+                out.push(Measure {
+                    axis: AXES[i],
+                    value: c[i] - zero[i],
+                    words: vec!["the slot's centre on the DRO".into()],
+                    from: at,
+                    to: at,
+                    ext: None,
+                    leader: false,
+                });
+            }
+        }
         _ => {}
     }
     out
+}
+/// Whether a measure is drawn on the picture: a position (`from` and `to`
+/// the same point) is only listed (LIO-449).
+fn drawn(m: &Measure) -> bool {
+    m.from != m.to
 }
 /// How far off the stock a size is drawn, mm.
 const OFF: f32 = 16.;
@@ -2093,6 +2179,107 @@ impl<'a> Page<'a> {
     }
 }
 
+/// How the Steps page was entered (LIO-449), said over its screen until
+/// the place moves.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Entry {
+    /// At the place setup `setup` (an id) was left. `ahead`: the section of
+    /// the operation picked in planning, which comes later, not skipped to.
+    Resumed { setup: String, ahead: Option<usize> },
+    /// At the start of the operation picked in planning; the place before
+    /// was step `from`, at its hole or readout `item`.
+    Picked {
+        setup: String,
+        from: usize,
+        item: usize,
+    },
+}
+/// The line over the screen that says how the page was entered, with the
+/// way to the other place (LIO-449).
+fn entry_line<'a>(app: &'a App, g: &Guide, at: usize) -> Option<Element<'a, Message>> {
+    let setup = app.doc.setups.get(g.setup)?;
+    let entry = app.steps_entry.as_ref()?;
+    let place = |at: usize, item: usize| {
+        let s = &g.sections[section_of(g, at)];
+        let p = progress(g, s, at, item);
+        let name = section_name(app, g, s);
+        if p.is_empty() {
+            name
+        } else {
+            format!("{name} · {p}")
+        }
+    };
+    let (said, go) = match entry {
+        Entry::Resumed {
+            setup: id,
+            ahead: Some(i),
+        } if *id == setup.id && *i < g.sections.len() => {
+            let picked = section_name(app, g, &g.sections[*i]);
+            let now = if at == 0 && app.guide_item == 0 {
+                "These steps start at the beginning".to_string()
+            } else {
+                format!(
+                    "Resuming where these steps were left: {}",
+                    place(at, app.guide_item)
+                )
+            };
+            (
+                format!("{now}. {picked}, picked in planning, comes later."),
+                (
+                    format!("Skip to {picked} ▶"),
+                    GuideAction::Go(g.sections[*i].steps.start),
+                ),
+            )
+        }
+        Entry::Resumed { setup: id, .. } if *id == setup.id => {
+            let s = &g.sections[section_of(g, at)];
+            (
+                format!(
+                    "Resuming where these steps were left: {}.",
+                    place(at, app.guide_item)
+                ),
+                (
+                    format!("◀ Start {} again", section_name(app, g, s)),
+                    GuideAction::Go(s.steps.start),
+                ),
+            )
+        }
+        Entry::Picked {
+            setup: id,
+            from,
+            item,
+        } if *id == setup.id && *from < g.steps.len() => (
+            format!(
+                "Opened at the start of the operation picked in planning. The steps had got to {}.",
+                place(*from, *item)
+            ),
+            ("Back to there ▶".to_string(), GuideAction::Resume),
+        ),
+        _ => return None,
+    };
+    let line = row![
+        text(said).size(13).color(INK).width(Fill),
+        crate::ui::secondary(go.0, Message::Guide(go.1))
+    ]
+    .spacing(12)
+    .align_y(Alignment::Center);
+    Some(
+        container(line)
+            .padding([6, 12])
+            .width(Fill)
+            .style(|_| container::Style {
+                background: Some(CHIP.into()),
+                border: Border {
+                    color: ACCENT,
+                    width: 1.,
+                    radius: 8.into(),
+                },
+                text_color: Some(INK),
+                ..Default::default()
+            })
+            .into(),
+    )
+}
 /// The page.
 pub fn view(app: &App) -> Element<'_, Message> {
     let main: Element<_> = match app.current_guide() {
@@ -2356,8 +2543,12 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
     ]
     .spacing(12)
     .align_y(Alignment::Center);
-    column![top, header, container(screen(&page)).height(Fill)]
-        .spacing(12)
+    let mut page_column = column![top, header].spacing(12);
+    if let Some(line) = entry_line(app, g, at) {
+        page_column = page_column.push(line);
+    }
+    page_column
+        .push(container(screen(&page)).height(Fill))
         .into()
 }
 /// The left panel's scrollable: scrolled so that the place's section is in
@@ -2715,7 +2906,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
         }
         // A hand tap: put it in, the spindle off and free; no gear and no
         // Z pick-up (LIO-410).
-        Step::TapIn { op, tool } => {
+        Step::TapIn { op, tool, top } => {
             let d = p
                 .tool(*op)
                 .and_then(|t| num(&t.p, "diameter"))
@@ -2757,6 +2948,24 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     ]
                 ),
             ];
+            // Z on the top, for each hole's lift to a safe Z (LIO-449). In
+            // a wrench the DRO follows the centre, not the tap: the tap and
+            // wrench come out by hand before each move.
+            let right = match top {
+                Some(top) => right
+                    .push(row(
+                        3,
+                        "Z",
+                        &dro(*top),
+                        vec![
+                            "in the chuck: touch the top with the tap's tip".into(),
+                            "in a wrench: with the centre's point".into(),
+                            "set Z".into(),
+                        ],
+                    ))
+                    .push(muted(WRENCH_LIFT).size(13)),
+                None => right,
+            };
             let left = p.picture(p.done(*op), Fill);
             ("Tap".into(), "put it in", left, right)
         }
@@ -3068,7 +3277,8 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                         None,
                     );
                 }
-                let n = moving.iter().position(|&m| m == k).unwrap_or(k);
+                // After the lift (LIO-449).
+                let n = moving.iter().position(|&m| m == k).unwrap_or(k) + 1;
                 let (value, tags) = match pattern {
                     Some(_) => (
                         dro(0.),
@@ -3094,6 +3304,11 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 )
             };
             let tapping = p.setup.operations.get(*op).is_some_and(|o| o.tapping());
+            // Up to a safe Z first, every hole: the move to it must not
+            // drag the tool through the stock or into the holding (LIO-449).
+            let lift = lift(p, *op, tapping);
+            // The depth's step, after the lift and the axes that move.
+            let z = z + 1;
             // Every hole is cut from its mouth: the stock above it may be
             // gone already (LIO-365).
             let mouth = mouths.get(i).copied().unwrap_or(stock.max[2]);
@@ -3166,6 +3381,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 let right = column![
                     chips(said),
                     hole_label(i, holes.len(), number(i)),
+                    lift,
                     xy(0),
                     xy(1),
                     readout(
@@ -3231,6 +3447,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 let right = column![
                     chips(said),
                     hole_label(i, holes.len(), number(i)),
+                    lift,
                     xy(0),
                     xy(1),
                     readout(
@@ -3385,6 +3602,23 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 },
                 None,
             ));
+            // Up to a safe Z before each hole's move (LIO-449).
+            right = right.push(readout(
+                Readout {
+                    order: next(),
+                    lead: Some("up to".into()),
+                    axis: "Z".into(),
+                    value: dro(safe_z(p, *op)),
+                    lock: None,
+                    tags: vec![
+                        format!("clear of the stock and {}", holder(p)),
+                        "before X and Y move".into(),
+                    ],
+                    lit: Lit::Next,
+                    big: false,
+                },
+                None,
+            ));
             for (axis, value, lock, tags) in [
                 ("X", h[0], Some("X"), vec!["centre".to_string()]),
                 ("Y", h[1], Some("Y"), vec!["centre".to_string()]),
@@ -3427,6 +3661,16 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 .filter(|a| *a > 0.)
             {
                 c.push(chip(format!("{} mm left on the walls and floor", mm(a))));
+            }
+            // A Slot's stock to leave, said with its sizes (LIO-449).
+            if let Some(o) = o.filter(|o| o.strategy == Strategy::Slot) {
+                let left = |k: &str| num(&o.p, k).filter(|a| *a > 0.);
+                if let Some(a) = left("allowance") {
+                    c.push(chip(format!("{} mm left on the walls", mm(a))));
+                }
+                if let Some(a) = left("axial_allowance").filter(|_| get(&o.p, "through") != "Yes") {
+                    c.push(chip(format!("{} mm left on the floor", mm(a))));
+                }
             }
             // The sizes to measure, drawn on the picture and listed large
             // (LIO-370).
@@ -3666,6 +3910,73 @@ fn never_lines(
 const LIFT: f32 = crate::cam::LIFT + 0.05;
 /// The heading over a hole's readouts: "Hole 2 of 6", and the DRO's hole
 /// to call up when that is another number (LIO-407).
+/// How far above the stock and its holding, mm, the tool goes at least
+/// before it moves to a hole (LIO-449).
+const SAFE_ABOVE: f32 = 5.;
+/// The DRO's Z the tool goes up to before X and Y move to a hole of `op`
+/// (LIO-449): the plan's own clearance over the stock (its highest move,
+/// the operation's "clearance"), and never less than `SAFE_ABOVE` over the
+/// stock left and the tops of the vise's jaws or the clamps.
+fn safe_z(p: &Page<'_>, op: usize) -> f32 {
+    let g = p.guide();
+    let planned = (g.done.get(p.done(op)).filter(|d| d.op == op))
+        .and_then(|d| {
+            (d.plan.moves.iter())
+                .flat_map(|m| [m.from[2], m.to[2]])
+                .reduce(f32::max)
+        })
+        // A centre drill's plan is of its pilot's top, the DRO set to its
+        // tip (`Step::Holes`): its clearance reads the pilot lower.
+        .map(|z| {
+            z - g.zero[2]
+                - p.tool(op)
+                    .and_then(|t| t.centre_drill())
+                    .map_or(0., |c| c.pilot_length)
+        });
+    let holder = (p.shown.jaws.iter()).map(|j| j.max[2]);
+    let highest = holder.fold(p.before(op).max[2], f32::max);
+    up(planned
+        .unwrap_or(f32::NEG_INFINITY)
+        .max(highest + SAFE_ABOVE))
+}
+/// A tap in a wrench on a centre (LIO-449): Z is the centre's point, which
+/// the DRO follows; the tap is in the hole, not on the quill.
+const WRENCH_LIFT: &str = "In a wrench, Z is the centre's point, not the tap's tip: before each move to a hole, turn the tap out, lift it and the wrench clear of the stock by hand, then raise the centre.";
+/// What holds the stock, in a hole page's words.
+fn holder(p: &Page<'_>) -> &'static str {
+    if !p.shown.vise.is_empty() {
+        "the vise"
+    } else if !p.shown.jaws.is_empty() {
+        "the clamps"
+    } else {
+        "what holds it"
+    }
+}
+/// A hole page's first readout (LIO-449): Z up to `safe_z` before X and Y
+/// move, so that no move drags the tool through the stock or the holding;
+/// a tap is turned back out first.
+fn lift<'a>(p: &Page<'a>, op: usize, tapping: bool) -> Element<'a, Message> {
+    let mut tags = vec![];
+    if tapping {
+        tags.push("turn the tap back out first".to_string());
+        tags.push("in a wrench: lift the tap and wrench out by hand, then the centre".into());
+    }
+    tags.push(format!("clear of the stock and {}", holder(p)));
+    tags.push("before X and Y move".into());
+    readout(
+        Readout {
+            order: Some(1),
+            lead: Some("up to".into()),
+            axis: "Z".into(),
+            value: dro(safe_z(p, op)),
+            lock: None,
+            tags,
+            lit: lit(0, p.app.guide_reached),
+            big: false,
+        },
+        Some(Message::Guide(GuideAction::Reached(0))),
+    )
+}
 fn hole_label<'a>(i: usize, of: usize, called: usize) -> Element<'a, Message> {
     match called == i + 1 {
         true => label(format!("Hole {} of {of}", i + 1)),
@@ -4607,6 +4918,8 @@ pub(crate) mod tests {
         let key = a.guide_key().unwrap();
         let built = shown(&a.doc, a.part_mesh().unwrap(), a.doc.index()).map(Arc::new);
         a.guide = Some((key, built));
+        // As `GuideAction::Built` does: the page entered meanwhile.
+        a.apply_steps_entry();
     }
     fn texts(a: &App) -> Vec<String> {
         crate::ui::probe::texts(a.view(), iced::Size::new(1280., 800.))
@@ -4970,15 +5283,16 @@ pub(crate) mod tests {
     /// The Holes screen of a grid, back and forth (LIO-405): each hole asks
     /// only for the axis that moves, the other "stays"; hole 1 and a bolt
     /// circle's holes move both; a plain Drill's hole on the Y of the one
-    /// before keeps Y.
+    /// before keeps Y. Each starts with the lift to a safe Z, ① (LIO-449).
     #[test]
     fn a_hole_asks_only_for_the_axis_that_moves() {
         use crate::guide::tests::{plate_circle, plate_grid};
         // The numbered steps of the screen: the axis after each disc.
+        // The lift's "up to" comes between its disc and its axis.
         let steps = |a: &App| -> Vec<(String, String)> {
-            let t = texts(a);
+            let t: Vec<String> = texts(a).into_iter().filter(|s| s != "up to").collect();
             (0..t.len().saturating_sub(1))
-                .filter(|&i| ["1", "2", "3"].contains(&t[i].as_str()))
+                .filter(|&i| ["1", "2", "3", "4"].contains(&t[i].as_str()))
                 .filter(|&i| ["X", "Y", "Z"].contains(&t[i + 1].as_str()))
                 .map(|i| (t[i].clone(), t[i + 1].clone()))
                 .collect()
@@ -4991,17 +5305,21 @@ pub(crate) mod tests {
         let mut a = pattern_app(&plate_grid(), true, false, false);
         let holes = patterns(&a)[0] + 1;
         send(&mut a, GuideAction::Go(holes));
-        assert_eq!(steps(&a), pairs(&[("1", "X"), ("2", "Y"), ("3", "Z")]));
+        // ① is the lift, Z up to a safe height (LIO-449).
+        assert_eq!(
+            steps(&a),
+            pairs(&[("1", "Z"), ("2", "X"), ("3", "Y"), ("4", "Z")])
+        );
         // Hole 2: X, then Z; Y stays. Hole 5, up onto the second row: Y.
         a.guide_item = 1;
-        assert_eq!(steps(&a), pairs(&[("1", "X"), ("2", "Z")]));
+        assert_eq!(steps(&a), pairs(&[("1", "Z"), ("2", "X"), ("3", "Z")]));
         assert_eq!(after(&texts(&a), "Y"), ["stays", "leave it locked"]);
         a.guide_item = 4;
-        assert_eq!(steps(&a), pairs(&[("1", "Y"), ("2", "Z")]));
+        assert_eq!(steps(&a), pairs(&[("1", "Z"), ("2", "Y"), ("3", "Z")]));
         assert_eq!(after(&texts(&a), "X"), ["stays", "leave it locked"]);
-        // Tapping X lights Z, the next step.
-        send(&mut a, GuideAction::Reached(0));
-        assert_eq!(a.guide_reached, 1);
+        // Tapping Y lights Z, the next step.
+        send(&mut a, GuideAction::Reached(1));
+        assert_eq!(a.guide_reached, 2);
         // A bolt circle moves both, but between two holes on one X or Y
         // (150° and 210° on this one) that one stays, as on any Drill.
         let mut a = pattern_app(&plate_circle(), false, true, false);
@@ -5014,7 +5332,7 @@ pub(crate) mod tests {
         for item in 0..6 {
             a.guide_item = item;
             let stays = |k: usize| item > 0 && (holes[item][k] - holes[item - 1][k]).abs() < 0.005;
-            let mut want = vec![];
+            let mut want = vec![("1".to_string(), "Z".to_string())];
             for k in (0..2).filter(|&k| !stays(k)) {
                 want.push(((want.len() + 1).to_string(), AXES[k].to_string()));
             }
@@ -6127,6 +6445,345 @@ pub(crate) mod tests {
             }
         }
         std::fs::write(dir.join("rendered-steps.txt"), text).unwrap();
+    }
+    /// Every hole page starts with Z up to a safe height, a DRO reading,
+    /// before X and Y move (LIO-449): the plan's clearance over the stock,
+    /// above the jaws too; the depth comes after the axes.
+    #[test]
+    fn every_hole_page_lifts_to_a_safe_z_before_x_and_y_move() {
+        let mut a = app("Yes");
+        let shown = a.guide_at().unwrap().0;
+        let g = shown.guide.clone();
+        let id = a.doc.setups[0].id.clone();
+        let mut seen = 0;
+        for (at, step) in g.steps.iter().enumerate() {
+            let Step::Holes { op, holes, .. } = step else {
+                continue;
+            };
+            let j = g.done.iter().position(|d| d.op == *op).unwrap();
+            let o = &a.doc.setups[0].operations[*op];
+            // The operation's clearance over the setup's stock top, in work Z.
+            let clear = (g.done[j].plan.stock.max[2] - g.zero[2])
+                + num(&o.p, "top").unwrap_or(0.)
+                + num(&o.p, "clearance").unwrap();
+            let top = shown.boxes[j].max[2];
+            let jaws = (shown.jaws.iter()).map(|b| b.max[2]).fold(top, f32::max);
+            let safe = clear.max(jaws + SAFE_ABOVE);
+            assert!(safe >= top + SAFE_ABOVE - 1e-4 && safe >= jaws + SAFE_ABOVE - 1e-4);
+            for item in 0..holes.len() {
+                a.doc.guide.insert(id.clone(), at);
+                a.guide_item = item;
+                a.guide_reached = 0;
+                let t = texts(&a);
+                assert_eq!(after(&t, "up to"), ["Z", &dro(safe)], "hole {item}: {t:?}");
+                let lift = t.iter().position(|s| s == "up to").unwrap();
+                // Its order: 1, then the axes, then the depth.
+                assert_eq!(t[lift - 1], "1", "{t:?}");
+                let axes = t.iter().position(|s| s == "X" || s == "Y").unwrap();
+                assert!(lift < axes, "{t:?}");
+                assert!(t.iter().any(|s| s.contains("before X and Y move")), "{t:?}");
+                // The lift is the first readout lit; reached, the axes are.
+                send(&mut a, GuideAction::Reached(0));
+                assert_eq!(a.guide_reached, 1);
+                seen += 1;
+            }
+        }
+        assert!(seen >= 2, "{seen} hole pages");
+    }
+    /// A Slot (LIO-445) on the 40 × 30 × 8 slotted plate in the vise, cut
+    /// blind to `bottom` or through (LIO-449).
+    fn slot_job(through: bool, bottom: &str) -> (Document, crate::mesh::Mesh) {
+        let (mut doc, _) = crate::corner::tests::plate_job("Y");
+        let mesh = crate::mesh::normalize(crate::cam::arcs::tests::slot(5.)).unwrap();
+        let tool = &mut doc.tools[0];
+        tool.p.insert("center_cutting".into(), "Yes".into());
+        let mut op = crate::model::Operation::new(Strategy::Slot, tool.id.clone());
+        for (k, v) in [
+            ("name", "Slot 15x10"),
+            ("slot_x", "0"),
+            ("slot_y", "0"),
+            ("slot_axis", "X"),
+            ("slot_length", "15"),
+            ("slot_width", "10"),
+            ("z_top", "0"),
+            ("z_bottom", bottom),
+            ("through", if through { "Yes" } else { "No" }),
+            ("breakthrough", if through { "0.5" } else { "0" }),
+            ("axial_allowance", "0"),
+            ("allowance", "0"),
+        ] {
+            op.p.insert(k.into(), v.into());
+        }
+        let s = &mut doc.setups[0];
+        s.p.insert("vise_grip".into(), "4".into());
+        s.operations = vec![op];
+        (doc, mesh)
+    }
+    /// A Slot's Check page gives what to measure (LIO-449): its length and
+    /// width, its floor below the row's top and on the DRO, or through and
+    /// to check the back; and where its centre is, listed, not drawn.
+    #[test]
+    fn a_slots_check_gives_its_sizes_depth_and_place() {
+        for through in [false, true] {
+            let (doc, mesh) = slot_job(through, if through { "-8" } else { "-5" });
+            let shown = shown(&doc, &mesh, 0).unwrap();
+            let g = &shown.guide;
+            assert!(g.steps.iter().any(|s| matches!(s, Step::Check { op: 0 })));
+            let top = shown.boxes[0].max[2] + g.zero[2];
+            let m = measures(&doc, g, &g.done[0], top);
+            let row = |axis: &str, value: f32| {
+                (m.iter())
+                    .find(|x| x.axis == axis && (x.value - value).abs() < 0.01)
+                    .unwrap_or_else(|| panic!("{axis} {value} in {m:?}"))
+            };
+            assert!(row("X", 15.).words.contains(&"long".to_string()));
+            assert!(row("Y", 10.).words.contains(&"wide".to_string()));
+            let depth = row("Z", if through { 8. } else { 5. });
+            if through {
+                assert_eq!(depth.words, ["through: check the back and deburr"]);
+            } else {
+                assert_eq!(
+                    depth.words,
+                    ["deep below the row's top Z 0.00", "floor Z −5.00"]
+                );
+            }
+            // Its centre on the DRO: listed, not drawn.
+            for axis in ["X", "Y"] {
+                let at = row(axis, 0.);
+                assert_eq!(at.words, ["the slot's centre on the DRO"]);
+                assert!(!drawn(at));
+            }
+            assert_eq!(m.iter().filter(|x| drawn(x)).count(), 3);
+            assert_eq!(shown.dims[1].len(), 3, "{:?}", shown.dims[1]);
+        }
+    }
+    /// Steps entered from planning (LIO-449): at the start of the operation
+    /// picked there, saying where the steps had got to, one press from it;
+    /// with none picked, where they were left, saying so; the line goes
+    /// once the place moves.
+    #[test]
+    fn steps_open_at_the_operation_picked_in_planning_or_say_they_resume() {
+        let mut a = app("Yes");
+        let g = guide(&a);
+        let id = a.doc.setups[0].id.clone();
+        let si = a.doc.index();
+        let last = g.steps.len() - 1;
+        let k = (g.sections.iter())
+            .position(|s| s.op.is_some() && s.steps.len() > 1)
+            .unwrap();
+        let (picked, start) = (g.sections[k].op.unwrap(), g.sections[k].steps.start);
+        // Picked, the place at the hand-over: the operation's start.
+        a.doc.guide.insert(id.clone(), last);
+        a.page = Page::Work;
+        a.selected = Some(picked);
+        let _ = a.update(Message::Guide(GuideAction::Open(si)));
+        assert!(a.steps_page());
+        assert_eq!(place(&a), start);
+        assert!(matches!(&a.steps_entry, Some(Entry::Picked { from, .. }) if *from == last));
+        let t = texts(&a);
+        assert!(
+            t.iter().any(|s| s.starts_with(
+                "Opened at the start of the operation picked in planning. The steps had got to"
+            )),
+            "{t:?}"
+        );
+        assert!(has(&a, "Back to there ▶"));
+        send(&mut a, GuideAction::Resume);
+        assert_eq!(place(&a), last);
+        assert_eq!(a.steps_entry, None);
+        // Entered by MACHINE's page, the place in the picked operation:
+        // kept, and said to be resumed.
+        a.doc.guide.insert(id.clone(), start + 1);
+        a.page = Page::Work;
+        let _ = a.update(Message::Page(Page::Control));
+        assert_eq!(place(&a), start + 1);
+        assert!(matches!(&a.steps_entry, Some(Entry::Resumed { .. })));
+        let t = texts(&a);
+        assert!(
+            t.iter()
+                .any(|s| s.starts_with("Resuming where these steps were left:")),
+            "{t:?}"
+        );
+        // Its button starts the operation again; the line goes.
+        let again = (t.iter()).find(|s| s.starts_with("◀ Start ") && s.ends_with(" again"));
+        assert!(again.is_some(), "{t:?}");
+        send(&mut a, GuideAction::Go(start));
+        assert_eq!(a.steps_entry, None);
+        assert!(!texts(&a).iter().any(|s| s.starts_with("Resuming")));
+        // Picked, but the steps are not there yet (a fresh job): kept at
+        // the start, none skipped unasked; the picked one a press away.
+        a.doc.guide.insert(id.clone(), 0);
+        a.page = Page::Work;
+        a.selected = Some(picked);
+        let _ = a.update(Message::Page(Page::Control));
+        assert_eq!(place(&a), 0);
+        assert_eq!(
+            a.steps_entry,
+            Some(Entry::Resumed {
+                setup: id.clone(),
+                ahead: Some(k)
+            })
+        );
+        let t = texts(&a);
+        let name = section_name(&a, &g, &g.sections[k]);
+        assert!(
+            t.iter().any(|s| *s
+                == format!(
+                    "These steps start at the beginning. {name}, picked in planning, comes later."
+                )),
+            "{t:?}"
+        );
+        assert!(has(&a, &format!("Skip to {name} ▶")), "{t:?}");
+        send(&mut a, GuideAction::Go(start));
+        assert_eq!((place(&a), a.steps_entry.clone()), (start, None));
+        // Nothing picked, at the very start: nothing to say.
+        a.doc.guide.insert(id.clone(), 0);
+        a.page = Page::Work;
+        a.selected = None;
+        let _ = a.update(Message::Page(Page::Control));
+        assert_eq!(a.steps_entry, None);
+        // Nothing picked, part way: resumed, said; the next step drops it.
+        a.doc.guide.insert(id.clone(), start + 1);
+        a.page = Page::Work;
+        let _ = a.update(Message::Page(Page::Control));
+        assert_eq!(place(&a), start + 1);
+        assert!(matches!(&a.steps_entry, Some(Entry::Resumed { .. })));
+        send(&mut a, GuideAction::Next);
+        assert_eq!(a.steps_entry, None);
+    }
+    /// The left list follows the place only when it moves to another
+    /// section (LIO-449): the handwheel's beat on a pass, every 100 ms, and
+    /// a readout reached leave it where the hand scrolled it.
+    #[test]
+    fn the_operations_list_is_not_snapped_back_while_a_pass_beats() {
+        let mut a = app("Yes");
+        let g = guide(&a);
+        let pass = (g.steps.iter())
+            .position(
+                |s| matches!(s, Step::Pass { turns_per_minute, .. } if *turns_per_minute > 0.),
+            )
+            .unwrap();
+        a.doc.guide.insert(a.doc.setups[0].id.clone(), pass);
+        let beat = a.update(Message::Guide(GuideAction::Beat(std::time::Instant::now())));
+        assert_eq!(beat.units(), 0);
+        assert_eq!(a.update(Message::Guide(GuideAction::Reached(0))).units(), 0);
+        // Another section: the list follows.
+        let here = section_of(&g, pass);
+        let other = (0..g.sections.len()).find(|i| *i != here).unwrap();
+        assert!(
+            a.update(Message::Guide(GuideAction::Section(other)))
+                .units()
+                > 0
+        );
+        assert_eq!(section_of(&g, place(&a)), other);
+    }
+    /// LIO-449 on a private copy of the finished adapter plate
+    /// (`AXIS_ADAPTER_COPY`: a folder with adapter-plate.axis.json and its
+    /// .step): the hole pages, the TapIn page, the Slots' Check pages and
+    /// the page entered from planning, as PNGs and texts in that folder.
+    #[test]
+    #[ignore = "private adapter copy: AXIS_ADAPTER_COPY"]
+    fn render_the_adapter_plate_lio_449() {
+        let dir = std::path::PathBuf::from(std::env::var_os("AXIS_ADAPTER_COPY").unwrap());
+        let mut doc = crate::storage::load(&dir.join("adapter-plate.axis.json")).unwrap();
+        doc.file.as_mut().unwrap().path = dir.join("adapter-plate.step");
+        let mesh = crate::mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
+        doc.active = doc.setups[2].id.clone();
+        let mut a = App::from_workspace(dir.join("render-state.axis.json"), None);
+        a.doc = doc;
+        a.imported_mesh = Some(mesh);
+        a.window_width = 1440.;
+        a.window_height = 1000.;
+        let size = Size::new(1440., 1000.);
+        let id = a.doc.setups[2].id.clone();
+        a.page = crate::Page::Control;
+        build(&mut a);
+        let g = guide(&a);
+        let mut said = String::new();
+        let mut shot = |a: &App, name: &str| {
+            let t = crate::ui::probe::texts(a.view(), size);
+            said += &format!("== {name}\n{}\n", t.join(" | "));
+            render(a, (1440, 1000), &dir.join(format!("{name}.png")));
+            t
+        };
+        let ops = a.doc.setups[2].operations.clone();
+        let named = |s: &str| ops.iter().position(|o| o.name().starts_with(s)).unwrap();
+        for (name, op) in [
+            ("centre", named("Centre drill")),
+            ("drill", named("Drill 6.8")),
+            ("tap", named("Hand tap")),
+        ] {
+            let at = (g.steps.iter())
+                .position(|s| matches!(s, Step::Holes { op: o, .. } if *o == op))
+                .unwrap();
+            for item in 0..2 {
+                a.doc.guide.insert(id.clone(), at);
+                a.guide_item = item;
+                let t = shot(&a, &format!("{name}-hole-{}", item + 1));
+                assert!(t.iter().any(|s| s == "up to"), "{t:?}");
+            }
+            if name == "tap" {
+                let tap_in = (g.steps.iter())
+                    .position(|s| matches!(s, Step::TapIn { op: o, .. } if *o == op))
+                    .unwrap();
+                a.doc.guide.insert(id.clone(), tap_in);
+                a.guide_item = 0;
+                shot(&a, "tap-in");
+            }
+        }
+        for (name, op) in [
+            (
+                "check-counterbore-ll",
+                named("Counterbore 18x13 lower left"),
+            ),
+            (
+                "check-counterbore-ul",
+                named("Counterbore 18x13 upper left"),
+            ),
+            ("check-through-ul", named("Through slot 13x8 upper left")),
+        ] {
+            let at = (g.steps.iter())
+                .position(|s| matches!(s, Step::Check { op: o } if *o == op))
+                .unwrap();
+            a.doc.guide.insert(id.clone(), at);
+            a.guide_item = 0;
+            shot(&a, name);
+        }
+        // Entered from planning with the drill picked, the place at the
+        // hand-over: at the drill's start, the hand-over one press away.
+        let last = g.steps.len() - 1;
+        a.doc.guide.insert(id.clone(), last);
+        a.page = crate::Page::Work;
+        a.selected = Some(named("Drill 6.8"));
+        let _ = a.update(Message::Guide(GuideAction::Open(2)));
+        shot(&a, "entry-picked");
+        assert_eq!(
+            place(&a),
+            g.sections
+                .iter()
+                .find(|s| s.op == a.selected)
+                .unwrap()
+                .steps
+                .start
+        );
+        send(&mut a, GuideAction::Resume);
+        shot(&a, "entry-back-there");
+        // A fresh start with a later operation picked: kept at Set up.
+        a.doc.guide.insert(id.clone(), 0);
+        a.page = crate::Page::Work;
+        let _ = a.update(Message::Guide(GuideAction::Open(2)));
+        assert_eq!(place(&a), 0);
+        shot(&a, "entry-ahead");
+        // Again with nothing picked, the place mid-way: resuming, said.
+        a.page = crate::Page::Work;
+        a.selected = None;
+        let mid = (g.steps.iter())
+            .position(|s| matches!(s, Step::Slot { index: 3, .. }))
+            .unwrap();
+        a.doc.guide.insert(id.clone(), mid);
+        let _ = a.update(Message::Guide(GuideAction::Open(2)));
+        shot(&a, "entry-resumed");
+        std::fs::write(dir.join("lio-449.txt"), said).unwrap();
     }
     /// The Steps page at 1280 × 800, one PNG per kind of step, in
     /// /tmp/manual-steps.

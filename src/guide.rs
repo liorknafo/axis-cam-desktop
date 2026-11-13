@@ -100,8 +100,14 @@ pub enum Step {
         top: Option<f32>,
     },
     /// A hand tap `tool` (an id) for the tapping `op`: put it in, the
-    /// spindle off and free to turn; no gear and no Z to pick up (LIO-410).
-    TapIn { op: usize, tool: String },
+    /// spindle off and free to turn; no gear (LIO-410). With `top`, Z is
+    /// set on the stock's top with the tap's tip, as for a new tool, so
+    /// that each hole's lift to a safe Z is a DRO reading (LIO-449).
+    TapIn {
+        op: usize,
+        tool: String,
+        top: Option<f32>,
+    },
     /// Same tool and gear: enter its `diameter` in the DRO and set the
     /// compensation sides `comp`, not set before or changed.
     Comp {
@@ -1631,12 +1637,13 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
         // The DRO's compensation this tool and gear leave on, when on.
         let comp_on = matches!(set, Some((t, s, Some(c))) if t == tool && s == rpm && c != [0; 2]);
         let mut sides = |comp: [i8; 2], steps: &mut Vec<Step>| {
-            // A tap is turned by hand: its own screen, no gear, no Z
-            // pick-up (LIO-410).
+            // A tap is turned by hand: its own screen, no gear (LIO-410);
+            // a new one picks up Z for the lifts between holes (LIO-449).
             if tap {
                 steps.push(Step::TapIn {
                     op: oi,
                     tool: tool.into(),
+                    top,
                 });
                 set = Some((tool, rpm, Some(comp)));
                 return;

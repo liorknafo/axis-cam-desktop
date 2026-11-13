@@ -662,6 +662,9 @@ pub enum GuideAction {
     Section(usize),
     /// The readout `i` of the step shown is reached: the next is lit.
     Reached(usize),
+    /// Back to the place the steps had reached before they were opened at
+    /// the operation picked in planning (`steps::Entry::Picked`, LIO-449).
+    Resume,
     /// Setup `i` on the MACHINE page: its steps, or the CNC's control.
     Open(usize),
     /// What stops the active setup's steps, `problem`, opened in
@@ -1274,6 +1277,12 @@ pub struct App {
     pub guide_reached: usize,
     /// What is typed in a lathe step's measure box: its key and the text.
     pub guide_typed: Option<(String, String)>,
+    /// How the Steps page was last entered, said over its screen until the
+    /// place moves (LIO-449).
+    pub steps_entry: Option<steps::Entry>,
+    /// The Steps page entered while its guide is still being built: the
+    /// setup (id) and the operation picked in planning, applied once built.
+    steps_pending: Option<(String, Option<usize>)>,
     /// When the step shown was opened, and the page's clock since
     /// (`GuideAction::Beat`): the handwheel's beat.
     pub guide_clock: (Instant, Instant),
@@ -2078,6 +2087,8 @@ impl App {
             guide_job: None,
             guide_item: 0,
             guide_reached: 0,
+            steps_entry: None,
+            steps_pending: None,
             guide_typed: None,
             guide_clock: (Instant::now(), Instant::now()),
             ready: run::Ready::default(),
@@ -5036,6 +5047,68 @@ impl App {
             move |result| Message::Guide(GuideAction::Built(key, result)),
         )
     }
+    /// The Steps page entered (LIO-449): at the start of the operation
+    /// picked in planning, or where the setup's steps were left, saying so.
+    /// Waits for the guide when it is still being built.
+    fn enter_steps(&mut self) {
+        self.steps_entry = None;
+        self.steps_pending = None;
+        if !self.steps_page() {
+            return;
+        }
+        let Some(setup) = self.doc.active_setup() else {
+            return;
+        };
+        self.steps_pending = Some((setup.id.clone(), self.selected));
+        self.apply_steps_entry();
+    }
+    /// `enter_steps` carried out once the active setup's guide is built.
+    fn apply_steps_entry(&mut self) {
+        let Some((id, picked)) = self.steps_pending.clone() else {
+            return;
+        };
+        if !self.steps_page() || self.doc.active_setup().map(|s| &s.id) != Some(&id) {
+            self.steps_pending = None;
+            return;
+        }
+        let Some((shown, at)) = self.guide_at() else {
+            return;
+        };
+        self.steps_pending = None;
+        let g = &shown.guide;
+        if g.setup != self.doc.index() {
+            return;
+        }
+        let picked = picked.and_then(|oi| g.sections.iter().position(|s| s.op == Some(oi)));
+        let item = self.guide_item;
+        let resumed = |ahead| steps::Entry::Resumed {
+            setup: id.clone(),
+            ahead,
+        };
+        self.steps_entry = match picked.map(|i| (i, g.sections[i].steps.clone())) {
+            // Picked in it: where the steps were left, said so unless that
+            // is the operation's start.
+            Some((_, steps)) if steps.contains(&at) => {
+                (at != steps.start || item > 0).then(|| resumed(None))
+            }
+            // Picked before it: back at the start of the picked operation,
+            // the place before one press away.
+            Some((_, steps)) if steps.start < at => {
+                self.guide_to(&shown, steps.start);
+                Some(steps::Entry::Picked {
+                    setup: id,
+                    from: at,
+                    item,
+                })
+            }
+            // Picked after it: the steps before it are not done, so none is
+            // skipped unasked; the page says so, the picked operation one
+            // press away (a fresh job opens at its Set up, not past it).
+            Some((i, _)) => Some(resumed(Some(i))),
+            // None picked: resumed, said, unless at the setup's start.
+            None => (at > 0 || item > 0).then(|| resumed(None)),
+        };
+    }
     /// Puts the guide of `shown` at step `at`, saved with the project as
     /// `SelectSetup` saves the active setup: no undo step.
     fn guide_to(&mut self, shown: &steps::Shown, at: usize) {
@@ -5086,6 +5159,11 @@ impl App {
         }
         Task::batch([setup, operation])
     }
+    /// The setup and the section of it the Steps page is at, when built.
+    fn steps_here(&self) -> Option<(usize, usize)> {
+        let (shown, at) = self.guide_at()?;
+        Some((shown.guide.setup, steps::section_of(&shown.guide, at)))
+    }
     /// Scrolls the Steps page's left panel so the place's section is in view
     /// (LIO-431). ponytail: by its share of the sections, not its pixel row.
     fn snap_steps_list(&self) -> Task<Message> {
@@ -5108,6 +5186,7 @@ impl App {
                 if self.guide_key() == Some(key) {
                     self.guide = Some((key, result));
                     self.guide_clock.0 = Instant::now();
+                    self.apply_steps_entry();
                 }
                 return Task::none();
             }
@@ -5120,7 +5199,8 @@ impl App {
                     return Task::none();
                 };
                 self.cnc_over_guide = None;
-                if s.id != self.doc.active {
+                let switched = s.id != self.doc.active;
+                if switched {
                     self.doc.active = s.id.clone();
                     self.stop_selection();
                     self.dirty = true;
@@ -5128,7 +5208,14 @@ impl App {
                     self.guide_item = 0;
                 }
                 self.machine_setup = false;
-                return self.update(Message::Page(Page::Control));
+                let entering = self.page != Page::Control;
+                let task = self.update(Message::Page(Page::Control));
+                // Entering the page enters the steps (`Message::Page`);
+                // another setup's steps on it are entered here.
+                if !entering && switched {
+                    self.enter_steps();
+                }
+                return task;
             }
             GuideAction::Fix(op, problem) => {
                 let si = self.doc.index();
@@ -5153,6 +5240,30 @@ impl App {
         // Each hole starts at its first readout.
         if !matches!(action, GuideAction::Reached(_)) {
             self.guide_reached = 0;
+        }
+        // The place moved: what the page was entered with is said no more.
+        if matches!(
+            action,
+            GuideAction::Next
+                | GuideAction::Back
+                | GuideAction::Go(_)
+                | GuideAction::Section(_)
+                | GuideAction::Resume
+        ) {
+            let entry = self.steps_entry.take();
+            // Back to where the steps were before the picked operation.
+            if let (GuideAction::Resume, Some(steps::Entry::Picked { setup, from, item })) =
+                (&action, entry)
+                && self
+                    .doc
+                    .setups
+                    .get(shown.guide.setup)
+                    .is_some_and(|s| s.id == setup)
+            {
+                self.guide_to(&shown, from);
+                self.guide_item = item;
+                return Task::none();
+            }
         }
         match action {
             GuideAction::Reached(i) if holes > 0 => self.guide_reached = i + 1,
@@ -5873,15 +5984,24 @@ impl App {
                         self.last_edit = Instant::now();
                     }
                 }
+                let entering = p == Page::Control && self.page != Page::Control;
                 self.page = p;
                 self.picking = false;
                 self.playing = false;
+                if entering {
+                    self.enter_steps();
+                }
                 let restore = if p == Page::Ai {
                     self.restore_account()
                 } else {
                     Task::none()
                 };
-                return Task::batch([self.refresh_post(), restore, self.refresh_guide()]);
+                let snap = if entering {
+                    self.snap_steps_list()
+                } else {
+                    Task::none()
+                };
+                return Task::batch([self.refresh_post(), restore, self.refresh_guide(), snap]);
             }
             Message::SelectSetup(i) => {
                 self.box_refused = None;
@@ -9457,7 +9577,17 @@ impl App {
             Message::Exported(p) => self.status = format!("Exported {}", p.display()),
             Message::ExportError(e) => self.status = format!("Export failed: {e}"),
             Message::Guide(action) => {
+                // The list follows the place only when it moves to another
+                // section: the handwheel's beat every 100 ms snapped it back
+                // under the hand scrolling it, so a press on a line further
+                // down missed (LIO-449).
+                let before = self.steps_here();
+                // A page opened, or its guide built: the place shown.
+                let shown = matches!(action, GuideAction::Open(_) | GuideAction::Built(..));
                 let task = self.guide_action(action);
+                if !shown && self.steps_here() == before {
+                    return task;
+                }
                 return Task::batch([task, self.snap_steps_list()]);
             }
             Message::LeftStock(found) => {
