@@ -482,14 +482,6 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "Save coordinated XYZ and two-rotary capability. Tool-axis planning, singularity handling and machine kinematics are not yet available.",
             "",
         ),
-        ("direction", "Positive") if matches!(target, Target::Machine) => (
-            "Positive A turns the part by the right-hand rule about +X: the top of the part toward −Y, the front. The indexed setups, the chuck checks, the program header and Find A zero all take it.",
-            "",
-        ),
-        ("direction", "Negative") if matches!(target, Target::Machine) => (
-            "Positive A turns the part the other way: the top of the part toward +Y, the back. The indexed setups, the chuck checks, the program header and Find A zero all take it; the controller's A is not reversed by it.",
-            "",
-        ),
         ("direction2", "Positive") if matches!(target, Target::Machine) => (
             "Record the positive rotary sign convention for this axis. Match the machine documentation; this setting is saved for future kinematics.",
             "",
@@ -821,6 +813,15 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
                 }
             )),
             "origin" => origin_help(value).unwrap_or_default(),
+            // The machine's own fields: -Y named where it is (LIO-457).
+            "direction" if matches!(target, Target::Machine) && value == "Positive" => plain(format!(
+                "Positive A turns the part by the right-hand rule about +X: the top of the part toward {}. The indexed setups, the chuck checks, the program header and Find A zero all take it.",
+                crate::orient::Orient::from_fields(p).y_words(false)
+            )),
+            "direction" if matches!(target, Target::Machine) && value == "Negative" => plain(format!(
+                "Positive A turns the part the other way: the top of the part toward {}. The indexed setups, the chuck checks, the program header and Find A zero all take it; the controller's A is not reversed by it.",
+                crate::orient::Orient::from_fields(p).y_words(true)
+            )),
             "speed" => plain(format!(
                 "Play the preview at {value}× the estimated machining rate. This changes playback speed only, not the programmed feed or stock result. Estimates omit acceleration and tool changes."
             )),

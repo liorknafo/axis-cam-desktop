@@ -5778,7 +5778,9 @@ fn bar_zeros<'a>(s: &Setup, origin: &str) -> Element<'a, Message> {
         .spacing(4)
     ]
     .spacing(4);
-    if let Some(words) = crate::round_hold::zero_words(origin) {
+    if let Some(words) =
+        crate::round_hold::zero_words(crate::orient::Orient::of(&s.machine), origin)
+    {
         c = c.push(muted(words));
     }
     c.into()
@@ -6127,17 +6129,19 @@ fn zero_note(app: &App) -> Element<'_, Message> {
                 "On the stock this setup starts from ({from}): the Steps page's Zero screen has you touch a side for X and one for Y with the edge finder (both sides of an axis whose zero is at the middle, halving the reading) and the top for Z, and set the DRO so that it reads 0 at this work zero."
             ),
             (Some(spots), _) => format!(
-                "On the stock this setup starts from ({from}): touch off {spots}.{}",
+                "On the stock this setup starts from ({from}): touch off {spots}.{}{}",
                 crate::round_hold::side_note(setup, stock)
                     .map(|note| format!(" {note}"))
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                o.turned_note().map(|n| format!(" {n}")).unwrap_or_default()
             ),
             (None, Some(refs)) => format!(
                 "Model origin is the part file's own 0,0,0. A probe finds it from the stock this setup starts from ({from}): {}. By hand, the program header locates it from the part.",
                 crate::post::probe_spots(o, refs, stock)
             ),
             _ => match crate::indexed::zero_words(origin)
-                .or_else(|| crate::round_hold::zero_words(origin))
+                .map(str::to_string)
+                .or_else(|| crate::round_hold::zero_words(o, origin))
             {
                 Some(words) => format!("On the stock this setup starts from ({from}): {words}"),
                 None => "Choose a work zero.".into(),
@@ -10940,7 +10944,15 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
 /// The Work zero tab: each axis set to a value, the work system, the work
 /// zero on the stock for the setup picked, step by step until its first
 /// tool run, and the reference surface for its tool changes.
-const WORK_ZERO_NOTE: &str = "Zero makes the current position work zero in the active coordinate system; ½ halves the position shown, Set gives it the value typed. For the middle of a part by hand, zero X with an edge finder on its left side, touch its right side and press ½ on X. G54 to G59 each keep their own; they change only while Idle.";
+/// The Work zero tab's note on a machine of orientation `o`: X's sides
+/// named where they are (LIO-457).
+fn work_zero_note(o: crate::orient::Orient) -> String {
+    format!(
+        "Zero makes the current position work zero in the active coordinate system; ½ halves the position shown, Set gives it the value typed. For the middle of a part by hand, zero X with an edge finder on its {} (-X) side, touch its {} (+X) side and press ½ on X. G54 to G59 each keep their own; they change only while Idle.",
+        o.end(0, false),
+        o.end(0, true)
+    )
+}
 fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Message> {
     let fit = Fit::of(app);
     use crate::control::Action;
@@ -10990,7 +11002,7 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
     };
     let mut systems = row![help::wrap(
         muted("Work system").width(80),
-        Help::text("Work zero", WORK_ZERO_NOTE),
+        Help::text("Work zero", work_zero_note(c.orient)),
         widget::tooltip::Position::Top,
     )]
     .spacing(4)
@@ -11005,7 +11017,7 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
     let mut col = column![set, systems].spacing(8);
     // Short, the hint is on the work systems' hover.
     if !fit.short {
-        col = col.push(hint("Work zero", WORK_ZERO_NOTE, fit.chars(110)));
+        col = col.push(hint("Work zero", work_zero_note(c.orient), fit.chars(110)));
     }
     let Some(run) = &c.run else {
         return tab_scroll(col.push(muted(
@@ -12920,10 +12932,10 @@ fn rotary_tab<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>
     .wrap()
     .vertical_spacing(6);
     let how = match c.calibrating() {
-        Some(what) => format!("{} E-stop stops it.", what.how()),
+        Some(what) => format!("{} E-stop stops it.", what.how(c.orient)),
         None => match c.calibrate_blocked(Calibrate::Centreline) {
-            Some(why) => format!("{} {why}", Calibrate::Centreline.how()),
-            None => Calibrate::Centreline.how(),
+            Some(why) => format!("{} {why}", Calibrate::Centreline.how(c.orient)),
+            None => Calibrate::Centreline.how(c.orient),
         },
     };
     let mut col = column![state, fields, buttons, muted(how)].spacing(8);

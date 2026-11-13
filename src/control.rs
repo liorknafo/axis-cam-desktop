@@ -1513,8 +1513,9 @@ impl Calibrate {
         }
     }
 
-    /// Where to put the tip before pressing it, and what it does.
-    pub fn how(self) -> String {
+    /// Where to put the tip before pressing it, and what it does, on a
+    /// machine of orientation `o`.
+    pub fn how(self, o: crate::orient::Orient) -> String {
         match self {
             Calibrate::Centreline => format!(
                 "Put a ground test bar in the chuck, the probe's clip on it, type its diameter, jog the tip over the middle of the bar a few mm above it and {CHUCK_GAP:.0} mm or more out from the jaws, and press {}: it touches the top, goes down beside the bar on both sides, touches the top over the middle found, lifts {TURN_CLEAR:.0} mm over the bar, turns A half a turn and does it again, then turns A back.",
@@ -1525,8 +1526,10 @@ impl Calibrate {
                 self.label()
             ),
             Calibrate::AZero => format!(
-                "Turn A until a flat on the stock (or a jaw face) is about level and on top, jog the tip over its middle a few mm above it and press {}: it touches the flat at the spacing typed either side of the tip along Y, lifts {TURN_CLEAR:.0} mm over the stock, turns A by the slope found (by {DIRECTION_TURN:.0}° or more the first time, to check that +A turns the part the way the machine's Direction says: the top toward −Y, the front, for Positive, toward +Y for Negative; it stops if A turns backwards), and again until the two are level, then zeroes A there.",
-                self.label()
+                "Turn A until a flat on the stock (or a jaw face) is about level and on top, jog the tip over its middle a few mm above it and press {}: it touches the flat at the spacing typed either side of the tip along Y, lifts {TURN_CLEAR:.0} mm over the stock, turns A by the slope found (by {DIRECTION_TURN:.0}° or more the first time, to check that +A turns the part the way the machine's Direction says: the top toward {}, for Positive, toward {} for Negative; it stops if A turns backwards), and again until the two are level, then zeroes A there.",
+                self.label(),
+                o.y_words(false),
+                o.y_words(true)
             ),
         }
     }
@@ -4748,7 +4751,7 @@ impl Connection {
         let Some(mut r) = self.turning.take() else {
             return;
         };
-        let how = r.what.how();
+        let how = r.what.how(r.orient);
         if let Some((leg, seq)) = r.sent {
             let Some((ok, message, result)) = self.ended(seq) else {
                 self.turning = Some(r);

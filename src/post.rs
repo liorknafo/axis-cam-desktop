@@ -843,8 +843,9 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
     let model = origin == "Model origin";
     // An indexed setup's work zero is its clamping's, touched off there: the
     // stock A has turned no longer has the faces it was found on.
-    let words =
-        crate::indexed::zero_words(origin).or_else(|| crate::round_hold::zero_words(origin));
+    let words = crate::indexed::zero_words(origin)
+        .map(str::to_string)
+        .or_else(|| crate::round_hold::zero_words(Orient::of(&h.setup.machine), origin));
     let kept = indexed && words.is_none();
     if later {
         w.note(&format!(

@@ -820,15 +820,17 @@ pub fn side_note(setup: &Setup, stock: Bounds) -> Option<String> {
         )
     })
 }
-/// How the operator finds a work zero of `ORIGINS`, for the program header
-/// and the Work zero step. None for another work zero.
-pub fn zero_words(origin: &str) -> Option<&'static str> {
-    match ORIGINS.iter().position(|o| *o == origin)? {
-        0 => Some(
-            "Touch off the top of the bar and set Z0 one radius below it; Y0 midway between the bar's two sides, touched at its axis height; X0 on its left (-X) end face.",
-        ),
+/// How the operator finds a work zero of `ORIGINS` on a machine of
+/// orientation `o` (the -X end named where it is, LIO-457), for the program
+/// header and the Work zero step. None for another work zero.
+pub fn zero_words(o: crate::orient::Orient, origin: &str) -> Option<String> {
+    match ORIGINS.iter().position(|x| *x == origin)? {
+        0 => Some(format!(
+            "Touch off the top of the bar and set Z0 one radius below it; Y0 midway between the bar's two sides, touched at its axis height; X0 on its {} (-X) end face.",
+            o.end(0, false)
+        )),
         _ => Some(
-            "Touch off the top of the bar and set Z0 one radius below it; Y0 midway between the bar's two sides, touched at its axis height; X0 midway between its end faces.",
+            "Touch off the top of the bar and set Z0 one radius below it; Y0 midway between the bar's two sides, touched at its axis height; X0 midway between its end faces.".into(),
         ),
     }
 }
@@ -1259,10 +1261,14 @@ mod tests {
         s.p.insert("origin".into(), "Bar axis center".into());
         assert_eq!(crate::post::datum(&s, bar, &mesh), Ok([0., 0., 6.]));
         assert!(
-            zero_words("Bar axis center")
+            zero_words(crate::orient::Orient::Right, "Bar axis center")
                 .unwrap()
                 .contains("one radius below")
         );
+        // The -X end is named where it is on the table (LIO-457).
+        let left_end = |o| zero_words(o, "Bar axis at left end").unwrap();
+        assert!(left_end(crate::orient::Orient::Right).contains("X0 on its left (-X) end face"));
+        assert!(left_end(crate::orient::Orient::Left).contains("X0 on its right (-X) end face"));
         // A zero on the box touches the bar's sides at its axis height.
         assert_eq!(
             side_note(&s, bar).as_deref(),

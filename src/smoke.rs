@@ -2354,6 +2354,38 @@ flood = { pin = 8 }
         run_of(a).problems(conn(a), &a.doc)
     }
 
+    /// LIO-457: a setup whose snapshot of the machine points +X otherwise
+    /// than the connected machine would have the program header and the
+    /// Control page name the stock's sides differently: it does not run
+    /// until it is assigned the machine again.
+    #[test]
+    fn a_setup_with_another_orientation_than_the_machine_does_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let said = |a: &App| problems(a).iter().any(|p| p.contains("+X pointing"));
+        assert!(!said(&a), "{:?}", problems(&a));
+        // Turned in the Machine library and on the connection, the setup's
+        // snapshot still the usual one.
+        let id = conn(&a).machine_id.clone();
+        let m = a.doc.machines.iter_mut().find(|m| m.id == id).unwrap();
+        m.p.insert(crate::orient::KEY.into(), "Left".into());
+        a.control.as_mut().unwrap().orient = crate::orient::Orient::Left;
+        check_run(&mut a, 0);
+        let p = problems(&a);
+        assert!(
+            p.iter()
+                .any(|p| p.contains("+X pointing right but the Machine library has left")),
+            "{p:?}"
+        );
+        // Assigned again: it runs.
+        let m = a.doc.machines.iter().find(|m| m.id == id).unwrap().clone();
+        a.doc.setups[0].machine = m;
+        check_run(&mut a, 0);
+        assert!(!said(&a), "{:?}", problems(&a));
+    }
+
     /// Ticks until the run satisfies `ok`; fails after `secs`.
     fn run_until(a: &mut App, secs: f64, what: &str, ok: impl Fn(&crate::run::Run) -> bool) {
         let mut deadline = Deadline::new(secs);
