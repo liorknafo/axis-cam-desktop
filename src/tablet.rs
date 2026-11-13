@@ -510,6 +510,89 @@ mod tests {
         assert_eq!(sync(tablet.path()).unwrap_err(), NOT_PAIRED);
     }
 
+    /// Not a check: shares the fixture block (Face and Drill on a UC100
+    /// machine, `run::tablet_fixture`) on port 7111 for `AXIS_SERVE_MINUTES`
+    /// (default 20), for testing a tablet against it (axis-shop's live test,
+    /// the emulator at 10.0.2.2). The machine profile is
+    /// `AXIS_SERVE_PROFILE`, by default the driver's template. Prints the
+    /// pairing code.
+    #[test]
+    #[ignore]
+    fn serve_the_fixture_to_a_tablet() {
+        let mac = tempfile::tempdir().unwrap();
+        let profile = match std::env::var("AXIS_SERVE_PROFILE") {
+            Ok(p) => PathBuf::from(p),
+            Err(_) => {
+                let p = mac.path().join("template.toml");
+                fs::write(&p, uc100::config::TEMPLATE).unwrap();
+                p
+            }
+        };
+        let (doc, _) = crate::run::tablet_fixture(&profile);
+        let state = mac.path().join("workspace.json");
+        crate::storage::save(&state, &doc).unwrap();
+        println!("Pairing code: {}", new_code(&state).unwrap());
+        serve(state, "Fixture computer".into());
+        let minutes = std::env::var("AXIS_SERVE_MINUTES").map_or(20, |m| m.parse().unwrap());
+        std::thread::sleep(Duration::from_secs(60 * minutes));
+    }
+
+    /// The TypeScript tablet app (axis-shop `src/computer/wire.test.ts`)
+    /// reads and writes these exact bytes: a change here must change it too.
+    #[test]
+    fn the_messages_are_the_bytes_axis_shop_reads() {
+        let hex = |m: Vec<u8>| self::hex(&m[4..]);
+        let count = |from: u8, up: bool| -> [u8; 32] {
+            std::array::from_fn(|i| if up { from + i as u8 } else { from - i as u8 })
+        };
+        let to_computer = [
+            (
+                ToComputer::Pair {
+                    code: "123456".into(),
+                    name: "Shop tablet".into(),
+                },
+                "00063132333435360b53686f70207461626c6574",
+            ),
+            (ToComputer::Hello { client: 300 }, "01ac02"),
+            (
+                ToComputer::Proof(count(0, true)),
+                "02000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+            ),
+            (ToComputer::List, "03"),
+            (ToComputer::Get("ab12".into()), "040461623132"),
+        ];
+        for (m, bytes) in to_computer {
+            assert_eq!(hex(wire::frame(&m)), bytes);
+        }
+        let paired = format!("0042373a{}034d6163", "6162".repeat(32));
+        let to_tablet = [
+            (
+                ToTablet::Paired {
+                    token: format!("7:{}", "ab".repeat(32)),
+                    computer: "Mac".into(),
+                },
+                paired.as_str(),
+            ),
+            (ToTablet::Refused("no".into()), "01026e6f"),
+            (
+                ToTablet::Nonce(count(31, false)),
+                "021f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100",
+            ),
+            (
+                ToTablet::List(vec![Shared {
+                    key: "open".into(),
+                    title: "Block".into(),
+                    version: "0011223344556677".into(),
+                }]),
+                "0301046f70656e05426c6f636b1030303131323233333434353536363737",
+            ),
+            (ToTablet::Bundle(vec![1, 2, 3]), "0403010203"),
+        ];
+        for (m, bytes) in to_tablet {
+            assert_eq!(hex(wire::frame(&m)), bytes);
+        }
+    }
+
     #[test]
     fn a_typed_address_gets_the_port() {
         assert_eq!(with_port(" 10.0.2.2 "), "10.0.2.2:7111");

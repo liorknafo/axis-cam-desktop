@@ -3082,7 +3082,7 @@ fn beneath(doc: &Document, si: usize, sims: &Sims, cut: &[usize]) -> Vec<(usize,
     out
 }
 
-const NO_PART: &str = "Import a part before running a setup. The example project's paths are illustrative and cannot be machined.";
+pub(crate) const NO_PART: &str = "Import a part before running a setup. The example project's paths are illustrative and cannot be machined.";
 pub const REMOVED: &str = "This setup was removed from the project.";
 
 /// The `sequence` results of setup `si`'s enabled operations, from a
@@ -3429,6 +3429,312 @@ pub fn lower(
     let blocks = p.from(k)?;
     let leave = way_out(p, blocks, offset, start).unwrap_or_default();
     lower_blocks(p, blocks, blocks.len(), offset, start, leave)
+}
+
+/// A setup's tool runs worked out on the computer for the shop tablet
+/// (LIO-475), which plans nothing: each tool run as Cycle Start sends it
+/// from its first operation, lowered here once in work coordinates, with
+/// where Stop after step stops. The tablet file carries them as
+/// `runs.json` (`bundle::pack`).
+///
+/// The tablet makes the job's machine coordinates from the live work
+/// offset `o` and where the machine is, `at`, move by move: each axis of a
+/// `Move` target is `target[k] + o[k]`, or `at[k]` (where the tool is) when
+/// null; a `lift` move's Z is the larger of `lift` (in machine Z, `+ o[2]`
+/// unless `lift.machine`) and `at[2]`. `at` is then the target. That is
+/// `lower` exactly, but for a move to where the tool already is, which the
+/// tablet may drop.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabletSetup {
+    pub setup_id: String,
+    pub name: String,
+    /// The machine profile's file name in the tablet file's `machine/`.
+    pub machine_profile: Option<String>,
+    /// The work offset its zero is set in ("G54").
+    pub work_offset: String,
+    /// Why it cannot run, as the computer's Run panel says; no tool runs then.
+    pub problems: Vec<String>,
+    pub tool_runs: Vec<TabletRun>,
+}
+
+/// One tool run of a `TabletSetup`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabletRun {
+    /// The job's name, as the computer names it: "Setup 1 · tool run 2 of 3".
+    pub name: String,
+    pub tool: TabletTool,
+    /// Its tool is not the previous tool run's: the operator changes the
+    /// tool and touches off its Z before it (`Run::tool_change`).
+    pub tool_change: bool,
+    pub operations: Vec<TabletOperation>,
+    /// Where a retract lifts the tool, and Stop after step after its stop
+    /// (`Run::step_lift`): a work Z, or a machine Z when `machine` (a
+    /// machine that retracts to machine Z 0).
+    pub lift: Lift,
+    pub actions: Vec<TabletLine>,
+    /// Its operations' steps, in order.
+    pub steps: Vec<TabletStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabletTool {
+    pub number: u32,
+    pub name: String,
+    /// As the computer shows it: "T1 Flat 10".
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabletOperation {
+    /// Its index in the setup.
+    pub index: usize,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Lift {
+    pub z: f64,
+    pub machine: bool,
+}
+
+/// An action of the job and its job line: the driver's `Located`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabletLine {
+    pub line: u32,
+    #[serde(flatten)]
+    pub action: TabletAction,
+}
+
+/// The driver's `Action`, a move's target in work coordinates
+/// (`TabletSetup`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum TabletAction {
+    Move {
+        /// X, Y, Z, A, B, C; null: where the tool is.
+        target: [Option<f64>; 6],
+        /// mm/s; null: rapid.
+        feed: Option<f64>,
+        /// A retract: Z rises to the lift height, unless higher already.
+        lift: bool,
+    },
+    Dwell {
+        seconds: f64,
+    },
+    Spindle {
+        state: Spindle,
+        rpm: f64,
+    },
+    Coolant {
+        flood: bool,
+        mist: bool,
+    },
+    Pause {
+        reason: String,
+    },
+    End,
+}
+
+/// A step of an operation (`Step`) in a tool run's job.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabletStep {
+    /// Its operation's index in the setup.
+    pub operation: usize,
+    /// Its index among the operation's steps.
+    pub step: usize,
+    /// "Level 3", "Hole 2", "Pass 1".
+    pub label: String,
+    /// The first and last job lines it is cut on: the job is in this step
+    /// while its line is in there.
+    pub lines: Option<[u32; 2]>,
+    /// The job lines Stop after step stops on at its end, runs of lines
+    /// as first and last (`Run::stop_ranges`): the first time the job's
+    /// line is in one, the tool is back at its clearance.
+    pub end_lines: Vec<[u32; 2]>,
+}
+
+/// The tool runs of setup `si` for the tablet: those Cycle Start sends
+/// after the Run panel's check, or why it refuses them.
+/// `mesh` is the part, or why it could not be loaded.
+pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> TabletSetup {
+    let setup = &doc.setups[si];
+    let profile = crate::model::get(&setup.machine.p, "uc100_profile");
+    let mut out = TabletSetup {
+        setup_id: setup.id.clone(),
+        name: setup.name().to_string(),
+        machine_profile: (profile.rsplit(['/', '\\']).next())
+            .filter(|n| !n.trim().is_empty())
+            .map(|n| n.trim().to_string()),
+        work_offset: String::new(),
+        problems: vec![],
+        tool_runs: vec![],
+    };
+    let mesh = match mesh {
+        Ok(m) => m,
+        Err(why) => {
+            out.problems = vec![why.to_string()];
+            return out;
+        }
+    };
+    let (programs, left) = check(doc, mesh, si);
+    let mut run = Run::new(doc, si, 0);
+    run.checked_as(Arc::new(programs), Some(Arc::new(left)), None);
+    let all = run.programs.clone().expect("checked");
+    let programs = match all.as_ref() {
+        Ok(p) => p,
+        Err(why) => {
+            out.problems = why.clone();
+            return out;
+        }
+    };
+    // ponytail: the way in past the chuck's jaws is checked from where the
+    // machine stands (`way_out`), which the tablet cannot do (LIO-482).
+    if programs.iter().any(|p| p.chuck.is_some()) {
+        out.problems = vec!["The stock is held in the chuck: the way in past its jaws is checked from where the machine stands, which only the computer can do. Run this setup from the computer.".into()];
+        return out;
+    }
+    out.work_offset = programs.first().map_or(String::new(), |p| p.offset.clone());
+    let count = programs.len();
+    for (i, p) in programs.iter().enumerate() {
+        let blocks = &p.blocks;
+        // From nowhere (NaN), so that no move is dropped as already there,
+        // and each axis kept where the tool is comes out NaN.
+        let lowered = match lower_blocks(
+            p,
+            blocks,
+            blocks.len(),
+            [0.; 6],
+            [f64::NAN; 6],
+            Leave::default(),
+        ) {
+            Ok(l) => l,
+            Err(why) => {
+                (out.problems, out.tool_runs) = (why, vec![]);
+                return out;
+            }
+        };
+        let actions = (lowered.into_iter())
+            .map(|l| {
+                let block = &blocks[l.line as usize - 1];
+                let action = match l.action {
+                    Do::Move { target, feed } => {
+                        // Where the tool is: all of a retract's (its Z
+                        // the lift), an approach's Z and A, an index's
+                        // X, Y and Z; those are where an earlier move
+                        // left them, which `lower` takes from the machine.
+                        let kept: &[usize] = match block {
+                            Block::Retract => &[0, 1, 2, 3, 4, 5],
+                            Block::Approach { .. } => &[2, 3, 4, 5],
+                            Block::Index { .. } => &[0, 1, 2, 4, 5],
+                            _ => &[],
+                        };
+                        TabletAction::Move {
+                            target: std::array::from_fn(|k| {
+                                Some(target[k]).filter(|v| !v.is_nan() && !kept.contains(&k))
+                            }),
+                            feed,
+                            lift: matches!(block, Block::Retract),
+                        }
+                    }
+                    Do::Dwell { seconds } => TabletAction::Dwell { seconds },
+                    Do::Spindle { state, rpm } => TabletAction::Spindle { state, rpm },
+                    Do::Coolant { flood, mist } => TabletAction::Coolant { flood, mist },
+                    Do::Pause { reason } => TabletAction::Pause { reason },
+                    Do::End => TabletAction::End,
+                    Do::Probe { .. } => unreachable!("a run lowers no probe"),
+                };
+                TabletLine {
+                    line: l.line,
+                    action,
+                }
+            })
+            .collect();
+        // As running from its first operation, at work offset 0: what
+        // `stop_ranges` and `step_lift` read.
+        run.running = Some(Running {
+            index: i,
+            from: 0,
+            seq: 0,
+            offset: [0.; 6],
+            before: Before {
+                xy: None,
+                zero: None,
+                last: None,
+                touched: false,
+            },
+            paths: vec![],
+            tip: [0.; 3],
+            start: [0.; 6],
+            print: 0,
+            cut_ops: vec![],
+            on: None,
+            marks: run.marks_of(p, blocks),
+        });
+        let mut steps: Vec<TabletStep> = (p.indexes.iter())
+            .filter_map(|&oi| run.op_steps(oi))
+            .flat_map(|os| {
+                (0..os.steps.len()).map(|s| TabletStep {
+                    operation: os.op,
+                    step: s,
+                    label: os.label(s),
+                    lines: None,
+                    end_lines: vec![],
+                })
+            })
+            .collect();
+        let marks = run.running.as_ref().map_or(&[][..], |r| &r.marks[..]);
+        fn of(steps: &mut [TabletStep], at: Option<(usize, usize)>) -> Option<&mut TabletStep> {
+            let (oi, s) = at?;
+            steps.iter_mut().find(|t| (t.operation, t.step) == (oi, s))
+        }
+        for b in 0..blocks.len() {
+            let line = b as u32 + 1;
+            let on = marks.get(b).copied().flatten();
+            let on = on
+                .and_then(|m| run.mark_step(p, m))
+                .map(|(oi, s, _)| (oi, s));
+            if let Some(t) = of(&mut steps, on) {
+                let span = t.lines.get_or_insert([line, line]);
+                span[1] = line;
+            }
+            if let Some(t) = of(&mut steps, run.step_end(b)) {
+                match t.end_lines.last_mut() {
+                    Some(r) if r[1] + 1 == line => r[1] = line,
+                    _ => t.end_lines.push([line, line]),
+                }
+            }
+        }
+        let o = &p.ops[0];
+        out.tool_runs.push(TabletRun {
+            name: format!("{} · tool run {} of {count}", run.name, i + 1),
+            tool: TabletTool {
+                number: o.tool,
+                name: o.tool_name.clone(),
+                label: crate::model::tool_label(o.tool, &o.tool_name),
+            },
+            tool_change: i > 0 && programs[i - 1].ops[0].tool_id != o.tool_id,
+            operations: (p.indexes.iter().zip(&p.ops))
+                .map(|(&index, o)| TabletOperation {
+                    index,
+                    name: o.name.clone(),
+                })
+                .collect(),
+            lift: Lift {
+                z: run.step_lift().expect("running"),
+                machine: p.settings.machine_home,
+            },
+            actions,
+            steps,
+        });
+    }
+    out
 }
 
 /// How a run leaves where the machine is before its approach (LIO-213),
@@ -4163,6 +4469,29 @@ fn pin_problems(c: &Connection, setup: &crate::model::Setup, p: &Checked) -> Vec
     e
 }
 
+/// The fixture block's Face and Drill (two tools, levels and holes) on a
+/// UC100 machine with the profile at `profile`: a project for the tablet's
+/// tool runs (LIO-475).
+#[cfg(test)]
+pub(crate) fn tablet_fixture(profile: &std::path::Path) -> (Document, Mesh) {
+    let (mut doc, mesh) = crate::post::fixture::job();
+    let setup = &mut doc.setups[0];
+    setup.operations = [0, 3].map(|i| setup.operations[i].clone()).to_vec();
+    let profile = profile.display().to_string();
+    let m = &mut doc.setups[0].machine;
+    for (k, v) in [
+        ("controller", "UC100"),
+        ("uc100_profile", profile.as_str()),
+        ("x", "390"),
+        ("y", "280"),
+        ("z", "80"),
+    ] {
+        m.p.insert(k.into(), v.into());
+    }
+    doc.machines = vec![doc.setups[0].machine.clone()];
+    (doc, mesh)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4240,6 +4569,126 @@ mod tests {
     }
 
     /// One facing tool run: down to Z5, across at F600, a 1 s dwell.
+    /// The tool runs a tablet file carries (LIO-475), read back from it:
+    /// made into machine coordinates as `TabletSetup` tells the tablet to,
+    /// with a work offset and from where the machine stands, each is the
+    /// job Cycle Start sends (`lower`). With its tool, the tool change
+    /// before it, the lift and its operations' steps.
+    #[test]
+    fn the_tablet_file_carries_the_tool_runs_cycle_start_sends() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (doc, mesh) = tablet_fixture(&profile);
+        let zip = crate::bundle::pack(&doc).unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(zip)).unwrap();
+        let runs: crate::bundle::Runs =
+            serde_json::from_reader(zip.by_name(crate::bundle::RUNS).unwrap()).unwrap();
+        assert_eq!(runs.format, 1);
+        let [s] = &runs.setups[..] else {
+            panic!("{:?}", runs.setups.len())
+        };
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
+        assert_eq!(s.machine_profile.as_deref(), Some("template.toml"));
+        assert_eq!(s.work_offset, "G54");
+        let tools: Vec<_> = (s.tool_runs.iter())
+            .map(|r| (r.tool.number, r.tool_change, r.name.as_str()))
+            .collect();
+        assert_eq!(
+            tools,
+            [
+                (1, false, "Top · tool run 1 of 2"),
+                (3, true, "Top · tool run 2 of 2")
+            ]
+        );
+        assert_eq!(s.tool_runs[1].tool.label, "T3 Drill 4");
+        let programs = programs(&doc, &mesh, 0).unwrap();
+        // What the tablet does with the live work offset `o`, from `at`.
+        let made = |r: &TabletRun, o: [f64; 6], mut at: [f64; 6]| -> Vec<Located> {
+            let lift = r.lift.z + if r.lift.machine { 0. } else { o[2] };
+            let mut out = vec![];
+            for l in &r.actions {
+                let action = match &l.action {
+                    TabletAction::Move {
+                        target,
+                        feed,
+                        lift: up,
+                    } => {
+                        let mut to: [f64; 6] =
+                            std::array::from_fn(|k| target[k].map_or(at[k], |v| v + o[k]));
+                        if *up {
+                            to[2] = lift.max(at[2]);
+                        }
+                        if to == at {
+                            continue;
+                        }
+                        at = to;
+                        Do::Move {
+                            target: to,
+                            feed: *feed,
+                        }
+                    }
+                    TabletAction::Dwell { seconds } => Do::Dwell { seconds: *seconds },
+                    TabletAction::Spindle { state, rpm } => Do::Spindle {
+                        state: *state,
+                        rpm: *rpm,
+                    },
+                    TabletAction::Coolant { flood, mist } => Do::Coolant {
+                        flood: *flood,
+                        mist: *mist,
+                    },
+                    TabletAction::Pause { reason } => Do::Pause {
+                        reason: reason.clone(),
+                    },
+                    TabletAction::End => Do::End,
+                };
+                out.push(Located {
+                    line: l.line,
+                    action,
+                });
+            }
+            out
+        };
+        let offset = [120., 90., -35., 0., 0., 0.];
+        for (r, p) in s.tool_runs.iter().zip(&programs) {
+            assert!(!r.lift.machine);
+            let plane = clearance_plane(&p.blocks) as f64 - p.datum[2] as f64;
+            assert!((r.lift.z - plane).abs() < 1e-9, "{} {plane}", r.lift.z);
+            // Below the lift and above it (a tool change leaves Z high).
+            for start in [[-5., -7., -30., 0., 0., 0.], [3., 4., -1., 0., 0., 0.]] {
+                assert_eq!(
+                    made(r, offset, start),
+                    lower(p, 0, offset, start).unwrap(),
+                    "{}",
+                    r.name
+                );
+            }
+            let ops: Vec<usize> = r.operations.iter().map(|o| o.index).collect();
+            assert_eq!(ops, p.indexes);
+            // Each step is cut on its own lines, in order, and ends where
+            // Stop after step stops: after its first line.
+            assert!(!r.steps.is_empty(), "{}", r.name);
+            let mut last = 0;
+            for t in &r.steps {
+                let [a, b] = t.lines.unwrap_or_else(|| panic!("{} {}", r.name, t.label));
+                assert!(a > last && b >= a, "{} {:?}", t.label, t.lines);
+                last = b;
+                for [x, y] in &t.end_lines {
+                    assert!(
+                        *x > a && y >= x,
+                        "{} {:?} {:?}",
+                        t.label,
+                        t.lines,
+                        t.end_lines
+                    );
+                }
+            }
+        }
+        let holes = &s.tool_runs[1].steps;
+        assert!(holes.len() > 1 && holes.iter().all(|t| t.label.starts_with("Hole")));
+        assert!(holes.iter().all(|t| !t.end_lines.is_empty()), "{holes:?}");
+    }
+
     fn program() -> Checked {
         let plan = fixture::plan(
             [0., 0., 15.],
