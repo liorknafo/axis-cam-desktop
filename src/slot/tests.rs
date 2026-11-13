@@ -1211,3 +1211,54 @@ fn the_redesigned_adapters_counterbores_cut_with_a_twelve() {
     std::fs::write(dir.join("acceptance.txt"), report.join("\n") + "\n").unwrap();
     println!("{}", report.join("\n"));
 }
+
+/// The walks before the finish overlap whatever scallop the finish is
+/// given (LIO-455 review: a Ø2 with a 1 mm scallop left floor standing
+/// between its step-outs, 4.4 mm in from the wall).
+#[test]
+fn a_coarse_finish_scallop_leaves_no_floor_between_the_walks() {
+    for (width, length, diameter) in [(30., 40., "2"), (38., 48., "6")] {
+        let mesh =
+            crate::mesh::normalize(counterbore((90., 80., 20.), length, width, 1., false)).unwrap();
+        let doc = job(
+            &mesh,
+            diameter,
+            &[
+                ("slot_width", &width.to_string()),
+                ("slot_length", &length.to_string()),
+                ("z_top", "0"),
+                ("z_bottom", "-1"),
+                ("through", "No"),
+                ("stepdown", "1"),
+                ("scallop", "1"),
+            ],
+        );
+        let (plan, stock) = cut(&doc, &mesh);
+        let zero = crate::post::datum(&doc.setups[0], plan.stock, &mesh).unwrap();
+        let slot = Slot::read(&doc.setups[0].operations[0], zero).unwrap();
+        let rc = plan.radius;
+        for p in plan.slot_passes.iter().filter(|p| p.kind != Kind::Finish) {
+            assert!(p.scallop <= 0.1 * rc + 1e-6, "{diameter}: {:?}", p.kind);
+        }
+        // Every walk before the finish leaves its band covered: up to the
+        // finish's 0.2 and the walks' own steps off the walls.
+        let half = width as f32 / 2.;
+        covered(
+            &plan,
+            slot.a,
+            slot.b,
+            half - 0.2 - 0.1 * rc - 0.01,
+            plan.target,
+        )
+        .unwrap_or_else(|q| panic!("Ø{diameter}: floor left at {q:?}"));
+        let left = crate::uncut::uncut(&stock, &doc.setups, &mesh);
+        // The walls' 1 mm scallops are what was asked for; the floor is cut.
+        for r in &left.regions {
+            assert!(
+                r.bounds.max[2] - r.bounds.min[2] > 0.5 || r.bounds.min[2] > 18.9,
+                "Ø{diameter}: {}",
+                r.line()
+            );
+        }
+    }
+}

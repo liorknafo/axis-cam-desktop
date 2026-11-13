@@ -23,6 +23,9 @@ At each depth level, from the top of the material left down to the floor:
    cuts past the round. Where the gap from the sweep to the outline is
    wider than 0.9 × the cutter's diameter, walks step out between them. The
    level's last walk leaves 0.2 mm on the walls.
+   Walks before the finish step to at most a tenth of the cutter's radius
+   (0.1 mm at most), whatever the finish's scallop, so each overlaps the
+   next.
 3. After the last level, **finish** with one walk at size on the floor. The
    cutter's side takes the 0.2 mm off the whole wall, its steps leaving at
    most the operation's scallop (new field, default 0.05 mm).
@@ -75,6 +78,15 @@ kind, level, offset, what it leaves, its scallop and readings):
   37 Slot screens. Every walk reading is a DRO number on its screen, and
   each walk is closed at the end's tip (4.55 out, 4.75 for the finish). The
   Check gives 21.5, 16.5, 8.9 and R8.25 with "0.05".
+- `a_coarse_finish_scallop_leaves_no_floor_between_the_walks` (from review
+  1): Ø2 and Ø6 with a 1 mm scallop in 30 × 40 and 38 × 48 slots; floor
+  covered up to the finish band, every earlier walk's steps ≤ 0.1 × r.
+- `proposal::…::a_planner_edit_of_a_slots_geometry_applies_and_keeps_its_scallop`
+  (from review 1): a planner edit of a kept Slot's X, width, length and floor
+  reaches the operation; its scallop stays.
+- `steps::tests::a_slot_sweep_says_whether_to_stay_down_or_lift` (from review
+  1): a sweep followed by a walk says stay down; a cutter so near the width
+  that only the finish walks round says lift.
 - `corner::tests::an_inside_stair_leaves_at_most_the_scallop_and_never_cuts_past_the_round`:
   R8.25 with a Ø12, at size and 0.2 in, all four quarters, about centres on
   and off the hundredths.

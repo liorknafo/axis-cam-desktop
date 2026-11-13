@@ -5151,6 +5151,16 @@ fn slot_screen<'a>(
         unreachable!()
     };
     let walk = !matches!(pass, Kind::Sweep);
+    // Whether a walk round the slot follows this sweep at its level, or the
+    // tool lifts (a cutter so near the slot's width that only the finish
+    // walks round it).
+    let walk_follows = matches!(
+        p.guide().steps.get(p.at + 1),
+        Some(Step::Slot {
+            pass: Kind::Outline { .. },
+            ..
+        })
+    );
     let axis = usize::from((b[1] - a[1]).abs() > (b[0] - a[0]).abs());
     // Where the tool is after each number: a walk starts where the sweep
     // left it, at the far end's centre.
@@ -5288,7 +5298,7 @@ fn slot_screen<'a>(
         right = right
             .push(muted(format!("Material starts at Z {}.", dro(*top))).size(13))
             .push(muted(if *entry_clear {"Entry was proven clear for the full diameter to final depth."} else if narrow {"Use the confirmed center-cutting end mill. Feed down at 25% cutting feed."} else {"Use the confirmed center-cutting slot drill. Feed down at 25% cutting feed; clear chips at each return."}).size(13))
-            .push(muted(if narrow {"Feed along the centre line in the indicated direction, the backlash taken up and the other axes locked. Stay down at the far end: the walk round the slot follows at this level. Verify parallels, table and breakthrough clearance below the part; these are unmodeled."} else {"Feed the slot in the indicated direction. Take up backlash before feeding and lock the other axes. Lift before returning to the entry. Verify parallels, table and breakthrough clearance below the part; these are unmodeled."}).size(13));
+            .push(muted(if narrow && walk_follows {"Feed along the centre line in the indicated direction, the backlash taken up and the other axes locked. Stay down at the far end: the walk round the slot follows at this level. Verify parallels, table and breakthrough clearance below the part; these are unmodeled."} else if narrow {"Feed along the centre line in the indicated direction, the backlash taken up and the other axes locked. Lift at the far end: the outline is walked once, at size, after the last level. Verify parallels, table and breakthrough clearance below the part; these are unmodeled."} else {"Feed the slot in the indicated direction. Take up backlash before feeding and lock the other axes. Lift before returning to the entry. Verify parallels, table and breakthrough clearance below the part; these are unmodeled."}).size(13));
     } else {
         let ends: Vec<String> = [*b, *a]
             .iter()
@@ -7115,6 +7125,67 @@ pub(crate) mod tests {
             }
         }
         std::fs::write(dir.join("rendered-steps.txt"), text).unwrap();
+    }
+    /// A sweep says what comes after it (LIO-455 review): with a walk round
+    /// the slot at its level, stay down; with a cutter so near the slot's
+    /// width that only the finish walks round it, lift.
+    #[test]
+    fn a_slot_sweep_says_whether_to_stay_down_or_lift() {
+        for (width, length, stays) in [("16.5", "21.5", true), ("12.2", "17.2", false)] {
+            let mesh = crate::mesh::normalize(crate::slot::tests::counterbore(
+                (60., 50., 20.),
+                length.parse().unwrap(),
+                width.parse().unwrap(),
+                2.,
+                false,
+            ))
+            .unwrap();
+            let mut doc = crate::slot::tests::job(
+                &mesh,
+                "12",
+                &[
+                    ("slot_width", width),
+                    ("slot_length", length),
+                    ("z_top", "0"),
+                    ("z_bottom", "-2"),
+                    ("through", "No"),
+                    ("stepdown", "1"),
+                ],
+            );
+            doc.active = doc.setups[0].id.clone();
+            doc.file = Some(crate::model::ModelFile {
+                name: "counterbore.stl".into(),
+                path: std::path::PathBuf::from("counterbore.stl"),
+                format: "stl".into(),
+                bytes: 1,
+                thickness: None,
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+            a.doc = doc;
+            a.imported_mesh = Some(mesh);
+            a.page = crate::Page::Control;
+            build(&mut a);
+            let guide = a.guide_at().unwrap().0.guide.clone();
+            let at = (guide.steps.iter())
+                .position(|s| {
+                    matches!(
+                        s,
+                        Step::Slot {
+                            pass: crate::slot::Kind::Sweep,
+                            ..
+                        }
+                    )
+                })
+                .unwrap();
+            let id = a.doc.setups[0].id.clone();
+            a.doc.guide.insert(id, at);
+            a.guide_item = 0;
+            let t = texts(&a);
+            let has = |w: &str| t.iter().any(|s| s.contains(w));
+            assert_eq!(has("Stay down at the far end"), stays, "{width}: {t:?}");
+            assert_eq!(has("Lift at the far end"), !stays, "{width}: {t:?}");
+        }
     }
     /// The redesigned adapter's counterbores with a Ø12 (LIO-455): its
     /// Steps pages rendered from a private copy of the STEP, the tool, a

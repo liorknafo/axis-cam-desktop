@@ -303,10 +303,12 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     let work = |p: [f32; 2]| [f64::from(p[0] - zero[0]), f64::from(p[1] - zero[1])];
     let (aw, bw) = (work(slot.a), work(slot.b));
     let fine = f64::from(scallop(&op.p));
-    // Steps a walk leaves for the next to take: coarser, but no deeper
-    // than a tenth of the cutter's radius, so that the next walk's sweep
-    // overlaps it.
-    let coarse = (0.1 * f64::from(rc)).min(0.1).max(fine);
+    // Steps a walk leaves for the next to take: coarser than the finish's
+    // as a rule, but never deeper than a tenth of the cutter's radius,
+    // whatever scallop the finish is given, so that the next walk's sweep
+    // (at most `STEP_OVER` of the diameter out) overlaps it and the floor
+    // between them is cut.
+    let coarse = (0.1 * f64::from(rc)).min(0.1);
     let mut walks: Vec<(f32, f32, Vec<[f64; 2]>, f64)> = vec![];
     let mut finish = None;
     if !matching {
