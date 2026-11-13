@@ -3925,7 +3925,14 @@ fn safe_z(p: &Page<'_>, op: usize) -> f32 {
                 .flat_map(|m| [m.from[2], m.to[2]])
                 .reduce(f32::max)
         })
-        .map(|z| z - g.zero[2]);
+        // A centre drill's plan is of its pilot's top, the DRO set to its
+        // tip (`Step::Holes`): its clearance reads the pilot lower.
+        .map(|z| {
+            z - g.zero[2]
+                - p.tool(op)
+                    .and_then(|t| t.centre_drill())
+                    .map_or(0., |c| c.pilot_length)
+        });
     let holder = (p.shown.jaws.iter()).map(|j| j.max[2]);
     let highest = holder.fold(p.before(op).max[2], f32::max);
     up(planned

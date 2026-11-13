@@ -6593,6 +6593,22 @@ flood = { pin = 8 }
             let turns = t.iter().position(|s| s == "turns").unwrap();
             assert!(up < turns, "{t:?}");
         }
+        // Every hole page's lift reads the same DRO Z: the operations'
+        // one clearance over the top, a centre drill's too, its DRO on the
+        // pilot's tip (the plan's point is the pilot's top).
+        let mut lifts = std::collections::BTreeSet::new();
+        for (at, step) in shown.guide.steps.iter().enumerate() {
+            if !matches!(step, Step::Holes { .. }) {
+                continue;
+            }
+            let _ = a.update(Message::Guide(crate::GuideAction::Go(at)));
+            let t = crate::ui::probe::texts(a.view(), iced::Size::new(1280., 800.));
+            let up = t.iter().position(|s| s == "up to").expect("the lift");
+            lifts.insert(t[up + 2].clone());
+        }
+        let ops = &a.doc.setups[0].operations;
+        assert!(ops.iter().any(|o| crate::centre::centres(o).is_some()));
+        assert_eq!(lifts.len(), 1, "{lifts:?}");
     }
     /// LIO-411: the centre drill goes in once; names fit the browser.
     #[test]
