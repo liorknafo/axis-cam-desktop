@@ -2675,7 +2675,7 @@ fn next_hole(holes: &mut Vec<Hole>, pos: [f32; 3], op: &Operation) -> Hole {
 pub(crate) const TOO_DEEP: &str = "Drilling depth must fit the flute length, and the bottom offset cannot take the drill below the hole bottom: only Through does, below a hole that goes through the part.";
 /// Whether a Drill operation goes through, and how far past a through
 /// hole's exit (Breakthrough, 0 when it does not).
-fn breakthrough(op: &Operation) -> Result<(bool, f32), String> {
+pub(crate) fn breakthrough(op: &Operation) -> Result<(bool, f32), String> {
     if !["Yes", "No"].contains(&get(&op.p, "through")) {
         return Err("Choose Yes or No for breakthrough.".into());
     }

@@ -437,19 +437,20 @@ pub(crate) fn measures(
         // A thread is tried, not measured (LIO-413).
         Strategy::Drill if op.tapping() => {}
         Strategy::Drill => {
-            let Some((holes, mouths)) = g.steps.iter().find_map(|st| match st {
+            let Some((holes, mouths, numbers)) = g.steps.iter().find_map(|st| match st {
                 Step::Holes {
                     op: o,
                     holes,
                     mouths,
+                    numbers,
                     ..
-                } if *o == d.op => Some((holes, mouths)),
+                } if *o == d.op => Some((holes, mouths, Some(numbers))),
                 Step::Bore {
                     op: o,
                     holes,
                     mouths,
                     ..
-                } if *o == d.op => Some((holes, mouths)),
+                } if *o == d.op => Some((holes, mouths, None)),
                 _ => None,
             }) else {
                 return out;
@@ -457,6 +458,17 @@ pub(crate) fn measures(
             let Some(h) = holes.first() else {
                 return out;
             };
+            // Each cut starts Top over the material it meets (`rest::start_over`):
+            // the mouths a depth is measured from are that material's top.
+            // Fixture-pin holes start on the face itself, and are blind
+            // whatever Through says (`cam::pin_holes`).
+            let pins = op.drills_pin_holes();
+            let air = if pins {
+                0.
+            } else {
+                crate::cam::number(op, "top").unwrap_or(0.).max(0.)
+            };
+            let mouths: Vec<f32> = mouths.iter().map(|m| m - air).collect();
             let mouth = mouths.first().copied().unwrap_or(top - zero[2]);
             let at = [h[0] + zero[0], h[1] + zero[1], mouth + zero[2]];
             let up = [at[0], at[1], at[2] + 2. * d.plan.radius.max(6.)];
@@ -474,23 +486,93 @@ pub(crate) fn measures(
                 ext: None,
                 leader: true,
             });
-            let deep: Vec<f32> = (holes.iter().zip(mouths)).map(|(h, m)| m - h[2]).collect();
-            let (least, most) = deep
-                .iter()
-                .fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
-            let mut words = vec!["deep from the mouth".to_string()];
-            if most - least > 0.005 {
-                words.push(format!("{}–{} by hole", mm(least), mm(most)));
-            }
-            out.push(Measure {
-                axis: "Z",
-                value: most,
-                words,
-                from: at,
-                to: [at[0], at[1], at[2] - deep[0]],
-                ext: None,
-                leader: false,
+            // Through (LIO-450): the material from the mouth to the back,
+            // where the tool's end went Breakthrough past it, less the
+            // bottom offset (`cam::drill` and the finishing cycles). A
+            // chamfer mill's or centre drill's cone never goes through.
+            let cone = (doc.tools.iter().find(|t| t.id == op.tool)).is_some_and(|t| {
+                ["Chamfer mill", crate::model::CENTRE_DRILL].contains(&get(&t.p, "type"))
             });
+            let through = match crate::cam::breakthrough(op) {
+                Ok((true, past)) if !cone && !pins => {
+                    Some(past - crate::cam::number(op, "bottom").unwrap_or(0.))
+                }
+                _ => None,
+            };
+            // Blind, a twist drill's full diameter stops its 118° point
+            // above its tip.
+            let point = if d.plan.shape == crate::simulation::CutterShape::Drill {
+                d.plan.radius * crate::simulation::POINT_RISE
+            } else {
+                0.
+            };
+            // A cut shallower than that point never reaches the full
+            // diameter: measured to its tip, said so. Holes of one
+            // operation from mouths at several heights may be either: each
+            // kind its own size, its holes named by their DRO numbers.
+            let n = holes.len().min(mouths.len());
+            let reach = |i: usize| {
+                through.is_some() || point == 0. || mouths[i] - (holes[i][2] + point) >= 0.005
+            };
+            for full in [true, false] {
+                let these: Vec<usize> = (0..n).filter(|&i| reach(i) == full).collect();
+                let Some(&first) = these.first() else {
+                    continue;
+                };
+                let end = match (through, full) {
+                    (Some(t), _) => t,
+                    (None, true) => point,
+                    (None, false) => 0.,
+                };
+                let deep: Vec<f32> = (these.iter())
+                    .map(|&i| mouths[i] - (holes[i][2] + end))
+                    .collect();
+                let (least, most) = deep
+                    .iter()
+                    .fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
+                let mut words = match through {
+                    Some(_) => vec![
+                        "through".to_string(),
+                        "check it breaks out at the back".to_string(),
+                    ],
+                    None if !full => vec![
+                        "deep from the mouth to the point's tip".to_string(),
+                        "the full Ø is not reached".to_string(),
+                    ],
+                    None if point > 0. => vec![
+                        "deep from the mouth".to_string(),
+                        "to the full Ø, not the point".to_string(),
+                    ],
+                    None => vec!["deep from the mouth".to_string()],
+                };
+                if these.len() < n {
+                    let named: Vec<String> = (these.iter())
+                        .map(|&i| {
+                            numbers
+                                .and_then(|k| k.get(i))
+                                .copied()
+                                .unwrap_or(i + 1)
+                                .to_string()
+                        })
+                        .collect();
+                    let which = if named.len() == 1 { "hole" } else { "holes" };
+                    words.insert(0, format!("{which} {}", named.join(", ")));
+                }
+                if most - least > 0.005 {
+                    words.push(format!("{}–{} by hole", mm(least), mm(most)));
+                }
+                let h = holes[first];
+                let at = [h[0] + zero[0], h[1] + zero[1], mouths[first] + zero[2]];
+                out.push(Measure {
+                    axis: "Z",
+                    value: most,
+                    words,
+                    from: at,
+                    to: [at[0], at[1], at[2] - deep[0]],
+                    ext: None,
+                    leader: false,
+                });
+            }
         }
         // A Slot (LIO-449): its length and width as cut, its floor below
         // the top of the row it is cut into and on the DRO, or through;
@@ -5896,10 +5978,17 @@ pub(crate) mod tests {
         ] {
             assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
         }
-        // The Holes: 4 of Ø4, 42 deep from their mouths on the faced top.
+        // The Holes: 4 of Ø4, drilled with Through off to the back 42 below
+        // their mouths on the faced top: 40.8 to the full Ø, over the
+        // point (LIO-450).
         send(&mut a, GuideAction::Go(checks[1]));
         let t = texts(&a);
-        for want in ["4.00", "4 holes", "42.00", "deep from the mouth"] {
+        for want in [
+            "4.00",
+            "4 holes",
+            "40.80",
+            "deep from the mouth · to the full Ø, not the point",
+        ] {
             assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
         }
         // Drawn on the pictures after them, inside the picture.
@@ -5916,7 +6005,7 @@ pub(crate) mod tests {
             shown.dims[i].iter().map(|d| d.label.clone()).collect()
         };
         assert_eq!(labels(2), ["Y 15", "Z 9.5"]);
-        assert_eq!(labels(3), ["Ø 4", "Z 42"]);
+        assert_eq!(labels(3), ["Ø 4", "Z 40.8"]);
         // The labels' tags overlap neither each other nor any dimension
         // line, in the picture's panel at 1440 × 900 and at 1024 × 700
         // (LIO-379: "Z 9.5" lay on "Y 15"); the step's sizes have extension
@@ -6564,6 +6653,224 @@ pub(crate) mod tests {
             assert_eq!(shown.dims[1].len(), 3, "{:?}", shown.dims[1]);
         }
     }
+    /// The Check page's depth of a drilled hole on the manual mill
+    /// (LIO-450): `mesh` drilled with a Ø`size` drill, through with 2.5 of
+    /// breakthrough or blind, from a stock whose top is the part's.
+    fn drilled(
+        mesh: &Mesh,
+        size: &str,
+        through: bool,
+        bottom: &str,
+        air: &str,
+    ) -> (Document, Guide, f32) {
+        use crate::cam::boring::tests::{drill, drilling, job};
+        let manual = crate::manual::defaults();
+        let mut tool = drill(size);
+        tool.p.insert("machines".into(), manual.id.clone());
+        let mut op = drilling(mesh, &tool, "Drilling");
+        for (k, v) in [
+            ("through", if through { "Yes" } else { "No" }),
+            ("breakthrough", "2.5"),
+            ("bottom", bottom),
+            ("top", air),
+            ("rpm", "640"),
+            ("feed", "60"),
+        ] {
+            op.p.insert(k.into(), v.into());
+        }
+        let (mut doc, _) = job(mesh, manual, vec![(tool, op)]);
+        doc.setups[0].p.insert("stock_top".into(), "0".into());
+        let shown = shown(&doc, mesh, 0).unwrap();
+        let g = &shown.guide;
+        let top = shown.boxes[0].max[2] + g.zero[2];
+        (doc, g.clone(), top)
+    }
+    /// `drilled`'s one depth, drawn from the mouth down as far as it says.
+    fn drilled_depth(mesh: &Mesh, size: &str, through: bool, bottom: &str, air: &str) -> Measure {
+        let (doc, g, top) = drilled(mesh, size, through, bottom, air);
+        let m = measures(&doc, &g, &g.done[0], top);
+        let deep = m.into_iter().find(|x| x.axis == "Z").unwrap();
+        assert!(
+            (deep.from[2] - deep.to[2] - deep.value).abs() < 0.01,
+            "{deep:?}"
+        );
+        deep
+    }
+    /// A through hole's Check says through, with the material's thickness
+    /// at the hole, not how far the drill's tip went past its back
+    /// (LIO-450): the adapter plate's Ø6.8 through 18.5.
+    #[test]
+    fn a_through_holes_check_says_through_and_the_thickness_not_the_tips_depth() {
+        let mesh = crate::cam::boring::tests::ring(6.8, 30., 18.5);
+        // From the stock's top, the cut starting there or 1.5 over it (Top):
+        // the same mouth, drawn from the same height.
+        let mut mouth = None;
+        for air in ["0", "1.5"] {
+            let deep = drilled_depth(&mesh, "6.8", true, "0", air);
+            assert!((deep.value - 18.5).abs() < 0.01, "{air}: {deep:?}");
+            assert_eq!(deep.words, ["through", "check it breaks out at the back"]);
+            let at = *mouth.get_or_insert(deep.from[2]);
+            assert!((deep.from[2] - at).abs() < 0.01, "{air}: {deep:?}");
+        }
+    }
+    /// A blind hole's Check gives its depth from the mouth to its full
+    /// diameter, the drill's 118° point below it left out (LIO-450): a Ø8
+    /// hole 8 deep, its drill-point floor 2.4 lower; and to the tip, saying
+    /// so, when the cut is too shallow to reach the full diameter.
+    #[test]
+    fn a_blind_holes_check_gives_its_full_diameter_depth_without_the_point() {
+        let point = 4. * crate::simulation::POINT_RISE;
+        let section = [
+            (0., -4.),
+            (12., -4.),
+            (12., 10.),
+            (4., 10.),
+            (4., 2.),
+            (0., 2. - point),
+        ];
+        let mesh = crate::mesh::normalize(crate::cam::tests::revolved(&section)).unwrap();
+        let deep = drilled_depth(&mesh, "8", false, "0", "0");
+        assert!((deep.value - 8.).abs() < 0.01, "{deep:?}");
+        assert_eq!(
+            deep.words,
+            ["deep from the mouth", "to the full Ø, not the point"]
+        );
+        // Stopped 9.4 over the floor, 1 into the stock: the point only, its
+        // full Ø never reached; measured to its tip, down, not −1.4.
+        let deep = drilled_depth(&mesh, "8", false, "9.4", "0");
+        assert!((deep.value - 1.).abs() < 0.01, "{deep:?}");
+        assert!(deep.to[2] < deep.from[2], "{deep:?}");
+        assert_eq!(
+            deep.words,
+            [
+                "deep from the mouth to the point's tip",
+                "the full Ø is not reached"
+            ]
+        );
+    }
+    /// One Drill's holes from mouths at two heights (LIO-450): those whose
+    /// cut reaches the full Ø give that depth, those too shallow for it
+    /// their tip's, each named by its DRO hole number. The blind Ø8 job
+    /// with a second hole whose mouth is 1 over its tip.
+    #[test]
+    fn a_drills_holes_that_do_and_do_not_reach_the_full_diameter_are_told_apart() {
+        let point = 4. * crate::simulation::POINT_RISE;
+        let section = [
+            (0., -4.),
+            (12., -4.),
+            (12., 10.),
+            (4., 10.),
+            (4., 2.),
+            (0., 2. - point),
+        ];
+        let mesh = crate::mesh::normalize(crate::cam::tests::revolved(&section)).unwrap();
+        let (doc, mut g, top) = drilled(&mesh, "8", false, "0", "0");
+        for st in &mut g.steps {
+            if let Step::Holes {
+                holes,
+                mouths,
+                numbers,
+                ..
+            } = st
+            {
+                let h = holes[0];
+                holes.push([h[0] + 20., h[1], h[2]]);
+                mouths.push(h[2] + 1.);
+                *numbers = vec![1, 2];
+            }
+        }
+        let m = measures(&doc, &g, &g.done[0], top);
+        let deep: Vec<&Measure> = m.iter().filter(|x| x.axis == "Z").collect();
+        assert_eq!(deep.len(), 2, "{m:?}");
+        assert!((deep[0].value - 8.).abs() < 0.01, "{m:?}");
+        assert_eq!(
+            deep[0].words,
+            [
+                "hole 1",
+                "deep from the mouth",
+                "to the full Ø, not the point"
+            ]
+        );
+        assert!((deep[1].value - 1.).abs() < 0.01, "{m:?}");
+        assert_eq!(
+            deep[1].words,
+            [
+                "hole 2",
+                "deep from the mouth to the point's tip",
+                "the full Ø is not reached"
+            ]
+        );
+        for d in deep {
+            assert!((d.from[2] - d.to[2] - d.value).abs() < 0.01, "{d:?}");
+        }
+    }
+    /// A Drill of fixture-pin holes on the manual mill (LIO-450): 7 deep
+    /// for 6 mm pins, from the face, to the full Ø; blind whatever Through
+    /// says and with or without a Top offset, which `cam::pin_holes` uses
+    /// neither of.
+    #[test]
+    fn a_pin_holes_check_gives_its_full_diameter_depth_from_the_face() {
+        use crate::cam::boring::tests::{drill, drilling, job, ring};
+        let mesh = ring(6.8, 30., 18.5);
+        let mut mouth = None;
+        for (air, through) in [("0", "No"), ("1.5", "No"), ("0", "Yes"), ("1.5", "Yes")] {
+            let mut manual = crate::manual::defaults();
+            for (k, v) in [
+                ("pins", "0 0; 50 0"),
+                ("pin_diameter", "4"),
+                ("pin_height", "6"),
+            ] {
+                manual.p.insert(k.into(), v.into());
+            }
+            let mut tool = drill("4.1");
+            tool.p.insert("machines".into(), manual.id.clone());
+            let mut op = drilling(&mesh, &tool, "Drilling");
+            for (k, v) in [
+                ("holes", crate::model::DRILL_HOLES[1]),
+                ("rpm", "640"),
+                ("feed", "60"),
+                ("top", air),
+                ("through", through),
+            ] {
+                op.p.insert(k.into(), v.into());
+            }
+            let (mut doc, _) = job(&mesh, manual, vec![(tool, op)]);
+            let setup = &mut doc.setups[0];
+            for (k, v) in [
+                ("stock_top", "0"),
+                ("stock_left", "20"),
+                ("stock_right", "20"),
+            ] {
+                setup.p.insert(k.into(), v.into());
+            }
+            let frame = crate::volume::Frame::new(setup, &mesh);
+            let points = [[-25., 0., 0.], [25., 0., 0.]].map(|p| frame.unmap(p));
+            let (o, d) = (frame.unmap([0.; 3]), frame.unmap([0., 0., -1.]));
+            let pin = &mut setup.operations[0].p;
+            pin.insert("pin_points".into(), crate::post::pin_holes_text(&points));
+            let axis = format!("{} {} {}", d[0] - o[0], d[1] - o[1], d[2] - o[2]);
+            pin.insert("pin_axis".into(), axis);
+            let shown = shown(&doc, &mesh, 0).unwrap();
+            let g = &shown.guide;
+            let top = shown.boxes[0].max[2] + g.zero[2];
+            let m = measures(&doc, g, &g.done[0], top);
+            let deep = m.iter().find(|x| x.axis == "Z").unwrap();
+            let case = format!("Top {air}, Through {through}");
+            assert!((deep.value - 7.).abs() < 0.01, "{case}: {deep:?}");
+            assert_eq!(
+                deep.words,
+                ["deep from the mouth", "to the full Ø, not the point"],
+                "{case}"
+            );
+            assert!(
+                (deep.from[2] - deep.to[2] - 7.).abs() < 0.01,
+                "{case}: {deep:?}"
+            );
+            // From the face, the same with Top or without.
+            let at = *mouth.get_or_insert(deep.from[2]);
+            assert!((deep.from[2] - at).abs() < 0.01, "{case}: {deep:?}");
+        }
+    }
     /// Steps entered from planning (LIO-449): at the start of the operation
     /// picked there, saying where the steps had got to, one press from it;
     /// with none picked, where they were left, saying so; the line goes
@@ -6791,6 +7098,53 @@ pub(crate) mod tests {
         let _ = a.update(Message::Guide(GuideAction::Open(2)));
         shot(&a, "entry-resumed");
         std::fs::write(dir.join("lio-449.txt"), said).unwrap();
+    }
+    /// LIO-450 on a private copy of the adapter plate (`AXIS_ADAPTER_COPY`):
+    /// the Ø6.8 drill's Check page says through the 18.5 of the plate under
+    /// the seat, not the 21 its tip goes, as a PNG and its texts.
+    #[test]
+    #[ignore = "private adapter copy: AXIS_ADAPTER_COPY"]
+    fn render_the_adapter_plate_drill_check_lio_450() {
+        let dir = std::path::PathBuf::from(std::env::var_os("AXIS_ADAPTER_COPY").unwrap());
+        let mut doc = crate::storage::load(&dir.join("adapter-plate.axis.json")).unwrap();
+        doc.file.as_mut().unwrap().path = dir.join("adapter-plate.step");
+        let mesh = crate::mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
+        doc.active = doc.setups[2].id.clone();
+        let mut a = App::from_workspace(dir.join("render-state.axis.json"), None);
+        a.doc = doc;
+        a.imported_mesh = Some(mesh);
+        a.window_width = 1440.;
+        a.window_height = 1000.;
+        let id = a.doc.setups[2].id.clone();
+        a.page = crate::Page::Control;
+        build(&mut a);
+        let g = guide(&a);
+        let op = (a.doc.setups[2].operations.iter())
+            .position(|o| o.name().starts_with("Drill 6.8"))
+            .unwrap();
+        let at = (g.steps.iter())
+            .position(|s| matches!(s, Step::Check { op: o } if *o == op))
+            .unwrap();
+        a.doc.guide.insert(id, at);
+        a.guide_item = 0;
+        let t = crate::ui::probe::texts(a.view(), Size::new(1440., 1000.));
+        std::fs::write(dir.join("drill-check.txt"), t.join("\n")).unwrap();
+        render(&a, (1440, 1000), &dir.join("drill-check.png"));
+        let m = (t.iter().position(|s| s == "MEASURE")).unwrap_or_else(|| panic!("{t:?}"));
+        assert_eq!(
+            t[m..m + 7],
+            [
+                "MEASURE",
+                "Ø",
+                "6.80",
+                "4 holes",
+                "Z",
+                "18.50",
+                "through · check it breaks out at the back"
+            ],
+            "{t:?}"
+        );
+        assert!(!t.iter().any(|s| s == "21.00"), "{t:?}");
     }
     /// The Steps page at 1280 × 800, one PNG per kind of step, in
     /// /tmp/manual-steps.
