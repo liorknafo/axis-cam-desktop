@@ -1251,7 +1251,7 @@ impl SetupPost {
         .map(Vec::as_slice)
     }
     /// The programs to write: none for a UC100 setup.
-    fn programs(&self) -> &[Program] {
+    pub(crate) fn programs(&self) -> &[Program] {
         match (&self.run, &self.result) {
             (None, Ok(programs)) => programs,
             _ => &[],

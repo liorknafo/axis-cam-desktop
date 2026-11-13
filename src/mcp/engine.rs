@@ -6,7 +6,8 @@
 //! the `Message`s a click would send, waited for until the app's work has
 //! settled (`App::pending`) or `wait_s` is up, and then checked for its
 //! expected effect. The result says which of these happened (`Outcome`).
-use crate::{App, Message, Page, model::Strategy};
+use super::commands::{self, Ctx, Problem};
+use crate::{App, Message};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -26,6 +27,9 @@ pub trait Backend {
     fn kind(&self) -> &'static str;
     /// The session's id and folder.
     fn session(&self) -> Value;
+    /// The headless session's folder, the one place in the app's data
+    /// folder a command may write; None in the window.
+    fn session_folder(&self) -> Option<std::path::PathBuf>;
 }
 
 /// How long a call waits for its work by default, and at most, s. Clients
@@ -258,7 +262,7 @@ fn inspect(b: &impl Backend) -> Value {
 }
 
 /// The command groups, in the order `list_commands` gives them.
-const GROUPS: [&str; 11] = [
+pub const GROUPS: [&str; 11] = [
     "project",
     "part",
     "setup",
@@ -272,371 +276,129 @@ const GROUPS: [&str; 11] = [
     "machine",
 ];
 
-/// Why a command was not sent.
-enum Problem {
-    /// Its arguments do not read: an error of the call.
-    Args(String),
-    /// Its precondition failed: outcome `refused`.
-    Refused(String),
-}
-/// The effect a command must have: `Err` says what did not happen.
-type Expect = Box<dyn Fn(&App) -> Result<(), String>>;
-/// What a command's precondition decided.
-enum Prepared {
-    /// Send these messages, then check the effect.
-    Send(Vec<Message>, Expect),
-    /// It is already so: why.
-    Unchanged(String),
-}
-
-/// A command `execute` runs.
-struct Command {
-    name: &'static str,
-    group: &'static str,
-    /// One line.
-    help: &'static str,
-    /// What must exist or be selected.
-    requires: &'static str,
-    /// What `execute` checks for after it.
-    effect: &'static str,
-    /// The JSON schema of its `args`.
-    schema: fn() -> Value,
-    /// Its fuller help.
-    details: fn() -> String,
-    /// Its precondition, and the messages and effect when it holds.
-    prepare: fn(&App, &Value) -> Result<Prepared, Problem>,
-}
-
-const COMMANDS: &[Command] = &[
-    Command {
-        name: "set_project_title",
-        group: "project",
-        help: "Names the project.",
-        requires: "Nothing.",
-        effect: "The project's title is `title`.",
-        schema: || {
-            json!({
-                "type": "object",
-                "properties": {"title": {"type": "string"}},
-                "required": ["title"],
-            })
-        },
-        details: || {
-            "The title names the project in the window's title bar, its setup sheets and its programs' headers.".into()
-        },
-        prepare: |app, args| {
-            let title = string(args, "title")?;
-            if app.doc.title == title {
-                return Ok(Prepared::Unchanged(format!(
-                    "The project is already titled \"{title}\"."
-                )));
-            }
-            let expect = title.clone();
-            Ok(Prepared::Send(
-                vec![Message::Title(title)],
-                Box::new(move |app| {
-                    (app.doc.title == expect)
-                        .then_some(())
-                        .ok_or_else(|| "The title was not changed.".into())
-                }),
-            ))
-        },
-    },
-    Command {
-        name: "select_setup",
-        group: "setup",
-        help: "Makes a setup active, with no operation selected, on the Work page.",
-        requires: "The setup exists.",
-        effect: "The setup is the active one.",
-        schema: || {
-            json!({
-                "type": "object",
-                "properties": {"setup": addressed("setup")},
-                "required": ["setup"],
-            })
-        },
-        details: || help_text(&Message::SelectSetup(0)),
-        prepare: |app, args| {
-            let si = setup_of(app, arg(args, "setup")?)?;
-            let id = app.doc.setups[si].id.clone();
-            if app.doc.active == id && app.selected.is_none() && app.page == Page::Work {
-                return Ok(Prepared::Unchanged(format!(
-                    "{} is already the active setup.",
-                    app.doc.setups[si].name()
-                )));
-            }
-            Ok(Prepared::Send(
-                vec![Message::SelectSetup(si)],
-                Box::new(move |app| {
-                    (app.doc.active == id)
-                        .then_some(())
-                        .ok_or_else(|| "The setup was not made active.".into())
-                }),
-            ))
-        },
-    },
-    Command {
-        name: "select_operation",
-        group: "operation",
-        help: "Selects an operation and opens its editor on the Work page.",
-        requires: "The operation exists. An index counts in `setup`, else in the active setup; an id may be in any setup, which is made active.",
-        effect: "The operation is the selected one.",
-        schema: || {
-            json!({
-                "type": "object",
-                "properties": {
-                    "operation": addressed("operation"),
-                    "setup": addressed("setup"),
-                },
-                "required": ["operation"],
-            })
-        },
-        details: || help_text(&Message::SelectOp(0)),
-        prepare: |app, args| {
-            let operation = arg(args, "operation")?;
-            let setup = match args.get("setup") {
-                Some(s) => Some(setup_of(app, s)?),
-                None => None,
-            };
-            let (si, oi) = operation_of(app, setup, operation)?;
-            let s = &app.doc.setups[si];
-            let id = s.operations[oi].id.clone();
-            if app.doc.active == s.id && app.selected == Some(oi) && app.page == Page::Work {
-                return Ok(Prepared::Unchanged(format!(
-                    "{} is already selected.",
-                    s.operations[oi].name()
-                )));
-            }
-            let mut messages = vec![];
-            if app.doc.active != s.id {
-                messages.push(Message::SelectSetup(si));
-            }
-            messages.push(Message::SelectOp(oi));
-            Ok(Prepared::Send(
-                messages,
-                Box::new(move |app| {
-                    (app.operation().is_some_and(|o| o.id == id))
-                        .then_some(())
-                        .ok_or_else(|| "The operation was not selected.".into())
-                }),
-            ))
-        },
-    },
-    Command {
-        name: "add_operation",
-        group: "operation",
-        help: "Adds an operation of a strategy to the active setup, with the library's first tool that fits.",
-        requires: "An active setup; on an imported part, a strategy available for it. With no fitting tool in the library the app opens the Tool library to make one, and the operation is not added.",
-        effect: "The active setup has a new operation (and its centre drilling, for a drill on the manual mill), and the new operation is selected.",
-        schema: || {
-            let names: Vec<String> = Strategy::ALL.iter().map(|s| format!("{s:?}")).collect();
-            json!({
-                "type": "object",
-                "properties": {"strategy": {"type": "string", "enum": names}},
-                "required": ["strategy"],
-            })
-        },
-        details: || {
-            let strategies: Vec<String> = (Strategy::ALL.iter())
-                .map(|s| format!("- {s:?} ({}): {}", s.name(), s.availability()))
-                .collect();
-            format!(
-                "The new operation opens on its Tool tab, or on Geometry, picking, when it needs a place on the part. The strategies:\n{}",
-                strategies.join("\n")
-            )
-        },
-        prepare: |app, args| {
-            let strategy = strategy_of(&string(args, "strategy")?)?;
-            let Some(setup) = app.doc.active_setup() else {
-                return Err(Problem::Refused(
-                    "There is no setup to add the operation to: add a setup first.".into(),
-                ));
-            };
-            if !app.is_sample() && !strategy.imported_preview() {
-                return Err(Problem::Refused(format!(
-                    "{} cannot be added to an imported part: {}",
-                    strategy.name(),
-                    strategy.availability()
-                )));
-            }
-            let (id, before) = (setup.id.clone(), setup.operations.clone());
-            Ok(Prepared::Send(
-                vec![Message::AddOp(strategy)],
-                Box::new(move |app| {
-                    let setup = app.doc.setups.iter().find(|s| s.id == id);
-                    let added = setup.is_some_and(|s| s.operations.len() > before.len());
-                    let selected = app.operation().is_some_and(|o| {
-                        o.strategy == strategy && !before.iter().any(|b| b.id == o.id)
-                    });
-                    (added && selected && app.doc.active == id)
-                        .then_some(())
-                        .ok_or_else(|| "No operation was added.".into())
-                }),
-            ))
-        },
-    },
-];
-
-fn command(name: &str) -> Option<&'static Command> {
-    COMMANDS.iter().find(|c| c.name == name)
-}
-
-/// The schema of an argument that names a setup or an operation.
-fn addressed(what: &str) -> Value {
-    json!({
-        "type": ["string", "integer"],
-        "description": format!("The {what}'s id, or its index from 0 as inspect lists it."),
-    })
-}
-
-/// The app's own help for the control that sends `message`.
-fn help_text(message: &Message) -> String {
-    let help = crate::help::command(message, String::new());
-    if help.more.is_empty() {
-        help.body
-    } else {
-        format!("{}\n\n{}", help.body, help.more)
-    }
-}
-
-fn arg<'a>(args: &'a Value, key: &str) -> Result<&'a Value, Problem> {
-    args.get(key)
-        .ok_or_else(|| Problem::Args(format!("`{key}` is missing.")))
-}
-fn string(args: &Value, key: &str) -> Result<String, Problem> {
-    (arg(args, key)?.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| Problem::Args(format!("`{key}` must be a string.")))
-}
-
-/// The setup `v` names: an id, or an index.
-fn setup_of(app: &App, v: &Value) -> Result<usize, Problem> {
-    let setups = &app.doc.setups;
-    let found = match v {
-        Value::String(id) => setups.iter().position(|s| s.id == *id),
-        Value::Number(n) => n.as_u64().map(|i| i as usize).filter(|i| *i < setups.len()),
-        _ => return Err(Problem::Args("`setup` must be an id or an index.".into())),
-    };
-    found.ok_or_else(|| {
-        Problem::Refused(format!(
-            "There is no setup {v}; the job has {} (inspect lists them).",
-            setups.len()
-        ))
-    })
-}
-
-/// The operation `v` names, as (setup, operation) indices: an id in any
-/// setup (or in `setup`), or an index in `setup` or the active setup.
-fn operation_of(app: &App, setup: Option<usize>, v: &Value) -> Result<(usize, usize), Problem> {
-    let setups = &app.doc.setups;
-    let found = match v {
-        Value::String(id) => (setups.iter().enumerate())
-            .filter(|(si, _)| setup.is_none_or(|s| s == *si))
-            .find_map(|(si, s)| Some((si, s.operations.iter().position(|o| o.id == *id)?))),
-        Value::Number(n) => {
-            let si = match setup.or_else(|| setups.iter().position(|s| s.id == app.doc.active)) {
-                Some(si) => si,
-                None => {
-                    return Err(Problem::Refused(
-                        "There is no active setup: select a setup first.".into(),
-                    ));
-                }
-            };
-            (n.as_u64().map(|i| i as usize))
-                .filter(|i| *i < setups[si].operations.len())
-                .map(|oi| (si, oi))
-        }
-        _ => {
-            return Err(Problem::Args(
-                "`operation` must be an id or an index.".into(),
-            ));
-        }
-    };
-    found.ok_or_else(|| {
-        Problem::Refused(format!(
-            "There is no operation {v} there (inspect lists them)."
-        ))
-    })
-}
-
-/// The strategy `name` names: as `inspect` writes it ("FiveAxis"), its
-/// tile's word ("5-axis") or its full name ("Adaptive clearing").
-fn strategy_of(name: &str) -> Result<Strategy, Problem> {
-    let name = name.trim();
-    (Strategy::ALL.iter().copied())
-        .find(|s| {
-            [format!("{s:?}"), s.short().into(), s.name().into()]
-                .iter()
-                .any(|n| n.eq_ignore_ascii_case(name))
-        })
-        .ok_or_else(|| {
-            let names: Vec<String> = Strategy::ALL.iter().map(|s| format!("{s:?}")).collect();
-            Problem::Args(format!(
-                "There is no strategy \"{name}\"; the strategies are {}.",
-                names.join(", ")
-            ))
-        })
-}
-
 fn list_commands(args: &Value) -> Value {
     let filter = (args.get("filter").and_then(Value::as_str))
         .unwrap_or("")
         .to_lowercase();
     let group = args.get("group").and_then(Value::as_str);
-    let mut listed: Vec<&Command> = (COMMANDS.iter())
-        .filter(|c| group.is_none_or(|g| c.group == g))
-        .filter(|c| c.name.contains(&filter) || c.help.to_lowercase().contains(&filter))
-        .collect();
-    listed.sort_by_key(|c| (GROUPS.iter().position(|g| *g == c.group), c.name));
-    let commands: Vec<Value> = (listed.iter())
-        .map(|c| json!({"name": c.name, "group": c.group, "help": c.help, "allowed": true}))
-        .collect();
+    let matches =
+        |name: &str, help: &str| name.contains(&filter) || help.to_lowercase().contains(&filter);
+    let mut listed: Vec<(usize, &str, Value)> = vec![];
+    for c in commands::all() {
+        let (line, _) = c.help();
+        if group.is_none_or(|g| c.group == g) && matches(c.name, &line) {
+            let order = GROUPS
+                .iter()
+                .position(|g| *g == c.group)
+                .unwrap_or(GROUPS.len());
+            listed.push((
+                order,
+                c.name,
+                json!({"name": c.name, "group": c.group, "help": line, "allowed": true}),
+            ));
+        }
+    }
+    for (name, help, reason) in commands::REFUSED {
+        if group.is_none_or(|g| g == "machine") && matches(name, help) {
+            listed.push((
+                GROUPS.len(),
+                name,
+                json!({"name": name, "group": "machine", "help": help, "allowed": false, "reason": reason}),
+            ));
+        }
+    }
+    listed.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    let commands: Vec<Value> = listed.into_iter().map(|(_, _, v)| v).collect();
     json!({"commands": commands})
 }
 
 fn describe_command(args: &Value) -> Result<Value, String> {
     let name = (args.get("name").and_then(Value::as_str))
         .ok_or("`name` is missing: give a command's name from list_commands.")?;
-    let c = command(name).ok_or_else(|| no_command(name))?;
+    if let Some((name, help, reason)) = commands::REFUSED.iter().find(|r| r.0 == name) {
+        return Ok(json!({
+            "name": name,
+            "group": "machine",
+            "help": help,
+            "allowed": false,
+            "reason": reason,
+        }));
+    }
+    let c = commands::find(name).ok_or_else(|| no_command(name))?;
+    let (line, full) = c.help();
     Ok(json!({
         "name": c.name,
         "group": c.group,
-        "help": c.help,
-        "details": (c.details)(),
-        "args": (c.schema)(),
+        "help": line,
+        "details": full,
+        "args": c.schema(),
+        "example": c.example_args().first(),
         "requires": c.requires,
         "effect": c.effect,
+        "while_machine_runs": c.while_locked,
+        "waits": "for the work it starts to settle (pending empty), up to wait_s",
         "allowed": true,
     }))
 }
 
+/// A `refused` result.
+fn refuse(b: &impl Backend, why: String) -> Result<Value, String> {
+    Ok(Report::of(b, Outcome::Refused, Some(why)).json())
+}
+
 fn no_command(name: &str) -> String {
-    format!("There is no command {name}; list_commands lists them.")
+    match commands::LATER.iter().find(|(n, _)| *n == name) {
+        Some((_, what)) => format!("{name} is not in this version yet ({what})."),
+        None => format!("There is no command {name}; list_commands lists them."),
+    }
 }
 
 fn execute(b: &mut impl Backend, args: &Value, deadline: Instant) -> Result<Value, String> {
     let name = (args.get("command").and_then(Value::as_str))
         .ok_or("`command` is missing: give a command's name from list_commands.")?;
-    let c = command(name).ok_or_else(|| no_command(name))?;
+    let Some(c) = commands::find(name) else {
+        return match commands::REFUSED.iter().find(|r| r.0 == name) {
+            Some((_, _, reason)) => refuse(b, reason.to_string()),
+            None => Err(no_command(name)),
+        };
+    };
     let empty = json!({});
     let command_args = match args.get("args") {
         None | Some(Value::Null) => &empty,
         Some(a @ Value::Object(_)) => a,
         Some(_) => return Err("`args` must be an object.".into()),
     };
-    if b.app().locked() {
-        return Ok(Report::of(b, Outcome::Refused, Some(LOCKED.into())).json());
+    if b.app().locked() && !c.while_locked {
+        return refuse(b, LOCKED.into());
     }
-    let (messages, expect) = match (c.prepare)(b.app(), command_args) {
-        Err(Problem::Args(e)) => return Err(format!("{name}: {e}")),
-        Err(Problem::Refused(reason)) => {
-            return Ok(Report::of(b, Outcome::Refused, Some(reason)).json());
-        }
-        Ok(Prepared::Unchanged(reason)) => {
-            return Ok(Report::of(b, Outcome::NoChange, Some(reason)).json());
-        }
-        Ok(Prepared::Send(messages, expect)) => (messages, expect),
+    let folder = b.session_folder();
+    let prepared = {
+        let app = b.app();
+        commands::resolve(c.on, app, command_args).and_then(|(setup, operation)| {
+            let ctx = Ctx {
+                app,
+                args: command_args,
+                session: folder.as_deref(),
+                setup,
+                operation,
+            };
+            if let Some(why) = c.unchanged.and_then(|f| f(&ctx)) {
+                return Ok(Err(why));
+            }
+            let messages = c.messages(&ctx)?;
+            Ok(Ok((messages, c.expect.map(|f| f(&ctx)))))
+        })
     };
+    let (messages, expect) = match prepared {
+        Err(Problem::Args(e)) => return Err(format!("{name}: {e}")),
+        Err(Problem::Refused(why)) => return refuse(b, why),
+        Ok(Err(why)) => return Ok(Report::of(b, Outcome::NoChange, Some(why)).json()),
+        Ok(Ok(prepared)) => prepared,
+    };
+    // Nothing of a command is sent unless all of it may be.
+    if let Err(why) = commands::guard(&messages) {
+        return refuse(b, why.into());
+    }
     let status = b.app().status.clone();
     for message in messages {
         b.send(message);
@@ -648,6 +410,13 @@ fn execute(b: &mut impl Backend, args: &Value, deadline: Instant) -> Result<Valu
         );
         return Ok(Report::of(b, Outcome::StillRunning, Some(reason)).json());
     }
+    let Some(expect) = expect else {
+        let mut report = Report::of(b, Outcome::Done, None);
+        report.notes.push(
+            "Sent and settled; this command's effect is not checked yet, so read the status line and inspect.".into(),
+        );
+        return Ok(report.json());
+    };
     let report = match expect(b.app()) {
         Ok(()) => Report::of(b, Outcome::Done, None),
         Err(sentence) => {
@@ -669,35 +438,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_command_has_help_a_schema_and_a_group() {
-        for c in COMMANDS {
-            assert!(
-                !c.help.is_empty() && !(c.details)().is_empty(),
-                "{}",
-                c.name
-            );
-            assert_eq!((c.schema)()["type"], "object", "{}", c.name);
-            assert!(GROUPS.contains(&c.group), "{}", c.name);
-        }
-        for t in tools().as_array().unwrap() {
-            assert!(is_tool(t["name"].as_str().unwrap()));
-            assert_eq!(t["inputSchema"]["type"], "object");
-        }
-    }
-
-    #[test]
-    fn strategies_read_by_any_of_their_names() {
-        assert!(matches!(strategy_of("FiveAxis"), Ok(Strategy::FiveAxis)));
-        assert!(matches!(strategy_of("5-axis"), Ok(Strategy::FiveAxis)));
-        assert!(matches!(
-            strategy_of("adaptive clearing"),
-            Ok(Strategy::Adaptive)
-        ));
-        assert!(matches!(strategy_of(" pocket "), Ok(Strategy::Pocket)));
-        assert!(matches!(strategy_of("Laser"), Err(Problem::Args(_))));
-    }
-
-    #[test]
     fn wait_s_is_kept_within_its_bounds() {
         assert_eq!(wait_of(&json!({})), Duration::from_secs(25));
         assert_eq!(wait_of(&json!({"wait_s": 400})), Duration::from_secs(50));
@@ -709,33 +449,37 @@ mod tests {
     }
 
     #[test]
-    fn list_commands_filters_by_word_and_group() {
-        let names = |v: Value| -> Vec<String> {
-            (v["commands"].as_array().unwrap().iter())
-                .map(|c| c["name"].as_str().unwrap().to_string())
+    fn list_commands_filters_and_shows_the_refused_ones() {
+        let listed = |args: Value| -> Vec<(String, bool)> {
+            (list_commands(&args)["commands"].as_array().unwrap().iter())
+                .map(|c| (c["name"].as_str().unwrap().into(), c["allowed"] == true))
                 .collect()
         };
+        let setup = listed(json!({"group": "setup"}));
+        assert!(setup.iter().all(|(_, allowed)| *allowed));
+        assert!(setup.iter().any(|(n, _)| n == "select_setup"));
+        let machine = listed(json!({"group": "machine"}));
+        for (name, allowed) in [
+            ("estop", true),
+            ("hold", true),
+            ("cycle_start", false),
+            ("jog", false),
+        ] {
+            assert!(
+                machine.contains(&(name.into(), allowed)),
+                "{name}: {machine:?}"
+            );
+        }
+        let all = listed(json!({}));
+        assert_eq!(all.len(), commands::all().len() + commands::REFUSED.len());
+        assert!(listed(json!({"filter": "SPINDLE"})).contains(&("spindle".into(), false)));
+        let pocket = describe_command(&json!({"name": "add_operation"})).unwrap();
         assert_eq!(
-            names(list_commands(&json!({"group": "setup"}))),
-            ["select_setup"]
+            pocket["args"]["properties"]["strategy"]["enum"][2],
+            "Pocket"
         );
-        assert_eq!(
-            names(list_commands(&json!({"filter": "SELECT"}))),
-            ["select_setup", "select_operation"]
-        );
-        assert_eq!(
-            list_commands(&json!({}))["commands"]
-                .as_array()
-                .unwrap()
-                .len(),
-            COMMANDS.len()
-        );
-        assert!(
-            describe_command(&json!({"name": "add_operation"})).unwrap()["details"]
-                .as_str()
-                .unwrap()
-                .contains("Pocket")
-        );
+        let refused = describe_command(&json!({"name": "home"})).unwrap();
+        assert_eq!(refused["allowed"], false);
         assert!(describe_command(&json!({"name": "fly"})).is_err());
     }
 }

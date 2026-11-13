@@ -6,6 +6,10 @@
 //! - `runner`: the headless session, an `App` with no window on a thread
 //!   of its own.
 //! - `engine`: the tools, carried out against that `App`.
+//! - `class`: what each `Message` is to an agent, with no wildcard.
+//! - `commands`: the commands `execute` runs.
+pub mod class;
+pub mod commands;
 pub mod engine;
 pub mod protocol;
 pub mod runner;

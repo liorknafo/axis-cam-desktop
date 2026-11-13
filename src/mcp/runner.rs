@@ -367,6 +367,9 @@ impl Backend for Host {
     fn kind(&self) -> &'static str {
         "headless"
     }
+    fn session_folder(&self) -> Option<PathBuf> {
+        Some(self.session.folder.clone())
+    }
     fn session(&self) -> Value {
         json!({
             "id": self.session.id,
