@@ -562,6 +562,21 @@ impl PartGrid {
 /// The operations to name, given the deep part cells each one removed: none
 /// while the total is under `GOUGE_CELLS`, and then every operation that
 /// removed some.
+/// The problem setup `si`'s Steps refused (`why`) for a Round corners walk
+/// that cannot be followed (LIO-447): with the operation its name starts.
+fn broken_steps(setup: &crate::model::Setup, si: usize, why: &str) -> Problem {
+    Problem {
+        setup: si + 1,
+        operation: (setup.operations.iter())
+            .position(|o| {
+                o.strategy == crate::model::Strategy::Corner
+                    && why.starts_with(&format!("{}:", o.name()))
+            })
+            .map(|oi| oi + 1),
+        stage: "steps",
+        message: proposal::clip(why, 300),
+    }
+}
 fn gouging_operations(removed: &[usize]) -> Vec<usize> {
     if removed.iter().sum::<usize>() < GOUGE_CELLS {
         return vec![];
@@ -1466,6 +1481,12 @@ fn run(
                     stage: "workholding",
                     message: crate::guide::NOT_CLEAR.into(),
                 }),
+                // A Round corners walk whose DRO numbers cannot be followed
+                // (LIO-447): not a number, no safe X and Y to go down at,
+                // or against the walk's one way.
+                Err(why) if why.contains(crate::corner::BROKEN) => {
+                    export.push(broken_steps(&job_doc.setups[si], si, &why))
+                }
                 Ok(guide) => {
                     for step in &guide.steps {
                         if let crate::guide::Step::Holes { op, uncentred, .. } = step
@@ -3840,6 +3861,100 @@ mod totem {
             tests::{aluminium, hold, op},
         },
     };
+    /// A Round corners whose Steps cannot be followed fails the whole plan
+    /// check, end to end (LIO-447 review): a walk's first feed made to go
+    /// along two axes, or to no number, in the plan its Steps are said from;
+    /// and a reading not a number.
+    #[test]
+    fn a_broken_corner_walk_fails_the_plan_check() {
+        use crate::simulation::{Motion, Plan};
+        fn first_feed(p: &mut Plan) -> (&mut crate::simulation::Move, usize) {
+            let range = p.corner_walks[0].moves.clone();
+            let m = (p.moves[range].iter_mut())
+                .find(|m| m.motion == Motion::Feed)
+                .unwrap();
+            let k = (0..2).find(|&k| m.to[k] == m.from[k]).unwrap();
+            (m, k)
+        }
+        let faults: [(&str, crate::guide::tests::Fault, &str); 3] = [
+            (
+                "diagonal",
+                |p| {
+                    let (m, k) = first_feed(p);
+                    m.to[k] += 1.;
+                },
+                "two axes",
+            ),
+            (
+                "no number",
+                |p| {
+                    let (m, k) = first_feed(p);
+                    m.to[k] = f32::NAN;
+                },
+                "not a number",
+            ),
+            (
+                "reading",
+                |p| p.corner_walks[0].stair.points[0][0] = f64::NAN,
+                "not all numbers",
+            ),
+        ];
+        for (name, fault, said) in faults {
+            let (mut doc, mesh) = crate::corner::tests::adapter_plate_setup_3();
+            doc.file = Some(crate::model::ModelFile {
+                name: "adapter-plate.stl".into(),
+                path: "adapter-plate.stl".into(),
+                format: "stl".into(),
+                bytes: 1,
+                thickness: None,
+            });
+            let report = crate::analysis::report(&doc, &mesh).unwrap();
+            // Whole, it passes.
+            let check = super::check_built(&doc, &mesh, &report);
+            assert!(
+                !check.problems.iter().any(|p| p.stage == "steps"),
+                "{:?}",
+                check.problems
+            );
+            let id = doc.setups[0].operations.last().unwrap().id.clone();
+            crate::guide::tests::CORNER_FAULTS
+                .lock()
+                .unwrap()
+                .push((id.clone(), fault));
+            let check = super::check_built(&doc, &mesh, &report);
+            crate::guide::tests::CORNER_FAULTS
+                .lock()
+                .unwrap()
+                .retain(|(i, _)| *i != id);
+            assert!(!check.passed, "{name}");
+            let p = (check.problems.iter())
+                .find(|p| p.stage == "steps")
+                .unwrap_or_else(|| panic!("{name}: {:?}", check.problems));
+            assert_eq!((p.setup, p.operation), (1, Some(3)), "{name}");
+            assert!(p.message.contains("walk 1 of 16"), "{name}: {}", p.message);
+            assert!(p.message.contains(said), "{name}: {}", p.message);
+            assert!(p.message.contains(crate::corner::BROKEN), "{name}");
+        }
+    }
+    /// A Round corners walk the Steps cannot follow is a problem of its
+    /// operation, not a green check (LIO-447).
+    #[test]
+    fn a_corner_walk_the_steps_refuse_is_a_problem() {
+        let (doc, _) = crate::corner::tests::plate_job("Y");
+        let setup = &doc.setups[0];
+        let name = setup.operations[0].name().to_string();
+        let why = crate::corner::broken(
+            &name,
+            (9, 16),
+            crate::corner::WHERE[2],
+            "it goes down with no X to go down at",
+        );
+        assert!(why.contains(crate::corner::BROKEN));
+        let p = super::broken_steps(setup, 0, &why);
+        assert_eq!((p.setup, p.operation, p.stage), (1, Some(1), "steps"));
+        assert!(p.message.contains("walk 9 of 16"), "{}", p.message);
+        assert!(p.message.contains("no X"), "{}", p.message);
+    }
     #[test]
     #[ignore]
     fn the_totem_case_machines_from_both_sides() {

@@ -265,6 +265,7 @@ impl Builder {
                 neck: None,
                 stops: vec![],
                 keep_air: vec![],
+                corner_walks: vec![],
                 display_scale: stock.display_scale,
                 duration: 0.,
                 target: top,

@@ -32805,6 +32805,83 @@ soft_max = 180.0
         assert!(most > 0.04 && most < 0.05, "{most}");
         assert!(texts.iter().any(|t| t == "0.05"), "{texts:?}");
     }
+    /// Every walk's Steps screen on the adapter plate's setup 3 (LIO-447):
+    /// up above the stock, X and Y said where the tool goes down, and each
+    /// feed's arrow the way the screen says its axis only ever goes. With
+    /// `$AXIS_RENDER_DIR`, each walk's screen as a PNG there.
+    #[test]
+    fn every_corner_walk_screen_says_where_to_go_down_and_points_the_one_way() {
+        use crate::{GuideAction, guide::Step};
+        let (doc, mesh) = crate::corner::tests::adapter_plate_setup_3();
+        let mut a = plate_app();
+        let file = a.doc.file.take();
+        a.doc = doc;
+        a.doc.file = file;
+        a.imported_mesh = Some(mesh);
+        let _ = a.update(Message::Guide(GuideAction::Open(0)));
+        crate::steps::tests::build(&mut a);
+        let g = a.current_guide().unwrap().as_ref().unwrap().guide.clone();
+        let dro = crate::steps::tests::dro_of;
+        let out = std::env::var("AXIS_RENDER_DIR")
+            .ok()
+            .map(std::path::PathBuf::from);
+        let mut walks = 0;
+        for (i, s) in g.steps.iter().enumerate() {
+            let Step::Corner {
+                index,
+                points,
+                targets,
+                ..
+            } = s
+            else {
+                continue;
+            };
+            walks += 1;
+            let _ = a.update(Message::Guide(GuideAction::Go(i)));
+            let texts = page_texts(&a);
+            let way = |k: usize| points[points.len() - 1][k] > points[0][k];
+            let words = format!(
+                "X only ever {}, Y only ever {}",
+                if way(0) { "up" } else { "down" },
+                if way(1) { "up" } else { "down" }
+            );
+            assert!(
+                texts.iter().any(|t| t.contains(&words)),
+                "walk {index}: {words} in {texts:?}"
+            );
+            assert!(
+                texts.iter().any(|t| t == "up, above the stock"),
+                "walk {index}: {texts:?}"
+            );
+            // Z, then X and Y, all said before the tool goes down.
+            let down = targets
+                .iter()
+                .position(|t| t.axis == 2 && t.lock[2])
+                .unwrap();
+            for k in 0..3 {
+                assert!(
+                    targets[..down].iter().any(|t| t.axis == k),
+                    "walk {index}: axis {k} not said before going down"
+                );
+            }
+            // Each feed's arrow the walk's way on its axis.
+            for t in targets.iter().filter(|t| t.feed) {
+                let arrow = [["◀", "▶"], ["▼", "▲"]][t.axis][usize::from(way(t.axis))];
+                let shown = format!("{arrow} {}", dro(t.centre));
+                assert!(texts.contains(&shown), "walk {index}: {shown} in {texts:?}");
+            }
+            if let Some(dir) = &out {
+                std::fs::create_dir_all(dir).unwrap();
+                let _ = a.view();
+                render_png(
+                    &a,
+                    iced::Size::new(1600., 1000.),
+                    &dir.join(format!("walk-{index:02}.png")),
+                );
+            }
+        }
+        assert_eq!(walks, 16);
+    }
     /// Pictures of Round corners on the adapter plate (LIO-443): the
     /// Corners tab with all four picked, the 3D view with the toolpath, a
     /// walk's screen and the File screen, as PNGs in `$AXIS_RENDER_DIR`

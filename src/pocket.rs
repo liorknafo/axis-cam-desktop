@@ -3482,6 +3482,7 @@ fn finish_plan(setup: &Setup, op: &Operation, job: Job) -> Result<Plan, String> 
         neck: None,
         stops: vec![],
         keep_air: vec![],
+        corner_walks: vec![],
         display_scale: scale,
         duration: 0.,
         target: clearings

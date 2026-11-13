@@ -657,6 +657,7 @@ pub fn nominal(
         rings: vec![],
         stops: vec![],
         keep_air: vec![],
+        corner_walks: vec![],
     };
     let mut sim = Simulation::new(plan);
     (sim.initial_volume, sim.frame) = (Some(volume), Some(frame));

@@ -456,6 +456,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
         neck: None,
         stops: vec![],
         keep_air: vec![],
+        corner_walks: vec![],
         display_scale: resolved.display_scale,
         duration: cut.duration,
         target,

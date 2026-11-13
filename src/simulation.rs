@@ -180,6 +180,11 @@ pub struct Plan {
     /// are. Air trimming takes one out only where earlier cuts are proven
     /// to have swept all it would (`air::SUPPORT_GAP`). Empty means none.
     pub keep_air: Vec<bool>,
+    /// A Round corners' walks as it made them (`corner::walks`), each with
+    /// the corner it goes round and its moves; the Steps say them from here
+    /// (LIO-447: read back from the moves alone, a walk could be given a
+    /// neighbouring corner's). Empty for every other plan.
+    pub corner_walks: Vec<crate::corner::Walk>,
 }
 /// A stop of the spindle partway through a plan: before move `at` the
 /// spindle and coolant stop and, with a `pause`, the program waits there,
@@ -589,6 +594,7 @@ fn generate_plan(
         neck: None,
         stops: vec![],
         keep_air: vec![],
+        corner_walks: vec![],
         display_scale: scale,
         duration: 0.,
         target,

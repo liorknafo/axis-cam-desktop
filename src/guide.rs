@@ -1945,11 +1945,32 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                     ));
                 }
                 let corners = crate::corner::picked(setup, mesh, op)?;
-                let walks = crate::corner::read(&plan, &corners, zero);
+                #[cfg(test)]
+                let plan = tests::faulted(op, &plan);
+                // The walks as the plan made them, each with its corner.
+                let walks = &plan.corner_walks;
+                if walks.is_empty() {
+                    return Err(format!(
+                        "{}: its walks are not known. {}",
+                        op.name(),
+                        crate::corner::BROKEN
+                    ));
+                }
                 count = walks.len();
                 for (k, w) in walks.iter().enumerate() {
-                    let c = &corners[w.corner];
-                    let moves = &plan.moves[w.moves.clone()];
+                    let at = (k + 1, walks.len());
+                    let (Some(c), Some(moves)) =
+                        (corners.get(w.corner), plan.moves.get(w.moves.clone()))
+                    else {
+                        return Err(format!(
+                            "{}: walk {} of {}: its corner or its moves are not the plan's. {}",
+                            op.name(),
+                            at.0,
+                            at.1,
+                            crate::corner::BROKEN
+                        ));
+                    };
+                    let offset = crate::corner::shown_offset(w, c, plan.radius, zero);
                     let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
                     for m in moves.iter().filter(|m| m.motion == Motion::Feed) {
                         for p in [m.from, m.to] {
@@ -1961,13 +1982,26 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                     let legs: Vec<&Move> =
                         moves.iter().filter(|m| m.motion != Motion::Dwell).collect();
                     let mut targets = vec![];
-                    for (i, m) in legs.iter().enumerate() {
-                        let axis = moved(m)?;
+                    for m in &legs {
+                        // A move of no number, or along two axes, is no DRO
+                        // row: refused as the walk's, which the plan checks
+                        // report (LIO-447).
+                        let axis = (m.from.iter().chain(&m.to).all(|v| v.is_finite()))
+                            .then(|| moved(m).ok())
+                            .flatten()
+                            .ok_or_else(|| {
+                                crate::corner::broken(
+                                    op.name(),
+                                    at,
+                                    c.place(),
+                                    "a move of it is not a number or goes along two axes at once",
+                                )
+                            })?;
                         let centre = m.to[axis] - zero[axis];
                         let down =
                             axis == 2 && m.to[2] < m.from[2] && (m.to[2] - lo[2]).abs() < 1e-4;
                         targets.push(Target {
-                            order: u8::try_from(i + 1).unwrap_or(u8::MAX),
+                            order: 0,
                             axis,
                             centre,
                             shown: centre,
@@ -1976,6 +2010,70 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                             // The quill locked at the level for the walk.
                             lock: [false, false, down],
                         });
+                    }
+                    // Each walk's screen stands alone: Z up above the stock,
+                    // then X and Y where it goes down, said even when the
+                    // walk before left the tool there already (LIO-447:
+                    // walk 9 of the adapter plate went down with no X).
+                    let down = targets.iter().position(|t| t.axis == 2 && t.lock[2]);
+                    if let (Some(down), Some(start)) = (down, legs.first().map(|m| m.from)) {
+                        let said: Vec<usize> = (targets[..down].iter()).map(|t| t.axis).collect();
+                        let first_z = said.iter().position(|&k| k == 2);
+                        let mut ahead = vec![];
+                        for axis in [2, 0, 1] {
+                            // Z must come before X and Y are set; X and Y
+                            // before the tool goes down.
+                            let needed = if axis == 2 {
+                                first_z.is_none_or(|i| said[..i].iter().any(|&k| k < 2))
+                            } else {
+                                !said.contains(&axis)
+                            };
+                            if needed {
+                                let centre = start[axis] - zero[axis];
+                                ahead.push(Target {
+                                    order: 0,
+                                    axis,
+                                    centre,
+                                    shown: centre,
+                                    edge: false,
+                                    feed: false,
+                                    lock: [false; 3],
+                                });
+                            }
+                        }
+                        targets.splice(0..0, ahead);
+                    }
+                    for (i, t) in targets.iter_mut().enumerate() {
+                        t.order = u8::try_from(i + 1).unwrap_or(u8::MAX);
+                    }
+                    let points: Vec<[f32; 2]> = (w.stair.points.iter())
+                        .map(|p| [p[0] as f32, p[1] as f32])
+                        .collect();
+                    let s = plan.stock;
+                    if let Some(why) = crate::corner::walk_problem(
+                        &targets,
+                        &points,
+                        w.z,
+                        (
+                            [s.min[0] - zero[0], s.min[1] - zero[1]],
+                            [s.max[0] - zero[0], s.max[1] - zero[1]],
+                            s.max[2] - zero[2],
+                        ),
+                        &crate::corner::Round {
+                            centre: [c.centre[0] - zero[0], c.centre[1] - zero[1]],
+                            radius: c.r,
+                            quarter: c.quarter,
+                            tool: plan.radius,
+                            offset,
+                            scallop: w.stair.scallop as f32,
+                        },
+                    ) {
+                        return Err(crate::corner::broken(
+                            op.name(),
+                            (k + 1, walks.len()),
+                            c.place(),
+                            &why,
+                        ));
                     }
                     let feed = moves.iter().find(|m| m.motion == Motion::Feed);
                     steps.push(Step::Corner {
@@ -1987,14 +2085,12 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                         place: c.place(),
                         radius: c.r,
                         centre: [c.centre[0] - zero[0], c.centre[1] - zero[1]],
-                        offset: w.offset,
+                        offset,
                         z: w.z,
                         level: w.level,
                         levels: w.levels,
                         scallop: w.stair.scallop as f32,
-                        points: (w.stair.points.iter())
-                            .map(|p| [p[0] as f32, p[1] as f32])
-                            .collect(),
+                        points,
                         targets,
                         never: Limits {
                             x: [lo[0] - r - zero[0], hi[0] + r - zero[0]],
@@ -2613,6 +2709,25 @@ pub fn place(doc: &Document, guide: &Guide) -> usize {
 pub(crate) mod tests {
     use super::*;
     use crate::model::BOX_FIELDS;
+
+    /// Damage done to the plan a Round corners' Steps are said from, by
+    /// operation id: for tests that the Steps refuse a broken walk and the
+    /// plan checks say so (LIO-447). Keyed by id, so tests running at once
+    /// touch only their own operation.
+    pub(crate) static CORNER_FAULTS: std::sync::Mutex<Vec<(String, Fault)>> =
+        std::sync::Mutex::new(vec![]);
+    /// Damage done to a plan (`CORNER_FAULTS`).
+    pub(crate) type Fault = fn(&mut Plan);
+    /// `plan` with the damage registered for `op`, if any.
+    pub(crate) fn faulted(op: &Operation, plan: &Plan) -> Plan {
+        let mut plan = plan.clone();
+        for (id, fault) in CORNER_FAULTS.lock().unwrap().iter() {
+            if *id == op.id {
+                fault(&mut plan);
+            }
+        }
+        plan
+    }
 
     /// A Box named `name` cutting `b` (x_min, x_max, y_min, y_max, z_top,
     /// z_bottom, work frame) with the tool `tool`.
