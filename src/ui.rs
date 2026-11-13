@@ -4285,6 +4285,8 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             }
             c=c.push(choice(p,"through","Through stock", &["No","Yes"],t))
                 .push(checks.field(p,"breakthrough","Breakthrough beyond stock bottom · mm"))
+                .push(checks.field(p,"scallop","Scallop left between steps · mm"))
+                .push(note("A cutter narrower than the slot sweeps the centre line, steps out round it and walks the outline each level, the round ends in DRO steps leaving at most the scallop between two; then it finishes the outline at size on the floor."))
                 .push(note("Blind: bottom is the floor before floor stock to leave. Through: bottom is the stock's back face; breakthrough extends below it. Check clearance below the part: parallels and table are unmodeled."));
         }
         "Box" => {

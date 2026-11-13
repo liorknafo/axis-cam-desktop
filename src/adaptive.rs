@@ -1276,6 +1276,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
             stops: vec![],
             keep_air: vec![],
             corner_walks: vec![],
+            slot_passes: vec![],
             display_scale: job.scale,
             duration: 0.,
             target: zones
