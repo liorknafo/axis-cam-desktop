@@ -4,7 +4,8 @@
 //! A project only points to its part by a path on the computer that planned
 //! it; the bundle carries the part along. The computer writes it (Save for
 //! tablet…), and the tablet opens it from "Open with" (`ShopActivity.java`
-//! copies it to `INBOX` beside the workspace).
+//! copies it to `INBOX` beside the workspace). It also carries the tool runs
+//! worked out here for the TypeScript tablet app (`Runs`, LIO-475).
 use crate::model::Document;
 use std::{
     fs,
@@ -15,6 +16,8 @@ use std::{
 const PROJECT: &str = "project.json";
 const PART: &str = "part/";
 const MACHINE: &str = "machine/";
+/// The tool runs worked out for the tablet (`Runs`).
+pub const RUNS: &str = "runs.json";
 /// Where the tablet finds a bundle it was given, beside its workspace.
 pub const INBOX: &str = "inbox.axisjob";
 pub const EXTENSION: &str = "axisjob";
@@ -37,6 +40,8 @@ pub fn pack(doc: &Document) -> Result<Vec<u8>, String> {
     };
     let json = serde_json::to_vec_pretty(doc).map_err(|e| e.to_string())?;
     add(PROJECT, &json)?;
+    let runs = serde_json::to_vec_pretty(&runs(doc)).map_err(|e| e.to_string())?;
+    add(RUNS, &runs)?;
     if let Some(file) = &doc.file {
         let name = file_name(&file.path)?;
         let part = fs::read(&file.path)
@@ -71,6 +76,32 @@ pub fn pack(doc: &Document) -> Result<Vec<u8>, String> {
         add(&format!("{MACHINE}{name}"), &bytes)?;
     }
     Ok(w.finish().map_err(|e| e.to_string())?.into_inner())
+}
+
+/// What the TypeScript tablet app runs (LIO-475): the tool runs of each
+/// setup on a UC100 machine, worked out here, as the tablet plans nothing.
+/// `format` changes when a reader of an older one would run it wrong.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Runs {
+    pub format: u32,
+    pub setups: Vec<crate::run::TabletSetup>,
+}
+
+pub fn runs(doc: &Document) -> Runs {
+    let uc100: Vec<usize> = (0..doc.setups.len())
+        .filter(|&si| crate::model::get(&doc.setups[si].machine.p, "controller") == "UC100")
+        .collect();
+    let mesh = match (&doc.file, uc100.is_empty()) {
+        (_, true) => Err(String::new()),
+        (Some(file), false) => {
+            crate::mesh::load_file(file).map_err(|e| format!("The part could not be loaded: {e}"))
+        }
+        (None, false) => Err(crate::run::NO_PART.into()),
+    };
+    let setups = (uc100.into_iter())
+        .map(|si| crate::run::tablet_runs(doc, mesh.as_ref().map_err(String::as_str), si))
+        .collect();
+    Runs { format: 1, setups }
 }
 
 /// The UC100 profile path of every machine in `doc`, the library's and the
