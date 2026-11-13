@@ -5842,8 +5842,104 @@ flood = { pin = 8 }
         assert_eq!(
             notes(&none),
             [Some(
-                "M8×1.25 thread: no M8×1.25 tap or thread mill cuts it".to_string()
+                "M8×1.25 thread: no M8×1.25 tap, thread mill or threading tool cuts it".to_string()
             )]
+        );
+    }
+    #[test]
+    fn a_thread_single_pointed_inside_on_the_lathe_is_cut_and_one_short_says_so() {
+        // LIO-448 review: a Ø30 sleeve 20 long with an M8 × 1.25 thread
+        // through it, turned, drilled Ø6.6, threaded inside with a single
+        // point to `z_end` and parted off. Its passes are simulated to the
+        // pitch diameter; the thread they cut full length is cut.
+        let left = |z_end: &str| {
+            let mut part =
+                crate::thread::tests::modeled([0., 0.], 8., 1.25, 60., true, true, 20., 0.);
+            // Close the thread's wall to the Ø30 outside at both ends.
+            let wall = part.clone();
+            for z in [0., 20.] {
+                let mut ring: Vec<[f32; 3]> = (wall.iter().flatten().copied())
+                    .filter(|p| (p[2] - z).abs() < 1e-4)
+                    .collect();
+                ring.sort_by(|a, b| a[1].atan2(a[0]).total_cmp(&b[1].atan2(b[0])));
+                ring.dedup_by(|a, b| (a[0] - b[0]).abs() + (a[1] - b[1]).abs() < 1e-4);
+                if ring
+                    .first()
+                    .zip(ring.last())
+                    .is_some_and(|(a, b)| (a[0] - b[0]).abs() + (a[1] - b[1]).abs() < 1e-4)
+                {
+                    ring.pop();
+                }
+                let outer = |p: [f32; 3], z: f32| {
+                    let r = p[0].hypot(p[1]);
+                    [p[0] * 15. / r, p[1] * 15. / r, z]
+                };
+                for i in 0..ring.len() {
+                    let (a, b) = (ring[i], ring[(i + 1) % ring.len()]);
+                    let (c, d) = (outer(a, z), outer(b, z));
+                    let mut ends = [[a, c, d], [a, d, b]];
+                    if z == 0. {
+                        for t in &mut ends {
+                            t.swap(1, 2);
+                        }
+                        part.extend([[c, d, outer(b, 20.)], [c, outer(b, 20.), outer(a, 20.)]]);
+                    }
+                    part.extend(ends);
+                }
+            }
+            let a = lathe_job_app(32., part, -20., |doc| {
+                use crate::turn::tests::add;
+                add(
+                    doc,
+                    "Outside",
+                    &[
+                        ("diameter", "30"),
+                        ("z_end", "-20"),
+                        ("depth", "1"),
+                        ("finish", "0"),
+                    ],
+                );
+                for t in &mut doc.tools {
+                    if crate::model::get(&t.p, "type") == "Drill" {
+                        t.p.insert("diameter".into(), "6.6".into());
+                    }
+                }
+                add(doc, "Drill", &[("depth", "25")]);
+                add(
+                    doc,
+                    "Thread",
+                    &[
+                        ("thread_side", "Inside"),
+                        ("diameter", "8"),
+                        ("pitch", "1.25"),
+                        ("z_end", z_end),
+                    ],
+                );
+                add(doc, "Part off", &[("z", "-20")]);
+            });
+            let mesh = a.part_mesh().unwrap().clone();
+            let mut stock = None;
+            crate::simulation::sequence_walk(
+                &a.doc,
+                &mesh,
+                None,
+                |_, _, r| {
+                    r.as_ref().unwrap();
+                },
+                |_, _, v| stock = Some(v.clone()),
+                |_, _| {},
+            );
+            crate::uncut::uncut(&stock.unwrap(), &a.doc.setups, &mesh)
+        };
+        let full = left("-20");
+        assert!(!full.any(), "{:?} {:?}", full.regions, full.thin.regions);
+        let short = left("-15");
+        let notes: Vec<_> = short.regions.iter().map(|r| r.thread.clone()).collect();
+        assert_eq!(
+            notes,
+            [Some("M8×1.25 thread: threaded 5.0 mm short".to_string())],
+            "{:?}",
+            short.regions
         );
     }
     /// A lathe job on the Work page: `part` in a Ø`bar` bar (`turn::tests::job`),

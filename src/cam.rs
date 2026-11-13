@@ -8628,7 +8628,7 @@ pub(crate) mod tests {
                 "{amount}"
             );
         };
-        let none = "M8×1.25 thread: no M8×1.25 tap or thread mill cuts it";
+        let none = "M8×1.25 thread: no M8×1.25 tap, thread mill or threading tool cuts it";
         // Drilled only.
         check(&job(&|_, _| false, 0.).0, none);
         // Tapped 10 mm, and 17.8 of the thread's 18.4 (LIO-448 review): the

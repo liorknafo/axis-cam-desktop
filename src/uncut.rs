@@ -173,9 +173,11 @@ pub fn uncut(stock: &Volume, setups: &[Setup], mesh: &Mesh) -> Uncut {
         Samples::new(mesh.faces.len()),
         Samples::new(mesh.faces.len()),
     ];
-    // The modelled hole threads the job's taps and thread mills of their
-    // size leave short of full form: their faces there are under stock
-    // whatever the samples find, as the thread is not there (LIO-448).
+    // The modelled hole threads, and where the job's taps, thread mills and
+    // lathe threading of their size give them full form: their faces there
+    // are cut, and under stock where none does, whatever the samples find
+    // (LIO-448). A thread is finer than the samples, and a lathe's
+    // threading is simulated to its pitch diameter only.
     let shorts = shortfalls(
         (crate::thread::in_setup(setup1, mesh).into_iter()).filter(|t| t.internal),
         stock,
@@ -202,7 +204,12 @@ pub fn uncut(stock: &Volume, setups: &[Setup], mesh: &Mesh) -> Uncut {
             continue;
         }
         let n = n.map(|x| x / twice);
-        if shorts.iter().any(|s| s.holds([a, b, c])) {
+        let held = shorts.iter().find_map(|s| s.holds([a, b, c]));
+        if held == Some(false) {
+            total += twice / 2.;
+            continue;
+        }
+        if held == Some(true) {
             let layer = &mut layers[0];
             total += twice / 2.;
             layer.covered += twice / 2.;
@@ -296,8 +303,8 @@ pub fn uncut(stock: &Volume, setups: &[Setup], mesh: &Mesh) -> Uncut {
     for coverage in [&mut thick, &mut thin] {
         let mut kept: Vec<(Option<usize>, Region)> = vec![];
         for mut region in std::mem::take(&mut coverage.regions) {
-            let on = shorts.iter().position(|s| s.covers(&region, part));
-            region.thread = on.map(|k| shorts[k].note.clone());
+            let on = (shorts.iter()).position(|s| s.note.is_some() && s.covers(&region, part));
+            region.thread = on.and_then(|k| shorts[k].note.clone());
             match kept.iter_mut().find(|(k, _)| on.is_some() && *k == on) {
                 Some((_, into)) => {
                     into.area += region.area;
@@ -436,31 +443,47 @@ fn coverage(samples: Samples, part: Bounds, total: f32) -> Coverage {
         regions,
     }
 }
-/// A modelled hole thread (in setup 1's frame) that the job's taps and
-/// thread mills of its size give its full form short of its length.
+/// A modelled hole thread (in setup 1's frame) and what of it the job's
+/// taps, thread mills and lathe threading of its size give full form.
 struct Short {
     thread: crate::thread::Thread,
+    /// Whether any of them reaches it.
+    threaded: bool,
     /// The stretches along its axis without the full form.
     gaps: Vec<(f32, f32)>,
-    /// Why: "M8×1.25 thread: tapped 4.2 mm short", "M8×1.25 thread: no
-    /// M8×1.25 tap or thread mill cuts it".
-    note: String,
+    /// Why it is left, when it is short by `SHORT` or more: "M8×1.25
+    /// thread: tapped 4.2 mm short", "M8×1.25 thread: no M8×1.25 tap,
+    /// thread mill or threading tool cuts it". None when it is not.
+    note: Option<String>,
 }
 /// How short of its length a thread may be cut and still count as full,
 /// mm: the measure of its ends, not a missing turn.
 const SHORT: f32 = 0.05;
 impl Short {
-    /// Whether the face `tri` (setup 1's frame) is one of the thread's, in
-    /// a stretch without its full form: within its root of its axis, its
-    /// middle in a gap.
-    fn holds(&self, tri: Tri) -> bool {
+    /// Whether the face `tri` (setup 1's frame), when it is one of the
+    /// thread's (within its root of its axis, its middle along the
+    /// thread), is under stock: true in a gap of a thread left short, false
+    /// where it has its full form. None off the thread, or on one nothing
+    /// threads that is not short either.
+    fn holds(&self, tri: Tri) -> Option<bool> {
         let t = &self.thread;
         let (u, v) = ((t.axis + 1) % 3, (t.axis + 2) % 3);
         let reach = t.root.max(t.major) / 2. + 0.02;
         let along = (tri[0][t.axis] + tri[1][t.axis] + tri[2][t.axis]) / 3.;
-        tri.iter()
-            .all(|p| (p[u] - t.centre[0]).hypot(p[v] - t.centre[1]) <= reach)
-            && self.gaps.iter().any(|g| along >= g.0 && along <= g.1)
+        let on = along >= t.from
+            && along <= t.to
+            && tri
+                .iter()
+                .all(|p| (p[u] - t.centre[0]).hypot(p[v] - t.centre[1]) <= reach);
+        if !on {
+            return None;
+        }
+        let gap = self.gaps.iter().any(|g| along >= g.0 && along <= g.1);
+        match (self.note.is_some() && gap, self.threaded) {
+            (true, _) => Some(true),
+            (false, true) => Some(false),
+            (false, false) => None,
+        }
     }
     /// Whether `region` (its bounds from the part's corner `part.min`) lies
     /// on the thread.
@@ -483,12 +506,12 @@ impl Short {
             })
     }
 }
-/// The `threads` (holes', in setup 1's frame `first`) that the taps and
-/// thread mills of `setups`, of each one's size and pitch, cut short of
-/// full form, from the cuts that made `stock`. The full form is what a cut
-/// gives over its lowest tip, less a tap's lead, up its flutes to its
-/// highest. A tap or thread mill of another size gives none: the thread
-/// with no other is "not cut".
+/// What of each of `threads` (holes', in setup 1's frame `first`) the
+/// taps, thread mills and inside lathe threading of `setups`, of each
+/// one's size and pitch, give full form, from the cuts that made `stock`:
+/// a tap's or thread mill's over its lowest tip, less a tap's lead, up its
+/// flutes to its highest; a lathe tap's or threading's rings over their
+/// length along the spindle. One of another size gives none.
 fn shortfalls(
     threads: impl Iterator<Item = crate::thread::Thread>,
     stock: &Volume,
@@ -499,32 +522,49 @@ fn shortfalls(
     for t in threads {
         let (u, v) = ((t.axis + 1) % 3, (t.axis + 2) % 3);
         let mut spans = vec![];
-        let mut tapped = false;
+        // How they cut it, the first that does of: tapped, thread milled,
+        // threaded on the lathe.
+        let mut how = [false; 3];
+        let fits = |major: f32, pitch: f32| {
+            (pitch - t.pitch).abs() < 1e-3 && (major - t.major).abs() <= 0.3
+        };
         for c in stock.cuts.iter() {
             let Some(op) = (setups.get(usize::from(c.source.0)))
                 .and_then(|s| s.operations.get(usize::from(c.source.1)))
             else {
                 continue;
             };
-            if !(op.tapping() || op.thread_milling()) {
+            // Its size: the hole's own, or one chosen that matches it; a
+            // lathe threading's, its diameter and pitch.
+            let get = |k: &str| crate::model::get(&op.p, k);
+            let lathe = op.strategy == crate::model::Strategy::Turn
+                && get("turn_kind") == "Thread"
+                && get("thread_side") == "Inside";
+            let kind = if lathe {
+                let at = |k: &str| crate::model::num(&op.p, k).unwrap_or(f32::NAN);
+                if !fits(at("diameter"), at("pitch")) {
+                    continue;
+                }
+                2
+            } else if op.tapping() || op.thread_milling() {
+                let chosen = get("thread");
+                if chosen != crate::model::FROM_MODEL
+                    && !crate::thread::spec(chosen).is_some_and(|s| fits(s.major, s.pitch))
+                {
+                    continue;
+                }
+                if op.tapping() { 0 } else { 1 }
+            } else {
                 continue;
-            }
-            // Its size: the hole's own, or one chosen that matches it.
-            let chosen = crate::model::get(&op.p, "thread");
-            let fits = chosen == crate::model::FROM_MODEL
-                || crate::thread::spec(chosen).is_some_and(|s| {
-                    (s.pitch - t.pitch).abs() < 1e-3 && (s.major - t.major).abs() <= 0.3
-                });
-            if !fits {
-                continue;
-            }
+            };
             let up = c.frame.transfer_vector([0., 0., 1.], first)[t.axis];
             let off = |p: [f32; 3]| (p[u] - t.centre[0]).hypot(p[v] - t.centre[1]);
             // A lathe's ring turns about its frame's Z axis between Z a[0]
             // and b[0], out to radius b[1]: all of it the full form when it
-            // reaches the thread's major on the thread's axis.
+            // reaches the thread's major on the thread's axis, or is a
+            // threading pass (simulated to the pitch diameter).
             let (a, b) = if c.shape == crate::simulation::CutterShape::Revolve {
-                if c.b[1] < t.major / 2. - 0.05 {
+                if kind != 2 && c.b[1] < t.major / 2. - 0.05 {
                     continue;
                 }
                 let at = |z: f32| moved([0., 0., z], c.frame, first);
@@ -535,7 +575,7 @@ fn shortfalls(
             if up.abs() < 0.99 || off(a).max(off(b)) > t.root.max(t.major) / 2. {
                 continue;
             }
-            tapped |= op.tapping();
+            how[kind] = true;
             let lead = c
                 .shape
                 .rise()
@@ -564,18 +604,19 @@ fn shortfalls(
             gaps.push((reached, t.to));
         }
         let short: f32 = gaps.iter().map(|g| g.1 - g.0).sum();
-        if short < SHORT {
-            continue;
-        }
         let name = t.name();
-        let note = if spans.is_empty() {
-            format!("{name} thread: no {name} tap or thread mill cuts it")
-        } else {
-            let how = if tapped { "tapped" } else { "thread milled" };
-            format!("{name} thread: {how} {short:.1} mm short")
-        };
+        let note = (short >= SHORT).then(|| {
+            if spans.is_empty() {
+                format!("{name} thread: no {name} tap, thread mill or threading tool cuts it")
+            } else {
+                let how = ["tapped", "thread milled", "threaded"]
+                    [how.iter().position(|h| *h).unwrap_or(0)];
+                format!("{name} thread: {how} {short:.1} mm short")
+            }
+        });
         out.push(Short {
             thread: t,
+            threaded: !spans.is_empty(),
             gaps,
             note,
         });
