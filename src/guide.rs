@@ -94,6 +94,13 @@ pub enum Step {
     /// the holding's jaws when that face is only in them; `round` whether
     /// what it touches is round there (turned), so that the touch is true
     /// only on its centre line, where it stands out farthest.
+    ///
+    /// On clamps, `clamps` are their boxes (labelled, work coordinates)
+    /// and each touch is clear of them, moved along its face when one is
+    /// over the spot it would have (LIO-458); `blocked` (by axis, at its −
+    /// face and its + face) names the clamps over every spot of a face the
+    /// finder could touch, whose `at` is then where it would touch without
+    /// them.
     Zero {
         corner: [f32; 3],
         approach: [i8; 2],
@@ -102,6 +109,8 @@ pub enum Step {
         at: [[f32; 3]; 2],
         round: [bool; 2],
         far: [Option<Far>; 2],
+        clamps: Vec<(String, Bounds)>,
+        blocked: [[Option<String>; 2]; 2],
     },
     /// Set the gear to `rpm` for the tool `tool` (an id). With `top`, a new
     /// tool: put it in, touch the stock's top with it and set Z to `top`
@@ -1374,6 +1383,56 @@ const FINDER_LEAST: f32 = 0.5;
 /// Why a manual mill's setup has no Zero: nothing of its stock stands clear
 /// of the jaws for the edge finder to touch.
 pub const NOT_CLEAR: &str = "Nothing of the stock stands clear of the jaws for the edge finder to touch on X and Y: grip less of it, or hold it by another part, so that X and Y can be picked up above the jaws.";
+/// How far an edge finder keeps from a clamp, mm, beyond its radius, and
+/// how far out from a face it comes down before it is fed in to touch
+/// (LIO-458).
+const CLAMP_CLEAR: f32 = 2.;
+const FINDER_OUT: f32 = 3.;
+/// Where `contact` has the edge finder touch a face: the spot, whether what
+/// it touches is round there, and, when every spot of the face's material
+/// is under a clamp, those clamps (indexes into the clamps it was given):
+/// `at` is then where it would touch without them (LIO-458).
+#[derive(Debug, Clone, PartialEq)]
+struct Touch {
+    at: [f32; 3],
+    round: bool,
+    under: Vec<usize>,
+}
+/// The clamps of `clamps` (holding boxes, in the setup's frame) in the way
+/// of an edge finder of radius `r` touching a face on axis `k` at `face`
+/// (`out` +1 when its outside is the + side, −1 the − side) at `a` across
+/// it (the other of X and Y) and height `z` (LIO-458): one that reaches
+/// above `z` over where the finder comes down `FINDER_OUT` out from where
+/// it touches and is fed in, `CLAMP_CLEAR` around it. The clamps are the
+/// probe check's (`post::in_the_way`), so that the two agree.
+fn clamps_in_the_way(
+    clamps: &[crate::holding::HoldBox],
+    k: usize,
+    out: f32,
+    face: f32,
+    a: f32,
+    z: f32,
+    r: f32,
+) -> Vec<usize> {
+    let o = 1 - k;
+    let far = face + out * (2. * r + FINDER_OUT);
+    let mut room = Bounds {
+        min: [0.; 3],
+        max: [0.; 3],
+    };
+    (room.min[k], room.max[k]) = (face.min(far) - CLAMP_CLEAR, face.max(far) + CLAMP_CLEAR);
+    (room.min[o], room.max[o]) = (a - r - CLAMP_CLEAR, a + r + CLAMP_CLEAR);
+    (clamps.iter().enumerate())
+        .filter(|(_, c)| {
+            let b = &c.bounds;
+            b.max[2] > z
+                && [k, o]
+                    .iter()
+                    .all(|&i| b.min[i] < room.max[i] && b.max[i] > room.min[i])
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
 /// Where an edge finder touches the stock (the box of what the earlier
 /// setups left, `before`, in the setup's `frame`) coming in along axis `k`
 /// (X or Y) from its + side when `plus`, else from its − side, and whether
@@ -1391,6 +1450,14 @@ pub const NOT_CLEAR: &str = "Nothing of the stock stands clear of the jaws for t
 /// than half the stock's width: a turned diameter, met along a line. With
 /// no earlier cuts, the top's middle on the box's face; None when nothing
 /// of the stock stands above `above`.
+///
+/// A finder of radius `r` touches clear of `clamps` (`clamps_in_the_way`,
+/// LIO-458): a spot under one moves along the face to the nearest stretch
+/// of its material clear of them all, to its middle (the one first along
+/// the face when two are as near and as wide). Where they cover all of a
+/// height's material the heights under it are tried; with none clear, the
+/// first height's spot without them, and the clamps over it (`Touch`).
+#[allow(clippy::too_many_arguments)]
 fn contact(
     before: &Volume,
     frame: crate::volume::Frame,
@@ -1398,7 +1465,9 @@ fn contact(
     k: usize,
     plus: bool,
     above: f32,
-) -> Option<([f32; 3], bool)> {
+    clamps: &[crate::holding::HoldBox],
+    r: f32,
+) -> Option<Touch> {
     // Inside the face, as far as a turned bar's chord is wide enough to
     // find; samples across it, and rows down it a whole millimetre apart
     // (more for a tall stock); steps in from the face where it is not.
@@ -1414,15 +1483,83 @@ fn contact(
     at[o] = (stock.min[o] + stock.max[o]) / 2.;
     at[2] = stock.max[2];
     let height = stock.max[2] - stock.min[2];
+    let inward = if plus { -1. } else { 1. };
+    let (width, depth) = (stock.max[o] - stock.min[o], stock.max[k] - stock.min[k]);
+    let across = |i: usize| stock.min[o] + (i as f32 + 0.5) / ACROSS as f32 * width;
+    let gap = 1.5 * width / ACROSS as f32;
+    // The clamps in the way of a touch `d` in from the box's face, at `a`
+    // across it, at height `z`.
+    let under =
+        |d: f32, a: f32, z: f32| clamps_in_the_way(clamps, k, -inward, edge + inward * d, a, z, r);
+    // The spot `at` (across the face) a touch `d` in at height `z` moves to
+    // clear of the clamps: itself when clear, else the middle of the
+    // nearest unbroken run of `found` (samples with material, which
+    // `solid` says of any point across) clear of them, or its sample
+    // nearest that middle when the middle itself is not clear or has no
+    // material. Err with the clamps over all of `found`.
+    let clear = |at: f32, found: &[f32], solid: &dyn Fn(f32) -> bool, d: f32, z: f32| {
+        if under(d, at, z).is_empty() {
+            return Ok(at);
+        }
+        let free: Vec<f32> = (found.iter().copied())
+            .filter(|&a| under(d, a, z).is_empty())
+            .collect();
+        if free.is_empty() {
+            let mut over: Vec<usize> = found.iter().flat_map(|&a| under(d, a, z)).collect();
+            over.sort_unstable();
+            over.dedup();
+            return Err(over);
+        }
+        let mut runs: Vec<(f32, f32)> = vec![];
+        for &a in &free {
+            match runs.last_mut() {
+                Some(run) if a - run.1 <= gap => run.1 = a,
+                _ => runs.push((a, a)),
+            }
+        }
+        // The nearest run; of two as near (within a third of the samples'
+        // pitch), the wider, then the first.
+        let off = |(lo, hi): (f32, f32)| (lo - at).max(at - hi).max(0.);
+        let alike = |a: f32, b: f32| (a - b).abs() <= gap / 3.;
+        let mut nearest = runs[0];
+        for &run in &runs[1..] {
+            let (d, best) = (off(run), off(nearest));
+            let (w, widest) = (run.1 - run.0, nearest.1 - nearest.0);
+            if (!alike(d, best) && d < best) || (alike(d, best) && !alike(w, widest) && w > widest)
+            {
+                nearest = run;
+            }
+        }
+        let mid = (nearest.0 + nearest.1) / 2.;
+        if solid(mid) && under(d, mid, z).is_empty() {
+            return Ok(mid);
+        }
+        Ok((free.iter().copied())
+            .filter(|a| (nearest.0..=nearest.1).contains(a))
+            .min_by(|a, b| (a - mid).abs().total_cmp(&(b - mid).abs()))
+            .unwrap_or(nearest.0))
+    };
     if before.cuts.is_empty() || height.is_nan() || height <= 2. * IN {
-        return Some((at, false));
+        let found: Vec<f32> = (0..ACROSS).map(across).collect();
+        return Some(match clear(at[o], &found, &|_| true, 0., at[2]) {
+            Ok(a) => {
+                at[o] = a;
+                Touch {
+                    at,
+                    round: false,
+                    under: vec![],
+                }
+            }
+            Err(over) => Touch {
+                at,
+                round: false,
+                under: over,
+            },
+        });
     }
     let rest = crate::rest::RestStock::new(before, frame);
     // Only the cuts that reach the stock, by cell.
     let removed = rest.removed_in(stock);
-    let inward = if plus { -1. } else { 1. };
-    let (width, depth) = (stock.max[o] - stock.min[o], stock.max[k] - stock.min[k]);
-    let across = |i: usize| stock.min[o] + (i as f32 + 0.5) / ACROSS as f32 * width;
     // Material `d` in from the box's face, at `a` across it, at height `z`.
     let has = |d: f32, a: f32, z: f32| {
         let mut p = [0.; 3];
@@ -1441,7 +1578,6 @@ fn contact(
     // middle, the run's sample nearest it (LIO-451). Round when all it
     // meets spans less than half the stock's width.
     let met = |found: &[f32], solid: &dyn Fn(f32) -> bool| {
-        let gap = 1.5 * width / ACROSS as f32;
         let middle = (stock.min[o] + stock.max[o]) / 2.;
         let mut best = (found[0], found[0]);
         let mut run = best;
@@ -1493,32 +1629,69 @@ fn contact(
         .chain((1..).map(|n| stock.max[2] - n as f32 * pitch))
         .take_while(|z| *z >= low)
         .collect();
+    // The touch at `a` across, `d` in, at height `z` (shown at `shown`),
+    // moved clear of the clamps (`clear`); a round is touched on its centre
+    // line or not at all. Err with the spot without them and the clamps
+    // over it.
+    let place = |a: f32, round: bool, found: &[f32], d: f32, z: f32, shown: f32| {
+        let solid = |a: f32| has(d, a, z);
+        let moved = match clear(a, found, &solid, d, z) {
+            Ok(b) if round && b != a => Err(under(d, a, z)),
+            moved => moved,
+        };
+        let spot = |a: f32| {
+            let mut p = [0.; 3];
+            (p[o], p[2]) = (a, shown);
+            p[k] = edge + inward * face((d - STEP).max(0.), d, a, z);
+            p
+        };
+        match moved {
+            Ok(b) => Ok(Touch {
+                at: spot(b),
+                round,
+                under: vec![],
+            }),
+            Err(over) => Err(Touch {
+                at: spot(a),
+                round,
+                under: over,
+            }),
+        }
+    };
+    // The first height's touch all under the clamps, when no height has
+    // one clear of them.
+    let mut covered: Option<Touch> = None;
     for (n, &z) in rows.iter().enumerate() {
         let found = solid(IN, z);
         if found.is_empty() {
             continue;
         }
-        let round;
-        if n == 0 {
-            (at[o], round) = met(&found, &|a| has(IN, a, z));
-            at[k] = edge + inward * face(0., IN, at[o], z);
-            return Some((at, round));
-        }
-        let lower = z - UNDER;
-        let below = if lower >= low {
-            solid(IN, lower)
-        } else {
-            vec![]
-        };
-        let (z, found) = if below.is_empty() {
+        let (z, found) = if n == 0 {
             (z, found)
         } else {
-            (lower, below)
+            let lower = z - UNDER;
+            let below = if lower >= low {
+                solid(IN, lower)
+            } else {
+                vec![]
+            };
+            if below.is_empty() {
+                (z, found)
+            } else {
+                (lower, below)
+            }
         };
-        (at[o], round) = met(&found, &|a| has(IN, a, z));
-        at[k] = edge + inward * face(0., IN, at[o], z);
-        at[2] = z;
-        return Some((at, round));
+        let (a, round) = met(&found, &|a| has(IN, a, z));
+        let shown = if n == 0 { at[2] } else { z };
+        match place(a, round, &found, IN, z, shown) {
+            Ok(touch) => return Some(touch),
+            Err(touch) => {
+                covered.get_or_insert(touch);
+            }
+        }
+    }
+    if covered.is_some() {
+        return covered;
     }
     // The box's face is only in the jaws: the outermost material above
     // them, stepped in to, then found between the steps.
@@ -1539,15 +1712,16 @@ fn contact(
             .filter(|(d, _)| *d <= nearest)
             .map(|(_, a)| *a)
             .collect();
-        let round;
-        (at[o], round) = met(&lines, &|a| has(nearest, a, z));
-        at[k] = edge + inward * face((nearest - STEP).max(0.), nearest, at[o], z);
-        if n > 0 {
-            at[2] = z;
+        let (a, round) = met(&lines, &|a| has(nearest, a, z));
+        let shown = if n > 0 { z } else { at[2] };
+        match place(a, round, &lines, nearest, z, shown) {
+            Ok(touch) => return Some(touch),
+            Err(touch) => {
+                covered.get_or_insert(touch);
+            }
         }
-        return Some((at, round));
     }
-    None
+    covered
 }
 /// The guide of setup `si`, a setup on a manual mill or a manual lathe
 /// (`lathe_guide`): the document's operations simulated in order up to the
@@ -1623,16 +1797,30 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
         }
         _ => None,
     };
+    // The clamps over the stock, which the finder touches clear of: the
+    // probe check's (LIO-458). A vise's jaws are below where it touches.
+    let clamps = match crate::holding::layout(setup) {
+        Ok(Layout::Clamps { .. }) => doc.holding_boxes(setup, held).unwrap_or_default(),
+        _ => vec![],
+    };
+    // By axis, at its − face and its + face: the clamps over every spot
+    // of the face the finder could touch, named.
+    let mut blocked: [[Option<String>; 2]; 2] = Default::default();
     // Where axis `k` is touched from its + side when `plus`: clear above
     // the jaws, else just above them.
-    let touch = |k: usize, plus: bool| {
+    let mut touch = |k: usize, plus: bool| {
         let near = |clear: f32| {
             let above = jaws.map_or(f32::NEG_INFINITY, |top| top + clear);
-            contact(&before, frame, stock, k, plus, above)
+            contact(&before, frame, stock, k, plus, above, &clamps, finder / 2.)
         };
-        near(FINDER_CLEAR)
+        let t = near(FINDER_CLEAR)
             .or_else(|| near(FINDER_LEAST))
-            .ok_or(NOT_CLEAR)
+            .ok_or(NOT_CLEAR)?;
+        if !t.under.is_empty() {
+            let names: Vec<&str> = t.under.iter().map(|&i| clamps[i].label.as_str()).collect();
+            blocked[k][usize::from(plus)] = Some(crate::post::listed(&names));
+        }
+        Ok::<_, &str>((t.at, t.round))
     };
     let mut touched = [([0.; 3], false); 2];
     let mut far: [Option<Far>; 2] = [None; 2];
@@ -1677,6 +1865,10 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
             at: std::array::from_fn(|k| std::array::from_fn(|i| touched[k].0[i] - zero[i])),
             round: touched.map(|(_, round)| round),
             far,
+            clamps: (clamps.iter())
+                .map(|c| (c.label.clone(), work(c.bounds)))
+                .collect(),
+            blocked,
         },
     ];
     let mut sections = vec![Section {
@@ -3665,6 +3857,9 @@ pub(crate) mod tests {
                 round: [false, false],
                 // A corner: no axis is halved.
                 far: [None; 2],
+                // In a vise: no clamps.
+                clamps: vec![],
+                blocked: Default::default(),
             }
         );
         let Step::Face {
@@ -4133,6 +4328,106 @@ pub(crate) mod tests {
             .insert("edge_finder".into(), "0".into());
         let error = build(&doc, &mesh, 0).unwrap_err();
         assert!(error.contains("edge finder"), "{error}");
+    }
+    /// `job`'s manual setup held down by the starter toe clamp, made
+    /// `width` wide, at `clamps` (a clamp layout) instead of its vise
+    /// (LIO-458).
+    pub(crate) fn on_clamps(doc: &mut Document, clamps: &str, width: &str) {
+        let mut holder = (crate::holding::starters().into_iter())
+            .find(|h| h.kind() == "Clamp")
+            .unwrap();
+        holder
+            .p
+            .insert("machines".into(), doc.setups[0].machine.id.clone());
+        holder.p.insert("width".into(), width.into());
+        for (k, v) in [
+            ("holding", "Clamps"),
+            ("holder", holder.id.as_str()),
+            ("clamps", clamps),
+        ] {
+            doc.setups[0].p.insert(k.into(), v.into());
+        }
+        doc.workholding.push(holder);
+    }
+    #[test]
+    fn a_touch_under_a_toe_clamp_moves_along_its_face_clear_of_it() {
+        // The 124 × 120 block's left and front faces, touched at their
+        // middles in a vise
+        // (`steps_run_hold_zero_then_each_operation_and_a_face_is_one_step`),
+        // here have a 20 wide clamp each over that middle.
+        let (mut doc, mesh) = job("No");
+        on_clamps(&mut doc, "-Y:0;-X:0;+Y:0", "20");
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let Step::Zero {
+            at,
+            touch,
+            finder,
+            clamps,
+            blocked,
+            far,
+            ..
+        } = &guide.steps[1]
+        else {
+            panic!("{:?}", guide.steps[1])
+        };
+        // The probe check's clamps, drawn: on −Y over X 52 to 72.
+        assert_eq!(clamps.len(), 3);
+        let (label, front) = &clamps[0];
+        assert_eq!(label, "clamp on -Y (offset 0)");
+        close(front.min[0], 52.);
+        close(front.max[0], 72.);
+        assert_eq!(*blocked, <[[Option<String>; 2]; 2]>::default());
+        assert_eq!(*far, [None; 2]);
+        // The faces and what the DRO is set to there are as in the vise.
+        assert_eq!(*touch, [-5., -5., 0.]);
+        close(at[0][0], 0.);
+        close(at[1][1], 0.);
+        // Each touch is the Ø10 finder's radius and 2 mm clear of its
+        // clamp, in the middle of the nearest stretch of the face clear of
+        // it, the first of the two as near: the front's X 0 to 45, the
+        // left's Y 0 to 43.
+        let room = finder / 2. + CLAMP_CLEAR;
+        assert!((at[1][0] - 62.).abs() >= 10. + room, "{at:?}");
+        assert!((at[0][1] - 60.).abs() >= 10. + room, "{at:?}");
+        assert!((at[1][0] - 22.).abs() < 1., "{at:?}");
+        assert!((at[0][1] - 21.6).abs() < 1., "{at:?}");
+        // A clamp off the touched faces moves nothing: the +Y one alone
+        // leaves both at their middles.
+        let (mut doc, mesh) = job("No");
+        on_clamps(&mut doc, "+Y:0", "20");
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let Step::Zero { at, blocked, .. } = &guide.steps[1] else {
+            panic!()
+        };
+        assert_eq!(*at, [[0., 60., 0.], [62., 0., 0.]]);
+        assert_eq!(*blocked, <[[Option<String>; 2]; 2]>::default());
+    }
+    #[test]
+    fn a_face_all_under_a_clamp_is_named_not_touched() {
+        // A strap 140 wide over the whole of the 124 long front face, and
+        // its centre zero halved between the front and the back.
+        let (mut doc, mesh) = job("No");
+        on_clamps(&mut doc, "-Y:0", "140");
+        doc.setups[0].operations.drain(..2);
+        doc.setups[0]
+            .p
+            .insert("origin".into(), "Stock top center".into());
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let Step::Zero {
+            at, far, blocked, ..
+        } = &guide.steps[1]
+        else {
+            panic!()
+        };
+        assert_eq!(
+            *blocked,
+            [[None, None], [Some("clamp on -Y (offset 0)".into()), None]]
+        );
+        // The front's spot is where it would be without the strap, which
+        // the page does not show; the back is touched as without it.
+        close(at[1][0], 0.);
+        close(at[1][1], -60.);
+        close(far[1].unwrap().at[0], 0.);
     }
     /// `squared_job`'s manual setup twice (LIO-451): the first cuts the
     /// Box `cut` (x_min, x_max, y_min, y_max, z_top, z_bottom, work) into

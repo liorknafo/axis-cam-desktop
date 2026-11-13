@@ -29,6 +29,8 @@ const STOCK: Color = Color::from_rgb(0.90, 0.92, 0.94);
 const PART: Color = Color::from_rgb(0.69, 0.73, 0.77);
 const JAW: Color = Color::from_rgb(0.80, 0.82, 0.85);
 const DONE: Color = Color::from_rgb(0.50, 0.55, 0.60);
+/// A clamp seen from above, over the stock it holds down (LIO-458).
+const CLAMP: Color = Color::from_rgba(0.38, 0.43, 0.49, 0.9);
 /// The pixels of the 3D pictures, twice the size they are shown at.
 const PICTURE: (u32, u32) = (960, 640);
 /// The size of a Tool step's picture: square, as the tool stands up off
@@ -1090,6 +1092,9 @@ enum Shape {
     Word([f32; 3], String, Color),
     /// A solid block, such as a parallel under the stock.
     Block(Bounds),
+    /// A clamp from above, over the stock, labelled at its outer end
+    /// (LIO-458).
+    Clamp(Bounds, String),
     /// An arrow `mm` long down onto a point, labelled at its tail.
     Down([f32; 3], f32, String),
     /// A height from `[0]` down to `[1]`, measured just right of them,
@@ -1141,7 +1146,7 @@ impl Drawing<'_> {
                     grow([p[a], p[b]]);
                     grow([p[a], p[b] + mm]);
                 }
-                Shape::Block(bx) => {
+                Shape::Block(bx) | Shape::Clamp(bx, _) => {
                     grow([bx.min[a], bx.min[b]]);
                     grow([bx.max[a], bx.max[b]]);
                 }
@@ -1307,14 +1312,17 @@ impl Drawing<'_> {
                             },
                         );
                     } else {
-                        write(
-                            f,
-                            s.clone(),
-                            Point::new(c.x + 14., c.y),
-                            INK,
-                            13.,
-                            Align::Left,
-                        );
+                        // Right of it, or left of it when it is well left
+                        // of the stock's middle: away from what is there,
+                        // a clamp it was moved clear of (LIO-458).
+                        let middle = rect(&self.stock);
+                        let left = c.x < middle.center_x() - middle.width / 4.;
+                        let (dx, align) = if left {
+                            (-14., Align::Right)
+                        } else {
+                            (14., Align::Left)
+                        };
+                        write(f, s.clone(), Point::new(c.x + dx, c.y), INK, 13., align);
                     }
                 }
                 Shape::Hole(q, r, n, state) => {
@@ -1370,6 +1378,27 @@ impl Drawing<'_> {
                     let r = rect(bx);
                     f.fill(&path(r), DONE);
                     f.stroke(&path(r), stroke(INK, 1.));
+                }
+                Shape::Clamp(bx, label) => {
+                    let r = rect(bx);
+                    f.fill(&path(r), CLAMP);
+                    f.stroke(&path(r), stroke(INK, 1.4));
+                    // Beside its end out of the stock: right of it on the
+                    // drawing's bottom or top side, over it on its left or
+                    // right side.
+                    let (c, st) = (r.center(), rect(&self.stock));
+                    let m = st.center();
+                    let across = (c.y - m.y).abs() / st.height.max(1.)
+                        > (c.x - m.x).abs() / st.width.max(1.);
+                    let (at, align) = if across {
+                        let y = if c.y < m.y { r.y } else { r.y + r.height - 14. };
+                        (Point::new(r.x + r.width + 5., y), Align::Left)
+                    } else if c.x < m.x {
+                        (Point::new(r.x, r.y - 16.), Align::Left)
+                    } else {
+                        (Point::new(r.x + r.width, r.y - 16.), Align::Right)
+                    };
+                    write(f, label.clone(), at, INK, 12., align);
                 }
                 Shape::Down(q, mm, s) => {
                     let mut t = *q;
@@ -2871,6 +2900,8 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             at,
             round,
             far,
+            clamps,
+            blocked,
             ..
         } => {
             let stock = p.shown.boxes[0];
@@ -2892,7 +2923,32 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             };
             // The work Z 0 is on the top, or the top is at a height.
             let top = touch[2].abs() < 0.005;
-            let mut shapes = vec![];
+            // The clamps over the stock, under the finders (LIO-458).
+            let mut shapes: Vec<Shape> = (clamps.iter())
+                .map(|(_, b)| Shape::Clamp(*b, "clamp".into()))
+                .collect();
+            // The clamps over all of the face axis `k` is touched on at its
+            // + face when `plus`, named.
+            let over = |k: usize, plus: bool| blocked[k][usize::from(plus)].as_deref();
+            // A face under clamps: no finder on it, said in red on the
+            // stock just inside the clamps' toes over that face.
+            let finder_at =
+                |shapes: &mut Vec<Shape>, q: [f32; 3], from: [f32; 2], s: String, plus| {
+                    let k = usize::from(from[1] != 0.);
+                    if over(k, plus).is_some() {
+                        let toes =
+                            (clamps.iter()).filter(|(_, b)| b.min[k] < q[k] && b.max[k] > q[k]);
+                        let mut w = q;
+                        w[k] = if plus {
+                            toes.map(|(_, b)| b.min[k]).fold(q[k], f32::min) - 3.
+                        } else {
+                            toes.map(|(_, b)| b.max[k]).fold(q[k], f32::max) + 3.
+                        };
+                        shapes.push(Shape::Word(w, "under a clamp".into(), NEVER));
+                    } else {
+                        shapes.push(Shape::Finder(q, from, s));
+                    }
+                };
             // A round touched on X and Y: the diameter the finder meets,
             // its centre where their lines cross.
             if round[0] && round[1] {
@@ -2907,7 +2963,8 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 from[k] = f32::from(approach[k].signum());
                 match far[k] {
                     Some(f) => {
-                        shapes.push(Shape::Finder(at[k], from, format!("{} 0", AXES[k])));
+                        let zero = format!("{} 0", AXES[k]);
+                        finder_at(&mut shapes, at[k], from, zero, false);
                         from[k] = 1.;
                         let read = format!(
                             "{} {} → {}",
@@ -2915,11 +2972,11 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             dro(f.reads),
                             halving(touch[k], f.reads)
                         );
-                        shapes.push(Shape::Finder(f.at, from, read));
+                        finder_at(&mut shapes, f.at, from, read, true);
                     }
                     None => {
                         let set = format!("{} {}", AXES[k], dro(touch[k]));
-                        shapes.push(Shape::Finder(at[k], from, set));
+                        finder_at(&mut shapes, at[k], from, set, approach[k] > 0);
                     }
                 }
             }
@@ -2940,23 +2997,58 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 INK,
             ));
             // Each row: what to do, the axis, its number and tags.
-            let mut todo: Vec<(String, usize, f32, Vec<String>)> = vec![];
+            let mut todo: Vec<(String, usize, String, Vec<String>)> = vec![];
+            // A face under clamps: the clamps named, no number (LIO-458).
+            let under = |k: usize, plus: bool, name: &str| {
+                over(k, plus).map(|clamps| {
+                    (
+                        format!("the {name} face is under the {clamps}"),
+                        k,
+                        "—".to_string(),
+                        vec![
+                            "no spot of it clear for the edge finder".to_string(),
+                            "move the clamp along its side".to_string(),
+                        ],
+                    )
+                })
+            };
+            // On clamps, where along a Y face to touch it clear of them:
+            // X is set by then (LIO-458).
+            let along = |k: usize, at: [f32; 3]| -> Vec<String> {
+                if k == 1 && !clamps.is_empty() {
+                    vec![format!(
+                        "at about X {}, clear of the clamps",
+                        mm(at[0].round() + 0.)
+                    )]
+                } else {
+                    vec![]
+                }
+            };
             for k in 0..2 {
                 let Some(f) = far[k] else {
-                    todo.push((
-                        format!("{} → set", touching(side(k), at[k])),
-                        k,
-                        touch[k],
-                        vec![],
-                    ));
+                    let plus = approach[k] > 0;
+                    todo.push(under(k, plus, side(k)).unwrap_or_else(|| {
+                        (
+                            format!("{} → set", touching(side(k), at[k])),
+                            k,
+                            dro(touch[k]),
+                            along(k, at[k]),
+                        )
+                    }));
                     continue;
                 };
-                todo.push((
-                    format!("{} → set", touching(sides[k][0], at[k])),
-                    k,
-                    0.,
-                    vec![],
-                ));
+                todo.push(under(k, false, sides[k][0]).unwrap_or_else(|| {
+                    (
+                        format!("{} → set", touching(sides[k][0], at[k])),
+                        k,
+                        dro(0.),
+                        along(k, at[k]),
+                    )
+                }));
+                if let Some(row) = under(k, true, sides[k][1]) {
+                    todo.push(row);
+                    continue;
+                }
                 // One row for the + face: what the DRO reads there first,
                 // a check, under it; then half of that, or more or less
                 // when the touches are not either side of the zero alike.
@@ -2970,11 +3062,11 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 todo.push((
                     format!("{} → {how}", touching(sides[k][1], f.at)),
                     k,
-                    touch[k],
-                    vec![reads, then],
+                    dro(touch[k]),
+                    along(k, f.at).into_iter().chain([reads, then]).collect(),
                 ));
             }
-            todo.push(("touch the top → set".into(), 2, touch[2], vec![]));
+            todo.push(("touch the top → set".into(), 2, dro(touch[2]), vec![]));
             let rows = todo
                 .into_iter()
                 .enumerate()
@@ -2984,7 +3076,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             order: Some(i as u8 + 1),
                             lead: Some(what),
                             axis: AXES[k].into(),
-                            value: dro(value),
+                            value,
                             lock: None,
                             tags,
                             lit: lit(i, p.item),
@@ -3005,6 +3097,9 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 .any(|r| *r)
             {
                 c.push(warn_chip("round: touch on its centre line"));
+            }
+            if blocked.iter().flatten().any(Option::is_some) {
+                c.push(warn_chip("a face is under a clamp"));
             }
             let right = column![chips(c), label("Touch, then set the DRO"),].extend(rows);
             // A corner is picked up; a middle is found (LIO-451).
@@ -5992,6 +6087,81 @@ pub(crate) mod tests {
         t[i + 1..end].to_vec()
     }
     #[test]
+    fn the_zero_page_draws_the_clamps_and_says_where_to_touch_clear_of_them() {
+        use crate::guide::tests::on_clamps;
+        // The 124 × 120 block's centre zero, toe clamps on its front and
+        // back at their middles (LIO-458): Y is touched clear of them, at
+        // an X the DRO already reads.
+        let mut a = app_with("Yes", |doc| {
+            doc.setups[0].operations.drain(..2);
+            (doc.setups[0].p).insert("origin".into(), "Stock top center".into());
+            on_clamps(doc, "-Y:0;+Y:0", "20");
+        });
+        send(&mut a, GuideAction::Go(1));
+        let Step::Zero {
+            clamps, blocked, ..
+        } = &guide(&a).steps[1]
+        else {
+            panic!()
+        };
+        assert_eq!(clamps.len(), 2);
+        assert!(blocked.iter().flatten().all(Option::is_none));
+        let rows = zero_rows(&texts(&a));
+        let i = rows
+            .iter()
+            .position(|s| s == "touch the front face → set")
+            .unwrap();
+        assert_eq!(
+            rows[i + 1..i + 4],
+            ["Y", "0.00", "at about X −40, clear of the clamps"]
+        );
+        let i = rows
+            .iter()
+            .position(|s| s == "touch the back face → ½")
+            .unwrap();
+        assert!(
+            rows[i + 3].starts_with("at about X −40, clear of the clamps · reads about"),
+            "{rows:?}"
+        );
+        // X is touched as without them.
+        assert_eq!(after(&rows, "touch the left face → set"), ["X", "0.00"]);
+        assert!(!rows.iter().any(|s| s.contains("under")), "{rows:?}");
+        // A strap over the whole front: that face is named under it, with
+        // no number, and the page warns.
+        let mut a = app_with("Yes", |doc| {
+            doc.setups[0].operations.drain(..2);
+            (doc.setups[0].p).insert("origin".into(), "Stock top center".into());
+            on_clamps(doc, "-Y:0", "140");
+        });
+        send(&mut a, GuideAction::Go(1));
+        let t = texts(&a);
+        assert!(has(&a, "a face is under a clamp"), "{t:?}");
+        let rows = zero_rows(&t);
+        assert_eq!(
+            after(&rows, "the front face is under the clamp on -Y (offset 0)"),
+            ["Y", "—"]
+        );
+        assert!(
+            rows.contains(
+                &"no spot of it clear for the edge finder · move the clamp along its side".into()
+            ),
+            "{rows:?}"
+        );
+        // The back face is touched as ever.
+        assert!(rows.contains(&"touch the back face → ½".into()), "{rows:?}");
+        // In the vise, no clamps and no word of them.
+        let mut a = app_with("Yes", |doc| {
+            doc.setups[0].operations.drain(..2);
+            (doc.setups[0].p).insert("origin".into(), "Stock top center".into());
+        });
+        send(&mut a, GuideAction::Go(1));
+        let Step::Zero { clamps, .. } = &guide(&a).steps[1] else {
+            panic!()
+        };
+        assert!(clamps.is_empty());
+        assert!(!texts(&a).iter().any(|s| s.contains("clamp")));
+    }
+    #[test]
     fn a_centre_zero_is_found_by_halving_each_axis_between_its_faces() {
         // The 124 × 120 block with its zero at the top's centre (LIO-451).
         let mut a = app_with("Yes", |doc| {
@@ -6725,6 +6895,61 @@ pub(crate) mod tests {
         let id = a.doc.setups[0].id.clone();
         a.doc.guide.insert(id, at);
         a.guide_item = item;
+    }
+    /// The spindle adapter plate's setup 3, face up under toe clamps on
+    /// its long sides (`-Y:0;+Y:0`): its Zero screen at 1280 × 800 into
+    /// `AXIS_RENDER_DIR`, with its touches in `zero.txt` (LIO-458).
+    /// `AXIS_ADAPTER_PLATE` names a folder with copies of the plate's
+    /// project, adapter-plate.axis.json, and its part, adapter-plate.step.
+    #[test]
+    #[ignore = "private adapter acceptance; headless only"]
+    fn render_the_adapter_plates_clamped_zero() {
+        let (Ok(plate), Ok(out)) = (
+            std::env::var("AXIS_ADAPTER_PLATE"),
+            std::env::var("AXIS_RENDER_DIR"),
+        ) else {
+            eprintln!("skipped: set AXIS_ADAPTER_PLATE and AXIS_RENDER_DIR");
+            return;
+        };
+        let (plate, out) = (std::path::Path::new(&plate), std::path::Path::new(&out));
+        std::fs::create_dir_all(out).unwrap();
+        let mut doc = crate::storage::load(&plate.join("adapter-plate.axis.json")).unwrap();
+        let step = plate.join("adapter-plate.step");
+        if let Some(f) = doc.file.as_mut() {
+            f.path = step.clone();
+        }
+        let mesh = crate::mesh::load(&step).unwrap();
+        doc.active = doc.setups[2].id.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        a.doc = doc;
+        a.imported_mesh = Some(mesh);
+        a.page = crate::Page::Control;
+        build(&mut a);
+        let id = a.doc.setups[2].id.clone();
+        a.doc.guide.insert(id, 1);
+        a.guide_item = 0;
+        let g = guide(&a);
+        std::fs::write(
+            out.join("zero.txt"),
+            format!("{:#?}\n{}", g.steps[1], texts(&a).join("\n")),
+        )
+        .unwrap();
+        render(&a, (1280, 800), &out.join("setup3-zero.png"));
+        // A face with no stretch clear: the 124 × 120 test block's front
+        // under one strap 140 wide (the plate's own cuts would run into
+        // such a strap).
+        let mut a = app_with("Yes", |doc| {
+            doc.setups[0].operations.drain(..2);
+            (doc.setups[0].p).insert("origin".into(), "Stock top center".into());
+            crate::guide::tests::on_clamps(doc, "-Y:0;+Y:-30", "140");
+        });
+        send(&mut a, GuideAction::Go(1));
+        render(
+            &a,
+            (1280, 800),
+            &out.join("block-zero-front-under-a-strap.png"),
+        );
     }
     #[test]
     #[ignore = "private adapter acceptance; headless only"]
