@@ -1,6 +1,7 @@
 mod adaptive;
 mod air;
 mod analysis;
+mod bundle;
 mod cam;
 mod centre;
 mod chamfer;
@@ -488,6 +489,11 @@ pub enum Message {
     SaveProject,
     /// Saves the project to a file the user chooses, which becomes its file.
     SaveProjectAs,
+    /// Saves the project with its part as one file the shop tablet opens
+    /// (`bundle`).
+    SaveForTablet,
+    /// That file written, or why not; None when the dialog was cancelled.
+    TabletSaved(Option<Result<PathBuf, String>>),
     OpenProject,
     OpenHistory,
     Import,
@@ -1776,6 +1782,8 @@ fn while_locked(m: &Message) -> bool {
             | SaveProject
             | SaveProjectAs
             | Saved(_)
+            | SaveForTablet
+            | TabletSaved(_)
             | FileImported(_)
             | ProjectOpened(_)
             | ModelRestored(..)
@@ -8552,6 +8560,59 @@ impl App {
                     Message::Saved,
                 );
             }
+            Message::SaveForTablet => {
+                if self.save_busy || self.import_busy {
+                    return Task::none();
+                }
+                let Some(file) = &self.doc.file else {
+                    self.status = "Import the part first: the tablet file carries it.".into();
+                    return Task::none();
+                };
+                if !file.path.exists() {
+                    self.status = format!(
+                        "The part {} is not where the project says. Reimport it, then save for the tablet.",
+                        file.path.display()
+                    );
+                    return Task::none();
+                }
+                self.save_busy = true;
+                self.record_picks();
+                let doc = self.doc.clone();
+                let dialog = rfd::AsyncFileDialog::new()
+                    .set_title("Save for the shop tablet")
+                    .add_filter("AXIS tablet file", &[bundle::EXTENSION])
+                    .set_file_name(format!(
+                        "{}.{}",
+                        sanitize_name(&self.doc.title),
+                        bundle::EXTENSION
+                    ));
+                return Task::perform(
+                    async move {
+                        let path = dialog.save_file().await?.path().to_path_buf();
+                        Some(
+                            tokio::task::spawn_blocking(move || {
+                                bundle::write(&path, &doc).map(|()| path)
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(e.to_string())),
+                        )
+                    },
+                    Message::TabletSaved,
+                );
+            }
+            Message::TabletSaved(result) => {
+                self.save_busy = false;
+                match result {
+                    Some(Ok(p)) => {
+                        self.status = format!(
+                            "Saved {} with its part. Send it to the tablet and open it there.",
+                            p.display()
+                        )
+                    }
+                    Some(Err(e)) => self.status = format!("Save for tablet failed: {e}"),
+                    None => {}
+                }
+            }
             Message::OpenProject | Message::OpenHistory => {
                 if self.import_busy || self.save_busy {
                     return Task::none();
@@ -8796,6 +8857,12 @@ impl App {
                     "Project opened. Your previous project is in Project history.",
                     &notes,
                 );
+                if SHOP {
+                    return Task::batch([
+                        self.restore_model(),
+                        Task::done(Message::Page(Page::Control)),
+                    ]);
+                }
                 return self.restore_model();
             }
             Message::ProjectOpened(Some(Err(e))) => {
@@ -9186,6 +9253,20 @@ impl App {
             Message::HelpMore(expanded) => self.pinned_expanded = expanded,
             Message::HelpPause(paused) => self.pinned_paused = paused,
             Message::Tick => {
+                // A tablet file opened with AXIS Shop (`bundle::INBOX`), once
+                // nothing is loading and the machine is not running.
+                if SHOP
+                    && !self.import_busy
+                    && !self.save_busy
+                    && !self.locked()
+                    && let inbox = self.state_path.with_file_name(bundle::INBOX)
+                    && inbox.exists()
+                {
+                    let dir = self.state_path.parent().unwrap().to_path_buf();
+                    let opened = bundle::open(&inbox, &dir);
+                    let _ = std::fs::remove_file(&inbox);
+                    return self.update(Message::ProjectOpened(Some(opened)));
+                }
                 if let Some(c) = &mut self.control {
                     c.refresh();
                     // "Connecting to <machine>…" until the driver reports a

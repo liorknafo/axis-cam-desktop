@@ -112,8 +112,22 @@ fn poll(running: &Running, pid: u32) -> Poll {
 /// them (`mesh::stl_faces`).
 pub type Faces = (Vec<[[f32; 3]; 3]>, Option<Vec<u32>>);
 pub fn load(path: &Path) -> Result<Faces, String> {
-    let bytes = convert(&RUNNING, &helper()?, path, READ_TIMEOUT, TIMEOUT)?;
+    let bytes = match helper() {
+        Ok(helper) => convert(&RUNNING, &helper, path, READ_TIMEOUT, TIMEOUT)?,
+        // The shop tablet has no converter: its bundle brought the part
+        // converted, beside it (`bundle::write`).
+        Err(e) => fs::read(format!("{}.stl", path.display())).map_err(|_| e)?,
+    };
     Ok((super::mesh::stl(&bytes)?, super::mesh::stl_faces(&bytes)))
+}
+/// The part at `path` converted, as `load` reads it.
+pub fn converted(path: &Path) -> Result<Vec<u8>, String> {
+    convert(&RUNNING, &helper()?, path, READ_TIMEOUT, TIMEOUT)
+}
+pub fn is_step(path: &Path) -> bool {
+    path.extension()
+        .and_then(|x| x.to_str())
+        .is_some_and(|x| matches!(x.to_lowercase().as_str(), "step" | "stp"))
 }
 
 /// A read of a file's first bytes, shared by every import of that path
