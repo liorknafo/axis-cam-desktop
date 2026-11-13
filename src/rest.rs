@@ -345,7 +345,7 @@ impl Cuts {
                     .map(move |m| Cut {
                         a: m.from,
                         b: m.to,
-                        radius: plan.radius,
+                        radius: plan.cut_radius(),
                         flute: plan.flute_length,
                         shape: plan.shape,
                         frame,
@@ -383,7 +383,7 @@ pub fn after_setup<'p>(
             before.cut(
                 m.from,
                 m.to,
-                plan.radius,
+                plan.cut_radius(),
                 plan.flute_length,
                 plan.shape,
                 frame,

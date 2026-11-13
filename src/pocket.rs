@@ -3476,6 +3476,7 @@ fn finish_plan(setup: &Setup, op: &Operation, job: Job) -> Result<Plan, String> 
         moves: vec![],
         stock,
         radius,
+        form: None,
         flute_length,
         tool_length,
         holder_radius,

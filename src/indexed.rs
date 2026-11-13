@@ -2111,7 +2111,7 @@ pub(crate) mod tests {
         assert!(top < z + 12., "{top}");
         // The whole job leaves none of the square's four sides under stock.
         sim.seek(1.);
-        let left = crate::uncut::uncut(sim.volume.as_ref().unwrap(), &doc.setups[0], &mesh);
+        let left = crate::uncut::uncut(sim.volume.as_ref().unwrap(), &doc.setups, &mesh);
         for (i, f) in mesh.faces.iter().enumerate() {
             let [a, b, c] = [f.points[0], f.points[1], f.points[2]];
             let (u, v) = ([b[1] - a[1], b[2] - a[2]], [c[1] - a[1], c[2] - a[2]]);

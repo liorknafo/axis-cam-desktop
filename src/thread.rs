@@ -184,6 +184,13 @@ pub const SPECS: &[Spec] = &[
     pipe("3/4-14 NPT", 26.568, 14., 60., true, 23.),
     pipe("1-11.5 NPT", 33.228, 11.5, 60., true, 29.),
 ];
+/// How far past its major diameter an internal thread's root may lie, on
+/// the radius: to the sharp V of its basic form, H/8 for a 60° thread (ISO
+/// 68-1), H/6 for a 55° one, H the sharp V's height.
+pub fn root_reach(pitch: f32, angle: f32) -> f32 {
+    let sharp = pitch / 2. / (angle / 2.).to_radians().tan();
+    sharp / if angle < 57. { 6. } else { 8. }
+}
 /// The size named `name` (as `Spec::name`).
 pub fn spec(name: &str) -> Option<&'static Spec> {
     SPECS.iter().find(|s| s.name == name)
@@ -211,6 +218,12 @@ pub struct Thread {
     /// end.
     pub major: f32,
     pub minor: f32,
+    /// A hole's root diameter as modelled: as far as its faces reach from
+    /// the axis along the thread, at least its major and at most the sharp
+    /// V of its basic form (`root_reach`). A model may relieve the root
+    /// past the major, and a tap of the size forms it there (LIO-448). A
+    /// stud's: its minor.
+    pub root: f32,
     pub tapered: bool,
     /// The standard size it matches; none for a size off the table.
     pub spec: Option<&'static Spec>,
@@ -640,6 +653,16 @@ fn read(
                 off <= 0.3f32.max(0.05 * s.major)
             }
         });
+    let root = if internal {
+        let reach = major / 2. + root_reach(pitch, angle) + 0.01;
+        let far = (triangles.iter().flatten())
+            .map(|p| polar(*p))
+            .filter(|p| p.2 >= from && p.2 <= to && p.0 <= reach)
+            .fold(major / 2., |far, p| far.max(p.0));
+        2. * far
+    } else {
+        minor
+    };
     Some(Thread {
         axis,
         centre: at,
@@ -651,6 +674,7 @@ fn read(
         angle,
         major,
         minor,
+        root,
         tapered,
         spec,
     })

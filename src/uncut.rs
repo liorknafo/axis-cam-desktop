@@ -85,6 +85,9 @@ struct Samples {
     pieces: Vec<Vec<Piece>>,
     found: HashMap<usize, (f32, Tri, Vec<Tri>)>,
     covered: f32,
+    /// The faces of a thread left short (`Short`): its regions are kept
+    /// however small.
+    short: HashMap<usize, usize>,
 }
 impl Samples {
     fn new(n: usize) -> Self {
@@ -106,6 +109,11 @@ pub struct Region {
     /// faces lie on, else those its edges meet, as a hole's or slot's meet
     /// the side it opens onto. Empty inside the box.
     pub from: Vec<&'static str>,
+    /// Why it is left, when it lies on a thread modelled in a hole that no
+    /// tap or thread mill cuts in full (`thread_note`): "M8×1.25 thread:
+    /// no tap or thread mill cuts it", "M8×1.25 thread: tapped 4.2 mm
+    /// short".
+    pub thread: Option<String>,
 }
 impl Region {
     /// "120 mm² reached from −Y: X 48–72, Y 0–14, Z 8–32".
@@ -113,7 +121,7 @@ impl Region {
         let b = self.bounds;
         let span = |k: usize| format!("{:.0}–{:.0}", b.min[k].max(0.), b.max[k].max(0.));
         let at = format!("X {}, Y {}, Z {}", span(0), span(1), span(2));
-        if self.from.is_empty() {
+        let line = if self.from.is_empty() {
             format!("{:.0} mm² inside: {at}", self.area)
         } else {
             format!(
@@ -121,13 +129,41 @@ impl Region {
                 self.area,
                 self.from.join(", ")
             )
+        };
+        match &self.thread {
+            Some(why) => format!("{line} · {why}"),
+            None => line,
         }
     }
 }
-/// The faces of `mesh`, placed as `setup1` places it, that `stock` still
-/// covers: `stock` is the stock the job's last setup leaves, in setup 1's
-/// frame as `simulation::sequence_walk` keeps it.
-pub fn uncut(stock: &Volume, setup1: &Setup, mesh: &Mesh) -> Uncut {
+/// A share of the part's surface as the app shows it, in whole percent;
+/// "< 1%" for one under a percent, which would round to none (LIO-448).
+pub fn percent(share: f32) -> String {
+    if share <= 0. {
+        "0%".into()
+    } else if share < 0.01 {
+        "< 1%".into()
+    } else {
+        format!("{:.0}%", share * 100.)
+    }
+}
+/// What a category covers, with its regions counted: "8 regions, < 1%",
+/// "1 region, 3%", or "0%" with none.
+pub fn amount(regions: &[Region], share: f32) -> String {
+    match regions.len() {
+        0 => percent(share),
+        1 => format!("1 region, {}", percent(share)),
+        n => format!("{n} regions, {}", percent(share)),
+    }
+}
+/// The faces of `mesh`, placed as the first of the job's `setups` places
+/// it, that `stock` still covers: `stock` is the stock the job's last
+/// setup leaves, in setup 1's frame as `simulation::sequence_walk` keeps
+/// it, its cuts from the operations of `setups`.
+pub fn uncut(stock: &Volume, setups: &[Setup], mesh: &Mesh) -> Uncut {
+    let Some(setup1) = setups.first() else {
+        return Uncut::default();
+    };
     let placement = Placement::new(mesh, Some(setup1));
     let scale = mesh.display_scale();
     let part = placement.bounds.scaled(1. / scale);
@@ -137,6 +173,17 @@ pub fn uncut(stock: &Volume, setup1: &Setup, mesh: &Mesh) -> Uncut {
         Samples::new(mesh.faces.len()),
         Samples::new(mesh.faces.len()),
     ];
+    // The modelled hole threads, and where the job's taps, thread mills and
+    // lathe threading of their size give them full form: their faces there
+    // are cut, and under stock where none does, whatever the samples find
+    // (LIO-448). A thread is finer than the samples, and a lathe's
+    // threading is simulated to its pitch diameter only.
+    let shorts = shortfalls(
+        (crate::thread::in_setup(setup1, mesh).into_iter()).filter(|t| t.internal),
+        stock,
+        setups,
+        first,
+    );
     let mut total = 0.;
     for (i, face) in mesh.faces.iter().enumerate() {
         let (raw, [a, b, c]) = match face.points[..] {
@@ -157,6 +204,23 @@ pub fn uncut(stock: &Volume, setup1: &Setup, mesh: &Mesh) -> Uncut {
             continue;
         }
         let n = n.map(|x| x / twice);
+        let held =
+            (shorts.iter().enumerate()).find_map(|(k, s)| s.holds([a, b, c]).map(|h| (k, h)));
+        if let Some((_, false)) = held {
+            total += twice / 2.;
+            continue;
+        }
+        if let Some((k, true)) = held {
+            let layer = &mut layers[0];
+            total += twice / 2.;
+            layer.covered += twice / 2.;
+            layer.faces[i] = true;
+            layer
+                .found
+                .insert(i, (twice / 2., [a, b, c], vec![[a, b, c]]));
+            layer.short.insert(i, k);
+            continue;
+        }
         // ponytail: trusts the mesh's winding for which side is outside; a
         // face wound inwards samples the part and reads as under stock.
         // The face in triangles with no edge over `SPLIT`, each sampled in
@@ -234,7 +298,33 @@ pub fn uncut(stock: &Volume, setup1: &Setup, mesh: &Mesh) -> Uncut {
             }
         }
     }
-    let [thick, thin] = layers.map(|layer| coverage(layer, part, total));
+    let [mut thick, mut thin] = layers.map(|layer| coverage(layer, part, total));
+    // A thread left short is one region, which says why: its faces where
+    // the full form stops, as a faded end is cut, need not share edges.
+    for coverage in [&mut thick, &mut thin] {
+        let mut kept: Vec<(Option<usize>, Region)> = vec![];
+        for mut region in std::mem::take(&mut coverage.regions) {
+            let on = (shorts.iter()).position(|s| s.note.is_some() && s.covers(&region, part));
+            region.thread = on.and_then(|k| shorts[k].note.clone());
+            match kept.iter_mut().find(|(k, _)| on.is_some() && *k == on) {
+                Some((_, into)) => {
+                    into.area += region.area;
+                    for k in 0..3 {
+                        into.bounds.min[k] = into.bounds.min[k].min(region.bounds.min[k]);
+                        into.bounds.max[k] = into.bounds.max[k].max(region.bounds.max[k]);
+                    }
+                    for side in region.from {
+                        if !into.from.contains(&side) {
+                            into.from.push(side);
+                        }
+                    }
+                }
+                None => kept.push((on, region)),
+            }
+        }
+        coverage.regions = kept.into_iter().map(|(_, r)| r).collect();
+        coverage.regions.sort_by(|a, b| b.area.total_cmp(&a.area));
+    }
     Uncut {
         faces: thick.faces,
         pieces: thick.pieces,
@@ -251,6 +341,7 @@ fn coverage(samples: Samples, part: Bounds, total: f32) -> Coverage {
         mut pieces,
         found,
         mut covered,
+        short,
     } = samples;
     // Faces under stock that share an edge make one region.
     let mut root: HashMap<usize, usize> = found.keys().map(|i| (*i, *i)).collect();
@@ -268,10 +359,13 @@ fn coverage(samples: Samples, part: Bounds, total: f32) -> Coverage {
             let mut key = [p[e], p[(e + 1) % 3]].map(|v| v.map(|x| (x * 1000.).round() as i64));
             key.sort_unstable();
             match edges.get(&key) {
-                Some(&other) => {
+                // A thread's faces left short make a region of their own,
+                // not one with the faces round it (`Short`).
+                Some(&other) if short.get(&i) == short.get(&other) => {
                     let (a, b) = (top(&mut root, i), top(&mut root, other));
                     root.insert(a, b);
                 }
+                Some(_) => {}
                 None => {
                     edges.insert(key, i);
                 }
@@ -319,7 +413,7 @@ fn coverage(samples: Samples, part: Bounds, total: f32) -> Coverage {
     }
     let mut regions = vec![];
     for group in grouped.into_values() {
-        if group.area < SLIVER {
+        if group.area < SLIVER && !group.faces.iter().any(|f| short.contains_key(f)) {
             covered -= group.area;
             for i in group.faces {
                 faces[i] = false;
@@ -336,19 +430,223 @@ fn coverage(samples: Samples, part: Bounds, total: f32) -> Coverage {
             area: group.area,
             bounds: group.bounds,
             from: (0..6).filter(|d| sides[*d]).map(|d| SIDES[d]).collect(),
+            thread: None,
         });
     }
     regions.sort_by(|a, b| b.area.total_cmp(&a.area));
     Coverage {
         faces,
         pieces,
-        regions,
-        share: if total > 0. {
+        // With no region left, none: not what rounding leaves of the
+        // slivers' areas taken off.
+        share: if total > 0. && !regions.is_empty() {
             covered.max(0.) / total
         } else {
             0.
         },
+        regions,
     }
+}
+/// A modelled hole thread (in setup 1's frame) and what of it the job's
+/// taps, thread mills and lathe threading of its size give full form.
+struct Short {
+    thread: crate::thread::Thread,
+    /// Whether any of them reaches it.
+    threaded: bool,
+    /// The stretches along its axis without the full form.
+    gaps: Vec<(f32, f32)>,
+    /// Why it is left, when it is short by `SHORT` or more: "M8×1.25
+    /// thread: tapped 4.2 mm short", "M8×1.25 thread: no M8×1.25 tap,
+    /// thread mill or threading tool cuts it". None when it is not.
+    note: Option<String>,
+}
+/// How short of its length a thread may be cut and still count as full,
+/// mm: the measure of its ends, not a missing turn.
+const SHORT: f32 = 0.05;
+impl Short {
+    /// Whether the face `tri` (setup 1's frame), when it is one of the
+    /// thread's (within its root of its axis, its middle along the
+    /// thread), is under stock: true in a gap of a thread left short, false
+    /// where it has its full form. None off the thread, or on one nothing
+    /// threads that is not short either.
+    fn holds(&self, tri: Tri) -> Option<bool> {
+        let t = &self.thread;
+        let (u, v) = ((t.axis + 1) % 3, (t.axis + 2) % 3);
+        let reach = t.root.max(t.major) / 2. + 0.02;
+        let along = (tri[0][t.axis] + tri[1][t.axis] + tri[2][t.axis]) / 3.;
+        let on = along >= t.from
+            && along <= t.to
+            && tri
+                .iter()
+                .all(|p| (p[u] - t.centre[0]).hypot(p[v] - t.centre[1]) <= reach);
+        if !on {
+            return None;
+        }
+        let gap = self.gaps.iter().any(|g| along >= g.0 && along <= g.1);
+        match (self.note.is_some() && gap, self.threaded) {
+            (true, _) => Some(true),
+            (false, true) => Some(false),
+            (false, false) => None,
+        }
+    }
+    /// Whether `region` (its bounds from the part's corner `part.min`) lies
+    /// on the thread.
+    fn covers(&self, region: &Region, part: Bounds) -> bool {
+        let t = &self.thread;
+        let at = |k: usize| {
+            (
+                region.bounds.min[k] + part.min[k],
+                region.bounds.max[k] + part.min[k],
+            )
+        };
+        let (u, v) = ((t.axis + 1) % 3, (t.axis + 2) % 3);
+        let reach = t.root.max(t.major) / 2. + 0.5;
+        let (lo, hi) = at(t.axis);
+        lo >= t.from - t.pitch
+            && hi <= t.to + t.pitch
+            && [(u, t.centre[0]), (v, t.centre[1])].iter().all(|&(k, c)| {
+                let (lo, hi) = at(k);
+                lo >= c - reach && hi <= c + reach
+            })
+    }
+}
+/// What of each of `threads` (holes', in setup 1's frame `first`) the
+/// taps, thread mills and inside lathe threading of `setups`, of each
+/// one's size and pitch, give full form, from the cuts that made `stock`:
+/// a tap's or thread mill's over its lowest tip, less a tap's lead, up its
+/// flutes to its highest; a lathe tap's or threading's rings over their
+/// length along the spindle. One of another size gives none.
+fn shortfalls(
+    threads: impl Iterator<Item = crate::thread::Thread>,
+    stock: &Volume,
+    setups: &[Setup],
+    first: Frame,
+) -> Vec<Short> {
+    let mut out = vec![];
+    for t in threads {
+        let (u, v) = ((t.axis + 1) % 3, (t.axis + 2) % 3);
+        let mut spans = vec![];
+        // How they cut it, the first that does of: tapped, thread milled,
+        // threaded on the lathe.
+        let mut how = [false; 3];
+        // One of its size that cuts the other hand: how it does.
+        let mut wrong_hand = None;
+        let fits = |major: f32, pitch: f32| {
+            (pitch - t.pitch).abs() < 1e-3 && (major - t.major).abs() <= 0.3
+        };
+        for c in stock.cuts.iter() {
+            let Some(op) = (setups.get(usize::from(c.source.0)))
+                .and_then(|s| s.operations.get(usize::from(c.source.1)))
+            else {
+                continue;
+            };
+            // Its size: the hole's own, or one chosen that matches it; a
+            // lathe threading's, its diameter and pitch.
+            let get = |k: &str| crate::model::get(&op.p, k);
+            let lathe = op.strategy == crate::model::Strategy::Turn
+                && get("turn_kind") == "Thread"
+                && get("thread_side") == "Inside";
+            // And its hand: a lathe's threading is right hand; a tap's or
+            // thread mill's as chosen, else the model's, or right hand for
+            // a size chosen.
+            let (kind, right_hand) = if lathe {
+                let at = |k: &str| crate::model::num(&op.p, k).unwrap_or(f32::NAN);
+                if !fits(at("diameter"), at("pitch")) {
+                    continue;
+                }
+                (2, true)
+            } else if op.tapping() || op.thread_milling() {
+                let chosen = get("thread");
+                let model = chosen == crate::model::FROM_MODEL;
+                if !model && !crate::thread::spec(chosen).is_some_and(|s| fits(s.major, s.pitch)) {
+                    continue;
+                }
+                let right_hand = match get("thread_hand") {
+                    "Right hand" => true,
+                    "Left hand" => false,
+                    _ => !model || t.right_hand,
+                };
+                (if op.tapping() { 0 } else { 1 }, right_hand)
+            } else {
+                continue;
+            };
+            let up = c.frame.transfer_vector([0., 0., 1.], first)[t.axis];
+            let off = |p: [f32; 3]| (p[u] - t.centre[0]).hypot(p[v] - t.centre[1]);
+            // A lathe's ring turns about its frame's Z axis between Z a[0]
+            // and b[0], out to radius b[1]: all of it the full form when it
+            // reaches the thread's major on the thread's axis, or is a
+            // threading pass (simulated to the pitch diameter).
+            let (a, b) = if c.shape == crate::simulation::CutterShape::Revolve {
+                if kind != 2 && c.b[1] < t.major / 2. - 0.05 {
+                    continue;
+                }
+                let at = |z: f32| moved([0., 0., z], c.frame, first);
+                (at(c.a[0]), at(c.b[0]))
+            } else {
+                (moved(c.a, c.frame, first), moved(c.b, c.frame, first))
+            };
+            if up.abs() < 0.99 || off(a).max(off(b)) > t.root.max(t.major) / 2. {
+                continue;
+            }
+            if right_hand != t.right_hand {
+                wrong_hand = Some((kind, right_hand));
+                continue;
+            }
+            how[kind] = true;
+            let lead = c
+                .shape
+                .rise()
+                .map_or(0., |rise| rise * (c.radius - c.shape.flat()).max(0.));
+            let (low, high) = (a[t.axis].min(b[t.axis]), a[t.axis].max(b[t.axis]));
+            if c.shape == crate::simulation::CutterShape::Revolve {
+                spans.push((low, high));
+                continue;
+            }
+            spans.push(if up > 0. {
+                (low + lead, high + c.flute)
+            } else {
+                (low - c.flute, high - lead)
+            });
+        }
+        // What of the thread's length the spans leave.
+        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let (mut gaps, mut reached) = (vec![], t.from);
+        for (lo, hi) in &spans {
+            if lo.min(t.to) > reached {
+                gaps.push((reached, lo.min(t.to)));
+            }
+            reached = reached.max(*hi);
+        }
+        if t.to > reached {
+            gaps.push((reached, t.to));
+        }
+        let short: f32 = gaps.iter().map(|g| g.1 - g.0).sum();
+        let name = t.name();
+        let hand = |right: bool| if right { "right hand" } else { "left hand" };
+        let verb = |k: usize| ["tapped", "thread milled", "threaded"][k];
+        let note = (short >= SHORT).then(|| match (spans.is_empty(), wrong_hand) {
+            (true, Some((k, right))) => format!(
+                "{name} thread: {} {}; the model's is {}",
+                verb(k),
+                hand(right),
+                hand(t.right_hand)
+            ),
+            (true, None) => {
+                format!("{name} thread: no {name} tap, thread mill or threading tool cuts it")
+            }
+            (false, _) => {
+                let k = how.iter().position(|h| *h).unwrap_or(0);
+                format!("{name} thread: {} {short:.1} mm short", verb(k))
+            }
+        });
+        out.push(Short {
+            thread: t,
+            threaded: !spans.is_empty(),
+            gaps,
+            note,
+        });
+    }
+    out
 }
 /// `p` in frame `from` as frame `to` sees it.
 fn moved(p: [f32; 3], from: Frame, to: Frame) -> [f32; 3] {
@@ -512,7 +810,7 @@ mod tests {
                 source: (0, 0),
             });
         }
-        super::uncut(&stock, &setup, &mesh)
+        super::uncut(&stock, std::slice::from_ref(&setup), &mesh)
     }
     #[test]
     fn an_uncut_04_mm_recess_is_thin() {
@@ -554,7 +852,7 @@ mod tests {
         cut.a = [a[0] + 45., a[1] - 40., a[2] + 0.2];
         cut.b = [a[0] + 45., c[1] + 40., a[2] + 0.2];
         std::sync::Arc::make_mut(&mut stock.cuts).push(cut);
-        let left = super::uncut(&stock, &setup, &mesh);
+        let left = super::uncut(&stock, std::slice::from_ref(&setup), &mesh);
         assert!(left.faces[0] && left.thin.faces[0]);
         assert_eq!(left.pieces[0].len(), left.thin.pieces[0].len());
         let mut areas = [0.; 3];
@@ -717,7 +1015,7 @@ mod tests {
             }
             eprintln!("{name}: {samples} samples, maximum normal residual {most:.4} mm");
             assert!(samples > 0 && most < super::THIN_OFFSET, "{name}: {most}");
-            let left = super::uncut(&stock, &setup, &mesh);
+            let left = super::uncut(&stock, std::slice::from_ref(&setup), &mesh);
             for (i, face) in mesh.faces.iter().enumerate() {
                 let z = face
                     .points
@@ -737,7 +1035,7 @@ mod tests {
     fn a_long_face_half_cut_is_under_stock_only_where_the_stock_is() {
         let (mesh, setup, [a, b, c], stock) = super::half_cut_face();
         assert!((b[0] - a[0] - 100.).abs() < 0.01 && (c[1] - a[1] - 20.).abs() < 0.01);
-        let uncut = super::uncut(&stock, &setup, &mesh);
+        let uncut = super::uncut(&stock, std::slice::from_ref(&setup), &mesh);
         assert!(uncut.faces[0]);
         // The face in pieces that make it up, back in setup 1 as `uncut`
         // places them, each under stock just where its centre is past 45.
@@ -906,7 +1204,7 @@ mod tests {
         };
         // Y -68…-48 and -44…64.
         std::sync::Arc::make_mut(&mut stock.cuts).extend([cut(-58., 10.), cut(10., 54.)]);
-        let uncut = super::uncut(&stock, &setup, &mesh);
+        let uncut = super::uncut(&stock, std::slice::from_ref(&setup), &mesh);
         // The strip is 4 of the face's 120 mm.
         assert!(
             uncut.share > 0.01 && uncut.share < 0.1,
@@ -915,7 +1213,7 @@ mod tests {
         );
         // Without the cut over the strip's side the whole face is under stock.
         std::sync::Arc::make_mut(&mut stock.cuts).truncate(1);
-        let uncut = super::uncut(&stock, &setup, &mesh);
+        let uncut = super::uncut(&stock, std::slice::from_ref(&setup), &mesh);
         assert!(uncut.share > 0.8, "{}", uncut.share);
         assert!(uncut.faces.iter().all(|f| *f));
     }
@@ -948,7 +1246,7 @@ mod tests {
             |_, _, r| assert!(r.is_ok()),
             |_, _, v| last = Some(v.clone()),
         );
-        let uncut = super::uncut(last.as_ref().unwrap(), setup, &mesh);
+        let uncut = super::uncut(last.as_ref().unwrap(), &doc.setups, &mesh);
         let placement = crate::stock::Placement::new(&mesh, Some(setup));
         let scale = mesh.display_scale();
         let placed = |p: [f32; 3]| placement.transform(p).map(|v| v / scale);
@@ -1094,5 +1392,114 @@ mod tests {
         // One short line: the operation's own check says what is wrong
         // (LIO-425, was "Top / … could not be generated.").
         assert!(why.starts_with("Completeness waits on Top / "), "{why}");
+    }
+    #[test]
+    fn a_share_that_rounds_to_nothing_is_never_shown_as_0_percent() {
+        // LIO-448: the adapter plate listed 8 regions as "0%".
+        let region = super::Region {
+            area: 18.,
+            bounds: crate::mesh::Bounds {
+                min: [0.; 3],
+                max: [1.; 3],
+            },
+            from: vec![],
+            thread: None,
+        };
+        let eight = vec![region.clone(); 8];
+        assert_eq!(super::amount(&eight, 0.0039), "8 regions, < 1%");
+        assert_eq!(super::amount(&eight[..1], 0.03), "1 region, 3%");
+        assert_eq!(super::amount(&[], 0.), "0%");
+        assert_eq!(super::percent(0.005), "< 1%");
+        assert_eq!(super::percent(0.0099), "< 1%");
+        assert_eq!(super::percent(0.01), "1%");
+    }
+    /// The spindle adapter plate's own job (LIO-448): `AXIS_ADAPTER_PLATE`
+    /// names a folder with copies of its project, adapter-plate.axis.json,
+    /// and its part, adapter-plate.step. Its four M8×1.25 holes are drilled
+    /// Ø6.8 through and hand tapped through: none of their thread is left.
+    /// Tapped short, each is.
+    #[test]
+    #[ignore]
+    fn the_adapter_plates_tapped_m8_holes_are_cut() {
+        let Ok(dir) = std::env::var("AXIS_ADAPTER_PLATE") else {
+            eprintln!(
+                "skipped: set AXIS_ADAPTER_PLATE to a folder with the plate's project and part"
+            );
+            return;
+        };
+        let dir = std::path::Path::new(&dir);
+        let doc = crate::storage::load(&dir.join("adapter-plate.axis.json")).unwrap();
+        let mesh = crate::mesh::load(&dir.join("adapter-plate.step")).unwrap();
+        let mut last = None;
+        crate::simulation::sequence_walk(
+            &doc,
+            &mesh,
+            None,
+            |_, _, r| assert!(r.is_ok()),
+            |_, _, v| last = Some(v.clone()),
+            |_, _| {},
+        );
+        let threads = crate::thread::in_setup(&doc.setups[0], &mesh);
+        assert_eq!(threads.len(), 4);
+        assert!(
+            threads.iter().all(|t| (t.root - 8.108).abs() < 0.01),
+            "{threads:?}"
+        );
+        let left = super::uncut(last.as_ref().unwrap(), &doc.setups, &mesh);
+        let lines: Vec<String> = left.regions.iter().map(|r| r.line()).collect();
+        eprintln!(
+            "{} · amber {} · {lines:#?}",
+            super::amount(&left.regions, left.share),
+            super::amount(&left.thin.regions, left.thin.share)
+        );
+        let placement = crate::stock::Placement::new(&mesh, Some(&doc.setups[0]));
+        let scale = mesh.display_scale();
+        for (i, face) in mesh.faces.iter().enumerate() {
+            if !(left.faces[i] || left.thin.faces[i]) {
+                continue;
+            }
+            for p in &face.points {
+                let p = placement.transform(*p).map(|v| v / scale);
+                for t in &threads {
+                    let (u, v) = ((t.axis + 1) % 3, (t.axis + 2) % 3);
+                    let off = (p[u] - t.centre[0]).hypot(p[v] - t.centre[1]);
+                    assert!(
+                        off > t.root / 2. + 0.5
+                            || p[t.axis] < t.from - 0.5
+                            || p[t.axis] > t.to + 0.5,
+                        "face {i} on a thread is left: {lines:#?}"
+                    );
+                }
+            }
+        }
+        // Tapped 18.1 mm of the 18.5 (LIO-448 review): each hole's thread
+        // (18.34 mm, faded 0.08 inside each face) is left short, as one
+        // region that says so.
+        let mut doc = doc;
+        for op in doc.setups.iter_mut().flat_map(|s| &mut s.operations) {
+            if op.tapping() {
+                op.p.insert("thread_depth".into(), "18.1".into());
+            }
+        }
+        let mut last = None;
+        crate::simulation::sequence_walk(
+            &doc,
+            &mesh,
+            None,
+            |_, _, r| assert!(r.is_ok()),
+            |_, _, v| last = Some(v.clone()),
+            |_, _| {},
+        );
+        let left = super::uncut(last.as_ref().unwrap(), &doc.setups, &mesh);
+        let lines: Vec<String> = left.regions.iter().map(|r| r.line()).collect();
+        eprintln!("{} · {lines:#?}", super::amount(&left.regions, left.share));
+        assert_eq!(left.regions.len(), 4, "{lines:#?}");
+        for r in &left.regions {
+            let why = r.thread.as_deref().unwrap_or_default();
+            assert!(
+                why.starts_with("M8×1.25 thread: tapped 0.") && why.ends_with(" mm short"),
+                "{lines:#?}"
+            );
+        }
     }
 }

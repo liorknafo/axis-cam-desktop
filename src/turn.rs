@@ -425,8 +425,23 @@ fn below_end(op: &Operation, key: &str) -> Result<f32, String> {
 pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
     let resolved = stock::resolve(setup, Some(mesh))?;
     let stock = resolved.stock;
-    let (cut, radius) = planned(setup, op, tool, stock, Material::new(setup, stock))?;
+    let (mut cut, radius) = planned(setup, op, tool, stock, Material::new(setup, stock))?;
     part_check(setup, mesh, stock, &cut.checks)?;
+    // A tap forms the thread modelled on the axis to the model's root, at
+    // most the basic form's sharp V, as on the mill (LIO-448).
+    if op.tapping()
+        && let Some(spec) = tool.tap_spec()
+    {
+        let major = spec.major / 2.;
+        let form = (crate::thread::holes_in_setup(setup, mesh).iter())
+            .filter(|t| t.centre[0].hypot(t.centre[1]) < 0.5)
+            .filter(|t| (t.pitch - spec.pitch).abs() < 1e-3 && (t.major - spec.major).abs() <= 0.3)
+            .fold(major, |r, t| r.max(t.root / 2.))
+            .min(major + crate::thread::root_reach(spec.pitch, spec.angle));
+        for ring in cut.rings.iter_mut().filter(|r| r.r[1] == major) {
+            ring.r[1] = form;
+        }
+    }
     if !cut.moves.iter().any(|m| m.motion == Motion::Feed) || !cut.duration.is_finite() {
         return Err("No cutting motion fits the selected geometry and settings.".into());
     }
@@ -448,6 +463,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
         moves: cut.moves,
         stock,
         radius: radius.max(0.05),
+        form: None,
         flute_length: reach,
         tool_length: num(&tool.p, "stickout")
             .filter(|v| *v >= reach)
