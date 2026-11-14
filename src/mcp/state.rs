@@ -87,6 +87,10 @@ const WINDOW: &str = "the window's own";
 const SMOKE: &str = "the renderer smoke run's";
 #[cfg_attr(not(test), allow(dead_code))]
 const FLAG: &str = "a flag of the work's progress, not the work";
+/// The shop tablet's pairing and its own state (LIO-459, LIO-485): the
+/// agent cannot touch them, and the tablet build serves no MCP.
+const DEVICE: &str =
+    "pairing with the shop tablet, or the tablet build's own: the agent cannot touch it";
 
 /// The fields of `App` that are not the work state, and why.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -248,6 +252,16 @@ pub const NOT_WORK_STATE: &[(&str, &str)] = &[
     ("control_machine", CONTROLLER),
     ("switch_machine", CONTROLLER),
     ("pi_code", CONTROLLER),
+    ("opened_notes", STATUS),
+    ("tablet_code", DEVICE),
+    ("tablet_firewall", DEVICE),
+    ("shop_projects", DEVICE),
+    ("computer_address", DEVICE),
+    ("computer_code", DEVICE),
+    ("computer", DEVICE),
+    ("kept", DEVICE),
+    ("computer_busy", DEVICE),
+    ("sync_note", DEVICE),
     ("pi_pairing", CONTROLLER),
     ("pi_run", CONTROLLER),
     ("cnc_over_guide", VIEW),
@@ -819,7 +833,7 @@ pub fn external_name(m: &Message) -> Option<String> {
         Class::Planner => {
             matches!(m, Message::ApplyPlan | Message::UndoPlan).then(|| format!("user: {m:?}"))
         }
-        Class::Machine => {
+        Class::Machine | Class::Device => {
             let said = format!("{m:?}");
             let cut = (said.char_indices().nth(60)).map_or(said.len(), |(i, _)| i);
             Some(format!("user: {}", &said[..cut]))

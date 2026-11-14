@@ -190,6 +190,10 @@ pub struct Plan {
     /// (LIO-447: read back from the moves alone, a walk could be given a
     /// neighbouring corner's). Empty for every other plan.
     pub corner_walks: Vec<crate::corner::Walk>,
+    /// A Slot's passes as it made them (`slot::generate`, LIO-455), each
+    /// with its moves; the Steps give one page a pass. Empty for every
+    /// other plan.
+    pub slot_passes: Vec<crate::slot::Pass>,
 }
 /// A stop of the spindle partway through a plan: before move `at` the
 /// spindle and coolant stop and, with a `pause`, the program waits there,
@@ -605,6 +609,7 @@ fn generate_plan(
         stops: vec![],
         keep_air: vec![],
         corner_walks: vec![],
+        slot_passes: vec![],
         display_scale: scale,
         duration: 0.,
         target,

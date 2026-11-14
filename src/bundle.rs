@@ -4,7 +4,8 @@
 //! A project only points to its part by a path on the computer that planned
 //! it; the bundle carries the part along. The computer writes it (Save for
 //! tablet…), and the tablet opens it from "Open with" (`ShopActivity.java`
-//! copies it to `INBOX` beside the workspace).
+//! copies it to `INBOX` beside the workspace). It also carries the tool runs
+//! worked out here for the TypeScript tablet app (`Runs`, LIO-475).
 use crate::model::Document;
 use std::{
     fs,
@@ -15,6 +16,8 @@ use std::{
 const PROJECT: &str = "project.json";
 const PART: &str = "part/";
 const MACHINE: &str = "machine/";
+/// The tool runs worked out for the tablet (`Runs`).
+pub const RUNS: &str = "runs.json";
 /// Where the tablet finds a bundle it was given, beside its workspace.
 pub const INBOX: &str = "inbox.axisjob";
 pub const EXTENSION: &str = "axisjob";
@@ -22,6 +25,12 @@ pub const EXTENSION: &str = "axisjob";
 /// The project, its part file, and for a STEP part the part converted as
 /// `step::load` reads it: the tablet has no converter (`step::load`).
 pub fn write(path: &Path, doc: &Document) -> Result<(), String> {
+    crate::storage::write_atomic(path, &pack(doc)?)
+}
+
+/// The tablet file `write` writes, in memory: what the computer sends a
+/// tablet over Wi-Fi (`tablet`).
+pub fn pack(doc: &Document) -> Result<Vec<u8>, String> {
     let mut w = zip::ZipWriter::new(Cursor::new(vec![]));
     let opt = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
@@ -31,6 +40,8 @@ pub fn write(path: &Path, doc: &Document) -> Result<(), String> {
     };
     let json = serde_json::to_vec_pretty(doc).map_err(|e| e.to_string())?;
     add(PROJECT, &json)?;
+    let runs = serde_json::to_vec_pretty(&runs(doc)).map_err(|e| e.to_string())?;
+    add(RUNS, &runs)?;
     if let Some(file) = &doc.file {
         let name = file_name(&file.path)?;
         let part = fs::read(&file.path)
@@ -64,13 +75,38 @@ pub fn write(path: &Path, doc: &Document) -> Result<(), String> {
             .map_err(|e| format!("Could not read the machine profile {}: {e}", path.display()))?;
         add(&format!("{MACHINE}{name}"), &bytes)?;
     }
-    let zip = w.finish().map_err(|e| e.to_string())?.into_inner();
-    crate::storage::write_atomic(path, &zip)
+    Ok(w.finish().map_err(|e| e.to_string())?.into_inner())
+}
+
+/// What the TypeScript tablet app runs (LIO-475): the tool runs of each
+/// setup on a UC100 machine, worked out here, as the tablet plans nothing.
+/// `format` changes when a reader of an older one would run it wrong.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Runs {
+    pub format: u32,
+    pub setups: Vec<crate::run::TabletSetup>,
+}
+
+pub fn runs(doc: &Document) -> Runs {
+    let uc100: Vec<usize> = (0..doc.setups.len())
+        .filter(|&si| crate::model::get(&doc.setups[si].machine.p, "controller") == "UC100")
+        .collect();
+    let mesh = match (&doc.file, uc100.is_empty()) {
+        (_, true) => Err(String::new()),
+        (Some(file), false) => {
+            crate::mesh::load_file(file).map_err(|e| format!("The part could not be loaded: {e}"))
+        }
+        (None, false) => Err(crate::run::NO_PART.into()),
+    };
+    let setups = (uc100.into_iter())
+        .map(|si| crate::run::tablet_runs(doc, mesh.as_ref().map_err(String::as_str), si))
+        .collect();
+    Runs { format: 1, setups }
 }
 
 /// The UC100 profile path of every machine in `doc`, the library's and the
 /// setups' copies.
-fn profiles_of(doc: &Document) -> impl Iterator<Item = &str> {
+pub(crate) fn profiles_of(doc: &Document) -> impl Iterator<Item = &str> {
     let setups = doc.setups.iter().map(|s| &s.machine);
     (doc.machines.iter().chain(setups))
         .map(|m| crate::model::get(&m.p, "uc100_profile").trim())
@@ -78,16 +114,19 @@ fn profiles_of(doc: &Document) -> impl Iterator<Item = &str> {
 }
 
 /// Unpacks the bundle at `zip` into `dir`: its part files into `dir/part`,
-/// and the project as `dir/tablet.axis.json`, its part's path pointing
-/// there. The project, that file, and what its load changed.
+/// its machine profiles into `dir/machine`, and the project as
+/// `dir/tablet.axis.json`, its part's and machines' paths pointing there.
+/// The bundle's profile wins, as the job was planned with it; a different
+/// copy the tablet had is kept as `.old` (LIO-464). The project, that file,
+/// and notes on what changed.
 pub fn open(zip: &Path, dir: &Path) -> Result<(Document, PathBuf, Vec<String>), String> {
     let bad = |e: zip::result::ZipError| format!("Not an AXIS tablet file: {e}");
     let mut archive =
         zip::ZipArchive::new(fs::File::open(zip).map_err(|e| e.to_string())?).map_err(bad)?;
     let parts = dir.join("part");
     let machines = dir.join("machine");
-    let mut profiles = vec![];
     let mut project = None;
+    let mut kept = vec![];
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(bad)?;
         let entry_name = entry.name().to_owned();
@@ -104,30 +143,36 @@ pub fn open(zip: &Path, dir: &Path) -> Result<(Document, PathBuf, Vec<String>), 
             // Only the file's name: a path in the zip never leaves its folder.
             Some(folder) => {
                 let name = file_name(Path::new(&entry_name))?;
-                crate::storage::write_atomic(&folder.join(&name), &bytes)?;
-                if folder == &machines {
-                    profiles.push(name);
+                let to = folder.join(&name);
+                if folder == &machines && fs::read(&to).is_ok_and(|old| old != bytes) {
+                    fs::rename(&to, folder.join(format!("{name}.old")))
+                        .map_err(|e| e.to_string())?;
+                    kept.push(format!(
+                        "This tablet's {name} differed from the file's; it is kept as {name}.old."
+                    ));
                 }
+                crate::storage::write_atomic(&to, &bytes)?;
             }
         }
     }
     let project = project.ok_or("Not an AXIS tablet file: it has no project.")?;
     let path = dir.join("tablet.axis.json");
     crate::storage::write_atomic(&path, &project)?;
-    let (mut doc, notes) = crate::storage::load_reporting(&path)?;
+    let (mut doc, mut notes) = crate::storage::load_reporting(&path)?;
+    notes.extend(kept);
     if let Some(file) = &mut doc.file {
         file.path = parts.join(file_name(&file.path)?);
     }
-    // Each machine's profile, where it came along (a bundle saved before
-    // LIO-456 has none).
+    // Each machine's profile, where it came along or an earlier bundle left
+    // it (one saved before LIO-456 carries none: LIO-464).
     let setups = doc.setups.iter_mut().map(|s| &mut s.machine);
     for m in doc.machines.iter_mut().chain(setups) {
         let path = crate::model::get(&m.p, "uc100_profile").trim();
         if let Ok(name) = file_name(Path::new(path))
-            && profiles.contains(&name)
+            && let here = machines.join(name)
+            && here.exists()
         {
-            let here = machines.join(name).display().to_string();
-            m.p.insert("uc100_profile".into(), here);
+            m.p.insert("uc100_profile".into(), here.display().to_string());
         }
     }
     crate::storage::save(&path, &doc)?;
@@ -204,6 +249,27 @@ mod tests {
             fs::read(&profile).unwrap(),
             fs::read(mac.path().join("jy5800.toml")).unwrap()
         );
+        // A copy changed on the tablet is kept, not lost (LIO-464); opened
+        // again unchanged, nothing is said.
+        fs::write(&profile, b"changed at the machine").unwrap();
+        let (_, _, notes) = open(&zip, tablet.path()).unwrap();
+        assert!(
+            notes.iter().any(|n| n.contains("jy5800.toml.old")),
+            "{notes:?}"
+        );
+        let old = tablet.path().join("machine").join("jy5800.toml.old");
+        assert_eq!(fs::read(old).unwrap(), b"changed at the machine");
+        let (_, _, notes) = open(&zip, tablet.path()).unwrap();
+        assert!(notes.iter().all(|n| !n.contains(".old")), "{notes:?}");
+        // A bundle saved before profiles travelled uses the tablet's copy.
+        let older = mac.path().join("Older.axisjob");
+        let mut w = zip::ZipWriter::new(fs::File::create(&older).unwrap());
+        (w.start_file(PROJECT, zip::write::SimpleFileOptions::default())).unwrap();
+        w.write_all(&serde_json::to_vec(&doc).unwrap()).unwrap();
+        w.finish().unwrap();
+        let (opened_older, _, _) = open(&older, tablet.path()).unwrap();
+        let m = &opened_older.setups[0].machine;
+        assert_eq!(m.p["uc100_profile"], profile.display().to_string());
         // The tablet's own way to the machine stays as it set it.
         let mut here = opened.clone();
         let mine = here.machines.last_mut().unwrap();

@@ -50,7 +50,7 @@ pub const WHERE: [&str; 4] = [
     "front right (X+ Y−)",
 ];
 /// The DRO's resolution: every reading is a hundredth.
-const READ: f64 = 0.01;
+pub(crate) const READ: f64 = 0.01;
 /// The most steps a walk round one corner takes: one a degree.
 const MAX_STEPS: usize = 90;
 /// How far clear of the stock the tool goes down beside it, mm.
@@ -189,12 +189,71 @@ fn outward(v: f64, c: f64) -> f64 {
     };
     n * READ
 }
+/// `v` on the DRO's hundredths, the one nearest it that is no farther from
+/// `c` (LIO-455): a point so rounded inside a round about `c` stays inside
+/// it. When no hundredth is that near `c` (`c` itself off the hundredths
+/// and `v` all but on it), the hundredth nearest `c`.
+fn inward(v: f64, c: f64) -> f64 {
+    // Single precision sizes are a few millionths off their hundredths:
+    // 2.05 mm is 2.0499999 as given. Within `SLACK` they count as on them.
+    const SLACK: f64 = 2e-5;
+    let d = (v - c).abs();
+    let at = v / READ;
+    let candidates = [(at + SLACK / READ).floor(), (at - SLACK / READ).ceil()].map(|n| n * READ);
+    let near = |g: &f64| (g - c).abs() <= d + SLACK;
+    match candidates
+        .iter()
+        .filter(|g| near(g))
+        .min_by(|a, b| (*a - v).abs().total_cmp(&(*b - v).abs()))
+    {
+        Some(g) => *g,
+        None => (c / READ).round() * READ,
+    }
+}
 /// The corner between `a` and `b` that a one-axis move then another one
 /// make, the one farther from `c`: outside the round both are on.
 fn outer(c: [f64; 2], a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
     let (p, q) = ([b[0], a[1]], [a[0], b[1]]);
     let d = |p: [f64; 2]| (p[0] - c[0]).hypot(p[1] - c[1]);
     if d(p) >= d(q) { p } else { q }
+}
+/// The corner between `a` and `b` that a one-axis move then another one
+/// make, the one nearer `c`: inside the round both are in (LIO-455).
+fn inner(c: [f64; 2], a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
+    let (p, q) = ([b[0], a[1]], [a[0], b[1]]);
+    let d = |p: [f64; 2]| (p[0] - c[0]).hypot(p[1] - c[1]);
+    if d(p) <= d(q) { p } else { q }
+}
+/// Which side of its round a walk goes (LIO-455): round a part's outside
+/// corner, the tool outside the round; or round the inside of a hollow's
+/// rounded end, the tool inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Outside,
+    Inside,
+}
+impl Side {
+    /// +1 outside, −1 inside: which way from the round the tool's centre is.
+    fn sign(self) -> f64 {
+        match self {
+            Side::Outside => 1.,
+            Side::Inside => -1.,
+        }
+    }
+    /// A reading on the hundredths, on the side of the round it walks.
+    fn round(self, v: f64, c: f64) -> f64 {
+        match self {
+            Side::Outside => outward(v, c),
+            Side::Inside => inward(v, c),
+        }
+    }
+    /// The corner between two readings on its side of the round.
+    fn corner(self, c: [f64; 2], a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
+        match self {
+            Side::Outside => outer(c, a, b),
+            Side::Inside => inner(c, a, b),
+        }
+    }
 }
 fn segment(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
     let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
@@ -254,10 +313,20 @@ fn ray_capsule(a: [f64; 2], n: [f64; 2], p: [f64; 2], q: [f64; 2], rc: f64) -> O
 /// centre walks `path` leaves standing proud of the round there, measured
 /// out along the round's normal to where the tool's sweep starts (the
 /// scallop's height there); and how far the path is from that point less
-/// `rc`, negative where the tool would cut into the round.
-fn left_at(c: [f64; 2], r: f64, rc: f64, q: usize, path: &[[f64; 2]], t: f64) -> (f64, f64) {
-    let n = unit(q, t);
-    let a = [c[0] + r * n[0], c[1] + r * n[1]];
+/// `rc`, negative where the tool would cut into the round. Inside a round
+/// (`Side::Inside`) the material stands in from it, toward its centre.
+fn left_at(
+    side: Side,
+    c: [f64; 2],
+    r: f64,
+    rc: f64,
+    q: usize,
+    path: &[[f64; 2]],
+    t: f64,
+) -> (f64, f64) {
+    let u = unit(q, t);
+    let a = [c[0] + r * u[0], c[1] + r * u[1]];
+    let n = [side.sign() * u[0], side.sign() * u[1]];
     let height = (path.windows(2))
         .filter_map(|w| ray_capsule(a, n, w[0], w[1], rc))
         .fold(f64::INFINITY, f64::min);
@@ -270,7 +339,9 @@ fn left_at(c: [f64; 2], r: f64, rc: f64, q: usize, path: &[[f64; 2]], t: f64) ->
 /// The most material `left_at` finds proud of the round from `from` to `to`
 /// radians round quarter `q`, at `samples` points over it, and the least
 /// gap.
+#[allow(clippy::too_many_arguments)]
 fn left(
+    side: Side,
     c: [f64; 2],
     r: f64,
     rc: f64,
@@ -282,6 +353,7 @@ fn left(
     let (mut most, mut least) = (f64::NEG_INFINITY, f64::INFINITY);
     for k in 0..=samples {
         let (h, g) = left_at(
+            side,
             c,
             r,
             rc,
@@ -299,19 +371,19 @@ fn left(
 /// meet, between two samples: each sample higher than both its neighbours
 /// is followed to its peak between them (the height rises to a peak and
 /// falls past it), to a ten-millionth of a radian.
-fn bound(c: [f64; 2], r: f64, rc: f64, q: usize, path: &[[f64; 2]]) -> (f64, f64) {
+fn bound(side: Side, c: [f64; 2], r: f64, rc: f64, q: usize, path: &[[f64; 2]]) -> (f64, f64) {
     let quarter = std::f64::consts::FRAC_PI_2;
     let samples = (r * quarter / 0.002).ceil().clamp(2000., 50_000.) as usize;
     let at = |k: usize| quarter * k as f64 / samples as f64;
     let heights: Vec<(f64, f64)> = (0..=samples)
-        .map(|k| left_at(c, r, rc, q, path, at(k)))
+        .map(|k| left_at(side, c, r, rc, q, path, at(k)))
         .collect();
     let least = heights.iter().map(|h| h.1).fold(f64::INFINITY, f64::min);
     let mut most = heights
         .iter()
         .map(|h| h.0)
         .fold(f64::NEG_INFINITY, f64::max);
-    let height = |t: f64| left_at(c, r, rc, q, path, t).0;
+    let height = |t: f64| left_at(side, c, r, rc, q, path, t).0;
     for k in 1..samples {
         if heights[k].0 < heights[k - 1].0 || heights[k].0 < heights[k + 1].0 {
             continue;
@@ -339,24 +411,25 @@ pub struct Stair {
     pub scallop: f64,
 }
 /// The point `t` radians round quarter `q` of the round of radius `rho`
-/// about `c`, on the DRO's hundredths, outward.
-fn on(c: [f64; 2], rho: f64, q: usize, t: f64) -> [f64; 2] {
+/// about `c`, on the DRO's hundredths: outward, or inward inside a round.
+fn on(side: Side, c: [f64; 2], rho: f64, q: usize, t: f64) -> [f64; 2] {
     let u = unit(q, t);
     [
-        outward(c[0] + rho * u[0], c[0]),
-        outward(c[1] + rho * u[1], c[1]),
+        side.round(c[0] + rho * u[0], c[0]),
+        side.round(c[1] + rho * u[1], c[1]),
     ]
 }
 /// The angles of the steps round quarter `q` (0 to π/2) that each leave
 /// at most `h` proud of the round of radius `r` (`left` over that step
 /// alone, which is never less than over the whole walk), each as long as
 /// it may be; None when that takes more than `MAX_STEPS`.
-fn angles(c: [f64; 2], r: f64, rc: f64, q: usize, h: f64) -> Option<Vec<f64>> {
-    let rho = r + rc;
+fn angles(side: Side, c: [f64; 2], r: f64, rc: f64, q: usize, h: f64) -> Option<Vec<f64>> {
+    let rho = r + side.sign() * rc;
     let quarter = std::f64::consts::FRAC_PI_2;
     let step = |a: f64, b: f64| {
-        let (p, n) = (on(c, rho, q, a), on(c, rho, q, b));
-        left(c, r, rc, q, &[p, outer(c, p, n), n], (a, b), 24).0
+        let (p, n) = (on(side, c, rho, q, a), on(side, c, rho, q, b));
+        let path = [p, side.corner(c, p, n), n];
+        left(side, c, r, rc, q, &path, (a, b), 24).0
     };
     let mut at = vec![0.];
     let mut t = 0.;
@@ -401,13 +474,47 @@ pub fn stair(
     offset: f64,
     scallop: f64,
 ) -> Result<Stair, String> {
-    let r = r + offset;
-    let rho = r + rc;
+    walk_round(Side::Outside, c, r, rc, q, offset, scallop)
+}
+/// The walk round quarter `q` of the inside of a round of radius `r` about
+/// `c` (a hollow's rounded end, LIO-455), as `stair` walks an outside one:
+/// the tool's centre `offset` inside the round offset in by the tool's
+/// radius `rc`, the corners of its steps toward `c`, every reading on the
+/// hundredths rounded toward `c`, so that no reading cuts past the round;
+/// the scallops it leaves stand in from the round.
+pub fn inside_stair(
+    c: [f64; 2],
+    r: f64,
+    rc: f64,
+    q: usize,
+    offset: f64,
+    scallop: f64,
+) -> Result<Stair, String> {
+    if r - offset - rc < READ {
+        return Err(format!(
+            "A Ø{} tool walks no R{} round {offset} mm in from it: its centre would not move.",
+            2. * rc,
+            r
+        ));
+    }
+    walk_round(Side::Inside, c, r, rc, q, offset, scallop)
+}
+fn walk_round(
+    side: Side,
+    c: [f64; 2],
+    r: f64,
+    rc: f64,
+    q: usize,
+    offset: f64,
+    scallop: f64,
+) -> Result<Stair, String> {
+    let r = r + side.sign() * offset;
+    let rho = r + side.sign() * rc;
     let walk = |angles: &[f64]| {
-        let mut points = vec![on(c, rho, q, angles[0])];
+        let mut points = vec![on(side, c, rho, q, angles[0])];
         for w in angles.windows(2) {
-            let (p, n) = (*points.last().unwrap(), on(c, rho, q, w[1]));
-            for v in [outer(c, p, n), n] {
+            let (p, n) = (*points.last().unwrap(), on(side, c, rho, q, w[1]));
+            for v in [side.corner(c, p, n), n] {
                 if *points.last().unwrap() != v {
                     points.push(v);
                 }
@@ -417,21 +524,25 @@ pub fn stair(
     };
     let too_many = || {
         format!(
-            "A scallop of {scallop} mm takes more than {MAX_STEPS} steps round an R{} corner: allow a larger scallop.",
-            r - offset
+            "A scallop of {scallop} mm takes more than {MAX_STEPS} steps round an R{} {}: allow a larger scallop.",
+            r - side.sign() * offset,
+            match side {
+                Side::Outside => "corner",
+                Side::Inside => "end",
+            }
         )
     };
     // Rounding to the DRO's hundredths may leave a little more than each
     // step was worked out to: then the steps are worked out again to less.
     let mut h = scallop;
     for _ in 0..8 {
-        let first = angles(c, r, rc, q, h).ok_or_else(too_many)?;
+        let first = angles(side, c, r, rc, q, h).ok_or_else(too_many)?;
         let n = first.len();
         // The least that still takes that many steps: the steps even.
         let (mut lo, mut hi, mut best) = (0.25 * h, h, first);
         for _ in 0..20 {
             let mid = (lo + hi) / 2.;
-            match angles(c, r, rc, q, mid) {
+            match angles(side, c, r, rc, q, mid) {
                 Some(a) if a.len() <= n => {
                     hi = mid;
                     best = a;
@@ -440,7 +551,7 @@ pub fn stair(
             }
         }
         let points = walk(&best);
-        let (most, _) = bound(c, r, rc, q, &points);
+        let (most, _) = bound(side, c, r, rc, q, &points);
         if most <= scallop + 1e-9 {
             return Ok(Stair {
                 points,
@@ -1197,6 +1308,7 @@ pub(crate) mod tests {
             // Checked again, finer: nothing over the scallop, nothing cut
             // into the round (the tool's edge never nearer than R).
             let (most, least) = left(
+                Side::Outside,
                 c,
                 5.,
                 5.,
@@ -1233,6 +1345,51 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn an_inside_stair_leaves_at_most_the_scallop_and_never_cuts_past_the_round() {
+        // A slot's R8.25 end walked by a Ø12 (LIO-455), at size and 0.2 in,
+        // about centres on and off the hundredths, every quarter.
+        for c in [[2.5, 0.], [-52.847, 4.103]] {
+            for (offset, h) in [(0., 0.05), (0.2, 0.1)] {
+                for q in 0..4 {
+                    let s = inside_stair(c, 8.25, 6., q, offset, h).unwrap();
+                    assert!(s.scallop <= h + 1e-9, "{q}: {}", s.scallop);
+                    let (most, least) = left(
+                        Side::Inside,
+                        c,
+                        8.25 - offset,
+                        6.,
+                        q,
+                        &s.points,
+                        (0., std::f64::consts::FRAC_PI_2),
+                        20_000,
+                    );
+                    assert!(most <= h + 1e-6, "{q}: {most}");
+                    // Off the hundredths, the readings at the quarter's ends
+                    // are the centre's nearest: past it by at most that.
+                    assert!(least >= -2e-5, "{c:?} {q}: cuts in {least}");
+                    for p in &s.points {
+                        for v in p {
+                            assert!(((v / READ).round() * READ - v).abs() < 1e-6, "{v}");
+                        }
+                        let d = (p[0] - c[0]).hypot(p[1] - c[1]);
+                        assert!(d <= 2.25 - offset + 0.0071, "{p:?} {d}");
+                    }
+                    for w in s.points.windows(2) {
+                        let moved = (0..2).filter(|&k| (w[0][k] - w[1][k]).abs() > 1e-9).count();
+                        assert_eq!(moved, 1, "{w:?}");
+                    }
+                }
+            }
+        }
+        // A tool too big to move inside the round: said.
+        assert!(inside_stair([0., 0.], 6.005, 6., 0, 0., 0.05).is_err());
+        // Rounded toward the centre, never away.
+        assert_eq!(inward(4.5499999, 2.5), 4.55);
+        assert_eq!(inward(4.556, 2.5), 4.55);
+        assert_eq!(inward(-4.556, -2.5), -4.55);
+        assert_eq!(inward(2.5, 2.5), 2.5);
     }
     #[test]
     fn each_axis_moves_one_way_round_the_walk() {
@@ -1272,6 +1429,7 @@ pub(crate) mod tests {
     fn an_offset_walk_keeps_its_offset_off_the_round() {
         let s = stair([0., 0.], 5., 5., 0, 2., 0.2).unwrap();
         let (_, least) = left(
+            Side::Outside,
             [0., 0.],
             7.,
             5.,
@@ -1282,6 +1440,7 @@ pub(crate) mod tests {
         );
         assert!(least >= -1e-9, "{least}");
         let (_, least) = left(
+            Side::Outside,
             [0., 0.],
             5.,
             5.,

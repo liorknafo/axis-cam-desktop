@@ -2354,6 +2354,161 @@ flood = { pin = 8 }
         run_of(a).problems(conn(a), &a.doc)
     }
 
+    /// LIO-457: a project opened while a turned machine is connected, whose
+    /// copies of that machine were saved before the setting (the usual
+    /// orientation), takes the connected machine's: the 3D machine, the jog
+    /// pad, the words and the run checks stay in one frame, and it runs.
+    #[test]
+    fn a_project_opened_while_connected_takes_the_machines_orientation() {
+        use crate::orient::{KEY, Orient};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        let id = conn(&a).machine_id.clone();
+        // An older copy of the project: no orientation anywhere.
+        let older = a.doc.clone();
+        assert!(older.machines.iter().all(|m| !m.p.contains_key(KEY)));
+        // The machine turned round and saved while connected.
+        a.page = Page::Machines;
+        let _ = a.update(Message::EditMachine(id.clone()));
+        a.machine_draft.p.insert(KEY.into(), "Left".into());
+        let _ = a.update(Message::SaveMachine);
+        assert_eq!(conn(&a).orient, Orient::Left);
+        // The older project opened, its part loaded again.
+        let mesh = a.imported_mesh.clone();
+        a.replace_document(older, None);
+        a.imported_mesh = mesh;
+        let of = |m: &Machine| Orient::of(m);
+        assert!(
+            a.doc
+                .machines
+                .iter()
+                .filter(|m| m.id == id)
+                .all(|m| of(m) == Orient::Left)
+        );
+        assert!(
+            a.doc
+                .setups
+                .iter()
+                .filter(|s| s.machine.id == id)
+                .all(|s| of(&s.machine) == Orient::Left)
+        );
+        assert_eq!(conn(&a).orient, Orient::Left);
+        let view = crate::ui::machine_model(&a, conn(&a));
+        assert_eq!(view.figures.orient, Orient::Left);
+        a.page = Page::Control;
+        check_run(&mut a, 0);
+        assert!(
+            !problems(&a).iter().any(|p| p.contains("+X pointing")),
+            "{:?}",
+            problems(&a)
+        );
+    }
+
+    /// LIO-457: a project without the connected machine still draws it as
+    /// it jogs, in every orientation; and a profile draft kept for its
+    /// unsaved changes says A's direction by the orientation saved since.
+    #[test]
+    fn the_control_page_keeps_the_connected_orientation() {
+        use crate::orient::Orient;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        idle(&mut a);
+        let id = conn(&a).machine_id.clone();
+        // A project without this machine opened: the drawing keeps the
+        // connected orientation, whichever it is.
+        let mut other = a.doc.clone();
+        other.machines.retain(|m| m.id != id);
+        other.setups.clear();
+        a.replace_document(other, None);
+        assert!(a.doc.machines.iter().all(|m| m.id != id));
+        for o in [Orient::Right, Orient::Left, Orient::Away, Orient::Toward] {
+            a.control.as_mut().unwrap().orient = o;
+            assert_eq!(crate::ui::machine_model(&a, conn(&a)).figures.orient, o);
+        }
+    }
+
+    /// LIO-457: the Controller configuration of a machine with A, kept open
+    /// with unsaved changes and a warning showing while the machine is
+    /// turned round in the Machine library, says A's direction by the
+    /// machine as it is now when it is shown again, without being opened
+    /// again; the kept changes stay and no kept text names the old side.
+    #[test]
+    fn the_profile_kept_open_says_a_by_the_machine_as_it_is_now() {
+        use crate::orient::KEY;
+        use crate::setup::Edit;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), &crate::control::rotary_profile());
+        a.page = Page::Control;
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        let _ = a.update(Message::ControlSetup(true));
+        // An unsaved change, and the pins ticked before A's direction: the
+        // warning shows.
+        setup_edit(
+            &mut a,
+            Edit::Number("axes.x.max_velocity".into(), "900".into()),
+        );
+        setup_edit(
+            &mut a,
+            Edit::Flag("commissioning.pinout_verified".into(), true),
+        );
+        let shown = |a: &App| {
+            crate::ui::probe::texts(crate::setup::view(a), iced::Size::new(1600., 4000.)).join("\n")
+        };
+        let before = shown(&a);
+        assert!(before.contains("Check A's direction first"), "{before}");
+        assert!(before.contains("toward −Y, the front"), "{before}");
+        // Turned round in the Machine library and saved.
+        let id = conn(&a).machine_id.clone();
+        a.page = Page::Machines;
+        let _ = a.update(Message::EditMachine(id));
+        a.machine_draft.p.insert(KEY.into(), "Left".into());
+        let _ = a.update(Message::SaveMachine);
+        // Back to MACHINE, the configuration still open: not opened again.
+        a.page = Page::Control;
+        assert!(draft(&a).dirty(), "the unsaved change is kept");
+        let after = shown(&a);
+        assert!(after.contains("Check A's direction first"), "{after}");
+        assert!(after.contains("toward −Y, the back"), "{after}");
+        assert!(!after.contains("−Y, the front"), "{after}");
+    }
+
+    /// LIO-457: a setup whose snapshot of the machine points +X otherwise
+    /// than the connected machine would have the program header and the
+    /// Control page name the stock's sides differently: it does not run
+    /// until it is assigned the machine again.
+    #[test]
+    fn a_setup_with_another_orientation_than_the_machine_does_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let said = |a: &App| problems(a).iter().any(|p| p.contains("+X pointing"));
+        assert!(!said(&a), "{:?}", problems(&a));
+        // Turned in the Machine library and on the connection, the setup's
+        // snapshot still the usual one.
+        let id = conn(&a).machine_id.clone();
+        let m = a.doc.machines.iter_mut().find(|m| m.id == id).unwrap();
+        m.p.insert(crate::orient::KEY.into(), "Left".into());
+        a.control.as_mut().unwrap().orient = crate::orient::Orient::Left;
+        check_run(&mut a, 0);
+        let p = problems(&a);
+        assert!(
+            p.iter()
+                .any(|p| p.contains("+X pointing right but the Machine library has left")),
+            "{p:?}"
+        );
+        // Assigned again: it runs.
+        let m = a.doc.machines.iter().find(|m| m.id == id).unwrap().clone();
+        a.doc.setups[0].machine = m;
+        check_run(&mut a, 0);
+        assert!(!said(&a), "{:?}", problems(&a));
+    }
+
     /// Ticks until the run satisfies `ok`; fails after `secs`.
     fn run_until(a: &mut App, secs: f64, what: &str, ok: impl Fn(&crate::run::Run) -> bool) {
         let mut deadline = Deadline::new(secs);
@@ -2944,6 +3099,112 @@ flood = { pin = 8 }
             s.referenced[..3].iter().all(|r| *r),
             "an E-stop cleared the references"
         );
+    }
+
+    /// A relay to `target` passing this computer's frames on, one part of a
+    /// message in parts every `pace` (a slow link), and noting the snapshot
+    /// number each part carries. It stops taking computers once the numbers
+    /// are dropped; a link already open ends when either side closes it.
+    fn pacing_relay(
+        target: std::net::SocketAddr,
+        pace: std::time::Duration,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    ) {
+        use std::io::{ErrorKind, Write};
+        use std::net::{Shutdown, TcpListener, TcpStream};
+        use std::sync::{Arc, Mutex};
+        use uc100_remote::wire::{self, MAX_FRAME, ToServer};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stamps = Arc::new(Mutex::new(Vec::new()));
+        let noted = Arc::downgrade(&stamps);
+        std::thread::spawn(move || {
+            while noted.strong_count() > 0 {
+                let client = match listener.accept() {
+                    Ok((client, _)) => client,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                client.set_nonblocking(false).unwrap();
+                let server = TcpStream::connect(target).unwrap();
+                let (mut up_from, mut up_to) =
+                    (client.try_clone().unwrap(), server.try_clone().unwrap());
+                let noted = noted.clone();
+                std::thread::spawn(move || {
+                    while let Ok(f) = wire::read_frame(&mut up_from, MAX_FRAME) {
+                        if let Ok(ToServer::Part { heard, .. }) = wire::decode::<ToServer>(&f) {
+                            if let Some(stamps) = noted.upgrade() {
+                                stamps.lock().unwrap().push(heard);
+                            }
+                            std::thread::sleep(pace);
+                        }
+                        let len = (f.len() as u32).to_le_bytes();
+                        if up_to
+                            .write_all(&len)
+                            .and_then(|_| up_to.write_all(&f))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    let _ = up_to.shutdown(Shutdown::Write);
+                });
+                std::thread::spawn(move || {
+                    let (mut down_from, mut down_to) = (server, client);
+                    let _ = std::io::copy(&mut down_from, &mut down_to);
+                    let _ = down_to.shutdown(Shutdown::Write);
+                });
+            }
+        });
+        (addr, stamps)
+    }
+
+    /// LIO-498: a still machine's Pi sends a snapshot only every 500 ms, and
+    /// each part of a long tool run must reach it within 2 s of the
+    /// snapshot it carries. So the parts after the first wait for a newer
+    /// snapshot than the one the first carried, rather than all those that
+    /// fill the link at the start carrying an old heartbeat; on a slow link
+    /// the tool run arrives whole and runs.
+    #[test]
+    fn a_long_tool_run_sent_to_a_still_pis_machine_carries_fresh_snapshots() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), FAST, &[0]);
+        // Narrow facing passes: a tool run of many parts.
+        let op = &mut a.doc.setups[0].operations[0];
+        op.p.insert("stepover".into(), "1".into());
+        op.p.insert("stepdown".into(), "1".into());
+        let server = to_pi(&mut a, dir.path());
+        let (relay, stamps) = pacing_relay(server.addr(), std::time::Duration::from_millis(30));
+        let _ = a.update(Message::PiAddress(relay.to_string()));
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // Still for a while: the Pi sends only heartbeats.
+        tick_for(&mut a, 800);
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 20.0, "the tool run running on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        let notes = &conn(&a).link.as_ref().unwrap().notes;
+        assert!(!notes.iter().any(|n| n.contains("late")), "{notes:?}");
+        let stamps = stamps.lock().unwrap().clone();
+        assert!(stamps.len() >= 5, "{} parts", stamps.len());
+        assert!(
+            stamps[1] > stamps[0],
+            "the second part waited for a newer snapshot: {stamps:?}"
+        );
+        assert!(stamps.windows(2).all(|w| w[0] <= w[1]), "{stamps:?}");
+        let _ = a.update(Message::Run(R::Stop));
+        tick_until(&mut a, 5.0, "the stop", |s| s.state == Some(State::Idle));
     }
 
     /// A tool run cuts on the Pi that this computer has no record of (sent
@@ -4272,6 +4533,33 @@ flood = { pin = 8 }
         other.shutdown();
     }
 
+    /// The Pi's simulator gets the simulated stock once this computer is in
+    /// control, not before the link is up (LIO-465): a probe down from
+    /// Z -30 touches its top, and no note says it was not sent.
+    #[test]
+    fn the_pis_simulator_gets_the_stock_once_in_control() {
+        use crate::control::Action;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), &probe_profile());
+        plate(&mut a, "1000");
+        a.page = Page::Control;
+        let _server = to_pi(&mut a, dir.path());
+        idle(&mut a);
+        let _ = a.update(Message::Machine(Action::MachineZero(None)));
+        tick_until(&mut a, 3.0, "machine zero", |s| {
+            s.referenced[..3].iter().all(|r| *r)
+        });
+        mdi(&mut a, "G0 X195 Y140 Z-30");
+        let _ = a.update(Message::Machine(Action::ProbeZ));
+        let (ok, message) = probed(&mut a);
+        assert!(ok, "{message}");
+        let notes = &conn(&a).link.as_ref().unwrap().notes;
+        assert!(
+            !notes.iter().any(|n| n.contains("Simulated stock")),
+            "{notes:?}"
+        );
+    }
+
     /// The profile `pi_app` wrote, as the other computer sends it.
     fn conn_profile(dir: &std::path::Path) -> uc100::config::MachineConfig {
         uc100::config::MachineConfig::load(&dir.join("uc100.toml")).unwrap()
@@ -4898,6 +5186,92 @@ flood = { pin = 8 }
                 _ => None,
             })
             .collect()
+    }
+
+    /// On the shop tablet (1280 × 800, LIO-460) every button and field of
+    /// the MACHINE page is a finger tall and wide, in every tab: from a
+    /// place a press does something, up and down and to the sides, as far
+    /// as the same press does the same.
+    #[test]
+    fn on_the_tablet_every_machine_button_is_a_finger_tall() {
+        use crate::ui::{ControlTab, FINGER, probe};
+        crate::ui::TOUCH.with(|t| t.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let window = iced::Size::new(1280., 800.);
+        let _ = a.update(Message::Resized(window));
+        // The extent of what a press at `at` does, along one line through it.
+        let reach = |a: &App, at: iced::Point, said: &str, across: bool| -> f32 {
+            let line = if across {
+                iced::Rectangle::new(
+                    iced::Point::new(at.x - 80., at.y),
+                    iced::Size::new(160., 1.),
+                )
+            } else {
+                iced::Rectangle::new(
+                    iced::Point::new(at.x, at.y - 80.),
+                    iced::Size::new(1., 160.),
+                )
+            };
+            let same: Vec<f32> = (probe::presses(a.view(), window, line, 1.).into_iter())
+                .filter(|(_, m)| format!("{m:?}") == said)
+                .map(|(p, _)| if across { p.x } else { p.y })
+                .collect();
+            let mid = if across { at.x } else { at.y };
+            let (mut lo, mut hi) = (mid, mid);
+            while same.contains(&(lo - 1.)) {
+                lo -= 1.;
+            }
+            while same.contains(&(hi + 1.)) {
+                hi += 1.;
+            }
+            hi - lo + 1.
+        };
+        let mut small = vec![];
+        for tab in [
+            ControlTab::Job,
+            ControlTab::Machine,
+            ControlTab::WorkZero,
+            ControlTab::Probe,
+            ControlTab::Mdi,
+        ] {
+            let _ = a.update(Message::ControlTab(tab));
+            let mut seen: Vec<String> = vec![];
+            let page = iced::Rectangle::with_size(window);
+            for (at, m) in probe::presses(a.view(), window, page, 6.) {
+                let said = format!("{m:?}");
+                // Leaving a jog button stops the jog wherever the pointer is;
+                // a slider says another value at each point of it.
+                if seen.contains(&said)
+                    || ["JogRelease", "JogSpeed", "FeedOverride"]
+                        .iter()
+                        .any(|w| said.contains(w))
+                {
+                    continue;
+                }
+                seen.push(said.clone());
+                let (high, wide) = (reach(&a, at, &said, false), reach(&a, at, &said, true));
+                if high < FINGER - 1. || wide < FINGER - 1. {
+                    small.push(format!("{tab:?} {said}: {wide} × {high}"));
+                }
+            }
+            for f in probe::fields(a.view(), window) {
+                if f.height < FINGER - 1. {
+                    small.push(format!("{tab:?} field at {f:?}"));
+                }
+            }
+        }
+        assert!(
+            small.is_empty(),
+            "smaller than a finger:
+{}",
+            small.join(
+                "
+"
+            )
+        );
     }
 
     /// A step's hover card leaves the steps after it to be clicked: with
@@ -6662,6 +7036,19 @@ flood = { pin = 8 }
         a.doc.setups[0].p.insert("stock_bottom".into(), "0".into());
         crate::steps::tests::build(&mut a);
         assert!(under(&texts(&mut a)));
+        // The setup's notes say where the supports go: the warning points
+        // back to them on the Hold page (LIO-487).
+        let notes = |t: &Vec<String>| {
+            t.iter().any(|t| {
+                t.ends_with(
+                    "nothing under the hole; the setup notes on the Hold page say where the supports go",
+                )
+            })
+        };
+        assert!(!notes(&texts(&mut a)));
+        (a.doc.setups[0].p).insert("notes".into(), "On two parallels at X-18 and X+18.".into());
+        crate::steps::tests::build(&mut a);
+        assert!(notes(&texts(&mut a)));
     }
     /// The guide's step of the operation named `name`, of kind `holes`
     /// (its Holes) or the step before it.
@@ -11022,6 +11409,7 @@ flood = { pin = 8 }
             travel: [600., 400., 100.],
             nose_to_table: 220.,
             gantry: [180., 700.],
+            orient: crate::orient::Orient::Right,
         };
         for (figures, rotary, name) in [
             (Figures::JINGYAN, None, "plain.png"),
@@ -11046,6 +11434,90 @@ flood = { pin = 8 }
                 .into();
             render_element(element, iced::Size::new(900., 640.), &out.join(name));
         }
+    }
+    /// LIO-457: the Jingyan with its tool tip at the same place on the
+    /// table, as the usual machine and turned round (+X left, +Y toward
+    /// you): the two pictures are the same. Then the Control page of a
+    /// turned machine: its Machine tab (the 3D machine, the jog pad) and its
+    /// Probe tab (the corners).
+    #[test]
+    #[ignore]
+    fn render_a_turned_machine_lio_457() {
+        use crate::machine_view::Figures;
+        use crate::orient::Orient;
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/lio-457-renders".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let [x, y, z] = Figures::JINGYAN.travel;
+        for (orient, pos, zero, block, name) in [
+            (
+                Orient::Right,
+                [80., 60., -10.],
+                [100., 80., -30.],
+                [[100., 80., -50.], [220., 170., -30.]],
+                "1-usual.png",
+            ),
+            (
+                Orient::Left,
+                [x - 80., y - 60., -10.],
+                [x - 100., y - 80., -30.],
+                [[x - 220., y - 170., -50.], [x - 100., y - 80., -30.]],
+                "2-turned.png",
+            ),
+        ] {
+            let view = crate::machine_view::MachineView {
+                figures: Figures {
+                    orient,
+                    ..Figures::JINGYAN
+                },
+                pos,
+                known: true,
+                envelope: [[0., 0., -z], [x, y, 0.]],
+                assumed: false,
+                block: Some(block),
+                zero,
+                rotary: None,
+                a: 0.,
+            };
+            let element: iced::Element<'_, Message> = iced::widget::canvas(view)
+                .width(iced::Fill)
+                .height(iced::Fill)
+                .into();
+            render_element(element, iced::Size::new(900., 640.), &out.join(name));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        idle(&mut a);
+        let id = a.control.as_ref().unwrap().machine_id.clone();
+        let m = a.doc.machines.iter_mut().find(|m| m.id == id).unwrap();
+        m.p.insert(crate::orient::KEY.into(), "Left".into());
+        a.control.as_mut().unwrap().orient = Orient::Left;
+        a.page = Page::Control;
+        let size = iced::Size::new(1600., 1000.);
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Machine));
+        render_png(&a, size, &out.join("3-machine-tab.png"));
+        // The setting in the Machine library.
+        a.page = Page::Machines;
+        let _ = a.update(Message::EditMachine(id));
+        let _ = a.update(Message::WizardStep(1));
+        render_png(&a, size, &out.join("5-setting.png"));
+        // A setup with a probe, its work zero at the stock's -X -Y corner:
+        // the Probe tab's grids, back at the top.
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = edges_app(dir.path(), Some("Stock top front-left"));
+        let m = a.doc.machines.last_mut().unwrap();
+        m.p.insert(crate::orient::KEY.into(), "Left".into());
+        let m = m.clone();
+        for s in &mut a.doc.setups {
+            s.machine = m.clone();
+        }
+        a.control.as_mut().unwrap().orient = Orient::Left;
+        a.page = Page::Control;
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Probe));
+        render_png(&a, size, &out.join("4-probe-tab.png"));
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        render_png(&a, size, &out.join("6-work-zero-tab.png"));
     }
     #[test]
     #[ignore]
@@ -13601,6 +14073,16 @@ soft_max = 180.0
         let _ = a.update(Message::JogKeyUp);
         assert_eq!((held(&a), a.jog_key), (None, None));
         tick_until(&mut a, 3.0, "Idle", |s| s.state == Some(State::Idle));
+        // On a machine turned round (+X left, +Y toward you, LIO-457), →
+        // still moves the tool right, which is X−, and ↑ away, Y−.
+        a.control.as_mut().unwrap().orient = crate::orient::Orient::Left;
+        for (key, sent) in [((0, false), (0, true)), ((1, false), (1, true))] {
+            let _ = a.update(Message::JogKey(key.0, key.1, false));
+            let _ = a.update(Message::JogKeyChecked(key.0, key.1, false));
+            assert_eq!(held(&a), Some(sent), "{key:?}");
+            let _ = a.update(Message::JogKeyUp);
+            tick_until(&mut a, 3.0, "Idle", |s| s.state == Some(State::Idle));
+        }
     }
 
     /// The Controller configuration view hides the jog controls and the run
@@ -13821,6 +14303,22 @@ soft_max = 180.0
     /// The texts of the app's view, in tree order.
     fn page_texts(a: &App) -> Vec<String> {
         crate::ui::probe::texts(a.view(), WINDOW)
+    }
+
+    /// Pair a tablet says when Windows Firewall keeps tablets out, with the
+    /// fix beside it, and says nothing when it doesn't (LIO-485).
+    #[test]
+    fn the_export_page_says_when_the_firewall_keeps_the_tablet_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        let _ = a.update(Message::Page(Page::Post));
+        let fix = "Let the tablet through the firewall";
+        assert!(!page_texts(&a).iter().any(|t| t == fix));
+        let why = "Windows Firewall blocks this app (axis-cam.exe)";
+        let _ = a.update(Message::Firewall(Some(why.into())));
+        let texts = page_texts(&a);
+        assert!(texts.iter().any(|t| t == fix), "{texts:?}");
+        assert!(texts.iter().any(|t| t.contains(why)), "{texts:?}");
     }
 
     /// What a view offers to widget operations: the form fields' tags and
@@ -21164,6 +21662,28 @@ soft_max = 180.0
         let mesh = a.imported_mesh.as_ref().unwrap();
         assert!(mesh.surfaces[ids[0]].normal[2] > 0.999);
         assert_eq!(a.status, "Saved model geometry restored.");
+    }
+    /// What opening a project noted is still said once its part has loaded
+    /// (LIO-464: the tablet's own profile kept as `.old`).
+    #[test]
+    fn a_projects_opening_notes_outlast_its_part_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, file) = block_app(dir.path());
+        let doc = a.doc.clone();
+        let note = "This tablet's x.toml differed from the file's; it is kept as x.toml.old.";
+        let path = dir.path().join("job.axis.json");
+        let opened = Ok((doc, path, vec![note.to_string()]));
+        let _ = a.update(Message::ProjectOpened(Some(opened)));
+        let mesh = crate::mesh::load(&file.path).unwrap();
+        let _ = a.update(Message::ModelRestored(file.clone(), Ok(mesh)));
+        // First: the tablet has no hover card for the rest of the line.
+        assert!(a.status.starts_with(note), "{}", a.status);
+        assert!(
+            a.status.ends_with("Saved model geometry restored."),
+            "{}",
+            a.status
+        );
+        assert!(a.opened_notes.is_empty());
     }
     #[test]
     fn a_click_on_a_wall_picks_or_drops_its_whole_hole_in_a_pocket() {

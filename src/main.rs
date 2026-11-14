@@ -38,6 +38,7 @@ mod model;
 mod ngc;
 mod oauth;
 mod openai;
+mod orient;
 mod picks;
 mod plan_changes;
 mod plan_check;
@@ -66,6 +67,7 @@ mod stock;
 mod stock_surface;
 mod storage;
 mod surface;
+mod tablet;
 mod thread;
 mod threading;
 mod three_mf;
@@ -503,6 +505,28 @@ pub enum Message {
     SaveForTablet,
     /// That file written, or why not; None when the dialog was cancelled.
     TabletSaved(Option<Result<PathBuf, String>>),
+    /// Shows a code to pair a shop tablet with this computer (`tablet`).
+    PairTablet,
+    /// What Windows Firewall does to tablets reaching this app (`tablet::firewall_problem`).
+    Firewall(Option<String>),
+    /// Asks Windows to let tablets through its firewall (`tablet::open_firewall`).
+    OpenFirewall,
+    /// The shop tablet's list of projects from the computer, shown or not.
+    ShowProjects(bool),
+    /// The computer's address typed on the tablet; empty finds it.
+    ComputerAddress(String),
+    /// The code the computer shows, typed on the tablet.
+    ComputerCode(String),
+    PairComputer,
+    /// The computer answered the pairing: its name, or why not.
+    ComputerPaired(Result<String, String>),
+    ForgetComputer,
+    /// Fetches the projects the computer shares that are new or changed.
+    SyncProjects,
+    /// How many came, or why none could.
+    ProjectsSynced(Result<usize, String>),
+    /// Opens the tablet's copy of a project (its key).
+    OpenKept(String),
     OpenProject,
     OpenHistory,
     Import,
@@ -1421,6 +1445,10 @@ pub struct App {
     pub save_busy: bool,
     pub last_archived: Option<PathBuf>,
     pub import_error: Option<String>,
+    /// What opening the project noted, said again, first, once its part has
+    /// loaded (`take_model`), whose status would otherwise replace it
+    /// (LIO-464).
+    pub opened_notes: Vec<String>,
     /// Whether the Import from path field shows under the application bar.
     pub import_path_open: bool,
     /// The path typed or pasted into it.
@@ -1527,6 +1555,21 @@ pub struct App {
     /// Pi is being asked.
     pub pi_code: String,
     pub pi_pairing: bool,
+    /// The code that pairs a shop tablet, and when it was made.
+    pub tablet_code: Option<(String, Instant)>,
+    /// Why Windows Firewall keeps tablets out, shown by Pair a tablet (LIO-485).
+    pub tablet_firewall: Option<String>,
+    /// The shop tablet's list of projects from the computer shows.
+    pub shop_projects: bool,
+    /// On the tablet: the address and code typed to pair with the computer,
+    /// the pairing kept, the projects kept, whether the computer is being
+    /// asked, and what the last sync said.
+    pub computer_address: String,
+    pub computer_code: String,
+    pub computer: Option<tablet::Link>,
+    pub kept: Vec<tablet::Shared>,
+    pub computer_busy: bool,
+    pub sync_note: String,
     /// A tool run left running on the Pi when this computer disconnected,
     /// followed again on connecting back.
     pub pi_run: Option<control::PiRun>,
@@ -1803,6 +1846,15 @@ fn while_locked(m: &Message) -> bool {
             | Saved(_)
             | SaveForTablet
             | TabletSaved(_)
+            | ShowProjects(_)
+            | ComputerAddress(_)
+            | ComputerCode(_)
+            | PairComputer
+            | ComputerPaired(_)
+            | ForgetComputer
+            | SyncProjects
+            | ProjectsSynced(_)
+            | OpenKept(_)
             | FileImported(_)
             | ProjectOpened(_)
             | ModelRestored(..)
@@ -2072,6 +2124,15 @@ impl App {
             switch_machine: None,
             pi_code: String::new(),
             pi_pairing: false,
+            tablet_code: None,
+            tablet_firewall: None,
+            shop_projects: false,
+            computer_address: String::new(),
+            computer_code: String::new(),
+            computer: None,
+            kept: vec![],
+            computer_busy: false,
+            sync_note: String::new(),
             pi_run: None,
             cnc_over_guide: None,
             run_on_connect: None,
@@ -2174,6 +2235,7 @@ impl App {
             save_busy: false,
             last_archived: None,
             import_error: None,
+            opened_notes: vec![],
             import_path_open: false,
             import_path: String::new(),
             import_path_error: None,
@@ -2266,11 +2328,25 @@ impl App {
         // The shop tablet has no start page: it continues the project, its
         // part loaded as Continue project would, straight on MACHINE.
         if SHOP {
+            let dir = app.state_path.parent().unwrap();
+            app.computer = tablet::link(dir);
+            app.kept = tablet::kept(dir);
             let model = app.restore_model();
             return (
                 app,
-                Task::batch([model, Task::done(Message::Page(Page::Control))]),
+                Task::batch([
+                    model,
+                    Task::done(Message::Page(Page::Control)),
+                    Task::done(Message::SyncProjects),
+                ]),
             );
+        }
+        // Shop tablets get this computer's projects over Wi-Fi while the
+        // app is open (LIO-459); not from a test's or smoke run's workspace.
+        if app.smoke_dir.is_none() && app.state_path == storage::state_path() {
+            let path = app.state_path.clone();
+            std::thread::spawn(move || tablet::serve(path, computer_name()));
+            return (app, firewall(tablet::firewall_problem));
         }
         (app, Task::none())
     }
@@ -2307,6 +2383,13 @@ impl App {
             self.dirty = true;
             self.persist();
             self.settings.project_file = self.project_path.clone();
+            // The shop tablet gets these too (`tablet`).
+            if let Some(p) = &self.project_path {
+                let recent = &mut self.settings.recent_projects;
+                recent.retain(|r| r != p);
+                recent.insert(0, p.clone());
+                recent.truncate(tablet::RECENT + 1);
+            }
             self.save_settings();
         }
     }
@@ -2318,8 +2401,30 @@ impl App {
         let Some(c) = &self.control else {
             return false;
         };
-        let (id, cfg) = (c.machine_id.clone(), c.config.clone());
-        self.travel_from(&id, &cfg)
+        let (id, cfg, o) = (c.machine_id.clone(), c.config.clone(), c.orient);
+        self.travel_from(&id, &cfg) | self.orient_from(&id, o)
+    }
+    /// Machine `id`'s orientation in the library, each setup's copy and the
+    /// machine editor made the connected machine's `o` (LIO-457): a project
+    /// opened, or an edit put back, while it is connected keeps the 3D
+    /// machine, the jog pad, the words and the checks in one frame, as its
+    /// travel is kept at the profile's. Whether any changed.
+    fn orient_from(&mut self, id: &str, o: orient::Orient) -> bool {
+        let setups = self.doc.setups.iter_mut().map(|s| &mut s.machine);
+        let mut changed = false;
+        for m in self
+            .doc
+            .machines
+            .iter_mut()
+            .chain(setups)
+            .chain(std::iter::once(&mut self.machine_draft))
+        {
+            if m.id == id && !manual::is_hand(m) && orient::Orient::of(m) != o {
+                m.p.insert(orient::KEY.into(), o.label().into());
+                changed = true;
+            }
+        }
+        changed
     }
     /// Machine `id`'s X, Y and Z travel, in the library, each setup's copy
     /// and the machine editor, made profile `cfg`'s soft limit spans
@@ -2598,7 +2703,12 @@ impl App {
         if changed {
             self.touch();
         }
-        self.status = with_notes(&done, &notes);
+        // What opening noted first: the line's only part a tablet shows.
+        let opened = std::mem::take(&mut self.opened_notes);
+        self.status = (opened.into_iter())
+            .chain([with_notes(&done, &notes)])
+            .collect::<Vec<_>>()
+            .join(" ");
     }
     pub fn operation(&self) -> Option<&Operation> {
         self.doc
@@ -8110,6 +8220,7 @@ impl App {
             }
             Message::ControlSetup(on) => {
                 self.machine_setup = on;
+                self.shop_projects = false;
                 if on {
                     // The jog pad goes off screen: a jog held by key stops.
                     if self.jog_key.take().is_some()
@@ -8241,6 +8352,8 @@ impl App {
                     && self.jog_pad_shown()
                     && let Some(c) = &mut self.control
                 {
+                    // The key points where the tool goes (`jog_key`).
+                    let (axis, negative) = c.orient.jog_like_usual(axis, negative);
                     c.act(control::Action::JogPress(axis, negative));
                 }
             }
@@ -8494,6 +8607,7 @@ impl App {
                             c.probe = control::probe_settings(&m.p);
                             c.pins = control::pins_settings(&m.p);
                             c.rotary = control::Rotary::of(&m);
+                            c.orient = orient::Orient::of(&m);
                             // Its travel is the connected profile's (LIO-344).
                             synced = control::travel_into(&mut m, &c.machine_id, &c.config);
                         }
@@ -8823,6 +8937,100 @@ impl App {
                     None => {}
                 }
             }
+            Message::PairTablet => match tablet::new_code(&self.state_path) {
+                Ok(code) => {
+                    self.tablet_code = Some((code, Instant::now()));
+                    // Answered "Allow access?" since the app started, or not.
+                    return firewall(tablet::firewall_problem);
+                }
+                Err(e) => self.status = format!("Could not make a pairing code: {e}"),
+            },
+            Message::Firewall(why) => self.tablet_firewall = why,
+            Message::OpenFirewall => return firewall(tablet::open_firewall),
+            Message::ShowProjects(show) => self.shop_projects = show,
+            Message::ComputerAddress(a) => self.computer_address = a,
+            Message::ComputerCode(code) => {
+                self.computer_code = code.chars().filter(char::is_ascii_digit).take(6).collect();
+            }
+            Message::PairComputer => {
+                if self.computer_busy || self.computer_code.len() != 6 {
+                    return Task::none();
+                }
+                self.computer_busy = true;
+                self.sync_note = "Pairing…".into();
+                let dir = self.state_path.parent().unwrap().to_path_buf();
+                let (address, code) = (
+                    self.computer_address.clone(),
+                    std::mem::take(&mut self.computer_code),
+                );
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            tablet::pair(&dir, &address, &code, "Shop tablet").map(|l| l.computer)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()))
+                    },
+                    Message::ComputerPaired,
+                );
+            }
+            Message::ComputerPaired(answer) => {
+                self.computer_busy = false;
+                match answer {
+                    Ok(computer) => {
+                        self.computer = tablet::link(self.state_path.parent().unwrap());
+                        self.sync_note = format!("Paired with {computer}.");
+                        return self.update(Message::SyncProjects);
+                    }
+                    Err(why) => self.sync_note = format!("Not paired. {why}"),
+                }
+            }
+            Message::ForgetComputer => match tablet::forget(self.state_path.parent().unwrap()) {
+                Ok(()) => {
+                    self.computer = None;
+                    self.sync_note = "Forgotten. The projects it sent stay on this tablet.".into();
+                }
+                Err(e) => self.sync_note = format!("Could not forget the computer: {e}"),
+            },
+            Message::SyncProjects => {
+                if !SHOP || self.computer_busy || self.computer.is_none() {
+                    return Task::none();
+                }
+                self.computer_busy = true;
+                let dir = self.state_path.parent().unwrap().to_path_buf();
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || tablet::sync(&dir))
+                            .await
+                            .unwrap_or_else(|e| Err(e.to_string()))
+                    },
+                    Message::ProjectsSynced,
+                );
+            }
+            Message::ProjectsSynced(answer) => {
+                self.computer_busy = false;
+                let dir = self.state_path.parent().unwrap();
+                self.computer = tablet::link(dir);
+                self.kept = tablet::kept(dir);
+                let computer = (self.computer.as_ref()).map_or("The computer", |l| &l.computer);
+                self.sync_note = match answer {
+                    Ok(_) => format!("Up to date with {computer}."),
+                    // The copies kept here still open.
+                    Err(why) => format!("{computer} is not reachable now. {why}"),
+                };
+            }
+            Message::OpenKept(key) => {
+                let dir = self.state_path.parent().unwrap();
+                // The copy opens as a tablet file opened with AXIS Shop does,
+                // once the machine is not running (`Message::Tick`).
+                let opened = std::fs::read(tablet::kept_file(dir, &key))
+                    .map_err(|e| e.to_string())
+                    .and_then(|b| storage::write_atomic(&dir.join(bundle::INBOX), &b));
+                match opened {
+                    Ok(()) => self.shop_projects = false,
+                    Err(e) => self.sync_note = format!("Could not open it: {e}"),
+                }
+            }
             Message::OpenProject | Message::OpenHistory => {
                 if self.import_busy || self.save_busy {
                     return Task::none();
@@ -9001,7 +9209,10 @@ impl App {
                 match result {
                     Ok(mesh) => self.take_model(mesh, false),
                     Err(e) => {
-                        self.status = format!("Model could not be restored: {e}");
+                        self.status = with_notes(
+                            &format!("Model could not be restored: {e}"),
+                            &std::mem::take(&mut self.opened_notes),
+                        );
                         self.import_error = Some(e);
                     }
                 }
@@ -9068,6 +9279,9 @@ impl App {
                     "Project opened. Your previous project is in Project history.",
                     &notes,
                 );
+                if self.doc.file.is_some() {
+                    self.opened_notes = notes;
+                }
                 if SHOP {
                     return Task::batch([
                         self.restore_model(),
@@ -10313,6 +10527,11 @@ impl App {
         if self.smoke_dir.is_some() {
             subscriptions.push(smoke::frames());
         }
+        // The shop tablet keeps up with the computer's projects.
+        if SHOP && self.computer.is_some() {
+            subscriptions
+                .push(iced::time::every(Duration::from_secs(30)).map(|_| Message::SyncProjects));
+        }
         // The handwheel's beat on a pass, only while its page shows.
         if self.steps_page()
             && let Some((shown, at)) = self.guide_at()
@@ -10433,9 +10652,11 @@ pub(crate) fn tab_move(typing: bool, back: bool, jogging: bool) -> TabMove {
         (false, _, false) => TabMove::First,
     }
 }
-/// The axis and direction a jog key moves: the arrows jog X and Y (up is
-/// +Y, away from the operator), Page Up and Page Down jog Z, Home and End
-/// jog A (on a machine without A they move nothing).
+/// The axis and direction a jog key moves on the usual machine: the arrows
+/// move the tool the way they point, seen from the front (up is away from
+/// the operator: X+ and Y+ there), Page Up and Page Down jog Z, Home and
+/// End jog A (on a machine without A they move nothing). A machine whose
+/// X and Y point otherwise turns them (`Orient::jog_like_usual`).
 fn jog_key(key: iced::keyboard::key::Named) -> Option<(usize, bool)> {
     use iced::keyboard::key::Named;
     match key {
@@ -11068,6 +11289,14 @@ const NO_LINK: &str = "No link to the Pi of ";
 
 /// How this computer names itself to a Pi it pairs with: the Mac's name
 /// ("Lior's MacBook Pro"), else its host name.
+/// Runs a firewall check or fix off the UI thread (it takes about a second).
+fn firewall(f: fn() -> Option<String>) -> Task<Message> {
+    Task::perform(
+        async move { tokio::task::spawn_blocking(f).await.ok().flatten() },
+        Message::Firewall,
+    )
+}
+
 fn computer_name() -> String {
     let run = |cmd: &str, args: &[&str]| {
         std::process::Command::new(cmd)

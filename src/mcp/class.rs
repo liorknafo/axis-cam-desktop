@@ -18,6 +18,9 @@ pub enum Class {
     Internal,
     /// The AI planner's, until it is removed (M4).
     Planner,
+    /// Pairs a device with this computer, changes its firewall, or is the
+    /// shop tablet's own (the tablet build has no MCP server): refused.
+    Device,
 }
 
 /// Why a `Machine` message is refused: the machine boundary.
@@ -28,6 +31,9 @@ pub const SHOP_FLOOR: &str = "This records the machinist's progress at the machi
 /// Why a planner message is refused.
 pub const PLANNER: &str =
     "The AI planner is not driven through MCP: plan with the commands, as the user does.";
+/// Why pairing a device, the firewall and the shop tablet's own actions
+/// are refused (LIO-470).
+pub const DEVICE: &str = "This pairs a device with this computer, changes its firewall, or is the shop tablet's own, so it is done by the user.";
 /// Why an internal message is refused.
 pub const INTERNAL: &str = "This is the app's own event, not something a user does.";
 
@@ -38,6 +44,7 @@ pub fn refusal(m: &Message) -> Option<&'static str> {
         Class::Machine if shop_floor(m) => Some(SHOP_FLOOR),
         Class::Machine => Some(MACHINE),
         Class::Planner => Some(PLANNER),
+        Class::Device => Some(DEVICE),
         Class::Internal => Some(INTERNAL),
     }
 }
@@ -69,7 +76,7 @@ pub fn machine_key(key: &str) -> bool {
 
 /// The class of `m`.
 pub fn class(m: &Message) -> Class {
-    use Class::{Command as C, Internal, Machine, Planner};
+    use Class::{Command as C, Device, Internal, Machine, Planner};
     match m {
         Message::NewProject => C("new_project"),
         Message::ResumeProject => C("resume_project"),
@@ -216,6 +223,19 @@ pub fn class(m: &Message) -> Class {
         // The file commands do the dialog's work and send its answer.
         Message::SaveProject | Message::SaveProjectAs | Message::Saved(_) => C("save_project"),
         Message::SaveForTablet | Message::TabletSaved(_) => C("save_for_tablet"),
+        // Pairing a shop tablet and opening Windows Firewall to it are the
+        // user's trust in a device (LIO-485, LIO-459); the rest is the
+        // tablet's own build, which serves no MCP.
+        Message::PairTablet
+        | Message::OpenFirewall
+        | Message::ShowProjects(_)
+        | Message::ComputerAddress(_)
+        | Message::ComputerCode(_)
+        | Message::PairComputer
+        | Message::ForgetComputer
+        | Message::SyncProjects
+        | Message::OpenKept(_) => Device,
+        Message::Firewall(_) | Message::ComputerPaired(_) | Message::ProjectsSynced(_) => Internal,
         Message::OpenProject | Message::OpenHistory | Message::ProjectOpened(_) => {
             C("open_project")
         }

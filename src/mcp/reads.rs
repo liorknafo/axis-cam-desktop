@@ -1275,6 +1275,17 @@ fn step_detail(doc: &Document, si: usize, step: &guide::Step) -> Value {
                 vec![],
                 vec![],
             ),
+            S::Leave { op, at, number, .. } => (
+                "Leave",
+                Some(*op),
+                format!(
+                    "Leave the DRO's hole function after hole {number}: X and Y read work coordinates again, at X {} Y {}.",
+                    plan_check::plain(at[0]),
+                    plan_check::plain(at[1])
+                ),
+                vec![],
+                vec![],
+            ),
             S::Comp { op, comp, diameter } => (
                 "Comp",
                 Some(*op),

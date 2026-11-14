@@ -10,14 +10,14 @@ A working native desktop **CAM workflow prototype**, built with Rust and Iced 0.
 
 The app bundle is built from this source with `./scripts/package-macos.sh` (see below). Rebuild it from the current source before opening the workspace: older bundles can drop the material and workholding libraries when they save. A bundle is an Apple Silicon build for macOS 26 or later (the bundled CAD libraries require macOS 26). It includes its STEP reader and runtime libraries; end users do not need Homebrew or Python. Double-click it to open. It is ad-hoc signed, not notarized for public distribution.
 
-To build from source with a current stable Rust toolchain:
+To build from source with the Rust that `rust-toolchain.toml` pins (1.98.0; rustup installs it, with its rustfmt and clippy, on the first `cargo` run in this folder; with rustup 1.28.0, or with auto-install turned off, run `rustup toolchain install` here first):
 
 ```sh
 brew install opencascade
 cargo run --release --locked
 ```
 
-The build was tested with Rust 1.97.1 on Apple Silicon. The STEP helper uses a C++17 compiler and Open CASCADE 7.9. The HTTPS client builds aws-lc, which needs a C compiler and CMake. Set `OCCT_PREFIX` to a custom installation prefix if needed. The build script reruns when `OCCT_PREFIX`, `CXX`, `AXIS_SKIP_STEP`, the prefix's `include/opencascade/Standard_Version.hxx` or its `lib` directory change, so an upgrade of Open CASCADE rebuilds the helper. `AXIS_SKIP_STEP=1` explicitly builds without STEP support; the macOS packaging script refuses such a build (`scripts/bundle-step.py` stops with "No compiled STEP helper; package requires Open CASCADE support"). The tests and the renderer smoke run need Open CASCADE too: without it the five tests that import a `.step` fixture print `skipped: …` and pass without testing it, and `--smoke-test` stops at once with exit code 2 (see Tests and renderer checks).
+The build was tested with Rust 1.98.0 on Apple Silicon. The STEP helper uses a C++17 compiler and Open CASCADE 7.9. The HTTPS client builds aws-lc, which needs a C compiler and CMake. Set `OCCT_PREFIX` to a custom installation prefix if needed. The build script reruns when `OCCT_PREFIX`, `CXX`, `AXIS_SKIP_STEP`, the prefix's `include/opencascade/Standard_Version.hxx` or its `lib` directory change, so an upgrade of Open CASCADE rebuilds the helper. `AXIS_SKIP_STEP=1` explicitly builds without STEP support; the macOS packaging script refuses such a build (`scripts/bundle-step.py` stops with "No compiled STEP helper; package requires Open CASCADE support"). The tests and the renderer smoke run need Open CASCADE too: without it the five tests that import a `.step` fixture print `skipped: …` and pass without testing it, and `--smoke-test` stops at once with exit code 2 (see Tests and renderer checks).
 
 | Platform | Status |
 | --- | --- |
@@ -488,6 +488,15 @@ Box removes an axis-aligned block with one flat end mill. Facing, squaring a sid
 - **Checked.** Every move is tested against the part (the cutter's side and end). A walk that reaches into the part is refused with where. The plan is simulated as cut, and checked against the vise jaws or clamps as any manual plan is; a Round corners that reaches into them has no Steps, which say where it hits, nor has one whose workholding cannot be checked (a vise that does not open to the stock, a deleted holder), which say why. The adapter plate gripped on its 88 mm sides in the 100 mm vise, 17 mm overhanging each end, clears the jaws at all four corners.
 - **Steps.** The DRO's compensation is off for it (tool centres): a Comp screen says so when the operation before left it on. One screen per walk: the corner close up from above with the walk and the tool where it is, the whole stock with the corner's place, which way each axis goes, and the numbers in order (clear of the stock, a millimetre short, on to it, down beside the stock with the quill locked, in, each step, out, up). The section ends on a **File** screen: the most left between two steps, file the scallops to the line, and each corner's radius to try with a radius gauge.
 
+### Slot
+
+**Slot** (toolbar: **Slot**) cuts a round-ended counterbore or through slot along X or Y on the manual mill (LIO-445). A click on its floor or a rounded end fills **Centre X/Y**, **Overall length/width**, **Slot axis** and **Z top/bottom**; they stay editable. **Through stock** with **Breakthrough**, **allowance** (walls) and **axial_allowance** (floor), **stepdown** and **scallop** are on its tab. The cut goes from the top of the material left there down to the floor in equal levels no deeper than the stepdown; the first plunge needs a centre-cutting cutter, or an entry an earlier cut cleared to the floor.
+
+- **A cutter as wide as the slot** (its width less twice the allowance) sweeps the centre line at each level, from one end's centre to the other's.
+- **A narrower cutter** (LIO-455; at least 0.02 mm narrower; a wider one overcuts the ends and is refused): each level sweeps the centre line, then walks round the slot from the far end's tip, the sides as straight moves and the round ends in DRO steps one axis at a time, as Round corners walks a corner but inside the round: each step's corner toward the end's centre, every reading on the hundredths rounded toward it, so no reading cuts past the round. Between the sweep and the outline it steps out in walks no more than 0.9 of the cutter's diameter apart, so the floor has no ridges; the levels' last walk leaves 0.2 mm on the walls. Then one finishing walk at size on the floor takes that off the whole wall, its steps leaving at most the **scallop** (default 0.05 mm) between two. The walks go clockwise seen from above with the spindle clockwise (conventional inside a hollow), the other way with it counter-clockwise. The adapter plate's 16.5 × 21.5 counterbores with a Ø12: one walk 2.05 out a level, the finish 2.25 out, R8.25 within 0.05.
+- **Checked.** Every tool centre the plan feeds through stays within the cutter's reach of the centre line, and the capsule that leaves is proven clear of the part, its round ends against their nominal arcs; the plan is simulated as cut and checked against the vise jaws or clamps.
+- **Steps.** One screen a pass: the sweep (where it goes down, at 25 % feed), each walk with the slot close up from above, the walk and the tool where it is, each reading with its arrow (straight side, step n of m), and the DRO arc function's centre, radius to the tool's centre and angles for each round end where the machine has one (**DRO has arc holes**), with the function left at the end of each round end, before the straight side, where X and Y read the walk's own reading again. The Check lists the length, width and depth, each round end's radius with the most the steps leave, and the centre.
+
 ### Centre drilling
 
 A twist drill started on a flat face walks: its chisel edge skids before its lips bite, and the hole lands off its place. So on the manual mill every hole a drill opens from the solid (Drilling, Chip breaking, Deep drilling or Counterboring with a **Drill**, not the pin holes) is centre drilled first.
@@ -522,11 +531,12 @@ When the steps cannot be worked out, the page says why and names the operation i
 | --- | --- |
 | Hold | The stock in 3D in the vise or clamps, and a view across the jaws: the jaws at their height, the parallels under the stock, how much is in the jaws ("8 in the jaws") and a THIS FACE UP arrow; the size |
 | Zero | The work zero to pick up with the edge finder (DRO compensation off), and Z set on the top. An axis whose zero is on a face is touched on that face and set there to the zero less or plus the finder's radius ("touch the left face → set X −5.00" with a Ø10 finder): "pick up the corner". An axis whose zero is at the middle (Stock top center, or the middle of an edge) is halved (LIO-451), so that its 0 is midway whatever the blank's real size: touch the − face and set 0, touch the + face, where the DRO reads about the stock's width plus the finder's diameter (a check, "X 145.00" on a 140 mm blank with a Ø5 finder), then press ½ or set half the reading (X 72.50); the finder's radius cancels. Both faces are touched clear of the jaws and of earlier cuts and drawn with what to set or read at each; the subtitle says "find the centre" or "find the middle of the front edge" |
-| Tool | For the setup's first tool and each change of tool: the stock as it is in 3D with the tool standing on the spot to touch, drawn to scale (its diameter, flute length and stick-out, a drill's point, the holder over it), the spot ringed on the highest top left; the gear large beside it; the Z pick-up ("touch the top → set Z −2.00": the top the operations before left, in work Z), and with compensation on the diameter to enter and the sides to set. With the same tool still in, only what changes: a **Gear** screen for another speed (with the DRO when its sides change too), a **Comp** screen with the diameter and sides when only they are new (after a Face or Square, or other open sides), and no screen when nothing changes |
+| Tool | For the setup's first tool and each change of tool: the stock as it is in 3D with the tool standing on the spot to touch, drawn to scale (its diameter, flute length and stick-out, a drill's point, the holder over it), the spot ringed on the highest top left ("where it is ringed"; when no flat top face is found there is no picture, and the Z pick-up says "on solid stock, clear of holes and slots" instead); "where it is ringed" only when the picture is there; the gear large beside it; the Z pick-up ("touch the top → set Z −2.00": the top the operations before left, in work Z), and with compensation on the diameter to enter and the sides to set. With the same tool still in, only what changes: a **Gear** screen for another speed (with the DRO when its sides change too), a **Comp** screen with the diameter and sides when only they are new (after a Face or Square, or other open sides), and no screen when nothing changes |
 | Face | The whole facing on one screen: tool, gear, the Z pick-up (only for a tool not already in), how much comes off and the Z to face down to. You plan the passes and stepdown yourself, so it has no Pass or Check screen |
 | Square | A thin slab along one wall (one closed X or Y side, at most one tool radius wide) on one screen: tool, gear, the Z pick-up (only for a tool not already in), with compensation on the diameter to enter and the side to set (toward the wall), the X or Y to cut that side to, how much comes off and the Z to go down to. No Pass or Check screen |
 | Pass | One pass: top and front views, the band it removes, the tool where it starts and an arrow to where it stops, what earlier passes removed, and the DRO numbers |
 | Matrix holes, Arc holes | Before the Holes screen of a Drill whose holes are one pattern the DRO has (**Hole patterns**): the numbers to type into the DRO, large, two to a row, and the top view with the holes numbered in the DRO's order, hole 1 in orange, arrows from hole to hole, and the pitches (a grid) or the circle, its centre and the angle from +X round to hole 1 (an arc). After a centre drilling of the same pattern it says "the same pattern: start the DRO again at hole 1" |
+| DRO | The first screen of the operation after a Drill the DRO led to (unless that operation starts the same pattern again): "matrix holes off" (or arc holes), then X and Y read work coordinates again, the last hole's place ("X −49.20 · over hole 4, the last"; both 0.00 means the hole function is still on, unless the last hole is the work zero itself, where both read 0.00 either way and the screen says to check the DRO shows its plain X, Y and Z readings), with the holes drawn from above and the last one lit. The Drill's Check screen (or Try, for a tapping) says "then leave the DRO's matrix holes" when this screen or the hand-over follows |
 | Holes | The top view with every hole numbered, the current one lit, and its X, Y and the Z to drill to, with how deep that is from the hole's mouth (where the drill enters, lower where an earlier cut took the top down); a Reaming says Ream, "ream to" and "feed back out" |
 | Bore | One pass of a Boring: the holes and the bore as this pass leaves it over the last one's, then in order the bore to measure ("measure Ø31.90", after the first pass), the head setting ("head Ø32.00 · out 0.10 on Ø · 10 divisions", set with the spindle off), each hole's X and Y and the Z to bore to, and how to come out (spindle off, then raise; or feed back out) |
 | Check | The stock after the operation, lit as the one before it so that only the cut differs, with the sizes to measure drawn on it and listed large: a Box's width from the face it is measured from (or between its walls) and its depth below the top, with the stock to leave in them ("15.00 wide · from the front face", "9.50 deep below the top · floor Z −11.50"); holes' count, diameter and depth from the mouth |
@@ -550,6 +560,7 @@ Many DROs have **matrix holes** (a grid) and **arc holes** (holes on a circle or
 - **What counts.** A Drill's holes (a drilling, a centre drilling, a reaming or a tapping) all together, every one drilled to the same Z (to 0.01: the DRO's own order of the holes is not known, so holes of different depths go one by one): a **grid** is rows and columns at even pitches, square to each other, at any angle, and one row of three or more is a grid of one row (a line along Y is 1 hole a row × N rows at 0°); an **arc** is four or more holes on one circle at even angles, all the way round or along part of it (at least 10° from the first to the last), or three all the way round (120° apart). Holes match within 0.02 mm and the numbers are given to 0.01; a grid within 0.02° of square to the axes reads 0.00°. The pattern is used only when the numbers as shown, typed as a pitch or an angle between holes, put every hole within 0.05 mm of its place. Four holes on a square are a grid and a circle: the grid when the square is square to the axes, else the circle (a bolt circle of four); a DRO with only one of the two gets that one. Fewer than three holes, holes that are no such pattern and a pattern the DRO does not have are shown hole by hole.
 - **The DRO's order.** A grid's rows run along the pitch nearer X, toward +X, and the holes go row by row from the first hole, back and forth (each row the opposite way from the one before), the rows after the first counter-clockwise of it: front-left first for a grid square to the axes, and every move to the next hole along one axis. If the DRO takes the holes in another order, follow the DRO: every hole is drilled alike. An arc is numbered counter-clockwise from its first hole: the one at the least angle from +X on a full circle, the one after the widest gap on part of one. Holes that mirror each other share an X or a Y, so an arc is drilled from hole 1 to a hole left on its Y (a move along X), else on its X, else the nearest, when that keeps more moves on one axis than going round: six holes from 30° go 1, 3, 4, 6, 5, 2, four of five moves on one axis (LIO-406). Every hole is then named by the DRO's number (in the drawings, the hole chips and "on the DRO's hole N"), and the Pattern screen says to call each hole up on the DRO in the order shown. The Holes screen takes the holes in the order drilled.
 - **What to type.** A grid: the first hole's X and Y, the pitch along a row and between the rows (each with the whole span), how many holes a row and how many rows, and the rows' angle from +X. An arc: the centre's X and Y, the diameter (and the radius), how many holes and whether it is a full circle, the first hole's and the last hole's angle from +X, the last with the angle between holes under it, counter-clockwise. DROs ask for different ones of these; type the ones yours asks for. Every number is in view at 1024 × 700.
+- **Leaving the hole function.** After the holes, before an operation that moves in work coordinates, the Steps page has you leave the DRO's hole function and check that X and Y read the last hole's place again, not 0.00; an operation that drills the same pattern again (a drill after its centre drill, a tap after its drill) goes on in it and starts the DRO again at hole 1 (LIO-488).
 
 ### Minutes
 
@@ -821,11 +832,35 @@ the real machine. A setup that sits on the pins has its block where the pins
 place it, and it is put on them only once X and Y are referenced from pin 1:
 the part is off the pins while they are probed.
 
+**Which way the axes point (LIO-457).** A machine's **+X points** setting
+(Machine library, Travel & spindle) says which way +X goes on the table,
+standing at the machine's front: **Right** (the usual, and every machine saved
+before it), **Left**, **Away from you** or **Toward you**. +Y follows by the
+right-hand rule with Z up, so a part is never mirrored: the frame is only
+turned. Set it the way the machine's own controls count up; the Jingyan
+CNC4030's handheld counts X up going left and Y up toward the front, which is
+**Left** (+Y toward you). The UC100 profile's `reversed` sets which way a
+motor turns for +; this setting sets where + is. The Control page's 3D machine
+(the tool, the travel box, the work zero, the simulator's block and the rotary
+unit), the jog pad and the arrow keys, the probing grids (the stock top seen
+from above, back at the top), and the sides and corners that touch-off,
+probing, the program header and the plan checks name ("touch off the
+back-right corner") all follow it. The setup editor's work zeros keep the
+part's own names as the screen shows it (Stock top front-left is −X −Y). A
+setup whose snapshot of the machine has another orientation than the Machine
+library does not run until it is assigned the machine again; a project opened,
+or an edit put back, while the machine is connected takes the connected
+machine's orientation into its copies of it, as it takes the profile's travel.
+The setting is a CNC's: a manual mill or lathe keeps the usual orientation, its
+Steps drawn and said from the operator's side and its DRO set to count that way.
+
 Once the machine is Idle, the Control page has everything needed before a job:
 
 - **Machine zero and soft limits.** A machine without home switches (the
-  JY5800) does not know where its axes are. Jog X to its left end, Y to its
-  front end (gantry toward you) and Z to the top, then press **Set machine
+  JY5800) does not know where its axes are. Jog X and Y to their minimum ends
+  and Z to the top (on the usual machine X to its left end and Y to its front
+  end, the gantry toward you; the page names the ends from the machine's
+  orientation, below), then press **Set machine
   zero here** (or **X**, **Y**, **Z** for one axis). **Keep the last position**
   takes the position AXIS CAM saved at the last disconnect, for when nothing
   moved the machine since. Until every axis with a soft limit has a machine
@@ -839,8 +874,11 @@ Once the machine is Idle, the Control page has everything needed before a job:
   green "Soft limits on" line needs all three. Every E-stop clears the machine position, so
   set it again after one. **Home** appears when every axis has a home switch;
   an axis with a switch gets its position only by homing.
-- **Jog.** Hold **X−/X+/Y−/Y+/Z+/Z−**, or on this page the arrow keys (X, Y;
-  up is +Y, away from you) and **Page Up/Down** (Z), and let go to stop. A
+- **Jog.** Hold **X−/X+/Y−/Y+/Z+/Z−**, or on this page the arrow keys and
+  **Page Up/Down** (Z), and let go to stop. The pad's buttons and the arrows
+  stand where they move the tool, seen from the front: → moves it right and
+  ↑ away from you, whatever axis and sign that is on the machine (each button
+  says which, as the machine's **+X points** setting gives it). A
   release anywhere, leaving the button, or the window losing focus stops the
   jog too; a jog that a soft limit or E-stop ended needs a new press. Keys
   jog only while the jog pad is on screen (LIO-273): not in the Controller
@@ -1543,6 +1581,8 @@ cargo run --locked -- --smoke-test ./smoke-output
 # Fast, isolated rendering of field help only:
 cargo run --release --locked -- --smoke-test ./help-output --help-only
 ```
+
+Every machine formats and lints with the pinned toolchain's rustfmt (1.9.0) and clippy, so `cargo fmt` gives the same result on the Mac, Windows and Linux; another Rust's rustfmt (1.10 in Rust 1.99, for example) formats some lines differently. Moving to a newer Rust is its own pull request: change the channel in `rust-toolchain.toml`, run `cargo fmt` and `cargo fmt --all --manifest-path android/Cargo.toml` (the root one does not reach `android/rfd-stub`) and fix what the new clippy finds, with no other changes. Every pull request into main runs the `fmt` check (`.github/workflows/fmt.yml`): `cargo fmt --check` for the desktop app and for the shop tablet build in `android/`, with the pinned rustfmt and no build. Main's branch protection requires it, for administrators too, on a branch that is up to date with main: two branches that pass apart can fail together, so a pull request behind main is brought up to date (rebase, or `gh pr update-branch`) and checked again before it is merged.
 
 `scripts/check-validation-names.sh` checks that every test name `docs/VALIDATION.md` cites exists as a function in `src/` (or in the UC100 driver crate's checkout), so a renamed or deleted test cannot stay cited.
 

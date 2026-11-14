@@ -381,10 +381,19 @@ pub fn sentence(setup: &Setup, stock: Bounds, datum: [f32; 3]) -> Option<String>
         "Tape" => "Held down by double-sided tape under the sheet.".to_string(),
         "Screws" => match (screw_places(setup, stock), screw_size(setup)) {
             (Ok(places), Ok((head, _))) => format!(
-                "Held down by {} screw{} through the waste into the spoilboard (Ø{} heads) at X,Y from the sheet's front-left corner: {}.",
+                "Held down by {} screw{} through the waste into the spoilboard (Ø{} heads) at X,Y from the sheet's {}: {}.",
                 places.len(),
                 if places.len() == 1 { "" } else { "s" },
                 mm(head),
+                // Its -X -Y corner, named where it is on the machine (LIO-457).
+                {
+                    let o = crate::orient::Orient::of(&setup.machine);
+                    let corner = o.corner([crate::post::At::Min; 2]);
+                    match o {
+                        crate::orient::Orient::Right => format!("{corner} corner"),
+                        _ => format!("{corner} corner (its -X -Y corner)"),
+                    }
+                },
                 places
                     .iter()
                     .map(|[x, y]| format!("{},{}", mm(*x), mm(*y)))
@@ -546,6 +555,22 @@ mod tests {
         let stock = bounds(&s, part()).unwrap();
         let text = sentence(&s, stock, [0., 0., stock.max[2]]).unwrap();
         assert!(text.starts_with("Sheet 250 × 320 × 1.5 mm on a spoilboard, its top at Z-1.5 (work); cuts go at most 0.5 mm into it. Held down by 4 screws"), "{text}");
+        assert!(
+            text.contains("from the sheet's front-left corner: "),
+            "{text}"
+        );
+        // On a machine turned round (LIO-457) the screws' corner is the
+        // back-right one.
+        let mut turned = s.clone();
+        turned
+            .machine
+            .p
+            .insert(crate::orient::KEY.into(), "Left".into());
+        let text = sentence(&turned, stock, [0., 0., stock.max[2]]).unwrap();
+        assert!(
+            text.contains("from the sheet's back-right corner (its -X -Y corner): "),
+            "{text}"
+        );
     }
 
     /// The power feed's mains tray, a DXF flat pattern extruded 1.5 mm, on a

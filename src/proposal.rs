@@ -2085,6 +2085,19 @@ fn merged(base: &Operation, fresh: &Operation, p: &ProposedOp, d: &ProposedOp) -
                 "allowance",
             ],
         ),
+        // A Slot's geometry (LIO-455: an edit kept the old sizes).
+        (
+            p.slot != d.slot,
+            &[
+                "slot_x",
+                "slot_y",
+                "slot_length",
+                "slot_width",
+                "slot_axis",
+                "z_top",
+                "z_bottom",
+            ],
+        ),
         (
             p.turn != d.turn,
             &[
@@ -7346,6 +7359,61 @@ pub(crate) mod tests {
 #[cfg(test)]
 mod capsule_tests {
     use super::*;
+    /// An edit of a kept Slot's sizes reaches the operation (LIO-455: the
+    /// merge kept the old geometry), and what the plan does not carry, its
+    /// scallop, stays as the user set it.
+    #[test]
+    fn a_planner_edit_of_a_slots_geometry_applies_and_keeps_its_scallop() {
+        let (doc, mesh, report) = super::tests::with_mill();
+        let mut plan = super::tests::milled(&report);
+        plan.setups[0].operations = vec![ProposedOp {
+            strategy: "Slot".into(),
+            name: "Manual capsule".into(),
+            tool: 9,
+            surfaces: vec![],
+            slot: Some(ProposedSlot {
+                x: 12.,
+                y: -7.,
+                length: 37.,
+                width: 32.,
+                axis: "X".into(),
+                z_top: 0.,
+                z_bottom: -2.5,
+            }),
+            rpm: 1600.,
+            feed: 150.,
+            stepdown: Some(0.5),
+            radial_allowance: Some(0.),
+            axial_allowance: Some(0.2),
+            through: Some(false),
+            breakthrough: Some(0.),
+            coolant: "Off".into(),
+            ..ProposedOp::default()
+        }];
+        let mut built = build(&doc, &mesh, &report, &plan).unwrap();
+        (built.setups[0].operations[0].p).insert("scallop".into(), "0.01".into());
+        let mut edit = describe(&built, &report).unwrap().current_plan;
+        let geometry = edit.setups[0].operations[0].slot.as_mut().unwrap();
+        (
+            geometry.x,
+            geometry.width,
+            geometry.length,
+            geometry.z_bottom,
+        ) = (13., 34., 39., -3.5);
+        edit.setups[0].operations[0].feed = 120.;
+        let changed = build(&built, &mesh, &report, &edit).unwrap();
+        let op = &changed.setups[0].operations[0];
+        for (k, want) in [
+            ("slot_x", 13.),
+            ("slot_width", 34.),
+            ("slot_length", 39.),
+            ("z_bottom", -3.5),
+            ("feed", 120.),
+            ("scallop", 0.01),
+        ] {
+            assert_eq!(num(&op.p, k), Some(want), "{k}: {:?}", op.p);
+        }
+    }
     #[test]
     fn manual_slot_schema_and_edit_roundtrip_preserve_all_geometry_and_depths() {
         let (doc, mesh, report) = super::tests::with_mill();

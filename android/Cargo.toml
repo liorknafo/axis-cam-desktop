@@ -43,8 +43,8 @@ sha2 = "0.10"
 clipper2 = "0.6.0"
 fidget = { version = "=0.4.3", default-features = false, features = ["mesh"] }
 toml_edit = "0.25"
-uc100 = { git = "https://github.com/liorknafo/UC100-driver.git", rev = "e1fadccf48b93f8bff3200d4ebb71d84a0325f99", default-features = false }
-uc100-remote = { git = "https://github.com/liorknafo/uc100-server.git", rev = "11383de5b7e458b530a6ea2835cfd213ca5b8bfa" }
+uc100 = { git = "https://github.com/liorknafo/UC100-driver.git", rev = "8ef29f77f7d630c61e2a7b294e16af78df8a776f", default-features = false }
+uc100-remote = { git = "https://github.com/liorknafo/uc100-server.git", rev = "e124d35924ba7cf5056bf27ac60cec870d4f7956" }
 wgpu = "27"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"

@@ -78,7 +78,7 @@ pub(crate) fn btn<'a>(label: impl Into<String>, msg: Message, active: bool) -> H
     let action = msg.clone();
     let b = button(text(label.clone()).size(12))
         .on_press(msg)
-        .padding([7, 10])
+        .padding(finger([7, 10], 12, &label))
         .style(move |_, status| flat(active, status));
     HelpButton::new(b, &action, label)
 }
@@ -107,6 +107,41 @@ fn flat(active: bool, status: button::Status) -> button::Style {
 /// The top and bottom padding of a filled or outlined button: the same, so
 /// one stands as tall as the other.
 const BUTTON_PAD: u16 = 8;
+/// The least height of a button or field on a touch screen (LIO-460):
+/// Android's 48 dp touch target, about 9 mm.
+pub(crate) const FINGER: f32 = 48.;
+thread_local! {
+    /// Finger sizes off the tablet too: for the tests.
+    pub(crate) static TOUCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Whether buttons and fields are sized for a finger: on the shop tablet.
+pub(crate) fn touch() -> bool {
+    crate::SHOP || TOUCH.with(std::cell::Cell::get)
+}
+/// A button's or field's padding around `size` px text: `pad`, or on a
+/// touch screen enough more that it stands `FINGER` tall and, with a short
+/// `label`, as wide.
+pub(crate) fn finger(pad: [u16; 2], size: u16, label: &str) -> [u16; 2] {
+    if !touch() {
+        return pad;
+    }
+    let room = |used: f32| ((FINGER - used) / 2.).ceil().max(0.) as u16;
+    let size = f32::from(size);
+    // Iced's line is 1.3 of the text size.
+    // ponytail: a character taken as 0.4 of the size wide, a little less than
+    // digits and short words are, so a short label errs wide; measure the
+    // label if one comes out narrower than a finger.
+    let wide = label.chars().count() as f32 * size * 0.4;
+    [pad[0].max(room(size * 1.3)), pad[1].max(room(wide))]
+}
+/// A checkbox a finger tall on a touch screen: its label's line is.
+fn finger_box<'a>(b: widget::Checkbox<'a, Message>) -> widget::Checkbox<'a, Message> {
+    if touch() {
+        b.size(22).text_line_height(iced::Pixels(FINGER))
+    } else {
+        b
+    }
+}
 /// The edge of an outlined button: darker than `LINE`, so the button is seen
 /// as one on a white panel.
 pub(crate) const BUTTON_EDGE: Color = Color::from_rgb8(190, 201, 212);
@@ -128,7 +163,7 @@ fn outlined_btn<'a>(label: String, msg: Message, deletes: bool) -> HelpButton<'a
     // The text and height of `primary`'s, so the two line up in a row.
     let b = button(text(label.clone()).size(13))
         .on_press(msg)
-        .padding([BUTTON_PAD, 12])
+        .padding(finger([BUTTON_PAD, 12], 13, &label))
         .style(move |_, status| outlined(deletes, status));
     HelpButton::new(b, &action, label)
 }
@@ -217,7 +252,7 @@ fn bar_btn<'a>(label: &str, msg: Message, active: bool) -> HelpButton<'a> {
     let action = msg.clone();
     let b = button(text(label.to_string()).size(12))
         .on_press(msg)
-        .padding([6, 10])
+        .padding(finger([6, 10], 12, label))
         .style(move |_, status| button::Style {
             background: (active
                 || matches!(status, button::Status::Hovered | button::Status::Pressed))
@@ -313,7 +348,7 @@ pub(crate) fn primary<'a>(label: impl Into<String>, msg: Message) -> HelpButton<
     let action = msg.clone();
     let b = button(text(label.clone()).size(13))
         .on_press(msg)
-        .padding([BUTTON_PAD, 14])
+        .padding(finger([BUTTON_PAD, 14], 13, &label))
         .style(|_, status| button::Style {
             background: Some(
                 if matches!(status, button::Status::Hovered) {
@@ -4419,6 +4454,8 @@ fn operation_editor_with<'a>(
             }
             c=c.push(choice(p,"through","Through stock", &["No","Yes"],t))
                 .push(checks.field(p,"breakthrough","Breakthrough beyond stock bottom · mm"))
+                .push(checks.field(p,"scallop","Scallop left between steps · mm"))
+                .push(note("A cutter narrower than the slot sweeps the centre line, steps out round it and walks the outline each level, the round ends in DRO steps leaving at most the scallop between two; then it finishes the outline at size on the floor."))
                 .push(note("Blind: bottom is the floor before floor stock to leave. Through: bottom is the stock's back face; breakthrough extends below it. Check clearance below the part: parallels and table are unmodeled."));
         }
         "Box" => {
@@ -5300,7 +5337,7 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
         return c.push(checks.field(p,"allowance","Wall stock to leave · mm"))
             .push(checks.field(p,"axial_allowance","Floor stock to leave · mm (blind only)"))
             .push(checks.field(p,"stepdown","Maximum stepdown · mm"))
-            .push(note("Use a cutter matching width minus twice wall stock to leave. Entry feeds down at 25% feed. It requires a confirmed center-cutting tool or a proven full-diameter entry clear to the final depth. Flutes must reach from the original stock top, including breakthrough." )).into();
+            .push(note("Use a cutter as wide as the slot less twice the wall stock to leave (one sweep a level), or one at least 0.02 mm narrower (it also walks the outline). Entry feeds down at 25% feed. It requires a confirmed center-cutting tool or a proven full-diameter entry clear to the final depth. Flutes must reach from the original stock top, including breakthrough." )).into();
     }
     if s == Strategy::Box {
         return c
@@ -5915,7 +5952,9 @@ fn bar_zeros<'a>(s: &Setup, origin: &str) -> Element<'a, Message> {
         .spacing(4)
     ]
     .spacing(4);
-    if let Some(words) = crate::round_hold::zero_words(origin) {
+    if let Some(words) =
+        crate::round_hold::zero_words(crate::orient::Orient::of(&s.machine), origin)
+    {
         c = c.push(muted(words));
     }
     c.into()
@@ -6284,27 +6323,32 @@ fn zero_note(app: &App) -> Element<'_, Message> {
     // A hand machine has no probe and no Control page (LIO-386): the Steps
     // page's Zero screen picks the zero up with the edge finder.
     let hand = crate::manual::is_hand(&setup.machine);
-    let mut lines = vec![match (crate::post::touch_off_spots(origin, stock), refs) {
-        (_, Some(_)) if hand => format!(
-            "On the stock this setup starts from ({from}): the Steps page's Zero screen has you touch a side for X and one for Y with the edge finder (both sides of an axis whose zero is at the middle, halving the reading) and the top for Z, and set the DRO so that it reads 0 at this work zero."
-        ),
-        (Some(spots), _) => format!(
-            "On the stock this setup starts from ({from}): touch off {spots}.{}",
-            crate::round_hold::side_note(setup, stock)
-                .map(|note| format!(" {note}"))
-                .unwrap_or_default()
-        ),
-        (None, Some(refs)) => format!(
-            "Model origin is the part file's own 0,0,0. A probe finds it from the stock this setup starts from ({from}): {}. By hand, the program header locates it from the part.",
-            crate::post::probe_spots(refs, stock)
-        ),
-        _ => match crate::indexed::zero_words(origin)
-            .or_else(|| crate::round_hold::zero_words(origin))
-        {
-            Some(words) => format!("On the stock this setup starts from ({from}): {words}"),
-            None => "Choose a work zero.".into(),
+    let o = crate::orient::Orient::of(&setup.machine);
+    let mut lines = vec![
+        match (crate::post::touch_off_spots(o, origin, stock), refs) {
+            (_, Some(_)) if hand => format!(
+                "On the stock this setup starts from ({from}): the Steps page's Zero screen has you touch a side for X and one for Y with the edge finder (both sides of an axis whose zero is at the middle, halving the reading) and the top for Z, and set the DRO so that it reads 0 at this work zero."
+            ),
+            (Some(spots), _) => format!(
+                "On the stock this setup starts from ({from}): touch off {spots}.{}{}",
+                crate::round_hold::side_note(setup, stock)
+                    .map(|note| format!(" {note}"))
+                    .unwrap_or_default(),
+                o.turned_note().map(|n| format!(" {n}")).unwrap_or_default()
+            ),
+            (None, Some(refs)) => format!(
+                "Model origin is the part file's own 0,0,0. A probe finds it from the stock this setup starts from ({from}): {}. By hand, the program header locates it from the part.",
+                crate::post::probe_spots(o, refs, stock)
+            ),
+            _ => match crate::indexed::zero_words(origin)
+                .map(str::to_string)
+                .or_else(|| crate::round_hold::zero_words(o, origin))
+            {
+                Some(words) => format!("On the stock this setup starts from ({from}): {words}"),
+                None => "Choose a work zero.".into(),
+            },
         },
-    }];
+    ];
     if let Some(refs) = refs.filter(|_| !hand) {
         lines.push(format!(
             "On the Control page, {} sets exactly this work zero, probed from its own spot or, under Probe from, from another corner, edge middle or the centre a probe can reach.",
@@ -8132,6 +8176,23 @@ fn wizard_at(app: &App, at: usize) -> Element<'_, Message> {
                 .spacing(8)
             };
             form = form.push(three(travel));
+            if !manual::is_hand(m) {
+                // Which way + is on the table (LIO-457): a CNC's.
+                let o = crate::orient::Orient::from_fields(p);
+                form = form
+                    .push(choice_value(
+                        p,
+                        o.label(),
+                        crate::orient::KEY,
+                        "+X points, standing at the machine's front",
+                        &crate::orient::LABELS,
+                        t,
+                    ))
+                    .push(note(format!(
+                        "{}. Y follows by the right-hand rule, so a part is never mirrored. Set it the way the machine's own counts go up: the jog pad and arrow keys, the 3D machine and the sides and corners named for touch-off and probing follow it. On a UC100, the profile's reversed sets which way the motor turns for +.",
+                        o.describe()
+                    )));
+            }
             if manual::is_manual(m) {
                 // In pairs, so that the step fits without scrolling.
                 for pair in [
@@ -8550,7 +8611,7 @@ fn wizard_at(app: &App, at: usize) -> Element<'_, Message> {
 fn estop<'a>() -> Element<'a, Message> {
     button(bold("E-STOP", 14).color(Color::WHITE))
         .on_press(Message::MachineEStop)
-        .padding([8, 16])
+        .padding(finger([8, 16], 14, "E-STOP"))
         .style(|_, status| button::Style {
             background: Some(
                 if matches!(status, button::Status::Hovered | button::Status::Pressed) {
@@ -8596,7 +8657,7 @@ pub(crate) fn act_sized<'a>(
     };
     let b = button(face)
         .width(width.unwrap_or(Length::Shrink))
-        .padding([7, 12])
+        .padding(finger([7, 12], 12, &label))
         .on_press_maybe(msg.clone())
         .style(move |_, status| {
             let (background, text_color) = match status {
@@ -8774,17 +8835,22 @@ pub enum JobView {
 /// not a setting. Short, under 860 px of height (a 13" laptop's 790, or
 /// larger text): thinner bars, smaller DRO digits and jog keys, tighter
 /// cards and no hint lines. Narrow, under 1360 px of width: narrower
-/// columns, tighter tabs, and Hold and Resume one button.
+/// columns, tighter tabs, and Hold and Resume one button. Touch, on the
+/// shop tablet (LIO-460): every button and field a finger tall, bars and
+/// rows to hold them, and the Spindle card under the operations, as the
+/// hands' column has no room left for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct Fit {
     pub short: bool,
     pub narrow: bool,
+    pub touch: bool,
 }
 impl Fit {
     pub(crate) fn window(width: f32, height: f32) -> Fit {
         Fit {
             short: height < 860.,
             narrow: width < 1360.,
+            touch: touch(),
         }
     }
     pub(crate) fn of(app: &App) -> Fit {
@@ -8792,15 +8858,32 @@ impl Fit {
     }
     /// The bar of the MACHINE workspace and the run bar under it.
     pub(crate) fn machine_bar(self) -> f32 {
-        if self.short { 38. } else { 44. }
+        match (self.touch, self.short) {
+            (true, _) => FINGER + 10.,
+            (_, true) => 38.,
+            _ => 44.,
+        }
     }
     pub(crate) fn run_bar(self) -> f32 {
-        if self.short { 54. } else { 64. }
+        match (self.touch, self.short) {
+            (true, _) => FINGER + 14.,
+            (_, true) => 54.,
+            _ => 64.,
+        }
+    }
+    /// A row that holds buttons: a card's title row, a row of buttons.
+    fn row(self, least: f32) -> f32 {
+        if self.touch { FINGER + 2. } else { least }
     }
     /// The widths of the left (the hands: position, jog, spindle) and right
     /// (the operations) columns; the centre takes the rest.
     pub(crate) fn hands(self) -> f32 {
-        if self.narrow { 310. } else { 340. }
+        match (self.touch, self.narrow) {
+            // A DRO line's Zero and ½ a finger wide beside its figures.
+            (true, true) => 324.,
+            (_, true) => 310.,
+            _ => 340.,
+        }
     }
     pub(crate) fn program(self) -> f32 {
         if self.narrow { 350. } else { 400. }
@@ -8816,6 +8899,10 @@ impl Fit {
     /// A DRO line of the Position card and its digits' size. With A the
     /// four lines are a little lower, so the left column still fits.
     fn dro_row(self, axes: usize) -> (f32, u32) {
+        if self.touch {
+            // Zero and ½ a finger tall, a gap between the lines' buttons.
+            return (FINGER + 6., if axes > 3 { 21 } else { 24 });
+        }
         match (self.short, axes > 3) {
             (false, false) => (46., 24),
             (false, true) => (42., 21),
@@ -8837,7 +8924,11 @@ impl Fit {
     }
     /// A jog button.
     fn jog(self) -> (f32, f32) {
-        if self.short { (46., 30.) } else { (50., 36.) }
+        match (self.touch, self.short) {
+            (true, _) => (56., FINGER + 2.),
+            (_, true) => (46., 30.),
+            _ => (50., 36.),
+        }
     }
 }
 const GREEN: Color = Color::from_rgb8(39, 130, 93);
@@ -8893,7 +8984,7 @@ fn act_with<'a>(
     };
     let b = button(face)
         .width(width.unwrap_or(Length::Shrink))
-        .padding(pad)
+        .padding(finger(pad, 12, &label))
         .on_press_maybe(msg.clone())
         .style(move |_, status| {
             let (background, text_color) = match status {
@@ -8999,7 +9090,7 @@ fn machine_bar(app: &App) -> Element<'_, Message> {
             .push(bar_btn(
                 "Control",
                 Message::ControlSetup(false),
-                !app.machine_setup,
+                !app.machine_setup && !app.shop_projects,
             ))
             .push(bar_btn(
                 if fit.narrow {
@@ -9008,8 +9099,16 @@ fn machine_bar(app: &App) -> Element<'_, Message> {
                     "Controller configuration"
                 },
                 Message::ControlSetup(true),
-                app.machine_setup,
+                app.machine_setup && !app.shop_projects,
             ));
+    }
+    // The shop tablet's projects from the computer (LIO-459).
+    if crate::SHOP {
+        bar = bar.push(bar_btn(
+            "Projects",
+            Message::ShowProjects(!app.shop_projects),
+            app.shop_projects,
+        ));
     }
     let file = Help::text(
         "Project file",
@@ -9231,7 +9330,7 @@ fn pi_pairing<'a>(
             )
             .on_input(Message::PiAddress)
             .width(Length::Fixed(200.))
-            .padding([5, 8])
+            .padding(finger([5, 8], 13, ""))
             .size(13),
         ]
     } else {
@@ -9261,7 +9360,7 @@ fn pi_pairing<'a>(
                 .on_input(Message::PiCode)
                 .on_submit(Message::PiPair)
                 .width(Length::Fixed(100.))
-                .padding([5, 8])
+                .padding(finger([5, 8], 13, ""))
                 .size(13);
             let pair: Element<'a, Message> = if app.pi_pairing {
                 muted("Pairing…").into()
@@ -9342,6 +9441,9 @@ fn machine_log(c: &crate::control::Connection) -> Element<'_, Message> {
 /// and feed), always there; one task at a time in the centre's tabs; the
 /// operations on the right. Not connected, the machine to connect to.
 fn control(app: &App) -> Element<'_, Message> {
+    if crate::SHOP && app.shop_projects {
+        return shop_projects(app);
+    }
     // A setup on the manual mill or the lathe shows its steps, with or
     // without the CNC connected.
     if app.steps_page() {
@@ -9395,7 +9497,18 @@ fn control(app: &App) -> Element<'_, Message> {
             row![
                 hands(c, fit),
                 centre(app, c),
-                container(program(app, c)).width(fit.program()).height(Fill)
+                container(if fit.touch {
+                    column![
+                        program(app, c),
+                        spindle_card(c, fit, Some(spindle_height(fit)))
+                    ]
+                    .spacing(fit.gap())
+                    .into()
+                } else {
+                    program(app, c)
+                })
+                .width(fit.program())
+                .height(Fill)
             ]
             .spacing(fit.gap())
             .padding(fit.gap())
@@ -9403,6 +9516,81 @@ fn control(app: &App) -> Element<'_, Message> {
         )
         .height(Fill)
         .into()
+}
+
+/// The shop tablet's projects from the computer (LIO-459): the copies kept
+/// here, newest list first, each opened with a tap; pairing with the
+/// computer once; what the last sync said.
+fn shop_projects(app: &App) -> Element<'_, Message> {
+    let mut col = column![bold("Projects from the computer", 18)].spacing(10);
+    if app.kept.is_empty() {
+        col = col.push(muted(if app.computer.is_some() {
+            "None yet. Save or open a project on the computer, with the computer and this tablet on the same Wi-Fi."
+        } else {
+            "Pair this tablet with the computer below, and its projects come here by themselves."
+        }));
+    }
+    for k in &app.kept {
+        col = col.push(secondary(k.title.clone(), Message::OpenKept(k.key.clone())).width(Fill));
+    }
+    col = col.push(rule::horizontal(1));
+    match &app.computer {
+        Some(link) => {
+            col = col.push(
+                row![
+                    muted(format!(
+                        "Paired with {} at {}.",
+                        link.computer, link.address
+                    )),
+                    secondary("Forget", Message::ForgetComputer),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+        }
+        None => {
+            col = col.push(muted(
+                "Pair once: on the computer's Export page click Pair a tablet, then type the 6-digit code it shows. Leave the address empty to find the computer on this Wi-Fi.",
+            ));
+            let pair: Element<'_, Message> = if app.computer_busy {
+                muted("Pairing…").into()
+            } else if app.computer_code.len() == 6 {
+                primary("Pair", Message::PairComputer).into()
+            } else {
+                muted("").into()
+            };
+            col = col.push(
+                row![
+                    muted("Code"),
+                    text_input("123456", &app.computer_code)
+                        .on_input(Message::ComputerCode)
+                        .on_submit(Message::PairComputer)
+                        .width(Length::Fixed(110.))
+                        .padding(finger([5, 8], 14, ""))
+                        .size(14),
+                    muted("Address"),
+                    text_input("found on this Wi-Fi", &app.computer_address)
+                        .on_input(Message::ComputerAddress)
+                        .width(Length::Fixed(200.))
+                        .padding(finger([5, 8], 14, ""))
+                        .size(14),
+                    pair,
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            );
+        }
+    }
+    if !app.sync_note.is_empty() {
+        col = col.push(muted(app.sync_note.clone()));
+    }
+    container(scrollable(
+        container(col).padding(18).width(560).style(panel_style),
+    ))
+    .padding(24)
+    .center_x(Fill)
+    .height(Fill)
+    .into()
 }
 
 /// What the Control page says over every tab while the link to the Pi is
@@ -9441,7 +9629,11 @@ fn cycle_start<'a>(msg: Option<Message>, fit: Fit) -> Element<'a, Message> {
     )
     .width(if fit.narrow { 108 } else { 132 })
     .on_press_maybe(msg.clone())
-    .padding(if fit.short { [7, 10] } else { [10, 14] })
+    .padding(finger(
+        if fit.short { [7, 10] } else { [10, 14] },
+        if fit.short { 13 } else { 14 },
+        "Cycle Start",
+    ))
     .style(move |_, status| button::Style {
         background: Some(
             if !on {
@@ -9658,6 +9850,7 @@ pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
             })
             .placeholder("Pick a setup")
             .text_size(13)
+            .padding(finger([5, 10], 13, ""))
             .width(picker_width)
             .style(choice_style),
             help::command(&Message::Run(R::Setup(0)), "Setup to run".into()),
@@ -9861,17 +10054,27 @@ fn run_times(
 /// its thin scroll bar over the cards' padding.
 fn hands(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
     let axes = (0..6).filter(|&a| c.snapshot.axes_enabled[a]).count();
+    // Touch, the Spindle card is under the operations (`Fit`).
+    let spindle = !fit.touch;
     let least = position_height(axes, fit)
         + jog_height(c.axis(3), fit)
-        + spindle_height(fit)
-        + 2. * fit.gap();
+        + fit.gap()
+        + if spindle {
+            spindle_height(fit) + fit.gap()
+        } else {
+            0.
+        };
     responsive(move |size| {
         let cards = column![position_card(c, fit), jog_card(c, fit)].spacing(fit.gap());
         if size.height >= least {
-            cards.push(spindle_card(c, fit, None)).height(Fill).into()
+            cards
+                .push(spindle.then(|| spindle_card(c, fit, None)))
+                .height(Fill)
+                .into()
         } else {
             let bar = scrollable::Scrollbar::new().width(4).scroller_width(4);
-            scrollable(cards.push(spindle_card(c, fit, Some(spindle_height(fit)))))
+            let height = spindle_height(fit);
+            scrollable(cards.push(spindle.then(|| spindle_card(c, fit, Some(height)))))
                 .direction(scrollable::Direction::Vertical(bar))
                 .height(Fill)
                 .into()
@@ -9955,7 +10158,7 @@ fn position_card(c: &crate::control::Connection, fit: Fit) -> Element<'_, Messag
         ]
         .spacing(8)
         .align_y(Alignment::Center)
-        .height(22)
+        .height(fit.row(22.))
     ];
     let (line, size) = fit.dro_row(enabled.len());
     for &a in &enabled {
@@ -9997,7 +10200,7 @@ fn position_card(c: &crate::control::Connection, fit: Fit) -> Element<'_, Messag
                 )
                 .on_submit(target_enter(a))
                 .width(Fill)
-                .padding([4, 6])
+                .padding(finger([4, 6], 12, ""))
                 .size(12);
             row![
                 bold(AXES[a], 18).width(20),
@@ -10061,7 +10264,7 @@ fn position_card(c: &crate::control::Connection, fit: Fit) -> Element<'_, Messag
             }
         }
     }
-    let foot_height = if fit.short { 28. } else { 32. };
+    let foot_height = fit.row(if fit.short { 28. } else { 32. });
     col = col.push(container(foot).height(foot_height).center_y(foot_height));
     card(col, Some(position_height(enabled.len(), fit)), fit)
 }
@@ -10073,8 +10276,8 @@ pub(crate) fn target_enter(a: usize) -> Message {
 /// The Position card's height for `axes` axes: the title, the DRO lines,
 /// the foot, the padding and the frame.
 fn position_height(axes: usize, fit: Fit) -> f32 {
-    let foot = if fit.short { 28. } else { 32. };
-    22. + fit.dro_row(axes).0 * axes as f32 + foot + 2. * fit.pad() + 2.
+    let foot = fit.row(if fit.short { 28. } else { 32. });
+    fit.row(22.) + fit.dro_row(axes).0 * axes as f32 + foot + 2. * fit.pad() + 2.
 }
 
 /// The key that jogs `axis` toward `negative` (`main::jog_key`), as the jog
@@ -10140,7 +10343,8 @@ fn jog_card(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
             slider(1.0..=100.0, c.jog_speed, |v| Message::Machine(
                 Action::JogSpeed(v)
             ))
-            .step(1.0_f32),
+            .step(1.0_f32)
+            .height(fit.row(16.)),
             help::command(&Message::Machine(Action::JogSpeed(0.)), "Jog speed".into()),
             widget::tooltip::Position::Top,
         ),
@@ -10160,7 +10364,7 @@ fn jog_card(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
     ]
     .spacing(8)
     .align_y(Alignment::Center)
-    .height(22);
+    .height(fit.row(22.));
     let mut modes = row![small(
         "Cont.",
         Some(Message::Machine(Action::JogStep(None))),
@@ -10209,7 +10413,12 @@ fn jog_card(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
         col = col.push(angles);
     }
     let (w, h) = fit.jog();
-    let jog = |axis: usize, negative: bool| -> Element<'_, Message> {
+    // A button stands where its jog moves the tool, seen from the front
+    // (`axis` and `negative` the usual machine's: X+ right, Y+ away), and
+    // sends what this machine needs for that (`Orient::jog_like_usual`).
+    let jog = |at_axis: usize, at_negative: bool| -> Element<'_, Message> {
+        let key = jog_key_name(at_axis, at_negative);
+        let (axis, negative) = c.orient.jog_like_usual(at_axis, at_negative);
         if !c.axis(axis) {
             return space().width(w).height(h).into();
         }
@@ -10250,20 +10459,16 @@ fn jog_card(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
                 .on_press(Message::Machine(Action::JogPress(axis, negative)))
                 .on_release(release.clone())
                 .on_exit(release),
-            container(
-                text(jog_key_name(axis, negative))
-                    .size(12)
-                    .color(Color::WHITE),
-            )
-            .padding([3, 8])
-            .style(|_| container::Style {
-                background: Some(Color::from_rgb8(29, 43, 58).into()),
-                border: Border {
-                    radius: 5.into(),
+            container(text(key).size(12).color(Color::WHITE))
+                .padding([3, 8])
+                .style(|_| container::Style {
+                    background: Some(Color::from_rgb8(29, 43, 58).into()),
+                    border: Border {
+                        radius: 5.into(),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            }),
+                }),
             widget::tooltip::Position::Top,
         )
         .gap(4)
@@ -10299,14 +10504,16 @@ fn jog_gap(fit: Fit) -> f32 {
 /// of three rows, the padding and the frame.
 fn jog_height(a_axis: bool, fit: Fit) -> f32 {
     let gap = jog_gap(fit);
-    let rows = 22. + gap + 26. + gap + (fit.jog().1 * 3. + 12.) + 2. * fit.pad() + 2.;
-    if a_axis { rows + gap + 26. } else { rows }
+    let steps = fit.row(26.);
+    let rows = fit.row(22.) + gap + steps + gap + (fit.jog().1 * 3. + 12.) + 2. * fit.pad() + 2.;
+    if a_axis { rows + gap + steps } else { rows }
 }
 
 /// The least height the Spindle card's rows need: the title, the speed,
 /// the rule, the feed and its line, the gaps, the padding and the frame.
 fn spindle_height(fit: Fit) -> f32 {
-    24. + 28. + 1. + 26. + 15. + 4. * if fit.short { 4. } else { 6. } + 2. * fit.pad() + 2.
+    let gap = if fit.short && !fit.touch { 4. } else { 6. };
+    fit.row(24.) + fit.row(28.) + 1. + fit.row(26.) + 15. + 4. * gap + 2. * fit.pad() + 2.
 }
 /// The Spindle and feed card: the spindle's state, speed and direction,
 /// Spindle off, the coolant, the feed override and the feed now; `height`
@@ -10363,10 +10570,12 @@ fn spindle_card(
     .spacing(10)
     .align_y(Alignment::Center);
     let coolant = |on: bool, label: &'static str, f: fn(bool) -> Action| {
-        checkbox(on)
-            .label(label)
-            .on_toggle(move |b| Message::Machine(f(b)))
-            .text_size(12)
+        finger_box(
+            checkbox(on)
+                .label(label)
+                .on_toggle(move |b| Message::Machine(f(b)))
+                .text_size(12),
+        )
     };
     if c.config.outputs.flood.is_some() {
         head = head.push(coolant(s.flood, "Flood", Action::Flood));
@@ -10379,7 +10588,7 @@ fn spindle_card(
             text_input("RPM", &c.rpm)
                 .on_input(|v| Message::Machine(Action::Rpm(v)))
                 .width(80)
-                .padding([5, 8])
+                .padding(finger([5, 8], 13, ""))
                 .size(13),
             "control_rpm",
             "Spindle speed · RPM",
@@ -10415,7 +10624,8 @@ fn spindle_card(
                     c.feed_override
                 }))
             })
-            .step(5.0_f32),
+            .step(5.0_f32)
+            .height(fit.row(16.)),
             help::command(
                 &Message::Machine(Action::FeedOverride(100.)),
                 "Feed override".into()
@@ -10433,7 +10643,7 @@ fn spindle_card(
     .align_y(Alignment::Center);
     card(
         column![
-            head.height(24),
+            head.height(fit.row(24.)),
             spin,
             rule::horizontal(1),
             feed,
@@ -10442,7 +10652,7 @@ fn spindle_card(
                 .color(MUTED)
                 .wrapping(Wrapping::None),
         ]
-        .spacing(if fit.short { 4 } else { 6 }),
+        .spacing(if fit.short && !fit.touch { 4 } else { 6 }),
         height,
         fit,
     )
@@ -10476,7 +10686,12 @@ fn control_tab<'a>(tab: ControlTab, shown: bool, alert: bool, fit: Fit) -> Eleme
         .spacing(7)
         .width(Length::Shrink),
     )
-    .padding(if fit.narrow { [8, 7] } else { [8, 10] })
+    .padding(match (fit.touch, fit.narrow) {
+        // The face, its gap and line, 26 px, a finger tall.
+        (true, _) => [12, finger([8, 10], 13, tab.label())[1]],
+        (_, true) => [8, 7],
+        _ => [8, 10],
+    })
     .on_press(Message::ControlTab(tab))
     .style(|_, status| button::Style {
         background: matches!(status, button::Status::Hovered | button::Status::Pressed)
@@ -10647,6 +10862,12 @@ pub(crate) fn machine_model<'a>(
         crate::machine_view::Figures::JINGYAN,
         crate::machine_view::Figures::of,
     );
+    // The connected machine's orientation, the jog pad's (LIO-457), also when
+    // the project open has no copy of it.
+    let figures = crate::machine_view::Figures {
+        orient: c.orient,
+        ..figures
+    };
     let (envelope, assumed) = crate::machine_view::MachineView::envelope(&c.config, figures.travel);
     crate::machine_view::MachineView {
         figures,
@@ -11127,7 +11348,15 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
 /// The Work zero tab: each axis set to a value, the work system, the work
 /// zero on the stock for the setup picked, step by step until its first
 /// tool run, and the reference surface for its tool changes.
-const WORK_ZERO_NOTE: &str = "Zero makes the current position work zero in the active coordinate system; ½ halves the position shown, Set gives it the value typed. For the middle of a part by hand, zero X with an edge finder on its left side, touch its right side and press ½ on X. G54 to G59 each keep their own; they change only while Idle.";
+/// The Work zero tab's note on a machine of orientation `o`: X's sides
+/// named where they are (LIO-457).
+fn work_zero_note(o: crate::orient::Orient) -> String {
+    format!(
+        "Zero makes the current position work zero in the active coordinate system; ½ halves the position shown, Set gives it the value typed. For the middle of a part by hand, zero X with an edge finder on its {} (-X) side, touch its {} (+X) side and press ½ on X. G54 to G59 each keep their own; they change only while Idle.",
+        o.end(0, false),
+        o.end(0, true)
+    )
+}
 fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Message> {
     let fit = Fit::of(app);
     use crate::control::Action;
@@ -11148,7 +11377,7 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
                             .then_some(Message::Machine(Action::WorkSet(a))),
                     )
                     .width(if fit.narrow { 56 } else { 70 })
-                    .padding([5, 8])
+                    .padding(finger([5, 8], 13, ""))
                     .size(13),
                 "work_set",
                 &format!(
@@ -11177,7 +11406,7 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
     };
     let mut systems = row![help::wrap(
         muted("Work system").width(80),
-        Help::text("Work zero", WORK_ZERO_NOTE),
+        Help::text("Work zero", work_zero_note(c.orient)),
         widget::tooltip::Position::Top,
     )]
     .spacing(4)
@@ -11192,7 +11421,7 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
     let mut col = column![set, systems].spacing(8);
     // Short, the hint is on the work systems' hover.
     if !fit.short {
-        col = col.push(hint("Work zero", WORK_ZERO_NOTE, fit.chars(110)));
+        col = col.push(hint("Work zero", work_zero_note(c.orient), fit.chars(110)));
     }
     let Some(run) = &c.run else {
         return tab_scroll(col.push(muted(
@@ -11267,7 +11496,7 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
                         idle(Action::MachineZero(None)),
                         false
                     ),
-                    hint("Work zero", MOVE_THERE_WAITS, fit.chars(60)),
+                    hint("Work zero", move_there_waits(c.orient), fit.chars(60)),
                 ]
                 .spacing(6)
                 .align_y(Alignment::Center),
@@ -11381,8 +11610,8 @@ fn probe_tab(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
                                 && crate::post::stock_zero(&p.origin).is_some();
                             format!(
                                 "Jog the probe above the stock top, over {}, and press {name}: it touches off {}, allowing for the {} mm tip, at {} mm/min, and sets the X, Y and Z work zero on {}{}.",
-                                crate::control::probe_spot(refs),
-                                crate::post::probe_spots(refs, p.stock),
+                                crate::control::probe_spot(c.orient, refs),
+                                crate::post::probe_spots(c.orient, refs, p.stock),
                                 pr.tip.unwrap_or_default(),
                                 pr.feed,
                                 p.origin,
@@ -11417,16 +11646,17 @@ fn probe_tab(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
     // Features found where the tip is, without a setup.
     let feature = |f: Feature| {
         small(
-            f.label(),
+            f.label(c.orient),
             c.feature_blocked(f)
                 .is_none()
                 .then_some(Message::Machine(Action::ProbeFeature(f))),
             c.feature() == Some(f),
         )
     };
+    let [bl, br, fl, fr] = Feature::corners(c.orient);
     let corners = column![
-        row![feature(Feature::CORNERS[0]), feature(Feature::CORNERS[1])].spacing(4),
-        row![feature(Feature::CORNERS[2]), feature(Feature::CORNERS[3])].spacing(4),
+        row![feature(bl), feature(br)].spacing(4),
+        row![feature(fl), feature(fr)].spacing(4),
     ]
     .spacing(4);
     let mut edges = row![].spacing(4);
@@ -11458,7 +11688,7 @@ fn probe_tab(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
             hint(
                 "Feature at the tip",
                 match (why, c.feature()) {
-                    (_, Some(f)) => f.how(),
+                    (_, Some(f)) => f.how(c.orient),
                     (Some(why), None) => why,
                     (None, None) => "Put the tip as each button's card says and press it: the surface, side, corner or centre found becomes work zero in the active work system, on the axes it sets.".into(),
                 },
@@ -11492,7 +11722,7 @@ fn mdi_tab(c: &crate::control::Connection, fit: Fit) -> Element<'_, Message> {
                 text_input("One G-code line, for example G0 X10 Y10", &c.mdi)
                     .on_input(|v| Message::Machine(Action::MdiText(v)))
                     .on_submit_maybe(send.clone())
-                    .padding([7, 9])
+                    .padding(finger([7, 9], 13, ""))
                     .size(13),
                 "mdi_line",
                 "MDI line",
@@ -11580,21 +11810,21 @@ fn machine_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'
         zero = zero.push(small("Home", idle(Action::Home), false));
     }
     zero = zero.push(muted(if declared.is_empty() {
-        HOME_NOTE
+        HOME_NOTE.to_string()
     } else {
-        MACHINE_ZERO_NOTE
+        machine_zero_note(c.orient)
     }));
     if let Some(pins) = pin_block(c) {
         zero = zero.push(pins);
     }
     col = col.push(rule::horizontal(1)).push(zero);
     if c.limit_inputs() {
-        col = col.push(
+        col = col.push(finger_box(
             checkbox(s.limits_override)
                 .label("Override limit switches")
                 .on_toggle(|b| Message::Machine(Action::OverrideLimits(b)))
                 .text_size(12),
-        );
+        ));
         col = col.push(muted("To drive off a limit switch that tripped. It turns itself off a second after no switch is active."));
     }
     // The machine itself, in 3D, beside what sets it up (LIO-343): it was
@@ -11777,7 +12007,7 @@ fn op_row<'a>(
     let mut named = row![].spacing(4).align_y(Alignment::Center);
     if let Some((unfolded, m, note)) = steps {
         let toggle = button(text(if unfolded { "▾" } else { "▸" }).size(11).color(MUTED))
-            .padding([0, 2])
+            .padding(finger([0, 2], 11, "▸"))
             .on_press(m.clone())
             .style(|_, _| button::Style::default());
         named = named
@@ -11794,7 +12024,7 @@ fn op_row<'a>(
     }
     .spacing(if fit.narrow { 6 } else { 8 })
     .align_y(Alignment::Center)
-    .height(if fit.short { 26 } else { 28 });
+    .height(fit.row(if fit.short { 26. } else { 28. }));
     let mut body = column![line].spacing(3);
     if let Some(cut) = cut {
         body = body.push(widget::progress_bar(0.0..=1.0, cut).girth(5));
@@ -11865,13 +12095,22 @@ fn step_budget(app: &App, (runs, ops): (usize, usize), picked: bool) -> usize {
         - 2. * fit.gap()
         - 2. * fit.pad()
         - 30.;
-    let row = if fit.short { 32. } else { 34. };
-    let used = ops as f32 * row + runs as f32 * 26. + if picked { 64. } else { 0. } + 96.;
-    (((card - used) / STEP_LINE).floor() as usize).clamp(3, 16)
+    // Touch, the Spindle card is under the list (`Fit`).
+    let card = if fit.touch {
+        card - spindle_height(fit) - fit.gap()
+    } else {
+        card
+    };
+    let row = fit.row(if fit.short { 26. } else { 28. }) + 6.;
+    let buttons = fit.row(25.) - 25.;
+    let used = ops as f32 * row + runs as f32 * 26. + if picked { 64. + buttons } else { 0. } + 96.;
+    (((card - used) / step_line(fit)).floor() as usize).clamp(3, 16)
 }
 
 /// A step list line's height with its spacing.
-const STEP_LINE: f32 = 22.;
+fn step_line(fit: Fit) -> f32 {
+    fit.row(20.) + 2.
+}
 
 /// Which of `n` steps get a line of their own when `max` lines are all
 /// there is room for (LIO-275): those in `keep`, the first first, while
@@ -11973,7 +12212,7 @@ fn step_list<'a>(
         S::ToCome => "",
     };
     let mut col = column![].spacing(2);
-    let lh = STEP_LINE - 2.;
+    let lh = step_line(fit) - 2.;
     for r in step_lines(os.steps.len(), &keep, shown.lines) {
         let first = *r.start();
         let one = r.start() == r.end();
@@ -12341,7 +12580,7 @@ pub(crate) fn program<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
                     number += 1;
                     use crate::run::Stage;
                     let start_width = Some(Length::Fixed(74.));
-                    let more_width = Length::Fixed(22.);
+                    let more_width = Length::Fixed(if fit.touch { FINGER } else { 22. });
                     if let Some(how) = skipped(oi) {
                         list = list.push(op_row(
                             number,
@@ -12569,15 +12808,23 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
     let setup = app.doc.setups.get(run.setup)?;
     let s = &c.snapshot;
     let mut steps = vec![format!(
-        "Every tool run is cut from this setup's work zero, {} in {}. Before the first Cycle Start, put it on the stock:",
-        p.origin, p.offset
+        "Every tool run is cut from this setup's work zero, {} in {}.{} Before the first Cycle Start, put it on the stock:",
+        p.origin,
+        p.offset,
+        c.orient
+            .turned_note()
+            .map(|n| format!(" {n}"))
+            .unwrap_or_default()
     )];
     steps.push(if (0..3).all(|a| s.referenced[a]) {
         "1. X, Y and Z have a machine position.".into()
     } else if c.home_switches() {
         "1. Optional: Home in the Machine tab, so that the soft limits are on. Without it Cycle Start runs with them off.".into()
     } else {
-        "1. Optional: Set machine zero in the Machine tab, so that the soft limits are on: jog X to its left end, Y to its front end and Z to the top first. Without it Cycle Start runs with them off.".into()
+        format!(
+            "1. Optional: Set machine zero in the Machine tab, so that the soft limits are on: jog {} first. Without it Cycle Start runs with them off.",
+            zero_ends(c.orient, "to")
+        )
     });
     steps.push(if p.offset == format!("G{}", 54 + s.active_wcs) {
         format!("2. {} is the active work system.", p.offset)
@@ -12611,7 +12858,7 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
         } else {
             "the stock top"
         };
-        let spot = match crate::control::probe_spot(refs).as_str() {
+        let spot = match crate::control::probe_spot(c.orient, refs).as_str() {
             "its centre" => "the centre".to_string(),
             spot => spot.to_string(),
         };
@@ -12626,7 +12873,7 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
     } else {
         match (c.touch_off(), crate::post::references(&p.origin)) {
             (Some((_, work)), Some(refs)) => {
-                let spot = match crate::control::probe_spot(refs).as_str() {
+                let spot = match crate::control::probe_spot(c.orient, refs).as_str() {
                     "its centre" => "the centre".to_string(),
                     spot => spot.to_string(),
                 };
@@ -12801,7 +13048,7 @@ fn pin_steps(
     steps.push(match c.touch_off() {
         Some((_, work)) => {
             let spot = crate::post::references(&p.origin).map_or("the stock top".to_string(), |refs| {
-                match crate::control::probe_spot(refs).as_str() {
+                match crate::control::probe_spot(c.orient, refs).as_str() {
                     "its centre" => "the centre of the stock top".to_string(),
                     spot => format!("{spot} of the stock top"),
                 }
@@ -12848,7 +13095,7 @@ fn probe_from_grid<'a>(
     spots: &[([crate::post::At; 2], Result<(), String>)],
 ) -> Element<'a, Message> {
     use crate::control::Action;
-    use crate::post::At::{Max, Mid, Min};
+    use crate::post::At::{Max, Mid};
     let program = c.run_program().ok();
     // The zero's own spot, reachable or not: the one a jaw may stand at.
     let own = program.and_then(|p| crate::post::references(&p.origin));
@@ -12859,23 +13106,24 @@ fn probe_from_grid<'a>(
         .probe_spot
         .filter(|&r| reachable(r))
         .or(own.filter(|&r| reachable(r)));
+    let o = c.orient;
     let name = |refs: [crate::post::At; 2]| match refs {
         [Mid, Mid] => "Centre".to_string(),
         [Mid, _] | [_, Mid] => {
             let k = usize::from(refs[0] == Mid);
-            let s = crate::post::ENDS[k][usize::from(refs[k] == Max)];
+            let s = o.end(k, refs[k] == Max);
             s[..1].to_uppercase() + &s[1..]
         }
         _ => {
-            let s = crate::post::corner_name(refs);
+            let s = o.corner(refs);
             s[..1].to_uppercase() + &s[1..]
         }
     };
     let mut grid = column![].spacing(4);
-    for y in [Max, Mid, Min] {
+    for away in [1, 0, -1] {
         let mut line = row![].spacing(4);
-        for x in [Min, Mid, Max] {
-            let refs = [x, y];
+        for right in [-1, 0, 1] {
+            let refs = o.spot_at(right, away);
             let ok = reachable(refs);
             // Model origin is set off from its spot, not on it.
             let label = match (Some(refs) == own, model) {
@@ -13033,7 +13281,7 @@ fn rotary_tab<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>
             text_input(hint, value)
                 .on_input(move |v| Message::Machine(on(v)))
                 .width(90)
-                .padding([7, 9])
+                .padding(finger([7, 9], 13, ""))
                 .size(13),
             key,
             label,
@@ -13097,10 +13345,10 @@ fn rotary_tab<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>
     .wrap()
     .vertical_spacing(6);
     let how = match c.calibrating() {
-        Some(what) => format!("{} E-stop stops it.", what.how()),
+        Some(what) => format!("{} E-stop stops it.", what.how(c.orient)),
         None => match c.calibrate_blocked(Calibrate::Centreline) {
-            Some(why) => format!("{} {why}", Calibrate::Centreline.how()),
-            None => Calibrate::Centreline.how(),
+            Some(why) => format!("{} {why}", Calibrate::Centreline.how(c.orient)),
+            None => Calibrate::Centreline.how(c.orient),
         },
     };
     let mut col = column![state, fields, buttons, muted(how)].spacing(8);
@@ -13128,8 +13376,28 @@ fn rotary_tab<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>
     Some(tab_scroll(col))
 }
 const HOME_NOTE: &str = "Home references every axis on its switch. Every E-stop clears the machine position: home again after one.";
-const MOVE_THERE_WAITS: &str = "Move there waits for machine zero: it rises to the top of Z first. Set it here, with X at its left end, Y at its front end and Z at the top (where the simulator starts), or in the Machine tab.";
-const MACHINE_ZERO_NOTE: &str = "Every E-stop clears the machine position: set it again after one. Without home switches, jog X to its left end, Y to its front end (gantry toward you) and Z to the top, then Set machine zero here. Keep the last position takes the position AXIS CAM saved at the last disconnect: only if nothing moved the machine since.";
+/// Where machine zero is on a machine of orientation `o`, after `at`
+/// ("at" or "to"): X and Y at their minimum ends, named where they are on
+/// the table, and Z at the top.
+pub(crate) fn zero_ends(o: crate::orient::Orient, at: &str) -> String {
+    format!(
+        "X {at} its {} end, Y {at} its {} end and Z {at} the top",
+        o.end(0, false),
+        o.end(1, false)
+    )
+}
+fn move_there_waits(o: crate::orient::Orient) -> String {
+    format!(
+        "Move there waits for machine zero: it rises to the top of Z first. Set it here, with {} (where the simulator starts), or in the Machine tab.",
+        zero_ends(o, "at")
+    )
+}
+fn machine_zero_note(o: crate::orient::Orient) -> String {
+    format!(
+        "Every E-stop clears the machine position: set it again after one. Without home switches, jog {}, then Set machine zero here. Keep the last position takes the position AXIS CAM saved at the last disconnect: only if nothing moved the machine since.",
+        zero_ends(o, "to")
+    )
+}
 /// The note under a library editor's fields when its draft is not what the
 /// library holds: `saved` is the entry with the draft's id, if there is one.
 fn unsaved_note(draft: &Fields, saved: Option<&Fields>, what: &str) -> Option<String> {
@@ -15902,7 +16170,29 @@ fn post(app: &App) -> Element<'_, Message> {
         .push(secondary("Export setup sheet (.md)", Message::Export("sheet")).width(Fill))
         .push(secondary("Save complete project (.json)", Message::SaveProject).width(Fill))
         // The job with its part, for the shop tablet at the machine (LIO-453).
-        .push(secondary("Save for tablet (.axisjob)", Message::SaveForTablet).width(Fill));
+        .push(secondary("Save for tablet (.axisjob)", Message::SaveForTablet).width(Fill))
+        // Or no file at all: a paired tablet on this Wi-Fi gets the open
+        // project and the recent project files itself (LIO-459).
+        .push(secondary("Pair a tablet", Message::PairTablet).width(Fill));
+    if let Some(why) = &app.tablet_firewall {
+        summary = summary.push(caution(
+            "The tablet can't reach this computer",
+            vec![
+                why.clone(),
+                "Click Let the tablet through the firewall and answer Yes. Or by hand: Windows Defender Firewall, Advanced settings, Inbound Rules: delete this app's Block rules and allow it.".into(),
+            ],
+        ));
+        summary = summary.push(
+            secondary("Let the tablet through the firewall", Message::OpenFirewall).width(Fill),
+        );
+    }
+    if let Some((code, at)) = &app.tablet_code
+        && at.elapsed() < std::time::Duration::from_secs(600)
+    {
+        summary = summary.push(note(format!(
+            "On the tablet, tap Projects and type {code} (it works for 10 minutes). Once paired, the tablet gets this computer's open project and recent project files whenever both are on the same Wi-Fi."
+        )));
+    }
     if shown == 0 {
         // An empty dark pane reads as a failed load: say what will be here.
         code = code.push(
@@ -16194,6 +16484,28 @@ pub(crate) mod probe {
         let mut bounds = Bounds(vec![]);
         ui.operate(&renderer, &mut bounds);
         bounds.0
+    }
+    struct Fields(Vec<iced::Rectangle>);
+    impl Operation for Fields {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+        fn text_input(
+            &mut self,
+            _: Option<&Id>,
+            bounds: iced::Rectangle,
+            _: &mut dyn iced_runtime::core::widget::operation::TextInput,
+        ) {
+            self.0.push(bounds);
+        }
+    }
+    /// Where the text fields of `page` are, unscrolled.
+    pub(crate) fn fields(page: Element<'_, Message>, window: Size) -> Vec<iced::Rectangle> {
+        let mut renderer = renderer();
+        let mut ui = UserInterface::build(page, window, Cache::default(), &mut renderer);
+        let mut fields = Fields(vec![]);
+        ui.operate(&renderer, &mut fields);
+        fields.0
     }
     /// What pressing the left button, then releasing it, gives at every
     /// `step` px of `area`, with the point it was pressed at.

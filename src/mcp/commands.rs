@@ -891,7 +891,7 @@ pub const LATER: [(&str, &str); 0] = [];
 
 /// The user's actions an agent may not run, by name, so `list_commands`
 /// shows them and says why.
-pub const REFUSED: [(&str, &str, &str); 27] = [
+pub const REFUSED: [(&str, &str, &str); 28] = [
     ("connect", "Connects to the machine.", class::MACHINE),
     (
         "disconnect",
@@ -1002,6 +1002,11 @@ pub const REFUSED: [(&str, &str, &str); 27] = [
         "planner",
         "The AI planner's plan, chat and sign-in.",
         class::PLANNER,
+    ),
+    (
+        "pair_tablet",
+        "Pairs a shop tablet with this computer, or lets tablets through Windows Firewall.",
+        class::DEVICE,
     ),
 ];
 
@@ -4057,6 +4062,7 @@ pub(crate) mod tests {
                     assert_eq!(why, expected, "{m:?}");
                 }
                 Class::Planner => assert_eq!(guard(&[m]).unwrap_err(), class::PLANNER),
+                Class::Device => assert_eq!(guard(&[m]).unwrap_err(), class::DEVICE),
                 Class::Command(_) | Class::Internal => {}
             }
         }
