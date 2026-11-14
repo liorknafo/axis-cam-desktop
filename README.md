@@ -10,14 +10,14 @@ A working native desktop **CAM workflow prototype**, built with Rust and Iced 0.
 
 The app bundle is built from this source with `./scripts/package-macos.sh` (see below). Rebuild it from the current source before opening the workspace: older bundles can drop the material and workholding libraries when they save. A bundle is an Apple Silicon build for macOS 26 or later (the bundled CAD libraries require macOS 26). It includes its STEP reader and runtime libraries; end users do not need Homebrew or Python. Double-click it to open. It is ad-hoc signed, not notarized for public distribution.
 
-To build from source with a current stable Rust toolchain:
+To build from source with the Rust that `rust-toolchain.toml` pins (1.98.0; rustup installs it, with its rustfmt and clippy, on the first `cargo` run in this folder):
 
 ```sh
 brew install opencascade
 cargo run --release --locked
 ```
 
-The build was tested with Rust 1.97.1 on Apple Silicon. The STEP helper uses a C++17 compiler and Open CASCADE 7.9. The HTTPS client builds aws-lc, which needs a C compiler and CMake. Set `OCCT_PREFIX` to a custom installation prefix if needed. The build script reruns when `OCCT_PREFIX`, `CXX`, `AXIS_SKIP_STEP`, the prefix's `include/opencascade/Standard_Version.hxx` or its `lib` directory change, so an upgrade of Open CASCADE rebuilds the helper. `AXIS_SKIP_STEP=1` explicitly builds without STEP support; the macOS packaging script refuses such a build (`scripts/bundle-step.py` stops with "No compiled STEP helper; package requires Open CASCADE support"). The tests and the renderer smoke run need Open CASCADE too: without it the five tests that import a `.step` fixture print `skipped: …` and pass without testing it, and `--smoke-test` stops at once with exit code 2 (see Tests and renderer checks).
+The build was tested with Rust 1.98.0 on Apple Silicon. The STEP helper uses a C++17 compiler and Open CASCADE 7.9. The HTTPS client builds aws-lc, which needs a C compiler and CMake. Set `OCCT_PREFIX` to a custom installation prefix if needed. The build script reruns when `OCCT_PREFIX`, `CXX`, `AXIS_SKIP_STEP`, the prefix's `include/opencascade/Standard_Version.hxx` or its `lib` directory change, so an upgrade of Open CASCADE rebuilds the helper. `AXIS_SKIP_STEP=1` explicitly builds without STEP support; the macOS packaging script refuses such a build (`scripts/bundle-step.py` stops with "No compiled STEP helper; package requires Open CASCADE support"). The tests and the renderer smoke run need Open CASCADE too: without it the five tests that import a `.step` fixture print `skipped: …` and pass without testing it, and `--smoke-test` stops at once with exit code 2 (see Tests and renderer checks).
 
 | Platform | Status |
 | --- | --- |
@@ -1579,6 +1579,8 @@ cargo run --locked -- --smoke-test ./smoke-output
 # Fast, isolated rendering of field help only:
 cargo run --release --locked -- --smoke-test ./help-output --help-only
 ```
+
+Every machine formats and lints with the pinned toolchain's rustfmt (1.9.0) and clippy, so `cargo fmt` gives the same result on the Mac, Windows and Linux; another Rust's rustfmt (1.10 in Rust 1.99, for example) formats some lines differently. Moving to a newer Rust is its own pull request: change the channel in `rust-toolchain.toml`, run `cargo fmt` and fix what the new clippy finds, with no other changes. Every pull request into main runs the `fmt` check (`.github/workflows/fmt.yml`): `cargo fmt --check` for the desktop app and for the shop tablet build in `android/`, with the pinned rustfmt and no build. It must pass before the pull request can be merged.
 
 `scripts/check-validation-names.sh` checks that every test name `docs/VALIDATION.md` cites exists as a function in `src/` (or in the UC100 driver crate's checkout), so a renamed or deleted test cannot stay cited.
 
