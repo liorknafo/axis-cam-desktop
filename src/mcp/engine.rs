@@ -56,9 +56,12 @@ pub trait Backend {
     /// folder a command may write; None in the window.
     fn session_folder(&self) -> Option<std::path::PathBuf>;
     /// Keeps on disk what results are about to report: a headless session
-    /// writes its `session.json` and workspace when they changed. Called
-    /// before the answers are sent.
-    fn keep(&mut self) {}
+    /// writes its workspace and `session.json` when they changed. Called
+    /// before the answers are sent; what could not be written, which the
+    /// answers then say (`flush`).
+    fn keep(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// What a tool call gives back: its result object, or why the call could
@@ -460,10 +463,9 @@ fn session_info(b: &impl Backend) -> Value {
     let app = b.app();
     let mut session = b.session();
     if let Value::Object(o) = &mut session {
-        o.insert(
-            "saved_to_project_file".into(),
-            json!(app.project_path.is_some() && !app.project_dirty),
-        );
+        // A file removed since it was saved holds nothing.
+        let saved = app.project_path.as_ref().is_some_and(|p| p.is_file()) && !app.project_dirty;
+        o.insert("saved_to_project_file".into(), json!(saved));
         o.insert(
             "project_file".into(),
             json!(app.project_path.as_ref().map(|p| p.display().to_string())),
@@ -471,6 +473,35 @@ fn session_info(b: &impl Backend) -> Value {
         o.insert("last_saves_and_exports".into(), json!(app.mcp.outputs));
     }
     session
+}
+
+/// A result sent while the session could not be saved (`why`): a change
+/// it reports done failed, its change kept in memory only; any other result
+/// says the session is not saved.
+fn not_persisted(result: &mut serde_json::Map<String, Value>, why: &str) {
+    let done = result.get("outcome") == Some(&json!("done"));
+    let changes = (result.get("changed").and_then(Value::as_array)).is_some_and(|c| !c.is_empty())
+        || result.get("checkpoint").is_some()
+        || result.get("steps").is_some_and(Value::is_array);
+    if done && changes {
+        result.insert("outcome".into(), json!("failed"));
+        result.insert(
+            "reason".into(),
+            json!(format!(
+                "The session could not be saved: {why}. Your change is in memory only."
+            )),
+        );
+    } else {
+        let note = format!(
+            "The session is not saved: {why}. Its changes since the last save are in memory only."
+        );
+        match result.get_mut("notes").and_then(Value::as_array_mut) {
+            Some(notes) => notes.push(json!(note)),
+            None => {
+                result.insert("notes".into(), json!([note]));
+            }
+        }
+    }
 }
 
 /// The command groups, in the order `list_commands` gives them.
@@ -852,8 +883,17 @@ impl Agent {
                 result.insert("session".into(), session);
             }
         }
-        // Whatever a result reports is on disk before it is sent.
-        b.keep();
+        // Whatever a result reports is on disk before it is sent; when it
+        // could not be written, the result says so.
+        let kept = b.keep();
+        for (_, answer, stamp) in &mut out {
+            if *stamp && let Ok(Value::Object(result)) = answer {
+                result.insert("persisted".into(), json!(kept.is_ok()));
+                if let Err(why) = &kept {
+                    not_persisted(result, why);
+                }
+            }
+        }
         for (reply, answer, _) in out {
             reply(answer);
         }

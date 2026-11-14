@@ -21,11 +21,14 @@
 //! - `checkpoint`: the job kept by name, and put back.
 //! - `session`: what a headless session keeps on disk beside its workspace,
 //!   its lock, and the session tools.
+//! - `instance`: the instance files of open AXIS CAM windows, and the
+//!   backend chosen from them (a call is refused while a window is open).
 pub mod checkpoint;
 pub mod class;
 pub mod commands;
 pub mod engine;
 pub mod fields;
+pub mod instance;
 pub mod pick;
 pub mod protocol;
 pub mod reads;
@@ -39,7 +42,8 @@ pub use state::{NOT_WORK_STATE, WORK_STATE};
 
 /// `axis-cam --mcp [--session <id>]`, given the arguments after `--mcp`:
 /// serves MCP on stdin and stdout until stdin ends, in a new headless
-/// session or in session `id`. The process's exit code.
+/// session or in session `id`, once no AXIS CAM window is open
+/// (`instance`, checked at each call). The process's exit code.
 pub fn main(args: &[String]) -> i32 {
     let id = match args {
         [] => None,

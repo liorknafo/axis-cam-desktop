@@ -927,10 +927,10 @@ mod tests {
         assert_eq!(names.len(), MOST);
         assert_eq!(names[0], "c1");
         assert_eq!(names[MOST - 1], "c5");
-        let files = || std::fs::read_dir(d.folder.join(DIR)).unwrap().count();
+        let files = || std::fs::read_dir(d.session.join(DIR)).unwrap().count();
         assert_eq!(files(), MOST);
         // The hook for a write lease that changes hands.
-        let folder = d.folder.clone();
+        let folder = d.session.clone();
         d.app.mcp.checkpoints.drop_all(Some(&folder));
         assert!(d.app.mcp.checkpoints.list.is_empty());
         assert_eq!(files(), 0);

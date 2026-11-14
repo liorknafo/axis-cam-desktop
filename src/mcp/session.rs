@@ -11,14 +11,19 @@
 //!   the revision with its change log, the last snapshot and the revision
 //!   last reported, the project file and whether it is saved, the paths of
 //!   the last saves and exports, and the checkpoints' index. It is written
-//!   (`storage::write_atomic`) with the `Document` before a result about
-//!   anything that changed is sent (`engine::Backend::keep`);
+//!   (`storage::write_atomic`) after the `Document`, and only once the
+//!   `Document` is on disk, before a result about anything that changed is
+//!   sent (`engine::Backend::keep`); it holds the `fingerprint` of the
+//!   workspace it goes with. A write that fails is reported in the result
+//!   (`persisted: false`, a change `failed`);
 //! - `checkpoints/`: the checkpoints (`checkpoint`);
 //! - `lock`: the process that has it open (`Lock`).
 //!
 //! Sessions are never deleted on their own: one may hold the only copy of
 //! a job. `delete_session` deletes one, never an open one, and one with work
-//! not saved to a project file only when asked to discard it.
+//! not saved to a project file only when asked to discard it. Saved means
+//! the project file is there now and holds the session's job by value
+//! (`saved_now`), not what the session last knew of it.
 use super::checkpoint::{Drafts, Meta, Place};
 use super::engine::Reply;
 use super::runner::{Runner, Session};
@@ -86,6 +91,17 @@ pub struct SessionFile {
     /// When it was written, s since 1970.
     #[serde(default)]
     pub written: u64,
+    /// The `fingerprint` of the `workspace.json` it was written with: the
+    /// two are one pair only while they match (`runner`).
+    #[serde(default)]
+    pub workspace: Option<u64>,
+}
+/// A stable fingerprint of a file's bytes (FNV-1a, 64 bits): the same in
+/// every build, so a resume by a newer app still pairs the files.
+pub fn fingerprint(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 /// The file's name in the session's folder.
 pub const FILE: &str = "session.json";
@@ -101,6 +117,7 @@ impl SessionFile {
             outputs: app.mcp.outputs.clone(),
             checkpoints: app.mcp.checkpoints.list.clone(),
             written: 0,
+            workspace: None,
         }
     }
     /// What changed of it since `key`: its hash, without when it was
@@ -133,15 +150,29 @@ impl SessionFile {
         app.mcp.outputs = self.outputs.clone();
         app.mcp.checkpoints = super::checkpoint::Kept::from_list(self.checkpoints.clone());
         app.project_path = self.project_path.clone().filter(|p| p.is_file());
-        app.project_dirty = self.project_dirty || app.project_path.is_none();
+        // Saved only if the file holds this job now: it may have been
+        // removed or changed since.
+        app.project_dirty =
+            !super::checkpoint::saved_by_value(&app.doc, app.project_path.as_deref());
     }
     pub fn put_place(&self, app: &mut App) {
         self.place.put(app);
     }
-    /// Whether the job is saved to a project file.
-    pub fn saved(&self) -> bool {
-        self.project_path.is_some() && !self.project_dirty
-    }
+}
+
+/// Whether the job of the session in `folder`, which kept `kept`, is saved
+/// to a project file now: its project file is there, loads, and holds the
+/// session's `Document` (its `workspace.json`) by value
+/// (`checkpoint::saved_by_value`). A file removed, unreadable or changed
+/// since, or a session never saved, is not.
+pub fn saved_now(folder: &Path, kept: Option<&SessionFile>) -> bool {
+    let Some(project) = kept.and_then(|k| k.project_path.as_deref()) else {
+        return false;
+    };
+    let Ok(doc) = crate::storage::load(&folder.join("workspace.json")) else {
+        return false;
+    };
+    super::checkpoint::saved_by_value(&doc, Some(project))
 }
 
 /// The lock file's name in a session's folder.
@@ -176,7 +207,7 @@ struct Owner {
 ///   and no new crate is added for it, so the owner refreshes its lock
 ///   file's modification time every `BEAT` (5 s), and a lock not refreshed
 ///   for `STALE` (30 s) is taken as dead.
-fn started(pid: u32) -> Option<String> {
+pub fn started(pid: u32) -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         let pid = i32::try_from(pid).ok()?;
@@ -208,14 +239,20 @@ fn started(pid: u32) -> Option<String> {
 /// Whether the owner of a lock whose file was last refreshed at `beat` is
 /// alive (`started` says how it is told).
 fn alive(owner: &Owner, beat: Option<SystemTime>) -> bool {
+    process_alive(owner.pid, owner.started.as_deref(), beat)
+}
+/// Whether process `pid`, which started at `start` (as `started` gives it),
+/// is alive, its file last refreshed at `beat`: a lock's owner, or an
+/// instance file's app (`instance`).
+pub fn process_alive(pid: u32, start: Option<&str>, beat: Option<SystemTime>) -> bool {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let _ = beat;
-        owner.started.is_some() && started(owner.pid) == owner.started
+        start.is_some() && started(pid).as_deref() == start
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = owner;
+        let _ = (pid, start);
         fresh(beat)
     }
 }
@@ -402,7 +439,7 @@ fn describe(root: &Path, id: &str) -> Option<Value> {
         "id": id,
         "title": title,
         "last_change": last.map(super::checkpoint::utc),
-        "saved_to_project_file": kept.as_ref().is_some_and(SessionFile::saved),
+        "saved_to_project_file": saved_now(&folder, kept.as_ref()),
         "project_file": kept.as_ref().and_then(|k| k.project_path.as_ref()).map(|p| p.display().to_string()),
         "revision": kept.as_ref().map_or(0, |k| k.log.revision),
         "checkpoints": kept.as_ref().map_or(0, |k| k.checkpoints.len()),
@@ -451,7 +488,7 @@ pub fn delete(root: &Path, id: &str, discard_unsaved: bool) -> Result<Value, Str
         }
     };
     let kept = SessionFile::read(&folder).and_then(Result::ok);
-    if !discard_unsaved && !kept.as_ref().is_some_and(SessionFile::saved) {
+    if !discard_unsaved && !saved_now(&folder, kept.as_ref()) {
         let title = describe(root, id)
             .and_then(|d| d["title"].as_str().map(String::from))
             .unwrap_or_default();
@@ -468,10 +505,18 @@ pub fn delete(root: &Path, id: &str, discard_unsaved: bool) -> Result<Value, Str
 /// The session tools, and the headless session the other tools go to:
 /// opened at the start (`--session <id>`), resumed (`resume_session`), or
 /// made new at the first tool that needs one.
+///
+/// Instance discovery (`instance`): until the headless session has changed
+/// its job, each call first looks for an open AXIS CAM window, and while
+/// one is open the call is refused (its access off, several open, or
+/// driving a window, which comes in the next version); a session that has
+/// changed its job stays headless.
 pub struct Sessions {
     root: PathBuf,
     workspace: PathBuf,
     runner: Option<(String, Runner)>,
+    /// The window the agent chose with `select_window`.
+    chosen: Option<u32>,
 }
 impl Sessions {
     pub fn new(root: PathBuf, workspace: PathBuf, opened: Option<Session>) -> Sessions {
@@ -479,11 +524,34 @@ impl Sessions {
             root,
             workspace,
             runner: opened.map(|s| (s.id.clone(), Runner::start(s))),
+            chosen: None,
         }
     }
     /// Whether `tool` is one of the session tools.
     pub fn is_tool(tool: &str) -> bool {
-        matches!(tool, "list_sessions" | "resume_session" | "delete_session")
+        matches!(
+            tool,
+            "list_sessions" | "resume_session" | "delete_session" | "select_window"
+        )
+    }
+    /// Why the call cannot go to a headless session: a window is open
+    /// (`instance::refusal`). None when there is no window, or when the
+    /// session open now (or `resuming`) has changed its job: it stays.
+    fn window(&self, resuming: Option<&str>) -> Option<String> {
+        let changed = match resuming {
+            Some(id) => {
+                valid_id(id)
+                    && SessionFile::read(&self.root.join(id))
+                        .and_then(Result::ok)
+                        .is_some_and(|k| k.log.revision > 0)
+            }
+            None => self.runner.as_ref().is_some_and(|(_, r)| r.changed()),
+        };
+        if changed {
+            return None;
+        }
+        let found = super::instance::discover(&super::instance::folder(&self.workspace));
+        super::instance::refusal(&found, self.chosen)
     }
     /// The session tools, as `tools/list` lists them.
     pub fn tools() -> Vec<Value> {
@@ -503,6 +571,16 @@ impl Sessions {
                     "type": "object",
                     "properties": {"id": {"type": "string"}},
                     "required": ["id"],
+                },
+            }),
+            json!({
+                "name": "select_window",
+                "title": "Choose an AXIS CAM window",
+                "description": "When several AXIS CAM windows are open, chooses the one (by its pid, as the error listing them gives) the calls go to. In this version an open window cannot be driven yet: close the app to work in a headless session.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"pid": {"type": "integer", "minimum": 0}},
+                    "required": ["pid"],
                 },
             }),
             json!({
@@ -552,11 +630,29 @@ impl Sessions {
                 let discard = args.get("discard_unsaved").and_then(Value::as_bool) == Some(true);
                 reply(id().and_then(|id| delete(&self.root, &id, discard)));
             }
+            "select_window" => {
+                let Some(pid) = args.get("pid").and_then(Value::as_u64) else {
+                    return reply(Err(
+                        "`pid` is missing: give a window's pid from the list of windows.".into(),
+                    ));
+                };
+                let pid = u32::try_from(pid).unwrap_or(u32::MAX);
+                let found = super::instance::discover(&super::instance::folder(&self.workspace));
+                if let super::instance::Found::Windows(all) = &found
+                    && all.iter().any(|i| i.pid == pid)
+                {
+                    self.chosen = Some(pid);
+                }
+                reply(Err(super::instance::select(&found, pid)));
+            }
             "resume_session" => {
                 let id = match id() {
                     Ok(id) => id,
                     Err(e) => return reply(Err(e)),
                 };
+                if let Some(why) = self.window(Some(&id)) {
+                    return reply(Err(why));
+                }
                 if self.runner.as_ref().is_none_or(|(open, _)| *open != id) {
                     let session = match Session::open(&self.root, Some(&id), &self.workspace) {
                         Ok(session) => session,
@@ -583,10 +679,15 @@ impl Sessions {
                     }),
                 );
             }
-            _ => match self.runner() {
-                Ok(runner) => runner.send(tool.into(), args, reply),
-                Err(e) => reply(Err(e)),
-            },
+            _ => {
+                if let Some(why) = self.window(None) {
+                    return reply(Err(why));
+                }
+                match self.runner() {
+                    Ok(runner) => runner.send(tool.into(), args, reply),
+                    Err(e) => reply(Err(e)),
+                }
+            }
         }
     }
     /// Answers the calls already sent, saves the session and ends it.

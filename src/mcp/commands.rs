@@ -662,18 +662,25 @@ fn data_folder() -> PathBuf {
         .map(Path::to_path_buf)
         .unwrap_or_default()
 }
-/// Whether the command may write `path`: not inside the app's data folder
-/// (a headless session's own folder aside), not onto a library machine's
-/// UC100 profile, not onto a folder, and not over a file that is there
-/// unless `overwrite` is true or it is the project's own file (`own`).
+/// Whether `target` (resolved) is inside the app's data folder or the
+/// headless session's own folder: the files only the app and the server
+/// write (the workspace, its history, settings, the instance files, every
+/// session's workspace, `session.json`, lock and checkpoints).
+fn in_app_files(ctx: &Ctx, target: &Path) -> bool {
+    target.starts_with(resolved(&data_folder()))
+        || ctx.session.is_some_and(|s| target.starts_with(resolved(s)))
+}
+/// Whether the command may write `path`: nowhere inside the app's data
+/// folder, the headless session's own folder included (`in_app_files`),
+/// not onto a library machine's UC100 profile, not onto a folder, and not
+/// over a file that is there unless `overwrite` is true or it is the
+/// project's own file (`own`). Every write a command makes goes through it,
+/// the project's own file on a save without `path` too.
 fn may_write(ctx: &Ctx, path: &Path, own: Option<&Path>) -> Result<(), Problem> {
     let target = resolved(path);
-    let session = ctx.session.map(resolved);
-    if target.starts_with(resolved(&data_folder()))
-        && !session.is_some_and(|s| target.starts_with(s))
-    {
+    if in_app_files(ctx, &target) {
         return refused(format!(
-            "{} is inside the app's data folder, which only the app writes: choose another place.",
+            "{} is inside the app's data folder, whose files only the app itself writes: choose a place outside it.",
             path.display()
         ));
     }
@@ -967,9 +974,23 @@ fn table() -> Vec<Command> {
                 if !path.is_file() {
                     return refused(format!("There is no project file at {}.", path.display()));
                 }
+                // The app's own files are not projects to open: an archive
+                // in Project history may be, and saving it again then needs
+                // a path outside (`save_project`).
+                let target = resolved(&path);
+                let history = [Some(data_folder()), ctx.session.map(Path::to_path_buf)]
+                    .into_iter()
+                    .flatten()
+                    .any(|f| target.starts_with(resolved(&f.join("history"))));
+                if in_app_files(ctx, &target) && !history {
+                    return refused(format!(
+                        "{} is one of the app's own files (its data folder), not a project an agent may open. Of that folder, only the archives in Project history (history/) open; save one elsewhere with save_project {{path}}.",
+                        path.display()
+                    ));
+                }
                 Ok((vec![], off_thread(move || crate::storage::load_reporting(&path).map(|(d, n)| (d, path, n)), |opened| Message::ProjectOpened(Some(opened)))))
             })
-            .requires("An absolute path; no unsaved work, or discard_unsaved: true.")
+            .requires("An absolute path to a project file, not one of the app's own files (in its data folder only Project history's archives open); no unsaved work, or discard_unsaved: true.")
             .effect("The project opened, its part loaded; the old one is in Project history."),
         cmd("save_project", "project")
             .help_of(|| Message::SaveProject, "")
@@ -985,16 +1006,25 @@ fn table() -> Vec<Command> {
             .with(|ctx| {
                 let own = ctx.app.project_path.as_deref();
                 if ctx.args.get("path").is_none() {
-                    return match own {
-                        Some(_) => Ok(vec![Message::SaveProject]),
-                        None => refused("The project has no file yet: give `path`."),
+                    let Some(own) = own else {
+                        return refused("The project has no file yet: give `path`.");
+                    };
+                    // The project's own file follows the same rules as a
+                    // path given: one opened from the app's data folder
+                    // (Project history) is saved elsewhere.
+                    return match may_write(ctx, own, Some(own)) {
+                        Ok(()) => Ok(vec![Message::SaveProject]),
+                        Err(Problem::Refused(why)) => refused(format!(
+                            "The project's own file cannot be saved over: {why} Give `path` to save the project elsewhere."
+                        )),
+                        Err(e) => Err(e),
                     };
                 }
                 let path = path_arg(ctx, "path")?;
                 may_write(ctx, &path, own)?;
                 Ok(vec![Message::Saved(Some(path))])
             })
-            .requires("A path, or a project that has its file; the path's rules (absolute, outside the app's data folder, overwrite to replace).")
+            .requires("A path, or a project that has its file; the path's rules, for the project's own file too (absolute, outside the app's data folder and the session's folder, not a UC100 profile, overwrite to replace).")
             .effect("The file is written and becomes the project's file; the project is saved."),
         cmd("set_project_title", "project")
             .text("Names the project: the window's title, its setup sheets and its programs' headers.")
@@ -3236,7 +3266,10 @@ pub(crate) mod tests {
     /// session's thread.
     pub(crate) struct Direct {
         pub(crate) app: App,
+        /// Where the tests write their files.
         pub(crate) folder: PathBuf,
+        /// The session's own folder, which holds its workspace, in `folder`.
+        pub(crate) session: PathBuf,
         pub(crate) agent: Option<Agent>,
         runtime: tokio::runtime::Runtime,
         _dir: tempfile::TempDir,
@@ -3293,16 +3326,16 @@ pub(crate) mod tests {
             "headless"
         }
         fn session(&self) -> Value {
-            json!({"id": "test", "folder": self.folder.display().to_string()})
+            json!({"id": "test", "folder": self.session.display().to_string()})
         }
         fn session_folder(&self) -> Option<PathBuf> {
-            Some(self.folder.clone())
+            Some(self.session.clone())
         }
     }
     /// The sample job, its first operation selected, in a folder of its own.
     pub(crate) fn direct() -> Direct {
         let dir = tempfile::tempdir().unwrap();
-        let mut app = App::from_workspace(dir.path().join("workspace.json"), None);
+        let mut app = App::from_workspace(dir.path().join("session").join("workspace.json"), None);
         let mut doc = crate::model::Document::sample();
         doc.adopt_materials();
         doc.adopt_holders();
@@ -3318,6 +3351,7 @@ pub(crate) mod tests {
         // Edits settle at once here: the workspace is saved as it changes.
         app.dirty = false;
         let folder = dir.path().to_path_buf();
+        let session = folder.join("session");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -3325,6 +3359,7 @@ pub(crate) mod tests {
         Direct {
             app,
             folder,
+            session,
             agent: Some(Agent::new()),
             runtime,
             _dir: dir,
@@ -3362,7 +3397,7 @@ pub(crate) mod tests {
         Ctx {
             app: &d.app,
             args,
-            session: Some(&d.folder),
+            session: Some(&d.session),
             setup,
             operation,
             fields,
@@ -4259,8 +4294,8 @@ pub(crate) mod tests {
         .unwrap();
         assert!(refused(r).contains("UC100 profile"));
         assert_eq!(std::fs::read_to_string(&profile).unwrap(), "kept");
-        // A headless session's own folder is the one place in the data
-        // folder a command may write.
+        // Nothing in the data folder is written by a path, a headless
+        // session's own folder included.
         let session = data_folder().join("mcp-sessions").join("s");
         let args = json!({});
         let c = Ctx {
@@ -4271,8 +4306,155 @@ pub(crate) mod tests {
             operation: None,
             fields: None,
         };
-        assert!(may_write(&c, &session.join("job.axis.json"), None).is_ok());
+        assert!(may_write(&c, &session.join("job.axis.json"), None).is_err());
         assert!(may_write(&c, &data_folder().join("workspace.json"), None).is_err());
+        assert!(may_write(&c, &d.folder.join("job.axis.json"), None).is_ok());
+    }
+
+    /// The reviewer's probe (LIO-470): an export onto the session's own
+    /// `workspace.json` with overwrite replaced the job with Markdown. No
+    /// path argument writes into the session's folder: its workspace,
+    /// `session.json`, lock, checkpoints or anything new there.
+    #[test]
+    fn writes_into_the_sessions_own_folder_are_refused() {
+        let mut d = direct();
+        std::fs::create_dir_all(d.session.join("checkpoints")).unwrap();
+        crate::storage::save(&d.session.join("workspace.json"), &d.app.doc).unwrap();
+        std::fs::write(d.session.join("session.json"), "{}").unwrap();
+        std::fs::write(d.session.join("lock"), "{}").unwrap();
+        let before = |name: &str| std::fs::read(d.session.join(name)).ok();
+        let kept: Vec<_> = ["workspace.json", "session.json", "lock"]
+            .map(before)
+            .into();
+        for name in [
+            "workspace.json",
+            "session.json",
+            "lock",
+            "settings.json",
+            "checkpoints/c.json",
+            "sheet.md",
+        ] {
+            let path = d.session.join(name).display().to_string();
+            for (command, args) in [
+                (
+                    "export_setup_sheet",
+                    json!({"path": path, "overwrite": true}),
+                ),
+                ("save_project", json!({"path": path, "overwrite": true})),
+            ] {
+                let r = run(&mut d, command, args).unwrap();
+                assert_eq!(r["outcome"], "refused", "{command} {name}: {r}");
+                assert!(r["reason"].as_str().unwrap().contains("data folder"), "{r}");
+            }
+        }
+        let folder = d.session.display().to_string();
+        let r = run(
+            &mut d,
+            "export_gcode",
+            json!({"folder": folder, "overwrite": true}),
+        )
+        .unwrap();
+        assert_eq!(r["outcome"], "refused", "{r}");
+        let now: Vec<_> = ["workspace.json", "session.json", "lock"]
+            .map(|n| std::fs::read(d.session.join(n)).ok())
+            .into();
+        assert_eq!(now, kept, "nothing of the session's was written");
+        assert!(!d.session.join("sheet.md").exists());
+        assert!(!d.session.join("checkpoints").join("c.json").exists());
+        // An ordinary place outside is written as before.
+        let sheet = d.folder.join("sheet.md").display().to_string();
+        let r = run(&mut d, "export_setup_sheet", json!({"path": sheet})).unwrap();
+        assert_eq!(r["outcome"], "done", "{r}");
+    }
+
+    /// The reviewer's probe (LIO-470): the user's workspace opened as a
+    /// project, retitled and saved with no path overwrote it, though a save
+    /// to the same path was refused. Opening the app's own files is refused;
+    /// an archive in Project history opens, and a save without a path is
+    /// then refused (it needs one outside), leaving the archive as it was.
+    #[test]
+    fn the_apps_own_files_are_never_saved_over_by_a_save_without_a_path() {
+        let mut d = direct();
+        // The session's own workspace, as the probe opened the user's.
+        let workspace = d.session.join("workspace.json");
+        crate::storage::save(&workspace, &d.app.doc).unwrap();
+        let open = |p: &Path| json!({"path": p.display().to_string(), "discard_unsaved": true});
+        let r = run(&mut d, "open_project", open(&workspace)).unwrap();
+        assert_eq!(r["outcome"], "refused", "{r}");
+        assert!(
+            r["reason"].as_str().unwrap().contains("app's own files"),
+            "{r}"
+        );
+        // An archive in Project history opens, read-only.
+        let mut archived = d.app.doc.clone();
+        archived.title = "Archived job".into();
+        let archive = d.session.join("history").join("Archived-1.axis.json");
+        crate::storage::save(&archive, &archived).unwrap();
+        let bytes = std::fs::read(&archive).unwrap();
+        let r = run(&mut d, "open_project", open(&archive)).unwrap();
+        assert_eq!(r["outcome"], "done", "{r}");
+        assert_eq!(d.app.doc.title, "Archived job");
+        let title = json!({"title": "OVERWROTE USER WORKSPACE"});
+        assert_eq!(
+            run(&mut d, "set_project_title", title).unwrap()["outcome"],
+            "done"
+        );
+        // The app takes an archive of its own history for a recovery, with
+        // no file of its own; one of the user's history (the data folder's)
+        // is the project's file, and is saved over by no save without a
+        // path either: as here, the archive the project's file.
+        let r = run(&mut d, "save_project", json!({})).unwrap();
+        assert_eq!(r["outcome"], "refused", "{r}");
+        d.app.project_path = Some(archive.clone());
+        let r = run(&mut d, "save_project", json!({})).unwrap();
+        assert_eq!(r["outcome"], "refused", "{r}");
+        let why = r["reason"].as_str().unwrap();
+        assert!(why.contains("data folder") && why.contains("`path`"), "{r}");
+        let r = run(
+            &mut d,
+            "save_project",
+            json!({"path": archive.display().to_string(), "overwrite": true}),
+        )
+        .unwrap();
+        assert_eq!(r["outcome"], "refused", "{r}");
+        assert_eq!(
+            std::fs::read(&archive).unwrap(),
+            bytes,
+            "the archive is as it was"
+        );
+        // Saved elsewhere, it is the project's file, and saves again there.
+        let elsewhere = d.folder.join("job.axis.json");
+        let r = run(
+            &mut d,
+            "save_project",
+            json!({"path": elsewhere.display().to_string()}),
+        )
+        .unwrap();
+        assert_eq!(r["outcome"], "done", "{r}");
+        let r = run(&mut d, "save_project", json!({})).unwrap();
+        assert_eq!(r["outcome"], "done", "{r}");
+        assert_eq!(
+            crate::storage::load(&elsewhere).unwrap().title,
+            "OVERWROTE USER WORKSPACE"
+        );
+        // A project whose own file became a machine's UC100 profile is
+        // not saved over it either.
+        d.app.doc.machines[0]
+            .p
+            .insert("uc100_profile".into(), elsewhere.display().to_string());
+        let before = std::fs::read(&elsewhere).unwrap();
+        let title = json!({"title": "Changed again"});
+        assert_eq!(
+            run(&mut d, "set_project_title", title).unwrap()["outcome"],
+            "done"
+        );
+        let r = run(&mut d, "save_project", json!({})).unwrap();
+        assert_eq!(r["outcome"], "refused", "{r}");
+        assert!(
+            r["reason"].as_str().unwrap().contains("UC100 profile"),
+            "{r}"
+        );
+        assert_eq!(std::fs::read(&elsewhere).unwrap(), before);
     }
 
     #[test]

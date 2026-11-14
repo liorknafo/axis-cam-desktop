@@ -608,6 +608,10 @@ impl Log {
     }
 }
 
+/// The event of a resumed session's change that its `session.json` did not
+/// record (`Tracker::unrecorded`).
+pub const UNRECORDED: &str = "agent: a change made before the session was resumed, whose record (session.json) was not saved";
+
 /// The app's record of who changes the job (`App::mcp`): the log, and the
 /// external events since the last snapshot.
 #[derive(Debug, Default)]
@@ -632,6 +636,11 @@ pub struct Tracker {
     pub checkpoints: super::checkpoint::Kept,
     /// The paths of the last saves and exports the agent made.
     pub outputs: Vec<super::session::Output>,
+    /// A headless session resumed whose workspace holds a change its
+    /// `session.json` was not written with (that write failed, or the
+    /// process ended first): the next difference found is the server's own
+    /// work for the agent, not the user's (`mcp_outside`).
+    pub unrecorded: bool,
     /// How long each read's worker waits before it works (tests).
     #[cfg(test)]
     pub slow_reads: Option<std::time::Duration>,
@@ -774,10 +783,18 @@ impl App {
     }
     /// A snapshot when a window opens, or by a read while none is open: a
     /// difference since the last is the user's. Its entry, if any.
+    /// A resumed session's change not recorded before (`Tracker::unrecorded`)
+    /// is the agent's, named as such.
     pub(crate) fn mcp_outside(&mut self) -> Option<Entry> {
         let now = snapshot(self);
-        let events = std::mem::take(&mut self.mcp.events);
-        self.mcp.log.record(now, Source::User, events).cloned()
+        let mut events = std::mem::take(&mut self.mcp.events);
+        let source = if std::mem::take(&mut self.mcp.unrecorded) {
+            events = vec![UNRECORDED.to_string()];
+            Source::Agent
+        } else {
+            Source::User
+        };
+        self.mcp.log.record(now, source, events).cloned()
     }
     /// The external events since the window opened.
     pub(crate) fn mcp_events(&self) -> &[String] {
@@ -1330,8 +1347,10 @@ pub(crate) mod tests {
         fn session(&self) -> Value {
             json!({"id": "bench"})
         }
+        /// The session's own folder, in the tests' folder: no path the
+        /// agent gives is written in it.
         fn session_folder(&self) -> Option<std::path::PathBuf> {
-            Some(self.dir.path().to_path_buf())
+            Some(self.dir.path().join("session"))
         }
     }
 

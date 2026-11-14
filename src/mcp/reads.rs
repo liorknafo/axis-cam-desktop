@@ -776,7 +776,7 @@ fn list_surfaces(app: &App, args: &Value) -> Result<Plan, Answer> {
             "sample": true,
             "setup": setup_ref(&app.doc, si),
             "features": features,
-            "note": "The built-in sample is picked by its features: pick_surfaces takes these ids.",
+            "note": "The built-in sample is picked by its features: pick_features takes these ids, not pick_surfaces.",
         }))));
     }
     needs_part(app)?;
@@ -1311,7 +1311,7 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "list_surfaces",
             "title": "List the part's surfaces",
-            "description": format!("The part's surfaces, the largest first: id (what pick_surfaces takes), normal, centre, area and the smooth region it belongs to, with the part report's planes from the setup's orientation. On the built-in sample, its features instead.{fresh}"),
+            "description": format!("The part's surfaces, the largest first: id (what pick_surfaces takes), normal, centre, area and the smooth region it belongs to, with the part report's planes from the setup's orientation. On the built-in sample, its features instead, which pick_features takes.{fresh}"),
             "inputSchema": {
                 "type": "object",
                 "properties": {

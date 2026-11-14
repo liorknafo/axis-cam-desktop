@@ -57,9 +57,11 @@ MCP client ──stdio──▶ axis-cam --mcp ──loopback TCP + token──�
 | Several | Error listing them (pid, project, started), until the agent calls `select_window {pid}` |
 | `on`, but the token is refused or the port does not answer | Error saying so. Never headless. |
 
+- **In M1** the client side is in place (`mcp::instance`, whose `Instance` the M2 app writes). There is no bridge yet, so one `on` window is an error too: "An AXIS CAM window is open (pid …). Driving the open window comes in the next version; close the app to work without a window." Never headless. An instance file of a live pid that cannot be read is an error as well. `select_window {pid}` chooses among several, and gives the chosen window's error.
+
 - The choice is pinned for the MCP session.
 - If the pinned window closes, calls fail with "The AXIS CAM window closed". They do not move to a headless session.
-- A headless session that has made no change yet moves to a window that appears later, as SolidCraft does. Otherwise it stays headless, and every result names the backend.
+- A headless session that has made no change yet moves to a window that appears later, as SolidCraft does. Otherwise it stays headless, and every result names the backend. In M1, with no bridge, a session with no change yet (its revision 0) is refused with the window's error while a window is open; one with changes stays headless.
 
 ### Headless sessions
 
@@ -77,13 +79,14 @@ A headless session is kept on disk, so a client crash or restart does not lose t
   - the paths of the last saves and exports;
   - the checkpoint index.
 
-  It is written atomically together with the `Document`, before the result of each command that changed anything is sent. Whatever a result reported is on disk.
+  It is written atomically after the `Document`, and only once the `Document` is on disk, before the result of each command that changed anything is sent. Whatever a result reported as done is on disk. It holds a fingerprint of the `workspace.json` it goes with: on resume, a workspace written after it (its own write failed) is told, and the change found is the agent's, not the user's.
+- **A failed write.** When the `Document` or `session.json` cannot be written, the result says so: a change it would report `done` is `failed`, with the reason "The session could not be saved: <error>. Your change is in memory only.", and `persisted: false`. The change stays in memory and the revision is the one in memory. Every later result has `persisted: false` and a note that the session is not saved, until a write succeeds; each result tries the write again.
 - **One process at a time.** A session folder holds a lock file, `lock`, created exclusively, with the owner's pid and start time. A second `resume_session` of the same id is refused while the owner is alive: "Session <id> is open in another MCP server (pid …)". A lock whose pid is dead is taken over.
 - **Reporting.** `inspect` and every result report the session id, its folder, whether the job is saved to a project file, and the paths of the last saves and exports.
 - **Resuming.** On stdin EOF the session is left on disk. `resume_session {id}` (or `--mcp --session <id>`) continues it. `list_sessions` lists them with their title, last change, whether the job is saved to a project file, and its size.
 - **Deleting.** Sessions are never deleted automatically, because a session may hold the only copy of a job. `delete_session {id}` deletes one.
   - It is refused for a session that is open (its lock is held).
-  - It is refused for a session with work not saved to a project file, unless it is called with `discard_unsaved: true`.
+  - It is refused for a session with work not saved to a project file, unless it is called with `discard_unsaved: true`. Saved means the session's project file is there now, loads, and holds the session's `Document` by value (as a checkpoint restore tells it). A file removed, unreadable or changed since is not saved. `list_sessions` and a resumed session say saved by the same rule.
   - The Agents page lists the sessions with a Delete button that asks the same.
   - Test: an unsaved job with an open tool draft survives a restart with the clock moved 31 days on.
 - **Loading.** Startup waits until the saved model is restored (`ModelRestored`) before the first command runs, so the part is loaded.
@@ -252,6 +255,7 @@ Every `execute` result:
   "selection": {"setup": "<id>", "operation": "<id>", "page": "Work", "tab": "Geometry"},
   "pending": [],
   "user_changed": false,
+  "persisted": true,                 // false: the session could not be saved (headless)
   "notes": ["…"] }
 ```
 
@@ -483,7 +487,10 @@ Arguments are JSON. Values that were `&'static str` in a message are enums in th
 ## Safety and the user's view
 
 - **Access.** The token and the loopback-only listener keep other users and computers out. The token is compared in constant time.
-- **Paths.** Every path argument must be absolute; `~` is expanded. Writes inside the app's data folder are refused, except a headless session's own folder. Writes onto a UC100 profile are refused.
+- **Paths.** Every path argument must be absolute; `~` is expanded.
+  - Nothing inside the app's data folder is written by a path argument, a headless session's own folder included: its `workspace.json`, `session.json`, `lock`, `checkpoints/` and anything else there are written only by the server itself. Writes onto a UC100 profile are refused. Every user-directed write follows these rules: `save_project`, `export_gcode`, `export_setup_sheet` and `save_for_tablet`.
+  - A `save_project` without `path` writes the project's own file, which follows the same rules: a project file inside the app's data folder or on a UC100 profile is refused, and the agent gives a `path` outside.
+  - `open_project` refuses the app's own files (the data folder and the session's folder), such as the user's `workspace.json`, `settings.json`, the instance files and other sessions' files. Only the archives in Project history (`history/`) open, as read-only copies: the app's own history opens with no project file, and the user's archive, whose file is in the data folder, cannot be saved over by a save without `path`.
 - **Visibility.** In the window, each command the agent runs shows in the status line ("Agent: added Pocket 2 to Setup 1"). The Agents page lists every command.
 - **The toggle.** It is saved in the settings. Turned off, it closes the listener at once, refuses requests in flight, and marks the instance file `off`.
 
@@ -659,3 +666,9 @@ Four milestones, each with its own Linear issue and PR.
     - `status_page` and the tab are restored with an undone click;
     - the temporary picking mode sets the tab back, and playback stays stopped;
     - the picks result paragraph is repaired.
+11. **gpt-6.1-sol, M1 implementation review, REJECT.** All five findings were taken:
+    - a `save_project` without `path` follows the path rules, and `open_project` refuses the app's own files (Project history's archives aside);
+    - saved, for `delete_session`, `list_sessions` and a resume, is the project file as it is now, compared by value;
+    - a failed write of the `Document` or `session.json` reaches the result (`failed`, `persisted: false`), and the two are paired by a fingerprint;
+    - no path argument writes anywhere in the app's data folder, the session's own folder included;
+    - instance discovery's client side is in M1, and never goes headless while a window is open.
