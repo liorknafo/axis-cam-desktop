@@ -1220,6 +1220,42 @@ pub struct Program {
     pub lines: usize,
     pub tools: Vec<String>,
     pub operations: Vec<String>,
+    /// Its estimated time, s (`estimated_seconds`).
+    pub seconds: f32,
+}
+/// The rate the simulation times a rapid at, mm/min (`simulation`).
+const RAPID_ESTIMATE: f32 = 6000.;
+/// A program's estimated time, s, as the simulation times its plans: each
+/// feed move at its feed, each rapid at `RAPID_ESTIMATE`, and its dwells;
+/// the approach and retract moves to the clearance plane are not counted.
+pub fn estimated_seconds(blocks: &[Block]) -> f32 {
+    let length =
+        |a: [f32; 3], b: [f32; 3]| (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f32>().sqrt();
+    (blocks.iter())
+        .map(|b| match b {
+            Block::Move {
+                kind: Kind::Feed,
+                from,
+                to,
+                feed,
+                ..
+            } if *feed > 0. => length(*from, *to) / feed * 60.,
+            Block::Move {
+                kind: Kind::Rapid,
+                from,
+                to,
+                ..
+            } => length(*from, *to) / RAPID_ESTIMATE * 60.,
+            Block::Move {
+                kind: Kind::Dwell,
+                seconds,
+                ..
+            }
+            | Block::Wait { seconds }
+            | Block::Standstill { seconds } => *seconds,
+            _ => 0.,
+        })
+        .sum()
 }
 #[derive(Debug, Clone)]
 pub struct SetupPost {
@@ -3954,7 +3990,9 @@ pub(crate) fn post_simulated(
                                 tools.push(tool);
                             }
                         }
+                        let seconds = estimated_seconds(&p.blocks);
                         Ok(Program {
+                            seconds,
                             file_name: p.file_name,
                             lines: p.text.lines().count(),
                             operations: p.ops.iter().map(|o| o.name.clone()).collect(),

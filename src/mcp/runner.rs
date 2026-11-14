@@ -49,8 +49,8 @@ impl Session {
     pub fn root() -> PathBuf {
         crate::storage::state_path().with_file_name("mcp-sessions")
     }
-    /// Session `id` in `root`, whose folder must be there and which no
-    /// other live process has open (`session::Lock`), or with no id a new
+    /// Session `id` in `root`, whose folder must be there with its job, and
+    /// which no other server has open (`session::Lock`), or with no id a new
     /// session, which starts from a copy of the user's `workspace` (when
     /// there is one) so it has their libraries. The user's workspace is
     /// only read: the session's `App` saves its own copy.
@@ -60,13 +60,21 @@ impl Session {
                 return Err(format!("\"{id}\" is not a session id."));
             }
             let folder = root.join(id);
+            let missing = || format!("There is no MCP session {id} in {}.", root.display());
             if !folder.is_dir() {
+                return Err(missing());
+            }
+            let lock = super::session::Lock::take(&folder, id)
+                .map_err(|why| if folder.is_dir() { why } else { missing() })?;
+            // Locked before anything in it is read. `delete` removes the
+            // workspace and the record first, and holds the lock through
+            // the rest: a folder without either is being deleted or gone,
+            // and is never started, so never written again.
+            if !super::session::has_job(&folder) {
                 return Err(format!(
-                    "There is no MCP session {id} in {}.",
-                    root.display()
+                    "Session {id} is being deleted, or is gone: it holds no job."
                 ));
             }
-            let lock = super::session::Lock::take(&folder, id)?;
             return Ok(Session {
                 id: id.into(),
                 folder,
@@ -994,7 +1002,7 @@ mod tests {
         let folder = root.join(&id);
         let kept = SessionFile::read(&folder).unwrap().unwrap();
         assert!(kept.log.revision > 0, "{kept:?}");
-        assert!(!folder.join("lock").exists(), "let go at the end");
+        assert!(!held(&folder), "let go at the end");
         let session = Session::open(&root, Some(&id), &user).unwrap();
         let runner = Runner::start(session);
         let read = runner.call("inspect", json!({})).unwrap();
@@ -1032,25 +1040,196 @@ mod tests {
             )
         );
         runner.stop();
-        // A lock left by a process that is gone: an unknown pid, a start
-        // time no process has, and not refreshed for an hour.
+        // A lock file left by a process that is gone, as the old lock files
+        // were: nothing holds it, so it is taken at once, never deleted,
+        // and signed by its new holder.
         let (id, folder) = (first.id.clone(), first.folder.clone());
         drop(first);
         let lock = folder.join("lock");
+        assert!(lock.is_file(), "the lock file stays with its session");
+        assert!(!held(&folder));
         let dead = json!({"pid": 999_999, "started": "1.000001", "at": 1});
         std::fs::write(&lock, dead.to_string()).unwrap();
-        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
-        std::fs::File::options()
-            .write(true)
-            .open(&lock)
-            .unwrap()
-            .set_modified(old)
-            .unwrap();
         let taken = Session::open(&root, Some(&id), &user).unwrap();
+        assert!(held(&folder));
         let owner: Value = serde_json::from_slice(&std::fs::read(&lock).unwrap()).unwrap();
         assert_eq!(owner["pid"], std::process::id());
         drop(taken);
-        assert!(!lock.exists());
+        assert!(lock.is_file() && !held(&folder), "let go, not deleted");
+    }
+
+    /// Whether some open of the session in `folder` holds its lock: its
+    /// lock file cannot be held shared now.
+    fn held(folder: &Path) -> bool {
+        let file = std::fs::File::open(folder.join("lock")).unwrap();
+        matches!(
+            file.try_lock_shared(),
+            Err(std::fs::TryLockError::WouldBlock)
+        )
+    }
+
+    /// The reviewer's race (LIO-470): many opens of one session at once, its
+    /// lock file left by a dead process. The lock is the OS's, held for the
+    /// session's life: while one holds it every other open is refused and
+    /// writes nothing, the lock file included; racing, exactly one wins;
+    /// once it lets go, the next takes it. (`flock` locks an open of the
+    /// file, not a process: threads race here as processes do; the
+    /// processes' race is in `tests/mcp_stdio.rs`.)
+    #[test]
+    fn of_many_opens_racing_for_a_session_one_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("mcp-sessions");
+        let user = user_workspace(dir.path());
+        let first = Session::open(&root, None, &user).unwrap();
+        let runner = Runner::start(first.clone());
+        let title = json!({"command": "set_project_title", "args": {"title": "Raced"}});
+        assert_eq!(runner.call("execute", title).unwrap()["outcome"], "done");
+        runner.stop();
+        let (id, folder) = (first.id.clone(), first.folder.clone());
+        drop(first);
+        let dead = json!({"pid": 2_147_483_000u32, "started": "dead", "at": 0});
+        std::fs::write(folder.join("lock"), dead.to_string()).unwrap();
+        let race = |n: usize| -> Vec<Result<Session, String>> {
+            let gate = std::sync::Arc::new(std::sync::Barrier::new(n));
+            let racers: Vec<_> = (0..n)
+                .map(|_| {
+                    let (gate, root, user, id) =
+                        (gate.clone(), root.clone(), user.clone(), id.clone());
+                    std::thread::spawn(move || {
+                        gate.wait();
+                        Session::open(&root, Some(&id), &user)
+                    })
+                })
+                .collect();
+            racers.into_iter().map(|r| r.join().unwrap()).collect()
+        };
+        let files = || {
+            ["workspace.json", "session.json", "lock"].map(|name| {
+                let path = folder.join(name);
+                let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                (std::fs::read(&path).unwrap(), modified)
+            })
+        };
+        for round in 0..20 {
+            let opened = race(8);
+            let won: Vec<&Session> = opened.iter().filter_map(|r| r.as_ref().ok()).collect();
+            assert_eq!(won.len(), 1, "round {round}: {opened:?}");
+            for lost in opened.iter().filter_map(|r| r.as_ref().err()) {
+                assert!(
+                    lost.starts_with(&format!("Session {id} is open in another MCP server")),
+                    "{lost}"
+                );
+            }
+            // While it is held, every other open is refused and writes
+            // nothing.
+            let before = files();
+            let again = race(6);
+            assert!(again.iter().all(Result::is_err), "{again:?}");
+            assert_eq!(files(), before, "a refused open wrote");
+            drop(again);
+            drop(opened);
+            assert!(!held(&folder), "let go with the session");
+        }
+        let resumed = Runner::start(Session::open(&root, Some(&id), &user).unwrap());
+        assert_eq!(
+            resumed.call("inspect", json!({})).unwrap()["project"]["title"],
+            "Raced"
+        );
+        resumed.stop();
+    }
+
+    /// The reviewer's race of delete and resume (LIO-470): a resume while a
+    /// session is being deleted, at each step of the deletion, is refused
+    /// and writes nothing, and the deletion ends with the folder gone; a
+    /// session resumed first is not deleted, its checkpoints all there.
+    #[test]
+    fn a_session_being_deleted_is_never_resumed() {
+        use super::super::session::{DELETE_STEP, delete};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("mcp-sessions");
+        let user = user_workspace(dir.path());
+        let worked = |title: &str| {
+            let session = Session::open(&root, None, &user).unwrap();
+            let id = session.id.clone();
+            let runner = Runner::start(session);
+            let edit = json!({"command": "set_project_title", "args": {"title": title}});
+            assert_eq!(runner.call("execute", edit).unwrap()["outcome"], "done");
+            for name in ["a", "b"] {
+                let kept = runner.call("checkpoint", json!({"name": name})).unwrap();
+                assert_eq!(kept["outcome"], "done", "{kept}");
+            }
+            runner.stop();
+            id
+        };
+        let checkpoints =
+            |folder: &Path| std::fs::read_dir(folder.join("checkpoints")).map_or(0, |d| d.count());
+
+        // Resumed first: the deletion is refused, and nothing of it goes.
+        let id = worked("Kept");
+        let folder = root.join(&id);
+        let listed = SessionFile::read(&folder)
+            .unwrap()
+            .unwrap()
+            .checkpoints
+            .len();
+        assert_eq!(listed, 2);
+        assert_eq!(checkpoints(&folder), listed);
+        let resumed = Runner::start(Session::open(&root, Some(&id), &user).unwrap());
+        let refused = delete(&root, &id, true).unwrap();
+        assert_eq!(refused["outcome"], "refused", "{refused}");
+        assert!(
+            refused["reason"]
+                .as_str()
+                .unwrap()
+                .contains("open in another MCP server"),
+            "{refused}"
+        );
+        assert_eq!(checkpoints(&folder), listed);
+        let back = resumed.call("list_checkpoints", json!({})).unwrap();
+        assert_eq!(back["checkpoints"].as_array().unwrap().len(), 2, "{back}");
+        resumed.stop();
+
+        // Deleted first: a resume at each step is refused.
+        let tried: std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>> = Default::default();
+        let log = tried.clone();
+        let (r, u, i) = (root.clone(), user.clone(), id.clone());
+        DELETE_STEP.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |step: &str| {
+                let (r, u, i) = (r.clone(), u.clone(), i.clone());
+                // Another open of the file, as another server's would be.
+                let opened = std::thread::spawn(move || Session::open(&r, Some(&i), &u).map(drop))
+                    .join()
+                    .unwrap();
+                let why = opened.expect_err("a session being deleted was opened");
+                log.borrow_mut().push((step.to_string(), why));
+            }));
+        });
+        let gone = delete(&root, &id, true);
+        DELETE_STEP.with(|hook| hook.borrow_mut().take());
+        assert_eq!(gone.unwrap()["outcome"], "done");
+        assert!(!folder.exists(), "the folder is gone");
+        let tried = tried.borrow();
+        let steps: Vec<&str> = tried.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(
+            steps,
+            [
+                "session.json",
+                "workspace.json",
+                "entries",
+                "lock",
+                "folder"
+            ]
+        );
+        for (step, why) in tried.iter() {
+            let expected = match step.as_str() {
+                // The lock still held.
+                "session.json" | "workspace.json" | "entries" => "is open in another MCP server",
+                // Its file removed: a resume makes a new one, and finds no job.
+                "lock" => "is being deleted, or is gone",
+                _ => "There is no MCP session",
+            };
+            assert!(why.contains(expected), "{step}: {why}");
+        }
     }
 
     /// An unsaved job with an open tool draft is kept through a restart
@@ -1144,7 +1323,7 @@ mod tests {
             "{unsaved}"
         );
         assert!(folder.is_dir());
-        assert!(!folder.join("lock").exists(), "the refusal let go of it");
+        assert!(!held(&folder), "the refusal let go of it");
         // Saved: it goes without asking.
         let session = Session::open(&root, Some(&id), &user).unwrap();
         let runner = Runner::start(session);
@@ -1353,7 +1532,7 @@ mod tests {
     #[test]
     fn a_call_goes_headless_only_while_no_window_is_open() {
         use super::super::instance::{ACCESS_OFF, Access, Instance, folder};
-        use super::super::session::{Sessions, started};
+        use super::super::{instance::started, session::Sessions};
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("mcp-sessions");
         let user = user_workspace(dir.path());

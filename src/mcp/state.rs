@@ -157,6 +157,10 @@ pub const NOT_WORK_STATE: &[(&str, &str)] = &[
     ("tooth_load_job", JOB),
     ("stock_pictures", VIEW),
     ("post_epoch", JOB),
+    (
+        "post_for",
+        "the job the NC review's check is of, worked out with it",
+    ),
     ("picture_job", JOB),
     (
         "settings",

@@ -173,5 +173,131 @@ fn the_server_answers_over_stdio() {
     let kept: Value =
         serde_json::from_slice(&std::fs::read(folder.join("session.json")).unwrap()).unwrap();
     assert_eq!(kept["title"], "Slow", "{kept}");
-    assert!(!folder.join("lock").exists());
+    assert!(!held(&folder.join("lock")));
+}
+
+/// Whether some process holds the lock file `lock`: it cannot be held
+/// shared now.
+fn held(lock: &std::path::Path) -> bool {
+    let file = std::fs::File::open(lock).unwrap();
+    matches!(
+        file.try_lock_shared(),
+        Err(std::fs::TryLockError::WouldBlock)
+    )
+}
+
+/// `axis-cam --mcp` with `args`, its data folder `data`.
+fn server(data: &std::path::Path, args: &[&str]) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_axis-cam"))
+        .arg("--mcp")
+        .args(args)
+        .env("AXIS_CAM_DATA_DIR", data)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// Sends `initialize` to `server` and waits up to `within` for its answer:
+/// whether it answered.
+fn answers(server: &mut std::process::Child, within: Duration) -> bool {
+    let mut stdin = server.stdin.take().unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    // A server that refused the session has gone: its pipe may be closed.
+    let _ = writeln!(stdin, "{init}").and_then(|()| stdin.flush());
+    server.stdin = Some(stdin);
+    let out = server.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let mut out = BufReader::new(out);
+        let read = out.read_line(&mut line).map(|n| n > 0).unwrap_or(false);
+        let _ = tx.send((read, line));
+    });
+    match rx.recv_timeout(within) {
+        Ok((true, line)) => {
+            let v: Value = serde_json::from_str(&line).unwrap();
+            v["result"]["serverInfo"]["name"] == "axis-cam"
+        }
+        _ => false,
+    }
+}
+
+/// The reviewer's race (LIO-470), with real processes: eight servers
+/// started at once on one session, its lock file left by a dead process.
+/// Exactly one opens it and serves; the others are refused at once,
+/// naming the session, and write nothing (the lock file holds the
+/// winner's pid). Killed, the winner's lock goes with its process, and the
+/// next server opens the session.
+#[test]
+fn of_servers_racing_for_a_session_one_opens_it() {
+    let data = tempfile::tempdir().unwrap();
+    // A session to race for: made, worked in, and ended.
+    let mut maker = server(data.path(), &[]);
+    let mut stdin = maker.stdin.take().unwrap();
+    let call = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"execute","arguments":{"command":"set_project_title","args":{"title":"Raced"}}}}"#;
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    writeln!(stdin, "{init}\n{call}").unwrap();
+    stdin.flush().unwrap();
+    let mut out = BufReader::new(maker.stdout.take().unwrap());
+    let made = loop {
+        let mut line = String::new();
+        assert!(out.read_line(&mut line).unwrap() > 0, "the server ended");
+        let v: Value = serde_json::from_str(&line).unwrap();
+        if v["id"] == 2 {
+            break v;
+        }
+    };
+    let state = &made["result"]["structuredContent"];
+    assert_eq!(state["outcome"], "done", "{made}");
+    let id = state["session"]["id"].as_str().unwrap().to_string();
+    let folder = std::path::PathBuf::from(state["session"]["folder"].as_str().unwrap());
+    drop(stdin);
+    assert!(maker.wait().unwrap().success());
+    let lock = folder.join("lock");
+    let dead = json!({"pid": 2_147_483_000u32, "started": "dead", "at": 0});
+    for round in 0..3 {
+        std::fs::write(&lock, dead.to_string()).unwrap();
+        let record = std::fs::read(folder.join("session.json")).unwrap();
+        let mut racers: Vec<_> = (0..8)
+            .map(|_| server(data.path(), &["--session", &id]))
+            .collect();
+        let served: Vec<bool> = (racers.iter_mut())
+            .map(|r| answers(r, Duration::from_secs(60)))
+            .collect();
+        assert_eq!(
+            served.iter().filter(|s| **s).count(),
+            1,
+            "round {round}: {served:?}"
+        );
+        let winner = served.iter().position(|s| *s).unwrap();
+        for (i, racer) in racers.iter_mut().enumerate() {
+            if i == winner {
+                continue;
+            }
+            let status = racer.wait().unwrap();
+            assert_eq!(status.code(), Some(1), "round {round}");
+            let mut why = String::new();
+            std::io::Read::read_to_string(racer.stderr.as_mut().unwrap(), &mut why).unwrap();
+            assert!(
+                why.contains(&format!("Session {id} is open in another MCP server")),
+                "{why}"
+            );
+        }
+        // The losers wrote nothing: the lock file is the winner's, the
+        // record as it was.
+        let owner: Value = serde_json::from_slice(&std::fs::read(&lock).unwrap()).unwrap();
+        assert_eq!(owner["pid"], racers[winner].id(), "round {round}");
+        assert_eq!(std::fs::read(folder.join("session.json")).unwrap(), record);
+        assert!(held(&lock));
+        // Killed: no stale lock is left to tell.
+        racers[winner].kill().unwrap();
+        racers[winner].wait().unwrap();
+        assert!(!held(&lock), "round {round}");
+    }
+    let mut next = server(data.path(), &["--session", &id]);
+    assert!(answers(&mut next, Duration::from_secs(60)));
+    next.kill().unwrap();
+    next.wait().unwrap();
 }

@@ -1,8 +1,9 @@
 //! The read-only tools that work something out (LIO-470): the plan checks
 //! on the job as it is (`check_job`, `check_holding`, `stock_after`), the
 //! part (`part_report`, `list_surfaces`, `surface_info`), speeds and feeds
-//! (`cutting_data`), pictures (`view_model`), the machining rules (`guide`)
-//! and a hand setup's steps (`inspect {what: "steps"}`).
+//! (`cutting_data`), pictures (`view_model`), the machining rules (`guide`),
+//! a hand setup's steps (`inspect {what: "steps"}`) and the NC review
+//! (`inspect {what: "post"}`).
 //!
 //! A read that computes takes a `JobSnapshot` on the `App`'s thread and
 //! works on it on a thread of its own, so the `App` keeps taking events
@@ -17,7 +18,8 @@
 //!
 //! **Heavy and light.** A read that simulates toolpaths (`check_job`,
 //! `check_holding`, `stock_after`, a `view_model` of an operation, the steps
-//! of a guide still to build) is heavy: while the machine is `locked()` it
+//! of a guide still to build, an NC review the app has not checked for the
+//! job as it is) is heavy: while the machine is `locked()` it
 //! is refused, and its worker is counted in `App::planning_busy` from its
 //! start until its thread has actually ended, so Cycle Start waits for it,
 //! whatever became of its call (cancelled, timed out, the client gone). The
@@ -64,7 +66,12 @@ pub const TOOLS: [&str; 9] = [
 
 /// Whether `tool` with `args` is one of this module's reads.
 pub fn is_read(tool: &str, args: &Value) -> bool {
-    TOOLS.contains(&tool) || (tool == "inspect" && args.get("what") == Some(&json!("steps")))
+    TOOLS.contains(&tool)
+        || (tool == "inspect"
+            && matches!(
+                args.get("what").and_then(Value::as_str),
+                Some("steps" | "post")
+            ))
 }
 
 /// Counts the heavy reads' workers still running; each stops counting when
@@ -335,6 +342,9 @@ fn fresh(r: &Reading, answer: Answer, now: &state::Snapshot) -> Value {
         o.insert("command_id".into(), json!(r.id));
         o.entry("checked_at").or_insert(checked_at);
         o.insert("stale".into(), json!(stale));
+        if r.tool == "post" {
+            o.insert("current".into(), json!(!stale));
+        }
         if stale {
             o.insert("changed_meanwhile".into(), json!(changed));
         }
@@ -517,6 +527,7 @@ impl Reads {
             "list_surfaces" => list_surfaces(app, args),
             "view_model" => view_model(app, args),
             "guide" => Ok(Plan::Now(guide_topic(args))),
+            "inspect" if args.get("what") == Some(&json!("post")) => post_review(app, args),
             "inspect" => steps(app, args),
             other => Err(Err(format!("There is no read {other}."))),
         }
@@ -929,6 +940,205 @@ fn steps(app: &App, args: &Value) -> Result<Plan, Answer> {
             Err(why) => refused(why),
         }
     })
+}
+
+/// The most G-code `inspect {what: "post", program: true}` gives, bytes.
+pub const PROGRAM_CAP: usize = 200_000;
+
+/// `inspect {what: "post", setup?, program?}`: the NC review as the app's
+/// NC review page has it (`post::post_job`, which export writes from): for
+/// each setup, or the one asked, its programs (file names as export names
+/// them, lines, tools, operations and estimated time) or what its checks
+/// refuse, each problem with its operation; and with `program: true` the
+/// G-code of the programs of `setup` (default the active one), at most
+/// `PROGRAM_CAP` bytes. The app's own check is read when it is of the job
+/// as it is now (`App::post_current`); otherwise it is worked out on a
+/// snapshot, which simulates the job (heavy).
+fn post_review(app: &App, args: &Value) -> Result<Plan, Answer> {
+    let asked = match args.get("setup") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(setup_arg(app, args)?),
+    };
+    let program = match args.get("program") {
+        None | Some(Value::Null) => false,
+        Some(v) => v
+            .as_bool()
+            .ok_or_else(|| Err("`program` is true or false.".into()))?,
+    };
+    let text_of = match (program, asked) {
+        (false, _) => None,
+        (true, Some(si)) => Some(si),
+        (true, None) => Some(setup_arg(app, args)?),
+    };
+    let app_check = if app.post_current() {
+        "current"
+    } else if app.post_busy {
+        "running"
+    } else {
+        "not_current"
+    };
+    if app.post_current()
+        && let Some(job) = &app.post
+    {
+        let mut v = review(&app.doc, job, asked, text_of);
+        v["source"] = json!("app");
+        v["app_check"] = json!(app_check);
+        v["current"] = json!(true);
+        v["stale"] = json!(false);
+        let now = state::snapshot(app);
+        v["checked_at"] =
+            json!({"revision": app.mcp.log.revision, "fingerprint": format!("{:016x}", now.hash)});
+        return Ok(Plan::Now(done(v)));
+    }
+    work("post", true, move |s| {
+        let job = match &s.mesh {
+            Some(mesh) => crate::post::post_job(&s.doc, mesh),
+            None => crate::post::JobPost::blocked("Load the imported part before posting."),
+        };
+        let mut v = review(&s.doc, &job, asked, text_of);
+        v["source"] = json!("worked_out");
+        v["app_check"] = json!(app_check);
+        v["checked_at"] = s.checked_at();
+        done(v)
+    })
+}
+
+/// The NC review of `doc` that `job` checked: every setup, or `only`; with
+/// the G-code of setup `text_of`'s programs.
+fn review(
+    doc: &Document,
+    job: &crate::post::JobPost,
+    only: Option<usize>,
+    text_of: Option<usize>,
+) -> Value {
+    let setups: Vec<Value> = (job.setups.iter())
+        .filter(|s| only.is_none_or(|si| s.setup == si))
+        .filter(|s| s.setup < doc.setups.len())
+        .map(|s| setup_review(doc, s))
+        .collect();
+    let lines = crate::ui::speed_feed_lines_of(doc);
+    let speeds: Vec<Value> = (lines.iter())
+        .map(|(problem, line)| json!({"line": line, "problem": problem}))
+        .collect();
+    let mut v = json!({
+        "ready": job.ready(),
+        "errors": job.errors,
+        "setups": setups,
+        "speeds_and_feeds": speeds,
+        "numbering": "setup and operation index count from 0, as in inspect; id is the id the commands take",
+    });
+    if !speeds.is_empty() {
+        v["speeds_and_feeds_note"] = json!(crate::ui::speed_feed_heading(&lines));
+    }
+    if let Some(si) = text_of {
+        v["program"] = program_text(doc, job, si);
+    }
+    v
+}
+
+/// One setup of the NC review: how it is run, whether it passes, its
+/// programs, and its problems each with its operation.
+fn setup_review(doc: &Document, s: &crate::post::SetupPost) -> Value {
+    let setup = &doc.setups[s.setup];
+    let hand = crate::manual::is_hand(&setup.machine);
+    let uc100 = get(&setup.machine.p, "controller") == "UC100";
+    let problems_of = |problems: &[String]| -> Vec<Value> {
+        (problems.iter())
+            .map(|p| {
+                let (operation, message) = match crate::ui::nc_operation(doc, s.setup, p) {
+                    Some((oi, rest)) => (operation_ref(doc, s.setup, oi), rest),
+                    None => (Value::Null, p.as_str()),
+                };
+                json!({
+                    "setup": setup_ref(doc, s.setup),
+                    "operation": operation,
+                    "message": message,
+                    "waits_for_earlier": crate::post::is_waiting(p),
+                })
+            })
+            .collect()
+    };
+    let mut v = json!({
+        "setup": setup_ref(doc, s.setup),
+        "controller": if hand { "hand" } else if uc100 { "UC100" } else { "LinuxCNC" },
+    });
+    if hand {
+        v["passes"] = json!(true);
+        v["programs"] = json!([]);
+        v["problems"] = json!([]);
+        v["note"] = json!(crate::manual::no_gcode_on(&setup.machine, &s.name));
+        return v;
+    }
+    v["passes"] = json!(s.passes());
+    let programs: Vec<Value> = (s.programs().iter())
+        .map(|p| {
+            json!({
+                "file_name": p.file_name,
+                "lines": p.lines,
+                "tools": p.tools,
+                "operations": p.operations,
+                "estimated_minutes": (p.seconds / 60. * 10.).round() / 10.,
+            })
+        })
+        .collect();
+    v["programs"] = json!(programs);
+    v["problems"] = json!(match (&s.run, &s.result) {
+        (Some(Err(problems)), _) | (None, Err(problems)) => problems_of(problems),
+        _ => vec![],
+    });
+    if uc100 {
+        v["note"] = json!(crate::ui::NO_EXPORT_FILE);
+    }
+    v
+}
+
+/// The G-code of setup `si`'s programs as export writes them, at most
+/// `PROGRAM_CAP` bytes in all, each cut at a line's end and marked
+/// `truncated` when it is cut; or why the setup has none.
+fn program_text(doc: &Document, job: &crate::post::JobPost, si: usize) -> Value {
+    let mut v = json!({"setup": setup_ref(doc, si), "cap_bytes": PROGRAM_CAP});
+    let Some(s) = job.setups.iter().find(|s| s.setup == si) else {
+        v["files"] = json!([]);
+        v["why_none"] = json!(
+            job.errors
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "The job has no programs.".into())
+        );
+        return v;
+    };
+    let mut left = PROGRAM_CAP;
+    let files: Vec<Value> = (s.programs().iter())
+        .map(|p| {
+            let cut = if p.text.len() <= left {
+                p.text.len()
+            } else {
+                // At a line's end within what is left.
+                p.text[..p.text.floor_char_boundary(left)]
+                    .rfind('\n')
+                    .map_or(0, |i| i + 1)
+            };
+            left -= cut;
+            json!({
+                "file_name": p.file_name,
+                "bytes": p.text.len(),
+                "truncated": cut < p.text.len(),
+                "text": &p.text[..cut],
+            })
+        })
+        .collect();
+    if files.is_empty() {
+        let setup = &doc.setups[si];
+        v["why_none"] = json!(if crate::manual::is_hand(&setup.machine) {
+            crate::manual::no_gcode_on(&setup.machine, &s.name)
+        } else if s.run.is_some() {
+            crate::ui::NO_EXPORT_FILE.to_string()
+        } else {
+            "Its checks refuse it: see its problems.".to_string()
+        });
+    }
+    v["files"] = json!(files);
+    v
 }
 
 /// The steps of `guide` read at `step` (None: the first), with its
@@ -1373,6 +1583,9 @@ pub fn heaviness(tool: &str) -> &'static str {
     match tool {
         "check_job" | "check_holding" | "stock_after" => "heavy",
         "view_model" => "heavy with operation, light otherwise",
+        "inspect" => {
+            "light; heavy with what: post when the app's own NC review check is not of the job as it is now, and with what: steps when the guide has to be built"
+        }
         _ => "light",
     }
 }
@@ -1827,5 +2040,182 @@ pub(crate) mod tests {
             assert!(crate::mcp::engine::is_tool(name));
         }
         assert!(crate::mcp::protocol::INSTRUCTIONS.contains("check_job"));
+    }
+
+    /// The example block's job of the post fixture, its Face alone.
+    fn faced() -> Direct {
+        let mut d = direct();
+        let (mut doc, mesh) = crate::post::fixture::job();
+        doc.setups[0].operations.truncate(1);
+        install(&mut d, doc, mesh);
+        d
+    }
+
+    /// The NC review (LIO-470): what the app's NC review page has, read
+    /// only. Generated, the job's program is listed as export names it,
+    /// with no problem; the app's own check is read once the page has run
+    /// it; `program: true` gives what export_gcode writes; a missing tool is
+    /// a problem of its operation.
+    #[test]
+    fn inspect_reads_the_nc_review() {
+        let mut d = faced();
+        let all = ask(&mut d, "execute", json!({"command": "generate_all"}));
+        assert_eq!(all["outcome"], "done", "{all}");
+        // The page not open: worked out for the call.
+        let review = ask(&mut d, "inspect", json!({"what": "post"}));
+        assert_eq!(review["outcome"], "done", "{review}");
+        assert_eq!(review["source"], "worked_out", "{review}");
+        assert_eq!(review["app_check"], "not_current", "{review}");
+        assert_eq!(
+            (&review["current"], &review["stale"]),
+            (&json!(true), &json!(false))
+        );
+        assert!(review["command_id"].is_string(), "{review}");
+        assert_eq!(review["ready"], true, "{review}");
+        assert_eq!(review["errors"], json!([]), "{review}");
+        let setup = &review["setups"][0];
+        assert_eq!(setup["setup"]["id"], d.app.doc.setups[0].id.as_str());
+        assert_eq!(
+            (&setup["controller"], &setup["passes"], &setup["problems"]),
+            (&json!("LinuxCNC"), &json!(true), &json!([])),
+            "{setup}"
+        );
+        let program = &setup["programs"][0];
+        let posted = crate::post::post_job(&d.app.doc, d.app.part_mesh().unwrap());
+        let expected = &posted.setups[0].programs()[0];
+        assert_eq!(
+            program["file_name"],
+            crate::post::file_name(&d.app.doc, 0, None)
+        );
+        assert_eq!(program["lines"], expected.lines, "{program}");
+        assert_eq!(program["tools"], json!(expected.tools), "{program}");
+        assert_eq!(program["operations"], json!(["Face"]), "{program}");
+        assert!(
+            program["estimated_minutes"].as_f64().unwrap() > 0.,
+            "{program}"
+        );
+        assert_eq!(d.app.mcp.heavy.running(), 0);
+
+        // The page open: the app's own check, read as it has it.
+        let page = ask(
+            &mut d,
+            "execute",
+            json!({"command": "goto_page", "args": {"page": "Post"}}),
+        );
+        assert_eq!(page["outcome"], "done", "{page}");
+        assert!(d.app.post_current(), "the page checked the job");
+        let app = ask(&mut d, "inspect", json!({"what": "post"}));
+        assert_eq!(
+            (&app["source"], &app["app_check"], &app["current"]),
+            (&json!("app"), &json!("current"), &json!(true)),
+            "{app}"
+        );
+        assert_eq!(app["setups"], review["setups"]);
+
+        // The program as export_gcode writes it.
+        let folder = tempfile::tempdir().unwrap();
+        let export = json!({"command": "export_gcode", "args": {"folder": folder.path().display().to_string()}});
+        let written = ask(&mut d, "execute", export);
+        assert_eq!(written["outcome"], "done", "{written}");
+        let text = ask(
+            &mut d,
+            "inspect",
+            json!({"what": "post", "setup": 0, "program": true}),
+        );
+        let file = &text["program"]["files"][0];
+        let on_disk =
+            std::fs::read_to_string(folder.path().join(file["file_name"].as_str().unwrap()))
+                .unwrap();
+        assert_eq!(file["text"], on_disk.as_str());
+        assert_eq!(file["truncated"], false);
+        assert_eq!(file["bytes"], on_disk.len());
+
+        // Its tool gone from the library: the Face's problem.
+        let mut doc = d.app.doc.clone();
+        doc.setups[0].operations[0].tool = "no-such-tool".into();
+        let mesh = d.app.part_mesh().unwrap().clone();
+        install(&mut d, doc, mesh);
+        let broken = ask(&mut d, "inspect", json!({"what": "post"}));
+        assert_eq!(broken["ready"], false, "{broken}");
+        let setup = &broken["setups"][0];
+        assert_eq!(setup["passes"], false, "{setup}");
+        assert_eq!(setup["programs"], json!([]), "{setup}");
+        let problem = &setup["problems"][0];
+        assert_eq!(problem["operation"]["index"], 0, "{problem}");
+        assert_eq!(
+            problem["operation"]["id"],
+            d.app.doc.setups[0].operations[0].id.as_str()
+        );
+        assert_eq!(
+            problem["message"], "Choose a tool from the library.",
+            "{problem}"
+        );
+        let none = ask(&mut d, "inspect", json!({"what": "post", "program": true}));
+        assert_eq!(none["program"]["files"], json!([]), "{none}");
+        assert!(none["program"]["why_none"].is_string(), "{none}");
+    }
+
+    /// The NC review of a job changed since its check: the app's own check
+    /// is not current (or still running) and is not read; one changed
+    /// while it was worked out says so (`current: false`, `stale`); while
+    /// the machine runs one to work out is refused, as a heavy read.
+    #[test]
+    fn an_nc_review_of_a_job_changed_since_says_it_is_not_current() {
+        let mut d = faced();
+        let page = ask(
+            &mut d,
+            "execute",
+            json!({"command": "goto_page", "args": {"page": "Post"}}),
+        );
+        assert_eq!(page["outcome"], "done", "{page}");
+        assert!(d.app.post_current());
+        // The user's edit, the page's check not run again yet.
+        d.app.doc.setups[0].operations[0]
+            .p
+            .insert("feed".into(), "777".into());
+        assert!(d.app.post.is_some() && !d.app.post_current());
+        let edited = ask(&mut d, "inspect", json!({"what": "post"}));
+        assert_eq!(
+            (&edited["source"], &edited["app_check"], &edited["current"]),
+            (&json!("worked_out"), &json!("not_current"), &json!(true)),
+            "{edited}"
+        );
+        d.app.post = None;
+        d.app.post_busy = true;
+        let running = ask(&mut d, "inspect", json!({"what": "post"}));
+        assert_eq!(running["app_check"], "running", "{running}");
+        d.app.post_busy = false;
+        // Pending, then changed while it was worked out.
+        d.app.mcp.slow_reads = Some(Duration::from_millis(800));
+        let pending = ask(&mut d, "inspect", json!({"what": "post", "wait_s": 0.05}));
+        assert_eq!(pending["outcome"], "still_running", "{pending}");
+        let busy = Some("An agent's check is still simulating the job: wait for it.");
+        assert_eq!(d.app.planning_busy(), busy);
+        d.app.doc.setups[0].operations[0]
+            .p
+            .insert("feed".into(), "555".into());
+        let id = pending["command_id"].clone();
+        let late = ask(&mut d, "wait", json!({"command_id": id, "wait_s": 50}));
+        assert_eq!(late["outcome"], "done", "{late}");
+        assert_eq!(
+            (&late["current"], &late["stale"]),
+            (&json!(false), &json!(true)),
+            "{late}"
+        );
+        assert!(
+            late["changed_meanwhile"]
+                .as_array()
+                .is_some_and(|c| !c.is_empty())
+        );
+        d.app.mcp.slow_reads = None;
+        // While the machine runs.
+        jogging(&mut d);
+        let refused = ask(&mut d, "inspect", json!({"what": "post"}));
+        assert_eq!(
+            (refused["outcome"].as_str(), refused["reason"].as_str()),
+            (Some("refused"), Some(LOCKED)),
+            "{refused}"
+        );
+        stop(&mut d);
     }
 }

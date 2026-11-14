@@ -17,7 +17,8 @@
 //!   workspace it goes with. A write that fails is reported in the result
 //!   (`persisted: false`, a change `failed`);
 //! - `checkpoints/`: the checkpoints (`checkpoint`);
-//! - `lock`: the process that has it open (`Lock`).
+//! - `lock`: held with an OS lock by the process that has it open
+//!   (`Lock`).
 //!
 //! Sessions are never deleted on their own: one may hold the only copy of
 //! a job. `delete_session` deletes one, never an open one, and one with work
@@ -33,7 +34,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
-    sync::mpsc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -197,213 +197,209 @@ pub fn saved_now(folder: &Path, kept: Option<&SessionFile>) -> bool {
 }
 
 /// The lock file's name in a session's folder.
-const LOCK: &str = "lock";
-/// How often the owner refreshes its lock, and how old a lock is that no
-/// owner refreshed (where liveness is told by it).
-const BEAT: Duration = Duration::from_secs(5);
-const STALE: Duration = Duration::from_secs(30);
+pub const LOCK: &str = "lock";
 
-/// Who holds a session's lock.
+/// Who holds a session's lock, as its holder writes it into the lock file
+/// once it holds it: for the refusal's message only, never to tell whether
+/// the lock is held (the OS tells that).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Owner {
     pid: u32,
-    /// The process's start time as its OS gives it (`started`), which a
-    /// process given the same pid later does not share.
+    /// The process's start time as its OS gives it (`instance::started`).
     #[serde(default)]
     started: Option<String>,
     /// When the lock was taken, s since 1970.
     at: u64,
 }
 
-/// When process `pid` started, as its OS tells it; None when there is no
-/// such process, or the OS is not asked (Windows).
-///
-/// Liveness of a lock's owner:
-/// - **macOS:** `proc_pidinfo(PROC_PIDTBSDINFO)` gives the process's start
-///   time; the owner is alive when a process with its pid exists and
-///   started when it did (`libc`, already a macOS dependency).
-/// - **Linux:** the same from `/proc/<pid>/stat` (its 22nd field, the start
-///   time in clock ticks since boot), with std only.
-/// - **Elsewhere (Windows):** std has no way to ask about another process
-///   and no new crate is added for it, so the owner refreshes its lock
-///   file's modification time every `BEAT` (5 s), and a lock not refreshed
-///   for `STALE` (30 s) is taken as dead.
-pub fn started(pid: u32) -> Option<String> {
-    #[cfg(target_os = "macos")]
-    {
-        let pid = i32::try_from(pid).ok()?;
-        // SAFETY: proc_pidinfo writes at most `size` bytes into `info`, a
-        // plain C struct for which all zeroes is a valid value.
-        unsafe {
-            let mut info: libc::proc_bsdinfo = std::mem::zeroed();
-            let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
-            let got =
-                libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size);
-            (got == size).then(|| format!("{}.{:06}", info.pbi_start_tvsec, info.pbi_start_tvusec))
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        // After the command's closing parenthesis: field 3 (state) on, so
-        // the start time, field 22, is the 20th.
-        let rest = &stat[stat.rfind(')')? + 1..];
-        rest.split_whitespace().nth(19).map(String::from)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = pid;
-        None
-    }
-}
+/// How often a lock another process holds is asked for again before the
+/// refusal, and the pause between: `list_sessions` holds a lock shared
+/// for a moment to tell whether its session is open (`holder`).
+const TRIES: u32 = 10;
+const PAUSE: Duration = Duration::from_millis(10);
 
-/// Whether the owner of a lock whose file was last refreshed at `beat` is
-/// alive (`started` says how it is told).
-fn alive(owner: &Owner, beat: Option<SystemTime>) -> bool {
-    process_alive(owner.pid, owner.started.as_deref(), beat)
-}
-/// Whether process `pid`, which started at `start` (as `started` gives it),
-/// is alive, its file last refreshed at `beat`: a lock's owner, or an
-/// instance file's app (`instance`).
-pub fn process_alive(pid: u32, start: Option<&str>, beat: Option<SystemTime>) -> bool {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        let _ = beat;
-        start.is_some() && started(pid).as_deref() == start
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = (pid, start);
-        fresh(beat)
-    }
-}
-/// Whether a lock file last refreshed at `beat` was refreshed within
-/// `STALE`.
-fn fresh(beat: Option<SystemTime>) -> bool {
-    beat.and_then(|t| t.elapsed().ok())
-        .is_some_and(|age| age < STALE)
-}
-
-/// The live owner of the lock in `folder`, if any: the lock file read, and
-/// whether its owner is alive. An unreadable lock counts as held while it is
-/// fresh (it may be being written), else as dead.
-fn holder(folder: &Path) -> Option<(Owner, bool, Vec<u8>)> {
-    let path = folder.join(LOCK);
-    let bytes = std::fs::read(&path).ok()?;
-    let beat = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-    match serde_json::from_slice::<Owner>(&bytes) {
-        Ok(owner) => {
-            let live = alive(&owner, beat);
-            Some((owner, live, bytes))
-        }
-        Err(_) => {
-            let fresh = fresh(beat);
-            let owner = Owner {
-                pid: 0,
-                started: None,
-                at: 0,
-            };
-            Some((owner, fresh, bytes))
-        }
-    }
-}
-
-/// A session's lock, held while this process has it open: a file created
-/// exclusively (`create_new`) with the owner's pid and start time, its
-/// modification time refreshed every `BEAT`. Dropped, it is removed.
+/// A session's lock: its folder's `lock` file, opened (made when it is
+/// not there) and held with an exclusive OS lock (`File::try_lock`: `flock`
+/// on Unix, `LockFileEx` on Windows) for as long as this process has the
+/// session open. The OS lets go when the file is closed, by drop or by the
+/// process's end however it ends: there is no stale lock to tell, take over
+/// or delete, and the file stays with its session (`delete` removes it
+/// last). Who holds it is written into it once it is held, for the
+/// refusal's message.
 #[derive(Debug)]
 pub struct Lock {
-    path: PathBuf,
-    written: Vec<u8>,
-    stop: Option<mpsc::Sender<()>>,
-    beat: Option<std::thread::JoinHandle<()>>,
+    file: std::fs::File,
 }
 impl Lock {
-    /// Takes session `id`'s lock in `folder`: refused while another live
-    /// process holds it; a lock whose owner is dead is taken over.
+    /// Takes session `id`'s lock in `folder`, which must be there (the
+    /// folder is never made here): refused while another process, or
+    /// another open of this one, holds it.
     pub fn take(folder: &Path, id: &str) -> Result<Lock, String> {
         let path = folder.join(LOCK);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| format!("Could not lock session {id}: {e}"))?;
+        let mut tries = 1;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if tries < TRIES => {
+                    tries += 1;
+                    std::thread::sleep(PAUSE);
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    let pid = owner(&mut &file).map(|o| o.pid);
+                    return Err(open_elsewhere(id, pid));
+                }
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(format!("Could not lock session {id}: {e}"));
+                }
+            }
+        }
+        let lock = Lock { file };
+        lock.sign();
+        Ok(lock)
+    }
+    /// Writes this process into the lock file it holds. A write that fails
+    /// leaves the lock held, only the message without its pid.
+    fn sign(&self) {
+        use std::io::{Seek, Write};
         let pid = std::process::id();
         let me = Owner {
             pid,
-            started: started(pid),
+            started: super::instance::started(pid),
             at: now_s(),
         };
-        let written = serde_json::to_vec(&me).map_err(|e| e.to_string())?;
-        for _ in 0..4 {
-            use std::io::Write;
-            let created = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path);
-            match created {
-                Ok(mut file) => {
-                    file.write_all(&written)
-                        .and_then(|()| file.sync_all())
-                        .map_err(|e| format!("Could not lock session {id}: {e}"))?;
-                    return Ok(Lock::beating(path, written));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    match holder(folder) {
-                        Some((owner, true, _)) => {
-                            return Err(match owner.pid {
-                                0 => format!(
-                                    "Session {id} is open in another MCP server (its lock is being written)."
-                                ),
-                                pid => format!(
-                                    "Session {id} is open in another MCP server (pid {pid})."
-                                ),
-                            });
-                        }
-                        // Dead: taken over, if it is still that lock.
-                        Some((_, false, bytes))
-                            if std::fs::read(&path).ok().as_ref() == Some(&bytes) =>
-                        {
-                            let _ = std::fs::remove_file(&path);
-                        }
-                        // Gone or changed meanwhile: try again.
-                        _ => {}
-                    }
-                }
-                Err(e) => return Err(format!("Could not lock session {id}: {e}")),
-            }
-        }
-        Err(format!(
-            "Session {id} could not be locked: another process keeps taking its lock."
-        ))
-    }
-    fn beating(path: PathBuf, written: Vec<u8>) -> Lock {
-        let (stop, stopped) = mpsc::channel::<()>();
-        let beat_path = path.clone();
-        let beat = std::thread::Builder::new()
-            .name("mcp-session-lock".into())
-            .spawn(move || {
-                while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(BEAT) {
-                    if let Ok(file) = std::fs::File::options().write(true).open(&beat_path) {
-                        let _ = file.set_modified(SystemTime::now());
-                    }
-                }
-            })
-            .ok();
-        Lock {
-            path,
-            written,
-            stop: Some(stop),
-            beat,
-        }
+        let Ok(bytes) = serde_json::to_vec(&me) else {
+            return;
+        };
+        let mut file = &self.file;
+        let _ = file
+            .seek(std::io::SeekFrom::Start(0))
+            .and_then(|_| file.write_all(&bytes))
+            .and_then(|()| file.set_len(bytes.len() as u64));
     }
 }
-impl Drop for Lock {
-    fn drop(&mut self) {
-        drop(self.stop.take());
-        if let Some(beat) = self.beat.take() {
-            let _ = beat.join();
+
+/// The refusal for session `id`, whose lock process `pid` holds.
+fn open_elsewhere(id: &str, pid: Option<u32>) -> String {
+    match pid {
+        Some(pid) => format!("Session {id} is open in another MCP server (pid {pid})."),
+        // Being written, or not readable while it is held (Windows).
+        None => format!("Session {id} is open in another MCP server."),
+    }
+}
+
+/// Who a lock file says holds it, when it says.
+fn owner(file: &mut impl std::io::Read) -> Option<Owner> {
+    let mut bytes = vec![];
+    file.read_to_end(&mut bytes).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Whether a server has the session in `folder` open (its lock is held),
+/// with its pid when the lock file says it: told by holding the lock shared
+/// for a moment, which a holder's exclusive lock refuses. None when it is
+/// not open (no lock file: never opened).
+fn holder(folder: &Path) -> Option<Option<u32>> {
+    let mut file = std::fs::File::open(folder.join(LOCK)).ok()?;
+    match file.try_lock_shared() {
+        // Not held; let go as the file closes.
+        Ok(()) => None,
+        Err(std::fs::TryLockError::WouldBlock) => Some(owner(&mut file).map(|o| o.pid)),
+        Err(std::fs::TryLockError::Error(_)) => None,
+    }
+}
+
+/// Whether the session in `folder` holds a job to resume: its workspace or
+/// its record. `delete` removes both first, so a folder with neither is
+/// being deleted or gone.
+pub fn has_job(folder: &Path) -> bool {
+    folder.join("workspace.json").is_file() || folder.join(FILE).is_file()
+}
+
+/// What `DELETE_STEP` holds: called with each step's name.
+#[cfg(test)]
+pub type DeleteHook = Box<dyn FnMut(&str)>;
+#[cfg(test)]
+thread_local! {
+    /// Called by `delete` on this thread after each of its steps, with the
+    /// step's name (tests: a race made at a step).
+    pub static DELETE_STEP: std::cell::RefCell<Option<DeleteHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+/// `delete` has done `step`.
+fn deleted(step: &str) {
+    #[cfg(test)]
+    DELETE_STEP.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(step);
         }
-        // Only its own: a lock taken over meanwhile is another's.
-        if std::fs::read(&self.path).ok().as_ref() == Some(&self.written) {
-            let _ = std::fs::remove_file(&self.path);
+    });
+    #[cfg(not(test))]
+    let _ = step;
+}
+
+/// Deletes the session folder `folder` while its lock, `lock`, is held,
+/// so no server opens it meanwhile: its workspace and record first (a
+/// folder without them is never resumed, `has_job`), then everything else
+/// but the lock file, then the lock file and the folder, the lock held to
+/// the end. On Windows a file held open cannot be deleted: the lock is let
+/// go just before its file. A resume that opens the lock file after it is
+/// removed makes a new one, finds no job and refuses; that file goes with
+/// the folder.
+fn remove(folder: &Path, lock: Lock) -> Result<(), String> {
+    let err = |e: std::io::Error| format!("Could not delete {}: {e}", folder.display());
+    let gone = |r: std::io::Result<()>| match r {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        r => r,
+    };
+    let clear = |keep_lock: bool| -> std::io::Result<()> {
+        for entry in std::fs::read_dir(folder)? {
+            let entry = entry?;
+            if keep_lock && entry.file_name() == LOCK {
+                continue;
+            }
+            let path = entry.path();
+            gone(if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            })?;
+        }
+        Ok(())
+    };
+    for name in [FILE, "workspace.json"] {
+        gone(std::fs::remove_file(folder.join(name))).map_err(err)?;
+        deleted(name);
+    }
+    clear(true).map_err(err)?;
+    deleted("entries");
+    let mut held = Some(lock);
+    if cfg!(windows) {
+        held = None;
+    }
+    gone(std::fs::remove_file(folder.join(LOCK))).map_err(err)?;
+    deleted(LOCK);
+    let mut tries = 0;
+    loop {
+        match gone(std::fs::remove_dir(folder)) {
+            Ok(()) => break,
+            Err(_) if tries < 50 => {
+                tries += 1;
+                let _ = clear(false);
+                std::thread::sleep(PAUSE);
+            }
+            Err(e) => return Err(err(e)),
         }
     }
+    deleted("folder");
+    drop(held);
+    Ok(())
 }
 
 /// Whether `id` names a session folder: letters, digits, `-` and `_`.
@@ -455,7 +451,7 @@ fn describe(root: &Path, id: &str) -> Option<Value> {
             .and_then(|v| v.get("title")?.as_str().map(String::from))
             .unwrap_or_default(),
     };
-    let owner = holder(&folder).filter(|(_, live, _)| *live);
+    let owner = holder(&folder);
     Some(json!({
         "id": id,
         "title": title,
@@ -466,7 +462,7 @@ fn describe(root: &Path, id: &str) -> Option<Value> {
         "checkpoints": kept.as_ref().map_or(0, |k| k.checkpoints.len()),
         "size_bytes": size_of(&folder),
         "open": owner.is_some(),
-        "pid": owner.map(|(o, ..)| o.pid),
+        "pid": owner.flatten(),
         "folder": folder.display().to_string(),
     }))
 }
@@ -486,22 +482,21 @@ fn refused(why: String) -> Value {
 }
 
 /// Deletes session `id` in `root`: refused while it is open (its lock is
-/// held by a live process, this one's included), and while it has work not
-/// saved to a project file unless `discard_unsaved`.
+/// held, by this process too), and while it has work not saved to a project
+/// file unless `discard_unsaved`. Its lock is taken before anything is read
+/// and held through the deletion (`remove`).
 pub fn delete(root: &Path, id: &str, discard_unsaved: bool) -> Result<Value, String> {
     if !valid_id(id) {
         return Err(format!("\"{id}\" is not a session id."));
     }
     let folder = root.join(id);
+    let missing = || format!("There is no MCP session {id} in {}.", root.display());
     if !folder.is_dir() {
-        return Err(format!(
-            "There is no MCP session {id} in {}.",
-            root.display()
-        ));
+        return Err(missing());
     }
-    // Held while it is deleted: no server opens it meanwhile.
     let lock = match Lock::take(&folder, id) {
         Ok(lock) => lock,
+        Err(_) if !folder.is_dir() => return Err(missing()),
         Err(why) => {
             return Ok(refused(format!(
                 "{why} It cannot be deleted while it is open."
@@ -517,9 +512,7 @@ pub fn delete(root: &Path, id: &str, discard_unsaved: bool) -> Result<Value, Str
             "Session {id} (\"{title}\") holds work not saved to a project file; deleting it would lose it. Resume it and save the project, or call again with discard_unsaved: true."
         )));
     }
-    drop(lock);
-    std::fs::remove_dir_all(&folder)
-        .map_err(|e| format!("Could not delete {}: {e}", folder.display()))?;
+    remove(&folder, lock)?;
     Ok(json!({"outcome": "done", "deleted": id}))
 }
 
@@ -560,21 +553,17 @@ impl Sessions {
     }
     /// Why the call cannot go to a headless session: a window is open, or
     /// whether one is cannot be told (`instance::refusal`). None when there
-    /// is no window, or when the session open now (or `resuming`) is
-    /// committed to staying headless.
-    fn window(&self, resuming: Option<&str>) -> Option<String> {
-        let committed = match resuming {
-            Some(id) => {
-                valid_id(id)
-                    && SessionFile::read(&self.root.join(id))
-                        .and_then(Result::ok)
-                        .is_some_and(|k| k.log.revision > 0)
-            }
-            None => self.runner.as_ref().is_some_and(|(_, r)| r.committed()),
-        };
-        if committed {
+    /// is no window, or when the session open now is committed to staying
+    /// headless.
+    fn window(&self) -> Option<String> {
+        if self.runner.as_ref().is_some_and(|(_, r)| r.committed()) {
             return None;
         }
+        self.windows()
+    }
+    /// Why a window keeps the calls from a headless session, whatever the
+    /// session (`instance::refusal`).
+    fn windows(&self) -> Option<String> {
         let found = super::instance::discover(&super::instance::folder(&self.workspace));
         super::instance::refusal(&found, self.chosen)
     }
@@ -693,14 +682,37 @@ impl Sessions {
                     Ok(id) => id,
                     Err(e) => return reply(Err(e)),
                 };
-                if let Some(why) = self.window(Some(&id)) {
+                let open_now = self.runner.as_ref().is_some_and(|(open, _)| *open == id);
+                let window = if open_now {
+                    self.window()
+                } else {
+                    self.windows()
+                };
+                // Locked before anything of it is read (whether it is
+                // committed to headless, which a window cannot then
+                // refuse); let go again when the call is refused.
+                let session = if open_now {
+                    None
+                } else {
+                    match Session::open(&self.root, Some(&id), &self.workspace) {
+                        Ok(session) => Some(session),
+                        Err(why) => {
+                            return reply(match window {
+                                Some(window) => Err(window),
+                                None => Ok(refused(why)),
+                            });
+                        }
+                    }
+                };
+                let committed = session.as_ref().is_some_and(|s| {
+                    SessionFile::read(&s.folder)
+                        .and_then(Result::ok)
+                        .is_some_and(|k| k.log.revision > 0)
+                });
+                if let Some(why) = window.filter(|_| !committed) {
                     return reply(Err(why));
                 }
-                if self.runner.as_ref().is_none_or(|(open, _)| *open != id) {
-                    let session = match Session::open(&self.root, Some(&id), &self.workspace) {
-                        Ok(session) => session,
-                        Err(why) => return reply(Ok(refused(why))),
-                    };
+                if let Some(session) = session {
                     // The session open now is saved and left on disk.
                     if let Some((_, old)) = self.runner.take() {
                         old.stop();
@@ -724,7 +736,7 @@ impl Sessions {
             }
             _ => {
                 if !self.bound(tool, &args)
-                    && let Some(why) = self.window(None)
+                    && let Some(why) = self.window()
                 {
                     return reply(Err(why));
                 }

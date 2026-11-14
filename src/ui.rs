@@ -6797,11 +6797,15 @@ pub(crate) fn material_note(doc: &Document) -> Option<String> {
 /// The NC page's list: one line per speed or feed problem of an enabled
 /// operation (true), and one per operation that could not be checked (false).
 pub(crate) fn speed_feed_lines(app: &App) -> Vec<(bool, String)> {
+    speed_feed_lines_of(&app.doc)
+}
+/// `speed_feed_lines` of `doc`.
+pub(crate) fn speed_feed_lines_of(doc: &Document) -> Vec<(bool, String)> {
     let mut lines = vec![];
-    for (i, setup) in app.doc.setups.iter().enumerate() {
+    for (i, setup) in doc.setups.iter().enumerate() {
         for op in setup.operations.iter().filter(|o| o.enabled) {
             let at = format!("Setup {} · {}", i + 1, op.name());
-            match app.doc.speed_feed(setup, op) {
+            match doc.speed_feed(setup, op) {
                 Some(SpeedFeed::Out(problems)) => {
                     lines.extend(problems.into_iter().map(|p| (true, format!("{at}: {p}"))))
                 }
@@ -15721,12 +15725,20 @@ fn open_label(app: &App, m: &Message) -> String {
 }
 pub(crate) fn nc_issue(app: &App, name: &str, problem: &str) -> Option<Message> {
     let si = app.doc.setups.iter().position(|s| s.name() == name)?;
-    let ops = app.doc.setups[si].operations.iter().enumerate();
+    let (oi, rest) = nc_operation(&app.doc, si, problem)?;
+    Some(Message::OpenIssue(si, oi, rest.to_string()))
+}
+/// The operation of setup `si` an NC review problem is about, and the
+/// message after its name: the problem starts with the operation's name
+/// and ": ".
+pub(crate) fn nc_operation<'a>(
+    doc: &Document,
+    si: usize,
+    problem: &'a str,
+) -> Option<(usize, &'a str)> {
+    let ops = doc.setups.get(si)?.operations.iter().enumerate();
     ops.filter(|(_, o)| !o.name().is_empty())
-        .find_map(|(oi, o)| {
-            let rest = problem.strip_prefix(o.name())?.strip_prefix(": ")?;
-            Some(Message::OpenIssue(si, oi, rest.to_string()))
-        })
+        .find_map(|(oi, o)| Some((oi, problem.strip_prefix(o.name())?.strip_prefix(": ")?)))
 }
 /// A setup's problems on the NC review page: its causes, counted, each with
 /// Open beside it when it is an operation's, then the operations that wait

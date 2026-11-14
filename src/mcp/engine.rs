@@ -112,13 +112,14 @@ pub fn tools() -> Value {
         {
             "name": "inspect",
             "title": "Inspect the job",
-            "description": "The state as the user would read it: the project (title, project file, part, material, whether it is saved), its setups and their operations by id, the selection with its page and tab, the status line, the work still pending, the backend and the session. With `what: \"libraries\"`, the library's machines, tools, materials and holders, each with its id (what the library commands take) and fields. With `what: \"steps\"`, a manual mill or lathe setup's steps instead: one step (`step`, from 0) with its text, DRO readouts and holes, the sections and where the machinist's own place is; it reads with a cursor of its own and never moves that place. A guide the app has not built for the job as it is is built first, which simulates the setup: refused while the machine runs.",
+            "description": "The state as the user would read it: the project (title, project file, part, material, whether it is saved), its setups and their operations by id, the selection with its page and tab, the status line, the work still pending, the backend and the session. With `what: \"libraries\"`, the library's machines, tools, materials and holders, each with its id (what the library commands take) and fields. With `what: \"steps\"`, a manual mill or lathe setup's steps instead: one step (`step`, from 0) with its text, DRO readouts and holes, the sections and where the machinist's own place is; it reads with a cursor of its own and never moves that place. A guide the app has not built for the job as it is is built first, which simulates the setup: refused while the machine runs. With `what: \"post\"`, the NC review as the app's NC review page has it, read only and nothing exported: for each setup (or `setup`) its controller, whether it passes, its programs (file names as export_gcode names them, lines, tools, operations, estimated minutes) and its problems, each with its setup and operation; whether the job is `ready` to export; the speeds and feeds lines. `program: true` adds the G-code of `setup`'s programs (default the active setup; at most 200 KB, `truncated` when cut). It reads the app's own check when that is of the job as it is now (`source: \"app\"`); otherwise it works one out (`source: \"worked_out\"`), which simulates the job: refused while the machine runs, `still_running` with a command_id for wait. `current` says whether it is of the job as it is now (false, with `stale` and `changed_meanwhile`, when the job changed while it was worked out); `app_check` whether the NC review page's own check is current, running or not current.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "what": {"type": "string", "enum": ["libraries", "steps"], "description": "Leave out for the whole state; libraries for the library entries and their ids; steps for a hand setup's steps."},
-                    "setup": {"type": ["string", "integer"], "description": "With steps: the setup's id or index from 0; default the active setup."},
+                    "what": {"type": "string", "enum": ["libraries", "steps", "post"], "description": "Leave out for the whole state; libraries for the library entries and their ids; steps for a hand setup's steps; post for the NC review."},
+                    "setup": {"type": ["string", "integer"], "description": "With steps: the setup's id or index from 0; default the active setup. With post: the one setup to review (default all), and the setup whose program `program` gives (default the active setup)."},
                     "step": {"type": "integer", "minimum": 0, "description": "With steps: the step to read, from 0 (default 0)."},
+                    "program": {"type": "boolean", "description": "With post: also give the G-code of the setup's programs (at most 200 KB)."},
                     "wait_s": wait,
                 },
             },
@@ -585,6 +586,22 @@ fn describe_command(args: &Value) -> Result<Value, String> {
             "allowed": true,
         }));
     }
+    // Another tool (inspect, the session tools...): its own description.
+    if commands::find(name).is_none()
+        && is_tool(name)
+        && let Some(tool) =
+            (tools().as_array()).and_then(|all| all.iter().find(|t| t["name"] == name))
+    {
+        return Ok(json!({
+            "name": name,
+            "tool": true,
+            "help": tool["description"],
+            "args": tool["inputSchema"],
+            "while_machine_runs": reads::heaviness(name),
+            "note": "This is a tool: call it by its name, not with execute.",
+            "allowed": true,
+        }));
+    }
     let c = commands::find(name).ok_or_else(|| no_command(name))?;
     let (line, full) = c.help();
     Ok(json!({
@@ -809,7 +826,7 @@ impl Agent {
                     None => Ok(inspect(b)),
                     Some("libraries") => Ok(libraries(b)),
                     Some(what) => Err(format!(
-                        "inspect: `what` is \"libraries\" or \"steps\", not \"{what}\"."
+                        "inspect: `what` is \"libraries\", \"steps\" or \"post\", not \"{what}\"."
                     )),
                 };
                 self.give(reply, answer)

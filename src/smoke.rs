@@ -15186,6 +15186,7 @@ soft_max = 180.0
                     tools: vec![],
                     operations: vec![],
                     text: long.clone(),
+                    seconds: 0.,
                 }]),
                 run: None,
             }],

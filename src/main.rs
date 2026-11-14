@@ -1362,6 +1362,9 @@ pub struct App {
     /// (`ui::stock_picture`).
     pub(crate) stock_pictures: std::cell::RefCell<Vec<(u64, iced::widget::image::Handle)>>,
     post_epoch: u64,
+    /// The job the NC review's last check started was for (`post_key`):
+    /// `post` is of the job as it is now while the two match.
+    pub(crate) post_for: u64,
     /// The check epoch of the run whose stock is being pictured
     /// (`picture_run`).
     picture_job: Option<u64>,
@@ -2142,6 +2145,7 @@ impl App {
             tooth_load_job: None,
             stock_pictures: Default::default(),
             post_epoch: 0,
+            post_for: 0,
             picture_job: None,
             settings,
             settings_path,
@@ -4271,11 +4275,26 @@ impl App {
         self.post = None;
         self.post_epoch = self.post_epoch.wrapping_add(1);
     }
+    /// A fingerprint of what the NC review's check works on: the whole
+    /// `Document` and the part.
+    pub(crate) fn post_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        let _ = serde_json::to_writer(HashWriter(&mut hasher), &self.doc);
+        self.part_mesh().map(|m| &m.fingerprint).hash(&mut hasher);
+        hasher.finish()
+    }
+    /// Whether the NC review's check (`post`) is in, and of the job as it
+    /// is now.
+    pub(crate) fn post_current(&self) -> bool {
+        self.post.is_some() && self.post_for == self.post_key()
+    }
     /// Check and emit the whole job while the NC review page is open.
     fn refresh_post(&mut self) -> Task<Message> {
         if self.page != Page::Post || self.post.is_some() || self.post_busy || self.locked() {
             return Task::none();
         }
+        self.post_for = self.post_key();
         let doc = self.doc.clone();
         let mesh = self.part_mesh().cloned();
         let run = move || match mesh {
