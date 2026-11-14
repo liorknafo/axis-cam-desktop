@@ -12,6 +12,7 @@ use super::{
     class::{self, Class},
     fields,
     pick::{self, Mode},
+    state::{Completion, Kind},
 };
 use crate::{
     App, GuideAction, Message, Page, Target, control, model::Strategy, run, section, settings,
@@ -2311,6 +2312,36 @@ fn holds(f: impl Fn(&App) -> bool + 'static, fail: impl Into<String>) -> Expect 
     let fail = fail.into();
     Box::new(move |app| if f(app) { Ok(None) } else { Err(fail.clone()) })
 }
+/// An effect for a command whose work completes through the app's result
+/// message (`Kind`): the messages that arrived in its window decide first,
+/// an error among them (or none of `primary`) failing it, and `check` then
+/// verifies the state the success must have left.
+fn judged(
+    command: &'static str,
+    primary: Kind,
+    also: &'static [Kind],
+    check: impl Fn(&App) -> bool + 'static,
+    fail: impl Into<String>,
+) -> Expect {
+    let fail = fail.into();
+    Box::new(move |app| {
+        let mine = |k: Kind| k == primary || also.contains(&k);
+        let done = &app.mcp.completions;
+        if let Some(Completion { result: Err(e), .. }) =
+            done.iter().find(|c| mine(c.kind) && c.result.is_err())
+        {
+            return Err(e.clone());
+        }
+        if !done.iter().any(|c| c.kind == primary) {
+            return Err(format!("The app did not finish {command}."));
+        }
+        if check(app) {
+            Ok(None)
+        } else {
+            Err(fail.clone())
+        }
+    })
+}
 /// An effect that holds when what `get` reads changed. Unchanged, it is
 /// `no_change` (`already` says why) unless the status line said something
 /// new, which is then the failure's reason: the app refused.
@@ -2646,11 +2677,14 @@ fn effect(name: &str) -> Option<fn(&Ctx) -> Expect> {
         },
         "open_project" => |ctx| {
             let path = arg_path(ctx, "path");
-            holds(
+            judged(
+                "open_project",
+                Kind::Open,
+                &[Kind::Restore],
                 move |a| {
                     let history = a.state_path.with_file_name("history");
                     let opened = a.project_path.as_deref() == Some(path.as_path())
-                        || (path.starts_with(&history) && a.status.starts_with("Project opened"));
+                        || path.starts_with(&history);
                     opened && (a.doc.file.is_none() || a.imported_mesh.is_some())
                 },
                 "The project did not open.",
@@ -2661,14 +2695,23 @@ fn effect(name: &str) -> Option<fn(&Ctx) -> Expect> {
                 Some(_) => arg_path(ctx, "path"),
                 None => ctx.app.project_path.clone().unwrap_or_default(),
             };
-            holds(
-                move |a| {
-                    a.project_path.as_deref() == Some(path.as_path())
-                        && !a.project_dirty
-                        && path.is_file()
-                },
-                "The project was not saved.",
-            )
+            Box::new(move |a| {
+                match &a.mcp.last_save {
+                    Some(Ok(done)) if *done == path => {}
+                    Some(Ok(_)) => return Err("The project was saved somewhere else.".into()),
+                    Some(Err(e)) => return Err(format!("Save failed: {e}")),
+                    None => return Err("The app did not finish save_project.".into()),
+                }
+                // The file holds the project, by value.
+                if a.project_path.as_deref() == Some(path.as_path())
+                    && !a.project_dirty
+                    && a.saved_to_file()
+                {
+                    Ok(None)
+                } else {
+                    Err("The project was not saved.".into())
+                }
+            })
         },
         "set_project_material" => |ctx| {
             let id = arg_str(ctx, "id");
@@ -2683,19 +2726,29 @@ fn effect(name: &str) -> Option<fn(&Ctx) -> Expect> {
         },
         // Part.
         "import_model" => |ctx| {
-            let name = arg_path(ctx, "path").file_name().map(|n| n.to_os_string());
-            holds(
+            let asked = arg_path(ctx, "path");
+            judged(
+                "import_model",
+                Kind::Import,
+                &[Kind::Reimport],
                 move |a| {
-                    let file = a.doc.file.as_ref();
-                    file.is_some_and(|f| f.path.file_name() == name.as_deref())
-                        && a.imported_mesh.is_some()
+                    // The requested file, by any spelling of its path.
+                    let same = |d: &Path| {
+                        d == asked
+                            || std::fs::canonicalize(d)
+                                .is_ok_and(|d| std::fs::canonicalize(&asked).is_ok_and(|p| p == d))
+                    };
+                    a.doc.file.as_ref().is_some_and(|f| same(&f.path)) && a.imported_mesh.is_some()
                 },
                 "The model was not imported.",
             )
         },
         "reimport_model" => |_| {
-            holds(
-                |a| a.imported_mesh.is_some() && !a.status.starts_with("Reimport failed"),
+            judged(
+                "reimport_model",
+                Kind::Reimport,
+                &[],
+                |a| a.imported_mesh.is_some(),
                 "The model was not loaded again.",
             )
         },
@@ -3280,33 +3333,38 @@ fn effect(name: &str) -> Option<fn(&Ctx) -> Expect> {
         // Export.
         "export_gcode" => |ctx| {
             let (folder, since) = (arg_path(ctx, "folder"), std::time::SystemTime::now());
-            holds(
-                move |a| {
-                    let written = std::fs::read_dir(&folder).is_ok_and(|d| {
+            judged(
+                "export_gcode",
+                Kind::Gcode,
+                &[],
+                move |_| {
+                    std::fs::read_dir(&folder).is_ok_and(|d| {
                         d.flatten().any(|e| {
                             e.path().extension().is_some_and(|x| x == "ngc")
                                 && written_since(&e.path(), since)
                         })
-                    });
-                    written && a.status.starts_with("Exported ")
+                    })
                 },
                 "No program was written.",
             )
         },
         "export_setup_sheet" => |ctx| {
             let (path, since) = (arg_path(ctx, "path"), std::time::SystemTime::now());
-            holds(
-                move |a| {
-                    written_since(&path, since)
-                        && a.status == format!("Exported {}", path.display())
-                },
+            judged(
+                "export_setup_sheet",
+                Kind::Sheet,
+                &[],
+                move |_| written_since(&path, since),
                 "The setup sheet was not written.",
             )
         },
         "save_for_tablet" => |ctx| {
             let (path, since) = (arg_path(ctx, "path"), std::time::SystemTime::now());
-            holds(
-                move |a| written_since(&path, since) && a.status.starts_with("Saved "),
+            judged(
+                "save_for_tablet",
+                Kind::Tablet,
+                &[],
+                move |_| written_since(&path, since),
                 "The tablet file was not written.",
             )
         },
@@ -5108,5 +5166,124 @@ pub(crate) mod tests {
         assert_eq!(page(&d), once);
         // A listing found while a view was built is not kept.
         assert_eq!(ui::collecting("x", || {}), vec![]);
+    }
+
+    /// A valid ASCII STL part.
+    fn stl_text() -> String {
+        let mut text = String::from("solid hole\n");
+        for t in crate::pocket::chamfered_hole() {
+            text += "facet normal 0 0 0\nouter loop\n";
+            for p in t {
+                text += &format!("vertex {} {} {}\n", p[0], p[1], p[2]);
+            }
+            text += "endloop\nendfacet\n";
+        }
+        text + "endsolid hole\n"
+    }
+    fn import_part(d: &mut Direct, path: &Path) -> Value {
+        run(
+            d,
+            "import_model",
+            json!({"path": path.display().to_string()}),
+        )
+        .unwrap()
+    }
+
+    /// The reviewer's probes (LIO-470, round 4): a file command is judged
+    /// by the app's own completion result, not by state that may already
+    /// match. An invalid import after a valid one fails, whether it has
+    /// the same basename in another folder or is the same path.
+    #[test]
+    fn a_failed_import_is_failed_though_a_part_of_that_name_is_loaded() {
+        let mut d = direct();
+        let (one, two) = (d.folder.join("one"), d.folder.join("two"));
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        let (p, q) = (one.join("part.stl"), two.join("part.stl"));
+        std::fs::write(&p, stl_text()).unwrap();
+        std::fs::write(&q, "not a mesh").unwrap();
+        let r = import_part(&mut d, &p);
+        assert_eq!(r["outcome"], "done", "{r}");
+        // Another folder, the same name.
+        let r = import_part(&mut d, &q);
+        assert_eq!(r["outcome"], "failed", "{r}");
+        assert_eq!(d.app.doc.file.as_ref().unwrap().path, p);
+        assert!(d.app.imported_mesh.is_some());
+        // The same path, damaged since.
+        std::fs::write(&p, "not a mesh").unwrap();
+        let r = import_part(&mut d, &p);
+        assert_eq!(r["outcome"], "failed", "{r}");
+        assert!(d.app.imported_mesh.is_some(), "the previous part is kept");
+        // A valid one still imports.
+        std::fs::write(&q, stl_text()).unwrap();
+        let r = import_part(&mut d, &q);
+        assert_eq!(r["outcome"], "done", "{r}");
+        assert_eq!(d.app.doc.file.as_ref().unwrap().path, q);
+    }
+
+    /// A save that could not write is failed: the project was clean, so
+    /// the old dirty flag said it was saved.
+    #[cfg(unix)]
+    #[test]
+    fn a_save_that_could_not_write_is_failed() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut d = direct();
+        let folder = d.folder.join("work");
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("job.axis.json");
+        let r = run(
+            &mut d,
+            "save_project",
+            json!({"path": file.display().to_string()}),
+        )
+        .unwrap();
+        assert_eq!(r["outcome"], "done", "{r}");
+        // Another project's title in the file, with this one's id.
+        let mut text: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        text["title"] = json!("External job B");
+        let external = serde_json::to_vec(&text).unwrap();
+        std::fs::write(&file, &external).unwrap();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let binds = std::fs::write(folder.join("probe"), "x").is_err();
+        let r = run(&mut d, "save_project", json!({})).unwrap();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // (Running as a user the mode does not bind, nothing to see.)
+        if !binds {
+            return;
+        }
+        assert_eq!(r["outcome"], "failed", "{r}");
+        assert!(r["reason"].as_str().unwrap().contains("Save failed"), "{r}");
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            external,
+            "the file is as it was"
+        );
+        assert!(!d.app.saved_to_file());
+        // Writable again, it saves.
+        let r = run(&mut d, "save_project", json!({"overwrite": true})).unwrap();
+        assert_eq!(r["outcome"], "done", "{r}");
+        assert!(d.app.saved_to_file());
+    }
+
+    /// Reopening the current path after its contents became invalid fails
+    /// and keeps the job; a valid one opens.
+    #[test]
+    fn reopening_a_now_invalid_current_file_is_failed() {
+        let mut d = direct();
+        let file = d.folder.join("job.axis.json");
+        let path = file.display().to_string();
+        let r = run(&mut d, "save_project", json!({"path": path})).unwrap();
+        assert_eq!(r["outcome"], "done", "{r}");
+        let title = d.app.doc.title.clone();
+        let good = std::fs::read(&file).unwrap();
+        std::fs::write(&file, "{broken").unwrap();
+        let open = json!({"path": path, "discard_unsaved": true});
+        let r = run(&mut d, "open_project", open.clone()).unwrap();
+        assert_eq!(r["outcome"], "failed", "{r}");
+        assert_eq!(d.app.doc.title, title, "the previous job is kept");
+        assert_eq!(d.app.project_path.as_deref(), Some(file.as_path()));
+        std::fs::write(&file, good).unwrap();
+        let r = run(&mut d, "open_project", open).unwrap();
+        assert_eq!(r["outcome"], "done", "{r}");
     }
 }

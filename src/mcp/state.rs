@@ -634,6 +634,14 @@ pub struct Tracker {
     pub heavy: super::reads::Heavy,
     /// The checkpoints the agent took (`checkpoint`), oldest first.
     pub checkpoints: super::checkpoint::Kept,
+    /// What the file commands' completion messages said since the window
+    /// opened (`Tracker::note`): the effect checks judge by these, not by
+    /// state that may already match.
+    pub completions: Vec<Completion>,
+    /// What the project save handler's last run came to: the path it
+    /// wrote, or why it could not (set in `Message::Saved`; cleared when a
+    /// window opens).
+    pub last_save: Option<Result<std::path::PathBuf, String>>,
     /// The paths of the last saves and exports the agent made.
     pub outputs: Vec<super::session::Output>,
     /// A headless session resumed whose workspace holds a change its
@@ -652,6 +660,99 @@ pub struct Tracker {
     /// How long a checkpoint's part takes to load before it loads (tests).
     #[cfg(test)]
     pub slow_candidate: Option<std::time::Duration>,
+}
+
+/// Which file work a completion message finishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Import,
+    Reimport,
+    Restore,
+    Open,
+    Gcode,
+    Sheet,
+    Tablet,
+}
+
+/// A file work's completion message as the app received it: the path it
+/// came to, or the app's error text.
+#[derive(Debug, Clone)]
+pub struct Completion {
+    pub kind: Kind,
+    pub result: Result<Option<std::path::PathBuf>, String>,
+}
+
+/// The most completions kept between windows.
+const MOST_COMPLETIONS: usize = 32;
+
+impl Tracker {
+    /// Records `m` when it completes file work, whoever started it.
+    pub(crate) fn note(&mut self, m: &Message) {
+        let none = || "No file was chosen.".to_string();
+        let (kind, result) = match m {
+            Message::FileImported(r) => (
+                Kind::Import,
+                match r {
+                    Some(Ok((f, _))) => Ok(Some(f.path.clone())),
+                    Some(Err(e)) => Err(e.clone()),
+                    None => Err(none()),
+                },
+            ),
+            Message::ModelReimported(_, r) => (
+                Kind::Reimport,
+                match r {
+                    Ok((f, _)) => Ok(Some(f.path.clone())),
+                    Err(e) => Err(e.clone()),
+                },
+            ),
+            Message::ModelRestored(_, r) => (
+                Kind::Restore,
+                r.as_ref().map(|_| None).map_err(Clone::clone),
+            ),
+            Message::ProjectOpened(r) => (
+                Kind::Open,
+                match r {
+                    Some(Ok((_, p, _))) => Ok(Some(p.clone())),
+                    Some(Err(e)) => Err(e.clone()),
+                    None => Err(none()),
+                },
+            ),
+            Message::GcodeExported(r) => (
+                Kind::Gcode,
+                match r {
+                    Some(Ok((p, _))) => Ok(Some(p.clone())),
+                    Some(Err(e)) => Err(e.clone()),
+                    None => Err(none()),
+                },
+            ),
+            Message::Exported(p) => (Kind::Sheet, Ok(Some(p.clone()))),
+            Message::ExportError(e) => (Kind::Sheet, Err(e.clone())),
+            Message::TabletSaved(r) => (
+                Kind::Tablet,
+                match r {
+                    Some(Ok(p)) => Ok(Some(p.clone())),
+                    Some(Err(e)) => Err(e.clone()),
+                    None => Err(none()),
+                },
+            ),
+            _ => return,
+        };
+        if self.completions.len() >= MOST_COMPLETIONS {
+            self.completions.remove(0);
+        }
+        self.completions.push(Completion { kind, result });
+    }
+    /// A command's window opens: what came before is not its.
+    pub(crate) fn begin(&mut self) {
+        self.completions.clear();
+        self.last_save = None;
+    }
+    /// The completion just noted turned out not to have done its work.
+    pub(crate) fn failed_last(&mut self, why: String) {
+        if let Some(c) = self.completions.last_mut() {
+            c.result = Err(why);
+        }
+    }
 }
 
 /// The most external events an entry names: with no agent connected for
@@ -756,6 +857,7 @@ impl App {
     /// and a result of a generation the user started is counted when it is
     /// still current, so it will be applied.
     pub(crate) fn mcp_arrive(&mut self, message: &Message) {
+        self.mcp.note(message);
         self.mcp.depth += 1;
         if self.mcp.depth > 1 {
             return;

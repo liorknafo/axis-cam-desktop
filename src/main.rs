@@ -9038,6 +9038,7 @@ impl App {
             Message::ProjectOpened(Some(Ok((d, p, notes)))) => {
                 self.import_busy = false;
                 if !self.archive_current() {
+                    self.mcp.failed_last(self.status.clone());
                     return Task::none();
                 }
                 // A copy from History is a recovery, not the project's file:
@@ -9072,13 +9073,18 @@ impl App {
                     Ok(()) => {
                         self.status = format!("Saved {}", p.display());
                         self.project_dirty = false;
+                        self.mcp.last_save = Some(Ok(p.clone()));
                         self.set_project_file(Some(p));
                     }
-                    Err(e) => self.status = format!("Save failed: {e}"),
+                    Err(e) => {
+                        self.status = format!("Save failed: {e}");
+                        self.mcp.last_save = Some(Err(e.clone()));
+                    }
                 }
             }
             Message::Saved(None) => {
                 self.save_busy = false;
+                self.mcp.last_save = Some(Err("No file was chosen.".into()));
             }
             Message::Export(_) => {
                 let data = self.doc.setup_sheet(self.part_mesh());

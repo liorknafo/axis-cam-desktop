@@ -270,7 +270,7 @@ The status line alone does not tell whether a command worked. Each registry entr
     - After sending, `done` means the library holds exactly the expected entry, and the editor stays open, as it does for the user.
     - The connected machine's save, which also writes the controller's travel, is refused before any of this (see *The machine boundary*).
     - Tests: a successful save of each kind, an unchanged save (`no_change`, version unchanged), an invalid draft (`refused`), and a machine save that drops the centre marks.
-  - `save_project`: the file is written, and the project is not dirty.
+  - `save_project`: the file is written, and the project is not dirty. A command whose work ends in the app's result message (an import, a reimport, an open, a save, an export, a tablet file) is judged by that message first: the engine records those that arrive in its window, an error among them or none at all makes it `failed` with the app's own text, and only then is the state checked (the path is the new one, the file equals the `Document` by value, the files are written).
   - `generate`: a simulation for the operation at this revision, or a `GenerationFailed` reason.
   - `select_operation`: the selection is that id.
 
@@ -681,3 +681,4 @@ Four milestones, each with its own Linear issue and PR.
     - an existing project file that cannot be read or parsed counts as possibly holding another project: `save_project` refuses it, or needs `overwrite: true`;
     - the project-replacing commands go by the current by-value saved rule (file there, loads, equals the `Document`), not a cached dirty flag;
     - the saved-state cache is keyed by dev, inode, mtime and ctime (ns), size, mode and the `Document` hash on unix, and is not kept elsewhere.
+14. **gpt-6.1-sol, M1 implementation review round 4, REJECT.** All three findings were taken: file commands are judged by the app's own completion result.

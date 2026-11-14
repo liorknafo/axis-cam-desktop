@@ -1113,6 +1113,8 @@ impl Agent {
         let records = (windowed && !state::REPLACES_PROJECT.contains(&c.name))
             .then(|| Records::of(&b.app().doc));
         let output = output_of(c.name, command_args, b.app());
+        // What the file work's completion messages say is this command's.
+        b.app_mut().mcp.begin();
         for message in dispatch.messages {
             b.send(message);
         }
