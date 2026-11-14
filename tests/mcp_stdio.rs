@@ -13,12 +13,14 @@ use std::{
 #[test]
 fn the_server_answers_over_stdio() {
     let data = tempfile::tempdir().unwrap();
+    let stderr_file = data.path().join("server-stderr.log");
+    let stderr = || std::fs::read_to_string(&stderr_file).unwrap_or_default();
     let mut server = Command::new(env!("CARGO_BIN_EXE_axis-cam"))
         .arg("--mcp")
         .env("AXIS_CAM_DATA_DIR", data.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(std::fs::File::create(&stderr_file).unwrap())
         .spawn()
         .unwrap();
     let out = server.stdout.take().unwrap();
@@ -57,9 +59,10 @@ fn the_server_answers_over_stdio() {
     // Seven answers, in any order: the notification gets none.
     let mut answers: HashMap<String, Value> = HashMap::new();
     while answers.len() < 7 {
-        let line = rx
-            .recv_timeout(Duration::from_secs(60))
-            .expect("an answer within a minute");
+        let line = rx.recv_timeout(Duration::from_secs(60)).unwrap_or_else(|e| {
+            let status = server.try_wait();
+            panic!("no answer: {e} (timeout: still running; disconnected: exited); status {status:?}; server stderr:\n{}", stderr())
+        });
         // Standard output carries the protocol's lines and nothing else.
         let v: Value = serde_json::from_str(&line).expect("a JSON line");
         assert_eq!(v["jsonrpc"], "2.0", "{line}");
@@ -139,9 +142,10 @@ fn the_server_answers_over_stdio() {
     );
     let mut order = vec![];
     while order.len() < 2 {
-        let line = rx
-            .recv_timeout(Duration::from_secs(60))
-            .expect("an answer within a minute");
+        let line = rx.recv_timeout(Duration::from_secs(60)).unwrap_or_else(|e| {
+            let status = server.try_wait();
+            panic!("no answer: {e} (timeout: still running; disconnected: exited); status {status:?}; server stderr:\n{}", stderr())
+        });
         let v: Value = serde_json::from_str(&line).unwrap();
         order.push(v);
     }

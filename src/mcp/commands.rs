@@ -254,15 +254,11 @@ impl Command {
         let mut properties = serde_json::Map::new();
         let mut required = vec![];
         let selector = match self.on {
-            On::Setup => Some(("setup", addressed("setup"))),
-            On::Operation => Some(("operation", addressed("operation"))),
-            On::Nothing => None,
+            On::Setup => vec![("setup", addressed("setup"), false)],
+            On::Operation => operation_selectors(),
+            On::Nothing => vec![],
         };
-        for (name, schema, needed) in selector
-            .map(|(n, s)| (n, s, false))
-            .into_iter()
-            .chain((self.params)())
-        {
+        for (name, schema, needed) in selector.into_iter().chain((self.params)()) {
             properties.insert(name.into(), schema);
             if needed {
                 required.push(name);
@@ -414,12 +410,22 @@ fn selecting(app: &App, si: usize, oi: Option<usize>) -> Vec<Message> {
     m
 }
 
+/// The `operation` and `setup` arguments of every operation-addressed
+/// command, `list_fields` and `edit_field` (the one place they are written).
+pub fn operation_selectors() -> Vec<(&'static str, Value, bool)> {
+    vec![
+        ("operation", addressed("operation"), false),
+        ("setup", addressed("setup_of_operation"), false),
+    ]
+}
+
 /// The schema of an argument that names a setup or an operation.
 fn addressed(what: &str) -> Value {
-    json!({
-        "type": ["string", "integer"],
-        "description": format!("The {what}'s id, or its index from 0 as inspect lists it."),
-    })
+    let description = match what {
+        "setup_of_operation" => "The setup's id or index from 0: the setup the operation index counts in; default the active setup. An operation id names its own setup.".to_string(),
+        _ => format!("The {what}'s id, or its index from 0 as inspect lists it."),
+    };
+    json!({"type": ["string", "integer"], "description": description})
 }
 fn text_param(description: &str) -> Value {
     json!({"type": "string", "description": description})
@@ -1527,9 +1533,10 @@ fn table() -> Vec<Command> {
                     ("target", choice_param(&names(&EDIT_TARGETS)), true),
                     ("key", text_param("The field's key, one `list_fields` gives for the target."), true),
                     ("value", json!({"type": ["string", "number", "boolean"], "description": "The value, as typed."}), true),
-                    ("setup", addressed("setup"), false),
-                    ("operation", addressed("operation"), false),
                 ]
+                .into_iter()
+                .chain(operation_selectors())
+                .collect()
             })
             .examples(|| vec![json!({"target": "operation", "key": "rpm", "value": "8000"})])
             // The machine's controller fields and the dial reading are the
@@ -2331,6 +2338,16 @@ fn versioned(m: &crate::model::Machine, version: u32) -> crate::model::Machine {
     }
 }
 
+/// Whether setup `si` (as `resolve` gave it) is the active one.
+fn setup_is_open(app: &App, si: Option<usize>) -> bool {
+    si.and_then(|si| app.doc.setups.get(si))
+        .is_some_and(|s| s.id == app.doc.active)
+}
+/// Whether the addressed operation is the selected one, in the active setup.
+fn operation_is_open(app: &App, target: Option<(usize, usize)>) -> bool {
+    target.is_some_and(|(si, oi)| setup_is_open(app, Some(si)) && app.selected == Some(oi))
+}
+
 /// An effect that holds when `f` does.
 fn holds(f: impl Fn(&App) -> bool + 'static, fail: impl Into<String>) -> Expect {
     let fail = fail.into();
@@ -2536,7 +2553,8 @@ fn already(name: &str) -> Option<fn(&Ctx) -> Option<String>> {
                 .then(|| "The setup's work zero is that already.".into())
         },
         "set_setup_step" => |ctx| {
-            (ctx.app.setup_step == arg_str(ctx, "step")
+            (setup_is_open(ctx.app, ctx.setup)
+                && ctx.app.setup_step == arg_str(ctx, "step")
                 && ctx.app.selected.is_none()
                 && ctx.app.page == Page::Work)
                 .then(|| "The setup editor shows that step already.".into())
@@ -2556,7 +2574,9 @@ fn already(name: &str) -> Option<fn(&Ctx) -> Option<String>> {
                 .then(|| "The operation makes that setup's pin holes already.".into())
         },
         "set_tab" => |ctx| {
-            (ctx.app.tab.eq_ignore_ascii_case(&arg_str(ctx, "tab")) && ctx.app.page == Page::Work)
+            (operation_is_open(ctx.app, ctx.operation)
+                && ctx.app.tab.eq_ignore_ascii_case(&arg_str(ctx, "tab"))
+                && ctx.app.page == Page::Work)
                 .then(|| "That tab is open already.".into())
         },
         "edit_field" => |ctx| {
@@ -2838,9 +2858,13 @@ fn effect(name: &str) -> Option<fn(&Ctx) -> Expect> {
             )
         },
         "set_setup_step" => |ctx| {
-            let step = arg_str(ctx, "step");
+            let (step, id) = (arg_str(ctx, "step"), setup_id(ctx));
             holds(
-                move |a| a.setup_step.eq_ignore_ascii_case(&step) && a.selected.is_none(),
+                move |a| {
+                    a.setup_step.eq_ignore_ascii_case(&step)
+                        && a.selected.is_none()
+                        && a.doc.active == id
+                },
                 "The setup editor did not open on that step.",
             )
         },
@@ -2979,9 +3003,16 @@ fn effect(name: &str) -> Option<fn(&Ctx) -> Expect> {
             )
         },
         "set_tab" => |ctx| {
-            let tab = arg_str(ctx, "tab");
+            let (tab, id) = (arg_str(ctx, "tab"), op_id(ctx));
             holds(
-                move |a| a.tab.eq_ignore_ascii_case(&tab),
+                move |a| {
+                    a.tab.eq_ignore_ascii_case(&tab)
+                        && a.selected.is_some_and(|oi| {
+                            (a.doc.setups.iter().find(|s| s.id == a.doc.active))
+                                .and_then(|s| s.operations.get(oi))
+                                .is_some_and(|o| o.id == id)
+                        })
+                },
                 "The tab did not open.",
             )
         },
@@ -3977,6 +4008,16 @@ pub(crate) mod tests {
             let schema = c.schema();
             assert_eq!(schema["type"], "object", "{}", c.name);
             let properties = schema["properties"].as_object().unwrap();
+            // `set_pin_setup`'s `setup` is a value, not an address.
+            if (c.on == On::Operation || c.name == "edit_field") && !c.own_setup {
+                let setup = &properties.get("setup");
+                let said = setup.and_then(|s| s["description"].as_str());
+                assert!(
+                    said.is_some_and(|d| d.contains("operation index counts in")),
+                    "{}: no `setup` saying where an operation index counts",
+                    c.name
+                );
+            }
             for p in properties.values() {
                 assert!(
                     p.get("type").is_some() || p.get("enum").is_some(),
@@ -5117,6 +5158,58 @@ pub(crate) mod tests {
         let r = run(&mut d, "edit_field", args).unwrap();
         assert_eq!(outcome(&r), "refused", "{r}");
         assert!(r["reason"].as_str().unwrap().contains("set_origin"), "{r}");
+    }
+
+    #[test]
+    fn tabs_and_steps_follow_the_target_named() {
+        let mut d = direct();
+        let (_a, b) = two_setups(&mut d);
+        // Setup 0 (active after duplicate? make it so) with its operation
+        // selected on the Tool tab; then name the other setup's operation.
+        run(&mut d, "select_setup", json!({"setup": 0})).unwrap();
+        run(&mut d, "select_operation", json!({"operation": 0})).unwrap();
+        let r = run(&mut d, "set_tab", json!({"tab": "Tool"})).unwrap();
+        assert!(["done", "no_change"].contains(&outcome(&r)), "{r}");
+        let r = run(
+            &mut d,
+            "set_tab",
+            json!({"tab": "Tool", "setup": 1, "operation": 0}),
+        )
+        .unwrap();
+        assert_eq!(outcome(&r), "done", "{r}");
+        assert_eq!(d.app.doc.setups[1].operations[0].id, b);
+        assert_eq!(d.app.doc.active, d.app.doc.setups[1].id);
+        assert_eq!(d.app.selected, Some(0));
+        assert_eq!(d.app.tab, "Tool");
+        // The same tab, same target: nothing to do.
+        let r = run(
+            &mut d,
+            "set_tab",
+            json!({"tab": "Tool", "setup": 1, "operation": 0}),
+        )
+        .unwrap();
+        assert_eq!(outcome(&r), "no_change", "{r}");
+        // A setup step on the other setup while this one's is shown.
+        run(&mut d, "select_setup", json!({"setup": 0})).unwrap();
+        let r = run(&mut d, "set_setup_step", json!({"step": "Stock"})).unwrap();
+        assert!(["done", "no_change"].contains(&outcome(&r)), "{r}");
+        let r = run(
+            &mut d,
+            "set_setup_step",
+            json!({"step": "Stock", "setup": 1}),
+        )
+        .unwrap();
+        assert_eq!(outcome(&r), "done", "{r}");
+        assert_eq!(d.app.doc.active, d.app.doc.setups[1].id);
+        assert_eq!(d.app.setup_step, "Stock");
+        assert!(d.app.selected.is_none());
+        let r = run(
+            &mut d,
+            "set_setup_step",
+            json!({"step": "Stock", "setup": 1}),
+        )
+        .unwrap();
+        assert_eq!(outcome(&r), "no_change", "{r}");
     }
 
     /// Two setups with an operation each, setup 1 active; each operation's

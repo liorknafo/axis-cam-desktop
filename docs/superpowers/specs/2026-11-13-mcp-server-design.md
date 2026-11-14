@@ -683,3 +683,7 @@ Four milestones, each with its own Linear issue and PR.
     - the saved-state cache is keyed by dev, inode, mtime and ctime (ns), size, mode and the `Document` hash on unix, and is not kept elsewhere.
 14. **gpt-6.1-sol, M1 implementation review round 4, REJECT.** All three findings were taken: file commands are judged by the app's own completion result.
 15. **gpt-6.1-sol, M1 implementation review round 5, REJECT.** Its finding was taken: setup and operation addresses are resolved once, the same way, for every command.
+16. **gpt-6.1-sol, M1 implementation review round 6, ACCEPT.** Its three minor points were taken:
+    - `set_tab` and `set_setup_step` judge "already so" and their effect by the setup and operation named, not only the app's current tab or step;
+    - every operation command, `list_fields` and `edit_field` advertise `setup` (where an operation index counts), from one place, and `describe_command` says so;
+    - the end-to-end harness keeps the server's standard error and tells a timeout from the server's exit.

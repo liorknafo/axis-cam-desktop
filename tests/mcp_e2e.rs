@@ -35,6 +35,9 @@ struct Server {
     stdin: Option<ChildStdin>,
     lines: mpsc::Receiver<String>,
     next: u64,
+    /// The server's standard error, in a file of its own folder.
+    stderr: std::path::PathBuf,
+    _stderr_folder: tempfile::TempDir,
 }
 
 impl Server {
@@ -46,11 +49,13 @@ impl Server {
         if let Some(id) = session {
             command.args(["--session", id]);
         }
+        let folder = tempfile::tempdir().unwrap();
+        let stderr = folder.path().join("server-stderr.log");
         let mut child = command
             .env("AXIS_CAM_DATA_DIR", data)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(std::fs::File::create(&stderr).unwrap())
             .spawn()
             .unwrap();
         let out = child.stdout.take().unwrap();
@@ -69,6 +74,8 @@ impl Server {
             stdin,
             lines,
             next: 0,
+            stderr,
+            _stderr_folder: folder,
         };
         let init = server.request(
             "initialize",
@@ -92,14 +99,46 @@ impl Server {
         self.next += 1;
         let id = self.next;
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        let started = Instant::now();
         loop {
-            let line = (self.lines.recv_timeout(CALL))
-                .unwrap_or_else(|_| panic!("no answer to {method} {params} in {CALL:?}"));
+            let line = match self.lines.recv_timeout(CALL) {
+                Ok(line) => line,
+                Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+                    "TIMEOUT: no line from the server for {CALL:?} while waiting for {method} {params} (waited {:?} in all); the server is still running: {:?}\nserver stderr:\n{}",
+                    started.elapsed(),
+                    self.child.try_wait().ok().flatten(),
+                    self.stderr_tail(),
+                ),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // Its output closed: give it a moment to be reaped.
+                    let status = (0..50).find_map(|_| {
+                        std::thread::sleep(Duration::from_millis(100));
+                        self.child.try_wait().ok().flatten()
+                    });
+                    panic!(
+                        "EOF: the server's output closed {:?} into {method} {params}; exit status {status:?}\nserver stderr:\n{}",
+                        started.elapsed(),
+                        self.stderr_tail(),
+                    )
+                }
+            };
             let v: Value = serde_json::from_str(&line).expect("a JSON line");
             if v["id"] == id {
                 assert!(v["error"].is_null(), "{method} {params}: {v}");
                 return v["result"].clone();
             }
+        }
+    }
+    /// The last lines the server wrote to standard error.
+    fn stderr_tail(&self) -> String {
+        let text = std::fs::read_to_string(&self.stderr).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().collect();
+        let from = lines.len().saturating_sub(40);
+        let tail = lines[from..].join("\n");
+        if tail.is_empty() {
+            "(empty)".into()
+        } else {
+            tail
         }
     }
     /// A tool's whole result (content and structured content); a tool

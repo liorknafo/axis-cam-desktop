@@ -130,11 +130,7 @@ pub fn tools() -> Value {
             "description": "Every field the user could type into or pick for a target, as the editor draws it now: key, label, tab (or step), value, choices, unit and a line of help. `edit_field` takes only these keys, and a choice only from its choices. An operation's fields are on every tab it has, and the user's open tab is not changed. A key with `command` is set by that command instead.",
             "inputSchema": {
                 "type": "object",
-                "properties": {
-                    "target": {"type": "string", "enum": fields::TARGETS.map(|(n, _)| n)},
-                    "setup": {"type": ["string", "integer"], "description": "For a setup (or an operation in it): its id or index; default the active setup."},
-                    "operation": {"type": ["string", "integer"], "description": "For an operation: its id (which names its own setup; refused if `setup` is given and it is not in it), or its index in `setup`, else in the active setup; default the selected one."},
-                },
+                "properties": list_fields_properties(),
                 "required": ["target"],
             },
             "annotations": {"readOnlyHint": true},
@@ -595,7 +591,11 @@ fn describe_command(args: &Value) -> Result<Value, String> {
         "name": c.name,
         "group": c.group,
         "help": line,
-        "details": full,
+        "details": if c.on == commands::On::Operation || c.name == "edit_field" {
+            format!("{full}\n\nAn operation index counts in `setup` (an id or index), else in the active setup; an operation id names its own setup.")
+        } else {
+            full
+        },
         "args": c.schema(),
         "example": c.example_args().first(),
         "requires": c.requires,
@@ -608,6 +608,20 @@ fn describe_command(args: &Value) -> Result<Value, String> {
         },
         "allowed": true,
     }))
+}
+
+/// `list_fields`' arguments: the target, then `operation` and `setup` as
+/// every operation command has them (`commands::operation_selectors`).
+fn list_fields_properties() -> Value {
+    let mut p = serde_json::Map::new();
+    p.insert(
+        "target".into(),
+        json!({"type": "string", "enum": fields::TARGETS.map(|(n, _)| n)}),
+    );
+    for (name, schema, _) in commands::operation_selectors() {
+        p.insert(name.into(), schema);
+    }
+    Value::Object(p)
 }
 
 /// A `refused` result.
