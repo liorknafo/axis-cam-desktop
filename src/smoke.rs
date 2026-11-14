@@ -33885,6 +33885,72 @@ soft_max = 180.0
         let cost = fits() - before;
         assert!(cost < 200_000, "{cost} circle fits");
     }
+    /// On the spindle adapter plate as the STEP helper meshes it, at
+    /// `AXIS_PLATE_STL`, a click on each M8 thread's flank or crest in a
+    /// Drill picks its hole, and a click again drops it, each in under a
+    /// second in a release build: on the current plate (cb9152e) they took
+    /// 1.7 to 8.6 s (LIO-520).
+    #[test]
+    #[ignore]
+    fn a_click_on_the_spindle_plates_threads_picks_and_drops_their_holes_in_a_second() {
+        let path = std::path::PathBuf::from(std::env::var("AXIS_PLATE_STL").unwrap());
+        let mut a = app();
+        let mesh = crate::mesh::load(&path).unwrap();
+        let file = ModelFile {
+            name: "adapter-plate.stl".into(),
+            path,
+            format: "stl".into(),
+            bytes: 1,
+            thickness: None,
+        };
+        let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
+        a.doc.setup_mut().operations.clear();
+        a.selected = None;
+        let _ = a.update(Message::AddOp(Strategy::Drill));
+        if !a.picking {
+            let _ = a.update(Message::PickMode);
+        }
+        let mesh = a.imported_mesh.clone().unwrap();
+        let setup = a.doc.setup().clone();
+        let placement = crate::stock::Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        let threads = crate::thread::holes_in_setup(&setup, &mesh);
+        assert_eq!(threads.len(), 4, "{threads:?}");
+        let mut click = |id: usize, what: &str| {
+            let started = std::time::Instant::now();
+            let _ = a.update(Message::Surface(id));
+            let took = started.elapsed().as_secs_f32();
+            eprintln!("surface {id}: {took:.2} s: {}", a.status);
+            assert!(a.status.starts_with(what), "surface {id}: {}", a.status);
+            assert!(
+                cfg!(debug_assertions) || took < 1.,
+                "surface {id}: {took} s"
+            );
+        };
+        for t in &threads {
+            let mid = (t.from + t.to) / 2.;
+            let surfaces: Vec<usize> = (0..mesh.surfaces.len())
+                .filter(|&id| {
+                    let c = placement
+                        .transform(mesh.surfaces[id].center)
+                        .map(|v| v / scale);
+                    (t.minor / 2. ..=t.major / 2.)
+                        .contains(&(c[0] - t.centre[0]).hypot(c[1] - t.centre[1]))
+                        && (c[2] - mid).abs() < 2.
+                })
+                .collect();
+            let flank = (surfaces.iter().copied())
+                .find(|&id| !crate::pocket::is_wall(&setup, &mesh, id))
+                .unwrap();
+            let crest = (surfaces.iter().copied())
+                .find(|&id| crate::pocket::is_wall(&setup, &mesh, id))
+                .unwrap();
+            for id in [flank, crest] {
+                click(id, "Picked the Ø");
+                click(id, "Dropped");
+            }
+        }
+    }
 
     /// The adapter plate face up in the vise on the manual mill (LIO-443),
     /// imported, with its Round corners taken off: no operation yet.

@@ -2472,7 +2472,9 @@ pub(crate) mod tests {
     /// in under a second in a release build, where four M8 threads made it
     /// an hour (LIO-434), its four M8 holes where the drawing has them and
     /// each round end of its four slots and of the four blind counterbores
-    /// over them apart (LIO-440).
+    /// over them apart (LIO-440). Either plate: LIO-434's (dbec7e9, 134 ×
+    /// 88), or the current one (cb9152e, 138 × 127), whose threads run the
+    /// whole plate in holes opened past them and took 7.5 s (LIO-520).
     #[test]
     #[ignore]
     fn the_spindle_plates_holes_are_found_in_a_second() {
@@ -2484,8 +2486,32 @@ pub(crate) mod tests {
         let took = started.elapsed().as_secs_f32();
         eprintln!("the plate's holes found in {took:.2} s");
         assert!(cfg!(debug_assertions) || took < 1., "{took} s");
-        // The plate is centred: model X 0..134, Y 0..88.
-        let model = |c: [f32; 2]| [c[0] + 67., c[1] + 44.];
+        // The plate is centred: model X and Y from its corner.
+        let b = Geometry::new(&setup, &mesh).bounds;
+        let model = |c: [f32; 2]| [c[0] - b.min[0], c[1] - b.min[1]];
+        // Its M8 holes, its slots' middles, and its counterbores' width and
+        // floor (model Z: the back face at 0), from its `build.py`.
+        let old = (b.max[1] - b.min[1] - 88.).abs() < 0.5;
+        let (expected, slot, bore, seat) = if old {
+            (
+                [[17.8, 16.35], [17.8, 40.85], [116.2, 16.35], [116.2, 40.85]],
+                [[14.15, 28.6], [14.15, 74.4], [119.85, 28.6], [119.85, 74.4]],
+                13.,
+                10.,
+            )
+        } else {
+            (
+                [[19.8, 16.35], [19.8, 40.85], [118.2, 16.35], [118.2, 40.85]],
+                [
+                    [16.15, 67.6],
+                    [16.15, 113.4],
+                    [121.85, 67.6],
+                    [121.85, 113.4],
+                ],
+                16.5,
+                13.,
+            )
+        };
         let mut m8: Vec<[f32; 2]> = found
             .round
             .iter()
@@ -2493,7 +2519,6 @@ pub(crate) mod tests {
             .map(|h| model(h.center))
             .collect();
         m8.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
-        let expected = [[17.8, 16.35], [17.8, 40.85], [116.2, 16.35], [116.2, 40.85]];
         assert_eq!(m8.len(), 4, "{m8:?}");
         for (c, e) in m8.iter().zip(expected) {
             assert!((c[0] - e[0]).hypot(c[1] - e[1]) < 0.005, "{m8:?}");
@@ -2522,12 +2547,10 @@ pub(crate) mod tests {
                 "{diameter} {picked:?}"
             );
         }
-        // Model Z: the back face at 0, the counterbores' floor at 10.
-        let floor = Geometry::new(&setup, &mesh).bounds.min[2] + 10.;
+        let floor = b.min[2] + seat;
         let (mut slots, mut bores) = (0, 0);
         for (_, h) in &found.arcs {
             let c = model(h.center);
-            let slot = [[14.15, 28.6], [14.15, 74.4], [119.85, 28.6], [119.85, 74.4]];
             let end = slot
                 .iter()
                 .any(|s| ((c[0] - s[0]).abs() - 2.5).abs() < 0.005 && (c[1] - s[1]).abs() < 0.005);
@@ -2537,7 +2560,7 @@ pub(crate) mod tests {
             } else {
                 assert!(
                     !h.through
-                        && (h.diameter - 13.).abs() < 0.01
+                        && (h.diameter - bore).abs() < 0.01
                         && (h.bottom - floor).abs() < 0.01,
                     "{c:?} {h:?}"
                 );

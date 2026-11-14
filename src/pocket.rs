@@ -1853,6 +1853,19 @@ pub fn part_holes(setup: &Setup, mesh: &Mesh) -> Vec<Hole> {
         let Ok((path, walls)) = walls_of(&g, &spans, id) else {
             continue;
         };
+        // A loop round a thread's axis in its band, its hole opened past it
+        // (`OPENED`), is its hole: found from the thread (below), as on a
+        // plate whose hole opens at the thread's end (LIO-520).
+        let z = level(&spans, &walls).unwrap_or(f32::NAN);
+        let threaded = g.threads.iter().any(|t| {
+            let centre = (t.centre[0] as f64, t.centre[1] as f64);
+            crate::cam::encloses(&path, centre)
+                && (path.iter()).all(|q| in_band([q.0 as f32, q.1 as f32, z], t, OPENED))
+        });
+        if threaded {
+            seen.extend(walls);
+            continue;
+        }
         if let Ok(h) = hole(&g, &spans, path, walls) {
             seen.extend(h.walls.iter().copied());
             // One outline for each opening from above: a recess under a
@@ -1930,11 +1943,29 @@ fn thread_hole(g: &crate::cam::Geometry, t: &crate::thread::Thread) -> Result<Ho
 /// Whether triangle `p` is of the modeled thread `t` along Z: its corners
 /// in the thread's band round its axis, within its length.
 fn of_thread(p: &[[f32; 3]; 3], t: &crate::thread::Thread) -> bool {
-    p.iter().all(|q| {
-        let r = (q[0] - t.centre[0]).hypot(q[1] - t.centre[1]);
-        (t.minor / 2. - 0.05..=t.major / 2. + 0.05).contains(&r)
-            && (t.from - t.pitch..=t.to + t.pitch).contains(&q[2])
-    })
+    p.iter().all(|q| in_band(*q, t, 0.05))
+}
+/// How far past a modeled thread's major radius its hole may be opened, mm:
+/// the spindle adapter plate's are opened 0.05 mm past it, so the ridge
+/// joins, and its centre is read to a few hundredths. A ledge or a bore no
+/// wider is its own (`opened`). A wall round its axis just past it can be
+/// another feature's (a slot's round end over it, LIO-481), so `of_thread`
+/// stops at 0.05.
+const OPENED: f32 = 0.1;
+/// Whether triangle `p` is of the modeled thread `t` or of its hole opened
+/// past it (`OPENED`): the ledge at each turn's root, where the plate's
+/// root meets its bore, is no floor. Read as floors, they were some 60 a
+/// hole there, the part over each read from 10,000 triangles: 7.5 s
+/// (LIO-520).
+fn opened(p: &[[f32; 3]; 3], t: &crate::thread::Thread) -> bool {
+    p.iter().all(|q| in_band(*q, t, OPENED))
+}
+/// Whether point `q` is in modeled thread `t`'s band round its axis, out to
+/// `past` its major radius, within its length.
+fn in_band(q: [f32; 3], t: &crate::thread::Thread, past: f32) -> bool {
+    let r = (q[0] - t.centre[0]).hypot(q[1] - t.centre[1]);
+    (t.minor / 2. - 0.05..=t.major / 2. + past).contains(&r)
+        && (t.from - t.pitch..=t.to + t.pitch).contains(&q[2])
 }
 /// Why a wall picks no hole when its outline crosses a sloping face: a
 /// chamfer's, a fillet's, a cone's (`hole_near` looks past it).
@@ -2219,11 +2250,12 @@ fn hole_at(g: &crate::cam::Geometry, z: f32, path: Polygon, walls: Walls) -> Res
     // the outline's inside. A faceted wall's facets lean a few degrees, and
     // one leaning in is kept clear of as the part over the hole.
     // A modeled thread's flanks are no floor (`g.threads`): each was one,
-    // and a plate's four M8 threads took minutes to read (LIO-434). The
-    // part over the hole still has them.
+    // and a plate's four M8 threads took minutes to read (LIO-434); nor
+    // are the ledges at their roots where a hole is opened past them
+    // (`opened`, LIO-520). The part over the hole still has them.
     let mut floors: Vec<f32> = vec![];
     for t in &near {
-        if facing(&t.p) < WALL || g.threads.iter().any(|th| of_thread(&t.p, th)) {
+        if facing(&t.p) < WALL || g.threads.iter().any(|th| opened(&t.p, th)) {
             continue;
         }
         let mut p = below(&t.p, z);
