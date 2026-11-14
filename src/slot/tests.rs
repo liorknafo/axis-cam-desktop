@@ -110,6 +110,166 @@ fn nominal_end_arcs_reject_subfacet_shifts_and_oversize() {
     assert!(arc_overcut(&arc, [-2.501, 0.], [2.499, 0.], 5.) > 0.0009);
     assert!(arc_overcut(&arc, [-2.5, 0.], [2.5, 0.], 5.001) > 0.0009);
 }
+/// The fixture's plate and slot, with four round holes far from the slot
+/// and a modelled M4 thread in one of them: a part of many small faces,
+/// none of them in the slot's way.
+fn busy_plate() -> Mesh {
+    let hole = |x: f64, y: f64, r: f64| vec![(x - r, y, 1.), (x + r, y, 1.)];
+    let holes = [
+        hole(15., 10., 2.5),
+        hole(-15., 10., 2.),
+        hole(-15., -10., 2.),
+        hole(15., -10., 2.),
+    ];
+    let mut loops: Vec<&[(f64, f64, f64)]> = vec![
+        &[
+            (-20., -15., 0.),
+            (20., -15., 0.),
+            (20., 15., 0.),
+            (-20., 15., 0.),
+        ],
+        &[
+            (-2.5, -5., 0.),
+            (2.5, -5., 1.),
+            (2.5, 5., 0.),
+            (-2.5, 5., 1.),
+        ],
+    ];
+    loops.extend(holes.iter().map(Vec::as_slice));
+    let mut tris = crate::cam::arcs::tests::slab(&loops, 8., 0., true, true);
+    tris.extend(crate::thread::tests::modeled(
+        [15., 10.],
+        4.,
+        0.7,
+        60.,
+        true,
+        true,
+        8.,
+        0.,
+    ));
+    crate::mesh::normalize(tris).unwrap()
+}
+#[test]
+fn a_slots_part_check_looks_only_at_the_walls_it_cuts() {
+    // LIO-481: on the adapter plate, with four modelled M8 threads, one
+    // counterbore's part check grew arcs round every wall of the part,
+    // hundreds of thread roots among them, and took ten minutes. It fits as
+    // many circles on a part with far holes and a modelled thread as on the
+    // bare plate, though the whole part's search fits many more.
+    let (s, plain, t, o) = fixture();
+    let busy = busy_plate();
+    assert_eq!(crate::thread::holes_in_setup(&s, &busy).len(), 1);
+    let fits = |m: &Mesh| {
+        cam::arcs::FITS.with(|n| n.set(0));
+        generate(&s, &o, &t, m).unwrap();
+        cam::arcs::FITS.with(|n| n.get())
+    };
+    let alone = fits(&plain);
+    assert_eq!(fits(&busy), alone);
+    cam::arcs::FITS.with(|n| n.set(0));
+    let whole = cam::arcs::arcs_among(&s, &busy, &cam::arcs::upright(&s, &busy));
+    // The slot's two round ends: the holes and the thread go all the way
+    // round.
+    assert_eq!(whole.len(), 2, "{whole:#?}");
+    let everywhere = cam::arcs::FITS.with(|n| n.get());
+    assert!(everywhere > 2 * alone, "{everywhere} vs {alone}");
+    // Its round ends are still proven nominal, and any overcut refused.
+    for (key, value) in [
+        ("slot_x", "0.001"),
+        ("slot_y", "-0.001"),
+        ("slot_length", "15.002"),
+    ] {
+        let mut bad = o.clone();
+        set(&mut bad.p, key, value);
+        let error = generate(&s, &bad, &t, &busy).unwrap_err();
+        assert!(error.contains("sweep"), "{key}={value}: {error}");
+    }
+}
+#[test]
+fn a_slots_pick_looks_only_round_the_slot() {
+    // LIO-481: a pick of a Slot's round end looked for every round of the
+    // part, a modelled thread's hundreds of roots among them. On a part
+    // with far holes and a modelled thread it fits as many circles as on the
+    // bare plate, and reads the same slot.
+    let (s, plain, _, _) = fixture();
+    let busy = busy_plate();
+    let pick = |m: &Mesh| {
+        let g = Geometry::new(&s, m);
+        // A wall of the slot's round end at X+7.5, its tip.
+        let tip = (g.triangles.iter())
+            .filter(|t| {
+                t.p.iter()
+                    .all(|p| p[0] > 7.4 && p[0] < 7.6 && p[1].abs() < 1.)
+            })
+            .find_map(|t| t.feature)
+            .unwrap();
+        let stock = crate::stock::resolve(&s, Some(m)).unwrap().stock;
+        let pick = Selection {
+            mesh_fingerprint: m.fingerprint.clone(),
+            ids: vec![tip],
+        };
+        cam::arcs::forget();
+        cam::arcs::FITS.with(|n| n.set(0));
+        let fields = from_face(&s, m, &pick, stock).unwrap();
+        (fields, cam::arcs::FITS.with(|n| n.get()))
+    };
+    let (alone, cost) = pick(&plain);
+    assert_eq!(get(&alone, "slot_length"), "15.000");
+    assert_eq!(get(&alone, "slot_width"), "10.000");
+    assert_eq!(pick(&busy), (alone, cost));
+}
+#[test]
+fn every_wall_of_a_slots_round_end_over_a_thread_picks_it() {
+    // LIO-481 review: a 22.08 × 12.08 capsule 0.1 to 1 mm deep over a
+    // modelled M12×1.75 thread (Z0 to 12), one R6.04 round end round the
+    // thread's axis, its walls in the thread's band: no arc starts from
+    // them, but one grows through them. A click on any wall of either end
+    // (as the whole part's arcs read them) picks the slot, as before.
+    let outer = [
+        (-20., -15., 0.),
+        (20., -15., 0.),
+        (20., 15., 0.),
+        (-20., 15., 0.),
+    ];
+    let end = |x: f64, start: f64| {
+        (0..=48).map(move |k| {
+            let a = (start + 3.75 * k as f64).to_radians();
+            (x + 6.04 * a.cos(), 6.04 * a.sin(), 0.)
+        })
+    };
+    let capsule: Vec<_> = end(10., -90.).chain(end(0., 90.)).collect();
+    for height in [0.1f32, 0.5, 1.] {
+        let mut tris = crate::cam::arcs::tests::slab(&[&outer, &capsule], height, 12., true, true);
+        tris.extend(crate::thread::tests::modeled(
+            [0., 0.],
+            12.,
+            1.75,
+            60.,
+            true,
+            true,
+            12.,
+            0.,
+        ));
+        let mesh = crate::mesh::normalize(tris).unwrap();
+        let s = crate::corner::tests::setup("0");
+        let stock = crate::stock::resolve(&s, Some(&mesh)).unwrap().stock;
+        let ends: Vec<_> = cam::arcs::arcs_among(&s, &mesh, &cam::arcs::upright(&s, &mesh))
+            .into_iter()
+            .filter(|a| (a.span - 180.).abs() < 1. && (a.r - 6.04).abs() < 0.01)
+            .collect();
+        assert_eq!(ends.len(), 2, "{height} mm: {ends:#?}");
+        for &id in ends.iter().flat_map(|a| &a.walls) {
+            let pick = Selection {
+                mesh_fingerprint: mesh.fingerprint.clone(),
+                ids: vec![id],
+            };
+            let fields = from_face(&s, &mesh, &pick, stock)
+                .unwrap_or_else(|e| panic!("{height} mm, surface {id}: {e}"));
+            assert_eq!(get(&fields, "slot_length"), "22.080", "{height} mm, {id}");
+            assert_eq!(get(&fields, "slot_width"), "12.080", "{height} mm, {id}");
+        }
+    }
+}
 #[test]
 fn sizes_orientation_allowances_blind_through_and_reach_are_honest() {
     let (s, m, t, o) = fixture();
@@ -1014,7 +1174,25 @@ pub(crate) fn redesigned() -> (Document, Mesh, std::path::PathBuf) {
     doc.tools.push(eight);
     let setup = doc.setups[0].clone();
     let stock = crate::stock::resolve(&setup, Some(&mesh)).unwrap().stock;
-    let arcs = cam::arcs::arcs_among(&setup, &mesh, &cam::arcs::upright(&setup, &mesh));
+    // The round ends of the capsules (none round a thread's axis): the
+    // whole part's arcs, all but its threads' relieved roots, along which a
+    // search took minutes before LIO-481.
+    let threads = crate::thread::holes_in_setup(&setup, &mesh);
+    let g = Geometry::new(&setup, &mesh);
+    let up: std::collections::HashSet<usize> = cam::arcs::upright(&setup, &mesh)
+        .into_iter()
+        .filter(|&id| {
+            !(g.triangles.iter())
+                .filter(|t| t.feature == Some(id))
+                .flat_map(|t| t.p)
+                .any(|p| {
+                    threads
+                        .iter()
+                        .any(|t| (p[0] - t.centre[0]).hypot(p[1] - t.centre[1]) < t.root / 2. + 0.1)
+                })
+        })
+        .collect();
+    let arcs = cam::arcs::arcs_among(&setup, &mesh, &up);
     let zero = crate::post::datum(&setup, stock, &mesh).unwrap();
     // One end of each capsule of radius `r`, in order round the plate.
     let ends = |r: f32| {
@@ -1345,7 +1523,10 @@ fn a_counterbore_far_from_the_setups_origin_is_planned_as_near_it() {
 /// (adapter-plate.axis.json and the STEP), never the original: every
 /// operation of every setup plans and simulates, the Slots among them
 /// (LIO-455: setup 4's two upper counterbores, far from its origin, were
-/// refused), and every setup's Steps build.
+/// refused), and every setup's Steps build. Each Slot plans and simulates
+/// in seconds, and each is picked again by its round end in seconds
+/// (LIO-481: setup 4's one counterbore took ten minutes, a pick as long).
+/// Run it on a release build.
 #[test]
 #[ignore = "requires a private copy of the user's adapter project (AXIS_ADAPTER_COPY)"]
 fn the_users_adapter_project_plans_every_slot() {
@@ -1356,7 +1537,8 @@ fn the_users_adapter_project_plans_every_slot() {
     doc.file.as_mut().unwrap().path = dir.join("adapter-plate.step");
     let mesh = crate::mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
     let mut failures = vec![];
-    let mut slots = 0;
+    let mut slots = vec![];
+    let mut since = std::time::Instant::now();
     simulation::sequence_with(
         &doc,
         &mesh,
@@ -1364,15 +1546,76 @@ fn the_users_adapter_project_plans_every_slot() {
         |si, oi, r| {
             let op = &doc.setups[si].operations[oi];
             match r {
-                Ok(_) if op.strategy == Strategy::Slot => slots += 1,
+                Ok(_) if op.strategy == Strategy::Slot => {
+                    slots.push((op.name(), since.elapsed().as_secs_f32()));
+                }
                 Ok(_) => {}
                 Err(e) => failures.push(format!("{}/{} {}: {e}", si + 1, oi, op.name())),
             }
+            since = std::time::Instant::now();
         },
         |_, _, _| {},
     );
     assert!(failures.is_empty(), "{failures:#?}");
-    assert_eq!(slots, 8);
+    assert_eq!(slots.len(), 8);
+    eprintln!("{slots:#?}");
+    assert!(slots.iter().all(|(_, s)| *s < 10.), "{slots:#?}");
+    // Each Slot of setup 4 picked again by its far round end: the fields it
+    // reads back are the operation's, each pick in seconds (the whole
+    // part's arcs, along its threads' relieved roots, took minutes).
+    let si = 3;
+    let first = doc.setups[si]
+        .operations
+        .iter()
+        .find(|o| o.strategy == Strategy::Slot)
+        .unwrap();
+    let here = pick_setup(&doc, &mesh, si, &first.id).unwrap();
+    let stock = crate::stock::resolve(&doc.setups[si], Some(&mesh))
+        .unwrap()
+        .stock;
+    let zero = crate::post::datum(&here, stock, &mesh).unwrap();
+    let g = Geometry::new(&here, &mesh);
+    let mut picks = vec![];
+    for o in doc.setups[si]
+        .operations
+        .iter()
+        .filter(|o| o.strategy == Strategy::Slot)
+    {
+        let slot = Slot::read(o, zero).unwrap();
+        let axis = slot.axis();
+        let half = slot.width / 2.;
+        let tip = (g.triangles.iter())
+            .find(|t| {
+                t.p.iter().all(|p| {
+                    let d = [p[0] - slot.b[0], p[1] - slot.b[1]];
+                    (d[0].hypot(d[1]) - half).abs() < 0.05
+                        && d[axis] > 0.9 * half
+                        && p[2] > slot.bottom - 0.01
+                        && p[2] < slot.top + 0.01
+                })
+            })
+            .and_then(|t| t.feature)
+            .unwrap_or_else(|| panic!("{}: no wall at its far end", o.name()));
+        let pick = Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: vec![tip],
+        };
+        let took = std::time::Instant::now();
+        let fields =
+            from_face(&here, &mesh, &pick, stock).unwrap_or_else(|e| panic!("{}: {e}", o.name()));
+        let took = took.elapsed().as_secs_f32();
+        for k in ["slot_x", "slot_y", "slot_length", "slot_width"] {
+            let (got, want) = (num(&fields, k).unwrap(), num(&o.p, k).unwrap());
+            assert!(
+                (got - want).abs() < 0.01,
+                "{}: {k} {got} for {want}",
+                o.name()
+            );
+        }
+        picks.push((o.name(), took));
+    }
+    eprintln!("{picks:#?}");
+    assert!(picks.iter().all(|(_, s)| *s < 10.), "{picks:#?}");
     for si in 0..doc.setups.len() {
         if let Err(e) = crate::steps::shown(&doc, &mesh, si) {
             panic!("setup {}: {e}", si + 1);

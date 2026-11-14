@@ -766,32 +766,174 @@ pub fn upright(setup: &Setup, mesh: &Mesh) -> HashSet<usize> {
         .collect()
 }
 fn arcs_among_by(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>, outside: bool) -> Vec<Arc> {
+    arcs_from(setup, mesh, ids, None, None, outside)
+}
+/// The arcs among the surfaces `ids` (`arcs_among`) that have a wall
+/// reaching into `near`: one of its triangles meets the box (`meets`). Each
+/// is grown as `arcs_among` grows it, through every surface of `ids`, but
+/// only from walls in the box: a slot's part check (`slot::check_part`)
+/// looks for the arcs its cutter reaches, not every round on the part
+/// (LIO-481).
+pub fn arcs_reaching(
+    setup: &Setup,
+    mesh: &Mesh,
+    ids: &HashSet<usize>,
+    near: &crate::mesh::Bounds,
+) -> Vec<Arc> {
+    arcs_from(setup, mesh, ids, Some(near), None, false)
+}
+/// `arcs_reaching` for a click on surface `picked` (`slot::from_face`): it
+/// seeds too, last, though wholly in a thread's band (a slot's round end
+/// over a thread, as wide as its root, may be; before LIO-481 another wall
+/// of the end, anywhere on the part, grew its arc through it), unless it is
+/// the thread's own (`own_walls`).
+pub fn arcs_picked(
+    setup: &Setup,
+    mesh: &Mesh,
+    ids: &HashSet<usize>,
+    near: &crate::mesh::Bounds,
+    picked: usize,
+) -> Vec<Arc> {
+    arcs_from(setup, mesh, ids, Some(near), Some(picked), false)
+}
+/// How many searches `arcs_from` keeps on a thread.
+const KEPT: usize = 8;
+thread_local! {
+    /// The arcs `arcs_from` found lately on this thread, by what it looked
+    /// at (`searched`): a Slot's pick, a Round corners job or a Drill asks
+    /// for the same rounds again and again, and on a part with modelled
+    /// threads each search can take long (LIO-481).
+    static FOUND: std::cell::RefCell<Vec<(u64, Vec<Arc>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+/// What an arc search over the part `g` (with its modeled `threads`, its
+/// stock `wide` across) among `ids`, seeded in `near`, `outside` or not,
+/// depends on, hashed: the part as placed, face by face and surface by
+/// surface, so that no other part, setup or stock reads another's arcs.
+fn searched(
+    g: &Geometry,
+    threads: &[crate::thread::Thread],
+    wide: f32,
+    ids: &HashSet<usize>,
+    near: Option<&crate::mesh::Bounds>,
+    picked: Option<usize>,
+    outside: bool,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for t in &g.triangles {
+        t.p.as_flattened()
+            .iter()
+            .for_each(|v| v.to_bits().hash(&mut h));
+        t.feature.hash(&mut h);
+    }
+    for t in threads {
+        let (c, d) = (
+            t.centre,
+            [t.from, t.to, t.pitch, t.angle, t.major, t.minor, t.root],
+        );
+        c.iter().chain(&d).for_each(|v| v.to_bits().hash(&mut h));
+        (t.axis, t.internal, t.right_hand).hash(&mut h);
+    }
+    let mut ids: Vec<usize> = ids.iter().copied().collect();
+    ids.sort_unstable();
+    ids.hash(&mut h);
+    near.map(|b| {
+        b.min
+            .iter()
+            .chain(&b.max)
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>()
+    })
+    .hash(&mut h);
+    (wide.to_bits(), picked, outside).hash(&mut h);
+    h.finish()
+}
+/// Forgets the searches kept on this thread (`FOUND`).
+#[cfg(test)]
+pub(crate) fn forget() {
+    FOUND.with(|f| f.borrow_mut().clear());
+}
+/// `arcs_among_by`, its seeds the walls with a triangle meeting `near` when
+/// there is one; the same search again on this thread is its last answer
+/// (`FOUND`).
+fn arcs_from(
+    setup: &Setup,
+    mesh: &Mesh,
+    ids: &HashSet<usize>,
+    near: Option<&crate::mesh::Bounds>,
+    picked: Option<usize>,
+    outside: bool,
+) -> Vec<Arc> {
     let g = Geometry::new(setup, mesh);
-    let facets = facets(&g, |id| ids.contains(&id));
-    if facets.len() < 3 {
+    if facets(&g, |id| ids.contains(&id)).len() < 3 {
         return vec![];
     }
-    let at = corners(&facets);
-    let wide = across(setup, mesh, &g);
-    // A modeled thread's own walls (`own_walls`) are its hole's: no arc
-    // starts from them (grown along a thread's hundreds of crests, one took
-    // minutes), though one may grow on through them. Other walls start arcs
-    // as on main.
     let threads = crate::thread::holes_in_setup(setup, mesh);
+    let wide = across(setup, mesh, &g);
+    let key = searched(&g, &threads, wide, ids, near, picked, outside);
+    if let Some(found) = FOUND.with(|f| {
+        let f = f.borrow();
+        f.iter().find(|(k, _)| *k == key).map(|(_, a)| a.clone())
+    }) {
+        return found;
+    }
+    let found = search(g, threads, wide, ids, near, picked, outside);
+    FOUND.with(|f| {
+        let mut f = f.borrow_mut();
+        if f.len() >= KEPT {
+            f.remove(0);
+        }
+        f.push((key, found.clone()));
+    });
+    found
+}
+/// The arc search of `arcs_from`, not kept: as before LIO-481, but for its
+/// seeds when `near` is given.
+fn search(
+    g: Geometry,
+    threads: Vec<crate::thread::Thread>,
+    wide: f32,
+    ids: &HashSet<usize>,
+    near: Option<&crate::mesh::Bounds>,
+    picked: Option<usize>,
+    outside: bool,
+) -> Vec<Arc> {
+    let facets = facets(&g, |id| ids.contains(&id));
+    let at = corners(&facets);
     // The part's upright facets, for where a curve goes on past an arc.
     let mut all: Option<(HashMap<usize, Facet>, Corners)> = None;
-    let mut seeds: Vec<usize> = facets.keys().copied().collect();
+    let mut seeds: Vec<usize> = match near {
+        None => facets.keys().copied().collect(),
+        Some(b) => (g.triangles.iter())
+            .filter(|t| super::meets(&t.p, b))
+            .filter_map(|t| t.feature.filter(|id| facets.contains_key(id)))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect(),
+    };
     seeds.sort_unstable();
     let (mut done, mut found) = (HashSet::new(), vec![]);
-    done.extend(own_walls(&g, &threads, |id| ids.contains(&id)));
+    // A modeled thread's own walls (`own_walls`) are its hole's: no arc
+    // starts from them (grown along a thread's hundreds of crests, one took
+    // minutes), though one may grow on through them.
+    let own = own_walls(&g, &threads, |id| ids.contains(&id));
+    done.extend(own.iter().copied());
     // Nor from any wall wholly in a thread's band: a picked thread's whole
     // hole selects all of them, and arcs grown from those took minutes a
-    // click (LIO-434).
-    let banded = Geometry {
-        threads: threads.clone(),
-        ..Geometry::new(setup, mesh)
-    };
-    done.extend(crate::pocket::thread_band_walls(&banded));
+    // click (LIO-434). But for the one clicked (`arcs_picked`), last.
+    let banded = crate::pocket::thread_band_walls(&Geometry {
+        threads,
+        triangles: g.triangles.clone(),
+        bounds: g.bounds,
+    });
+    let mut last = None;
+    if let Some(p) = picked.filter(|p| facets.contains_key(p) && !own.contains(p)) {
+        seeds.retain(|&s| s != p);
+        seeds.push(p);
+        last = Some(p);
+    }
+    done.extend(banded.into_iter().filter(|&id| Some(id) != last));
     for seed in seeds {
         if done.contains(&seed) {
             continue;
@@ -800,7 +942,14 @@ fn arcs_among_by(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>, outside: bool
         let Some(members) = grow(&facets, &at, seed) else {
             continue;
         };
-        done.extend(members.iter().copied());
+        // Every wall a seed grows round is done with; but in the box
+        // (`arcs_reaching`) only when it grows an arc: a slot's flat side,
+        // seeded where it touches its round end, fits a circle with the
+        // end's first facets, and would leave the end unseeded.
+        let kept = near.is_none();
+        if kept {
+            done.extend(members.iter().copied());
+        }
         if arc(&facets, members.clone(), outside).is_err() {
             continue;
         }
@@ -810,6 +959,9 @@ fn arcs_among_by(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>, outside: bool
             (every, by_corner)
         });
         if let Ok(a) = whole_arc(wide, &facets, every, by_corner, members, outside) {
+            if !kept {
+                done.extend(a.walls.iter().copied());
+            }
             found.push(a);
         }
     }
@@ -1765,6 +1917,228 @@ pub(crate) mod tests {
             })
             .map(|(id, _)| id)
             .collect()
+    }
+    #[test]
+    fn a_box_on_a_slot_ends_tangent_point_finds_the_end() {
+        // LIO-481 review: seeded only in a box (`arcs_reaching`), a box on
+        // the point where a slot's flat side meets its round end seeded the
+        // side first: it fits a circle with the end's first facets, and took
+        // them, leaving the end unseeded. Each end, from a box on either of
+        // its tangent points, is found as among all the walls.
+        let (setup, _, _) = fixture(Strategy::Drill);
+        let mesh = mesh::normalize(slotted_plate()).unwrap();
+        let all = upright(&setup, &mesh);
+        let ends = arcs_among(&setup, &mesh, &all);
+        assert_eq!(ends.len(), 2, "{ends:#?}");
+        for a in &ends {
+            for side in [-1f32, 1.] {
+                let t = a.middle + side * std::f32::consts::FRAC_PI_2;
+                let p = [a.centre[0] + a.r * t.cos(), a.centre[1] + a.r * t.sin()];
+                let z = (a.bottom + a.top) / 2.;
+                let near = crate::mesh::Bounds {
+                    min: [p[0] - 1e-4, p[1] - 1e-4, z - 1e-4],
+                    max: [p[0] + 1e-4, p[1] + 1e-4, z + 1e-4],
+                };
+                let found = arcs_reaching(&setup, &mesh, &all, &near);
+                assert!(found.contains(a), "{p:?}: {found:#?}");
+            }
+        }
+    }
+    #[test]
+    fn the_same_search_again_is_its_last_answer_and_no_other() {
+        // LIO-481: a Slot's pick and a Round corners job search the whole
+        // part again and again. The same search again fits no circle; one
+        // on another part, another stock or among other walls looks anew.
+        let fits = |f: &dyn Fn() -> Vec<Arc>| {
+            FITS.with(|n| n.set(0));
+            let found = f();
+            (found, FITS.with(|n| n.get()))
+        };
+        let (mut setup, _, _) = fixture(Strategy::Drill);
+        let mesh = mesh::normalize(slotted_plate()).unwrap();
+        let all = upright(&setup, &mesh);
+        let (first, cost) = fits(&|| arcs_among(&setup, &mesh, &all));
+        assert_eq!(first.len(), 2, "{first:#?}");
+        assert!(cost > 0);
+        assert_eq!(
+            fits(&|| arcs_among(&setup, &mesh, &all)),
+            (first.clone(), 0)
+        );
+        // Other walls: one end's.
+        let one: HashSet<usize> = first[0].walls.iter().copied().collect();
+        let (only, cost) = fits(&|| arcs_among(&setup, &mesh, &one));
+        assert!(cost > 0 && only.len() == 1, "{only:#?}");
+        // Another part: the slot 2 mm longer.
+        let longer = mesh::normalize(slot(14.)).unwrap();
+        let (other, cost) = fits(&|| arcs_among(&setup, &longer, &upright(&setup, &longer)));
+        assert!(cost > 0 && other != first, "{other:#?}");
+        // Another stock round the same part.
+        setup.p.insert("stock_left".into(), "500".into());
+        assert!(fits(&|| arcs_among(&setup, &mesh, &all)).1 > 0);
+        forget();
+    }
+    #[test]
+    fn a_rounded_corner_standing_on_a_threads_end_is_still_a_corner() {
+        // LIO-481 review: an R6 quarter-round wall, 6 mm high, standing on
+        // the top end of a modelled M12×1.75 thread (Z0 to 12), its foot on
+        // the thread's roots: round the thread's axis at its root, joined
+        // to it, but going on far past its end. It is no wall of the
+        // thread's: picked, it is a rounded corner for Round corners.
+        let mut tris = crate::thread::tests::modeled([0., 0.], 12., 1.75, 60., true, true, 12., 0.);
+        let at = |i: usize, z: f32| {
+            let a = i as f32 * std::f32::consts::TAU / 96.;
+            [6. * a.cos(), 6. * a.sin(), z]
+        };
+        for i in 24..48 {
+            let (a, b, c, d) = (at(i, 12.), at(i + 1, 12.), at(i + 1, 18.), at(i, 18.));
+            tris.push([a, b, c]);
+            tris.push([a, c, d]);
+        }
+        let mesh = mesh::normalize(tris).unwrap();
+        let (setup, _, _) = fixture(Strategy::Drill);
+        let g = Geometry::new(&setup, &mesh);
+        let ids: HashSet<usize> = (facets(&g, |_| true).into_iter())
+            .filter(|(_, f)| f.high > g.bounds.max[2] - 0.1 && f.high - f.low > 5.9)
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids.len(), 24);
+        assert_eq!(crate::thread::holes_in_setup(&setup, &mesh).len(), 1);
+        assert_eq!(outside_arcs_among(&setup, &mesh, &ids).len(), 1);
+        let tool = crate::corner::tests::end_mill("4");
+        let op = crate::corner::tests::corner_op(&mesh, &tool, ids.iter().copied().collect());
+        let picked = crate::corner::picked(&setup, &mesh, &op);
+        assert!(picked.is_ok(), "{picked:#?}");
+    }
+    #[test]
+    fn a_rounded_corner_on_a_threads_end_is_found_among_all_the_walls() {
+        // LIO-481 review: an R6 quarter-round outside corner, 3 mm (and 6
+        // mm) high, standing on the top end of a modelled M12×1.75 thread
+        // (Z0 to 12), on its root's circle. Among all the part's walls, the
+        // thread's with them, it is a corner: it turns away from the thread's
+        // walls it meets, and grew no further onto them before LIO-481
+        // either.
+        for height in [3f32, 6.] {
+            let mut tris =
+                crate::thread::tests::modeled([0., 0.], 12., 1.75, 60., true, true, 12., 0.);
+            let at = |i: usize, z: f32| {
+                let a = i as f32 * std::f32::consts::TAU / 96.;
+                [6. * a.cos(), 6. * a.sin(), z]
+            };
+            for i in 24..48 {
+                let (a, b) = (at(i, 12.), at(i + 1, 12.));
+                let (c, d) = (at(i + 1, 12. + height), at(i, 12. + height));
+                tris.push([a, b, c]);
+                tris.push([a, c, d]);
+            }
+            let mesh = mesh::normalize(tris).unwrap();
+            let (setup, _, _) = fixture(Strategy::Drill);
+            let found = outside_arcs_among(&setup, &mesh, &upright(&setup, &mesh));
+            assert_eq!(found.len(), 1, "{height} mm: {found:#?}");
+            assert!((found[0].span - 90.).abs() < 1., "{found:#?}");
+            assert_eq!(crate::corner::all(&setup, &mesh).len(), 1, "{height} mm");
+        }
+    }
+    #[test]
+    fn a_short_outside_corner_on_a_threads_relieved_root_is_still_a_corner() {
+        // LIO-481 review: a modelled M12×1.75 thread, Z0 to 12, its root
+        // running out over its top 0.2 mm from R6.04 to R6.08, facing its
+        // axis; on its top end an R6.08 quarter-round outside corner 1 mm
+        // high, facing away, the root meeting its foot. At the thread's root
+        // and joined to it, but no wall of the thread's: picked, or found
+        // among all, it is a rounded corner.
+        let mut tris = crate::thread::tests::modeled([0., 0.], 12., 1.75, 60., true, true, 12., 0.);
+        let p = |angle: f32, r: f32, z: f32| {
+            let a = angle.to_radians();
+            [r * a.cos(), r * a.sin(), z]
+        };
+        for i in 0..16 {
+            let (u, v) = (45. + i as f32 * 5.625, 45. + (i + 1) as f32 * 5.625);
+            let (ru, rv) = (6.04 + i as f32 * 0.0025, 6.04 + (i + 1) as f32 * 0.0025);
+            let (a, b) = (p(u, ru, 11.8), p(v, rv, 11.8));
+            let (c, d) = (p(v, rv, 12.), p(u, ru, 12.));
+            tris.push([a, c, b]);
+            tris.push([a, d, c]);
+        }
+        for i in 24..48 {
+            let (u, v) = (i as f32 * 3.75, (i + 1) as f32 * 3.75);
+            let (a, b, c, d) = (
+                p(u, 6.08, 12.),
+                p(v, 6.08, 12.),
+                p(v, 6.08, 13.),
+                p(u, 6.08, 13.),
+            );
+            tris.push([a, b, c]);
+            tris.push([a, c, d]);
+        }
+        let mesh = mesh::normalize(tris).unwrap();
+        let (setup, _, _) = fixture(Strategy::Drill);
+        assert_eq!(crate::thread::holes_in_setup(&setup, &mesh).len(), 1);
+        let found = outside_arcs_among(&setup, &mesh, &upright(&setup, &mesh));
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!((found[0].r - 6.08).abs() < 0.01, "{found:#?}");
+        assert_eq!(crate::corner::all(&setup, &mesh).len(), 1);
+    }
+    #[test]
+    fn a_slots_round_end_on_a_threads_relieved_root_is_still_an_arc() {
+        // LIO-481 review: a 17.16 × 12.16 capsule 0.1 to 3 mm deep over a
+        // modelled M12×1.75 thread, Z0 to 12, one round end R6.08 round its
+        // axis, facing it, its foot on the thread's root running out from
+        // R6.04 to R6.08 over its top 0.2 mm, a hair past the thread's band.
+        // However shallow, no wall of the thread's: both ends are arcs, and
+        // a click on it picks the slot.
+        let outer = [
+            (-20., -15., 0.),
+            (20., -15., 0.),
+            (20., 15., 0.),
+            (-20., 15., 0.),
+        ];
+        let end = |x: f64, start: f64| {
+            (0..=48).map(move |k| {
+                let a = (start + 3.75 * k as f64).to_radians();
+                (x + 6.08 * a.cos(), 6.08 * a.sin(), 0.)
+            })
+        };
+        let slot: Vec<_> = end(5., -90.).chain(end(0., 90.)).collect();
+        for height in [0.1f32, 0.2, 1., 3.] {
+            let mut tris = slab(&[&outer, &slot], height, 12., true, true);
+            tris.extend(crate::thread::tests::modeled(
+                [0., 0.],
+                12.,
+                1.75,
+                60.,
+                true,
+                true,
+                12.,
+                0.,
+            ));
+            let p = |angle: f32, r: f32, z: f32| {
+                let a = angle.to_radians();
+                [r * a.cos(), r * a.sin(), z]
+            };
+            for i in 0..16 {
+                let (u, v) = (45. + i as f32 * 5.625, 45. + (i + 1) as f32 * 5.625);
+                let (ru, rv) = (6.04 + i as f32 * 0.0025, 6.04 + (i + 1) as f32 * 0.0025);
+                let (a, b) = (p(u, ru, 11.8), p(v, rv, 11.8));
+                let (c, d) = (p(v, rv, 12.), p(u, ru, 12.));
+                tris.push([a, c, b]);
+                tris.push([a, d, c]);
+            }
+            let mesh = mesh::normalize(tris).unwrap();
+            let (setup, _, _) = fixture(Strategy::Drill);
+            assert_eq!(crate::thread::holes_in_setup(&setup, &mesh).len(), 1);
+            let found = arcs_among(&setup, &mesh, &upright(&setup, &mesh));
+            assert_eq!(found.len(), 2, "{height} mm: {found:#?}");
+            let over = (found.iter())
+                .min_by(|a, b| a.centre[0].total_cmp(&b.centre[0]))
+                .unwrap();
+            let stock = crate::stock::resolve(&setup, Some(&mesh)).unwrap().stock;
+            let pick = surface::Selection {
+                mesh_fingerprint: mesh.fingerprint.clone(),
+                ids: vec![over.walls[0]],
+            };
+            let picked = crate::slot::from_face(&setup, &mesh, &pick, stock);
+            assert!(picked.is_ok(), "{height} mm: {picked:?}");
+        }
     }
     #[test]
     fn an_obrounds_ends_over_a_modeled_thread_are_no_walls_of_it() {
