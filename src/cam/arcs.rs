@@ -537,14 +537,15 @@ fn round_thread(f: &Facet, t: &crate::thread::Thread) -> bool {
 /// each round a thread's axis as its crests and roots are: its corners as
 /// far from the axis as each other (to `fit`'s 0.005 mm and 0.01 % of
 /// that), between its minor diameter and its root's as modelled (each to
-/// 0.05 mm), and within a pitch of its ends along its axis. Where a thread
-/// runs out at a face its last roots go on past its flanks, a hair outside
-/// its band (the adapter plate's M8 roots at R4.0673, relieved past its
-/// major diameter, its band to R4.0669, LIO-481): they are its own, facing
-/// its axis as a hole's walls do. A wall round another centre or radius is
-/// not, nor one going on past its end, nor one facing away from its axis
-/// (a rounded outside corner standing on it, as wide as its root, however
-/// short).
+/// 0.05 mm), facing its axis as a hole's walls do, and within its length
+/// (to an eighth of its pitch past its ends). A relieved root, the adapter
+/// plate's M8 roots at R4.0673 against a band to R4.0669, lies a hair
+/// outside the thread's band, in strips along its length, at its ends a
+/// sixteenth of its pitch past them (LIO-481): it is its own, for in its
+/// length the thread fills the round to its root. A wall round another
+/// centre or radius is not, nor one facing away from its axis (a rounded
+/// outside corner), nor one standing on past its end (a counterbore's or a
+/// slot's round end over it, however short past an eighth of a pitch).
 fn run_out(
     g: &Geometry,
     threads: &[crate::thread::Thread],
@@ -578,8 +579,8 @@ fn run_out(
             near >= lo
                 && far <= hi
                 && far - near <= 0.005 + far * 1e-4
-                && f.low >= t.from - t.pitch
-                && f.high <= t.to + t.pitch
+                && f.low >= t.from - t.pitch / 8.
+                && f.high <= t.to + t.pitch / 8.
                 && facing
         })
     };
@@ -1894,7 +1895,7 @@ pub(crate) mod tests {
         // theirs was the thread's, and arcs grown from them along its roots
         // took seconds a search, minutes grown on through its own walls. A
         // modelled M8 thread, Z0 to 10, its root as modelled Ø8.16, and over
-        // its top end a root running on round its axis from R4.04 to R4.07
+        // its top 0.3 mm a root running on round its axis from R4.04 to R4.07
         // in steps each round it to 0.005 mm, facing it: the root is the
         // thread's. A wall standing on it 6 mm high at its radius, and one
         // round another centre joined to it, are not.
@@ -1913,7 +1914,7 @@ pub(crate) mod tests {
             let t = (i as f32 * 7.5).to_radians();
             [r * t.cos(), r * t.sin()]
         };
-        let z = [10.4, 10.7];
+        let z = [9.7, 10.];
         // Its root running out, a quarter turn from R4.04 to R4.07.
         let radius = |i: usize| 4.04 + 0.0025 * i as f32;
         for i in 0..12 {
@@ -1958,7 +1959,7 @@ pub(crate) mod tests {
                 .fold(0., f64::max);
             (f.low, f.high, far)
         };
-        let over = |id: &&usize| span(id).0 > threads[0].to - 0.01 + 0.05;
+        let over = |id: &&usize| span(id).1 > threads[0].to - 0.31;
         let mut added: Vec<_> = threaded
             .difference(&before)
             .filter(over)
@@ -2051,6 +2052,68 @@ pub(crate) mod tests {
         assert_eq!(found.len(), 1, "{found:#?}");
         assert!((found[0].r - 6.08).abs() < 0.01, "{found:#?}");
         assert_eq!(crate::corner::all(&setup, &mesh).len(), 1);
+    }
+    #[test]
+    fn a_slots_round_end_on_a_threads_relieved_root_is_no_run_out_of_it() {
+        // LIO-481 review: a 17.16 × 12.16 capsule 1 mm (and 3 mm) deep over
+        // a modelled M12×1.75 thread, Z0 to 12, one round end R6.08 round its
+        // axis, facing it, its foot on the thread's root running out from
+        // R6.04 to R6.08 over its top 0.2 mm. The end stands past the
+        // thread's end: no wall of the thread's. Both ends are arcs, and a
+        // click on it picks the slot.
+        let outer = [
+            (-20., -15., 0.),
+            (20., -15., 0.),
+            (20., 15., 0.),
+            (-20., 15., 0.),
+        ];
+        let end = |x: f64, start: f64| {
+            (0..=48).map(move |k| {
+                let a = (start + 3.75 * k as f64).to_radians();
+                (x + 6.08 * a.cos(), 6.08 * a.sin(), 0.)
+            })
+        };
+        let slot: Vec<_> = end(5., -90.).chain(end(0., 90.)).collect();
+        for height in [1f32, 3.] {
+            let mut tris = slab(&[&outer, &slot], height, 12., true, true);
+            tris.extend(crate::thread::tests::modeled(
+                [0., 0.],
+                12.,
+                1.75,
+                60.,
+                true,
+                true,
+                12.,
+                0.,
+            ));
+            let p = |angle: f32, r: f32, z: f32| {
+                let a = angle.to_radians();
+                [r * a.cos(), r * a.sin(), z]
+            };
+            for i in 0..16 {
+                let (u, v) = (45. + i as f32 * 5.625, 45. + (i + 1) as f32 * 5.625);
+                let (ru, rv) = (6.04 + i as f32 * 0.0025, 6.04 + (i + 1) as f32 * 0.0025);
+                let (a, b) = (p(u, ru, 11.8), p(v, rv, 11.8));
+                let (c, d) = (p(v, rv, 12.), p(u, ru, 12.));
+                tris.push([a, c, b]);
+                tris.push([a, d, c]);
+            }
+            let mesh = mesh::normalize(tris).unwrap();
+            let (setup, _, _) = fixture(Strategy::Drill);
+            assert_eq!(crate::thread::holes_in_setup(&setup, &mesh).len(), 1);
+            let found = arcs_among(&setup, &mesh, &upright(&setup, &mesh));
+            assert_eq!(found.len(), 2, "{height} mm: {found:#?}");
+            let over = (found.iter())
+                .min_by(|a, b| a.centre[0].total_cmp(&b.centre[0]))
+                .unwrap();
+            let stock = crate::stock::resolve(&setup, Some(&mesh)).unwrap().stock;
+            let pick = surface::Selection {
+                mesh_fingerprint: mesh.fingerprint.clone(),
+                ids: vec![over.walls[0]],
+            };
+            let picked = crate::slot::from_face(&setup, &mesh, &pick, stock);
+            assert!(picked.is_ok(), "{height} mm: {picked:?}");
+        }
     }
     #[test]
     fn an_obrounds_ends_over_a_modeled_thread_are_no_walls_of_it() {
