@@ -423,6 +423,33 @@ fn integer(ctx: &Ctx, key: &str) -> Result<i64, Problem> {
         None => bad(format!("`{key}` must be an integer.")),
     }
 }
+/// A move by `delta` places, as the clicks of the Up or Down button that
+/// make it: one place each, for the app swaps an item with the one `delta`
+/// away (a move of two would swap past the one between).
+fn moves(ctx: &Ctx) -> Result<impl Iterator<Item = isize>, Problem> {
+    let delta = integer(ctx, "delta")?;
+    Ok(std::iter::repeat_n(
+        delta.signum() as isize,
+        delta.unsigned_abs() as usize,
+    ))
+}
+/// Refused when a move by `delta` of item `from` of `n` would leave the
+/// list (the app would do nothing). With nothing to move, the selection's
+/// refusal says so.
+fn moves_within(ctx: &Ctx, from: Option<usize>, n: usize, what: &str) -> Result<(), Problem> {
+    let Some(from) = from else {
+        return Ok(());
+    };
+    let delta = integer(ctx, "delta")?;
+    let to = from as i64 + delta;
+    if to < 0 || to >= n as i64 {
+        return refused(format!(
+            "The {what} is number {} of {n}: it cannot move {delta} places.",
+            from + 1
+        ));
+    }
+    Ok(())
+}
 fn index(ctx: &Ctx, key: &str) -> Result<usize, Problem> {
     match arg(ctx, key)?.as_u64() {
         Some(n) => Ok(n as usize),
@@ -1093,7 +1120,8 @@ fn table() -> Vec<Command> {
             .on_setup()
             .params(|| vec![("delta", integer_param("Places to move: negative earlier, positive later."), true)])
             .examples(|| vec![json!({"delta": 1})])
-            .with(|ctx| Ok(vec![Message::MoveSetup(integer(ctx, "delta")? as isize)]))
+            .when(|ctx| moves_within(ctx, ctx.setup, ctx.app.doc.setups.len(), "setup"))
+            .with(|ctx| Ok(moves(ctx)?.map(Message::MoveSetup).collect()))
             .effect("The setup moves in the job's order."),
         cmd("flip_setup", "setup")
             .help_of(|| Message::Flip("rx"), "")
@@ -1256,7 +1284,13 @@ fn table() -> Vec<Command> {
             .on_operation()
             .params(|| vec![("delta", integer_param("Places to move: negative earlier, positive later."), true)])
             .examples(|| vec![json!({"delta": 1})])
-            .with(|ctx| Ok(vec![Message::MoveOp(integer(ctx, "delta")? as isize)]))
+            .when(|ctx| {
+                let n = (ctx.operation)
+                    .and_then(|(si, _)| ctx.app.doc.setups.get(si))
+                    .map_or(0, |s| s.operations.len());
+                moves_within(ctx, ctx.operation.map(|(_, oi)| oi), n, "operation")
+            })
+            .with(|ctx| Ok(moves(ctx)?.map(Message::MoveOp).collect()))
             .effect("The operation moves in its setup's order."),
         cmd("toggle_operation", "operation").sends(|| Message::ToggleOp).on_operation().effect("The operation is excluded from, or included in, generation and review."),
         cmd("set_operation_tool", "operation")
@@ -1316,7 +1350,26 @@ fn table() -> Vec<Command> {
         cmd("add_threading", "operation").sends(|| Message::AddThreading).on_setup().effect("A Thread operation for each modelled thread the setup reaches, with what it needs before it."),
         cmd("add_needed_tool", "operation").sends(|| Message::AddNeededTool).on_operation().effect("The tool the threading operation needs, in the library and given to it."),
         cmd("add_hole_stages", "operation").sends(|| Message::AddHoleStages).on_operation().effect("The drilling (and roughing) before the Reaming or Boring."),
-        cmd("add_centring", "operation").sends(|| Message::AddCentring).on_operation().effect("A centre drilling before the manual-mill drill."),
+        cmd("add_centring", "operation")
+            .sends(|| Message::AddCentring)
+            .on_operation()
+            // Offered as the app offers it: on a manual-mill twist drill
+            // drilling from solid, not yet centred.
+            .when(|ctx| {
+                let (Some((si, oi)), Some(o)) = (ctx.operation, ctx.op()) else {
+                    return Ok(());
+                };
+                let setup = &ctx.app.doc.setups[si];
+                if !crate::centre::wants_centre(o, &ctx.app.doc.tools, &setup.machine) {
+                    return refused("A centre drilling goes before a Drill on the manual mill, with a twist drill drilling from solid.");
+                }
+                if crate::centre::centred(setup, oi) {
+                    return refused("This drill is centre drilled already.");
+                }
+                Ok(())
+            })
+            .requires("A manual-mill Drill with a twist drill, not yet centre drilled.")
+            .effect("A centre drilling before the manual-mill drill."),
         cmd("add_pin_drilling", "operation").sends(|| Message::AddPinDrilling).on_setup().effect("A Drill of the pin holes in the earlier setup."),
         cmd("thread_from_part", "operation").sends(|| Message::ThreadFromPart).on_operation().effect("The Turn thread's side, diameter, pitch and end from the part."),
         cmd("box_from_face", "operation").sends(|| Message::BoxFromFace).on_operation().effect("The Box's six fields from its picked face."),
@@ -2625,11 +2678,27 @@ fn effect(name: &str) -> Option<fn(&Ctx) -> Expect> {
         },
         "suggest_layout" => |ctx| {
             let id = setup_id(ctx);
-            alters(
-                ctx,
-                move |a| setup_in(a, &id).map(|s| s.p.clone()),
-                "The workholding stands where Suggest layout puts it already.",
-            )
+            let placed = move |a: &App| setup_in(a, &id).map(|s| s.p.clone());
+            let (before, status) = (placed(ctx.app), ctx.app.status.clone());
+            // A layout suggested ("Suggested: ...") that is the one saved
+            // already changes nothing: no_change, in the app's words, which
+            // say what the toolpaths come to beside it.
+            Box::new(move |a| {
+                if placed(a) != before {
+                    Ok(None)
+                } else if a.status.starts_with("Suggested: ") {
+                    Ok(Some(format!(
+                        "The workholding stands where Suggest layout puts it already. {}",
+                        a.status
+                    )))
+                } else if a.status != status && !a.status.is_empty() {
+                    Err(a.status.clone())
+                } else {
+                    Ok(Some(
+                        "The workholding stands where Suggest layout puts it already.".into(),
+                    ))
+                }
+            })
         },
         "show_stock_after_setup" => {
             |_| holds(|a| a.setup_end, "The stock after the setup is not shown.")
@@ -4253,6 +4322,62 @@ pub(crate) mod tests {
                 c.name
             );
         }
+    }
+
+    /// A move of more places is the Up or Down clicks that make it, one
+    /// place each: the app swaps an item with the one `delta` away, which
+    /// for two places would swap past the one between. A move out of the
+    /// list is refused.
+    #[test]
+    fn a_move_goes_one_place_a_click() {
+        let mut d = direct();
+        let order = |d: &Direct| -> Vec<String> {
+            (d.app.doc.setup().operations.iter())
+                .map(|o| format!("{:?}", o.strategy))
+                .collect()
+        };
+        assert_eq!(order(&d), ["Face", "Adaptive", "Contour", "Drill"]);
+        let moved = run(
+            &mut d,
+            "move_operation",
+            json!({"operation": 3, "delta": -2}),
+        )
+        .unwrap();
+        assert_eq!(moved["outcome"], "done", "{moved}");
+        assert_eq!(order(&d), ["Face", "Drill", "Adaptive", "Contour"]);
+        assert_eq!(d.app.selected, Some(1));
+        let moved = run(
+            &mut d,
+            "move_operation",
+            json!({"operation": 1, "delta": 2}),
+        )
+        .unwrap();
+        assert_eq!(moved["outcome"], "done", "{moved}");
+        assert_eq!(order(&d), ["Face", "Adaptive", "Contour", "Drill"]);
+        for delta in [-1, 4] {
+            let out = run(
+                &mut d,
+                "move_operation",
+                json!({"operation": 0, "delta": delta}),
+            )
+            .unwrap();
+            assert_eq!(out["outcome"], "refused", "{out}");
+        }
+        assert_eq!(order(&d), ["Face", "Adaptive", "Contour", "Drill"]);
+        let out = run(&mut d, "move_setup", json!({"delta": 1})).unwrap();
+        assert_eq!(out["outcome"], "refused", "{out}");
+    }
+
+    /// A centre drilling is offered as the app offers it: before a manual
+    /// mill's drill only. The sample's CNC drill and its Face are refused.
+    #[test]
+    fn add_centring_is_for_a_manual_mill_drill() {
+        let mut d = direct();
+        for op in [3, 0] {
+            let out = run(&mut d, "add_centring", json!({"operation": op})).unwrap();
+            assert_eq!(out["outcome"], "refused", "{out}");
+        }
+        assert_eq!(d.app.doc.setup().operations.len(), 4);
     }
 
     /// The fixture block imported, its job's material chosen.

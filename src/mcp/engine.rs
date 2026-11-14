@@ -104,11 +104,11 @@ pub fn tools() -> Value {
         {
             "name": "inspect",
             "title": "Inspect the job",
-            "description": "The state as the user would read it: the project (title, project file, part, material, whether it is saved), its setups and their operations by id, the selection with its page and tab, the status line, the work still pending, the backend and the session. With `what: \"steps\"`, a manual mill or lathe setup's steps instead: one step (`step`, from 0) with its text, DRO readouts and holes, the sections and where the machinist's own place is; it reads with a cursor of its own and never moves that place. A guide the app has not built for the job as it is is built first, which simulates the setup: refused while the machine runs.",
+            "description": "The state as the user would read it: the project (title, project file, part, material, whether it is saved), its setups and their operations by id, the selection with its page and tab, the status line, the work still pending, the backend and the session. With `what: \"libraries\"`, the library's machines, tools, materials and holders, each with its id (what the library commands take) and fields. With `what: \"steps\"`, a manual mill or lathe setup's steps instead: one step (`step`, from 0) with its text, DRO readouts and holes, the sections and where the machinist's own place is; it reads with a cursor of its own and never moves that place. A guide the app has not built for the job as it is is built first, which simulates the setup: refused while the machine runs.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "what": {"type": "string", "enum": ["steps"], "description": "Leave out for the whole state; steps for a hand setup's steps."},
+                    "what": {"type": "string", "enum": ["libraries", "steps"], "description": "Leave out for the whole state; libraries for the library entries and their ids; steps for a hand setup's steps."},
                     "setup": {"type": ["string", "integer"], "description": "With steps: the setup's id or index from 0; default the active setup."},
                     "step": {"type": "integer", "minimum": 0, "description": "With steps: the step to read, from 0 (default 0)."},
                     "wait_s": wait,
@@ -434,6 +434,26 @@ fn inspect(b: &impl Backend) -> Value {
     })
 }
 
+/// `inspect {what: "libraries"}`: the ids the library commands take
+/// (`assign_machine`, `set_operation_tool`, `set_project_material`, the
+/// holders), each entry with its fields as its editor holds them.
+fn libraries(b: &impl Backend) -> Value {
+    let doc = &b.app().doc;
+    let entries = |all: Vec<(&str, &crate::model::Fields)>| -> Vec<Value> {
+        all.into_iter()
+            .map(|(id, p)| json!({"id": id, "fields": p}))
+            .collect()
+    };
+    json!({
+        "project_material": doc.material,
+        "machines": entries(doc.machines.iter().map(|m| (m.id.as_str(), &m.p)).collect()),
+        "tools": entries(doc.tools.iter().map(|t| (t.id.as_str(), &t.p)).collect()),
+        "materials": entries(doc.materials.iter().map(|m| (m.id.as_str(), &m.p)).collect()),
+        "holders": entries(doc.workholding.iter().map(|h| (h.id.as_str(), &h.p)).collect()),
+        "session": session_info(b),
+    })
+}
+
 /// The session as every result reports it: its id and folder, whether the
 /// job is saved to a project file, and the last saves and exports.
 fn session_info(b: &impl Backend) -> Value {
@@ -734,7 +754,16 @@ impl Agent {
             b.app_mut().mcp_outside();
         }
         match tool {
-            "inspect" => self.give(reply, Ok(inspect(b))),
+            "inspect" => {
+                let answer = match args.get("what").and_then(Value::as_str) {
+                    None => Ok(inspect(b)),
+                    Some("libraries") => Ok(libraries(b)),
+                    Some(what) => Err(format!(
+                        "inspect: `what` is \"libraries\" or \"steps\", not \"{what}\"."
+                    )),
+                };
+                self.give(reply, answer)
+            }
             "list_fields" => {
                 let fields = fields::list(b.app_mut(), &args);
                 self.give(reply, fields)
@@ -834,7 +863,7 @@ impl Agent {
     /// the session's start has settled, closes a window whose work has
     /// settled, and answers the calls whose time is up.
     pub fn poll(&mut self, b: &mut impl Backend) {
-        let settled = b.quiet() && b.app().pending().is_empty();
+        let mut settled = b.quiet() && b.app().pending().is_empty();
         let now = Instant::now();
         if !self.started {
             self.started = settled;
@@ -849,6 +878,12 @@ impl Agent {
                 } else {
                     self.held.push(h);
                 }
+            }
+            // A held call started just now has sent its messages since
+            // `settled` was read: its window waits for the next poll, or
+            // an import would be closed before its load began.
+            if self.window.is_some() {
+                settled = false;
             }
         }
         // A checkpoint's part loaded: the restore is checked again and

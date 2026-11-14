@@ -259,6 +259,14 @@ impl Host {
             kept.put(&mut app);
         }
         prepare(&mut app);
+        // A workspace not yet on disk is written now: until it is, every
+        // start makes the starter library afresh, with new ids, and a
+        // resume would report each material and holder as the user's
+        // change.
+        if !session.workspace().exists() {
+            app.dirty = true;
+            app.persist();
+        }
         let mut host = Host {
             app,
             session,
