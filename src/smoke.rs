@@ -3005,6 +3005,7 @@ flood = { pin = 8 }
             data: dir.join("pi"),
             listen: "127.0.0.1:0".parse().unwrap(),
             link_lost,
+            decoding: None,
         })
         .unwrap();
         // The Pi runs its simulator: the profile asks it to.

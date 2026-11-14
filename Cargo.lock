@@ -5793,7 +5793,7 @@ dependencies = [
 [[package]]
 name = "uc100-remote"
 version = "0.1.0"
-source = "git+https://github.com/liorknafo/uc100-server.git?rev=cdb6348bcadf1bb3dccf129659aebe4ea55dc657#cdb6348bcadf1bb3dccf129659aebe4ea55dc657"
+source = "git+https://github.com/liorknafo/uc100-server.git?rev=a8afdc972ed76d227b34bf273d085edddccad46a#a8afdc972ed76d227b34bf273d085edddccad46a"
 dependencies = [
  "clap",
  "env_logger",
@@ -5808,6 +5808,7 @@ dependencies = [
  "signal-hook",
  "toml",
  "uc100",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
