@@ -20,6 +20,7 @@
 use super::commands::{self, Ctx, Expect, Problem};
 use super::fields;
 use super::pick;
+use super::reads::{self, Reads, Started};
 use super::state::{self, Change, Entry, Records};
 use crate::{App, Message};
 use iced::Task;
@@ -94,12 +95,20 @@ pub fn tools() -> Value {
         "minimum": 0,
         "description": "Run only if the job is still at this revision (from the last result); otherwise the outcome is conflict, with what changed.",
     });
-    json!([
+    let mut tools = json!([
         {
             "name": "inspect",
             "title": "Inspect the job",
-            "description": "The state as the user would read it: the project (title, project file, part, material, whether it is saved), its setups and their operations by id, the selection with its page and tab, the status line, the work still pending, the backend and the session.",
-            "inputSchema": {"type": "object", "properties": {"wait_s": wait}},
+            "description": "The state as the user would read it: the project (title, project file, part, material, whether it is saved), its setups and their operations by id, the selection with its page and tab, the status line, the work still pending, the backend and the session. With `what: \"steps\"`, a manual mill or lathe setup's steps instead: one step (`step`, from 0) with its text, DRO readouts and holes, the sections and where the machinist's own place is; it reads with a cursor of its own and never moves that place. A guide the app has not built for the job as it is is built first, which simulates the setup: refused while the machine runs.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "what": {"type": "string", "enum": ["steps"], "description": "Leave out for the whole state; steps for a hand setup's steps."},
+                    "setup": {"type": ["string", "integer"], "description": "With steps: the setup's id or index from 0; default the active setup."},
+                    "step": {"type": "integer", "minimum": 0, "description": "With steps: the step to read, from 0 (default 0)."},
+                    "wait_s": wait,
+                },
+            },
             "annotations": {"readOnlyHint": true},
         },
         {
@@ -192,29 +201,34 @@ pub fn tools() -> Value {
         {
             "name": "cancel",
             "title": "Cancel a command",
-            "description": "Cancels the generation a still_running command started; its final result is cancelled. Other work cannot be cancelled: wait for it.",
+            "description": "Cancels the generation a still_running command started, or a read still working (its worker finishes on its own); the final result is cancelled. Other work cannot be cancelled: wait for it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"command_id": id, "wait_s": wait},
                 "required": ["command_id"],
             },
         },
-    ])
+    ]);
+    if let Value::Array(list) = &mut tools {
+        list.extend(reads::tools());
+    }
+    tools
 }
 
 /// Whether `tool` is one of `tools()`.
 pub fn is_tool(tool: &str) -> bool {
-    matches!(
-        tool,
-        "inspect"
-            | "list_fields"
-            | "list_commands"
-            | "describe_command"
-            | "execute"
-            | "batch"
-            | "wait"
-            | "cancel"
-    )
+    reads::TOOLS.contains(&tool)
+        || matches!(
+            tool,
+            "inspect"
+                | "list_fields"
+                | "list_commands"
+                | "describe_command"
+                | "execute"
+                | "batch"
+                | "wait"
+                | "cancel"
+        )
 }
 
 /// What became of a command.
@@ -248,7 +262,7 @@ pub struct Selection {
     pub tab: String,
 }
 impl Selection {
-    fn of(app: &App) -> Selection {
+    pub(crate) fn of(app: &App) -> Selection {
         Selection {
             setup: app.doc.active_setup().map(|s| s.id.clone()),
             operation: app.operation().map(|o| o.id.clone()),
@@ -426,7 +440,11 @@ fn list_commands(args: &Value) -> Value {
     }
     listed.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
     let commands: Vec<Value> = listed.into_iter().map(|(_, _, v)| v).collect();
-    json!({"commands": commands})
+    json!({
+        "commands": commands,
+        "read_tools": reads::TOOLS,
+        "note": "The read tools (checks, the part, pictures, the rules) are called by their own names, not with execute; describe_command describes them too.",
+    })
 }
 
 fn describe_command(args: &Value) -> Result<Value, String> {
@@ -439,6 +457,19 @@ fn describe_command(args: &Value) -> Result<Value, String> {
             "help": help,
             "allowed": false,
             "reason": reason,
+        }));
+    }
+    if reads::TOOLS.contains(&name) {
+        let tool = (reads::tools().into_iter()).find(|t| t["name"] == name);
+        let tool = tool.unwrap_or_default();
+        return Ok(json!({
+            "name": name,
+            "tool": true,
+            "help": tool["description"],
+            "args": tool["inputSchema"],
+            "while_machine_runs": reads::heaviness(name),
+            "note": "This is a read tool: call it by its name, not with execute.",
+            "allowed": true,
         }));
     }
     let c = commands::find(name).ok_or_else(|| no_command(name))?;
@@ -550,6 +581,8 @@ pub struct Agent {
     batch: Option<Batch>,
     held: Vec<Held>,
     started: bool,
+    /// The reads working on a snapshot of the job (`reads`).
+    reads: Reads,
     /// The answers given, each stamped with the revision and what the user
     /// changed (`flush`) as it goes; a read's or a list's is not.
     outbox: Vec<(Reply, Answer, bool)>,
@@ -561,7 +594,7 @@ impl Agent {
     /// Whether a call waits for the app's work: the event loop then ticks
     /// fast, as the window's does for a pending MCP request.
     pub fn waiting(&self) -> bool {
-        self.window.is_some() || !self.held.is_empty() || !self.started
+        self.window.is_some() || !self.held.is_empty() || !self.started || self.reads.any()
     }
     /// Whether nothing is open or unanswered.
     pub fn idle(&self) -> bool {
@@ -603,6 +636,9 @@ impl Agent {
         deadline: Instant,
         reply: Reply,
     ) {
+        if reads::is_read(tool, &args) {
+            return self.read(b, tool, &args, deadline, reply);
+        }
         // A read takes a snapshot only while no window is open: a wait
         // cannot take the user's work for the agent's.
         if self.window.is_none() && matches!(tool, "inspect" | "list_fields" | "wait" | "cancel") {
@@ -621,6 +657,52 @@ impl Agent {
             "wait" => self.wait(&args, deadline, reply),
             "cancel" => self.cancel(b, &args, deadline, reply),
             _ => self.give_plain(reply, Err(format!("There is no tool {tool}."))),
+        }
+    }
+    /// Starts a read (`reads`): answered now, or by its worker within the
+    /// call's time, else `still_running` with its id. Its snapshot of the
+    /// work state is taken as a read's is: the user's changes are found
+    /// first while no window is open.
+    fn read(
+        &mut self,
+        b: &mut impl Backend,
+        tool: &str,
+        args: &Value,
+        deadline: Instant,
+        reply: Reply,
+    ) {
+        let outside = self.window.is_none();
+        if outside {
+            b.app_mut().mcp_outside();
+        }
+        self.count += 1;
+        let id = format!("{tool}-{}", self.count);
+        let app = b.app();
+        let before = || match app.mcp.log.last.as_ref().filter(|_| outside) {
+            Some(last) => last.clone(),
+            None => state::snapshot(app),
+        };
+        match self.reads.start(app, &id, tool, args, before) {
+            Started::Now(answer) => self.give(reply, answer),
+            Started::Working => self.waiters.push(Waiter {
+                id,
+                deadline,
+                reply,
+            }),
+        }
+    }
+    /// Gives each finished read's result to the calls waiting for it, and
+    /// keeps it for `wait`.
+    fn finish_reads(&mut self, b: &impl Backend) {
+        for (id, result) in self.reads.finished(b.app()) {
+            self.results.insert(id.clone(), result.clone());
+            let (mine, others): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiters)
+                .into_iter()
+                .partition(|w| w.id == id);
+            self.waiters = others;
+            for w in mine {
+                self.give(w.reply, Ok(result.clone()));
+            }
         }
     }
     /// Gives `answer` to `reply`, stamped with the revision and what the
@@ -678,13 +760,18 @@ impl Agent {
         } else if settled && self.window.is_some() {
             self.close(b);
         }
+        self.finish_reads(b);
         let now = Instant::now();
         let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiters)
             .into_iter()
             .partition(|w| w.deadline <= now);
         self.waiters = waiting;
         for w in due {
-            let answer = Ok(still_running(b, &w.id));
+            let answer = if self.reads.working(&w.id) {
+                Ok(self.reads.still_running(&w.id))
+            } else {
+                Ok(still_running(b, &w.id))
+            };
             self.give(w.reply, answer);
         }
         if self
@@ -970,7 +1057,7 @@ impl Agent {
             let result = result.clone();
             return self.give(reply, Ok(result));
         }
-        if self.window.as_ref().is_some_and(|w| w.id == id) {
+        if self.window.as_ref().is_some_and(|w| w.id == id) || self.reads.working(id) {
             let id = id.to_string();
             return self.waiters.push(Waiter {
                 id,
@@ -996,6 +1083,17 @@ impl Agent {
                 "result": result,
             });
             return self.give(reply, Ok(answer));
+        }
+        if let Some(result) = self.reads.cancel(id) {
+            self.results.insert(id.to_string(), result.clone());
+            let (mine, others): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiters)
+                .into_iter()
+                .partition(|w| w.id == id);
+            self.waiters = others;
+            for w in mine {
+                self.give(w.reply, Ok(result.clone()));
+            }
+            return self.give(reply, Ok(result));
         }
         if !self.window.as_ref().is_some_and(|w| w.id == id) {
             return self.give_plain(

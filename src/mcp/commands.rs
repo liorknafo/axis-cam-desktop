@@ -3168,7 +3168,7 @@ pub(crate) mod tests {
     pub(crate) struct Direct {
         pub(crate) app: App,
         pub(crate) folder: PathBuf,
-        agent: Option<Agent>,
+        pub(crate) agent: Option<Agent>,
         runtime: tokio::runtime::Runtime,
         _dir: tempfile::TempDir,
     }

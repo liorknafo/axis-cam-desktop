@@ -14,12 +14,18 @@
 //!   full.
 //! - `state`: the work state's snapshots, the revisions and their change
 //!   log, the external events, and the machinist's records.
+//! - `reads`: the reads that work something out (the checks of the job as
+//!   it is, the part, pictures, a hand setup's steps), on a snapshot of the
+//!   job off the `App`'s thread, heavy ones kept from a running machine.
+//! - `rules`: the machining rules by topic, for `guide`.
 pub mod class;
 pub mod commands;
 pub mod engine;
 pub mod fields;
 pub mod pick;
 pub mod protocol;
+pub mod reads;
+pub mod rules;
 pub mod runner;
 pub mod state;
 

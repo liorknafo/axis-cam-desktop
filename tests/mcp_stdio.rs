@@ -81,6 +81,15 @@ fn the_server_answers_over_stdio() {
         "list_commands",
         "describe_command",
         "execute",
+        "check_job",
+        "check_holding",
+        "stock_after",
+        "cutting_data",
+        "surface_info",
+        "part_report",
+        "list_surfaces",
+        "view_model",
+        "guide",
     ] {
         assert!(tools.contains(&name), "{tools:?}");
     }

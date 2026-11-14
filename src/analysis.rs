@@ -1716,7 +1716,7 @@ pub fn preconditions(doc: &Document, mesh: Option<&Mesh>) -> Vec<Precondition> {
 /// A machine's limits as the model is told them. A UC100 machine's profile
 /// limits them further, as a run checks: the spindle's maximum rpm, and the
 /// coolant it has outputs for.
-fn machine_report(machine: &crate::model::Machine) -> Result<MachineReport, String> {
+pub(crate) fn machine_report(machine: &crate::model::Machine) -> Result<MachineReport, String> {
     let inch = if get(&machine.p, "units") == "inch" {
         25.4
     } else {
@@ -1750,7 +1750,7 @@ fn clearance_report(machine: &crate::model::Machine, inch: f32) -> Option<Cleara
 }
 /// The project's material and its cutting data, or why planning cannot use
 /// the project's material. The user's text is cleaned and bounded.
-fn material_report(doc: &Document) -> Result<MaterialReport, String> {
+pub(crate) fn material_report(doc: &Document) -> Result<MaterialReport, String> {
     let material = doc
         .selected_material()
         .ok_or("Choose a material on the setup page.")?;
@@ -1833,9 +1833,208 @@ fn closed_solid(setup1: &Setup, mesh: &Mesh) -> Result<(), String> {
     }
     Ok(())
 }
-/// The report without the closed-surface checks, so tests can run the plan
-/// checks on open meshes.
-#[cfg(test)]
+/// The least spindle speed a plan may ask for, rpm.
+pub const MIN_RPM: f64 = 100.;
+/// A range with the value a tool is recommended to run at in it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Recommended {
+    pub min: u32,
+    pub max: u32,
+    pub recommended: u32,
+}
+/// The feed range at the recommended spindle speed, mm/min.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FeedRange {
+    /// The spindle speed the feed range is for: the recommended rpm.
+    pub at_rpm: u32,
+    pub min: u32,
+    pub max: u32,
+    pub recommended: u32,
+}
+/// The chip-load band of a tool's diameter, in mm per tooth.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BandUsed {
+    /// The largest diameter the band holds; null for every larger one.
+    pub up_to_mm: Option<f32>,
+    pub min: f32,
+    pub max: f32,
+}
+/// The spindle speed and feed a tool can run at in a material on a machine.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CuttingData {
+    pub tool: u32,
+    pub diameter: f32,
+    pub flutes: u32,
+    pub rpm: Recommended,
+    pub feed_mm_per_min: FeedRange,
+    pub chip_load_band: BandUsed,
+}
+/// What a tool of `diameter` with `flutes` (numbered `number`, named
+/// `named` in what is said) can run at in `material` on `machine`: the rpm
+/// range from the material's surface speed and the machine's maximum, a
+/// recommended rpm (`material::pick`, whole), and at that rpm the feed range
+/// from the chip-load band of the diameter (scaled down under 3 mm) and the
+/// flutes, clipped to the machine's maximum feed, with a recommended feed;
+/// or one sentence on why there is none.
+pub fn cutting_data(
+    material: &MaterialReport,
+    machine: &MachineReport,
+    (number, named): (u32, &str),
+    diameter: f32,
+    flutes: u32,
+) -> Result<CuttingData, String> {
+    let band = material.chip_load_mm.get(crate::material::band(diameter));
+    let Some(band) = band.filter(|band| {
+        material.vc_min_m_per_min > 0.
+            && material.vc_max_m_per_min >= material.vc_min_m_per_min
+            && band.min > 0.
+            && band.max >= band.min
+    }) else {
+        return Err("The material has no cutting data.".into());
+    };
+    if machine.max_rpm <= 0. || machine.max_feed <= 0. {
+        return Err("The machine has no maximum rpm or feed.".into());
+    }
+    if diameter <= 0. || flutes == 0 {
+        return Err(format!(
+            "{named} has no diameter or flutes to compute with."
+        ));
+    }
+    let (d, n) = (f64::from(diameter), f64::from(flutes));
+    // The surface speed range as rpm, up to what the machine gives. When even
+    // the maximum is too slow for the least surface speed, it counts as in range.
+    let rpm_at = |vc: f32| f64::from(vc) * 1000. / (std::f64::consts::PI * d);
+    let max_rpm = f64::from(machine.max_rpm);
+    let top = rpm_at(material.vc_max_m_per_min).min(max_rpm);
+    // A plan's spindle speed is at least MIN_RPM: a range under it holds no
+    // speed the checks accept.
+    if top < MIN_RPM {
+        return Err(format!(
+            "{named} cannot be used in this material: its surface speed range gives at most {top:.0} rpm, under the plan's minimum of {MIN_RPM} rpm. Choose a smaller tool."
+        ));
+    }
+    let bottom = rpm_at(material.vc_min_m_per_min).max(MIN_RPM).min(top);
+    // The chip load the tool takes: the band's, less under 3 mm, as the
+    // check reads it (`material::chip_load`).
+    let share = crate::material::chip_share(diameter);
+    let (fz_min, fz_max) = (band.min * share, band.max * share);
+    // The speed and feed a material change sets (`material::pick`), whole:
+    // a value above the machine's maximum, or below the least surface speed
+    // at a maximum that cannot reach it, would not pass the check.
+    let max_feed = f64::from(machine.max_feed);
+    let (rpm, feed) = crate::material::pick(
+        (bottom as f32, top as f32),
+        (fz_min, fz_max),
+        flutes as f32,
+        machine.max_rpm,
+        machine.max_feed,
+    );
+    let rpm = f64::from(rpm)
+        .round()
+        .clamp(bottom.ceil().min(top.floor()), top.floor());
+    // The feed range at that rpm, up to what the machine gives; when even the
+    // maximum feed is below the least chip load, it counts as in range.
+    let feed_top = (f64::from(fz_max) * n * rpm).min(max_feed);
+    let feed_bottom = (f64::from(fz_min) * n * rpm).min(feed_top);
+    let feed = f64::from(feed)
+        .clamp(feed_bottom, feed_top)
+        .round()
+        .min(max_feed.floor());
+    let (rpm, feed) = (rpm as u32, feed as u32);
+    Ok(CuttingData {
+        tool: number,
+        diameter,
+        flutes,
+        rpm: Recommended {
+            min: (bottom.ceil() as u32).min(top.floor() as u32),
+            max: top.floor() as u32,
+            recommended: rpm,
+        },
+        feed_mm_per_min: FeedRange {
+            at_rpm: rpm,
+            min: (feed_bottom.ceil() as u32).min(feed_top.floor() as u32),
+            max: feed_top.floor() as u32,
+            recommended: feed,
+        },
+        chip_load_band: BandUsed {
+            up_to_mm: band.up_to_mm,
+            min: fz_min,
+            max: fz_max,
+        },
+    })
+}
+/// One orientation that lists a surface, with the plane that does.
+#[derive(Debug, Serialize)]
+pub struct Seen<'a> {
+    pub up: &'static str,
+    #[serde(flatten)]
+    pub plane: &'a PlaneReport,
+}
+/// What the part report and the part say of one surface.
+#[derive(Debug, Serialize)]
+pub struct SurfaceInfo<'a> {
+    pub surface: usize,
+    /// This surface's faces alone, mm²; `area` of an entry is its whole plane's.
+    pub surface_area: f64,
+    /// The area-weighted mean of the faces' normals in setup 1's frame; null
+    /// when they cancel out, as the faces of a closed round surface do.
+    pub mean_normal: Option<[f64; 3]>,
+    pub orientations: Vec<Seen<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<&'static str>,
+}
+/// `value` rounded to `places` decimals, never -0.
+fn rounded(value: f64, places: i32) -> f64 {
+    let scale = 10f64.powi(places);
+    // Adding 0 turns a rounded -0.0 into 0.0, so it never prints as "-0.0".
+    (value * scale).round() / scale + 0.
+}
+/// Surface `id` of `mesh` as `report` and the part say it: every
+/// orientation whose planes list it, its own area in mm² and its mean
+/// normal in setup 1's frame; or why there is no such surface.
+pub fn surface_info<'a>(
+    doc: &Document,
+    mesh: &Mesh,
+    report: &'a PartReport,
+    id: usize,
+) -> Result<SurfaceInfo<'a>, String> {
+    if id >= mesh.surfaces.len() {
+        return Err(format!("Surface {id} is not a surface of this part."));
+    }
+    let seen: Vec<Seen> = (report.orientations.iter())
+        .flat_map(|o| {
+            (o.planes.iter())
+                .filter(move |p| p.surfaces.contains(&id))
+                .map(|plane| Seen { up: o.up, plane })
+        })
+        .collect();
+    // The surface's faces in setup 1's frame, in mm.
+    let (mut area, mut sum) = (0f64, [0f64; 3]);
+    if let Some(setup1) = doc.setups.first() {
+        for t in (Geometry::new(setup1, mesh).triangles.iter()).filter(|t| t.feature == Some(id)) {
+            // Twice the area, along the normal.
+            let n = normal(&t.p).map(f64::from);
+            area += n.iter().map(|v| v * v).sum::<f64>().sqrt() / 2.;
+            sum = std::array::from_fn(|k| sum[k] + n[k]);
+        }
+    }
+    let length = sum.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let mean_normal =
+        (length > 1e-3 * 2. * area && length > 1e-9).then(|| sum.map(|v| rounded(v / length, 3)));
+    let note = seen.is_empty().then_some(
+        "No orientation lists this surface as a horizontal face: it is a wall, a slope, hidden from above, or beyond the report's plane list.",
+    );
+    Ok(SurfaceInfo {
+        surface: id,
+        surface_area: rounded(area, 2),
+        mean_normal,
+        orientations: seen,
+        note,
+    })
+}
+/// The report without the closed-surface checks: what an open mesh's
+/// surfaces and planes are (an agent's pictures and surface lists,
+/// LIO-470), and for tests that run the plan checks on open meshes.
 pub(crate) fn report_unchecked(doc: &Document, mesh: &Mesh) -> Result<PartReport, String> {
     let machines = machines(doc);
     let view = planning(doc);

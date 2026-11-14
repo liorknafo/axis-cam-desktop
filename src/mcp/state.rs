@@ -593,6 +593,12 @@ pub struct Tracker {
     user_turn: bool,
     /// The epoch of the generation under way, when the user started it.
     user_generation: Option<u64>,
+    /// The heavy reads' workers still running (`reads`), which Cycle Start
+    /// waits for (`App::planning_busy`), cancelled ones too.
+    pub heavy: super::reads::Heavy,
+    /// How long each read's worker waits before it works (tests).
+    #[cfg(test)]
+    pub slow_reads: Option<std::time::Duration>,
 }
 
 /// The most external events an entry names: with no agent connected for

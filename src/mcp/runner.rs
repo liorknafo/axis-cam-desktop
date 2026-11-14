@@ -706,6 +706,71 @@ mod tests {
         runner.stop();
     }
 
+    /// The freshness rule (LIO-470): `generate` is still running, a
+    /// `check_job` starts on a snapshot of the job, and the user changes a
+    /// clamp position in the window before it is done. The check is refused
+    /// as stale, saying what changed; asked again it checks the job as it is.
+    #[test]
+    fn a_check_whose_job_the_user_changed_meanwhile_is_refused_as_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user").join("workspace.json");
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        let (mut doc, _) = crate::post::fixture::job();
+        doc.setups[0].operations.truncate(1);
+        doc.adopt_materials();
+        doc.adopt_holders();
+        let aluminium = (doc.materials.iter())
+            .find(|m| m.name() == "Aluminium 6061-T6")
+            .map(|m| m.id.clone())
+            .unwrap();
+        assert!(doc.select_material(&aluminium));
+        crate::proposal::tests::hold(&mut doc, "Clamp", &[("clamps", "-X:0;+X:0")]);
+        doc.active = doc.setups[0].id.clone();
+        crate::storage::save(&user, &doc).unwrap();
+        let session = Session::open(&dir.path().join("mcp-sessions"), None, &user).unwrap();
+        let runner = Runner::start_with(
+            session,
+            Box::new(|app| {
+                app.slow_generation = Some(std::time::Duration::from_secs(3));
+                app.mcp.slow_reads = Some(std::time::Duration::from_millis(1500));
+            }),
+        );
+        let start = runner.call("inspect", json!({})).unwrap();
+        assert!(start["project"]["model"].is_object(), "{start}");
+        let pick = json!({"command": "select_operation", "args": {"operation": 0}});
+        assert_eq!(runner.call("execute", pick).unwrap()["outcome"], "done");
+        let generate = json!({"command": "generate", "wait_s": 0.2});
+        let generating = runner.call("execute", generate).unwrap();
+        assert_eq!(generating["outcome"], "still_running", "{generating}");
+        let id = generating["command_id"].as_str().unwrap().to_string();
+        let check = runner.call_later("check_job", json!({"wait_s": 45}));
+        runner.user(Message::SetClamps("-Y:0;+Y:0".into()));
+        let checked = check.recv().unwrap().unwrap();
+        assert_eq!(checked["outcome"], "refused", "{checked}");
+        assert_eq!(checked["stale"], true, "{checked}");
+        assert!(
+            checked["reason"].as_str().unwrap().contains("changed"),
+            "{checked}"
+        );
+        let changed = checked["changed_meanwhile"].as_array().unwrap();
+        assert!(
+            changed
+                .iter()
+                .any(|c| c["kind"] == "setup" && c["what"] == "changed"),
+            "{checked}"
+        );
+        assert!(checked.get("passed").is_none(), "nothing of it reported");
+        let done = runner
+            .call("wait", json!({"command_id": id, "wait_s": 45}))
+            .unwrap();
+        assert_ne!(done["outcome"], "still_running", "{done}");
+        // Unchanged meanwhile, the check is of the job as it is.
+        let again = runner.call("check_job", json!({"wait_s": 45})).unwrap();
+        assert_eq!(again["outcome"], "done", "{again}");
+        assert_eq!(again["stale"], false, "{again}");
+        runner.stop();
+    }
+
     /// The user's edit in the window while the agent's generation runs:
     /// the generation is dropped, and the agent is told the job changed by
     /// both, the edit named. Then an edit with no window open is the user's.

@@ -3422,6 +3422,8 @@ impl App {
             Some("A model is loading: wait for it.")
         } else if matches!(self.planner, Planner::Running(_)) || self.plan_busy.running() > 0 {
             Some("The AI planner is working: wait for it, or cancel it.")
+        } else if self.mcp.heavy.running() > 0 {
+            Some("An agent's check is still simulating the job: wait for it.")
         } else if self.picturing() {
             Some("The stock after each operation is still being pictured: wait a moment.")
         } else if self.stock_mesh_job.is_some()

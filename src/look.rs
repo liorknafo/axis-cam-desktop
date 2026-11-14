@@ -30,7 +30,7 @@ const MAX_IDS: usize = 200;
 /// Each angle: name, words, yaw and pitch of `viewport::Camera`, whose
 /// yaw 0 looks from the front (-Y), a positive yaw round to the right (+X)
 /// and a positive pitch from above.
-const ANGLES: [(&str, &str, f32, f32); 9] = [
+pub(crate) const ANGLES: [(&str, &str, f32, f32); 9] = [
     ("top", "top", 0., std::f32::consts::FRAC_PI_2),
     ("front", "front (from -Y)", 0., 0.),
     ("back", "back (from +Y)", std::f32::consts::PI, 0.),
