@@ -9709,12 +9709,23 @@ impl App {
                     // after the first state until the state changes.
                     let connecting = (self.status.strip_prefix("Connecting to "))
                         .and_then(|rest| rest.rsplit_once('…'));
-                    let name = connecting.map(|(name, _)| name).or_else(|| {
+                    // "The Pi of <machine> refused this computer: <why>"
+                    // while it does (LIO-519): it is tried again every 5 s,
+                    // and once let in the status goes on from there.
+                    let refused = (self.status.strip_prefix(PI_REFUSED))
+                        .and_then(|rest| rest.split_once(REFUSED_WHY))
+                        .map(|(name, _)| name);
+                    let name = connecting.map(|(name, _)| name).or(refused).or_else(|| {
                         let rest = (self.status.strip_prefix("Connected to "))
                             .or_else(|| self.status.strip_prefix(NO_LINK))?;
                         Some(rest.rsplit_once(": ")?.0)
                     });
-                    if let (Some(name), Some(state)) = (name, &c.snapshot.state) {
+                    if let (Some(name), Some(why)) = (name, c.pi_refused()) {
+                        // As the banner: the refusal says what to do, over
+                        // the last known state (a note said while connecting
+                        // is dropped; the refusal is what matters now).
+                        self.status = format!("{PI_REFUSED}{name}{REFUSED_WHY}{why}");
+                    } else if let (Some(name), Some(state)) = (name, &c.snapshot.state) {
                         use uc100::controller::State;
                         self.status = match state {
                             // The Pi's state as last known, never "Connected".
@@ -9724,6 +9735,10 @@ impl App {
                             ),
                             // Never live yet: still "Connecting to <machine>…"
                             // (LIO-517).
+                            // Let in after a refusal, not live yet: connecting.
+                            _ if c.pi_down() && refused.is_some() => {
+                                format!("Connecting to {name}…")
+                            }
                             _ if c.pi_down() => self.status.clone(),
                             State::Disconnected if connecting.is_some() => format!(
                                 "Could not connect to {name}; see the log in the Control page's Machine tab."
@@ -11289,6 +11304,11 @@ fn run() -> iced::Result {
 
 /// The status line's start while the link to the Pi is not answering.
 const NO_LINK: &str = "No link to the Pi of ";
+/// The status line's start while the Pi refuses this computer, then the
+/// machine's name, `REFUSED_WHY` and the Pi's reason (LIO-519).
+const PI_REFUSED: &str = "The Pi of ";
+/// Between the machine's name and the Pi's reason in a `PI_REFUSED` status.
+const REFUSED_WHY: &str = " refused this computer: ";
 
 /// How this computer names itself to a Pi it pairs with: the Mac's name
 /// ("Lior's MacBook Pro"), else its host name.
