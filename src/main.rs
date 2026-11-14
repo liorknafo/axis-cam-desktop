@@ -1658,8 +1658,9 @@ pub struct App {
     plan_refined: Option<Refined>,
     pub undo: Option<Document>,
     pub confirm_delete_setup: bool,
-    /// The operation editor asks before deleting the selected operation.
-    pub confirm_delete_op: bool,
+    /// The id of the operation the editor asks about deleting: the question
+    /// shows while that operation is selected, wherever it moves.
+    pub confirm_delete_op: Option<String>,
     /// An action that sent the user to a page to make what it needs first
     /// (Face to the Tool library), and that page: saving there carries the
     /// action out; leaving the page drops it.
@@ -2329,7 +2330,7 @@ impl App {
             plan_dropped: None,
             undo: None,
             confirm_delete_setup: false,
-            confirm_delete_op: false,
+            confirm_delete_op: None,
             status_page: Page::Home,
             status_problem: false,
             typed_last: None,
@@ -6193,6 +6194,15 @@ impl App {
             Message::AccountRestored,
         )
     }
+    /// The selected operation's id.
+    fn selected_op(&self) -> Option<String> {
+        self.operation().map(|o| o.id.clone())
+    }
+    /// Whether the operation editor asks about deleting the selected
+    /// operation: another selection leaves the question.
+    pub fn asking_delete_op(&self) -> bool {
+        self.confirm_delete_op.is_some() && self.confirm_delete_op == self.selected_op()
+    }
     fn stop_selection(&mut self) {
         self.selected = None;
         self.setup_end = false;
@@ -6201,7 +6211,7 @@ impl App {
         self.progress = 0.;
         self.simulation = None;
         self.confirm_delete_setup = false;
-        self.confirm_delete_op = false;
+        self.confirm_delete_op = None;
     }
     /// Carries out the pending action, once its page has saved what the
     /// action needed.
@@ -6257,7 +6267,6 @@ impl App {
     fn update_turn(&mut self, message: Message) -> Task<Message> {
         let before = self.status.clone();
         let problem = std::mem::take(&mut self.status_problem);
-        let (selected, page) = (self.selected, self.page);
         let edit = match message {
             Message::Edit(target, ..) => Some((target, self.edited(target))),
             _ => None,
@@ -6327,10 +6336,6 @@ impl App {
         if let Some(c) = &mut self.control {
             c.material =
                 (self.doc.selected_material()).map(|m| (m.name().to_string(), m.conducts()));
-        }
-        // Another operation or page closes the delete question.
-        if self.selected != selected || self.page != page {
-            self.confirm_delete_op = false;
         }
         // An operation selected, however, leaves the stock after the setup.
         if self.selected.is_some() {
@@ -6772,8 +6777,17 @@ impl App {
                 }
                 Target::Tool => {
                     if k == "type" {
+                        // The new type's usual flutes, while the count is
+                        // still the old type's, not one the user typed.
+                        let usual = get(&self.tool_draft.p, "flutes")
+                            == model::default_flutes(get(&self.tool_draft.p, "type"));
                         // A lathe type takes its sizes' defaults, as the editor shows them.
                         self.tool_draft.set_type(&v);
+                        if usual && !self.tool_draft.is_lathe() {
+                            self.tool_draft
+                                .p
+                                .insert("flutes".into(), model::default_flutes(&v).into());
+                        }
                     } else {
                         // A tap's size is its diameter.
                         let major = (k == "thread" && get(&self.tool_draft.p, "type") == "Tap")
@@ -7028,10 +7042,10 @@ impl App {
                     self.touch()
                 }
             }
-            Message::AskRemoveOp => self.confirm_delete_op = self.selected.is_some(),
+            Message::AskRemoveOp => self.confirm_delete_op = self.selected_op(),
             Message::ConfirmDeleteOp(yes) => {
-                self.confirm_delete_op = false;
-                if yes {
+                let asked = self.confirm_delete_op.take();
+                if yes && asked.is_some() && asked == self.selected_op() {
                     return self.handle(Message::RemoveOp);
                 }
             }

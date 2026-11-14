@@ -738,6 +738,21 @@ pub fn centre_reference(p: &Fields) -> Option<[f32; 3]> {
 /// short, so the spindle nose is taken as low as it can plausibly be (an
 /// ER11 collet nut on the 800 W spindle stands about this far below it).
 pub const HOLDER_LENGTH: f32 = 10.;
+/// The starter library's drill (`Document::sample`).
+pub const STARTER_DRILL: &str = "Twist drill · Ø8";
+/// The flutes a tool of `kind` usually has: those of its defaults
+/// (`mill_tool_defaults`), else two for a twist drill and three for an end
+/// mill. The tool editor sets them when the type changes.
+pub fn default_flutes(kind: &str) -> &'static str {
+    match mill_tool_defaults(kind)
+        .iter()
+        .find(|(k, _)| *k == "flutes")
+    {
+        Some((_, n)) => n,
+        None if kind == "Drill" => "2",
+        None => "3",
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
     pub id: String,
@@ -2848,6 +2863,11 @@ pub struct Document {
     /// owner's tap and die set and lathe threading insert.
     #[serde(default)]
     pub starter_tools: u32,
+    /// Whether the starter drill's flutes have been set to a drill's two
+    /// (`fix_starter_drill`): false in a project saved before, so the fix
+    /// runs once and a count the user sets later stays.
+    #[serde(default)]
+    pub starter_drill_fixed: bool,
     /// The workholding library: vises and clamps, carried to new projects
     /// like tools.
     #[serde(default)]
@@ -2911,6 +2931,7 @@ impl Default for Document {
             material_id: String::new(),
             starter_materials: 0,
             starter_tools: 0,
+            starter_drill_fixed: true,
             workholding: vec![],
             file: None,
             sample_model: false,
@@ -2928,9 +2949,10 @@ impl Default for Document {
 impl Document {
     pub fn sample() -> Self {
         let machines = vec![Machine::new(3), Machine::new(4), Machine::new(5)];
-        let mut drill = Tool::new("Twist drill · Ø8", "Drill", "8");
-        // A twist drill has two flutes, not an end mill's three.
-        drill.p.insert("flutes".into(), "2".into());
+        let mut drill = Tool::new(STARTER_DRILL, "Drill", "8");
+        drill
+            .p
+            .insert("flutes".into(), default_flutes("Drill").into());
         let tools = vec![
             Tool::new("Flat end mill · Ø10", "Flat end mill", "10"),
             Tool::new("Ball end mill · Ø6", "Ball end mill", "6"),
@@ -3219,6 +3241,24 @@ impl Document {
     /// 16ER AG60 insert as the lathe's threading tool; since set 2, three
     /// centre drills for the manual mill. A tool of the same name already
     /// there is kept.
+    /// Gives the unedited starter drill, saved with an end mill's three
+    /// flutes, a drill's two: once (`starter_drill_fixed`).
+    pub fn fix_starter_drill(&mut self) {
+        if self.starter_drill_fixed {
+            return;
+        }
+        for tool in &mut self.tools {
+            if tool.name() == STARTER_DRILL
+                && get(&tool.p, "type") == "Drill"
+                && get(&tool.p, "diameter") == "8"
+                && get(&tool.p, "flutes") == "3"
+            {
+                tool.p
+                    .insert("flutes".into(), default_flutes("Drill").into());
+            }
+        }
+        self.starter_drill_fixed = true;
+    }
     pub fn adopt_tools(&mut self) {
         if self.starter_tools >= STARTER_TOOLS {
             return;
