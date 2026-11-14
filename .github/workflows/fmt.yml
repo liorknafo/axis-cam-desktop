@@ -1,0 +1,29 @@
+# The formatting check every pull request into main must pass before it is
+# merged (LIO-513). It runs `cargo fmt --check` only, with no build, so it
+# needs neither Open CASCADE nor the private UC100 driver. rustup installs the
+# Rust that rust-toolchain.toml pins, so this formats with the same rustfmt as
+# every machine that builds the app.
+name: fmt
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the pinned Rust
+        run: rustup toolchain install
+      - run: cargo fmt --version
+      - name: cargo fmt --check (the desktop app)
+        run: cargo fmt --check
+      - name: cargo fmt --check (the shop tablet build in android/)
+        run: cargo fmt --all --check --manifest-path android/Cargo.toml
