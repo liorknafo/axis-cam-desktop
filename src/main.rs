@@ -67,6 +67,7 @@ mod stock_surface;
 mod storage;
 mod surface;
 mod tablet;
+const  LIO_513_DEMO :  u8=1 ;
 mod thread;
 mod threading;
 mod three_mf;
