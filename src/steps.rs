@@ -304,8 +304,12 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
 }
 /// Where a new tool touches the top: on the highest flat face of the stock
 /// `triangles` (stock frame), the middle of it, or the face's triangle
-/// nearest that when the face is not convex.
+/// nearest that when the face is not convex. A face's triangles are taken
+/// as one within `TOUCH_FLAT` of the highest's middle: a sliver a hundredth
+/// proud of the rest, as a modelled thread leaves at a hole's mouth, is no
+/// face of its own (LIO-488).
 pub(crate) fn touch_spot(triangles: &[([[f32; 3]; 3], [u8; 4])]) -> Option<[f32; 3]> {
+    const TOUCH_FLAT: f32 = 0.05;
     let flat = |t: &[[f32; 3]; 3]| {
         let n = normal(t);
         let size = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
@@ -313,10 +317,10 @@ pub(crate) fn touch_spot(triangles: &[([[f32; 3]; 3], [u8; 4])]) -> Option<[f32;
     };
     let top = (triangles.iter())
         .filter(|(t, _)| flat(t))
-        .map(|(t, _)| t[0][2])
+        .map(|(t, _)| (t[0][2] + t[1][2] + t[2][2]) / 3.)
         .fold(f32::NEG_INFINITY, f32::max);
     let middles: Vec<[f32; 3]> = (triangles.iter())
-        .filter(|(t, _)| flat(t) && t.iter().all(|p| (p[2] - top).abs() < 0.01))
+        .filter(|(t, _)| flat(t) && t.iter().all(|p| (p[2] - top).abs() < TOUCH_FLAT))
         .map(|(t, _)| std::array::from_fn(|k| (t[0][k] + t[1][k] + t[2][k]) / 3.))
         .collect();
     let n = middles.len() as f32;
@@ -3150,7 +3154,12 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 .chain(under)
                 .collect()
             ),]
-            .extend(pick_up(*top, true))
+            // "Where it is ringed" only over a picture that rings it
+            // (LIO-488).
+            .extend(pick_up(
+                *top,
+                p.shown.tools.get(p.at).is_some_and(Option::is_some),
+            ))
             .extend(
                 comp.map(|c| dro_tool(*diameter, c, 110.))
                     .unwrap_or_default(),
@@ -3487,6 +3496,12 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
         step @ Step::Pass { .. } => pass(p, step),
         step @ Step::Corner { .. } => corner(p, step),
         Step::Pattern { op, pattern, same } => pattern_screen(p, *op, pattern, *same),
+        Step::Leave {
+            op,
+            from,
+            at,
+            number,
+        } => leave_screen(p, *op, *from, *at, *number),
         Step::Holes {
             op,
             holes,
@@ -3923,6 +3938,26 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             let j = p.done(*op);
             let o = p.setup.operations.get(*op);
             let mut c = vec![chip(format!("{} done", o.map_or("", |o| o.name())))];
+            // Holes the DRO led to: its hole function is left next, unless
+            // the next operation starts the same pattern again (LIO-488).
+            let kind = (g.steps.iter()).find_map(|s| match s {
+                Step::Holes {
+                    op: o,
+                    pattern: Some(pattern),
+                    ..
+                } if o == op => Some(match pattern {
+                    Pattern::Arc { .. } => "arc holes",
+                    Pattern::Grid { .. } => "matrix holes",
+                }),
+                _ => None,
+            });
+            let leaves = matches!(
+                g.steps.get(p.at + 1),
+                Some(Step::Leave { from, .. }) if from == op
+            ) || matches!(g.steps.get(p.at + 1), Some(Step::HandOver { .. }));
+            if let Some(kind) = kind.filter(|_| leaves) {
+                c.push(warn_chip(format!("then leave the DRO's {kind}")));
+            }
             if let Some(a) = o
                 .filter(|o| o.strategy == Strategy::Box)
                 .and_then(|o| num(&o.p, "allowance"))
@@ -4436,6 +4471,101 @@ fn pattern_screen<'a>(
         Fill,
     );
     (title.into(), sub, left, right)
+}
+/// The screen that leaves the DRO's hole function after operation `from`'s
+/// holes, before `op` moves in work coordinates (LIO-488): the function
+/// off, then X and Y read `at`, over the last hole, the DRO's hole
+/// `number`, where the hole function would read 0.00.
+fn leave_screen<'a>(
+    p: &Page<'a>,
+    op: usize,
+    from: usize,
+    at: [f32; 2],
+    number: usize,
+) -> (
+    String,
+    &'static str,
+    Element<'a, Message>,
+    Column<'a, Message>,
+) {
+    let g = p.guide();
+    let (holes, numbers, arc) = (g.steps.iter())
+        .find_map(|s| match s {
+            Step::Holes {
+                op: o,
+                holes,
+                numbers,
+                pattern,
+                ..
+            } if *o == from => Some((
+                holes.as_slice(),
+                numbers.as_slice(),
+                matches!(pattern, Some(Pattern::Arc { .. })),
+            )),
+            _ => None,
+        })
+        .unwrap_or((&[], &[], false));
+    let kind = if arc { "arc holes" } else { "matrix holes" };
+    let row = |n: u8, axis: &str, value: String, tags: Vec<String>| {
+        readout(
+            Readout {
+                order: Some(n),
+                lead: None,
+                axis: axis.into(),
+                value,
+                lock: None,
+                tags,
+                lit: lit(usize::from(n) - 1, p.item),
+                big: false,
+            },
+            Some(Message::Guide(GuideAction::Reached(usize::from(n) - 1))),
+        )
+    };
+    // In the hole function both read 0.00 over a hole; out of it, the
+    // hole's place, unless that is the work zero itself.
+    let zero = at.iter().all(|v| v.abs() < 0.005);
+    let mut y = vec!["reads".to_string()];
+    if !zero {
+        y.push("both 0.00 instead: still in the hole function".into());
+    }
+    let right = column![
+        label(format!("Leave the DRO's {kind}")),
+        row(
+            1,
+            kind,
+            "off".into(),
+            vec![
+                "leave the function the DRO's way".into(),
+                "it shows X, Y and Z again".into()
+            ]
+        ),
+        label("X and Y read work coordinates"),
+        row(
+            2,
+            "X",
+            dro(at[0]),
+            vec![
+                "reads".into(),
+                format!("over hole {number}, the last, not moved since")
+            ]
+        ),
+        row(3, "Y", dro(at[1]), y),
+        muted(format!(
+            "If the DRO took the holes in another order, X and Y read the place of the hole it ended on. From here on every X and Y is from the work zero, and the DRO's hole {number} is no longer 0.00."
+        ))
+        .size(13),
+    ];
+    let r = (p.tool(from).and_then(|t| num(&t.p, "diameter"))).unwrap_or(4.) / 2.;
+    let stock = p.before(op);
+    let last = holes.len().saturating_sub(1);
+    let shapes = (holes.iter().enumerate())
+        .map(|(n, h)| {
+            let k = numbers.get(n).copied().unwrap_or(n + 1);
+            Shape::Hole([h[0], h[1], stock.max[2]], r, k, lit(n, last))
+        })
+        .collect();
+    let left = p.drawing(0, stock, shapes, Fill);
+    ("DRO".into(), "back to work coordinates", left, right)
 }
 /// The screen of a Pass `step`.
 fn pass<'a>(
@@ -6801,6 +6931,16 @@ pub(crate) mod tests {
         stock.extend(viewport::box_triangles(high, viewport::BLOCK));
         let spot = touch_spot(&stock).unwrap();
         assert!(spot[2] == 10. && spot[1] > 15., "{spot:?}");
+        // A sliver a hundredth proud of the top, as a modelled thread leaves
+        // at a hole's mouth, is no top of its own: the spot stays on the top
+        // (LIO-488; it was none, the Tool page's picture blank).
+        let mut slivered = viewport::box_triangles(high, viewport::BLOCK);
+        slivered.push((
+            [[50., 30., 10.011], [52., 30., 10.], [50., 32., 10.]],
+            [0; 4],
+        ));
+        let spot = touch_spot(&slivered).unwrap();
+        assert!((spot[2] - 10.).abs() < 0.01 && spot[1] > 15., "{spot:?}");
         // On the guide's job every new tool has its picture.
         let a = app("Yes");
         let shown = a.guide_at().unwrap().0;
@@ -6808,6 +6948,80 @@ pub(crate) mod tests {
             let new = matches!(s, Step::Tool { top: Some(_), .. });
             assert_eq!(shown.tools[i].is_some(), new, "{i} {s:?}");
         }
+    }
+    /// LIO-488: after the DRO's matrix holes, the Check says to leave the
+    /// hole function, and the next operation in work coordinates starts on
+    /// the screen that leaves it and checks X and Y read the last hole's
+    /// place; a drill after its centre drill on the same pattern goes on.
+    #[test]
+    fn the_dro_leaves_its_hole_function_before_work_coordinates() {
+        const NOTE: &str = "then leave the DRO's matrix holes";
+        let mut a = app_with("Yes", |d| d.setups[0].operations.swap(1, 2));
+        let g = guide(&a);
+        let check = (g.steps.iter())
+            .position(|s| matches!(s, Step::Check { op: 1 }))
+            .unwrap();
+        send(&mut a, GuideAction::Go(check));
+        shows(&a, &[NOTE]);
+        let Some(Step::Leave { at, number, .. }) = g.steps.get(check + 1).cloned() else {
+            panic!("{:?}", g.steps.get(check + 1))
+        };
+        send(&mut a, GuideAction::Go(check + 1));
+        shows(
+            &a,
+            &[
+                "DRO",
+                "back to work coordinates",
+                "LEAVE THE DRO'S MATRIX HOLES",
+                "matrix holes",
+                "off",
+                "leave the function the DRO's way · it shows X, Y and Z again",
+                "X AND Y READ WORK COORDINATES",
+                &dro(at[0]),
+                &dro(at[1]),
+                &format!("reads · over hole {number}, the last, not moved since"),
+                "reads · both 0.00 instead: still in the hole function",
+            ],
+        );
+        // Its new tool comes next; the Step's own Check says nothing of holes.
+        assert!(matches!(g.steps[check + 2], Step::Tool { op: 2, .. }));
+        let last = (g.steps.iter())
+            .rposition(|s| matches!(s, Step::Check { op: 2 }))
+            .unwrap();
+        send(&mut a, GuideAction::Go(last));
+        assert!(!has(&a, NOTE));
+        // Holes last in the setup: the Check says it before the hand-over.
+        let mut a = app("Yes");
+        let check = (guide(&a).steps.iter())
+            .position(|s| matches!(s, Step::Check { op: 2 }))
+            .unwrap();
+        send(&mut a, GuideAction::Go(check));
+        shows(&a, &[NOTE]);
+        // A centre drill's Check, its drill on the same pattern next: no note.
+        let mut a = pattern_app(&crate::guide::tests::plate_grid(), true, false, true);
+        let check = (guide(&a).steps.iter())
+            .position(|s| matches!(s, Step::Check { op: 0 }))
+            .unwrap();
+        send(&mut a, GuideAction::Go(check));
+        assert!(!has(&a, NOTE), "{:?}", texts(&a));
+    }
+    /// LIO-488: "where it is ringed" only over a picture that rings it.
+    #[test]
+    fn the_tool_page_names_the_ring_only_over_its_picture() {
+        let mut a = app("Yes");
+        let tool = (guide(&a).steps.iter())
+            .position(|s| matches!(s, Step::Tool { top: Some(_), .. }))
+            .unwrap();
+        send(&mut a, GuideAction::Go(tool));
+        assert!(has(&a, "where it is ringed"), "{:?}", texts(&a));
+        let (key, Ok(shown)) = a.guide.clone().unwrap() else {
+            panic!()
+        };
+        let mut blank = shown.again(&a.doc, a.part_mesh().unwrap()).unwrap();
+        blank.tools[tool] = None;
+        a.guide = Some((key, Ok(Arc::new(blank))));
+        assert!(!has(&a, "where it is ringed"), "{:?}", texts(&a));
+        shows(&a, &["touch the top → set", "Z"]);
     }
     #[test]
     fn back_and_next_are_in_one_place_on_every_screen() {
