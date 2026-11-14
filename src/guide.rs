@@ -223,6 +223,17 @@ pub enum Step {
         pattern: Pattern,
         same: bool,
     },
+    /// The first screen of `op` after operation `from`, whose holes the
+    /// DRO led to with its matrix or arc holes (LIO-488): leave the hole
+    /// function, and X and Y read work coordinates again, `at` (work X, Y)
+    /// over the last hole drilled, the DRO's hole `number`. Not before an
+    /// operation that starts the same pattern again.
+    Leave {
+        op: usize,
+        from: usize,
+        at: [f32; 2],
+        number: usize,
+    },
     /// One pass of a Boring (1-based `index` of `of`): the boring head set
     /// to `size` (Ø mm), from `before` (what the last pass left, or None
     /// before the first: set it to `size`), turning out `dial` mm on the
@@ -2515,6 +2526,33 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
             }
             other => return Err(format!("{} does not run on a manual mill.", other.name())),
         }
+        // After holes the DRO led to, it leaves its hole function before
+        // this operation moves in work coordinates; one that starts the same
+        // pattern again goes on in it (LIO-488).
+        let again = (steps[first..].iter()).any(|s| matches!(s, Step::Pattern { same: true, .. }));
+        if last_pattern.is_some() && !again {
+            let last = (steps[..first].iter().rev()).find_map(|s| match s {
+                Step::Holes {
+                    op,
+                    holes,
+                    numbers,
+                    pattern: Some(_),
+                    ..
+                } => Some((*op, *holes.last()?, *numbers.last()?)),
+                _ => None,
+            });
+            if let Some((from, h, number)) = last {
+                steps.insert(
+                    first,
+                    Step::Leave {
+                        op: oi,
+                        from,
+                        at: [h[0], h[1]],
+                        number,
+                    },
+                );
+            }
+        }
         sections.push(Section {
             // A Thread as a Thread (LIO-419).
             name: crate::threading::shown_name(op, &doc.tools),
@@ -3228,6 +3266,7 @@ pub(crate) mod tests {
                 Step::Square { .. } => "Square",
                 Step::Holes { .. } => "Holes",
                 Step::Pattern { .. } => "Pattern",
+                Step::Leave { .. } => "Leave",
                 Step::Bore { .. } => "Bore",
                 Step::Check { .. } => "Check",
                 Step::HandOver { .. } => "HandOver",
@@ -3850,6 +3889,51 @@ pub(crate) mod tests {
             (*diameter, *count, *first, *step, *full),
             (60., 6, 30., 60., true)
         );
+    }
+    /// The guide's job with its holes drilled before the Step, so that an
+    /// operation in work coordinates follows the DRO's matrix holes.
+    pub(crate) fn holes_then_step() -> (Document, Mesh) {
+        let (mut doc, mesh) = job("Yes");
+        doc.setups[0].operations.swap(1, 2);
+        (doc, mesh)
+    }
+    #[test]
+    fn the_operation_after_the_dros_holes_starts_by_leaving_its_hole_function() {
+        let (doc, mesh) = holes_then_step();
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let of = |i: usize| kinds(&guide, guide.sections[i].steps.clone());
+        assert_eq!(of(2), ["Tool", "Pattern", "Holes", "Check"]);
+        // The Step, in work coordinates, starts with the DRO back in them
+        // (LIO-488), then its new tool.
+        assert_eq!(of(3)[..2], ["Leave", "Tool"]);
+        let Some(Step::Holes { holes, numbers, .. }) =
+            guide.steps.iter().find(|s| matches!(s, Step::Holes { .. }))
+        else {
+            panic!()
+        };
+        let h = holes.last().unwrap();
+        assert_eq!(
+            guide.steps[guide.sections[3].steps.start],
+            Step::Leave {
+                op: 2,
+                from: 1,
+                at: [h[0], h[1]],
+                number: *numbers.last().unwrap(),
+            }
+        );
+        // A drill after its centre drill on the same pattern goes on in the
+        // hole function, and the setup's last holes hand over: no Leave.
+        let (doc, mesh) = pattern_job(&plate_grid(), true, false, true);
+        let guide = build(&doc, &mesh, 0).unwrap();
+        assert!(
+            !guide.steps.iter().any(|s| matches!(s, Step::Leave { .. })),
+            "{:?}",
+            kinds(&guide, 0..guide.steps.len())
+        );
+        // As on the job, where the holes are last.
+        let (doc, mesh) = job("Yes");
+        let guide = build(&doc, &mesh, 0).unwrap();
+        assert!(!guide.steps.iter().any(|s| matches!(s, Step::Leave { .. })));
     }
     #[test]
     fn one_section_per_operation_between_set_up_and_hand_over() {
