@@ -279,6 +279,11 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
             let point = t.is_some_and(|t| get(&t.p, "type").to_lowercase().contains("drill"));
             let centre = t.and_then(|t| t.centre_drill());
             let spot = touch_spot(&stock[j])?;
+            // Ringed only on the top the page has Z set on (LIO-488): a
+            // spot off it would show the touch somewhere else.
+            if (spot[2] - (boxes[j].max[2] + zero[2])).abs() > 0.05 {
+                return None;
+            }
             let mut triangles = stock[j].clone();
             triangles.extend(viewport::tool_triangles(
                 spot, *diameter, flutes, stickout, point, centre,
@@ -308,10 +313,14 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
 /// triangles, their corners within `SPAN` of one height: a near-flat sliver
 /// a hundredth proud of the top, as a modelled thread leaves at a hole's
 /// mouth, is none, and a real face a few hundredths higher is one
-/// (LIO-488). It is the highest level, its triangles' middles within
-/// `LEVEL`, with `FACE` mm² or more; else the highest there is.
+/// (LIO-488), unless they are lower than the highest flat triangle by
+/// more than `PROUD`: a top tilted a few thousandths has no level
+/// triangle, and the level underside is no top. It is the highest level,
+/// its triangles' middles within `LEVEL`, with `FACE` mm² or more; else
+/// the highest there is.
 pub(crate) fn touch_spot(triangles: &[([[f32; 3]; 3], [u8; 4])]) -> Option<[f32; 3]> {
     const SPAN: f32 = 0.002;
+    const PROUD: f32 = 0.015;
     const LEVEL: f32 = 0.01;
     const FACE: f32 = 1.;
     let flats = |span: f32| -> Vec<([f32; 3], f32)> {
@@ -328,10 +337,15 @@ pub(crate) fn touch_spot(triangles: &[([[f32; 3]; 3], [u8; 4])]) -> Option<[f32;
             })
             .collect()
     };
-    // Level triangles, or any flat ones when none is level.
-    let mut flats = match flats(SPAN) {
-        f if f.is_empty() => flats(f32::INFINITY),
-        f => f,
+    // Level triangles, when they reach the top: within `PROUD` of the
+    // highest flat middle, as under a thread's slivers; else, the top
+    // tilted or no triangle level, any flat ones.
+    let highest = |f: &[([f32; 3], f32)]| f.iter().map(|m| m.0[2]).fold(f32::MIN, f32::max);
+    let all = flats(f32::INFINITY);
+    let level = flats(SPAN);
+    let mut flats = match level.is_empty() || highest(&level) < highest(&all) - PROUD {
+        true => all,
+        false => level,
     };
     flats.sort_by(|a, b| b.0[2].total_cmp(&a.0[2]));
     let (mut j, mut area) = (0, 0.);
@@ -7002,6 +7016,36 @@ pub(crate) mod tests {
         stepped.extend(viewport::box_triangles(right, viewport::BLOCK));
         let spot = touch_spot(&stepped).unwrap();
         assert!((spot[2] - 10.04).abs() < 1e-4 && spot[0] > 50., "{spot:?}");
+        // A top tilted 0.006 over its length has no level triangle: the
+        // spot is on it, not on the level underside, nor on a level terrace
+        // 0.03 lower (LIO-488 review).
+        let tilted = |x: f32| 10. + 0.00006 * x;
+        let top = |x0: f32, x1: f32| -> Vec<([[f32; 3]; 3], [u8; 4])> {
+            let (a, b) = ([x0, 0.], [x1, 60.]);
+            let p = |x: f32, y: f32| [x, y, tilted(x)];
+            vec![
+                ([p(a[0], a[1]), p(b[0], a[1]), p(b[0], b[1])], [0; 4]),
+                ([p(a[0], a[1]), p(b[0], b[1]), p(a[0], b[1])], [0; 4]),
+            ]
+        };
+        let under = [
+            ([[0., 0., 0.], [0., 60., 0.], [100., 60., 0.]], [0; 4]),
+            ([[0., 0., 0.], [100., 60., 0.], [100., 0., 0.]], [0; 4]),
+        ];
+        let mut slab = top(0., 100.);
+        slab.extend(under);
+        let spot = touch_spot(&slab).unwrap();
+        assert!((spot[2] - tilted(spot[0])).abs() < 0.01, "{spot:?}");
+        let mut terraced = top(0., 70.);
+        terraced.extend(viewport::box_triangles(
+            Bounds {
+                min: [70., 0., 0.],
+                max: [100., 60., 9.97],
+            },
+            viewport::BLOCK,
+        ));
+        let spot = touch_spot(&terraced).unwrap();
+        assert!(spot[0] < 70. && spot[2] > 9.99, "{spot:?}");
         // On the guide's job every new tool has its picture.
         let a = app("Yes");
         let shown = a.guide_at().unwrap().0;
