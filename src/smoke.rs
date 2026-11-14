@@ -3560,6 +3560,80 @@ flood = { pin = 8 }
         lacks(&a, &[crate::ui::PI_LOST, PI_NOT_ANSWERING]);
     }
 
+    /// Connecting to the Pi for the first time, the run bar and a command
+    /// pressed say it is still connecting, not that the link is not
+    /// answering; live and then cut, they say it is not answering. Refused
+    /// by the Pi, the status line says so while it is tried again, and let
+    /// in, the refusal is not carried on (LIO-519).
+    #[test]
+    fn connecting_to_the_pi_first_says_connecting_on_the_run_bar() {
+        use crate::control::Action;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        a.page = Page::Control;
+        let gate = pi_through_a_gate(&mut a, &server);
+        check_run(&mut a, 0);
+        let said = |a: &mut App, bar: &str, note: &str| {
+            let _ = a.update(Message::Machine(Action::Home));
+            assert_eq!(problems(a), [bar]);
+            assert_eq!(conn(a).pi_note.as_deref(), Some(note));
+            let seen = page_texts(a);
+            assert!(seen.iter().any(|t| t.contains(bar)), "{bar}: {seen:?}");
+        };
+        said(
+            &mut a,
+            "Connecting to the Pi: wait for it.",
+            "Not sent: still connecting to the Pi.",
+        );
+        gate.set_open(true);
+        pi_live(&mut a, true, "the link live");
+        assert!(
+            !problems(&a).iter().any(|p| p.contains("the Pi")),
+            "{:?}",
+            problems(&a)
+        );
+        gate.set_cut(true);
+        pi_live(&mut a, false, "the link lost");
+        said(
+            &mut a,
+            "The link to the Pi is not answering: wait for it to reconnect.",
+            "Not sent: the link to the Pi is not answering.",
+        );
+        // Refused: this computer no longer paired on the Pi.
+        let _ = a.update(Message::Disconnect);
+        let pi = uc100_remote::data::Data {
+            dir: dir.path().join("pi"),
+        };
+        let clients = std::fs::read_to_string(pi.clients_file()).unwrap();
+        for k in pi.clients().unwrap() {
+            pi.forget(k.id).unwrap();
+        }
+        let _ = a.update(Message::PiAddress(server.addr().to_string()));
+        let _ = a.update(Message::Connect);
+        let name = a.control_target().unwrap().name().to_string();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let why = loop {
+            let _ = a.update(Message::Tick);
+            if let Some(uc100_remote::LinkState::Refused(why)) =
+                conn(&a).link.as_ref().map(|l| l.state.clone())
+            {
+                break why;
+            }
+            assert!(std::time::Instant::now() < end, "never refused");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let _ = a.update(Message::Tick);
+        assert_eq!(a.status, format!("Refused by the Pi of {name}: {why}"));
+        // Paired again: let in at its next try.
+        pi.write(&pi.clients_file(), &clients).unwrap();
+        pi_live(&mut a, true, "the link live after the refusal");
+        assert!(
+            a.status.starts_with(&format!("Connected to {name}: ")) && !a.status.contains("efuse"),
+            "{}",
+            a.status
+        );
+    }
+
     /// Renders the Control page's Machine tab while connecting to the Pi
     /// for the first time (never live), connected, with the link lost and
     /// while it reconnects, to `$AXIS_RENDER_DIR` (default /tmp/pi-connecting),

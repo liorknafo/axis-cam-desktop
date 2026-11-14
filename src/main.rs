@@ -9506,7 +9506,23 @@ impl App {
                             .or_else(|| self.status.strip_prefix(NO_LINK))?;
                         Some(rest.rsplit_once(": ")?.0)
                     });
-                    if let (Some(name), Some(state)) = (name, &c.snapshot.state) {
+                    // The Pi refuses this computer (pairing, versions): the
+                    // status line says so, as the banner does, while it is
+                    // tried again; let in, "Connecting to <machine>…" again,
+                    // the refusal not carried on (LIO-519).
+                    let was_refused = self.status.strip_prefix(PI_REFUSED);
+                    let name = name.or_else(|| Some(was_refused?.split_once(": ")?.0));
+                    let refused = match c.link.as_ref().map(|l| &l.state) {
+                        Some(uc100_remote::LinkState::Refused(why)) => Some(why),
+                        _ => None,
+                    };
+                    if let (Some(name), Some(why)) = (name, refused) {
+                        self.status = format!("{PI_REFUSED}{name}: {why}");
+                    } else if let Some(name) = name.filter(|_| {
+                        was_refused.is_some() && (c.pi_down() || c.snapshot.state.is_none())
+                    }) {
+                        self.status = format!("Connecting to {name}…");
+                    } else if let (Some(name), Some(state)) = (name, &c.snapshot.state) {
                         use uc100::controller::State;
                         self.status = match state {
                             // The Pi's state as last known, never "Connected".
@@ -11071,6 +11087,9 @@ fn run() -> iced::Result {
 
 /// The status line's start while the link to the Pi is not answering.
 const NO_LINK: &str = "No link to the Pi of ";
+
+/// The status line's start while the Pi refuses this computer.
+const PI_REFUSED: &str = "Refused by the Pi of ";
 
 /// How this computer names itself to a Pi it pairs with: the Mac's name
 /// ("Lior's MacBook Pro"), else its host name.

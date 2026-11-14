@@ -3329,8 +3329,11 @@ impl Connection {
                 | Action::SpacingText(_)
         );
         if !local_only && !self.in_control() {
-            self.pi_note = Some(if self.pi_down() {
+            self.pi_note = Some(if self.pi_lost() {
                 "Not sent: the link to the Pi is not answering.".into()
+            } else if self.pi_down() {
+                // Never live yet (LIO-519).
+                "Not sent: still connecting to the Pi.".into()
             } else {
                 "Not sent: another computer controls the machine. Take control first.".into()
             });

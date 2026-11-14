@@ -1572,8 +1572,12 @@ impl Run {
         if self.running.is_some() {
             return vec!["A tool run is running.".into()];
         }
-        if c.pi_down() {
+        if c.pi_lost() {
             return vec!["The link to the Pi is not answering: wait for it to reconnect.".into()];
+        }
+        // Never live yet: nothing to reconnect (LIO-519).
+        if c.pi_down() {
+            return vec!["Connecting to the Pi: wait for it.".into()];
         }
         if c.watching() {
             return vec!["Another computer controls the machine: Take control first.".into()];
