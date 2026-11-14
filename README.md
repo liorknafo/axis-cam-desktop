@@ -10,7 +10,7 @@ A working native desktop **CAM workflow prototype**, built with Rust and Iced 0.
 
 The app bundle is built from this source with `./scripts/package-macos.sh` (see below). Rebuild it from the current source before opening the workspace: older bundles can drop the material and workholding libraries when they save. A bundle is an Apple Silicon build for macOS 26 or later (the bundled CAD libraries require macOS 26). It includes its STEP reader and runtime libraries; end users do not need Homebrew or Python. Double-click it to open. It is ad-hoc signed, not notarized for public distribution.
 
-To build from source with the Rust that `rust-toolchain.toml` pins (1.98.0; rustup 1.28.1 or later installs it, with its rustfmt and clippy, on the first `cargo` run in this folder; with an older rustup, or with auto-install turned off, run `rustup toolchain install` here first):
+To build from source with the Rust that `rust-toolchain.toml` pins (1.98.0; rustup installs it, with its rustfmt and clippy, on the first `cargo` run in this folder; with rustup 1.28.0, or with auto-install turned off, run `rustup toolchain install` here first):
 
 ```sh
 brew install opencascade
