@@ -61,12 +61,12 @@ mod simulation;
 mod slot;
 mod smoke;
 mod step;
-mod tablet;
 mod steps;
 mod stock;
 mod stock_surface;
 mod storage;
 mod surface;
+mod tablet;
 mod thread;
 mod threading;
 mod three_mf;
@@ -10316,9 +10316,8 @@ impl App {
         }
         // The shop tablet keeps up with the computer's projects.
         if SHOP && self.computer.is_some() {
-            subscriptions.push(
-                iced::time::every(Duration::from_secs(30)).map(|_| Message::SyncProjects),
-            );
+            subscriptions
+                .push(iced::time::every(Duration::from_secs(30)).map(|_| Message::SyncProjects));
         }
         // The handwheel's beat on a pass, only while its page shows.
         if self.steps_page()
