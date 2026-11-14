@@ -6667,14 +6667,15 @@ pub(crate) mod tests {
         // A Face with no size keeps its depth.
         let b = app("Yes");
         let g = guide(&b);
-        if let Some(at) = (g.steps.iter()).position(|s| matches!(s, Step::Face { size: None, .. }))
-        {
-            let read = crate::mcp::reads::step_detail(&b.doc, &g, 0, &g.steps[at]);
-            assert!(
-                read["text"].as_str().unwrap().contains("taking off"),
-                "{read}"
-            );
-        }
+        let at = (g.steps.iter())
+            .position(|s| matches!(s, Step::Face { size: None, .. }))
+            .expect("the example's Face has no size");
+        let read = crate::mcp::reads::step_detail(&b.doc, &g, 0, &g.steps[at]);
+        let text = read["text"].as_str().unwrap();
+        assert!(
+            text.contains("taking off") && !text.contains("about"),
+            "{read}"
+        );
         // The Hold step carries the setup's notes, and none when it has none.
         let note =
             "Face up on two 15 mm parallels at X-18 and X+18, clear of the holes. Add a stop.";
