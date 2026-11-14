@@ -14186,6 +14186,22 @@ soft_max = 180.0
         crate::ui::probe::texts(a.view(), WINDOW)
     }
 
+    /// Pair a tablet says when Windows Firewall keeps tablets out, with the
+    /// fix beside it, and says nothing when it doesn't (LIO-485).
+    #[test]
+    fn the_export_page_says_when_the_firewall_keeps_the_tablet_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        let _ = a.update(Message::Page(Page::Post));
+        let fix = "Let the tablet through the firewall";
+        assert!(!page_texts(&a).iter().any(|t| t == fix));
+        let why = "Windows Firewall blocks this app (axis-cam.exe)";
+        let _ = a.update(Message::Firewall(Some(why.into())));
+        let texts = page_texts(&a);
+        assert!(texts.iter().any(|t| t == fix), "{texts:?}");
+        assert!(texts.iter().any(|t| t.contains(why)), "{texts:?}");
+    }
+
     /// What a view offers to widget operations: the form fields' tags and
     /// the titles of the hover cards (`help::HoverHelp`).
     #[derive(Default)]

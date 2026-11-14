@@ -498,6 +498,10 @@ pub enum Message {
     TabletSaved(Option<Result<PathBuf, String>>),
     /// Shows a code to pair a shop tablet with this computer (`tablet`).
     PairTablet,
+    /// What Windows Firewall does to tablets reaching this app (`tablet::firewall_problem`).
+    Firewall(Option<String>),
+    /// Asks Windows to let tablets through its firewall (`tablet::open_firewall`).
+    OpenFirewall,
     /// The shop tablet's list of projects from the computer, shown or not.
     ShowProjects(bool),
     /// The computer's address typed on the tablet; empty finds it.
@@ -1541,6 +1545,8 @@ pub struct App {
     pub pi_pairing: bool,
     /// The code that pairs a shop tablet, and when it was made.
     pub tablet_code: Option<(String, Instant)>,
+    /// Why Windows Firewall keeps tablets out, shown by Pair a tablet (LIO-485).
+    pub tablet_firewall: Option<String>,
     /// The shop tablet's list of projects from the computer shows.
     pub shop_projects: bool,
     /// On the tablet: the address and code typed to pair with the computer,
@@ -2097,6 +2103,7 @@ impl App {
             pi_code: String::new(),
             pi_pairing: false,
             tablet_code: None,
+            tablet_firewall: None,
             shop_projects: false,
             computer_address: String::new(),
             computer_code: String::new(),
@@ -2313,6 +2320,7 @@ impl App {
         if app.smoke_dir.is_none() && app.state_path == storage::state_path() {
             let path = app.state_path.clone();
             std::thread::spawn(move || tablet::serve(path, computer_name()));
+            return (app, firewall(tablet::firewall_problem));
         }
         (app, Task::none())
     }
@@ -8728,9 +8736,15 @@ impl App {
                 }
             }
             Message::PairTablet => match tablet::new_code(&self.state_path) {
-                Ok(code) => self.tablet_code = Some((code, Instant::now())),
+                Ok(code) => {
+                    self.tablet_code = Some((code, Instant::now()));
+                    // Answered "Allow access?" since the app started, or not.
+                    return firewall(tablet::firewall_problem);
+                }
                 Err(e) => self.status = format!("Could not make a pairing code: {e}"),
             },
+            Message::Firewall(why) => self.tablet_firewall = why,
+            Message::OpenFirewall => return firewall(tablet::open_firewall),
             Message::ShowProjects(show) => self.shop_projects = show,
             Message::ComputerAddress(a) => self.computer_address = a,
             Message::ComputerCode(code) => {
@@ -11058,6 +11072,14 @@ const NO_LINK: &str = "No link to the Pi of ";
 
 /// How this computer names itself to a Pi it pairs with: the Mac's name
 /// ("Lior's MacBook Pro"), else its host name.
+/// Runs a firewall check or fix off the UI thread (it takes about a second).
+fn firewall(f: fn() -> Option<String>) -> Task<Message> {
+    Task::perform(
+        async move { tokio::task::spawn_blocking(f).await.ok().flatten() },
+        Message::Firewall,
+    )
+}
+
 fn computer_name() -> String {
     let run = |cmd: &str, args: &[&str]| {
         std::process::Command::new(cmd)
