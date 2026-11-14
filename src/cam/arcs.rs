@@ -766,7 +766,7 @@ pub fn upright(setup: &Setup, mesh: &Mesh) -> HashSet<usize> {
         .collect()
 }
 fn arcs_among_by(setup: &Setup, mesh: &Mesh, ids: &HashSet<usize>, outside: bool) -> Vec<Arc> {
-    arcs_from(setup, mesh, ids, None, outside)
+    arcs_from(setup, mesh, ids, None, None, outside)
 }
 /// The arcs among the surfaces `ids` (`arcs_among`) that have a wall
 /// reaching into `near`: one of its triangles meets the box (`meets`). Each
@@ -780,7 +780,21 @@ pub fn arcs_reaching(
     ids: &HashSet<usize>,
     near: &crate::mesh::Bounds,
 ) -> Vec<Arc> {
-    arcs_from(setup, mesh, ids, Some(near), false)
+    arcs_from(setup, mesh, ids, Some(near), None, false)
+}
+/// `arcs_reaching` for a click on surface `picked` (`slot::from_face`): it
+/// seeds too, last, though wholly in a thread's band (a slot's round end
+/// over a thread, as wide as its root, may be; before LIO-481 another wall
+/// of the end, anywhere on the part, grew its arc through it), unless it is
+/// the thread's own (`own_walls`).
+pub fn arcs_picked(
+    setup: &Setup,
+    mesh: &Mesh,
+    ids: &HashSet<usize>,
+    near: &crate::mesh::Bounds,
+    picked: usize,
+) -> Vec<Arc> {
+    arcs_from(setup, mesh, ids, Some(near), Some(picked), false)
 }
 /// How many searches `arcs_from` keeps on a thread.
 const KEPT: usize = 8;
@@ -802,6 +816,7 @@ fn searched(
     wide: f32,
     ids: &HashSet<usize>,
     near: Option<&crate::mesh::Bounds>,
+    picked: Option<usize>,
     outside: bool,
 ) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -831,7 +846,7 @@ fn searched(
             .collect::<Vec<_>>()
     })
     .hash(&mut h);
-    (wide.to_bits(), outside).hash(&mut h);
+    (wide.to_bits(), picked, outside).hash(&mut h);
     h.finish()
 }
 /// Forgets the searches kept on this thread (`FOUND`).
@@ -847,6 +862,7 @@ fn arcs_from(
     mesh: &Mesh,
     ids: &HashSet<usize>,
     near: Option<&crate::mesh::Bounds>,
+    picked: Option<usize>,
     outside: bool,
 ) -> Vec<Arc> {
     let g = Geometry::new(setup, mesh);
@@ -855,14 +871,14 @@ fn arcs_from(
     }
     let threads = crate::thread::holes_in_setup(setup, mesh);
     let wide = across(setup, mesh, &g);
-    let key = searched(&g, &threads, wide, ids, near, outside);
+    let key = searched(&g, &threads, wide, ids, near, picked, outside);
     if let Some(found) = FOUND.with(|f| {
         let f = f.borrow();
         f.iter().find(|(k, _)| *k == key).map(|(_, a)| a.clone())
     }) {
         return found;
     }
-    let found = search(g, threads, wide, ids, near, outside);
+    let found = search(g, threads, wide, ids, near, picked, outside);
     FOUND.with(|f| {
         let mut f = f.borrow_mut();
         if f.len() >= KEPT {
@@ -880,6 +896,7 @@ fn search(
     wide: f32,
     ids: &HashSet<usize>,
     near: Option<&crate::mesh::Bounds>,
+    picked: Option<usize>,
     outside: bool,
 ) -> Vec<Arc> {
     let facets = facets(&g, |id| ids.contains(&id));
@@ -900,15 +917,23 @@ fn search(
     // A modeled thread's own walls (`own_walls`) are its hole's: no arc
     // starts from them (grown along a thread's hundreds of crests, one took
     // minutes), though one may grow on through them.
-    done.extend(own_walls(&g, &threads, |id| ids.contains(&id)));
+    let own = own_walls(&g, &threads, |id| ids.contains(&id));
+    done.extend(own.iter().copied());
     // Nor from any wall wholly in a thread's band: a picked thread's whole
     // hole selects all of them, and arcs grown from those took minutes a
-    // click (LIO-434).
-    done.extend(crate::pocket::thread_band_walls(&Geometry {
+    // click (LIO-434). But for the one clicked (`arcs_picked`), last.
+    let banded = crate::pocket::thread_band_walls(&Geometry {
         threads,
         triangles: g.triangles.clone(),
         bounds: g.bounds,
-    }));
+    });
+    let mut last = None;
+    if let Some(p) = picked.filter(|p| facets.contains_key(p) && !own.contains(p)) {
+        seeds.retain(|&s| s != p);
+        seeds.push(p);
+        last = Some(p);
+    }
+    done.extend(banded.into_iter().filter(|&id| Some(id) != last));
     for seed in seeds {
         if done.contains(&seed) {
             continue;

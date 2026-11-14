@@ -636,7 +636,7 @@ pub fn from_face(
 
 /// The round ends a pick of surface `id` (of `g`, `setup`'s placing of
 /// `mesh`) may pair: those with a wall where it is (its own, or a floor's
-/// rim), then each half round's partner where the straight walls tangent
+/// rim; grown from it too, `arcs_picked`), then each half round's partner where the straight walls tangent
 /// to it end, along X or Y between the same heights. Found as the whole
 /// part's arcs are (`arcs_among`), in the same order, but only there: every
 /// round of a part with modelled threads took minutes a pick (LIO-481).
@@ -655,7 +655,7 @@ fn near_pick(setup: &Setup, mesh: &Mesh, g: &Geometry, id: usize) -> Vec<cam::ar
     if min[0] > max[0] {
         return vec![];
     }
-    let mut arcs = cam::arcs::arcs_reaching(setup, mesh, &up, &Bounds { min, max });
+    let mut arcs = cam::arcs::arcs_picked(setup, mesh, &up, &Bounds { min, max }, id);
     let mut partners = vec![];
     for a in arcs.iter().filter(|a| (a.span - 180.).abs() < 1.) {
         for axis in 0..2 {
