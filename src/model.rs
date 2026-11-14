@@ -2826,6 +2826,12 @@ pub struct ModelFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     pub schema: u32,
+    /// The project's identity (LIO-470), a UUID given when the project is
+    /// created and kept in its file: a checkpoint belongs to one project.
+    /// A file saved before it had one loads with none, and the app gives it
+    /// one (`Document::own_id`), saved with it from then on.
+    #[serde(default)]
+    pub project_id: String,
     pub title: String,
     pub material: String,
     /// The material library, carried to new projects like tools.
@@ -2874,6 +2880,15 @@ pub struct Document {
     pub pick_checks: BTreeMap<String, String>,
 }
 impl Document {
+    /// Gives a project loaded from a file saved before projects had an
+    /// identity one of its own. Whether it had none.
+    pub fn own_id(&mut self) -> bool {
+        let none = self.project_id.is_empty();
+        if none {
+            self.project_id = id();
+        }
+        none
+    }
     /// Operation `to`, a copy of `from`, keeps its picks' places and what
     /// changed in them: its picks are the same.
     pub fn copy_picks(&mut self, from: &str, to: &str) {
@@ -2889,6 +2904,7 @@ impl Default for Document {
     fn default() -> Self {
         Self {
             schema: 1,
+            project_id: id(),
             title: "Untitled project".into(),
             material: String::new(),
             materials: vec![],

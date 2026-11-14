@@ -90,6 +90,9 @@ fn the_server_answers_over_stdio() {
         "list_surfaces",
         "view_model",
         "guide",
+        "checkpoint",
+        "restore_checkpoint",
+        "list_checkpoints",
     ] {
         assert!(tools.contains(&name), "{tools:?}");
     }

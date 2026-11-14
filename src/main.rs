@@ -2003,6 +2003,9 @@ impl App {
         if shared && !isolated {
             status += " No home directory was found, so the workspace is in the shared temp directory and signing in is unavailable.";
         }
+        // A project saved before projects had an identity gets one, saved
+        // with the workspace (LIO-470).
+        migrated |= doc.own_id();
         // A blank workspace has the starter materials and workholding too.
         doc.adopt_materials();
         doc.adopt_holders();
@@ -2325,9 +2328,14 @@ impl App {
         }
         changed
     }
-    fn replace_document(&mut self, doc: Document, path: Option<PathBuf>) {
-        // What is being generated is the old project's.
-        self.cancel_generation();
+    /// Another project in place of this one (New, Open, the example,
+    /// Recover previous): the job replaced (`job_replaced`), its part loaded
+    /// later (`restore_model`), the editors on its libraries, its file `path`
+    /// (none: not saved to one), on the Work page with nothing selected. A
+    /// replacement of the project for an agent's checkpoints (LIO-470).
+    fn replace_document(&mut self, mut doc: Document, path: Option<PathBuf>) {
+        // A project saved before projects had an identity gets one.
+        doc.own_id();
         self.machine_draft = doc
             .machines
             .first()
@@ -2341,42 +2349,97 @@ impl App {
         self.material_draft = material_draft(&doc);
         self.holder_draft = holder_draft(&doc);
         self.clamps_draft = None;
+        self.job_replaced(doc, None);
+        self.mcp.log.projects += 1;
+        self.project_dirty = path.is_none();
+        self.set_project_file(path);
+        self.page = Page::Work;
+        self.camera = viewport::Camera::default();
+        self.tab = "Tool".into();
+        self.stop_selection();
+        self.help_animating = false;
+        // The chat was about the project that is gone.
+        self.plan_chat.clear();
+        self.plan_request.clear();
+        // Saved with the project's file just now: it settles after a pause.
+        self.dirty = true;
+        self.last_edit = Instant::now();
+    }
+    /// The job is `doc` now, its part `mesh` (none: there is none, or it is
+    /// loaded later): what was worked out for the job before is dropped, and
+    /// the work still under way for it is stopped, or comes back to a key
+    /// or epoch that is no longer current and is dropped. `replace_document`
+    /// and a checkpoint restored (`mcp::checkpoint`) both come through
+    /// here, so the two cannot drift apart. The editors' drafts, the
+    /// selection, the page and the project's file are the caller's.
+    ///
+    /// Dropped: the generation and layout under way (`generating`, its
+    /// epoch moved on); the simulation, its playback place and a replay
+    /// under way (`catching_up`, its epoch moved on); the tooth load (its
+    /// job cancelled); the audit report; the NC review (`post`, its epoch
+    /// moved on); the left stock and holding checks; the run check
+    /// (`ready`) and the Run panel's prepared programs, marked stale as an
+    /// edit marks them; the step guide; the part's holes and the hole lists
+    /// worked out from the part; the start and stock meshes; the planner's
+    /// run, preview and undo; the last edit kept to put back; the notes of
+    /// the last click and Suggest layout. The left stock, guide, part holes
+    /// and meshes still being worked out come back keyed by the job they
+    /// were worked out for, which is no longer this one.
+    pub(crate) fn job_replaced(&mut self, doc: Document, mesh: Option<mesh::Mesh>) {
+        // What is being generated is the old job's.
+        self.cancel_generation();
+        self.generation_epoch = self.generation_epoch.wrapping_add(1);
+        self.simulation = None;
+        self.playing = false;
+        self.progress = 0.;
+        self.scrub_pending = false;
+        self.catching_up = None;
+        self.catch_up_epoch = self.catch_up_epoch.wrapping_add(1);
+        if let Some((_, job)) = self.tooth_load_job.take() {
+            job.cancel();
+        }
+        self.audit_report.clear();
+        self.invalidate_post();
+        // What was worked out for the old job is not even a last result of
+        // this one (`stale_ready`, `ui::stock_picture`).
+        self.left_stock = LeftStock::default();
+        self.holding_checks = HoldingChecks::default();
+        self.ready = run::Ready::default();
+        self.ready_job = None;
+        self.guide = None;
+        self.part_holes = None;
+        self.drill_holes.replace(None);
+        self.bottom_holes.replace(None);
+        self.pocket_holes.replace(None);
+        self.pocket_fits.replace(None);
+        self.holding_note.replace(None);
+        self.later_holes.borrow_mut().clear();
+        self.later_drills.borrow_mut().clear();
+        self.start_mesh.clear();
+        self.start_mesh_failed = None;
+        self.stock_mesh_failed = None;
+        self.stock_pictures.borrow_mut().clear();
         self.typed_last = None;
+        self.box_refused = None;
+        self.clamp_refusal = None;
+        self.fresh = None;
+        self.drop_plan();
+        self.undo = None;
         self.doc = doc;
+        self.imported_mesh = mesh;
+        self.import_error = None;
         // Old default names read as the new ones (LIO-426).
         self.doc.follow_default_names();
         if !self.is_sample() {
             self.doc.sync_stock_sources();
         }
         self.travel_from_connected();
-        // A run picked in the old project must not start its programs
+        // A run picked in the old job must not start its programs
         // (LIO-456): a job sent again keeps its setups' ids.
         self.run_follows_project();
-        // What was worked out for the old project is not even a last result
-        // of this one (`stale_ready`, `ui::stock_picture`).
-        self.ready = run::Ready::default();
-        self.ready_job = None;
-        self.left_stock = LeftStock::default();
-        self.holding_checks = HoldingChecks::default();
-        self.imported_mesh = None;
         self.sync_turns();
-        self.import_error = None;
-        self.project_dirty = path.is_none();
-        self.set_project_file(path);
-        self.page = Page::Work;
-        self.audit_report.clear();
-        self.invalidate_post();
         self.dirty = true;
         self.last_edit = Instant::now();
-        self.camera = viewport::Camera::default();
-        self.tab = "Tool".into();
-        self.stop_selection();
-        self.help_animating = false;
-        self.drop_plan();
-        self.undo = None;
-        // The chat was about the project that is gone.
-        self.plan_chat.clear();
-        self.plan_request.clear();
     }
     /// Says which later setups turned with setup 1 to stay square to the
     /// stock (`Document::rotate_first`).

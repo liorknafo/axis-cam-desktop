@@ -3174,7 +3174,7 @@ pub(crate) mod tests {
     }
     impl Direct {
         /// The messages `task` produces, run to its end.
-        fn outputs(&self, task: Task<Message>) -> Vec<Message> {
+        pub(crate) fn outputs(&self, task: Task<Message>) -> Vec<Message> {
             use futures_util::StreamExt;
             let Some(stream) = iced_runtime::task::into_stream(task) else {
                 return vec![];

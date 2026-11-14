@@ -299,7 +299,7 @@ impl Write for Sink<'_> {
 }
 
 /// The hash of `value`'s saved serialization (SipHash, std's own).
-fn hash_of(value: &impl Serialize) -> u64 {
+pub(crate) fn hash_of(value: &impl Serialize) -> u64 {
     let mut hasher = DefaultHasher::new();
     {
         // serde_json writes a token at a time: buffered, the hasher takes
@@ -337,6 +337,7 @@ pub fn snapshot(app: &App) -> Snapshot {
     // a `Setup` does not compile until it is hashed here.
     let Document {
         schema,
+        project_id,
         title,
         material,
         materials,
@@ -377,6 +378,7 @@ pub fn snapshot(app: &App) -> Snapshot {
         "",
         hash_of(&(
             schema,
+            project_id,
             title,
             material,
             material_id,
@@ -524,6 +526,10 @@ pub struct Entry {
     pub changed: Vec<Change>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<String>,
+    /// What the step was, when the change log says it: "checkpoint
+    /// restored".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// The revision, the last snapshot and the change log. Kept with the
@@ -539,6 +545,11 @@ pub struct Log {
     pub entries: Vec<Entry>,
     /// The revision last reported to the agent.
     pub reported: u64,
+    /// How many times the project was replaced (`App::replace_document`):
+    /// New, Open, the example, Recover previous. A checkpoint taken before
+    /// a replacement belongs to another project.
+    #[serde(default)]
+    pub projects: u64,
 }
 impl Log {
     /// Takes `now` as the last snapshot. When it differs from the one
@@ -557,8 +568,29 @@ impl Log {
             source,
             changed,
             events,
+            note: None,
         });
         self.entries.last()
+    }
+    /// Takes `now` as the last snapshot and goes up a revision whether or
+    /// not it differs, with an entry saying `note`: a checkpoint restored
+    /// is a step of its own, so an `if_revision` from before it is stale.
+    pub fn step(&mut self, now: Snapshot, source: Source, note: &str) -> &Entry {
+        let changed = match &self.last {
+            Some(last) => diff(last, &now),
+            None => vec![],
+        };
+        self.last = Some(now);
+        self.revision += 1;
+        self.entries.push(Entry {
+            revision: self.revision,
+            source,
+            changed,
+            events: vec![],
+            note: Some(note.into()),
+        });
+        let last = self.entries.len() - 1;
+        &self.entries[last]
     }
     /// The entries after `revision`.
     pub fn since(&self, revision: u64) -> impl Iterator<Item = &Entry> {
@@ -596,9 +628,14 @@ pub struct Tracker {
     /// The heavy reads' workers still running (`reads`), which Cycle Start
     /// waits for (`App::planning_busy`), cancelled ones too.
     pub heavy: super::reads::Heavy,
+    /// The checkpoints the agent took (`checkpoint`), oldest first.
+    pub checkpoints: super::checkpoint::Kept,
     /// How long each read's worker waits before it works (tests).
     #[cfg(test)]
     pub slow_reads: Option<std::time::Duration>,
+    /// How long a checkpoint's part takes to load before it loads (tests).
+    #[cfg(test)]
+    pub slow_candidate: Option<std::time::Duration>,
 }
 
 /// The most external events an entry names: with no agent connected for
@@ -744,6 +781,13 @@ impl App {
     pub(crate) fn mcp_events(&self) -> &[String] {
         &self.mcp.events
     }
+    /// A checkpoint was restored, in the turn that committed it: a step of
+    /// the revision of the agent's, whatever changed. Its entry.
+    pub(crate) fn mcp_restored(&mut self, name: &str) -> Entry {
+        let now = snapshot(self);
+        let note = format!("checkpoint restored: {name}");
+        self.mcp.log.step(now, Source::Agent, &note).clone()
+    }
     /// A snapshot when a window closes: a difference is the agent's, or
     /// mixed with the external events during it. Its entry, if any.
     pub(crate) fn mcp_close(&mut self) -> Option<Entry> {
@@ -785,7 +829,7 @@ pub struct Records {
     dials: BTreeMap<(Option<String>, String), String>,
 }
 /// Where a machine's cross-slide dial reading is kept.
-const DIAL: &str = "cross_reads";
+pub(crate) const DIAL: &str = "cross_reads";
 impl Records {
     pub fn of(doc: &Document) -> Records {
         let dial = |m: &crate::model::Machine| m.p.get(DIAL).cloned();

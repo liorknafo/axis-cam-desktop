@@ -1378,7 +1378,7 @@ pub fn heaviness(tool: &str) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         Message,
@@ -1482,7 +1482,7 @@ mod tests {
     }
     /// A simulated UC100 added to `d`'s library, connected, referenced and
     /// jogging +X: the machine runs (`App::locked`) until `stop`.
-    fn jogging(d: &mut Direct) {
+    pub(crate) fn jogging(d: &mut Direct) {
         use crate::control::Action;
         use uc100::controller::State;
         if d.app.control.is_some() {
@@ -1523,7 +1523,7 @@ mod tests {
         }
     }
     /// The jog ends: the machine stops.
-    fn stop(d: &mut Direct) {
+    pub(crate) fn stop(d: &mut Direct) {
         use uc100::controller::State;
         let _ = d
             .app

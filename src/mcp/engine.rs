@@ -17,6 +17,7 @@
 //! carries the `revision`, what the command `changed`, and what the user
 //! changed since the agent was last told (`user_changed`). A command may
 //! not change the machinist's records unless the machinist did meanwhile.
+use super::checkpoint;
 use super::commands::{self, Ctx, Expect, Problem};
 use super::fields;
 use super::pick;
@@ -199,6 +200,38 @@ pub fn tools() -> Value {
             "annotations": {"readOnlyHint": true},
         },
         {
+            "name": "checkpoint",
+            "title": "Take a checkpoint",
+            "description": "Keeps the job as it is now under `name`, to go back to with restore_checkpoint: the project with its libraries, every editor's draft, the project file, the selection with its page and tab, and the part it was taken with. A checkpoint of the same name is replaced; at most 20 are kept, the oldest dropped. It belongs to this project: after another project is opened or started it cannot be restored.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        },
+        {
+            "name": "restore_checkpoint",
+            "title": "Restore a checkpoint",
+            "description": "Puts the job back as checkpoint `name` held it, as one new revision (an if_revision from before is then stale). The machinist's step places, measurements and dial readings stay as they are now. Whether the project is saved is worked out against its file. Refused, with nothing changed: for a checkpoint of another project; when the part file is not the part the checkpoint was taken with; while the machine runs; and when the user changed the job since the checkpoint, or changes it while the part loads, unless `discard_user_changes: true`. Waits for what the app works out again.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "discard_user_changes": {"type": "boolean", "description": "Restore even over the user's changes since the checkpoint."},
+                    "wait_s": wait,
+                    "if_revision": if_revision,
+                },
+                "required": ["name"],
+            },
+        },
+        {
+            "name": "list_checkpoints",
+            "title": "List the checkpoints",
+            "description": "The checkpoints taken, oldest first: name, the revision taken at, when, the project's title, and whether it can be restored now (and why not).",
+            "inputSchema": {"type": "object", "properties": {}},
+            "annotations": {"readOnlyHint": true},
+        },
+        {
             "name": "cancel",
             "title": "Cancel a command",
             "description": "Cancels the generation a still_running command started, or a read still working (its worker finishes on its own); the final result is cancelled. Other work cannot be cancelled: wait for it.",
@@ -228,6 +261,9 @@ pub fn is_tool(tool: &str) -> bool {
                 | "batch"
                 | "wait"
                 | "cancel"
+                | "checkpoint"
+                | "restore_checkpoint"
+                | "list_checkpoints"
         )
 }
 
@@ -533,6 +569,19 @@ struct Window {
     /// A pick command's clicks: due once picking is on and the app has
     /// settled, then what they came to.
     clicks: Option<Clicking>,
+    /// The step of the revision the command made as it was sent (a
+    /// checkpoint restored), before what settling it changed.
+    stepped: Option<Entry>,
+    notes: Vec<String>,
+}
+/// A checkpoint being restored while its part loads (`checkpoint`).
+struct Restoring {
+    id: String,
+    checkpoint: Box<checkpoint::Checkpoint>,
+    discard: bool,
+    /// The work state's hash when the restore began.
+    began: Option<u64>,
+    candidate: checkpoint::Candidate,
 }
 /// A pick command's clicks in its window.
 enum Clicking {
@@ -583,6 +632,8 @@ pub struct Agent {
     started: bool,
     /// The reads working on a snapshot of the job (`reads`).
     reads: Reads,
+    /// A checkpoint restore waiting for its part.
+    restoring: Option<Restoring>,
     /// The answers given, each stamped with the revision and what the user
     /// changed (`flush`) as it goes; a read's or a list's is not.
     outbox: Vec<(Reply, Answer, bool)>,
@@ -594,7 +645,11 @@ impl Agent {
     /// Whether a call waits for the app's work: the event loop then ticks
     /// fast, as the window's does for a pending MCP request.
     pub fn waiting(&self) -> bool {
-        self.window.is_some() || !self.held.is_empty() || !self.started || self.reads.any()
+        self.window.is_some()
+            || !self.held.is_empty()
+            || !self.started
+            || self.reads.any()
+            || self.restoring.is_some()
     }
     /// Whether nothing is open or unanswered.
     pub fn idle(&self) -> bool {
@@ -602,6 +657,7 @@ impl Agent {
             && self.waiters.is_empty()
             && self.batch.is_none()
             && self.held.is_empty()
+            && self.restoring.is_none()
     }
     /// The soonest a call must be answered.
     pub fn deadline(&self) -> Option<Instant> {
@@ -641,7 +697,13 @@ impl Agent {
         }
         // A read takes a snapshot only while no window is open: a wait
         // cannot take the user's work for the agent's.
-        if self.window.is_none() && matches!(tool, "inspect" | "list_fields" | "wait" | "cancel") {
+        if self.window.is_none()
+            && self.restoring.is_none()
+            && matches!(
+                tool,
+                "inspect" | "list_fields" | "wait" | "cancel" | "list_checkpoints"
+            )
+        {
             b.app_mut().mcp_outside();
         }
         match tool {
@@ -656,6 +718,9 @@ impl Agent {
             "batch" => self.batch(b, &args, deadline, reply),
             "wait" => self.wait(&args, deadline, reply),
             "cancel" => self.cancel(b, &args, deadline, reply),
+            "checkpoint" => self.checkpoint(b, &args, reply),
+            "restore_checkpoint" => self.restore(b, &args, deadline, reply),
+            "list_checkpoints" => self.give(reply, Ok(list_checkpoints(b))),
             _ => self.give_plain(reply, Err(format!("There is no tool {tool}."))),
         }
     }
@@ -749,6 +814,13 @@ impl Agent {
                 }
             }
         }
+        // A checkpoint's part loaded: the restore is checked again and
+        // committed, in this turn.
+        if let Some(loaded) = self.restoring.as_ref().and_then(|r| r.candidate.take())
+            && let Some(r) = self.restoring.take()
+        {
+            self.commit_restore(b, r, Some(loaded));
+        }
         // A pick command's clicks are made once picking is on and the app
         // has settled, as a user clicks; its window closes after them.
         let due =
@@ -769,6 +841,11 @@ impl Agent {
         for w in due {
             let answer = if self.reads.working(&w.id) {
                 Ok(self.reads.still_running(&w.id))
+            } else if self.restoring.as_ref().is_some_and(|r| r.id == w.id) {
+                let why = "The checkpoint's part is still loading; nothing is restored yet. Call wait with its command_id for the final result.";
+                Ok(Report::of(b, Outcome::StillRunning, Some(why.into()))
+                    .with_id(&w.id)
+                    .json())
             } else {
                 Ok(still_running(b, &w.id))
             };
@@ -785,10 +862,11 @@ impl Agent {
     }
 
     fn busy(&self, b: &impl Backend) -> Option<Answer> {
-        let (name, id) = match (&self.window, &self.batch) {
-            (Some(w), _) => (w.name.to_string(), w.id.clone()),
-            (None, Some(_)) => ("batch".to_string(), "the batch".to_string()),
-            (None, None) => return None,
+        let (name, id) = match (&self.window, &self.batch, &self.restoring) {
+            (Some(w), ..) => (w.name.to_string(), w.id.clone()),
+            (None, Some(_), _) => ("batch".to_string(), "the batch".to_string()),
+            (None, None, Some(r)) => ("restore_checkpoint".to_string(), r.id.clone()),
+            (None, None, None) => return None,
         };
         let why = format!(
             "Nothing was done; the previous command ({name}, {id}) is still running. Call wait, then retry."
@@ -925,6 +1003,8 @@ impl Agent {
             cancelled: false,
             records,
             clicks,
+            stepped: None,
+            notes: vec![],
         });
         Start::Opened(id)
     }
@@ -1016,6 +1096,10 @@ impl Agent {
             report.picks = Some(done.picks);
             report.clicks = done.clicks;
         }
+        report.notes = std::mem::take(&mut w.notes);
+        if let Some(stepped) = w.stepped.take() {
+            report.changed = stepped.changed;
+        }
         if let Some(entry) = entry {
             if !entry.events.is_empty() {
                 report.notes.push(format!(
@@ -1023,7 +1107,7 @@ impl Agent {
                     entry.events.join("; ")
                 ));
             }
-            report.changed = entry.changed;
+            report.changed.extend(entry.changed);
         }
         if !theirs.is_empty() {
             report.notes.push(format!(
@@ -1057,7 +1141,10 @@ impl Agent {
             let result = result.clone();
             return self.give(reply, Ok(result));
         }
-        if self.window.as_ref().is_some_and(|w| w.id == id) || self.reads.working(id) {
+        if self.window.as_ref().is_some_and(|w| w.id == id)
+            || self.reads.working(id)
+            || self.restoring.as_ref().is_some_and(|r| r.id == id)
+        {
             let id = id.to_string();
             return self.waiters.push(Waiter {
                 id,
@@ -1095,6 +1182,14 @@ impl Agent {
             }
             return self.give(reply, Ok(result));
         }
+        if self.restoring.as_ref().is_some_and(|r| r.id == id) {
+            let answer = json!({
+                "cancelled": false,
+                "command_id": id,
+                "reason": "A checkpoint restore cannot be cancelled while its part loads: wait for it. Nothing is restored until it is loaded and checked again.",
+            });
+            return self.give(reply, Ok(answer));
+        }
         if !self.window.as_ref().is_some_and(|w| w.id == id) {
             return self.give_plain(
                 reply,
@@ -1119,6 +1214,209 @@ impl Agent {
             deadline,
             reply,
         });
+    }
+
+    /// `checkpoint {name}`: the job kept as it is (`checkpoint::take`),
+    /// once no command's work is settling, with the user's changes found
+    /// first.
+    fn checkpoint(&mut self, b: &mut impl Backend, args: &Value, reply: Reply) {
+        let Some(name) = args.get("name").and_then(Value::as_str) else {
+            return self.give_plain(reply, Err("`name` is missing: name the checkpoint.".into()));
+        };
+        if let Some(busy) = self.busy(b) {
+            return self.give(reply, busy);
+        }
+        b.app_mut().mcp_outside();
+        let folder = b.session_folder();
+        let answer = match checkpoint::take(b.app_mut(), name, folder.as_deref()) {
+            Ok(meta) => Ok(json!({
+                "outcome": "done",
+                "backend": b.kind(),
+                "checkpoint": {"name": meta.name, "revision": meta.revision, "taken": checkpoint::utc(meta.taken)},
+                "checkpoints": list_checkpoints(b)["checkpoints"],
+            })),
+            Err(why) => refuse(b, why),
+        };
+        self.give(reply, answer)
+    }
+
+    /// `restore_checkpoint {name, discard_user_changes?}`: checked first,
+    /// changing nothing (another project, the user's changes since, a
+    /// running machine); the checkpoint's part loaded as a candidate when
+    /// it is not the one loaded; then committed (`commit_restore`).
+    fn restore(&mut self, b: &mut impl Backend, args: &Value, deadline: Instant, reply: Reply) {
+        let Some(name) = args.get("name").and_then(Value::as_str) else {
+            return self.give_plain(
+                reply,
+                Err("`name` is missing: give a checkpoint's name from list_checkpoints.".into()),
+            );
+        };
+        let discard = args.get("discard_user_changes").and_then(Value::as_bool) == Some(true);
+        let expected = match if_revision(args) {
+            Ok(r) => r,
+            Err(e) => return self.give_plain(reply, Err(e)),
+        };
+        if let Some(busy) = self.busy(b) {
+            return self.give(reply, busy);
+        }
+        // What changed since the last window closed is the user's.
+        b.app_mut().mcp_outside();
+        if let Some(r) = expected
+            && r != b.app().mcp.log.revision
+        {
+            let answer = conflict(b, r);
+            return self.give(reply, answer);
+        }
+        let folder = b.session_folder();
+        let found = checkpoint::load(b.app(), name, folder.as_deref());
+        let found = found.and_then(|cp| {
+            match checkpoint::other_project(b.app(), cp.projects, &cp.doc.project_id) {
+                Some(why) => Err(why.to_string()),
+                None => Ok(cp),
+            }
+        });
+        let cp = match found {
+            Ok(cp) => cp,
+            Err(why) => {
+                let answer = refuse(b, why);
+                return self.give(reply, answer);
+            }
+        };
+        let log = &b.app().mcp.log;
+        let theirs: Vec<Entry> = (log.since(cp.revision))
+            .filter(|e| e.source != state::Source::Agent)
+            .cloned()
+            .collect();
+        if !theirs.is_empty() && !discard {
+            let why = format!(
+                "Nothing was done: the user changed the job since checkpoint \"{name}\" (revision {}), and restoring it would undo their work (entries). Call again with discard_user_changes: true to restore it anyway.",
+                cp.revision
+            );
+            let mut report = Report::of(b, Outcome::Refused, Some(why));
+            report.entries = theirs;
+            return self.give(reply, Ok(report.json()));
+        }
+        if b.app().locked() {
+            let answer = refuse(b, LOCKED.into());
+            return self.give(reply, answer);
+        }
+        self.count += 1;
+        let id = format!("restore_checkpoint-{}", self.count);
+        self.waiters.push(Waiter {
+            id: id.clone(),
+            deadline,
+            reply,
+        });
+        let began = b.app().mcp.log.last.as_ref().map(|s| s.hash);
+        let needs_part = checkpoint::needs_part(b.app(), &cp);
+        #[cfg(test)]
+        let slow = b.app().mcp.slow_candidate;
+        #[cfg(not(test))]
+        let slow = None;
+        let candidate = match needs_part {
+            true => checkpoint::Candidate::load(&cp, slow),
+            false => checkpoint::Candidate::default(),
+        };
+        let r = Restoring {
+            id,
+            checkpoint: Box::new(cp),
+            discard,
+            began,
+            candidate,
+        };
+        match needs_part {
+            true => self.restoring = Some(r),
+            false => self.commit_restore(b, r, None),
+        }
+    }
+
+    /// The turn that commits a restore: refused if its part is not the
+    /// checkpoint's, if the user changed the job since the restore began
+    /// (unless discarding), or while the machine runs; otherwise the
+    /// checkpoint put back (`App::restore`) as one step of the revision,
+    /// and a window open until what the app works out again has settled.
+    fn commit_restore(
+        &mut self,
+        b: &mut impl Backend,
+        r: Restoring,
+        loaded: Option<Result<crate::mesh::Mesh, String>>,
+    ) {
+        let mesh = match loaded {
+            None => None,
+            Some(Ok(mesh)) => Some(mesh),
+            Some(Err(why)) => {
+                let answer = Report::of(b, Outcome::Refused, Some(why))
+                    .with_id(&r.id)
+                    .json();
+                return self.finish(&r.id, answer);
+            }
+        };
+        let app = b.app_mut();
+        let now = state::snapshot(app);
+        let theirs = app.mcp_events().to_vec();
+        if Some(now.hash) != r.began && !theirs.is_empty() && !r.discard {
+            // Theirs, and kept.
+            app.mcp_outside();
+            let why = format!(
+                "Nothing was restored: the job changed while the checkpoint's part loaded ({}). Their change is kept. Call again with discard_user_changes: true to restore it anyway.",
+                theirs.join("; ")
+            );
+            let answer = Report::of(b, Outcome::Refused, Some(why))
+                .with_id(&r.id)
+                .json();
+            return self.finish(&r.id, answer);
+        }
+        if app.locked() {
+            let answer = Report::of(b, Outcome::Refused, Some(LOCKED.into()))
+                .with_id(&r.id)
+                .json();
+            return self.finish(&r.id, answer);
+        }
+        // What changed meanwhile, discarded, is still logged as theirs.
+        app.mcp_outside();
+        let records = Records::of(&app.doc);
+        let status = app.status.clone();
+        app.restore(&r.checkpoint, mesh);
+        let stepped = app.mcp_restored(&r.checkpoint.name);
+        let saved = !app.project_dirty;
+        let note = format!(
+            "Checkpoint \"{}\" (revision {}) restored as revision {}. {}",
+            r.checkpoint.name,
+            r.checkpoint.revision,
+            stepped.revision,
+            match (saved, &app.project_path) {
+                (true, Some(p)) => format!("The project is as its file {} holds it.", p.display()),
+                (false, Some(p)) => format!(
+                    "The project differs from its file {}: it is not saved.",
+                    p.display()
+                ),
+                (_, None) => "The project has no file: it is not saved.".to_string(),
+            }
+        );
+        self.window = Some(Window {
+            id: r.id,
+            name: "restore_checkpoint",
+            status,
+            expect: None,
+            cancelled: false,
+            records: Some(records),
+            clicks: None,
+            stepped: Some(stepped),
+            notes: vec![note],
+        });
+    }
+
+    /// A command's final `answer` kept for `wait` and given to the calls
+    /// waiting for it.
+    fn finish(&mut self, id: &str, answer: Value) {
+        self.results.insert(id.to_string(), answer.clone());
+        let (mine, others): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiters)
+            .into_iter()
+            .partition(|w| w.id == id);
+        self.waiters = others;
+        for w in mine {
+            self.give(w.reply, Ok(answer.clone()));
+        }
     }
 
     fn batch(&mut self, b: &mut impl Backend, args: &Value, deadline: Instant, reply: Reply) {
@@ -1278,6 +1576,33 @@ pub fn call_now(agent: &mut Agent, b: &mut impl Backend, tool: &str, args: Value
     }
     let taken = answer.lock().unwrap().take();
     taken.unwrap_or_else(|| Err("no answer".into()))
+}
+
+/// `list_checkpoints`: each with whether it can be restored now.
+fn list_checkpoints(b: &impl Backend) -> Value {
+    let app = b.app();
+    let log = &app.mcp.log;
+    let list: Vec<Value> = (app.mcp.checkpoints.list.iter())
+        .map(|m| {
+            let why = checkpoint::other_project(app, m.projects, &m.project_id)
+                .map(String::from)
+                .or_else(|| {
+                    (log.since(m.revision)).any(|e| e.source != state::Source::Agent).then(|| {
+                        "The user changed the job since: restoring it needs discard_user_changes: true."
+                            .to_string()
+                    })
+                });
+            json!({
+                "name": m.name,
+                "revision": m.revision,
+                "taken": checkpoint::utc(m.taken),
+                "title": m.title,
+                "restorable": why.is_none(),
+                "why_not": why,
+            })
+        })
+        .collect();
+    json!({"backend": b.kind(), "checkpoints": list, "most": checkpoint::MOST})
 }
 
 fn no_command(name: &str) -> String {

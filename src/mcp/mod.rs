@@ -18,6 +18,8 @@
 //!   it is, the part, pictures, a hand setup's steps), on a snapshot of the
 //!   job off the `App`'s thread, heavy ones kept from a running machine.
 //! - `rules`: the machining rules by topic, for `guide`.
+//! - `checkpoint`: the job kept by name, and put back.
+pub mod checkpoint;
 pub mod class;
 pub mod commands;
 pub mod engine;
