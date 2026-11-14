@@ -1422,8 +1422,9 @@ fn a_counterbore_far_from_the_setups_origin_is_planned_as_near_it() {
 /// (LIO-455: setup 4's two upper counterbores, far from its origin, were
 /// refused), and every setup's Steps build. Each Slot plans and simulates
 /// in seconds, and the arc search a Slot's pick runs over the whole part
-/// stays off its threads' roots (LIO-481: setup 4's one counterbore took
-/// ten minutes, its picks as long). Run it on a release build.
+/// grows no arc along its threads' crests, and is kept for the next
+/// (LIO-481: setup 4's one counterbore took ten minutes, its picks as
+/// long). Run it on a release build.
 #[test]
 #[ignore = "requires a private copy of the user's adapter project (AXIS_ADAPTER_COPY)"]
 fn the_users_adapter_project_plans_every_slot() {
@@ -1457,16 +1458,33 @@ fn the_users_adapter_project_plans_every_slot() {
     assert_eq!(slots.len(), 8);
     eprintln!("{slots:#?}");
     assert!(slots.iter().all(|(_, s)| *s < 10.), "{slots:#?}");
+    // Each setup's search over the whole part, as a pick's first: fewer
+    // circles fitted than the one wall it grew from on main (3.75 million),
+    // and the same again none.
     let mut searches = vec![];
     for s in &doc.setups {
+        cam::arcs::forget();
         cam::arcs::FITS.with(|n| n.set(0));
         let took = std::time::Instant::now();
-        cam::arcs::arcs_among(s, &mesh, &cam::arcs::upright(s, &mesh));
+        let first = cam::arcs::arcs_among(s, &mesh, &cam::arcs::upright(s, &mesh));
         let fits = cam::arcs::FITS.with(|n| n.get());
-        searches.push((s.name(), fits, took.elapsed().as_secs_f32()));
+        let took = took.elapsed().as_secs_f32();
+        let again = cam::arcs::arcs_among(s, &mesh, &cam::arcs::upright(s, &mesh));
+        assert_eq!(again, first, "{}", s.name());
+        searches.push((
+            s.name(),
+            fits,
+            cam::arcs::FITS.with(|n| n.get()) - fits,
+            took,
+        ));
     }
     eprintln!("{searches:#?}");
-    assert!(searches.iter().all(|(_, _, s)| *s < 1.), "{searches:#?}");
+    assert!(
+        searches
+            .iter()
+            .all(|(_, fits, again, _)| *fits < 1_000_000 && *again == 0),
+        "{searches:#?}"
+    );
     for si in 0..doc.setups.len() {
         if let Err(e) = crate::steps::shown(&doc, &mesh, si) {
             panic!("setup {}: {e}", si + 1);
