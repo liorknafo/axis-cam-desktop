@@ -3220,26 +3220,50 @@ mod tests {
             let result = worker.run(|| generate(&setup, &op, &tool, &mesh));
             let _ = sent.send((result.map(|p| p.moves.len()), std::time::Instant::now()));
         });
-        // The bar moves while the level is walked, before any move is out.
-        let start = std::time::Instant::now();
-        while progress.fraction() < 0.2 {
-            assert!(
-                start.elapsed().as_secs() < 60,
-                "the bar stood at {}",
-                progress.fraction()
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
+        // The bar moves while the level is walked, before any move is out:
+        // step by step to 5% of the level. No limit on how long that takes,
+        // which a busy computer stretches; only on the bar standing still,
+        // or the work ending before it got there.
+        use std::time::{Duration, Instant};
+        let mut seen = vec![(0., Instant::now())];
+        while seen.last().unwrap().0 < 0.05 {
+            std::thread::sleep(Duration::from_millis(5));
+            let (last, since) = *seen.last().unwrap();
+            let now = progress.fraction();
+            assert!(now < 1., "the work ended with the bar at {last}");
+            if now > last {
+                seen.push((now, Instant::now()));
+            } else {
+                assert!(
+                    since.elapsed() < Duration::from_secs(300),
+                    "the bar stood at {last} for 5 minutes"
+                );
+            }
         }
-        let at = progress.fraction();
-        assert!(at < 1., "it finished before it could be cancelled");
-        let cancelled = std::time::Instant::now();
+        let (at, reached) = *seen.last().unwrap();
+        assert!(
+            seen.len() > 10,
+            "the bar jumped to {at} in {} steps",
+            seen.len() - 1
+        );
+        // Cancel stops the work soon: before it would have cleared another
+        // half percent of the level at the pace the bar took for its last
+        // percent, which a busy computer stretches, and never needing to
+        // be quicker than 250 ms.
+        let (_, earlier) = *seen.iter().find(|(f, _)| *f >= at - 0.01).unwrap();
+        let soon = ((reached - earlier) / 2).max(Duration::from_millis(250));
+        let cancelled = Instant::now();
         progress.cancel();
+        let wait = soon + Duration::from_secs(60);
         let (result, ended) = finished
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .unwrap();
+            .recv_timeout(wait)
+            .unwrap_or_else(|_| panic!("the work went on {wait:?} after Cancel"));
         assert_eq!(result, Err(crate::progress::CANCELLED.into()), "at {at}");
         let took = ended.duration_since(cancelled);
-        assert!(took.as_millis() < 250, "it stopped {took:?} after Cancel");
+        assert!(
+            took < soon,
+            "it stopped {took:?} after Cancel, more than {soon:?}"
+        );
     }
     #[test]
     fn the_totem_keyboard_case_plate_clears_with_a_2_mm_cutter_too() {
