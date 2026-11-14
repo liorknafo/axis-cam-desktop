@@ -43,6 +43,7 @@ pub enum NoArc {
 /// The refusal for a wall that curves round the part (`NoArc::Outside`).
 pub const OUTSIDE: &str = "That wall curves round the outside of the part (a boss or a rounded corner), not round a hole: a Drill drills holes. Click the wall of a hole, or part of one.";
 /// One upright face of the part (a mesh surface) seen from above.
+#[derive(Clone)]
 struct Facet {
     /// Its corners seen from above, each once.
     xy: Vec<(f64, f64)>,
@@ -896,25 +897,35 @@ fn search(
         bounds: g.bounds,
     };
     threaded.extend(crate::pocket::thread_band_walls(&banded));
+    // Every wall among `ids`, the thread's too, for the growth before
+    // LIO-481 (`onto_thread`).
+    let both = facets.clone();
     let (thread, facets): (HashMap<usize, Facet>, HashMap<usize, Facet>) =
         (facets.into_iter()).partition(|(id, _)| threaded.contains(id));
     if facets.len() < 3 {
         return vec![];
     }
     let at = corners(&facets);
-    // An arc that meets a thread's wall on its own circle would have grown
-    // on round the thread, a whole round: the thread's hole's, never an
-    // arc (as before LIO-481, without growing along all its crests). One
-    // whose circle the thread's walls it meets are off (a slot's or a
-    // corner's round over a thread, of another radius) is its own.
+    // Whether the arc `members` would have grown on onto a thread's wall,
+    // as it did before LIO-481 (`grow_from`'s step: the wall meets one of
+    // them at a corner, all their corners fit one circle with it, and it
+    // turns from that one as two chords of the circle do): it would have
+    // gone on round the thread, a whole round, the thread's hole's and
+    // never an arc. Without growing along all its crests. An arc whose
+    // circle the thread's walls it meets are off (a slot's or a corner's
+    // round over a thread, of another radius), or that turns away from
+    // them (a rounded outside corner on a thread's end, as wide as its
+    // root), stopped there before too, and is its own.
     let thread_at = corners(&thread);
     let onto_thread = |members: &[usize]| {
-        fit(&facets, members).is_some_and(|(c, r, _)| {
-            let on =
-                |q: &(f64, f64)| ((q.0 - c[0]).hypot(q.1 - c[1]) - r).abs() <= 0.005 + r * 1e-4;
-            (members.iter().flat_map(|m| &facets[m].xy))
+        members.iter().any(|m| {
+            (facets[m].xy.iter())
                 .flat_map(|p| thread_at.get(&key(*p)).into_iter().flatten())
-                .any(|t| thread[t].xy.iter().all(on))
+                .any(|&t| {
+                    let mut with = members.to_vec();
+                    with.push(t);
+                    fit(&both, &with).is_some_and(|(_, r, _)| inscribed(&both[m], &both[&t], r))
+                })
         })
     };
     // The part's upright facets, for where a curve goes on past an arc.
@@ -1968,6 +1979,35 @@ pub(crate) mod tests {
         let op = crate::corner::tests::corner_op(&mesh, &tool, ids.iter().copied().collect());
         let picked = crate::corner::picked(&setup, &mesh, &op);
         assert!(picked.is_ok(), "{picked:#?}");
+    }
+    #[test]
+    fn a_rounded_corner_on_a_threads_end_is_found_among_all_the_walls() {
+        // LIO-481 review: an R6 quarter-round outside corner, 3 mm (and 6
+        // mm) high, standing on the top end of a modelled M12×1.75 thread
+        // (Z0 to 12), on its root's circle. Among all the part's walls, the
+        // thread's with them, it is a corner: it turns away from the thread's
+        // walls it meets, and grew no further onto them before LIO-481
+        // either.
+        for height in [3f32, 6.] {
+            let mut tris =
+                crate::thread::tests::modeled([0., 0.], 12., 1.75, 60., true, true, 12., 0.);
+            let at = |i: usize, z: f32| {
+                let a = i as f32 * std::f32::consts::TAU / 96.;
+                [6. * a.cos(), 6. * a.sin(), z]
+            };
+            for i in 24..48 {
+                let (a, b) = (at(i, 12.), at(i + 1, 12.));
+                let (c, d) = (at(i + 1, 12. + height), at(i, 12. + height));
+                tris.push([a, b, c]);
+                tris.push([a, c, d]);
+            }
+            let mesh = mesh::normalize(tris).unwrap();
+            let (setup, _, _) = fixture(Strategy::Drill);
+            let found = outside_arcs_among(&setup, &mesh, &upright(&setup, &mesh));
+            assert_eq!(found.len(), 1, "{height} mm: {found:#?}");
+            assert!((found[0].span - 90.).abs() < 1., "{found:#?}");
+            assert_eq!(crate::corner::all(&setup, &mesh).len(), 1, "{height} mm");
+        }
     }
     #[test]
     fn a_short_outside_corner_on_a_threads_relieved_root_is_still_a_corner() {
