@@ -9725,6 +9725,10 @@ impl App {
                         // the last known state (a note said while connecting
                         // is dropped; the refusal is what matters now).
                         self.status = format!("{PI_REFUSED}{name}{REFUSED_WHY}{why}");
+                    } else if let Some(name) = refused.filter(|_| c.snapshot.state.is_none()) {
+                        // Let in after a refusal, the Pi's state not known
+                        // yet: connecting again, not still refused.
+                        self.status = format!("Connecting to {name}…");
                     } else if let (Some(name), Some(state)) = (name, &c.snapshot.state) {
                         use uc100::controller::State;
                         self.status = match state {

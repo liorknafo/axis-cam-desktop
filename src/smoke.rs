@@ -3649,8 +3649,12 @@ flood = { pin = 8 }
     fn a_refusing_pi_is_said_on_the_status_line_until_it_lets_this_computer_in() {
         use crate::control::{Action as A, NOT_SENT_PI_REFUSED};
         let dir = tempfile::tempdir().unwrap();
-        let (mut a, _server) = pi_app(dir.path());
+        let (mut a, server) = pi_app(dir.path());
         a.page = Page::Control;
+        // Through a closed gate: once let in, the Pi's Welcome crosses and
+        // nothing more until it opens.
+        let gate = Gate::to(server.addr(), false);
+        let _ = a.update(Message::PiAddress(gate.addr.to_string()));
         let clients = uc100_remote::data::Data {
             dir: dir.path().join("pi"),
         }
@@ -3694,8 +3698,29 @@ flood = { pin = 8 }
             );
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        // Paired again: let in at the next try, within 5 s.
+        // Paired again: let in at the next try, within 5 s, the Pi's state
+        // not known yet: connecting, the refusal gone.
         std::fs::rename(&kept, &clients).unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(7);
+        while conn(&a).pi_refused().is_some()
+            || conn(&a).link.as_ref().is_none_or(|l| l.name.is_none())
+        {
+            let _ = a.update(Message::Tick);
+            assert!(std::time::Instant::now() < end, "never let in");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = a.update(Message::Tick);
+        assert!(conn(&a).snapshot.state.is_none() && conn(&a).pi_down());
+        assert_eq!(a.status, format!("Connecting to {name}…"));
+        assert_eq!(problems(&a), vec![crate::run::PI_CONNECTING.to_string()]);
+        // Through the client's silence time and its reconnect: still so.
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while std::time::Instant::now() < end {
+            let _ = a.update(Message::Tick);
+            assert_eq!(a.status, format!("Connecting to {name}…"));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        gate.set_open(true);
         pi_live(&mut a, true, "the link live");
         assert!(
             a.status.starts_with(&format!("Connected to {name}: "))
@@ -3705,6 +3730,15 @@ flood = { pin = 8 }
         );
         let p = problems(&a);
         assert!(!p.iter().any(|t| t.contains("refused")), "{p:?}");
+        // Live and then cut: a lost link, as before.
+        gate.set_cut(true);
+        pi_live(&mut a, false, "the link lost");
+        assert!(
+            a.status
+                .starts_with(&format!("No link to the Pi of {name}: ")),
+            "{}",
+            a.status
+        );
     }
 
     /// Renders the Control page's Machine tab while connecting to the Pi
