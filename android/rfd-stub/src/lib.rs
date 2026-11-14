@@ -40,6 +40,9 @@ impl FileHandle {
         &self.0
     }
     pub fn file_name(&self) -> String {
-        self.0.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+        self.0
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 }

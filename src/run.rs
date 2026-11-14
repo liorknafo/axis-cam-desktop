@@ -3771,7 +3771,12 @@ pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> Tabl
 /// machine Z 0 reads (where that is over the part). The computer's live
 /// checks of the work zero (`rotary_problems`) are the tablet's to make
 /// before it runs (LIO-476).
-fn tablet_start(doc: &Document, mesh: &Mesh, si: usize, p: &Checked) -> Result<TabletStart, Vec<String>> {
+fn tablet_start(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    p: &Checked,
+) -> Result<TabletStart, Vec<String>> {
     let blocks = &p.blocks;
     let end = (blocks.iter())
         .position(|b| matches!(b, Block::Descend { .. }))
@@ -3785,7 +3790,9 @@ fn tablet_start(doc: &Document, mesh: &Mesh, si: usize, p: &Checked) -> Result<T
         _ => None,
     });
     let Some(xy) = over else {
-        return Err(vec!["The tool run has no first point to start over. Check the setup again.".into()]);
+        return Err(vec![
+            "The tool run has no first point to start over. Check the setup again.".into(),
+        ]);
     };
     // The work offset that puts the work zero where the setup has it on
     // the machine; without it, any: only machine Z 0 depends on it.
@@ -3809,7 +3816,14 @@ fn tablet_start(doc: &Document, mesh: &Mesh, si: usize, p: &Checked) -> Result<T
         true => 0.,
         false => clearance_plane(blocks) as f64 - p.datum[2] as f64 + offset[2],
     };
-    let start = [at.x + offset[0], at.y + offset[1], top, at.a + offset[3], 0., 0.];
+    let start = [
+        at.x + offset[0],
+        at.y + offset[1],
+        top,
+        at.a + offset[3],
+        0.,
+        0.,
+    ];
     match way_out(p, blocks, offset, start) {
         Ok(leave) if leave == Leave::default() => Ok(at),
         _ => Err(vec![format!(

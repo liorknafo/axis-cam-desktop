@@ -142,7 +142,10 @@ fn answer(mut s: TcpStream, state_path: &Path, computer: &str) -> io::Result<()>
                 return Err(bad());
             };
             let known = tablets(state_path)?.clients()?;
-            if !known.iter().any(|c| c.id == client && c.verify(&nonce, &mac)) {
+            if !known
+                .iter()
+                .any(|c| c.id == client && c.verify(&nonce, &mac))
+            {
                 return wire::write(&mut s, &ToTablet::Refused(NOT_PAIRED.into()));
             }
             let shared = shared(state_path);
@@ -275,7 +278,8 @@ pub fn forget(dir: &Path) -> Result<(), String> {
 pub fn discover() -> Option<String> {
     let udp = UdpSocket::bind(("0.0.0.0", 0)).ok()?;
     udp.set_broadcast(true).ok()?;
-    udp.set_read_timeout(Some(Duration::from_millis(1500))).ok()?;
+    udp.set_read_timeout(Some(Duration::from_millis(1500)))
+        .ok()?;
     udp.send_to(ASK, ("255.255.255.255", PORT)).ok()?;
     let mut buf = [0; 256];
     let (n, from) = udp.recv_from(&mut buf).ok()?;
@@ -370,7 +374,13 @@ pub fn sync(dir: &Path) -> Result<usize, String> {
         }
     };
     let token: Token = link.token.parse()?;
-    wire::write(&mut s, &ToComputer::Hello { client: token.client }).map_err(lost)?;
+    wire::write(
+        &mut s,
+        &ToComputer::Hello {
+            client: token.client,
+        },
+    )
+    .map_err(lost)?;
     let nonce = match wire::read(&mut s, SMALL).map_err(lost)? {
         ToTablet::Nonce(n) => n,
         ToTablet::Refused(why) => return Err(why),
@@ -404,7 +414,12 @@ pub fn sync(dir: &Path) -> Result<usize, String> {
         fetched += 1;
     }
     // The computer's order first, then those it no longer shares.
-    let order = |k: &Shared| listed.iter().position(|l| l.key == k.key).unwrap_or(usize::MAX);
+    let order = |k: &Shared| {
+        listed
+            .iter()
+            .position(|l| l.key == k.key)
+            .unwrap_or(usize::MAX)
+    };
     kept.sort_by_key(order);
     let json = serde_json::to_vec_pretty(&kept).map_err(|e| e.to_string())?;
     crate::storage::write_atomic(&projects(dir).join("index.json"), &json)?;
@@ -561,7 +576,10 @@ mod tests {
         let dir = tablet.path();
         assert_eq!(sync(dir).unwrap_err(), "Not paired with a computer.");
         let why = pair(dir, &address, "000000", "Shop tablet").unwrap_err();
-        assert!(why.contains("Pair a tablet") && !why.contains("uc100"), "{why}");
+        assert!(
+            why.contains("Pair a tablet") && !why.contains("uc100"),
+            "{why}"
+        );
         let code = new_code(&state).unwrap();
         let wrong = if code == "000000" { "111111" } else { "000000" };
         let why = pair(dir, &address, wrong, "Shop tablet").unwrap_err();
@@ -576,10 +594,12 @@ mod tests {
         let open = &kept(dir)[0];
         assert_eq!(open.key, "open");
         let unpacked = tempfile::tempdir().unwrap();
-        let (doc, _, _) =
-            crate::bundle::open(&kept_file(dir, &open.key), unpacked.path()).unwrap();
+        let (doc, _, _) = crate::bundle::open(&kept_file(dir, &open.key), unpacked.path()).unwrap();
         assert_eq!(doc.title, "Open job");
-        assert_eq!(fs::read(doc.file.unwrap().path).unwrap(), b"solid x\nendsolid x\n");
+        assert_eq!(
+            fs::read(doc.file.unwrap().path).unwrap(),
+            b"solid x\nendsolid x\n"
+        );
 
         // Unchanged: nothing fetched. Changed: only that one.
         assert_eq!(sync(dir).unwrap(), 0);

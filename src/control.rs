@@ -7260,7 +7260,10 @@ spindle_max_rpm = 24000
         // A at the first side's angle.
         assert_eq!(start.a, 0., "{start:?}");
         let o = c.snapshot.work_offset;
-        go_to(&mut c, [start.x + o[0], start.y + o[1], r.lift.z, start.a + o[3]]);
+        go_to(
+            &mut c,
+            [start.x + o[0], start.y + o[1], r.lift.z, start.a + o[3]],
+        );
         let problems = c.run.as_ref().unwrap().problems(&c, &doc);
         assert!(problems.is_empty(), "{problems:?}");
         let here = c.snapshot.machine_pos;
