@@ -3103,7 +3103,8 @@ flood = { pin = 8 }
 
     /// A relay to `target` passing this computer's frames on, one part of a
     /// message in parts every `pace` (a slow link), and noting the snapshot
-    /// number each part carries.
+    /// number each part carries. It stops taking computers once the numbers
+    /// are dropped; a link already open ends when either side closes it.
     fn pacing_relay(
         target: std::net::SocketAddr,
         pace: std::time::Duration,
@@ -3111,17 +3112,26 @@ flood = { pin = 8 }
         std::net::SocketAddr,
         std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
     ) {
-        use std::io::Write;
+        use std::io::{ErrorKind, Write};
         use std::net::{Shutdown, TcpListener, TcpStream};
         use std::sync::{Arc, Mutex};
         use uc100_remote::wire::{self, MAX_FRAME, ToServer};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
         let stamps = Arc::new(Mutex::new(Vec::new()));
-        let noted = stamps.clone();
+        let noted = Arc::downgrade(&stamps);
         std::thread::spawn(move || {
-            for client in listener.incoming() {
-                let Ok(client) = client else { return };
+            while noted.strong_count() > 0 {
+                let client = match listener.accept() {
+                    Ok((client, _)) => client,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                client.set_nonblocking(false).unwrap();
                 let server = TcpStream::connect(target).unwrap();
                 let (mut up_from, mut up_to) =
                     (client.try_clone().unwrap(), server.try_clone().unwrap());
@@ -3129,7 +3139,9 @@ flood = { pin = 8 }
                 std::thread::spawn(move || {
                     while let Ok(f) = wire::read_frame(&mut up_from, MAX_FRAME) {
                         if let Ok(ToServer::Part { heard, .. }) = wire::decode::<ToServer>(&f) {
-                            noted.lock().unwrap().push(heard);
+                            if let Some(stamps) = noted.upgrade() {
+                                stamps.lock().unwrap().push(heard);
+                            }
                             std::thread::sleep(pace);
                         }
                         let len = (f.len() as u32).to_le_bytes();
