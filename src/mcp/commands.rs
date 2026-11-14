@@ -133,6 +133,8 @@ pub struct Command {
     /// view, which leave the job alone.
     pub while_locked: bool,
     pub on: On,
+    /// Its `setup` argument is a value of its own, not where its operation is.
+    own_setup: bool,
     params: fn() -> Vec<(&'static str, Value, bool)>,
     examples: fn() -> Vec<Value>,
     precondition: fn(&Ctx) -> Result<(), Problem>,
@@ -152,6 +154,7 @@ fn cmd(name: &'static str, group: &'static str) -> Command {
         effect: "",
         while_locked: false,
         on: On::Nothing,
+        own_setup: false,
         params: Vec::new,
         examples: || vec![json!({})],
         precondition: |_| Ok(()),
@@ -218,6 +221,11 @@ impl Command {
         if self.requires == "Nothing." {
             self.requires = "An operation: the selected one, or `operation`.";
         }
+        self
+    }
+    /// Its `setup` argument is not an address (`set_pin_setup`'s pin setup).
+    fn own_setup(mut self) -> Self {
+        self.own_setup = true;
         self
     }
     fn params(mut self, p: fn() -> Vec<(&'static str, Value, bool)>) -> Self {
@@ -305,6 +313,17 @@ impl Command {
             clicks,
         })
     }
+    /// The setup and operation its arguments address (`address`).
+    pub fn resolve(&self, app: &App, args: &Value) -> Result<Addressed, Problem> {
+        if self.own_setup {
+            let mut own = args.clone();
+            if let Some(o) = own.as_object_mut() {
+                o.remove("setup");
+            }
+            return resolve(self.on, app, &own);
+        }
+        resolve(self.on, app, args)
+    }
     /// Its precondition: what must hold before anything is sent.
     pub fn check(&self, ctx: &Ctx) -> Result<(), Problem> {
         (self.precondition)(ctx)
@@ -326,11 +345,7 @@ fn select_first(on: On, ctx: &Ctx) -> Result<Vec<Message>, Problem> {
             let Some(si) = ctx.setup else {
                 return refused("There is no setup: add one first (add_setup).");
             };
-            Ok(if app.doc.setups[si].id == app.doc.active {
-                vec![]
-            } else {
-                vec![Message::SelectSetup(si)]
-            })
+            Ok(selecting(app, si, None))
         }
         On::Operation => {
             let Some((si, oi)) = ctx.operation else {
@@ -338,43 +353,65 @@ fn select_first(on: On, ctx: &Ctx) -> Result<Vec<Message>, Problem> {
                     "No operation is selected: give `operation`, or select one (select_operation).",
                 );
             };
-            let mut m = vec![];
-            if app.doc.setups[si].id != app.doc.active {
-                m.push(Message::SelectSetup(si));
-            }
-            if app.doc.setups[si].id != app.doc.active || app.selected != Some(oi) {
-                m.push(Message::SelectOp(oi));
-            }
-            Ok(m)
+            Ok(selecting(app, si, Some(oi)))
         }
     }
 }
 
 /// The setup a command acts on, and its operation: (setup, operation).
 pub type Addressed = (Option<usize>, Option<(usize, usize)>);
-/// Resolves what `on` addresses in `args`: the setup and operation the
-/// command acts on, before its precondition runs.
-pub fn resolve(on: On, app: &App, args: &Value) -> Result<Addressed, Problem> {
+
+/// The one place `setup` and `operation` arguments become indices, for every
+/// command and read: an operation by index counts in the given `setup`, else
+/// in the active one; an operation by id names its own setup (refused when
+/// `setup` is also given and the id is not in it). Without `operation`, the
+/// selected one, when its setup is the one addressed. Returns (setup,
+/// operation); the setup is the operation's, else `setup`, else the active
+/// one. `with_op` false leaves `operation` unread.
+pub fn address(app: &App, args: &Value, with_op: bool) -> Result<Addressed, Problem> {
+    let given = match args.get("setup") {
+        Some(v) => Some(setup_of(app, v)?),
+        None => None,
+    };
+    if let (true, Some(v)) = (with_op, args.get("operation")) {
+        let (si, oi) = operation_of(app, given, v)?;
+        return Ok((Some(si), Some((si, oi))));
+    }
     let active = app.doc.setups.iter().position(|s| s.id == app.doc.active);
+    let si = given.or(active);
+    let op = si.zip(app.selected).filter(|&(si, oi)| {
+        with_op
+            && app.doc.setups[si].id == app.doc.active
+            && oi < app.doc.setups[si].operations.len()
+    });
+    Ok((si, op))
+}
+/// Resolves what `on` addresses in `args` (`address`): the setup and
+/// operation the command acts on, before its precondition runs.
+pub fn resolve(on: On, app: &App, args: &Value) -> Result<Addressed, Problem> {
     match on {
         On::Nothing => Ok((None, None)),
-        On::Setup => match args.get("setup") {
-            Some(v) => Ok((Some(setup_of(app, v)?), None)),
-            None => Ok((active, None)),
-        },
-        On::Operation => match args.get("operation") {
-            Some(v) => {
-                let (si, oi) = operation_of(app, None, v)?;
-                Ok((Some(si), Some((si, oi))))
-            }
-            None => Ok((
-                active,
-                active
-                    .zip(app.selected)
-                    .filter(|&(si, oi)| oi < app.doc.setups[si].operations.len()),
-            )),
-        },
+        On::Setup => {
+            let (si, _) = address(app, args, args.get("operation").is_some())?;
+            Ok((si, None))
+        }
+        On::Operation => address(app, args, true),
     }
+}
+/// The messages that make setup `si` active and operation `oi` selected,
+/// when they are not, for the app's handler to act on in the same turn.
+fn selecting(app: &App, si: usize, oi: Option<usize>) -> Vec<Message> {
+    let mut m = vec![];
+    let other = app.doc.setups[si].id != app.doc.active;
+    if other {
+        m.push(Message::SelectSetup(si));
+    }
+    if let Some(oi) = oi
+        && (other || app.selected != Some(oi))
+    {
+        m.push(Message::SelectOp(oi));
+    }
+    m
 }
 
 /// The schema of an argument that names a setup or an operation.
@@ -505,9 +542,16 @@ pub fn operation_of(app: &App, setup: Option<usize>, v: &Value) -> Result<(usize
         }
         _ => return bad("An operation is given by its id or its index."),
     };
-    match found {
-        Some(found) => Ok(found),
-        None => refused(format!(
+    match (found, v, setup) {
+        (Some(found), ..) => Ok(found),
+        (None, Value::String(id), Some(si))
+            if setups
+                .iter()
+                .any(|s| s.operations.iter().any(|o| o.id == *id)) =>
+        {
+            refused(format!("Operation {id} is not in setup {}.", setups[si].id))
+        }
+        _ => refused(format!(
             "There is no operation {v} there (inspect lists them)."
         )),
     }
@@ -1304,16 +1348,12 @@ fn table() -> Vec<Command> {
             })
             .examples(|| vec![json!({"operation": 0})])
             .with(|ctx| {
-                let setup = match ctx.args.get("setup") {
-                    Some(s) => Some(setup_of(ctx.app, s)?),
-                    None => None,
-                };
-                let (si, oi) = operation_of(ctx.app, setup, arg(ctx, "operation")?)?;
-                let mut m = vec![];
-                if ctx.app.doc.setups[si].id != ctx.app.doc.active {
-                    m.push(Message::SelectSetup(si));
+                arg(ctx, "operation")?;
+                let (si, oi) = selected_operation_arg(ctx).ok_or_else(|| Problem::Refused("There is no such operation.".into()))?;
+                let mut m = selecting(ctx.app, si, Some(oi));
+                if m.last().is_none_or(|m| !matches!(m, Message::SelectOp(_))) {
+                    m.push(Message::SelectOp(oi));
                 }
-                m.push(Message::SelectOp(oi));
                 Ok(m)
             })
             .unchanged(|ctx| {
@@ -1427,6 +1467,7 @@ fn table() -> Vec<Command> {
         cmd("set_pin_setup", "operation")
             .help_of(|| Message::Edit(Target::Operation, "pin_setup", String::new()), "")
             .on_operation()
+            .own_setup()
             .params(|| vec![("setup", addressed("setup"), true)])
             .examples(|| vec![json!({"setup": 0})])
             .with(|ctx| {
@@ -1532,37 +1573,21 @@ fn table() -> Vec<Command> {
                     Value::Bool(b) => b.to_string(),
                     _ => return bad("`value` is a string, a number or true/false."),
                 };
-                let mut m = vec![];
-                match target {
+                let mut m = match target {
                     Target::Operation => {
-                        let (si, oi) = match ctx.args.get("operation") {
-                            Some(v) => operation_of(ctx.app, None, v)?,
-                            None => match ctx.app.doc.setups.iter().position(|s| s.id == ctx.app.doc.active).zip(ctx.app.selected) {
-                                Some(found) => found,
-                                None => return refused("No operation is selected: give `operation`."),
-                            },
+                        let (_, Some((si, oi))) = address(ctx.app, ctx.args, true)? else {
+                            return refused("No operation is selected: give `operation`.");
                         };
-                        if ctx.app.doc.setups[si].id != ctx.app.doc.active {
-                            m.push(Message::SelectSetup(si));
-                        }
-                        if ctx.app.doc.setups[si].id != ctx.app.doc.active || ctx.app.selected != Some(oi) {
-                            m.push(Message::SelectOp(oi));
-                        }
+                        selecting(ctx.app, si, Some(oi))
                     }
                     Target::Setup => {
-                        let si = match ctx.args.get("setup") {
-                            Some(v) => setup_of(ctx.app, v)?,
-                            None => match ctx.app.doc.setups.iter().position(|s| s.id == ctx.app.doc.active) {
-                                Some(si) => si,
-                                None => return refused("There is no setup: add one first."),
-                            },
+                        let (Some(si), _) = address(ctx.app, ctx.args, false)? else {
+                            return refused("There is no setup: add one first.");
                         };
-                        if ctx.app.doc.setups[si].id != ctx.app.doc.active {
-                            m.push(Message::SelectSetup(si));
-                        }
+                        selecting(ctx.app, si, None)
                     }
-                    Target::Machine | Target::Tool | Target::Material | Target::Holder => {}
-                }
+                    Target::Machine | Target::Tool | Target::Material | Target::Holder => vec![],
+                };
                 m.push(Message::Edit(target, key, value));
                 Ok(m)
             })
@@ -2008,8 +2033,11 @@ fn table() -> Vec<Command> {
             .params(|| vec![("setup", addressed("setup"), true), ("operation", addressed("operation"), true), ("message", text_param("The problem's message, as the NC review gives it."), true)])
             .examples(|| vec![json!({"setup": 0, "operation": 0, "message": ""})])
             .with(|ctx| {
-                let si = setup_of(ctx.app, arg(ctx, "setup")?)?;
-                let (si, oi) = operation_of(ctx.app, Some(si), arg(ctx, "operation")?)?;
+                arg(ctx, "setup")?;
+                arg(ctx, "operation")?;
+                let Some((si, oi)) = address(ctx.app, ctx.args, true)?.1 else {
+                    return refused("There is no such operation.");
+                };
                 Ok(vec![Message::OpenIssue(si, oi, string(ctx, "message")?)])
             })
             .effect("The operation is open at the tab the problem is about."),
@@ -2019,9 +2047,8 @@ fn table() -> Vec<Command> {
             .params(|| vec![("operation", addressed("operation"), false), ("problem", text_param("The problem, as the steps say it."), true)])
             .examples(|| vec![json!({"operation": 0, "problem": ""}), json!({"problem": ""})])
             .with(|ctx| {
-                let si = ctx.setup.unwrap_or(0);
                 let op = match ctx.args.get("operation") {
-                    Some(v) => Some(operation_of(ctx.app, Some(si), v)?.1),
+                    Some(v) => Some(operation_of(ctx.app, ctx.setup, v)?.1),
                     None => None,
                 };
                 Ok(vec![Message::Guide(GuideAction::Fix(op, string(ctx, "problem")?))])
@@ -2182,11 +2209,8 @@ fn table() -> Vec<Command> {
 
 /// The operation `select_operation`'s arguments name.
 fn selected_operation_arg(ctx: &Ctx) -> Option<(usize, usize)> {
-    let setup = match ctx.args.get("setup") {
-        Some(s) => Some(setup_of(ctx.app, s).ok()?),
-        None => None,
-    };
-    operation_of(ctx.app, setup, ctx.args.get("operation")?).ok()
+    ctx.args.get("operation")?;
+    address(ctx.app, ctx.args, true).ok()?.1
 }
 /// The schema of a pick command's ids.
 fn ids_param(description: &str) -> Value {
@@ -2421,17 +2445,14 @@ fn edited(ctx: &Ctx) -> Option<(Target, String, String)> {
         .find(|(n, _)| n.eq_ignore_ascii_case(name))?;
     let app = ctx.app;
     let id = match target {
-        Target::Operation => match ctx.args.get("operation") {
-            Some(v) => {
-                let (si, oi) = operation_of(app, None, v).ok()?;
-                app.doc.setups[si].operations[oi].id.clone()
-            }
-            None => app.operation()?.id.clone(),
-        },
-        Target::Setup => match ctx.args.get("setup") {
-            Some(v) => app.doc.setups[setup_of(app, v).ok()?].id.clone(),
-            None => app.doc.active_setup()?.id.clone(),
-        },
+        Target::Operation => {
+            let (si, oi) = address(app, ctx.args, true).ok()?.1?;
+            app.doc.setups[si].operations[oi].id.clone()
+        }
+        Target::Setup => {
+            let si = address(app, ctx.args, false).ok()?.0?;
+            app.doc.setups[si].id.clone()
+        }
         _ => String::new(),
     };
     Some((*target, id, ctx.args.get("key")?.as_str()?.to_string()))
@@ -3307,12 +3328,7 @@ fn effect(name: &str) -> Option<fn(&Ctx) -> Expect> {
             )
         },
         "open_issue" => |ctx| {
-            let si = ctx
-                .args
-                .get("setup")
-                .and_then(|v| setup_of(ctx.app, v).ok());
-            let at =
-                si.and_then(|si| operation_of(ctx.app, Some(si), ctx.args.get("operation")?).ok());
+            let at = address(ctx.app, ctx.args, true).ok().and_then(|(_, at)| at);
             holds(
                 move |a| at == Some((a.doc.index(), a.selected.unwrap_or(usize::MAX))),
                 "The operation did not open.",
@@ -3525,7 +3541,7 @@ pub(crate) mod tests {
         args: &'a Value,
         fields: Option<Result<Vec<ui::FieldInfo>, String>>,
     ) -> Ctx<'a> {
-        let (setup, operation) = resolve(c.on, &d.app, args).ok().unwrap_or_default();
+        let (setup, operation) = c.resolve(&d.app, args).ok().unwrap_or_default();
         Ctx {
             app: &d.app,
             args,
@@ -5101,6 +5117,108 @@ pub(crate) mod tests {
         let r = run(&mut d, "edit_field", args).unwrap();
         assert_eq!(outcome(&r), "refused", "{r}");
         assert!(r["reason"].as_str().unwrap().contains("set_origin"), "{r}");
+    }
+
+    /// Two setups with an operation each, setup 1 active; each operation's
+    /// feed set apart (1000 and 2000). Returns the two operation ids.
+    fn two_setups(d: &mut Direct) -> (String, String) {
+        run(d, "duplicate_setup", json!({})).unwrap();
+        let ids = |d: &Direct| {
+            let ops = |si: usize| d.app.doc.setups[si].operations[0].id.clone();
+            (ops(0), ops(1))
+        };
+        let (a, b) = ids(d);
+        for (id, feed) in [(&a, "1111"), (&b, "2222")] {
+            let args =
+                json!({"target": "operation", "operation": id, "key": "feed", "value": feed});
+            let r = run(d, "edit_field", args).unwrap();
+            assert_eq!(outcome(&r), "done", "{r}");
+        }
+        run(d, "select_setup", json!({"setup": 0})).unwrap();
+        (a, b)
+    }
+    fn feed(d: &Direct, id: &str) -> String {
+        op_field(&d.app, id, "feed").unwrap()
+    }
+
+    #[test]
+    fn an_operation_by_index_is_one_of_the_setup_given_not_the_active_one() {
+        let mut d = direct();
+        let (a, b) = two_setups(&mut d);
+        let second = d.app.doc.setups[1].id.clone();
+        let args = json!({"target": "operation", "setup": second, "operation": 0, "key": "feed", "value": "733"});
+        let r = run(&mut d, "edit_field", args).unwrap();
+        assert_eq!(outcome(&r), "done", "{r}");
+        assert_eq!(feed(&d, &a), "1111");
+        assert_eq!(feed(&d, &b), "733");
+        // list_fields reads the same operation.
+        let fields = fields_of(
+            &mut d,
+            json!({"target": "operation", "setup": 1, "operation": 0}),
+        );
+        let shown = fields.iter().find(|f| f["key"] == "feed").unwrap();
+        assert_eq!(shown["value"], "733", "{shown}");
+        // Without `setup`, an index counts in the active setup.
+        run(&mut d, "select_setup", json!({"setup": 0})).unwrap();
+        let fields = fields_of(&mut d, json!({"target": "operation", "operation": 0}));
+        let shown = fields.iter().find(|f| f["key"] == "feed").unwrap();
+        assert_eq!(shown["value"], "1111", "{shown}");
+    }
+
+    #[test]
+    fn an_operation_id_with_a_setup_that_does_not_hold_it_is_refused() {
+        let mut d = direct();
+        let (a, b) = two_setups(&mut d);
+        let first = d.app.doc.setups[0].id.clone();
+        let before = d.app.doc.clone();
+        let args = json!({"target": "operation", "setup": first, "operation": b, "key": "feed", "value": "733"});
+        let r = run(&mut d, "edit_field", args).unwrap();
+        assert_eq!(outcome(&r), "refused", "{r}");
+        assert!(
+            r["reason"].as_str().unwrap().contains("is not in setup"),
+            "{r}"
+        );
+        assert_eq!(feed(&d, &a), "1111");
+        assert_eq!(feed(&d, &b), "2222");
+        assert_eq!(
+            serde_json::to_string(&d.app.doc).unwrap(),
+            serde_json::to_string(&before).unwrap()
+        );
+        let args = json!({"target": "operation", "setup": first, "operation": b});
+        let e = call(&mut d, "list_fields", args).unwrap_err();
+        assert!(e.contains("is not in setup"), "{e}");
+        // An id alone names its own setup.
+        let args = json!({"target": "operation", "operation": b, "key": "feed", "value": "733"});
+        let r = run(&mut d, "edit_field", args).unwrap();
+        assert_eq!(outcome(&r), "done", "{r}");
+        assert_eq!(feed(&d, &b), "733");
+    }
+
+    #[test]
+    fn another_operation_command_given_a_setup_acts_on_that_setups_operation() {
+        let mut d = direct();
+        let (a, b) = two_setups(&mut d);
+        let second = d.app.doc.setups[1].id.clone();
+        let off = |d: &Direct, id: &str| {
+            let o = d
+                .app
+                .doc
+                .setups
+                .iter()
+                .flat_map(|s| &s.operations)
+                .find(|o| o.id == id);
+            o.unwrap().enabled
+        };
+        let (was_a, was_b) = (off(&d, &a), off(&d, &b));
+        let r = run(
+            &mut d,
+            "toggle_operation",
+            json!({"setup": second, "operation": 0}),
+        )
+        .unwrap();
+        assert_eq!(outcome(&r), "done", "{r}");
+        assert_eq!(off(&d, &a), was_a);
+        assert_eq!(off(&d, &b), !was_b);
     }
 
     #[test]

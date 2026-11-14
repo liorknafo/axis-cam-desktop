@@ -49,7 +49,7 @@ fn viewing<R>(app: &mut App, si: usize, oi: Option<usize>, build: impl FnOnce(&A
 
 /// The fields of the target `args` name, each once, as the editors now draw
 /// them. `args` may give `setup` (for a setup) or `operation` (an id, or an
-/// index in the active setup); the active setup and the selected operation
+/// index in `setup`, else the active setup); the active setup and the selected operation
 /// are the default.
 pub fn of(app: &mut App, args: &Value) -> Result<Vec<FieldInfo>, String> {
     let Some(target) = target_of(args) else {
@@ -58,23 +58,19 @@ pub fn of(app: &mut App, args: &Value) -> Result<Vec<FieldInfo>, String> {
             TARGETS.map(|(n, _)| n).join(", ")
         ));
     };
-    let active = app.doc.setups.iter().position(|s| s.id == app.doc.active);
     let mut found = match target {
         Target::Operation => {
-            let (si, oi) = match args.get("operation") {
-                Some(v) => commands::operation_of(app, None, v).map_err(why)?,
-                None => active
-                    .zip(app.selected)
-                    .filter(|&(si, oi)| oi < app.doc.setups[si].operations.len())
-                    .ok_or("No operation is selected: give `operation`.")?,
-            };
+            let (si, oi) = commands::address(app, args, true)
+                .map_err(why)?
+                .1
+                .ok_or("No operation is selected: give `operation`.")?;
             viewing(app, si, Some(oi), ui::operation_fields)
         }
         Target::Setup => {
-            let si = match args.get("setup") {
-                Some(v) => commands::setup_of(app, v).map_err(why)?,
-                None => active.ok_or("There is no setup: add one first.")?,
-            };
+            let si = commands::address(app, args, false)
+                .map_err(why)?
+                .0
+                .ok_or("There is no setup: add one first.")?;
             viewing(app, si, None, ui::setup_fields)
         }
         Target::Machine => ui::machine_fields(app),

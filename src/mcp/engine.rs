@@ -133,7 +133,7 @@ pub fn tools() -> Value {
                 "properties": {
                     "target": {"type": "string", "enum": fields::TARGETS.map(|(n, _)| n)},
                     "setup": {"type": ["string", "integer"], "description": "For a setup (or an operation in it): its id or index; default the active setup."},
-                    "operation": {"type": ["string", "integer"], "description": "For an operation: its id or index in the active setup; default the selected one."},
+                    "operation": {"type": ["string", "integer"], "description": "For an operation: its id (which names its own setup; refused if `setup` is given and it is not in it), or its index in `setup`, else in the active setup; default the selected one."},
                 },
                 "required": ["target"],
             },
@@ -1070,7 +1070,7 @@ impl Agent {
         let fields = (c.name == "edit_field").then(|| fields::of(b.app_mut(), command_args));
         let prepared = {
             let app = b.app();
-            commands::resolve(c.on, app, command_args).and_then(|(setup, operation)| {
+            c.resolve(app, command_args).and_then(|(setup, operation)| {
                 let ctx = Ctx {
                     app,
                     args: command_args,
