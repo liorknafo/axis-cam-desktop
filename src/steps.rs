@@ -309,69 +309,55 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
 }
 /// Where a new tool touches the top: on the highest flat face of the stock
 /// `triangles` (stock frame), the middle of it, or the face's triangle
-/// nearest that when the face is not convex. The face is made of level
-/// triangles, their corners within `SPAN` of one height: a near-flat sliver
-/// a hundredth proud of the top, as a modelled thread leaves at a hole's
-/// mouth, is none, and a real face a few hundredths higher is one
-/// (LIO-488), unless they are lower than the highest flat triangle by
-/// more than `PROUD`: a top tilted a few thousandths has no level
-/// triangle, and the level underside is no top. It is the highest level,
-/// its triangles' middles within `LEVEL`, with `FACE` mm² or more; else
-/// the highest there is.
+/// nearest that when the face is not convex. The top is the highest corner
+/// of a flat triangle, the face the flat triangles with every corner within
+/// `LEVEL` under it. A top whose face is under `FACE` mm², such as a
+/// near-flat sliver a hundredth proud, as a modelled thread leaves at a
+/// hole's mouth, gives way to the next lower one (LIO-488); none within
+/// `DEPTH` of the highest corner, no spot.
 pub(crate) fn touch_spot(triangles: &[([[f32; 3]; 3], [u8; 4])]) -> Option<[f32; 3]> {
-    const SPAN: f32 = 0.002;
-    const PROUD: f32 = 0.015;
     const LEVEL: f32 = 0.01;
     const FACE: f32 = 1.;
-    let flats = |span: f32| -> Vec<([f32; 3], f32)> {
-        (triangles.iter())
-            .filter_map(|(t, _)| {
-                let n = normal(t);
-                let size = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-                let z = t.iter().map(|p| p[2]);
-                let spread = z.clone().fold(f32::MIN, f32::max) - z.fold(f32::MAX, f32::min);
-                (size > 1e-9 && n[2].abs() / size > 0.999 && spread <= span).then(|| {
-                    let middle = std::array::from_fn(|k| (t[0][k] + t[1][k] + t[2][k]) / 3.);
-                    (middle, size / 2.)
-                })
+    const DEPTH: f32 = 0.05;
+    // The flat triangles' lowest and highest corners, middles and areas.
+    let flats: Vec<(f32, f32, [f32; 2], f32)> = (triangles.iter())
+        .filter_map(|(t, _)| {
+            let n = normal(t);
+            let size = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            (size > 1e-9 && n[2].abs() / size > 0.999).then(|| {
+                let z = t.map(|p| p[2]);
+                let middle = std::array::from_fn(|k| (t[0][k] + t[1][k] + t[2][k]) / 3.);
+                (
+                    z.iter().copied().fold(f32::MAX, f32::min),
+                    z.iter().copied().fold(f32::MIN, f32::max),
+                    middle,
+                    size / 2.,
+                )
             })
-            .collect()
-    };
-    // Level triangles, when they reach the top: within `PROUD` of the
-    // highest flat middle, as under a thread's slivers; else, the top
-    // tilted or no triangle level, any flat ones.
-    let highest = |f: &[([f32; 3], f32)]| f.iter().map(|m| m.0[2]).fold(f32::MIN, f32::max);
-    let all = flats(f32::INFINITY);
-    let level = flats(SPAN);
-    let mut flats = match level.is_empty() || highest(&level) < highest(&all) - PROUD {
-        true => all,
-        false => level,
-    };
-    flats.sort_by(|a, b| b.0[2].total_cmp(&a.0[2]));
-    let (mut j, mut area) = (0, 0.);
-    let mut top = flats.first().map(|f| f.0[2]);
-    for i in 0..flats.len() {
-        while j < flats.len() && flats[j].0[2] >= flats[i].0[2] - LEVEL {
-            area += flats[j].1;
-            j += 1;
-        }
-        if area >= FACE {
-            top = Some(flats[i].0[2]);
-            break;
-        }
-        area -= flats[i].1;
-    }
-    let top = top?;
-    let middles: Vec<[f32; 3]> = (flats.into_iter())
-        .filter(|(m, _)| m[2] <= top && m[2] >= top - LEVEL)
-        .map(|(m, _)| m)
+        })
         .collect();
+    let mut tops: Vec<f32> = flats.iter().map(|f| f.1).collect();
+    tops.sort_by(|a, b| b.total_cmp(a));
+    let highest = *tops.first()?;
+    tops.dedup_by(|a, b| (*b - *a) < 1e-4);
+    let face = |top: f32| {
+        flats
+            .iter()
+            .filter(move |f| f.1 <= top && f.0 >= top - LEVEL)
+    };
+    let top = (tops.into_iter())
+        .take_while(|t| *t >= highest - DEPTH)
+        .find(|t| face(*t).map(|f| f.3).sum::<f32>() >= FACE)?;
+    let middles: Vec<[f32; 2]> = face(top).map(|f| f.2).collect();
     let n = middles.len() as f32;
     let centre: [f32; 2] = std::array::from_fn(|k| middles.iter().map(|m| m[k]).sum::<f32>() / n);
-    middles.into_iter().min_by(|a, b| {
-        let d = |m: &[f32; 3]| (m[0] - centre[0]).hypot(m[1] - centre[1]);
-        d(a).total_cmp(&d(b))
-    })
+    middles
+        .into_iter()
+        .min_by(|a, b| {
+            let d = |m: &[f32; 2]| (m[0] - centre[0]).hypot(m[1] - centre[1]);
+            d(a).total_cmp(&d(b))
+        })
+        .map(|m| [m[0], m[1], top])
 }
 
 /// A size the Check screen gives to measure (LIO-370): `value` mm along
@@ -7018,7 +7004,7 @@ pub(crate) mod tests {
         assert!((spot[2] - 10.04).abs() < 1e-4 && spot[0] > 50., "{spot:?}");
         // A top tilted 0.006 over its length has no level triangle: the
         // spot is on it, not on the level underside, nor on a level terrace
-        // 0.03 lower (LIO-488 review).
+        // 0.01 lower (LIO-488 review).
         let tilted = |x: f32| 10. + 0.00006 * x;
         let top = |x0: f32, x1: f32| -> Vec<([[f32; 3]; 3], [u8; 4])> {
             let (a, b) = ([x0, 0.], [x1, 60.]);
@@ -7040,12 +7026,35 @@ pub(crate) mod tests {
         terraced.extend(viewport::box_triangles(
             Bounds {
                 min: [70., 0., 0.],
-                max: [100., 60., 9.97],
+                max: [100., 60., 9.99],
             },
             viewport::BLOCK,
         ));
         let spot = touch_spot(&terraced).unwrap();
-        assert!(spot[0] < 70. && spot[2] > 9.99, "{spot:?}");
+        assert!(spot[0] < 70. && spot[2] > 9.995, "{spot:?}");
+        // A top tilted more than the face's hundredth over a triangle has
+        // no face: no spot, rather than one on the underside.
+        let steep = |x: f32| 10. + 0.001 * x;
+        let mut sloped = vec![
+            (
+                [
+                    [0., 0., steep(0.)],
+                    [100., 0., steep(100.)],
+                    [100., 60., steep(100.)],
+                ],
+                [0; 4],
+            ),
+            (
+                [
+                    [0., 0., steep(0.)],
+                    [100., 60., steep(100.)],
+                    [0., 60., steep(0.)],
+                ],
+                [0; 4],
+            ),
+        ];
+        sloped.extend(under);
+        assert_eq!(touch_spot(&sloped), None);
         // On the guide's job every new tool has its picture.
         let a = app("Yes");
         let shown = a.guide_at().unwrap().0;
