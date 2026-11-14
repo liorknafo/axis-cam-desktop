@@ -573,30 +573,54 @@ fn holder_id(ctx: &Ctx, key: &str) -> Result<String, Problem> {
     library_id(ctx, key, "workholding entry", ids)
 }
 
-/// Whether the file at `path` holds a project other than `doc`: it reads,
-/// and its `project_id` is there and is not `doc`'s. A file not there or
-/// not readable as a project, or one saved before projects had ids, is not
-/// known to hold another.
-fn holds_another_project(path: &Path, doc: &crate::model::Document) -> bool {
-    let small = std::fs::metadata(path).is_ok_and(|m| m.len() <= 20_000_000);
-    let Some(value) = small
-        .then(|| std::fs::read(path).ok())
-        .flatten()
+/// What a project file may hold, for a save over it.
+#[derive(PartialEq)]
+enum FileHolds {
+    /// Not there, or this project (its `project_id`, or none: saved before
+    /// projects had ids).
+    ThisOrNothing,
+    /// A project with another id.
+    Another,
+    /// There, but cannot be read or parsed (or is too large to be one): it
+    /// may hold another project.
+    Unknown,
+}
+fn file_holds(path: &Path, doc: &crate::model::Document) -> FileHolds {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return FileHolds::ThisOrNothing,
+        Err(_) => return FileHolds::Unknown,
+    };
+    if !meta.is_file() || meta.len() > 20_000_000 {
+        return FileHolds::Unknown;
+    }
+    let Some(value) = std::fs::read(path)
+        .ok()
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .filter(Value::is_object)
     else {
-        return false;
+        return FileHolds::Unknown;
     };
     let id = value
         .get("project_id")
         .and_then(Value::as_str)
         .unwrap_or("");
-    !id.is_empty() && id != doc.project_id
+    if !id.is_empty() && id != doc.project_id {
+        FileHolds::Another
+    } else {
+        FileHolds::ThisOrNothing
+    }
 }
 
 /// Whether the job has work not saved to a project file: changes since its
-/// file was saved, or setups never saved to one.
+/// file was saved (the file not there, not readable, or not holding the
+/// job by value: `App::saved_to_file`), or setups never saved to one.
 fn unsaved(app: &App) -> bool {
-    app.project_dirty || (app.project_path.is_none() && !app.doc.setups.is_empty())
+    if app.project_path.is_none() {
+        !app.doc.setups.is_empty()
+    } else {
+        !app.saved_to_file()
+    }
 }
 /// The rule of the commands that replace the project: refused over unsaved
 /// work unless `discard_unsaved` is true, so the agent cannot drop the
@@ -1032,11 +1056,21 @@ fn table() -> Vec<Command> {
                     // Never over another project: the file may have been
                     // replaced since, or the project file named may not be
                     // this project's (a stale record).
-                    if holds_another_project(own, &ctx.app.doc) {
-                        return refused(format!(
-                            "The project file {} holds another project; save with a path.",
-                            own.display()
-                        ));
+                    match file_holds(own, &ctx.app.doc) {
+                        FileHolds::ThisOrNothing => {}
+                        FileHolds::Another => {
+                            return refused(format!(
+                                "The project file {} holds another project; save with a path.",
+                                own.display()
+                            ));
+                        }
+                        FileHolds::Unknown if !flag(ctx, "overwrite") => {
+                            return refused(format!(
+                                "The project file {} cannot be read, so it may hold another project; save with a path, or with overwrite: true.",
+                                own.display()
+                            ));
+                        }
+                        FileHolds::Unknown => {}
                     }
                     // The project's own file follows the same rules as a
                     // path given: one opened from the app's data folder
@@ -1055,10 +1089,10 @@ fn table() -> Vec<Command> {
                 // overwrite: unless it holds another project now.
                 if own.is_some_and(|o| resolved(o) == resolved(&path))
                     && !flag(ctx, "overwrite")
-                    && holds_another_project(&path, &ctx.app.doc)
+                    && file_holds(&path, &ctx.app.doc) != FileHolds::ThisOrNothing
                 {
                     return refused(format!(
-                        "The project file {} holds another project: call again with overwrite: true to replace it.",
+                        "The project file {} holds another project, or cannot be read and may: call again with overwrite: true to replace it.",
                         path.display()
                     ));
                 }
@@ -4537,6 +4571,88 @@ pub(crate) mod tests {
         assert_eq!(r["outcome"], "done", "{r}");
         let saved = crate::storage::load(&file).unwrap();
         assert_eq!(saved.project_id, d.app.doc.project_id);
+    }
+
+    /// The reviewer's probe (LIO-470, round 3): the project file replaced
+    /// by another project and made unreadable; both save forms said done
+    /// and destroyed it. An unreadable file may hold another project.
+    #[cfg(unix)]
+    #[test]
+    fn save_project_never_writes_over_an_unreadable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut d = direct();
+        let file = d.folder.join("job.axis.json");
+        let path = file.display().to_string();
+        let r = run(&mut d, "save_project", json!({"path": path})).unwrap();
+        assert_eq!(r["outcome"], "done", "{r}");
+        let mut other: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        other["project_id"] = json!("another-project");
+        let bytes = serde_json::to_vec(&other).unwrap();
+        std::fs::write(&file, &bytes).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads it anyway: nothing to probe then.
+        if std::fs::read(&file).is_ok() {
+            return;
+        }
+        let r = run(&mut d, "save_project", json!({})).unwrap();
+        assert_eq!(r["outcome"], "refused", "{r}");
+        assert_eq!(
+            r["reason"],
+            format!(
+                "The project file {} cannot be read, so it may hold another project; save with a path, or with overwrite: true.",
+                file.display()
+            )
+        );
+        let r = run(&mut d, "save_project", json!({"path": path})).unwrap();
+        assert_eq!(r["outcome"], "refused", "{r}");
+        assert!(
+            r["reason"].as_str().unwrap().contains("overwrite: true"),
+            "{r}"
+        );
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), bytes, "as it was");
+    }
+
+    /// The reviewer's probe (LIO-470, round 3): `new_project` went by a
+    /// cached dirty flag, so a saved file changed or removed outside
+    /// dropped the job unasked. It goes by the file as it is now.
+    #[test]
+    fn replacing_the_project_goes_by_the_file_as_it_is_now() {
+        let mut d = direct();
+        let file = d.folder.join("job.axis.json");
+        let path = file.display().to_string();
+        let r = run(&mut d, "save_project", json!({"path": path})).unwrap();
+        assert_eq!(r["outcome"], "done", "{r}");
+        let original = std::fs::read(&file).unwrap();
+        let setups = d.app.doc.setups.len();
+        assert!(setups > 0);
+        let intact = |d: &Direct| {
+            assert_eq!(d.app.doc.setups.len(), setups);
+            assert_eq!(d.app.project_path.as_deref(), Some(file.as_path()));
+        };
+        // Changed outside.
+        let mut changed = crate::storage::load(&file).unwrap();
+        changed.title = "Changed elsewhere".into();
+        crate::storage::save(&file, &changed).unwrap();
+        let r = run(&mut d, "new_project", json!({})).unwrap();
+        assert_eq!(r["outcome"], "refused", "{r}");
+        intact(&d);
+        for tool in ["open_sample", "recover_previous_project"] {
+            let r = run(&mut d, tool, json!({})).unwrap();
+            assert_eq!(r["outcome"], "refused", "{tool}: {r}");
+            intact(&d);
+        }
+        // Removed.
+        std::fs::remove_file(&file).unwrap();
+        let r = run(&mut d, "new_project", json!({})).unwrap();
+        assert_eq!(r["outcome"], "refused", "{r}");
+        intact(&d);
+        // Put back as it was: saved, so replacing is allowed.
+        std::fs::write(&file, &original).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        let r = run(&mut d, "new_project", json!({"discard_unsaved": true})).unwrap();
+        assert_eq!(r["outcome"], "done", "{r}");
+        assert!(d.app.doc.setups.is_empty());
     }
 
     #[test]

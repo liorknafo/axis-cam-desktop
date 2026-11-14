@@ -385,24 +385,52 @@ pub fn saved_by_value(doc: &Document, path: Option<&Path>) -> bool {
 }
 
 /// What `App::saved_to_file` last worked out, and for what: the project
-/// file (its path, modification time and length) and the `Document` (the
-/// hash of its serialization). Worked out again when any of them changes.
+/// file (everything its metadata can show of a change: see `file_stamp`)
+/// and the `Document` (the hash of its serialization). Worked out again
+/// when either changes. Only on unix; elsewhere nothing is kept.
 #[derive(Debug, Default)]
 pub struct SavedCache(Mutex<Option<(SavedKey, bool)>>);
 #[derive(Debug, PartialEq)]
 struct SavedKey {
     path: PathBuf,
-    modified: std::time::SystemTime,
-    len: u64,
+    stamp: FileStamp,
     doc: u64,
+}
+/// Device, inode, modification and status-change times (to the
+/// nanosecond), size and mode: a chmod changes the status-change time, and
+/// so does any replacement of the file (which also changes the inode).
+#[cfg(unix)]
+type FileStamp = (u64, u64, i64, i64, i64, i64, u64, u32);
+#[cfg(not(unix))]
+type FileStamp = ();
+
+#[cfg(unix)]
+fn file_stamp(meta: &std::fs::Metadata) -> Option<FileStamp> {
+    use std::os::unix::fs::MetadataExt;
+    Some((
+        meta.dev(),
+        meta.ino(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+        meta.ctime(),
+        meta.ctime_nsec(),
+        meta.size(),
+        meta.mode(),
+    ))
+}
+#[cfg(not(unix))]
+fn file_stamp(_: &std::fs::Metadata) -> Option<FileStamp> {
+    None
 }
 
 impl App {
     /// Whether the job is saved to its project file now: the file is
     /// there, loads, and holds the `Document` by value (`saved_by_value`),
-    /// the rule `list_sessions` and `delete_session` use. Every saved flag
-    /// a result reports is this. Kept (`SavedCache`) while neither the
-    /// file nor the `Document` changes.
+    /// the rule `list_sessions` and `delete_session` use, and the one the
+    /// project-replacing commands go by. Every saved flag a result reports
+    /// is this. On unix a `true` or `false` is kept (`SavedCache`) while
+    /// neither the file's metadata nor the `Document` changes; an
+    /// unreadable file is never saved.
     pub(crate) fn saved_to_file(&self) -> bool {
         let Some(path) = self.project_path.as_deref() else {
             return false;
@@ -413,13 +441,12 @@ impl App {
         if !meta.is_file() {
             return false;
         }
-        let Ok(modified) = meta.modified() else {
+        let Some(stamp) = file_stamp(&meta) else {
             return saved_by_value(&self.doc, Some(path));
         };
         let key = SavedKey {
             path: path.to_path_buf(),
-            modified,
-            len: meta.len(),
+            stamp,
             doc: super::state::hash_of(&self.doc),
         };
         let mut cache =

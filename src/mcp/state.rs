@@ -1705,6 +1705,10 @@ pub(crate) mod tests {
                 let path = b.dir.path().join("job.axis.json");
                 crate::storage::save(&path, &b.app.doc).unwrap();
                 b.app.project_path = Some(path);
+                // Unsaved is the job differing from its file by value.
+                if dirty {
+                    b.app.doc.title = "Changed since saved".into();
+                }
                 b.app.project_dirty = dirty;
                 // The other project: the same setups, records of its own.
                 let other = b.dir.path().join("other.axis.json");

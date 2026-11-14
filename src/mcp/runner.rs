@@ -1689,4 +1689,76 @@ mod tests {
         saved(&runner, true);
         runner.stop();
     }
+
+    /// The reviewer's probes (LIO-470, round 3): a chmod of the project
+    /// file, and a same-length replacement with its mtime put back, left
+    /// `inspect` saying saved while `list_sessions` did not.
+    #[cfg(unix)]
+    #[test]
+    fn saved_flags_agree_after_a_chmod_and_a_same_mtime_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("mcp-sessions");
+        let user = user_workspace(dir.path());
+        let session = Session::open(&root, None, &user).unwrap();
+        let id = session.id.clone();
+        let runner = Runner::start(session);
+        let project = dir.path().join("job.axis.json");
+        let r = exec(
+            &runner,
+            "save_project",
+            json!({"path": project.display().to_string()}),
+        );
+        assert_eq!(r["outcome"], "done", "{r}");
+        let original = std::fs::read(&project).unwrap();
+        let saved = |runner: &Runner, want: bool| {
+            let read = runner.call("inspect", json!({})).unwrap();
+            assert_eq!(read["project"]["saved"], want, "{read}");
+            assert_eq!(read["session"]["saved_to_project_file"], want, "{read}");
+            let listed = super::super::session::list(&root);
+            let it = listed.iter().find(|s| s["id"] == id.as_str()).unwrap();
+            assert_eq!(it["saved_to_project_file"], want, "{it}");
+        };
+        saved(&runner, true);
+        // Unreadable: never saved.
+        std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&project).is_err() {
+            saved(&runner, false);
+        }
+        std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o644)).unwrap();
+        saved(&runner, true);
+        // Same length, same mtime, other content, by an atomic replace.
+        let mtime = std::fs::metadata(&project).unwrap().modified().unwrap();
+        let mut other = String::from_utf8(original.clone()).unwrap();
+        let at = other.find("\"title\"").expect("a title");
+        let digit = other[at..]
+            .find(|c: char| c.is_alphanumeric() && c != 't')
+            .unwrap()
+            + at;
+        let c = other.as_bytes()[digit];
+        let swapped = if c == b'x' { 'y' } else { 'x' };
+        other.replace_range(digit..=digit, &swapped.to_string());
+        assert_eq!(other.len(), original.len());
+        let temp = dir.path().join("replacement.tmp");
+        std::fs::write(&temp, &other).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&temp)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        std::fs::rename(&temp, &project).unwrap();
+        saved(&runner, false);
+        // Restored the same way.
+        std::fs::write(&temp, &original).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&temp)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        std::fs::rename(&temp, &project).unwrap();
+        saved(&runner, true);
+        runner.stop();
+    }
 }
