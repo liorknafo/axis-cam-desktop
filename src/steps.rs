@@ -2194,16 +2194,17 @@ fn dro_tool<'a>(diameter: f32, comp: [i8; 2], height: f32) -> Vec<Element<'a, Me
 /// tool already in.
 /// A Face that makes the part's top on a bottom already at size: measure
 /// before the last level and set it so the part reads `size`, then check
-/// it and that it is parallel (LIO-487). Measured at the ends of the
-/// stock's longer side (`stock`, work coordinates), where a vise leaves
-/// them out of its jaws.
-fn to_size<'a>(size: f32, stock: &Bounds) -> Vec<Element<'a, Message>> {
+/// it and that it is parallel (LIO-487). Measured at the ends out of a
+/// vise's jaws: along the axis its jaws are not on (`across`, the axis
+/// they close on); without one, at the ends of the stock's longer side
+/// (`stock`, work coordinates).
+fn to_size<'a>(size: f32, stock: &Bounds, across: Option<usize>) -> Vec<Element<'a, Message>> {
     let d = stock.dimensions();
-    let ends = if d[0] >= d[1] {
-        "the left and right ends"
-    } else {
-        "the front and back ends"
+    let along = match across {
+        Some(k) => 1 - k,
+        None => usize::from(d[1] > d[0]),
     };
+    let ends = ["the left and right ends", "the front and back ends"][along];
     let size = dro(size);
     let line = |n: u8, s: String| -> Element<'a, Message> {
         row![
@@ -3458,7 +3459,13 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 .size(13),
             );
             let right = match size {
-                Some(size) => right.extend(to_size(*size, &stock)),
+                Some(size) => {
+                    let across = match &g.steps[0] {
+                        Step::Hold { vise: Some(v), .. } => Some(v.across),
+                        _ => None,
+                    };
+                    right.extend(to_size(*size, &stock, across))
+                }
                 None => right,
             };
             (
@@ -6429,6 +6436,26 @@ pub(crate) mod tests {
             on("Section done ▶").expect("done"),
         );
         assert!(check.y + check.height < done.y, "{check:?} {done:?}");
+        // In a vise, measured at the ends out of its jaws: with the jaws on
+        // the X sides, the front and back (LIO-487).
+        for (axis, ends) in [("X", "front and back"), ("Y", "left and right")] {
+            let mut a = app_with("Yes", |d| {
+                for (k, v) in [("stock_top", "2"), ("stock_bottom", "0")] {
+                    d.setups[0].p.insert(k.into(), v.into());
+                }
+                crate::guide::tests::in_the_vise(d);
+                d.setups[0].p.insert("vise_axis".into(), axis.into());
+                d.settle_holding(0);
+            });
+            let at = (guide(&a).steps.iter())
+                .position(|s| matches!(s, Step::Face { size: Some(_), .. }))
+                .expect("a face to size");
+            send(&mut a, GuideAction::Go(at));
+            let want = format!(
+                "Before the last level, measure it at the {ends} ends; if they differ, seat the part again."
+            );
+            assert!(texts(&a).contains(&want), "{want} in {:?}", texts(&a));
+        }
         // A face on stock with more under the part: the depth alone.
         let mut a = app("Yes");
         send(&mut a, GuideAction::Go(at));

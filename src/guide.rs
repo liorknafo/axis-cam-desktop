@@ -2081,11 +2081,14 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                 match kind(open, lo, hi, r) {
                     Kind::Face => {
                         // The part's top cut, on a bottom already at size:
-                        // a size to measure to (LIO-487).
+                        // a size to measure to (LIO-487). Not with an
+                        // allowance, however small: it is left on purpose.
                         let part = simulation::part_box(setup, mesh);
                         let on = |a: f32, b: f32| (a - b).abs() <= SIZE_ON;
-                        let size = (on(plan.target, part.max[2]) && on(left.min[2], part.min[2]))
-                            .then_some(part.max[2] - part.min[2]);
+                        let size = (allowance <= 0.
+                            && on(plan.target, part.max[2])
+                            && on(left.min[2], part.min[2]))
+                        .then_some(part.max[2] - part.min[2]);
                         steps.push(Step::Face {
                             size,
                             op: oi,
@@ -3982,10 +3985,13 @@ pub(crate) mod tests {
         set(&mut doc, "stock_bottom", "0");
         set(&mut doc, "stock_top", "4");
         assert_eq!(face(&doc).0, None);
-        // 0.2 left on the top for a finish: not the part's face yet.
+        // Any allowance left on the top, however small, is left on purpose:
+        // not the part's face yet.
         set(&mut doc, "stock_top", "2");
-        (doc.setups[0].operations[0].p).insert("allowance".into(), "0.2".into());
-        assert_eq!(face(&doc).0, None);
+        for allowance in ["0.2", "0.01", "0.005"] {
+            (doc.setups[0].operations[0].p).insert("allowance".into(), allowance.into());
+            assert_eq!(face(&doc).0, None, "{allowance}");
+        }
     }
     #[test]
     fn steps_run_hold_zero_then_each_operation_and_a_face_is_one_step() {
