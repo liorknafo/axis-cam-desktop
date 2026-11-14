@@ -1043,9 +1043,12 @@ fn setup_review(doc: &Document, s: &crate::post::SetupPost) -> Value {
     let hand = crate::manual::is_hand(&setup.machine);
     let uc100 = get(&setup.machine.p, "controller") == "UC100";
     let problems_of = |problems: &[String]| -> Vec<Value> {
-        (problems.iter())
-            .map(|p| {
-                let (operation, message) = match crate::ui::nc_operation(doc, s.setup, p) {
+        (problems.iter().enumerate())
+            .map(|(k, p)| {
+                // The operation the check recorded, by its id; names can repeat.
+                let recorded = s.problem_operations.get(k).and_then(Option::as_ref);
+                let (operation, message) = match crate::ui::nc_operation(doc, s.setup, p, recorded)
+                {
                     Some((oi, rest)) => (operation_ref(doc, s.setup, oi), rest),
                     None => (Value::Null, p.as_str()),
                 };
@@ -2153,6 +2156,52 @@ pub(crate) mod tests {
         let none = ask(&mut d, "inspect", json!({"what": "post", "program": true}));
         assert_eq!(none["program"]["files"], json!([]), "{none}");
         assert!(none["program"]["why_none"].is_string(), "{none}");
+    }
+
+    /// Two operations of one setup both named "Pocket", only the second
+    /// without its cutter: the problem is the second's, by its id (names
+    /// repeat), and the agent's repair of that id clears it (LIO-470).
+    #[test]
+    fn an_nc_problem_names_its_operation_by_id_when_two_share_a_name() {
+        let mut d = direct();
+        let (mut doc, mesh) = crate::post::fixture::job();
+        doc.setups[0].operations.truncate(1);
+        let tool = doc.setups[0].operations[0].tool.clone();
+        let mut pockets = vec![];
+        for id in ["pocket-one", "pocket-two"] {
+            let mut o = doc.setups[0].operations[0].clone();
+            o.id = id.into();
+            o.p.insert("name".into(), "Pocket".into());
+            pockets.push(o);
+        }
+        pockets[1].tool = "no-such-tool".into();
+        doc.setups[0].operations = pockets;
+        install(&mut d, doc, mesh);
+        let broken = ask(&mut d, "inspect", json!({"what": "post"}));
+        let problems = &broken["setups"][0]["problems"];
+        assert_eq!(problems.as_array().map(Vec::len), Some(1), "{broken}");
+        assert_eq!(problems[0]["operation"]["id"], "pocket-two", "{broken}");
+        assert_eq!(problems[0]["operation"]["index"], 1, "{broken}");
+        assert_eq!(
+            problems[0]["message"], "Choose a tool from the library.",
+            "{broken}"
+        );
+        let fixed = ask(
+            &mut d,
+            "execute",
+            json!({"command": "set_operation_tool", "args": {"operation": "pocket-two", "id": tool}}),
+        );
+        assert_eq!(fixed["outcome"], "done", "{fixed}");
+        // The page's check runs again for the job as it is now.
+        let page = ask(
+            &mut d,
+            "execute",
+            json!({"command": "goto_page", "args": {"page": "Post"}}),
+        );
+        assert_eq!(page["outcome"], "done", "{page}");
+        let after = ask(&mut d, "inspect", json!({"what": "post"}));
+        assert_eq!(after["setups"][0]["problems"], json!([]), "{after}");
+        assert_eq!(after["setups"][0]["passes"], true, "{after}");
     }
 
     /// The NC review of a job changed since its check: the app's own check

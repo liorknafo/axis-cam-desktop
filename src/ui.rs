@@ -15603,11 +15603,17 @@ pub(crate) enum NcCard<'a> {
     /// A LinuxCNC setup whose programs were produced.
     Programs(&'a [crate::post::Program]),
     /// A LinuxCNC setup that failed its export checks.
-    Refused(&'a [String]),
+    Refused {
+        problems: &'a [String],
+        /// The operation each problem is about (`SetupPost::problem_operations`).
+        operations: &'a [Option<(usize, String)>],
+        setup: usize,
+    },
     /// A UC100 setup: the run checks' problems (none when it passes) and the
     /// setup Run on the machine opens.
     Run {
         problems: &'a [String],
+        operations: &'a [Option<(usize, String)>],
         setup: usize,
     },
     /// A manual mill's setup: no program, its steps are on the MACHINE page.
@@ -15630,7 +15636,7 @@ impl NcPage<'_> {
     /// Every problem the page shows as an error.
     pub(crate) fn problems(&self) -> Vec<&str> {
         let cards = self.cards.iter().flat_map(|(_, card)| match card {
-            NcCard::Refused(p) | NcCard::Run { problems: p, .. } => p.iter(),
+            NcCard::Refused { problems: p, .. } | NcCard::Run { problems: p, .. } => p.iter(),
             NcCard::Programs(_) | NcCard::Manual => [].iter(),
         });
         self.errors
@@ -15697,12 +15703,17 @@ pub(crate) fn nc_page(app: &App) -> NcPage<'_> {
                         Some(Err(problems)) => problems,
                         _ => &[],
                     },
+                    operations: &s.problem_operations,
                     setup: s.setup,
                 }
             } else {
                 match &s.result {
                     Ok(programs) => NcCard::Programs(programs),
-                    Err(problems) => NcCard::Refused(problems),
+                    Err(problems) => NcCard::Refused {
+                        problems,
+                        operations: &s.problem_operations,
+                        setup: s.setup,
+                    },
                 }
             };
             page.cards.push((s.name.as_str(), card));
@@ -15723,37 +15734,56 @@ fn open_label(app: &App, m: &Message) -> String {
         _ => "Open in planning ▶".to_string(),
     }
 }
-pub(crate) fn nc_issue(app: &App, name: &str, problem: &str) -> Option<Message> {
-    let si = app.doc.setups.iter().position(|s| s.name() == name)?;
-    let (oi, rest) = nc_operation(&app.doc, si, problem)?;
+pub(crate) fn nc_issue(
+    app: &App,
+    si: usize,
+    problem: &str,
+    operation: Option<&(usize, String)>,
+) -> Option<Message> {
+    let (oi, rest) = nc_operation(&app.doc, si, problem, operation)?;
     Some(Message::OpenIssue(si, oi, rest.to_string()))
 }
 /// The operation of setup `si` an NC review problem is about, and the
-/// message after its name: the problem starts with the operation's name
-/// and ": ".
+/// message after its name. The operation the check recorded for the problem
+/// (`operation`: its index and id) is found by its id, as two operations
+/// can share a name; a problem without one is matched by name, as it
+/// starts with the operation's name and ": ".
 pub(crate) fn nc_operation<'a>(
     doc: &Document,
     si: usize,
     problem: &'a str,
+    operation: Option<&(usize, String)>,
 ) -> Option<(usize, &'a str)> {
     let ops = doc.setups.get(si)?.operations.iter().enumerate();
+    if let Some((_, id)) = operation {
+        let (oi, o) = ops.clone().find(|(_, o)| &o.id == id)?;
+        let rest = problem
+            .strip_prefix(o.name())
+            .and_then(|r| r.strip_prefix(": "));
+        return Some((oi, rest.unwrap_or(problem)));
+    }
     ops.filter(|(_, o)| !o.name().is_empty())
         .find_map(|(oi, o)| Some((oi, problem.strip_prefix(o.name())?.strip_prefix(": ")?)))
 }
 /// A setup's problems on the NC review page: its causes, counted, each with
 /// Open beside it when it is an operation's, then the operations that wait
 /// for a failure, in the one line `post::waiting_line` makes (LIO-394).
-fn nc_problems<'a>(app: &App, name: &str, problems: &[String]) -> Element<'a, Message> {
-    let (waits, causes): (Vec<&String>, Vec<&String>) =
-        problems.iter().partition(|p| crate::post::is_waiting(p));
+fn nc_problems<'a>(
+    app: &App,
+    si: usize,
+    problems: &[String],
+    operations: &[Option<(usize, String)>],
+) -> Element<'a, Message> {
+    let (waits, causes): (Vec<_>, Vec<_>) =
+        (problems.iter().enumerate()).partition(|(_, p)| crate::post::is_waiting(p));
     let heading = match causes.len() {
         0 => "Waits for an earlier setup".to_string(),
         1 => "1 issue".to_string(),
         n => format!("{n} issues"),
     };
-    let causes = causes.into_iter().map(|cause| {
+    let causes = causes.into_iter().map(|(k, cause)| {
         let line = caution_line(format!("• {cause}"));
-        match nc_issue(app, name, cause) {
+        match nc_issue(app, si, cause, operations.get(k).and_then(Option::as_ref)) {
             // The Steps page's words for the same way (LIO-438).
             Some(open) => row![
                 container(line).width(Fill),
@@ -15765,7 +15795,9 @@ fn nc_problems<'a>(app: &App, name: &str, problems: &[String]) -> Element<'a, Me
             None => line.into(),
         }
     });
-    let waits = waits.into_iter().map(|w| caution_line(w.clone()).into());
+    let waits = waits
+        .into_iter()
+        .map(|(_, w)| caution_line(w.clone()).into());
     caution_box(heading, causes.chain(waits).collect::<Vec<_>>())
 }
 fn post(app: &App) -> Element<'_, Message> {
@@ -15817,10 +15849,14 @@ fn post(app: &App) -> Element<'_, Message> {
                             );
                         }
                     }
-                    NcCard::Refused(problems) => {
+                    NcCard::Refused {
+                        problems,
+                        operations,
+                        setup,
+                    } => {
                         summary = summary
                             .push(bold(format!("!  {name}"), 13))
-                            .push(nc_problems(app, name, problems));
+                            .push(nc_problems(app, *setup, problems, operations));
                     }
                     NcCard::Manual => {
                         let line = match app.doc.setups.iter().find(|x| x.name() == *name) {
@@ -15829,11 +15865,15 @@ fn post(app: &App) -> Element<'_, Message> {
                         };
                         summary = summary.push(muted(line));
                     }
-                    NcCard::Run { problems, setup } => {
+                    NcCard::Run {
+                        problems,
+                        operations,
+                        setup,
+                    } => {
                         let mark = if problems.is_empty() { "✓" } else { "!" };
                         summary = summary.push(bold(format!("{mark}  Run on UC100: {name}"), 13));
                         if !problems.is_empty() {
-                            summary = summary.push(nc_problems(app, name, problems));
+                            summary = summary.push(nc_problems(app, *setup, problems, operations));
                         }
                         summary = summary
                             .push(muted(RUN_PREREQUISITES))

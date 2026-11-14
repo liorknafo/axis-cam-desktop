@@ -692,3 +692,4 @@ Four milestones, each with its own Linear issue and PR.
     - a session's lock is an OS lock on its `lock` file, held for the session's life and let go by the OS: two servers racing for a session can no longer both open it (no pid check, heartbeat or unlink of a stale lock);
     - `delete_session` holds the session's lock through the whole deletion, the lock file and the folder last, and a resume takes the lock before reading anything and refuses a folder with no job: a resume never finds a session half deleted;
     - `inspect {what: "post", setup?, program?}` reads the NC review: programs, problems by operation, whether it is current, and a setup's G-code.
+18. **gpt-6-astra, M1 implementation review round 2, REJECT.** Its finding was taken: NC problems carry their operation's id, for the agent and for the page's Open button.

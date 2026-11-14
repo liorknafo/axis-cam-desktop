@@ -1267,6 +1267,10 @@ pub struct SetupPost {
     /// For a UC100 setup only: whether it passes the checks of a run on the
     /// machine (`run::plan_problems`), or what they refuse.
     pub run: Option<Result<(), Vec<String>>>,
+    /// The operation each of `problems()` is about, in step with it: its
+    /// index in the setup's operations and its id, None for a problem of
+    /// the setup or the job. Names do not tell operations apart.
+    pub problem_operations: Vec<Option<(usize, String)>>,
 }
 impl SetupPost {
     /// Whether the setup passes: a UC100 setup by the checks of a run, since
@@ -1279,7 +1283,7 @@ impl SetupPost {
         }
     }
     /// What stops the setup from passing, if anything.
-    fn problems(&self) -> Option<&[String]> {
+    pub(crate) fn problems(&self) -> Option<&[String]> {
         match &self.run {
             Some(run) => run.as_ref().err(),
             None => self.result.as_ref().err(),
@@ -2784,20 +2788,24 @@ fn walk<'a>(
     si: usize,
     sims: &'a [(usize, Result<Simulation, String>)],
     settings: Settings,
-) -> Result<Walk<'a>, Vec<String>> {
+) -> Result<Walk<'a>, Vec<Held>> {
     let setup = &doc.setups[si];
     // A hand machine's setup has no work offset (LIO-371); its moves are
     // walked, for the holding check, as if in G54: it writes no program.
     let offset = setup.offset().unwrap_or("G54").to_string();
-    let mut errors = vec![];
-    let settings = settings(&setup.machine).map_err(|e| errors.extend(e)).ok();
+    let mut errors: Vec<Held> = vec![];
+    let settings = settings(&setup.machine)
+        .map_err(|e| errors.extend(e.into_iter().map(Held::setup)))
+        .ok();
     if !OFFSETS.contains(&offset.as_str()) {
-        errors.push(format!(
+        errors.push(Held::setup(format!(
             "Work offset \"{offset}\" is not a LinuxCNC register (G54-G59.3)."
-        ));
+        )));
     }
     if sims.is_empty() {
-        errors.push("This setup has no enabled operations. Add one or remove the setup.".into());
+        errors.push(Held::setup(
+            "This setup has no enabled operations. Add one or remove the setup.".into(),
+        ));
     }
     let mut ops = vec![];
     let mut simulations = vec![];
@@ -2812,7 +2820,7 @@ fn walk<'a>(
                 waiting.push(op.name());
                 cause = &e[crate::simulation::WAITS.len()..];
             }
-            Err(e) => errors.push(format!("{}: {e}", op.name())),
+            Err(e) => errors.push(Held::of(*oi, format!("{}: {e}", op.name()))),
             Ok(sim) => match op_state(
                 doc,
                 op,
@@ -2824,20 +2832,20 @@ fn walk<'a>(
                     ops.push(state);
                     simulations.push(sim);
                 }
-                Err(e) => errors.extend(e),
+                Err(e) => errors.extend(e.into_iter().map(|m| Held::of(*oi, m))),
             },
         }
     }
     if !waiting.is_empty() {
-        errors.push(waiting_line(
+        errors.push(Held::setup(waiting_line(
             &waiting,
             // A cause in this setup is listed above; one before it is said here.
             (!cause.starts_with(&format!("{} / ", setup.name()))).then_some(cause),
-        ));
+        )));
     }
     let zero = simulations.first().and_then(|sim| {
         datum(setup, sim.plan.stock, mesh)
-            .map_err(|e| errors.push(e))
+            .map_err(|e| errors.push(Held::setup(e)))
             .ok()
     });
     let (Some(settings), Some(zero), true) = (settings, zero, errors.is_empty()) else {
@@ -2846,10 +2854,10 @@ fn walk<'a>(
     // One work zero for the whole setup, even when touch-off mode splits it into programs.
     let stock = simulations[0].plan.stock;
     if simulations.iter().any(|s| s.plan.stock != stock) {
-        return Err(vec![
+        return Err(vec![Held::setup(
             "Operations in this setup report different stock boxes, so the work zero is ambiguous."
                 .into(),
-        ]);
+        )]);
     }
     let groups = groups(&ops, settings.tool_table);
     let indexes: Vec<usize> = sims.iter().map(|(oi, _)| *oi).collect();
@@ -2906,6 +2914,26 @@ fn groups(ops: &[OpState], tool_table: bool) -> Vec<std::ops::Range<usize>> {
 pub struct Held {
     pub operation: Option<usize>,
     pub message: String,
+}
+impl Held {
+    /// A problem of the setup as a whole.
+    fn setup(message: String) -> Self {
+        Self {
+            operation: None,
+            message,
+        }
+    }
+    /// A problem of operation `oi` (an index in the setup's operations).
+    fn of(oi: usize, message: String) -> Self {
+        Self {
+            operation: Some(oi),
+            message,
+        }
+    }
+}
+/// The messages of `problems`, without the operations they are about.
+fn texts(problems: Vec<Held>) -> Vec<String> {
+    problems.into_iter().map(|h| h.message).collect()
 }
 /// What tells the bands the vise of `setup` closes on (`holding::Bands`),
 /// from `first`, the setup's first simulation, which starts from the stock
@@ -3095,7 +3123,7 @@ fn index_problems(
     walk: &Walk,
     range: &std::ops::Range<usize>,
     blocks: &[Block],
-) -> Vec<String> {
+) -> Vec<Held> {
     let setup = &doc.setups[si];
     let (ops, indexes) = (&walk.ops[range.clone()], &walk.indexes[range.clone()]);
     let (settings, datum) = (&walk.settings, walk.zero);
@@ -3109,7 +3137,7 @@ fn index_problems(
     let mut tip: Option<f32> = None;
     // The tool tip's X; None until the program moves it.
     let mut x: Option<f32> = None;
-    let mut out = vec![];
+    let mut out: Vec<Held> = vec![];
     for block in blocks {
         match block {
             Block::Retract => tip = Some(retract),
@@ -3148,8 +3176,8 @@ fn index_problems(
                         exact_mm(s.clearance),
                     )),
                 };
-                if let Some(p) = problem.filter(|p| !out.contains(p)) {
-                    out.push(p);
+                if let Some(p) = problem.filter(|p| !out.iter().any(|h| &h.message == p)) {
+                    out.push(Held::of(indexes[*op], p));
                 }
             }
             _ => {}
@@ -3276,7 +3304,7 @@ pub(crate) fn held_walked(
     if crate::indexed::is_indexed(&doc.setups[si]) {
         return crate::rotary_check::held(doc, mesh, si, sims);
     }
-    let walk = walk(doc, mesh, si, sims, PostSettings::for_holding)?;
+    let walk = walk(doc, mesh, si, sims, PostSettings::for_holding).map_err(texts)?;
     let held = gripped(doc, mesh, si, &walk);
     let boxes = match holding_boxes(doc, mesh, si, held, walk.zero) {
         Ok(boxes) => boxes,
@@ -3472,14 +3500,24 @@ pub struct Partly {
 }
 /// Check and emit one setup from its `sequence` results (enabled operations only):
 /// one program, or one per run of the same tool in touch-off mode.
+#[cfg(test)]
 pub(crate) fn prepare(
     doc: &Document,
     mesh: &Mesh,
     si: usize,
     sims: &[(usize, Result<Simulation, String>)],
 ) -> Result<Vec<Prepared>, Vec<String>> {
+    prepare_held(doc, mesh, si, sims).map_err(texts)
+}
+/// `prepare`, each problem with the operation it is about.
+fn prepare_held(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    sims: &[(usize, Result<Simulation, String>)],
+) -> Result<Vec<Prepared>, Vec<Held>> {
     let setup = &doc.setups[si];
-    let programs = checked(doc, mesh, si, sims, PostSettings::from_machine)?;
+    let programs = checked_held(doc, mesh, si, sims, PostSettings::from_machine, false, &[])?;
     Ok(programs
         .into_iter()
         .map(|c| {
@@ -3525,7 +3563,7 @@ pub(crate) fn checked(
     sims: &[(usize, Result<Simulation, String>)],
     settings: Settings,
 ) -> Result<Vec<Checked>, Vec<String>> {
-    checked_with(doc, mesh, si, sims, settings, false, &[])
+    checked_held(doc, mesh, si, sims, settings, false, &[]).map_err(texts)
 }
 /// `checked` for a run, which may start at any operation: with each
 /// program's `starts` and `partly`. The operations `cut` (indexes in the
@@ -3538,9 +3576,11 @@ pub(crate) fn checked_to_start(
     settings: Settings,
     cut: &[usize],
 ) -> Result<Vec<Checked>, Vec<String>> {
-    checked_with(doc, mesh, si, sims, settings, true, cut)
+    checked_held(doc, mesh, si, sims, settings, true, cut).map_err(texts)
 }
-fn checked_with(
+/// `checked` and `checked_to_start`, each problem with the operation it is
+/// about (an index in the setup's operations), when it is one's.
+pub(crate) fn checked_held(
     doc: &Document,
     mesh: &Mesh,
     si: usize,
@@ -3548,7 +3588,7 @@ fn checked_with(
     settings: Settings,
     to_start: bool,
     cut: &[usize],
-) -> Result<Vec<Checked>, Vec<String>> {
+) -> Result<Vec<Checked>, Vec<Held>> {
     let setup = &doc.setups[si];
     if crate::manual::is_hand(&setup.machine) {
         return Ok(vec![]);
@@ -3559,7 +3599,7 @@ fn checked_with(
     let (settings, zero, stock) = (walk.settings, walk.zero, walk.stock);
     let (ops, simulations, groups) = (&walk.ops, &walk.simulations, &walk.groups);
     let held = gripped(doc, mesh, si, &walk);
-    let boxes = holding_boxes(doc, mesh, si, held, zero).map_err(|e| vec![e])?;
+    let boxes = holding_boxes(doc, mesh, si, held, zero).map_err(|e| vec![Held::setup(e)])?;
     // The jaws turn with A: an indexed setup's moves on the machine (travel,
     // A range, Z reach, the swing) and its grip, the cutting forces and the
     // tool's way past the chuck at each angle and while A turns are
@@ -3567,35 +3607,32 @@ fn checked_with(
     // links operations as they are checked there; its own turns of A are
     // `index_problems`'. A cut that parts the stock off the bar in the
     // chuck is refused in a plain setup in the chuck too.
-    let mut rotary: Vec<String> = crate::rotary_check::problems(doc, mesh, si, sims)
+    let mut rotary: Vec<Held> = crate::rotary_check::problems(doc, mesh, si, sims)
         .into_iter()
-        .map(|(_, message)| message)
+        .map(|(operation, message)| Held { operation, message })
         .collect();
     if indexed {
         match crate::rotary_check::held(doc, mesh, si, sims) {
-            Ok(held) => rotary.extend(held.into_iter().map(|h| h.message)),
-            Err(why) => rotary.extend(why),
+            Ok(held) => rotary.extend(held),
+            Err(why) => rotary.extend(why.into_iter().map(Held::setup)),
         }
     } else {
         let unholdable = unholdable(doc, mesh, si, &walk, held);
         if !unholdable.is_empty() {
             // Why the setup cannot be held first, then where its programs come
             // too close to the jaws or clamps, which says where to look.
-            let mut problems = unholdable;
+            let mut problems: Vec<Held> = unholdable.into_iter().map(Held::setup).collect();
             for group in groups {
                 let blocks = blocks(&ops[group.clone()], &walk.plans(group), &settings);
                 for h in walk.held(setup, group, &blocks, &boxes) {
-                    if !problems.contains(&h.message) {
-                        problems.push(h.message);
+                    if !problems.iter().any(|p| p.message == h.message) {
+                        problems.push(h);
                     }
                 }
             }
             return Err(problems);
         }
-        let pushed: Vec<String> = pushed(doc, si, &walk, held)
-            .into_iter()
-            .map(|h| h.message)
-            .collect();
+        let pushed = pushed(doc, si, &walk, held);
         if !pushed.is_empty() {
             return Err(pushed);
         }
@@ -3603,7 +3640,7 @@ fn checked_with(
     let origin = get(&setup.p, "origin");
     let found = zero_check(setup, mesh, stock, zero, simulations[0], &boxes);
     if !found.refused.is_empty() {
-        rotary.extend(found.refused);
+        rotary.extend(found.refused.into_iter().map(Held::setup));
         return Err(rotary);
     }
     let located = model_zero(setup, mesh, simulations[0]);
@@ -3633,35 +3670,38 @@ fn checked_with(
         let plans = walk.plans(g);
         let blocks = blocks(group_ops, &plans, &settings);
         let mut problems = rotary.clone();
-        problems.extend(crate::post_check::check_setup(
-            setup, group_ops, group_sims, &blocks, &settings, zero,
-        ));
+        problems.extend(
+            crate::post_check::check_setup_ops(
+                setup, group_ops, group_sims, &blocks, &settings, zero,
+            )
+            .into_iter()
+            .map(|(k, message)| Held {
+                operation: k.map(|k| walk.indexes[g.start + k]),
+                message,
+            }),
+        );
         problems.extend(index_problems(doc, mesh, si, walk, g, &blocks));
         let tools: Vec<(usize, &Plan)> = g
             .clone()
             .map(|k| (walk.indexes[k], &walk.simulations[k].plan))
             .collect();
         let chuck = crate::rotary_check::chuck(doc, mesh, si, held.stock, &tools, settings.blend)
-            .map_err(|e| problems.push(format!("{}: {e}", setup.name())))
+            .map_err(|e| problems.push(Held::setup(format!("{}: {e}", setup.name()))))
             .ok()
             .flatten();
         // A program's first retract starts wherever the tool was left, which
         // it cannot know: only machine Z home, the top of Z, is sure to move
         // it up there, not down over the chuck (LIO-213).
         if chuck.is_some() && !settings.machine_home {
-            problems.push(format!(
+            problems.push(Held::setup(format!(
                 "{}: a setup in the chuck retracts to machine Z home. With the setup clearance plane, the program's first retract starts wherever the tool was left, which the program cannot know, and can move it down over the chuck. Set Safe retract to \"{}\" on the machine.",
                 setup.name(),
                 crate::model::POST_RETRACT[0]
-            ));
+            )));
         }
         // An indexed setup's jaws were checked at each angle above.
         if !indexed {
-            problems.extend(
-                walk.held(setup, g, &blocks, &boxes)
-                    .into_iter()
-                    .map(|h| h.message),
-            );
+            problems.extend(walk.held(setup, g, &blocks, &boxes));
         }
         if !problems.is_empty() {
             return Err(problems);
@@ -3675,24 +3715,26 @@ fn checked_with(
             .map(|k| {
                 let range = g.start + k..g.end;
                 let mut start = self::blocks(&group_ops[k..], &plans[k..], &settings);
-                let mut problems = crate::post_check::check_setup(
+                let mut problems: Vec<Held> = crate::post_check::check_setup_ops(
                     setup,
                     &group_ops[k..],
                     &group_sims[k..],
                     &start,
                     &settings,
                     zero,
-                );
+                )
+                .into_iter()
+                .map(|(j, message)| Held {
+                    operation: j.map(|j| walk.indexes[range.start + j]),
+                    message,
+                })
+                .collect();
                 problems.extend(index_problems(doc, mesh, si, walk, &range, &start));
                 if !indexed {
-                    problems.extend(
-                        walk.held(setup, &range, &start, &boxes)
-                            .into_iter()
-                            .map(|h| h.message),
-                    );
+                    problems.extend(walk.held(setup, &range, &start, &boxes));
                 }
                 if !problems.is_empty() {
-                    return Err(problems);
+                    return Err(texts(problems));
                 }
                 for b in &mut start {
                     if let Block::Start { op, .. }
@@ -3964,7 +4006,7 @@ pub(crate) fn post_simulated(
     let setups = (0..doc.setups.len())
         .map(|si| {
             let sims = results.get(si).map_or(&[][..], Vec::as_slice);
-            let result = prepare(doc, mesh, si, sims).and_then(|parts| {
+            let result = prepare_held(doc, mesh, si, sims).and_then(|parts| {
                 parts
                     .into_iter()
                     .map(|p| {
@@ -3978,10 +4020,10 @@ pub(crate) fn post_simulated(
                         )
                         // Named by number: the file name carries the project title.
                         .map_err(|e| {
-                            vec![format!(
+                            vec![Held::setup(format!(
                                 "Setup {}: round-trip verification failed: {e}",
                                 si + 1
-                            )]
+                            ))]
                         })?;
                         let mut tools: Vec<String> = vec![];
                         for op in &p.ops {
@@ -4003,12 +4045,25 @@ pub(crate) fn post_simulated(
                     .collect::<Result<Vec<_>, _>>()
             });
             let run = (get(&doc.setups[si].machine.p, "controller") == "UC100")
-                .then(|| crate::run::plan_problems(doc, mesh, si, sims));
+                .then(|| crate::run::plan_held(doc, mesh, si, sims));
+            // What `problems()` says, each with its operation.
+            let held = match (&run, &result) {
+                (Some(Err(held)), _) | (None, Err(held)) => held.as_slice(),
+                _ => &[],
+            };
+            let problem_operations = (held.iter())
+                .map(|h| {
+                    let o = doc.setups[si].operations.get(h.operation?)?;
+                    Some((h.operation?, o.id.clone()))
+                })
+                .collect();
+            let (result, run) = (result.map_err(texts), run.map(|r| r.map_err(texts)));
             SetupPost {
                 setup: si,
                 name: doc.setups[si].name().to_string(),
                 result,
                 run,
+                problem_operations,
             }
         })
         .collect();
