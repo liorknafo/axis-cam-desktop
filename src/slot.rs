@@ -521,7 +521,7 @@ pub fn from_face(
         return Err("The model changed; pick the slot again.".into());
     }
     let g = Geometry::new(setup, mesh);
-    let arcs = cam::arcs::arcs_among(setup, mesh, &cam::arcs::upright(setup, mesh));
+    let arcs = near_pick(setup, mesh, &g, id);
     let zero = crate::post::datum(setup, stock, mesh)?;
     for (i, a) in arcs
         .iter()
@@ -632,6 +632,82 @@ pub fn from_face(
         }
     }
     Err("Pick the horizontal floor or rounded end of an X- or Y-aligned capsule slot. Rotated or irregular pockets need another setup or CNC Pocket.".into())
+}
+
+/// The round ends a pick of surface `id` (of `g`, `setup`'s placing of
+/// `mesh`) may pair: those with a wall where it is (its own, or a floor's
+/// rim), then each half round's partner where the straight walls tangent
+/// to it end, along X or Y between the same heights. Found as the whole
+/// part's arcs are (`arcs_among`), in the same order, but only there: every
+/// round of a part with modelled threads took minutes a pick (LIO-481).
+fn near_pick(setup: &Setup, mesh: &Mesh, g: &Geometry, id: usize) -> Vec<cam::arcs::Arc> {
+    const EPS: f32 = 0.01;
+    let up = cam::arcs::upright(setup, mesh);
+    let points = (g.triangles.iter())
+        .filter(|t| t.feature == Some(id))
+        .flat_map(|t| t.p);
+    let (mut min, mut max) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+    for p in points {
+        for k in 0..3 {
+            (min[k], max[k]) = (min[k].min(p[k] - EPS), max[k].max(p[k] + EPS));
+        }
+    }
+    if min[0] > max[0] {
+        return vec![];
+    }
+    let mut arcs = cam::arcs::arcs_reaching(setup, mesh, &up, &Bounds { min, max });
+    let mut partners = vec![];
+    for a in arcs.iter().filter(|a| (a.span - 180.).abs() < 1.) {
+        for axis in 0..2 {
+            for side in [-1., 1.] {
+                // The flat walls tangent to it there, by surface: where
+                // one that starts at its centre ends, its partner's is.
+                let cross = a.centre[1 - axis] + side * a.r;
+                let mut ends = std::collections::HashMap::<usize, (f32, f32)>::new();
+                for t in &g.triangles {
+                    if let Some(f) = t.feature
+                        && t.p.iter().all(|p| {
+                            (p[1 - axis] - cross).abs() < 0.001
+                                && p[2] >= a.bottom - 0.001
+                                && p[2] <= a.top + 0.001
+                        })
+                    {
+                        let e = ends.entry(f).or_insert((f32::INFINITY, f32::NEG_INFINITY));
+                        for p in &t.p {
+                            *e = (e.0.min(p[axis]), e.1.max(p[axis]));
+                        }
+                    }
+                }
+                for (lo, hi) in ends.into_values() {
+                    let far = if (lo - a.centre[axis]).abs() < 0.001 {
+                        hi
+                    } else if (hi - a.centre[axis]).abs() < 0.001 {
+                        lo
+                    } else {
+                        continue;
+                    };
+                    let (mut min, mut max) = ([0.; 3], [0.; 3]);
+                    (min[axis], max[axis]) = (far - a.r - EPS, far + a.r + EPS);
+                    min[1 - axis] = a.centre[1 - axis] - a.r - EPS;
+                    max[1 - axis] = a.centre[1 - axis] + a.r + EPS;
+                    (min[2], max[2]) = (a.bottom - EPS, a.top + EPS);
+                    partners.extend(cam::arcs::arcs_reaching(
+                        setup,
+                        mesh,
+                        &up,
+                        &Bounds { min, max },
+                    ));
+                }
+            }
+        }
+    }
+    for b in partners {
+        if !arcs.iter().any(|a| a.walls == b.walls) {
+            arcs.push(b);
+        }
+    }
+    arcs.sort_by_key(|a| a.walls.first().copied());
+    arcs
 }
 
 /// Maximum outward support of the whole capsule minus the nominal arc

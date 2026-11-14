@@ -186,6 +186,39 @@ fn a_slots_part_check_looks_only_at_the_walls_it_cuts() {
     }
 }
 #[test]
+fn a_slots_pick_looks_only_round_the_slot() {
+    // LIO-481: a pick of a Slot's round end looked for every round of the
+    // part, a modelled thread's hundreds of roots among them. On a part
+    // with far holes and a modelled thread it fits as many circles as on the
+    // bare plate, and reads the same slot.
+    let (s, plain, _, _) = fixture();
+    let busy = busy_plate();
+    let pick = |m: &Mesh| {
+        let g = Geometry::new(&s, m);
+        // A wall of the slot's round end at X+7.5, its tip.
+        let tip = (g.triangles.iter())
+            .filter(|t| {
+                t.p.iter()
+                    .all(|p| p[0] > 7.4 && p[0] < 7.6 && p[1].abs() < 1.)
+            })
+            .find_map(|t| t.feature)
+            .unwrap();
+        let stock = crate::stock::resolve(&s, Some(m)).unwrap().stock;
+        let pick = Selection {
+            mesh_fingerprint: m.fingerprint.clone(),
+            ids: vec![tip],
+        };
+        cam::arcs::forget();
+        cam::arcs::FITS.with(|n| n.set(0));
+        let fields = from_face(&s, m, &pick, stock).unwrap();
+        (fields, cam::arcs::FITS.with(|n| n.get()))
+    };
+    let (alone, cost) = pick(&plain);
+    assert_eq!(get(&alone, "slot_length"), "15.000");
+    assert_eq!(get(&alone, "slot_width"), "10.000");
+    assert_eq!(pick(&busy), (alone, cost));
+}
+#[test]
 fn sizes_orientation_allowances_blind_through_and_reach_are_honest() {
     let (s, m, t, o) = fixture();
     // Wider than the slot overcuts its ends; narrower walks it (LIO-455),
@@ -1089,7 +1122,25 @@ pub(crate) fn redesigned() -> (Document, Mesh, std::path::PathBuf) {
     doc.tools.push(eight);
     let setup = doc.setups[0].clone();
     let stock = crate::stock::resolve(&setup, Some(&mesh)).unwrap().stock;
-    let arcs = cam::arcs::arcs_among(&setup, &mesh, &cam::arcs::upright(&setup, &mesh));
+    // The round ends of the capsules (none round a thread's axis): the
+    // whole part's arcs, all but its threads' relieved roots, along which a
+    // search took minutes before LIO-481.
+    let threads = crate::thread::holes_in_setup(&setup, &mesh);
+    let g = Geometry::new(&setup, &mesh);
+    let up: std::collections::HashSet<usize> = cam::arcs::upright(&setup, &mesh)
+        .into_iter()
+        .filter(|&id| {
+            !(g.triangles.iter())
+                .filter(|t| t.feature == Some(id))
+                .flat_map(|t| t.p)
+                .any(|p| {
+                    threads
+                        .iter()
+                        .any(|t| (p[0] - t.centre[0]).hypot(p[1] - t.centre[1]) < t.root / 2. + 0.1)
+                })
+        })
+        .collect();
+    let arcs = cam::arcs::arcs_among(&setup, &mesh, &up);
     let zero = crate::post::datum(&setup, stock, &mesh).unwrap();
     // One end of each capsule of radius `r`, in order round the plate.
     let ends = |r: f32| {
@@ -1421,10 +1472,9 @@ fn a_counterbore_far_from_the_setups_origin_is_planned_as_near_it() {
 /// operation of every setup plans and simulates, the Slots among them
 /// (LIO-455: setup 4's two upper counterbores, far from its origin, were
 /// refused), and every setup's Steps build. Each Slot plans and simulates
-/// in seconds, and the arc search a Slot's pick runs over the whole part
-/// grows no arc along its threads' crests, and is kept for the next
-/// (LIO-481: setup 4's one counterbore took ten minutes, its picks as
-/// long). Run it on a release build.
+/// in seconds, and each is picked again by its round end in seconds
+/// (LIO-481: setup 4's one counterbore took ten minutes, a pick as long).
+/// Run it on a release build.
 #[test]
 #[ignore = "requires a private copy of the user's adapter project (AXIS_ADAPTER_COPY)"]
 fn the_users_adapter_project_plans_every_slot() {
@@ -1458,33 +1508,62 @@ fn the_users_adapter_project_plans_every_slot() {
     assert_eq!(slots.len(), 8);
     eprintln!("{slots:#?}");
     assert!(slots.iter().all(|(_, s)| *s < 10.), "{slots:#?}");
-    // Each setup's search over the whole part, as a pick's first: fewer
-    // circles fitted than the one wall it grew from on main (3.75 million),
-    // and the same again none.
-    let mut searches = vec![];
-    for s in &doc.setups {
-        cam::arcs::forget();
-        cam::arcs::FITS.with(|n| n.set(0));
+    // Each Slot of setup 4 picked again by its far round end: the fields it
+    // reads back are the operation's, each pick in seconds (the whole
+    // part's arcs, along its threads' relieved roots, took minutes).
+    let si = 3;
+    let first = doc.setups[si]
+        .operations
+        .iter()
+        .find(|o| o.strategy == Strategy::Slot)
+        .unwrap();
+    let here = pick_setup(&doc, &mesh, si, &first.id).unwrap();
+    let stock = crate::stock::resolve(&doc.setups[si], Some(&mesh))
+        .unwrap()
+        .stock;
+    let zero = crate::post::datum(&here, stock, &mesh).unwrap();
+    let g = Geometry::new(&here, &mesh);
+    let mut picks = vec![];
+    for o in doc.setups[si]
+        .operations
+        .iter()
+        .filter(|o| o.strategy == Strategy::Slot)
+    {
+        let slot = Slot::read(o, zero).unwrap();
+        let axis = slot.axis();
+        let half = slot.width / 2.;
+        let tip = (g.triangles.iter())
+            .find(|t| {
+                t.p.iter().all(|p| {
+                    let d = [p[0] - slot.b[0], p[1] - slot.b[1]];
+                    (d[0].hypot(d[1]) - half).abs() < 0.05
+                        && d[axis] > 0.9 * half
+                        && p[2] > slot.bottom - 0.01
+                        && p[2] < slot.top + 0.01
+                })
+            })
+            .and_then(|t| t.feature)
+            .unwrap_or_else(|| panic!("{}: no wall at its far end", o.name()));
+        let pick = Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: vec![tip],
+        };
         let took = std::time::Instant::now();
-        let first = cam::arcs::arcs_among(s, &mesh, &cam::arcs::upright(s, &mesh));
-        let fits = cam::arcs::FITS.with(|n| n.get());
+        let fields =
+            from_face(&here, &mesh, &pick, stock).unwrap_or_else(|e| panic!("{}: {e}", o.name()));
         let took = took.elapsed().as_secs_f32();
-        let again = cam::arcs::arcs_among(s, &mesh, &cam::arcs::upright(s, &mesh));
-        assert_eq!(again, first, "{}", s.name());
-        searches.push((
-            s.name(),
-            fits,
-            cam::arcs::FITS.with(|n| n.get()) - fits,
-            took,
-        ));
+        for k in ["slot_x", "slot_y", "slot_length", "slot_width"] {
+            let (got, want) = (num(&fields, k).unwrap(), num(&o.p, k).unwrap());
+            assert!(
+                (got - want).abs() < 0.01,
+                "{}: {k} {got} for {want}",
+                o.name()
+            );
+        }
+        picks.push((o.name(), took));
     }
-    eprintln!("{searches:#?}");
-    assert!(
-        searches
-            .iter()
-            .all(|(_, fits, again, _)| *fits < 1_000_000 && *again == 0),
-        "{searches:#?}"
-    );
+    eprintln!("{picks:#?}");
+    assert!(picks.iter().all(|(_, s)| *s < 10.), "{picks:#?}");
     for si in 0..doc.setups.len() {
         if let Err(e) = crate::steps::shown(&doc, &mesh, si) {
             panic!("setup {}: {e}", si + 1);
