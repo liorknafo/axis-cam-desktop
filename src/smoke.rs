@@ -6930,6 +6930,19 @@ flood = { pin = 8 }
         a.doc.setups[0].p.insert("stock_bottom".into(), "0".into());
         crate::steps::tests::build(&mut a);
         assert!(under(&texts(&mut a)));
+        // The setup's notes say where the supports go: the warning points
+        // back to them on the Hold page (LIO-487).
+        let notes = |t: &Vec<String>| {
+            t.iter().any(|t| {
+                t.ends_with(
+                    "nothing under the hole; the setup notes on the Hold page say where they go",
+                )
+            })
+        };
+        assert!(!notes(&texts(&mut a)));
+        (a.doc.setups[0].p).insert("notes".into(), "On two parallels at X-18 and X+18.".into());
+        crate::steps::tests::build(&mut a);
+        assert!(notes(&texts(&mut a)));
     }
     /// The guide's step of the operation named `name`, of kind `holes`
     /// (its Holes) or the step before it.

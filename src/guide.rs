@@ -68,6 +68,9 @@ pub struct Far {
     pub round: bool,
     pub reads: f32,
 }
+/// How near a face is to the part's to be the part's own (mm): a Face's
+/// floor on the part's top, the stock's bottom on the part's bottom.
+const SIZE_ON: f32 = 0.01;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Step {
     /// The stock box the setup starts from, what the vise or clamps hold,
@@ -158,6 +161,11 @@ pub enum Step {
     /// A facing Box (open on all four sides): face the top down to `to`,
     /// taking off `remove`; the user plans the passes. A new tool picks up Z
     /// on the top first, set to `top`, as on a Tool step.
+    ///
+    /// With `size`, the face cut is the part's own top and the stock's
+    /// bottom is at the part's bottom already: the part's finished size
+    /// along Z, which the last level is measured to rather than taken off
+    /// by `remove`, as a sawn blank is never the size planned (LIO-487).
     Face {
         op: usize,
         tool: String,
@@ -166,6 +174,7 @@ pub enum Step {
         top: Option<f32>,
         remove: f32,
         to: f32,
+        size: Option<f32>,
     },
     /// A squaring Box (one closed X or Y side, the wall, and a slab off it
     /// one row wide): cut the stock's `side` (−1 or +1) of `axis` to `to`
@@ -2071,7 +2080,14 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                 let comp = if dro { comp_sides(open) } else { [0; 2] };
                 match kind(open, lo, hi, r) {
                     Kind::Face => {
+                        // The part's top cut, on a bottom already at size:
+                        // a size to measure to (LIO-487).
+                        let part = simulation::part_box(setup, mesh);
+                        let on = |a: f32, b: f32| (a - b).abs() <= SIZE_ON;
+                        let size = (on(plan.target, part.max[2]) && on(left.min[2], part.min[2]))
+                            .then_some(part.max[2] - part.min[2]);
                         steps.push(Step::Face {
+                            size,
                             op: oi,
                             tool: tool.into(),
                             rpm,
@@ -3934,6 +3950,43 @@ pub(crate) mod tests {
         assert!(!unchecked(0), "{:?}", held(0));
         assert!(unchecked(1), "{:?}", held(1));
     }
+    /// A Face that cuts the part's own top, on stock whose bottom is the
+    /// part's already, has the part's size along Z to be measured to; one
+    /// that stops above the top, or on stock with more under the part, or
+    /// with an allowance left, has none (LIO-487).
+    #[test]
+    fn a_face_that_makes_the_parts_top_on_a_bottom_at_size_has_the_size() {
+        let (mut doc, mesh) = job("Yes");
+        let part = simulation::part_box(&doc.setups[0], &mesh);
+        let face = |doc: &Document| {
+            (build(doc, &mesh, 0).unwrap().steps.into_iter())
+                .find_map(|s| match s {
+                    Step::Face { size, to, .. } => Some((size, to)),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let set = |doc: &mut Document, k: &str, v: &str| {
+            doc.setups[0].p.insert(k.into(), v.into());
+        };
+        // 2 over the part's top, which the Face takes off, none under it.
+        set(&mut doc, "stock_top", "2");
+        set(&mut doc, "stock_bottom", "0");
+        let (size, to) = face(&doc);
+        close(to, -2.);
+        close(size.expect("a size"), part.max[2] - part.min[2]);
+        // 3 under the part: its bottom is not at size yet.
+        set(&mut doc, "stock_bottom", "3");
+        assert_eq!(face(&doc).0, None);
+        // 4 over the top: the Face stops 2 above it.
+        set(&mut doc, "stock_bottom", "0");
+        set(&mut doc, "stock_top", "4");
+        assert_eq!(face(&doc).0, None);
+        // 0.2 left on the top for a finish: not the part's face yet.
+        set(&mut doc, "stock_top", "2");
+        (doc.setups[0].operations[0].p).insert("allowance".into(), "0.2".into());
+        assert_eq!(face(&doc).0, None);
+    }
     #[test]
     fn steps_run_hold_zero_then_each_operation_and_a_face_is_one_step() {
         let (doc, mesh) = job("Yes");
@@ -3987,6 +4040,7 @@ pub(crate) mod tests {
             top,
             remove,
             to,
+            size,
         } = &guide.steps[2]
         else {
             panic!("{:?}", guide.steps[2])
@@ -3997,6 +4051,8 @@ pub(crate) mod tests {
         );
         close(*to, -2.);
         close(*remove, 2.);
+        // Stock under the part: no size to face to (LIO-487).
+        assert_eq!(*size, None);
         // The first tool picks up Z on the untouched top.
         close(top.unwrap(), 0.);
         assert_eq!(guide.steps[11], Step::HandOver { next: Some(1) });
