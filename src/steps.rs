@@ -2196,13 +2196,26 @@ fn dro_tool<'a>(diameter: f32, comp: [i8; 2], height: f32) -> Vec<Element<'a, Me
 /// vise's jaws: along the axis its jaws are not on (`across`, the axis
 /// they close on); without one, at the ends of the stock's longer side
 /// (`stock`, work coordinates).
-fn to_size<'a>(size: f32, stock: &Bounds, across: Option<usize>) -> Vec<Element<'a, Message>> {
+/// The three lines of a Face to size, as the page and the agent's read of
+/// the step both say them (LIO-487, LIO-470).
+pub(crate) fn to_size_lines(size: f32, stock: &Bounds, across: Option<usize>) -> [String; 3] {
     let d = stock.dimensions();
     let along = match across {
         Some(k) => 1 - k,
         None => usize::from(d[1] > d[0]),
     };
     let ends = ["the left and right ends", "the front and back ends"][along];
+    let size = dro(size);
+    [
+        format!(
+            "Before the last level, measure it at {ends}; if they differ, seat the part again."
+        ),
+        format!("For the last level, go down from the Z just cut by what it reads over {size}."),
+        format!("Then check {size} at both ends: the top parallel to the bottom."),
+    ]
+}
+fn to_size<'a>(size: f32, stock: &Bounds, across: Option<usize>) -> Vec<Element<'a, Message>> {
+    let [first, second, third] = to_size_lines(size, stock, across);
     let size = dro(size);
     let line = |n: u8, s: String| -> Element<'a, Message> {
         row![
@@ -2227,22 +2240,9 @@ fn to_size<'a>(size: f32, stock: &Bounds, across: Option<usize>) -> Vec<Element<
             },
             None,
         ),
-        line(
-            1,
-            format!(
-                "Before the last level, measure it at {ends}; if they differ, seat the part again."
-            ),
-        ),
-        line(
-            2,
-            format!(
-                "For the last level, go down from the Z just cut by what it reads over {size}."
-            ),
-        ),
-        line(
-            3,
-            format!("Then check {size} at both ends: the top parallel to the bottom."),
-        ),
+        line(1, first),
+        line(2, second),
+        line(3, third),
     ]
 }
 /// Where a new tool touches the top, over its picture with the spot ringed.
@@ -6632,6 +6632,71 @@ pub(crate) mod tests {
         assert!(notes.y + notes.height < next.y, "{notes:?} {next:?}");
         let a = app("Yes");
         assert!(!texts(&a).iter().any(|s| s == "SETUP NOTES"));
+    }
+    /// The agent's read of a step says what the page says (LIO-470): a Face
+    /// to size its measured finish, the Hold page the setup's notes.
+    #[test]
+    fn the_agents_read_of_the_steps_says_what_the_page_says() {
+        let a = app_with("Yes", |d| {
+            for (k, v) in [("stock_top", "2"), ("stock_bottom", "0")] {
+                d.setups[0].p.insert(k.into(), v.into());
+            }
+        });
+        let g = guide(&a);
+        let at = (g.steps.iter())
+            .position(|s| matches!(s, Step::Face { .. }))
+            .unwrap();
+        let Step::Face {
+            size: Some(size), ..
+        } = g.steps[at]
+        else {
+            panic!("{:?}", g.steps[at])
+        };
+        let read = crate::mcp::reads::step_detail(&a.doc, &g, 0, &g.steps[at]);
+        let text = read["text"].as_str().unwrap();
+        let size = dro(size);
+        for want in [
+            "about 2 mm off".to_string(),
+            "Before the last level, measure it at the left and right ends; if they differ, seat the part again.".into(),
+            format!("For the last level, go down from the Z just cut by what it reads over {size}."),
+            format!("Then check {size} at both ends: the top parallel to the bottom."),
+        ] {
+            assert!(text.contains(&want), "{want} in {text}");
+        }
+        assert!(!text.contains("taking off"), "{text}");
+        // A Face with no size keeps its depth.
+        let b = app("Yes");
+        let g = guide(&b);
+        if let Some(at) = (g.steps.iter()).position(|s| matches!(s, Step::Face { size: None, .. }))
+        {
+            let read = crate::mcp::reads::step_detail(&b.doc, &g, 0, &g.steps[at]);
+            assert!(
+                read["text"].as_str().unwrap().contains("taking off"),
+                "{read}"
+            );
+        }
+        // The Hold step carries the setup's notes, and none when it has none.
+        let note =
+            "Face up on two 15 mm parallels at X-18 and X+18, clear of the holes. Add a stop.";
+        let c = app_with("Yes", |d| {
+            d.setups[0].p.insert("notes".into(), format!("  {note}\n"));
+        });
+        let g = guide(&c);
+        let read = crate::mcp::reads::step_detail(&c.doc, &g, 0, &g.steps[0]);
+        assert_eq!(read["kind"], "Hold");
+        assert!(
+            read["text"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!("Setup notes: {note}")),
+            "{read}"
+        );
+        let g = guide(&b);
+        let read = crate::mcp::reads::step_detail(&b.doc, &g, 0, &g.steps[0]);
+        assert!(
+            !read["text"].as_str().unwrap().contains("Setup notes"),
+            "{read}"
+        );
     }
     #[test]
     fn a_new_tool_picks_up_z_on_the_top_the_operations_before_left() {

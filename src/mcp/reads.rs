@@ -1170,7 +1170,7 @@ fn steps_of(doc: &Document, guide: &guide::Guide, step: Option<usize>, how: &str
         })
         .collect();
     let section = guide.sections.iter().position(|s| s.steps.contains(&at));
-    let mut detail = step_detail(doc, si, &guide.steps[at]);
+    let mut detail = step_detail(doc, guide, si, &guide.steps[at]);
     detail["index"] = json!(at);
     detail["section"] = json!(section.map(|k| &guide.sections[k].name));
     done(json!({
@@ -1208,7 +1208,12 @@ fn holes(at: &[[f32; 3]], mouths: &[f32]) -> Vec<Value> {
 
 /// What a step says: its kind, its operation, a line of text, its readouts
 /// and holes, and all it holds (`detail`).
-fn step_detail(doc: &Document, si: usize, step: &guide::Step) -> Value {
+pub(crate) fn step_detail(
+    doc: &Document,
+    guide: &guide::Guide,
+    si: usize,
+    step: &guide::Step,
+) -> Value {
     use guide::Step as S;
     let tool_name = |id: &str| {
         (doc.tools.iter().find(|t| t.id == id)).map_or(id.to_string(), |t| t.name().to_string())
@@ -1225,10 +1230,18 @@ fn step_detail(doc: &Document, si: usize, step: &guide::Step) -> Value {
                     ),
                     None => String::new(),
                 };
+                // The setup's notes say what holds and supports the part,
+                // as the Hold page shows them (LIO-487).
+                let notes = (doc.setups.get(si)).map_or("", |s| get(&s.p, "notes").trim());
+                let notes = if notes.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Setup notes: {notes}")
+                };
                 (
                     "Hold",
                     None,
-                    format!("Hold the {x} × {y} × {z} mm stock{held}."),
+                    format!("Hold the {x} × {y} × {z} mm stock{held}.{notes}"),
                     vec![],
                     vec![],
                 )
@@ -1315,17 +1328,44 @@ fn step_detail(doc: &Document, si: usize, step: &guide::Step) -> Value {
                 rpm,
                 remove,
                 to,
+                size,
                 ..
             } => (
                 "Face",
                 Some(*op),
-                format!(
-                    "Face the top with {} at {} rpm down to Z {}, taking off {} mm.",
-                    tool_name(tool),
-                    plan_check::plain(*rpm),
-                    plan_check::plain(*to),
-                    plan_check::plain(*remove)
-                ),
+                match size {
+                    // To size (LIO-487): the planned depth is on the blank's
+                    // planned size, so it is about; the measured size sets
+                    // the last level, in the page's own words.
+                    Some(size) => {
+                        let (stock, across) = match guide.steps.first() {
+                            Some(S::Hold { stock, vise, .. }) => (*stock, vise.map(|v| v.across)),
+                            _ => (
+                                crate::mesh::Bounds {
+                                    min: [0.; 3],
+                                    max: [0.; 3],
+                                },
+                                None,
+                            ),
+                        };
+                        format!(
+                            "Face the top with {} at {} rpm, finishing the part to {} mm top to bottom: plan down to about Z {}, about {} mm off. {}",
+                            tool_name(tool),
+                            plan_check::plain(*rpm),
+                            plan_check::plain(*size),
+                            plan_check::plain(*to),
+                            plan_check::plain(*remove),
+                            crate::steps::to_size_lines(*size, &stock, across).join(" ")
+                        )
+                    }
+                    None => format!(
+                        "Face the top with {} at {} rpm down to Z {}, taking off {} mm.",
+                        tool_name(tool),
+                        plan_check::plain(*rpm),
+                        plan_check::plain(*to),
+                        plan_check::plain(*remove)
+                    ),
+                },
                 vec![],
                 vec![],
             ),
