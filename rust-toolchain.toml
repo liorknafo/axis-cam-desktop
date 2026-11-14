@@ -3,7 +3,8 @@
 # same rustfmt (1.9.0 here) and lint with the same clippy. rustup reads this
 # file and installs the toolchain on the first `cargo` run in this folder.
 # Moving to a newer Rust is its own pull request: change the channel, run
-# `cargo fmt` and fix what the new clippy finds, with no other changes.
+# `cargo fmt` (and `cargo fmt --all --manifest-path android/Cargo.toml`) and
+# fix what the new clippy finds, with no other changes.
 [toolchain]
 channel = "1.98.0"
 components = ["rustfmt", "clippy"]
