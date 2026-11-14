@@ -19,10 +19,10 @@ use crate::{App, Message};
 use iced::Task;
 use serde_json::{Value, json};
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
         mpsc,
     },
@@ -130,9 +130,15 @@ type Prepare = Box<dyn FnOnce(&mut App) + Send>;
 pub struct Runner {
     events: mpsc::Sender<Event>,
     thread: Option<std::thread::JoinHandle<()>>,
-    /// The session has changed its job (its revision is above 0): it stays
-    /// headless though a window opens (`session::Sessions`).
-    changed: Arc<AtomicBool>,
+    /// The session is committed to staying headless though a window opens
+    /// (`session::Sessions`): it has dispatched work that may change its
+    /// job (`Backend::issued`), or its revision is above 0. Set at the
+    /// dispatch, on the session's thread, before any answer about it goes;
+    /// never cleared.
+    committed: Arc<AtomicBool>,
+    /// The `command_id`s the session has given out: `wait` and `cancel` for
+    /// one of them go to it whatever window is open.
+    issued: Arc<Mutex<HashSet<String>>>,
 }
 impl Runner {
     /// Starts `session` on a thread of its own. The saved part is loaded
@@ -147,21 +153,28 @@ impl Runner {
         let before = SessionFile::read(&session.folder)
             .and_then(Result::ok)
             .is_some_and(|k| k.log.revision > 0);
-        let changed = Arc::new(AtomicBool::new(before));
-        let flag = changed.clone();
+        let committed = Arc::new(AtomicBool::new(before));
+        let issued = Arc::new(Mutex::new(HashSet::new()));
+        let (flag, ids) = (committed.clone(), issued.clone());
         let thread = std::thread::Builder::new()
             .name("mcp-session".into())
-            .spawn(move || Host::new(session, inbox, own, flag, prepare).serve())
+            .spawn(move || Host::new(session, inbox, own, flag, ids, prepare).serve())
             .expect("the MCP session's thread starts");
         Runner {
             events,
             thread: Some(thread),
-            changed,
+            committed,
+            issued,
         }
     }
-    /// Whether the session has changed its job, as its last answer said.
-    pub fn changed(&self) -> bool {
-        self.changed.load(SeqCst)
+    /// Whether the session is committed to staying headless: it has
+    /// dispatched a change, or has one from before it was resumed.
+    pub fn committed(&self) -> bool {
+        self.committed.load(SeqCst)
+    }
+    /// Whether the session gave out `command_id` `id`.
+    pub fn knows(&self, id: &str) -> bool {
+        self.issued.lock().is_ok_and(|ids| ids.contains(id))
     }
     /// Sends a tool call; `reply` gets its answer on the session's thread,
     /// at once for a read, or when the command's work has settled or its
@@ -243,15 +256,19 @@ struct Host {
     stopping: bool,
     /// What `session.json` last held (`SessionFile::key`).
     kept: Option<u64>,
-    /// `Runner::changed`, set before each answer is sent.
-    changed: Arc<AtomicBool>,
+    /// `Runner::committed`: set at a dispatch that may change the job, and
+    /// once the revision is above 0.
+    committed: Arc<AtomicBool>,
+    /// `Runner::issued`.
+    issued: Arc<Mutex<HashSet<String>>>,
 }
 impl Host {
     fn new(
         session: Session,
         inbox: mpsc::Receiver<Event>,
         events: mpsc::Sender<Event>,
-        changed: Arc<AtomicBool>,
+        committed: Arc<AtomicBool>,
+        issued: Arc<Mutex<HashSet<String>>>,
         prepare: Prepare,
     ) -> Host {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -276,11 +293,21 @@ impl Host {
             }
             None => None,
         };
+        // Whether the record goes with the workspace on disk. Not when the
+        // workspace was written after it (its own write failed, or the
+        // process ended first): the difference is the agent's, and what the
+        // record holds of the job it was written with (its project file,
+        // drafts, selection, checkpoints' project) may be another job's.
+        let paired = kept
+            .as_ref()
+            .is_some_and(|k| k.workspace.is_none() || k.workspace == on_disk);
         if let Some(kept) = &kept {
-            kept.put(&mut app);
-            // Its workspace was written after it (its own write failed, or
-            // the process ended first): the difference is the agent's.
-            app.mcp.unrecorded = kept.workspace.is_some() && kept.workspace != on_disk;
+            if paired {
+                kept.put(&mut app);
+            } else {
+                kept.put_unpaired(&mut app);
+            }
+            app.mcp.unrecorded = !paired;
         }
         prepare(&mut app);
         // A workspace not yet on disk is written now: until it is, every
@@ -303,11 +330,12 @@ impl Host {
             ticked: false,
             stopping: false,
             kept: None,
-            changed,
+            committed,
+            issued,
         };
         host.update(Message::ResumeProject, false);
         // The selection, page and tab as they were, the part loading.
-        if let Some(kept) = &kept {
+        if let Some(kept) = kept.as_ref().filter(|_| paired) {
             kept.put_place(&mut host.app);
             host.kept = Some(SessionFile::of(&host.app).key());
         }
@@ -321,7 +349,9 @@ impl Host {
     /// the fingerprint. What failed, if anything; it is tried again at the
     /// next answer.
     fn keep_session(&mut self, force: bool) -> Result<(), String> {
-        self.changed.store(self.app.mcp.log.revision > 0, SeqCst);
+        if self.app.mcp.log.revision > 0 {
+            self.committed.store(true, SeqCst);
+        }
         let mut file = SessionFile::of(&self.app);
         let key = file.key();
         if !force && self.kept == Some(key) && !self.app.dirty {
@@ -517,6 +547,14 @@ impl Backend for Host {
     }
     fn keep(&mut self) -> Result<(), String> {
         self.keep_session(false)
+    }
+    fn issued(&mut self, id: &str, changes: bool) {
+        if changes {
+            self.committed.store(true, SeqCst);
+        }
+        if let Ok(mut ids) = self.issued.lock() {
+            ids.insert(id.to_string());
+        }
     }
 }
 
@@ -1399,5 +1437,256 @@ mod tests {
         let r = ask(&mut sessions, "inspect", json!({})).unwrap();
         assert_eq!(r["project"]["title"], "Headless", "{r}");
         sessions.stop();
+    }
+
+    /// A command run in a session, waited for.
+    fn exec(runner: &Runner, command: &str, args: Value) -> Value {
+        let call = json!({"command": command, "args": args});
+        runner.call("execute", call).unwrap()
+    }
+
+    /// The reviewer's probe (LIO-470, round 2): project A saved; then, with
+    /// `session.json` alone unwritable, project B opened (B written to the
+    /// workspace, the record still naming A's file); the server ended and
+    /// the old record put back. Resumed, the session held B with A's path,
+    /// and `save_project {}` wrote B over A. The record older than its job
+    /// now restores no project file, says so, and A is never written.
+    #[test]
+    fn a_record_older_than_its_job_never_saves_over_another_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("mcp-sessions");
+        let user = user_workspace(dir.path());
+        let session = Session::open(&root, None, &user).unwrap();
+        let (id, folder) = (session.id.clone(), session.folder.clone());
+        let runner = Runner::start(session);
+        let r = exec(&runner, "set_project_title", json!({"title": "Original A"}));
+        assert_eq!(r["outcome"], "done", "{r}");
+        let a = dir.path().join("A.axis.json");
+        let b = dir.path().join("B.axis.json");
+        let r = exec(
+            &runner,
+            "save_project",
+            json!({"path": a.display().to_string()}),
+        );
+        assert_eq!(r["outcome"], "done", "{r}");
+        let old_a = std::fs::read(&a).unwrap();
+        let mut other: Value = serde_json::from_slice(&old_a).unwrap();
+        other["title"] = json!("Different B");
+        other["project_id"] = json!(uuid::Uuid::new_v4().to_string());
+        std::fs::write(&b, serde_json::to_vec(&other).unwrap()).unwrap();
+        // session.json alone cannot be replaced; the workspace can.
+        let record = folder.join(super::super::session::FILE);
+        let aside = folder.join("old-record.json");
+        std::fs::rename(&record, &aside).unwrap();
+        std::fs::create_dir(&record).unwrap();
+        let r = exec(
+            &runner,
+            "open_project",
+            json!({"path": b.display().to_string()}),
+        );
+        assert_eq!(r["persisted"], false, "{r}");
+        let read = runner.call("inspect", json!({})).unwrap();
+        assert_eq!(read["project"]["title"], "Different B", "{read}");
+        // The server ends (its last write of the record fails too), and
+        // the record of A is back beside B's workspace.
+        runner.stop();
+        std::fs::remove_dir(&record).unwrap();
+        std::fs::rename(&aside, &record).unwrap();
+        let kept = SessionFile::read(&folder).unwrap().unwrap();
+        assert_eq!(kept.project_path.as_deref(), Some(a.as_path()));
+
+        let runner = Runner::start(Session::open(&root, Some(&id), &user).unwrap());
+        let read = runner.call("inspect", json!({})).unwrap();
+        assert_eq!(read["project"]["title"], "Different B", "{read}");
+        assert_eq!(read["project"]["file"], Value::Null, "{read}");
+        assert_eq!(read["project"]["saved"], false, "{read}");
+        assert_eq!(read["project"]["dirty"], true, "{read}");
+        assert_eq!(read["session"]["project_file"], Value::Null, "{read}");
+        assert_eq!(read["session"]["saved_to_project_file"], false, "{read}");
+        assert_eq!(
+            read["notes"],
+            json!([super::super::session::OLDER_RECORD]),
+            "{read}"
+        );
+        // Said once.
+        let again = runner.call("inspect", json!({})).unwrap();
+        assert!(again.get("notes").is_none(), "{again}");
+        let r = exec(&runner, "save_project", json!({}));
+        assert_eq!(r["outcome"], "refused", "{r}");
+        assert_eq!(std::fs::read(&a).unwrap(), old_a, "A is as it was");
+        // Saved with a path, it is saved there.
+        let c = dir.path().join("C.axis.json");
+        let r = exec(
+            &runner,
+            "save_project",
+            json!({"path": c.display().to_string()}),
+        );
+        assert_eq!(r["outcome"], "done", "{r}");
+        assert_eq!(r["session"]["saved_to_project_file"], true, "{r}");
+        runner.stop();
+        assert_eq!(std::fs::read(&a).unwrap(), old_a, "A is as it was");
+        assert_eq!(crate::storage::load(&c).unwrap().title, "Different B");
+    }
+
+    /// The reviewer's probe (LIO-470, round 2): the instance folder made
+    /// unreadable with a live window's file in it; the call went headless
+    /// and made a session. Whether a window is open cannot be told then:
+    /// the call is an error, and no session is made.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_instance_folder_is_an_error_not_headless() {
+        use super::super::instance::{ACCESS_OFF, Access, Found, Instance, discover, folder};
+        use super::super::session::Sessions;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("mcp-sessions");
+        let user = user_workspace(dir.path());
+        let windows = folder(&user);
+        Instance::of_this_process(Access::Off)
+            .write(&windows)
+            .unwrap();
+        let mode = |m: u32| {
+            std::fs::set_permissions(&windows, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        let mut sessions = Sessions::new(root.clone(), user.clone(), None);
+        mode(0o000);
+        let found = discover(&windows);
+        let read = ask(&mut sessions, "inspect", json!({}));
+        let resume = ask(&mut sessions, "resume_session", json!({"id": "any"}));
+        let made = root.exists();
+        mode(0o755);
+        assert!(matches!(found, Found::Unknown(_)), "{found:?}");
+        let why = read.unwrap_err();
+        assert!(
+            why.starts_with("Whether an AXIS CAM window is open cannot be told")
+                && why.contains(&windows.display().to_string()),
+            "{why}"
+        );
+        assert!(resume.unwrap_err().contains("cannot be told"));
+        assert!(!made, "no session made");
+        // Readable again: the window is found.
+        let r = ask(&mut sessions, "inspect", json!({})).unwrap_err();
+        assert_eq!(r, format!("{ACCESS_OFF} (pid {})", std::process::id()));
+        assert!(!root.exists());
+        sessions.stop();
+    }
+
+    /// The reviewer's probe (LIO-470, round 2): a session's first change
+    /// sent with `wait_s: 0` (still running at revision 0), then a window
+    /// appears; `wait` and `inspect` were refused for it even after the
+    /// change had settled. A session that has dispatched a change is
+    /// committed to staying headless from the dispatch. Before that, a
+    /// window refuses the session's calls but its stops, and a `wait` for
+    /// a command it gave out.
+    #[test]
+    fn a_change_dispatched_before_a_window_opens_stays_headless() {
+        use super::super::instance::{ACCESS_OFF, Access, Instance, folder};
+        use super::super::session::Sessions;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("mcp-sessions");
+        let user = user_workspace(dir.path());
+        let windows = folder(&user);
+        let off = format!("{ACCESS_OFF} (pid {})", std::process::id());
+        let mut sessions = Sessions::new(root.clone(), user.clone(), None);
+        let start = ask(&mut sessions, "inspect", json!({})).unwrap();
+        assert_eq!(start["revision"], 0, "{start}");
+
+        // No change dispatched yet: the window refuses a call, but not a
+        // stop, nor the wait for a read the session gave out.
+        let read = ask(&mut sessions, "check_job", json!({"wait_s": 50})).unwrap();
+        let read_id = read["command_id"].as_str().unwrap().to_string();
+        let window = Instance::of_this_process(Access::Off)
+            .write(&windows)
+            .unwrap();
+        assert_eq!(ask(&mut sessions, "inspect", json!({})).unwrap_err(), off);
+        let stop = json!({"command": "hold"});
+        let r = ask(&mut sessions, "execute", stop).unwrap();
+        assert_ne!(r["outcome"], "busy", "{r}");
+        let r = ask(&mut sessions, "wait", json!({"command_id": read_id})).unwrap();
+        assert_eq!(r["command_id"], read_id.as_str(), "{r}");
+        assert_ne!(r["outcome"], "still_running", "{r}");
+        let r = ask(&mut sessions, "wait", json!({"command_id": "nothing-9"}));
+        assert_eq!(r.unwrap_err(), off, "not a command it gave out");
+        std::fs::remove_file(&window).unwrap();
+
+        // A change sent, still running at revision 0.
+        let set = json!({"command": "set_project_title", "args": {"title": "Before the window"}, "wait_s": 0});
+        let r = ask(&mut sessions, "execute", set).unwrap();
+        assert_eq!(r["outcome"], "still_running", "{r}");
+        assert_eq!(r["revision"], 0, "{r}");
+        let id = r["command_id"].as_str().unwrap().to_string();
+        // A window opens; the change settles with no one waiting.
+        Instance::of_this_process(Access::Off)
+            .write(&windows)
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+        let r = ask(
+            &mut sessions,
+            "wait",
+            json!({"command_id": id, "wait_s": 10}),
+        )
+        .unwrap();
+        assert_eq!(r["outcome"], "done", "{r}");
+        assert_eq!(r["revision"], 1, "{r}");
+        assert_eq!(r["backend"], "headless", "{r}");
+        let read = ask(&mut sessions, "inspect", json!({})).unwrap();
+        assert_eq!(read["project"]["title"], "Before the window", "{read}");
+        assert_eq!(read["backend"], "headless", "{read}");
+        sessions.stop();
+    }
+
+    /// The reviewer's probe (LIO-470, round 2): the project file changed by
+    /// another program while the server ran; `inspect` still said saved,
+    /// and `list_sessions` not. Every saved flag is the file as it is now,
+    /// by value: changed, removed, unreadable and put back, no restart.
+    #[test]
+    fn inspect_says_saved_by_the_project_file_as_it_is_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("mcp-sessions");
+        let user = user_workspace(dir.path());
+        let session = Session::open(&root, None, &user).unwrap();
+        let id = session.id.clone();
+        let runner = Runner::start(session);
+        let project = dir.path().join("job.axis.json");
+        let r = exec(
+            &runner,
+            "save_project",
+            json!({"path": project.display().to_string()}),
+        );
+        assert_eq!(r["outcome"], "done", "{r}");
+        let original = std::fs::read(&project).unwrap();
+        let saved = |runner: &Runner, want: bool| {
+            let read = runner.call("inspect", json!({})).unwrap();
+            assert_eq!(read["project"]["saved"], want, "{read}");
+            assert_eq!(read["session"]["saved_to_project_file"], want, "{read}");
+            let listed = super::super::session::list(&root);
+            let it = listed.iter().find(|s| s["id"] == id.as_str()).unwrap();
+            assert_eq!(it["saved_to_project_file"], want, "{it}");
+        };
+        saved(&runner, true);
+        let mut changed = crate::storage::load(&project).unwrap();
+        changed.title = "Changed elsewhere".into();
+        crate::storage::save(&project, &changed).unwrap();
+        saved(&runner, false);
+        std::fs::write(&project, &original).unwrap();
+        saved(&runner, true);
+        std::fs::write(&project, "not a project").unwrap();
+        saved(&runner, false);
+        std::fs::remove_file(&project).unwrap();
+        saved(&runner, false);
+        std::fs::write(&project, &original).unwrap();
+        saved(&runner, true);
+        // The job changed here: not saved, until saved again.
+        let r = exec(
+            &runner,
+            "set_project_title",
+            json!({"title": "Changed here"}),
+        );
+        assert_eq!(r["session"]["saved_to_project_file"], false, "{r}");
+        saved(&runner, false);
+        let r = exec(&runner, "save_project", json!({}));
+        assert_eq!(r["outcome"], "done", "{r}");
+        saved(&runner, true);
+        runner.stop();
     }
 }

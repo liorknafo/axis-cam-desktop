@@ -158,7 +158,28 @@ impl SessionFile {
     pub fn put_place(&self, app: &mut App) {
         self.place.put(app);
     }
+    /// Puts into `app` what it kept that does not depend on the job, when
+    /// the workspace on disk is not the one it was written with (`runner`):
+    /// that workspace may hold another project than the one it names. The
+    /// revision and change log, and the last saves and exports, go on. The
+    /// project file is not restored (the project has none, and is not
+    /// saved), nor the drafts and the selection; its checkpoints stay
+    /// listed, but as another project's (`checkpoint::other_project`), so
+    /// none is restored over this job. A note says so in the next result.
+    pub fn put_unpaired(&self, app: &mut App) {
+        app.mcp.log = self.log.clone();
+        app.mcp.log.projects += 1;
+        app.mcp.outputs = self.outputs.clone();
+        app.mcp.checkpoints = super::checkpoint::Kept::from_list(self.checkpoints.clone());
+        app.project_path = None;
+        app.project_dirty = true;
+        app.mcp.notes.push(OLDER_RECORD.into());
+    }
 }
+
+/// The note of a session resumed whose `session.json` is older than its
+/// workspace (`SessionFile::put_unpaired`).
+pub const OLDER_RECORD: &str = "The session record was older than its job; the project file was not restored — save with a path.";
 
 /// Whether the job of the session in `folder`, which kept `kept`, is saved
 /// to a project file now: its project file is there, loads, and holds the
@@ -506,11 +527,14 @@ pub fn delete(root: &Path, id: &str, discard_unsaved: bool) -> Result<Value, Str
 /// opened at the start (`--session <id>`), resumed (`resume_session`), or
 /// made new at the first tool that needs one.
 ///
-/// Instance discovery (`instance`): until the headless session has changed
-/// its job, each call first looks for an open AXIS CAM window, and while
-/// one is open the call is refused (its access off, several open, or
-/// driving a window, which comes in the next version); a session that has
-/// changed its job stays headless.
+/// Instance discovery (`instance`): until the headless session is committed
+/// (`Runner::committed`: it has dispatched work that may change its job, or
+/// has changes from before a resume), each call first looks for an open
+/// AXIS CAM window, and while one is open, or whether one is cannot be
+/// told, the call is refused (its access off, several open, or driving a
+/// window, which comes in the next version); a committed session stays
+/// headless. `wait` and `cancel` for a `command_id` the open session gave
+/// out, and the machine's stops sent to it, are never refused for a window.
 pub struct Sessions {
     root: PathBuf,
     workspace: PathBuf,
@@ -534,20 +558,21 @@ impl Sessions {
             "list_sessions" | "resume_session" | "delete_session" | "select_window"
         )
     }
-    /// Why the call cannot go to a headless session: a window is open
-    /// (`instance::refusal`). None when there is no window, or when the
-    /// session open now (or `resuming`) has changed its job: it stays.
+    /// Why the call cannot go to a headless session: a window is open, or
+    /// whether one is cannot be told (`instance::refusal`). None when there
+    /// is no window, or when the session open now (or `resuming`) is
+    /// committed to staying headless.
     fn window(&self, resuming: Option<&str>) -> Option<String> {
-        let changed = match resuming {
+        let committed = match resuming {
             Some(id) => {
                 valid_id(id)
                     && SessionFile::read(&self.root.join(id))
                         .and_then(Result::ok)
                         .is_some_and(|k| k.log.revision > 0)
             }
-            None => self.runner.as_ref().is_some_and(|(_, r)| r.changed()),
+            None => self.runner.as_ref().is_some_and(|(_, r)| r.committed()),
         };
-        if changed {
+        if committed {
             return None;
         }
         let found = super::instance::discover(&super::instance::folder(&self.workspace));
@@ -598,6 +623,24 @@ impl Sessions {
                 "annotations": {"destructiveHint": true},
             }),
         ]
+    }
+    /// Whether `tool` with `args` goes to the session open now whatever
+    /// window is open: `wait` or `cancel` for a `command_id` it gave out
+    /// (its work was dispatched there, and only it can answer), and the
+    /// machine's stops. With no session open, none does.
+    fn bound(&self, tool: &str, args: &Value) -> bool {
+        let Some((_, runner)) = &self.runner else {
+            return false;
+        };
+        match tool {
+            "wait" | "cancel" => {
+                (args.get("command_id").and_then(Value::as_str)).is_some_and(|id| runner.knows(id))
+            }
+            "execute" => (args.get("command").and_then(Value::as_str))
+                .and_then(super::commands::find)
+                .is_some_and(|c| c.group == "machine"),
+            _ => false,
+        }
     }
     /// The session open now, or a new one.
     fn runner(&mut self) -> Result<&Runner, String> {
@@ -680,7 +723,9 @@ impl Sessions {
                 );
             }
             _ => {
-                if let Some(why) = self.window(None) {
+                if !self.bound(tool, &args)
+                    && let Some(why) = self.window(None)
+                {
                     return reply(Err(why));
                 }
                 match self.runner() {

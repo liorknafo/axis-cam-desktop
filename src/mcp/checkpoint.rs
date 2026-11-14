@@ -384,7 +384,55 @@ pub fn saved_by_value(doc: &Document, path: Option<&Path>) -> bool {
     }
 }
 
+/// What `App::saved_to_file` last worked out, and for what: the project
+/// file (its path, modification time and length) and the `Document` (the
+/// hash of its serialization). Worked out again when any of them changes.
+#[derive(Debug, Default)]
+pub struct SavedCache(Mutex<Option<(SavedKey, bool)>>);
+#[derive(Debug, PartialEq)]
+struct SavedKey {
+    path: PathBuf,
+    modified: std::time::SystemTime,
+    len: u64,
+    doc: u64,
+}
+
 impl App {
+    /// Whether the job is saved to its project file now: the file is
+    /// there, loads, and holds the `Document` by value (`saved_by_value`),
+    /// the rule `list_sessions` and `delete_session` use. Every saved flag
+    /// a result reports is this. Kept (`SavedCache`) while neither the
+    /// file nor the `Document` changes.
+    pub(crate) fn saved_to_file(&self) -> bool {
+        let Some(path) = self.project_path.as_deref() else {
+            return false;
+        };
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
+        if !meta.is_file() {
+            return false;
+        }
+        let Ok(modified) = meta.modified() else {
+            return saved_by_value(&self.doc, Some(path));
+        };
+        let key = SavedKey {
+            path: path.to_path_buf(),
+            modified,
+            len: meta.len(),
+            doc: super::state::hash_of(&self.doc),
+        };
+        let mut cache =
+            (self.mcp.saved.0.lock()).unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((k, saved)) = cache.as_ref()
+            && *k == key
+        {
+            return *saved;
+        }
+        let saved = saved_by_value(&self.doc, Some(path));
+        *cache = Some((key, saved));
+        saved
+    }
     /// Puts `checkpoint` back, in one turn (`engine` checked it may be):
     /// the job through `job_replaced`, with the machinist's records as they
     /// are now (the step guide's places, the measurements and the dial

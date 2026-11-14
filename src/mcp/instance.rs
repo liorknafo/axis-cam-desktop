@@ -14,8 +14,9 @@
 //! This version writes no instance file, and has no bridge to a window
 //! (the next milestone, M2, adds both, writing this same `Instance`). The
 //! client side is here: a server finds the windows at each call until its
-//! headless session has changed its job (`session::Sessions`), and never
-//! goes headless while a window is open.
+//! headless session is committed (it has dispatched a change,
+//! `session::Sessions`), and never goes headless while a window is open
+//! or while the folder of these files cannot be read.
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -124,14 +125,29 @@ pub enum Found {
     Windows(Vec<Instance>),
     /// A live window's file that cannot be read: its pid and why.
     Unreadable(u32, String),
+    /// The instance folder, or an entry of it, cannot be read (not merely
+    /// missing): whether a window is open is not known. Why.
+    Unknown(String),
 }
 
 /// Reads the instance files in `folder`, deleting those whose process is
-/// not alive.
+/// not alive. A folder that is not there means no window; one that cannot
+/// be listed, or an entry whose metadata cannot be read, is `Unknown`,
+/// never taken as no window. A file gone between the listing and its read
+/// (a window closing) is skipped.
 pub fn discover(folder: &Path) -> Found {
+    use std::io::ErrorKind::NotFound;
     let mut windows = vec![];
-    let entries = std::fs::read_dir(folder).into_iter().flatten().flatten();
+    let entries = match std::fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == NotFound => return Found::None,
+        Err(e) => return Found::Unknown(format!("{}: {e}", folder.display())),
+    };
     for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => return Found::Unknown(format!("{}: {e}", folder.display())),
+        };
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(pid) = name
@@ -140,10 +156,17 @@ pub fn discover(folder: &Path) -> Found {
         else {
             continue;
         };
-        let beat = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-        let read = std::fs::read(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|b| serde_json::from_slice::<Instance>(&b).map_err(|e| e.to_string()));
+        let beat = match std::fs::metadata(&path) {
+            Ok(meta) => meta.modified().ok(),
+            Err(e) if e.kind() == NotFound => continue,
+            Err(e) => return Found::Unknown(format!("{}: {e}", path.display())),
+        };
+        let read = match std::fs::read(&path) {
+            Err(e) if e.kind() == NotFound => continue,
+            read => read
+                .map_err(|e| e.to_string())
+                .and_then(|b| serde_json::from_slice::<Instance>(&b).map_err(|e| e.to_string())),
+        };
         match read {
             Ok(i) if super::session::process_alive(i.pid, i.started.as_deref(), beat) => {
                 windows.push(i)
@@ -189,6 +212,9 @@ pub fn refusal(found: &Found, chosen: Option<u32>) -> Option<String> {
         Found::None => None,
         Found::Unreadable(pid, why) => Some(format!(
             "An AXIS CAM window (pid {pid}) is open, but its instance file cannot be read ({why}). Close the app to work without a window."
+        )),
+        Found::Unknown(why) => Some(format!(
+            "Whether an AXIS CAM window is open cannot be told: its instance folder cannot be read ({why}). Make the folder readable, or remove it if no AXIS CAM window is open."
         )),
         Found::Windows(all) => {
             let one = match (all.as_slice(), chosen) {
@@ -238,7 +264,7 @@ pub fn select(found: &Found, pid: u32) -> String {
         Found::Windows(all) if all.iter().any(|i| i.pid == pid) => {
             refusal(found, Some(pid)).unwrap_or_default()
         }
-        Found::Unreadable(..) => refusal(found, None).unwrap_or_default(),
+        Found::Unreadable(..) | Found::Unknown(..) => refusal(found, None).unwrap_or_default(),
         _ => format!("No AXIS CAM window with pid {pid} is open."),
     }
 }

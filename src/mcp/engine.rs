@@ -62,6 +62,11 @@ pub trait Backend {
     fn keep(&mut self) -> Result<(), String> {
         Ok(())
     }
+    /// A `command_id` was given out, as the work it names is dispatched:
+    /// `changes` when that work may change the job (a command's ownership
+    /// window, a checkpoint restore). A headless session that has
+    /// dispatched such work stays headless from then on (`session::Sessions`).
+    fn issued(&mut self, _id: &str, _changes: bool) {}
 }
 
 /// What a tool call gives back: its result object, or why the call could
@@ -422,7 +427,7 @@ fn inspect(b: &impl Backend) -> Value {
             "title": doc.title,
             "file": app.project_path.as_ref().map(|p| p.display().to_string()),
             "revision": app.mcp.log.revision,
-            "saved": app.project_path.is_some() && !app.project_dirty,
+            "saved": app.saved_to_file(),
             "dirty": app.project_dirty,
             "model": model,
             "sample": app.is_sample(),
@@ -463,9 +468,9 @@ fn session_info(b: &impl Backend) -> Value {
     let app = b.app();
     let mut session = b.session();
     if let Value::Object(o) = &mut session {
-        // A file removed since it was saved holds nothing.
-        let saved = app.project_path.as_ref().is_some_and(|p| p.is_file()) && !app.project_dirty;
-        o.insert("saved_to_project_file".into(), json!(saved));
+        // The file as it is now, by value: one removed, unreadable or
+        // changed since it was saved does not hold the job.
+        o.insert("saved_to_project_file".into(), json!(app.saved_to_file()));
         o.insert(
             "project_file".into(),
             json!(app.project_path.as_ref().map(|p| p.display().to_string())),
@@ -829,6 +834,7 @@ impl Agent {
         }
         self.count += 1;
         let id = format!("{tool}-{}", self.count);
+        b.issued(&id, false);
         let app = b.app();
         let before = || match app.mcp.log.last.as_ref().filter(|_| outside) {
             Some(last) => last.clone(),
@@ -874,8 +880,20 @@ impl Agent {
         if out.is_empty() {
             return;
         }
+        // Notes kept for the next results about the job (a resume's).
+        let notes = if out.iter().any(|(_, a, stamp)| *stamp && a.is_ok()) {
+            std::mem::take(&mut b.app_mut().mcp.notes)
+        } else {
+            vec![]
+        };
         for (_, answer, stamp) in &mut out {
             if *stamp && let Ok(Value::Object(result)) = answer {
+                if !notes.is_empty() {
+                    let list = result.entry("notes").or_insert_with(|| json!([]));
+                    if let Some(list) = list.as_array_mut() {
+                        list.extend(notes.iter().map(|n| json!(n)));
+                    }
+                }
                 let session = session_info(b);
                 let log = &mut b.app_mut().mcp.log;
                 result.insert("revision".into(), json!(log.revision));
@@ -1088,6 +1106,9 @@ impl Agent {
         }
         self.count += 1;
         let id = format!("{}-{}", c.name, self.count);
+        // Committed from here, before any of it is sent: its result is the
+        // headless session's, whatever window appears meanwhile.
+        b.issued(&id, windowed);
         let status = b.app().status.clone();
         let records = (windowed && !state::REPLACES_PROJECT.contains(&c.name))
             .then(|| Records::of(&b.app().doc));
@@ -1421,6 +1442,7 @@ impl Agent {
         }
         self.count += 1;
         let id = format!("restore_checkpoint-{}", self.count);
+        b.issued(&id, true);
         self.waiters.push(Waiter {
             id: id.clone(),
             deadline,
@@ -1497,7 +1519,7 @@ impl Agent {
         let status = app.status.clone();
         app.restore(&r.checkpoint, mesh);
         let stepped = app.mcp_restored(&r.checkpoint.name);
-        let saved = !app.project_dirty;
+        let saved = app.saved_to_file();
         let note = format!(
             "Checkpoint \"{}\" (revision {}) restored as revision {}. {}",
             r.checkpoint.name,

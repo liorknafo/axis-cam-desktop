@@ -641,6 +641,11 @@ pub struct Tracker {
     /// process ended first): the next difference found is the server's own
     /// work for the agent, not the user's (`mcp_outside`).
     pub unrecorded: bool,
+    /// Notes for the next result about the job (`engine`), then dropped.
+    pub notes: Vec<String>,
+    /// Whether the job is saved to its project file, as last worked out
+    /// (`App::saved_to_file`).
+    pub saved: super::checkpoint::SavedCache,
     /// How long each read's worker waits before it works (tests).
     #[cfg(test)]
     pub slow_reads: Option<std::time::Duration>,
