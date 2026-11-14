@@ -19,6 +19,8 @@
 //!   job off the `App`'s thread, heavy ones kept from a running machine.
 //! - `rules`: the machining rules by topic, for `guide`.
 //! - `checkpoint`: the job kept by name, and put back.
+//! - `session`: what a headless session keeps on disk beside its workspace,
+//!   its lock, and the session tools.
 pub mod checkpoint;
 pub mod class;
 pub mod commands;
@@ -29,6 +31,7 @@ pub mod protocol;
 pub mod reads;
 pub mod rules;
 pub mod runner;
+pub mod session;
 pub mod state;
 
 #[cfg_attr(not(test), allow(unused_imports))]
@@ -48,11 +51,16 @@ pub fn main(args: &[String]) -> i32 {
     };
     crate::fault::install();
     let workspace = crate::storage::state_path();
-    match runner::Session::open(&runner::Session::root(), id, &workspace) {
-        Ok(session) => protocol::serve(session),
-        Err(e) => {
+    let root = runner::Session::root();
+    // A session named is opened (and locked) at once; otherwise one is
+    // made at the first tool that needs it, or resumed.
+    let opened = match id.map(|id| runner::Session::open(&root, Some(id), &workspace)) {
+        None => None,
+        Some(Ok(session)) => Some(session),
+        Some(Err(e)) => {
             eprintln!("{e}");
-            1
+            return 1;
         }
-    }
+    };
+    protocol::serve(session::Sessions::new(root, workspace, opened))
 }

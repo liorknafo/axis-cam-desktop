@@ -11,7 +11,7 @@
 use super::{
     engine::{self, Answer},
     reads,
-    runner::{Runner, Session},
+    session::Sessions,
 };
 use serde_json::{Value, json};
 use std::{
@@ -38,29 +38,31 @@ Ids: setups and operations are addressed by `id`. An index from 0, in inspect's 
 
 Outcomes: every `execute` result has `outcome`: `done` (its effect was checked and holds), `no_change` (it was already so), `refused` (nothing was done; `reason` says what is missing), `busy` (the previous command's work is still settling; nothing was done: call `wait`, then retry), `failed` (it was sent and did not take; `reason` gives the app's status line or says what did not happen), `still_running` (it was sent and its work, listed in `pending`, had not settled within `wait_s`: 25 s by default, at most 50), or `cancelled`. A command that was sent has a `command_id`: `wait {command_id}` gives its final result, and `cancel {command_id}` stops a generation. `batch {steps}` runs commands in order and stops at the first that does not go; it is not all-or-nothing. Reads, `wait`, `cancel` and the stops answer while a command's work settles. The status line alone does not tell whether a command worked; the outcome does.
 
-Session: with no AXIS CAM window to work in, this server runs a headless session of its own, which starts from a copy of the user's workspace (their libraries and last job). It never writes the user's workspace. It is kept on disk in the folder inspect names when the client ends, and `axis-cam --mcp --session <id>` continues it. Every result names its backend.
+Session: with no AXIS CAM window to work in, this server runs a headless session of its own, which starts from a copy of the user's workspace (their libraries and last job). It never writes the user's workspace. Everything a result reports is on disk in the session's folder before the result is sent, and it stays there when the client ends: `resume_session {id}` (or `axis-cam --mcp --session <id>`) continues it, `list_sessions` lists them, and `delete_session` deletes one; nothing deletes them otherwise. Every result names its backend and its session, whether the job is saved to a project file, and the last saves and exports.
+
+Checkpoints: `checkpoint {name}` keeps the job as it is; `restore_checkpoint {name}` puts it back as one new revision, refused when the user changed the job since (unless `discard_user_changes: true`), for another project, or when the part file changed. Take one before a risky batch.
 
 The machine: moving it, turning the spindle or coolant on, connecting, and what its controller holds stay with the user in the app; no command here does them.";
 
-/// Serves MCP on stdin and stdout for `session` until stdin ends; the exit
-/// code. The session is left on disk.
-pub fn serve(session: Session) -> i32 {
+/// Serves MCP on stdin and stdout until stdin ends, the tools carried out
+/// in the headless session of `sessions`; the exit code. The session is
+/// left on disk.
+pub fn serve(mut sessions: Sessions) -> i32 {
     let out = protocol_output();
     let (lines, written) = mpsc::channel::<String>();
     let writer = std::thread::Builder::new()
         .name("mcp-stdout".into())
         .spawn(move || write_lines(out, written))
         .expect("the MCP writer starts");
-    let runner = Runner::start(session);
     let reader = std::thread::Builder::new()
         .name("mcp-stdin".into())
         .spawn(move || {
             for line in std::io::stdin().lock().lines() {
                 let Ok(line) = line else { break };
-                handle_line(&line, &runner, &lines);
+                handle_line(&line, &mut sessions, &lines);
             }
             // The calls already read are answered before the session ends.
-            runner.stop();
+            sessions.stop();
         })
         .expect("the MCP reader starts");
     let _ = reader.join();
@@ -146,7 +148,7 @@ pub fn tool_result(answer: Answer) -> Value {
 
 /// Answers one line from the client. A notification, or a response, gets
 /// no answer; a `tools/call` is answered by the session when it is done.
-fn handle_line(line: &str, runner: &Runner, out: &mpsc::Sender<String>) {
+fn handle_line(line: &str, sessions: &mut Sessions, out: &mpsc::Sender<String>) {
     if line.trim().is_empty() {
         return;
     }
@@ -226,8 +228,8 @@ fn handle_line(line: &str, runner: &Runner, out: &mpsc::Sender<String>) {
                 }
             };
             let out = out.clone();
-            runner.send(
-                name.into(),
+            sessions.call(
+                name,
                 args,
                 Box::new(move |answer| {
                     let _ = out.send(result(&id, tool_result(answer)));

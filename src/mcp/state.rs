@@ -630,6 +630,8 @@ pub struct Tracker {
     pub heavy: super::reads::Heavy,
     /// The checkpoints the agent took (`checkpoint`), oldest first.
     pub checkpoints: super::checkpoint::Kept,
+    /// The paths of the last saves and exports the agent made.
+    pub outputs: Vec<super::session::Output>,
     /// How long each read's worker waits before it works (tests).
     #[cfg(test)]
     pub slow_reads: Option<std::time::Duration>,

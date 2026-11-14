@@ -3682,6 +3682,20 @@ impl App {
             picks::record(&mut self.doc, mesh);
         }
     }
+    /// Saves the workspace now if it has changed, as the `Tick` after an
+    /// edit's pause will: the headless MCP session's work is on disk before
+    /// a result about it is sent (LIO-470). Whether it is saved. The edit
+    /// still counts as unsettled (`dirty`) until that `Tick`, which starts
+    /// the checks that follow it.
+    pub(crate) fn persist_now(&mut self) -> bool {
+        if !self.dirty {
+            return true;
+        }
+        self.persist();
+        let saved = !self.dirty;
+        self.dirty = true;
+        saved
+    }
     fn persist(&mut self) {
         if !self.dirty {
             return;

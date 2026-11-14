@@ -14,6 +14,7 @@
 //! the messages of the work it starts: a task carries who started it. A
 //! `Tick` and the work it starts are the app's own.
 use super::engine::{Agent, Backend, Reply};
+use super::session::SessionFile;
 use crate::{App, Message};
 use iced::Task;
 use serde_json::{Value, json};
@@ -33,29 +34,29 @@ const FAST_TICK: Duration = Duration::from_millis(33);
 const SLOW_TICK: Duration = Duration::from_millis(500);
 
 /// A headless session: its id and the folder it is kept in,
-/// `AXIS CAM Studio/mcp-sessions/<id>/`, which holds its own workspace.
+/// `AXIS CAM Studio/mcp-sessions/<id>/`, which holds its own workspace
+/// (`session` says what else). Open, it holds the folder's lock: no other
+/// process opens it until the last of its clones goes.
 #[derive(Debug, Clone)]
 pub struct Session {
     pub id: String,
     pub folder: PathBuf,
+    /// Held, never read: dropped with the last clone, it lets go.
+    _lock: Option<Arc<super::session::Lock>>,
 }
 impl Session {
     /// The folder the sessions are kept in, beside the user's workspace.
     pub fn root() -> PathBuf {
         crate::storage::state_path().with_file_name("mcp-sessions")
     }
-    /// Session `id` in `root`, whose folder must be there, or with no id a
-    /// new session, which starts from a copy of the user's `workspace`
-    /// (when there is one) so it has their libraries. The user's workspace
-    /// is only read: the session's `App` saves its own copy.
+    /// Session `id` in `root`, whose folder must be there and which no
+    /// other live process has open (`session::Lock`), or with no id a new
+    /// session, which starts from a copy of the user's `workspace` (when
+    /// there is one) so it has their libraries. The user's workspace is
+    /// only read: the session's `App` saves its own copy.
     pub fn open(root: &Path, id: Option<&str>, workspace: &Path) -> Result<Session, String> {
         if let Some(id) = id {
-            let named = !id.is_empty()
-                && id.len() <= 64
-                && id
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-            if !named {
+            if !super::session::valid_id(id) {
                 return Err(format!("\"{id}\" is not a session id."));
             }
             let folder = root.join(id);
@@ -65,9 +66,11 @@ impl Session {
                     root.display()
                 ));
             }
+            let lock = super::session::Lock::take(&folder, id)?;
             return Ok(Session {
                 id: id.into(),
                 folder,
+                _lock: Some(Arc::new(lock)),
             });
         }
         let id = crate::model::id();
@@ -78,7 +81,12 @@ impl Session {
                 folder.display()
             )
         })?;
-        let session = Session { id, folder };
+        let lock = super::session::Lock::take(&folder, &id)?;
+        let session = Session {
+            id,
+            folder,
+            _lock: Some(Arc::new(lock)),
+        };
         if workspace.is_file() {
             std::fs::copy(workspace, session.workspace()).map_err(|e| {
                 format!(
@@ -219,6 +227,8 @@ struct Host {
     /// starts after a change has been started.
     ticked: bool,
     stopping: bool,
+    /// What `session.json` last held (`SessionFile::key`).
+    kept: Option<u64>,
 }
 impl Host {
     fn new(
@@ -236,6 +246,18 @@ impl Host {
         // Generation, layout, left stock and meshing run in the background
         // as in the window, so a call is answered while they run.
         app.generate_inline = false;
+        // A session resumed: what the workspace does not hold.
+        let kept = match SessionFile::read(&session.folder) {
+            Some(Ok(kept)) => Some(kept),
+            Some(Err(e)) => {
+                eprintln!("The session's {}: {e}", super::session::FILE);
+                None
+            }
+            None => None,
+        };
+        if let Some(kept) = &kept {
+            kept.put(&mut app);
+        }
         prepare(&mut app);
         let mut host = Host {
             app,
@@ -248,9 +270,32 @@ impl Host {
             last_tick: Instant::now(),
             ticked: false,
             stopping: false,
+            kept: None,
         };
         host.update(Message::ResumeProject, false);
+        // The selection, page and tab as they were, the part loading.
+        if let Some(kept) = &kept {
+            kept.put_place(&mut host.app);
+            host.kept = Some(SessionFile::of(&host.app).key());
+        }
         host
+    }
+    /// Writes `session.json`, and the workspace with it, when what it holds
+    /// changed since it was last written (or always, `force`).
+    fn keep_session(&mut self, force: bool) {
+        let file = SessionFile::of(&self.app);
+        let key = file.key();
+        if !force && self.kept == Some(key) && !self.app.dirty {
+            return;
+        }
+        self.app.persist_now();
+        match file.write(&self.session.folder) {
+            Ok(()) => self.kept = Some(key),
+            Err(e) => eprintln!(
+                "Could not write the session's {}: {e}",
+                super::session::FILE
+            ),
+        }
     }
     /// The event loop: calls, task messages and ticks, and after each the
     /// agent's windows and answers (`Agent::poll`). On the client's end it
@@ -281,6 +326,7 @@ impl Host {
         if self.app.dirty {
             self.app.persist();
         }
+        self.keep_session(true);
         self.runtime.shutdown_background();
     }
     /// The next event: one taken already, one waiting, or (with `until`)
@@ -427,12 +473,16 @@ impl Backend for Host {
             "folder": self.session.folder.display().to_string(),
         })
     }
+    fn keep(&mut self) {
+        self.keep_session(false);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::Document;
+    use std::time::Duration;
 
     /// A user's workspace holding the sample job, in `dir`.
     fn user_workspace(dir: &Path) -> PathBuf {
@@ -515,9 +565,16 @@ mod tests {
         let kept = crate::storage::load(&session.workspace()).unwrap();
         assert_eq!(kept.title, "Bracket");
         assert_eq!(kept.setup().operations.len(), ops.len() + 1);
-        // The session can be opened again by its id, without a new copy.
-        let again = Session::open(&root, Some(&session.id), &user).unwrap();
-        assert_eq!(again.folder, session.folder);
+        // The session can be opened again by its id, without a new copy,
+        // once this process lets it go.
+        let (id, folder) = (session.id.clone(), session.folder.clone());
+        assert!(
+            Session::open(&root, Some(&id), &user).is_err(),
+            "open in this process still"
+        );
+        drop(session);
+        let again = Session::open(&root, Some(&id), &user).unwrap();
+        assert_eq!(again.folder, folder);
         assert!(Session::open(&root, Some("../x"), &user).is_err());
         assert!(Session::open(&root, Some("missing"), &user).is_err());
     }
@@ -805,5 +862,226 @@ mod tests {
         assert_eq!(e.source, crate::mcp::state::Source::User);
         assert_eq!(read["project"]["title"], "Renamed by hand");
         runner.stop();
+    }
+
+    /// A session on the sample job, its tool draft edited and an operation
+    /// added by the agent, the second operation selected; then stopped as
+    /// at the client's end. Its id and the user's workspace.
+    fn worked_session(root: &Path, dir: &Path) -> (String, PathBuf) {
+        let user = user_workspace(dir);
+        let session = Session::open(root, None, &user).unwrap();
+        let id = session.id.clone();
+        let runner = Runner::start(session);
+        let edit = json!({"command": "edit_field", "args": {"target": "tool", "key": "name", "value": "Draft kept"}});
+        let r = runner.call("execute", edit).unwrap();
+        assert_eq!(r["outcome"], "done", "{r}");
+        let add = json!({"command": "add_operation", "args": {"strategy": "Pocket"}});
+        assert_eq!(runner.call("execute", add).unwrap()["outcome"], "done");
+        let pick = json!({"command": "select_operation", "args": {"operation": 1}});
+        let r = runner.call("execute", pick).unwrap();
+        assert_eq!(r["outcome"], "done", "{r}");
+        // Every result names the session and what is saved.
+        assert_eq!(r["session"]["id"], id.as_str(), "{r}");
+        assert_eq!(r["session"]["saved_to_project_file"], false, "{r}");
+        // What it reported was on disk before it was sent.
+        let kept = SessionFile::read(&root.join(&id)).unwrap().unwrap();
+        assert_eq!(kept.log.revision, r["revision"].as_u64().unwrap());
+        assert_eq!(
+            kept.place.operation.as_deref(),
+            r["selection"]["operation"].as_str()
+        );
+        let saved = crate::storage::load(&root.join(&id).join("workspace.json")).unwrap();
+        assert_eq!(saved.setup().operations.len(), 5);
+        runner.stop();
+        (id, user)
+    }
+    fn tool_name(runner: &Runner) -> Value {
+        let fields = runner
+            .call("list_fields", json!({"target": "tool"}))
+            .unwrap();
+        let name = (fields["fields"].as_array().unwrap().iter()).find(|f| f["key"] == "name");
+        name.unwrap()["value"].clone()
+    }
+
+    /// A session resumed after the client ended: the draft, the selection,
+    /// the revision and the change log are back, and nothing new is said
+    /// to have changed.
+    #[test]
+    fn a_resumed_session_is_where_it_was_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("mcp-sessions");
+        let (id, user) = worked_session(&root, dir.path());
+        let folder = root.join(&id);
+        let kept = SessionFile::read(&folder).unwrap().unwrap();
+        assert!(kept.log.revision > 0, "{kept:?}");
+        assert!(!folder.join("lock").exists(), "let go at the end");
+        let session = Session::open(&root, Some(&id), &user).unwrap();
+        let runner = Runner::start(session);
+        let read = runner.call("inspect", json!({})).unwrap();
+        assert_eq!(read["revision"], kept.log.revision, "{read}");
+        assert_eq!(read["user_changed"], json!([]), "{read}");
+        assert_eq!(
+            read["selection"]["operation"],
+            kept.place.operation.as_deref().unwrap()
+        );
+        assert_eq!(read["selection"]["page"], kept.place.page.as_str());
+        assert_eq!(tool_name(&runner), "Draft kept");
+        runner.stop();
+        let again = SessionFile::read(&folder).unwrap().unwrap();
+        assert_eq!(again.log.entries, kept.log.entries);
+        assert_eq!(again.log.revision, kept.log.revision);
+    }
+
+    /// One process at a time: a second open of a session open in this
+    /// process is refused, naming the pid; a lock whose owner is dead is
+    /// taken over.
+    #[test]
+    fn a_session_is_open_in_one_server_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("mcp-sessions");
+        let user = user_workspace(dir.path());
+        let first = Session::open(&root, None, &user).unwrap();
+        let runner = Runner::start(first.clone());
+        let second = Session::open(&root, Some(&first.id), &user).unwrap_err();
+        assert_eq!(
+            second,
+            format!(
+                "Session {} is open in another MCP server (pid {}).",
+                first.id,
+                std::process::id()
+            )
+        );
+        runner.stop();
+        // A lock left by a process that is gone: an unknown pid, a start
+        // time no process has, and not refreshed for an hour.
+        let (id, folder) = (first.id.clone(), first.folder.clone());
+        drop(first);
+        let lock = folder.join("lock");
+        let dead = json!({"pid": 999_999, "started": "1.000001", "at": 1});
+        std::fs::write(&lock, dead.to_string()).unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let taken = Session::open(&root, Some(&id), &user).unwrap();
+        let owner: Value = serde_json::from_slice(&std::fs::read(&lock).unwrap()).unwrap();
+        assert_eq!(owner["pid"], std::process::id());
+        drop(taken);
+        assert!(!lock.exists());
+    }
+
+    /// An unsaved job with an open tool draft is kept through a restart
+    /// with the clock 31 days on: nothing deletes a session on its own.
+    /// It is listed, and resumed through the session tools.
+    #[test]
+    fn an_unsaved_session_survives_31_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("mcp-sessions");
+        let (id, user) = worked_session(&root, dir.path());
+        let folder = root.join(&id);
+        let month = std::time::SystemTime::now() - Duration::from_secs(31 * 86_400);
+        fn age(path: &Path, to: std::time::SystemTime) {
+            if path.is_dir() {
+                for e in std::fs::read_dir(path).unwrap().flatten() {
+                    age(&e.path(), to);
+                }
+            } else {
+                let f = std::fs::File::options().write(true).open(path).unwrap();
+                f.set_modified(to).unwrap();
+            }
+        }
+        age(&folder, month);
+        // A new server starts, makes a session of its own, and lists both.
+        let mut sessions = super::super::session::Sessions::new(root.clone(), user.clone(), None);
+        let ask = |sessions: &mut super::super::session::Sessions, tool: &str, args: Value| {
+            let (tx, rx) = mpsc::channel();
+            sessions.call(tool, args, Box::new(move |a| tx.send(a).unwrap()));
+            rx.recv().unwrap().unwrap()
+        };
+        let fresh = ask(&mut sessions, "inspect", json!({}));
+        assert_ne!(fresh["session"]["id"], id.as_str());
+        let listed = ask(&mut sessions, "list_sessions", json!({}));
+        let all = listed["sessions"].as_array().unwrap();
+        assert_eq!(all.len(), 2, "{listed}");
+        let old = all.iter().find(|s| s["id"] == id.as_str()).unwrap();
+        assert_eq!(old["saved_to_project_file"], false, "{old}");
+        assert_eq!(old["open"], false, "{old}");
+        assert_eq!(old["title"], "The user's job", "{old}");
+        assert!(old["size_bytes"].as_u64().unwrap() > 0);
+        let resumed = ask(&mut sessions, "resume_session", json!({"id": id}));
+        assert_eq!(resumed["resumed"], id.as_str(), "{resumed}");
+        assert_eq!(resumed["session"]["id"], id.as_str(), "{resumed}");
+        let ops = active_ops(&resumed);
+        assert_eq!(
+            resumed["selection"]["operation"],
+            ops[1].as_str(),
+            "{resumed}"
+        );
+        let fields = ask(&mut sessions, "list_fields", json!({"target": "tool"}));
+        let name = (fields["fields"].as_array().unwrap().iter()).find(|f| f["key"] == "name");
+        assert_eq!(name.unwrap()["value"], "Draft kept");
+        sessions.stop();
+        assert!(folder.join("workspace.json").is_file());
+    }
+
+    /// delete_session: refused while the session is open and while its job
+    /// is not saved to a project file, unless discarded; a saved one goes.
+    #[test]
+    fn delete_session_refuses_what_would_lose_work() {
+        use super::super::session::delete;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("mcp-sessions");
+        let user = user_workspace(dir.path());
+        let session = Session::open(&root, None, &user).unwrap();
+        let (id, folder) = (session.id.clone(), session.folder.clone());
+        let runner = Runner::start(session);
+        let open = delete(&root, &id, true).unwrap();
+        assert_eq!(open["outcome"], "refused", "{open}");
+        assert!(
+            open["reason"]
+                .as_str()
+                .unwrap()
+                .contains("open in another MCP server")
+        );
+        let project = dir.path().join("job.axis.json");
+        let save =
+            json!({"command": "save_project", "args": {"path": project.display().to_string()}});
+        let saved = runner.call("execute", save).unwrap();
+        assert_eq!(saved["outcome"], "done", "{saved}");
+        assert_eq!(saved["session"]["saved_to_project_file"], true, "{saved}");
+        let outputs = &saved["session"]["last_saves_and_exports"];
+        assert_eq!(outputs[0]["path"], project.display().to_string(), "{saved}");
+        let title = json!({"command": "set_project_title", "args": {"title": "Unsaved"}});
+        assert_eq!(runner.call("execute", title).unwrap()["outcome"], "done");
+        runner.stop();
+        let unsaved = delete(&root, &id, false).unwrap();
+        assert_eq!(unsaved["outcome"], "refused", "{unsaved}");
+        assert!(
+            unsaved["reason"].as_str().unwrap().contains("not saved"),
+            "{unsaved}"
+        );
+        assert!(folder.is_dir());
+        assert!(!folder.join("lock").exists(), "the refusal let go of it");
+        // Saved: it goes without asking.
+        let session = Session::open(&root, Some(&id), &user).unwrap();
+        let runner = Runner::start(session);
+        let r = runner
+            .call("execute", json!({"command": "save_project"}))
+            .unwrap();
+        assert_eq!(r["outcome"], "done", "{r}");
+        runner.stop();
+        let gone = delete(&root, &id, false).unwrap();
+        assert_eq!(gone["outcome"], "done", "{gone}");
+        assert!(!folder.exists());
+        // An unsaved one goes when asked to discard it.
+        let other = Session::open(&root, None, &user).unwrap();
+        let other_id = other.id.clone();
+        drop(other);
+        let r = delete(&root, &other_id, true).unwrap();
+        assert_eq!(r["outcome"], "done", "{r}");
+        assert!(delete(&root, "missing", true).is_err());
     }
 }

@@ -166,6 +166,13 @@ pub struct Kept {
     memory: HashMap<String, Box<Checkpoint>>,
 }
 impl Kept {
+    /// The index as `session.json` keeps it.
+    pub fn from_list(list: Vec<Meta>) -> Kept {
+        Kept {
+            list,
+            memory: HashMap::new(),
+        }
+    }
     /// Every checkpoint dropped: the agent who took them is gone (the
     /// window's write lease changed hands), so none can restore over
     /// another's work.
@@ -575,6 +582,7 @@ mod tests {
         let same = restore(&mut d, "a");
         assert_eq!(same["outcome"], "done", "{same}");
         assert!(!d.app.project_dirty, "{same}");
+        assert_eq!(same["session"]["saved_to_project_file"], true, "{same}");
         let title = json!({"title": "B"});
         assert_eq!(
             run(&mut d, "set_project_title", title).unwrap()["outcome"],

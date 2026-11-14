@@ -93,6 +93,9 @@ fn the_server_answers_over_stdio() {
         "checkpoint",
         "restore_checkpoint",
         "list_checkpoints",
+        "list_sessions",
+        "resume_session",
+        "delete_session",
     ] {
         assert!(tools.contains(&name), "{tools:?}");
     }
@@ -162,4 +165,9 @@ fn the_server_answers_over_stdio() {
     };
     assert!(status.success());
     assert!(folder.is_dir());
+    // With what a resume needs beside its workspace, and let go of.
+    let kept: Value =
+        serde_json::from_slice(&std::fs::read(folder.join("session.json")).unwrap()).unwrap();
+    assert_eq!(kept["title"], "Slow", "{kept}");
+    assert!(!folder.join("lock").exists());
 }

@@ -55,6 +55,10 @@ pub trait Backend {
     /// The headless session's folder, the one place in the app's data
     /// folder a command may write; None in the window.
     fn session_folder(&self) -> Option<std::path::PathBuf>;
+    /// Keeps on disk what results are about to report: a headless session
+    /// writes its `session.json` and workspace when they changed. Called
+    /// before the answers are sent.
+    fn keep(&mut self) {}
 }
 
 /// What a tool call gives back: its result object, or why the call could
@@ -244,6 +248,7 @@ pub fn tools() -> Value {
     ]);
     if let Value::Array(list) = &mut tools {
         list.extend(reads::tools());
+        list.extend(super::session::Sessions::tools());
     }
     tools
 }
@@ -251,6 +256,7 @@ pub fn tools() -> Value {
 /// Whether `tool` is one of `tools()`.
 pub fn is_tool(tool: &str) -> bool {
     reads::TOOLS.contains(&tool)
+        || super::session::Sessions::is_tool(tool)
         || matches!(
             tool,
             "inspect"
@@ -424,8 +430,27 @@ fn inspect(b: &impl Backend) -> Value {
         "status": app.status,
         "status_problem": app.status_problem,
         "pending": b.pending(),
-        "session": b.session(),
+        "session": session_info(b),
     })
+}
+
+/// The session as every result reports it: its id and folder, whether the
+/// job is saved to a project file, and the last saves and exports.
+fn session_info(b: &impl Backend) -> Value {
+    let app = b.app();
+    let mut session = b.session();
+    if let Value::Object(o) = &mut session {
+        o.insert(
+            "saved_to_project_file".into(),
+            json!(app.project_path.is_some() && !app.project_dirty),
+        );
+        o.insert(
+            "project_file".into(),
+            json!(app.project_path.as_ref().map(|p| p.display().to_string())),
+        );
+        o.insert("last_saves_and_exports".into(), json!(app.mcp.outputs));
+    }
+    session
 }
 
 /// The command groups, in the order `list_commands` gives them.
@@ -573,6 +598,8 @@ struct Window {
     /// checkpoint restored), before what settling it changed.
     stepped: Option<Entry>,
     notes: Vec<String>,
+    /// Where a save or export writes, kept once it is done.
+    output: Option<(&'static str, std::path::PathBuf)>,
 }
 /// A checkpoint being restored while its part loads (`checkpoint`).
 struct Restoring {
@@ -783,12 +810,22 @@ impl Agent {
     /// revision and the `user` and `mixed` entries since the agent was
     /// last told, which it is now (`state::Log::report`).
     fn flush(&mut self, b: &mut impl Backend) {
-        for (reply, mut answer, stamp) in std::mem::take(&mut self.outbox) {
-            if stamp && let Ok(Value::Object(result)) = &mut answer {
+        let mut out = std::mem::take(&mut self.outbox);
+        if out.is_empty() {
+            return;
+        }
+        for (_, answer, stamp) in &mut out {
+            if *stamp && let Ok(Value::Object(result)) = answer {
+                let session = session_info(b);
                 let log = &mut b.app_mut().mcp.log;
                 result.insert("revision".into(), json!(log.revision));
                 result.insert("user_changed".into(), json!(log.report()));
+                result.insert("session".into(), session);
             }
+        }
+        // Whatever a result reports is on disk before it is sent.
+        b.keep();
+        for (reply, answer, _) in out {
             reply(answer);
         }
     }
@@ -979,6 +1016,7 @@ impl Agent {
         let status = b.app().status.clone();
         let records = (windowed && !state::REPLACES_PROJECT.contains(&c.name))
             .then(|| Records::of(&b.app().doc));
+        let output = output_of(c.name, command_args, b.app());
         for message in dispatch.messages {
             b.send(message);
         }
@@ -1005,6 +1043,7 @@ impl Agent {
             clicks,
             stepped: None,
             notes: vec![],
+            output,
         });
         Start::Opened(id)
     }
@@ -1091,6 +1130,11 @@ impl Agent {
                 }
             }
         };
+        if outcome == Outcome::Done
+            && let Some((what, path)) = &w.output
+        {
+            super::session::record_output(b.app_mut(), what, path);
+        }
         let mut report = Report::of(b, outcome, reason).with_id(&w.id);
         if let Some(done) = made {
             report.picks = Some(done.picks);
@@ -1403,6 +1447,7 @@ impl Agent {
             clicks: None,
             stepped: Some(stepped),
             notes: vec![note],
+            output: None,
         });
     }
 
@@ -1576,6 +1621,26 @@ pub fn call_now(agent: &mut Agent, b: &mut impl Backend, tool: &str, args: Value
     }
     let taken = answer.lock().unwrap().take();
     taken.unwrap_or_else(|| Err("no answer".into()))
+}
+
+/// Where a save or export command `name` writes, from its `args`.
+fn output_of(
+    name: &'static str,
+    args: &Value,
+    app: &App,
+) -> Option<(&'static str, std::path::PathBuf)> {
+    let arg = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .map(std::path::PathBuf::from)
+    };
+    let path = match name {
+        "save_project" => arg("path").or_else(|| app.project_path.clone()),
+        "export_gcode" => arg("folder"),
+        "export_setup_sheet" | "save_for_tablet" => arg("path"),
+        _ => None,
+    }?;
+    Some((name, path))
 }
 
 /// `list_checkpoints`: each with whether it can be restored now.
