@@ -6935,7 +6935,7 @@ flood = { pin = 8 }
         let notes = |t: &Vec<String>| {
             t.iter().any(|t| {
                 t.ends_with(
-                    "nothing under the hole; the setup notes on the Hold page say where they go",
+                    "nothing under the hole; the setup notes on the Hold page say where the supports go",
                 )
             })
         };

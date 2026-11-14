@@ -750,7 +750,7 @@ fn chips<'a>(items: Vec<Element<'a, Message>>) -> Element<'a, Message> {
 const SETUP_NOTES: &str = "Setup notes";
 /// What a page that leaves the supports under the part to the user adds
 /// when the setup's notes say where they go (LIO-487).
-const SEE_NOTES: &str = "the setup notes on the Hold page say where they go";
+const SEE_NOTES: &str = "the setup notes on the Hold page say where the supports go";
 /// A small capital label over a group.
 fn label<'a>(s: impl Into<String>) -> Element<'a, Message> {
     text(s.into().to_uppercase()).size(11).color(MUTED).into()
