@@ -3321,6 +3321,311 @@ flood = { pin = 8 }
         }
     }
 
+    /// A relay to the Pi that, until opened, holds all the Pi sends after
+    /// its Welcome on each connection: the Pi has let this computer in and
+    /// nothing more comes, as on a slow network or while the Pi starts up
+    /// (the client gives up after its silence time and connects again).
+    /// `control_only`, it holds only the Pi's word on who controls the
+    /// machine: the snapshots come, and a client that waits for that word
+    /// (uc100-remote cdb6348 on, LIO-503) stays connecting with the Pi's
+    /// state known. Open, frames cross; cut, nothing crosses either way, as
+    /// `Relay`.
+    struct Gate {
+        addr: std::net::SocketAddr,
+        open: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        cut: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Gate {
+        fn to(server: std::net::SocketAddr, control_only: bool) -> Gate {
+            use std::sync::atomic::Ordering::SeqCst;
+            use uc100_remote::wire;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let gate = Gate {
+                addr: listener.local_addr().unwrap(),
+                open: Default::default(),
+                cut: Default::default(),
+            };
+            let (open, cut) = (gate.open.clone(), gate.cut.clone());
+            std::thread::spawn(move || {
+                for client in listener.incoming().flatten() {
+                    let Ok(upstream) = std::net::TcpStream::connect(server) else {
+                        continue;
+                    };
+                    // This computer to the Pi: bytes, dropped while cut.
+                    let (mut from, mut to) =
+                        (client.try_clone().unwrap(), upstream.try_clone().unwrap());
+                    let c = cut.clone();
+                    std::thread::spawn(move || {
+                        let mut buf = [0u8; 16384];
+                        while let Ok(n @ 1..) = std::io::Read::read(&mut from, &mut buf) {
+                            if !c.load(SeqCst)
+                                && std::io::Write::write_all(&mut to, &buf[..n]).is_err()
+                            {
+                                break;
+                            }
+                        }
+                        let _ = to.shutdown(std::net::Shutdown::Both);
+                    });
+                    // The Pi to this computer: frame by frame, held after
+                    // the Welcome until open, dropped while cut.
+                    let (mut from, mut to) = (upstream, client);
+                    let (open, cut) = (open.clone(), cut.clone());
+                    std::thread::spawn(move || {
+                        let mut welcomed = false;
+                        let mut held = Vec::new();
+                        'frames: while let Ok(frame) = wire::read_frame(&mut from, wire::MAX_FRAME)
+                        {
+                            if cut.load(SeqCst) {
+                                continue;
+                            }
+                            let kind = wire::decode::<wire::ToClient>(&frame);
+                            let control = matches!(kind, Ok(wire::ToClient::Control { .. }));
+                            let open = open.load(SeqCst);
+                            if welcomed && !open && (control || !control_only) {
+                                held.push(frame);
+                                continue;
+                            }
+                            welcomed |= matches!(kind, Ok(wire::ToClient::Welcome { .. }));
+                            // What was held crosses first, once open.
+                            let mut out = if open {
+                                std::mem::take(&mut held)
+                            } else {
+                                vec![]
+                            };
+                            out.push(frame);
+                            for f in out {
+                                let len = (f.len() as u32).to_le_bytes();
+                                if std::io::Write::write_all(&mut to, &len).is_err()
+                                    || std::io::Write::write_all(&mut to, &f).is_err()
+                                {
+                                    break 'frames;
+                                }
+                            }
+                        }
+                        let _ = to.shutdown(std::net::Shutdown::Both);
+                    });
+                }
+            });
+            gate
+        }
+
+        fn set_open(&self, on: bool) {
+            self.open.store(on, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn set_cut(&self, on: bool) {
+            self.cut.store(on, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Connects `a` to its Pi through a closed `Gate` and ticks until the
+    /// Pi's Welcome has crossed and the link's live time (1.5 s) has passed
+    /// without a word more: connected, never live.
+    fn pi_through_a_gate(a: &mut App, server: &uc100_remote::Server) -> Gate {
+        let gate = Gate::to(server.addr(), false);
+        let _ = a.update(Message::PiAddress(gate.addr.to_string()));
+        connect_never_live(a);
+        gate
+    }
+
+    /// Connects `a` to a Pi behind a closed `Gate`, as `pi_through_a_gate`.
+    fn connect_never_live(a: &mut App) {
+        let _ = a.update(Message::Connect);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs_f64(5.);
+        while !conn(a).link.as_ref().is_some_and(|l| l.name.is_some()) {
+            let _ = a.update(Message::Tick);
+            assert!(
+                std::time::Instant::now() < end,
+                "timed out waiting for {}",
+                "the Pi's Welcome"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let end = std::time::Instant::now() + std::time::Duration::from_millis(1700);
+        while std::time::Instant::now() < end {
+            let _ = a.update(Message::Tick);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Ticks until the link to the Pi is live (`live`), with the machine's
+    /// state, or not.
+    fn pi_live(a: &mut App, live: bool, what: &str) {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs_f64(10.);
+        while conn(a).pi_down() == live || (live && conn(a).snapshot.state.is_none()) {
+            let _ = a.update(Message::Tick);
+            assert!(
+                std::time::Instant::now() < end,
+                "timed out waiting for {}",
+                what
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = a.update(Message::Tick);
+    }
+
+    /// What the Machine tab says while a link to the Pi that was live is
+    /// not answering.
+    const PI_NOT_ANSWERING: &str = "• The link to the Pi is not answering: what you see is its last state, and the machine carries on. Reconnecting…";
+
+    /// Connecting to the Pi for the first time is no lost link: while the
+    /// Pi has let this computer in and said nothing more, through its
+    /// silence time and the reconnect after it, neither the banner nor the
+    /// Machine tab nor the status line says the link is lost, and nothing
+    /// is sent. Live and then cut, they say it, and keep saying it while it
+    /// reconnects. Connected anew, it is a first connection again (LIO-517).
+    #[test]
+    fn connecting_to_the_pi_is_no_lost_link() {
+        use crate::ui::ControlTab as T;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        a.page = Page::Control;
+        let _ = a.update(Message::ControlTab(T::Machine));
+        let gate = pi_through_a_gate(&mut a, &server);
+        let connecting = |a: &mut App| {
+            let c = conn(a);
+            assert!(
+                c.pi_down() && !c.pi_lost() && !c.in_control(),
+                "{:?}",
+                c.link
+            );
+            lacks(a, &[crate::ui::PI_LOST, PI_NOT_ANSWERING]);
+            assert!(
+                a.status.starts_with("Connecting to ") && !a.status.contains("No link"),
+                "{}",
+                a.status
+            );
+        };
+        // Through the client's 3 s silence time and its reconnect.
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < end {
+            let _ = a.update(Message::Tick);
+            connecting(&mut a);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        gate.set_open(true);
+        pi_live(&mut a, true, "the link live");
+        assert!(!conn(&a).pi_lost());
+        lacks(&a, &[crate::ui::PI_LOST, PI_NOT_ANSWERING]);
+        assert!(a.status.starts_with("Connected to "), "{}", a.status);
+        gate.set_cut(true);
+        pi_live(&mut a, false, "the link lost");
+        let lost = |a: &mut App| {
+            assert!(conn(a).pi_lost() && !conn(a).in_control());
+            shows(a, &[crate::ui::PI_LOST]);
+            assert!(a.status.starts_with("No link to the Pi of"), "{}", a.status);
+        };
+        lost(&mut a);
+        // Still connected, before the client's silence time.
+        shows(&a, &[PI_NOT_ANSWERING]);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !matches!(
+            conn(&a).link.as_ref().map(|l| &l.state),
+            Some(uc100_remote::LinkState::Connecting)
+        ) {
+            let _ = a.update(Message::Tick);
+            assert!(std::time::Instant::now() < end, "never reconnecting");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        lost(&mut a);
+        // Disconnected and connected again: a first connection.
+        let _ = a.update(Message::Disconnect);
+        gate.set_cut(false);
+        gate.set_open(false);
+        connect_never_live(&mut a);
+        connecting(&mut a);
+        // The Pi's state known, its word on who controls the machine not
+        // yet: the client stays connecting (since uc100-remote cdb6348,
+        // LIO-503), never live, and that is no lost link either: the status
+        // line keeps "Connecting to", not "No link to the Pi of".
+        let _ = a.update(Message::Disconnect);
+        let gate = Gate::to(server.addr(), true);
+        let _ = a.update(Message::PiAddress(gate.addr.to_string()));
+        let _ = a.update(Message::Connect);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while std::time::Instant::now() < end {
+            let _ = a.update(Message::Tick);
+            let c = conn(&a);
+            assert!(
+                c.pi_down() && !c.pi_lost() && !c.in_control(),
+                "{:?}",
+                c.link
+            );
+            assert!(!a.status.contains("No link"), "{}", a.status);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(conn(&a).snapshot.state.is_some());
+        assert!(a.status.starts_with("Connecting to "), "{}", a.status);
+        lacks(&a, &[crate::ui::PI_LOST, PI_NOT_ANSWERING]);
+    }
+
+    /// Renders the Control page's Machine tab while connecting to the Pi
+    /// for the first time (never live), connected, with the link lost and
+    /// while it reconnects, to `$AXIS_RENDER_DIR` (default /tmp/pi-connecting),
+    /// at 1440 × 900 and 1120 × 690 (LIO-517). Not a check: run it with
+    /// --ignored.
+    #[test]
+    #[ignore]
+    fn render_the_pi_link_while_connecting() {
+        use crate::ui::ControlTab as T;
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/pi-connecting".into()),
+        );
+        let shot = |a: &mut App, name: &str| {
+            let _ = a.update(Message::Tick);
+            for (w, h) in [(1440., 900.), (1120., 690.)] {
+                let size = iced::Size::new(w, h);
+                let _ = a.update(Message::Resized(size));
+                let dir = out.join(format!("{w}x{h}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                render_png(a, size, &dir.join(format!("{name}.png")));
+            }
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        a.page = Page::Control;
+        let _ = a.update(Message::ControlTab(T::Machine));
+        let gate = pi_through_a_gate(&mut a, &server);
+        shot(&mut a, "1-connecting");
+        gate.set_open(true);
+        pi_live(&mut a, true, "the link live");
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+            s.state == Some(uc100::controller::State::Idle)
+        });
+        shot(&mut a, "2-connected");
+        gate.set_cut(true);
+        pi_live(&mut a, false, "the link lost");
+        shot(&mut a, "3-link-lost");
+        let end = std::time::Instant::now() + std::time::Duration::from_secs_f64(10.);
+        while !matches!(
+            conn(&a).link.as_ref().map(|l| &l.state),
+            Some(uc100_remote::LinkState::Connecting)
+        ) {
+            let _ = a.update(Message::Tick);
+            assert!(
+                std::time::Instant::now() < end,
+                "timed out waiting for {}",
+                "reconnecting"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        shot(&mut a, "4-reconnecting");
+        // Connected anew with the Pi's word on who controls the machine
+        // held: the Pi's state known, never live (LIO-503's case).
+        let _ = a.update(Message::Disconnect);
+        let gate = Gate::to(server.addr(), true);
+        let _ = a.update(Message::PiAddress(gate.addr.to_string()));
+        let _ = a.update(Message::Connect);
+        let end = std::time::Instant::now() + std::time::Duration::from_millis(2500);
+        while std::time::Instant::now() < end {
+            let _ = a.update(Message::Tick);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        shot(&mut a, "5-waiting-for-control");
+    }
+
     /// The link to the Pi drops while a tool run cuts: every tab says so
     /// over the page, the status line says it is the last known state, never
     /// "Connected", and the Pi finishes the tool run. With the link back the

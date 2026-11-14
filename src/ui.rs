@@ -9208,7 +9208,7 @@ fn pi_link(c: &crate::control::Connection) -> Element<'_, Message> {
             None => "In control.".into(),
         })),
     };
-    if matches!(link.state, L::Watching { .. } | L::Controlling) && !link.live {
+    if matches!(link.state, L::Watching { .. } | L::Controlling) && c.pi_lost() {
         col = col.push(warnings(vec![
             "The link to the Pi is not answering: what you see is its last state, and the machine carries on. Reconnecting…".into(),
         ]));
@@ -9395,13 +9395,14 @@ fn shop_projects(app: &App) -> Element<'_, Message> {
 /// not answering.
 pub(crate) const PI_LOST: &str = "No link to the Pi. Everything shown is its last known state. The machine carries on without this computer: a jog stops by itself, and a tool run goes on, but if no computer controls the machine again within a minute it stops after the step it is cutting, lifts Z and turns the spindle off. Hold, Stop and E-stop cannot reach it from here until the link is back: use the machine's own E-stop. Reconnecting…";
 
-/// The banner over the Control page while the link to the Pi is down, or
-/// the Pi refuses this computer.
+/// The banner over the Control page while the link to the Pi is down after
+/// it was live, or the Pi refuses this computer. Connecting for the first
+/// time, the Machine tab says so and nothing is over the page (LIO-517).
 fn pi_lost(c: &crate::control::Connection) -> Option<Element<'_, Message>> {
     let link = c.link.as_ref()?;
     let said = match &link.state {
         uc100_remote::LinkState::Refused(why) => format!("The Pi refused this computer: {why}"),
-        _ if !link.live => PI_LOST.to_string(),
+        _ if c.pi_lost() => PI_LOST.to_string(),
         _ => return None,
     };
     Some(

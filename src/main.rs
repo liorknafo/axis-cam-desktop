@@ -9510,10 +9510,13 @@ impl App {
                         use uc100::controller::State;
                         self.status = match state {
                             // The Pi's state as last known, never "Connected".
-                            s if c.pi_down() => format!(
+                            s if c.pi_lost() => format!(
                                 "{NO_LINK}{name}: last known {}; the machine carries on.",
                                 s.label()
                             ),
+                            // Never live yet: still "Connecting to <machine>…"
+                            // (LIO-517).
+                            _ if c.pi_down() => self.status.clone(),
                             State::Disconnected if connecting.is_some() => format!(
                                 "Could not connect to {name}; see the log in the Control page's Machine tab."
                             ),

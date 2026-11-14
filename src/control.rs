@@ -2367,6 +2367,10 @@ pub struct Connection {
     pub pi: Option<String>,
     /// The link to the Pi at the last tick (None on USB and the simulator).
     pub link: Option<uc100_remote::Link>,
+    /// The link to the Pi was live at a tick since this connection opened:
+    /// down after that it has dropped; never live, it is still connecting
+    /// (`pi_lost`, LIO-517).
+    pi_was_live: bool,
     /// The newest of the link's notes, for the status line, and the count
     /// of notes seen.
     pub pi_note: Option<String>,
@@ -2651,6 +2655,7 @@ impl Connection {
             simulated,
             pi: None,
             link: None,
+            pi_was_live: false,
             pi_note: None,
             notes_seen: 0,
             job_missing: None,
@@ -3097,6 +3102,14 @@ impl Connection {
         self.link.as_ref().is_some_and(|l| !l.live)
     }
 
+    /// The link to the Pi was live and is down: what is shown is the Pi's
+    /// last known state. Not while it connects for the first time, when
+    /// nothing was lost (LIO-517). Only what is said follows it: what this
+    /// computer sends follows `pi_down`.
+    pub fn pi_lost(&self) -> bool {
+        self.pi_down() && self.pi_was_live
+    }
+
     /// The machine runs a probe move, which Feed hold does not pause (the
     /// driver only logs it); Stop aborts it. Its program is the driver's
     /// "Probe", or a move with the probe flag on.
@@ -3139,6 +3152,7 @@ impl Connection {
                 self.pi_note = link.notes.iter().rev().take(new).next().cloned();
                 self.notes_seen = link.note_seq;
             }
+            self.pi_was_live |= link.live;
             self.link = Some(link);
             // The Pi's feed override, whatever this computer asked (none
             // before its first snapshot).
