@@ -746,6 +746,11 @@ fn warn_chip<'a>(s: impl Into<String>) -> Element<'a, Message> {
 fn chips<'a>(items: Vec<Element<'a, Message>>) -> Element<'a, Message> {
     row(items).spacing(6).wrap().vertical_spacing(6).into()
 }
+/// The Hold page's label over the setup's notes.
+const SETUP_NOTES: &str = "Setup notes";
+/// What a page that leaves the supports under the part to the user adds
+/// when the setup's notes say where they go (LIO-487).
+const SEE_NOTES: &str = "the setup notes on the Hold page say where the supports go";
 /// A small capital label over a group.
 fn label<'a>(s: impl Into<String>) -> Element<'a, Message> {
     text(s.into().to_uppercase()).size(11).color(MUTED).into()
@@ -1519,13 +1524,18 @@ fn part_bottom(p: &Page<'_>) -> f32 {
 }
 /// A Drill's warning when its tip comes out under the stock, how far
 /// (LIO-417).
-fn under_stock<'a>(tip: f32, stock: &Bounds) -> Option<Element<'a, Message>> {
+/// With `notes`, the setup's notes say where the supports go: said so.
+fn under_stock<'a>(tip: f32, stock: &Bounds, notes: bool) -> Option<Element<'a, Message>> {
     let under = stock.min[2] - tip;
     (under > 0.005).then(|| {
-        warn_chip(format!(
+        let mut said = format!(
             "comes out {} under the stock: nothing under the hole",
             mm(under)
-        ))
+        );
+        if notes {
+            said += &format!("; {SEE_NOTES}");
+        }
+        warn_chip(said)
     })
 }
 /// The Check of a tapping `op`: try a screw, as a thread is not measured
@@ -2182,6 +2192,61 @@ fn dro_tool<'a>(diameter: f32, comp: [i8; 2], height: f32) -> Vec<Element<'a, Me
 
 /// A new tool picks up Z: touch the top and set Z to `top`; nothing for a
 /// tool already in.
+/// A Face that makes the part's top on a bottom already at size: measure
+/// before the last level and set it so the part reads `size`, then check
+/// it and that it is parallel (LIO-487). Measured at the ends out of a
+/// vise's jaws: along the axis its jaws are not on (`across`, the axis
+/// they close on); without one, at the ends of the stock's longer side
+/// (`stock`, work coordinates).
+fn to_size<'a>(size: f32, stock: &Bounds, across: Option<usize>) -> Vec<Element<'a, Message>> {
+    let d = stock.dimensions();
+    let along = match across {
+        Some(k) => 1 - k,
+        None => usize::from(d[1] > d[0]),
+    };
+    let ends = ["the left and right ends", "the front and back ends"][along];
+    let size = dro(size);
+    let line = |n: u8, s: String| -> Element<'a, Message> {
+        row![
+            disc(n.to_string(), false, 22.),
+            text(s).size(13).color(INK).width(Fill)
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center)
+        .into()
+    };
+    vec![
+        readout(
+            Readout {
+                order: None,
+                lead: Some("Finish to".into()),
+                axis: String::new(),
+                value: size.clone(),
+                lock: None,
+                tags: vec!["top to bottom".into()],
+                lit: Lit::Next,
+                big: false,
+            },
+            None,
+        ),
+        line(
+            1,
+            format!(
+                "Before the last level, measure it at {ends}; if they differ, seat the part again."
+            ),
+        ),
+        line(
+            2,
+            format!(
+                "For the last level, go down from the Z just cut by what it reads over {size}."
+            ),
+        ),
+        line(
+            3,
+            format!("Then check {size} at both ends: the top parallel to the bottom."),
+        ),
+    ]
+}
 fn pick_up<'a>(top: Option<f32>, ringed: bool) -> Vec<Element<'a, Message>> {
     let Some(top) = top else {
         return vec![];
@@ -2220,6 +2285,12 @@ struct Page<'a> {
 impl<'a> Page<'a> {
     fn guide(&self) -> &'a Guide {
         &self.shown.guide
+    }
+    /// The setup's notes, where it says what holds and supports the part
+    /// (LIO-487): shown on the Hold page, which pages that leave the
+    /// supports under the part to the user point back to. Empty when none.
+    fn notes(&self) -> &'a str {
+        get(&self.setup.p, "notes").trim()
     }
     /// The position of operation `op` among those the setup ran.
     fn done(&self, op: usize) -> usize {
@@ -2845,6 +2916,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             vise,
         } => {
             let d = stock.dimensions();
+            let narrow = turning::narrow(p);
             let mut c = vec![chip(p.app.doc.holding_label(p.setup)), chip("top face up")];
             // Across the jaws, seen from the front or the right: the stock
             // on its parallels, the jaws at their height and the grip.
@@ -2899,15 +2971,37 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                         // wrap at 1024 × 700 (LIO-435).
                         lead: Some("X × Y × Z".into()),
                         axis: String::new(),
-                        value: format!("{} × {} × {}", mm(d[0]), mm(d[1]), mm(d[2])),
+                        // Narrow, the size closes up and its tag, said
+                        // again under it, goes: three sizes of 100 or more
+                        // are clipped otherwise at 1024 × 700 (LIO-487).
+                        value: [d[0], d[1], d[2]]
+                            .map(mm)
+                            .join(if narrow { "×" } else { " × " }),
                         lock: None,
-                        tags: vec!["remaining material envelope".into()],
+                        tags: if narrow {
+                            vec![]
+                        } else {
+                            vec!["remaining material envelope".into()]
+                        },
                         lit: Lit::Next,
                         big: false
                     },
                     None
                 ),
             ];
+            // How the setup holds and supports the part, in its own words:
+            // the parallels, a stop and the room under holes are not
+            // modelled (LIO-487).
+            let notes = p.notes();
+            let right = if notes.is_empty() {
+                right
+            } else {
+                right.push(label(SETUP_NOTES)).push(
+                    boxed(text(notes).size(14).color(INK), false)
+                        .padding([8, 12])
+                        .width(Fill),
+                )
+            };
             let right = right.push(muted("Dimensions bound the remaining stock; earlier pockets and recesses remain as cut.").size(13));
             // The caption follows the holding (LIO-375).
             let sub = match (vise, get(&p.setup.p, "holding")) {
@@ -3140,7 +3234,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     _ => None,
                 })
                 .reduce(f32::min);
-            let under = tip.and_then(|tip| under_stock(tip, &p.before(*op)));
+            let under = tip.and_then(|tip| under_stock(tip, &p.before(*op), !p.notes().is_empty()));
             let right = column![chips(
                 vec![
                     chip(p.named(tool, *diameter)),
@@ -3295,6 +3389,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             top,
             remove,
             to,
+            size,
         } => {
             let stock = p.before(*op);
             let mut band = stock;
@@ -3331,7 +3426,8 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 chip(format!("{} rpm", rpm.round()))
             ]),]
             .extend(pick_up(*top, false))
-            .push(label("Final facing depth"))
+            // With a size, "Face to" says it: room for the size's steps.
+            .extend(size.is_none().then(|| label("Final facing depth")))
             .push(readout(
                 Readout {
                     order: None,
@@ -3339,22 +3435,46 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     axis: "Z".into(),
                     value: dro(*to),
                     lock: None,
-                    tags: vec![format!("{} mm off", dro(*remove))],
+                    // Planned on the blank's planned size: the measured
+                    // size sets the last level (LIO-487).
+                    tags: vec![match size {
+                        Some(_) => format!("about {} mm off", dro(*remove)),
+                        None => format!("{} mm off", dro(*remove)),
+                    }],
                     lit: Lit::Now,
-                    big: true,
+                    // The size is the number to work to: room for it and
+                    // its steps at 1024 × 700.
+                    big: size.is_none(),
                 },
                 None,
             ))
             .push(milling_limits(p, *op))
             .push(
-                muted(
-                    "Work down in layers to this final depth; start each layer clear of the stock.",
-                )
+                muted(match size {
+                    Some(_) => "Work down in layers; start each layer clear of the stock.",
+                    None => {
+                        "Work down in layers to this final depth; start each layer clear of the stock."
+                    }
+                })
                 .size(13),
             );
+            let right = match size {
+                Some(size) => {
+                    let across = match &g.steps[0] {
+                        Step::Hold { vise: Some(v), .. } => Some(v.across),
+                        _ => None,
+                    };
+                    right.extend(to_size(*size, &stock, across))
+                }
+                None => right,
+            };
             (
                 "Face".into(),
-                "tool, cutting limits and final depth",
+                if size.is_some() {
+                    "tool, cutting limits and the size to finish to"
+                } else {
+                    "tool, cutting limits and final depth"
+                },
                 left,
                 right,
             )
@@ -3638,7 +3758,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 ];
                 // The tap's tip comes out under the stock: a parallel there
                 // stops it, or it cuts the vise.
-                said.extend(under_stock(h[2], &stock));
+                said.extend(under_stock(h[2], &stock, !p.notes().is_empty()));
                 // The depth as a hand follows it (LIO-410).
                 let through = h[2] < part_bottom(p) - 0.005;
                 let how = if through {
@@ -3694,7 +3814,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 if uncentred.get(i).copied().unwrap_or(false) {
                     said.push(warn_chip("centre drill first"));
                 }
-                said.extend(under_stock(h[2], &stock));
+                said.extend(under_stock(h[2], &stock, !p.notes().is_empty()));
                 let cone = centre.map(|_| format!("cone Ø{} at the top", mm(2. * cone(i, &h))));
                 // The planned cycle, as the hand on the quill does it.
                 let cycle = o.map(|o| get(&o.p, "cycle")).unwrap_or_default();
@@ -5364,6 +5484,12 @@ fn slot_screen<'a>(
             dro((*scallop * 100. - 1e-4).ceil() / 100.)
         ),
     };
+    // What is under the part is left to the user; the setup's notes on the
+    // Hold page say where it goes, when it has some (LIO-487).
+    let verify = match p.notes() {
+        "" => "Verify parallels, table and breakthrough clearance below the part; these are unmodeled.".to_string(),
+        _ => format!("Verify parallels, table and breakthrough clearance below the part; these are unmodeled: {SEE_NOTES}."),
+    };
     let mut right = column![
         chips(vec![
             chip(p.tool_name(*op, 2. * tool)),
@@ -5379,7 +5505,7 @@ fn slot_screen<'a>(
         right = right
             .push(muted(format!("Material starts at Z {}.", dro(*top))).size(13))
             .push(muted(if *entry_clear {"Entry was proven clear for the full diameter to final depth."} else if narrow {"Use the confirmed center-cutting end mill. Feed down at 25% cutting feed."} else {"Use the confirmed center-cutting slot drill. Feed down at 25% cutting feed; clear chips at each return."}).size(13))
-            .push(muted(if narrow && walk_follows {"Feed along the centre line in the indicated direction, the backlash taken up and the other axes locked. Stay down at the far end: the walk round the slot follows at this level. Verify parallels, table and breakthrough clearance below the part; these are unmodeled."} else if narrow {"Feed along the centre line in the indicated direction, the backlash taken up and the other axes locked. Lift at the far end: the outline is walked once, at size, after the last level. Verify parallels, table and breakthrough clearance below the part; these are unmodeled."} else {"Feed the slot in the indicated direction. Take up backlash before feeding and lock the other axes. Lift before returning to the entry. Verify parallels, table and breakthrough clearance below the part; these are unmodeled."}).size(13));
+            .push(muted(format!("{} {}", if narrow && walk_follows {"Feed along the centre line in the indicated direction, the backlash taken up and the other axes locked. Stay down at the far end: the walk round the slot follows at this level."} else if narrow {"Feed along the centre line in the indicated direction, the backlash taken up and the other axes locked. Lift at the far end: the outline is walked once, at size, after the last level."} else {"Feed the slot in the indicated direction. Take up backlash before feeding and lock the other axes. Lift before returning to the entry."}, verify)).size(13));
     } else {
         let ends: Vec<String> = [*b, *a]
             .iter()
@@ -6263,6 +6389,103 @@ pub(crate) mod tests {
         );
         // The face's tool picks up Z on the top first.
         assert_eq!(after(&t, "touch the top → set"), ["Z", "0.00"]);
+    }
+    /// A Face that makes the part's top on a bottom at size says to
+    /// measure before the last level, to set it so the part reads its
+    /// size, and to check the size and that it is parallel (LIO-487).
+    #[test]
+    fn a_face_to_size_says_to_measure_set_the_last_level_and_check() {
+        let mut a = app_with("Yes", |d| {
+            for (k, v) in [("stock_top", "2"), ("stock_bottom", "0")] {
+                d.setups[0].p.insert(k.into(), v.into());
+            }
+        });
+        let at = (guide(&a).steps.iter())
+            .position(|s| matches!(s, Step::Face { .. }))
+            .unwrap();
+        let Step::Face {
+            size: Some(size), ..
+        } = guide(&a).steps[at]
+        else {
+            panic!("{:?}", guide(&a).steps[at])
+        };
+        send(&mut a, GuideAction::Go(at));
+        let size = dro(size);
+        let t = texts(&a);
+        let check = format!("Then check {size} at both ends: the top parallel to the bottom.");
+        for want in [
+            "Finish to".to_string(),
+            size.clone(),
+            "top to bottom".into(),
+            "about 2.00 mm off".into(),
+            "Before the last level, measure it at the left and right ends; if they differ, seat the part again.".into(),
+            format!("For the last level, go down from the Z just cut by what it reads over {size}."),
+            check.clone(),
+        ] {
+            assert!(t.contains(&want), "{want} in {t:?}");
+        }
+        // The planned depth is still there, as where it ends about.
+        assert_eq!(after(&t, "Face to"), ["Z", "−2.00"]);
+        // The check after the last level is in sight at 1024 × 700, above
+        // the buttons.
+        (a.window_width, a.window_height) = (1024., 700.);
+        let placed = crate::ui::probe::placed(a.view(), Size::new(1024., 700.));
+        let on = |s: &str| (placed.iter()).find(|(t, _)| t == s).map(|(_, r)| *r);
+        let (check, done) = (
+            on(&check).expect("the check"),
+            on("Section done ▶").expect("done"),
+        );
+        assert!(check.y + check.height < done.y, "{check:?} {done:?}");
+        // In a vise, measured at the ends out of its jaws: with the jaws on
+        // the X sides, the front and back (LIO-487).
+        for (axis, ends) in [("X", "front and back"), ("Y", "left and right")] {
+            let mut a = app_with("Yes", |d| {
+                for (k, v) in [("stock_top", "2"), ("stock_bottom", "0")] {
+                    d.setups[0].p.insert(k.into(), v.into());
+                }
+                crate::guide::tests::in_the_vise(d);
+                d.setups[0].p.insert("vise_axis".into(), axis.into());
+                d.settle_holding(0);
+            });
+            let at = (guide(&a).steps.iter())
+                .position(|s| matches!(s, Step::Face { size: Some(_), .. }))
+                .expect("a face to size");
+            send(&mut a, GuideAction::Go(at));
+            let want = format!(
+                "Before the last level, measure it at the {ends} ends; if they differ, seat the part again."
+            );
+            assert!(texts(&a).contains(&want), "{want} in {:?}", texts(&a));
+        }
+        // A face on stock with more under the part: the depth alone.
+        let mut a = app("Yes");
+        send(&mut a, GuideAction::Go(at));
+        let t = texts(&a);
+        assert!(t.iter().any(|s| s == "2.00 mm off"), "{t:?}");
+        assert!(!t.iter().any(|s| s == "Finish to"), "{t:?}");
+    }
+    /// The Hold page shows the setup's notes, which say what supports the
+    /// part and where; none without (LIO-487). A slot's page, which leaves
+    /// what is under the part to the user, points back to them.
+    #[test]
+    fn the_hold_page_shows_the_setups_notes() {
+        let note =
+            "Face up on two 15 mm parallels at X-18 and X+18, clear of the holes. Add a stop.";
+        let a = app_with("Yes", |d| {
+            d.setups[0].p.insert("notes".into(), format!("  {note}\n"));
+        });
+        assert!(matches!(guide(&a).steps[place(&a)], Step::Hold { .. }));
+        let t = texts(&a);
+        let i = (t.iter().position(|s| s == "SETUP NOTES")).expect("the notes' label");
+        assert_eq!(t[i + 1], note);
+        // The label and the notes fit at 1024 × 700, above the buttons.
+        let mut a = a;
+        (a.window_width, a.window_height) = (1024., 700.);
+        let placed = crate::ui::probe::placed(a.view(), Size::new(1024., 700.));
+        let at = |s: &str| (placed.iter()).find(|(t, _)| t == s).map(|(_, r)| *r);
+        let (notes, next) = (at(note).expect("the notes"), at("Next ▶").expect("Next"));
+        assert!(notes.y + notes.height < next.y, "{notes:?} {next:?}");
+        let a = app("Yes");
+        assert!(!texts(&a).iter().any(|s| s == "SETUP NOTES"));
     }
     #[test]
     fn a_new_tool_picks_up_z_on_the_top_the_operations_before_left() {
