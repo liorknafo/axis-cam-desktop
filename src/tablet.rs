@@ -411,6 +411,117 @@ pub fn sync(dir: &Path) -> Result<usize, String> {
     Ok(fetched)
 }
 
+// ---- Windows Firewall (LIO-485) ----
+//
+// Windows lets nothing in to an app until a rule allows it. The first time
+// the app listens Windows asks "Allow access?", and a prompt nobody answers
+// leaves inbound Block rules for the exe. Then a tablet can't find, pair or
+// sync, with no error anywhere. Reading the rules needs no admin rights;
+// changing them does, so the fix runs elevated (one Windows "Yes").
+
+/// Rules for this app, on every network the computer is on now:
+/// "blocked", "closed" (nothing allows it) or "open".
+#[cfg(windows)]
+const FIREWALL_CHECK: &str = r#"
+$on = Get-NetFirewallProfile -PolicyStore ActiveStore | ? Enabled -eq 'True' | % { "$($_.Name)" }
+$need = @(Get-NetConnectionProfile | % { "$($_.NetworkCategory)" -replace 'DomainAuthenticated','Domain' } | ? { $on -contains $_ })
+$mine = @(Get-NetFirewallApplicationFilter -PolicyStore ActiveStore | ? { [Environment]::ExpandEnvironmentVariables("$($_.Program)") -eq $p } | Get-NetFirewallRule | ? { "$($_.Enabled)" -eq 'True' -and "$($_.Direction)" -eq 'Inbound' })
+if (-not $need) { 'open' }
+elseif ($mine | ? { "$($_.Action)" -eq 'Block' }) { 'blocked' }
+elseif ($need | ? { $n = $_; -not ($mine | ? { "$($_.Action)" -eq 'Allow' -and ("$($_.Profile)" -eq 'Any' -or "$($_.Profile)" -match $n) }) }) { 'closed' }
+else { 'open' }
+"#;
+
+/// Run as admin: drops this exe's inbound Block rules and allows it port
+/// `PORT` from the local network, on any network type.
+// ponytail: one rule pair for the group, so the app run from a new path
+// replaces the old path's rules rather than piling them up.
+#[cfg(windows)]
+const FIREWALL_FIX: &str = r#"
+$ErrorActionPreference = 'Stop'
+$g = 'AXIS CAM shop tablet'
+Get-NetFirewallApplicationFilter | ? { [Environment]::ExpandEnvironmentVariables("$($_.Program)") -eq $p } | Get-NetFirewallRule | ? { "$($_.Direction)" -eq 'Inbound' -and "$($_.Action)" -eq 'Block' } | Remove-NetFirewallRule
+Get-NetFirewallRule -Group $g -EA SilentlyContinue | Remove-NetFirewallRule
+foreach ($t in 'TCP', 'UDP') { New-NetFirewallRule -DisplayName "$g ($t)" -Group $g -Direction Inbound -Action Allow -Program $p -Protocol $t -LocalPort $port -RemoteAddress LocalSubnet -Profile Any | Out-Null }
+"#;
+
+/// `script` with `$p` (the exe) and `$port` set.
+#[cfg(windows)]
+fn for_exe(exe: &Path, script: &str) -> String {
+    let p = exe.display().to_string().replace('\'', "''");
+    format!("$p = '{p}'\n$port = {PORT}\n{script}")
+}
+
+/// Runs a PowerShell script with no console window.
+#[cfg(windows)]
+fn powershell(script: &str) -> io::Result<std::process::Output> {
+    use std::os::windows::process::CommandExt;
+    let script = encoded(script);
+    std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &script])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output()
+}
+
+/// A script as PowerShell's -EncodedCommand takes it: UTF-16LE, base64.
+#[cfg(windows)]
+fn encoded(script: &str) -> String {
+    use base64::Engine;
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+#[cfg(windows)]
+fn firewall_state(exe: &Path) -> String {
+    powershell(&for_exe(exe, FIREWALL_CHECK))
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default()
+}
+
+/// Why Windows Firewall keeps a tablet on the Wi-Fi from reaching this app,
+/// or None (also when it can't tell, and off Windows).
+pub fn firewall_problem() -> Option<String> {
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe().ok()?;
+        let name = exe.file_name()?.to_string_lossy().into_owned();
+        match firewall_state(&exe).as_str() {
+            "blocked" => Some(format!(
+                "Windows Firewall blocks this app ({name}), so the tablet can't find or reach it. Windows made Block rules when its \"Allow access?\" question went unanswered."
+            )),
+            "closed" => Some(format!(
+                "Windows Firewall doesn't let the tablet in to this app ({name}) on every network this computer is on."
+            )),
+            _ => None,
+        }
+    }
+    #[cfg(not(windows))]
+    None
+}
+
+/// Asks Windows (one "Yes") to let tablets on the local network in, then
+/// checks again: what still stands in the way, or None.
+pub fn open_firewall() -> Option<String> {
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe().ok()?;
+        let fix = encoded(&for_exe(&exe, FIREWALL_FIX));
+        let run = format!(
+            "$x = Start-Process powershell -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','{fix}'\nexit $x.ExitCode"
+        );
+        let done = powershell(&run).is_ok_and(|o| o.status.success());
+        firewall_problem().map(|why| {
+            if done {
+                why
+            } else {
+                format!("Windows Firewall was not changed (Windows didn't get a Yes). {why}")
+            }
+        })
+    }
+    #[cfg(not(windows))]
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -598,5 +709,15 @@ mod tests {
         assert_eq!(with_port(" 10.0.2.2 "), "10.0.2.2:7111");
         assert_eq!(with_port("10.0.2.2:9000"), "10.0.2.2:9000");
         assert_eq!(with_port("mac.local"), "mac.local:7111");
+    }
+
+    /// An exe no rule names is shut out, like the app before anyone
+    /// answered Windows's prompt (LIO-485). A path with a quote in it still
+    /// makes a script that runs.
+    #[cfg(windows)]
+    #[test]
+    fn the_firewall_shuts_out_an_app_no_rule_allows() {
+        let exe = Path::new(r"C:\nowhere\it's axis_cam.exe");
+        assert_eq!(firewall_state(exe), "closed");
     }
 }

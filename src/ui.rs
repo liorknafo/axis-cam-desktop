@@ -15924,6 +15924,18 @@ fn post(app: &App) -> Element<'_, Message> {
         // Or no file at all: a paired tablet on this Wi-Fi gets the open
         // project and the recent project files itself (LIO-459).
         .push(secondary("Pair a tablet", Message::PairTablet).width(Fill));
+    if let Some(why) = &app.tablet_firewall {
+        summary = summary.push(caution(
+            "The tablet can't reach this computer",
+            vec![
+                why.clone(),
+                "Click Let the tablet through the firewall and answer Yes. Or by hand: Windows Defender Firewall, Advanced settings, Inbound Rules: delete this app's Block rules and allow it.".into(),
+            ],
+        ));
+        summary = summary.push(
+            secondary("Let the tablet through the firewall", Message::OpenFirewall).width(Fill),
+        );
+    }
     if let Some((code, at)) = &app.tablet_code
         && at.elapsed() < std::time::Duration::from_secs(600)
     {
