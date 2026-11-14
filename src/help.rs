@@ -3841,7 +3841,7 @@ pub fn gallery<'a>(kind: u8) -> Element<'a, Message> {
         .into()
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Every illustration as a strip of eight moments through its 5 s phase,
@@ -4723,7 +4723,7 @@ mod tests {
             .collect()
     }
     /// The keys `field_help` has an arm for.
-    fn field_keys() -> Vec<String> {
+    pub(crate) fn field_keys() -> Vec<String> {
         let mut keys: Vec<String> = arm_literals(include_str!("help.rs"), "pub fn field_help(")
             .into_iter()
             .flatten()

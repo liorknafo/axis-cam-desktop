@@ -1,0 +1,70 @@
+//! The MCP server (LIO-470): `axis-cam --mcp` lets an AI agent (Claude
+//! Code, Codex or any MCP client) plan a job with the user's own commands.
+//! The design is `docs/superpowers/specs/2026-11-13-mcp-server-design.md`.
+//!
+//! - `protocol`: JSON-RPC 2.0 over stdin and stdout, one message a line.
+//! - `runner`: the headless session, an `App` with no window on a thread
+//!   of its own.
+//! - `engine`: the tools, carried out against that `App`.
+//! - `class`: what each `Message` is to an agent, with no wildcard.
+//! - `commands`: the commands `execute` runs.
+//! - `fields`: the editors' fields, which `list_fields` lists and
+//!   `edit_field` checks its key against.
+//! - `pick`: the picks made by clicks, each checked, and a click undone in
+//!   full.
+//! - `state`: the work state's snapshots, the revisions and their change
+//!   log, the external events, and the machinist's records.
+//! - `reads`: the reads that work something out (the checks of the job as
+//!   it is, the part, pictures, a hand setup's steps), on a snapshot of the
+//!   job off the `App`'s thread, heavy ones kept from a running machine.
+//! - `rules`: the machining rules by topic, for `guide`.
+//! - `checkpoint`: the job kept by name, and put back.
+//! - `session`: what a headless session keeps on disk beside its workspace,
+//!   its lock, and the session tools.
+//! - `instance`: the instance files of open AXIS CAM windows, and the
+//!   backend chosen from them (a call is refused while a window is open).
+pub mod checkpoint;
+pub mod class;
+pub mod commands;
+pub mod engine;
+pub mod fields;
+pub mod instance;
+pub mod pick;
+pub mod protocol;
+pub mod reads;
+pub mod rules;
+pub mod runner;
+pub mod session;
+pub mod state;
+
+#[cfg_attr(not(test), allow(unused_imports))]
+pub use state::{NOT_WORK_STATE, WORK_STATE};
+
+/// `axis-cam --mcp [--session <id>]`, given the arguments after `--mcp`:
+/// serves MCP on stdin and stdout until stdin ends, in a new headless
+/// session or in session `id`, once no AXIS CAM window is open
+/// (`instance`, checked at each call). The process's exit code.
+pub fn main(args: &[String]) -> i32 {
+    let id = match args {
+        [] => None,
+        [flag, id] if flag == "--session" => Some(id.as_str()),
+        _ => {
+            eprintln!("Usage: axis-cam --mcp [--session <id>]");
+            return 2;
+        }
+    };
+    crate::fault::install();
+    let workspace = crate::storage::state_path();
+    let root = runner::Session::root();
+    // A session named is opened (and locked) at once; otherwise one is
+    // made at the first tool that needs it, or resumed.
+    let opened = match id.map(|id| runner::Session::open(&root, Some(id), &workspace)) {
+        None => None,
+        Some(Ok(session)) => Some(session),
+        Some(Err(e)) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    protocol::serve(session::Sessions::new(root, workspace, opened))
+}

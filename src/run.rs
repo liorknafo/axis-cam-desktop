@@ -3376,14 +3376,37 @@ pub(crate) fn plan_problems(
     si: usize,
     sims: &[(usize, Result<crate::simulation::Simulation, String>)],
 ) -> Result<(), Vec<String>> {
+    plan_held(doc, mesh, si, sims).map_err(|e| e.into_iter().map(|h| h.message).collect())
+}
+/// `plan_problems`, each problem with the operation it is about.
+pub(crate) fn plan_held(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    sims: &[(usize, Result<crate::simulation::Simulation, String>)],
+) -> Result<(), Vec<crate::post::Held>> {
+    use crate::post::Held;
     if crate::manual::is_hand(&doc.setups[si].machine) {
         return Ok(());
     }
-    let programs = crate::post::checked(doc, mesh, si, sims, PostSettings::for_uc100)?;
-    let config = crate::control::profile(&doc.setups[si].machine).map_err(|e| vec![e])?;
-    let e: Vec<String> = programs
-        .iter()
-        .flat_map(|p| output_problems(&config.outputs, &p.ops))
+    let programs =
+        crate::post::checked_held(doc, mesh, si, sims, PostSettings::for_uc100, false, &[])?;
+    let config = crate::control::profile(&doc.setups[si].machine).map_err(|e| {
+        vec![Held {
+            operation: None,
+            message: e,
+        }]
+    })?;
+    let e: Vec<Held> = (programs.iter())
+        .flat_map(|p| p.ops.iter().zip(&p.indexes))
+        .flat_map(|(op, oi)| {
+            output_problems(&config.outputs, std::slice::from_ref(op))
+                .into_iter()
+                .map(|message| Held {
+                    operation: Some(*oi),
+                    message,
+                })
+        })
         .collect();
     if e.is_empty() { Ok(()) } else { Err(e) }
 }

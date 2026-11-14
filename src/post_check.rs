@@ -50,9 +50,6 @@ impl Problems {
             self.list.push((op, message));
         }
     }
-    fn messages(self) -> Vec<String> {
-        self.list.into_iter().map(|(_, message)| message).collect()
-    }
 }
 fn key(x: f32, y: f32) -> (i64, i64) {
     ((x * 1000.).round() as i64, (y * 1000.).round() as i64)
@@ -74,6 +71,7 @@ fn angles(blocks: &[Block]) -> Vec<(usize, f32)> {
     }
     out
 }
+#[cfg(test)]
 pub fn check_setup(
     setup: &Setup,
     ops: &[OpState],
@@ -82,6 +80,20 @@ pub fn check_setup(
     settings: &PostSettings,
     datum: [f32; 3],
 ) -> Vec<String> {
+    (check_setup_ops(setup, ops, sims, blocks, settings, datum).into_iter())
+        .map(|(_, message)| message)
+        .collect()
+}
+/// `check_setup`, each problem with the operation it is about: an index in
+/// `ops`, None for a problem of the program as a whole.
+pub fn check_setup_ops(
+    setup: &Setup,
+    ops: &[OpState],
+    sims: &[&Simulation],
+    blocks: &[Block],
+    settings: &PostSettings,
+    datum: [f32; 3],
+) -> Vec<(Option<usize>, String)> {
     let mut problems = Problems::default();
     let machine = &setup.machine;
     if !settings.tool_table {
@@ -318,7 +330,7 @@ pub fn check_setup(
             }
         }
     }
-    problems.messages()
+    problems.list
 }
 /// How far above the highest box a retract to the machine's Z home is checked
 /// to, in mm: the home height is not known, and it is above everything.

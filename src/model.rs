@@ -2826,6 +2826,12 @@ pub struct ModelFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     pub schema: u32,
+    /// The project's identity (LIO-470), a UUID given when the project is
+    /// created and kept in its file: a checkpoint belongs to one project.
+    /// A file saved before it had one loads with none, and the app gives it
+    /// one (`Document::own_id`), saved with it from then on.
+    #[serde(default)]
+    pub project_id: String,
     pub title: String,
     pub material: String,
     /// The material library, carried to new projects like tools.
@@ -2874,6 +2880,15 @@ pub struct Document {
     pub pick_checks: BTreeMap<String, String>,
 }
 impl Document {
+    /// Gives a project loaded from a file saved before projects had an
+    /// identity one of its own. Whether it had none.
+    pub fn own_id(&mut self) -> bool {
+        let none = self.project_id.is_empty();
+        if none {
+            self.project_id = id();
+        }
+        none
+    }
     /// Operation `to`, a copy of `from`, keeps its picks' places and what
     /// changed in them: its picks are the same.
     pub fn copy_picks(&mut self, from: &str, to: &str) {
@@ -2889,6 +2904,7 @@ impl Default for Document {
     fn default() -> Self {
         Self {
             schema: 1,
+            project_id: id(),
             title: "Untitled project".into(),
             material: String::new(),
             materials: vec![],
@@ -3888,6 +3904,82 @@ impl Document {
         Some(format!(
             "Used by {list}. Assign another tool to them before deleting this one."
         ))
+    }
+    /// The tool library entry `draft` is saved as (Save in the Tool
+    /// library), or why it cannot be: its own issues and a tool number
+    /// another tool has. The Save handler and the MCP engine both use it
+    /// (LIO-470), so what the engine expects is what the save does.
+    pub fn saved_tool(&self, draft: &Tool) -> Result<Tool, Vec<String>> {
+        let mut issues = draft.issues();
+        issues.extend(self.tool_number_issues(draft));
+        if issues.is_empty() {
+            Ok(draft.clone())
+        } else {
+            Err(issues)
+        }
+    }
+    /// The material library entry `draft` is saved as: its name trimmed;
+    /// or why it cannot be (`saved_tool`).
+    pub fn saved_material(
+        &self,
+        draft: &crate::material::Material,
+    ) -> Result<crate::material::Material, Vec<String>> {
+        let mut issues = draft.issues();
+        issues.extend(self.material_name_issues(draft));
+        if !issues.is_empty() {
+            return Err(issues);
+        }
+        let mut saved = draft.clone();
+        saved
+            .p
+            .insert("name".into(), draft.name().trim().to_string());
+        Ok(saved)
+    }
+    /// The workholding entry `draft` is saved as: its name trimmed; or why
+    /// it cannot be (`saved_tool`).
+    pub fn saved_holder(
+        &self,
+        draft: &crate::holding::Holder,
+    ) -> Result<crate::holding::Holder, Vec<String>> {
+        let mut issues = draft.issues();
+        issues.extend(self.holder_name_issues(draft));
+        if !issues.is_empty() {
+            return Err(issues);
+        }
+        let mut saved = draft.clone();
+        saved
+            .p
+            .insert("name".into(), draft.name().trim().to_string());
+        Ok(saved)
+    }
+    /// The machine library entry `draft` is saved as, or why it cannot be
+    /// (`saved_tool`): a hand machine settled (`manual::settle`); the
+    /// centreline's measured marks dropped when its typed centre differs
+    /// from the saved one, since it is no longer the measurement; and one
+    /// more `version` when the library has it already. The connected
+    /// machine's travel is the Save handler's to keep (LIO-344).
+    pub fn saved_machine(&self, draft: &Machine) -> Result<Machine, Vec<String>> {
+        let mut m = draft.clone();
+        if crate::manual::is_hand(&m) {
+            crate::manual::settle(&mut m);
+        }
+        let errors = m.issues();
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        let saved = self.machines.iter().find(|x| x.id == m.id);
+        if saved.is_some_and(|x| {
+            ["a_centre_y", "a_centre_z"]
+                .iter()
+                .any(|k| get(&x.p, k) != get(&m.p, k))
+        }) {
+            m.p.remove(crate::control::CENTRE_MARK);
+            m.p.remove(CENTRE_REF);
+        }
+        if let Some(x) = saved {
+            m.version = x.version + 1;
+        }
+        Ok(m)
     }
     pub fn tool_number_issues(&self, tool: &Tool) -> Vec<String> {
         // A tool with no name has no "name: " before its message (LIO-393).

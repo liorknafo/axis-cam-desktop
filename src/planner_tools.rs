@@ -6,9 +6,8 @@
 //! draft; only `check_plan` changes which draft that is, and nothing else
 //! changes the job.
 use crate::{
-    analysis::{self, PartReport, PlaneReport},
-    cam::Geometry,
-    holding, look, material,
+    analysis::{self, PartReport},
+    holding, look,
     openai::{MAX_CALLS, Tool},
     plan_check::{self, Checked, CheckedSetup, hundredths, plain},
     planner::{MAX_PICTURES_PER_REQUEST, MAX_PICTURES_PER_RUN, MAX_TOOL_ROUNDS},
@@ -32,8 +31,6 @@ pub const SURFACE_INFO: &str = "surface_info";
 pub const MAX_CHECKS_PER_REQUEST: usize = 3;
 /// Drafts `check_plan` checks in a whole run.
 pub const MAX_CHECKS_PER_RUN: usize = 8;
-/// The least spindle speed a plan may ask for (see RULES).
-const MIN_RPM: f64 = 100.;
 /// What `stock_after` and `check_holding` answer before any draft or answer
 /// was checked, or after a draft that could not be built.
 const NO_DRAFT: &str = "Check a draft with check_plan first, or answer with a proposal.";
@@ -402,93 +399,9 @@ struct Holding {
     problems: Vec<HoldingProblem>,
 }
 
-/// What the plan check's workholding stage says of setup `si` of `job` (one
-/// of the latest draft's setups with another holder laid out), from that
-/// setup's toolpaths in `start`: the entry or its layout refused, a stock it
-/// cannot hold (`holding::holdable`, with what the earlier setups cut away),
-/// and every move within the gap of a jaw or clamp (`post::held`, which the
-/// plan check runs). When the setup's programs cannot be made, which the plan
-/// check reports at its export stage, the refusals and `holdable` alone.
-/// Each as (operation index, message).
-fn workholding(
-    job: &crate::model::Document,
-    mesh: &crate::mesh::Mesh,
-    si: usize,
-    start: &CheckedSetup,
-) -> Vec<(Option<usize>, String)> {
-    use crate::simulation::Simulation;
-    // The setup's simulations as the sequence made them, for the export's
-    // walk: the first knows the stock the earlier setups left.
-    let sims: Vec<(usize, Result<Simulation, String>)> = start
-        .operations
-        .iter()
-        .zip(&start.plans)
-        .enumerate()
-        .map(|(k, (&oi, plan))| {
-            let mut sim = Simulation::new(plan.clone());
-            if k == 0 {
-                sim.initial_volume = start.before.as_deref().cloned();
-                sim.frame = Some(start.frame);
-            }
-            (oi, Ok(sim))
-        })
-        .collect();
-    if let Ok(found) = crate::post::held_walked(job, mesh, si, &sims) {
-        return found
-            .into_iter()
-            .map(|h| (h.operation, h.message))
-            .collect();
-    }
-    let setup = &job.setups[si];
-    let named = |message: String| (None, format!("{}: {message}", setup.name()));
-    let held = holding::held_by(job, setup, start.stock, bands(start).as_ref());
-    if let Err(refused) = job.holding_boxes(setup, held) {
-        return vec![named(refused)];
-    }
-    let (Ok(layout), Some(entry)) = (
-        holding::layout(setup),
-        job.holder(crate::model::get(&setup.p, "holder")),
-    ) else {
-        return vec![];
-    };
-    let with_part = |v| crate::plan_check::PartGrid::removed(v, start.frame, job, mesh);
-    let removed = start.before.as_deref().map(with_part);
-    let plans = start.operations.iter().copied().zip(&start.plans);
-    let cuts = crate::rest::Cuts::of_plans(plans.clone(), si, start.frame);
-    // Clamps hold the stock to the end of the setup.
-    let after = matches!(layout, holding::Layout::Clamps { .. }).then(|| {
-        crate::rest::after_setup_from(start.before.as_deref(), start.stock, plans, si, start.frame)
-    });
-    let after = after.as_ref().map(with_part);
-    let own = holding::Own {
-        cuts: &cuts,
-        part: start.part,
-        after: after.as_ref(),
-    };
-    let names = |s, o| holding::operation_name(job, s, o);
-    holding::holdable(
-        si,
-        &layout,
-        entry,
-        held,
-        removed.as_ref(),
-        Some(&own),
-        &names,
-    )
-    .into_iter()
-    .map(named)
-    .collect()
-}
-
 /// What `check_holding` answers for setup 1 with an entry other than setup
 /// 1's own.
 const SETUP_1_HOLDER: &str = "Setup 1 keeps its own holder; check_holding is for later setups.";
-/// What tells the bands the vise of a checked setup closes on: the stock the
-/// earlier setups left it. None for setup 1 and when nothing was cut.
-fn bands(start: &CheckedSetup) -> Option<holding::Bands> {
-    let before = start.before.as_deref().filter(|v| !v.cuts.is_empty())?;
-    Some(holding::Bands::new(before, start.frame, start.part))
-}
 /// Whether library entry `holder` could hold setup `setup` of the latest
 /// draft: the layout the program suggests for the setup's toolpaths, as
 /// Suggest layout and the plan check do, and the problems the plan check's
@@ -527,7 +440,7 @@ fn check_holding(arguments: &str, state: &ToolState) -> Answer {
     }
     let mut job = (*checked.job).clone();
     let setup = &mut job.setups[si];
-    let (stock, bands) = (start.stock, bands(start));
+    let (stock, bands) = (start.stock, plan_check::start_bands(start));
     // Why clamps cannot be laid out for the setup's toolpaths, which the plan
     // check reports instead of any other workholding problem of the setup.
     let mut refused = None;
@@ -575,7 +488,7 @@ fn check_holding(arguments: &str, state: &ToolState) -> Answer {
     let unplaced = refused.is_some();
     let found: Vec<HoldingProblem> = match refused {
         Some(message) => vec![(None, message)],
-        None => workholding(&job, &state.scene.mesh, si, start),
+        None => plan_check::setup_holding(&job, &state.scene.mesh, si, start),
     }
     .into_iter()
     .map(|(operation, message)| HoldingProblem {
@@ -651,38 +564,6 @@ fn check_holding(arguments: &str, state: &ToolState) -> Answer {
 struct ToolArgs {
     tool: u32,
 }
-/// A range with the value the tool recommends in it.
-#[derive(Serialize)]
-struct Range {
-    min: u32,
-    max: u32,
-    recommended: u32,
-}
-#[derive(Serialize)]
-struct Feed {
-    /// The spindle speed the feed range is for: the recommended rpm.
-    at_rpm: u32,
-    min: u32,
-    max: u32,
-    recommended: u32,
-}
-/// The chip-load band of the tool's diameter, in mm per tooth.
-#[derive(Serialize)]
-struct Band {
-    /// The largest diameter the band holds; null for every larger one.
-    up_to_mm: Option<f32>,
-    min: f32,
-    max: f32,
-}
-#[derive(Serialize)]
-struct CuttingData {
-    tool: u32,
-    diameter: f32,
-    flutes: u32,
-    rpm: Range,
-    feed_mm_per_min: Feed,
-    chip_load_band: Band,
-}
 /// 7960 as "7 960".
 fn grouped(n: u32) -> String {
     let digits = n.to_string();
@@ -704,98 +585,24 @@ fn cutting_data(arguments: &str, report: &PartReport) -> Answer {
     let Some(tool) = report.tools.iter().find(|t| t.number == args.tool) else {
         return Answer::sentence(format!("The part report has no tool number {}.", args.tool));
     };
-    let (material, machine) = (&report.material, &report.machine);
-    let band = report
-        .material
-        .chip_load_mm
-        .get(material::band(tool.diameter));
-    let Some(band) = band.filter(|band| {
-        material.vc_min_m_per_min > 0.
-            && material.vc_max_m_per_min >= material.vc_min_m_per_min
-            && band.min > 0.
-            && band.max >= band.min
-    }) else {
-        return Answer::sentence("The material has no cutting data.");
-    };
-    if machine.max_rpm <= 0. || machine.max_feed <= 0. {
-        return Answer::sentence("The machine has no maximum rpm or feed.");
-    }
-    if tool.diameter <= 0. || tool.flutes == 0 {
-        return Answer::sentence(format!(
-            "Tool {} has no diameter or flutes to compute with.",
-            tool.number
-        ));
-    }
-    let (diameter, flutes) = (f64::from(tool.diameter), f64::from(tool.flutes));
-    // The surface speed range as rpm, up to what the machine gives. When even
-    // the maximum is too slow for the least surface speed, it counts as in range.
-    let rpm_at = |vc: f32| f64::from(vc) * 1000. / (std::f64::consts::PI * diameter);
-    let max_rpm = f64::from(machine.max_rpm);
-    let top = rpm_at(material.vc_max_m_per_min).min(max_rpm);
-    // A plan's spindle speed is at least MIN_RPM: a range under it holds no
-    // speed the checks accept.
-    if top < MIN_RPM {
-        return Answer::sentence(format!(
-            "Tool {} cannot be used in this material: its surface speed range gives at most {:.0} rpm, under the plan's minimum of {MIN_RPM} rpm. Choose a smaller tool.",
-            tool.number, top
-        ));
-    }
-    let bottom = rpm_at(material.vc_min_m_per_min).max(MIN_RPM).min(top);
-    // The chip load the tool takes: the band's, less under 3 mm, as the
-    // check reads it (`material::chip_load`).
-    let share = material::chip_share(tool.diameter);
-    let (fz_min, fz_max) = (band.min * share, band.max * share);
-    // The speed and feed a material change sets (`material::pick`), whole:
-    // a value above the machine's maximum, or below the least surface speed
-    // at a maximum that cannot reach it, would not pass the check.
-    let max_feed = f64::from(machine.max_feed);
-    let (rpm, feed) = material::pick(
-        (bottom as f32, top as f32),
-        (fz_min, fz_max),
-        tool.flutes as f32,
-        machine.max_rpm,
-        machine.max_feed,
-    );
-    let rpm = f64::from(rpm)
-        .round()
-        .clamp(bottom.ceil().min(top.floor()), top.floor());
-    // The feed range at that rpm, up to what the machine gives; when even the
-    // maximum feed is below the least chip load, it counts as in range.
-    let feed_top = (f64::from(fz_max) * flutes * rpm).min(max_feed);
-    let feed_bottom = (f64::from(fz_min) * flutes * rpm).min(feed_top);
-    let feed = f64::from(feed)
-        .clamp(feed_bottom, feed_top)
-        .round()
-        .min(max_feed.floor());
-    let (rpm, feed) = (rpm as u32, feed as u32);
-    let data = CuttingData {
-        tool: tool.number,
-        diameter: tool.diameter,
-        flutes: tool.flutes,
-        rpm: Range {
-            min: (bottom.ceil() as u32).min(top.floor() as u32),
-            max: top.floor() as u32,
-            recommended: rpm,
-        },
-        feed_mm_per_min: Feed {
-            at_rpm: rpm,
-            min: (feed_bottom.ceil() as u32).min(feed_top.floor() as u32),
-            max: feed_top.floor() as u32,
-            recommended: feed,
-        },
-        chip_load_band: Band {
-            up_to_mm: band.up_to_mm,
-            min: fz_min,
-            max: fz_max,
-        },
+    let named = format!("Tool {}", tool.number);
+    let data = match analysis::cutting_data(
+        &report.material,
+        &report.machine,
+        (tool.number, &named),
+        tool.diameter,
+        tool.flutes,
+    ) {
+        Ok(data) => data,
+        Err(why) => return Answer::sentence(why),
     };
     Answer {
         output: serde_json::to_string(&data).expect("plain numbers serialize"),
         line: format!(
             "Cutting data for T{}: {} rpm, {} mm/min",
             tool.number,
-            grouped(rpm),
-            grouped(feed)
+            grouped(data.rpm.recommended),
+            grouped(data.feed_mm_per_min.recommended)
         ),
         picture: None,
     }
@@ -806,30 +613,6 @@ fn cutting_data(arguments: &str, report: &PartReport) -> Answer {
 struct SurfaceArgs {
     surface: usize,
 }
-/// One orientation that lists the surface, with the plane that does.
-#[derive(Serialize)]
-struct Seen<'a> {
-    up: &'static str,
-    #[serde(flatten)]
-    plane: &'a PlaneReport,
-}
-#[derive(Serialize)]
-struct SurfaceInfo<'a> {
-    surface: usize,
-    /// This surface's faces alone, mm²; `area` of an entry is its whole plane's.
-    surface_area: f64,
-    /// The area-weighted mean of the faces' normals in setup 1's frame; null
-    /// when they cancel out, as the faces of a closed round surface do.
-    mean_normal: Option<[f64; 3]>,
-    orientations: Vec<Seen<'a>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    note: Option<&'static str>,
-}
-fn rounded(value: f64, places: i32) -> f64 {
-    let scale = 10f64.powi(places);
-    // Adding 0 turns a rounded -0.0 into 0.0, so it never prints as "-0.0".
-    (value * scale).round() / scale + 0.
-}
 
 fn surface_info(arguments: &str, scene: &look::Scene) -> Answer {
     let args: SurfaceArgs = match parse(SURFACE_INFO, arguments) {
@@ -837,42 +620,16 @@ fn surface_info(arguments: &str, scene: &look::Scene) -> Answer {
         Err(answer) => return answer,
     };
     let id = args.surface;
-    if id >= scene.mesh.surfaces.len() {
-        return Answer::sentence(format!("Surface {id} is not a surface of this part."));
-    }
-    let seen: Vec<Seen> = scene
-        .report
-        .orientations
-        .iter()
-        .flat_map(|o| {
-            o.planes
-                .iter()
-                .filter(move |p| p.surfaces.contains(&id))
-                .map(|plane| Seen { up: o.up, plane })
-        })
-        .collect();
-    // The surface's faces in setup 1's frame, in mm.
-    let (mut area, mut sum) = (0f64, [0f64; 3]);
-    if let Some(setup1) = scene.doc.setups.first() {
-        for t in Geometry::new(setup1, &scene.mesh)
-            .triangles
-            .iter()
-            .filter(|t| t.feature == Some(id))
-        {
-            // Twice the area, along the normal.
-            let n = analysis::normal(&t.p).map(f64::from);
-            area += n.iter().map(|v| v * v).sum::<f64>().sqrt() / 2.;
-            sum = std::array::from_fn(|k| sum[k] + n[k]);
-        }
-    }
-    let length = sum.iter().map(|v| v * v).sum::<f64>().sqrt();
-    let mean_normal =
-        (length > 1e-3 * 2. * area && length > 1e-9).then(|| sum.map(|v| rounded(v / length, 3)));
-    let area = rounded(area, 2);
-    let line = if seen.is_empty() {
+    let info = match analysis::surface_info(&scene.doc, &scene.mesh, &scene.report, id) {
+        Ok(info) => info,
+        Err(why) => return Answer::sentence(why),
+    };
+    let area = info.surface_area;
+    let line = if info.orientations.is_empty() {
         format!("Surface {id}: in no orientation's plane list ({area:.1} mm²)")
     } else {
-        let places: Vec<String> = seen
+        let places: Vec<String> = info
+            .orientations
             .iter()
             .map(|s| match s.plane.kind {
                 "top" => format!("top in {}", s.up),
@@ -885,16 +642,6 @@ fn surface_info(arguments: &str, scene: &look::Scene) -> Answer {
             .collect();
         format!("Surface {id}: {}", places.join("; "))
     };
-    let note = seen.is_empty().then_some(
-        "No orientation lists this surface as a horizontal face: it is a wall, a slope, hidden from above, or beyond the report's plane list.",
-    );
-    let info = SurfaceInfo {
-        surface: id,
-        surface_area: area,
-        mean_normal,
-        orientations: seen,
-        note,
-    };
     Answer {
         output: serde_json::to_string(&info).expect("plain numbers serialize"),
         line,
@@ -906,7 +653,7 @@ fn surface_info(arguments: &str, scene: &look::Scene) -> Answer {
 mod tests {
     use super::*;
     use crate::{
-        analysis::{self, PartReport, PlaneReport},
+        analysis::{self, MIN_RPM, PartReport, PlaneReport},
         proposal::tests::block,
     };
     use serde_json::{Value, json};

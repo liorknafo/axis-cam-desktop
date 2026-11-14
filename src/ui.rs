@@ -386,6 +386,131 @@ pub(crate) const FIXTURE_CLEARANCE_LABEL: &str = "Requested fixture clearance ·
 /// The Holding step's section of fields that are recorded on the setup sheet
 /// and in the program header and checked by nothing.
 pub(crate) const SETUP_NOTES_SECTION: &str = "Setup notes · recorded, not checked";
+/// A field the inspector shows, as `collecting` finds it (LIO-470): what an
+/// agent's `list_fields` lists and `edit_field` checks a key against.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FieldInfo {
+    pub(crate) target: Target,
+    pub(crate) key: &'static str,
+    pub(crate) label: String,
+    /// The operation tab, setup step or wizard step it is on.
+    pub(crate) tab: String,
+    pub(crate) value: String,
+    /// The values a pick list offers; None for a text field.
+    pub(crate) choices: Option<Vec<String>>,
+    /// The unit the label names, as in "Feed (mm/min)" or "X travel · mm".
+    pub(crate) unit: Option<String>,
+}
+thread_local! {
+    /// Whether the field helpers record what they draw: a bool check is all
+    /// they cost while it is off.
+    static COLLECTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The tab being built, and the fields found on it.
+    static COLLECTED: std::cell::RefCell<(String, Vec<FieldInfo>)> =
+        const { std::cell::RefCell::new((String::new(), Vec::new())) };
+}
+/// Runs `build`, which draws an editor's `tab` and drops it, with the field
+/// helpers recording, and gives the fields it drew. The editor's elements are
+/// only built: no layout, no renderer, nothing is drawn.
+pub(crate) fn collecting(tab: &str, build: impl FnOnce()) -> Vec<FieldInfo> {
+    /// Switches the collector off again, also when `build` panics.
+    struct Off;
+    impl Drop for Off {
+        fn drop(&mut self) {
+            COLLECTING.with(|c| c.set(false));
+        }
+    }
+    COLLECTED.with(|c| *c.borrow_mut() = (tab.to_string(), Vec::new()));
+    COLLECTING.with(|c| c.set(true));
+    let off = Off;
+    build();
+    drop(off);
+    let mut found = COLLECTED.with(|c| std::mem::take(&mut c.borrow_mut().1));
+    // A field a tab draws twice is one field.
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|f| seen.insert((f.target as u8, f.key, f.tab.clone())));
+    found
+}
+/// The fields of the active setup's selected operation, on every tab it has,
+/// the user's open tab left as it is (LIO-470).
+pub(crate) fn operation_fields(app: &App) -> Vec<FieldInfo> {
+    let Some(o) = app.operation() else {
+        return vec![];
+    };
+    let mut all = vec![];
+    for tab in o.tabs(&app.doc.setup().machine) {
+        let mut checks = Checks::new(app);
+        all.extend(collecting(tab, || {
+            drop(operation_editor_with(app, o, &mut checks, tab))
+        }));
+    }
+    all
+}
+/// The fields of the active setup, on every step of its editor.
+pub(crate) fn setup_fields(app: &App) -> Vec<FieldInfo> {
+    let mut all = vec![];
+    for step in SETUP_STEPS {
+        all.extend(collecting(step, || drop(setup_editor(app, step))));
+    }
+    all
+}
+/// The fields of the machine draft, on every step of the wizard.
+pub(crate) fn machine_fields(app: &App) -> Vec<FieldInfo> {
+    let mut all = vec![];
+    for (at, step) in wizard_steps(&app.machine_draft).into_iter().enumerate() {
+        all.extend(collecting(step, || drop(wizard_at(app, at))));
+    }
+    all
+}
+/// The fields of the tool draft's editor.
+pub(crate) fn tool_fields(app: &App) -> Vec<FieldInfo> {
+    collecting("Tool definition", || drop(tools(app)))
+}
+/// The fields of the material draft's editor.
+pub(crate) fn material_fields(app: &App) -> Vec<FieldInfo> {
+    collecting("Material definition", || drop(materials(app)))
+}
+/// The fields of the workholding draft's editor.
+pub(crate) fn holder_fields(app: &App) -> Vec<FieldInfo> {
+    collecting("Workholding definition", || drop(workholding(app)))
+}
+/// Whether the field helpers are recording (tests).
+#[cfg(test)]
+pub(crate) fn recording() -> bool {
+    COLLECTING.with(|c| c.get())
+}
+/// Records a field of the tab being collected; `info` is not called while
+/// the collector is off.
+fn record(info: impl FnOnce() -> (&'static str, Target, String, String, Option<Vec<String>>)) {
+    if !COLLECTING.with(|c| c.get()) {
+        return;
+    }
+    let (key, target, label, value, choices) = info();
+    COLLECTED.with(|c| {
+        let mut c = c.borrow_mut();
+        let tab = c.0.clone();
+        let unit = unit_of(&label);
+        c.1.push(FieldInfo {
+            target,
+            key,
+            label,
+            tab,
+            value,
+            choices,
+            unit,
+        });
+    });
+}
+/// The unit a field's label names: "(mm/min)" at its end, or what follows
+/// its first " · " up to a comma, as in "X travel · mm".
+fn unit_of(label: &str) -> Option<String> {
+    let unit = match label.strip_suffix(')').and_then(|l| l.rsplit_once('(')) {
+        Some((_, unit)) => unit,
+        None => label.split_once(" · ")?.1.split([',', '·']).next()?,
+    };
+    let unit = unit.trim();
+    (!unit.is_empty() && unit.chars().count() <= 12).then(|| unit.to_string())
+}
 fn field<'a>(
     p: &'a Fields,
     key: &'static str,
@@ -414,6 +539,7 @@ fn hinted_field<'a>(
     target: Target,
     checks: &[&Check],
 ) -> Element<'a, Message> {
+    record(|| (key, target, label.into(), get(p, key).into(), None));
     let mark = checks
         .iter()
         .find(|c| c.error)
@@ -468,6 +594,7 @@ fn choice_value<'a>(
     target: Target,
 ) -> Element<'a, Message> {
     let list: Vec<String> = options.iter().map(|s| s.to_string()).collect();
+    record(|| (key, target, label.into(), value.into(), Some(list.clone())));
     help::wrap(
         column![
             muted(label),
@@ -928,7 +1055,7 @@ fn checks_summary<'a>(checks: &Checks, open: bool) -> Element<'a, Message> {
 pub(crate) fn editor_checks(app: &App) -> Checks {
     let mut checks = Checks::new(app);
     if let Some(o) = app.operation() {
-        drop(operation_editor_with(app, o, &mut checks));
+        drop(operation_editor_with(app, o, &mut checks, &app.tab));
     }
     checks
 }
@@ -3500,7 +3627,7 @@ pub(crate) fn inspector(app: &App) -> Element<'_, Message> {
     } else if let Some(o) = app.operation() {
         operation_editor(app, o)
     } else {
-        setup_editor(app)
+        setup_editor(app, app.setup_step)
     };
     // The body's scrollbar is drawn over its right edge: the content stops
     // short of it, and the fixed parts line up with the content.
@@ -3553,10 +3680,17 @@ fn about<'a>(label: String, open: bool) -> Element<'a, Message> {
 }
 fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Panel<'a> {
     let mut checks = Checks::new(app);
-    operation_editor_with(app, o, &mut checks)
+    operation_editor_with(app, o, &mut checks, &app.tab)
 }
-/// The editor, placing `checks` at their fields as it draws them.
-fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Panel<'a> {
+/// The editor on its `open` tab, placing `checks` at their fields as it draws
+/// them. The tab is an argument, not `App::tab`, so that `fields_of` can draw
+/// each tab in turn and leave the user's open (LIO-470).
+fn operation_editor_with<'a>(
+    app: &'a App,
+    o: &'a Operation,
+    checks: &mut Checks,
+    open_tab: &str,
+) -> Panel<'a> {
     // Pinned: the operation's identity and its tabs, in rows of one width.
     // A Thread is a Thread everywhere (LIO-419).
     let title = if o.is_thread() {
@@ -3588,7 +3722,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 "Turn" if o.strategy == Strategy::Turn => get(&o.p, "turn_kind"),
                 _ => t,
             };
-            r = r.push(tab(t, shown, app.tab == *t));
+            r = r.push(tab(t, shown, open_tab == *t));
         }
         tabs = tabs.push(r)
     }
@@ -3627,7 +3761,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
     let lathe = lathe::is_lathe(machine);
     // A Thread's tab is the Drill's Cycle or the Turn's Turn, its own
     // fields only (LIO-419).
-    let tab = match (app.tab.as_str(), o.strategy) {
+    let tab = match (open_tab, o.strategy) {
         ("Thread", Strategy::Turn) => "Turn",
         ("Thread", _) => "Cycle",
         (t, _) => t,
@@ -5522,7 +5656,8 @@ fn outside_fixed_stock(s: &Setup, resolved: &crate::stock::ResolvedStock) -> boo
             .part_radius
             .is_some_and(|r| r > crate::stock::bar(resolved.stock).1 + 0.001))
 }
-fn setup_editor(app: &App) -> Panel<'_> {
+/// The setup editor on its `open` step (`App::setup_step` in the window).
+fn setup_editor<'a>(app: &'a App, open: &str) -> Panel<'a> {
     let s = app.doc.setup();
     let p = &s.p;
     let t = Target::Setup;
@@ -5530,7 +5665,7 @@ fn setup_editor(app: &App) -> Panel<'_> {
     for pair in SETUP_STEPS.chunks(2) {
         let mut r = Row::new().spacing(1);
         for &step in pair {
-            let on = app.setup_step == step;
+            let on = open == step;
             let mark = if setup_step_done(app, step) {
                 "✓"
             } else {
@@ -5556,7 +5691,7 @@ fn setup_editor(app: &App) -> Panel<'_> {
     ]
     .spacing(12);
     let c = column![field(p, "name", "Setup name", t)].spacing(12);
-    let c = match app.setup_step {
+    let c = match open {
         "Stock" => setup_stock(app, c),
         "Position" => setup_position(app, c),
         "Holding" => setup_holding(app, c),
@@ -5634,6 +5769,8 @@ fn setup_zero<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
     let p = &s.p;
     let t = Target::Setup;
     let origin = get(p, "origin");
+    // Its buttons send Edit; `set_origin` is the command for it (LIO-470).
+    record(|| ("origin", t, "Work zero".into(), origin.into(), None));
     if let Some(base) = app.doc.index_base(app.doc.index()) {
         return c.push(section("Work zero")).push(note(format!(
             "{origin} in {}, as setup {} ({}) has it: A turns the stock about the A centreline and leaves the work zero where it is, so nothing is probed again.",
@@ -5896,6 +6033,15 @@ fn pins_block<'a>(app: &'a App, s: &'a Setup) -> Element<'a, Message> {
         return leftover_pins(app, c, s, mesh, placed, &work).into();
     }
     let chosen = crate::post::chosen_pin_holes(s);
+    record(|| {
+        (
+            "pin_holes",
+            t,
+            "Pin holes".into(),
+            get(&s.p, "pin_holes").into(),
+            None,
+        )
+    });
     c = c.push(section("Pin holes")).push(muted(
         "Choose the part's holes that drop over the pins, as drawn in the part: the round holes it opens on its bottom in this setup, ringed and numbered in the 3D view. Click them here, or Pick holes on the part and click inside each hole in the 3D view (turn the view to see under the part). Which hole takes which pin follows from the plate.",
     ));
@@ -5987,6 +6133,15 @@ fn op_tool_is(app: &App, o: &Operation, kind: &str) -> bool {
 fn pin_hole_drilling<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> {
     let mut c = column![].spacing(8);
     let named = get(&o.p, "pin_setup");
+    record(|| {
+        (
+            "pin_setup",
+            Target::Operation,
+            "Pin setup".into(),
+            named.into(),
+            None,
+        )
+    });
     let mine = (app.doc.setups.iter()).position(|s| s.id == named);
     let Some(si) = mine.filter(|&si| {
         let s = &app.doc.setups[si];
@@ -6098,6 +6253,15 @@ fn leftover_pins<'a>(
         }
         None => {}
     }
+    record(|| {
+        (
+            "pin_place",
+            t,
+            "Pins' place".into(),
+            get(&s.p, "pin_place").into(),
+            None,
+        )
+    });
     if crate::post::leftover_pin(s).is_some() {
         c = c.push(secondary(
             "Clear the pins' place",
@@ -6253,6 +6417,16 @@ fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> 
                 })
                 .collect();
             let chosen = axes[usize::from(crate::stock::lying(s))].clone();
+            record(|| {
+                let ids = axes.iter().map(|a| a.id.clone()).collect();
+                (
+                    "stock_axis",
+                    t,
+                    "The bar".into(),
+                    chosen.id.clone(),
+                    Some(ids),
+                )
+            });
             c = c.push(help::field(
                 column![
                     muted("The bar"),
@@ -6667,11 +6841,15 @@ pub(crate) fn material_note(doc: &Document) -> Option<String> {
 /// The NC page's list: one line per speed or feed problem of an enabled
 /// operation (true), and one per operation that could not be checked (false).
 pub(crate) fn speed_feed_lines(app: &App) -> Vec<(bool, String)> {
+    speed_feed_lines_of(&app.doc)
+}
+/// `speed_feed_lines` of `doc`.
+pub(crate) fn speed_feed_lines_of(doc: &Document) -> Vec<(bool, String)> {
     let mut lines = vec![];
-    for (i, setup) in app.doc.setups.iter().enumerate() {
+    for (i, setup) in doc.setups.iter().enumerate() {
         for op in setup.operations.iter().filter(|o| o.enabled) {
             let at = format!("Setup {} · {}", i + 1, op.name());
-            match app.doc.speed_feed(setup, op) {
+            match doc.speed_feed(setup, op) {
                 Some(SpeedFeed::Out(problems)) => {
                     lines.extend(problems.into_iter().map(|p| (true, format!("{at}: {p}"))))
                 }
@@ -6872,6 +7050,16 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
                 })
                 .collect();
             let chosen = axes[usize::from(get(p, "vise_axis") == "Y")].clone();
+            record(|| {
+                let ids = axes.iter().map(|a| a.id.clone()).collect();
+                (
+                    "vise_axis",
+                    t,
+                    "Jaws face".into(),
+                    chosen.id.clone(),
+                    Some(ids),
+                )
+            });
             c.push(help::field(
                 column![
                     muted("Jaws face"),
@@ -7156,6 +7344,16 @@ fn holder_picker<'a>(app: &'a App, kind: &'static str) -> Element<'a, Message> {
         .collect();
     let current = get(&app.doc.setup().p, "holder");
     let chosen = choices.iter().find(|c| c.id == current).cloned();
+    record(|| {
+        let ids = choices.iter().map(|c| c.id.clone()).collect();
+        (
+            "holder",
+            Target::Setup,
+            kind.into(),
+            current.into(),
+            Some(ids),
+        )
+    });
     help::field(
         column![
             muted(kind),
@@ -7908,11 +8106,15 @@ pub(crate) fn wizard_steps(m: &Machine) -> Vec<&'static str> {
     }
 }
 fn wizard(app: &App) -> Element<'_, Message> {
+    wizard_at(app, app.wizard_step)
+}
+/// The machine wizard on step `at` (`App::wizard_step` in the window).
+fn wizard_at(app: &App, at: usize) -> Element<'_, Message> {
     let m = &app.machine_draft;
     let p = &m.p;
     let t = Target::Machine;
     let steps = wizard_steps(m);
-    let step = app.wizard_step.min(steps.len() - 1);
+    let step = at.min(steps.len() - 1);
     let mut nav = Row::new().spacing(8);
     for (i, label) in steps.iter().enumerate() {
         nav = nav.push(btn(
@@ -15675,11 +15877,17 @@ pub(crate) enum NcCard<'a> {
     /// A LinuxCNC setup whose programs were produced.
     Programs(&'a [crate::post::Program]),
     /// A LinuxCNC setup that failed its export checks.
-    Refused(&'a [String]),
+    Refused {
+        problems: &'a [String],
+        /// The operation each problem is about (`SetupPost::problem_operations`).
+        operations: &'a [Option<(usize, String)>],
+        setup: usize,
+    },
     /// A UC100 setup: the run checks' problems (none when it passes) and the
     /// setup Run on the machine opens.
     Run {
         problems: &'a [String],
+        operations: &'a [Option<(usize, String)>],
         setup: usize,
     },
     /// A manual mill's setup: no program, its steps are on the MACHINE page.
@@ -15702,7 +15910,7 @@ impl NcPage<'_> {
     /// Every problem the page shows as an error.
     pub(crate) fn problems(&self) -> Vec<&str> {
         let cards = self.cards.iter().flat_map(|(_, card)| match card {
-            NcCard::Refused(p) | NcCard::Run { problems: p, .. } => p.iter(),
+            NcCard::Refused { problems: p, .. } | NcCard::Run { problems: p, .. } => p.iter(),
             NcCard::Programs(_) | NcCard::Manual => [].iter(),
         });
         self.errors
@@ -15769,12 +15977,17 @@ pub(crate) fn nc_page(app: &App) -> NcPage<'_> {
                         Some(Err(problems)) => problems,
                         _ => &[],
                     },
+                    operations: &s.problem_operations,
                     setup: s.setup,
                 }
             } else {
                 match &s.result {
                     Ok(programs) => NcCard::Programs(programs),
-                    Err(problems) => NcCard::Refused(problems),
+                    Err(problems) => NcCard::Refused {
+                        problems,
+                        operations: &s.problem_operations,
+                        setup: s.setup,
+                    },
                 }
             };
             page.cards.push((s.name.as_str(), card));
@@ -15795,29 +16008,56 @@ fn open_label(app: &App, m: &Message) -> String {
         _ => "Open in planning ▶".to_string(),
     }
 }
-pub(crate) fn nc_issue(app: &App, name: &str, problem: &str) -> Option<Message> {
-    let si = app.doc.setups.iter().position(|s| s.name() == name)?;
-    let ops = app.doc.setups[si].operations.iter().enumerate();
+pub(crate) fn nc_issue(
+    app: &App,
+    si: usize,
+    problem: &str,
+    operation: Option<&(usize, String)>,
+) -> Option<Message> {
+    let (oi, rest) = nc_operation(&app.doc, si, problem, operation)?;
+    Some(Message::OpenIssue(si, oi, rest.to_string()))
+}
+/// The operation of setup `si` an NC review problem is about, and the
+/// message after its name. The operation the check recorded for the problem
+/// (`operation`: its index and id) is found by its id, as two operations
+/// can share a name; a problem without one is matched by name, as it
+/// starts with the operation's name and ": ".
+pub(crate) fn nc_operation<'a>(
+    doc: &Document,
+    si: usize,
+    problem: &'a str,
+    operation: Option<&(usize, String)>,
+) -> Option<(usize, &'a str)> {
+    let ops = doc.setups.get(si)?.operations.iter().enumerate();
+    if let Some((_, id)) = operation {
+        let (oi, o) = ops.clone().find(|(_, o)| &o.id == id)?;
+        let rest = problem
+            .strip_prefix(o.name())
+            .and_then(|r| r.strip_prefix(": "));
+        return Some((oi, rest.unwrap_or(problem)));
+    }
     ops.filter(|(_, o)| !o.name().is_empty())
-        .find_map(|(oi, o)| {
-            let rest = problem.strip_prefix(o.name())?.strip_prefix(": ")?;
-            Some(Message::OpenIssue(si, oi, rest.to_string()))
-        })
+        .find_map(|(oi, o)| Some((oi, problem.strip_prefix(o.name())?.strip_prefix(": ")?)))
 }
 /// A setup's problems on the NC review page: its causes, counted, each with
 /// Open beside it when it is an operation's, then the operations that wait
 /// for a failure, in the one line `post::waiting_line` makes (LIO-394).
-fn nc_problems<'a>(app: &App, name: &str, problems: &[String]) -> Element<'a, Message> {
-    let (waits, causes): (Vec<&String>, Vec<&String>) =
-        problems.iter().partition(|p| crate::post::is_waiting(p));
+fn nc_problems<'a>(
+    app: &App,
+    si: usize,
+    problems: &[String],
+    operations: &[Option<(usize, String)>],
+) -> Element<'a, Message> {
+    let (waits, causes): (Vec<_>, Vec<_>) =
+        (problems.iter().enumerate()).partition(|(_, p)| crate::post::is_waiting(p));
     let heading = match causes.len() {
         0 => "Waits for an earlier setup".to_string(),
         1 => "1 issue".to_string(),
         n => format!("{n} issues"),
     };
-    let causes = causes.into_iter().map(|cause| {
+    let causes = causes.into_iter().map(|(k, cause)| {
         let line = caution_line(format!("• {cause}"));
-        match nc_issue(app, name, cause) {
+        match nc_issue(app, si, cause, operations.get(k).and_then(Option::as_ref)) {
             // The Steps page's words for the same way (LIO-438).
             Some(open) => row![
                 container(line).width(Fill),
@@ -15829,7 +16069,9 @@ fn nc_problems<'a>(app: &App, name: &str, problems: &[String]) -> Element<'a, Me
             None => line.into(),
         }
     });
-    let waits = waits.into_iter().map(|w| caution_line(w.clone()).into());
+    let waits = waits
+        .into_iter()
+        .map(|(_, w)| caution_line(w.clone()).into());
     caution_box(heading, causes.chain(waits).collect::<Vec<_>>())
 }
 fn post(app: &App) -> Element<'_, Message> {
@@ -15881,10 +16123,14 @@ fn post(app: &App) -> Element<'_, Message> {
                             );
                         }
                     }
-                    NcCard::Refused(problems) => {
+                    NcCard::Refused {
+                        problems,
+                        operations,
+                        setup,
+                    } => {
                         summary = summary
                             .push(bold(format!("!  {name}"), 13))
-                            .push(nc_problems(app, name, problems));
+                            .push(nc_problems(app, *setup, problems, operations));
                     }
                     NcCard::Manual => {
                         let line = match app.doc.setups.iter().find(|x| x.name() == *name) {
@@ -15893,11 +16139,15 @@ fn post(app: &App) -> Element<'_, Message> {
                         };
                         summary = summary.push(muted(line));
                     }
-                    NcCard::Run { problems, setup } => {
+                    NcCard::Run {
+                        problems,
+                        operations,
+                        setup,
+                    } => {
                         let mark = if problems.is_empty() { "✓" } else { "!" };
                         summary = summary.push(bold(format!("{mark}  Run on UC100: {name}"), 13));
                         if !problems.is_empty() {
-                            summary = summary.push(nc_problems(app, name, problems));
+                            summary = summary.push(nc_problems(app, *setup, problems, operations));
                         }
                         summary = summary
                             .push(muted(RUN_PREREQUISITES))

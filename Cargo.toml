@@ -16,7 +16,10 @@ png = "0.17"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 roxmltree = "0.21"
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "net", "time", "io-util", "sync", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "io-util", "sync", "macros"] }
+# Runs an Iced `Task` to its messages (`task::into_stream`): the headless MCP
+# session (`mcp::runner`) and the tests. Already in the tree through iced.
+iced_runtime = "0.14"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "stream", "form"] }
 jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
 base64 = "0.23.1"
@@ -50,8 +53,6 @@ opt-level = 2
 opt-level = 2
 
 [dev-dependencies]
-# Lets a test run an Iced `Task` to its messages (`task::into_stream`).
-iced_runtime = "0.14"
 # Lay a page out on the software renderer, with no window, to read its widget
 # tree and click it (`ui::probe`); both are already in the tree through iced.
 iced_renderer = "0.14"

@@ -973,7 +973,7 @@ pub fn evaluate_full(
 ) -> (CheckReport, Option<Document>, Option<Checked>) {
     match proposal::build(doc, mesh, report, proposal) {
         Ok(built) => {
-            let (out, laid, setups) = run(&built, mesh, report, true);
+            let (out, laid, setups) = run(&built, mesh, report, Fill::Planned);
             let job = laid.unwrap_or(built);
             let checked = Checked {
                 job: Arc::new(job.clone()),
@@ -1015,7 +1015,165 @@ pub fn check(
 /// `run` without the job, so tests can check jobs `build` would refuse.
 #[cfg(test)]
 pub(crate) fn check_built(built: &Document, mesh: &Mesh, report: &PartReport) -> CheckReport {
-    run(built, mesh, report, false).0
+    run(built, mesh, report, Fill::Layouts).0
+}
+/// What `run` fills in of a job that does not say it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fill {
+    /// A job a proposal built: each later setup's vise or clamps laid out
+    /// for its toolpaths (`laid_out`) and each lathe setup's chuck settled
+    /// on its stock (`chucked`), as a plan cannot say them.
+    Planned,
+    /// The later setups' layouts only; the user's chucks are kept.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Layouts,
+    /// Nothing: the job exactly as the user sees it (an agent's
+    /// `check_job`, LIO-470). A setup that holds its stock with clamps and
+    /// says nowhere, or a vise or a lathe chuck with no grip, is a problem
+    /// at the stage workholding (`missing_placement`) instead.
+    Nothing,
+}
+/// The plan checks on `doc` exactly as it is (`Fill::Nothing`): nothing is
+/// filled in or suggested, and a setup without its placement is a problem.
+/// The report, and the setups whose starting stock the check knew.
+pub fn check_as_is(
+    doc: &Document,
+    mesh: &Mesh,
+    report: &PartReport,
+) -> (CheckReport, Vec<CheckedSetup>) {
+    let (out, _, setups) = run(doc, mesh, report, Fill::Nothing);
+    (out, setups)
+}
+/// Why setup `si` of a job checked as it is cannot be checked for holding:
+/// clamps with no positions, a vise with no grip, a lathe chuck with no grip
+/// or stickout. A vise whose axis is empty is on X, as the setup editor
+/// shows it and the export reads it. None when its placement is there (it
+/// may still not read: `holding::layout` says why) or it has no vise,
+/// clamps or lathe chuck.
+pub fn missing_placement(setup: &crate::model::Setup, si: usize) -> Option<String> {
+    let blank = |key: &str| get(&setup.p, key).trim().is_empty();
+    let n = si + 1;
+    match get(&setup.p, "holding") {
+        "Clamps" if blank("clamps") => Some(format!(
+            "Setup {n} has no clamp positions: use suggest_layout or set_clamps."
+        )),
+        "Vise" if blank("vise_grip") => Some(format!(
+            "Setup {n} has no vise grip: use suggest_layout, or set vise_grip with edit_field."
+        )),
+        "Chuck" if !crate::chuck::holds(setup) && (blank("grip") || blank("stickout")) => {
+            Some(format!(
+                "Setup {n} has no chuck grip or stickout: use suggest_layout, or set grip and stickout with edit_field."
+            ))
+        }
+        _ => None,
+    }
+}
+/// The setups of `doc` whose starting stock its operations' walk knows, as
+/// `run` keeps them (`checked_setups`), walking no further than `stop` (a
+/// setup and the index of one of its enabled operations, as
+/// `simulation::sequence_walk` takes it).
+pub fn walked_setups(
+    doc: &Document,
+    mesh: &Mesh,
+    stop: Option<(usize, usize)>,
+) -> Vec<CheckedSetup> {
+    let n = doc.setups.len();
+    let last: RefCell<Option<Arc<Volume>>> = RefCell::new(None);
+    let mut starts: Vec<Option<(Bounds, Option<Arc<Volume>>)>> = vec![None; n];
+    let mut results: Vec<Vec<(usize, Result<Simulation, String>)>> = vec![vec![]; n];
+    crate::simulation::sequence_walk(
+        doc,
+        mesh,
+        stop,
+        |si, oi, result| results[si].push((oi, result)),
+        |_, _, stock| *last.borrow_mut() = Some(Arc::new(stock.clone())),
+        |si, start| {
+            if let Some(start) = start {
+                starts[si] = Some((start, last.borrow().clone()));
+            }
+        },
+    );
+    checked_setups(doc, mesh, results, starts)
+}
+/// What the plan check's workholding stage says of setup `si` of `job`, from
+/// that setup's toolpaths in `start` (`walked_setups` or a check's setups):
+/// the entry or its layout refused, a stock it cannot hold
+/// (`holding::holdable`, with what the earlier setups cut away), and every
+/// move within the gap of a jaw or clamp (`post::held`, which the plan check
+/// runs). When the setup's programs cannot be made, which the plan check
+/// reports at its export stage, the refusals and `holdable` alone. Each as
+/// (operation index, message).
+pub fn setup_holding(
+    job: &Document,
+    mesh: &Mesh,
+    si: usize,
+    start: &CheckedSetup,
+) -> Vec<(Option<usize>, String)> {
+    // The setup's simulations as the sequence made them, for the export's
+    // walk: the first knows the stock the earlier setups left.
+    let sims: Vec<(usize, Result<Simulation, String>)> = start
+        .operations
+        .iter()
+        .zip(&start.plans)
+        .enumerate()
+        .map(|(k, (&oi, plan))| {
+            let mut sim = Simulation::new(plan.clone());
+            if k == 0 {
+                sim.initial_volume = start.before.as_deref().cloned();
+                sim.frame = Some(start.frame);
+            }
+            (oi, Ok(sim))
+        })
+        .collect();
+    if let Ok(found) = crate::post::held_walked(job, mesh, si, &sims) {
+        return found
+            .into_iter()
+            .map(|h| (h.operation, h.message))
+            .collect();
+    }
+    let setup = &job.setups[si];
+    let named = |message: String| (None, format!("{}: {message}", setup.name()));
+    let held = holding::held_by(job, setup, start.stock, start_bands(start).as_ref());
+    if let Err(refused) = job.holding_boxes(setup, held) {
+        return vec![named(refused)];
+    }
+    let (Ok(layout), Some(entry)) = (holding::layout(setup), job.holder(get(&setup.p, "holder")))
+    else {
+        return vec![];
+    };
+    let with_part = |v| PartGrid::removed(v, start.frame, job, mesh);
+    let removed = start.before.as_deref().map(with_part);
+    let plans = start.operations.iter().copied().zip(&start.plans);
+    let cuts = crate::rest::Cuts::of_plans(plans.clone(), si, start.frame);
+    // Clamps hold the stock to the end of the setup.
+    let after = matches!(layout, holding::Layout::Clamps { .. }).then(|| {
+        crate::rest::after_setup_from(start.before.as_deref(), start.stock, plans, si, start.frame)
+    });
+    let after = after.as_ref().map(with_part);
+    let own = holding::Own {
+        cuts: &cuts,
+        part: start.part,
+        after: after.as_ref(),
+    };
+    let names = |s, o| holding::operation_name(job, s, o);
+    holding::holdable(
+        si,
+        &layout,
+        entry,
+        held,
+        removed.as_ref(),
+        Some(&own),
+        &names,
+    )
+    .into_iter()
+    .map(named)
+    .collect()
+}
+/// What tells the bands the vise of a walked setup closes on: the stock the
+/// earlier setups left it. None for setup 1 and when nothing was cut.
+pub fn start_bands(start: &CheckedSetup) -> Option<holding::Bands> {
+    let before = start.before.as_deref().filter(|v| !v.cuts.is_empty())?;
+    Some(holding::Bands::new(before, start.frame, start.part))
 }
 /// A copy of `built` in which every later setup that holds its stock with a
 /// vise or clamps but says nowhere has the layout the app suggests for the
@@ -1029,10 +1187,14 @@ fn laid_out(
     built: &Document,
     mesh: &Mesh,
     results: &[Vec<(usize, Result<Simulation, String>)>],
-    planned: bool,
+    fill: Fill,
 ) -> (Option<Document>, Vec<(usize, String)>) {
     let mut laid: Option<Document> = None;
     let mut refused = vec![];
+    if fill == Fill::Nothing {
+        return (laid, refused);
+    }
+    let planned = fill == Fill::Planned;
     // Setup 1's holder is placed by the user; a manual setup a plan put in
     // front of the user's setup is laid out like a later one.
     let laid_out =
@@ -1204,14 +1366,16 @@ fn checked_setups(
 /// project's structure check. Returns the report, the copy of the job with
 /// the layouts suggested for its later setups (`laid_out`), whose workholding
 /// the check is of, and the setups whose starting stock it knew
-/// (`checked_setups`). With `planned` (a job a proposal built) each lathe
-/// setup's chuck is also settled on the stock it starts from (`chucked`), as
-/// a plan cannot say it; a job made by hand keeps the user's.
+/// (`checked_setups`). With `Fill::Planned` (a job a proposal built) each
+/// lathe setup's chuck is also settled on the stock it starts from
+/// (`chucked`), as a plan cannot say it; a job made by hand keeps the
+/// user's. With `Fill::Nothing` nothing is laid out, and each setup without
+/// its placement is a workholding problem (`missing_placement`).
 fn run(
     built: &Document,
     mesh: &Mesh,
     report: &PartReport,
-    planned: bool,
+    fill: Fill,
 ) -> (CheckReport, Option<Document>, Vec<CheckedSetup>) {
     let mut out = CheckReport {
         passed: false,
@@ -1239,6 +1403,14 @@ fn run(
     // Speeds and feeds against the material: reported beside the stages that
     // follow, so one round of feedback carries every problem.
     let cutting = cutting_data_problems(built);
+    // A job checked as it is: each setup whose holding says nowhere is held.
+    let missing: Vec<(usize, String)> = if fill == Fill::Nothing {
+        (built.setups.iter().enumerate())
+            .filter_map(|(si, s)| missing_placement(s, si).map(|why| (si, why)))
+            .collect()
+    } else {
+        vec![]
+    };
     // Generation and cumulative stock, with the stock after each operation.
     let geometries: Vec<Geometry> = built
         .setups
@@ -1378,7 +1550,7 @@ fn run(
         // The workholding is checked as the plan will be applied: with the
         // layouts the app suggests for the later setups.
         let unplaced;
-        (laid, unplaced) = laid_out(built, mesh, &results, planned);
+        (laid, unplaced) = laid_out(built, mesh, &results, fill);
         let job_doc = laid.as_ref().unwrap_or(built);
         let job = crate::post::post_simulated(job_doc, mesh, &results);
         // A UC100 machine runs the toolpaths through its driver, not as
@@ -1408,6 +1580,8 @@ fn run(
             })
             .collect();
         let held: Vec<(usize, crate::post::Held)> = (0..job_doc.setups.len())
+            // A setup with no placement says so instead (`missing`).
+            .filter(|si| !missing.iter().any(|(s, _)| s == si))
             .flat_map(|si| match unplaced.iter().find(|(s, _)| *s == si) {
                 Some((_, why)) => vec![(
                     si,
@@ -1521,7 +1695,7 @@ fn run(
                 Err(_) => {}
             }
         }
-        if export.is_empty() && held.is_empty() {
+        if export.is_empty() && held.is_empty() && missing.is_empty() {
             out.zeros = built
                 .setups
                 .iter()
@@ -1532,7 +1706,7 @@ fn run(
                 })
                 .collect();
         }
-        if !ready && export.is_empty() && held.is_empty() {
+        if !ready && export.is_empty() && held.is_empty() && missing.is_empty() {
             export.push(Problem {
                 setup: 0,
                 operation: None,
@@ -1548,6 +1722,13 @@ fn run(
             message: proposal::clip(&h.message, 300),
         }));
     }
+    out.problems
+        .extend(missing.into_iter().map(|(si, message)| Problem {
+            setup: si + 1,
+            operation: None,
+            stage: "workholding",
+            message,
+        }));
     out.problems.extend(cutting);
     out.problems.extend(axis);
     out.problems.extend(gouges);
@@ -3111,9 +3292,48 @@ mod tests {
         assert_eq!(get(&job.setups[1].p, "holding"), "Clamps");
         assert_eq!(get(&job.setups[1].p, "clamps"), "");
         job.setups[1].p.insert("clamps".into(), "-Y:0;+Y:0".into());
-        let (check, laid, _) = run(&job, &mesh, &report, true);
+        let (check, laid, _) = run(&job, &mesh, &report, Fill::Planned);
         assert!(check.passed, "{:?}", stages(&check));
         assert!(laid.is_none(), "nothing was suggested");
+    }
+    /// An agent's `check_job` (LIO-470): the job as it is. Setup 2's clamps
+    /// say nowhere: no layout is suggested for them and the job is left as
+    /// it was; the missing placement is the problem, where the planner's
+    /// check would have laid clamps out and passed. Placed, it passes.
+    #[test]
+    fn a_job_checked_as_it_is_fills_in_nothing() {
+        let (doc, mesh, report, proposal) = clamped("-X:0;+X:0", "36");
+        let mut job = proposal::build(&doc, &mesh, &report, &proposal).unwrap();
+        assert_eq!(get(&job.setups[1].p, "clamps"), "");
+        let saved = |d: &Document| serde_json::to_string(d).unwrap();
+        let before = saved(&job);
+        let (laid_check, laid, _) = run(&job, &mesh, &report, Fill::Layouts);
+        assert!(laid_check.passed, "{:?}", stages(&laid_check));
+        assert!(laid.is_some(), "the planner's check lays the clamps out");
+        let (check, setups) = check_as_is(&job, &mesh, &report);
+        assert_eq!(
+            stages(&check),
+            [
+                "workholding 2/None: Setup 2 has no clamp positions: use suggest_layout or set_clamps."
+            ]
+        );
+        assert_eq!(saved(&job), before, "nothing was filled in");
+        assert_eq!(setups.len(), 2);
+        job.setups[1].p.insert("clamps".into(), "-Y:0;+Y:0".into());
+        let (check, _) = check_as_is(&job, &mesh, &report);
+        assert!(check.passed, "{:?}", stages(&check));
+        // Neither a vise without its grip nor a lathe chuck without its
+        // stickout is filled in.
+        let mut setup = job.setups[1].clone();
+        setup.p.insert("holding".into(), "Vise".into());
+        setup.p.insert("vise_grip".into(), " ".into());
+        assert!(
+            missing_placement(&setup, 1)
+                .unwrap()
+                .contains("no vise grip")
+        );
+        setup.p.insert("vise_grip".into(), "8".into());
+        assert_eq!(missing_placement(&setup, 1), None);
     }
     #[test]
     fn a_vise_in_setup_1_gives_later_setups_jaws_on_the_axis_the_stock_fits() {

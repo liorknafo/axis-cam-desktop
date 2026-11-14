@@ -32,6 +32,7 @@ mod look;
 mod machine_view;
 mod manual;
 mod material;
+mod mcp;
 mod mesh;
 mod model;
 mod ngc;
@@ -96,6 +97,14 @@ pub enum Page {
     Ai,
     Post,
     Audit,
+}
+/// What a click on the part does to an operation's picks (`App::pick_kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickKind {
+    /// It adds or drops a whole group: a hole's walls, a corner, a face.
+    Toggle,
+    /// The face fills the operation's fields and replaces its pick.
+    Fill,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
@@ -1377,6 +1386,9 @@ pub struct App {
     /// (`ui::stock_picture`).
     pub(crate) stock_pictures: std::cell::RefCell<Vec<(u64, iced::widget::image::Handle)>>,
     post_epoch: u64,
+    /// The job the NC review's last check started was for (`post_key`):
+    /// `post` is of the job as it is now while the two match.
+    pub(crate) post_for: u64,
     /// The check epoch of the run whose stock is being pictured
     /// (`picture_run`).
     picture_job: Option<u64>,
@@ -1628,9 +1640,16 @@ pub struct App {
     signing_out: Option<std::sync::Arc<openai::Client>>,
     /// G-code exports started and not yet reported (folder choice and write).
     gcode_exports: usize,
+    /// Who changes the job, for an MCP agent (LIO-470): the revision, the
+    /// change log and the external events (`mcp::state`).
+    pub(crate) mcp: mcp::state::Tracker,
     /// The folder a test app is rooted in, removed when the app is dropped.
     #[cfg(test)]
     test_dir: Option<tempfile::TempDir>,
+    /// How long each generation off the window's thread waits before it
+    /// works, until it is cancelled: the MCP tests' slow generation.
+    #[cfg(test)]
+    pub(crate) slow_generation: Option<Duration>,
 }
 /// A line of the operation audit's report (`Message::GenerateAll`): the setup
 /// and operation it is about, by index, their names, whether the operation
@@ -2039,6 +2058,9 @@ impl App {
         if shared && !isolated {
             status += " No home directory was found, so the workspace is in the shared temp directory and signing in is unavailable.";
         }
+        // A project saved before projects had an identity gets one, saved
+        // with the workspace (LIO-470).
+        migrated |= doc.own_id();
         // A blank workspace has the starter materials and workholding too.
         doc.adopt_materials();
         doc.adopt_holders();
@@ -2184,6 +2206,7 @@ impl App {
             tooth_load_job: None,
             stock_pictures: Default::default(),
             post_epoch: 0,
+            post_for: 0,
             picture_job: None,
             settings,
             settings_path,
@@ -2282,8 +2305,11 @@ impl App {
             closing: None,
             signing_out: None,
             gcode_exports: 0,
+            mcp: Default::default(),
             #[cfg(test)]
             test_dir: None,
+            #[cfg(test)]
+            slow_generation: None,
         }
     }
     fn boot() -> (Self, Task<Message>) {
@@ -2405,11 +2431,20 @@ impl App {
     /// (`control::travel_from_profile`). Whether any changed.
     fn travel_from(&mut self, id: &str, cfg: &uc100::config::MachineConfig) -> bool {
         let draft = control::travel_into(&mut self.machine_draft, id, cfg);
-        control::travel_from_profile(&mut self.doc, id, cfg) | draft
+        let changed = control::travel_from_profile(&mut self.doc, id, cfg) | draft;
+        if changed {
+            self.external("machine: travel from the UC100 profile");
+        }
+        changed
     }
-    fn replace_document(&mut self, doc: Document, path: Option<PathBuf>) {
-        // What is being generated is the old project's.
-        self.cancel_generation();
+    /// Another project in place of this one (New, Open, the example,
+    /// Recover previous): the job replaced (`job_replaced`), its part loaded
+    /// later (`restore_model`), the editors on its libraries, its file `path`
+    /// (none: not saved to one), on the Work page with nothing selected. A
+    /// replacement of the project for an agent's checkpoints (LIO-470).
+    fn replace_document(&mut self, mut doc: Document, path: Option<PathBuf>) {
+        // A project saved before projects had an identity gets one.
+        doc.own_id();
         self.machine_draft = doc
             .machines
             .first()
@@ -2423,42 +2458,97 @@ impl App {
         self.material_draft = material_draft(&doc);
         self.holder_draft = holder_draft(&doc);
         self.clamps_draft = None;
+        self.job_replaced(doc, None);
+        self.mcp.log.projects += 1;
+        self.project_dirty = path.is_none();
+        self.set_project_file(path);
+        self.page = Page::Work;
+        self.camera = viewport::Camera::default();
+        self.tab = "Tool".into();
+        self.stop_selection();
+        self.help_animating = false;
+        // The chat was about the project that is gone.
+        self.plan_chat.clear();
+        self.plan_request.clear();
+        // Saved with the project's file just now: it settles after a pause.
+        self.dirty = true;
+        self.last_edit = Instant::now();
+    }
+    /// The job is `doc` now, its part `mesh` (none: there is none, or it is
+    /// loaded later): what was worked out for the job before is dropped, and
+    /// the work still under way for it is stopped, or comes back to a key
+    /// or epoch that is no longer current and is dropped. `replace_document`
+    /// and a checkpoint restored (`mcp::checkpoint`) both come through
+    /// here, so the two cannot drift apart. The editors' drafts, the
+    /// selection, the page and the project's file are the caller's.
+    ///
+    /// Dropped: the generation and layout under way (`generating`, its
+    /// epoch moved on); the simulation, its playback place and a replay
+    /// under way (`catching_up`, its epoch moved on); the tooth load (its
+    /// job cancelled); the audit report; the NC review (`post`, its epoch
+    /// moved on); the left stock and holding checks; the run check
+    /// (`ready`) and the Run panel's prepared programs, marked stale as an
+    /// edit marks them; the step guide; the part's holes and the hole lists
+    /// worked out from the part; the start and stock meshes; the planner's
+    /// run, preview and undo; the last edit kept to put back; the notes of
+    /// the last click and Suggest layout. The left stock, guide, part holes
+    /// and meshes still being worked out come back keyed by the job they
+    /// were worked out for, which is no longer this one.
+    pub(crate) fn job_replaced(&mut self, doc: Document, mesh: Option<mesh::Mesh>) {
+        // What is being generated is the old job's.
+        self.cancel_generation();
+        self.generation_epoch = self.generation_epoch.wrapping_add(1);
+        self.simulation = None;
+        self.playing = false;
+        self.progress = 0.;
+        self.scrub_pending = false;
+        self.catching_up = None;
+        self.catch_up_epoch = self.catch_up_epoch.wrapping_add(1);
+        if let Some((_, job)) = self.tooth_load_job.take() {
+            job.cancel();
+        }
+        self.audit_report.clear();
+        self.invalidate_post();
+        // What was worked out for the old job is not even a last result of
+        // this one (`stale_ready`, `ui::stock_picture`).
+        self.left_stock = LeftStock::default();
+        self.holding_checks = HoldingChecks::default();
+        self.ready = run::Ready::default();
+        self.ready_job = None;
+        self.guide = None;
+        self.part_holes = None;
+        self.drill_holes.replace(None);
+        self.bottom_holes.replace(None);
+        self.pocket_holes.replace(None);
+        self.pocket_fits.replace(None);
+        self.holding_note.replace(None);
+        self.later_holes.borrow_mut().clear();
+        self.later_drills.borrow_mut().clear();
+        self.start_mesh.clear();
+        self.start_mesh_failed = None;
+        self.stock_mesh_failed = None;
+        self.stock_pictures.borrow_mut().clear();
         self.typed_last = None;
+        self.box_refused = None;
+        self.clamp_refusal = None;
+        self.fresh = None;
+        self.drop_plan();
+        self.undo = None;
         self.doc = doc;
+        self.imported_mesh = mesh;
+        self.import_error = None;
         // Old default names read as the new ones (LIO-426).
         self.doc.follow_default_names();
         if !self.is_sample() {
             self.doc.sync_stock_sources();
         }
         self.travel_from_connected();
-        // A run picked in the old project must not start its programs
+        // A run picked in the old job must not start its programs
         // (LIO-456): a job sent again keeps its setups' ids.
         self.run_follows_project();
-        // What was worked out for the old project is not even a last result
-        // of this one (`stale_ready`, `ui::stock_picture`).
-        self.ready = run::Ready::default();
-        self.ready_job = None;
-        self.left_stock = LeftStock::default();
-        self.holding_checks = HoldingChecks::default();
-        self.imported_mesh = None;
         self.sync_turns();
-        self.import_error = None;
-        self.project_dirty = path.is_none();
-        self.set_project_file(path);
-        self.page = Page::Work;
-        self.audit_report.clear();
-        self.invalidate_post();
         self.dirty = true;
         self.last_edit = Instant::now();
-        self.camera = viewport::Camera::default();
-        self.tab = "Tool".into();
-        self.stop_selection();
-        self.help_animating = false;
-        self.drop_plan();
-        self.undo = None;
-        // The chat was about the project that is gone.
-        self.plan_chat.clear();
-        self.plan_request.clear();
     }
     /// Says which later setups turned with setup 1 to stay square to the
     /// stock (`Document::rotate_first`).
@@ -2801,33 +2891,60 @@ impl App {
     /// Whether the selected lathe cut is one taken from the part by a click
     /// (`turn::PICKED`), on an imported part (LIO-424).
     fn picks_turn(&self) -> bool {
+        self.operation().is_some_and(|o| self.turn_picked(o))
+    }
+    /// Whether `o` is a lathe cut taken from the part by a click
+    /// (`turn::PICKED`), or a lathe drill, on an imported part (LIO-424).
+    fn turn_picked(&self, o: &Operation) -> bool {
         !self.is_sample()
             && self.doc.file.is_some()
             && self.imported_mesh.is_some()
-            && self.operation().is_some_and(|o| {
-                (o.strategy == Strategy::Turn
-                    && crate::turn::PICKED.contains(&get(&o.p, "turn_kind")))
-                    || o.on_centre(&self.doc.setup().machine)
-            })
+            && ((o.strategy == Strategy::Turn
+                && crate::turn::PICKED.contains(&get(&o.p, "turn_kind")))
+                || o.on_centre(self.machine_of(o)))
+    }
+    /// The machine of the setup `o` is in: the active setup's when it is in
+    /// none.
+    fn machine_of(&self, o: &Operation) -> &model::Machine {
+        let setups = &self.doc.setups;
+        (setups.iter())
+            .find(|s| s.operations.iter().any(|x| x.id == o.id))
+            .map_or(&self.doc.setup().machine, |s| &s.machine)
+    }
+    /// What a click on the part does to `o`'s picks (LIO-470), as the click
+    /// handler (`Message::Surface`) decides it:
+    /// - **Fill:** the face fills the operation's fields and replaces its
+    ///   pick: a lathe cut or lathe drill taken from the part, a Slot, a Box;
+    /// - **Toggle:** the click adds or drops a whole group (a hole's walls, a
+    ///   corner, a smooth face, a sloped face's steps, or the one face).
+    pub fn pick_kind(&self, o: &Operation) -> PickKind {
+        if self.turn_picked(o) || matches!(o.strategy, Strategy::Slot | Strategy::Box) {
+            PickKind::Fill
+        } else {
+            PickKind::Toggle
+        }
     }
     pub fn can_pick(&self) -> bool {
-        if self.picks_turn() {
+        self.operation().is_some_and(|o| self.can_pick_op(o))
+    }
+    /// Whether operation `o` takes picks on the part (`can_pick` for the
+    /// selected one).
+    pub fn can_pick_op(&self, o: &Operation) -> bool {
+        if self.turn_picked(o) {
             return true;
         }
-        self.operation().is_some_and(|o| {
-            // A lathe drills on its centre: nothing to pick.
-            !o.on_centre(&self.doc.setup().machine)
-                && o.strategy != Strategy::Turn
-                && (self.is_sample()
-                    || (self.doc.file.is_some()
-                        && (o.needs_surfaces()
-                            || matches!(
-                                o.strategy,
-                                Strategy::Box | Strategy::Corner | Strategy::Slot
-                            ))
-                        && o.strategy.imported_preview()
-                        && self.imported_mesh.is_some()))
-        })
+        // A lathe drills on its centre: nothing to pick.
+        !o.on_centre(self.machine_of(o))
+            && o.strategy != Strategy::Turn
+            && (self.is_sample()
+                || (self.doc.file.is_some()
+                    && (o.needs_surfaces()
+                        || matches!(
+                            o.strategy,
+                            Strategy::Box | Strategy::Corner | Strategy::Slot
+                        ))
+                    && o.strategy.imported_preview()
+                    && self.imported_mesh.is_some()))
     }
     /// What a new operation says on its tab and in the status line before
     /// anything else is done to it (LIO-427): what to click on the part,
@@ -3099,6 +3216,7 @@ impl App {
         }
         self.generation_epoch += 1;
         let epoch = self.generation_epoch;
+        self.mcp_generation(epoch);
         let progress = std::sync::Arc::new(progress::Progress::default());
         self.generating = Some(Generating {
             epoch,
@@ -3110,6 +3228,17 @@ impl App {
             let made = progress.run(work);
             return self.update(done(epoch, made));
         }
+        #[cfg(test)]
+        let work = {
+            let (slow, cancelled) = (self.slow_generation, progress.clone());
+            move || {
+                let until = Instant::now() + slow.unwrap_or_default();
+                while Instant::now() < until && !cancelled.cancelled() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                work()
+            }
+        };
         Task::perform(
             async move { tokio::task::spawn_blocking(move || progress.run(work)).await },
             move |made| match made {
@@ -3470,6 +3599,8 @@ impl App {
             Some("A model is loading: wait for it.")
         } else if matches!(self.planner, Planner::Running(_)) || self.plan_busy.running() > 0 {
             Some("The AI planner is working: wait for it, or cancel it.")
+        } else if self.mcp.heavy.running() > 0 {
+            Some("An agent's check is still simulating the job: wait for it.")
         } else if self.picturing() {
             Some("The stock after each operation is still being pictured: wait a moment.")
         } else if self.stock_mesh_job.is_some()
@@ -3481,6 +3612,51 @@ impl App {
         } else {
             None
         }
+    }
+    /// The work still due for the job as it now is, named; empty once it
+    /// has settled. An MCP command waits for it before it answers
+    /// (`mcp::engine`, LIO-470), so its rules stay beside the busy flags:
+    /// - a generation under way (`generating`);
+    /// - an import, reimport, model restore or project open (`import_busy`),
+    ///   a save (`save_busy`) or a G-code export (`gcode_exports`);
+    /// - the NC review (`post_busy`), and the left stock with the holding
+    ///   checks on it (`left_job`);
+    /// - the run check (`ready_job`) and the pictures of its stock
+    ///   (`picturing`);
+    /// - the step guide (`guide_job`), the part's holes (`part_holes_job`),
+    ///   the stock, start and run meshes, and the tooth load;
+    /// - a scrub still to replay (`scrub_pending`) or replaying
+    ///   (`catching_up`);
+    /// - edits not yet settled (`dirty`): the edit pause (`EDIT_PAUSE`) not
+    ///   yet over, or over with the `Tick` that saves the workspace and
+    ///   starts the left stock and run checks still to come, since that work
+    ///   counts before it has started. A workspace that cannot be saved is
+    ///   said on the status line (`save_error`) and does not hold it.
+    pub fn pending(&self) -> Vec<&'static str> {
+        [
+            (self.generating.is_some(), "generation"),
+            (self.import_busy, "model load"),
+            (self.save_busy, "project save"),
+            (self.gcode_exports > 0, "G-code export"),
+            (self.post_busy, "NC review"),
+            (self.left_job.is_some(), "left stock and holding checks"),
+            (self.ready_job.is_some(), "run check"),
+            (self.picturing(), "run stock pictures"),
+            (self.guide_job.is_some(), "step guide"),
+            (self.part_holes_job.is_some(), "part holes"),
+            (self.stock_mesh_job.is_some(), "stock mesh"),
+            (self.start_mesh_job.is_some(), "start stock mesh"),
+            (self.run_mesh_job.is_some(), "run stock mesh"),
+            (self.tooth_load_job.is_some(), "tooth load"),
+            (
+                self.scrub_pending || self.catching_up.is_some(),
+                "playback catch-up",
+            ),
+            (self.dirty && self.save_error.is_none(), "edits settling"),
+        ]
+        .into_iter()
+        .filter_map(|(busy, what)| busy.then_some(what))
+        .collect()
     }
     /// Opens the Control page machine's profile for Setup: again when asked,
     /// for another machine, or when there are no changes to keep.
@@ -3619,6 +3795,20 @@ impl App {
         {
             picks::record(&mut self.doc, mesh);
         }
+    }
+    /// Saves the workspace now if it has changed, as the `Tick` after an
+    /// edit's pause will: the headless MCP session's work is on disk before
+    /// a result about it is sent (LIO-470). Whether it is saved. The edit
+    /// still counts as unsettled (`dirty`) until that `Tick`, which starts
+    /// the checks that follow it.
+    pub(crate) fn persist_now(&mut self) -> bool {
+        if !self.dirty {
+            return true;
+        }
+        self.persist();
+        let saved = !self.dirty;
+        self.dirty = true;
+        saved
     }
     fn persist(&mut self) {
         if !self.dirty {
@@ -4195,11 +4385,26 @@ impl App {
         self.post = None;
         self.post_epoch = self.post_epoch.wrapping_add(1);
     }
+    /// A fingerprint of what the NC review's check works on: the whole
+    /// `Document` and the part.
+    pub(crate) fn post_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        let _ = serde_json::to_writer(HashWriter(&mut hasher), &self.doc);
+        self.part_mesh().map(|m| &m.fingerprint).hash(&mut hasher);
+        hasher.finish()
+    }
+    /// Whether the NC review's check (`post`) is in, and of the job as it
+    /// is now.
+    pub(crate) fn post_current(&self) -> bool {
+        self.post.is_some() && self.post_for == self.post_key()
+    }
     /// Check and emit the whole job while the NC review page is open.
     fn refresh_post(&mut self) -> Task<Message> {
         if self.page != Page::Post || self.post.is_some() || self.post_busy || self.locked() {
             return Task::none();
         }
+        self.post_for = self.post_key();
         let doc = self.doc.clone();
         let mesh = self.part_mesh().cloned();
         let run = move || match mesh {
@@ -5256,6 +5461,9 @@ impl App {
             self.doc.guide.insert(setup.id.clone(), at);
             self.dirty = true;
             self.last_edit = Instant::now();
+            // Only the machinist moves it, also when the Steps page they
+            // entered is applied once its guide is built.
+            self.external("user: step guide moved");
         }
         self.guide_item = 0;
         self.guide_clock.0 = Instant::now();
@@ -5914,7 +6122,17 @@ impl App {
             now.saved() == e.after.saved()
         })
     }
+    /// Handles `message`, from the window or from the engine: what comes
+    /// from the window is counted as an external event for an MCP agent
+    /// (`mcp::state`), unless it is view-only; the engine sends its own
+    /// with `update_by_agent`.
     fn update(&mut self, message: Message) -> Task<Message> {
+        self.mcp_arrive(&message);
+        let task = self.update_turn(message);
+        self.mcp_leave();
+        task
+    }
+    fn update_turn(&mut self, message: Message) -> Task<Message> {
         let before = self.status.clone();
         let problem = std::mem::take(&mut self.status_problem);
         let (selected, page) = (self.selected, self.page);
@@ -6706,9 +6924,15 @@ impl App {
                 self.touch()
             }
             Message::Surface(n) => {
+                // What the click does, as the agent's picks read it too
+                // (`pick_kind`): fill the operation from the face, or add
+                // or drop a whole group.
+                let Some(kind) = self.operation().map(|o| self.pick_kind(o)) else {
+                    return Task::none();
+                };
                 // A lathe cut takes the smooth face clicked, and fills at
                 // once (LIO-424).
-                if self.picks_turn() {
+                if kind == PickKind::Fill && self.picks_turn() {
                     if let Some(mesh) = self.imported_mesh.as_ref()
                         && n < mesh.surfaces.len()
                     {
@@ -6749,6 +6973,55 @@ impl App {
                     crate::stock::Placement::new(mesh, Some(&setup)).rotation()
                         == crate::stock::Placement::new(mesh, Some(self.doc.setup())).rotation()
                 });
+                // A Slot or a Box takes one face, and a click on it fills
+                // the operation at once.
+                if kind == PickKind::Fill {
+                    if self
+                        .operation()
+                        .is_some_and(|o| o.strategy == Strategy::Slot)
+                    {
+                        let selection = surface::Selection {
+                            mesh_fingerprint: fingerprint,
+                            ids: vec![n],
+                        };
+                        let result = self
+                            .known_stock(self.doc.index())
+                            .0
+                            .ok_or_else(|| {
+                                "Resolve the setup stock before picking a slot.".to_string()
+                            })
+                            .and_then(|stock| {
+                                // Use the stock immediately before the edited operation.
+                                let mut here = setup.clone();
+                                if let Some(o) = self.operation() {
+                                    let check =
+                                        slot::pick_setup(&self.doc, mesh, self.doc.index(), &o.id)?;
+                                    here = check;
+                                }
+                                slot::from_face(&here, mesh, &selection, stock)
+                            });
+                        match result {
+                            Ok(fields) => {
+                                if let Some(o) = self.operation_mut() {
+                                    o.p.extend(fields);
+                                    o.surfaces = Some(selection);
+                                    o.geometry.clear();
+                                }
+                                self.touch();
+                                self.status = "Picked Slot. Check the matching cutter, Center cutting capability, top, bottom and Through before showing the cut.".into();
+                            }
+                            Err(e) => self.status = e,
+                        }
+                        return Task::none();
+                    }
+                    // A Box: a face that makes none says why and changes
+                    // nothing (LIO-401).
+                    self.fill_box(surface::Selection {
+                        mesh_fingerprint: fingerprint,
+                        ids: vec![n],
+                    });
+                    return Task::none();
+                }
                 // A Pocket, an inside Contour or a Drill takes a wall as its
                 // hole: every wall of it, added or removed together. A face
                 // that is neither a floor nor a wall (a cone, a chamfer, a
@@ -7014,55 +7287,6 @@ impl App {
                     }
                     self.touch();
                     self.status = said;
-                    return Task::none();
-                }
-                if self
-                    .operation()
-                    .is_some_and(|o| o.strategy == Strategy::Slot)
-                {
-                    let selection = surface::Selection {
-                        mesh_fingerprint: fingerprint,
-                        ids: vec![n],
-                    };
-                    let result = self
-                        .known_stock(self.doc.index())
-                        .0
-                        .ok_or_else(|| "Resolve the setup stock before picking a slot.".to_string())
-                        .and_then(|stock| {
-                            // Use the stock immediately before the edited operation.
-                            let mut here = setup.clone();
-                            if let Some(o) = self.operation() {
-                                let check =
-                                    slot::pick_setup(&self.doc, mesh, self.doc.index(), &o.id)?;
-                                here = check;
-                            }
-                            slot::from_face(&here, mesh, &selection, stock)
-                        });
-                    match result {
-                        Ok(fields) => {
-                            if let Some(o) = self.operation_mut() {
-                                o.p.extend(fields);
-                                o.surfaces = Some(selection);
-                                o.geometry.clear();
-                            }
-                            self.touch();
-                            self.status = "Picked Slot. Check the matching cutter, Center cutting capability, top, bottom and Through before showing the cut.".into();
-                        }
-                        Err(e) => self.status = e,
-                    }
-                    return Task::none();
-                }
-                // A Box takes one face, and a click on it fills the box at
-                // once; a face that makes none says why and changes nothing
-                // (LIO-401).
-                if self
-                    .operation()
-                    .is_some_and(|o| o.strategy == Strategy::Box)
-                {
-                    self.fill_box(surface::Selection {
-                        mesh_fingerprint: fingerprint,
-                        ids: vec![n],
-                    });
                     return Task::none();
                 }
                 // Parallel and Waterline finishing take a whole face, curved or
@@ -8027,6 +8251,7 @@ impl App {
             }
             Message::Setup(setup::Msg::Revert) => self.open_profile(true),
             Message::Setup(setup::Msg::UseCalibration) => {
+                let mut used = false;
                 if let (Some(c), Some((id, Ok(d)))) = (&self.control, &mut self.profile_draft)
                     && c.machine_id == *id
                     && let Some(Ok(v)) = c.calibrated()
@@ -8036,6 +8261,10 @@ impl App {
                         format!("axes.{axis}.steps_per_unit"),
                         setup::steps_text(v),
                     ));
+                    used = true;
+                }
+                if used {
+                    self.external("machine: calibration used in the controller profile");
                 }
             }
             Message::Setup(setup::Msg::Save) => return self.save_profile(),
@@ -8308,6 +8537,7 @@ impl App {
                     o.p.insert("coolant".into(), "Off".into());
                     names.push(o.name().to_string());
                 }
+                self.external("machine: coolant set to Off for the run");
                 self.touch();
                 self.status = format!("Coolant set to Off: {}.", names.join(", "));
                 return self.recheck_run();
@@ -8370,47 +8600,37 @@ impl App {
                 if manual::is_hand(&self.machine_draft) {
                     manual::settle(&mut self.machine_draft);
                 }
-                let errors = self.machine_draft.issues();
-                if errors.is_empty() {
-                    let mut m = self.machine_draft.clone();
-                    // A centreline typed over the probed one is no longer
-                    // the measurement.
-                    let saved = self.doc.machines.iter().find(|x| x.id == m.id);
-                    if saved.is_some_and(|x| {
-                        ["a_centre_y", "a_centre_z"]
-                            .iter()
-                            .any(|k| get(&x.p, k) != get(&m.p, k))
-                    }) {
-                        m.p.remove(control::CENTRE_MARK);
-                        m.p.remove(model::CENTRE_REF);
+                match self.doc.saved_machine(&self.machine_draft) {
+                    Ok(mut m) => {
+                        let mut synced = false;
+                        if let Some(c) = self.control.as_mut().filter(|c| c.machine_id == m.id) {
+                            c.probe = control::probe_settings(&m.p);
+                            c.pins = control::pins_settings(&m.p);
+                            c.rotary = control::Rotary::of(&m);
+                            c.orient = orient::Orient::of(&m);
+                            // Its travel is the connected profile's (LIO-344).
+                            synced = control::travel_into(&mut m, &c.machine_id, &c.config);
+                        }
+                        if synced {
+                            self.external("machine: travel from the UC100 profile");
+                        }
+                        if let Some(i) = self.doc.machines.iter().position(|x| x.id == m.id) {
+                            self.doc.machines[i] = m;
+                        } else {
+                            self.doc.machines.push(m);
+                        }
+                        self.page = Page::Machines;
+                        self.touch();
+                        // Said first: the status line is cut short to fit.
+                        self.status = if synced {
+                            "Machine profile saved, its X, Y and Z travel kept at its UC100 profile's soft limits: change them in Controller configuration. Use Assign to current setup to update an existing setup snapshot."
+                        } else {
+                            "Machine profile saved. Use Assign to current setup to update an existing setup snapshot."
+                        }
+                        .into();
+                        return self.resume();
                     }
-                    let mut synced = false;
-                    if let Some(c) = self.control.as_mut().filter(|c| c.machine_id == m.id) {
-                        c.probe = control::probe_settings(&m.p);
-                        c.pins = control::pins_settings(&m.p);
-                        c.rotary = control::Rotary::of(&m);
-                        c.orient = orient::Orient::of(&m);
-                        // Its travel is the connected profile's (LIO-344).
-                        synced = control::travel_into(&mut m, &c.machine_id, &c.config);
-                    }
-                    if let Some(i) = self.doc.machines.iter().position(|x| x.id == m.id) {
-                        m.version += 1;
-                        self.doc.machines[i] = m;
-                    } else {
-                        self.doc.machines.push(m);
-                    }
-                    self.page = Page::Machines;
-                    self.touch();
-                    // Said first: the status line is cut short to fit.
-                    self.status = if synced {
-                        "Machine profile saved, its X, Y and Z travel kept at its UC100 profile's soft limits: change them in Controller configuration. Use Assign to current setup to update an existing setup snapshot."
-                    } else {
-                        "Machine profile saved. Use Assign to current setup to update an existing setup snapshot."
-                    }
-                    .into();
-                    return self.resume();
-                } else {
-                    self.status = errors.join(" ");
+                    Err(errors) => self.status = errors.join(" "),
                 }
             }
             Message::ToolMachine(id, on) => {
@@ -8446,27 +8666,19 @@ impl App {
                 self.tool_draft = tool;
                 self.page = Page::Tools
             }
-            Message::SaveTool => {
-                let mut issues = self.tool_draft.issues();
-                issues.extend(self.doc.tool_number_issues(&self.tool_draft));
-                if issues.is_empty() {
-                    if let Some(t) = self
-                        .doc
-                        .tools
-                        .iter_mut()
-                        .find(|t| t.id == self.tool_draft.id)
-                    {
-                        *t = self.tool_draft.clone()
+            Message::SaveTool => match self.doc.saved_tool(&self.tool_draft) {
+                Ok(saved) => {
+                    if let Some(t) = self.doc.tools.iter_mut().find(|t| t.id == saved.id) {
+                        *t = saved
                     } else {
-                        self.doc.tools.push(self.tool_draft.clone())
+                        self.doc.tools.push(saved)
                     }
                     self.touch();
                     self.status = "Tool saved to the local library.".into();
                     return self.resume();
-                } else {
-                    self.status = issues.join(" ")
                 }
-            }
+                Err(issues) => self.status = issues.join(" "),
+            },
             Message::DeleteTool(id) => {
                 if let Some(note) = self.doc.tool_in_use_note(&id) {
                     self.status = format!("This tool is not deleted. {note}")
@@ -8491,13 +8703,9 @@ impl App {
                 self.material_draft = material::Material::new("New material");
                 self.page = Page::Materials
             }
-            Message::SaveMaterial => {
-                let mut issues = self.material_draft.issues();
-                issues.extend(self.doc.material_name_issues(&self.material_draft));
-                if issues.is_empty() {
-                    let name = self.material_draft.name().trim().to_string();
-                    self.material_draft.p.insert("name".into(), name);
-                    let saved = self.material_draft.clone();
+            Message::SaveMaterial => match self.doc.saved_material(&self.material_draft) {
+                Ok(saved) => {
+                    self.material_draft = saved.clone();
                     if let Some(m) = self.doc.materials.iter_mut().find(|m| m.id == saved.id) {
                         *m = saved.clone()
                     } else {
@@ -8512,10 +8720,9 @@ impl App {
                     }
                     self.touch();
                     self.status = "Material saved to the library.".into()
-                } else {
-                    self.status = issues.join(" ")
                 }
-            }
+                Err(issues) => self.status = issues.join(" "),
+            },
             Message::DeleteMaterial(id) => {
                 if self.doc.selected_material().is_some_and(|m| m.id == id) {
                     self.status = "This is the project material. Choose another project material before deleting it.".into()
@@ -8560,13 +8767,9 @@ impl App {
                 }
                 self.page = Page::Workholding
             }
-            Message::SaveHolder => {
-                let mut issues = self.holder_draft.issues();
-                issues.extend(self.doc.holder_name_issues(&self.holder_draft));
-                if issues.is_empty() {
-                    let name = self.holder_draft.name().trim().to_string();
-                    self.holder_draft.p.insert("name".into(), name);
-                    let saved = self.holder_draft.clone();
+            Message::SaveHolder => match self.doc.saved_holder(&self.holder_draft) {
+                Ok(saved) => {
+                    self.holder_draft = saved.clone();
                     if let Some(h) = self.doc.workholding.iter_mut().find(|h| h.id == saved.id) {
                         *h = saved
                     } else {
@@ -8574,10 +8777,9 @@ impl App {
                     }
                     self.touch();
                     self.status = "Workholding saved to the library.".into()
-                } else {
-                    self.status = issues.join(" ")
                 }
-            }
+                Err(issues) => self.status = issues.join(" "),
+            },
             Message::DeleteHolder(id) => {
                 let using = self.doc.setups.iter().find(|s| {
                     holding::library_kind(get(&s.p, "holding")).is_some()
@@ -9066,6 +9268,7 @@ impl App {
             Message::ProjectOpened(Some(Ok((d, p, notes)))) => {
                 self.import_busy = false;
                 if !self.archive_current() {
+                    self.mcp.failed_last(self.status.clone());
                     return Task::none();
                 }
                 // A copy from History is a recovery, not the project's file:
@@ -9103,13 +9306,18 @@ impl App {
                     Ok(()) => {
                         self.status = format!("Saved {}", p.display());
                         self.project_dirty = false;
+                        self.mcp.last_save = Some(Ok(p.clone()));
                         self.set_project_file(Some(p));
                     }
-                    Err(e) => self.status = format!("Save failed: {e}"),
+                    Err(e) => {
+                        self.status = format!("Save failed: {e}");
+                        self.mcp.last_save = Some(Err(e.clone()));
+                    }
                 }
             }
             Message::Saved(None) => {
                 self.save_busy = false;
+                self.mcp.last_save = Some(Err("No file was chosen.".into()));
             }
             Message::Export(_) => {
                 let data = self.doc.setup_sheet(self.part_mesh());
@@ -9553,10 +9761,15 @@ impl App {
                     .and_then(|c| Some((c.machine_id.clone(), c.recorded.take()?)))
                 {
                     self.record_pins(&id, at);
+                    self.external("machine: pin reference recorded");
                 }
                 if let Some((id, keep)) = (self.control.as_mut())
                     .and_then(|c| Some((c.machine_id.clone(), c.rotary_keep.take()?)))
                 {
+                    self.external(match keep {
+                        control::RotaryKeep::Centreline(..) => "machine: rotary centreline saved",
+                        control::RotaryKeep::Stale(_) => "machine: rotary centreline marked stale",
+                    });
                     self.keep_rotary(&id, keep);
                 }
                 if self.status == LOCKED && !self.locked() {
@@ -10955,6 +11168,11 @@ fn with_notes(status: &str, notes: &[String]) -> String {
 }
 fn main() -> iced::Result {
     let args: Vec<String> = std::env::args().collect();
+    // The MCP server (LIO-470): MCP on standard input and output, on a
+    // headless session; no window opens.
+    if args.get(1).map(String::as_str) == Some("--mcp") {
+        std::process::exit(mcp::main(&args[2..]))
+    }
     if args.get(1).map(String::as_str) == Some("--export-gcode") {
         match export_gcode(args.get(2), args.get(3)) {
             Ok(message) => {

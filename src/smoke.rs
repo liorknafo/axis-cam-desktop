@@ -16163,8 +16163,10 @@ soft_max = 180.0
                     tools: vec![],
                     operations: vec![],
                     text: long.clone(),
+                    seconds: 0.,
                 }]),
                 run: None,
+                problem_operations: vec![],
             }],
         }));
         a.page = Page::Post;
@@ -16230,6 +16232,48 @@ soft_max = 180.0
             (Page::Work, Some(1), "Tool")
         );
     }
+    /// Two operations named alike: Open beside the problem of the second
+    /// opens the second, not the first of that name (LIO-470).
+    #[test]
+    fn the_nc_review_opens_the_operation_with_the_problem_not_the_first_of_its_name() {
+        let mut a = app();
+        let (mut doc, mesh) = crate::post::fixture::job();
+        doc.setups[0].operations.truncate(1);
+        let mut pockets = vec![];
+        for id in ["pocket-one", "pocket-two"] {
+            let mut o = doc.setups[0].operations[0].clone();
+            o.id = id.into();
+            o.p.insert("name".into(), "Pocket".into());
+            pockets.push(o);
+        }
+        pockets[1].tool = "no-such-tool".into();
+        doc.setups[0].operations = pockets;
+        let posted = crate::post::post_job(&doc, &mesh);
+        assert_eq!(
+            posted.setups[0].problem_operations,
+            vec![Some((1, "pocket-two".to_string()))]
+        );
+        a.post = Some(std::sync::Arc::new(posted));
+        a.doc = doc;
+        a.page = Page::Post;
+        let open = (crate::ui::probe::clicks(a.view(), WINDOW).into_iter())
+            .find(|m| matches!(m, Message::OpenIssue(..)))
+            .expect("Open beside the issue");
+        assert!(matches!(&open, Message::OpenIssue(0, 1, _)), "{open:?}");
+        let _ = a.update(open);
+        assert_eq!((a.page, a.selected), (Page::Work, Some(1)));
+        // A problem with no operation recorded is still matched by name.
+        let by_name = crate::ui::nc_operation(&a.doc, 0, "Pocket: no cutter.", None);
+        assert_eq!(by_name, Some((0, "no cutter.")));
+        let by_id = (crate::ui::nc_operation(
+            &a.doc,
+            0,
+            "Pocket: no cutter.",
+            Some(&(1, "pocket-two".into())),
+        ))
+        .map(|(oi, _)| oi);
+        assert_eq!(by_id, Some(1));
+    }
     /// NC review hands a UC100 setup on to MACHINE, picked in the Run panel
     /// once Connect opens the machine (LIO-142).
     #[test]
@@ -16253,6 +16297,7 @@ soft_max = 180.0
                 name: a.doc.setups[0].name().into(),
                 result: Err(refused.unwrap_err()),
                 run: Some(Ok(())),
+                problem_operations: vec![],
             }],
         }));
         let _ = a.view();
@@ -16341,6 +16386,7 @@ soft_max = 180.0
                     "Work offset \"G92\" is not a LinuxCNC register.".into(),
                 ]),
                 run: None,
+                problem_operations: vec![],
             }],
         }));
         let refused = nc_page(&b);
