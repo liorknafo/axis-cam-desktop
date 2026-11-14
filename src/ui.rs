@@ -9190,19 +9190,16 @@ fn pi_link(c: &crate::control::Connection) -> Element<'_, Message> {
         L::Refused(why) => col.push(warnings(vec![format!(
             "The Pi refused this computer: {why}"
         )])),
-        L::Watching { holder } => col.push(
-            row![
-                muted(match holder {
-                    Some(who) => format!(
-                        "Watching: {who} controls the machine. You may E-stop, hold and stop."
-                    ),
-                    None => "Watching: nobody controls the machine.".into(),
-                }),
-                secondary("Take control", Message::PiTakeControl),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-        ),
+        // Take control under the words, not beside them: beside a long
+        // line the button was squeezed to a sliver (LIO-518).
+        L::Watching { holder } => col
+            .push(muted(match holder {
+                Some(who) => {
+                    format!("Watching: {who} controls the machine. You may E-stop, hold and stop.")
+                }
+                None => "Watching: nobody controls the machine.".into(),
+            }))
+            .push(secondary("Take control", Message::PiTakeControl)),
         L::Controlling => col.push(muted(match &link.name {
             Some(name) => format!("In control, as {name}."),
             None => "In control.".into(),

@@ -4839,6 +4839,143 @@ flood = { pin = 8 }
         other.shutdown();
     }
 
+    /// While another computer controls the Pi's machine, the Machine tab's
+    /// Take control stays whole beside "Watching: … controls the machine"
+    /// at every window size the Control page takes, from the least window
+    /// a short screen leaves up to 1920 × 1080, whatever the other computer
+    /// is called (LIO-518). With `$AXIS_RENDER_DIR` set, each is drawn
+    /// there too.
+    #[test]
+    fn take_control_stays_whole_beside_a_long_watching_line() {
+        let mut sizes = vec![
+            iced::Size::new(1920., 1080.),
+            iced::Size::new(1440., 900.),
+            iced::Size::new(1440., 790.),
+            iced::Size::new(1359., 790.),
+            iced::Size::new(1280., 690.),
+            iced::Size::new(1120., 720.),
+            crate::MIN_WINDOW,
+        ];
+        // The least windows of short or narrow screens (`least_window`).
+        for (w, h) in [(1093., 614.), (1067., 600.), (1024., 640.)] {
+            sizes.extend(crate::least_window(iced::Size::new(w, h)));
+        }
+        // The button alone, as wide and high as it would like.
+        let natural = {
+            let big = iced::Size::new(1000., 1000.);
+            let laid = laid_out_element(
+                crate::ui::secondary("Take control", Message::PiTakeControl).into(),
+                big,
+            );
+            laid.texts
+                .iter()
+                .find(|(t, _)| t == "Take control")
+                .unwrap()
+                .1
+        };
+        let render = std::env::var("AXIS_RENDER_DIR")
+            .ok()
+            .map(std::path::PathBuf::from);
+        let mut wrong = Vec::new();
+        for (k, other_name) in [
+            "Workshop PC",
+            "The old Dell laptop on the bench by the lathe in the back room",
+            "DESKTOP-7F3K9QX2LM4WORKSHOPBENCHCOMPUTER",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut a, server) = pi_app(dir.path());
+            let code = uc100_remote::data::Data {
+                dir: dir.path().join("pi"),
+            }
+            .new_code()
+            .unwrap();
+            let token =
+                uc100_remote::RemoteController::pair(&server.addr().to_string(), &code, other_name)
+                    .unwrap();
+            let other = uc100_remote::RemoteController::start(
+                conn_profile(dir.path()),
+                &server.addr().to_string(),
+                token,
+            );
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while other.link().state != uc100_remote::LinkState::Controlling {
+                assert!(std::time::Instant::now() < end, "{other_name}: no control");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let _ = a.update(Message::Connect);
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !matches!(
+                conn(&a).link.as_ref().map(|l| &l.state),
+                Some(uc100_remote::LinkState::Watching { holder: Some(who) }) if who == other_name
+            ) {
+                let _ = a.update(Message::Tick);
+                assert!(
+                    std::time::Instant::now() < end,
+                    "{other_name}: not watching: {:?}",
+                    conn(&a).link.as_ref().map(|l| &l.state)
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            a.page = Page::Control;
+            let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Machine));
+            for &size in &sizes {
+                let _ = a.update(Message::Resized(size));
+                let laid = laid_out(&a, size);
+                let what = format!("{other_name:?} at {}x{}", size.width, size.height);
+                let Some(button) = (laid.texts.iter())
+                    .find(|(t, _)| t == "Take control")
+                    .map(|(_, b)| *b)
+                else {
+                    wrong.push(format!("{what}: no Take control"));
+                    continue;
+                };
+                // Its words on one line, as wide as they like.
+                if button.width < natural.width - 0.5 || button.height > natural.height + 0.5 {
+                    wrong.push(format!("{what}: Take control squeezed to {button:?}"));
+                }
+                // In the window, or in what scrolls there (the Machine tab
+                // on a short window), and over no other words.
+                let within = |b: &iced::Rectangle, c: &iced::Rectangle| {
+                    b.x >= c.x - 0.5
+                        && b.y >= c.y - 0.5
+                        && b.x + b.width <= c.x + c.width + 0.5
+                        && b.y + b.height <= c.y + c.height + 0.5
+                };
+                let window = iced::Rectangle::with_size(size);
+                let scrolled = (laid.scrolls.iter())
+                    .any(|(shown, content)| within(shown, &window) && within(&button, content));
+                if !within(&button, &window) && !scrolled {
+                    wrong.push(format!(
+                        "{what}: Take control out of the window: {button:?}"
+                    ));
+                }
+                let over: Vec<_> = (laid.texts.iter())
+                    .filter(|(t, b)| {
+                        t != "Take control"
+                            && (b.intersection(&button))
+                                .is_some_and(|i| i.width > 0.5 && i.height > 0.5)
+                    })
+                    .collect();
+                if !over.is_empty() {
+                    wrong.push(format!("{what}: Take control over {over:?}"));
+                }
+                if let Some(out) = &render {
+                    std::fs::create_dir_all(out).unwrap();
+                    render_png(
+                        &a,
+                        size,
+                        &out.join(format!("{k}-{}x{}.png", size.width, size.height)),
+                    );
+                }
+            }
+            other.shutdown();
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
     /// The Pi's simulator gets the simulated stock once this computer is in
     /// control, not before the link is up (LIO-465): a probe down from
     /// Z -30 touches its top, and no note says it was not sent.
@@ -24085,6 +24222,10 @@ soft_max = 180.0
         }
     }
     fn laid_out(a: &App, size: iced::Size) -> LaidOut {
+        laid_out_element(a.view(), size)
+    }
+    /// What `element` lays out at `size`.
+    fn laid_out_element(element: iced::Element<'_, Message>, size: iced::Size) -> LaidOut {
         use futures_util::FutureExt;
         use iced::advanced::renderer::Headless;
         let mut renderer = <iced::Renderer as Headless>::new(
@@ -24096,7 +24237,7 @@ soft_max = 180.0
         .flatten()
         .expect("tiny-skia renderer");
         let mut ui = iced_runtime::UserInterface::build(
-            a.view(),
+            element,
             size,
             iced_runtime::user_interface::Cache::new(),
             &mut renderer,
