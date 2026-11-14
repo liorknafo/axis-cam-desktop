@@ -4962,6 +4962,33 @@ flood = { pin = 8 }
                 if !over.is_empty() {
                     wrong.push(format!("{what}: Take control over {over:?}"));
                 }
+                // The Watching words keep to the width the page gives them:
+                // drawn alone at that width, no ink falls to its right,
+                // where the panel would cut it off.
+                match (laid.texts.iter()).find(|(t, _)| t.starts_with("Watching:")) {
+                    None => wrong.push(format!("{what}: no Watching words")),
+                    Some((_, words)) => {
+                        let (w, h) = (words.width.ceil(), words.height.ceil() + 40.);
+                        let canvas = iced::Size::new(w + 200., h);
+                        let rgba = drawn(
+                            iced::widget::container(crate::ui::watching(Some(other_name)))
+                                .width(w)
+                                .into(),
+                            canvas,
+                            iced::mouse::Cursor::Unavailable,
+                        );
+                        let stride = canvas.width as usize * 4;
+                        let past = (rgba.chunks(stride))
+                            .flat_map(|row| row[(w as usize + 1) * 4..].chunks(4))
+                            .filter(|p| p[..3].iter().any(|c| *c < 240))
+                            .count();
+                        if past > 0 {
+                            wrong.push(format!(
+                                "{what}: the Watching words run {past} px past {w} px"
+                            ));
+                        }
+                    }
+                }
                 if let Some(out) = &render {
                     std::fs::create_dir_all(out).unwrap();
                     render_png(
@@ -10140,6 +10167,28 @@ flood = { pin = 8 }
         path: &std::path::Path,
         cursor: iced::mouse::Cursor,
     ) {
+        let rgba = drawn(element, size, cursor);
+        let physical = iced::Size::new(size.width as u32, size.height as u32);
+        let mut encoder = png::Encoder::new(
+            std::io::BufWriter::new(std::fs::File::create(path).unwrap()),
+            physical.width,
+            physical.height,
+        );
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(&rgba)
+            .unwrap();
+        eprintln!("Rendered {}", path.display());
+    }
+    /// `element` drawn `size` px on white, headless (tiny-skia): RGBA by rows.
+    fn drawn(
+        element: iced::Element<'_, Message>,
+        size: iced::Size,
+        cursor: iced::mouse::Cursor,
+    ) -> Vec<u8> {
         use futures_util::FutureExt;
         use iced::advanced::renderer::{self, Headless};
         let mut renderer = <iced::Renderer as Headless>::new(
@@ -10165,20 +10214,7 @@ flood = { pin = 8 }
             cursor,
         );
         let physical = iced::Size::new(size.width as u32, size.height as u32);
-        let rgba = renderer.screenshot(physical, 1., iced::Color::WHITE);
-        let mut encoder = png::Encoder::new(
-            std::io::BufWriter::new(std::fs::File::create(path).unwrap()),
-            physical.width,
-            physical.height,
-        );
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder
-            .write_header()
-            .unwrap()
-            .write_image_data(&rgba)
-            .unwrap();
-        eprintln!("Rendered {}", path.display());
+        renderer.screenshot(physical, 1., iced::Color::WHITE)
     }
 
     #[test]
