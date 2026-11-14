@@ -28,7 +28,7 @@ fidget = { version = "=0.4.3", default-features = false, features = ["mesh"] }
 toml_edit = "0.25"
 uc100 = { git = "https://github.com/liorknafo/UC100-driver.git", rev = "8ef29f77f7d630c61e2a7b294e16af78df8a776f", default-features = false }
 # The UC100 run by uc100-server on a Raspberry Pi, across the network ("Network (Pi)").
-uc100-remote = { git = "https://github.com/liorknafo/uc100-server.git", rev = "e124d35924ba7cf5056bf27ac60cec870d4f7956" }
+uc100-remote = { git = "https://github.com/liorknafo/uc100-server.git", rev = "d0881bf697943f0fa80054a29e9633fca6457a1d" }
 # The GPU stock mesher (`gpu_mesh`), on the wgpu iced already draws with.
 wgpu = "27"
 bytemuck = { version = "1", features = ["derive"] }

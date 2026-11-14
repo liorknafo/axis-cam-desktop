@@ -3101,6 +3101,112 @@ flood = { pin = 8 }
         );
     }
 
+    /// A relay to `target` passing this computer's frames on, one part of a
+    /// message in parts every `pace` (a slow link), and noting the snapshot
+    /// number each part carries. It stops taking computers once the numbers
+    /// are dropped; a link already open ends when either side closes it.
+    fn pacing_relay(
+        target: std::net::SocketAddr,
+        pace: std::time::Duration,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    ) {
+        use std::io::{ErrorKind, Write};
+        use std::net::{Shutdown, TcpListener, TcpStream};
+        use std::sync::{Arc, Mutex};
+        use uc100_remote::wire::{self, MAX_FRAME, ToServer};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stamps = Arc::new(Mutex::new(Vec::new()));
+        let noted = Arc::downgrade(&stamps);
+        std::thread::spawn(move || {
+            while noted.strong_count() > 0 {
+                let client = match listener.accept() {
+                    Ok((client, _)) => client,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                client.set_nonblocking(false).unwrap();
+                let server = TcpStream::connect(target).unwrap();
+                let (mut up_from, mut up_to) =
+                    (client.try_clone().unwrap(), server.try_clone().unwrap());
+                let noted = noted.clone();
+                std::thread::spawn(move || {
+                    while let Ok(f) = wire::read_frame(&mut up_from, MAX_FRAME) {
+                        if let Ok(ToServer::Part { heard, .. }) = wire::decode::<ToServer>(&f) {
+                            if let Some(stamps) = noted.upgrade() {
+                                stamps.lock().unwrap().push(heard);
+                            }
+                            std::thread::sleep(pace);
+                        }
+                        let len = (f.len() as u32).to_le_bytes();
+                        if up_to
+                            .write_all(&len)
+                            .and_then(|_| up_to.write_all(&f))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    let _ = up_to.shutdown(Shutdown::Write);
+                });
+                std::thread::spawn(move || {
+                    let (mut down_from, mut down_to) = (server, client);
+                    let _ = std::io::copy(&mut down_from, &mut down_to);
+                    let _ = down_to.shutdown(Shutdown::Write);
+                });
+            }
+        });
+        (addr, stamps)
+    }
+
+    /// LIO-498: a still machine's Pi sends a snapshot only every 500 ms, and
+    /// each part of a long tool run must reach it within 2 s of the
+    /// snapshot it carries. So the parts after the first wait for a newer
+    /// snapshot than the one the first carried, rather than all those that
+    /// fill the link at the start carrying an old heartbeat; on a slow link
+    /// the tool run arrives whole and runs.
+    #[test]
+    fn a_long_tool_run_sent_to_a_still_pis_machine_carries_fresh_snapshots() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), FAST, &[0]);
+        // Narrow facing passes: a tool run of many parts.
+        let op = &mut a.doc.setups[0].operations[0];
+        op.p.insert("stepover".into(), "1".into());
+        op.p.insert("stepdown".into(), "1".into());
+        let server = to_pi(&mut a, dir.path());
+        let (relay, stamps) = pacing_relay(server.addr(), std::time::Duration::from_millis(30));
+        let _ = a.update(Message::PiAddress(relay.to_string()));
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // Still for a while: the Pi sends only heartbeats.
+        tick_for(&mut a, 800);
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 20.0, "the tool run running on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        let notes = &conn(&a).link.as_ref().unwrap().notes;
+        assert!(!notes.iter().any(|n| n.contains("late")), "{notes:?}");
+        let stamps = stamps.lock().unwrap().clone();
+        assert!(stamps.len() >= 5, "{} parts", stamps.len());
+        assert!(
+            stamps[1] > stamps[0],
+            "the second part waited for a newer snapshot: {stamps:?}"
+        );
+        assert!(stamps.windows(2).all(|w| w[0] <= w[1]), "{stamps:?}");
+        let _ = a.update(Message::Run(R::Stop));
+        tick_until(&mut a, 5.0, "the stop", |s| s.state == Some(State::Idle));
+    }
+
     /// A tool run cuts on the Pi that this computer has no record of (sent
     /// by another computer, or before this one's records were lost): it
     /// follows nothing, but the run bar's Hold, Resume and Stop act on the
