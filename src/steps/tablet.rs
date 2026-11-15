@@ -85,9 +85,28 @@ pub struct Screen {
     /// A lathe step that takes a typed measurement or the dial check's
     /// answer, which only the computer works into the steps after it.
     pub asks: bool,
+    /// What it asks, which the tablet sends the computer (`tablet::Answer`,
+    /// LIO-524). Missing in files before it.
+    #[serde(default)]
+    pub ask: Option<Ask>,
     /// The pictures, and the numbers, which scroll when they do not fit.
     pub picture: Png,
     pub numbers: Png,
+}
+/// What a lathe step asks.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Ask {
+    /// A diameter measured with the calipers, mm, kept under `key`
+    /// (`guide::measure_key`): `expect` as planned, `measured` once typed.
+    Diameter {
+        key: String,
+        expect: f32,
+        measured: Option<f32>,
+    },
+    /// The dial check: the diameter went down by `reading` (the dial reads
+    /// the diameter) or by twice it (the radius).
+    Dial { reading: f32 },
 }
 /// A PNG in the tablet file, by its path there, and its size in pixels.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -177,10 +196,28 @@ fn fill(
             _ => None,
         };
         use crate::guide::LatheStep as L;
-        let asks = matches!(
-            &g.steps[at],
-            Step::Lathe(L::Measure { .. } | L::DialCheck { .. } | L::Zero { measure: true, .. })
-        );
+        let diameter = |key: &String, expect: &f32, measured: &Option<f32>| Ask::Diameter {
+            key: key.clone(),
+            expect: *expect,
+            measured: *measured,
+        };
+        let ask = match &g.steps[at] {
+            Step::Lathe(L::Measure {
+                key,
+                expect,
+                measured,
+                ..
+            }) => Some(diameter(key, expect, measured)),
+            Step::Lathe(L::Zero {
+                measure: true,
+                key,
+                planned,
+                measured,
+                ..
+            }) => Some(diameter(key, planned, measured)),
+            Step::Lathe(L::DialCheck { reading, .. }) => Some(Ask::Dial { reading: *reading }),
+            _ => None,
+        };
         let screen = Screen {
             step: at,
             item,
@@ -192,7 +229,8 @@ fn fill(
             next: parts.next.map(|(label, _)| label),
             opens,
             back: parts.back,
-            asks,
+            asks: ask.is_some(),
+            ask,
             picture: picture.0,
             numbers: numbers.0,
         };
@@ -450,7 +488,24 @@ mod tests {
                 .iter()
                 .any(|s| s.title.starts_with("Pass 1 of "))
         );
-        assert!(lathe.screens.iter().any(|s| s.asks));
+        // The bar measured at the Zero, and before each last pass (LIO-524).
+        let zero = crate::guide::measure_key(&a.doc.setups[0].id, "zero");
+        let asked: Vec<_> = (lathe.screens.iter())
+            .filter_map(|s| match &s.ask {
+                Some(Ask::Diameter { key, measured, .. }) if s.asks => Some((key, *measured)),
+                _ => None,
+            })
+            .collect();
+        assert!(asked.len() > 1 && asked[0] == (&zero, None), "{asked:?}");
+        assert!(lathe.screens.iter().all(|s| s.asks == s.ask.is_some()));
+        // The dial check while the lathe's dial is not known yet.
+        let unknown = crate::steps::tests::lathe_app("", |_| {});
+        let (steps, _) = super::steps(&unknown.doc, Ok(&mesh));
+        let first = &steps.setups[0].screens[0];
+        assert!(
+            matches!(first.ask, Some(Ask::Dial { reading }) if reading > 0.),
+            "{first:?}"
+        );
         assert!(
             lathe
                 .screens

@@ -2345,7 +2345,7 @@ impl App {
         // app is open (LIO-459); not from a test's or smoke run's workspace.
         if app.smoke_dir.is_none() && app.state_path == storage::state_path() {
             let path = app.state_path.clone();
-            std::thread::spawn(move || tablet::serve(path, computer_name()));
+            std::thread::spawn(move || tablet::serve(path, computer_name(), true));
             return (app, firewall(tablet::firewall_problem));
         }
         (app, Task::none())
@@ -5336,6 +5336,46 @@ impl App {
         let again = shown.again(&self.doc, mesh).map(std::sync::Arc::new);
         self.guide = Some((key, again));
     }
+    /// An answer to a lathe step, typed on its Steps page or on the shop
+    /// tablet (LIO-524), kept (`tablet::apply`), and the guide shown worked
+    /// out again with it. A measurement is not a setting: kept with the
+    /// project, as the place is, with no undo step. The dial check's answer
+    /// is an edit of the machine. What to say, or why it isn't kept.
+    fn keep_answer(&mut self, answer: &tablet::Answer) -> Result<String, String> {
+        let shown = self.guide_at().map(|(shown, _)| shown);
+        let said = match answer {
+            tablet::Answer::Measured { key, mm } => {
+                let same = self.doc.measured.get(key) == Some(&(*mm as f32));
+                let said = tablet::apply(&mut self.doc, answer)?;
+                if !same {
+                    self.dirty = true;
+                    self.last_edit = Instant::now();
+                }
+                said
+            }
+            tablet::Answer::CrossReads { setup, reads } => {
+                let said = tablet::apply(&mut self.doc, answer)?;
+                let machine = (self.doc.setups.iter()).find(|s| s.id == *setup);
+                if machine.is_some_and(|s| s.machine.id == self.machine_draft.id) {
+                    (self.machine_draft.p).insert("cross_reads".into(), reads.key().into());
+                }
+                // While the CNC runs, nothing it runs depends on the lathe:
+                // its run is not marked stale.
+                if self.locked() {
+                    self.dirty = true;
+                    self.project_dirty = true;
+                    self.last_edit = Instant::now();
+                } else {
+                    self.touch();
+                }
+                said
+            }
+        };
+        if let Some(shown) = shown {
+            self.guide_again(&shown);
+        }
+        Ok(said)
+    }
     /// The guide as built, when that was for the job as it is now.
     pub(crate) fn current_guide(&self) -> Option<&Result<std::sync::Arc<steps::Shown>, String>> {
         let key = self.guide_key()?;
@@ -5636,61 +5676,33 @@ impl App {
             GuideAction::Reached(i) => self.guide_item = i + 1,
             GuideAction::Typed(key, text) => self.guide_typed = Some((key, text)),
             GuideAction::Measured(key, value) => {
-                if !(value.is_finite() && value > 0. && value < 10_000.) {
-                    self.status = "Type the diameter the calipers read, in mm.".into();
-                    return Task::none();
-                }
                 let mine = (self.doc.setups.get(shown.guide.setup))
                     .is_some_and(|s| key.starts_with(&guide::measure_key(&s.id, "")));
                 if !mine {
                     return Task::none();
                 }
-                // A measurement, not a setting: kept with the project, as the
-                // place is, with no undo step.
-                if self.doc.measured.get(&key) != Some(&value) {
-                    self.doc.measured.insert(key.clone(), value);
-                    self.dirty = true;
-                    self.last_edit = Instant::now();
-                }
-                if self.guide_typed.as_ref().is_some_and(|(k, _)| *k == key) {
+                let measured = tablet::Answer::Measured {
+                    key: key.clone(),
+                    mm: value.into(),
+                };
+                self.status = self.keep_answer(&measured).unwrap_or_else(|why| why);
+                if self.guide_typed.as_ref().is_some_and(|(k, _)| *k == key)
+                    && self.doc.measured.get(&key) == Some(&value)
+                {
                     self.guide_typed = None;
                 }
-                self.status = format!("Measured Ø{value:.2} kept.");
-                self.guide_again(&shown);
             }
             GuideAction::CrossReads(reads) => {
                 let Some(setup) = self.doc.setups.get(shown.guide.setup) else {
                     return Task::none();
                 };
-                if !lathe::is_lathe(&setup.machine) {
-                    return Task::none();
-                }
-                let id = setup.machine.id.clone();
-                let set = |m: &mut Machine| {
-                    if m.id == id {
-                        m.p.insert("cross_reads".into(), reads.key().into());
-                    }
+                let answer = tablet::Answer::CrossReads {
+                    setup: setup.id.clone(),
+                    reads,
                 };
-                self.doc.machines.iter_mut().for_each(set);
-                for s in &mut self.doc.setups {
-                    set(&mut s.machine);
+                if let Ok(said) = self.keep_answer(&answer) {
+                    self.status = said;
                 }
-                set(&mut self.machine_draft);
-                // An edit of the machine. While the CNC runs, nothing it
-                // runs depends on the lathe: its run is not marked stale.
-                if self.locked() {
-                    self.dirty = true;
-                    self.project_dirty = true;
-                    self.last_edit = Instant::now();
-                } else {
-                    self.touch();
-                }
-                self.status = format!(
-                    "The cross-slide dial reads the {}: saved to {}.",
-                    reads.key().to_lowercase(),
-                    self.doc.setups[shown.guide.setup].machine.name()
-                );
-                self.guide_again(&shown);
             }
             _ => {}
         }
@@ -9704,6 +9716,23 @@ impl App {
                     });
                     let _ = std::fs::remove_file(&inbox);
                     return self.update(Message::ProjectOpened(Some(opened)));
+                }
+                // Answers to lathe steps typed on the shop tablet (LIO-524):
+                // kept and saved before the tablet hears back, so that it
+                // fetches the project with them.
+                for (answer, reply) in tablet::for_app(&self.state_path) {
+                    let kept = self.keep_answer(&answer).and_then(|said| {
+                        if self.persist_now() {
+                            Ok(said)
+                        } else {
+                            let why = self.save_error.clone().unwrap_or_default();
+                            Err(format!("The computer could not save it: {why}"))
+                        }
+                    });
+                    if let Ok(said) = &kept {
+                        self.status = format!("From the shop tablet: {said}");
+                    }
+                    let _ = reply.send(kept);
                 }
                 if let Some(c) = &mut self.control {
                     c.refresh();
