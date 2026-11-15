@@ -14,6 +14,15 @@ use uc100::protocol::Status;
 /// The Connection value of a UC100 run by uc100-server on a Raspberry Pi
 /// across the network (`pi`).
 pub const PI: &str = "Pi (network)";
+/// What a command pressed while a link to the Pi that was live is not
+/// answering says (`Connection::pi_lost`).
+pub const NOT_SENT_PI_LOST: &str = "Not sent: the link to the Pi is not answering.";
+/// What a command pressed while this computer connects to the Pi, the link
+/// never live yet, says (LIO-519).
+pub const NOT_SENT_PI_CONNECTING: &str = "Not sent: still connecting to the Pi.";
+/// What a command pressed while the Pi refuses this computer says: the
+/// banner says why (LIO-519).
+pub const NOT_SENT_PI_REFUSED: &str = "Not sent: the Pi refused this computer.";
 /// The Pi's address when the machine names none (port 7110).
 pub const PI_DEFAULT: &str = "uc100.local";
 
@@ -3102,6 +3111,15 @@ impl Connection {
         self.link.as_ref().is_some_and(|l| !l.live)
     }
 
+    /// Why the Pi turns this computer away (pairing, versions), while it
+    /// does: it is tried again every 5 s (LIO-519).
+    pub fn pi_refused(&self) -> Option<&str> {
+        match &self.link.as_ref()?.state {
+            uc100_remote::LinkState::Refused(why) => Some(why),
+            _ => None,
+        }
+    }
+
     /// The link to the Pi was live and is down: what is shown is the Pi's
     /// last known state. Not while it connects for the first time, when
     /// nothing was lost (LIO-517). Only what is said follows it: what this
@@ -3329,8 +3347,13 @@ impl Connection {
                 | Action::SpacingText(_)
         );
         if !local_only && !self.in_control() {
-            self.pi_note = Some(if self.pi_down() {
-                "Not sent: the link to the Pi is not answering.".into()
+            self.pi_note = Some(if self.pi_refused().is_some() {
+                NOT_SENT_PI_REFUSED.into()
+            } else if self.pi_lost() {
+                NOT_SENT_PI_LOST.into()
+            } else if self.pi_down() {
+                // Never live since it connected (LIO-519).
+                NOT_SENT_PI_CONNECTING.into()
             } else {
                 "Not sent: another computer controls the machine. Take control first.".into()
             });

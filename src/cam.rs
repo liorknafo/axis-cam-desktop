@@ -253,6 +253,7 @@ impl Builder {
         };
         Ok(Self {
             plan: Plan {
+                below: 0.,
                 strategy: op.strategy,
                 operation: op.id.clone(),
                 setup: setup.id.clone(),
@@ -2769,6 +2770,8 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         // the holder checks find the holder where it is.
         b.plan.tool_length -= c.pilot_length;
         b.plan.flute_length -= c.pilot_length;
+        // What reaches under the point: the checks that want the tip.
+        b.plan.below = c.pilot_length;
         // And the pilot's tip clears the stock as the point would: the
         // clearance, the retract and the approach go up by the pilot.
         b.clearance += c.pilot_length;

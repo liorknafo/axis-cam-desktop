@@ -1,6 +1,7 @@
 //! The Steps page: a setup on the manual mill shown screen by screen
 //! (`guide`), as pictures and the large numbers its DRO should read; a
 //! setup on the manual lathe as side views and dial pictures (`turning`).
+pub mod tablet;
 mod turning;
 use crate::{
     App, GuideAction, Message,
@@ -897,13 +898,41 @@ fn readout<'a>(r: Readout, msg: Option<Message>) -> Element<'a, Message> {
         None => face.into(),
     }
 }
-/// The tiles of a section's passes or holes: done, now, next.
-fn tiles<'a>(labels: Vec<(String, Option<Message>)>, at: usize) -> Element<'a, Message> {
+/// The tiles of a section's passes or holes: done, now, next. On the
+/// tablet, a tile a tap goes nowhere from is a plain label in a strip, the
+/// current one lit, no box (LIO-544); one that goes to its pass is a box a
+/// finger tall, which the tablet finds by its tap (LIO-525).
+fn tiles<'a>(
+    labels: Vec<(String, Option<Message>)>,
+    at: usize,
+    tablet: bool,
+) -> Element<'a, Message> {
     let mut lines = column![].spacing(6);
     let mut line = row![].spacing(6);
     let count = labels.len();
     for (i, (s, msg)) in labels.into_iter().enumerate() {
         let state = lit(i, at);
+        if tablet && msg.is_none() {
+            let label = text(s).size(13).font(Font::MONOSPACE).color(match state {
+                Lit::Done => MUTED,
+                Lit::Now => ACCENT,
+                Lit::Next => INK,
+            });
+            let under = container(space().width(Fill).height(2)).style(move |_| container::Style {
+                background: (state == Lit::Now).then(|| ACCENT.into()),
+                ..Default::default()
+            });
+            line = line.push(
+                column![container(label).center_x(Fill), under]
+                    .spacing(2)
+                    .width(FillPortion(1)),
+            );
+            if (i + 1) % 3 == 0 || i + 1 == count {
+                lines = lines.push(line);
+                line = row![].spacing(6);
+            }
+            continue;
+        }
         let face = container(
             text(s)
                 .size(13)
@@ -911,7 +940,7 @@ fn tiles<'a>(labels: Vec<(String, Option<Message>)>, at: usize) -> Element<'a, M
                 .color(if state == Lit::Now { ACCENT } else { INK }),
         )
         .center_x(Fill)
-        .padding([6, 0])
+        .padding([if tablet { 14 } else { 6 }, 0])
         .style(move |_| container::Style {
             background: Some(
                 if state == Lit::Done {
@@ -1069,8 +1098,11 @@ fn write(
     size: f32,
     align: Align,
 ) {
+    let s = s.into();
+    #[cfg(test)]
+    WRITTEN.with_borrow_mut(|w| w.push((s.clone(), text_box(&s, at, size, align))));
     f.fill_text(canvas::Text {
-        content: s.into(),
+        content: s,
         position: at,
         color: c,
         size: size.into(),
@@ -1079,6 +1111,121 @@ fn write(
         ..Default::default()
     });
 }
+/// Where `s` written `size` px high at `at`, `align`ed, lies on a canvas.
+// ponytail: a letter taken as 0.6 of the size wide, not measured; widen it
+// if a font's digits run wider.
+fn text_box(s: &str, at: Point, size: f32, align: Align) -> Rectangle {
+    let (w, h) = (s.chars().count() as f32 * size * 0.6, size * 1.2);
+    let x = match align {
+        Align::Right => at.x - w,
+        Align::Center => at.x - w / 2.,
+        _ => at.x,
+    };
+    Rectangle::new(Point::new(x, at.y - h / 2.), Size::new(w, h))
+}
+/// The labels a drawing has written, so that each next one keeps clear of
+/// them (LIO-534: on a narrow picture a slot pass wrote "X 59.00" over
+/// "X 81.00"), as the Check's dimensions do (`dim_tags`).
+struct Labels {
+    room: Size,
+    taken: Vec<Rectangle>,
+    /// What each label `put` said, and where.
+    said: Vec<(String, Rectangle)>,
+}
+impl Labels {
+    /// Whether `r` lies on the canvas, 2 px clear of every label before it.
+    fn free(&self, r: &Rectangle) -> bool {
+        let (w, h) = (self.room.width, self.room.height);
+        r.x >= 0.
+            && r.y >= 0.
+            && r.x + r.width <= w
+            && r.y + r.height <= h
+            && (self.taken.iter()).all(|o| {
+                r.x + r.width + 2. <= o.x
+                    || o.x + o.width + 2. <= r.x
+                    || r.y + r.height + 2. <= o.y
+                    || o.y + o.height + 2. <= r.y
+            })
+    }
+    /// The first of `boxes`, in order, that is free, or failing that the
+    /// first free with all of them slid `a` times `step` and `b` times
+    /// `across` either way, fewest moves first and along `step` first, up
+    /// to 40 moves: its index and how far it slid. `None` when none is.
+    // ponytail: up to 40² tries × the boxes taken when nothing is free;
+    // fine for a drawing's dozen labels.
+    fn slide(
+        &self,
+        boxes: &[Rectangle],
+        step: iced::Vector,
+        across: iced::Vector,
+    ) -> Option<(usize, iced::Vector)> {
+        (0..40)
+            .flat_map(|n: i32| (0..=n).rev().map(move |a| (a, n - a)))
+            .flat_map(|(a, b)| [b, -b].map(|b| step * a as f32 + across * b as f32))
+            .flat_map(|d| (0..boxes.len()).map(move |i| (i, d)))
+            .find(|(i, d)| self.free(&(boxes[*i] + *d)))
+    }
+    /// Writes `s` at the first of `tries` (a point and how the words align
+    /// on it) where it is clear (`slide`), or at the first as it is; not at
+    /// all when a label before it says the same within a line of one of
+    /// `tries` or of where it slid to, as both sides of a slot as wide as
+    /// its cutter read one X (LIO-545, LIO-546).
+    fn put(
+        &mut self,
+        f: &mut canvas::Frame,
+        s: impl Into<String>,
+        tries: &[(Point, Align)],
+        step: iced::Vector,
+        c: Color,
+        size: f32,
+    ) {
+        let s = s.into();
+        let boxes: Vec<Rectangle> = (tries.iter())
+            .map(|(at, al)| text_box(&s, *at, size, *al))
+            .collect();
+        // Slid along `step` and across it: a label hemmed in by lines and
+        // the stock's edge goes past the nearest of them (LIO-546).
+        let across = iced::Vector::new(step.y, step.x);
+        let (i, d) = (self.slide(&boxes, step, across)).unwrap_or((0, iced::Vector::new(0., 0.)));
+        let at = boxes[i] + d;
+        let near =
+            |o: &Rectangle| (boxes.iter().chain([&at])).any(|b| b.intersects(&o.expand(o.height)));
+        let twin = |(t, o): &(String, Rectangle)| *t == s && near(o);
+        if self.said.iter().any(twin) {
+            return;
+        }
+        self.taken.push(at);
+        self.said.push((s.clone(), at));
+        write(f, s, tries[i].0 + d, c, size, tries[i].1);
+    }
+    /// Takes the box `r` (a tag), slid on along `step` until it is clear,
+    /// and gives where.
+    fn take(&mut self, r: Rectangle, step: iced::Vector) -> Rectangle {
+        let (_, d) = self
+            .slide(&[r], step, iced::Vector::new(0., 0.))
+            .unwrap_or((0, iced::Vector::new(0., 0.)));
+        self.taken.push(r + d);
+        r + d
+    }
+}
+#[cfg(test)]
+thread_local! {
+    /// The words `write` wrote since the drawing being painted began.
+    static WRITTEN: std::cell::RefCell<Vec<(String, Rectangle)>> = Default::default();
+    /// Each Steps drawing's words as painted, for the tests.
+    static DRAWN: std::cell::RefCell<Vec<Vec<(String, Rectangle)>>> = Default::default();
+}
+/// A drawing's painting begins (`true`) or ends: the words written between
+/// are its own (tests only).
+#[cfg(test)]
+fn drawing_words(begins: bool) {
+    match begins {
+        true => drop(WRITTEN.take()),
+        false => DRAWN.with_borrow_mut(|d| d.push(WRITTEN.take())),
+    }
+}
+#[cfg(not(test))]
+fn drawing_words(_: bool) {}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Hatch {
@@ -1145,6 +1292,7 @@ struct Drawing<'a> {
 }
 impl Drawing<'_> {
     fn paint(&self, f: &mut canvas::Frame) {
+        drawing_words(true);
         let [a, b] = self.axes;
         let (mut lo, mut hi) = (
             [self.stock.min[a], self.stock.min[b]],
@@ -1224,6 +1372,65 @@ impl Drawing<'_> {
             f.fill(&outline, PART);
         }
         f.stroke(&path(stock), stroke(INK, 1.3));
+        // The axes' names in the bottom-left corner, written last, first
+        // in the way of the labels.
+        let corner = Point::new(10., size.height - 10.);
+        let names = [
+            (AXES[a], Point::new(40., corner.y)),
+            (AXES[b], Point::new(corner.x - 4., corner.y - 34.)),
+        ];
+        // The work zero's mark too (LIO-545: "Z −7.00" ran over it).
+        let zero = p3([0.; 3]);
+        let mark = Rectangle::new(zero - iced::Vector::new(6., 6.), Size::new(12., 12.));
+        let names_at = names
+            .iter()
+            .map(|(s, at)| text_box(s, *at, 12., Align::Left));
+        // And the lines not to pass and the stock's outline, 1 px wide (a
+        // label keeps 2 px clear), so that no label is written across one
+        // (LIO-546: the Z −7 line ran through "X 60.00", the stock's top
+        // through "Z −7.00").
+        let line = |m: Point, n: Point| {
+            let (w, h) = ((m.x - n.x).abs(), (m.y - n.y).abs());
+            Rectangle::new(
+                Point::new(m.x.min(n.x) - 0.5, m.y.min(n.y) - 0.5),
+                Size::new(w + 1., h + 1.),
+            )
+        };
+        let (tl, br) = (
+            stock.position(),
+            stock.position() + iced::Vector::new(stock.width, stock.height),
+        );
+        let corners = [tl, Point::new(br.x, tl.y), br, Point::new(tl.x, br.y), tl];
+        let edges = corners
+            .windows(2)
+            .map(|e| ("stock".to_string(), line(e[0], e[1])));
+        let lines = (self.shapes.iter())
+            .filter_map(|s| match s {
+                Shape::Never(m, n, s) | Shape::Depth(m, n, s) => {
+                    Some((s.clone(), line(p3(*m), p3(*n))))
+                }
+                _ => None,
+            })
+            .chain(edges);
+        #[cfg(test)]
+        WRITTEN.with_borrow_mut(|w| w.extend(lines.clone().map(|(s, r)| (format!("line {s}"), r))));
+        let taken = names_at
+            .chain([mark])
+            .chain(lines.map(|(_, r)| r))
+            .collect();
+        let mut labels = Labels {
+            room: size,
+            taken,
+            said: vec![],
+        };
+        let (down, up, leftward) = (
+            iced::Vector::new(0., 7.),
+            iced::Vector::new(0., -7.),
+            iced::Vector::new(-7., 0.),
+        );
+        // A side, a level, on the side away from the stock's middle first
+        // (LIO-534).
+        let middle = stock.center();
         for shape in &self.shapes {
             match shape {
                 Shape::Hatch(bx, kind) => {
@@ -1273,23 +1480,43 @@ impl Drawing<'_> {
                 Shape::Depth(from, to, s) => {
                     let (m, n) = (p3(*from), p3(*to));
                     f.stroke(&canvas::Path::line(m, n), dashed(NEVER, 1.8));
-                    write(f, s.clone(), depth_label(m, n), NEVER, 12., Align::Left);
+                    let at = depth_label(m, n);
+                    let other = Point::new(m.x.min(n.x) - 5., at.y);
+                    let tries = [(at, Align::Left), (other, Align::Right)];
+                    labels.put(f, s.clone(), &tries, down, NEVER, 12.);
                 }
                 Shape::Never(from, to, s) => {
                     let (m, n) = (p3(*from), p3(*to));
                     f.stroke(&canvas::Path::line(m, n), dashed(NEVER, 1.8));
-                    // Inside the stock: above a level's right end, beside a
-                    // side's top.
+                    // Inside the stock: over or under a level's right end,
+                    // beside a side's top.
                     if (m.x - n.x).abs() > (m.y - n.y).abs() && (m.x - n.x).abs() < 80. {
                         // A short line (a hole's floor): its label right of it.
-                        let at = Point::new(m.x.max(n.x) + 5., m.y);
-                        write(f, s.clone(), at, NEVER, 12., Align::Left);
+                        let tries = [
+                            (Point::new(m.x.max(n.x) + 5., m.y), Align::Left),
+                            (Point::new(m.x.min(n.x) - 5., m.y), Align::Right),
+                        ];
+                        labels.put(f, s.clone(), &tries, down, NEVER, 12.);
                     } else if (m.x - n.x).abs() > (m.y - n.y).abs() {
-                        let at = Point::new(m.x.max(n.x) - 8., m.y - 9.);
-                        write(f, s.clone(), at, NEVER, 12., Align::Right);
+                        let x = m.x.max(n.x) - 8.;
+                        let mut tries = [
+                            (Point::new(x, m.y - 10.), Align::Right),
+                            (Point::new(x, m.y + 10.), Align::Right),
+                        ];
+                        if m.y > middle.y {
+                            tries.reverse();
+                        }
+                        labels.put(f, s.clone(), &tries, leftward, NEVER, 12.);
                     } else {
-                        let at = Point::new(m.x + 5., m.y.min(n.y) + 12.);
-                        write(f, s.clone(), at, NEVER, 12., Align::Left);
+                        let y = m.y.min(n.y) + 12.;
+                        let mut tries = [
+                            (Point::new(m.x + 5., y), Align::Left),
+                            (Point::new(m.x - 5., y), Align::Right),
+                        ];
+                        if m.x < middle.x {
+                            tries.reverse();
+                        }
+                        labels.put(f, s.clone(), &tries, down, NEVER, 12.);
                     }
                 }
                 Shape::Tool(c, r, end) => {
@@ -1328,30 +1555,27 @@ impl Drawing<'_> {
                     );
                     if from[0] != 0. {
                         // Outside the stock, clear of its face.
-                        write(
-                            f,
-                            s.clone(),
-                            Point::new(c.x + from[0] * 4., c.y - 16.),
-                            INK,
-                            13.,
-                            if from[0] < 0. {
-                                Align::Right
-                            } else {
-                                Align::Left
-                            },
-                        );
+                        let at = Point::new(c.x + from[0] * 4., c.y - 16.);
+                        let align = if from[0] < 0. {
+                            Align::Right
+                        } else {
+                            Align::Left
+                        };
+                        labels.put(f, s.clone(), &[(at, align)], up, INK, 13.);
                     } else {
                         // Right of it, or left of it when it is well left
                         // of the stock's middle: away from what is there,
                         // a clamp it was moved clear of (LIO-458).
                         let middle = rect(&self.stock);
                         let left = c.x < middle.center_x() - middle.width / 4.;
-                        let (dx, align) = if left {
-                            (-14., Align::Right)
-                        } else {
-                            (14., Align::Left)
-                        };
-                        write(f, s.clone(), Point::new(c.x + dx, c.y), INK, 13., align);
+                        let mut tries = [
+                            (Point::new(c.x + 14., c.y), Align::Left),
+                            (Point::new(c.x - 14., c.y), Align::Right),
+                        ];
+                        if left {
+                            tries.reverse();
+                        }
+                        labels.put(f, s.clone(), &tries, down, INK, 13.);
                     }
                 }
                 Shape::Hole(q, r, n, state) => {
@@ -1376,32 +1600,26 @@ impl Drawing<'_> {
                     f.fill(&body, fill);
                     f.stroke(&body, stroke(edge, w));
                     let c = if *state == Lit::Now { ACCENT } else { MUTED };
-                    write(
-                        f,
-                        n.to_string(),
-                        Point::new(at.x + r * s + 5., at.y - 9.),
-                        c,
-                        12.,
-                        Align::Left,
-                    );
+                    let rs = (r * s).max(4.);
+                    let tries = [
+                        (Point::new(at.x + rs + 5., at.y - 9.), Align::Left),
+                        (Point::new(at.x - rs - 5., at.y - 9.), Align::Right),
+                    ];
+                    labels.put(f, n.to_string(), &tries, up, c, 12.);
                 }
                 Shape::Pattern(pattern, holes, r, numbers) => {
-                    paint_pattern(f, p, s, pattern, holes, *r, numbers)
+                    paint_pattern(f, &mut labels, p, s, pattern, holes, *r, numbers)
                 }
-                Shape::Word(q, s, c) => write(f, s.clone(), p3(*q), *c, 13., Align::Left),
+                Shape::Word(q, s, c) => {
+                    labels.put(f, s.clone(), &[(p3(*q), Align::Left)], down, *c, 13.)
+                }
                 Shape::Round(q, r, label) => {
                     let at = p3(*q);
                     f.stroke(&canvas::Path::circle(at, r * s), stroke(ACCENT, 2.));
                     // On its back-right, off the finders' lines.
                     let d = r * s * std::f32::consts::FRAC_1_SQRT_2;
-                    write(
-                        f,
-                        label.clone(),
-                        Point::new(at.x + d + 4., at.y - d - 14.),
-                        ACCENT,
-                        13.,
-                        Align::Left,
-                    );
+                    let at = Point::new(at.x + d + 4., at.y - d - 14.);
+                    labels.put(f, label.clone(), &[(at, Align::Left)], up, ACCENT, 13.);
                 }
                 Shape::Block(bx) => {
                     let r = rect(bx);
@@ -1427,21 +1645,18 @@ impl Drawing<'_> {
                     } else {
                         (Point::new(r.x + r.width, r.y - 16.), Align::Right)
                     };
-                    write(f, label.clone(), at, INK, 12., align);
+                    labels.put(f, label.clone(), &[(at, align)], up, INK, 12.);
                 }
                 Shape::Down(q, mm, s) => {
                     let mut t = *q;
                     t[b] += mm;
                     let (head, tail) = (p3(*q), p3(t));
                     arrow(f, tail, head, ACCENT, 2.5);
-                    write(
-                        f,
-                        s.clone(),
-                        Point::new(tail.x + 8., tail.y + 6.),
-                        ACCENT,
-                        13.,
-                        Align::Left,
-                    );
+                    let tries = [
+                        (Point::new(tail.x + 8., tail.y + 6.), Align::Left),
+                        (Point::new(tail.x - 8., tail.y + 6.), Align::Right),
+                    ];
+                    labels.put(f, s.clone(), &tries, up, ACCENT, 13.);
                 }
                 Shape::Height(top, bottom, s) => {
                     let (m, n) = (p3(*top), p3(*bottom));
@@ -1452,13 +1667,16 @@ impl Drawing<'_> {
                     }
                     let span = canvas::Path::line(Point::new(x, m.y), Point::new(x, n.y));
                     f.stroke(&span, stroke(ACCENT, 1.6));
-                    let mid = Point::new(x + 9., (m.y + n.y) / 2.);
-                    write(f, s.clone(), mid, ACCENT, 13., Align::Left);
+                    let y = (m.y + n.y) / 2.;
+                    let tries = [
+                        (Point::new(x + 9., y), Align::Left),
+                        (Point::new(x - 9., y), Align::Right),
+                    ];
+                    labels.put(f, s.clone(), &tries, down, ACCENT, 13.);
                 }
             }
         }
         // The work zero and the axes.
-        let zero = p3([0.; 3]);
         let mark = canvas::Path::circle(zero, 5.);
         f.fill(&mark, Color::WHITE);
         f.stroke(&mark, stroke(INK, 1.4));
@@ -1476,25 +1694,12 @@ impl Drawing<'_> {
             ),
             stroke(INK, 1.),
         );
-        let corner = Point::new(10., size.height - 10.);
         arrow(f, corner, Point::new(36., corner.y), MUTED, 1.3);
         arrow(f, corner, Point::new(corner.x, corner.y - 26.), MUTED, 1.3);
-        write(
-            f,
-            AXES[a],
-            Point::new(40., corner.y),
-            MUTED,
-            12.,
-            Align::Left,
-        );
-        write(
-            f,
-            AXES[b],
-            Point::new(corner.x - 4., corner.y - 34.),
-            MUTED,
-            12.,
-            Align::Left,
-        );
+        for (s, at) in names {
+            write(f, s, at, MUTED, 12., Align::Left);
+        }
+        drawing_words(false);
     }
 }
 /// Where a pattern drawing's tag of `chars` letters goes on a canvas of
@@ -1586,8 +1791,10 @@ fn screw_try<'a>(p: &Page<'a>, op: usize) -> Option<Element<'a, Message>> {
 /// the next row), the pitches as sizes off hole 1, or the circle with its
 /// centre, its diameter and the angle from +X round to hole 1; then the
 /// holes numbered, hole 1 in the accent.
+#[allow(clippy::too_many_arguments)]
 fn paint_pattern(
     f: &mut canvas::Frame,
+    labels: &mut Labels,
     at: impl Fn([f32; 2]) -> Point,
     s: f32,
     pattern: &Pattern,
@@ -1608,17 +1815,30 @@ fn paint_pattern(
         let t = deg.to_radians();
         [t.cos(), t.sin()]
     };
-    // A label on a white tag, `from` a point out along `out`, clear of it.
-    let tag = |f: &mut canvas::Frame, from: Point, out: [f32; 2], label: String| {
-        let place = tag_box(from, out, label.chars().count(), k, f.size());
-        let c = place.center();
-        let r = canvas::Path::rounded_rectangle(place.position(), place.size(), 5.into());
-        f.fill(&r, Color::WHITE);
-        f.stroke(&r, stroke(ACCENT, 1.5));
-        write(f, label, c, ACCENT, 16. * k, Align::Center);
-    };
+    // The screen's way `px` along `d`.
+    let along = |d: [f32; 2], px: f32| iced::Vector::new(d[0] * px, -d[1] * px);
+    // A label on a white tag, `from` a point out along `out`, clear of it
+    // and of the labels before it.
+    let tag =
+        |f: &mut canvas::Frame, labels: &mut Labels, from: Point, out: [f32; 2], label: String| {
+            let place = tag_box(from, out, label.chars().count(), k, f.size());
+            let place = labels.take(place, along(out, 6.));
+            let c = place.center();
+            let r = canvas::Path::rounded_rectangle(place.position(), place.size(), 5.into());
+            // A white tag hides the lines under it (tests: LIO-546).
+            #[cfg(test)]
+            WRITTEN.with_borrow_mut(|w| w.push(("tag".into(), place)));
+            f.fill(&r, Color::WHITE);
+            f.stroke(&r, stroke(ACCENT, 1.5));
+            write(f, label, c, ACCENT, 16. * k, Align::Center);
+        };
     // A size from `a` to `b`, `gap` px off the holes along `out`.
-    let size = |f: &mut canvas::Frame, a: Point, b: Point, out: [f32; 2], label: String| {
+    let size = |f: &mut canvas::Frame,
+                labels: &mut Labels,
+                a: Point,
+                b: Point,
+                out: [f32; 2],
+                label: String| {
         let gap = rs + 22.;
         let (m, n) = (on(a, out, gap), on(b, out, gap));
         for (h, e) in [(a, m), (b, n)] {
@@ -1628,7 +1848,7 @@ fn paint_pattern(
         let mid = Point::new((m.x + n.x) / 2., (m.y + n.y) / 2.);
         arrow(f, mid, m, ACCENT, 2.);
         arrow(f, mid, n, ACCENT, 2.);
-        tag(f, mid, out, label);
+        tag(f, labels, mid, out, label);
     };
     // The order: hole to hole, a grid back and forth (LIO-405).
     for w in pts.windows(2) {
@@ -1655,6 +1875,7 @@ fn paint_pattern(
             if columns > 1 {
                 size(
                     f,
+                    labels,
                     pts[0],
                     pts[1],
                     back(ub),
@@ -1664,7 +1885,14 @@ fn paint_pattern(
             if rows > 1 {
                 // Hole 1's neighbour in the second row, which runs back.
                 let to = pts[2 * columns - 1];
-                size(f, pts[0], to, back(ua), format!("rows {}", dro(pitch[1])));
+                size(
+                    f,
+                    labels,
+                    pts[0],
+                    to,
+                    back(ua),
+                    format!("rows {}", dro(pitch[1])),
+                );
             }
             if angle.abs() >= 0.005 {
                 let c = pts[0];
@@ -1684,6 +1912,7 @@ fn paint_pattern(
                 arrow(f, on(end, unit(angle - 90.), 12.), end, ACCENT, 2.);
                 tag(
                     f,
+                    labels,
                     on(c, unit(angle / 2.), reach),
                     unit(angle / 2.),
                     degrees(angle),
@@ -1706,7 +1935,8 @@ fn paint_pattern(
                 f.stroke(&cross, stroke(ACCENT, 2.2));
             }
             let under = Point::new(c.x - 10., c.y + 16.);
-            write(f, "centre", under, ACCENT, 15. * k, Align::Right);
+            let down = iced::Vector::new(0., 6.);
+            labels.put(f, "centre", &[(under, Align::Right)], down, ACCENT, 15. * k);
             // From +X round to hole 1, counter-clockwise, outside the circle
             // and its numbers.
             let reach = big + rs + 34. * k;
@@ -1730,6 +1960,7 @@ fn paint_pattern(
             let half = unit(first / 2.);
             tag(
                 f,
+                labels,
                 on(c, half, reach),
                 half,
                 format!("first {}", degrees(first)),
@@ -1766,7 +1997,8 @@ fn paint_pattern(
         let n = on(*c, out, rs + (if one { 15. } else { 12. }) * k);
         let (ink, size) = if one { (ACCENT, 20.) } else { (INK, 16.) };
         let number = numbers.get(j).copied().unwrap_or(j + 1);
-        write(f, number.to_string(), n, ink, size * k, Align::Center);
+        let tries = [(n, Align::Center)];
+        labels.put(f, number.to_string(), &tries, along(out, 4.), ink, size * k);
     }
 }
 impl canvas::Program<Message> for Drawing<'_> {
@@ -2276,13 +2508,24 @@ fn pick_up<'a>(top: Option<f32>, place: Option<&str>) -> Vec<Element<'a, Message
 
 /// What the page needs at hand for a step.
 struct Page<'a> {
-    app: &'a App,
+    doc: &'a Document,
     shown: &'a Shown,
     /// The fingerprint of the guide, for the drawings' keys.
     key: u64,
     at: usize,
     item: usize,
+    /// On a hole, the readout reached (`App::guide_reached`).
+    reached: usize,
+    /// What is typed in a lathe step's measure box (`App::guide_typed`).
+    typed: Option<&'a (String, String)>,
+    /// The window's width and height, which some screens fit to.
+    window: (f32, f32),
+    /// When the step was opened and now, for the handwheel's beat.
+    clock: (std::time::Instant, std::time::Instant),
     setup: &'a Setup,
+    /// Drawn for the shop tablet (`tablet::steps`), which types a lathe
+    /// measurement in its own field: no text box in the picture (LIO-543).
+    tablet: bool,
 }
 impl<'a> Page<'a> {
     fn guide(&self) -> &'a Guide {
@@ -2306,7 +2549,7 @@ impl<'a> Page<'a> {
     }
     fn tool(&self, op: usize) -> Option<&'a Tool> {
         let id = &self.setup.operations.get(op)?.tool;
-        self.app.doc.tools.iter().find(|t| &t.id == id)
+        self.doc.tools.iter().find(|t| &t.id == id)
     }
     /// The chip of an operation's tool.
     fn tool_name(&self, op: usize, diameter: f32) -> String {
@@ -2319,7 +2562,7 @@ impl<'a> Page<'a> {
     }
     /// The chip of the tool with this id.
     fn named(&self, id: &str, diameter: f32) -> String {
-        match self.app.doc.tools.iter().find(|t| t.id == id) {
+        match self.doc.tools.iter().find(|t| t.id == id) {
             Some(t) => match t.number() {
                 Some(n) if !crate::model::names_number(n, t.name()) => {
                     format!("Ø{} {} · T{n}", mm(diameter), t.name())
@@ -2421,7 +2664,7 @@ fn entry_line<'a>(app: &'a App, g: &Guide, at: usize) -> Option<Element<'a, Mess
     let place = |at: usize, item: usize| {
         let s = &g.sections[section_of(g, at)];
         let p = progress(g, s, at, item);
-        let name = section_name(app, g, s);
+        let name = section_name(&app.doc, g, s);
         if p.is_empty() {
             name
         } else {
@@ -2433,7 +2676,7 @@ fn entry_line<'a>(app: &'a App, g: &Guide, at: usize) -> Option<Element<'a, Mess
             setup: id,
             ahead: Some(i),
         } if *id == setup.id && *i < g.sections.len() => {
-            let picked = section_name(app, g, &g.sections[*i]);
+            let picked = section_name(&app.doc, g, &g.sections[*i]);
             let now = if at == 0 && app.guide_item == 0 {
                 "These steps start at the beginning".to_string()
             } else {
@@ -2458,7 +2701,7 @@ fn entry_line<'a>(app: &'a App, g: &Guide, at: usize) -> Option<Element<'a, Mess
                     place(at, app.guide_item)
                 ),
                 (
-                    format!("◀ Start {} again", section_name(app, g, s)),
+                    format!("◀ Start {} again", section_name(&app.doc, g, s)),
                     GuideAction::Go(s.steps.start),
                 ),
             )
@@ -2691,16 +2934,61 @@ fn counted(setup: &Setup, s: &Section) -> String {
         (n, false) => format!("{n} passes"),
     }
 }
-fn section_name(app: &App, g: &Guide, s: &Section) -> String {
-    let lathe = (app.doc.setups.get(g.setup)).is_some_and(|s| crate::lathe::is_lathe(&s.machine));
+fn section_name(doc: &Document, g: &Guide, s: &Section) -> String {
+    let lathe = (doc.setups.get(g.setup)).is_some_and(|s| crate::lathe::is_lathe(&s.machine));
     match (s.op, &g.steps[s.steps.start]) {
         (None, Step::HandOver { next: Some(n) }) => {
-            format!("→ {}", app.doc.setups.get(*n).map_or("", |s| s.name()))
+            format!("→ {}", doc.setups.get(*n).map_or("", |s| s.name()))
         }
         // On the lathe every operation turns: "Outside", not "Turn · Outside".
         (Some(_), _) if lathe => (s.name.strip_prefix("Turn · ").unwrap_or(&s.name)).to_string(),
         _ => s.name.clone(),
     }
+}
+/// The Steps page's line over a setup's steps. A setup named as its machine
+/// says it once (LIO-382).
+fn setup_title(setup: &Setup) -> String {
+    if setup.name().starts_with(setup.machine.name()) {
+        format!("{} · steps", setup.name())
+    } else {
+        format!("{} on the {}", setup.name(), setup.machine.name())
+    }
+}
+/// The header of section `here`: its number, its name, and its tool, count
+/// and time.
+fn head<'a>(p: &Page<'a>, here: usize) -> iced::widget::Row<'a, Message> {
+    let (g, setup) = (p.guide(), p.setup);
+    let s = &g.sections[here];
+    let header = row![
+        disc(
+            op_number(g, here).map_or("•".to_string(), |k| k.to_string()),
+            true,
+            26.
+        ),
+        bold(section_name(p.doc, g, s), 17)
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+    let mut tags = vec![];
+    let lathe = crate::lathe::is_lathe(&setup.machine);
+    if lathe && let Some(op) = s.op {
+        tags.extend(turning::header(p, op, s));
+    } else if let Some(op) = s.op
+        && setup.operations.get(op).is_some()
+    {
+        let d = num(
+            &p.tool(op).map_or(Default::default(), |t| t.p.clone()),
+            "diameter",
+        );
+        if let Some(d) = d {
+            tags.push(chip(p.tool_name(op, d)));
+        }
+        if s.count > 0 {
+            tags.push(chip(counted(setup, s)));
+        }
+        tags.push(chip(format!("~{} min", s.minutes.ceil())));
+    }
+    header.push(row(tags).spacing(6))
 }
 fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
     let g = &shown.guide;
@@ -2708,58 +2996,23 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
     let here = section_of(g, at);
     let setup = &app.doc.setups[g.setup];
     let page = Page {
-        app,
+        doc: &app.doc,
         shown,
         key: app.guide.as_ref().map_or(0, |(k, _)| *k),
         at,
         item: app.guide_item,
+        reached: app.guide_reached,
+        typed: app.guide_typed.as_ref(),
+        window: (app.window_width, app.window_height),
+        clock: app.guide_clock,
         setup,
+        tablet: false,
     };
-    // The header of the section the place is in.
-    let s = &g.sections[here];
-    let mut header = row![
-        disc(
-            op_number(g, here).map_or("•".to_string(), |k| k.to_string()),
-            true,
-            26.
-        ),
-        bold(section_name(app, g, s), 17)
-    ]
-    .spacing(10)
-    .align_y(Alignment::Center);
-    let mut tags = vec![];
-    let lathe = crate::lathe::is_lathe(&setup.machine);
-    if lathe && let Some(op) = s.op {
-        tags.extend(turning::header(&page, op, s));
-    } else if let Some(op) = s.op
-        && setup.operations.get(op).is_some()
-    {
-        let d = num(
-            &page.tool(op).map_or(Default::default(), |t| t.p.clone()),
-            "diameter",
-        );
-        if let Some(d) = d {
-            tags.push(chip(page.tool_name(op, d)));
-        }
-        if s.count > 0 {
-            tags.push(chip(counted(setup, s)));
-        }
-        tags.push(chip(format!("~{} min", s.minutes.ceil())));
-    }
-    header = header
-        .push(row(tags).spacing(6))
+    let header = head(&page, here)
         .push(space().width(Fill))
-        .push(bold(place(app, g, here, at), 14).color(ACCENT));
+        .push(bold(place(&app.doc, g, here, at, app.guide_item), 14).color(ACCENT));
     let top = row![
-        // A setup named as its machine says it once (LIO-382).
-        bold(
-            if setup.name().starts_with(setup.machine.name()) {
-                format!("{} · steps", setup.name())
-            } else {
-                format!("{} on the {}", setup.name(), setup.machine.name())
-            },
-            16
-        ),
+        bold(setup_title(setup), 16),
         muted(format!("~{} min", g.minutes.ceil())).size(13)
     ]
     .spacing(12)
@@ -2804,7 +3057,7 @@ fn operations<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
         // The name, what is left of it under it, as the Run page's lines.
         // A name is never cut (LIO-426): a section done wraps as the
         // current one does, a size smaller (LIO-431).
-        let name = text(section_name(app, g, s)).size(if done && !now { 12 } else { 13 });
+        let name = text(section_name(&app.doc, g, s)).size(if done && !now { 12 } else { 13 });
         let mut words = column![name].spacing(1);
         if !small.is_empty() {
             words = words.push(text(small).size(12).color(if now { ACCENT } else { MUTED }));
@@ -2840,9 +3093,9 @@ fn operations<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
 }
 /// Where the job is, in the Run page's words (LIO-431): "Setup 2 of 3 ·
 /// operation 2 of 4", then the hole or pass of the section.
-fn place(app: &App, g: &Guide, here: usize, at: usize) -> String {
+fn place(doc: &Document, g: &Guide, here: usize, at: usize, item: usize) -> String {
     let s = &g.sections[here];
-    let mut said = format!("Setup {} of {}", g.setup + 1, app.doc.setups.len());
+    let mut said = format!("Setup {} of {}", g.setup + 1, doc.setups.len());
     let ops: Vec<usize> = (g.sections.iter().enumerate())
         .filter(|(_, x)| x.op.is_some())
         .map(|(i, _)| i)
@@ -2850,7 +3103,7 @@ fn place(app: &App, g: &Guide, here: usize, at: usize) -> String {
     if let Some(k) = ops.iter().position(|i| *i == here) {
         said += &format!(" · operation {} of {}", k + 1, ops.len());
     }
-    let p = progress(g, s, at, app.guide_item);
+    let p = progress(g, s, at, item);
     if !p.is_empty() {
         said += &format!(" · {p}");
     }
@@ -2905,7 +3158,24 @@ fn milling_limits<'a>(p: &Page<'a>, op: usize) -> Element<'a, Message> {
     .size(13)
     .into()
 }
+/// A step's screen, in the parts `framed` lays out: its caption, the
+/// pictures, the numbers, the step's own command, whether Back is live, and
+/// how the pictures and the numbers share the card. The shop tablet shows
+/// them in its own frame (`tablet_steps`).
+pub(crate) struct Parts<'a> {
+    pub title: String,
+    pub sub: &'static str,
+    pub left: Element<'a, Message>,
+    pub right: Column<'a, Message>,
+    pub next: Option<(String, Message)>,
+    pub back: bool,
+    pub split: (u16, u16),
+}
 fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
+    let s = parts(p);
+    framed(s.title, s.sub, s.left, s.right, s.next, s.back, s.split)
+}
+fn parts<'a>(p: &Page<'a>) -> Parts<'a> {
     let g = p.guide();
     let next = Some((
         next_label(g, p.at, p.item),
@@ -2919,7 +3189,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
         } => {
             let d = stock.dimensions();
             let narrow = turning::narrow(p);
-            let mut c = vec![chip(p.app.doc.holding_label(p.setup)), chip("top face up")];
+            let mut c = vec![chip(p.doc.holding_label(p.setup)), chip("top face up")];
             // Across the jaws, seen from the front or the right: the stock
             // on its parallels, the jaws at their height and the grip.
             let view = match vise {
@@ -3701,7 +3971,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                         value,
                         lock: Some(AXES[k].into()),
                         tags,
-                        lit: lit(n, p.app.guide_reached),
+                        lit: lit(n, p.reached),
                         big: false,
                     },
                     Some(Message::Guide(GuideAction::Reached(n))),
@@ -3796,7 +4066,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             value: format!("{:.1}", turns),
                             lock: None,
                             tags: vec![how, "½ back every turn".into()],
-                            lit: lit(z, p.app.guide_reached),
+                            lit: lit(z, p.reached),
                             big: true
                         },
                         Some(Message::Guide(GuideAction::Reached(z)))
@@ -3805,7 +4075,8 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                         (0..holes.len())
                             .map(|n| (number(n).to_string(), None))
                             .collect(),
-                        i
+                        i,
+                        p.tablet
                     ),
                 ];
                 ("Tap".into(), "one hole at a time, by hand", left, right)
@@ -3876,7 +4147,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             .chain(cone)
                             .chain(pecking)
                             .collect(),
-                            lit: lit(z, p.app.guide_reached),
+                            lit: lit(z, p.reached),
                             big: false
                         },
                         Some(Message::Guide(GuideAction::Reached(z)))
@@ -3885,7 +4156,8 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                         (0..holes.len())
                             .map(|n| (number(n).to_string(), None))
                             .collect(),
-                        i
+                        i,
+                        p.tablet
                     ),
                 ];
                 let title = if centre.is_some() {
@@ -4051,6 +4323,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 right = right.push(tiles(
                     (1..=holes.len()).map(|n| (n.to_string(), None)).collect(),
                     i,
+                    p.tablet,
                 ));
             }
             ("Bore".into(), "set the head, then each hole", left, right)
@@ -4099,10 +4372,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             // The sizes to measure, drawn on the picture and listed large
             // (LIO-370).
             let top = p.shown.boxes[j].max[2] + g.zero[2];
-            let sizes = g
-                .done
-                .get(j)
-                .map_or(vec![], |d| measures(&p.app.doc, g, d, top));
+            let sizes = g.done.get(j).map_or(vec![], |d| measures(p.doc, g, d, top));
             let rows = sizes.into_iter().map(|m| {
                 readout(
                     Readout {
@@ -4160,7 +4430,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
         Step::HandOver { next: to } => {
             let last = p.shown.pictures.len() - 1;
             let mut c = vec![chip(format!("manual ~{} min", g.minutes.ceil()))];
-            let next = match to.and_then(|n| Some((n, p.app.doc.setups.get(n)?))) {
+            let next = match to.and_then(|n| Some((n, p.doc.setups.get(n)?))) {
                 Some((n, s)) => {
                     c.insert(0, warn_chip(format!("→ {}", s.name())));
                     Some((
@@ -4173,39 +4443,38 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     None
                 }
             };
-            return frame(
-                "Hand over".into(),
-                "the stock leaves the mill",
-                p.picture(last, Fill),
-                column![chips(c)],
+            return Parts {
+                title: "Hand over".into(),
+                sub: "the stock leaves the mill",
+                left: p.picture(last, Fill),
+                right: column![chips(c)],
                 next,
-                true,
-            );
+                back: true,
+                split: (11, 9),
+            };
         }
     };
     // The lathe's numbers take half the card at a narrow window (LIO-389).
     let split = match &g.steps[p.at] {
         Step::Lathe(_) => turning::split(p),
-        Step::Pattern { .. } if p.app.window_width < 1200. => (1, 1),
+        Step::Pattern { .. } if p.window.0 < 1200. => (1, 1),
         _ => (11, 9),
     };
-    framed(title, sub, left, right, next, p.at > 0 || p.item > 0, split)
+    Parts {
+        title,
+        sub,
+        left,
+        right,
+        next,
+        back: p.at > 0 || p.item > 0,
+        split,
+    }
 }
 /// A step's screen: its caption, the pictures, which grow with the room
 /// the page has, and the numbers, which scroll when they do not fit; Back
 /// (live unless `back` is false) and `next` in one place at the card's foot
-/// on every screen (LIO-369).
-pub(super) fn frame<'a>(
-    title: String,
-    sub: &str,
-    left: Element<'a, Message>,
-    right: Column<'a, Message>,
-    next: Option<(String, Message)>,
-    back: bool,
-) -> Element<'a, Message> {
-    framed(title, sub, left, right, next, back, (11, 9))
-}
-/// `frame`, the pictures and the numbers sharing the card's width as `split`.
+/// on every screen (LIO-369); the pictures and the numbers sharing the
+/// card's width as `split`.
 fn framed<'a>(
     title: String,
     sub: &str,
@@ -4395,7 +4664,7 @@ fn lift<'a>(p: &Page<'a>, op: usize, tapping: bool) -> Element<'a, Message> {
             value: dro(safe_z(p, op)),
             lock: None,
             tags,
-            lit: lit(0, p.app.guide_reached),
+            lit: lit(0, p.reached),
             big: false,
         },
         Some(Message::Guide(GuideAction::Reached(0))),
@@ -4442,7 +4711,7 @@ fn pattern_screen<'a>(
         .count();
     let r = (p.tool(op).and_then(|t| num(&t.p, "diameter"))).unwrap_or(4.) / 2.;
     // Smaller at a narrow window, where the numbers get half the card.
-    let size = if p.app.window_width < 1200. { 30 } else { 40 };
+    let size = if p.window.0 < 1200. { 30 } else { 40 };
     let mono = Font {
         weight: iced::font::Weight::Bold,
         ..Font::MONOSPACE
@@ -4833,11 +5102,7 @@ fn pass<'a>(
     }
     if turns > 0. {
         let period = 60. / turns;
-        let since = p
-            .app
-            .guide_clock
-            .1
-            .saturating_duration_since(p.app.guide_clock.0);
+        let since = p.clock.1.saturating_duration_since(p.clock.0);
         let on = since.as_secs_f32() % period < period.min(1.) * 0.3;
         let dot = container(space())
             .width(10)
@@ -4902,7 +5167,7 @@ fn pass<'a>(
         label(format!("Move in this order · pass {index} of {of}"))
     ]
     .extend(rows)
-    .push(tiles(labels, index - 1));
+    .push(tiles(labels, index - 1, p.tablet));
     (
         format!("Pass {index} of {of}"),
         "one screen per pass",
@@ -5215,6 +5480,7 @@ struct CornerDetail {
 }
 impl CornerDetail {
     fn paint(&self, f: &mut canvas::Frame) {
+        drawing_words(true);
         let (c, r, rc) = (self.centre, self.radius, self.tool);
         let quarter = std::f32::consts::FRAC_PI_2;
         let unit = |t: f32| {
@@ -5268,13 +5534,16 @@ impl CornerDetail {
         }
         // The round's centre and radius.
         f.fill(&canvas::Path::circle(p(c), 2.5), INK);
-        write(
+        let mut caption = Caption::new(size);
+        let at = p(off(c, r * 0.5, unit(quarter / 2.)));
+        let down = iced::Vector::new(0., 6.);
+        (caption.0).put(
             f,
             format!("R{}", mm(r)),
-            p(off(c, r * 0.5, unit(quarter / 2.))),
+            &[(at, Align::Center)],
+            down,
             INK,
             13.,
-            Align::Center,
         );
         // The walk: its moves, each a reading.
         if let Some(first) = self.path.first() {
@@ -5298,14 +5567,7 @@ impl CornerDetail {
             f.stroke(&body, stroke(TOOL, 1.6));
             f.fill(&canvas::Path::circle(p(at), 2.5), TOOL);
         }
-        write(
-            f,
-            "seen from above · tool centres",
-            Point::new(8., 10.),
-            MUTED,
-            12.,
-            Align::Left,
-        );
+        caption.write(f);
     }
 }
 impl canvas::Program<Message> for CornerDetail {
@@ -5326,6 +5588,22 @@ impl canvas::Program<Message> for CornerDetail {
     }
 }
 
+/// A close-up's labels, "seen from above · tool centres" in its top-left
+/// corner first in their way, written last.
+struct Caption(Labels);
+impl Caption {
+    const SAID: &str = "seen from above · tool centres";
+    const AT: Point = Point::new(8., 10.);
+    fn new(room: Size) -> Self {
+        let r = text_box(Self::SAID, Self::AT, 12., Align::Left);
+        let (taken, said) = (vec![r], vec![]);
+        Caption(Labels { room, taken, said })
+    }
+    fn write(self, f: &mut canvas::Frame) {
+        write(f, Self::SAID, Self::AT, MUTED, 12., Align::Left);
+        drawing_words(false);
+    }
+}
 /// A Slot's outline close up from above (LIO-455): the slot as cut, the
 /// line a pass leaves on its walls, the pass's moves one axis at a time,
 /// and the tool where it is.
@@ -5357,6 +5635,7 @@ impl SlotDetail {
         out
     }
     fn paint(&self, f: &mut canvas::Frame) {
+        drawing_words(true);
         let (r, rc) = (self.radius, self.tool);
         let margin = r * 0.6 + 2.;
         let lo = [
@@ -5401,7 +5680,16 @@ impl SlotDetail {
         let axis = usize::from((self.b[1] - self.a[1]).abs() > (self.b[0] - self.a[0]).abs());
         let mut label = self.b;
         label[1 - axis] += r * 0.55;
-        write(f, format!("R{}", mm(r)), p(label), INK, 13., Align::Center);
+        let mut caption = Caption::new(size);
+        let (at, down) = (p(label), iced::Vector::new(0., 6.));
+        (caption.0).put(
+            f,
+            format!("R{}", mm(r)),
+            &[(at, Align::Center)],
+            down,
+            INK,
+            13.,
+        );
         // The pass: its moves, each a reading.
         if let Some(first) = self.path.first() {
             let walk = canvas::Path::new(|b| {
@@ -5424,14 +5712,7 @@ impl SlotDetail {
             f.stroke(&body, stroke(TOOL, 1.6));
             f.fill(&canvas::Path::circle(p(at), 2.5), TOOL);
         }
-        write(
-            f,
-            "seen from above · tool centres",
-            Point::new(8., 10.),
-            MUTED,
-            12.,
-            Align::Left,
-        );
+        caption.write(f);
     }
 }
 impl canvas::Program<Message> for SlotDetail {
@@ -5847,6 +6128,11 @@ pub(crate) mod tests {
             bytes: 1,
             thickness: None,
         });
+        app_of(doc, mesh)
+    }
+    /// `doc`, as it is, and its part `mesh` on the Steps page, its guide
+    /// built.
+    pub(crate) fn app_of(doc: Document, mesh: Mesh) -> App {
         let dir = tempfile::tempdir().unwrap();
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
         a.test_dir = Some(dir);
@@ -5912,7 +6198,7 @@ pub(crate) mod tests {
                 )
             })
             .collect();
-        let placed = crate::ui::probe::placed(tiles(labels, 44), Size::new(320., 2000.));
+        let placed = crate::ui::probe::placed(tiles(labels, 44, false), Size::new(320., 2000.));
         assert_eq!(placed.len(), 45);
         for (i, (_, b)) in placed.iter().enumerate() {
             assert!(
@@ -5933,7 +6219,7 @@ pub(crate) mod tests {
             .collect();
         let last = placed.last().unwrap().1;
         let presses =
-            crate::ui::probe::presses(tiles(labels, 44), Size::new(320., 2000.), last, 15.);
+            crate::ui::probe::presses(tiles(labels, 44, false), Size::new(320., 2000.), last, 15.);
         assert!(
             presses
                 .iter()
@@ -7459,6 +7745,140 @@ pub(crate) mod tests {
             assert!(texts(&a).iter().any(|s| s.contains(&deep)), "{i} {deep}");
         }
     }
+    /// The job's Step as a Ø8 slot 30 × 8 in the stock in front of the
+    /// part (X 55..85, Y 4..12, 5 deep), as on the manual block demo's
+    /// "Through slot": with the comp off its lines read X 59 and 81, and
+    /// Y 8 twice, 8 mm apart.
+    fn slot_the_block(doc: &mut Document) {
+        let mut mill = Tool::new("End mill 8", "Flat end mill", "8");
+        let machine = doc.setups[0].machine.id.clone();
+        for (k, v) in [("length", "30"), ("stickout", "40"), ("machines", &machine)] {
+            mill.p.insert(k.into(), v.into());
+        }
+        let b = [55., 85., 4., 12., 0., -5.];
+        let fields = [("stepdown", "5"), ("allowance", "0")];
+        let slot = crate::guide::tests::boxed("Through slot", &mill.id, b, &fields);
+        doc.setups[0].operations[1] = slot;
+        doc.tools.push(mill);
+    }
+    /// The slot made one as wide as its Ø8 mill (X 55..63), open on the
+    /// front, as the demo's "Open slot across the bottom": with the comp
+    /// off both its sides read X 59 (LIO-545).
+    fn slot_as_wide_as_its_cutter(doc: &mut Document) {
+        slot_the_block(doc);
+        let p = &mut doc.setups[0].operations[1].p;
+        for (k, v) in [("x_max", "63"), ("y_min", "-500")] {
+            p.insert(k.into(), v.into());
+        }
+    }
+    #[test]
+    fn no_two_words_of_a_steps_drawing_lie_on_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        // A slot close up: a Ø12 mill in a 16.5 wide counterbore.
+        let slot = {
+            let mesh = crate::mesh::normalize(crate::slot::tests::counterbore(
+                (60., 50., 20.),
+                21.5,
+                16.5,
+                2.,
+                false,
+            ))
+            .unwrap();
+            let fields = [
+                ("slot_width", "16.5"),
+                ("slot_length", "21.5"),
+                ("z_top", "0"),
+                ("z_bottom", "-2"),
+                ("through", "No"),
+                ("stepdown", "1"),
+            ];
+            let mut doc = crate::slot::tests::job(&mesh, "12", &fields);
+            doc.active = doc.setups[0].id.clone();
+            on_page(doc, mesh)
+        };
+        let (plate, mesh) = crate::corner::tests::plate_job("Y");
+        let apps = [
+            ("block", app_with("No", slot_the_block)),
+            ("open slot", app_with("No", slot_as_wide_as_its_cutter)),
+            ("corners", on_page(plate, mesh)),
+            ("slot", slot),
+            (
+                "grid",
+                pattern_app(&crate::guide::tests::plate_grid(), true, false, false),
+            ),
+            (
+                "circle",
+                pattern_app(&crate::guide::tests::plate_circle(), false, true, true),
+            ),
+        ];
+        // The screens with labelled drawings of the cut.
+        const KINDS: [&str; 5] = ["Pass", "Slot", "Corner", "Holes", "Pattern"];
+        // No two words of a drawing on each other, nor one said twice side
+        // by side (LIO-545), nor one across a line not to pass
+        // or the stock's outline, but on a white tag (LIO-546).
+        let clear = |drawn: Vec<Vec<(String, Rectangle)>>, what: &str| {
+            for words in drawn {
+                let (tags, words): (Vec<_>, Vec<_>) =
+                    words.into_iter().partition(|(s, _)| s == "tag");
+                let tagged = |r: &Rectangle| tags.iter().any(|(_, t)| t.contains(r.center()));
+                for (j, (s, r)) in words.iter().enumerate() {
+                    for (t, o) in &words[..j] {
+                        let line = |s: &str| s.strip_prefix("line ").map(str::to_string);
+                        match (line(s), line(t)) {
+                            (Some(_), Some(_)) => continue,
+                            (Some(_), None) if tagged(o) => continue,
+                            (None, Some(_)) if tagged(r) => continue,
+                            _ => {}
+                        }
+                        assert!(!r.intersects(o), "{what}: {s:?} {r:?} on {t:?} {o:?}");
+                        let gap = (o.x - r.x - r.width)
+                            .max(r.x - o.x - o.width)
+                            .max(o.y - r.y - r.height)
+                            .max(r.y - o.y - o.height);
+                        let twice = s == t && gap <= r.height;
+                        assert!(!twice, "{what}: {s:?} {r:?} twice, {o:?}");
+                    }
+                }
+            }
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for (name, mut a) in apps {
+            if let Some((_, Err(e))) = &a.guide {
+                panic!("{name}: {e}");
+            }
+            // Every screen as the shop tablet gets it: its pictures drawn
+            // ~410 × 330, smaller still (LIO-477).
+            DRAWN.take();
+            let _ = tablet::steps(&a.doc, Ok(a.part_mesh().unwrap()));
+            clear(DRAWN.take(), &format!("{name} on the tablet"));
+            let steps = guide(&a).steps;
+            for (i, step) in steps.iter().enumerate() {
+                let kind = format!("{step:?}")
+                    .split([' ', '('])
+                    .next()
+                    .unwrap()
+                    .to_string();
+                if !KINDS.contains(&kind.as_str()) {
+                    continue;
+                }
+                send(&mut a, GuideAction::Go(i));
+                // The narrow window class draws the pictures ~440 px wide,
+                // where they crowd (a debug render is slow: one width).
+                let (w, h) = (1100, 800);
+                (a.window_width, a.window_height) = (w as f32, h as f32);
+                DRAWN.take();
+                render(&a, (w, h), &dir.path().join("steps.png"));
+                let drawn = DRAWN.take();
+                if !drawn.is_empty() {
+                    seen.insert(kind.clone());
+                }
+                clear(drawn, &format!("{name} step {i} ({kind}) at {w} px"));
+            }
+        }
+        for kind in KINDS {
+            assert!(seen.contains(kind), "{kind} not drawn: {seen:?}");
+        }
+    }
     #[test]
     fn a_do_not_pass_line_reads_what_the_dro_reads_with_the_tool_at_it() {
         // The labels of the Step's lines in the top view, Ø25 cutter.
@@ -7700,45 +8120,9 @@ pub(crate) mod tests {
         assert!(a.steps_page());
     }
     /// Draws the window's view on tiny-skia into a PNG.
-    fn render(a: &App, (w, h): (u32, u32), path: &std::path::Path) {
-        use iced::{
-            Pixels,
-            advanced::renderer::{self, Headless},
-            futures::FutureExt,
-        };
-        use iced_runtime::user_interface::{Cache, UserInterface};
-        let mut renderer =
-            <iced::Renderer as Headless>::new(Font::DEFAULT, Pixels(16.), Some("tiny-skia"))
-                .now_or_never()
-                .flatten()
-                .unwrap();
-        let mut ui = UserInterface::build(
-            a.view(),
-            Size::new(w as f32, h as f32),
-            Cache::default(),
-            &mut renderer,
-        );
-        // A frame's redraw, which sets each button's status: without it a
-        // button draws as disabled.
-        let redraw = iced::Event::Window(iced::window::Event::RedrawRequested(
-            std::time::Instant::now(),
-        ));
-        let _ = ui.update(
-            &[redraw],
-            mouse::Cursor::Unavailable,
-            &mut renderer,
-            &mut iced::advanced::clipboard::Null,
-            &mut vec![],
-        );
-        ui.draw(
-            &mut renderer,
-            &Theme::Light,
-            &renderer::Style {
-                text_color: Color::BLACK,
-            },
-            mouse::Cursor::Unavailable,
-        );
-        let rgba = renderer.screenshot(Size::new(w, h), 1., Color::WHITE);
+    pub(crate) fn render(a: &App, (w, h): (u32, u32), path: &std::path::Path) {
+        let size = Size::new(w as f32, h as f32);
+        let rgba = tablet::render(a.view(), size, 1., mouse::Cursor::Unavailable, true);
         let file = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
         let mut encoder = png::Encoder::new(file, w, h);
         encoder.set_color(png::ColorType::Rgba);
@@ -8555,7 +8939,7 @@ pub(crate) mod tests {
             })
         );
         let t = texts(&a);
-        let name = section_name(&a, &g, &g.sections[k]);
+        let name = section_name(&a.doc, &g, &g.sections[k]);
         assert!(
             t.iter().any(|s| *s
                 == format!(

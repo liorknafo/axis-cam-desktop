@@ -1125,6 +1125,16 @@ fn lathe_hits(plan: &Plan, boxes: &[HoldBox], gap: f32) -> Vec<Hit> {
         })
         .collect()
 }
+/// The parts of `plan`'s tool (`parts`), and under them the part that
+/// reaches below the point its moves take it to (`Plan::below`): a centre
+/// drill's pilot, as wide as its cone's flat.
+pub fn plan_parts(plan: &Plan) -> Vec<Part> {
+    let mut out = parts(plan.radius, plan.tool_length, plan.holder_radius).to_vec();
+    if plan.below > 0. {
+        out.push(("tool", plan.shape.flat(), -plan.below, 0.));
+    }
+    out
+}
 /// By how much the moves of `plan` keep clear of the box `b`: for each move
 /// and each part of the tool, the distance `hits_segments` finds (XY, from
 /// the stretch whose heights overlap the box grown by `gap`, to the box's
@@ -1133,7 +1143,7 @@ fn lathe_hits(plan: &Plan, boxes: &[HoldBox], gap: f32) -> Vec<Hit> {
 /// heights.
 fn margin(plan: &Plan, b: &Bounds, gap: f32) -> f32 {
     let mut least = f64::INFINITY;
-    for (_, radius, low, high) in parts(plan.radius, plan.tool_length, plan.holder_radius) {
+    for (_, radius, low, high) in plan_parts(plan) {
         let reach = f64::from(radius) + f64::from(gap);
         for m in &plan.moves {
             let (from, to) = (m.from.map(f64::from), m.to.map(f64::from));
@@ -1150,14 +1160,7 @@ pub fn hits(plan: &Plan, boxes: &[HoldBox], gap: f32) -> Vec<Hit> {
         return lathe_hits(plan, boxes, gap);
     }
     let moves: Vec<_> = plan.moves.iter().map(|m| (m.from, m.to)).collect();
-    hits_segments(
-        &moves,
-        plan.radius,
-        plan.tool_length,
-        plan.holder_radius,
-        boxes,
-        gap,
-    )
+    hits_parts(&moves, &plan_parts(plan), boxes, gap)
 }
 /// A hit as a problem line: the operation, the part of the tool, the box and
 /// where, in work coordinates (`datum` is the work zero in the setup's frame).
@@ -1832,9 +1835,11 @@ fn reach(plan: &Plan, part: Option<Bounds>, top: f32) -> f32 {
         .iter()
         .filter(|m| m.motion == crate::simulation::Motion::Feed)
         .filter_map(|m| {
-            let low = m.from[2].min(m.to[2]);
-            (low < top).then(|| {
-                let radius = if low + plan.tool_length < top {
+            // The tip, under a centre drill's cone by its pilot; the holder
+            // its stickout over the point the moves take it to.
+            let at = m.from[2].min(m.to[2]);
+            (at - plan.below < top).then(|| {
+                let radius = if at + plan.tool_length < top {
                     plan.radius.max(plan.holder_radius)
                 } else {
                     plan.radius
@@ -3037,6 +3042,25 @@ mod tests {
             })
             .collect();
         p
+    }
+    #[test]
+    fn a_centre_drills_reach_takes_its_pilots_tip_and_its_holder_over_its_cone() {
+        // A Ø6 cutter outside a part's -X..X10 edge by 5, its moves at Z0:
+        // a clamp's top and gap at Z10. A 12 mm stickout puts the holder
+        // over it, at Z12; the 3.1 mm pilot under Z0 does not lower that.
+        let mut p = plan(3., &[([15., 0., 0.], [15., 0., -1.])]);
+        p.strategy = crate::model::Strategy::Drill;
+        p.tool_length = 12.;
+        p.below = 3.1;
+        let part = Bounds {
+            min: [-10., -10., -20.],
+            max: [10., 10., 0.],
+        };
+        assert_eq!(reach(&p, Some(part), 10.), 8.);
+        // Under a clamp top at Z-2, only the pilot's tip comes below it.
+        assert_eq!(reach(&p, Some(part), -2.), 8.);
+        p.below = 0.;
+        assert_eq!(reach(&p, Some(part), -2.), 0.);
     }
     #[test]
     fn starters_are_valid() {

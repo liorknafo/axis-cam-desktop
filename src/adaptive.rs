@@ -1261,6 +1261,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     let mut done = 0;
     let mut out = Motions {
         plan: Plan {
+            below: 0.,
             shape: crate::simulation::CutterShape::Flat,
             strategy: Strategy::Adaptive,
             operation: op.id.clone(),

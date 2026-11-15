@@ -1943,14 +1943,14 @@ fn thread_hole(g: &crate::cam::Geometry, t: &crate::thread::Thread) -> Result<Ho
 /// Whether triangle `p` is of the modeled thread `t` along Z: its corners
 /// in the thread's band round its axis, within its length.
 fn of_thread(p: &[[f32; 3]; 3], t: &crate::thread::Thread) -> bool {
-    p.iter().all(|q| in_band(*q, t, 0.05))
+    p.iter().all(|q| in_band(*q, t, 0.06))
 }
 /// How far past a modeled thread's major radius its hole may be opened, mm:
 /// the spindle adapter plate's are opened 0.05 mm past it, so the ridge
-/// joins, and its centre is read to a few hundredths. A ledge or a bore no
-/// wider is its own (`opened`). A wall round its axis just past it can be
-/// another feature's (a slot's round end over it, LIO-481), so `of_thread`
-/// stops at 0.05.
+/// joins. A ledge or a bore no wider is its own (`opened`). A wall round
+/// its axis further out can be another feature's (a slot's round end over
+/// it, LIO-481), so `of_thread` stops at 0.06, just past the plate's bore:
+/// its axis is read to a thousandth (LIO-535).
 const OPENED: f32 = 0.1;
 /// Whether triangle `p` is of the modeled thread `t` or of its hole opened
 /// past it (`OPENED`): the ledge at each turn's root, where the plate's
@@ -3501,6 +3501,7 @@ fn finish_plan(setup: &Setup, op: &Operation, job: Job) -> Result<Plan, String> 
         .map(|p| p.top)
         .fold(f32::NEG_INFINITY, f32::max);
     let mut plan = Plan {
+        below: 0.,
         shape: crate::simulation::CutterShape::Flat,
         strategy: op.strategy,
         operation: op.id.clone(),

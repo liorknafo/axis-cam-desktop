@@ -474,16 +474,12 @@ pub fn detect(triangles: &[[[f32; 3]; 3]]) -> Vec<Thread> {
                 .iter()
                 .filter(|ring| ring.len() >= LEAST && around(ring))
                 .filter_map(|ring| {
-                    read(
-                        axis,
-                        at,
-                        &ring
-                            .iter()
-                            .map(|f| (f.index, f.up, f.lean))
-                            .collect::<Vec<_>>(),
-                        triangles,
-                        &pitches,
-                    )
+                    let members: Vec<_> = ring.iter().map(|f| (f.index, f.up, f.lean)).collect();
+                    let rough = read(axis, at, &members, triangles, &pitches)?;
+                    // The normal lines only roughly cross at the axis: its
+                    // vertices place it, and the thread is read round that.
+                    let at = on_helix(axis, at, &members, triangles, &rough);
+                    read(axis, at, &members, triangles, &pitches).or(Some(rough))
                 })
                 .next()
             {
@@ -678,6 +674,111 @@ fn read(
         tapered,
         spec,
     })
+}
+
+/// The axis of `thread`, from near `at`, whose flank triangles are
+/// `members` (index, faces up the axis, lean): the point round which their
+/// vertices lie on its flanks' helical surfaces, by least squares. The
+/// vertices lie on the modelled surface; the facets' normal lines that
+/// `detect` meets cross the axis only on average over facets spread evenly
+/// round it, and a mesher's uneven facets moved that 0.017 mm on an M8
+/// (LIO-535). Vertices off the helix, such as a faded end's, are left out.
+/// `at` itself when the fit runs away.
+fn on_helix(
+    axis: usize,
+    at: [f32; 2],
+    members: &[(usize, bool, f32)],
+    triangles: &[[[f32; 3]; 3]],
+    thread: &Thread,
+) -> [f32; 2] {
+    use std::f64::consts::TAU;
+    let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
+    let p = thread.pitch as f64;
+    let hand = if thread.right_hand { 1. } else { -1. };
+    let slope = (thread.angle as f64 / 2.).to_radians().tan();
+    // On a flank, z − hand·p·θ/2π − k·r is one phase all round: k is ±slope
+    // by the side the flank faces, as `read`'s coherence takes it.
+    let mut sides: Vec<(Vec<[f64; 3]>, f64, f64)> = [true, false]
+        .into_iter()
+        .filter_map(|up| {
+            let pts: Vec<[f64; 3]> = (members.iter().filter(|m| m.1 == up))
+                .flat_map(|m| triangles[m.0].iter())
+                .map(|q| [(q[u] - at[0]) as f64, (q[v] - at[1]) as f64, q[axis] as f64])
+                .collect();
+            if pts.len() < 9 {
+                return None;
+            }
+            let (_, k, phase) = [slope, -slope]
+                .map(|k| {
+                    let (c, s) = pts.iter().fold((0., 0.), |(c, s), q| {
+                        let ph = TAU / p
+                            * (q[2] - hand * p * q[1].atan2(q[0]) / TAU - k * q[0].hypot(q[1]));
+                        (c + ph.cos(), s + ph.sin())
+                    });
+                    (c.hypot(s), k, s.atan2(c) * p / TAU)
+                })
+                .into_iter()
+                .max_by(|a, b| a.0.total_cmp(&b.0))?;
+            Some((pts, k, phase))
+        })
+        .collect();
+    // Gauss-Newton on the centre, each side's phase taken out by its mean;
+    // after a first round on all of them, vertices more than 4% of the
+    // pitch off their helix are left out.
+    let mut c = [0f64; 2];
+    for round in 0..6 {
+        let trim = if round == 0 { p } else { 0.04 * p };
+        let (mut a, mut b) = ([0f64; 3], [0f64; 2]);
+        let mut means = vec![];
+        for (pts, k, phase) in &sides {
+            let rows: Vec<[f64; 3]> = pts
+                .iter()
+                .filter_map(|q| {
+                    let (x, y) = (q[0] - c[0], q[1] - c[1]);
+                    let (r2, r) = (x * x + y * y, x.hypot(y));
+                    let off = q[2] - hand * p * y.atan2(x) / TAU - k * r - phase;
+                    let off = (off + p / 2.).rem_euclid(p) - p / 2.;
+                    (r > 1e-9 && off.abs() < trim).then(|| {
+                        [
+                            -hand * p / TAU * y / r2 + k * x / r,
+                            hand * p / TAU * x / r2 + k * y / r,
+                            off,
+                        ]
+                    })
+                })
+                .collect();
+            let n = rows.len().max(1) as f64;
+            let m = rows.iter().fold([0f64; 3], |m, r| {
+                [m[0] + r[0] / n, m[1] + r[1] / n, m[2] + r[2] / n]
+            });
+            for r in &rows {
+                let (j0, j1, e) = (r[0] - m[0], r[1] - m[1], r[2] - m[2]);
+                a[0] += j0 * j0;
+                a[1] += j0 * j1;
+                a[2] += j1 * j1;
+                b[0] -= j0 * e;
+                b[1] -= j1 * e;
+            }
+            means.push(m);
+        }
+        let det = a[0] * a[2] - a[1] * a[1];
+        if det.abs() < 1e-12 {
+            return at;
+        }
+        let d = [
+            (a[2] * b[0] - a[1] * b[1]) / det,
+            (a[0] * b[1] - a[1] * b[0]) / det,
+        ];
+        c = [c[0] + d[0], c[1] + d[1]];
+        for ((_, _, phase), m) in sides.iter_mut().zip(means) {
+            *phase += m[2] + m[0] * d[0] + m[1] * d[1];
+        }
+    }
+    // ponytail: a runaway fit keeps the normal lines' axis (a NaN one too).
+    if c[0].hypot(c[1]).partial_cmp(&(0.1 * p)) != Some(std::cmp::Ordering::Less) {
+        return at;
+    }
+    [at[0] + c[0] as f32, at[1] + c[1] as f32]
 }
 
 #[cfg(test)]
@@ -956,6 +1057,22 @@ pub(crate) mod tests {
             .collect();
         let t = one(&detect(&along_x)).clone();
         assert!(t.axis == 0 && t.right_hand && t.internal, "{t:?}");
+    }
+    #[test]
+    fn uneven_facets_keep_the_axis() {
+        // Up-facing flanks thinned on one half, as a mesher's facets can
+        // fall unevenly: the normal lines alone read it 0.1 mm off (LIO-535).
+        let all = modeled([3., -2.], 8., 1.25, 60., true, true, 20., 0.);
+        let uneven: Vec<_> = (all.iter().enumerate())
+            .filter(|(i, t)| {
+                let n = cross(sub(t[1], t[0]), sub(t[2], t[0]));
+                n[2] <= 0. || t[0][0] <= 3. || i % 4 == 0
+            })
+            .map(|(_, t)| *t)
+            .collect();
+        let t = one(&detect(&uneven)).clone();
+        assert!((t.centre[0] - 3.).hypot(t.centre[1] + 2.) < 0.001, "{t:?}");
+        assert_eq!(t.spec.map(|s| s.name), Some("M8×1.25"));
     }
     #[test]
     fn two_holes_side_by_side_are_two_threads() {

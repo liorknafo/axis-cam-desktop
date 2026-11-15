@@ -18,7 +18,8 @@ roxmltree = "0.21"
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "io-util", "sync", "macros"] }
 # Runs an Iced `Task` to its messages (`task::into_stream`): the headless MCP
-# session (`mcp::runner`) and the tests. Already in the tree through iced.
+# session (`mcp::runner`) and the tests; draws the Steps screens headless for
+# the shop tablet (`steps::tablet`). Already in the tree through iced.
 iced_runtime = "0.14"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "stream", "form"] }
 jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
@@ -41,6 +42,11 @@ pollster = "0.4"
 security-framework = "3.7.0"
 # The run's stock mesher sets its thread's QoS (`below_the_driver`).
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# A session's lock on one byte past its owner (`mcp::session::Lock`), so the
+# owner stays readable; already in the tree.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 
 [profile.release]
 opt-level = 2

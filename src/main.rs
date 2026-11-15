@@ -2378,7 +2378,7 @@ impl App {
         // app is open (LIO-459); not from a test's or smoke run's workspace.
         if app.smoke_dir.is_none() && app.state_path == storage::state_path() {
             let path = app.state_path.clone();
-            std::thread::spawn(move || tablet::serve(path, computer_name()));
+            std::thread::spawn(move || tablet::serve(path, computer_name(), true));
             return (app, firewall(tablet::firewall_problem));
         }
         (app, Task::none())
@@ -5369,6 +5369,46 @@ impl App {
         let again = shown.again(&self.doc, mesh).map(std::sync::Arc::new);
         self.guide = Some((key, again));
     }
+    /// An answer to a lathe step, typed on its Steps page or on the shop
+    /// tablet (LIO-524), kept (`tablet::apply`), and the guide shown worked
+    /// out again with it. A measurement is not a setting: kept with the
+    /// project, as the place is, with no undo step. The dial check's answer
+    /// is an edit of the machine. What to say, or why it isn't kept.
+    fn keep_answer(&mut self, answer: &tablet::Answer) -> Result<String, String> {
+        let shown = self.guide_at().map(|(shown, _)| shown);
+        let said = match answer {
+            tablet::Answer::Measured { key, mm } => {
+                let same = self.doc.measured.get(key) == Some(&(*mm as f32));
+                let said = tablet::apply(&mut self.doc, answer)?;
+                if !same {
+                    self.dirty = true;
+                    self.last_edit = Instant::now();
+                }
+                said
+            }
+            tablet::Answer::CrossReads { setup, reads } => {
+                let said = tablet::apply(&mut self.doc, answer)?;
+                let machine = (self.doc.setups.iter()).find(|s| s.id == *setup);
+                if machine.is_some_and(|s| s.machine.id == self.machine_draft.id) {
+                    (self.machine_draft.p).insert("cross_reads".into(), reads.key().into());
+                }
+                // While the CNC runs, nothing it runs depends on the lathe:
+                // its run is not marked stale.
+                if self.locked() {
+                    self.dirty = true;
+                    self.project_dirty = true;
+                    self.last_edit = Instant::now();
+                } else {
+                    self.touch();
+                }
+                said
+            }
+        };
+        if let Some(shown) = shown {
+            self.guide_again(&shown);
+        }
+        Ok(said)
+    }
     /// The guide as built, when that was for the job as it is now.
     pub(crate) fn current_guide(&self) -> Option<&Result<std::sync::Arc<steps::Shown>, String>> {
         let key = self.guide_key()?;
@@ -5669,61 +5709,33 @@ impl App {
             GuideAction::Reached(i) => self.guide_item = i + 1,
             GuideAction::Typed(key, text) => self.guide_typed = Some((key, text)),
             GuideAction::Measured(key, value) => {
-                if !(value.is_finite() && value > 0. && value < 10_000.) {
-                    self.status = "Type the diameter the calipers read, in mm.".into();
-                    return Task::none();
-                }
                 let mine = (self.doc.setups.get(shown.guide.setup))
                     .is_some_and(|s| key.starts_with(&guide::measure_key(&s.id, "")));
                 if !mine {
                     return Task::none();
                 }
-                // A measurement, not a setting: kept with the project, as the
-                // place is, with no undo step.
-                if self.doc.measured.get(&key) != Some(&value) {
-                    self.doc.measured.insert(key.clone(), value);
-                    self.dirty = true;
-                    self.last_edit = Instant::now();
-                }
-                if self.guide_typed.as_ref().is_some_and(|(k, _)| *k == key) {
+                let measured = tablet::Answer::Measured {
+                    key: key.clone(),
+                    mm: value.into(),
+                };
+                self.status = self.keep_answer(&measured).unwrap_or_else(|why| why);
+                if self.guide_typed.as_ref().is_some_and(|(k, _)| *k == key)
+                    && self.doc.measured.get(&key) == Some(&value)
+                {
                     self.guide_typed = None;
                 }
-                self.status = format!("Measured Ø{value:.2} kept.");
-                self.guide_again(&shown);
             }
             GuideAction::CrossReads(reads) => {
                 let Some(setup) = self.doc.setups.get(shown.guide.setup) else {
                     return Task::none();
                 };
-                if !lathe::is_lathe(&setup.machine) {
-                    return Task::none();
-                }
-                let id = setup.machine.id.clone();
-                let set = |m: &mut Machine| {
-                    if m.id == id {
-                        m.p.insert("cross_reads".into(), reads.key().into());
-                    }
+                let answer = tablet::Answer::CrossReads {
+                    setup: setup.id.clone(),
+                    reads,
                 };
-                self.doc.machines.iter_mut().for_each(set);
-                for s in &mut self.doc.setups {
-                    set(&mut s.machine);
+                if let Ok(said) = self.keep_answer(&answer) {
+                    self.status = said;
                 }
-                set(&mut self.machine_draft);
-                // An edit of the machine. While the CNC runs, nothing it
-                // runs depends on the lathe: its run is not marked stale.
-                if self.locked() {
-                    self.dirty = true;
-                    self.project_dirty = true;
-                    self.last_edit = Instant::now();
-                } else {
-                    self.touch();
-                }
-                self.status = format!(
-                    "The cross-slide dial reads the {}: saved to {}.",
-                    reads.key().to_lowercase(),
-                    self.doc.setups[shown.guide.setup].machine.name()
-                );
-                self.guide_again(&shown);
             }
             _ => {}
         }
@@ -7192,9 +7204,14 @@ impl App {
                     let named = |h: &pocket::Hole| {
                         let ((x, y), (w, d)) = (h.centre(), h.size());
                         match round.first().and_then(|r| r.as_ref()) {
+                            // Where it drills it: a thread's hole's outline is
+                            // round its axis as fitted, a hundredth or two off
+                            // the bore it opens in (LIO-521).
                             Some(r) if drill => format!(
-                                "the Ø{} hole at X{x:.2} Y{y:.2}",
-                                crate::post::exact_mm(cam::largest_drill(r))
+                                "the Ø{} hole at X{:.2} Y{:.2}",
+                                crate::post::exact_mm(cam::largest_drill(r)),
+                                r.center[0],
+                                r.center[1]
                             ),
                             _ => format!("the hole at X{x:.2} Y{y:.2} ({w:.2} × {d:.2} mm)"),
                         }
@@ -9733,6 +9750,23 @@ impl App {
                     let _ = std::fs::remove_file(&inbox);
                     return self.update(Message::ProjectOpened(Some(opened)));
                 }
+                // Answers to lathe steps typed on the shop tablet (LIO-524):
+                // kept and saved before the tablet hears back, so that it
+                // fetches the project with them.
+                for (answer, reply) in tablet::for_app(&self.state_path) {
+                    let kept = self.keep_answer(&answer).and_then(|said| {
+                        if self.persist_now() {
+                            Ok(said)
+                        } else {
+                            let why = self.save_error.clone().unwrap_or_default();
+                            Err(format!("The computer could not save it: {why}"))
+                        }
+                    });
+                    if let Ok(said) = &kept {
+                        self.status = format!("From the shop tablet: {said}");
+                    }
+                    let _ = reply.send(kept);
+                }
                 if let Some(c) = &mut self.control {
                     c.refresh();
                     // "Connecting to <machine>…" until the driver reports a
@@ -9742,12 +9776,27 @@ impl App {
                     // after the first state until the state changes.
                     let connecting = (self.status.strip_prefix("Connecting to "))
                         .and_then(|rest| rest.rsplit_once('…'));
-                    let name = connecting.map(|(name, _)| name).or_else(|| {
+                    // "The Pi of <machine> refused this computer: <why>"
+                    // while it does (LIO-519): it is tried again every 5 s,
+                    // and once let in the status goes on from there.
+                    let refused = (self.status.strip_prefix(PI_REFUSED))
+                        .and_then(|rest| rest.split_once(REFUSED_WHY))
+                        .map(|(name, _)| name);
+                    let name = connecting.map(|(name, _)| name).or(refused).or_else(|| {
                         let rest = (self.status.strip_prefix("Connected to "))
                             .or_else(|| self.status.strip_prefix(NO_LINK))?;
                         Some(rest.rsplit_once(": ")?.0)
                     });
-                    if let (Some(name), Some(state)) = (name, &c.snapshot.state) {
+                    if let (Some(name), Some(why)) = (name, c.pi_refused()) {
+                        // As the banner: the refusal says what to do, over
+                        // the last known state (a note said while connecting
+                        // is dropped; the refusal is what matters now).
+                        self.status = format!("{PI_REFUSED}{name}{REFUSED_WHY}{why}");
+                    } else if let Some(name) = refused.filter(|_| c.snapshot.state.is_none()) {
+                        // Let in after a refusal, the Pi's state not known
+                        // yet: connecting again, not still refused.
+                        self.status = format!("Connecting to {name}…");
+                    } else if let (Some(name), Some(state)) = (name, &c.snapshot.state) {
                         use uc100::controller::State;
                         self.status = match state {
                             // The Pi's state as last known, never "Connected".
@@ -9757,6 +9806,10 @@ impl App {
                             ),
                             // Never live yet: still "Connecting to <machine>…"
                             // (LIO-517).
+                            // Let in after a refusal, not live yet: connecting.
+                            _ if c.pi_down() && refused.is_some() => {
+                                format!("Connecting to {name}…")
+                            }
                             _ if c.pi_down() => self.status.clone(),
                             State::Disconnected if connecting.is_some() => format!(
                                 "Could not connect to {name}; see the log in the Control page's Machine tab."
@@ -11322,6 +11375,11 @@ fn run() -> iced::Result {
 
 /// The status line's start while the link to the Pi is not answering.
 const NO_LINK: &str = "No link to the Pi of ";
+/// The status line's start while the Pi refuses this computer, then the
+/// machine's name, `REFUSED_WHY` and the Pi's reason (LIO-519).
+const PI_REFUSED: &str = "The Pi of ";
+/// Between the machine's name and the Pi's reason in a `PI_REFUSED` status.
+const REFUSED_WHY: &str = " refused this computer: ";
 
 /// How this computer names itself to a Pi it pairs with: the Mac's name
 /// ("Lior's MacBook Pro"), else its host name.

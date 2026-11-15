@@ -237,8 +237,11 @@ pub fn travel_problem<'a>(
     plans: impl Iterator<Item = &'a crate::simulation::Plan>,
 ) -> Option<String> {
     let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
-    for mv in plans.flat_map(|p| &p.moves) {
-        for p in [mv.from, mv.to] {
+    // Where the tool's tip goes: a centre drill's pilot is under the point
+    // its moves take it to (`Plan::below`).
+    for (mv, below) in plans.flat_map(|p| p.moves.iter().map(move |m| (m, p.below))) {
+        for mut p in [mv.from, mv.to] {
+            p[2] -= below;
             for k in 0..3 {
                 lo[k] = lo[k].min(p[k]);
                 hi[k] = hi[k].max(p[k]);
