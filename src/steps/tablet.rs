@@ -536,9 +536,12 @@ mod tests {
         let window = Size::new(WINDOW.0, WINDOW.1);
         let measures: Vec<_> = (shown.guide.steps.iter().enumerate())
             .filter_map(|(at, s)| match s {
-                Step::Lathe(L::Measure { key, .. } | L::Zero { measure: true, key, .. }) => {
-                    Some((at, key))
-                }
+                Step::Lathe(
+                    L::Measure { key, .. }
+                    | L::Zero {
+                        measure: true, key, ..
+                    },
+                ) => Some((at, key)),
                 _ => None,
             })
             .collect();
