@@ -2881,6 +2881,14 @@ impl App {
             }
         }
     }
+    /// Whether the Drill `o` drills any hole now (LIO-553); false for any
+    /// other operation, and with no part.
+    fn drills_any(&self, o: &Operation) -> bool {
+        o.strategy == Strategy::Drill
+            && self.part_mesh().is_some_and(
+                |mesh| matches!(self.drill_holes(o, mesh).as_ref(), Ok(holes) if !holes.is_empty()),
+            )
+    }
     /// A Drill `id` whose picks changed (LIO-553): its first picks, holes
     /// that all go through the part, drill through, the tip out past the
     /// exit by the drill's point and 1 mm; a blind hole picked while it
@@ -6251,11 +6259,24 @@ impl App {
             Message::Edit(target, ..) => Some((target, self.edited(target))),
             _ => None,
         };
-        // A click that picks or drops a surface: the selected operation's
-        // picks as they were, to see whether it changed them.
-        let picked = matches!(message, Message::Surface(_) | Message::DropHole(_))
-            .then(|| self.operation().map(|o| (o.id.clone(), o.surfaces.clone())))
-            .flatten();
+        // A click that picks or drops a surface, or a feature of the
+        // example: the selected operation's picks as they were, and whether
+        // a Drill drilled any hole, to see what it changed (LIO-553).
+        let picked = matches!(
+            message,
+            Message::Surface(_) | Message::DropHole(_) | Message::Feature(_)
+        )
+        .then(|| {
+            self.operation().map(|o| {
+                (
+                    o.id.clone(),
+                    o.surfaces.clone(),
+                    o.geometry.clone(),
+                    !self.drills_any(o),
+                )
+            })
+        })
+        .flatten();
         let task = match fault::guard(|| self.handle(message)) {
             Ok(task) => task,
             Err(fault) => {
@@ -6278,17 +6299,18 @@ impl App {
         }
         // Picked or dropped: what the model file's change did to its picks
         // is seen to. A click refused leaves the note.
-        if let Some((id, was)) = picked {
+        if let Some((id, was, features, first)) = picked {
             let ids = |s: &Option<surface::Selection>| {
                 s.as_ref()
                     .map(|s| (s.mesh_fingerprint.clone(), s.ids.clone()))
             };
-            let changed = (self.doc.setups.iter().flat_map(|s| &s.operations))
-                .find(|o| o.id == id)
-                .is_some_and(|o| ids(&o.surfaces) != ids(&was));
+            let now = (self.doc.setups.iter().flat_map(|s| &s.operations)).find(|o| o.id == id);
+            let changed = now.is_some_and(|o| ids(&o.surfaces) != ids(&was));
+            let refeatured = now.is_some_and(|o| o.geometry != features);
             if changed {
                 self.doc.pick_checks.remove(&id);
-                let first = was.as_ref().is_none_or(|s| s.ids.is_empty());
+            }
+            if changed || refeatured {
                 self.drill_through_default(&id, first);
             }
         }

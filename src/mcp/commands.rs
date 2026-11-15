@@ -4976,6 +4976,37 @@ pub(crate) mod tests {
             })
             .unwrap()
     }
+    /// LIO-553 review: on the built-in example, a Drill's first hole picked
+    /// from the feature list goes through as a wall picked does.
+    #[test]
+    fn a_drill_picking_the_examples_through_hole_from_its_features_goes_through() {
+        use crate::model::{Operation, Strategy, Tool};
+        let mut d = direct();
+        assert!(d.app.is_sample());
+        let mut drill = Tool::new("Drill 8", "Drill", "8");
+        drill.set_type("Drill");
+        for (k, v) in [("length", "40"), ("stickout", "60")] {
+            drill.p.insert(k.into(), v.into());
+        }
+        let mut op = Operation::new(Strategy::Drill, drill.id.clone());
+        op.geometry.clear();
+        d.app.doc.tools.push(drill);
+        d.app.doc.setup_mut().operations = vec![op];
+        d.app.selected = Some(0);
+        let get = |d: &Direct, k: &str| {
+            crate::model::get(&d.app.doc.setup().operations[0].p, k).to_string()
+        };
+        assert_eq!(get(&d, "through"), "No");
+        let _ = d.app.update(Message::Feature(5));
+        assert_eq!(d.app.doc.setup().operations[0].geometry, vec![5]);
+        assert_eq!(get(&d, "through"), "Yes", "{}", d.app.status);
+        assert_eq!(get(&d, "breakthrough"), "3.5");
+        // A second hole is no first pick: a No the user chose stays.
+        let args = json!({"target": "operation", "key": "through", "value": "No"});
+        assert_eq!(outcome(&run(&mut d, "edit_field", args).unwrap()), "done");
+        let _ = d.app.update(Message::Feature(6));
+        assert_eq!(get(&d, "through"), "No");
+    }
     /// LIO-553: a hand Drill says whether its tip goes out under a hole that
     /// goes through the part, and how far, in its editor and to `edit_field`;
     /// a pick of holes that all go through makes it go through, past by the
