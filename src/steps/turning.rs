@@ -2,8 +2,8 @@
 //! on the left, you at the front) and every number as a picture of a dial
 //! collar, as the lathe has no DRO.
 use super::{
-    ACCENT, CHIP, Lit, NEVER, Page, STOCK, TOOL, arrow, chip, chips, dashed, disc, frame, label,
-    lit, stroke, tiles, warn_chip,
+    ACCENT, CHIP, Lit, NEVER, Page, STOCK, TOOL, arrow, chip, chips, dashed, disc, label, lit,
+    stroke, tiles, warn_chip,
 };
 use crate::{
     GuideAction, Message, Target,
@@ -1342,24 +1342,22 @@ fn dial_box<'a>(p: &Page<'a>, d: &Dial, sub: String, size: f32) -> Element<'a, M
     .into()
 }
 /// How wide a dial is drawn, px (LIO-389): as wide as `n` pictures side by
-/// side leave of the right-hand column (`frame`'s 9 parts of 20 of the card
+/// side leave of the right-hand column (`framed`'s 9 parts of 20 of the card
 /// beside the setups list), and no taller than the window leaves above a
 /// Pass screen's three readouts, so that at 1024 × 700 they are all in
 /// sight; 84 to 260.
 fn dial_size(p: &Page<'_>, n: f32) -> f32 {
     let (pictures, numbers) = split(p);
-    let column = (p.app.window_width - 300.) * f32::from(numbers) / f32::from(pictures + numbers);
-    (column / n - 30.)
-        .min(p.app.window_height - 608.)
-        .clamp(84., 260.)
+    let column = (p.window.0 - 300.) * f32::from(numbers) / f32::from(pictures + numbers);
+    (column / n - 30.).min(p.window.1 - 608.).clamp(84., 260.)
 }
 /// Whether the window is narrow: the lathe's numbers then take half the card
 /// (`split`) and its readouts' keys only their width (LIO-389).
 pub(super) fn narrow(p: &Page<'_>) -> bool {
-    p.app.window_width < 1200.
+    p.window.0 < 1200.
 }
 /// How the side view and the numbers share a lathe screen's card, as
-/// `steps::frame` has it: half each at a narrow window, so that a Pass
+/// `steps::framed` has it: half each at a narrow window, so that a Pass
 /// screen's readouts and both dials are in sight at 1024 × 700.
 pub(super) fn split(p: &Page<'_>) -> (u16, u16) {
     if narrow(p) { (1, 1) } else { (11, 9) }
@@ -1442,7 +1440,7 @@ fn measure_box<'a>(
     measured: Option<f32>,
     expect: f32,
 ) -> Element<'a, Message> {
-    let typed = match &p.app.guide_typed {
+    let typed = match p.typed {
         Some((k, t)) if k == key => t.clone(),
         _ => measured.map_or(String::new(), |m| format!("{m:.2}")),
     };
@@ -1491,7 +1489,7 @@ fn measure_box<'a>(
 }
 /// How the tool with this id is drawn.
 fn cutter_of(p: &Page<'_>, id: &str) -> Cutter {
-    let tool = p.app.doc.tools.iter().find(|t| t.id == id);
+    let tool = p.doc.tools.iter().find(|t| t.id == id);
     match tool.map_or("", |t| crate::model::get(&t.p, "type")) {
         "Boring bar" => Cutter::Bore,
         "Threading tool" => Cutter::Thread,
@@ -1504,7 +1502,7 @@ fn cutter_of(p: &Page<'_>, id: &str) -> Cutter {
 /// The chip of the tool with this id.
 fn tool_chip<'a>(p: &Page<'a>, id: &str) -> Element<'a, Message> {
     chip(
-        (p.app.doc.tools.iter())
+        (p.doc.tools.iter())
             .find(|t| t.id == id)
             .map_or(id.to_string(), |t| t.name().to_string()),
     )
@@ -1534,7 +1532,7 @@ pub(super) fn header<'a>(p: &Page<'a>, op: usize, s: &Section) -> Vec<Element<'a
         Some(LatheStep::TailDrill { .. }) => {
             out.push(chip(format!(
                 "centre drill, then {}",
-                (p.app.doc.tools.iter())
+                (p.doc.tools.iter())
                     .find(|t| t.id == tool)
                     .map_or("the drill", |t| t.name())
             )));
@@ -3033,11 +3031,11 @@ fn thread_tiles<'a>(p: &Page<'a>, op: usize) -> Element<'a, Message> {
 }
 /// The Hand over screen of a lathe setup: the bar as it is left, where the
 /// part goes and how the next machine holds it.
-pub(super) fn hand_over<'a>(p: &Page<'a>, to: Option<usize>) -> Element<'a, Message> {
+pub(super) fn hand_over<'a>(p: &Page<'a>, to: Option<usize>) -> super::Parts<'a> {
     let g = p.guide();
     let side = p.shown.side.as_ref();
     let mut c = vec![];
-    let next = match to.and_then(|n| Some((n, p.app.doc.setups.get(n)?))) {
+    let next = match to.and_then(|n| Some((n, p.doc.setups.get(n)?))) {
         Some((n, s)) => {
             c.push(warn_chip(format!("→ {}", s.name())));
             if !lathe::is_lathe(&s.machine) {
@@ -3071,14 +3069,15 @@ pub(super) fn hand_over<'a>(p: &Page<'a>, to: Option<usize>) -> Element<'a, Mess
         }
         None => space().into(),
     };
-    frame(
-        "Hand over".into(),
-        "the part leaves the lathe",
+    super::Parts {
+        title: "Hand over".into(),
+        sub: "the part leaves the lathe",
         left,
-        column![chips(c)],
+        right: column![chips(c)],
         next,
-        true,
-    )
+        back: true,
+        split: (11, 9),
+    }
 }
 
 #[cfg(test)]

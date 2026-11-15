@@ -1,6 +1,7 @@
 //! The Steps page: a setup on the manual mill shown screen by screen
 //! (`guide`), as pictures and the large numbers its DRO should read; a
 //! setup on the manual lathe as side views and dial pictures (`turning`).
+pub mod tablet;
 mod turning;
 use crate::{
     App, GuideAction, Message,
@@ -2276,12 +2277,20 @@ fn pick_up<'a>(top: Option<f32>, place: Option<&str>) -> Vec<Element<'a, Message
 
 /// What the page needs at hand for a step.
 struct Page<'a> {
-    app: &'a App,
+    doc: &'a Document,
     shown: &'a Shown,
     /// The fingerprint of the guide, for the drawings' keys.
     key: u64,
     at: usize,
     item: usize,
+    /// On a hole, the readout reached (`App::guide_reached`).
+    reached: usize,
+    /// What is typed in a lathe step's measure box (`App::guide_typed`).
+    typed: Option<&'a (String, String)>,
+    /// The window's width and height, which some screens fit to.
+    window: (f32, f32),
+    /// When the step was opened and now, for the handwheel's beat.
+    clock: (std::time::Instant, std::time::Instant),
     setup: &'a Setup,
 }
 impl<'a> Page<'a> {
@@ -2306,7 +2315,7 @@ impl<'a> Page<'a> {
     }
     fn tool(&self, op: usize) -> Option<&'a Tool> {
         let id = &self.setup.operations.get(op)?.tool;
-        self.app.doc.tools.iter().find(|t| &t.id == id)
+        self.doc.tools.iter().find(|t| &t.id == id)
     }
     /// The chip of an operation's tool.
     fn tool_name(&self, op: usize, diameter: f32) -> String {
@@ -2319,7 +2328,7 @@ impl<'a> Page<'a> {
     }
     /// The chip of the tool with this id.
     fn named(&self, id: &str, diameter: f32) -> String {
-        match self.app.doc.tools.iter().find(|t| t.id == id) {
+        match self.doc.tools.iter().find(|t| t.id == id) {
             Some(t) => match t.number() {
                 Some(n) if !crate::model::names_number(n, t.name()) => {
                     format!("Ø{} {} · T{n}", mm(diameter), t.name())
@@ -2421,7 +2430,7 @@ fn entry_line<'a>(app: &'a App, g: &Guide, at: usize) -> Option<Element<'a, Mess
     let place = |at: usize, item: usize| {
         let s = &g.sections[section_of(g, at)];
         let p = progress(g, s, at, item);
-        let name = section_name(app, g, s);
+        let name = section_name(&app.doc, g, s);
         if p.is_empty() {
             name
         } else {
@@ -2433,7 +2442,7 @@ fn entry_line<'a>(app: &'a App, g: &Guide, at: usize) -> Option<Element<'a, Mess
             setup: id,
             ahead: Some(i),
         } if *id == setup.id && *i < g.sections.len() => {
-            let picked = section_name(app, g, &g.sections[*i]);
+            let picked = section_name(&app.doc, g, &g.sections[*i]);
             let now = if at == 0 && app.guide_item == 0 {
                 "These steps start at the beginning".to_string()
             } else {
@@ -2458,7 +2467,7 @@ fn entry_line<'a>(app: &'a App, g: &Guide, at: usize) -> Option<Element<'a, Mess
                     place(at, app.guide_item)
                 ),
                 (
-                    format!("◀ Start {} again", section_name(app, g, s)),
+                    format!("◀ Start {} again", section_name(&app.doc, g, s)),
                     GuideAction::Go(s.steps.start),
                 ),
             )
@@ -2691,16 +2700,61 @@ fn counted(setup: &Setup, s: &Section) -> String {
         (n, false) => format!("{n} passes"),
     }
 }
-fn section_name(app: &App, g: &Guide, s: &Section) -> String {
-    let lathe = (app.doc.setups.get(g.setup)).is_some_and(|s| crate::lathe::is_lathe(&s.machine));
+fn section_name(doc: &Document, g: &Guide, s: &Section) -> String {
+    let lathe = (doc.setups.get(g.setup)).is_some_and(|s| crate::lathe::is_lathe(&s.machine));
     match (s.op, &g.steps[s.steps.start]) {
         (None, Step::HandOver { next: Some(n) }) => {
-            format!("→ {}", app.doc.setups.get(*n).map_or("", |s| s.name()))
+            format!("→ {}", doc.setups.get(*n).map_or("", |s| s.name()))
         }
         // On the lathe every operation turns: "Outside", not "Turn · Outside".
         (Some(_), _) if lathe => (s.name.strip_prefix("Turn · ").unwrap_or(&s.name)).to_string(),
         _ => s.name.clone(),
     }
+}
+/// The Steps page's line over a setup's steps. A setup named as its machine
+/// says it once (LIO-382).
+fn setup_title(setup: &Setup) -> String {
+    if setup.name().starts_with(setup.machine.name()) {
+        format!("{} · steps", setup.name())
+    } else {
+        format!("{} on the {}", setup.name(), setup.machine.name())
+    }
+}
+/// The header of section `here`: its number, its name, and its tool, count
+/// and time.
+fn head<'a>(p: &Page<'a>, here: usize) -> iced::widget::Row<'a, Message> {
+    let (g, setup) = (p.guide(), p.setup);
+    let s = &g.sections[here];
+    let header = row![
+        disc(
+            op_number(g, here).map_or("•".to_string(), |k| k.to_string()),
+            true,
+            26.
+        ),
+        bold(section_name(p.doc, g, s), 17)
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+    let mut tags = vec![];
+    let lathe = crate::lathe::is_lathe(&setup.machine);
+    if lathe && let Some(op) = s.op {
+        tags.extend(turning::header(p, op, s));
+    } else if let Some(op) = s.op
+        && setup.operations.get(op).is_some()
+    {
+        let d = num(
+            &p.tool(op).map_or(Default::default(), |t| t.p.clone()),
+            "diameter",
+        );
+        if let Some(d) = d {
+            tags.push(chip(p.tool_name(op, d)));
+        }
+        if s.count > 0 {
+            tags.push(chip(counted(setup, s)));
+        }
+        tags.push(chip(format!("~{} min", s.minutes.ceil())));
+    }
+    header.push(row(tags).spacing(6))
 }
 fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
     let g = &shown.guide;
@@ -2708,58 +2762,22 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
     let here = section_of(g, at);
     let setup = &app.doc.setups[g.setup];
     let page = Page {
-        app,
+        doc: &app.doc,
         shown,
         key: app.guide.as_ref().map_or(0, |(k, _)| *k),
         at,
         item: app.guide_item,
+        reached: app.guide_reached,
+        typed: app.guide_typed.as_ref(),
+        window: (app.window_width, app.window_height),
+        clock: app.guide_clock,
         setup,
     };
-    // The header of the section the place is in.
-    let s = &g.sections[here];
-    let mut header = row![
-        disc(
-            op_number(g, here).map_or("•".to_string(), |k| k.to_string()),
-            true,
-            26.
-        ),
-        bold(section_name(app, g, s), 17)
-    ]
-    .spacing(10)
-    .align_y(Alignment::Center);
-    let mut tags = vec![];
-    let lathe = crate::lathe::is_lathe(&setup.machine);
-    if lathe && let Some(op) = s.op {
-        tags.extend(turning::header(&page, op, s));
-    } else if let Some(op) = s.op
-        && setup.operations.get(op).is_some()
-    {
-        let d = num(
-            &page.tool(op).map_or(Default::default(), |t| t.p.clone()),
-            "diameter",
-        );
-        if let Some(d) = d {
-            tags.push(chip(page.tool_name(op, d)));
-        }
-        if s.count > 0 {
-            tags.push(chip(counted(setup, s)));
-        }
-        tags.push(chip(format!("~{} min", s.minutes.ceil())));
-    }
-    header = header
-        .push(row(tags).spacing(6))
+    let header = head(&page, here)
         .push(space().width(Fill))
-        .push(bold(place(app, g, here, at), 14).color(ACCENT));
+        .push(bold(place(&app.doc, g, here, at, app.guide_item), 14).color(ACCENT));
     let top = row![
-        // A setup named as its machine says it once (LIO-382).
-        bold(
-            if setup.name().starts_with(setup.machine.name()) {
-                format!("{} · steps", setup.name())
-            } else {
-                format!("{} on the {}", setup.name(), setup.machine.name())
-            },
-            16
-        ),
+        bold(setup_title(setup), 16),
         muted(format!("~{} min", g.minutes.ceil())).size(13)
     ]
     .spacing(12)
@@ -2804,7 +2822,7 @@ fn operations<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
         // The name, what is left of it under it, as the Run page's lines.
         // A name is never cut (LIO-426): a section done wraps as the
         // current one does, a size smaller (LIO-431).
-        let name = text(section_name(app, g, s)).size(if done && !now { 12 } else { 13 });
+        let name = text(section_name(&app.doc, g, s)).size(if done && !now { 12 } else { 13 });
         let mut words = column![name].spacing(1);
         if !small.is_empty() {
             words = words.push(text(small).size(12).color(if now { ACCENT } else { MUTED }));
@@ -2840,9 +2858,9 @@ fn operations<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
 }
 /// Where the job is, in the Run page's words (LIO-431): "Setup 2 of 3 ·
 /// operation 2 of 4", then the hole or pass of the section.
-fn place(app: &App, g: &Guide, here: usize, at: usize) -> String {
+fn place(doc: &Document, g: &Guide, here: usize, at: usize, item: usize) -> String {
     let s = &g.sections[here];
-    let mut said = format!("Setup {} of {}", g.setup + 1, app.doc.setups.len());
+    let mut said = format!("Setup {} of {}", g.setup + 1, doc.setups.len());
     let ops: Vec<usize> = (g.sections.iter().enumerate())
         .filter(|(_, x)| x.op.is_some())
         .map(|(i, _)| i)
@@ -2850,7 +2868,7 @@ fn place(app: &App, g: &Guide, here: usize, at: usize) -> String {
     if let Some(k) = ops.iter().position(|i| *i == here) {
         said += &format!(" · operation {} of {}", k + 1, ops.len());
     }
-    let p = progress(g, s, at, app.guide_item);
+    let p = progress(g, s, at, item);
     if !p.is_empty() {
         said += &format!(" · {p}");
     }
@@ -2905,7 +2923,24 @@ fn milling_limits<'a>(p: &Page<'a>, op: usize) -> Element<'a, Message> {
     .size(13)
     .into()
 }
+/// A step's screen, in the parts `framed` lays out: its caption, the
+/// pictures, the numbers, the step's own command, whether Back is live, and
+/// how the pictures and the numbers share the card. The shop tablet shows
+/// them in its own frame (`tablet_steps`).
+pub(crate) struct Parts<'a> {
+    pub title: String,
+    pub sub: &'static str,
+    pub left: Element<'a, Message>,
+    pub right: Column<'a, Message>,
+    pub next: Option<(String, Message)>,
+    pub back: bool,
+    pub split: (u16, u16),
+}
 fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
+    let s = parts(p);
+    framed(s.title, s.sub, s.left, s.right, s.next, s.back, s.split)
+}
+fn parts<'a>(p: &Page<'a>) -> Parts<'a> {
     let g = p.guide();
     let next = Some((
         next_label(g, p.at, p.item),
@@ -2919,7 +2954,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
         } => {
             let d = stock.dimensions();
             let narrow = turning::narrow(p);
-            let mut c = vec![chip(p.app.doc.holding_label(p.setup)), chip("top face up")];
+            let mut c = vec![chip(p.doc.holding_label(p.setup)), chip("top face up")];
             // Across the jaws, seen from the front or the right: the stock
             // on its parallels, the jaws at their height and the grip.
             let view = match vise {
@@ -3701,7 +3736,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                         value,
                         lock: Some(AXES[k].into()),
                         tags,
-                        lit: lit(n, p.app.guide_reached),
+                        lit: lit(n, p.reached),
                         big: false,
                     },
                     Some(Message::Guide(GuideAction::Reached(n))),
@@ -3796,7 +3831,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             value: format!("{:.1}", turns),
                             lock: None,
                             tags: vec![how, "½ back every turn".into()],
-                            lit: lit(z, p.app.guide_reached),
+                            lit: lit(z, p.reached),
                             big: true
                         },
                         Some(Message::Guide(GuideAction::Reached(z)))
@@ -3876,7 +3911,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             .chain(cone)
                             .chain(pecking)
                             .collect(),
-                            lit: lit(z, p.app.guide_reached),
+                            lit: lit(z, p.reached),
                             big: false
                         },
                         Some(Message::Guide(GuideAction::Reached(z)))
@@ -4102,7 +4137,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             let sizes = g
                 .done
                 .get(j)
-                .map_or(vec![], |d| measures(&p.app.doc, g, d, top));
+                .map_or(vec![], |d| measures(&p.doc, g, d, top));
             let rows = sizes.into_iter().map(|m| {
                 readout(
                     Readout {
@@ -4160,7 +4195,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
         Step::HandOver { next: to } => {
             let last = p.shown.pictures.len() - 1;
             let mut c = vec![chip(format!("manual ~{} min", g.minutes.ceil()))];
-            let next = match to.and_then(|n| Some((n, p.app.doc.setups.get(n)?))) {
+            let next = match to.and_then(|n| Some((n, p.doc.setups.get(n)?))) {
                 Some((n, s)) => {
                     c.insert(0, warn_chip(format!("→ {}", s.name())));
                     Some((
@@ -4173,39 +4208,38 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     None
                 }
             };
-            return frame(
-                "Hand over".into(),
-                "the stock leaves the mill",
-                p.picture(last, Fill),
-                column![chips(c)],
+            return Parts {
+                title: "Hand over".into(),
+                sub: "the stock leaves the mill",
+                left: p.picture(last, Fill),
+                right: column![chips(c)],
                 next,
-                true,
-            );
+                back: true,
+                split: (11, 9),
+            };
         }
     };
     // The lathe's numbers take half the card at a narrow window (LIO-389).
     let split = match &g.steps[p.at] {
         Step::Lathe(_) => turning::split(p),
-        Step::Pattern { .. } if p.app.window_width < 1200. => (1, 1),
+        Step::Pattern { .. } if p.window.0 < 1200. => (1, 1),
         _ => (11, 9),
     };
-    framed(title, sub, left, right, next, p.at > 0 || p.item > 0, split)
+    Parts {
+        title,
+        sub,
+        left,
+        right,
+        next,
+        back: p.at > 0 || p.item > 0,
+        split,
+    }
 }
 /// A step's screen: its caption, the pictures, which grow with the room
 /// the page has, and the numbers, which scroll when they do not fit; Back
 /// (live unless `back` is false) and `next` in one place at the card's foot
-/// on every screen (LIO-369).
-pub(super) fn frame<'a>(
-    title: String,
-    sub: &str,
-    left: Element<'a, Message>,
-    right: Column<'a, Message>,
-    next: Option<(String, Message)>,
-    back: bool,
-) -> Element<'a, Message> {
-    framed(title, sub, left, right, next, back, (11, 9))
-}
-/// `frame`, the pictures and the numbers sharing the card's width as `split`.
+/// on every screen (LIO-369); the pictures and the numbers sharing the
+/// card's width as `split`.
 fn framed<'a>(
     title: String,
     sub: &str,
@@ -4395,7 +4429,7 @@ fn lift<'a>(p: &Page<'a>, op: usize, tapping: bool) -> Element<'a, Message> {
             value: dro(safe_z(p, op)),
             lock: None,
             tags,
-            lit: lit(0, p.app.guide_reached),
+            lit: lit(0, p.reached),
             big: false,
         },
         Some(Message::Guide(GuideAction::Reached(0))),
@@ -4442,7 +4476,7 @@ fn pattern_screen<'a>(
         .count();
     let r = (p.tool(op).and_then(|t| num(&t.p, "diameter"))).unwrap_or(4.) / 2.;
     // Smaller at a narrow window, where the numbers get half the card.
-    let size = if p.app.window_width < 1200. { 30 } else { 40 };
+    let size = if p.window.0 < 1200. { 30 } else { 40 };
     let mono = Font {
         weight: iced::font::Weight::Bold,
         ..Font::MONOSPACE
@@ -4833,11 +4867,7 @@ fn pass<'a>(
     }
     if turns > 0. {
         let period = 60. / turns;
-        let since = p
-            .app
-            .guide_clock
-            .1
-            .saturating_duration_since(p.app.guide_clock.0);
+        let since = p.clock.1.saturating_duration_since(p.clock.0);
         let on = since.as_secs_f32() % period < period.min(1.) * 0.3;
         let dot = container(space())
             .width(10)
@@ -5847,6 +5877,11 @@ pub(crate) mod tests {
             bytes: 1,
             thickness: None,
         });
+        app_of(doc, mesh)
+    }
+    /// `doc`, as it is, and its part `mesh` on the Steps page, its guide
+    /// built.
+    pub(crate) fn app_of(doc: Document, mesh: Mesh) -> App {
         let dir = tempfile::tempdir().unwrap();
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
         a.test_dir = Some(dir);
@@ -7700,45 +7735,9 @@ pub(crate) mod tests {
         assert!(a.steps_page());
     }
     /// Draws the window's view on tiny-skia into a PNG.
-    fn render(a: &App, (w, h): (u32, u32), path: &std::path::Path) {
-        use iced::{
-            Pixels,
-            advanced::renderer::{self, Headless},
-            futures::FutureExt,
-        };
-        use iced_runtime::user_interface::{Cache, UserInterface};
-        let mut renderer =
-            <iced::Renderer as Headless>::new(Font::DEFAULT, Pixels(16.), Some("tiny-skia"))
-                .now_or_never()
-                .flatten()
-                .unwrap();
-        let mut ui = UserInterface::build(
-            a.view(),
-            Size::new(w as f32, h as f32),
-            Cache::default(),
-            &mut renderer,
-        );
-        // A frame's redraw, which sets each button's status: without it a
-        // button draws as disabled.
-        let redraw = iced::Event::Window(iced::window::Event::RedrawRequested(
-            std::time::Instant::now(),
-        ));
-        let _ = ui.update(
-            &[redraw],
-            mouse::Cursor::Unavailable,
-            &mut renderer,
-            &mut iced::advanced::clipboard::Null,
-            &mut vec![],
-        );
-        ui.draw(
-            &mut renderer,
-            &Theme::Light,
-            &renderer::Style {
-                text_color: Color::BLACK,
-            },
-            mouse::Cursor::Unavailable,
-        );
-        let rgba = renderer.screenshot(Size::new(w, h), 1., Color::WHITE);
+    pub(crate) fn render(a: &App, (w, h): (u32, u32), path: &std::path::Path) {
+        let size = Size::new(w as f32, h as f32);
+        let rgba = tablet::render(a.view(), size, 1., mouse::Cursor::Unavailable, true);
         let file = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
         let mut encoder = png::Encoder::new(file, w, h);
         encoder.set_color(png::ColorType::Rgba);
@@ -8555,7 +8554,7 @@ pub(crate) mod tests {
             })
         );
         let t = texts(&a);
-        let name = section_name(&a, &g, &g.sections[k]);
+        let name = section_name(&a.doc, &g, &g.sections[k]);
         assert!(
             t.iter().any(|s| *s
                 == format!(

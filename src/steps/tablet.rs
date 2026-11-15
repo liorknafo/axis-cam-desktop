@@ -1,0 +1,509 @@
+//! The Steps page for the TypeScript shop tablet (LIO-477). The tablet plans
+//! nothing, so the computer works out every screen of each hand setup the
+//! way this page does and draws it: the pictures half and the numbers half
+//! of `parts`, headless (tiny-skia), as PNGs. With them go the words the
+//! tablet lays out itself around them, finger-sized: the setup's line, each
+//! section's header (drawn too) and the place, the step's caption, and
+//! Back and the step's own command.
+//!
+//! A screen is a step at one item: a hole of a Holes or Bore step, as Next
+//! and Back walk them here; other steps have one, its first readout lit.
+use super::*;
+use std::collections::HashMap;
+
+/// The window the screens are laid out for: below 1200 wide, as narrow as
+/// the desktop's 1024 × 700 class (`turning::narrow`), so the lathe's numbers
+/// take half the card, as they would on a 10" tablet.
+const WINDOW: (f32, f32) = (1100., 760.);
+/// The width the card leaves the pictures and the numbers together: the
+/// window less the setups list beside it (`turning::dial_size`).
+const CARD: f32 = WINDOW.0 - 300.;
+/// How high the pictures are drawn.
+const PICTURE_HEIGHT: f32 = 420.;
+/// Pixels a logical pixel: crisp on the tablet's dense screen.
+const SCALE: f32 = 2.;
+/// What a reader of an older `format` would show wrong bumps it.
+pub const FORMAT: u32 = 1;
+
+/// What the tablet's Steps page shows: the hand setups' screens.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Steps {
+    pub format: u32,
+    pub setups: Vec<SetupSteps>,
+}
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SetupSteps {
+    /// The setup's id.
+    pub setup: String,
+    /// The line over its steps, as the Steps page's (`setup_title`).
+    pub title: String,
+    /// Its name in the page's list of setups, "2 Top · by hand".
+    pub label: String,
+    pub lathe: bool,
+    pub minutes: f32,
+    /// Why its steps cannot be shown, the Steps page's words; then nothing
+    /// else is there.
+    pub problem: Option<String>,
+    pub sections: Vec<SectionSteps>,
+    pub screens: Vec<Screen>,
+}
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SectionSteps {
+    pub name: String,
+    /// Its number among the operations, or "•" (Set up, the hand-over).
+    pub mark: String,
+    /// What it counts, "4 passes", or empty.
+    pub count: String,
+    /// The header drawn: number, name, tool, count and time (`head`).
+    pub head: Png,
+    /// Its screens, `[first, end)`: a press on it goes to the first.
+    pub screens: [usize; 2],
+}
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Screen {
+    /// The step of the guide and its item (hole).
+    pub step: usize,
+    pub item: usize,
+    pub section: usize,
+    pub title: String,
+    pub sub: String,
+    /// Where the job is, "Setup 1 of 4 · operation 2 of 5 · hole 1/4".
+    pub place: String,
+    /// The place in its section, "hole 1/4", or empty.
+    pub progress: String,
+    /// The command that ends the screen, "Pass done ▶"; none on the last.
+    pub next: Option<String>,
+    /// A hand-over's command opens this setup (its id), not the next screen.
+    pub opens: Option<String>,
+    pub back: bool,
+    /// A lathe step that takes a typed measurement or the dial check's
+    /// answer, which only the computer works into the steps after it.
+    pub asks: bool,
+    /// The pictures, and the numbers, which scroll when they do not fit.
+    pub picture: Png,
+    pub numbers: Png,
+}
+/// A PNG in the tablet file, by its path there, and its size in pixels.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Png {
+    pub path: String,
+    pub size: [u32; 2],
+}
+
+/// The steps of every hand setup in `doc`, its part `mesh`, and the PNGs
+/// they name by path (named by their bytes: a picture many screens share is
+/// there once).
+pub fn steps(doc: &Document, mesh: Result<&Mesh, &str>) -> (Steps, HashMap<String, Vec<u8>>) {
+    let mut files = HashMap::new();
+    let setups = (doc.setups.iter().enumerate())
+        .filter(|(_, s)| crate::manual::is_hand(&s.machine))
+        .map(|(si, setup)| {
+            let shown = mesh.map_err(str::to_owned).and_then(|m| shown(doc, m, si));
+            let mut out = SetupSteps {
+                setup: setup.id.clone(),
+                title: setup_title(setup),
+                label: crate::ui::job_setup_label(si, setup),
+                lathe: crate::lathe::is_lathe(&setup.machine),
+                minutes: 0.,
+                problem: None,
+                sections: vec![],
+                screens: vec![],
+            };
+            match shown {
+                Ok(shown) => fill(doc, si, &shown, &mut out, &mut files),
+                Err(e) => out.problem = Some(e),
+            }
+            out
+        })
+        .collect();
+    (
+        Steps {
+            format: FORMAT,
+            setups,
+        },
+        files,
+    )
+}
+
+fn fill(
+    doc: &Document,
+    si: usize,
+    shown: &Shown,
+    out: &mut SetupSteps,
+    files: &mut HashMap<String, Vec<u8>>,
+) {
+    let g = &shown.guide;
+    let setup = &doc.setups[si];
+    out.minutes = g.minutes;
+    let page = |at: usize, item: usize| Page {
+        doc,
+        shown,
+        key: 0,
+        at,
+        item,
+        reached: 0,
+        typed: None,
+        window: WINDOW,
+        clock: (std::time::Instant::now(), std::time::Instant::now()),
+        setup,
+    };
+    let mut keep = |(png, bytes): (Png, Vec<u8>)| {
+        files.entry(png.path.clone()).or_insert(bytes);
+        png
+    };
+    // One screen: its words, and its pictures and numbers drawn.
+    let draw = |k: usize, at: usize, item: usize| {
+        let p = page(at, item);
+        let parts = parts(&p);
+        let (l, r) = parts.split;
+        let (l, r) = (f32::from(l), f32::from(r));
+        let left_w = ((CARD - 18.) * l / (l + r)).round();
+        let right_w = ((CARD - 18.) * r / (l + r)).round();
+        let picture = named(drawn(parts.left, (left_w, PICTURE_HEIGHT)));
+        let numbers = named(tall(
+            scrollable(parts.right.spacing(10)).into(),
+            right_w,
+            false,
+        ));
+        let opens = match (&g.steps[at], &parts.next) {
+            (Step::HandOver { next: Some(n) }, Some(_)) => doc.setups.get(*n).map(|s| s.id.clone()),
+            _ => None,
+        };
+        use crate::guide::LatheStep as L;
+        let asks = matches!(
+            &g.steps[at],
+            Step::Lathe(L::Measure { .. } | L::DialCheck { .. } | L::Zero { measure: true, .. })
+        );
+        let screen = Screen {
+            step: at,
+            item,
+            section: k,
+            title: parts.title,
+            sub: parts.sub.into(),
+            place: place(doc, g, k, at, item),
+            progress: progress(g, &g.sections[k], at, item),
+            next: parts.next.map(|(label, _)| label),
+            opens,
+            back: parts.back,
+            asks,
+            picture: picture.0,
+            numbers: numbers.0,
+        };
+        (screen, [picture.1, numbers.1])
+    };
+    // Every screen, a hole of a Holes or Bore step each, drawn on every
+    // core: the tablet waits for them.
+    let jobs: Vec<(usize, usize, usize)> = (g.sections.iter().enumerate())
+        .flat_map(|(k, s)| s.steps.clone().map(move |at| (k, at)))
+        .flat_map(|(k, at)| {
+            let items = match &g.steps[at] {
+                Step::Holes { holes, .. } | Step::Bore { holes, .. } => holes.len().max(1),
+                _ => 1,
+            };
+            (0..items).map(move |item| (k, at, item))
+        })
+        .collect();
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let mut drawn_screens: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let (jobs, draw) = (&jobs, &draw);
+                scope.spawn(move || {
+                    (jobs.iter().enumerate().skip(t).step_by(threads))
+                        .map(|(i, &(k, at, item))| (i, draw(k, at, item)))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        (handles.into_iter())
+            .flat_map(|h| h.join().expect("a screen drawn"))
+            .collect()
+    });
+    drawn_screens.sort_by_key(|(i, _)| *i);
+    for (_, (screen, pngs)) in drawn_screens {
+        let named = [screen.picture.clone(), screen.numbers.clone()];
+        for (png, bytes) in named.into_iter().zip(pngs) {
+            keep((png, bytes));
+        }
+        out.screens.push(screen);
+    }
+    for (k, s) in g.sections.iter().enumerate() {
+        let first = out
+            .screens
+            .iter()
+            .position(|x| x.section == k)
+            .unwrap_or(out.screens.len());
+        let end = out
+            .screens
+            .iter()
+            .rposition(|x| x.section == k)
+            .map_or(first, |i| i + 1);
+        let (head, size) = tall(head(&page(s.steps.start, 0), k).into(), CARD + 200., true);
+        out.sections.push(SectionSteps {
+            name: section_name(doc, g, s),
+            mark: op_number(g, k).map_or("•".to_string(), |n| n.to_string()),
+            count: if s.count > 0 {
+                counted(setup, s)
+            } else {
+                String::new()
+            },
+            head: keep(named((head, size))),
+            screens: [first, end],
+        });
+    }
+}
+
+/// A drawing as a PNG named by its bytes, so that one many screens share is
+/// in the tablet file once.
+fn named((rgba, size): (Vec<u8>, (u32, u32))) -> (Png, Vec<u8>) {
+    use std::hash::{Hash, Hasher};
+    let bytes = png(&rgba, size);
+    let mut h = std::hash::DefaultHasher::new();
+    bytes.hash(&mut h);
+    let png = Png {
+        path: format!("steps/{:016x}.png", h.finish()),
+        size: [size.0, size.1],
+    };
+    (png, bytes)
+}
+/// `element` drawn `size` logical px on white, headless (tiny-skia), at
+/// `SCALE`: RGBA by rows, and its size in pixels.
+pub(crate) fn drawn(element: Element<'_, Message>, size: (f32, f32)) -> (Vec<u8>, (u32, u32)) {
+    let px = ((size.0 * SCALE) as u32, (size.1 * SCALE) as u32);
+    let rgba = render(
+        element,
+        Size::new(size.0, size.1),
+        SCALE,
+        mouse::Cursor::Unavailable,
+        true,
+    );
+    (rgba, px)
+}
+/// `element` drawn `size` logical px on white at `scale`, headless
+/// (tiny-skia), with the pointer at `cursor`: RGBA by rows. With `redraw`,
+/// after a frame's redraw, which sets each button's status: without it a
+/// button draws as disabled.
+pub(crate) fn render(
+    element: Element<'_, Message>,
+    size: Size,
+    scale: f32,
+    cursor: mouse::Cursor,
+    redraw: bool,
+) -> Vec<u8> {
+    use futures_util::FutureExt;
+    use iced::advanced::renderer::{self, Headless};
+    let mut renderer =
+        <iced::Renderer as Headless>::new(Font::DEFAULT, iced::Pixels(16.), Some("tiny-skia"))
+            .now_or_never()
+            .flatten()
+            .expect("tiny-skia renderer");
+    let mut ui = iced_runtime::UserInterface::build(
+        element,
+        size,
+        iced_runtime::user_interface::Cache::new(),
+        &mut renderer,
+    );
+    if redraw {
+        let frame = iced::Event::Window(iced::window::Event::RedrawRequested(
+            std::time::Instant::now(),
+        ));
+        let _ = ui.update(
+            &[frame],
+            cursor,
+            &mut renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut vec![],
+        );
+    }
+    ui.draw(
+        &mut renderer,
+        &Theme::Light,
+        &renderer::Style {
+            text_color: Color::BLACK,
+        },
+        cursor,
+    );
+    let physical = Size::new((size.width * scale) as u32, (size.height * scale) as u32);
+    renderer.screenshot(physical, scale, Color::WHITE)
+}
+/// `element` drawn `width` logical px wide and as high as it is: drawn on a
+/// tall page, the white under it cut off, and right of it when `narrow`.
+fn tall(element: Element<'_, Message>, width: f32, narrow: bool) -> (Vec<u8>, (u32, u32)) {
+    let (mut rgba, (w, h)) = drawn(element, (width, 2400.));
+    let row = w as usize * 4;
+    let margin = (8. * SCALE) as usize;
+    let used = (rgba.chunks(row))
+        .rposition(|r| r.iter().any(|&b| b != 255))
+        .map_or(1, |i| i + 1);
+    let h = (used + margin).min(h as usize);
+    rgba.truncate(h * row);
+    if !narrow {
+        return (rgba, (w, h as u32));
+    }
+    let wide = (rgba.chunks(row))
+        .filter_map(|r| r.chunks(4).rposition(|p| p[..3] != [255; 3]))
+        .max()
+        .map_or(1, |x| x + 1);
+    let w2 = (wide + margin).min(w as usize);
+    let cut = (rgba.chunks(row))
+        .flat_map(|r| r[..w2 * 4].iter().copied())
+        .collect();
+    (cut, (w2 as u32, h as u32))
+}
+/// RGBA as a PNG, its alpha dropped: everything is drawn on white.
+fn png(rgba: &[u8], (w, h): (u32, u32)) -> Vec<u8> {
+    let rgb: Vec<u8> = rgba.chunks(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+    let mut bytes = vec![];
+    let mut encoder = ::png::Encoder::new(&mut bytes, w, h);
+    encoder.set_color(::png::ColorType::Rgb);
+    encoder.set_depth(::png::BitDepth::Eight);
+    encoder.set_compression(::png::Compression::Fast);
+    (encoder
+        .write_header()
+        .and_then(|mut w| w.write_image_data(&rgb)))
+    .expect("a PNG in memory");
+    bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::GuideAction;
+
+    /// The tablet's screens are the desktop's, in the order its Next walks
+    /// them, with its commands; every picture is a PNG it carries.
+    #[test]
+    fn the_tablet_walks_the_screens_the_steps_page_does() {
+        let mut a = crate::steps::tests::app("Yes");
+        let mesh = a.part_mesh().unwrap().clone();
+        let (steps, files) = super::steps(&a.doc, Ok(&mesh));
+        assert_eq!(steps.format, FORMAT);
+        let hand = (a.doc.setups.iter())
+            .filter(|s| crate::manual::is_hand(&s.machine))
+            .count();
+        assert_eq!(steps.setups.len(), hand);
+        let mine = &steps.setups[0];
+        assert_eq!(mine.setup, a.doc.setups[0].id);
+        assert!(mine.problem.is_none());
+        assert!(mine.screens.len() > mine.sections.len(), "{mine:#?}");
+        for (k, s) in mine.screens.iter().enumerate() {
+            let (shown, at) = a.guide_at().unwrap();
+            assert_eq!((s.step, s.item), (at, a.guide_item), "screen {k}");
+            let g = &shown.guide;
+            let section = section_of(g, at);
+            assert_eq!(s.section, section);
+            assert_eq!(
+                s.place,
+                place(&a.doc, g, section, at, a.guide_item),
+                "screen {k}"
+            );
+            if k + 1 < mine.screens.len() {
+                assert_eq!(s.next, Some(next_label(g, at, a.guide_item)));
+            }
+            assert_eq!(s.back, k > 0);
+            for png in [&s.picture, &s.numbers] {
+                let decoder = ::png::Decoder::new(std::io::Cursor::new(&files[&png.path]));
+                let info = decoder.read_info().unwrap().info().clone();
+                assert_eq!([info.width, info.height], png.size);
+                assert!(info.width > 400 && info.height > 40, "{png:?}");
+            }
+            let _ = a.update(Message::Guide(GuideAction::Next));
+        }
+        // Each section starts where a press on it goes.
+        for (i, s) in mine.sections.iter().enumerate() {
+            let _ = a.update(Message::Guide(GuideAction::Section(i)));
+            let (_, at) = a.guide_at().unwrap();
+            let first = &mine.screens[s.screens[0]];
+            assert_eq!((first.step, first.item), (at, 0), "{}", s.name);
+            assert!(files.contains_key(&s.head.path));
+        }
+        // Holes have a screen each; the numbers are drawn whole.
+        let holes = mine
+            .screens
+            .iter()
+            .filter(|s| s.progress.starts_with("hole "))
+            .count();
+        assert!(holes > 1, "{mine:#?}");
+        assert!(mine.screens.iter().all(|s| !s.asks));
+        assert!(mine.screens.last().unwrap().opens.is_some());
+    }
+
+    /// A lathe setup's screens, its measurement the tablet cannot work in
+    /// marked.
+    #[test]
+    fn a_lathe_setup_goes_to_the_tablet_too() {
+        let a = crate::steps::tests::lathe_app("Diameter", |_| {});
+        let mesh = a.part_mesh().unwrap().clone();
+        let (steps, files) = super::steps(&a.doc, Ok(&mesh));
+        let lathe = &steps.setups[0];
+        assert!(lathe.lathe && lathe.problem.is_none(), "{lathe:#?}");
+        assert!(
+            lathe
+                .screens
+                .iter()
+                .any(|s| s.title.starts_with("Pass 1 of "))
+        );
+        assert!(lathe.screens.iter().any(|s| s.asks));
+        assert!(
+            lathe
+                .screens
+                .iter()
+                .all(|s| files.contains_key(&s.numbers.path))
+        );
+        // No part: the setup says why, as the page would.
+        let (steps, _) = super::steps(&a.doc, Err(crate::run::NO_PART));
+        assert_eq!(
+            steps.setups[0].problem.as_deref(),
+            Some(crate::run::NO_PART)
+        );
+    }
+
+    /// The lathe setup the planner puts in front of the shaft's CNC setup
+    /// (`proposal::tests::turned`), as a tablet file in `AXIS_RENDER_DIR`:
+    /// its part is made here, not a file, so it cannot be shared.
+    #[test]
+    #[ignore]
+    fn save_the_planned_lathe_job_for_a_tablet() {
+        use crate::proposal::tests::{turned, with_lathe};
+        let dir = std::path::PathBuf::from(std::env::var("AXIS_RENDER_DIR").unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        let (doc, mesh, report) = with_lathe();
+        let mut job = crate::proposal::build(&doc, &mesh, &report, &turned(&report)).unwrap();
+        job.title = "Shaft (lathe)".into();
+        job.file = None;
+        for s in &mut job.setups {
+            if crate::lathe::is_lathe(&s.machine) {
+                s.machine.p.insert("cross_reads".into(), "Diameter".into());
+            }
+        }
+        let bytes = crate::bundle::pack_with(&job, Ok(&mesh)).unwrap();
+        std::fs::write(dir.join("shaft-lathe.axisjob"), bytes).unwrap();
+    }
+
+    /// The computer's own Steps page for the project at
+    /// `AXIS_RENDER_PROJECT`, at 1280 × 800, into `AXIS_RENDER_DIR`: each
+    /// hand setup at the first screen of each section, `<setup>-<section>.png`,
+    /// to set beside the tablet's.
+    #[test]
+    #[ignore]
+    fn render_a_projects_steps_on_the_computer() {
+        let dir = std::path::PathBuf::from(std::env::var("AXIS_RENDER_DIR").unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = std::env::var("AXIS_RENDER_PROJECT").unwrap();
+        let doc = crate::storage::load(std::path::Path::new(&path)).unwrap();
+        let mesh = crate::mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
+        let (steps, _) = super::steps(&doc, Ok(&mesh));
+        for (k, s) in steps.setups.iter().enumerate() {
+            let mut d = doc.clone();
+            d.active = s.setup.clone();
+            let mut a = crate::steps::tests::app_of(d, mesh.clone());
+            (a.window_width, a.window_height) = (1280., 800.);
+            for (j, section) in s.sections.iter().enumerate() {
+                let _ = a.update(Message::Guide(GuideAction::Go(
+                    s.screens[section.screens[0]].step,
+                )));
+                crate::steps::tests::render(&a, (1280, 800), &dir.join(format!("{k}-{j:02}.png")));
+            }
+        }
+    }
+}
