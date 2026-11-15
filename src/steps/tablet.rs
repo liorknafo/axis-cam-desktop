@@ -444,7 +444,8 @@ pub(crate) fn drawn(
 /// `element` drawn `size` logical px on white at `scale`, headless
 /// (tiny-skia), with the pointer at `cursor`: RGBA by rows. With `redraw`,
 /// after a frame's redraw, which sets each button's status: without it a
-/// button draws as disabled.
+/// button draws as disabled. Only the tests use it (LIO-547).
+#[cfg(test)]
 pub(crate) fn render(
     element: Element<'_, Message>,
     size: Size,

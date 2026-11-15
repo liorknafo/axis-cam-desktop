@@ -774,8 +774,8 @@ fn on_helix(
             *phase += m[2] + m[0] * d[0] + m[1] * d[1];
         }
     }
-    // ponytail: a runaway fit keeps the normal lines' axis.
-    if !(c[0].hypot(c[1]) < 0.1 * p) {
+    // ponytail: a runaway fit keeps the normal lines' axis (a NaN one too).
+    if c[0].hypot(c[1]).partial_cmp(&(0.1 * p)) != Some(std::cmp::Ordering::Less) {
         return at;
     }
     [at[0] + c[0] as f32, at[1] + c[1] as f32]

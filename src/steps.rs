@@ -4372,10 +4372,7 @@ fn parts<'a>(p: &Page<'a>) -> Parts<'a> {
             // The sizes to measure, drawn on the picture and listed large
             // (LIO-370).
             let top = p.shown.boxes[j].max[2] + g.zero[2];
-            let sizes = g
-                .done
-                .get(j)
-                .map_or(vec![], |d| measures(&p.doc, g, d, top));
+            let sizes = g.done.get(j).map_or(vec![], |d| measures(p.doc, g, d, top));
             let rows = sizes.into_iter().map(|m| {
                 readout(
                     Readout {
@@ -7867,16 +7864,15 @@ pub(crate) mod tests {
                 send(&mut a, GuideAction::Go(i));
                 // The narrow window class draws the pictures ~440 px wide,
                 // where they crowd (a debug render is slow: one width).
-                for (w, h) in [(1100, 800)] {
-                    (a.window_width, a.window_height) = (w as f32, h as f32);
-                    DRAWN.take();
-                    render(&a, (w, h), &dir.path().join("steps.png"));
-                    let drawn = DRAWN.take();
-                    if !drawn.is_empty() {
-                        seen.insert(kind.clone());
-                    }
-                    clear(drawn, &format!("{name} step {i} ({kind}) at {w} px"));
+                let (w, h) = (1100, 800);
+                (a.window_width, a.window_height) = (w as f32, h as f32);
+                DRAWN.take();
+                render(&a, (w, h), &dir.path().join("steps.png"));
+                let drawn = DRAWN.take();
+                if !drawn.is_empty() {
+                    seen.insert(kind.clone());
                 }
+                clear(drawn, &format!("{name} step {i} ({kind}) at {w} px"));
             }
         }
         for kind in KINDS {
