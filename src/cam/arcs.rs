@@ -2485,7 +2485,8 @@ pub(crate) mod tests {
         let found = crate::find_holes(&setup, &mesh);
         let took = started.elapsed().as_secs_f32();
         eprintln!("the plate's holes found in {took:.2} s");
-        assert!(cfg!(debug_assertions) || took < 1., "{took} s");
+        // The times are checked last: what is found, even on a busy machine.
+        let mut slowest = took;
         // The plate is centred: model X and Y from its corner.
         let b = Geometry::new(&setup, &mesh).bounds;
         let model = |c: [f32; 2]| [c[0] - b.min[0], c[1] - b.min[1]];
@@ -2523,6 +2524,17 @@ pub(crate) mod tests {
         for (c, e) in m8.iter().zip(expected) {
             assert!((c[0] - e[0]).hypot(c[1] - e[1]) < 0.005, "{m8:?}");
         }
+        // Their threads' axes too, faded ends and all (LIO-535).
+        let mut axes: Vec<[f32; 2]> = crate::thread::holes_in_setup(&setup, &mesh)
+            .iter()
+            .map(|t| model(t.centre))
+            .collect();
+        axes.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+        eprintln!("the M8 threads' axes, model X Y: {axes:?}");
+        assert_eq!(axes.len(), 4, "{axes:?}");
+        for (c, e) in axes.iter().zip(expected) {
+            assert!((c[0] - e[0]).hypot(c[1] - e[1]) < 0.005, "{axes:?}");
+        }
         assert_eq!(found.arcs.len(), 16);
         // A Drill picking each hole, as a click on it picks it: in a second,
         // the hole it was listed as.
@@ -2539,8 +2551,7 @@ pub(crate) mod tests {
             picking(&mut op, &mesh, &walls);
             let started = std::time::Instant::now();
             let picked = holes(&setup, &op, &mesh).unwrap();
-            let took = started.elapsed().as_secs_f32();
-            assert!(cfg!(debug_assertions) || took < 1., "{took} s");
+            slowest = slowest.max(started.elapsed().as_secs_f32());
             assert_eq!(picked.len(), 1, "{picked:?}");
             assert!(
                 (picked[0].diameter - diameter).abs() < 0.05,
@@ -2568,5 +2579,6 @@ pub(crate) mod tests {
             }
         }
         assert_eq!((slots, bores), (8, 8));
+        assert!(cfg!(debug_assertions) || slowest < 1., "{slowest} s");
     }
 }

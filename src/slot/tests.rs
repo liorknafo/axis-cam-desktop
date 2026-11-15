@@ -220,11 +220,13 @@ fn a_slots_pick_looks_only_round_the_slot() {
 }
 #[test]
 fn every_wall_of_a_slots_round_end_over_a_thread_picks_it() {
-    // LIO-481 review: a 22.08 × 12.08 capsule 0.1 to 1 mm deep over a
-    // modelled M12×1.75 thread (Z0 to 12), one R6.04 round end round the
-    // thread's axis, its walls in the thread's band: no arc starts from
-    // them, but one grows through them. A click on any wall of either end
-    // (as the whole part's arcs read them) picks the slot, as before.
+    // LIO-481 review: a 22.14 × 12.14 capsule 0.1 to 1 mm deep over a
+    // modelled M12×1.75 thread (Z0 to 12), one R6.07 round end round the
+    // thread's axis, just past the thread's band. A click on any wall of
+    // either end (as the whole part's arcs read them) picks the slot, as
+    // before. A wall up to 0.06 past the major is the bore the thread is
+    // opened in, as on the spindle plate: read off a true axis, R6.04 is
+    // (LIO-535).
     let outer = [
         (-20., -15., 0.),
         (20., -15., 0.),
@@ -234,7 +236,7 @@ fn every_wall_of_a_slots_round_end_over_a_thread_picks_it() {
     let end = |x: f64, start: f64| {
         (0..=48).map(move |k| {
             let a = (start + 3.75 * k as f64).to_radians();
-            (x + 6.04 * a.cos(), 6.04 * a.sin(), 0.)
+            (x + 6.07 * a.cos(), 6.07 * a.sin(), 0.)
         })
     };
     let capsule: Vec<_> = end(10., -90.).chain(end(0., 90.)).collect();
@@ -255,7 +257,7 @@ fn every_wall_of_a_slots_round_end_over_a_thread_picks_it() {
         let stock = crate::stock::resolve(&s, Some(&mesh)).unwrap().stock;
         let ends: Vec<_> = cam::arcs::arcs_among(&s, &mesh, &cam::arcs::upright(&s, &mesh))
             .into_iter()
-            .filter(|a| (a.span - 180.).abs() < 1. && (a.r - 6.04).abs() < 0.01)
+            .filter(|a| (a.span - 180.).abs() < 1. && (a.r - 6.07).abs() < 0.01)
             .collect();
         assert_eq!(ends.len(), 2, "{height} mm: {ends:#?}");
         for &id in ends.iter().flat_map(|a| &a.walls) {
@@ -265,8 +267,8 @@ fn every_wall_of_a_slots_round_end_over_a_thread_picks_it() {
             };
             let fields = from_face(&s, &mesh, &pick, stock)
                 .unwrap_or_else(|e| panic!("{height} mm, surface {id}: {e}"));
-            assert_eq!(get(&fields, "slot_length"), "22.080", "{height} mm, {id}");
-            assert_eq!(get(&fields, "slot_width"), "12.080", "{height} mm, {id}");
+            assert_eq!(get(&fields, "slot_length"), "22.140", "{height} mm, {id}");
+            assert_eq!(get(&fields, "slot_width"), "12.140", "{height} mm, {id}");
         }
     }
 }
