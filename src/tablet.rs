@@ -659,7 +659,11 @@ mod tests {
                 p
             }
         };
-        let (doc, _) = crate::run::tablet_fixture(&profile);
+        // Or the project at `AXIS_SERVE_PROJECT`, as it is (LIO-477).
+        let doc = match std::env::var("AXIS_SERVE_PROJECT") {
+            Ok(p) => crate::storage::load(Path::new(&p)).unwrap(),
+            Err(_) => crate::run::tablet_fixture(&profile).0,
+        };
         let state = mac.path().join("workspace.json");
         crate::storage::save(&state, &doc).unwrap();
         println!("Pairing code: {}", new_code(&state).unwrap());

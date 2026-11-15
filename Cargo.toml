@@ -25,6 +25,9 @@ jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
 base64 = "0.23.1"
 getrandom = "0.4.3"
 futures-util = "0.3.34"
+# Draws the Steps page's screens headless for the shop tablet
+# (`steps::tablet`), and lets a test run an Iced `Task` to its messages.
+iced_runtime = "0.14"
 sha2 = "0.10"
 clipper2 = "0.6.0"
 fidget = { version = "=0.4.3", default-features = false, features = ["mesh"] }

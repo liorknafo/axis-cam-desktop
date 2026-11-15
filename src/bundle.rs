@@ -5,7 +5,8 @@
 //! it; the bundle carries the part along. The computer writes it (Save for
 //! tablet…), and the tablet opens it from "Open with" (`ShopActivity.java`
 //! copies it to `INBOX` beside the workspace). It also carries the tool runs
-//! worked out here for the TypeScript tablet app (`Runs`, LIO-475).
+//! worked out here for the TypeScript tablet app (`Runs`, LIO-475), and the
+//! hand setups' Steps screens drawn here (`steps::tablet`, LIO-477).
 use crate::model::Document;
 use std::{
     fs,
@@ -18,6 +19,9 @@ const PART: &str = "part/";
 const MACHINE: &str = "machine/";
 /// The tool runs worked out for the tablet (`Runs`).
 pub const RUNS: &str = "runs.json";
+/// The hand setups' Steps screens (`steps::tablet::Steps`); the PNGs they
+/// name sit under `steps/`.
+pub const STEPS: &str = "steps.json";
 /// Where the tablet finds a bundle it was given, beside its workspace.
 pub const INBOX: &str = "inbox.axisjob";
 pub const EXTENSION: &str = "axisjob";
@@ -31,6 +35,16 @@ pub fn write(path: &Path, doc: &Document) -> Result<(), String> {
 /// The tablet file `write` writes, in memory: what the computer sends a
 /// tablet over Wi-Fi (`tablet`).
 pub fn pack(doc: &Document) -> Result<Vec<u8>, String> {
+    let mesh = part_mesh(doc);
+    pack_with(doc, mesh.as_ref().map_err(String::as_str))
+}
+
+/// `pack` with the part's `mesh` given: the runs and the steps are worked
+/// out on it.
+pub fn pack_with(
+    doc: &Document,
+    mesh: Result<&crate::mesh::Mesh, &str>,
+) -> Result<Vec<u8>, String> {
     let mut w = zip::ZipWriter::new(Cursor::new(vec![]));
     let opt = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
@@ -40,8 +54,18 @@ pub fn pack(doc: &Document) -> Result<Vec<u8>, String> {
     };
     let json = serde_json::to_vec_pretty(doc).map_err(|e| e.to_string())?;
     add(PROJECT, &json)?;
-    let runs = serde_json::to_vec_pretty(&runs(doc)).map_err(|e| e.to_string())?;
+    let runs = serde_json::to_vec_pretty(&runs(doc, mesh)).map_err(|e| e.to_string())?;
     add(RUNS, &runs)?;
+    let (steps, pictures) = crate::steps::tablet::steps(doc, mesh);
+    add(
+        STEPS,
+        &serde_json::to_vec_pretty(&steps).map_err(|e| e.to_string())?,
+    )?;
+    let mut pictures: Vec<_> = pictures.into_iter().collect();
+    pictures.sort();
+    for (name, bytes) in pictures {
+        add(&name, &bytes)?;
+    }
     if let Some(file) = &doc.file {
         let name = file_name(&file.path)?;
         let part = fs::read(&file.path)
@@ -87,21 +111,28 @@ pub struct Runs {
     pub setups: Vec<crate::run::TabletSetup>,
 }
 
-pub fn runs(doc: &Document) -> Runs {
-    let uc100: Vec<usize> = (0..doc.setups.len())
+pub fn runs(doc: &Document, mesh: Result<&crate::mesh::Mesh, &str>) -> Runs {
+    let setups = (0..doc.setups.len())
         .filter(|&si| crate::model::get(&doc.setups[si].machine.p, "controller") == "UC100")
-        .collect();
-    let mesh = match (&doc.file, uc100.is_empty()) {
-        (_, true) => Err(String::new()),
-        (Some(file), false) => {
-            crate::mesh::load_file(file).map_err(|e| format!("The part could not be loaded: {e}"))
-        }
-        (None, false) => Err(crate::run::NO_PART.into()),
-    };
-    let setups = (uc100.into_iter())
-        .map(|si| crate::run::tablet_runs(doc, mesh.as_ref().map_err(String::as_str), si))
+        .map(|si| crate::run::tablet_runs(doc, mesh, si))
         .collect();
     Runs { format: 1, setups }
+}
+
+/// The part, for the runs and the steps worked out for the tablet; not
+/// loaded when no setup needs it.
+fn part_mesh(doc: &Document) -> Result<crate::mesh::Mesh, String> {
+    let needed = doc.setups.iter().any(|s| {
+        crate::model::get(&s.machine.p, "controller") == "UC100"
+            || crate::manual::is_hand(&s.machine)
+    });
+    match (&doc.file, needed) {
+        (_, false) => Err(String::new()),
+        (Some(file), true) => {
+            crate::mesh::load_file(file).map_err(|e| format!("The part could not be loaded: {e}"))
+        }
+        (None, true) => Err(crate::run::NO_PART.into()),
+    }
 }
 
 /// The UC100 profile path of every machine in `doc`, the library's and the
@@ -294,5 +325,40 @@ mod tests {
         assert_eq!(file_name(Path::new(r"C:\x\..\b.stl")).unwrap(), "b.stl");
         assert!(file_name(Path::new("part/..")).is_err());
         assert!(open(&tablet.path().join("tablet.axis.json"), tablet.path()).is_err());
+    }
+
+    /// The tablet file carries the hand setups' Steps screens and every
+    /// picture they name (LIO-477).
+    #[test]
+    fn the_tablet_file_carries_the_steps_screens() {
+        let (mut doc, _) = crate::guide::tests::job("Yes");
+        doc.file = Some(crate::model::ModelFile {
+            name: "four-setup-block.3mf".into(),
+            path: Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/four-setup-block.3mf"),
+            format: "3mf".into(),
+            bytes: 1,
+            thickness: None,
+        });
+        let started = std::time::Instant::now();
+        let bytes = pack(&doc).unwrap();
+        eprintln!("Packed in {:?}: {} bytes", started.elapsed(), bytes.len());
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut read = |name: &str| {
+            let mut bytes = vec![];
+            zip.by_name(name).unwrap().read_to_end(&mut bytes).unwrap();
+            bytes
+        };
+        let steps: crate::steps::tablet::Steps = serde_json::from_slice(&read(STEPS)).unwrap();
+        let setup = &steps.setups[0];
+        assert_eq!(setup.setup, doc.setups[0].id);
+        assert!(setup.problem.is_none(), "{:?}", setup.problem);
+        assert!(!setup.screens.is_empty());
+        let named = (setup.screens.iter())
+            .flat_map(|s| [&s.picture, &s.numbers])
+            .chain(setup.sections.iter().map(|s| &s.head));
+        for png in named {
+            let name = &png.path;
+            assert!(read(name).starts_with(&[0x89, b'P', b'N', b'G']), "{name}");
+        }
     }
 }

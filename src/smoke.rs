@@ -10370,32 +10370,7 @@ flood = { pin = 8 }
         size: iced::Size,
         cursor: iced::mouse::Cursor,
     ) -> Vec<u8> {
-        use futures_util::FutureExt;
-        use iced::advanced::renderer::{self, Headless};
-        let mut renderer = <iced::Renderer as Headless>::new(
-            iced::Font::DEFAULT,
-            iced::Pixels(16.),
-            Some("tiny-skia"),
-        )
-        .now_or_never()
-        .flatten()
-        .expect("tiny-skia renderer");
-        let mut ui = iced_runtime::UserInterface::build(
-            element,
-            size,
-            iced_runtime::user_interface::Cache::new(),
-            &mut renderer,
-        );
-        ui.draw(
-            &mut renderer,
-            &iced::Theme::Light,
-            &renderer::Style {
-                text_color: iced::Color::BLACK,
-            },
-            cursor,
-        );
-        let physical = iced::Size::new(size.width as u32, size.height as u32);
-        renderer.screenshot(physical, 1., iced::Color::WHITE)
+        crate::steps::tablet::render(element, size, 1., cursor, false)
     }
 
     #[test]
