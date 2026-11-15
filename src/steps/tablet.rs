@@ -8,6 +8,9 @@
 //!
 //! A screen is a step at one item: a hole of a Holes or Bore step, as Next
 //! and Back walk them here; other steps have one, its first readout lit.
+//! Its numbers are drawn once more for each readout reached in turn, and
+//! where each readout and tile sits on them goes along: a tap there shows
+//! the next lit, or goes to that pass, as a click does here (LIO-525).
 use super::*;
 use std::collections::HashMap;
 
@@ -92,6 +95,29 @@ pub struct Screen {
     /// The pictures, and the numbers, which scroll when they do not fit.
     pub picture: Png,
     pub numbers: Png,
+    /// Where a tap on the numbers does something.
+    pub taps: Vec<Tap>,
+    /// The screen once readouts `0..=n` are reached, `reached[n]`: the next
+    /// lit, or all ticked after the last (`GuideAction::Reached`). A
+    /// walk's pictures move the tool to the readout lit.
+    pub reached: Vec<Reached>,
+}
+/// A screen drawn with some of its readouts reached.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Reached {
+    pub picture: Png,
+    pub numbers: Png,
+    pub taps: Vec<Tap>,
+}
+/// A readout or a tile on a numbers PNG: its box there, `[x, y, width,
+/// height]` in its pixels, and what a tap on it does.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Tap {
+    pub rect: [u32; 4],
+    /// Readout `n` reached: shows the screen's `reached[n]`.
+    pub reached: Option<usize>,
+    /// A pass's tile: goes to this screen of the setup.
+    pub screen: Option<usize>,
 }
 /// What a lathe step asks.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -161,13 +187,13 @@ fn fill(
     let g = &shown.guide;
     let setup = &doc.setups[si];
     out.minutes = g.minutes;
-    let page = |at: usize, item: usize| Page {
+    let page = |at: usize, item: usize, reached: usize| Page {
         doc,
         shown,
         key: 0,
         at,
         item,
-        reached: 0,
+        reached,
         typed: None,
         window: WINDOW,
         clock: (std::time::Instant::now(), std::time::Instant::now()),
@@ -178,21 +204,56 @@ fn fill(
         files.entry(png.path.clone()).or_insert(bytes);
         png
     };
-    // One screen: its words, and its pictures and numbers drawn.
-    let draw = |k: usize, at: usize, item: usize| {
-        let p = page(at, item);
-        let parts = parts(&p);
-        let (l, r) = parts.split;
+    // A screen's pictures and numbers drawn, `reached` readouts reached:
+    // a hole's by its own count, another step's by the item, as
+    // `App::guide` keeps them.
+    let pictures = |at: usize, item: usize, reached: usize| {
+        let holes = matches!(
+            &g.steps[at],
+            Step::Holes { holes, .. } | Step::Bore { holes, .. } if !holes.is_empty()
+        );
+        let p = match holes {
+            true => page(at, item, reached),
+            false => page(at, reached, 0),
+        };
+        let Parts {
+            title,
+            sub,
+            left,
+            right,
+            next,
+            back,
+            split: (l, r),
+        } = parts(&p);
         let (l, r) = (f32::from(l), f32::from(r));
         let left_w = ((CARD - 18.) * l / (l + r)).round();
         let right_w = ((CARD - 18.) * r / (l + r)).round();
-        let picture = named(drawn(parts.left, (left_w, PICTURE_HEIGHT)));
-        let numbers = named(tall(
-            scrollable(parts.right.spacing(10)).into(),
-            right_w,
-            false,
-        ));
-        let opens = match (&g.steps[at], &parts.next) {
+        let (rgba, size, _) = drawn(left, (left_w, PICTURE_HEIGHT));
+        let picture = named((rgba, size));
+        let (rgba, size, taps) = tall(scrollable(right.spacing(10)).into(), right_w, false);
+        let next = next.map(|(label, _)| label);
+        (picture, named((rgba, size)), taps, (title, sub, next, back))
+    };
+    // One screen: its words, and its pictures and numbers drawn, once more
+    // for each readout reached.
+    let draw = |k: usize, at: usize, item: usize| {
+        let (picture, numbers, taps, (title, sub, next, back)) = pictures(at, item, 0);
+        let readouts = (taps.iter())
+            .filter_map(|t| match t.1 {
+                Message::Guide(GuideAction::Reached(n)) => Some(n + 1),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let mut pngs = vec![picture.1, numbers.1];
+        let reached: Vec<_> = (1..=readouts)
+            .map(|n| {
+                let (picture, numbers, taps, _) = pictures(at, item, n);
+                pngs.extend([picture.1, numbers.1]);
+                (picture.0, numbers.0, taps)
+            })
+            .collect();
+        let opens = match (&g.steps[at], &next) {
             (Step::HandOver { next: Some(n) }, Some(_)) => doc.setups.get(*n).map(|s| s.id.clone()),
             _ => None,
         };
@@ -223,19 +284,21 @@ fn fill(
             step: at,
             item,
             section: k,
-            title: parts.title,
-            sub: parts.sub.into(),
+            title,
+            sub: sub.into(),
             place: place(doc, g, k, at, item),
             progress: progress(g, &g.sections[k], at, item),
-            next: parts.next.map(|(label, _)| label),
+            next,
             opens,
-            back: parts.back,
+            back,
             asks: ask.is_some(),
             ask,
             picture: picture.0,
             numbers: numbers.0,
+            taps: vec![],
+            reached: vec![],
         };
-        (screen, [picture.1, numbers.1])
+        (screen, pngs, taps, reached)
     };
     // Every screen, a hole of a Holes or Bore step each, drawn on every
     // core: the tablet waits for them.
@@ -266,8 +329,39 @@ fn fill(
             .collect()
     });
     drawn_screens.sort_by_key(|(i, _)| *i);
-    for (_, (screen, pngs)) in drawn_screens {
-        let named = [screen.picture.clone(), screen.numbers.clone()];
+    // A tile goes to its step's first screen, the screens being the jobs.
+    let taps = |taps: Taps| -> Vec<Tap> {
+        (taps.into_iter())
+            .filter_map(|(r, m)| {
+                let (reached, screen) = match m {
+                    Message::Guide(GuideAction::Reached(n)) => (Some(n), None),
+                    Message::Guide(GuideAction::Go(at)) => {
+                        (None, Some(jobs.iter().position(|j| (j.1, j.2) == (at, 0))?))
+                    }
+                    _ => return None,
+                };
+                // As the PNG's size is: within it.
+                let px = |v: f32| (v * SCALE) as u32;
+                let rect = [px(r.x), px(r.y), px(r.width), px(r.height)];
+                Some(Tap {
+                    rect,
+                    reached,
+                    screen,
+                })
+            })
+            .collect()
+    };
+    for (_, (mut screen, pngs, first, reached)) in drawn_screens {
+        let mut named = vec![screen.picture.clone(), screen.numbers.clone()];
+        screen.taps = taps(first);
+        for (picture, numbers, t) in reached {
+            named.extend([picture.clone(), numbers.clone()]);
+            screen.reached.push(Reached {
+                picture,
+                numbers,
+                taps: taps(t),
+            });
+        }
         for (png, bytes) in named.into_iter().zip(pngs) {
             keep((png, bytes));
         }
@@ -284,7 +378,11 @@ fn fill(
             .iter()
             .rposition(|x| x.section == k)
             .map_or(first, |i| i + 1);
-        let (head, size) = tall(head(&page(s.steps.start, 0), k).into(), CARD + 200., true);
+        let (head, size, _) = tall(
+            head(&page(s.steps.start, 0, 0), k).into(),
+            CARD + 200.,
+            true,
+        );
         out.sections.push(SectionSteps {
             name: section_name(doc, g, s),
             mark: op_number(g, k).map_or("•".to_string(), |n| n.to_string()),
@@ -312,18 +410,23 @@ fn named((rgba, size): (Vec<u8>, (u32, u32))) -> (Png, Vec<u8>) {
     };
     (png, bytes)
 }
+/// What a press on each of a drawing's controls sends, and where it is.
+type Taps = Vec<(Rectangle, Message)>;
 /// `element` drawn `size` logical px on white, headless (tiny-skia), at
-/// `SCALE`: RGBA by rows, and its size in pixels.
-pub(crate) fn drawn(element: Element<'_, Message>, size: (f32, f32)) -> (Vec<u8>, (u32, u32)) {
+/// `SCALE`: RGBA by rows, its size in pixels, and its controls.
+pub(crate) fn drawn(
+    element: Element<'_, Message>,
+    size: (f32, f32),
+) -> (Vec<u8>, (u32, u32), Taps) {
     let px = ((size.0 * SCALE) as u32, (size.1 * SCALE) as u32);
-    let rgba = render(
+    let (rgba, taps) = render_taps(
         element,
         Size::new(size.0, size.1),
         SCALE,
         mouse::Cursor::Unavailable,
         true,
     );
-    (rgba, px)
+    (rgba, px, taps)
 }
 /// `element` drawn `size` logical px on white at `scale`, headless
 /// (tiny-skia), with the pointer at `cursor`: RGBA by rows. With `redraw`,
@@ -336,6 +439,17 @@ pub(crate) fn render(
     cursor: mouse::Cursor,
     redraw: bool,
 ) -> Vec<u8> {
+    render_taps(element, size, scale, cursor, redraw).0
+}
+/// `render`, and where each control that says what it sends is (a
+/// `HelpButton`), in logical px.
+fn render_taps(
+    element: Element<'_, Message>,
+    size: Size,
+    scale: f32,
+    cursor: mouse::Cursor,
+    redraw: bool,
+) -> (Vec<u8>, Taps) {
     use futures_util::FutureExt;
     use iced::advanced::renderer::{self, Headless};
     let mut renderer =
@@ -361,6 +475,27 @@ pub(crate) fn render(
             &mut vec![],
         );
     }
+    struct Presses(Taps);
+    impl iced::advanced::widget::Operation for Presses {
+        fn traverse(
+            &mut self,
+            operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation),
+        ) {
+            operate(self);
+        }
+        fn custom(
+            &mut self,
+            _: Option<&iced::advanced::widget::Id>,
+            bounds: Rectangle,
+            state: &mut dyn std::any::Any,
+        ) {
+            if let Some(m) = state.downcast_ref::<Message>() {
+                self.0.push((bounds, m.clone()));
+            }
+        }
+    }
+    let mut presses = Presses(vec![]);
+    ui.operate(&renderer, &mut presses);
     ui.draw(
         &mut renderer,
         &Theme::Light,
@@ -370,12 +505,15 @@ pub(crate) fn render(
         cursor,
     );
     let physical = Size::new((size.width * scale) as u32, (size.height * scale) as u32);
-    renderer.screenshot(physical, scale, Color::WHITE)
+    (
+        renderer.screenshot(physical, scale, Color::WHITE),
+        presses.0,
+    )
 }
 /// `element` drawn `width` logical px wide and as high as it is: drawn on a
 /// tall page, the white under it cut off, and right of it when `narrow`.
-fn tall(element: Element<'_, Message>, width: f32, narrow: bool) -> (Vec<u8>, (u32, u32)) {
-    let (mut rgba, (w, h)) = drawn(element, (width, 2400.));
+fn tall(element: Element<'_, Message>, width: f32, narrow: bool) -> (Vec<u8>, (u32, u32), Taps) {
+    let (mut rgba, (w, h), taps) = drawn(element, (width, 2400.));
     let row = w as usize * 4;
     let margin = (8. * SCALE) as usize;
     let used = (rgba.chunks(row))
@@ -384,7 +522,7 @@ fn tall(element: Element<'_, Message>, width: f32, narrow: bool) -> (Vec<u8>, (u
     let h = (used + margin).min(h as usize);
     rgba.truncate(h * row);
     if !narrow {
-        return (rgba, (w, h as u32));
+        return (rgba, (w, h as u32), taps);
     }
     let wide = (rgba.chunks(row))
         .filter_map(|r| r.chunks(4).rposition(|p| p[..3] != [255; 3]))
@@ -394,7 +532,7 @@ fn tall(element: Element<'_, Message>, width: f32, narrow: bool) -> (Vec<u8>, (u
     let cut = (rgba.chunks(row))
         .flat_map(|r| r[..w2 * 4].iter().copied())
         .collect();
-    (cut, (w2 as u32, h as u32))
+    (cut, (w2 as u32, h as u32), taps)
 }
 /// RGBA as a PNG, its alpha dropped: everything is drawn on white.
 fn png(rgba: &[u8], (w, h): (u32, u32)) -> Vec<u8> {
@@ -403,7 +541,10 @@ fn png(rgba: &[u8], (w, h): (u32, u32)) -> Vec<u8> {
     let mut encoder = ::png::Encoder::new(&mut bytes, w, h);
     encoder.set_color(::png::ColorType::Rgb);
     encoder.set_depth(::png::BitDepth::Eight);
-    encoder.set_compression(::png::Compression::Fast);
+    // A Steps file carries a numbers PNG per readout reached (LIO-525):
+    // Default and Paeth halve it, Fast's size, for a few seconds more here.
+    encoder.set_compression(::png::Compression::Default);
+    encoder.set_filter(::png::FilterType::Paeth);
     (encoder
         .write_header()
         .and_then(|mut w| w.write_image_data(&rgb)))
@@ -432,6 +573,7 @@ mod tests {
         assert_eq!(mine.setup, a.doc.setups[0].id);
         assert!(mine.problem.is_none());
         assert!(mine.screens.len() > mine.sections.len(), "{mine:#?}");
+        let (mut tiles, mut reached) = (vec![], 0);
         for (k, s) in mine.screens.iter().enumerate() {
             let (shown, at) = a.guide_at().unwrap();
             assert_eq!((s.step, s.item), (at, a.guide_item), "screen {k}");
@@ -453,6 +595,35 @@ mod tests {
                 assert_eq!([info.width, info.height], png.size);
                 assert!(info.width > 400 && info.height > 40, "{png:?}");
             }
+            // Each readout's tap shows the screen as the page draws it once
+            // that readout is reached; the boxes stay where they were.
+            let readouts: Vec<usize> = s.taps.iter().filter_map(|t| t.reached).collect();
+            assert_eq!(
+                readouts,
+                (0..s.reached.len()).collect::<Vec<_>>(),
+                "screen {k}"
+            );
+            let holes = s.progress.starts_with("hole ");
+            for (n, r) in s.reached.iter().enumerate() {
+                let _ = a.update(Message::Guide(GuideAction::Reached(n)));
+                let state = (a.guide_item, a.guide_reached);
+                assert_eq!(state, if holes { (s.item, n + 1) } else { (n + 1, 0) });
+                assert_ne!(r.numbers, s.numbers, "screen {k}, readout {n}");
+                assert!(files.contains_key(&r.numbers.path) && files.contains_key(&r.picture.path));
+                let boxes = |t: &[Tap]| t.iter().map(|t| t.rect).collect::<Vec<_>>();
+                assert_eq!(boxes(&r.taps), boxes(&s.taps), "screen {k}, readout {n}");
+            }
+            for t in &s.taps {
+                let [x, y, w, h] = t.rect;
+                assert!(
+                    x + w <= s.numbers.size[0] && y + h <= s.numbers.size[1],
+                    "{t:?}"
+                );
+                assert!(h >= 30, "a finger can find it: {t:?}");
+                assert!(t.reached.is_some() != t.screen.is_some());
+                tiles.extend(t.screen);
+            }
+            reached += s.reached.len();
             let _ = a.update(Message::Guide(GuideAction::Next));
         }
         // Each section starts where a press on it goes.
@@ -470,6 +641,14 @@ mod tests {
             .filter(|s| s.progress.starts_with("hole "))
             .count();
         assert!(holes > 1, "{mine:#?}");
+        assert!(reached > holes, "every hole's readouts are drawn reached");
+        // A pass's tile goes to that pass, a step's first screen.
+        assert!(!tiles.is_empty());
+        for j in tiles {
+            let pass = &mine.screens[j];
+            assert_eq!(pass.item, 0);
+            assert!(pass.title.starts_with("Pass "), "{}", pass.title);
+        }
         assert!(mine.screens.iter().all(|s| !s.asks));
         assert!(mine.screens.last().unwrap().opens.is_some());
     }
@@ -569,11 +748,12 @@ mod tests {
         }
     }
 
-    /// A pass screen's tiles jump to another pass on the desktop. On the
-    /// tablet, where the screen is a picture, they are a plain strip that
-    /// nothing presses, still naming every pass (LIO-544).
+    /// A pass screen's tiles jump to another pass on the desktop, and on
+    /// the tablet too, where they are a finger tall: the tablet finds them by
+    /// their taps (LIO-525; LIO-544 had drawn them plain while a tap did
+    /// nothing).
     #[test]
-    fn the_tablets_pass_tiles_are_not_pressable() {
+    fn the_tablets_pass_tiles_go_where_the_desktops_do() {
         use crate::guide::LatheStep as L;
         let a = crate::steps::tests::lathe_app("Diameter", |_| {});
         let mesh = a.part_mesh().unwrap().clone();
@@ -620,11 +800,16 @@ mod tests {
                 (goes, placed.into_iter().map(|(s, _)| s).collect::<Vec<_>>())
             };
             let (desktop, _) = goes(false);
-            let (tablet, texts) = goes(true);
+            let (tablet, _) = goes(true);
             assert!(desktop.iter().any(|s| s == "measure"), "{desktop:?}");
-            assert!(tablet.is_empty(), "{tablet:?}");
-            for s in &desktop {
-                assert!(texts.contains(s), "{s} in {texts:?}");
+            assert_eq!(tablet, desktop);
+            let (_, _, taps) = drawn(parts(&page(true)).right.into(), (WINDOW.0, WINDOW.1));
+            let tiles: Vec<_> = (taps.iter())
+                .filter(|(_, m)| matches!(m, Message::Guide(GuideAction::Go(_))))
+                .collect();
+            assert!(!tiles.is_empty());
+            for (r, _) in tiles {
+                assert!(r.height >= 40., "a finger tall: {r:?}");
             }
         }
     }
