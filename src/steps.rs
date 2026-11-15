@@ -7708,11 +7708,26 @@ pub(crate) mod tests {
         ];
         // The screens with labelled drawings of the cut.
         const KINDS: [&str; 5] = ["Pass", "Slot", "Corner", "Holes", "Pattern"];
+        // No two words of a drawing on each other.
+        let clear = |drawn: Vec<Vec<(String, Rectangle)>>, what: &str| {
+            for words in drawn {
+                for (j, (s, r)) in words.iter().enumerate() {
+                    for (t, o) in &words[..j] {
+                        assert!(!r.intersects(o), "{what}: {s:?} {r:?} on {t:?} {o:?}");
+                    }
+                }
+            }
+        };
         let mut seen = std::collections::BTreeSet::new();
         for (name, mut a) in apps {
             if let Some((_, Err(e))) = &a.guide {
                 panic!("{name}: {e}");
             }
+            // Every screen as the shop tablet gets it: its pictures drawn
+            // ~410 × 330, smaller still (LIO-477).
+            DRAWN.take();
+            let _ = tablet::steps(&a.doc, Ok(a.part_mesh().unwrap()));
+            clear(DRAWN.take(), &format!("{name} on the tablet"));
             let steps = guide(&a).steps;
             for (i, step) in steps.iter().enumerate() {
                 let kind = format!("{step:?}")
@@ -7730,17 +7745,11 @@ pub(crate) mod tests {
                     (a.window_width, a.window_height) = (w as f32, h as f32);
                     DRAWN.take();
                     render(&a, (w, h), &dir.path().join("steps.png"));
-                    for words in DRAWN.take() {
+                    let drawn = DRAWN.take();
+                    if !drawn.is_empty() {
                         seen.insert(kind.clone());
-                        for (j, (s, r)) in words.iter().enumerate() {
-                            for (t, o) in &words[..j] {
-                                assert!(
-                                    !r.intersects(o),
-                                    "{name} step {i} ({kind}) at {w} px: {s:?} {r:?} on {t:?} {o:?}"
-                                );
-                            }
-                        }
                     }
+                    clear(drawn, &format!("{name} step {i} ({kind}) at {w} px"));
                 }
             }
         }
