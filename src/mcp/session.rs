@@ -219,7 +219,7 @@ const TRIES: u32 = 10;
 const PAUSE: Duration = Duration::from_millis(10);
 
 /// A session's lock: its folder's `lock` file, opened (made when it is
-/// not there) and held with an exclusive OS lock (`File::try_lock`: `flock`
+/// not there) and held with an exclusive OS lock (`try_lock`: `flock`
 /// on Unix, `LockFileEx` on Windows) for as long as this process has the
 /// session open. The OS lets go when the file is closed, by drop or by the
 /// process's end however it ends: there is no stale lock to tell, take over
@@ -245,7 +245,7 @@ impl Lock {
             .map_err(|e| format!("Could not lock session {id}: {e}"))?;
         let mut tries = 1;
         loop {
-            match file.try_lock() {
+            match try_lock(&file) {
                 Ok(()) => break,
                 Err(std::fs::TryLockError::WouldBlock) if tries < TRIES => {
                     tries += 1;
@@ -285,11 +285,50 @@ impl Lock {
     }
 }
 
+/// Holds `file`'s exclusive lock. On Unix `flock`, which leaves the file
+/// readable. Windows' locks bar every other handle from reading the bytes
+/// they cover, the whole file with `File::try_lock`, so there only the one
+/// byte at the end of the range is locked: the owner written at the start
+/// stays readable, and a shared lock of the whole file (`holder`) still
+/// meets it.
+#[cfg(not(windows))]
+fn try_lock(file: &std::fs::File) -> Result<(), std::fs::TryLockError> {
+    file.try_lock()
+}
+#[cfg(windows)]
+fn try_lock(file: &std::fs::File) -> Result<(), std::fs::TryLockError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{Foundation, Storage::FileSystem, System::IO};
+    let locked = unsafe {
+        let mut at: IO::OVERLAPPED = std::mem::zeroed();
+        at.Anonymous.Anonymous.Offset = u32::MAX - 1;
+        at.Anonymous.Anonymous.OffsetHigh = u32::MAX;
+        FileSystem::LockFileEx(
+            file.as_raw_handle(),
+            FileSystem::LOCKFILE_EXCLUSIVE_LOCK | FileSystem::LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut at,
+        )
+    };
+    if locked != 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error().map(|c| c as u32) {
+        Some(Foundation::ERROR_LOCK_VIOLATION | Foundation::ERROR_IO_PENDING) => {
+            Err(std::fs::TryLockError::WouldBlock)
+        }
+        _ => Err(std::fs::TryLockError::Error(e)),
+    }
+}
+
 /// The refusal for session `id`, whose lock process `pid` holds.
 fn open_elsewhere(id: &str, pid: Option<u32>) -> String {
     match pid {
         Some(pid) => format!("Session {id} is open in another MCP server (pid {pid})."),
-        // Being written, or not readable while it is held (Windows).
+        // Being written.
         None => format!("Session {id} is open in another MCP server."),
     }
 }

@@ -528,6 +528,7 @@ dependencies = [
  "uc100-remote",
  "uuid",
  "wgpu",
+ "windows-sys 0.61.2",
  "zip",
 ]
 
