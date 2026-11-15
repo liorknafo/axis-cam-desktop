@@ -3473,8 +3473,8 @@ pub fn lower(
 
 /// A setup's tool runs worked out on the computer for the shop tablet
 /// (LIO-475), which plans nothing: each tool run as Cycle Start sends it
-/// from its first operation, lowered here once in work coordinates, with
-/// where Stop after step stops. The tablet file carries them as
+/// from its first operation, and from each later one (`starts`, LIO-476),
+/// lowered here once in work coordinates, with where Stop after step stops. The tablet file carries them as
 /// `runs.json` (`bundle::pack`).
 ///
 /// The tablet makes the job's machine coordinates from the live work
@@ -3519,6 +3519,26 @@ pub struct TabletRun {
     pub start: Option<TabletStart>,
     pub actions: Vec<TabletLine>,
     /// Its operations' steps, in order.
+    pub steps: Vec<TabletStep>,
+    /// Its starts at each of its later operations (LIO-476), in order: the
+    /// operations before taken as cut, as a Start here on the Run panel
+    /// starts there (`Checked::starts`). A file from before them has none.
+    #[serde(default)]
+    pub starts: Vec<TabletOpStart>,
+}
+
+/// A tool run started at one of its operations after the first, as Cycle
+/// Start sends it from there: its own job (its lines numbered from 1), the
+/// steps from there on, and the lift; or why it cannot start there.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabletOpStart {
+    /// The operation it starts at: its index in the setup.
+    pub operation: usize,
+    /// Why it cannot start there, as the Run panel says; its job is empty then.
+    pub problems: Vec<String>,
+    pub lift: Lift,
+    pub actions: Vec<TabletLine>,
     pub steps: Vec<TabletStep>,
 }
 
@@ -3655,7 +3675,6 @@ pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> Tabl
     out.work_offset = programs.first().map_or(String::new(), |p| p.offset.clone());
     let count = programs.len();
     for (i, p) in programs.iter().enumerate() {
-        let blocks = &p.blocks;
         let start = match p.chuck {
             None => None,
             Some(_) => match tablet_start(doc, mesh, si, p) {
@@ -3666,113 +3685,34 @@ pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> Tabl
                 }
             },
         };
-        // From nowhere (NaN), so that no move is dropped as already there,
-        // and each axis kept where the tool is comes out NaN.
-        let lowered = match lower_blocks(
-            p,
-            blocks,
-            blocks.len(),
-            [0.; 6],
-            [f64::NAN; 6],
-            Leave::default(),
-        ) {
-            Ok(l) => l,
+        let (actions, steps, lift) = match tablet_job_from(&mut run, p, i, 0) {
+            Ok(job) => job,
             Err(why) => {
                 (out.problems, out.tool_runs) = (why, vec![]);
                 return out;
             }
         };
-        let actions = (lowered.into_iter())
-            .map(|l| {
-                let block = &blocks[l.line as usize - 1];
-                let action = match l.action {
-                    Do::Move { target, feed } => {
-                        // Where the tool is: all of a retract's (its Z
-                        // the lift), an approach's Z and A, an index's
-                        // X, Y and Z; those are where an earlier move
-                        // left them, which `lower` takes from the machine.
-                        let kept: &[usize] = match block {
-                            Block::Retract => &[0, 1, 2, 3, 4, 5],
-                            Block::Approach { .. } => &[2, 3, 4, 5],
-                            Block::Index { .. } => &[0, 1, 2, 4, 5],
-                            _ => &[],
-                        };
-                        TabletAction::Move {
-                            target: std::array::from_fn(|k| {
-                                Some(target[k]).filter(|v| !v.is_nan() && !kept.contains(&k))
-                            }),
-                            feed,
-                            lift: matches!(block, Block::Retract),
-                        }
-                    }
-                    Do::Dwell { seconds } => TabletAction::Dwell { seconds },
-                    Do::Spindle { state, rpm } => TabletAction::Spindle { state, rpm },
-                    Do::Coolant { flood, mist } => TabletAction::Coolant { flood, mist },
-                    Do::Pause { reason } => TabletAction::Pause { reason },
-                    Do::End => TabletAction::End,
-                    Do::Probe { .. } => unreachable!("a run lowers no probe"),
+        // A setup in the chuck starts only over the first point of its tool
+        // run, the one way in past the jaws that is checked (`tablet_start`).
+        let starts = (1..p.ops.len())
+            .map(|k| {
+                let job = match p.chuck {
+                    Some(_) => Err(vec![CHUCK_STARTS.to_string()]),
+                    None => tablet_job_from(&mut run, p, i, k),
                 };
-                TabletLine {
-                    line: l.line,
-                    action,
+                let (actions, steps, at_lift, problems) = match job {
+                    Ok((a, s, l)) => (a, s, l, vec![]),
+                    Err(why) => (vec![], vec![], lift, why),
+                };
+                TabletOpStart {
+                    operation: p.indexes[k],
+                    problems,
+                    lift: at_lift,
+                    actions,
+                    steps,
                 }
             })
             .collect();
-        // As running from its first operation, at work offset 0: what
-        // `stop_ranges` and `step_lift` read.
-        run.running = Some(Running {
-            index: i,
-            from: 0,
-            seq: 0,
-            offset: [0.; 6],
-            before: Before {
-                xy: None,
-                zero: None,
-                last: None,
-                touched: false,
-            },
-            paths: vec![],
-            tip: [0.; 3],
-            start: [0.; 6],
-            print: 0,
-            cut_ops: vec![],
-            on: None,
-            marks: run.marks_of(p, blocks),
-        });
-        let mut steps: Vec<TabletStep> = (p.indexes.iter())
-            .filter_map(|&oi| run.op_steps(oi))
-            .flat_map(|os| {
-                (0..os.steps.len()).map(|s| TabletStep {
-                    operation: os.op,
-                    step: s,
-                    label: os.label(s),
-                    lines: None,
-                    end_lines: vec![],
-                })
-            })
-            .collect();
-        let marks = run.running.as_ref().map_or(&[][..], |r| &r.marks[..]);
-        fn of(steps: &mut [TabletStep], at: Option<(usize, usize)>) -> Option<&mut TabletStep> {
-            let (oi, s) = at?;
-            steps.iter_mut().find(|t| (t.operation, t.step) == (oi, s))
-        }
-        for b in 0..blocks.len() {
-            let line = b as u32 + 1;
-            let on = marks.get(b).copied().flatten();
-            let on = on
-                .and_then(|m| run.mark_step(p, m))
-                .map(|(oi, s, _)| (oi, s));
-            if let Some(t) = of(&mut steps, on) {
-                let span = t.lines.get_or_insert([line, line]);
-                span[1] = line;
-            }
-            if let Some(t) = of(&mut steps, run.step_end(b)) {
-                match t.end_lines.last_mut() {
-                    Some(r) if r[1] + 1 == line => r[1] = line,
-                    _ => t.end_lines.push([line, line]),
-                }
-            }
-        }
         let o = &p.ops[0];
         out.tool_runs.push(TabletRun {
             name: format!("{} · tool run {} of {count}", run.name, i + 1),
@@ -3788,16 +3728,138 @@ pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> Tabl
                     name: o.name.clone(),
                 })
                 .collect(),
-            lift: Lift {
-                z: run.step_lift().expect("running"),
-                machine: p.settings.machine_home,
-            },
+            lift,
             start,
             actions,
             steps,
+            starts,
         });
     }
     out
+}
+
+/// Why a tablet's tool run on a setup in the chuck does not start at a later
+/// operation.
+const CHUCK_STARTS: &str = "The stock is held in the chuck: the computer checked the way in past its jaws only over the tool run's first point, so it starts there and nowhere else.";
+
+/// Program `p` (tool run `i` of `run`'s setup) as the tablet sends it from
+/// its operation `k`: its actions in work coordinates (`TabletSetup`), its
+/// steps from there with the job lines each is cut on and ends on, and the
+/// lift; why not when it cannot start there (`Checked::from`). Leaves `run`
+/// running it from there, at work offset 0.
+fn tablet_job_from(
+    run: &mut Run,
+    p: &Checked,
+    i: usize,
+    k: usize,
+) -> Result<(Vec<TabletLine>, Vec<TabletStep>, Lift), Vec<String>> {
+    let blocks = p.from(k)?;
+    // From nowhere (NaN), so that no move is dropped as already there,
+    // and each axis kept where the tool is comes out NaN.
+    let lowered = lower_blocks(
+        p,
+        blocks,
+        blocks.len(),
+        [0.; 6],
+        [f64::NAN; 6],
+        Leave::default(),
+    )?;
+    let actions = (lowered.into_iter())
+        .map(|l| {
+            let block = &blocks[l.line as usize - 1];
+            let action = match l.action {
+                Do::Move { target, feed } => {
+                    // Where the tool is: all of a retract's (its Z the
+                    // lift), an approach's Z and A, an index's X, Y and Z;
+                    // those are where an earlier move left them, which
+                    // `lower` takes from the machine.
+                    let kept: &[usize] = match block {
+                        Block::Retract => &[0, 1, 2, 3, 4, 5],
+                        Block::Approach { .. } => &[2, 3, 4, 5],
+                        Block::Index { .. } => &[0, 1, 2, 4, 5],
+                        _ => &[],
+                    };
+                    TabletAction::Move {
+                        target: std::array::from_fn(|k| {
+                            Some(target[k]).filter(|v| !v.is_nan() && !kept.contains(&k))
+                        }),
+                        feed,
+                        lift: matches!(block, Block::Retract),
+                    }
+                }
+                Do::Dwell { seconds } => TabletAction::Dwell { seconds },
+                Do::Spindle { state, rpm } => TabletAction::Spindle { state, rpm },
+                Do::Coolant { flood, mist } => TabletAction::Coolant { flood, mist },
+                Do::Pause { reason } => TabletAction::Pause { reason },
+                Do::End => TabletAction::End,
+                Do::Probe { .. } => unreachable!("a run lowers no probe"),
+            };
+            TabletLine {
+                line: l.line,
+                action,
+            }
+        })
+        .collect();
+    // As running from operation `k`, at work offset 0: what `stop_ranges`
+    // and `step_lift` read.
+    run.running = Some(Running {
+        index: i,
+        from: k,
+        seq: 0,
+        offset: [0.; 6],
+        before: Before {
+            xy: None,
+            zero: None,
+            last: None,
+            touched: false,
+        },
+        paths: vec![],
+        tip: [0.; 3],
+        start: [0.; 6],
+        print: 0,
+        cut_ops: vec![],
+        on: None,
+        marks: run.marks_of(p, blocks),
+    });
+    let mut steps: Vec<TabletStep> = (p.indexes[k..].iter())
+        .filter_map(|&oi| run.op_steps(oi))
+        .flat_map(|os| {
+            (0..os.steps.len()).map(|s| TabletStep {
+                operation: os.op,
+                step: s,
+                label: os.label(s),
+                lines: None,
+                end_lines: vec![],
+            })
+        })
+        .collect();
+    let marks = run.running.as_ref().map_or(&[][..], |r| &r.marks[..]);
+    fn of(steps: &mut [TabletStep], at: Option<(usize, usize)>) -> Option<&mut TabletStep> {
+        let (oi, s) = at?;
+        steps.iter_mut().find(|t| (t.operation, t.step) == (oi, s))
+    }
+    for b in 0..blocks.len() {
+        let line = b as u32 + 1;
+        let on = marks.get(b).copied().flatten();
+        let on = on
+            .and_then(|m| run.mark_step(p, m))
+            .map(|(oi, s, _)| (oi, s));
+        if let Some(t) = of(&mut steps, on) {
+            let span = t.lines.get_or_insert([line, line]);
+            span[1] = line;
+        }
+        if let Some(t) = of(&mut steps, run.step_end(b)) {
+            match t.end_lines.last_mut() {
+                Some(r) if r[1] + 1 == line => r[1] = line,
+                _ => t.end_lines.push([line, line]),
+            }
+        }
+    }
+    let lift = Lift {
+        z: run.step_lift().expect("running"),
+        machine: p.settings.machine_home,
+    };
+    Ok((actions, steps, lift))
 }
 
 /// The `TabletStart` of program `p` of setup `si`, in the chuck: over its
@@ -4612,7 +4674,9 @@ fn pin_problems(c: &Connection, setup: &crate::model::Setup, p: &Checked) -> Vec
 pub(crate) fn tablet_fixture(profile: &std::path::Path) -> (Document, Mesh) {
     let (mut doc, mesh) = crate::post::fixture::job();
     let setup = &mut doc.setups[0];
-    setup.operations = [0, 3].map(|i| setup.operations[i].clone()).to_vec();
+    // Face and pocket with the flat end mill, then the drill: a tool run of
+    // two operations (a start at the second, LIO-476) and a tool change.
+    setup.operations = [0, 1, 3].map(|i| setup.operations[i].clone()).to_vec();
     let profile = profile.display().to_string();
     let m = &mut doc.setups[0].machine;
     for (k, v) in [
@@ -4706,10 +4770,21 @@ pub(crate) mod tests {
 
     /// What the tablet makes of tool run `r` with the live work offset `o`,
     /// from where the machine is, `at` (`TabletSetup`).
-    pub(crate) fn tablet_job(r: &TabletRun, o: [f64; 6], mut at: [f64; 6]) -> Vec<Located> {
-        let lift = r.lift.z + if r.lift.machine { 0. } else { o[2] };
+    pub(crate) fn tablet_job(r: &TabletRun, o: [f64; 6], at: [f64; 6]) -> Vec<Located> {
+        tablet_job_of(&r.actions, r.lift, o, at)
+    }
+
+    /// `tablet_job` of `actions` lifted to `lift`: a tool run's, or one of
+    /// its `starts`.
+    pub(crate) fn tablet_job_of(
+        actions: &[TabletLine],
+        lift: Lift,
+        o: [f64; 6],
+        mut at: [f64; 6],
+    ) -> Vec<Located> {
+        let lift = lift.z + if lift.machine { 0. } else { o[2] };
         let mut out = vec![];
-        for l in &r.actions {
+        for l in actions {
             let action = match &l.action {
                 TabletAction::Move {
                     target,
@@ -4826,6 +4901,157 @@ pub(crate) mod tests {
         let holes = &s.tool_runs[1].steps;
         assert!(holes.len() > 1 && holes.iter().all(|t| t.label.starts_with("Hole")));
         assert!(holes.iter().all(|t| !t.end_lines.is_empty()), "{holes:?}");
+        // Each tool run starts at each of its later operations as the Run
+        // panel's Start here does (LIO-476): `lower` from there, the steps
+        // from there on, their lines its own.
+        for (r, p) in s.tool_runs.iter().zip(&programs) {
+            assert_eq!(r.starts.len(), p.ops.len() - 1, "{}", r.name);
+            for (k, st) in (1..).zip(&r.starts) {
+                assert!(st.problems.is_empty(), "{} {:?}", r.name, st.problems);
+                assert_eq!(st.operation, p.indexes[k]);
+                assert!(!st.lift.machine);
+                for start in [[-5., -7., -30., 0., 0., 0.], [3., 4., -1., 0., 0., 0.]] {
+                    assert_eq!(
+                        tablet_job_of(&st.actions, st.lift, offset, start),
+                        lower(p, k, offset, start).unwrap(),
+                        "{} from {k}",
+                        r.name
+                    );
+                }
+                let ops: Vec<usize> = st.steps.iter().map(|t| t.operation).collect();
+                assert!(ops.iter().all(|o| p.indexes[k..].contains(o)), "{ops:?}");
+                let mut last = 0;
+                for t in &st.steps {
+                    let [a, b] = t.lines.unwrap_or_else(|| panic!("{} {}", r.name, t.label));
+                    assert!(a > last && b >= a, "{} {:?}", t.label, t.lines);
+                    last = b;
+                }
+            }
+        }
+    }
+
+    /// A tablet file from before the starts (LIO-476) still reads: its tool
+    /// runs have none.
+    #[test]
+    fn a_tablet_run_without_starts_reads_with_none() {
+        let json = r#"{"name":"Top · tool run 1 of 1","tool":{"number":1,"name":"Flat 10","label":"T1 Flat 10"},"toolChange":false,"operations":[{"index":0,"name":"Face"}],"lift":{"z":15.0,"machine":false},"start":null,"actions":[],"steps":[]}"#;
+        let r: TabletRun = serde_json::from_str(json).unwrap();
+        assert!(r.starts.is_empty());
+    }
+
+    /// A tablet start at a second and a third operation (LIO-476), their
+    /// indexes in the setup not their places in the program, from machine
+    /// home and not: each sends what the Run panel's Start here sends from
+    /// there (a pause of the program kept), its lift is `step_lift`'s, and
+    /// its steps are its own, Stop after step stopping only on a move that
+    /// starts at the clearance, never on the way down into a step. A start
+    /// the check refused stays refused.
+    #[test]
+    fn a_tablet_start_at_a_later_operation_sends_what_start_here_sends() {
+        let (doc, _) = fixture::job();
+        let mut plan = fixture::plan(
+            [0., 0., 15.],
+            &[
+                (Motion::Rapid, [0., 0., 5.], 6000.),
+                (Motion::Feed, [10., 0., 5.], 600.),
+                (Motion::Rapid, [10., 0., 15.], 6000.),
+                (Motion::Rapid, [0., 0., 15.], 6000.),
+                (Motion::Rapid, [0., 0., 3.], 6000.),
+                (Motion::Feed, [10., 0., 3.], 600.),
+                (Motion::Rapid, [10., 0., 15.], 6000.),
+            ],
+        );
+        plan.stops.push(crate::simulation::Stop {
+            at: 0,
+            pause: Some("Set the head before cutting".into()),
+            size: None,
+        });
+        let ops = vec![fixture::facing_op(); 3];
+        let mut p = checked(ops, &[&plan, &plan, &plan]);
+        p.indexes = vec![0, 2, 4];
+        for home in [false, true] {
+            p.settings.machine_home = home;
+            p.starts = (1..3)
+                .map(|k| {
+                    let mut b = blocks(&p.ops[k..], &vec![&plan; 3 - k], &p.settings);
+                    for block in &mut b {
+                        match block {
+                            Block::Start { op, .. }
+                            | Block::Run { op, .. }
+                            | Block::Approach { op, .. }
+                            | Block::Descend { op, .. }
+                            | Block::Move { op, .. }
+                            | Block::Pause { op, .. }
+                            | Block::Index { op, .. } => *op += k,
+                            _ => {}
+                        }
+                    }
+                    Ok(b)
+                })
+                .collect();
+            let mut run = Run::new(&doc, 0, 0);
+            run.programs = Some(Arc::new(Ok(vec![p.clone()])));
+            run.steps = (p.indexes.iter())
+                .map(|&oi| OpSteps {
+                    op: oi,
+                    clear: 15.,
+                    hole: false,
+                    steps: plan_steps(&plan),
+                    fingerprint: 0,
+                })
+                .collect();
+            for k in 1..3 {
+                let (actions, steps, lift) = tablet_job_from(&mut run, &p, 0, k).unwrap();
+                assert_eq!(steps.len(), (3 - k) * 2);
+                let ops: Vec<usize> = steps.iter().map(|s| s.operation).collect();
+                let want: Vec<usize> = p.indexes[k..].iter().flat_map(|&oi| [oi, oi]).collect();
+                assert_eq!(ops, want);
+                assert!(actions.iter().any(|l| matches!(&l.action,
+                    TabletAction::Pause { reason } if reason == "Set the head before cutting")));
+                let offset = [100., 80., -30., 7., 2., 3.];
+                for at in [
+                    [3., 4., -50., 7., 2., 3.],
+                    [100., 80., 0., 7., 2., 3.],
+                    [100., 80., -25., 7., 2., 3.],
+                ] {
+                    let sent = run.job_actions(&p, k, offset, at, None).unwrap();
+                    assert_eq!(
+                        tablet_job_of(&actions, lift, offset, at),
+                        sent,
+                        "{home} {k}"
+                    );
+                }
+                run.running.as_mut().unwrap().offset = offset;
+                let z = lift.z + if home { 0. } else { offset[2] };
+                assert_eq!(run.step_lift().unwrap(), z);
+                let mut lines: Vec<u32> = (steps.iter().flat_map(|s| &s.end_lines))
+                    .flat_map(|r| r[0]..=r[1])
+                    .collect();
+                lines.sort_unstable();
+                let ranges: Vec<u32> = run.stop_ranges().iter().flat_map(|r| r.clone()).collect();
+                assert_eq!(lines, ranges);
+                assert!(steps.iter().all(|s| !s.end_lines.is_empty()));
+                for s in &steps {
+                    for line in s.end_lines.iter().flat_map(|r| r[0]..=r[1]) {
+                        assert_eq!(run.step_end(line as usize - 1), Some((s.operation, s.step)));
+                        match &p.from(k).unwrap()[line as usize - 1] {
+                            Block::Move { kind, from, .. } => {
+                                assert_ne!(*kind, Kind::Feed);
+                                assert!(from[2] >= 15. - AT_CLEARANCE);
+                            }
+                            Block::Descend { .. } => panic!("a stop on the way down into a step"),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            p.starts[0] = Err(vec!["The way in is not clear.".into()]);
+            assert_eq!(
+                tablet_job_from(&mut run, &p, 0, 1).unwrap_err(),
+                vec!["The way in is not clear."]
+            );
+            assert!(tablet_job_from(&mut run, &p, 0, 3).is_err());
+        }
     }
 
     fn program() -> Checked {
