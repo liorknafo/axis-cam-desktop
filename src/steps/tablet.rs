@@ -13,15 +13,19 @@ use std::collections::HashMap;
 
 /// The window the screens are laid out for: below 1200 wide, as narrow as
 /// the desktop's 1024 × 700 class (`turning::narrow`), so the lathe's numbers
-/// take half the card, as they would on a 10" tablet.
-const WINDOW: (f32, f32) = (1100., 760.);
+/// take half the card. Its card is about as wide as the shop tablet's
+/// (K10C: 960 × 552 dp, the operations list beside it), so the screens show
+/// near their size and the drawings' small words stay readable (LIO-477).
+/// The height only sizes the lathe's dials (`turning::dial_size`).
+const WINDOW: (f32, f32) = (1000., 760.);
 /// The width the card leaves the pictures and the numbers together: the
 /// window less the setups list beside it (`turning::dial_size`).
 const CARD: f32 = WINDOW.0 - 300.;
-/// How high the pictures are drawn.
-const PICTURE_HEIGHT: f32 = 420.;
-/// Pixels a logical pixel: crisp on the tablet's dense screen.
-const SCALE: f32 = 2.;
+/// How high the pictures are drawn: the room the tablet's page leaves them.
+const PICTURE_HEIGHT: f32 = 330.;
+/// Pixels a logical pixel: the K10C has 1.33 pixels a dp. More pixels only
+/// make it slower to show a screen.
+const SCALE: f32 = 1.5;
 /// What a reader of an older `format` would show wrong bumps it.
 pub const FORMAT: u32 = 1;
 
@@ -29,6 +33,8 @@ pub const FORMAT: u32 = 1;
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Steps {
     pub format: u32,
+    /// Pixels a logical pixel of the pictures (`SCALE`).
+    pub scale: f32,
     pub setups: Vec<SetupSteps>,
 }
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -119,6 +125,7 @@ pub fn steps(doc: &Document, mesh: Result<&Mesh, &str>) -> (Steps, HashMap<Strin
     (
         Steps {
             format: FORMAT,
+            scale: SCALE,
             setups,
         },
         files,

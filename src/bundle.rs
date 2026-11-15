@@ -48,7 +48,11 @@ pub fn pack_with(
     let mut w = zip::ZipWriter::new(Cursor::new(vec![]));
     let opt = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
+    // A PNG is compressed already: stored as it is, the tablet takes it out
+    // without inflating it, which is slow on it (LIO-477).
+    let stored = opt.compression_method(zip::CompressionMethod::Stored);
     let mut add = |name: &str, bytes: &[u8]| -> Result<(), String> {
+        let opt = if name.ends_with(".png") { stored } else { opt };
         w.start_file(name, opt).map_err(|e| e.to_string())?;
         w.write_all(bytes).map_err(|e| e.to_string())
     };
@@ -360,5 +364,9 @@ mod tests {
             let name = &png.path;
             assert!(read(name).starts_with(&[0x89, b'P', b'N', b'G']), "{name}");
         }
+        // Stored as they are: the tablet copies them out, inflating nothing.
+        let first = &setup.screens[0].picture.path;
+        let stored = zip.by_name(first).unwrap().compression();
+        assert_eq!(stored, zip::CompressionMethod::Stored);
     }
 }
