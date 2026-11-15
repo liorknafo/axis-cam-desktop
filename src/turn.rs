@@ -456,6 +456,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
         .map(|m| m.to[2])
         .fold(f32::INFINITY, f32::min);
     Ok(Plan {
+        below: 0.,
         shape: CutterShape::Revolve,
         strategy: op.strategy,
         operation: op.id.clone(),

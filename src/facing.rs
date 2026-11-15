@@ -340,6 +340,7 @@ pub(crate) fn outline(f: Outline) -> Result<Plan, String> {
         return Err(crate::cam::too_many("moves"));
     }
     let mut plan = Plan {
+        below: 0.,
         shape: CutterShape::Flat,
         strategy: Strategy::Face,
         operation: f.op.id.clone(),

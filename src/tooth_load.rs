@@ -636,6 +636,7 @@ pub fn nominal(
     })
     .to_vec();
     let plan = Plan {
+        below: 0.,
         shape: cut.shape,
         strategy: Strategy::Pocket,
         operation: String::new(),

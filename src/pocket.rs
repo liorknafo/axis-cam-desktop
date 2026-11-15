@@ -3501,6 +3501,7 @@ fn finish_plan(setup: &Setup, op: &Operation, job: Job) -> Result<Plan, String> 
         .map(|p| p.top)
         .fold(f32::NEG_INFINITY, f32::max);
     let mut plan = Plan {
+        below: 0.,
         shape: crate::simulation::CutterShape::Flat,
         strategy: op.strategy,
         operation: op.id.clone(),

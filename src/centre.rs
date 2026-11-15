@@ -595,4 +595,108 @@ mod tests {
         crate::proposal::tests::aluminium(&mut doc);
         assert_eq!(flagged(&doc), []);
     }
+
+    /// The Ø8 ring's through hole drilled on the manual mill, centre
+    /// drilled first by an A2.5×6.3 (a 3.1 mm pilot): the job and its mesh.
+    fn ring_job() -> (Document, Mesh) {
+        use crate::cam::boring::tests::{drill, drilling, job, ring};
+        let mesh = ring(8., 40., 10.);
+        let mill = manual::defaults();
+        let mut d = drill("8");
+        d.p.insert("machines".into(), mill.id.clone());
+        let mut op = drilling(&mesh, &d, "Drilling");
+        op.p.insert("rpm".into(), "640".into());
+        op.p.insert("feed".into(), "64".into());
+        let (mut doc, _) = job(&mesh, mill, vec![(d, op)]);
+        let mut c = centre_drill("2.5", "3.1", "6.3");
+        c.p.insert("number".into(), "2".into());
+        doc.tools.push(c);
+        let (ops, said) = needed(&doc, 0, Some(&mesh));
+        assert_eq!(ops.len(), 1, "{said}");
+        insert(&mut doc, 0, ops);
+        (doc, mesh)
+    }
+    fn simulated(
+        doc: &Document,
+        mesh: &Mesh,
+    ) -> Vec<Result<crate::simulation::Simulation, String>> {
+        let mut all = vec![];
+        crate::simulation::sequence(doc, mesh, None, |_, _, r| all.push(r));
+        all
+    }
+    #[test]
+    fn a_clamp_only_its_pilot_reaches_is_hit() {
+        let (doc, mesh, ci) = centred_job(centre_drill("2.5", "3.1", "6.3"));
+        let mut plan = plan(&doc, &mesh, ci).unwrap();
+        assert_eq!(plan.below, 3.1);
+        let across = (plan.moves.iter())
+            .find(|m| {
+                m.motion == crate::simulation::Motion::Rapid
+                    && (m.from[0] - m.to[0]).hypot(m.from[1] - m.to[1]) > 10.
+            })
+            .expect("a rapid across from hole to hole");
+        let mid = [
+            (across.from[0] + across.to[0]) / 2.,
+            (across.from[1] + across.to[1]) / 2.,
+        ];
+        let z = across.from[2].min(across.to[2]);
+        // A clamp under that rapid, its top 1.5 mm under the cone's point:
+        // the pilot's tip, 3.1 mm under it, crosses the clamp.
+        let clamp = crate::holding::HoldBox {
+            label: "Clamp".into(),
+            bounds: crate::mesh::Bounds {
+                min: [mid[0] - 1., mid[1] - 1., z - 20.],
+                max: [mid[0] + 1., mid[1] + 1., z - 1.5],
+            },
+            shape: Default::default(),
+        };
+        let hits = crate::holding::hits(&plan, std::slice::from_ref(&clamp), 0.5);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        // The parts the setup's holding walk takes the tool to be.
+        let tool = doc.setups[0].operations[ci].tool.clone();
+        let (parts, _) = crate::post::tool_parts(&doc, &doc.setups[0], &tool, &plan);
+        let moves: Vec<_> = plan.moves.iter().map(|m| (m.from, m.to)).collect();
+        let walked = crate::holding::hits_parts(&moves, &parts, std::slice::from_ref(&clamp), 0.5);
+        assert_eq!(walked.len(), 1, "{walked:?}");
+        // A tool that ends at its point passes over it.
+        plan.below = 0.;
+        assert!(crate::holding::hits(&plan, &[clamp], 0.5).is_empty());
+    }
+    #[test]
+    fn the_manual_mills_travel_is_counted_at_its_pilots_tip() {
+        let (mut doc, mesh) = ring_job();
+        let all = simulated(&doc, &mesh);
+        let plans: Vec<_> = (all.iter())
+            .map(|r| r.as_ref().unwrap().plan.clone())
+            .collect();
+        assert_eq!((plans[0].below, plans[1].below), (3.1, 0.));
+        // The centre drill's clearance is raised by its pilot, so its point
+        // stands 3.1 mm over the drill's highest; its tip does not.
+        let span = |below: f32| {
+            let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+            for (p, b) in plans.iter().zip([below, 0.]) {
+                for z in p.moves.iter().flat_map(|m| [m.from[2], m.to[2]]) {
+                    lo = lo.min(z - b);
+                    hi = hi.max(z - b);
+                }
+            }
+            hi - lo
+        };
+        let tips = span(3.1);
+        assert!((span(0.) - tips - 3.1).abs() < 1e-3, "{} {tips}", span(0.));
+        let refused = |doc: &mut Document, travel: f32| {
+            (doc.setups[0].machine.p).insert("z".into(), travel.to_string());
+            simulated(doc, &mesh)
+                .into_iter()
+                .filter_map(Result::err)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(refused(&mut doc, tips + 0.5), Vec::<String>::new());
+        let why = refused(&mut doc, tips - 0.5);
+        assert!(
+            why.iter()
+                .any(|e| e.contains(&format!("span {} mm", crate::envelope::mm(tips)))),
+            "{why:?}"
+        );
+    }
 }
