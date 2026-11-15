@@ -172,6 +172,7 @@ fn fill(
         window: WINDOW,
         clock: (std::time::Instant::now(), std::time::Instant::now()),
         setup,
+        tablet: true,
     };
     let mut keep = |(png, bytes): (Png, Vec<u8>)| {
         files.entry(png.path.clone()).or_insert(bytes);
@@ -518,6 +519,51 @@ mod tests {
             steps.setups[0].problem.as_deref(),
             Some(crate::run::NO_PART)
         );
+    }
+
+    /// A lathe screen that takes a measurement shows it as a plain readout
+    /// on the tablet, which types it in its own field: no box to type in
+    /// drawn as well (LIO-543). The desktop keeps its box.
+    #[test]
+    fn the_tablets_measure_screens_hold_no_box_to_type_in() {
+        use crate::guide::LatheStep as L;
+        let zero = |a: &crate::App| crate::guide::measure_key(&a.doc.setups[0].id, "zero");
+        let mut a = crate::steps::tests::lathe_app("Diameter", |_| {});
+        let key = zero(&a);
+        a.doc.measured.insert(key.clone(), 41.5);
+        let mesh = a.part_mesh().unwrap().clone();
+        let shown = super::shown(&a.doc, &mesh, 0).unwrap();
+        let window = Size::new(WINDOW.0, WINDOW.1);
+        let measures: Vec<_> = (shown.guide.steps.iter().enumerate())
+            .filter_map(|(at, s)| match s {
+                Step::Lathe(L::Measure { key, .. } | L::Zero { measure: true, key, .. }) => {
+                    Some((at, key))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(measures.len() > 1, "{measures:?}");
+        for (at, k) in measures {
+            let page = |tablet| Page {
+                doc: &a.doc,
+                shown: &shown,
+                key: 0,
+                at,
+                item: 0,
+                reached: 0,
+                typed: None,
+                window: WINDOW,
+                clock: (std::time::Instant::now(), std::time::Instant::now()),
+                setup: &a.doc.setups[0],
+                tablet,
+            };
+            let numbers = |tablet| parts(&page(tablet)).right.into();
+            assert_eq!(crate::ui::probe::fields(numbers(false), window).len(), 1);
+            assert!(crate::ui::probe::fields(numbers(true), window).is_empty());
+            let read = if *k == key { "Ø41.50" } else { "Ø ?" };
+            let texts = crate::ui::probe::texts(numbers(true), window);
+            assert!(texts.iter().any(|t| t == read), "{read} in {texts:?}");
+        }
     }
 
     /// The lathe setup the planner puts in front of the shaft's CNC setup

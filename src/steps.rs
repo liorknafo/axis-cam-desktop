@@ -2431,6 +2431,9 @@ struct Page<'a> {
     /// When the step was opened and now, for the handwheel's beat.
     clock: (std::time::Instant, std::time::Instant),
     setup: &'a Setup,
+    /// Drawn for the shop tablet (`tablet::steps`), which types a lathe
+    /// measurement in its own field: no text box in the picture (LIO-543).
+    tablet: bool,
 }
 impl<'a> Page<'a> {
     fn guide(&self) -> &'a Guide {
@@ -2911,6 +2914,7 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
         window: (app.window_width, app.window_height),
         clock: app.guide_clock,
         setup,
+        tablet: false,
     };
     let header = head(&page, here)
         .push(space().width(Fill))

@@ -1433,13 +1433,17 @@ fn line<'a>(
     }
 }
 /// The box to type a measured diameter in, under `key`, and the button
-/// that keeps it.
+/// that keeps it. On the tablet, which has its own field under the card,
+/// only the kept diameter, or "Ø ?" (LIO-543).
 fn measure_box<'a>(
     p: &Page<'a>,
     key: &str,
     measured: Option<f32>,
     expect: f32,
 ) -> Element<'a, Message> {
+    if p.tablet {
+        return big(measured.map_or_else(|| "Ø ?".into(), dia), Lit::Now);
+    }
     let typed = match p.typed {
         Some((k, t)) if k == key => t.clone(),
         _ => measured.map_or(String::new(), |m| format!("{m:.2}")),
