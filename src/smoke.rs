@@ -24646,8 +24646,9 @@ soft_max = 180.0
         assert!(folded.0 > open.0, "folded {} open {}", folded.0, open.0);
     }
     /// The top of the simulation strip and of the 3D view's hint line under
-    /// the scene, in `a`'s window at `size`, with the stock line it shows.
-    fn play_frame(a: &App, size: iced::Size) -> (f32, f32, String) {
+    /// the scene, in `a`'s window at `size`, with the stock line it shows
+    /// and where that line starts.
+    fn play_frame(a: &App, size: iced::Size) -> (f32, f32, String, Option<iced::Point>) {
         let texts = laid_out_texts(a, size);
         let top = |words: &str| {
             texts
@@ -24659,9 +24660,10 @@ soft_max = 180.0
         };
         let stock = texts
             .iter()
-            .find(|(t, _)| t.contains("stock surface") || t.contains("finest cell"))
-            .map_or(String::new(), |(t, _)| t.clone());
-        (top("SIMULATION"), top("Drag to orbit"), stock)
+            .find(|(t, _)| t.contains("stock surface") || t.contains("finest cell"));
+        let at = stock.map(|(_, bounds)| bounds.position());
+        let stock = stock.map_or(String::new(), |(t, _)| t.clone());
+        (top("SIMULATION"), top("Drag to orbit"), stock, at)
     }
     /// While Play runs, every frame meshes the stock again in the background:
     /// the strip and the 3D view stand still through it, a quick update says
@@ -24719,15 +24721,25 @@ soft_max = 180.0
             frame(&mut a, from, None);
             let still = play_frame(&a, size);
             assert_eq!(still.2, "0.50 mm finest cell · 0 triangles");
+            // The Detail line, where a notice must stand in for the details.
+            assert!(still.3.is_some());
             // A quick update, as Play's frames are: nothing moves, nothing is said.
             frame(&mut a, from + 0.1, Some(150));
             let quick = play_frame(&a, size);
-            assert_eq!((quick.0, quick.1), (still.0, still.1), "{size:?}");
+            assert_eq!(
+                (quick.0, quick.1, quick.3),
+                (still.0, still.1, still.3),
+                "{size:?}"
+            );
             assert_eq!(quick.2, still.2);
             // A slow one (a fine detail, a long toolpath): said in place.
             frame(&mut a, from + 0.2, Some(12_000));
             let slow = play_frame(&a, size);
-            assert_eq!((slow.0, slow.1), (still.0, still.1), "{size:?}");
+            assert_eq!(
+                (slow.0, slow.1, slow.3),
+                (still.0, still.1, still.3),
+                "{size:?}"
+            );
             assert_eq!(
                 slow.2,
                 "Updating the stock surface · 12 s, showing the last finished one"
@@ -24741,13 +24753,21 @@ soft_max = 180.0
                 result: Ok(mesh.clone()),
             });
             let done = play_frame(&a, size);
-            assert_eq!((done.0, done.1), (still.0, still.1), "{size:?}");
+            assert_eq!(
+                (done.0, done.1, done.3),
+                (still.0, still.1, still.3),
+                "{size:?}"
+            );
             assert_eq!(done.2, still.2);
             // The next update after a slow one is named at once, so that
             // slow updates one after another keep the line ...
             frame(&mut a, from + 0.3, Some(20));
             let next = play_frame(&a, size);
-            assert_eq!((next.0, next.1), (still.0, still.1), "{size:?}");
+            assert_eq!(
+                (next.0, next.1, next.3),
+                (still.0, still.1, still.3),
+                "{size:?}"
+            );
             assert_eq!(
                 next.2,
                 "Updating the stock surface · 0 s, showing the last finished one"
@@ -24787,6 +24807,9 @@ soft_max = 180.0
             std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/play-renders".into()),
         );
         std::fs::create_dir_all(&out).unwrap();
+        // The quick frame stays quick however long a render takes.
+        let now = std::time::Instant::now();
+        let _clock = crate::StoppedStockClock::at(now);
         let mut a = imported_app();
         let top = a
             .imported_mesh
@@ -24829,17 +24852,16 @@ soft_max = 180.0
         render_png(&a, size, &out.join("1-meshed.png"));
         at(&mut a, 0.35);
         a.stock_mesh_job = a.stock_mesh_key();
-        a.stock_mesh_started =
-            Some(std::time::Instant::now() - std::time::Duration::from_millis(150));
+        a.stock_mesh_started = Some(now - std::time::Duration::from_millis(150));
         render_png(&a, size, &out.join("2-meshing-quick.png"));
-        a.stock_mesh_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(12));
+        a.stock_mesh_started = Some(now - std::time::Duration::from_secs(12));
         render_png(&a, size, &out.join("3-meshing-slow.png"));
         mesh(&mut a);
         render_png(&a, size, &out.join("4-meshed-again.png"));
         // The smallest window: the time stays in sight.
         at(&mut a, 0.4);
         a.stock_mesh_job = a.stock_mesh_key();
-        a.stock_mesh_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(12));
+        a.stock_mesh_started = Some(now - std::time::Duration::from_secs(12));
         render_png(
             &a,
             iced::Size::new(1120., 720.),
