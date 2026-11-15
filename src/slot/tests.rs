@@ -1624,3 +1624,203 @@ fn the_users_adapter_project_plans_every_slot() {
         }
     }
 }
+
+/// The adapter's counterbore (`adapter_counterbore`) with both its round
+/// ends bored first (LIO-550): a Ø`2 r` round at each end's centre emptied
+/// down to `depth` below the top, as a boring head leaves it. The setup to
+/// plan the Slot in, with that stock before it, and the stock.
+fn bored_first(doc: &Document, mesh: &Mesh, r: f32, depth: f32) -> (Setup, Volume) {
+    let mut setup = doc.setups[0].clone();
+    let stock = crate::stock::resolve(&setup, Some(mesh)).unwrap().stock;
+    let zero = crate::post::datum(&setup, stock, mesh).unwrap();
+    let slot = Slot::read(&setup.operations[0], zero).unwrap();
+    let f = Frame::new(&setup, mesh);
+    let mut v = Volume::stock(stock, f, false);
+    for c in [slot.a, slot.b] {
+        v.cut(
+            [c[0], c[1], zero[2] + 5.],
+            [c[0], c[1], zero[2] - depth],
+            r,
+            40.,
+            CutterShape::Flat,
+            f,
+            (0, 5),
+        );
+    }
+    setup.preview_remaining = Some(std::sync::Arc::new(crate::rest::RestStock::new(&v, f)));
+    (setup, v)
+}
+/// `plan` run on `stock`: the stock after it.
+fn run_on(plan: &Plan, setup: &Setup, mesh: &Mesh, stock: &Volume) -> Volume {
+    let mut sim = Simulation::new(plan.clone());
+    sim.volume = Some(stock.clone());
+    sim.frame = Some(Frame::new(setup, mesh));
+    sim.seek(1.);
+    sim.volume.unwrap()
+}
+/// LIO-550: "create the holes, bore each to size and then with flat end
+/// mill connect two holes together". Both ends bored Ø16.5 to the floor,
+/// the Ø12 only joins them: each level the centre line, then one straight
+/// pass along each side, across inside the bored ends; the straight walls
+/// at size on the floor. Four readings a walk, none round an end, and the
+/// slot all cut, the cusp between the two bores too.
+#[test]
+fn a_twelve_mill_joins_the_adapters_bored_counterbore_ends_straight() {
+    for along_y in [false, true] {
+        for spindle in ["CW", "CCW"] {
+            let (mut doc, mesh) = adapter_counterbore(along_y);
+            if spindle == "CCW" {
+                let op = &mut doc.setups[0].operations[0];
+                set(&mut op.p, "spindle_rotation", "Counterclockwise (CCW)");
+            }
+            let (setup, before) = bored_first(&doc, &mesh, 8.25, 8.9);
+            let (op, tool) = (&setup.operations[0], &doc.tools[0]);
+            let plan = generate(&setup, op, tool, &mesh).unwrap();
+            let zero = crate::post::datum(&setup, plan.stock, &mesh).unwrap();
+            let slot = Slot::read(op, zero).unwrap();
+            let k = usize::from(along_y);
+            assert!(plan.milling_direction.starts_with("Bored ends joined"));
+            assert_eq!(plan.levels, 18);
+            let kinds: Vec<Kind> = plan.slot_passes.iter().map(|p| p.kind).collect();
+            assert_eq!(kinds.len(), 18 * 2 + 1);
+            for l in 0..18 {
+                assert_eq!(kinds[2 * l], Kind::Sweep);
+                assert_eq!(kinds[2 * l + 1], Kind::Outline { index: 1, of: 1 });
+            }
+            assert_eq!(kinds[36], Kind::Finish);
+            assert!(plan.slot_passes.iter().all(|p| p.joined));
+            let mut next = 0;
+            for p in &plan.slot_passes {
+                assert_eq!(p.moves.start, next, "{:?}", p.kind);
+                next = p.moves.end;
+            }
+            assert_eq!(next, plan.moves.len());
+            for mv in plan.moves.iter().filter(|m| m.motion != Motion::Dwell) {
+                assert_eq!((0..3).filter(|&k| mv.from[k] != mv.to[k]).count(), 1);
+            }
+            // Each walk: out to one side at the far end, along to the near
+            // end's centre, across, back along the other side. Four
+            // readings on the hundredths, none past an end's centre.
+            let (a, b) = (
+                [slot.a[0] - zero[0], slot.a[1] - zero[1]],
+                [slot.b[0] - zero[0], slot.b[1] - zero[1]],
+            );
+            for p in plan.slot_passes.iter().filter(|p| p.kind != Kind::Sweep) {
+                let want = if p.kind == Kind::Finish { 2.25 } else { 2.05 };
+                assert!((p.offset - want).abs() < 1e-4, "{:?} {}", p.kind, p.offset);
+                assert_eq!(p.points.len(), 4, "{:?}", p.points);
+                assert_eq!(p.scallop, 0.);
+                let first = p.points[0][1 - k] - a[1 - k];
+                for (q, (end, side)) in
+                    p.points
+                        .iter()
+                        .zip([(b, first), (a, first), (a, -first), (b, -first)])
+                {
+                    assert!((q[k] - end[k]).abs() < 0.0101, "{q:?} {end:?}");
+                    assert!((q[1 - k] - a[1 - k] - side).abs() < 1e-4, "{q:?}");
+                    assert!((first.abs() - want).abs() < 0.0101, "{first}");
+                    for v in q {
+                        assert!(((v / 0.01).round() * 0.01 - v).abs() < 2e-4, "{v}");
+                    }
+                }
+                // Conventional inside: clockwise with the spindle clockwise.
+                let mut walk = p.points.clone();
+                walk.push(walk[0]);
+                let area: f32 = walk
+                    .windows(2)
+                    .map(|w| w[0][0] * w[1][1] - w[1][0] * w[0][1])
+                    .sum();
+                assert_eq!(area < 0., plan.spindle_clockwise, "{spindle} {along_y}");
+            }
+            // The cutter never past the walls: within R8.25 of the centre line.
+            let reach = (plan.moves.iter())
+                .filter(|m| m.motion == Motion::Feed)
+                .flat_map(|m| [m.from, m.to])
+                .map(|p| off_line([p[0], p[1]], slot.a, slot.b))
+                .fold(0f32, f32::max);
+            assert!(reach <= 2.25 + 1e-5, "{reach}");
+            // The slot all cut: the part has nothing left, the floor and the
+            // cusps between the two bores gone, the walls still there.
+            let stock = run_on(&plan, &setup, &mesh, &before);
+            let docs = vec![setup.clone()];
+            let left = crate::uncut::uncut(&stock, &docs, &mesh);
+            assert!(!left.any(), "{:?}", left.regions);
+            let removed = crate::rest::Removed::new(&stock, Frame::new(&setup, &mesh));
+            let at = |along: f32, across: f32, z: f32| {
+                let mut q = [0., 0., zero[2] + z];
+                q[k] = zero[k] + along;
+                q[1 - k] = zero[1 - k] + across;
+                q
+            };
+            for (along, across) in [(0., 0.), (0., 8.15), (0., -8.15), (1., 8.15), (-1., -8.15)] {
+                for z in [-0.3, -4., -8.85] {
+                    assert!(removed.at(at(along, across, z)), "{along} {across} {z}");
+                }
+            }
+            for (along, across) in [(0., 8.5), (0., -8.5), (11.05, 0.), (-11.05, 0.)] {
+                assert!(!removed.at(at(along, across, -4.)), "{along} {across}");
+            }
+        }
+    }
+}
+/// LIO-550: the ends are open only when the stock shows them bored to the
+/// slot's width and its depth; otherwise, or told to, the Slot cuts them
+/// as before (LIO-455), in DRO steps. Told they are bored, it joins them.
+#[test]
+fn a_slot_joins_only_ends_bored_to_its_width_and_depth_or_as_told() {
+    let (doc, mesh) = adapter_counterbore(false);
+    let tool = &doc.tools[0];
+    let joined = |setup: &Setup, ends: &str| {
+        let mut op = setup.operations[0].clone();
+        set(&mut op.p, "slot_ends", ends);
+        let plan = generate(setup, &op, tool, &mesh).unwrap();
+        let walks = (plan.slot_passes.iter()).filter(|p| p.kind != Kind::Sweep);
+        let straight = walks.clone().all(|p| p.points.len() == 4 && p.joined);
+        let stepped = walks.clone().all(|p| p.points.len() > 10 && !p.joined);
+        assert!(straight != stepped, "{ends}");
+        straight
+    };
+    let auto = crate::slot::ENDS[0];
+    let (cut, told) = (crate::slot::ENDS[1], crate::slot::ENDS[2]);
+    // Bored: joined, unless told to cut the ends.
+    let (bored, _) = bored_first(&doc, &mesh, 8.25, 8.9);
+    assert!(joined(&bored, auto));
+    assert!(joined(&bored, ""));
+    assert!(!joined(&bored, cut));
+    // Bored deeper and wider: still open.
+    let (deeper, _) = bored_first(&doc, &mesh, 8.3, 9.5);
+    assert!(joined(&deeper, auto));
+    // Undersized, too shallow, or nothing before: the ends are cut.
+    for (r, depth) in [(8.0, 8.9), (8.25, 7.)] {
+        let (short, _) = bored_first(&doc, &mesh, r, depth);
+        assert!(!joined(&short, auto), "{r} {depth}");
+    }
+    let fresh = &doc.setups[0];
+    assert!(fresh.preview_remaining.is_none());
+    assert!(!joined(fresh, auto));
+    // Told so, it joins them, whatever the stock shows.
+    assert!(joined(fresh, told));
+    // A slot drill as wide as the slot sweeps one centre line either way.
+    let mut wide = tool.clone();
+    set(&mut wide.p, "diameter", "16.5");
+    for setup in [&bored, fresh] {
+        for ends in crate::slot::ENDS {
+            let mut op = setup.operations[0].clone();
+            set(&mut op.p, "slot_ends", ends);
+            let plan = generate(setup, &op, &wide, &mesh).unwrap();
+            assert!(
+                plan.slot_passes
+                    .iter()
+                    .all(|p| p.kind == Kind::Sweep && !p.joined)
+            );
+        }
+    }
+    // Anything else is refused.
+    let mut bad = doc.setups[0].operations[0].clone();
+    set(&mut bad.p, "slot_ends", "Sometimes");
+    assert!(
+        setting_issues(&bad.p)
+            .iter()
+            .any(|e| e.contains("Round ends"))
+    );
+}

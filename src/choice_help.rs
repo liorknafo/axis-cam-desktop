@@ -201,6 +201,18 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "Clear the selected floors, then cut each hole through them that nothing of the part covers or underlies down to where its walls end, plus Breakthrough. Openings narrower than the cutter are left for a smaller one.",
             "Each opening's walls keep the cutter's radius in their corners, as a pocket's do. The extra depth goes into the stock under the part; modelled vise jaws and clamps are checked, parallels and the table are not.",
         ),
+        ("slot_ends", "As the stock shows") => (
+            "Join the round ends with straight passes when the operations before this one have bored both of them to the slot's width and depth; otherwise walk them as Cut the round ends does.",
+            "The ends count as bored when the stock after the earlier cuts is empty within a hundredth of the slot's radius round each end's centre, from where the material starts down to the slot's floor.",
+        ),
+        ("slot_ends", "Cut the round ends") => (
+            "Walk the whole outline each level, the round ends included: a narrower cutter steps round them on the DRO, leaving at most the scallop between two steps; then the outline at size on the floor.",
+            "",
+        ),
+        ("slot_ends", "Already bored — join only") => (
+            "Only join the round ends: after the centre line, straight passes along each side and across inside the ends; then the straight walls at size. Use it when the ends are bored to the slot's width and depth, also where the plan does not show it.",
+            "Ends that are not bored in the plan's stock stay uncut in the simulation and its UNCUT check.",
+        ),
         ("through", "Yes") => (
             "Extend the drill target below the bottom of each hole that goes through the part by Breakthrough. A selected hole that is blind is refused, since the part goes on under its bottom: set Through to No, or use the diameter filter to drill only the holes that go through.",
             "That extra travel is included in the preview, and modelled vise jaws and clamps are checked as boxes with a clearance gap; the material, parallels or the table underneath are not collision checked.",

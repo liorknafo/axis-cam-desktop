@@ -2582,6 +2582,11 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "",
             Some(Operation(Strategy::Drill)),
         ),
+        (_, "slot_ends") => (
+            "What the Slot does at its round ends. As the stock shows: straight passes join them when earlier cuts bored both to the slot's width and depth; otherwise it cuts them. Cut the round ends: it always walks them. Already bored — join only: it joins them straight even where the plan's stock does not show them bored.",
+            "Joining, the centre line is swept each level, then straight passes along each side at the cutter's offset from the centre line, across inside the bored ends between them; the finish takes the straight walls to size on the floor. A cutter as wide as the slot sweeps the centre line either way.",
+            None,
+        ),
         (_, "breakthrough") => (
             "Additional travel past the exit, in mm: of a hole that goes through, for a drill (never under a blind hole), or of a Pocket's or Adaptive clearing's openings cut through, below where their walls end. The real required distance also depends on drill-point geometry.",
             "",

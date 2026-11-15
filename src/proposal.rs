@@ -277,6 +277,10 @@ pub struct ProposedSlot {
     pub axis: String,
     pub z_top: f32,
     pub z_bottom: f32,
+    /// What it does at its round ends, one of `slot::ENDS` (LIO-550);
+    /// null: as the stock shows.
+    #[serde(default)]
+    pub ends: Option<String>,
 }
 /// A lathe setup's round bar, mm: the part on its axis, its top `free_end`
 /// (null: `FREE_END`) below the bar's free end.
@@ -509,6 +513,7 @@ pub fn schema_full(edit: bool, rotary: bool, hands: Hands) -> Value {
         operation["properties"]["slot"] = json!({"anyOf": [object(json!({
             "x": number(), "y": number(), "length": number(), "width": number(),
             "axis": choice(&["X", "Y"], false), "z_top": number(), "z_bottom": number(),
+            "ends": choice(&crate::slot::ENDS, true),
         })), {"type":"null"}]});
         before_coolant(&mut operation, "slot");
     }
@@ -1487,6 +1492,10 @@ fn operation(
                 set(key, value.to_string());
             }
             set("slot_axis", v.axis);
+            set(
+                "slot_ends",
+                v.ends.unwrap_or_else(|| crate::slot::ENDS[0].into()),
+            );
             set("allowance", p.radial_allowance.unwrap_or(0.).to_string());
             set(
                 "axial_allowance",
@@ -1953,6 +1962,9 @@ fn described(op: &Operation, tools: &[Tool], on: &crate::model::Machine) -> Opti
                 axis: get(&op.p, "slot_axis").into(),
                 z_top: value("z_top")?,
                 z_bottom: value("z_bottom")?,
+                ends: Some(get(&op.p, "slot_ends"))
+                    .filter(|e| !e.is_empty() && *e != crate::slot::ENDS[0])
+                    .map(String::from),
             });
             p.stepdown = value("stepdown");
             p.radial_allowance = value("allowance");
@@ -2096,6 +2108,7 @@ fn merged(base: &Operation, fresh: &Operation, p: &ProposedOp, d: &ProposedOp) -
                 "slot_axis",
                 "z_top",
                 "z_bottom",
+                "slot_ends",
             ],
         ),
         (
@@ -7379,6 +7392,7 @@ mod capsule_tests {
                 axis: "X".into(),
                 z_top: 0.,
                 z_bottom: -2.5,
+                ends: None,
             }),
             rpm: 1600.,
             feed: 150.,
@@ -7431,6 +7445,7 @@ mod capsule_tests {
                 axis: "X".into(),
                 z_top: 0.,
                 z_bottom: -2.5,
+                ends: None,
             }),
             rpm: 1600.,
             feed: 150.,

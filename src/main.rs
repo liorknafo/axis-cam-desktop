@@ -2881,6 +2881,72 @@ impl App {
             }
         }
     }
+    /// A Drill `id` whose picks changed (LIO-553): its first picks, holes
+    /// that all go through the part, drill through, the tip out past the
+    /// exit by the drill's point and 1 mm; a blind hole picked while it
+    /// goes through makes it stop at the holes' bottoms, where through is
+    /// refused. Only a drill drilling: the other cycles and tools keep it.
+    fn drill_through_default(&mut self, id: &str, first: bool) {
+        let Some(mesh) = self.part_mesh() else {
+            return;
+        };
+        let Some(o) = self.operation().filter(|o| {
+            o.id == id
+                && o.strategy == Strategy::Drill
+                && !o.drills_pin_holes()
+                && ["Drilling", "Chip breaking", "Deep drilling"].contains(&get(&o.p, "cycle"))
+        }) else {
+            return;
+        };
+        let tool = self.doc.tools.iter().find(|t| t.id == o.tool);
+        if tool.is_some_and(|t| get(&t.p, "type") != "Drill") {
+            return;
+        }
+        let holes = self.drill_holes(o, mesh);
+        let Ok(holes) = holes.as_ref() else {
+            return;
+        };
+        if holes.is_empty() {
+            return;
+        }
+        let all = holes.iter().all(|h| h.through);
+        let yes = get(&o.p, "through") == "Yes";
+        let diameter = (tool.and_then(|t| num(&t.p, "diameter")))
+            .filter(|d| *d > 0.)
+            .unwrap_or_else(|| holes.iter().map(|h| h.diameter).fold(0., f32::max));
+        let set = if all && first && !yes {
+            // The 118° point's length, and a millimetre, to the tenth up.
+            let past = diameter / 2. * simulation::POINT_RISE + 1.;
+            let past = ((past * 10.) - 1e-3).ceil() / 10.;
+            Some(("Yes", Some(past)))
+        } else if !all && yes {
+            Some(("No", None))
+        } else {
+            None
+        };
+        let Some((through, past)) = set else {
+            return;
+        };
+        if let Some(o) = self.operation_mut() {
+            o.p.insert("through".into(), through.into());
+            if let Some(past) = past {
+                o.p.insert("breakthrough".into(), crate::envelope::mm(past));
+            }
+        }
+        self.touch();
+        let said = match past {
+            Some(past) => format!(
+                "The holes go through the part: Drill tip through bottom Yes, Breakthrough {} mm (the drill's point and 1 mm).",
+                crate::envelope::mm(past)
+            ),
+            None => "A hole picked is blind: Drill tip through bottom set to No, its drill stops at each hole's bottom.".into(),
+        };
+        self.status = if self.status.is_empty() {
+            said
+        } else {
+            format!("{} {said}", self.status)
+        };
+    }
     /// Whether the active setup is on a hand machine (the manual mill or
     /// the lathe): no program, its way to the machine is Steps (LIO-423).
     pub fn on_hand(&self) -> bool {
@@ -6222,6 +6288,8 @@ impl App {
                 .is_some_and(|o| ids(&o.surfaces) != ids(&was));
             if changed {
                 self.doc.pick_checks.remove(&id);
+                let first = was.as_ref().is_none_or(|s| s.ids.is_empty());
+                self.drill_through_default(&id, first);
             }
         }
         // Batched only when it starts one: a batch is never an empty task.

@@ -647,8 +647,8 @@ pub(crate) fn measures(
             });
             // A narrower cutter stepped the round ends (LIO-455): their
             // radius, and the most the steps leave, listed.
-            if let Some(f) =
-                (d.plan.slot_passes.iter()).find(|p| p.kind == crate::slot::Kind::Finish)
+            if let Some(f) = (d.plan.slot_passes.iter())
+                .find(|p| p.kind == crate::slot::Kind::Finish && !p.joined)
             {
                 let at = [slot.b[0], slot.b[1], row];
                 out.push(Measure {
@@ -5616,6 +5616,9 @@ struct SlotDetail {
     tool: f32,
     path: Vec<[f32; 2]>,
     at: Option<[f32; 2]>,
+    /// The round ends were bored before (LIO-550): what the pass leaves is
+    /// on the straight walls only.
+    joined: bool,
 }
 impl SlotDetail {
     /// The capsule `r` about the segment `a`–`b`, as points round it.
@@ -5669,8 +5672,17 @@ impl SlotDetail {
         let slot = outline(r);
         f.fill(&slot, Color::WHITE);
         f.stroke(&slot, stroke(INK, 1.5));
-        // What the pass leaves on the walls.
-        if self.left > 0.001 && self.left < r {
+        // What the pass leaves on the walls: on the straight ones only when
+        // the round ends were bored.
+        if self.left > 0.001 && self.left < r && self.joined {
+            let k = usize::from((self.b[1] - self.a[1]).abs() > (self.b[0] - self.a[0]).abs());
+            for side in [-1., 1.] {
+                let (mut u, mut v) = (self.a, self.b);
+                u[1 - k] += side * (r - self.left);
+                v[1 - k] += side * (r - self.left);
+                f.stroke(&canvas::Path::line(p(u), p(v)), dashed(MUTED, 1.2));
+            }
+        } else if self.left > 0.001 && self.left < r {
             f.stroke(&outline(r - self.left), dashed(MUTED, 1.2));
         }
         // The ends' centres and radius.
@@ -5684,7 +5696,11 @@ impl SlotDetail {
         let (at, down) = (p(label), iced::Vector::new(0., 6.));
         (caption.0).put(
             f,
-            format!("R{}", mm(r)),
+            if self.joined {
+                format!("R{} bored", mm(r))
+            } else {
+                format!("R{}", mm(r))
+            },
             &[(at, Align::Center)],
             down,
             INK,
@@ -5765,6 +5781,7 @@ fn slot_screen<'a>(
         points,
         radius,
         tool,
+        joined,
     } = step
     else {
         unreachable!()
@@ -5830,7 +5847,9 @@ fn slot_screen<'a>(
             if let Some(from) = from {
                 value = format!("{} {value}", arrows[t.axis][usize::from(t.centre > from)]);
             }
-            if Some(&i) == feeds.first() && !matches!(pass, Kind::Finish) {
+            if *joined && Some(&i) == feeds.first() {
+                "out to the side, inside the bored end".to_string()
+            } else if Some(&i) == feeds.first() && !matches!(pass, Kind::Finish) {
                 "out to the end's tip".to_string()
             } else if matches!(pass, Kind::Finish) && Some(&i) == feeds.last() {
                 "back to the centre, off the wall".to_string()
@@ -5838,6 +5857,8 @@ fn slot_screen<'a>(
                 "out to the end's tip".to_string()
             } else if side(i) {
                 "straight side".to_string()
+            } else if *joined {
+                "across inside the bored end".to_string()
             } else {
                 step_no += 1;
                 format!("step {step_no} of {steps_total}")
@@ -5873,6 +5894,19 @@ fn slot_screen<'a>(
         _ => true,
     };
     let what = match pass {
+        Kind::Outline { index: i, of: n } if *joined && i < n => format!(
+            "Level {level} of {levels}: straight along each side between the bored ends, the tool's centre {} mm off the centre line ({i} of {n} passes).",
+            mm(*offset)
+        ),
+        Kind::Outline { .. } if *joined => format!(
+            "Level {level} of {levels}: straight along each side between the bored ends, {} mm left on the walls for the finish.",
+            mm(*left)
+        ),
+        Kind::Finish if *joined => format!(
+            "Finish the straight walls at size on the floor: the cutter's side takes the last {} mm off each side, from one bored end to the other. The round ends are the boring's R{}: nothing is stepped round them.",
+            mm(crate::slot::FINISH.min(*offset)),
+            mm(*radius),
+        ),
         Kind::Sweep if narrow => format!(
             "Level {level} of {levels}: clear the middle along the centre line, X {} Y {} → X {} Y {}.",
             dro(a[0]),
@@ -5923,7 +5957,18 @@ fn slot_screen<'a>(
         right = right
             .push(muted(format!("Material starts at Z {}.", dro(*top))).size(13))
             .push(muted(if *entry_clear {"Entry was proven clear for the full diameter to final depth."} else if narrow {"Use the confirmed center-cutting end mill. Feed down at 25% cutting feed."} else {"Use the confirmed center-cutting slot drill. Feed down at 25% cutting feed; clear chips at each return."}).size(13))
-            .push(muted(format!("{} {}", if narrow && walk_follows {"Feed along the centre line in the indicated direction, the backlash taken up and the other axes locked. Stay down at the far end: the walk round the slot follows at this level."} else if narrow {"Feed along the centre line in the indicated direction, the backlash taken up and the other axes locked. Lift at the far end: the outline is walked once, at size, after the last level."} else {"Feed the slot in the indicated direction. Take up backlash before feeding and lock the other axes. Lift before returning to the entry."}, verify)).size(13));
+            .push(muted(format!("{} {}", if narrow && walk_follows && *joined {"Feed along the centre line in the indicated direction, the backlash taken up and the other axes locked. Stay down at the far end: the straight passes along the sides follow at this level."} else if narrow && *joined {"Feed along the centre line in the indicated direction, the backlash taken up and the other axes locked. Lift at the far end: the straight walls are finished once, at size, after the last level."} else if narrow && walk_follows {"Feed along the centre line in the indicated direction, the backlash taken up and the other axes locked. Stay down at the far end: the walk round the slot follows at this level."} else if narrow {"Feed along the centre line in the indicated direction, the backlash taken up and the other axes locked. Lift at the far end: the outline is walked once, at size, after the last level."} else {"Feed the slot in the indicated direction. Take up backlash before feeding and lock the other axes. Lift before returning to the entry."}, verify)).size(13));
+    } else if *joined {
+        right = right.push(
+            muted(format!(
+                "Join the bored ends {}: from the end at X {} Y {} out to the side, straight along it to the other end's centre, across inside that bored end, and straight back along the other side. Conventional with the spindle {}. Come to every number the way its arrow points, past the backlash, and keep the quill locked.",
+                if clockwise { "clockwise" } else { "counter-clockwise" },
+                dro(b[0]),
+                dro(b[1]),
+                if clockwise { "clockwise (M3)" } else { "counter-clockwise (M4)" },
+            ))
+            .size(13),
+        );
     } else {
         // Each end's text, and where its last step leaves the tool.
         let ends: Vec<(String, [f32; 2])> = [*b, *a]
@@ -5996,6 +6041,7 @@ fn slot_screen<'a>(
             tool: *tool,
             path,
             at: (now[0].is_finite() && now[1].is_finite()).then_some([now[0], now[1]]),
+            joined: *joined,
         })
         .width(Fill)
         .height(FillPortion(3));
@@ -6019,6 +6065,11 @@ fn slot_screen<'a>(
     (
         "Slot".into(),
         match pass {
+            Kind::Sweep if narrow && *joined => {
+                "the centre line, then the straight sides, a pass a screen"
+            }
+            Kind::Outline { .. } if *joined => "straight between the bored ends, a pass a screen",
+            Kind::Finish if *joined => "the straight walls at size, full depth",
             Kind::Sweep if narrow => "the centre line, then round it, a pass a screen",
             Kind::Sweep => "one straight cutter-centre sweep per depth",
             Kind::Outline { .. } => "round the slot, a pass a screen",
@@ -8377,6 +8428,117 @@ pub(crate) mod tests {
                 assert!(said, "{c:?} r {r}: {or}");
             }
         }
+    }
+    /// LIO-550: a Slot whose round ends are bored only joins them, and its
+    /// pages say so: a level's walk is four straight readings (out to the
+    /// side inside the bored end, along it, across, back along the other
+    /// side), the finish the straight walls at size; nothing steps round an
+    /// end, nor offers the DRO's arc function.
+    #[test]
+    fn a_slot_joining_bored_ends_reads_as_a_few_straight_moves() {
+        let mesh = crate::mesh::normalize(crate::slot::tests::counterbore(
+            (60., 50., 20.),
+            21.5,
+            16.5,
+            2.,
+            false,
+        ))
+        .unwrap();
+        let mut doc = crate::slot::tests::job(
+            &mesh,
+            "12",
+            &[
+                ("slot_width", "16.5"),
+                ("slot_length", "21.5"),
+                ("z_top", "0"),
+                ("z_bottom", "-2"),
+                ("through", "No"),
+                ("stepdown", "1"),
+                ("slot_ends", crate::slot::ENDS[2]),
+            ],
+        );
+        doc.active = doc.setups[0].id.clone();
+        doc.file = Some(crate::model::ModelFile {
+            name: "counterbore.stl".into(),
+            path: std::path::PathBuf::from("counterbore.stl"),
+            format: "stl".into(),
+            bytes: 1,
+            thickness: None,
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        a.doc = doc;
+        a.imported_mesh = Some(mesh);
+        a.page = crate::Page::Control;
+        build(&mut a);
+        let guide = a.guide_at().unwrap().0.guide.clone();
+        let id = a.doc.setups[0].id.clone();
+        let slots: Vec<usize> = (guide.steps.iter().enumerate())
+            .filter_map(|(i, s)| matches!(s, Step::Slot { .. }).then_some(i))
+            .collect();
+        // Two levels, each the centre line and one walk; then the finish.
+        assert_eq!(slots.len(), 5);
+        let mut seen = [false; 3];
+        for &at in &slots {
+            let Step::Slot {
+                pass,
+                targets,
+                joined,
+                ..
+            } = &guide.steps[at]
+            else {
+                panic!()
+            };
+            assert!(joined);
+            let xy = targets.iter().filter(|t| t.axis < 2 && t.feed).count();
+            a.doc.guide.insert(id.clone(), at);
+            a.guide_item = 0;
+            let t = texts(&a);
+            let has = |w: &str| t.iter().any(|s| s.contains(w));
+            assert!(!has("step 1 of"), "{t:?}");
+            assert!(!has("arc function"), "{t:?}");
+            assert!(!has("end's tip"), "{t:?}");
+            match pass {
+                crate::slot::Kind::Sweep => {
+                    seen[0] = true;
+                    assert_eq!(xy, 1);
+                    assert!(has("the straight passes along the sides follow"), "{t:?}");
+                }
+                crate::slot::Kind::Outline { .. } => {
+                    seen[1] = true;
+                    assert_eq!(xy, 4, "{targets:?}");
+                    for w in [
+                        "straight along each side between the bored ends",
+                        "Join the bored ends clockwise",
+                        "out to the side, inside the bored end",
+                        "straight side",
+                        "across inside the bored end",
+                        "straight between the bored ends, a pass a screen",
+                    ] {
+                        assert!(has(w), "{w}: {t:?}");
+                    }
+                }
+                crate::slot::Kind::Finish => {
+                    seen[2] = true;
+                    // Out, along, across, along, back to the centre.
+                    assert_eq!(xy, 5, "{targets:?}");
+                    for w in [
+                        "Finish the straight walls at size on the floor",
+                        "nothing is stepped round them",
+                        "back to the centre, off the wall",
+                        "the straight walls at size, full depth",
+                    ] {
+                        assert!(has(w), "{w}: {t:?}");
+                    }
+                }
+            }
+        }
+        assert_eq!(seen, [true; 3]);
+        // The Check lists no stepped round ends to gauge.
+        let shown = a.guide_at().unwrap().0;
+        let top = shown.boxes[0].max[2] + guide.zero[2];
+        let m = measures(&a.doc, &guide, &guide.done[0], top);
+        assert!(m.iter().all(|x| x.axis != "R"), "{m:?}");
     }
     /// LIO-488 review: when the last hole is the work zero itself, both
     /// readings are 0.00 in either mode, and the screen says so.

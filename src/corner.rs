@@ -193,7 +193,7 @@ fn outward(v: f64, c: f64) -> f64 {
 /// `c` (LIO-455): a point so rounded inside a round about `c` stays inside
 /// it. When no hundredth is that near `c` (`c` itself off the hundredths
 /// and `v` all but on it), the hundredth nearest `c`.
-fn inward(v: f64, c: f64) -> f64 {
+pub(crate) fn inward(v: f64, c: f64) -> f64 {
     // Single precision sizes are a few millionths off their hundredths:
     // 2.05 mm is 2.0499999 as given. Within `SLACK` they count as on them.
     const SLACK: f64 = 2e-5;

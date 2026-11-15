@@ -1,7 +1,10 @@
 //! Manual round-ended slots. A flat slot drill as wide as the slot sweeps
 //! one straight centre line; a narrower one (LIO-455) sweeps the centre
 //! line, steps out round it and walks the outline, its round ends in DRO
-//! steps as a Round corners walks, then finishes the outline at size. The
+//! steps as a Round corners walks, then finishes the outline at size. When
+//! both round ends are already bored to the slot's width (LIO-550), it only
+//! joins them: the centre line, then straight passes along each side and
+//! across inside the bored ends, the straight walls finished at size. The
 //! same Plan drives stock, holding and the operator's Steps.
 use crate::{
     cam::{self, Builder, Geometry, number},
@@ -11,8 +14,16 @@ use crate::{
     surface::Selection,
 };
 
-pub const HELP: &str = "Cut a round-ended counterbore or through slot on the manual mill. A narrower end mill than the slot also walks its outline, the ends in DRO steps. Pick its floor or rounded end, then check the sizes and depths. Tool centres move along X or Y; DRO comp off.";
-pub const DEFAULTS: [(&str, &str); 15] = [
+pub const HELP: &str = "Cut a round-ended counterbore or through slot on the manual mill. A narrower end mill walks its outline, the ends in DRO steps, or only joins ends already bored to width. Pick its floor or rounded end, then check the sizes and depths. Moves along X or Y; DRO comp off.";
+/// What the Slot does at its round ends (LIO-550): as the stock before it
+/// shows (joined only when earlier cuts bored both ends to the slot's
+/// width and depth), cut them, or join ends the user says are bored.
+pub const ENDS: [&str; 3] = [
+    "As the stock shows",
+    "Cut the round ends",
+    "Already bored — join only",
+];
+pub const DEFAULTS: [(&str, &str); 16] = [
     ("slot_x", "0"),
     ("slot_y", "0"),
     ("slot_length", "18"),
@@ -26,6 +37,7 @@ pub const DEFAULTS: [(&str, &str); 15] = [
     ("axial_allowance", "0"),
     ("stepdown", "0.5"),
     ("scallop", "0.05"),
+    ("slot_ends", ENDS[0]),
     ("rpm", "640"),
     ("feed", "120"),
 ];
@@ -71,6 +83,10 @@ pub struct Pass {
     pub points: Vec<[f32; 2]>,
     /// Its moves in the plan.
     pub moves: std::ops::Range<usize>,
+    /// Both round ends were already open to the slot's width (LIO-550): a
+    /// walk only joins them, straight along each side and across inside
+    /// the bored ends, and the finish takes the straight walls to size.
+    pub joined: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +170,10 @@ pub fn setting_issues(p: &Fields) -> Vec<String> {
     if !["Yes", "No"].contains(&get(p, "through")) {
         e.push("Choose blind or through for the slot.".into());
     }
+    let ends = get(p, "slot_ends");
+    if !ends.is_empty() && !ENDS.contains(&ends) {
+        e.push(format!("Round ends is one of: {}.", ENDS.join(", ")));
+    }
     e
 }
 
@@ -195,6 +215,57 @@ fn outline(
         points.reverse();
     }
     Ok((points, most))
+}
+
+/// The tool centre's walk joining two round ends already bored to the
+/// slot's width (LIO-550), `offset` out from the centre line `a`–`b` along
+/// `axis` (work coordinates, mm): from the far end `b` out to one side,
+/// straight along it to `a`, across inside `a`'s bored end and straight
+/// back along the other side to `b`. That is clockwise seen from above
+/// (conventional with the spindle clockwise; `clockwise` false the other
+/// way). Every reading on the hundredths, toward the centre line and
+/// between the ends' centres, so that none cuts past a wall.
+fn sides(a: [f64; 2], b: [f64; 2], axis: usize, offset: f64, clockwise: bool) -> Vec<[f64; 2]> {
+    let across = 1 - axis;
+    let middle = (a[axis] + b[axis]) / 2.;
+    // Clockwise round the inside, the side walked from `b` to `a` is the
+    // one at −Y of a slot along X, at +X of one along Y.
+    let first = if (axis == 0) == clockwise { -1. } else { 1. };
+    let at = |c: [f64; 2], side: f64| {
+        let mut p = [0.; 2];
+        p[axis] = crate::corner::inward(c[axis], middle);
+        p[across] = crate::corner::inward(c[across] + side * offset, c[across]);
+        p
+    };
+    vec![at(b, first), at(a, first), at(a, -first), at(b, -first)]
+}
+/// Whether the Slot only joins its round ends (LIO-550): the user says
+/// they are bored, or, as the stock shows, earlier cuts emptied the round
+/// `half` about each end's centre from `top` down to `target`. A hundredth
+/// is spared on the radius and the depth: a boring head set to the slot's
+/// width leaves its wall there exactly.
+fn joins(
+    setup: &Setup,
+    op: &Operation,
+    b: &Builder,
+    slot: &Slot,
+    half: f32,
+    top: f32,
+    target: f32,
+) -> bool {
+    match get(&op.p, "slot_ends") {
+        e if e == ENDS[1] => false,
+        e if e == ENDS[2] => true,
+        _ => {
+            let spare = crate::corner::READ as f32;
+            let r = half - spare;
+            let bottom = (target + spare).min(top);
+            setup.preview_remaining.is_some()
+                && [slot.a, slot.b]
+                    .iter()
+                    .all(|c| cam::bored(setup, b, *c, r, top, bottom))
+        }
+    }
 }
 
 pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
@@ -309,6 +380,25 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     // (at most `STEP_OVER` of the diameter out) overlaps it and the floor
     // between them is cut.
     let coarse = (0.1 * f64::from(rc)).min(0.1);
+    // Both ends already bored to the width (LIO-550): the walks only join
+    // them, straight, and nothing is stepped round an end.
+    let joined = !matching && joins(setup, op, &b, &slot, half, top, target);
+    let walk = |left: f32, scallop: f64| {
+        if joined {
+            Ok((sides(aw, bw, axis, f64::from(reach - left), clockwise), 0.))
+        } else {
+            outline(
+                aw,
+                bw,
+                axis,
+                f64::from(half),
+                f64::from(rc),
+                f64::from(left),
+                scallop,
+                clockwise,
+            )
+        }
+    };
     let mut walks: Vec<(f32, f32, Vec<[f64; 2]>, f64)> = vec![];
     let mut finish = None;
     if !matching {
@@ -318,29 +408,11 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
             for i in 1..=n {
                 let offset = rough * i as f32 / n as f32;
                 let left = reach - offset;
-                let (points, most) = outline(
-                    aw,
-                    bw,
-                    axis,
-                    f64::from(half),
-                    f64::from(rc),
-                    f64::from(left),
-                    coarse,
-                    clockwise,
-                )?;
+                let (points, most) = walk(left, coarse)?;
                 walks.push((offset, left, points, most));
             }
         }
-        finish = Some(outline(
-            aw,
-            bw,
-            axis,
-            f64::from(half),
-            f64::from(rc),
-            0.,
-            fine,
-            clockwise,
-        )?);
+        finish = Some(walk(0., fine)?);
     }
     let world = |p: [f64; 2]| [p[0] as f32 + zero[0], p[1] as f32 + zero[1]];
     let shown = |p: &[[f64; 2]]| p.iter().map(|p| [p[0] as f32, p[1] as f32]).collect();
@@ -385,6 +457,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
                 scallop: *most as f32,
                 points: shown(points),
                 moves: start..b.plan.moves.len(),
+                joined,
             });
         }
         b.push(
@@ -417,6 +490,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
                     [slot.b[0] - zero[0], slot.b[1] - zero[1]],
                 ],
                 moves: first..end,
+                joined,
             },
         );
     }
@@ -453,6 +527,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
             scallop: *most as f32,
             points: shown(points),
             moves: start..b.plan.moves.len(),
+            joined,
         });
     }
     b.push(
@@ -484,6 +559,10 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     b.plan.levels = count;
     b.plan.milling_direction = if matching {
         "Full-width slot · feed in one direction"
+    } else if joined && clockwise {
+        "Bored ends joined: centre sweep, then straight sides clockwise · conventional"
+    } else if joined {
+        "Bored ends joined: centre sweep, then straight sides counter-clockwise · conventional"
     } else if clockwise {
         "Centre sweep, then outlines clockwise · conventional"
     } else {

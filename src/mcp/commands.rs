@@ -4921,6 +4921,120 @@ pub(crate) mod tests {
         r["outcome"].as_str().unwrap_or_default()
     }
 
+    /// A hand Drill on the manual mill over `tris`, with a Ø`diameter`
+    /// drill, its one operation selected and nothing picked (LIO-553).
+    fn hand_drilling(tris: Vec<[[f32; 3]; 3]>, diameter: &str) -> Direct {
+        use crate::model::{ModelFile, Operation, Strategy, Tool};
+        let mut d = direct();
+        let mesh = crate::mesh::normalize(tris).unwrap();
+        let machine = crate::manual::defaults();
+        let mut drill = Tool::new(&format!("Drill {diameter}"), "Drill", diameter);
+        drill.set_type("Drill");
+        for (k, v) in [("length", "40"), ("stickout", "60")] {
+            drill.p.insert(k.into(), v.into());
+        }
+        drill.p.insert("machines".into(), machine.id.clone());
+        let mut doc = d.app.doc.clone();
+        doc.machines.push(machine.clone());
+        doc.tools.push(drill.clone());
+        doc.add_manual_setup().unwrap();
+        doc.setups[0].operations = vec![Operation::for_machine(
+            Strategy::Drill,
+            drill.id.clone(),
+            &machine,
+        )];
+        doc.active = doc.setups[0].id.clone();
+        doc.file = Some(ModelFile {
+            name: "part.stl".into(),
+            path: "part.stl".into(),
+            format: "stl".into(),
+            bytes: 1,
+            thickness: None,
+        });
+        d.app.replace_document(doc, None);
+        d.app.imported_mesh = Some(mesh);
+        d.app.selected = Some(0);
+        d.app.page = Page::Work;
+        d
+    }
+    /// A wall of the round hole of radius `r` round `x`, `y` from the
+    /// part's middle, as the setup holds it.
+    fn hole_wall(d: &Direct, x: f32, y: f32, r: f32) -> usize {
+        let mesh = d.app.imported_mesh.as_ref().unwrap();
+        let setup = d.app.doc.setup();
+        let placement = crate::stock::Placement::new(mesh, Some(setup));
+        let scale = mesh.display_scale();
+        let b = placement.bounds;
+        let mid = [0, 1].map(|k| (b.min[k] + b.max[k]) / 2. / scale);
+        (0..mesh.surfaces.len())
+            .find(|&id| {
+                let c = placement
+                    .transform(mesh.surfaces[id].center)
+                    .map(|v| v / scale);
+                crate::pocket::is_wall(setup, mesh, id)
+                    && (c[0] - mid[0] - x).hypot(c[1] - mid[1] - y) <= r + 0.01
+            })
+            .unwrap()
+    }
+    /// LIO-553: a hand Drill says whether its tip goes out under a hole that
+    /// goes through the part, and how far, in its editor and to `edit_field`;
+    /// a pick of holes that all go through makes it go through, past by the
+    /// drill's point and a millimetre, and a blind one picked keeps it from it.
+    #[test]
+    fn a_hand_drill_goes_through_the_holes_that_go_through() {
+        let mut d = hand_drilling(crate::cam::boring::tests::ring_triangles(8., 40., 10.), "8");
+        assert!(crate::manual::is_hand(&d.app.doc.setup().machine));
+        let op = |d: &Direct, k: &str| {
+            crate::model::get(&d.app.doc.setup().operations[0].p, k).to_string()
+        };
+        assert_eq!(op(&d, "through"), "No");
+        let listed = |d: &mut Direct| -> Vec<String> {
+            let found = fields::of(&mut d.app, &json!({"target": "operation"})).unwrap();
+            found.iter().map(|f| f.key.to_string()).collect()
+        };
+        let keys = listed(&mut d);
+        assert!(keys.contains(&"through".into()), "{keys:?}");
+        assert!(!keys.contains(&"breakthrough".into()), "{keys:?}");
+        for (key, value) in [("through", "Yes"), ("breakthrough", "2.5")] {
+            let args = json!({"target": "operation", "key": key, "value": value});
+            let r = run(&mut d, "edit_field", args).unwrap();
+            assert_eq!(outcome(&r), "done", "{key}: {r}");
+            assert_eq!(op(&d, key), value);
+        }
+        assert!(listed(&mut d).contains(&"breakthrough".into()));
+        let args = json!({"target": "operation", "key": "through", "value": "No"});
+        assert_eq!(outcome(&run(&mut d, "edit_field", args).unwrap()), "done");
+        // Picked, the Ø8 hole through the ring: through, 2.4 mm of point
+        // and 1 mm past the exit, to the tenth up.
+        let wall = hole_wall(&d, 0., 0., 4.);
+        let _ = d.app.update(Message::Surface(wall));
+        assert_eq!(op(&d, "through"), "Yes", "{}", d.app.status);
+        assert_eq!(op(&d, "breakthrough"), "3.5");
+        assert!(
+            d.app.status.contains("Breakthrough 3.5 mm"),
+            "{}",
+            d.app.status
+        );
+        // Its plan takes the drill's tip 3.5 mm under the part's underside.
+        let _ = d.app.update(Message::Generate);
+        let sim = d.app.active_simulation().expect(&d.app.status);
+        let mesh = d.app.imported_mesh.as_ref().unwrap();
+        let placement = crate::stock::Placement::new(mesh, Some(d.app.doc.setup()));
+        let under = placement.bounds.min[2] / mesh.display_scale();
+        let low = (sim.plan.moves.iter())
+            .map(|m| m.to[2])
+            .fold(f32::INFINITY, f32::min);
+        assert!((low - (under - 3.5)).abs() < 0.01, "{low} {under}");
+        // A blind hole picked: it stops at the bottom, where through is refused.
+        let mut d = hand_drilling(crate::pocket::hole_plate(false), "6");
+        let args = json!({"target": "operation", "key": "through", "value": "Yes"});
+        assert_eq!(outcome(&run(&mut d, "edit_field", args).unwrap()), "done");
+        let wall = hole_wall(&d, -10., 0., 3.);
+        let _ = d.app.update(Message::Surface(wall));
+        assert_eq!(op(&d, "through"), "No", "{}", d.app.status);
+        assert!(d.app.status.contains("blind"), "{}", d.app.status);
+    }
+
     #[test]
     fn outcomes_say_what_happened() {
         let mut d = direct();
