@@ -268,6 +268,11 @@ pub const CONTROLLER_TAKING: &str =
 /// (`Connection::declaring_machine`).
 pub const DECLARING: &str = "The machine position is being set, axis by axis: wait for it.";
 
+/// Why a run that starts partway cannot touch off or probe its work zero
+/// when the check did not work out the stock its start leaves.
+pub const PARTWAY_UNKNOWN: &str =
+    "The check did not work out the stock the start leaves: check the setup again.";
+
 /// A setup being run on the connected machine, tool run by tool run.
 pub struct Run {
     pub setup: usize,
@@ -2116,6 +2121,49 @@ impl Run {
         self.checked().is_some() && (self.at_step().is_some() || !self.started() && early)
     }
 
+    /// Where the operator touches off its setup, in plan mm, and the work
+    /// position that is there (`post::touch_point` less the datum). None
+    /// when it is not on the stock top: a Model origin whose stock top an
+    /// earlier setup cut. A run that starts partway touches off on the
+    /// surface the operations before it leave there, when the check knows
+    /// it (`partly`), and is None when not (`partway_blocked`).
+    pub fn touch_off(&self) -> Option<([f32; 3], [f64; 3])> {
+        let p = self.checked()?.first()?;
+        if p.located.is_some_and(|(_, top)| top.is_none()) {
+            return None;
+        }
+        let mut at = crate::post::touch_point(&p.origin, p.stock)?;
+        if self.partway() {
+            at[2] = self.partly()?.surface?;
+        }
+        Some((at, std::array::from_fn(|a| (at[a] - p.datum[a]) as f64)))
+    }
+
+    /// Why Zero Z on the stock top and Probe Z cannot set the work Z of a
+    /// run that starts partway (`partway`): the check cannot tell the
+    /// surface the operations before its start leave where the stock top
+    /// is touched off. None when it can, or the run starts at the setup's
+    /// first operation.
+    pub fn partway_blocked(&self) -> Option<String> {
+        if !self.partway() {
+            return None;
+        }
+        let Some(partly) = self.partly() else {
+            return Some(PARTWAY_UNKNOWN.into());
+        };
+        if partly.surface.is_some() {
+            return None;
+        }
+        Some(if partly.cut.is_empty() {
+            "The check cannot tell the surface the operations before the start leave where the stock top is touched off.".into()
+        } else {
+            format!(
+                "The operations before the start cut the stock's {}, and the check cannot tell the surface they left where the stock top is touched off.",
+                partly.cut.join(", ")
+            )
+        })
+    }
+
     /// The start at a step Cycle Start starts at (`start_step`), while its
     /// operation is the start: the operation (index in the setup) and step.
     pub fn at_step(&self) -> Option<(usize, usize)> {
@@ -3866,6 +3914,11 @@ pub struct TabletRun {
     /// file from before them has none.
     #[serde(default)]
     pub step_starts: Vec<TabletStepStart>,
+    /// For a later tool run, started at its first operation with the tool
+    /// runs before taken as cut: its work zero on the stock they left
+    /// (LIO-548). Null for the first tool run, and in a file from before.
+    #[serde(default)]
+    pub zero: Option<TabletZero>,
 }
 
 /// A tool run started at one of its operations after the first, as Cycle
@@ -3890,6 +3943,10 @@ pub struct TabletOpStart {
     /// As `TabletRun::way_out`.
     #[serde(default)]
     pub way_out: Option<u32>,
+    /// Its work zero on the stock the operations before it left (LIO-548);
+    /// null when it cannot start there, and in a file from before.
+    #[serde(default)]
+    pub zero: Option<TabletZero>,
 }
 
 /// A tool run started at a step of one of its operations after the step's
@@ -3926,6 +3983,48 @@ pub struct TabletStepStart {
     pub wait: String,
     /// As `TabletRun::way_out`.
     pub way_out: Option<u32>,
+}
+
+/// The work zero of a start partway through a setup (`Run::partway`) on
+/// the stock the operations before it left, as the Work zero tab guides
+/// it: X and Y stay those they were cut with, and the tool tip touched off
+/// at the stock top's touch-off spot sets Z (`Run::touch_off`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabletZero {
+    /// The work Z the touch-off at `spot` sets: the height of the surface
+    /// they left there. Null when the check cannot tell it (`blocked`).
+    pub set_z: Option<f64>,
+    /// Why the touch-off cannot set Z, as the Work zero tab says
+    /// (`Run::partway_blocked`); null when it can.
+    pub blocked: Option<String>,
+    /// What of the stock the work zero is found on they cut ("top"): empty
+    /// when they left it as the setup's first operation finds it
+    /// (`Partly::cut`).
+    pub cut: Vec<String>,
+    /// They cut below the stock top somewhere over it: a touch plate laid
+    /// on the top may not lie at a height the check knows.
+    pub top_cut: bool,
+    /// The stock top's work Z before the setup's first operation.
+    pub top: f64,
+    /// Where on the stock top the tool tip touches off, in the computer's
+    /// words for the machine's orientation: "the front-left corner", "the
+    /// centre". Null when the work zero is not on the stock.
+    pub spot: Option<String>,
+    /// The stock-top spots a probe finds the work zero from on the stock
+    /// they left, each with why it cannot (`Partly::probe_from`).
+    pub probe_from: Vec<TabletSpot>,
+}
+
+/// A stock-top spot a probe starts from: X and Y each on the stock's −
+/// side, its middle or its + side.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabletSpot {
+    pub x: crate::post::At,
+    pub y: crate::post::At,
+    /// Why a probe cannot find the work zero from there; null when it can.
+    pub problem: Option<String>,
 }
 
 /// Where a tool run on a setup in the chuck starts from: the tool at the
@@ -4048,9 +4147,18 @@ pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> Tabl
         }
     };
     let (programs, left) = check(doc, mesh, si);
+    let left = Arc::new(left);
     let mut run = Run::new(doc, si, 0);
-    run.checked_as(Arc::new(programs), Some(Arc::new(left)), None);
+    run.checked_as(Arc::new(programs), Some(left.clone()), None);
     let all = run.programs.clone().expect("checked");
+    // Each start's work zero as the Run panel finds it started there.
+    let mut started = Run::new(doc, si, 0);
+    started.checked_as(all.clone(), Some(left), None);
+    let orient = crate::orient::Orient::of(&setup.machine);
+    let mut zero = |i: usize, k: usize| {
+        started.start_at(i, k);
+        tablet_zero(&started, orient)
+    };
     let programs = match all.as_ref() {
         Ok(p) => p,
         Err(why) => {
@@ -4086,9 +4194,9 @@ pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> Tabl
                     Some(_) => Err(vec![CHUCK_STARTS.to_string()]),
                     None => tablet_job_from(&mut run, p, i, k),
                 };
-                let (actions, steps, at_lift, problems) = match job {
-                    Ok((a, s, l)) => (a, s, l, vec![]),
-                    Err(why) => (vec![], vec![], lift, why),
+                let (actions, steps, at_lift, problems, zero) = match job {
+                    Ok((a, s, l)) => (a, s, l, vec![], zero(i, k)),
+                    Err(why) => (vec![], vec![], lift, why, None),
                 };
                 let blocks = p.from(k).ok().filter(|_| problems.is_empty());
                 TabletOpStart {
@@ -4099,6 +4207,7 @@ pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> Tabl
                     steps,
                     entry: blocks.and_then(entry_line),
                     way_out: blocks.and_then(way_out_line),
+                    zero,
                 }
             })
             .collect();
@@ -4125,9 +4234,47 @@ pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> Tabl
             starts,
             way_out: way_out_line(&p.blocks),
             step_starts,
+            zero: if i > 0 { zero(i, 0) } else { None },
         });
     }
     out
+}
+
+/// The work zero of `run`, started partway (`Run::partway`), on the stock
+/// the operations before its start left (`TabletZero`), on a machine of
+/// orientation `orient`; None when it does not start partway.
+fn tablet_zero(run: &Run, orient: crate::orient::Orient) -> Option<TabletZero> {
+    if !run.partway() {
+        return None;
+    }
+    let p = run.checked()?.first()?;
+    let partly = run.partly();
+    let blocked = run.partway_blocked();
+    let set_z = run.touch_off().map(|(_, work)| work[2]);
+    Some(TabletZero {
+        set_z,
+        // Not on the stock top, the touch-off cannot set Z either, as
+        // Probe Z says (`Connection::stock_top`).
+        blocked: blocked.or_else(|| {
+            set_z
+                .is_none()
+                .then(|| crate::post::STOCK_TOP_CUT.to_string())
+        }),
+        cut: partly.as_ref().map_or_else(Vec::new, |x| x.cut.clone()),
+        top_cut: partly.as_ref().is_some_and(|x| x.top_cut),
+        top: (p.stock.max[2] - p.datum[2]) as f64,
+        spot: (crate::post::references(&p.origin))
+            .map(|refs| crate::control::touch_spot(orient, refs)),
+        probe_from: (partly.as_ref())
+            .map_or(&[][..], |x| &x.probe_from[..])
+            .iter()
+            .map(|([x, y], ok)| TabletSpot {
+                x: *x,
+                y: *y,
+                problem: ok.clone().err(),
+            })
+            .collect(),
+    })
 }
 
 /// The job line of the first way down onto a point of `blocks` (its first
@@ -5752,6 +5899,118 @@ pub(crate) mod tests {
         assert!(count >= 9, "{count}");
     }
 
+    /// Each start partway through the setup carries its work zero on the
+    /// stock the operations before it left (LIO-548), as the Work zero tab
+    /// finds it for a run started there: the Z the touch-off sets, or why
+    /// it cannot, what they cut, where the tool tip touches off and the
+    /// spots a probe can find the zero from. The setup's own start has none.
+    #[test]
+    fn the_tablet_file_carries_each_partway_starts_work_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (doc, mesh) = tablet_fixture(&profile);
+        let s = tablet_runs(&doc, Ok(&mesh), 0);
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
+        let (programs, left) = check(&doc, &mesh, 0);
+        let mut run = Run::new(&doc, 0, 0);
+        run.checked_as(Arc::new(programs), Some(Arc::new(left)), None);
+        let p = run.checked().unwrap()[0].clone();
+        let top = (p.stock.max[2] - p.datum[2]) as f64;
+        assert!(s.tool_runs[0].zero.is_none());
+        let mut zeros = vec![];
+        for (i, r) in s.tool_runs.iter().enumerate() {
+            let starts: Vec<_> = (r.starts.iter())
+                .map(|st| (p_index(&run, i, st.operation), &st.zero))
+                .collect();
+            for (k, zero) in [(0, &r.zero)]
+                .into_iter()
+                .chain(starts)
+                .skip(usize::from(i == 0))
+            {
+                run.start_at(i, k);
+                assert!(run.partway(), "{i} {k}");
+                let zero = zero.as_ref().unwrap_or_else(|| panic!("{i} {k}"));
+                let partly = run.partly().unwrap();
+                assert_eq!(zero.set_z, run.touch_off().map(|(_, w)| w[2]), "{i} {k}");
+                assert_eq!(zero.blocked, run.partway_blocked(), "{i} {k}");
+                assert_eq!(zero.cut, partly.cut, "{i} {k}");
+                assert_eq!(zero.top_cut, partly.top_cut, "{i} {k}");
+                assert_eq!(zero.top, top);
+                assert_eq!(zero.probe_from.len(), partly.probe_from.len());
+                for (t, ([x, y], ok)) in zero.probe_from.iter().zip(&partly.probe_from) {
+                    assert_eq!((t.x, t.y, t.problem.clone()), (*x, *y, ok.clone().err()));
+                }
+                zeros.push((i, k, zero.clone()));
+            }
+        }
+        // The face cut the top 4 mm down where the work zero (the stock
+        // top's centre) is touched off: the pocket's start touches off on
+        // that floor. The drill's touches off on the pocket's floor, cut
+        // there by the flat end mill, which the check knows exactly. Every
+        // stock-top spot a probe would start from was cut.
+        let [(0, 1, pocket), (1, 0, drill)] = &zeros[..] else {
+            panic!("{zeros:?}")
+        };
+        for z in [pocket, drill] {
+            assert_eq!(z.blocked, None);
+            assert_eq!(z.spot.as_deref(), Some("the centre"));
+            assert_eq!(z.top, 0.);
+            assert!(
+                z.top_cut && z.cut.first().is_some_and(|c| c == "top face"),
+                "{z:?}"
+            );
+            assert_eq!(z.probe_from.len(), 9);
+            assert!(z.probe_from.iter().all(|s| s.problem.is_some()), "{z:?}");
+        }
+        assert_eq!(pocket.set_z, Some(-4.));
+        assert!((drill.set_z.unwrap() + 15.8).abs() < 1e-5, "{drill:?}");
+        // As runs.json says it.
+        let json = serde_json::to_value(&s.tool_runs[1].zero).unwrap();
+        assert_eq!(json["spot"], "the centre");
+        assert_eq!(json["probeFrom"][0]["x"], "mid");
+        assert!(json["setZ"].is_number() && json["topCut"] == true, "{json}");
+    }
+
+    /// Where the check cannot tell the surface the operations before a
+    /// start left at the touch-off spot, the start's work zero has no Z to
+    /// set, and says why as the Work zero tab does; not partway, none.
+    #[test]
+    fn a_tablet_start_partway_whose_surface_the_check_cannot_tell_has_no_z_to_set() {
+        let (doc, _) = fixture::job();
+        let plan = fixture::plan([0., 0., 15.], &[(Motion::Feed, [10., 0., 5.], 600.)]);
+        let mut p = checked(vec![fixture::facing_op(); 2], &[&plan, &plan]);
+        let cut = Partly {
+            cut: vec!["top face".into()],
+            surface: None,
+            top_cut: true,
+            probe_from: vec![],
+        };
+        p.partly = vec![cut.clone(), cut];
+        let mut run = Run::new(&doc, 0, 0);
+        run.checked_as(Arc::new(Ok(vec![p])), None, None);
+        let orient = crate::orient::Orient::Right;
+        assert_eq!(tablet_zero(&run, orient), None);
+        run.start_at(0, 1);
+        let zero = tablet_zero(&run, orient).unwrap();
+        assert_eq!(zero.set_z, None);
+        assert_eq!(
+            zero.blocked.as_deref(),
+            Some(
+                "The operations before the start cut the stock's top face, and the check cannot tell the surface they left where the stock top is touched off."
+            )
+        );
+        assert_eq!(zero.blocked, run.partway_blocked());
+        assert_eq!(zero.spot.as_deref(), Some("the centre"));
+    }
+
+    /// The index in tool run `i`'s program of its operation `oi` (an index
+    /// in the setup).
+    fn p_index(run: &Run, i: usize, oi: usize) -> usize {
+        let p = &run.checked().unwrap()[i];
+        p.indexes.iter().position(|&o| o == oi).unwrap()
+    }
+
     /// A tablet file from before the starts (LIO-476) still reads: its tool
     /// runs have none.
     #[test]
@@ -5759,6 +6018,11 @@ pub(crate) mod tests {
         let json = r#"{"name":"Top · tool run 1 of 1","tool":{"number":1,"name":"Flat 10","label":"T1 Flat 10"},"toolChange":false,"operations":[{"index":0,"name":"Face"}],"lift":{"z":15.0,"machine":false},"start":null,"actions":[],"steps":[]}"#;
         let r: TabletRun = serde_json::from_str(json).unwrap();
         assert!(r.starts.is_empty());
+        // Nor a work zero for a start partway (LIO-548).
+        assert!(r.zero.is_none());
+        let start = r#"{"operation":1,"problems":[],"lift":{"z":15.0,"machine":false},"actions":[],"steps":[]}"#;
+        let st: TabletOpStart = serde_json::from_str(start).unwrap();
+        assert!(st.zero.is_none());
     }
 
     /// A tablet start at a second and a third operation (LIO-476), their

@@ -1049,6 +1049,16 @@ pub fn probe_spot(o: crate::orient::Orient, refs: [crate::post::At; 2]) -> Strin
     }
 }
 
+/// The touch-off spot of the stock top at `refs` on a machine of
+/// orientation `o`, as Work zero's steps say it: "the front-left corner",
+/// "the centre".
+pub fn touch_spot(o: crate::orient::Orient, refs: [crate::post::At; 2]) -> String {
+    match probe_spot(o, refs).as_str() {
+        "its centre" => "the centre".to_string(),
+        spot => spot.to_string(),
+    }
+}
+
 /// How far a corner probe steps along each side from where it starts
 /// before it probes the other side (mm): it starts outside the corner, less
 /// than this off both sides.
@@ -1160,10 +1170,6 @@ pub const BOSS_DEPTH: f64 = 3.;
 const BOSS_SIDES: [(usize, f64); 4] = [(0, 1.), (0, -1.), (1, 1.), (1, -1.)];
 
 /// Where to put the tip for Pin centre, with its button for `{}`.
-/// Why a run that starts partway cannot touch off or probe its work zero
-/// when the check did not work out the stock its start leaves.
-const PARTWAY_UNKNOWN: &str =
-    "The check did not work out the stock the start leaves: check the setup again.";
 const PIN_HOW: &str = "Take the part off the pins, jog the tip over the middle of pin 1, a few mm above its top, and press {} again.";
 
 /// What a `Routine` is for.
@@ -4323,7 +4329,7 @@ impl Connection {
             .filter(|r| r.partway())
             .map(|r| r.partly())
         {
-            Some(None) => Err(PARTWAY_UNKNOWN.to_string()),
+            Some(None) => Err(crate::run::PARTWAY_UNKNOWN.to_string()),
             Some(Some(partly)) if p.probe.is_ok() && !partly.cut.is_empty() => Err(format!(
                 "The operations before the start cut the stock's {}, where a probe finds this work zero.",
                 partly.cut.join(", ")
@@ -4355,26 +4361,10 @@ impl Connection {
     }
 
     /// Why Zero Z on the stock top and Probe Z cannot set the work Z of a
-    /// run that starts partway (`run::Run::partway`): the check cannot tell
-    /// the surface the operations before its start leave where the stock
-    /// top is touched off. None when it can, or the run starts at the
-    /// setup's first operation.
+    /// run that starts partway (`run::Run::partway_blocked`). None when they
+    /// can, or the run starts at the setup's first operation.
     pub fn partway_blocked(&self) -> Option<String> {
-        let run = self.run.as_ref().filter(|r| r.partway())?;
-        let Some(partly) = run.partly() else {
-            return Some(PARTWAY_UNKNOWN.into());
-        };
-        if partly.surface.is_some() {
-            return None;
-        }
-        Some(if partly.cut.is_empty() {
-            "The check cannot tell the surface the operations before the start leave where the stock top is touched off.".into()
-        } else {
-            format!(
-                "The operations before the start cut the stock's {}, and the check cannot tell the surface they left where the stock top is touched off.",
-                partly.cut.join(", ")
-            )
-        })
+        self.run.as_ref()?.partway_blocked()
     }
 
     /// An axis's Set field, when it is a number.
@@ -5344,22 +5334,9 @@ impl Connection {
     }
 
     /// Where the operator touches off the setup to run, in plan mm, and the
-    /// work position that is there (`post::touch_point` less the datum).
-    /// None when it is not on the stock top: a Model origin whose stock top
-    /// an earlier setup cut.
+    /// work position that is there (`run::Run::touch_off`).
     pub fn touch_off(&self) -> Option<([f32; 3], [f64; 3])> {
-        let run = self.run.as_ref()?;
-        let p = run.checked()?.first()?;
-        if p.located.is_some_and(|(_, top)| top.is_none()) {
-            return None;
-        }
-        let mut at = crate::post::touch_point(&p.origin, p.stock)?;
-        // A run that starts partway touches off on the surface the
-        // operations before it leave there, when the check knows it.
-        if run.partway() {
-            at[2] = run.partly()?.surface?;
-        }
-        Some((at, std::array::from_fn(|a| (at[a] - p.datum[a]) as f64)))
+        self.run.as_ref()?.touch_off()
     }
 
     /// Why Probe corner or Probe centre cannot start now; None when it can.
