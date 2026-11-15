@@ -177,6 +177,14 @@ pub const NOT_STARTED: &str = "not started";
 /// checked): for the machine to stop (#167), or for the edits to pause.
 pub const CHECK_WAITS: &str = "The setup is checked once the machine stops and the edits pause.";
 
+/// Why Cycle Start waits while a link to the Pi that was live is not
+/// answering (`Connection::pi_lost`).
+pub const PI_LOST: &str = "The link to the Pi is not answering: wait for it to reconnect.";
+
+/// Why Cycle Start waits while this computer connects to the Pi and the
+/// link was never live yet: nothing was lost (LIO-519).
+pub const PI_CONNECTING: &str = "Connecting to the Pi: wait for it.";
+
 /// A setup being run on the connected machine, tool run by tool run.
 pub struct Run {
     pub setup: usize,
@@ -1573,7 +1581,16 @@ impl Run {
             return vec!["A tool run is running.".into()];
         }
         if c.pi_down() {
-            return vec!["The link to the Pi is not answering: wait for it to reconnect.".into()];
+            // Never live since it connected: nothing to reconnect yet
+            // (LIO-519).
+            if let Some(why) = c.pi_refused() {
+                return vec![format!("The Pi refused this computer: {why}")];
+            }
+            return vec![if c.pi_lost() {
+                PI_LOST.into()
+            } else {
+                PI_CONNECTING.into()
+            }];
         }
         if c.watching() {
             return vec!["Another computer controls the machine: Take control first.".into()];

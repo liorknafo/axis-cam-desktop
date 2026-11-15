@@ -3560,6 +3560,187 @@ flood = { pin = 8 }
         lacks(&a, &[crate::ui::PI_LOST, PI_NOT_ANSWERING]);
     }
 
+    /// While this computer connects to the Pi for the first time, through
+    /// the client's silence time and its reconnect, the run bar and a
+    /// command pressed say it is still connecting, never that the link is
+    /// not answering or should reconnect, and nothing is sent. Live and then
+    /// cut, and while it reconnects, they say the link is not answering.
+    /// Connected anew, it is a first connection again (LIO-519).
+    #[test]
+    fn connecting_to_the_pi_the_run_bar_says_it_is_connecting() {
+        use crate::control::{Action as A, NOT_SENT_PI_CONNECTING, NOT_SENT_PI_LOST};
+        use crate::run::{PI_CONNECTING, PI_LOST};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        a.page = Page::Control;
+        let gate = pi_through_a_gate(&mut a, &server);
+        check_run(&mut a, 0);
+        // What the run bar and a command pressed say, with nothing sent.
+        let says = |a: &mut App, run: &str, not_sent: &str| {
+            assert!(conn(a).pi_down() && !conn(a).in_control());
+            assert_eq!(problems(a), vec![run.to_string()]);
+            assert!(
+                page_texts(a).iter().any(|t| t.contains(run)),
+                "{run}: {:?}",
+                page_texts(a)
+            );
+            let _ = a.update(Message::Machine(A::Home));
+            assert_eq!(conn(a).pi_note.as_deref(), Some(not_sent));
+        };
+        let connecting = |a: &mut App| {
+            assert!(!conn(a).pi_lost(), "{:?}", conn(a).link);
+            says(a, PI_CONNECTING, NOT_SENT_PI_CONNECTING);
+            let seen = page_texts(a);
+            assert!(
+                !seen
+                    .iter()
+                    .any(|t| t.contains("not answering") || t.contains("reconnect")),
+                "{seen:?}"
+            );
+        };
+        // Through the client's 3 s silence time and its reconnect.
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < end {
+            let _ = a.update(Message::Tick);
+            connecting(&mut a);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        gate.set_open(true);
+        pi_live(&mut a, true, "the link live");
+        let p = problems(&a);
+        assert!(
+            !p.iter().any(|t| t == PI_CONNECTING || t == PI_LOST),
+            "{p:?}"
+        );
+        gate.set_cut(true);
+        pi_live(&mut a, false, "the link lost");
+        assert!(conn(&a).pi_lost());
+        says(&mut a, PI_LOST, NOT_SENT_PI_LOST);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !matches!(
+            conn(&a).link.as_ref().map(|l| &l.state),
+            Some(uc100_remote::LinkState::Connecting)
+        ) {
+            let _ = a.update(Message::Tick);
+            assert!(std::time::Instant::now() < end, "never reconnecting");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // Reconnecting after a drop: the link was lost.
+        assert!(conn(&a).pi_lost());
+        says(&mut a, PI_LOST, NOT_SENT_PI_LOST);
+        // Disconnected and connected again: a first connection.
+        let _ = a.update(Message::Disconnect);
+        gate.set_cut(false);
+        gate.set_open(false);
+        connect_never_live(&mut a);
+        if conn(&a).run.is_none() {
+            check_run(&mut a, 0);
+        }
+        connecting(&mut a);
+    }
+
+    /// The Pi refuses this computer (forgotten): the status line says so
+    /// with the machine's name, as the banner, and the run bar and a
+    /// command pressed say it was refused, not connecting or not answering;
+    /// nothing is sent. Paired again, the Pi lets it in at its next try and
+    /// the status line says "Connected to <machine>: <state>", the refusal
+    /// gone (LIO-519).
+    #[test]
+    fn a_refusing_pi_is_said_on_the_status_line_until_it_lets_this_computer_in() {
+        use crate::control::{Action as A, NOT_SENT_PI_REFUSED};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        a.page = Page::Control;
+        // Through a closed gate: once let in, the Pi's Welcome crosses and
+        // nothing more until it opens.
+        let gate = Gate::to(server.addr(), false);
+        let _ = a.update(Message::PiAddress(gate.addr.to_string()));
+        let clients = uc100_remote::data::Data {
+            dir: dir.path().join("pi"),
+        }
+        .clients_file();
+        let kept = dir.path().join("clients-kept.toml");
+        std::fs::rename(&clients, &kept).unwrap();
+        let _ = a.update(Message::Connect);
+        let name = (a.status.strip_prefix("Connecting to "))
+            .and_then(|r| r.split_once('…'))
+            .map(|(n, _)| n.to_string())
+            .expect(&a.status);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while conn(&a).pi_refused().is_none() {
+            let _ = a.update(Message::Tick);
+            assert!(std::time::Instant::now() < end, "never refused");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = a.update(Message::Tick);
+        let why = conn(&a).pi_refused().unwrap().to_string();
+        assert!(why.contains("not paired"), "{why}");
+        assert_eq!(
+            a.status,
+            format!("The Pi of {name} refused this computer: {why}")
+        );
+        check_run(&mut a, 0);
+        assert_eq!(
+            problems(&a),
+            vec![format!("The Pi refused this computer: {why}")]
+        );
+        assert!(!conn(&a).in_control() && !conn(&a).pi_lost());
+        let _ = a.update(Message::Machine(A::Home));
+        assert_eq!(conn(&a).pi_note.as_deref(), Some(NOT_SENT_PI_REFUSED));
+        // Still refused at its next tries: the status line keeps it.
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(6);
+        while std::time::Instant::now() < end {
+            let _ = a.update(Message::Tick);
+            assert!(
+                a.status.starts_with(&format!("The Pi of {name} refused")),
+                "{}",
+                a.status
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // Paired again: let in at the next try, within 5 s, the Pi's state
+        // not known yet: connecting, the refusal gone.
+        std::fs::rename(&kept, &clients).unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(7);
+        while conn(&a).pi_refused().is_some()
+            || conn(&a).link.as_ref().is_none_or(|l| l.name.is_none())
+        {
+            let _ = a.update(Message::Tick);
+            assert!(std::time::Instant::now() < end, "never let in");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = a.update(Message::Tick);
+        assert!(conn(&a).snapshot.state.is_none() && conn(&a).pi_down());
+        assert_eq!(a.status, format!("Connecting to {name}…"));
+        assert_eq!(problems(&a), vec![crate::run::PI_CONNECTING.to_string()]);
+        // Through the client's silence time and its reconnect: still so.
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while std::time::Instant::now() < end {
+            let _ = a.update(Message::Tick);
+            assert_eq!(a.status, format!("Connecting to {name}…"));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        gate.set_open(true);
+        pi_live(&mut a, true, "the link live");
+        assert!(
+            a.status.starts_with(&format!("Connected to {name}: "))
+                && !a.status.contains("refused"),
+            "{}",
+            a.status
+        );
+        let p = problems(&a);
+        assert!(!p.iter().any(|t| t.contains("refused")), "{p:?}");
+        // Live and then cut: a lost link, as before.
+        gate.set_cut(true);
+        pi_live(&mut a, false, "the link lost");
+        assert!(
+            a.status
+                .starts_with(&format!("No link to the Pi of {name}: ")),
+            "{}",
+            a.status
+        );
+    }
+
     /// Renders the Control page's Machine tab while connecting to the Pi
     /// for the first time (never live), connected, with the link lost and
     /// while it reconnects, to `$AXIS_RENDER_DIR` (default /tmp/pi-connecting),
