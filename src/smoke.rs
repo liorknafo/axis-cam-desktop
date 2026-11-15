@@ -24198,6 +24198,9 @@ soft_max = 180.0
     /// on the Detail line (#83, LIO-222).
     #[test]
     fn the_simulation_strip_says_the_stock_surface_is_updating_while_the_mesher_runs() {
+        // The mesher's clock stands still: a busy computer does not age the job.
+        let now = std::time::Instant::now();
+        let _clock = crate::StoppedStockClock::at(now);
         let mut a = imported_app();
         let top = a
             .imported_mesh
@@ -24239,7 +24242,7 @@ soft_max = 180.0
         let _ = a.update(Message::Scrub(0.5));
         let key = a.stock_mesh_key().unwrap();
         a.stock_mesh_job = Some(key.clone());
-        a.stock_mesh_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(12));
+        a.stock_mesh_started = Some(now - std::time::Duration::from_secs(12));
         assert_eq!(
             crate::ui::stock_surface_notice(&a).as_deref(),
             Some("Updating the stock surface · 12 s, showing the last finished one")
@@ -24665,6 +24668,11 @@ soft_max = 180.0
     /// nothing, and a slow one says so in place, on the Detail line (LIO-222).
     #[test]
     fn the_view_stands_still_while_play_updates_the_stock_surface() {
+        // The mesher's clock stands still, so that an update is as old as
+        // set however long a busy computer takes to lay out the frame: a
+        // quick one stays quick and a slow one names its own time (LIO-529).
+        let now = std::time::Instant::now();
+        let _clock = crate::StoppedStockClock::at(now);
         let mut a = imported_app();
         a.sim_details = true;
         let top = a
@@ -24702,8 +24710,7 @@ soft_max = 180.0
             a.stock_mesh_started = None;
             if let Some(ms) = running {
                 a.stock_mesh_job = a.stock_mesh_key();
-                a.stock_mesh_started =
-                    Some(std::time::Instant::now() - std::time::Duration::from_millis(ms));
+                a.stock_mesh_started = Some(now - std::time::Duration::from_millis(ms));
             }
         };
         // Forward only: a step back would drop the finished surface.

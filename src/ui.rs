@@ -3562,11 +3562,6 @@ fn scene_panels(
 /// How long the stock mesher works before the strip says so: Play meshes
 /// the stock again for each frame, mostly in well under this.
 pub(crate) const STOCK_NOTICE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
-/// What the simulation strip's Detail line says once the stock mesher has
-/// run a while (`STOCK_NOTICE_AFTER`), or at once after a job that did, so
-/// that slow updates one after another keep it: for how long it has been
-/// working, and what is drawn meanwhile. The time comes first, so that a
-/// narrow strip cuts off the words rather than it.
 /// The legend's most force along a measured path (`load`): on one tooth,
 /// and on the whole cutter where its feed held that (`held`).
 fn most_force(
@@ -3583,6 +3578,11 @@ fn most_force(
         ))
     )
 }
+/// What the simulation strip's Detail line says once the stock mesher has
+/// run a while (`STOCK_NOTICE_AFTER`), or at once after a job that did, so
+/// that slow updates one after another keep it: for how long it has been
+/// working, and what is drawn meanwhile. The time comes first, so that a
+/// narrow strip cuts off the words rather than it.
 pub(crate) fn stock_surface_notice(app: &App) -> Option<String> {
     let elapsed = app.stock_mesh_elapsed()?;
     if elapsed < STOCK_NOTICE_AFTER && !app.stock_mesh_slow() {

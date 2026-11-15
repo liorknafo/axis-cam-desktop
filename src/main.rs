@@ -940,6 +940,39 @@ thread_local! {
     /// How many times this thread has run `cam::holes` for the Drill editor.
     pub(crate) static DRILL_HOLE_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
+#[cfg(test)]
+thread_local! {
+    /// The moment `stock_clock` stands at on this thread, while a test has
+    /// stopped it (`StoppedStockClock`).
+    static STOCK_CLOCK_STOPPED: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+/// Now, for timing the stock mesher: the wall clock, or in a test that has
+/// stopped it, the moment it stopped at, so that however long a busy
+/// computer takes to lay out a frame, a job is as old as the test set it
+/// (LIO-529).
+fn stock_clock() -> Instant {
+    #[cfg(test)]
+    if let Some(stopped) = STOCK_CLOCK_STOPPED.with(std::cell::Cell::get) {
+        return stopped;
+    }
+    Instant::now()
+}
+/// Stops `stock_clock` on this thread at a moment, until dropped.
+#[cfg(test)]
+pub(crate) struct StoppedStockClock;
+#[cfg(test)]
+impl StoppedStockClock {
+    pub(crate) fn at(moment: Instant) -> Self {
+        STOCK_CLOCK_STOPPED.with(|c| c.set(Some(moment)));
+        Self
+    }
+}
+#[cfg(test)]
+impl Drop for StoppedStockClock {
+    fn drop(&mut self) {
+        STOCK_CLOCK_STOPPED.with(|c| c.set(None));
+    }
+}
 /// A writer that feeds what is written to a hasher.
 struct HashWriter<'a>(&'a mut std::hash::DefaultHasher);
 impl std::io::Write for HashWriter<'_> {
@@ -3926,7 +3959,7 @@ impl App {
     /// How long the stock mesher has been running, while it is.
     pub fn stock_mesh_elapsed(&self) -> Option<Duration> {
         self.stock_mesh_job.as_ref()?;
-        self.stock_mesh_started.map(|t| t.elapsed())
+        (self.stock_mesh_started).map(|t| stock_clock().saturating_duration_since(t))
     }
     /// Whether the last mesher job took long enough to be named.
     pub fn stock_mesh_slow(&self) -> bool {
@@ -3963,7 +3996,7 @@ impl App {
         let snapshot = stock_surface::Snapshot::of(volume, self.stock_detail);
         let seconds = sim.seconds;
         self.stock_mesh_job = Some(key.clone());
-        self.stock_mesh_started = Some(Instant::now());
+        self.stock_mesh_started = Some(stock_clock());
         Task::perform(
             async move {
                 let result =
@@ -9602,9 +9635,9 @@ impl App {
                 if self.stock_mesh_job.as_ref() == Some(&key) {
                     self.stock_mesh_job = None;
                     // Only a job at the detail shown now says how slow the next is.
-                    self.stock_mesh_slow = (self.stock_mesh_started.take())
-                        .is_some_and(|t| t.elapsed() >= ui::STOCK_NOTICE_AFTER)
-                        && key.3 == self.stock_detail;
+                    self.stock_mesh_slow = (self.stock_mesh_started.take()).is_some_and(|t| {
+                        stock_clock().saturating_duration_since(t) >= ui::STOCK_NOTICE_AFTER
+                    }) && key.3 == self.stock_detail;
                 }
                 if let Some(sim) = &mut self.simulation
                     && sim.id == key.0
