@@ -33986,7 +33986,8 @@ soft_max = 180.0
                     let c = placement
                         .transform(mesh.surfaces[id].center)
                         .map(|v| v / scale);
-                    (t.minor / 2. ..=t.major / 2.)
+                    // A crest's centre lies a little inside its arc.
+                    (t.minor / 2. - 0.05..=t.major / 2.)
                         .contains(&(c[0] - t.centre[0]).hypot(c[1] - t.centre[1]))
                         && (c[2] - mid).abs() < 2.
                 })
@@ -34045,7 +34046,8 @@ soft_max = 180.0
     /// `AXIS_PLATE_STL`, a click on each M8 thread's flank or crest in a
     /// Drill picks its hole, and a click again drops it, each in under a
     /// second in a release build: on the current plate (cb9152e) they took
-    /// 1.7 to 8.6 s (LIO-520).
+    /// 1.7 to 8.6 s (LIO-520). It picks the hole where the hole list has
+    /// it, and says so (LIO-521).
     #[test]
     #[ignore]
     fn a_click_on_the_spindle_plates_threads_picks_and_drops_their_holes_in_a_second() {
@@ -34072,7 +34074,11 @@ soft_max = 180.0
         let scale = mesh.display_scale();
         let threads = crate::thread::holes_in_setup(&setup, &mesh);
         assert_eq!(threads.len(), 4, "{threads:?}");
-        let mut click = |id: usize, what: &str| {
+        let listed: Vec<[f32; 2]> = (crate::find_holes(&setup, &mesh).round.iter())
+            .flatten()
+            .map(|h| h.center)
+            .collect();
+        let click = |a: &mut App, id: usize, what: &str| {
             let started = std::time::Instant::now();
             let _ = a.update(Message::Surface(id));
             let took = started.elapsed().as_secs_f32();
@@ -34090,7 +34096,8 @@ soft_max = 180.0
                     let c = placement
                         .transform(mesh.surfaces[id].center)
                         .map(|v| v / scale);
-                    (t.minor / 2. ..=t.major / 2.)
+                    // A crest's centre lies a little inside its arc.
+                    (t.minor / 2. - 0.05..=t.major / 2.)
                         .contains(&(c[0] - t.centre[0]).hypot(c[1] - t.centre[1]))
                         && (c[2] - mid).abs() < 2.
                 })
@@ -34102,8 +34109,24 @@ soft_max = 180.0
                 .find(|&id| crate::pocket::is_wall(&setup, &mesh, id))
                 .unwrap();
             for id in [flank, crest] {
-                click(id, "Picked the Ø");
-                click(id, "Dropped");
+                click(&mut a, id, "Picked the Ø");
+                // Where the hole list has it (`find_holes`, its centres
+                // within 0.005 mm of the drawing).
+                let op = a.operation().unwrap().clone();
+                let holes = a.drill_holes(&op, &mesh).as_ref().clone().unwrap();
+                let [h] = &holes[..] else {
+                    panic!("surface {id}: {holes:?}")
+                };
+                let off = (listed.iter())
+                    .map(|c| (h.center[0] - c[0]).hypot(h.center[1] - c[1]))
+                    .fold(f32::INFINITY, f32::min);
+                eprintln!("surface {id}: picked at {:?}, {off:.4} mm off", h.center);
+                assert!(off < 0.005, "surface {id}: {h:?} {listed:?}");
+                // And says it is there: on the current plate it named the
+                // thread's fitted axis, 0.017 mm off in X (LIO-521).
+                let at = format!("X{:.2} Y{:.2}", h.center[0], h.center[1]);
+                assert!(a.status.contains(&at), "{at}: {}", a.status);
+                click(&mut a, id, "Dropped");
             }
         }
     }
