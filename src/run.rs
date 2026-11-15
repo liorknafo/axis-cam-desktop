@@ -4939,6 +4939,121 @@ pub(crate) mod tests {
         assert!(r.starts.is_empty());
     }
 
+    /// A tablet start at a second and a third operation (LIO-476), their
+    /// indexes in the setup not their places in the program, from machine
+    /// home and not: each sends what the Run panel's Start here sends from
+    /// there (a pause of the program kept), its lift is `step_lift`'s, and
+    /// its steps are its own, Stop after step stopping only on a move that
+    /// starts at the clearance, never on the way down into a step. A start
+    /// the check refused stays refused.
+    #[test]
+    fn a_tablet_start_at_a_later_operation_sends_what_start_here_sends() {
+        let (doc, _) = fixture::job();
+        let mut plan = fixture::plan(
+            [0., 0., 15.],
+            &[
+                (Motion::Rapid, [0., 0., 5.], 6000.),
+                (Motion::Feed, [10., 0., 5.], 600.),
+                (Motion::Rapid, [10., 0., 15.], 6000.),
+                (Motion::Rapid, [0., 0., 15.], 6000.),
+                (Motion::Rapid, [0., 0., 3.], 6000.),
+                (Motion::Feed, [10., 0., 3.], 600.),
+                (Motion::Rapid, [10., 0., 15.], 6000.),
+            ],
+        );
+        plan.stops.push(crate::simulation::Stop {
+            at: 0,
+            pause: Some("Set the head before cutting".into()),
+            size: None,
+        });
+        let ops = vec![fixture::facing_op(); 3];
+        let mut p = checked(ops, &[&plan, &plan, &plan]);
+        p.indexes = vec![0, 2, 4];
+        for home in [false, true] {
+            p.settings.machine_home = home;
+            p.starts = (1..3)
+                .map(|k| {
+                    let mut b = blocks(&p.ops[k..], &vec![&plan; 3 - k], &p.settings);
+                    for block in &mut b {
+                        match block {
+                            Block::Start { op, .. }
+                            | Block::Run { op, .. }
+                            | Block::Approach { op, .. }
+                            | Block::Descend { op, .. }
+                            | Block::Move { op, .. }
+                            | Block::Pause { op, .. }
+                            | Block::Index { op, .. } => *op += k,
+                            _ => {}
+                        }
+                    }
+                    Ok(b)
+                })
+                .collect();
+            let mut run = Run::new(&doc, 0, 0);
+            run.programs = Some(Arc::new(Ok(vec![p.clone()])));
+            run.steps = (p.indexes.iter())
+                .map(|&oi| OpSteps {
+                    op: oi,
+                    clear: 15.,
+                    hole: false,
+                    steps: plan_steps(&plan),
+                    fingerprint: 0,
+                })
+                .collect();
+            for k in 1..3 {
+                let (actions, steps, lift) = tablet_job_from(&mut run, &p, 0, k).unwrap();
+                assert_eq!(steps.len(), (3 - k) * 2);
+                let ops: Vec<usize> = steps.iter().map(|s| s.operation).collect();
+                let want: Vec<usize> = p.indexes[k..].iter().flat_map(|&oi| [oi, oi]).collect();
+                assert_eq!(ops, want);
+                assert!(actions.iter().any(|l| matches!(&l.action,
+                    TabletAction::Pause { reason } if reason == "Set the head before cutting")));
+                let offset = [100., 80., -30., 7., 2., 3.];
+                for at in [
+                    [3., 4., -50., 7., 2., 3.],
+                    [100., 80., 0., 7., 2., 3.],
+                    [100., 80., -25., 7., 2., 3.],
+                ] {
+                    let sent = run.job_actions(&p, k, offset, at, None).unwrap();
+                    assert_eq!(
+                        tablet_job_of(&actions, lift, offset, at),
+                        sent,
+                        "{home} {k}"
+                    );
+                }
+                run.running.as_mut().unwrap().offset = offset;
+                let z = lift.z + if home { 0. } else { offset[2] };
+                assert_eq!(run.step_lift().unwrap(), z);
+                let mut lines: Vec<u32> = (steps.iter().flat_map(|s| &s.end_lines))
+                    .flat_map(|r| r[0]..=r[1])
+                    .collect();
+                lines.sort_unstable();
+                let ranges: Vec<u32> = run.stop_ranges().iter().flat_map(|r| r.clone()).collect();
+                assert_eq!(lines, ranges);
+                assert!(steps.iter().all(|s| !s.end_lines.is_empty()));
+                for s in &steps {
+                    for line in s.end_lines.iter().flat_map(|r| r[0]..=r[1]) {
+                        assert_eq!(run.step_end(line as usize - 1), Some((s.operation, s.step)));
+                        match &p.from(k).unwrap()[line as usize - 1] {
+                            Block::Move { kind, from, .. } => {
+                                assert_ne!(*kind, Kind::Feed);
+                                assert!(from[2] >= 15. - AT_CLEARANCE);
+                            }
+                            Block::Descend { .. } => panic!("a stop on the way down into a step"),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            p.starts[0] = Err(vec!["The way in is not clear.".into()]);
+            assert_eq!(
+                tablet_job_from(&mut run, &p, 0, 1).unwrap_err(),
+                vec!["The way in is not clear."]
+            );
+            assert!(tablet_job_from(&mut run, &p, 0, 3).is_err());
+        }
+    }
+
     fn program() -> Checked {
         let plan = fixture::plan(
             [0., 0., 15.],
