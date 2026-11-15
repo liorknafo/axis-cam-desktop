@@ -1070,8 +1070,11 @@ fn write(
     size: f32,
     align: Align,
 ) {
+    let s = s.into();
+    #[cfg(test)]
+    WRITTEN.with_borrow_mut(|w| w.push((s.clone(), text_box(&s, at, size, align))));
     f.fill_text(canvas::Text {
-        content: s.into(),
+        content: s,
         position: at,
         color: c,
         size: size.into(),
@@ -1080,6 +1083,97 @@ fn write(
         ..Default::default()
     });
 }
+/// Where `s` written `size` px high at `at`, `align`ed, lies on a canvas.
+// ponytail: a letter taken as 0.6 of the size wide, not measured; widen it
+// if a font's digits run wider.
+fn text_box(s: &str, at: Point, size: f32, align: Align) -> Rectangle {
+    let (w, h) = (s.chars().count() as f32 * size * 0.6, size * 1.2);
+    let x = match align {
+        Align::Right => at.x - w,
+        Align::Center => at.x - w / 2.,
+        _ => at.x,
+    };
+    Rectangle::new(Point::new(x, at.y - h / 2.), Size::new(w, h))
+}
+/// The labels a drawing has written, so that each next one keeps clear of
+/// them (LIO-534: on a narrow picture a slot pass wrote "X 59.00" over
+/// "X 81.00"), as the Check's dimensions do (`dim_tags`).
+struct Labels {
+    room: Size,
+    taken: Vec<Rectangle>,
+}
+impl Labels {
+    /// Whether `r` lies on the canvas, 2 px clear of every label before it.
+    fn free(&self, r: &Rectangle) -> bool {
+        let (w, h) = (self.room.width, self.room.height);
+        r.x >= 0.
+            && r.y >= 0.
+            && r.x + r.width <= w
+            && r.y + r.height <= h
+            && (self.taken.iter()).all(|o| {
+                r.x + r.width + 2. <= o.x
+                    || o.x + o.width + 2. <= r.x
+                    || r.y + r.height + 2. <= o.y
+                    || o.y + o.height + 2. <= r.y
+            })
+    }
+    /// The first of `boxes`, in order, that is free, or failing that the
+    /// first free with all of them slid on `step` px, twice that, … up to
+    /// 40 steps: its index and how far it slid. `None` when none is.
+    fn slide(&self, boxes: &[Rectangle], step: iced::Vector) -> Option<(usize, iced::Vector)> {
+        (0..40)
+            .flat_map(|k| (0..boxes.len()).map(move |i| (i, step * k as f32)))
+            .find(|(i, d)| self.free(&(boxes[*i] + *d)))
+    }
+    /// Writes `s` at the first of `tries` (a point and how the words align
+    /// on it) where it is clear (`slide`), or at the first as it is.
+    fn put(
+        &mut self,
+        f: &mut canvas::Frame,
+        s: impl Into<String>,
+        tries: &[(Point, Align)],
+        step: iced::Vector,
+        c: Color,
+        size: f32,
+    ) {
+        let s = s.into();
+        let boxes: Vec<Rectangle> = (tries.iter())
+            .map(|(at, al)| text_box(&s, *at, size, *al))
+            .collect();
+        let (i, d) = self
+            .slide(&boxes, step)
+            .unwrap_or((0, iced::Vector::new(0., 0.)));
+        self.taken.push(boxes[i] + d);
+        write(f, s, tries[i].0 + d, c, size, tries[i].1);
+    }
+    /// Takes the box `r` (a tag), slid on along `step` until it is clear,
+    /// and gives where.
+    fn take(&mut self, r: Rectangle, step: iced::Vector) -> Rectangle {
+        let (_, d) = self
+            .slide(&[r], step)
+            .unwrap_or((0, iced::Vector::new(0., 0.)));
+        self.taken.push(r + d);
+        r + d
+    }
+}
+#[cfg(test)]
+thread_local! {
+    /// The words `write` wrote since the drawing being painted began.
+    static WRITTEN: std::cell::RefCell<Vec<(String, Rectangle)>> = Default::default();
+    /// Each Steps drawing's words as painted, for the tests.
+    static DRAWN: std::cell::RefCell<Vec<Vec<(String, Rectangle)>>> = Default::default();
+}
+/// A drawing's painting begins (`true`) or ends: the words written between
+/// are its own (tests only).
+#[cfg(test)]
+fn drawing_words(begins: bool) {
+    match begins {
+        true => drop(WRITTEN.take()),
+        false => DRAWN.with_borrow_mut(|d| d.push(WRITTEN.take())),
+    }
+}
+#[cfg(not(test))]
+fn drawing_words(_: bool) {}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Hatch {
@@ -1146,6 +1240,7 @@ struct Drawing<'a> {
 }
 impl Drawing<'_> {
     fn paint(&self, f: &mut canvas::Frame) {
+        drawing_words(true);
         let [a, b] = self.axes;
         let (mut lo, mut hi) = (
             [self.stock.min[a], self.stock.min[b]],
@@ -1225,6 +1320,27 @@ impl Drawing<'_> {
             f.fill(&outline, PART);
         }
         f.stroke(&path(stock), stroke(INK, 1.3));
+        // The axes' names in the bottom-left corner, written last, first
+        // in the way of the labels.
+        let corner = Point::new(10., size.height - 10.);
+        let names = [
+            (AXES[a], Point::new(40., corner.y)),
+            (AXES[b], Point::new(corner.x - 4., corner.y - 34.)),
+        ];
+        let mut labels = Labels {
+            room: size,
+            taken: (names.iter())
+                .map(|(s, at)| text_box(s, *at, 12., Align::Left))
+                .collect(),
+        };
+        let (down, up, leftward) = (
+            iced::Vector::new(0., 7.),
+            iced::Vector::new(0., -7.),
+            iced::Vector::new(-7., 0.),
+        );
+        // A side, a level, on the side away from the stock's middle first
+        // (LIO-534).
+        let middle = stock.center();
         for shape in &self.shapes {
             match shape {
                 Shape::Hatch(bx, kind) => {
@@ -1274,23 +1390,43 @@ impl Drawing<'_> {
                 Shape::Depth(from, to, s) => {
                     let (m, n) = (p3(*from), p3(*to));
                     f.stroke(&canvas::Path::line(m, n), dashed(NEVER, 1.8));
-                    write(f, s.clone(), depth_label(m, n), NEVER, 12., Align::Left);
+                    let at = depth_label(m, n);
+                    let other = Point::new(m.x.min(n.x) - 5., at.y);
+                    let tries = [(at, Align::Left), (other, Align::Right)];
+                    labels.put(f, s.clone(), &tries, down, NEVER, 12.);
                 }
                 Shape::Never(from, to, s) => {
                     let (m, n) = (p3(*from), p3(*to));
                     f.stroke(&canvas::Path::line(m, n), dashed(NEVER, 1.8));
-                    // Inside the stock: above a level's right end, beside a
-                    // side's top.
+                    // Inside the stock: over or under a level's right end,
+                    // beside a side's top.
                     if (m.x - n.x).abs() > (m.y - n.y).abs() && (m.x - n.x).abs() < 80. {
                         // A short line (a hole's floor): its label right of it.
-                        let at = Point::new(m.x.max(n.x) + 5., m.y);
-                        write(f, s.clone(), at, NEVER, 12., Align::Left);
+                        let tries = [
+                            (Point::new(m.x.max(n.x) + 5., m.y), Align::Left),
+                            (Point::new(m.x.min(n.x) - 5., m.y), Align::Right),
+                        ];
+                        labels.put(f, s.clone(), &tries, down, NEVER, 12.);
                     } else if (m.x - n.x).abs() > (m.y - n.y).abs() {
-                        let at = Point::new(m.x.max(n.x) - 8., m.y - 9.);
-                        write(f, s.clone(), at, NEVER, 12., Align::Right);
+                        let x = m.x.max(n.x) - 8.;
+                        let mut tries = [
+                            (Point::new(x, m.y - 9.), Align::Right),
+                            (Point::new(x, m.y + 9.), Align::Right),
+                        ];
+                        if m.y > middle.y {
+                            tries.reverse();
+                        }
+                        labels.put(f, s.clone(), &tries, leftward, NEVER, 12.);
                     } else {
-                        let at = Point::new(m.x + 5., m.y.min(n.y) + 12.);
-                        write(f, s.clone(), at, NEVER, 12., Align::Left);
+                        let y = m.y.min(n.y) + 12.;
+                        let mut tries = [
+                            (Point::new(m.x + 5., y), Align::Left),
+                            (Point::new(m.x - 5., y), Align::Right),
+                        ];
+                        if m.x < middle.x {
+                            tries.reverse();
+                        }
+                        labels.put(f, s.clone(), &tries, down, NEVER, 12.);
                     }
                 }
                 Shape::Tool(c, r, end) => {
@@ -1329,30 +1465,27 @@ impl Drawing<'_> {
                     );
                     if from[0] != 0. {
                         // Outside the stock, clear of its face.
-                        write(
-                            f,
-                            s.clone(),
-                            Point::new(c.x + from[0] * 4., c.y - 16.),
-                            INK,
-                            13.,
-                            if from[0] < 0. {
-                                Align::Right
-                            } else {
-                                Align::Left
-                            },
-                        );
+                        let at = Point::new(c.x + from[0] * 4., c.y - 16.);
+                        let align = if from[0] < 0. {
+                            Align::Right
+                        } else {
+                            Align::Left
+                        };
+                        labels.put(f, s.clone(), &[(at, align)], up, INK, 13.);
                     } else {
                         // Right of it, or left of it when it is well left
                         // of the stock's middle: away from what is there,
                         // a clamp it was moved clear of (LIO-458).
                         let middle = rect(&self.stock);
                         let left = c.x < middle.center_x() - middle.width / 4.;
-                        let (dx, align) = if left {
-                            (-14., Align::Right)
-                        } else {
-                            (14., Align::Left)
-                        };
-                        write(f, s.clone(), Point::new(c.x + dx, c.y), INK, 13., align);
+                        let mut tries = [
+                            (Point::new(c.x + 14., c.y), Align::Left),
+                            (Point::new(c.x - 14., c.y), Align::Right),
+                        ];
+                        if left {
+                            tries.reverse();
+                        }
+                        labels.put(f, s.clone(), &tries, down, INK, 13.);
                     }
                 }
                 Shape::Hole(q, r, n, state) => {
@@ -1377,32 +1510,26 @@ impl Drawing<'_> {
                     f.fill(&body, fill);
                     f.stroke(&body, stroke(edge, w));
                     let c = if *state == Lit::Now { ACCENT } else { MUTED };
-                    write(
-                        f,
-                        n.to_string(),
-                        Point::new(at.x + r * s + 5., at.y - 9.),
-                        c,
-                        12.,
-                        Align::Left,
-                    );
+                    let rs = (r * s).max(4.);
+                    let tries = [
+                        (Point::new(at.x + rs + 5., at.y - 9.), Align::Left),
+                        (Point::new(at.x - rs - 5., at.y - 9.), Align::Right),
+                    ];
+                    labels.put(f, n.to_string(), &tries, up, c, 12.);
                 }
                 Shape::Pattern(pattern, holes, r, numbers) => {
-                    paint_pattern(f, p, s, pattern, holes, *r, numbers)
+                    paint_pattern(f, &mut labels, p, s, pattern, holes, *r, numbers)
                 }
-                Shape::Word(q, s, c) => write(f, s.clone(), p3(*q), *c, 13., Align::Left),
+                Shape::Word(q, s, c) => {
+                    labels.put(f, s.clone(), &[(p3(*q), Align::Left)], down, *c, 13.)
+                }
                 Shape::Round(q, r, label) => {
                     let at = p3(*q);
                     f.stroke(&canvas::Path::circle(at, r * s), stroke(ACCENT, 2.));
                     // On its back-right, off the finders' lines.
                     let d = r * s * std::f32::consts::FRAC_1_SQRT_2;
-                    write(
-                        f,
-                        label.clone(),
-                        Point::new(at.x + d + 4., at.y - d - 14.),
-                        ACCENT,
-                        13.,
-                        Align::Left,
-                    );
+                    let at = Point::new(at.x + d + 4., at.y - d - 14.);
+                    labels.put(f, label.clone(), &[(at, Align::Left)], up, ACCENT, 13.);
                 }
                 Shape::Block(bx) => {
                     let r = rect(bx);
@@ -1428,21 +1555,18 @@ impl Drawing<'_> {
                     } else {
                         (Point::new(r.x + r.width, r.y - 16.), Align::Right)
                     };
-                    write(f, label.clone(), at, INK, 12., align);
+                    labels.put(f, label.clone(), &[(at, align)], up, INK, 12.);
                 }
                 Shape::Down(q, mm, s) => {
                     let mut t = *q;
                     t[b] += mm;
                     let (head, tail) = (p3(*q), p3(t));
                     arrow(f, tail, head, ACCENT, 2.5);
-                    write(
-                        f,
-                        s.clone(),
-                        Point::new(tail.x + 8., tail.y + 6.),
-                        ACCENT,
-                        13.,
-                        Align::Left,
-                    );
+                    let tries = [
+                        (Point::new(tail.x + 8., tail.y + 6.), Align::Left),
+                        (Point::new(tail.x - 8., tail.y + 6.), Align::Right),
+                    ];
+                    labels.put(f, s.clone(), &tries, up, ACCENT, 13.);
                 }
                 Shape::Height(top, bottom, s) => {
                     let (m, n) = (p3(*top), p3(*bottom));
@@ -1453,8 +1577,12 @@ impl Drawing<'_> {
                     }
                     let span = canvas::Path::line(Point::new(x, m.y), Point::new(x, n.y));
                     f.stroke(&span, stroke(ACCENT, 1.6));
-                    let mid = Point::new(x + 9., (m.y + n.y) / 2.);
-                    write(f, s.clone(), mid, ACCENT, 13., Align::Left);
+                    let y = (m.y + n.y) / 2.;
+                    let tries = [
+                        (Point::new(x + 9., y), Align::Left),
+                        (Point::new(x - 9., y), Align::Right),
+                    ];
+                    labels.put(f, s.clone(), &tries, down, ACCENT, 13.);
                 }
             }
         }
@@ -1477,25 +1605,12 @@ impl Drawing<'_> {
             ),
             stroke(INK, 1.),
         );
-        let corner = Point::new(10., size.height - 10.);
         arrow(f, corner, Point::new(36., corner.y), MUTED, 1.3);
         arrow(f, corner, Point::new(corner.x, corner.y - 26.), MUTED, 1.3);
-        write(
-            f,
-            AXES[a],
-            Point::new(40., corner.y),
-            MUTED,
-            12.,
-            Align::Left,
-        );
-        write(
-            f,
-            AXES[b],
-            Point::new(corner.x - 4., corner.y - 34.),
-            MUTED,
-            12.,
-            Align::Left,
-        );
+        for (s, at) in names {
+            write(f, s, at, MUTED, 12., Align::Left);
+        }
+        drawing_words(false);
     }
 }
 /// Where a pattern drawing's tag of `chars` letters goes on a canvas of
@@ -1587,8 +1702,10 @@ fn screw_try<'a>(p: &Page<'a>, op: usize) -> Option<Element<'a, Message>> {
 /// the next row), the pitches as sizes off hole 1, or the circle with its
 /// centre, its diameter and the angle from +X round to hole 1; then the
 /// holes numbered, hole 1 in the accent.
+#[allow(clippy::too_many_arguments)]
 fn paint_pattern(
     f: &mut canvas::Frame,
+    labels: &mut Labels,
     at: impl Fn([f32; 2]) -> Point,
     s: f32,
     pattern: &Pattern,
@@ -1609,17 +1726,27 @@ fn paint_pattern(
         let t = deg.to_radians();
         [t.cos(), t.sin()]
     };
-    // A label on a white tag, `from` a point out along `out`, clear of it.
-    let tag = |f: &mut canvas::Frame, from: Point, out: [f32; 2], label: String| {
-        let place = tag_box(from, out, label.chars().count(), k, f.size());
-        let c = place.center();
-        let r = canvas::Path::rounded_rectangle(place.position(), place.size(), 5.into());
-        f.fill(&r, Color::WHITE);
-        f.stroke(&r, stroke(ACCENT, 1.5));
-        write(f, label, c, ACCENT, 16. * k, Align::Center);
-    };
+    // The screen's way `px` along `d`.
+    let along = |d: [f32; 2], px: f32| iced::Vector::new(d[0] * px, -d[1] * px);
+    // A label on a white tag, `from` a point out along `out`, clear of it
+    // and of the labels before it.
+    let tag =
+        |f: &mut canvas::Frame, labels: &mut Labels, from: Point, out: [f32; 2], label: String| {
+            let place = tag_box(from, out, label.chars().count(), k, f.size());
+            let place = labels.take(place, along(out, 6.));
+            let c = place.center();
+            let r = canvas::Path::rounded_rectangle(place.position(), place.size(), 5.into());
+            f.fill(&r, Color::WHITE);
+            f.stroke(&r, stroke(ACCENT, 1.5));
+            write(f, label, c, ACCENT, 16. * k, Align::Center);
+        };
     // A size from `a` to `b`, `gap` px off the holes along `out`.
-    let size = |f: &mut canvas::Frame, a: Point, b: Point, out: [f32; 2], label: String| {
+    let size = |f: &mut canvas::Frame,
+                labels: &mut Labels,
+                a: Point,
+                b: Point,
+                out: [f32; 2],
+                label: String| {
         let gap = rs + 22.;
         let (m, n) = (on(a, out, gap), on(b, out, gap));
         for (h, e) in [(a, m), (b, n)] {
@@ -1629,7 +1756,7 @@ fn paint_pattern(
         let mid = Point::new((m.x + n.x) / 2., (m.y + n.y) / 2.);
         arrow(f, mid, m, ACCENT, 2.);
         arrow(f, mid, n, ACCENT, 2.);
-        tag(f, mid, out, label);
+        tag(f, labels, mid, out, label);
     };
     // The order: hole to hole, a grid back and forth (LIO-405).
     for w in pts.windows(2) {
@@ -1656,6 +1783,7 @@ fn paint_pattern(
             if columns > 1 {
                 size(
                     f,
+                    labels,
                     pts[0],
                     pts[1],
                     back(ub),
@@ -1665,7 +1793,14 @@ fn paint_pattern(
             if rows > 1 {
                 // Hole 1's neighbour in the second row, which runs back.
                 let to = pts[2 * columns - 1];
-                size(f, pts[0], to, back(ua), format!("rows {}", dro(pitch[1])));
+                size(
+                    f,
+                    labels,
+                    pts[0],
+                    to,
+                    back(ua),
+                    format!("rows {}", dro(pitch[1])),
+                );
             }
             if angle.abs() >= 0.005 {
                 let c = pts[0];
@@ -1685,6 +1820,7 @@ fn paint_pattern(
                 arrow(f, on(end, unit(angle - 90.), 12.), end, ACCENT, 2.);
                 tag(
                     f,
+                    labels,
                     on(c, unit(angle / 2.), reach),
                     unit(angle / 2.),
                     degrees(angle),
@@ -1707,7 +1843,8 @@ fn paint_pattern(
                 f.stroke(&cross, stroke(ACCENT, 2.2));
             }
             let under = Point::new(c.x - 10., c.y + 16.);
-            write(f, "centre", under, ACCENT, 15. * k, Align::Right);
+            let down = iced::Vector::new(0., 6.);
+            labels.put(f, "centre", &[(under, Align::Right)], down, ACCENT, 15. * k);
             // From +X round to hole 1, counter-clockwise, outside the circle
             // and its numbers.
             let reach = big + rs + 34. * k;
@@ -1731,6 +1868,7 @@ fn paint_pattern(
             let half = unit(first / 2.);
             tag(
                 f,
+                labels,
                 on(c, half, reach),
                 half,
                 format!("first {}", degrees(first)),
@@ -1767,7 +1905,8 @@ fn paint_pattern(
         let n = on(*c, out, rs + (if one { 15. } else { 12. }) * k);
         let (ink, size) = if one { (ACCENT, 20.) } else { (INK, 16.) };
         let number = numbers.get(j).copied().unwrap_or(j + 1);
-        write(f, number.to_string(), n, ink, size * k, Align::Center);
+        let tries = [(n, Align::Center)];
+        labels.put(f, number.to_string(), &tries, along(out, 4.), ink, size * k);
     }
 }
 impl canvas::Program<Message> for Drawing<'_> {
@@ -5245,6 +5384,7 @@ struct CornerDetail {
 }
 impl CornerDetail {
     fn paint(&self, f: &mut canvas::Frame) {
+        drawing_words(true);
         let (c, r, rc) = (self.centre, self.radius, self.tool);
         let quarter = std::f32::consts::FRAC_PI_2;
         let unit = |t: f32| {
@@ -5298,13 +5438,16 @@ impl CornerDetail {
         }
         // The round's centre and radius.
         f.fill(&canvas::Path::circle(p(c), 2.5), INK);
-        write(
+        let mut caption = Caption::new(size);
+        let at = p(off(c, r * 0.5, unit(quarter / 2.)));
+        let down = iced::Vector::new(0., 6.);
+        (caption.0).put(
             f,
             format!("R{}", mm(r)),
-            p(off(c, r * 0.5, unit(quarter / 2.))),
+            &[(at, Align::Center)],
+            down,
             INK,
             13.,
-            Align::Center,
         );
         // The walk: its moves, each a reading.
         if let Some(first) = self.path.first() {
@@ -5328,14 +5471,7 @@ impl CornerDetail {
             f.stroke(&body, stroke(TOOL, 1.6));
             f.fill(&canvas::Path::circle(p(at), 2.5), TOOL);
         }
-        write(
-            f,
-            "seen from above · tool centres",
-            Point::new(8., 10.),
-            MUTED,
-            12.,
-            Align::Left,
-        );
+        caption.write(f);
     }
 }
 impl canvas::Program<Message> for CornerDetail {
@@ -5356,6 +5492,24 @@ impl canvas::Program<Message> for CornerDetail {
     }
 }
 
+/// A close-up's labels, "seen from above · tool centres" in its top-left
+/// corner first in their way, written last.
+struct Caption(Labels);
+impl Caption {
+    const SAID: &str = "seen from above · tool centres";
+    const AT: Point = Point::new(8., 10.);
+    fn new(room: Size) -> Self {
+        let r = text_box(Self::SAID, Self::AT, 12., Align::Left);
+        Caption(Labels {
+            room,
+            taken: vec![r],
+        })
+    }
+    fn write(self, f: &mut canvas::Frame) {
+        write(f, Self::SAID, Self::AT, MUTED, 12., Align::Left);
+        drawing_words(false);
+    }
+}
 /// A Slot's outline close up from above (LIO-455): the slot as cut, the
 /// line a pass leaves on its walls, the pass's moves one axis at a time,
 /// and the tool where it is.
@@ -5387,6 +5541,7 @@ impl SlotDetail {
         out
     }
     fn paint(&self, f: &mut canvas::Frame) {
+        drawing_words(true);
         let (r, rc) = (self.radius, self.tool);
         let margin = r * 0.6 + 2.;
         let lo = [
@@ -5431,7 +5586,16 @@ impl SlotDetail {
         let axis = usize::from((self.b[1] - self.a[1]).abs() > (self.b[0] - self.a[0]).abs());
         let mut label = self.b;
         label[1 - axis] += r * 0.55;
-        write(f, format!("R{}", mm(r)), p(label), INK, 13., Align::Center);
+        let mut caption = Caption::new(size);
+        let (at, down) = (p(label), iced::Vector::new(0., 6.));
+        (caption.0).put(
+            f,
+            format!("R{}", mm(r)),
+            &[(at, Align::Center)],
+            down,
+            INK,
+            13.,
+        );
         // The pass: its moves, each a reading.
         if let Some(first) = self.path.first() {
             let walk = canvas::Path::new(|b| {
@@ -5454,14 +5618,7 @@ impl SlotDetail {
             f.stroke(&body, stroke(TOOL, 1.6));
             f.fill(&canvas::Path::circle(p(at), 2.5), TOOL);
         }
-        write(
-            f,
-            "seen from above · tool centres",
-            Point::new(8., 10.),
-            MUTED,
-            12.,
-            Align::Left,
-        );
+        caption.write(f);
     }
 }
 impl canvas::Program<Message> for SlotDetail {
@@ -7492,6 +7649,103 @@ pub(crate) mod tests {
             a.guide_item = i;
             let deep = format!("{} deep", mm(m - h[2]));
             assert!(texts(&a).iter().any(|s| s.contains(&deep)), "{i} {deep}");
+        }
+    }
+    /// The job's Step as a Ø8 slot 30 × 8 in the stock in front of the
+    /// part (X 55..85, Y 4..12, 5 deep), as on the manual block demo's
+    /// "Through slot": with the comp off its lines read X 59 and 81, and
+    /// Y 8 twice, 8 mm apart.
+    fn slot_the_block(doc: &mut Document) {
+        let mut mill = Tool::new("End mill 8", "Flat end mill", "8");
+        let machine = doc.setups[0].machine.id.clone();
+        for (k, v) in [("length", "30"), ("stickout", "40"), ("machines", &machine)] {
+            mill.p.insert(k.into(), v.into());
+        }
+        let b = [55., 85., 4., 12., 0., -5.];
+        let fields = [("stepdown", "5"), ("allowance", "0")];
+        let slot = crate::guide::tests::boxed("Through slot", &mill.id, b, &fields);
+        doc.setups[0].operations[1] = slot;
+        doc.tools.push(mill);
+    }
+    #[test]
+    fn no_two_words_of_a_steps_drawing_lie_on_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        // A slot close up: a Ø12 mill in a 16.5 wide counterbore.
+        let slot = {
+            let mesh = crate::mesh::normalize(crate::slot::tests::counterbore(
+                (60., 50., 20.),
+                21.5,
+                16.5,
+                2.,
+                false,
+            ))
+            .unwrap();
+            let fields = [
+                ("slot_width", "16.5"),
+                ("slot_length", "21.5"),
+                ("z_top", "0"),
+                ("z_bottom", "-2"),
+                ("through", "No"),
+                ("stepdown", "1"),
+            ];
+            let mut doc = crate::slot::tests::job(&mesh, "12", &fields);
+            doc.active = doc.setups[0].id.clone();
+            on_page(doc, mesh)
+        };
+        let (plate, mesh) = crate::corner::tests::plate_job("Y");
+        let apps = [
+            ("block", app_with("No", slot_the_block)),
+            ("corners", on_page(plate, mesh)),
+            ("slot", slot),
+            (
+                "grid",
+                pattern_app(&crate::guide::tests::plate_grid(), true, false, false),
+            ),
+            (
+                "circle",
+                pattern_app(&crate::guide::tests::plate_circle(), false, true, true),
+            ),
+        ];
+        // The screens with labelled drawings of the cut.
+        const KINDS: [&str; 5] = ["Pass", "Slot", "Corner", "Holes", "Pattern"];
+        let mut seen = std::collections::BTreeSet::new();
+        for (name, mut a) in apps {
+            if let Some((_, Err(e))) = &a.guide {
+                panic!("{name}: {e}");
+            }
+            let steps = guide(&a).steps;
+            for (i, step) in steps.iter().enumerate() {
+                let kind = format!("{step:?}")
+                    .split([' ', '('])
+                    .next()
+                    .unwrap()
+                    .to_string();
+                if !KINDS.contains(&kind.as_str()) {
+                    continue;
+                }
+                send(&mut a, GuideAction::Go(i));
+                // The narrow window class draws the pictures ~440 px wide,
+                // where they crowd (a debug render is slow: one width).
+                for (w, h) in [(1100, 800)] {
+                    (a.window_width, a.window_height) = (w as f32, h as f32);
+                    DRAWN.take();
+                    render(&a, (w, h), &dir.path().join("steps.png"));
+                    for words in DRAWN.take() {
+                        seen.insert(kind.clone());
+                        for (j, (s, r)) in words.iter().enumerate() {
+                            for (t, o) in &words[..j] {
+                                assert!(
+                                    !r.intersects(o),
+                                    "{name} step {i} ({kind}) at {w} px: {s:?} {r:?} on {t:?} {o:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for kind in KINDS {
+            assert!(seen.contains(kind), "{kind} not drawn: {seen:?}");
         }
     }
     #[test]
