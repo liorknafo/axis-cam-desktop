@@ -163,9 +163,21 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
         }
         _ => vec![],
     };
+    // The parallels the setup says the stock stands on (LIO-537), under
+    // the box it starts from.
+    let modelled: Vec<Bounds> = match &guide.steps[0] {
+        Step::Hold { holding, .. } => {
+            crate::parallels::boxes(setup, holding.stock.translated(zero))
+                .into_iter()
+                .map(|b| work(b.bounds))
+                .collect()
+        }
+        _ => vec![],
+    };
     let jaws: Vec<Bounds> = jaws.into_iter().map(work).collect();
     // In a vise: the jaw plates go down from the grip by their height, and
-    // parallels fill what is under the stock between them.
+    // parallels fill what is under the stock between them: the setup's own
+    // when it says where they are.
     let (vise, parallels) = match &guide.steps[0] {
         Step::Hold {
             holding,
@@ -188,10 +200,18 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
                 b
             });
             let under = floor < s.min[2] - 0.5;
-            (tall, if under { bars.to_vec() } else { vec![] })
+            let bars = match () {
+                _ if !modelled.is_empty() => modelled.clone(),
+                _ if under => bars.to_vec(),
+                _ => vec![],
+            };
+            (tall, bars)
         }
-        _ => (vec![], vec![]),
+        _ => (vec![], modelled.clone()),
     };
+    // The jaws or clamps and the parallels, in the pictures.
+    let mut jaws = jaws;
+    jaws.extend(modelled.iter().copied());
     let frame = crate::volume::Frame::new(setup, mesh);
     let solid = |boxes: &[Bounds]| -> Vec<_> {
         (boxes.iter())
@@ -3192,8 +3212,11 @@ fn parts<'a>(p: &Page<'a>) -> Parts<'a> {
             let mut c = vec![chip(p.doc.holding_label(p.setup)), chip("top face up")];
             // Across the jaws, seen from the front or the right: the stock
             // on its parallels, the jaws at their height and the grip.
-            let view = match vise {
-                Some(v) if v.across == 1 => 2,
+            // Without a vise, across the parallels the setup stands it on.
+            let parallels = crate::parallels::of(p.setup).ok().flatten();
+            let view = match (vise, &parallels) {
+                (Some(v), _) if v.across == 1 => 2,
+                (None, Some(par)) if par.across() == 1 => 2,
                 _ => 1,
             };
             let (k, top) = (VIEWS[view][0], stock.max[2]);
@@ -3219,11 +3242,42 @@ fn parts<'a>(p: &Page<'a>) -> Parts<'a> {
                 c.push(chip(format!("jaws on the {} sides", AXES[v.across])));
                 c.push(chip(format!("{} in the jaws", mm(v.grip))));
                 let under = holding.bottom + v.grip - v.jaw_height;
-                if !p.shown.parallels.is_empty() {
+                if !p.shown.parallels.is_empty() && parallels.is_none() {
                     c.push(chip(format!(
                         "on parallels {} high",
                         mm(stock.min[2] - under)
                     )));
+                }
+            }
+            // The parallels the setup says it stands on (LIO-537): how many,
+            // how high, which way and where, and their height drawn.
+            if let Some(par) = &parallels {
+                c.push(chip(format!(
+                    "on {} parallel{} {} high",
+                    par.at.len(),
+                    if par.at.len() == 1 { "" } else { "s" },
+                    mm(par.height)
+                )));
+                c.push(chip(format!(
+                    "running {} at {}",
+                    if par.along_y {
+                        "front to back"
+                    } else {
+                        "left to right"
+                    },
+                    (par.at.iter())
+                        .map(|a| par.place(*a))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+                // Just outside the + side, from the underside down to the
+                // table, labelled on its right.
+                if vise.is_none() {
+                    let (mut a, mut b) = ([0.; 3], [0.; 3]);
+                    let out = stock.max[k] + 1.;
+                    (a[k], b[k]) = (out, out);
+                    (a[2], b[2]) = (stock.min[2], stock.min[2] - par.height);
+                    shapes.push(Shape::Height(a, b, format!("{} parallels", mm(par.height))));
                 }
             }
             let left = column![
@@ -3233,37 +3287,40 @@ fn parts<'a>(p: &Page<'a>) -> Parts<'a> {
             .spacing(6)
             .align_x(Alignment::Center)
             .into();
-            let right = column![
-                label("Stock as it starts"),
-                chips(c),
-                readout(
-                    Readout {
-                        order: None,
-                        // The key before the size, one text that does not
-                        // wrap at 1024 × 700 (LIO-435).
-                        lead: Some("X × Y × Z".into()),
-                        axis: String::new(),
-                        // Narrow, the size closes up and its tag, said
-                        // again under it, goes: three sizes of 100 or more
-                        // are clipped otherwise at 1024 × 700 (LIO-487).
-                        value: [d[0], d[1], d[2]]
-                            .map(mm)
-                            .join(if narrow { "×" } else { " × " }),
-                        lock: None,
-                        tags: if narrow {
-                            vec![]
-                        } else {
-                            vec!["remaining material envelope".into()]
-                        },
-                        lit: Lit::Next,
-                        big: false
+            let right = column![label("Stock as it starts"), chips(c),];
+            // The parallels in a sentence: where they go from the stock's
+            // centre, what the halving on the Zero page finds.
+            let right = match crate::parallels::sentence(p.setup) {
+                Some(said) => right.push(text(said).size(14).color(INK)),
+                None => right,
+            };
+            let right = right.push(readout(
+                Readout {
+                    order: None,
+                    // The key before the size, one text that does not
+                    // wrap at 1024 × 700 (LIO-435).
+                    lead: Some("X × Y × Z".into()),
+                    axis: String::new(),
+                    // Narrow, the size closes up and its tag, said
+                    // again under it, goes: three sizes of 100 or more
+                    // are clipped otherwise at 1024 × 700 (LIO-487).
+                    value: [d[0], d[1], d[2]]
+                        .map(mm)
+                        .join(if narrow { "×" } else { " × " }),
+                    lock: None,
+                    tags: if narrow {
+                        vec![]
+                    } else {
+                        vec!["remaining material envelope".into()]
                     },
-                    None
-                ),
-            ];
+                    lit: Lit::Next,
+                    big: false,
+                },
+                None,
+            ));
             // How the setup holds and supports the part, in its own words:
-            // the parallels, a stop and the room under holes are not
-            // modelled (LIO-487).
+            // a stop and the room under holes are not modelled (LIO-487),
+            // nor the parallels when the setup does not say where they are.
             let notes = p.notes();
             let right = if notes.is_empty() {
                 right
@@ -4637,9 +4694,12 @@ fn safe_z(p: &Page<'_>, op: usize) -> f32 {
 const WRENCH_LIFT: &str = "In a wrench, Z is the centre's point, not the tap's tip: before each move to a hole, turn the tap out, lift it and the wrench clear of the stock by hand, then raise the centre.";
 /// What holds the stock, in a hole page's words.
 fn holder(p: &Page<'_>) -> &'static str {
+    // The jaws drawn are the clamps' and the parallels' (LIO-537): the
+    // clamps are said only when the setup has them.
+    let clamped = p.shown.jaws.len() > crate::parallels::boxes_count(p.setup);
     if !p.shown.vise.is_empty() {
         "the vise"
-    } else if !p.shown.jaws.is_empty() {
+    } else if clamped {
         "the clamps"
     } else {
         "what holds it"
@@ -5936,11 +5996,14 @@ fn slot_screen<'a>(
             dro((*scallop * 100. - 1e-4).ceil() / 100.)
         ),
     };
-    // What is under the part is left to the user; the setup's notes on the
-    // Hold page say where it goes, when it has some (LIO-487).
-    let verify = match p.notes() {
-        "" => "Verify parallels, table and breakthrough clearance below the part; these are unmodeled.".to_string(),
-        _ => format!("Verify parallels, table and breakthrough clearance below the part; these are unmodeled: {SEE_NOTES}."),
+    // What is under the part: the parallels the setup says it stands on
+    // and the table under them are checked (LIO-537); else it is left to
+    // the user, and the setup's notes on the Hold page say where it goes,
+    // when it has some (LIO-487).
+    let verify = match (crate::parallels::under_the_part(p.setup), p.notes()) {
+        (Some(checked), _) => checked,
+        (None, "") => "Verify parallels, table and breakthrough clearance below the part; these are unmodeled.".to_string(),
+        (None, _) => format!("Verify parallels, table and breakthrough clearance below the part; these are unmodeled: {SEE_NOTES}."),
     };
     let mut right = column![
         chips(vec![
@@ -8777,6 +8840,37 @@ pub(crate) mod tests {
         s.operations = vec![op];
         (doc, mesh)
     }
+    /// A through Slot over parallels (LIO-537): its Steps are given while
+    /// the parallels stand clear of its passes, and refused, naming the
+    /// parallel, when one stands under the slot.
+    #[test]
+    fn a_through_slot_is_checked_against_the_parallels_under_it() {
+        use crate::parallels::{AT, HEIGHT, LEFT_TO_RIGHT, RUN, WIDTH};
+        let (mut doc, mesh) = slot_job(true, "-8");
+        let mut on = |at: &str, height: &str| {
+            let p = &mut doc.setups[0].p;
+            for (k, v) in [
+                (RUN, LEFT_TO_RIGHT),
+                (AT, at),
+                (HEIGHT, height),
+                (WIDTH, "4"),
+            ] {
+                p.insert(k.into(), v.into());
+            }
+            shown(&doc, &mesh, 0).map(|_| ())
+        };
+        // The slot is Y -5..5; parallels Y 10..14 and -14..-10 are 5 mm
+        // clear of its walls, past the 2 mm gap.
+        assert_eq!(on("-12; 12", "10"), Ok(()));
+        let refused = on("0; 12", "10").unwrap_err();
+        assert!(refused.contains("the parallel at Y0"), "{refused}");
+        // Its 0.5 mm breakthrough goes 0.3 mm into the table under 0.2 mm
+        // parallels.
+        assert_eq!(
+            on("-12; 12", "0.2"),
+            Err("Slot 15x10: the tool goes 0.30 mm past the 0.2 mm parallels the part stands on, into the table or vise under them. Reduce the depth or the breakthrough.".into())
+        );
+    }
     /// A Slot's Check page gives what to measure (LIO-449): its length and
     /// width, its floor below the row's top and on the DRO, or through and
     /// to check the back; and where its centre is, listed, not drawn.
@@ -8825,6 +8919,14 @@ pub(crate) mod tests {
         bottom: &str,
         air: &str,
     ) -> (Document, Guide, f32) {
+        let doc = drilled_job(mesh, size, through, bottom, air);
+        let shown = shown(&doc, mesh, 0).unwrap();
+        let g = &shown.guide;
+        let top = shown.boxes[0].max[2] + g.zero[2];
+        (doc, g.clone(), top)
+    }
+    /// `drilled`'s job, its Steps not built.
+    fn drilled_job(mesh: &Mesh, size: &str, through: bool, bottom: &str, air: &str) -> Document {
         use crate::cam::boring::tests::{drill, drilling, job};
         let manual = crate::manual::defaults();
         let mut tool = drill(size);
@@ -8842,10 +8944,63 @@ pub(crate) mod tests {
         }
         let (mut doc, _) = job(mesh, manual, vec![(tool, op)]);
         doc.setups[0].p.insert("stock_top".into(), "0".into());
-        let shown = shown(&doc, mesh, 0).unwrap();
-        let g = &shown.guide;
-        let top = shown.boxes[0].max[2] + g.zero[2];
-        (doc, g.clone(), top)
+        doc
+    }
+    /// A hand Drill through a part on parallels (LIO-537): its Steps are
+    /// given while the drill breaks through over the open space between
+    /// them, and refused when a parallel stands under the hole or the
+    /// breakthrough goes past their height into the table.
+    #[test]
+    fn a_through_drill_is_checked_against_the_parallels_and_the_table_under_them() {
+        use crate::parallels::{AT, FRONT_TO_BACK, HEIGHT, RUN, WIDTH};
+        // Ø6.8 through the 18.5 mm ring, 2.5 mm of breakthrough.
+        let mesh = crate::cam::boring::tests::ring(6.8, 30., 18.5);
+        let mut doc = drilled_job(&mesh, "6.8", true, "0", "0");
+        // The part's underside is the stock's: the breakthrough leaves it.
+        doc.setups[0].p.insert("stock_bottom".into(), "0".into());
+        let mut on = |at: &str, height: &str| {
+            let p = &mut doc.setups[0].p;
+            for (k, v) in [
+                (RUN, FRONT_TO_BACK),
+                (AT, at),
+                (HEIGHT, height),
+                (WIDTH, "4"),
+            ] {
+                p.insert(k.into(), v.into());
+            }
+            shown(&doc, &mesh, 0).map(|_| ())
+        };
+        // The hole is at X0; parallels X 9..13 and -13..-9 are 5.6 mm clear
+        // of the drill's Ø6.8, past the 2 mm gap.
+        assert_eq!(on("-11; 11", "10"), Ok(()));
+        let into = on("0; 11", "10").unwrap_err();
+        assert!(
+            into.contains("hits the parallel at X0")
+                && into.ends_with("Stand the part so that the parallels are clear of its cuts."),
+            "{into}"
+        );
+        // Parallels 2 mm high: the breakthrough goes 0.5 mm into the table.
+        let past = on("-11; 11", "2").unwrap_err();
+        assert!(
+            past.ends_with(": the tool goes 0.50 mm past the 2 mm parallels the part stands on, into the table or vise under them. Reduce the depth or the breakthrough."),
+            "{past}"
+        );
+        // Parallels chosen but with no height (or a bad one) stand nothing
+        // up: no Steps, and what is wrong said.
+        for bad in ["", "-2", "NaN"] {
+            let unread = on("-11; 11", bad).unwrap_err();
+            assert!(
+                unread.ends_with("Give the parallels' height in mm: how far they raise the part."),
+                "{bad:?}: {unread}"
+            );
+        }
+        // Parallels off the stock hold nothing up either, whatever holds
+        // the stock (here none).
+        let off = on("-100; 100", "10").unwrap_err();
+        assert!(
+            off.contains("The parallel at X-100 is not under the stock, which spans X-"),
+            "{off}"
+        );
     }
     /// `drilled`'s one depth, drawn from the mouth down as far as it says.
     fn drilled_depth(mesh: &Mesh, size: &str, through: bool, bottom: &str, air: &str) -> Measure {

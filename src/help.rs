@@ -1082,7 +1082,7 @@ pub fn command(m: &Message, label: String) -> Help {
         ),
         Page(crate::Page::Post) => (
             "Check each setup and export LinuxCNC G-code or a setup sheet. Speeds and feeds outside the project material's cutting data are listed as warnings and never block export. A UC100 machine takes no G-code file: Run on the machine runs its setup from MACHINE.",
-            "Checks cover generation, machine limits, rapids into material and holder clearance, and, in a setup that models a vise or clamps, the jaws or clamps as boxes with a clearance gap over every program move, links, approaches and retracts included; parallels, bolts, the table, the machine body and other fixtures are not checked.",
+            "Checks cover generation, machine limits, rapids into material and holder clearance, and, in a setup that models a vise or clamps, the jaws or clamps as boxes with a clearance gap over every program move, links, approaches and retracts included; bolts, the table, the machine body, other fixtures and parallels a setup does not place are not checked.",
         ),
         OpenIssue(..) => (
             "Open this operation on the Work page, at the tab with the setting the problem is about.",
@@ -1408,7 +1408,7 @@ pub fn command(m: &Message, label: String) -> Help {
         ),
         SuggestLayout => (
             "Place this setup's vise jaws or clamps. A vise goes on the X or the Y side at its grip or less. Clamps go only where they hold, clear of the toolpaths, one per side on at least two opposite sides.",
-            "A vise goes on whichever of the X or the Y sides its generated toolpaths leave clearer. Clamps go along each side every 5 mm, at the spot clearest of the toolpaths whose bite keeps its stock for the whole setup; two on a small stock. Where no two opposite sides can be clamped, none are placed and the status says why and how much stock to leave beside the part. The status says how many operations still come within the clearance gap. The setup's operations are generated for this and never changed. Jaws and clamps are checked as boxes with the gap; parallels, bolts, the table and the machine body are not. Choosing Vise or Clamps, or another library entry, does this too; other edits are kept until you press this again. On a lathe setup it chooses the chuck instead: the 3-jaw when the bar in the jaws is round and within its range, else the 4-jaw (change the chuck), never a vise; the grip and the stickout stay yours.",
+            "A vise goes on whichever of the X or the Y sides its generated toolpaths leave clearer. Clamps go along each side every 5 mm, at the spot clearest of the toolpaths whose bite keeps its stock for the whole setup; two on a small stock. Where no two opposite sides can be clamped, none are placed and the status says why and how much stock to leave beside the part. The status says how many operations still come within the clearance gap. The setup's operations are generated for this and never changed. Jaws and clamps are checked as boxes with the gap; bolts, the table, the machine body and parallels the setup does not place are not. Choosing Vise or Clamps, or another library entry, does this too; other edits are kept until you press this again. On a lathe setup it chooses the chuck instead: the 3-jaw when the bar in the jaws is round and within its range, else the 4-jaw (change the chuck), never a vise; the grip and the stickout stay yours.",
         ),
         SetClamps(_) if label == crate::ui::ADD_CLAMP => (
             "Add a clamp at the middle of a side of the stock, the sides taken in turn. Change its side and offset in its row.",
@@ -2069,7 +2069,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (Target::Setup, "clearance") => (
             "A minimum gap between the fixture and the outside of the cutter or holder that you ask the operator to keep, in mm: the illustration shows a side gap measured from the wider holder. It is a note. It is printed on the setup sheet and in the program header, it changes no operation height or toolpath, and nothing checks it.",
-            "The checks of a modelled vise or clamps use Checked gap to jaws and clamps under Workholding instead; parallels, bolts, the table and the machine body are never checked.",
+            "The checks of a modelled vise or clamps use Checked gap to jaws and clamps under Workholding instead; bolts, the table, the machine body and parallels a setup does not place are never checked.",
             Some(FixtureClearance),
         ),
         (Target::Material, "name") => (
@@ -2409,7 +2409,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (Target::Setup, "holding") => (
             "The workholding to model: a Vise, jaws on two opposite sides, Clamps round the stock, a Chuck (a lathe's, or the rotary A axis's), or a round bar's V-block, Soft jaws or Collet block. Each is kept as boxes with a clearance gap that moves are checked against, as is its hold against each cut. None models nothing.",
-            "Each is kept as boxes with a clearance gap, and every move is checked against them: the cutter from its tip up to its stickout at its cutting diameter, the tool holder above that at the holder diameter (a wider shank or a reduced neck is not modelled). A move that comes within the gap is warned of in the operation preview, which covers that operation's own toolpath, and refused at export, which checks every program move, the links between operations, approaches and retracts included. Parallels, bolts, the table and the machine body are not modelled. Each operation's cutting force is also set against what the vise's or clamps' clamping force holds (sliding, lifting and tipping), over the contact the earlier setups left the jaws; an operation held with a margin under ×2 is refused at export. In a later setup the jaws or clamps sit at the stock box carried over from setup 1, not at the walls earlier operations cut, and a setup turned from setup 1 by other than a multiple of 90° cannot model them. None models nothing; the Fixture note below is only a description. Chuck on a machine with a rotary A axis models the chuck on A from its rotary unit's sizes: the chuck body, its jaws (turning with A), the rotary head, the tailstock and the stock gripped in the jaws, each as the box round it with the gap, at each A angle; the grip left after earlier cuts, the stock turning or sliding in the jaws and its stick-out bending under each cut are checked too. A lathe setup has a Chuck instead of a Vise or Clamps, and its checks are the chuck's: the bar's diameter in the jaws must be one the chuck closes on (a 3-jaw holds round work only), the grip at least a third of that diameter and no longer than the jaws, the stickout at least the furthest cut from the free end plus 5 mm, no cut inside the grip, the bar within the lathe's swing and the grip plus the stickout within the bar's length. A stickout over 4 diameters is warned of, not refused. The chuck's body is a box 40 mm deep behind the jaws' end, and a move within the clearance gap of it is warned of in the operation preview. Nothing is exported: a lathe has no G-code. A V-block holds a bar lying along X in its V under a strap clamp: the block, its flanks (as steps that hold them) and the clamp are kept clear, the bar must seat on the flanks inside the V's edges and stand above the block, and its two line contacts and the clamp hold it against each cut. Soft jaws bored to the bar's diameter (within 0.5 mm) close round it along X or upright: on a lying bar their top must be above its axis; their arc contact holds it. A collet block stands in the vise with the bar in an ER collet: the collet must close on the diameter it grips, the nut and block are kept clear, and its grip, less when the bar stands under two thirds of the collet's length in it, holds it.",
+            "Each is kept as boxes with a clearance gap, and every move is checked against them: the cutter from its tip up to its stickout at its cutting diameter, the tool holder above that at the holder diameter (a wider shank or a reduced neck is not modelled). A move that comes within the gap is warned of in the operation preview, which covers that operation's own toolpath, and refused at export, which checks every program move, the links between operations, approaches and retracts included. Bolts, the table and the machine body are not modelled, nor parallels but where Parallels under the stock places them. Each operation's cutting force is also set against what the vise's or clamps' clamping force holds (sliding, lifting and tipping), over the contact the earlier setups left the jaws; an operation held with a margin under ×2 is refused at export. In a later setup the jaws or clamps sit at the stock box carried over from setup 1, not at the walls earlier operations cut, and a setup turned from setup 1 by other than a multiple of 90° cannot model them. None models nothing; the Fixture note below is only a description. Chuck on a machine with a rotary A axis models the chuck on A from its rotary unit's sizes: the chuck body, its jaws (turning with A), the rotary head, the tailstock and the stock gripped in the jaws, each as the box round it with the gap, at each A angle; the grip left after earlier cuts, the stock turning or sliding in the jaws and its stick-out bending under each cut are checked too. A lathe setup has a Chuck instead of a Vise or Clamps, and its checks are the chuck's: the bar's diameter in the jaws must be one the chuck closes on (a 3-jaw holds round work only), the grip at least a third of that diameter and no longer than the jaws, the stickout at least the furthest cut from the free end plus 5 mm, no cut inside the grip, the bar within the lathe's swing and the grip plus the stickout within the bar's length. A stickout over 4 diameters is warned of, not refused. The chuck's body is a box 40 mm deep behind the jaws' end, and a move within the clearance gap of it is warned of in the operation preview. Nothing is exported: a lathe has no G-code. A V-block holds a bar lying along X in its V under a strap clamp: the block, its flanks (as steps that hold them) and the clamp are kept clear, the bar must seat on the flanks inside the V's edges and stand above the block, and its two line contacts and the clamp hold it against each cut. Soft jaws bored to the bar's diameter (within 0.5 mm) close round it along X or upright: on a lying bar their top must be above its axis; their arc contact holds it. A collet block stands in the vise with the bar in an ER collet: the collet must close on the diameter it grips, the nut and block are kept clear, and its grip, less when the bar stands under two thirds of the collet's length in it, holds it.",
             Some(Vise(8)),
         ),
         (Target::Setup, "holder") => (
@@ -2441,6 +2441,26 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "Where the clamps sit, a row each: the side of the stock, -X, +X, -Y or +Y, and the offset, in mm, that moves the clamp along that side from its middle (toward +Y on the X sides, toward +X on the Y sides), no more than half that side's length. Place 1 to 8 clamps with + Add clamp and Remove.",
             "The positions are saved only when every offset is a number; what is wrong is shown under the rows. The setup keeps them as side:offset separated by semicolons, for example -X:0;+X:20.",
             Some(Clamp(4)),
+        ),
+        (Target::Setup, "parallels") => (
+            "What the stock stands on in this setup: None for the table or the vise's floor, or parallels running front to back (along Y) or left to right (along X) that raise it by their height.",
+            "On parallels a through hole or slot may break through the part's underside over the open space between them. A cut into a parallel, or past their height into what they stand on, is refused, as a cut below the underside is without them. The parallels are drawn in the 3D view and on the manual Steps' Hold page.",
+            None,
+        ),
+        (Target::Setup, "parallel_at") => (
+            "Where each parallel runs: its centre in mm from the centre of the stock the setup starts from, X for parallels running front to back and Y for those running left to right, separated by semicolons, for example -18; 18.",
+            "1 to 6 parallels, each under the stock. They are as long as the stock along their run.",
+            None,
+        ),
+        (Target::Setup, "parallel_height") => (
+            "How high the parallels are, in mm: how far they raise the stock off the table or the vise's floor.",
+            "",
+            None,
+        ),
+        (Target::Setup, "parallel_width") => (
+            "How wide each parallel is across its run, in mm; left empty it is 10 mm.",
+            "",
+            None,
         ),
         (_, "name") => (
             "A descriptive name shown in the browser, library and setup sheet. Use names that identify the part position, operation or hardware.",
@@ -4288,7 +4308,9 @@ pub(crate) mod tests {
         );
         assert!(suggest.more.contains("never changed"), "{}", suggest.more);
         assert!(
-            suggest.more.contains("parallels, bolts, the table"),
+            suggest.more.contains(
+                "bolts, the table, the machine body and parallels the setup does not place"
+            ),
             "{}",
             suggest.more
         );
@@ -4404,7 +4426,7 @@ pub(crate) mod tests {
             "the tool holder above that at the holder diameter",
             "a wider shank or a reduced neck is not modelled",
             "warned of in the operation preview, which covers that operation's own toolpath, and refused at export, which checks every program move, the links between operations, approaches and retracts included",
-            "Parallels, bolts, the table and the machine body are not modelled",
+            "Bolts, the table and the machine body are not modelled, nor parallels but where Parallels under the stock places them",
             "In a later setup the jaws or clamps sit at the stock box carried over from setup 1, not at the walls earlier operations cut, and a setup turned from setup 1 by other than a multiple of 90° cannot model them",
             "the Fixture note below is only a description",
         ] {
@@ -4444,7 +4466,7 @@ pub(crate) mod tests {
         let post = command(&Message::Page(crate::Page::Post), "x".into()).more;
         for part in [
             "in a setup that models a vise or clamps, the jaws or clamps as boxes with a clearance gap over every program move, links, approaches and retracts included",
-            "parallels, bolts, the table, the machine body and other fixtures are not checked",
+            "bolts, the table, the machine body, other fixtures and parallels a setup does not place are not checked",
         ] {
             assert!(post.contains(part), "{part}: {post}");
         }

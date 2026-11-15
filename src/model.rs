@@ -274,7 +274,7 @@ const HOLDING: [&str; 11] = [
 ];
 /// The setup keys a manual setup put first takes from the old first setup,
 /// besides its stock: orientation, zero, offset and holding.
-const HANDED_OVER: [&str; 17] = [
+const HANDED_OVER: [&str; 21] = [
     "rx",
     "ry",
     "rz",
@@ -292,6 +292,10 @@ const HANDED_OVER: [&str; 17] = [
     "clamps",
     "fixture",
     "clearance",
+    crate::parallels::RUN,
+    crate::parallels::AT,
+    crate::parallels::HEIGHT,
+    crate::parallels::WIDTH,
 ];
 
 /// A tool as the app names it: "T4 Flat end mill 3mm" for tool number 4
@@ -3477,6 +3481,10 @@ impl Document {
             position_issue, refusal,
         };
         let kind = crate::holding::library_kind(get(&s.p, "holding")).unwrap_or("");
+        // Told once, for the jaws and the parallels alike.
+        let mut make = Some(held);
+        let mut told: Option<Option<crate::holding::Gripped>> = None;
+        let mut held = move || *told.get_or_insert_with(|| make.take().and_then(|f| f()));
         // A vise or clamps close on flat sides, which a round bar has not.
         let round = self.setups.first().is_some_and(crate::stock::round_bar);
         if round && matches!(kind, "Vise" | "Clamp") {
@@ -3583,6 +3591,10 @@ impl Document {
         // A chuck sits on the lathe's own axis, not on setup 1's box.
         if !kind.is_empty() && kind != "Chuck" && !square {
             issues.push(NOT_SQUARE.into());
+        }
+        // The parallels the stock stands on (LIO-537).
+        if crate::parallels::chosen(s) {
+            issues.extend(crate::parallels::issues(s, held().map(|h| h.stock)));
         }
         issues
     }

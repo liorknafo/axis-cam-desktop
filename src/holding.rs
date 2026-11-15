@@ -437,6 +437,10 @@ pub enum Shape {
     /// As its box, never cut at the stock's bottom: a solid that stands
     /// below the bar as it is (a V-block, a collet block: `round_hold`).
     Whole,
+    /// As its box, whole: a parallel under the stock (`parallels`). Its top
+    /// is not grown by the gap in the checks, the part's own material lying
+    /// between it and a tool that does not break through the underside.
+    Support,
 }
 /// What a setup's workholding holds, in mm in the setup's frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1066,11 +1070,19 @@ pub fn hits_parts(
 ) -> Vec<Hit> {
     let mut out = vec![];
     for b in boxes {
+        // A parallel's top is the underside of the part on it: a tool is
+        // in it only below that, past the thousandth the floor check
+        // (`plan_check::axis_problems_over`) allows too, so a cut that
+        // just reaches the underside cuts the part, not the parallel.
+        let mut bounds = b.bounds;
+        if b.shape == Shape::Support {
+            bounds.max[2] -= gap + 0.001;
+        }
         for &(part, part_radius, low, high) in tool {
             let reach = f64::from(part_radius) + f64::from(gap);
             let found = segments.iter().find_map(|&(from, to)| {
                 let (from, to) = (from.map(f64::from), to.map(f64::from));
-                let (distance, at) = closest(&b.bounds, from, to, low, high, gap)?;
+                let (distance, at) = closest(&bounds, from, to, low, high, gap)?;
                 (distance <= reach).then(|| at.map(|v| v as f32))
             });
             if let Some(at) = found {
@@ -3748,6 +3760,29 @@ mod tests {
         assert_eq!(across[0].part, "tool");
         // The hit is where the tool first comes within reach: the clamp's near face at X -98 (the path crosses the box).
         assert!(near(across[0].at, [-98., 0., 41.]), "{:?}", across[0].at);
+    }
+    #[test]
+    fn a_parallel_is_hit_only_below_the_underside_it_carries() {
+        // A parallel X -23..-13 under a stock whose underside is Z -20, 15 high (LIO-537).
+        let parallel = [HoldBox {
+            label: "parallel at X-18".into(),
+            bounds: Bounds {
+                min: [-23., -63.5, -35.],
+                max: [-13., 63.5, -20.],
+            },
+            shape: Shape::Support,
+        }];
+        let down = |x: f32, z: f32| hits(&plan(3.4, &[([x, 0., 5.], [x, 0., z])]), &parallel, 2.);
+        // A Ø6.8 drill over it, through to the underside, cuts the part, not the parallel.
+        assert!(down(-18., -20.).is_empty());
+        // 0.5 mm past the underside it is in the parallel.
+        let into = down(-18., -20.5);
+        assert_eq!(into.len(), 1, "{into:?}");
+        assert_eq!(into[0].label, "parallel at X-18");
+        // Beside it, 2.5 mm past the underside, the drill is clear of it by more than the gap (X -13 + 3.4 + 2 < -7).
+        assert!(down(-7., -22.5).is_empty());
+        // Within the gap of its side it is not.
+        assert_eq!(down(-8., -22.5).len(), 1);
     }
     #[test]
     fn a_long_move_through_a_thin_clamp_is_not_missed() {

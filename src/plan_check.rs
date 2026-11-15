@@ -630,7 +630,8 @@ pub(crate) fn angle_problems(
 ) -> Vec<String> {
     if sim.turns.is_empty() {
         let board = crate::stock::below(&doc.setups[si]);
-        return axis_problems_over(&sim.plan, geometry, index, si, board);
+        let raised = crate::parallels::height(&doc.setups[si]);
+        return axis_problems_over(&sim.plan, geometry, index, si, board, raised);
     }
     let mut out = vec![];
     for &(a, _) in &sim.turns {
@@ -711,16 +712,21 @@ pub(crate) fn axis_problems(
     index: &Index,
     si: usize,
 ) -> Vec<String> {
-    axis_problems_over(plan, geometry, index, si, 0.)
+    axis_problems_over(plan, geometry, index, si, 0., 0.)
 }
 /// `axis_problems` of setup 1 on a sheet, whose floor is `board` mm under
-/// the stock's bottom: the spoilboard's allowance (`stock::below`).
+/// the stock's bottom: the spoilboard's allowance (`stock::below`); and of
+/// a setup whose stock stands on parallels `raised` mm high (`parallels`,
+/// LIO-537), whose floor is that much lower: the top of what they stand on.
+/// A cut into a parallel itself is the workholding check's (`holding::hits`
+/// on `parallels::boxes`).
 pub(crate) fn axis_problems_over(
     plan: &Plan,
     geometry: &Geometry,
     index: &Index,
     si: usize,
     board: f32,
+    raised: f32,
 ) -> Vec<String> {
     let b = geometry.bounds;
     let (worst, at, lowest) = tool_axis(plan, index, b.max[2]);
@@ -738,10 +744,16 @@ pub(crate) fn axis_problems_over(
         plan.stock.min[2] - board
     } else {
         plan.stock.min[2].max(b.min[2])
-    };
+    } - raised;
     let below = floor - lowest;
     if below > 0.001 {
-        problems.push(if si == 0 && board > 0. {
+        problems.push(if raised > 0. {
+            format!(
+                "The tool goes {} mm past the {} mm parallels the part stands on in this setup, into the table or vise under them. Reduce the depth or the breakthrough.",
+                mm(below),
+                plain(raised)
+            )
+        } else if si == 0 && board > 0. {
             format!(
                 "The tool goes {} mm into the spoilboard under the sheet, past its {} mm allowance. Reduce the depth or the breakthrough.",
                 mm(below + board),
@@ -1603,6 +1615,8 @@ fn run(
                 message: message.clone(),
             })
             .collect();
+        // Whether a refusal was left to the gouge stage, which says why.
+        let mut said_as_gouge = false;
         for (setup, messages) in &refused {
             let ops = &built.setups[*setup].operations;
             for message in messages {
@@ -1611,6 +1625,12 @@ fn run(
                     .chain(&held)
                     .any(|(si, h)| si == setup && h.message == *message)
                 {
+                    continue;
+                }
+                // A cut past the parallels into the table is the gouge
+                // stage's (`axis_problems_over`), said there once.
+                if crate::parallels::past_the_table_said(message) {
+                    said_as_gouge = true;
                     continue;
                 }
                 // A message that starts with one operation's name is about it.
@@ -1706,7 +1726,7 @@ fn run(
                 })
                 .collect();
         }
-        if !ready && export.is_empty() && held.is_empty() && missing.is_empty() {
+        if !ready && export.is_empty() && held.is_empty() && missing.is_empty() && !said_as_gouge {
             export.push(Problem {
                 setup: 0,
                 operation: None,
@@ -2819,6 +2839,89 @@ mod tests {
         );
         let flush = through("0");
         assert!(flush.passed, "{:?}", stages(&flush));
+    }
+    /// LIO-537: a later setup whose part stands on parallels may break
+    /// through its underside over the open space between them, not into a
+    /// parallel or past their height into what they stand on.
+    #[test]
+    fn on_parallels_a_through_drill_may_break_through_between_them() {
+        let (doc, mesh, report) = block();
+        let mut plan = good(&report);
+        let mut drill = op("Drill", 3, underside(&report));
+        drill.hole_diameter = Some(6.6);
+        plan.setups[1].operations.push(drill);
+        let mut job = proposal::build(&doc, &mesh, &report, &plan).unwrap();
+        drill_through(&mut job.setups[1].operations[2], "6.6", "3");
+        // Where the drill goes down, from the stock's centre.
+        let mut drilled = None;
+        crate::simulation::sequence(&job, &mesh, Some((1, 2)), |si, oi, sim| {
+            if (si, oi) == (1, 2) {
+                drilled = Some(sim.unwrap().plan);
+            }
+        });
+        let drilled = drilled.expect("setup 2's drill is simulated");
+        let low = (drilled.moves.iter())
+            .map(|m| m.to)
+            .min_by(|a, b| a[2].total_cmp(&b[2]))
+            .unwrap();
+        let s = drilled.stock;
+        let centre = [0, 1].map(|k| (s.min[k] + s.max[k]) / 2.);
+        // Every hole's X from the stock's centre: where the drill is at its
+        // lowest.
+        let holes: Vec<f32> = (drilled.moves.iter())
+            .filter(|m| m.to[2] < low[2] + 0.01)
+            .map(|m| m.to[0] - centre[0])
+            .collect();
+        let x = holes[0];
+        let half = (s.max[0] - s.min[0]) / 2.;
+        // Two parallels 10 wide, front to back, under the stock and more
+        // than 5 mm clear of every hole's Ø6.6 drill and the gap: the
+        // outermost such places, mm by mm.
+        let clear: Vec<f32> = (0..=(2. * half - 12.) as i32)
+            .map(|i| -half + 6. + i as f32)
+            .filter(|p| holes.iter().all(|h| (p - h).abs() > 5. + 3.3 + 2. + 5.))
+            .collect();
+        assert!(
+            clear.len() >= 2,
+            "holes at X{holes:?} in a stock {half} either side"
+        );
+        let clear = [clear[0], clear[clear.len() - 1]];
+        let on = |at: &[f32], height: &str| {
+            let mut job = job.clone();
+            let p = &mut job.setups[1].p;
+            p.insert(
+                crate::parallels::RUN.into(),
+                crate::parallels::FRONT_TO_BACK.into(),
+            );
+            let at: Vec<String> = at.iter().map(|a| format!("{a}")).collect();
+            p.insert(crate::parallels::AT.into(), at.join("; "));
+            p.insert(crate::parallels::HEIGHT.into(), height.into());
+            check_built(&job, &mesh, &report)
+        };
+        // 3 mm past the underside over the open space: no problem.
+        let open = on(&clear, "15");
+        assert!(open.passed, "{:?}", stages(&open));
+        // Parallels 2 mm high: the drill goes 1 mm into the table under them.
+        assert_eq!(
+            stages(&on(&clear, "2")),
+            vec![
+                "gouge 2/Some(3): The tool goes 1.00 mm past the 2 mm parallels the part stands on in this setup, into the table or vise under them. Reduce the depth or the breakthrough."
+            ]
+        );
+        // A parallel under the hole: the drill goes into it.
+        let under = on(&[clear[0], x], "15");
+        let found = stages(&under);
+        assert!(!under.passed);
+        assert!(
+            found.iter().all(|s| s.starts_with("workholding 2/")),
+            "{found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|s| s.contains(&format!("parallel at X{}", crate::parallels::signed(x)))),
+            "{found:?}"
+        );
     }
     #[test]
     fn later_setups_cannot_drill_through() {

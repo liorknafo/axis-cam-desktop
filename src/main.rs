@@ -39,6 +39,7 @@ mod ngc;
 mod oauth;
 mod openai;
 mod orient;
+mod parallels;
 mod picks;
 mod plan_changes;
 mod plan_check;
