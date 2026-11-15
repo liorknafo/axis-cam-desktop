@@ -7159,9 +7159,14 @@ impl App {
                     let named = |h: &pocket::Hole| {
                         let ((x, y), (w, d)) = (h.centre(), h.size());
                         match round.first().and_then(|r| r.as_ref()) {
+                            // Where it drills it: a thread's hole's outline is
+                            // round its axis as fitted, a hundredth or two off
+                            // the bore it opens in (LIO-521).
                             Some(r) if drill => format!(
-                                "the Ø{} hole at X{x:.2} Y{y:.2}",
-                                crate::post::exact_mm(cam::largest_drill(r))
+                                "the Ø{} hole at X{:.2} Y{:.2}",
+                                crate::post::exact_mm(cam::largest_drill(r)),
+                                r.center[0],
+                                r.center[1]
                             ),
                             _ => format!("the hole at X{x:.2} Y{y:.2} ({w:.2} × {d:.2} mm)"),
                         }
