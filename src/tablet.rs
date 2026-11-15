@@ -15,6 +15,15 @@
 //! ones into `projects/` beside its workspace and lists them (`kept`), so
 //! they stay when the computer is off. A project the computer stops sharing
 //! stays on the tablet.
+//!
+//! The one thing the tablet sends back is an answer to a lathe step
+//! (LIO-524): a diameter measured, or the dial check's. The computer keeps
+//! it in the project (`apply`): the project open in the app through the app
+//! (`for_app`), so that the app's own saves keep it; another project in its
+//! file. The tablet then fetches the project again, its steps worked out
+//! anew with it. While the computer is off, the tablet keeps the answer and
+//! sends it at the next sync.
+use crate::lathe;
 use crate::model::Document;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -22,7 +31,7 @@ use std::{
     fs, io,
     net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, mpsc},
     time::Duration,
 };
 use uc100_remote::{
@@ -47,20 +56,123 @@ const NOT_PAIRED: &str =
 
 #[derive(Serialize, Deserialize)]
 enum ToComputer {
-    Pair { code: String, name: String },
-    Hello { client: u32 },
+    Pair {
+        code: String,
+        name: String,
+    },
+    Hello {
+        client: u32,
+    },
     Proof([u8; 32]),
     List,
     Get(String),
+    /// An answer to a lathe step of the shared project with key `project`.
+    Answer {
+        project: String,
+        answer: Answer,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
 enum ToTablet {
-    Paired { token: String, computer: String },
+    Paired {
+        token: String,
+        computer: String,
+    },
     Refused(String),
     Nonce([u8; 32]),
     List(Vec<Shared>),
     Bundle(Vec<u8>),
+    /// The answer is kept: what the computer says of it.
+    Kept(String),
+}
+
+/// An answer to a lathe step that takes one, typed at the lathe.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Answer {
+    /// A diameter measured, mm, under its key (`guide::measure_key`).
+    Measured { key: String, mm: f64 },
+    /// The dial check of the setup with id `setup`: what the cross-slide
+    /// dial reads.
+    CrossReads { setup: String, reads: lathe::Reads },
+}
+
+/// Keeps `answer` in `doc`: a measured diameter under its key, the dial
+/// check's answer on the lathe in the library and in every setup on it.
+/// What to say of it, or why it can't be kept.
+pub fn apply(doc: &mut Document, answer: &Answer) -> Result<String, String> {
+    let lathe_of = |id: &str| {
+        (doc.setups.iter())
+            .find(|s| s.id == id && lathe::is_lathe(&s.machine))
+            .map(|s| (s.machine.id.clone(), s.machine.name().to_owned()))
+            .ok_or_else(|| "That lathe setup is no longer in the project.".to_string())
+    };
+    match answer {
+        Answer::Measured { key, mm } => {
+            let mm = *mm as f32;
+            if !(mm.is_finite() && mm > 0. && mm < 10_000.) {
+                return Err("Type the diameter the calipers read, in mm.".into());
+            }
+            lathe_of(key.split_once('/').map_or("", |(setup, _)| setup))?;
+            doc.measured.insert(key.clone(), mm);
+            Ok(format!("Measured Ø{mm:.2} kept."))
+        }
+        Answer::CrossReads { setup, reads } => {
+            let (id, name) = lathe_of(setup)?;
+            let machines =
+                (doc.machines.iter_mut()).chain(doc.setups.iter_mut().map(|s| &mut s.machine));
+            for m in machines.filter(|m| m.id == id) {
+                m.p.insert("cross_reads".into(), reads.key().into());
+            }
+            Ok(format!(
+                "The cross-slide dial reads the {}: saved to {name}.",
+                reads.key().to_lowercase()
+            ))
+        }
+    }
+}
+
+/// Where what came of an answer the app took goes.
+type Reply = mpsc::Sender<Result<String, String>>;
+/// Answers to the project open in the app saving its workspace to the path,
+/// waiting for the app's next tick (`for_app`).
+static TO_APP: Mutex<Vec<(PathBuf, Answer, Reply)>> = Mutex::new(Vec::new());
+
+/// The answers tablets sent the app that saves its workspace to
+/// `state_path`, each with where what came of it goes: the app keeps each
+/// (`apply`), saves, then replies.
+pub fn for_app(state_path: &Path) -> Vec<(Answer, Reply)> {
+    let mut all = TO_APP.lock().unwrap_or_else(|e| e.into_inner());
+    let (mine, others): (Vec<_>, Vec<_>) =
+        (std::mem::take(&mut *all).into_iter()).partition(|(p, ..)| p == state_path);
+    *all = others;
+    mine.into_iter().map(|(_, a, r)| (a, r)).collect()
+}
+
+/// Keeps `answer` in the shared project with key `project`: through the app
+/// when the app (`app`) has it open, else in its file.
+fn keep(state_path: &Path, app: bool, project: &str, answer: &Answer) -> Result<String, String> {
+    let (path, mut doc) = (shared(state_path).into_iter())
+        .find(|(s, ..)| s.key == project)
+        .map(|(_, path, doc)| (path, doc))
+        .ok_or("The computer no longer shares that project.")?;
+    if app && path == state_path {
+        return through_app(state_path, answer);
+    }
+    let said = apply(&mut doc, answer)?;
+    crate::storage::save(&path, &doc)?;
+    Ok(said)
+}
+
+/// Hands `answer` to the app saving its workspace to `state_path`, and
+/// waits for what it made of it.
+fn through_app(state_path: &Path, answer: &Answer) -> Result<String, String> {
+    let (reply, said) = mpsc::channel();
+    let mut waiting = TO_APP.lock().unwrap_or_else(|e| e.into_inner());
+    waiting.push((state_path.to_path_buf(), answer.clone(), reply));
+    drop(waiting);
+    said.recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|_| Err("AXIS CAM on the computer didn't take it: try again.".into()))
 }
 
 /// A project the computer shares: `key` names it across changes (its file's
@@ -87,10 +199,12 @@ pub fn new_code(state_path: &Path) -> Result<String, String> {
 }
 
 /// Answers tablets from background threads for as long as the app runs.
-/// Another copy of the app holding the port leaves this one silent.
-pub fn serve(state_path: PathBuf, computer: String) {
+/// With `app`, the app has the open project and takes the answers to it
+/// (`for_app`). Another copy of the app holding the port leaves this one
+/// silent.
+pub fn serve(state_path: PathBuf, computer: String, app: bool) {
     match TcpListener::bind(("0.0.0.0", PORT)) {
-        Ok(l) => serve_on(l, state_path, computer.clone()),
+        Ok(l) => serve_on(l, state_path, computer.clone(), app),
         Err(e) => eprintln!("Shop tablet sharing is off: port {PORT}: {e}"),
     }
     if let Ok(udp) = UdpSocket::bind(("0.0.0.0", PORT)) {
@@ -105,12 +219,12 @@ pub fn serve(state_path: PathBuf, computer: String) {
     }
 }
 
-fn serve_on(listener: TcpListener, state_path: PathBuf, computer: String) {
+fn serve_on(listener: TcpListener, state_path: PathBuf, computer: String, app: bool) {
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let (state_path, computer) = (state_path.clone(), computer.clone());
             std::thread::spawn(move || {
-                let _ = answer(stream, &state_path, &computer);
+                let _ = answer(stream, &state_path, &computer, app);
             });
         }
     });
@@ -119,7 +233,7 @@ fn serve_on(listener: TcpListener, state_path: PathBuf, computer: String) {
 /// Two tablets trying codes at once must not both count as the first.
 static PAIRING: Mutex<()> = Mutex::new(());
 
-fn answer(mut s: TcpStream, state_path: &Path, computer: &str) -> io::Result<()> {
+fn answer(mut s: TcpStream, state_path: &Path, computer: &str, app: bool) -> io::Result<()> {
     s.set_read_timeout(Some(WAIT))?;
     s.set_write_timeout(Some(WAIT * 6))?;
     let bad = || io::Error::new(io::ErrorKind::InvalidData, "unexpected message");
@@ -148,19 +262,25 @@ fn answer(mut s: TcpStream, state_path: &Path, computer: &str) -> io::Result<()>
             {
                 return wire::write(&mut s, &ToTablet::Refused(NOT_PAIRED.into()));
             }
-            let shared = shared(state_path);
+            let mut shared = shared(state_path);
             loop {
                 let reply = match wire::read(&mut s, SMALL) {
                     Ok(ToComputer::List) => {
-                        ToTablet::List(shared.iter().map(|(s, _)| s.clone()).collect())
+                        ToTablet::List(shared.iter().map(|(s, ..)| s.clone()).collect())
                     }
-                    Ok(ToComputer::Get(key)) => match shared.iter().find(|(s, _)| s.key == key) {
-                        Some((_, doc)) => match crate::bundle::pack(doc) {
+                    Ok(ToComputer::Get(key)) => match shared.iter().find(|(s, ..)| s.key == key) {
+                        Some((.., doc)) => match crate::bundle::pack(doc) {
                             Ok(bytes) => ToTablet::Bundle(bytes),
                             Err(e) => ToTablet::Refused(e),
                         },
                         None => ToTablet::Refused("The computer no longer shares it.".into()),
                     },
+                    Ok(ToComputer::Answer { project, answer }) => {
+                        let kept = keep(state_path, app, &project, &answer);
+                        // The project changed: listed with its new version.
+                        shared = self::shared(state_path);
+                        kept.map_or_else(ToTablet::Refused, ToTablet::Kept)
+                    }
                     Ok(_) => return Err(bad()),
                     // The tablet has what it wanted.
                     Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
@@ -187,8 +307,8 @@ fn reword(why: String) -> String {
 
 /// What the computer shares, read from its files as the app last saved
 /// them: the open project first, then the recent project files. A project
-/// with no setups, or whose part is gone, is left out.
-fn shared(state_path: &Path) -> Vec<(Shared, Document)> {
+/// with no setups, or whose part is gone, is left out. Each with its file.
+fn shared(state_path: &Path) -> Vec<(Shared, PathBuf, Document)> {
     let settings: crate::settings::Settings = fs::read(crate::settings::path(state_path))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
@@ -224,7 +344,7 @@ fn shared(state_path: &Path) -> Vec<(Shared, Document)> {
                 title: doc.title.clone(),
                 version: hex(&h.finalize()[..8]),
             };
-            Some((shared, doc))
+            Some((shared, path.to_path_buf(), doc))
         })
         .collect()
 }
@@ -570,7 +690,7 @@ mod tests {
         crate::settings::save(&crate::settings::path(&state), &settings).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap().to_string();
-        serve_on(listener, state.clone(), "Mac".into());
+        serve_on(listener, state.clone(), "Mac".into(), false);
 
         let tablet = tempfile::tempdir().unwrap();
         let dir = tablet.path();
@@ -624,13 +744,149 @@ mod tests {
         assert_eq!(kept(dir).len(), 2);
     }
 
+    /// Asks the computer `ask` as the paired tablet in `dir`, after `List`:
+    /// the list, then the answer.
+    fn ask(dir: &Path, ask: ToComputer) -> (Vec<Shared>, ToTablet) {
+        let link = link(dir).unwrap();
+        let mut s = connect(&link.address).unwrap();
+        let token: Token = link.token.parse().unwrap();
+        let hello = ToComputer::Hello {
+            client: token.client,
+        };
+        wire::write(&mut s, &hello).unwrap();
+        let ToTablet::Nonce(nonce) = wire::read(&mut s, SMALL).unwrap() else {
+            panic!("no nonce");
+        };
+        wire::write(&mut s, &ToComputer::Proof(token.proof(&nonce))).unwrap();
+        wire::write(&mut s, &ToComputer::List).unwrap();
+        let ToTablet::List(listed) = wire::read(&mut s, SMALL).unwrap() else {
+            panic!("no list");
+        };
+        wire::write(&mut s, &ask).unwrap();
+        (listed, wire::read(&mut s, SMALL).unwrap())
+    }
+
+    /// A tablet's answers to a lathe step (LIO-524) go into the project's
+    /// file when the app doesn't have it open, and the project is listed
+    /// with a new version.
+    #[test]
+    fn a_tablets_answer_is_kept_in_the_project() {
+        let mac = tempfile::tempdir().unwrap();
+        let state = mac.path().join("workspace.json");
+        let part = mac.path().join("sleeve.stl");
+        fs::write(&part, b"solid x\nendsolid x\n").unwrap();
+        let (mut doc, _) = crate::guide::tests::sample("");
+        doc.file = Some(crate::model::ModelFile {
+            name: "sleeve.stl".into(),
+            path: part,
+            format: "stl".into(),
+            bytes: 19,
+            thickness: None,
+        });
+        crate::storage::save(&state, &doc).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        serve_on(listener, state.clone(), "Mac".into(), false);
+        let tablet = tempfile::tempdir().unwrap();
+        let dir = tablet.path();
+        pair(dir, &address, &new_code(&state).unwrap(), "Shop tablet").unwrap();
+
+        let id = doc.setups[0].id.clone();
+        let key = crate::guide::measure_key(&id, "zero");
+        let answer = |answer| ToComputer::Answer {
+            project: "open".into(),
+            answer,
+        };
+        let measured = answer(Answer::Measured {
+            key: key.clone(),
+            mm: 50.28,
+        });
+        let (before, kept) = ask(dir, measured);
+        assert!(matches!(&kept, ToTablet::Kept(s) if s == "Measured Ø50.28 kept."));
+        let loaded = crate::storage::load(&state).unwrap();
+        assert_eq!(loaded.measured.get(&key), Some(&50.28));
+
+        let reads = answer(Answer::CrossReads {
+            setup: id.clone(),
+            reads: lathe::Reads::Radius,
+        });
+        let (after, kept) = ask(dir, reads);
+        assert!(
+            matches!(&kept, ToTablet::Kept(s) if s.starts_with("The cross-slide dial reads the radius"))
+        );
+        assert_ne!(before[0].version, after[0].version);
+        let loaded = crate::storage::load(&state).unwrap();
+        assert_eq!(
+            lathe::cross_reads(&loaded.setups[0].machine),
+            Some("Radius")
+        );
+
+        // Refused: a setup that is gone, a number no calipers read, a
+        // project no longer shared.
+        let gone = answer(Answer::Measured {
+            key: "gone/zero".into(),
+            mm: 50.,
+        });
+        let nan = answer(Answer::Measured { key, mm: f64::NAN });
+        let elsewhere = ToComputer::Answer {
+            project: "abc".into(),
+            answer: Answer::CrossReads {
+                setup: id,
+                reads: lathe::Reads::Diameter,
+            },
+        };
+        for (m, why) in [
+            (gone, "That lathe setup is no longer in the project."),
+            (nan, "Type the diameter the calipers read, in mm."),
+            (elsewhere, "The computer no longer shares that project."),
+        ] {
+            assert!(
+                matches!(ask(dir, m).1, ToTablet::Refused(s) if s == why),
+                "{why}"
+            );
+        }
+    }
+
+    /// The project open in the app: the app keeps the answer, saves, and
+    /// works its steps out again before the tablet hears back.
+    #[test]
+    fn the_app_keeps_a_tablets_answer_and_saves_it() {
+        let mut a = crate::steps::tests::lathe_app("", |_| {});
+        let state = a.state_path.clone();
+        let key = crate::guide::measure_key(&a.doc.setups[0].id, "zero");
+        let answer = Answer::Measured {
+            key: key.clone(),
+            mm: 50.28,
+        };
+        let asked = std::thread::spawn({
+            let state = state.clone();
+            move || through_app(&state, &answer)
+        });
+        let queued = || (TO_APP.lock().unwrap().iter()).any(|(p, ..)| *p == state);
+        while !queued() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = a.update(crate::Message::Tick);
+        assert_eq!(asked.join().unwrap().unwrap(), "Measured Ø50.28 kept.");
+        let saved = crate::storage::load(&state).unwrap();
+        assert_eq!(saved.measured.get(&key), Some(&50.28));
+        let (shown, _) = a.guide_at().unwrap();
+        assert!(shown.guide.steps.iter().any(|s| matches!(
+            s,
+            crate::guide::Step::Lathe(crate::guide::LatheStep::Zero {
+                measured: Some(m),
+                ..
+            }) if *m == 50.28
+        )));
+    }
+
     #[test]
     fn a_forged_tablet_is_refused() {
         let mac = tempfile::tempdir().unwrap();
         let state = mac.path().join("workspace.json");
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap().to_string();
-        serve_on(listener, state, "Mac".into());
+        serve_on(listener, state, "Mac".into(), false);
         let tablet = tempfile::tempdir().unwrap();
         let forged = Link {
             address,
@@ -667,9 +923,52 @@ mod tests {
         let state = mac.path().join("workspace.json");
         crate::storage::save(&state, &doc).unwrap();
         println!("Pairing code: {}", new_code(&state).unwrap());
-        serve(state, "Fixture computer".into());
+        serve(state, "Fixture computer".into(), false);
         let minutes = std::env::var("AXIS_SERVE_MINUTES").map_or(20, |m| m.parse().unwrap());
         std::thread::sleep(Duration::from_secs(60 * minutes));
+    }
+
+    /// Not a check: shares a lathe job (`guide::tests::sample`, its dial
+    /// check not answered yet) from an app ticking as the desktop's does, so
+    /// that the app takes the tablet's answers (LIO-524), for
+    /// `AXIS_SERVE_MINUTES` (default 20). Prints the pairing code.
+    #[test]
+    #[ignore]
+    fn serve_a_lathe_job_from_the_app() {
+        let mut a = crate::steps::tests::lathe_app("", |_| {});
+        let part = a.state_path.with_file_name("sleeve.stl");
+        let triangles = crate::turn::tests::tube(5.5, 17.5, 0., 61.);
+        let mut stl = vec![0u8; 80];
+        stl.extend((triangles.len() as u32).to_le_bytes());
+        for t in &triangles {
+            stl.extend([0u8; 12]);
+            stl.extend(t.iter().flatten().flat_map(|v| v.to_le_bytes()));
+            stl.extend([0u8; 2]);
+        }
+        fs::write(&part, &stl).unwrap();
+        a.doc.title = "Sleeve (lathe)".into();
+        a.doc.file = Some(crate::model::ModelFile {
+            name: "sleeve.stl".into(),
+            path: part,
+            format: "stl".into(),
+            bytes: stl.len() as u64,
+            thickness: None,
+        });
+        a.dirty = true;
+        assert!(a.persist_now());
+        println!("Pairing code: {}", new_code(&a.state_path).unwrap());
+        serve(a.state_path.clone(), "Lathe computer".into(), true);
+        let minutes = std::env::var("AXIS_SERVE_MINUTES").map_or(20, |m| m.parse().unwrap());
+        let end = std::time::Instant::now() + Duration::from_secs(60 * minutes);
+        while std::time::Instant::now() < end {
+            let _ = a.update(crate::Message::Tick);
+            let said = &a.status;
+            if said.starts_with("From the shop tablet") {
+                println!("{said}");
+                a.status.clear();
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 
     /// The TypeScript tablet app (axis-shop `src/computer/wire.test.ts`)
@@ -695,6 +994,26 @@ mod tests {
             ),
             (ToComputer::List, "03"),
             (ToComputer::Get("ab12".into()), "040461623132"),
+            (
+                ToComputer::Answer {
+                    project: "open".into(),
+                    answer: Answer::Measured {
+                        key: "s1/zero".into(),
+                        mm: 50.25,
+                    },
+                },
+                "05046f70656e000773312f7a65726f0000000000204940",
+            ),
+            (
+                ToComputer::Answer {
+                    project: "open".into(),
+                    answer: Answer::CrossReads {
+                        setup: "s1".into(),
+                        reads: lathe::Reads::Radius,
+                    },
+                },
+                "05046f70656e0102733101",
+            ),
         ];
         for (m, bytes) in to_computer {
             assert_eq!(hex(wire::frame(&m)), bytes);
@@ -722,6 +1041,7 @@ mod tests {
                 "0301046f70656e05426c6f636b1030303131323233333434353536363737",
             ),
             (ToTablet::Bundle(vec![1, 2, 3]), "0403010203"),
+            (ToTablet::Kept("ok".into()), "05026f6b"),
         ];
         for (m, bytes) in to_tablet {
             assert_eq!(hex(wire::frame(&m)), bytes);

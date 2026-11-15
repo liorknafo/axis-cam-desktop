@@ -36,7 +36,7 @@ impl Slide {
 
 /// What the cross-slide dial's numbers mean, the dial check's answer
 /// (`cross_reads`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Reads {
     /// A reading of `d` takes `d` off the diameter.
     Diameter,
