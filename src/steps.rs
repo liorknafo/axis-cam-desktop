@@ -1129,6 +1129,8 @@ fn text_box(s: &str, at: Point, size: f32, align: Align) -> Rectangle {
 struct Labels {
     room: Size,
     taken: Vec<Rectangle>,
+    /// What each label `put` said, and where.
+    said: Vec<(String, Rectangle)>,
 }
 impl Labels {
     /// Whether `r` lies on the canvas, 2 px clear of every label before it.
@@ -1154,7 +1156,10 @@ impl Labels {
             .find(|(i, d)| self.free(&(boxes[*i] + *d)))
     }
     /// Writes `s` at the first of `tries` (a point and how the words align
-    /// on it) where it is clear (`slide`), or at the first as it is.
+    /// on it) where it is clear (`slide`), or at the first as it is; not at
+    /// all when a label before it says the same within a line of one of
+    /// `tries`, as both sides of a slot as wide as its cutter read one X
+    /// (LIO-545).
     fn put(
         &mut self,
         f: &mut canvas::Frame,
@@ -1168,10 +1173,16 @@ impl Labels {
         let boxes: Vec<Rectangle> = (tries.iter())
             .map(|(at, al)| text_box(&s, *at, size, *al))
             .collect();
+        let near = |o: &Rectangle| boxes.iter().any(|b| b.intersects(&o.expand(o.height)));
+        let twin = |(t, o): &(String, Rectangle)| *t == s && near(o);
+        if self.said.iter().any(twin) {
+            return;
+        }
         let (i, d) = self
             .slide(&boxes, step)
             .unwrap_or((0, iced::Vector::new(0., 0.)));
         self.taken.push(boxes[i] + d);
+        self.said.push((s.clone(), boxes[i] + d));
         write(f, s, tries[i].0 + d, c, size, tries[i].1);
     }
     /// Takes the box `r` (a tag), slid on along `step` until it is clear,
@@ -1355,11 +1366,17 @@ impl Drawing<'_> {
             (AXES[a], Point::new(40., corner.y)),
             (AXES[b], Point::new(corner.x - 4., corner.y - 34.)),
         ];
+        // The work zero's mark too (LIO-545: "Z −7.00" ran over it).
+        let zero = p3([0.; 3]);
+        let mark = Rectangle::new(zero - iced::Vector::new(6., 6.), Size::new(12., 12.));
+        let names_at = names
+            .iter()
+            .map(|(s, at)| text_box(s, *at, 12., Align::Left));
+        let taken = names_at.chain([mark]).collect();
         let mut labels = Labels {
             room: size,
-            taken: (names.iter())
-                .map(|(s, at)| text_box(s, *at, 12., Align::Left))
-                .collect(),
+            taken,
+            said: vec![],
         };
         let (down, up, leftward) = (
             iced::Vector::new(0., 7.),
@@ -1615,7 +1632,6 @@ impl Drawing<'_> {
             }
         }
         // The work zero and the axes.
-        let zero = p3([0.; 3]);
         let mark = canvas::Path::circle(zero, 5.);
         f.fill(&mark, Color::WHITE);
         f.stroke(&mark, stroke(INK, 1.4));
@@ -5535,10 +5551,8 @@ impl Caption {
     const AT: Point = Point::new(8., 10.);
     fn new(room: Size) -> Self {
         let r = text_box(Self::SAID, Self::AT, 12., Align::Left);
-        Caption(Labels {
-            room,
-            taken: vec![r],
-        })
+        let (taken, said) = (vec![r], vec![]);
+        Caption(Labels { room, taken, said })
     }
     fn write(self, f: &mut canvas::Frame) {
         write(f, Self::SAID, Self::AT, MUTED, 12., Align::Left);
@@ -7702,6 +7716,16 @@ pub(crate) mod tests {
         doc.setups[0].operations[1] = slot;
         doc.tools.push(mill);
     }
+    /// The slot made one as wide as its Ø8 mill (X 55..63), open on the
+    /// front, as the demo's "Open slot across the bottom": with the comp
+    /// off both its sides read X 59 (LIO-545).
+    fn slot_as_wide_as_its_cutter(doc: &mut Document) {
+        slot_the_block(doc);
+        let p = &mut doc.setups[0].operations[1].p;
+        for (k, v) in [("x_max", "63"), ("y_min", "-500")] {
+            p.insert(k.into(), v.into());
+        }
+    }
     #[test]
     fn no_two_words_of_a_steps_drawing_lie_on_each_other() {
         let dir = tempfile::tempdir().unwrap();
@@ -7730,6 +7754,7 @@ pub(crate) mod tests {
         let (plate, mesh) = crate::corner::tests::plate_job("Y");
         let apps = [
             ("block", app_with("No", slot_the_block)),
+            ("open slot", app_with("No", slot_as_wide_as_its_cutter)),
             ("corners", on_page(plate, mesh)),
             ("slot", slot),
             (
@@ -7743,12 +7768,19 @@ pub(crate) mod tests {
         ];
         // The screens with labelled drawings of the cut.
         const KINDS: [&str; 5] = ["Pass", "Slot", "Corner", "Holes", "Pattern"];
-        // No two words of a drawing on each other.
+        // No two words of a drawing on each other, nor one said twice side
+        // by side (LIO-545).
         let clear = |drawn: Vec<Vec<(String, Rectangle)>>, what: &str| {
             for words in drawn {
                 for (j, (s, r)) in words.iter().enumerate() {
                     for (t, o) in &words[..j] {
                         assert!(!r.intersects(o), "{what}: {s:?} {r:?} on {t:?} {o:?}");
+                        let gap = (o.x - r.x - r.width)
+                            .max(r.x - o.x - o.width)
+                            .max(o.y - r.y - r.height)
+                            .max(r.y - o.y - o.height);
+                        let twice = s == t && gap <= r.height;
+                        assert!(!twice, "{what}: {s:?} {r:?} twice, {o:?}");
                     }
                 }
             }

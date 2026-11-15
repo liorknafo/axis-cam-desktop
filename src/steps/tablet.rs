@@ -318,14 +318,27 @@ fn fill(
             .map(|t| {
                 let (jobs, draw) = (&jobs, &draw);
                 scope.spawn(move || {
-                    (jobs.iter().enumerate().skip(t).step_by(threads))
+                    let drawn = (jobs.iter().enumerate().skip(t).step_by(threads))
                         .map(|(i, &(k, at, item))| (i, draw(k, at, item)))
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>();
+                    // The words the drawings wrote on this thread, for the
+                    // tests on the caller's (LIO-545).
+                    #[cfg(test)]
+                    let drawn = (drawn, DRAWN.take());
+                    drawn
                 })
             })
             .collect();
         (handles.into_iter())
-            .flat_map(|h| h.join().expect("a screen drawn"))
+            .flat_map(|h| {
+                let drawn = h.join().expect("a screen drawn");
+                #[cfg(test)]
+                let drawn = {
+                    DRAWN.with_borrow_mut(|d| d.extend(drawn.1));
+                    drawn.0
+                };
+                drawn
+            })
             .collect()
     });
     drawn_screens.sort_by_key(|(i, _)| *i);
