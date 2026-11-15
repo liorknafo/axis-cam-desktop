@@ -899,8 +899,9 @@ fn readout<'a>(r: Readout, msg: Option<Message>) -> Element<'a, Message> {
     }
 }
 /// The tiles of a section's passes or holes: done, now, next. On the
-/// tablet, where the screen is a picture and a tap does nothing, a plain
-/// strip of labels with the current one lit, no boxes (LIO-544).
+/// tablet, a tile a tap goes nowhere from is a plain label in a strip, the
+/// current one lit, no box (LIO-544); one that goes to its pass is a box a
+/// finger tall, which the tablet finds by its tap (LIO-525).
 fn tiles<'a>(
     labels: Vec<(String, Option<Message>)>,
     at: usize,
@@ -911,7 +912,7 @@ fn tiles<'a>(
     let count = labels.len();
     for (i, (s, msg)) in labels.into_iter().enumerate() {
         let state = lit(i, at);
-        if tablet {
+        if tablet && msg.is_none() {
             let label = text(s).size(13).font(Font::MONOSPACE).color(match state {
                 Lit::Done => MUTED,
                 Lit::Now => ACCENT,
@@ -939,7 +940,7 @@ fn tiles<'a>(
                 .color(if state == Lit::Now { ACCENT } else { INK }),
         )
         .center_x(Fill)
-        .padding([6, 0])
+        .padding([if tablet { 14 } else { 6 }, 0])
         .style(move |_| container::Style {
             background: Some(
                 if state == Lit::Done {

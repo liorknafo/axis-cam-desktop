@@ -83,6 +83,9 @@ impl Help {
 pub struct HelpButton<'a> {
     button: widget::Button<'a, Message>,
     help: Help,
+    /// What a press sends, offered to widget operations: the tablet's
+    /// Steps screens find their taps by it (`steps::tablet`, LIO-525).
+    press: Option<Message>,
 }
 impl<'a> HelpButton<'a> {
     pub fn new(
@@ -93,6 +96,7 @@ impl<'a> HelpButton<'a> {
         Self {
             button,
             help: command(message, label.into()),
+            press: Some(message.clone()),
         }
     }
     pub fn operation(
@@ -104,6 +108,7 @@ impl<'a> HelpButton<'a> {
         Self {
             button,
             help: operation_help(strategy, name, mark),
+            press: None,
         }
     }
     /// A ribbon tile for a strategy the open job cannot run: the hover help
@@ -112,6 +117,7 @@ impl<'a> HelpButton<'a> {
         Self {
             button,
             help: unavailable_help(strategy),
+            press: None,
         }
     }
     pub fn width(mut self, width: impl Into<Length>) -> Self {
@@ -137,7 +143,13 @@ pub fn unavailable_help(strategy: Strategy) -> Help {
 }
 impl<'a> From<HelpButton<'a>> for Element<'a, Message> {
     fn from(b: HelpButton<'a>) -> Self {
-        wrap(b.button, b.help, tooltip::Position::Bottom)
+        Element::new(HoverHelp {
+            content: b.button.into(),
+            help: b.help,
+            position: tooltip::Position::Bottom,
+            card: None,
+            press: b.press,
+        })
     }
 }
 /// An operation's card in the setup browser: its mark (`ui::mark_help`)
@@ -252,6 +264,7 @@ pub fn wrap<'a>(
         help: h,
         position,
         card: None,
+        press: None,
     })
 }
 pub(crate) const HELP_DELAY: Duration = Duration::from_millis(600);
@@ -274,6 +287,8 @@ pub struct HoverHelp<'a> {
     position: tooltip::Position,
     /// The card, built while it is open, for the (expanded, paused) it shows.
     card: Option<(bool, bool, Element<'a, Message>)>,
+    /// What the control sends when pressed (`HelpButton::press`).
+    press: Option<Message>,
 }
 #[derive(Clone, Copy, Debug, Default)]
 struct Hover {
@@ -361,6 +376,9 @@ impl Widget<Message, Theme, Renderer> for HoverHelp<'_> {
     ) {
         // The card it shows, for the tests that look for a control's help.
         operation.custom(None, layout.bounds(), &mut self.help.clone());
+        if let Some(m) = &self.press {
+            operation.custom(None, layout.bounds(), &mut m.clone());
+        }
         self.content
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation)
