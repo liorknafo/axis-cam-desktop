@@ -1148,18 +1148,28 @@ impl Labels {
             })
     }
     /// The first of `boxes`, in order, that is free, or failing that the
-    /// first free with all of them slid on `step` px, twice that, … up to
-    /// 40 steps: its index and how far it slid. `None` when none is.
-    fn slide(&self, boxes: &[Rectangle], step: iced::Vector) -> Option<(usize, iced::Vector)> {
+    /// first free with all of them slid `a` times `step` and `b` times
+    /// `across` either way, fewest moves first and along `step` first, up
+    /// to 40 moves: its index and how far it slid. `None` when none is.
+    // ponytail: up to 40² tries × the boxes taken when nothing is free;
+    // fine for a drawing's dozen labels.
+    fn slide(
+        &self,
+        boxes: &[Rectangle],
+        step: iced::Vector,
+        across: iced::Vector,
+    ) -> Option<(usize, iced::Vector)> {
         (0..40)
-            .flat_map(|k| (0..boxes.len()).map(move |i| (i, step * k as f32)))
+            .flat_map(|n: i32| (0..=n).rev().map(move |a| (a, n - a)))
+            .flat_map(|(a, b)| [b, -b].map(|b| step * a as f32 + across * b as f32))
+            .flat_map(|d| (0..boxes.len()).map(move |i| (i, d)))
             .find(|(i, d)| self.free(&(boxes[*i] + *d)))
     }
     /// Writes `s` at the first of `tries` (a point and how the words align
     /// on it) where it is clear (`slide`), or at the first as it is; not at
     /// all when a label before it says the same within a line of one of
-    /// `tries`, as both sides of a slot as wide as its cutter read one X
-    /// (LIO-545).
+    /// `tries` or of where it slid to, as both sides of a slot as wide as
+    /// its cutter read one X (LIO-545, LIO-546).
     fn put(
         &mut self,
         f: &mut canvas::Frame,
@@ -1173,23 +1183,26 @@ impl Labels {
         let boxes: Vec<Rectangle> = (tries.iter())
             .map(|(at, al)| text_box(&s, *at, size, *al))
             .collect();
-        let near = |o: &Rectangle| boxes.iter().any(|b| b.intersects(&o.expand(o.height)));
+        // Slid along `step` and across it: a label hemmed in by lines and
+        // the stock's edge goes past the nearest of them (LIO-546).
+        let across = iced::Vector::new(step.y, step.x);
+        let (i, d) = (self.slide(&boxes, step, across)).unwrap_or((0, iced::Vector::new(0., 0.)));
+        let at = boxes[i] + d;
+        let near =
+            |o: &Rectangle| (boxes.iter().chain([&at])).any(|b| b.intersects(&o.expand(o.height)));
         let twin = |(t, o): &(String, Rectangle)| *t == s && near(o);
         if self.said.iter().any(twin) {
             return;
         }
-        let (i, d) = self
-            .slide(&boxes, step)
-            .unwrap_or((0, iced::Vector::new(0., 0.)));
-        self.taken.push(boxes[i] + d);
-        self.said.push((s.clone(), boxes[i] + d));
+        self.taken.push(at);
+        self.said.push((s.clone(), at));
         write(f, s, tries[i].0 + d, c, size, tries[i].1);
     }
     /// Takes the box `r` (a tag), slid on along `step` until it is clear,
     /// and gives where.
     fn take(&mut self, r: Rectangle, step: iced::Vector) -> Rectangle {
         let (_, d) = self
-            .slide(&[r], step)
+            .slide(&[r], step, iced::Vector::new(0., 0.))
             .unwrap_or((0, iced::Vector::new(0., 0.)));
         self.taken.push(r + d);
         r + d
@@ -1372,7 +1385,39 @@ impl Drawing<'_> {
         let names_at = names
             .iter()
             .map(|(s, at)| text_box(s, *at, 12., Align::Left));
-        let taken = names_at.chain([mark]).collect();
+        // And the lines not to pass and the stock's outline, 1 px wide (a
+        // label keeps 2 px clear), so that no label is written across one
+        // (LIO-546: the Z −7 line ran through "X 60.00", the stock's top
+        // through "Z −7.00").
+        let line = |m: Point, n: Point| {
+            let (w, h) = ((m.x - n.x).abs(), (m.y - n.y).abs());
+            Rectangle::new(
+                Point::new(m.x.min(n.x) - 0.5, m.y.min(n.y) - 0.5),
+                Size::new(w + 1., h + 1.),
+            )
+        };
+        let (tl, br) = (
+            stock.position(),
+            stock.position() + iced::Vector::new(stock.width, stock.height),
+        );
+        let corners = [tl, Point::new(br.x, tl.y), br, Point::new(tl.x, br.y), tl];
+        let edges = corners
+            .windows(2)
+            .map(|e| ("stock".to_string(), line(e[0], e[1])));
+        let lines = (self.shapes.iter())
+            .filter_map(|s| match s {
+                Shape::Never(m, n, s) | Shape::Depth(m, n, s) => {
+                    Some((s.clone(), line(p3(*m), p3(*n))))
+                }
+                _ => None,
+            })
+            .chain(edges);
+        #[cfg(test)]
+        WRITTEN.with_borrow_mut(|w| w.extend(lines.clone().map(|(s, r)| (format!("line {s}"), r))));
+        let taken = names_at
+            .chain([mark])
+            .chain(lines.map(|(_, r)| r))
+            .collect();
         let mut labels = Labels {
             room: size,
             taken,
@@ -1455,8 +1500,8 @@ impl Drawing<'_> {
                     } else if (m.x - n.x).abs() > (m.y - n.y).abs() {
                         let x = m.x.max(n.x) - 8.;
                         let mut tries = [
-                            (Point::new(x, m.y - 9.), Align::Right),
-                            (Point::new(x, m.y + 9.), Align::Right),
+                            (Point::new(x, m.y - 10.), Align::Right),
+                            (Point::new(x, m.y + 10.), Align::Right),
                         ];
                         if m.y > middle.y {
                             tries.reverse();
@@ -1780,6 +1825,9 @@ fn paint_pattern(
             let place = labels.take(place, along(out, 6.));
             let c = place.center();
             let r = canvas::Path::rounded_rectangle(place.position(), place.size(), 5.into());
+            // A white tag hides the lines under it (tests: LIO-546).
+            #[cfg(test)]
+            WRITTEN.with_borrow_mut(|w| w.push(("tag".into(), place)));
             f.fill(&r, Color::WHITE);
             f.stroke(&r, stroke(ACCENT, 1.5));
             write(f, label, c, ACCENT, 16. * k, Align::Center);
@@ -7769,11 +7817,22 @@ pub(crate) mod tests {
         // The screens with labelled drawings of the cut.
         const KINDS: [&str; 5] = ["Pass", "Slot", "Corner", "Holes", "Pattern"];
         // No two words of a drawing on each other, nor one said twice side
-        // by side (LIO-545).
+        // by side (LIO-545), nor one across a line not to pass
+        // or the stock's outline, but on a white tag (LIO-546).
         let clear = |drawn: Vec<Vec<(String, Rectangle)>>, what: &str| {
             for words in drawn {
+                let (tags, words): (Vec<_>, Vec<_>) =
+                    words.into_iter().partition(|(s, _)| s == "tag");
+                let tagged = |r: &Rectangle| tags.iter().any(|(_, t)| t.contains(r.center()));
                 for (j, (s, r)) in words.iter().enumerate() {
                     for (t, o) in &words[..j] {
+                        let line = |s: &str| s.strip_prefix("line ").map(str::to_string);
+                        match (line(s), line(t)) {
+                            (Some(_), Some(_)) => continue,
+                            (Some(_), None) if tagged(o) => continue,
+                            (None, Some(_)) if tagged(r) => continue,
+                            _ => {}
+                        }
                         assert!(!r.intersects(o), "{what}: {s:?} {r:?} on {t:?} {o:?}");
                         let gap = (o.x - r.x - r.width)
                             .max(r.x - o.x - o.width)
