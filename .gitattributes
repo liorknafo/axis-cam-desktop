@@ -1,0 +1,2 @@
+# Source-text tests (help, mcp) look for "\n}\n" in the .rs files: keep them LF on Windows too.
+*.rs text eol=lf

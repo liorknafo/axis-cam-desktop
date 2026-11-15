@@ -3562,13 +3562,15 @@ pub(crate) mod tests {
     /// The example's placeholders filled from `d`'s libraries and folder.
     fn filled(d: &Direct, example: &Value) -> Value {
         let doc = &d.app.doc;
+        // Escaped for the JSON text: a Windows folder has backslashes.
+        let folder = Value::from(d.folder.display().to_string()).to_string();
         let text = example
             .to_string()
             .replace("<tool>", &doc.tools[0].id)
             .replace("<machine>", &doc.machines[0].id)
             .replace("<material>", &doc.materials[0].id)
             .replace("<holder>", &doc.workholding[0].id)
-            .replace("/tmp", &d.folder.display().to_string());
+            .replace("/tmp", folder.trim_matches('"'));
         serde_json::from_str(&text).unwrap()
     }
     fn ctx<'a>(
@@ -4937,7 +4939,10 @@ pub(crate) mod tests {
                 .contains("No operation is selected")
         );
         // A save the file system refuses fails, in the app's words.
-        let nowhere = json!({"path": "/no-such-axis-folder/job.axis.json"});
+        // (Under a file: absolute on every system, and never writable.)
+        let file = d.folder.join("a-file");
+        std::fs::write(&file, "x").unwrap();
+        let nowhere = json!({"path": file.join("job.axis.json")});
         let r = run(&mut d, "save_project", nowhere).unwrap();
         assert_eq!(outcome(&r), "failed", "{r}");
         assert!(

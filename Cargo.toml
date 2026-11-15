@@ -43,6 +43,11 @@ security-framework = "3.7.0"
 # The run's stock mesher sets its thread's QoS (`below_the_driver`).
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# A session's lock on one byte past its owner (`mcp::session::Lock`), so the
+# owner stays readable; already in the tree.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+
 [profile.release]
 opt-level = 2
 strip = true
