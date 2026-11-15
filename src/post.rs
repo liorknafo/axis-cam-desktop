@@ -2784,8 +2784,8 @@ pub(crate) fn tool_parts(
         let (tool, assumed) = crate::rotary_check::in_spindle(doc, id, plan, unit);
         return (tool.parts(), assumed);
     }
-    let parts = crate::holding::parts(plan.radius, plan.tool_length, plan.holder_radius);
-    (parts.to_vec(), String::new())
+    // A centre drill's pilot too, under the point its moves take it to.
+    (crate::holding::plan_parts(plan), String::new())
 }
 /// How a setup's machine turns into post settings: `PostSettings::from_machine`
 /// for G-code export, `PostSettings::for_uc100` for a UC100 run.
@@ -4131,6 +4131,7 @@ pub(crate) mod fixture {
     /// For dwells the third tuple value is seconds, otherwise mm/min.
     pub fn plan(start: [f32; 3], moves: &[(Motion, [f32; 3], f32)]) -> Plan {
         let mut plan = Plan {
+            below: 0.,
             shape: CutterShape::Flat,
             strategy: Strategy::Face,
             operation: "op".into(),

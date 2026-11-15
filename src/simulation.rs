@@ -161,6 +161,10 @@ pub struct Plan {
     pub flute_length: f32,
     pub tool_length: f32,
     pub holder_radius: f32,
+    /// How far the tool reaches below the point its moves take it to, as
+    /// wide as `shape`'s flat: a centre drill's pilot under its cone's
+    /// point (`model::CentreDrill`). 0 for every other cutter.
+    pub below: f32,
     /// A thread mill's body over its teeth: its neck's radius, how far the
     /// neck reaches up from the tip, and the shank's radius above it. None
     /// for other cutters, one radius up to the stickout.
@@ -594,6 +598,7 @@ fn generate_plan(
         return Err("No facing strokes fit this boundary.".into());
     }
     let mut plan = Plan {
+        below: 0.,
         shape: CutterShape::Flat,
         strategy: Strategy::Face,
         operation: operation.id.clone(),
