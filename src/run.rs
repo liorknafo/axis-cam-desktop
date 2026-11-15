@@ -4669,7 +4669,12 @@ fn pin_problems(c: &Connection, setup: &crate::model::Setup, p: &Checked) -> Vec
 
 /// The fixture block's Face and Drill (two tools, levels and holes) on a
 /// UC100 machine with the profile at `profile`: a project for the tablet's
-/// tool runs (LIO-475).
+/// tool runs (LIO-475). It runs on the driver's template and on the JY5800
+/// (LIO-540): with no coolant, as neither has a coolant output, and with
+/// the drill's clearance 5 mm, so its 44 mm holes fit the JY5800's 55 mm
+/// of Z (from 15 mm the drill would need 59). Its pecks retract to 2 mm,
+/// below the clearance: a peck that rose to the clearance would read as the
+/// start of a new hole, each hole's pecks as steps of their own.
 #[cfg(test)]
 pub(crate) fn tablet_fixture(profile: &std::path::Path) -> (Document, Mesh) {
     let (mut doc, mesh) = crate::post::fixture::job();
@@ -4677,16 +4682,36 @@ pub(crate) fn tablet_fixture(profile: &std::path::Path) -> (Document, Mesh) {
     // Face and pocket with the flat end mill, then the drill: a tool run of
     // two operations (a start at the second, LIO-476) and a tool change.
     setup.operations = [0, 1, 3].map(|i| setup.operations[i].clone()).to_vec();
+    for op in &mut setup.operations {
+        op.p.insert("coolant".into(), "Off".into());
+        if op.strategy == crate::model::Strategy::Drill {
+            op.p.insert("clearance".into(), "5".into());
+            op.p.insert("retract".into(), "2".into());
+        }
+    }
+    // Each axis's travel is the profile's, where its soft limits give one
+    // (the JY5800's Z is 55 mm), so Cycle Start finds they agree.
+    let config = std::fs::read_to_string(profile)
+        .map_err(|e| e.to_string())
+        .and_then(|t| uc100::config::MachineConfig::from_toml(&t).map_err(|e| e.to_string()))
+        .unwrap_or_else(|e| panic!("{}: {e}", profile.display()));
+    let travel = |a: usize, default: f64| {
+        let axis = config.axes.get(a);
+        match axis.and_then(|x| Some(x.soft_max? - x.soft_min?)) {
+            Some(t) => t.to_string(),
+            None => default.to_string(),
+        }
+    };
     let profile = profile.display().to_string();
     let m = &mut doc.setups[0].machine;
     for (k, v) in [
-        ("controller", "UC100"),
-        ("uc100_profile", profile.as_str()),
-        ("x", "390"),
-        ("y", "280"),
-        ("z", "80"),
+        ("controller", "UC100".to_string()),
+        ("uc100_profile", profile),
+        ("x", travel(0, 390.)),
+        ("y", travel(1, 280.)),
+        ("z", travel(2, 80.)),
     ] {
-        m.p.insert(k.into(), v.into());
+        m.p.insert(k.into(), v);
     }
     doc.machines = vec![doc.setups[0].machine.clone()];
     (doc, mesh)
@@ -4862,6 +4887,52 @@ pub(crate) mod tests {
         );
         assert_eq!(s.tool_runs[1].tool.label, "T3 Drill 4");
         let programs = programs(&doc, &mesh, 0).unwrap();
+        // Cycle Start takes each tool run on the driver's template and on the
+        // JY5800 (LIO-540): no coolant, as neither has a coolant output; the
+        // machine's travel is the profile's where its soft limits give one;
+        // and each run spans no more of an axis than they allow, so some
+        // work zero fits it (the drill's 44 mm holes and 5 mm clearance in
+        // the JY5800's 55 mm of Z).
+        for (name, toml) in [
+            ("template.toml", uc100::config::TEMPLATE),
+            ("jy5800.toml", include_str!("../assets/jy5800.toml")),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, toml).unwrap();
+            let (doc, mesh) = tablet_fixture(&path);
+            let config = MachineConfig::from_toml(toml).unwrap();
+            let machine = &doc.setups[0].machine;
+            let runs = super::programs(&doc, &mesh, 0).unwrap();
+            let mut soft = 0;
+            for (a, axis_name) in AXES.iter().enumerate().take(3) {
+                let axis = config.axes.get(a).unwrap();
+                let (Some(lo), Some(hi)) = (axis.soft_min, axis.soft_max) else {
+                    continue;
+                };
+                soft += 1;
+                let travel =
+                    crate::post_check::machine_mm(machine, &axis_name.to_lowercase()) as f64;
+                assert!((travel - (hi - lo)).abs() < 0.01, "{name} {axis_name}");
+                for p in &runs {
+                    let span = extents(&p.blocks);
+                    let reach = (span.max[a] - span.min[a]) as f64;
+                    assert!(
+                        reach <= hi - lo,
+                        "{name} {} {}: {reach} > {}",
+                        p.indexes[0],
+                        axis_name,
+                        hi - lo
+                    );
+                }
+            }
+            assert_eq!(soft, if name == "jy5800.toml" { 3 } else { 0 });
+            for p in &runs {
+                assert_eq!(
+                    output_problems(&config.outputs, &p.ops),
+                    Vec::<String>::new()
+                );
+            }
+        }
         let offset = [120., 90., -35., 0., 0., 0.];
         for (r, p) in s.tool_runs.iter().zip(&programs) {
             // Not in the chuck: it starts from anywhere.
@@ -4901,6 +4972,34 @@ pub(crate) mod tests {
         let holes = &s.tool_runs[1].steps;
         assert!(holes.len() > 1 && holes.iter().all(|t| t.label.starts_with("Hole")));
         assert!(holes.iter().all(|t| !t.end_lines.is_empty()), "{holes:?}");
+        // One step for each hole, every peck of it in its lines (LIO-540:
+        // pecks that retract to the clearance would start steps of their
+        // own). A block's line is its index + 1.
+        let mut places: Vec<([i64; 2], usize)> = vec![];
+        for (i, b) in programs[1].blocks.iter().enumerate() {
+            let Block::Move {
+                kind: Kind::Feed,
+                to,
+                ..
+            } = b
+            else {
+                continue;
+            };
+            let place = [to[0], to[1]].map(|v| (v * 100.).round() as i64);
+            let step = (holes.iter())
+                .position(|t| {
+                    t.lines
+                        .is_some_and(|[a, b]| (a..=b).contains(&(i as u32 + 1)))
+                })
+                .unwrap_or_else(|| panic!("line {} is in no hole", i + 1));
+            match places.iter().find(|(p, _)| *p == place) {
+                Some((_, s)) => assert_eq!(*s, step, "{place:?}"),
+                None => places.push((place, step)),
+            }
+        }
+        let steps: Vec<usize> = places.iter().map(|(_, s)| *s).collect();
+        assert_eq!(steps, (0..holes.len()).collect::<Vec<_>>(), "{places:?}");
+        assert_eq!(holes.len(), 5);
         // Each tool run starts at each of its later operations as the Run
         // panel's Start here does (LIO-476): `lower` from there, the steps
         // from there on, their lines its own.
