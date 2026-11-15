@@ -2737,6 +2737,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                         .map(|c| (reading(p, c).short, None))
                         .collect(),
                     i,
+                    p.tablet,
                 ));
             }
             let (title, sub) = if *part_off {
@@ -3011,7 +3012,7 @@ fn pass_tiles<'a>(p: &Page<'a>, op: usize) -> Element<'a, Message> {
         }
         labels.push((label, Some(Message::Guide(GuideAction::Go(i)))));
     }
-    tiles(labels, now)
+    tiles(labels, now, p.tablet)
 }
 /// The tiles of a thread's passes: the top slide's number for each.
 fn thread_tiles<'a>(p: &Page<'a>, op: usize) -> Element<'a, Message> {
@@ -3031,7 +3032,7 @@ fn thread_tiles<'a>(p: &Page<'a>, op: usize) -> Element<'a, Message> {
             ));
         }
     }
-    tiles(labels, now)
+    tiles(labels, now, p.tablet)
 }
 /// The Hand over screen of a lathe setup: the bar as it is left, where the
 /// part goes and how the next machine holds it.

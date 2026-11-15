@@ -898,13 +898,40 @@ fn readout<'a>(r: Readout, msg: Option<Message>) -> Element<'a, Message> {
         None => face.into(),
     }
 }
-/// The tiles of a section's passes or holes: done, now, next.
-fn tiles<'a>(labels: Vec<(String, Option<Message>)>, at: usize) -> Element<'a, Message> {
+/// The tiles of a section's passes or holes: done, now, next. On the
+/// tablet, where the screen is a picture and a tap does nothing, a plain
+/// strip of labels with the current one lit, no boxes (LIO-544).
+fn tiles<'a>(
+    labels: Vec<(String, Option<Message>)>,
+    at: usize,
+    tablet: bool,
+) -> Element<'a, Message> {
     let mut lines = column![].spacing(6);
     let mut line = row![].spacing(6);
     let count = labels.len();
     for (i, (s, msg)) in labels.into_iter().enumerate() {
         let state = lit(i, at);
+        if tablet {
+            let label = text(s).size(13).font(Font::MONOSPACE).color(match state {
+                Lit::Done => MUTED,
+                Lit::Now => ACCENT,
+                Lit::Next => INK,
+            });
+            let under = container(space().width(Fill).height(2)).style(move |_| container::Style {
+                background: (state == Lit::Now).then(|| ACCENT.into()),
+                ..Default::default()
+            });
+            line = line.push(
+                column![container(label).center_x(Fill), under]
+                    .spacing(2)
+                    .width(FillPortion(1)),
+            );
+            if (i + 1) % 3 == 0 || i + 1 == count {
+                lines = lines.push(line);
+                line = row![].spacing(6);
+            }
+            continue;
+        }
         let face = container(
             text(s)
                 .size(13)
@@ -3983,7 +4010,8 @@ fn parts<'a>(p: &Page<'a>) -> Parts<'a> {
                         (0..holes.len())
                             .map(|n| (number(n).to_string(), None))
                             .collect(),
-                        i
+                        i,
+                        p.tablet
                     ),
                 ];
                 ("Tap".into(), "one hole at a time, by hand", left, right)
@@ -4063,7 +4091,8 @@ fn parts<'a>(p: &Page<'a>) -> Parts<'a> {
                         (0..holes.len())
                             .map(|n| (number(n).to_string(), None))
                             .collect(),
-                        i
+                        i,
+                        p.tablet
                     ),
                 ];
                 let title = if centre.is_some() {
@@ -4229,6 +4258,7 @@ fn parts<'a>(p: &Page<'a>) -> Parts<'a> {
                 right = right.push(tiles(
                     (1..=holes.len()).map(|n| (n.to_string(), None)).collect(),
                     i,
+                    p.tablet,
                 ));
             }
             ("Bore".into(), "set the head, then each hole", left, right)
@@ -5075,7 +5105,7 @@ fn pass<'a>(
         label(format!("Move in this order · pass {index} of {of}"))
     ]
     .extend(rows)
-    .push(tiles(labels, index - 1));
+    .push(tiles(labels, index - 1, p.tablet));
     (
         format!("Pass {index} of {of}"),
         "one screen per pass",
@@ -6108,7 +6138,7 @@ pub(crate) mod tests {
                 )
             })
             .collect();
-        let placed = crate::ui::probe::placed(tiles(labels, 44), Size::new(320., 2000.));
+        let placed = crate::ui::probe::placed(tiles(labels, 44, false), Size::new(320., 2000.));
         assert_eq!(placed.len(), 45);
         for (i, (_, b)) in placed.iter().enumerate() {
             assert!(
@@ -6129,7 +6159,7 @@ pub(crate) mod tests {
             .collect();
         let last = placed.last().unwrap().1;
         let presses =
-            crate::ui::probe::presses(tiles(labels, 44), Size::new(320., 2000.), last, 15.);
+            crate::ui::probe::presses(tiles(labels, 44, false), Size::new(320., 2000.), last, 15.);
         assert!(
             presses
                 .iter()
