@@ -569,6 +569,66 @@ mod tests {
         }
     }
 
+    /// A pass screen's tiles jump to another pass on the desktop. On the
+    /// tablet, where the screen is a picture, they are a plain strip that
+    /// nothing presses, still naming every pass (LIO-544).
+    #[test]
+    fn the_tablets_pass_tiles_are_not_pressable() {
+        use crate::guide::LatheStep as L;
+        let a = crate::steps::tests::lathe_app("Diameter", |_| {});
+        let mesh = a.part_mesh().unwrap().clone();
+        let shown = super::shown(&a.doc, &mesh, 0).unwrap();
+        let window = Size::new(WINDOW.0, WINDOW.1);
+        let passes: Vec<_> = (shown.guide.steps.iter().enumerate())
+            .filter(|(_, s)| matches!(s, Step::Lathe(L::Pass { .. } | L::Measure { .. })))
+            .map(|(at, _)| at)
+            .collect();
+        assert!(passes.len() > 2, "{passes:?}");
+        for at in passes {
+            let page = |tablet| Page {
+                doc: &a.doc,
+                shown: &shown,
+                key: 0,
+                at,
+                item: 0,
+                reached: 0,
+                typed: None,
+                window: WINDOW,
+                clock: (std::time::Instant::now(), std::time::Instant::now()),
+                setup: &a.doc.setups[0],
+                tablet,
+            };
+            // A click on the middle of each text drawn.
+            let goes = |tablet| {
+                let placed = crate::ui::probe::placed(parts(&page(tablet)).right.into(), window);
+                let mut goes = vec![];
+                for (s, b) in &placed {
+                    let dot = iced::Rectangle::new(b.center(), Size::new(1., 1.));
+                    let clicks = crate::ui::probe::clicks_in(
+                        parts(&page(tablet)).right.into(),
+                        window,
+                        dot,
+                        8.,
+                    );
+                    if clicks
+                        .iter()
+                        .any(|m| matches!(m, Message::Guide(GuideAction::Go(_))))
+                    {
+                        goes.push(s.clone());
+                    }
+                }
+                (goes, placed.into_iter().map(|(s, _)| s).collect::<Vec<_>>())
+            };
+            let (desktop, _) = goes(false);
+            let (tablet, texts) = goes(true);
+            assert!(desktop.iter().any(|s| s == "measure"), "{desktop:?}");
+            assert!(tablet.is_empty(), "{tablet:?}");
+            for s in &desktop {
+                assert!(texts.contains(s), "{s} in {texts:?}");
+            }
+        }
+    }
+
     /// The lathe setup the planner puts in front of the shaft's CNC setup
     /// (`proposal::tests::turned`), as a tablet file in `AXIS_RENDER_DIR`:
     /// its part is made here, not a file, so it cannot be shared.
