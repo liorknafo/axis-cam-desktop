@@ -1296,6 +1296,13 @@ pub fn sequence_walk(
             let mut issues = setup.issues();
             issues.extend(setup.operation_issues(oi, &doc.tools));
             let source = (index(si), index(oi));
+            // A manual-mill Drill goes from hole to hole over the clamps or
+            // the jaws (LIO-538).
+            let raised = (!holding.is_empty() && crate::manual::is_manual(&setup.machine))
+                .then(|| stock::resolve(&setup, Some(mesh)).ok())
+                .flatten()
+                .and_then(|s| crate::manual::over_holding(&setup, op, &holding, s.stock.max[2]));
+            let op = raised.as_ref().unwrap_or(op);
             let plan = if let Some(issue) = issues.first() {
                 Err(issue.clone())
             } else {

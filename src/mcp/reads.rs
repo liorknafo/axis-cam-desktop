@@ -929,14 +929,18 @@ fn steps(app: &App, args: &Value) -> Result<Plan, Answer> {
         && let Some(built) = app.current_guide()
     {
         return Ok(Plan::Now(match built {
-            Ok(shown) => steps_of(doc, &shown.guide, step, "cached"),
+            Ok(shown) => steps_of(doc, &shown.guide, &shown.lifts(), step, "cached"),
             Err(why) => refused(why.clone()),
         }));
     }
     needs_part(app)?;
     work("steps", true, move |s| {
-        match guide::build(&s.doc, part(s)?, si) {
-            Ok(guide) => steps_of(&s.doc, &guide, step, "built"),
+        let mesh = part(s)?;
+        match guide::build(&s.doc, mesh, si) {
+            Ok(guide) => {
+                let lifts = crate::steps::Lifts::of(&s.doc, mesh, &guide);
+                steps_of(&s.doc, &guide, &lifts, step, "built")
+            }
             Err(why) => refused(why),
         }
     })
@@ -1145,8 +1149,15 @@ fn program_text(doc: &Document, job: &crate::post::JobPost, si: usize) -> Value 
 }
 
 /// The steps of `guide` read at `step` (None: the first), with its
-/// sections and where the machinist's own place is.
-fn steps_of(doc: &Document, guide: &guide::Guide, step: Option<usize>, how: &str) -> Answer {
+/// sections and where the machinist's own place is; a hole step says how
+/// high the tool goes before X and Y move (`lifts`, as its page does).
+fn steps_of(
+    doc: &Document,
+    guide: &guide::Guide,
+    lifts: &crate::steps::Lifts,
+    step: Option<usize>,
+    how: &str,
+) -> Answer {
     let n = guide.steps.len();
     let at = step.unwrap_or(0);
     if at >= n {
@@ -1171,6 +1182,23 @@ fn steps_of(doc: &Document, guide: &guide::Guide, step: Option<usize>, how: &str
         .collect();
     let section = guide.sections.iter().position(|s| s.steps.contains(&at));
     let mut detail = step_detail(doc, guide, si, &guide.steps[at]);
+    // Over the stock and the clamps or the jaws between holes (LIO-449,
+    // LIO-538), as the page's first readout says.
+    if let guide::Step::Holes { op, .. } | guide::Step::Bore { op, .. } = &guide.steps[at] {
+        let z = lifts.z(doc, guide, *op);
+        let tapping = (doc.setups[si].operations.get(*op)).is_some_and(|o| o.tapping());
+        let lift = format!(
+            " Before X and Y move to each hole, {}go up to Z {z:.2}, clear of the stock and {}.",
+            if tapping {
+                "turn the tap back out and "
+            } else {
+                ""
+            },
+            lifts.holder()
+        );
+        detail["text"] = json!(detail["text"].as_str().unwrap_or("").to_string() + &lift);
+        detail["lift_z"] = json!((z * 100.).round() / 100.);
+    }
     detail["index"] = json!(at);
     detail["section"] = json!(section.map(|k| &guide.sections[k].name));
     done(json!({
@@ -2061,6 +2089,14 @@ pub(crate) mod tests {
         let at = step(&mut d, holes);
         assert_eq!(at["guide"], "built", "{at}");
         assert_eq!(at["step"]["kind"], "Holes", "{at}");
+        // Up over the stock and its holding between holes, as the page
+        // says (LIO-538).
+        let lift = at["step"]["lift_z"].as_f64().expect("lift_z") as f32;
+        assert!(
+            (at["step"]["text"].as_str().unwrap())
+                .contains(&format!("go up to Z {lift:.2}, clear of the stock and ")),
+            "{at}"
+        );
         assert!(!at["step"]["holes"].as_array().unwrap().is_empty(), "{at}");
         assert!(at["step"]["operation"]["id"].is_string(), "{at}");
         assert_eq!(d.app.doc.guide, place);

@@ -2877,33 +2877,46 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
             ));
         }
         let top = b.plan.stock.max[2] + number(op, "top")?.max(0.);
+        let reach = crate::rest::Reach::disc([h.center[0], h.center[1]], b.plan.radius);
         // A chamfer mill's cone is as wide as the opening at its rim; it
         // rises from the edge of its flat tip.
         // A centre drill's cone opens to the hole's size at its top, or
         // to the body when the hole is wider; its pilot reaches below.
-        let target = if let Some(c) = centre {
+        let mut target = if let Some(c) = centre {
             h.top - c.cone_depth(h.diameter) + number(op, "bottom")?
         } else if chamfer {
             h.top - (h.opening / 2. - b.plan.shape.flat()) * rise + number(op, "bottom")?
         } else {
             h.bottom + number(op, "bottom")? - breakthrough
         };
+        // Where the hole's mouth is to a centre drill: its top, or, when
+        // more stock stands over that than its flutes reach down through
+        // (a counterbore's floor not bored yet), that stock's top, where
+        // the drill after it starts too (LIO-536).
+        let mut mouth = h.top;
+        if let Some(c) = centre {
+            let over = crate::rest::start_over(setup, &reach, target, top, number(op, "top")?);
+            if over - target > b.plan.flute_length + 0.001 {
+                mouth = crate::rest::start_over(setup, &reach, h.top, top, number(op, "top")?);
+                target = mouth - c.cone_depth(h.diameter) + number(op, "bottom")?;
+            }
+        }
         let tip = target - centre.map_or(0., |c| c.pilot_length);
         if let Some(c) = centre
             && tip < h.bottom - 0.001
-            && target < h.top
+            && target < mouth
         {
             return Err(format!(
                 "The Ø{:.2} hole at X{:.2} Y{:.2} is {:.2} deep: too shallow for the centre drill, whose {:.2} mm pilot would go {:.2} past its bottom. Choose a centre drill with a shorter pilot, or a diameter filter.",
                 h.diameter,
                 h.center[0],
                 h.center[1],
-                h.top - h.bottom,
+                mouth - h.bottom,
                 c.pilot_length,
                 h.bottom - tip
             ));
         }
-        if target >= h.top
+        if target >= mouth
             || tip < h.bottom - breakthrough - 0.001
             || tip < b.plan.stock.min[2] - breakthrough - 0.001
             // A centre drill's body is as wide as its cone: only the cone
@@ -2912,13 +2925,7 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         {
             return Err(TOO_DEEP.into());
         }
-        let cutting_top = crate::rest::start_over(
-            setup,
-            &crate::rest::Reach::disc([h.center[0], h.center[1]], b.plan.radius),
-            target,
-            top,
-            number(op, "top")?,
-        );
+        let cutting_top = crate::rest::start_over(setup, &reach, target, top, number(op, "top")?);
         // A centre drill's flutes end at its body: above them its shank
         // would rub in a bore of its own size, so the stock left over the
         // hole must be no deeper than they reach.

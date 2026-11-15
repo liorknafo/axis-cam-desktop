@@ -1,7 +1,7 @@
 use crate::{
     cam::Geometry,
     mesh::{Bounds, Mesh, rotation},
-    model::{Document, Fields, Machine, Setup, get, num},
+    model::{Document, Fields, Machine, Operation, Setup, Strategy, get, num},
     surface::Selection,
 };
 
@@ -16,6 +16,44 @@ pub fn is_manual(m: &Machine) -> bool {
 /// has a program, a post, an export or a UC100 Run, nor a work offset of its own.
 pub fn is_hand(m: &Machine) -> bool {
     is_manual(m) || crate::lathe::is_lathe(m)
+}
+
+/// How far over the stock and the tops of the vise's jaws or the clamps,
+/// mm, the tool goes up before X and Y move on the manual mill (LIO-449):
+/// the quill raised clear of them, as the machinist does.
+pub const SAFE_ABOVE: f32 = 5.;
+/// `op` as it is generated on the manual mill of `setup`, held by
+/// `holding` (`air::workholding`, in the setup's frame) round the stock
+/// whose top is at `stock_top`: a Drill (a twist drill, a centre drill, a
+/// tap, a reamer, a boring head) goes from hole to hole with its tip
+/// `SAFE_ABOVE` over the clamps or jaws that stand higher than its own
+/// clearance, as the quill is raised over them at the machine (LIO-538).
+/// None when it goes as it is.
+pub fn over_holding(
+    setup: &Setup,
+    op: &Operation,
+    holding: &[crate::holding::HoldBox],
+    stock_top: f32,
+) -> Option<Operation> {
+    if !is_manual(&setup.machine) || op.strategy != Strategy::Drill {
+        return None;
+    }
+    let highest = (holding.iter()).map(|b| b.bounds.max[2]).reduce(f32::max)?;
+    // Heights as `cam::Builder` takes them, over the stock top and the
+    // positive Top offset.
+    let top = stock_top + num(&op.p, "top").unwrap_or(0.).max(0.);
+    let own = num(&op.p, "clearance")?;
+    let need = highest + SAFE_ABOVE - top;
+    (need > own + 1e-4).then(|| {
+        let mut raised = op.clone();
+        // Up to the next hundredth, but not for the float dust of the
+        // boxes' heights: the DRO reads 30.00, not 30.01.
+        raised.p.insert(
+            "clearance".into(),
+            format!("{}", (need * 100. - 0.01).ceil() / 100.),
+        );
+        raised
+    })
 }
 
 pub fn defaults() -> Machine {
@@ -427,7 +465,7 @@ pub const HELICAL_ON_MANUAL: &str = "Helical milling needs a CNC: the big mill m
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Operation, Strategy, fields};
+    use crate::model::fields;
     fn with(m: &mut Machine, k: &str, v: &str) {
         m.p.insert(k.into(), v.into());
     }
@@ -939,5 +977,63 @@ mod tests {
             box_from_face(&setup, &mesh, &stale, stock),
             Err(ONE_FACE.to_string())
         );
+    }
+    #[test]
+    fn a_drill_goes_from_hole_to_hole_over_the_clamps() {
+        // The manual job's Holes (`guide::tests::job`), held by 25 high toe
+        // clamps on its front and back (LIO-538): between holes the tip
+        // goes up 5 over their tops, not at the 15 over the stock its
+        // hidden clearance says, and nothing hits them.
+        let holes_plan = |clamps: Option<&str>| {
+            let (mut doc, mesh) = crate::guide::tests::job("No");
+            if let Some(clamps) = clamps {
+                crate::guide::tests::on_clamps(&mut doc, clamps, "20");
+            }
+            let mut plans = vec![];
+            crate::simulation::sequence(&doc, &mesh, None, |_, oi, r| {
+                plans.push((oi, r.unwrap().plan))
+            });
+            let plan = plans.into_iter().find(|(oi, _)| *oi == 2).unwrap().1;
+            (doc, mesh, plan)
+        };
+        // Its tip over every move across.
+        let across = |plan: &crate::simulation::Plan| {
+            (plan.moves.iter())
+                .filter(|m| m.from[0] != m.to[0] || m.from[1] != m.to[1])
+                .map(|m| m.from[2].min(m.to[2]))
+                .fold(f32::INFINITY, f32::min)
+        };
+        let (doc, _, plan) = holes_plan(None);
+        assert_eq!(num(&doc.setups[0].operations[2].p, "clearance"), Some(15.));
+        assert!((across(&plan) - plan.stock.max[2] - 15.).abs() < 1e-3);
+        let (doc, mesh, plan) = holes_plan(Some("-Y:0;+Y:0"));
+        let boxes = doc
+            .holding_boxes(&doc.setups[0], crate::holding::Gripped::whole(plan.stock))
+            .unwrap();
+        let tops = boxes
+            .iter()
+            .map(|b| b.bounds.max[2])
+            .fold(f32::MIN, f32::max);
+        assert!((tops - plan.stock.max[2] - 25.).abs() < 1e-3);
+        assert!(
+            (across(&plan) - plan.stock.max[2] - 25. - SAFE_ABOVE).abs() < 1e-3,
+            "{}",
+            across(&plan)
+        );
+        let gap = crate::holding::gap(&doc.setups[0]).unwrap();
+        assert!(crate::holding::hits(&plan, &boxes, gap).is_empty());
+        // The operation as saved keeps its own clearance.
+        assert_eq!(num(&doc.setups[0].operations[2].p, "clearance"), Some(15.));
+        // A clearance of its own above them is kept.
+        let mut doc = doc;
+        doc.setups[0].operations[2]
+            .p
+            .insert("clearance".into(), "40".into());
+        let mut plans = vec![];
+        crate::simulation::sequence(&doc, &mesh, None, |_, oi, r| {
+            plans.push((oi, r.unwrap().plan))
+        });
+        let plan = &plans.iter().find(|(oi, _)| *oi == 2).unwrap().1;
+        assert!((across(plan) - plan.stock.max[2] - 40.).abs() < 1e-3);
     }
 }

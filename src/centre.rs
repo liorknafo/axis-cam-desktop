@@ -68,20 +68,88 @@ pub fn same_holes(a: &Operation, b: &Operation) -> bool {
             x == y || num(&a.p, k).zip(num(&b.p, k)).is_some_and(|(x, y)| x == y)
         })
 }
+/// Within this, mm, a hole of an earlier drilling and one of a drill are
+/// at the same centre (`centred`): far less than any drill's walk, more
+/// than two arcs of one bore fitted from its facets differ by.
+pub const SAME_CENTRE: f32 = 0.05;
+/// What `centred` reads a Drill's holes with: those it picks
+/// (`cam::holes`), None when they are not known.
+pub type HolesOf<'a> = dyn FnMut(&Operation) -> Option<Vec<cam::Hole>> + 'a;
 /// Whether operation `oi` of `setup` has its holes opened before it: an
 /// enabled earlier operation centre drills it (`centres`), or drills the
-/// same holes (a centre drilling, a countersink, a pilot drill).
-pub fn centred(setup: &Setup, oi: usize) -> bool {
+/// same holes (a centre drilling, a countersink, a pilot drill), or, with
+/// the part `mesh`, drills from the solid at the centre of every hole it
+/// drills (`at_centres`): a centre drilling picked on a counterbore's
+/// arcs centres the drill picked on the slot's under them (LIO-536).
+pub fn centred(setup: &Setup, oi: usize, mesh: Option<&Mesh>) -> bool {
+    let mut kept = std::collections::HashMap::new();
+    centred_by(setup, oi, &mut |o: &Operation| {
+        let mesh = mesh?;
+        (kept.entry(o.id.clone()))
+            .or_insert_with(|| cam::holes(setup, o, mesh).ok())
+            .clone()
+    })
+}
+/// `centred`, the holes read by `holes`.
+pub fn centred_by(setup: &Setup, oi: usize, holes: &mut HolesOf<'_>) -> bool {
     let Some(op) = setup.operations.get(oi) else {
         return false;
     };
-    setup.operations[..oi]
-        .iter()
+    let opens = |o: &Operation| o.strategy == Strategy::Drill && !o.drills_pin_holes();
+    let earlier: Vec<&Operation> = (setup.operations[..oi].iter())
         .filter(|o| o.enabled)
-        .any(|o| {
-            get(&o.p, CENTRES) == op.id
-                || (o.strategy == Strategy::Drill && !o.drills_pin_holes() && same_holes(o, op))
-        })
+        .collect();
+    if (earlier.iter()).any(|o| get(&o.p, CENTRES) == op.id || (opens(o) && same_holes(o, op))) {
+        return true;
+    }
+    let candidates: Vec<&&Operation> = (earlier.iter())
+        .filter(|o| opens(o) && FROM_SOLID.contains(&get(&o.p, "cycle")))
+        .collect();
+    if candidates.is_empty() {
+        return false;
+    }
+    let Some(drilled) = holes(op) else {
+        return false;
+    };
+    candidates
+        .into_iter()
+        .any(|o| holes(o).is_some_and(|by| at_centres(op, &drilled, o, &by)))
+}
+/// Whether every hole of `holes` that drill `op` drills (`cam::drills`)
+/// has a hole of `by` that operation `o` drills at its centre, at the same
+/// A angle (`SAME_CENTRE`); false when it drills none.
+pub fn at_centres(op: &Operation, holes: &[cam::Hole], o: &Operation, by: &[cam::Hole]) -> bool {
+    let same = |a: &cam::Hole, b: &cam::Hole| {
+        a.a.unwrap_or(0.) == b.a.unwrap_or(0.)
+            && (a.center[0] - b.center[0]).hypot(a.center[1] - b.center[1]) <= SAME_CENTRE
+    };
+    let mut drilled = holes.iter().filter(|h| cam::drills(op, h)).peekable();
+    drilled.peek().is_some() && drilled.all(|h| by.iter().any(|c| cam::drills(o, c) && same(c, h)))
+}
+/// Takes out of `doc` each centre drilling of a drill that no longer
+/// drills from the solid (`FROM_SOLID`): one turned into a boring head's,
+/// a tap's or a reamer's, which follow the holes drilled before them and
+/// need none. The setup and the index of each taken out, in the order
+/// taken out, each as it was when taken out (the ones before it gone).
+pub fn drop_needless(doc: &mut Document) -> Vec<(usize, usize)> {
+    let mut out = vec![];
+    for (si, setup) in doc.setups.iter_mut().enumerate() {
+        let needless = |o: &Operation, ops: &[Operation]| {
+            centres(o).is_some_and(|id| {
+                (ops.iter()).any(|d| d.id == id && !FROM_SOLID.contains(&get(&d.p, "cycle")))
+            })
+        };
+        let mut i = 0;
+        while i < setup.operations.len() {
+            if needless(&setup.operations[i], &setup.operations) {
+                setup.operations.remove(i);
+                out.push((si, i));
+            } else {
+                i += 1;
+            }
+        }
+    }
+    out
 }
 /// Gives centre drilling `centre` the holes of `drill`, the one it centres.
 pub fn follow(centre: &mut Operation, drill: &Operation) {
@@ -256,13 +324,35 @@ pub fn centring(doc: &Document, setup: &Setup, drill: &Operation, mesh: Option<&
 /// of the operation it goes before; and what to say of them
 /// (`said`, empty when none).
 pub fn needed(doc: &Document, si: usize, mesh: Option<&Mesh>) -> (Vec<(usize, Operation)>, String) {
+    needed_for(doc, si, mesh, |_| true)
+}
+/// `needed`, for the operations `of` says only: the drills an Add just put
+/// in, not the setup's others, which their own centring or none was left
+/// to.
+pub fn needed_for(
+    doc: &Document,
+    si: usize,
+    mesh: Option<&Mesh>,
+    of: impl Fn(&Operation) -> bool,
+) -> (Vec<(usize, Operation)>, String) {
     let Some(setup) = doc.setups.get(si) else {
         return (vec![], String::new());
+    };
+    // Each Drill's holes worked out once.
+    let mut kept = std::collections::HashMap::new();
+    let mut holes = |o: &Operation| {
+        let mesh = mesh?;
+        (kept.entry(o.id.clone()))
+            .or_insert_with(|| cam::holes(setup, o, mesh).ok())
+            .clone()
     };
     let mut out = vec![];
     let (mut added, mut missing) = (vec![], vec![]);
     for (oi, op) in setup.operations.iter().enumerate() {
-        if !wants_centre(op, &doc.tools, &setup.machine) || centred(setup, oi) {
+        if !of(op)
+            || !wants_centre(op, &doc.tools, &setup.machine)
+            || centred_by(setup, oi, &mut holes)
+        {
             continue;
         }
         let c = centring(doc, setup, op, mesh);
@@ -415,11 +505,35 @@ mod tests {
         set(&mut doc, "pilot_length", "3.1");
         assert!(plan(&doc, &mesh, ci).is_ok());
         // Flutes 6.5 long reach 3.4 over the pilot: the 3.29 of the cone
-        // alone, not the stock standing over the holes as well.
+        // alone, not the stock standing over the holes as well. Then the
+        // cone opens at that stock's top, where the drill after it starts
+        // (LIO-536): a counterbore's floor not bored yet.
         set(&mut doc, "length", "6.5");
+        let p = plan(&doc, &mesh, ci).unwrap();
+        let setup = &doc.setups[0];
+        let holes = cam::holes(setup, &setup.operations[ci], &mesh).unwrap();
+        let cone = 3.8 / 2. * 3f32.sqrt();
+        let mut n = 0;
+        for h in holes
+            .iter()
+            .filter(|h| cam::drills(&setup.operations[ci], h))
+        {
+            let low = (p.moves.iter())
+                .filter(|m| {
+                    m.cutting_pass && (m.to[0] - h.center[0]).hypot(m.to[1] - h.center[1]) < 1e-3
+                })
+                .map(|m| m.to[2])
+                .fold(f32::INFINITY, f32::min);
+            assert!(p.stock.max[2] > h.top + 1., "{} {}", p.stock.max[2], h.top);
+            assert!((p.stock.max[2] - cone - low).abs() < 0.01, "{low}");
+            n += 1;
+        }
+        assert_eq!(n, 4);
+        // Flutes shorter than the cone alone: refused, and why.
+        set(&mut doc, "length", "6.3");
         let why = plan(&doc, &mesh, ci).unwrap_err();
         assert!(
-            why.contains("The centre drill's flutes reach 3.40 mm"),
+            why.contains("The centre drill's flutes reach 3.20 mm"),
             "{why}"
         );
         set(&mut doc, "length", "50");
@@ -513,13 +627,90 @@ mod tests {
         assert!(same_holes(&ops[ci], &ops[3]));
         assert!(!sync(&mut doc));
         // The drill is centred: nothing more is needed.
-        assert!(centred(&doc.setups[0], 3));
+        assert!(centred(&doc.setups[0], 3, None));
         assert!(needed(&doc, 0, None).0.is_empty());
         // A copied setup's centre drilling centres the copied drill.
         let copy = doc.setups[0].duplicate("G55");
         let ops = &copy.operations;
         assert_ne!(ops[3].id, doc.setups[0].operations[3].id);
         assert_eq!(centres(&ops[ci]), Some(ops[3].id.as_str()));
+    }
+    #[test]
+    fn a_drilling_at_the_same_centres_centres_a_drill_whatever_it_picks() {
+        // A centre drilling of its own before the Holes, unlinked and
+        // picking none of what they pick (LIO-536): a counterbore's arcs
+        // over a slot's, say.
+        let (mut doc, mesh) = job("Yes");
+        let tool = centre_drill("2.5", "3.1", "6.3");
+        let machine = doc.setups[0].machine.clone();
+        let mut spot = Operation::for_machine(Strategy::Drill, tool.id.clone(), &machine);
+        spot.p.insert("cycle".into(), "Drilling".into());
+        doc.tools.push(tool);
+        doc.setups[0].operations.insert(2, spot);
+        let setup = &doc.setups[0];
+        let (spot, drill) = (&setup.operations[2], &setup.operations[3]);
+        assert!(!same_holes(spot, drill));
+        // The four its Ø6.6 filter drills of the face's five.
+        let real: Vec<_> = (cam::holes(setup, drill, &mesh).unwrap().into_iter())
+            .filter(|h| cam::drills(drill, h))
+            .collect();
+        assert_eq!(real.len(), 4);
+        // The spot's holes, each moved `by` in X; the drill's as they are.
+        let moved = |by: f32, keep: usize| {
+            let (real, drill) = (real.clone(), drill.id.clone());
+            move |o: &Operation| {
+                Some(match o.id == drill {
+                    true => real.clone(),
+                    false => (real.iter().take(keep).cloned())
+                        .map(|mut h| {
+                            h.center[0] += by;
+                            h
+                        })
+                        .collect(),
+                })
+            }
+        };
+        assert!(centred_by(setup, 3, &mut moved(0., 4)));
+        assert!(centred_by(setup, 3, &mut moved(0.04, 4)));
+        // Off the centres, or one hole short: not centred.
+        assert!(!centred_by(setup, 3, &mut moved(0.2, 4)));
+        assert!(!centred_by(setup, 3, &mut moved(0., 3)));
+        // Holes not known: by its picks only.
+        assert!(!centred(setup, 3, None));
+        // A spot that is off, or a tap or a boring head before it, does
+        // not open the holes.
+        for (k, v) in [("enabled", ""), ("cycle", "Tapping"), ("cycle", "Boring")] {
+            let mut doc = doc.clone();
+            let spot = &mut doc.setups[0].operations[2];
+            match k {
+                "enabled" => spot.enabled = false,
+                _ => {
+                    spot.p.insert(k.into(), v.into());
+                }
+            }
+            assert!(!centred_by(&doc.setups[0], 3, &mut moved(0., 4)), "{k} {v}");
+        }
+    }
+    #[test]
+    fn a_drill_turned_into_a_bore_loses_its_centring_and_an_add_centres_only_its_own() {
+        let (mut doc, _, ci) = centred_job(centre_drill("2.5", "3.1", "6.3"));
+        // Drilling still: the centring stays.
+        assert!(drop_needless(&mut doc).is_empty());
+        doc.setups[0].operations[ci + 1]
+            .p
+            .insert("cycle".into(), "Boring".into());
+        assert_eq!(drop_needless(&mut doc), [(0, ci)]);
+        let ops = &doc.setups[0].operations;
+        assert!(ops.iter().all(|o| centres(o).is_none()));
+        assert_eq!(ops[ci].name(), "Holes");
+        assert!(drop_needless(&mut doc).is_empty());
+        // An Add asks for the drills it put in: the setup's others are
+        // left as they are.
+        let (doc, _) = job("Yes");
+        let holes = doc.setups[0].operations[2].id.clone();
+        assert!(needed_for(&doc, 0, None, |_| false).0.is_empty());
+        let (ops, _) = needed_for(&doc, 0, None, |o| o.id == holes);
+        assert_eq!(ops.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [2]);
     }
     /// The holes and the uncentred flags of the Holes step of operation
     /// `oi` in `guide`.

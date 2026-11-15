@@ -903,10 +903,11 @@ fn tenths_down(turns: f32) -> f32 {
 /// Whether the mouth of the hole Ø`d` at `at` (stock frame), drilled from
 /// as high as `top` down to `bottom`, is opened in `before` so that a twist
 /// drill finds its centre: its axis is open, or the material on it starts
-/// lower than all round the hole's rim (a centre drill's or a countersink's
-/// cone, a pilot hole). A flat face, a flat-bottomed pocket the hole starts
-/// in, a slope, a step beside it, or a rim with no material somewhere (the
-/// stock's edge) is not. Exact: the cuts' sweeps, every 0.02 mm down.
+/// lower than all round a ring about it within the hole's rim (a centre
+/// drill's or a countersink's cone, a pilot hole). A flat face, a
+/// flat-bottomed pocket the hole starts in, a slope, a step beside it, or
+/// a rim with no material somewhere (the stock's edge) is not. Exact: the
+/// cuts' sweeps, every 0.02 mm down.
 pub(crate) fn opened(
     before: &Volume,
     frame: crate::volume::Frame,
@@ -934,18 +935,28 @@ pub(crate) fn opened(
     let Some(axis) = first(at[0], at[1]) else {
         return true;
     };
-    // The rim's lowest material: a cone round the axis keeps all of it
-    // higher than the axis; a step or a slope keeps some no higher.
-    let mut rim = f32::INFINITY;
-    for k in 0..8 {
-        let a = k as f32 * std::f32::consts::TAU / 8.;
-        match first(at[0] + r * a.cos(), at[1] + r * a.sin()) {
-            Some(z) => rim = rim.min(z),
-            None => return false,
+    // A ring round the axis whose lowest material is still higher than
+    // the axis: a cone round it keeps all of its rim higher; a step or a
+    // slope keeps some no higher. Rings inside the rim count too: two
+    // holes closer than their size (a slot's ends) each find the other's
+    // pilot on their own rim, though each is centred in its own cone
+    // (LIO-536).
+    let ring = |rho: f32| {
+        let mut low = f32::INFINITY;
+        for k in 0..8 {
+            let a = k as f32 * std::f32::consts::TAU / 8.;
+            low = low.min(first(at[0] + rho * a.cos(), at[1] + rho * a.sin())?);
         }
-    }
-    axis < rim - STEP
+        Some(low)
+    };
+    (1..=RINGS)
+        .rev()
+        .map(|k| r * k as f32 / RINGS as f32)
+        .any(|rho| ring(rho).is_some_and(|rim| axis < rim - STEP))
 }
+/// How many rings round a hole's axis `opened` looks at, evenly out to its
+/// rim.
+const RINGS: usize = 4;
 fn holes(plan: &Plan, zero: [f32; 3]) -> Vec<[f32; 3]> {
     holes_of(&plan.moves, zero)
 }
@@ -5451,6 +5462,42 @@ pub(crate) mod tests {
             (0, 0),
         );
         assert!(opened(&v, f, [30., 20.], 6., 10., 0.));
+    }
+    #[test]
+    fn two_spots_closer_than_the_drill_each_centre_their_own_hole() {
+        // A slot's ends, Ø8 and 5 apart, each centre drilled (LIO-536):
+        // each end's rim reaches into the other's pilot, as deep as its
+        // own axis, and each is still centred in its own cone.
+        let f = crate::volume::Frame::identity();
+        let b = Bounds {
+            min: [0., 0., -20.],
+            max: [40., 40., 0.],
+        };
+        let mut v = Volume::new(b, f);
+        let c = crate::model::CentreDrill {
+            pilot: 2.5,
+            pilot_length: 3.1,
+            body: 6.3,
+        };
+        let point = -c.cone_depth(8.);
+        let spot = |v: &mut Volume, x: f32| {
+            v.cut(
+                [x, 20., 5.],
+                [x, 20., point],
+                3.15,
+                10.,
+                c.shape(),
+                f,
+                (0, 0),
+            )
+        };
+        spot(&mut v, 15.);
+        // One end spotted: the other, on the flat beside it, is not.
+        assert!(opened(&v, f, [15., 20.], 8., 0., -20.));
+        assert!(!opened(&v, f, [20., 20.], 8., 0., -20.));
+        spot(&mut v, 20.);
+        assert!(opened(&v, f, [15., 20.], 8., 0., -20.));
+        assert!(opened(&v, f, [20., 20.], 8., 0., -20.));
     }
     #[test]
     fn the_holes_are_centres_and_depths_in_work_coordinates() {

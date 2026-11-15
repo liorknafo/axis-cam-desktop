@@ -1520,7 +1520,12 @@ fn table() -> Vec<Command> {
                 if !crate::centre::wants_centre(o, &ctx.app.doc.tools, &setup.machine) {
                     return refused("A centre drilling goes before a Drill on the manual mill, with a twist drill drilling from solid.");
                 }
-                if crate::centre::centred(setup, oi) {
+                let centred = if si == ctx.app.doc.index() {
+                    ctx.app.centred(oi)
+                } else {
+                    crate::centre::centred(setup, oi, ctx.app.part_mesh())
+                };
+                if centred {
                     return refused("This drill is centre drilled already.");
                 }
                 Ok(())
