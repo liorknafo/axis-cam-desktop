@@ -33986,7 +33986,8 @@ soft_max = 180.0
                     let c = placement
                         .transform(mesh.surfaces[id].center)
                         .map(|v| v / scale);
-                    (t.minor / 2. ..=t.major / 2.)
+                    // A crest's centre lies a little inside its arc.
+                    (t.minor / 2. - 0.05..=t.major / 2.)
                         .contains(&(c[0] - t.centre[0]).hypot(c[1] - t.centre[1]))
                         && (c[2] - mid).abs() < 2.
                 })
@@ -34090,7 +34091,8 @@ soft_max = 180.0
                     let c = placement
                         .transform(mesh.surfaces[id].center)
                         .map(|v| v / scale);
-                    (t.minor / 2. ..=t.major / 2.)
+                    // A crest's centre lies a little inside its arc.
+                    (t.minor / 2. - 0.05..=t.major / 2.)
                         .contains(&(c[0] - t.centre[0]).hypot(c[1] - t.centre[1]))
                         && (c[2] - mid).abs() < 2.
                 })
