@@ -123,21 +123,63 @@ pub struct Running {
 /// move: its cutting done.
 type Mark = (usize, usize, bool);
 
-/// The `Mark` of each of `blocks`, the operations' clearances `clear` (by
-/// index in the program; None for one without steps): a step starts at the
-/// first feed move after the tool, between two feed moves, rose to the
-/// clearance (`plan_steps`), a retract to the clearance plane rising too.
-fn step_marks(blocks: &[Block], clear: &[Option<f32>]) -> Vec<Option<Mark>> {
+/// The `Mark` of each of `blocks`, the operations' clearances and whether
+/// each drills holes `clear` (by index in the program; None for one without
+/// steps): a step starts at the first feed move after the tool, between two
+/// feed moves, rose to the clearance (`plan_steps`), a retract to the
+/// clearance plane rising too; but a drilling operation's peck that comes
+/// back down into the hole it rose from is in that hole's step, which is
+/// not done until the tool leaves the hole (LIO-549).
+fn step_marks(blocks: &[Block], clear: &[Option<(f32, bool)>]) -> Vec<Option<Mark>> {
     let n = clear.len();
+    let op_at = |b: &Block, last: Option<usize>| {
+        match b {
+            Block::Retract | Block::Stop | Block::End => last,
+            _ => op_of(b),
+        }
+        .filter(|&o| o < n)
+    };
+    // Whether the next feed move after each block is a peck of its
+    // operation's: a drilling one's feed that starts where its feed before
+    // ended, over the hole that one left.
+    let mut peck_ahead = vec![false; blocks.len()];
+    {
+        let mut ended: Vec<Option<[f32; 3]>> = vec![None; n];
+        let mut pecks = vec![false; blocks.len()];
+        for (i, b) in blocks.iter().enumerate() {
+            if let Block::Move {
+                op,
+                kind: Kind::Feed,
+                from,
+                to,
+                ..
+            } = b
+                && *op < n
+            {
+                let hole = clear[*op].is_some_and(|c| c.1);
+                pecks[i] = hole && ended[*op].is_some_and(|e| same_hole(e, *from));
+                ended[*op] = Some(*to);
+            }
+        }
+        let mut ahead = false;
+        for (i, b) in blocks.iter().enumerate().rev() {
+            peck_ahead[i] = ahead;
+            if matches!(
+                b,
+                Block::Move {
+                    kind: Kind::Feed,
+                    ..
+                }
+            ) {
+                ahead = pecks[i];
+            }
+        }
+    }
     let (mut count, mut fed, mut high) = (vec![0; n], vec![false; n], vec![false; n]);
     let mut last = None;
-    (blocks.iter())
-        .map(|b| {
-            let op = match b {
-                Block::Retract | Block::Stop | Block::End => last,
-                _ => op_of(b),
-            }
-            .filter(|&o| o < n)?;
+    (blocks.iter().enumerate())
+        .map(|(i, b)| {
+            let op = op_at(b, last)?;
             match b {
                 Block::Move {
                     kind: Kind::Feed, ..
@@ -148,15 +190,21 @@ fn step_marks(blocks: &[Block], clear: &[Option<f32>]) -> Vec<Option<Mark>> {
                     (fed[op], high[op], last) = (true, false, Some(op));
                 }
                 Block::Move { from, to, .. } => {
-                    let c = clear[op].unwrap_or(f32::INFINITY);
-                    high[op] |= fed[op] && from[2].max(to[2]) >= c - AT_CLEARANCE;
+                    let c = clear[op].map_or(f32::INFINITY, |c| c.0);
+                    high[op] |= fed[op] && !peck_ahead[i] && from[2].max(to[2]) >= c - AT_CLEARANCE;
                 }
-                Block::Retract => high[op] |= fed[op],
+                Block::Retract => high[op] |= fed[op] && !peck_ahead[i],
                 _ => {}
             }
             Some((op, count[op], high[op]))
         })
         .collect()
+}
+
+/// Whether a feed move that starts at `next` goes back into the hole the
+/// one that ended at `left` drilled: over the same point, a peck of it.
+fn same_hole(left: [f32; 3], next: [f32; 3]) -> bool {
+    (0..2).all(|k| (left[k] - next[k]).abs() < 0.01)
 }
 
 /// The run's record of its tool runs before a Cycle Start.
@@ -822,8 +870,8 @@ impl Run {
     fn marks_of(&self, p: &Checked, blocks: &[Block]) -> Vec<Option<Mark>> {
         // An operation of one step ends it too, once risen to its clearance
         // (LIO-311).
-        let clear: Vec<Option<f32>> = (p.indexes.iter())
-            .map(|&oi| self.op_steps(oi).map(|s| s.clear))
+        let clear: Vec<Option<(f32, bool)>> = (p.indexes.iter())
+            .map(|&oi| self.op_steps(oi).map(|s| (s.clear, s.hole)))
             .collect();
         step_marks(blocks, &clear)
     }
@@ -1169,9 +1217,12 @@ impl Run {
             return;
         }
         if let Some(j) = self.journal.take() {
+            // Its steps as they split then: a build that splits them
+            // otherwise (a deep drilling's pecks into its holes, LIO-549)
+            // numbers them otherwise.
             let same = self
                 .op_steps(j.op)
-                .is_some_and(|s| s.fingerprint == j.fingerprint);
+                .is_some_and(|s| s.fingerprint == j.fingerprint && s.steps.len() == j.steps);
             if same && j.setup == self.setup_id {
                 self.resume_after(j.op, j.step);
                 self.resumed = Some(j);
@@ -2828,7 +2879,10 @@ const AT_CLEARANCE: f32 = 0.01;
 /// moves, is at the plan's clearance, its highest Z, which must be above the
 /// stock top. Empty for a plan that turns A, a lathe's, or one with no feed
 /// move; one step for a plan that never goes back up there between feeds.
-pub fn plan_steps(plan: &crate::simulation::Plan) -> Vec<Step> {
+/// A drilling plan's (`hole`) steps are its holes: a peck that rises to the
+/// clearance and comes back down into the hole it left is in that hole's
+/// step (LIO-549).
+pub fn plan_steps(plan: &crate::simulation::Plan, hole: bool) -> Vec<Step> {
     use crate::simulation::Motion;
     let moves = &plan.moves;
     let feed = |i: usize| moves[i].motion == Motion::Feed;
@@ -2847,11 +2901,12 @@ pub fn plan_steps(plan: &crate::simulation::Plan) -> Vec<Step> {
     // Between two feeds, the first move that starts at the clearance; a
     // stretch of rapids that only rises to it starts the step after them.
     let mut starts = vec![0];
-    let mut fed = None;
+    let mut fed: Option<usize> = None;
     for i in 0..=last {
         if feed(i) {
             if let Some(f) = fed
                 && i > f + 1
+                && !(hole && same_hole(moves[f].to, moves[i].from))
                 && let Some(s) = (f + 1..=i).find(|&j| moves[j].from[2] >= clear - AT_CLEARANCE)
             {
                 starts.push(s);
@@ -2889,11 +2944,12 @@ fn op_steps(doc: &Document, si: usize, sims: &Sims) -> Vec<OpSteps> {
             let clear = (plan.moves.iter())
                 .map(|m| m.from[2].max(m.to[2]))
                 .fold(f32::NEG_INFINITY, f32::max);
+            let hole = op.strategy == crate::model::Strategy::Drill;
             Some(OpSteps {
                 op: *oi,
                 clear,
-                hole: op.strategy == crate::model::Strategy::Drill,
-                steps: plan_steps(plan),
+                hole,
+                steps: plan_steps(plan, hole),
                 fingerprint: fingerprint(plan, &op.tool),
             })
         })
@@ -5095,7 +5151,7 @@ pub(crate) mod tests {
                     op: oi,
                     clear: 15.,
                     hole: false,
-                    steps: plan_steps(&plan),
+                    steps: plan_steps(&plan, false),
                     fingerprint: 0,
                 })
                 .collect();
@@ -5819,6 +5875,136 @@ pub(crate) mod tests {
         assert!(!run.skip(4, Some(Skip::Cut)) && run.skips.is_empty());
     }
 
+    /// A deep drilling's steps are its holes, each with all its pecks
+    /// (LIO-549): the tablet fixture's Drilling with its pecks retracting to
+    /// its clearance, both 5 mm above the stock, as axis-shop's copy of it
+    /// had (its holes go 44 mm deep and that profile has 55 mm of Z): 5 holes
+    /// in 3 mm pecks that each rise to the clearance. It has 5 steps,
+    /// "Hole 1" to "Hole 5", not a "Hole" a peck. The running program's marks
+    /// count them as the plan does and call a hole done only once the tool
+    /// leaves it, so Stop after
+    /// step stops between holes, never between two pecks; the tablet file
+    /// says the same.
+    #[test]
+    fn a_deep_drillings_pecks_are_in_the_step_of_their_hole() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (mut doc, mesh) = tablet_fixture(&profile);
+        let oi = (doc.setups[0].operations.iter())
+            .position(|o| o.strategy == crate::model::Strategy::Drill)
+            .unwrap();
+        let op = &mut doc.setups[0].operations[oi];
+        // The fixture's own pecks retract to 2 mm, below its 5 mm clearance
+        // (LIO-540); a project may retract them to the clearance itself.
+        op.p.insert("clearance".into(), "5".into());
+        op.p.insert("retract".into(), "5".into());
+        let op = &doc.setups[0].operations[oi];
+        assert_eq!(crate::get(&op.p, "cycle"), "Deep drilling");
+        assert_eq!(crate::num(&op.p, "peck"), Some(3.));
+        let sims = simulated(&doc, &mesh, 0);
+        let steps = op_steps(&doc, 0, &sims);
+        let drill = steps.iter().find(|s| s.op == oi).unwrap();
+        let plan = &sims
+            .iter()
+            .find(|s| s.0 == oi)
+            .unwrap()
+            .1
+            .as_ref()
+            .unwrap()
+            .plan;
+        let feeds: Vec<usize> = (0..plan.moves.len())
+            .filter(|&i| plan.moves[i].motion == Motion::Feed)
+            .collect();
+        let xy = |p: [f32; 3]| [0, 1].map(|k| (p[k] * 100.).round() as i64);
+        let mut holes: Vec<_> = feeds.iter().map(|&i| xy(plan.moves[i].to)).collect();
+        holes.dedup();
+        assert_eq!(holes.len(), 5);
+        // Pecked, each peck up to the clearance before the next: steps by
+        // the clearance alone would be a "Hole" a peck, "Hole 1" to
+        // "Hole 59".
+        assert_eq!(plan_steps(plan, false).len(), 59);
+        assert_eq!(drill.steps.len(), 5);
+        let labels: Vec<String> = (0..5).map(|s| drill.label(s)).collect();
+        assert_eq!(labels, ["Hole 1", "Hole 2", "Hole 3", "Hole 4", "Hole 5"]);
+        assert_eq!(drill.labels(0..=4), "Holes 1–5");
+        assert_eq!(drill.labels(1..=1), "Hole 2");
+        // Each step all the pecks of one hole.
+        for (s, step) in drill.steps.iter().enumerate() {
+            let at: Vec<_> = (feeds.iter())
+                .filter(|i| step.moves.contains(i))
+                .map(|&i| xy(plan.moves[i].to))
+                .collect();
+            assert!(at.len() > 1 && at.iter().all(|p| *p == holes[s]), "{s}");
+        }
+        // The program: its marks count the holes, and none is done while
+        // the tool is up between two of its pecks.
+        let programs =
+            crate::post::checked_to_start(&doc, &mesh, 0, &sims, PostSettings::for_uc100, &[])
+                .unwrap();
+        let (r, p) = (programs.iter().enumerate())
+            .find(|(_, p)| p.indexes.contains(&oi))
+            .unwrap();
+        let k = p.indexes.iter().position(|&o| o == oi).unwrap();
+        let clear: Vec<Option<(f32, bool)>> = (p.indexes.iter())
+            .map(|&o| steps.iter().find(|s| s.op == o).map(|s| (s.clear, s.hole)))
+            .collect();
+        let marks = step_marks(&p.blocks, &clear);
+        let is_feed = |b: &Block| {
+            matches!(
+                b,
+                Block::Move {
+                    op,
+                    kind: Kind::Feed,
+                    ..
+                } if *op == k
+            )
+        };
+        let fed: Vec<usize> = (0..p.blocks.len())
+            .filter(|&b| is_feed(&p.blocks[b]))
+            .collect();
+        assert_eq!(fed.len(), feeds.len());
+        let of_feed: Vec<usize> = fed.iter().map(|&b| marks[b].unwrap().1).collect();
+        assert_eq!(of_feed.first(), Some(&0));
+        assert_eq!(of_feed.last(), Some(&4));
+        assert!(of_feed.windows(2).all(|w| w[1] == w[0] || w[1] == w[0] + 1));
+        for (b, m) in marks.iter().enumerate() {
+            let Some((o, s, true)) = *m else { continue };
+            if o != k {
+                continue;
+            }
+            if let Some(&next) = fed.iter().find(|&&f| f > b) {
+                assert_eq!(
+                    marks[next].unwrap().1,
+                    s + 1,
+                    "block {b} said hole {s} done"
+                );
+            }
+        }
+        // The tablet file: the same 5 holes, each ending where Stop after
+        // step stops, after its last peck.
+        let zip = crate::bundle::pack(&doc).unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(zip)).unwrap();
+        let runs: crate::bundle::Runs =
+            serde_json::from_reader(zip.by_name(crate::bundle::RUNS).unwrap()).unwrap();
+        let tablet: Vec<_> = (runs.setups[0].tool_runs[r].steps.iter())
+            .filter(|t| t.operation == oi)
+            .collect();
+        let labels: Vec<&str> = tablet.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(labels, ["Hole 1", "Hole 2", "Hole 3", "Hole 4", "Hole 5"]);
+        for (s, t) in tablet.iter().enumerate() {
+            let last = fed.iter().rfind(|&&b| marks[b].unwrap().1 == s).unwrap();
+            let last = *last as u32 + 1;
+            assert!(!t.end_lines.is_empty(), "{}", t.label);
+            assert!(
+                t.end_lines.iter().all(|[x, _]| *x > last),
+                "{} ends {:?}, its last peck on line {last}",
+                t.label,
+                t.end_lines
+            );
+        }
+    }
+
     /// The fixture job's Face, Pocket, Contour and Drill on a UC100 (the
     /// template profile in `dir`): its Parallel and Waterline off, to be quick.
     fn four_ops(dir: &std::path::Path) -> (Document, Mesh) {
@@ -5891,7 +6077,7 @@ pub(crate) mod tests {
                     .filter(|s| !cut.contains(s))
                     .map(|s| &os.steps[s])
                     .collect();
-                let again = plan_steps(&less);
+                let again = plan_steps(&less, os.hole);
                 assert_eq!(again.len(), kept.len(), "{:?} cut {cut:?}", p.strategy);
                 assert!(less.moves[0].from[2] >= os.clear - AT_CLEARANCE);
                 for w in less.moves.windows(2) {
@@ -5904,7 +6090,9 @@ pub(crate) mod tests {
             crate::post::checked_to_start(&doc, &mesh, 0, &sims, PostSettings::for_uc100, &[])
                 .unwrap();
         let p = &programs[0];
-        let clear: Vec<Option<f32>> = (p.indexes.iter()).map(|&oi| Some(of(oi).clear)).collect();
+        let clear: Vec<Option<(f32, bool)>> = (p.indexes.iter())
+            .map(|&oi| Some((of(oi).clear, of(oi).hole)))
+            .collect();
         let marks = step_marks(&p.blocks, &clear);
         for (k, &oi) in p.indexes.iter().enumerate() {
             let last = marks.iter().flatten().rfind(|m| m.0 == k).unwrap();
@@ -6114,6 +6302,22 @@ pub(crate) mod tests {
         );
         assert!(run.checked().is_some());
         assert_eq!((run.next, run.from, run.at_step()), (0, 0, None));
+        // Its steps split otherwise since, as a deep drilling's pecks did
+        // before they were put in their holes (LIO-549): step 37 of 59 is
+        // no step now, so nothing is picked either.
+        let mut run = Run::new(&doc, 0, 0);
+        run.journal = Some(Journal {
+            steps: 59,
+            step: Some(36),
+            ..read.clone()
+        });
+        run.checked_as(
+            Arc::new(Ok(vec![program()])),
+            Some(Arc::new(steps(7))),
+            None,
+        );
+        assert_eq!((run.start_step, run.recheck), (None, false));
+        assert!(run.journal_note.as_ref().unwrap().contains("changed"));
         // Changed: nothing is picked, and that is said.
         let mut run = Run::new(&doc, 0, 0);
         run.journal = Some(read);
