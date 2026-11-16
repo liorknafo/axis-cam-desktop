@@ -3675,10 +3675,24 @@ flood = { pin = 8 }
     /// command pressed say it was refused, not connecting or not answering;
     /// nothing is sent. Paired again, the Pi lets it in at its next try and
     /// the status line says "Connected to <machine>: <state>", the refusal
-    /// gone (LIO-519).
+    /// gone (LIO-519). The MACHINE bar's state pill says "Refused" while
+    /// refused, also over a state known before, never "Connecting…"
+    /// (LIO-561).
     #[test]
     fn a_refusing_pi_is_said_on_the_status_line_until_it_lets_this_computer_in() {
         use crate::control::{Action as A, NOT_SENT_PI_REFUSED};
+        use crate::ui::PILL_REFUSED;
+        // The pill's word: the one of the two on the page.
+        let pill = |a: &App| {
+            let texts = page_texts(a);
+            let has = |w: &str| texts.iter().any(|t| t == w);
+            match (has(PILL_REFUSED), has("Connecting…")) {
+                (true, false) => PILL_REFUSED,
+                (false, true) => "Connecting…",
+                (false, false) => "",
+                _ => panic!("{texts:?}"),
+            }
+        };
         let dir = tempfile::tempdir().unwrap();
         let (mut a, server) = pi_app(dir.path());
         a.page = Page::Control;
@@ -3706,6 +3720,8 @@ flood = { pin = 8 }
         let _ = a.update(Message::Tick);
         let why = conn(&a).pi_refused().unwrap().to_string();
         assert!(why.contains("not paired"), "{why}");
+        assert!(conn(&a).snapshot.state.is_none());
+        assert_eq!(pill(&a), PILL_REFUSED);
         assert_eq!(
             a.status,
             format!("The Pi of {name} refused this computer: {why}")
@@ -3727,6 +3743,7 @@ flood = { pin = 8 }
                 "{}",
                 a.status
             );
+            assert_eq!(pill(&a), PILL_REFUSED);
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         // Paired again: let in at the next try, within 5 s, the Pi's state
@@ -3744,6 +3761,7 @@ flood = { pin = 8 }
         assert!(conn(&a).snapshot.state.is_none() && conn(&a).pi_down());
         assert_eq!(a.status, format!("Connecting to {name}…"));
         assert_eq!(problems(&a), vec![crate::run::PI_CONNECTING.to_string()]);
+        assert_eq!(pill(&a), "Connecting…");
         // Through the client's silence time and its reconnect: still so.
         let end = std::time::Instant::now() + std::time::Duration::from_secs(4);
         while std::time::Instant::now() < end {
@@ -3761,6 +3779,7 @@ flood = { pin = 8 }
         );
         let p = problems(&a);
         assert!(!p.iter().any(|t| t.contains("refused")), "{p:?}");
+        assert_eq!(pill(&a), "");
         // Live and then cut: a lost link, as before.
         gate.set_cut(true);
         pi_live(&mut a, false, "the link lost");
@@ -3770,6 +3789,83 @@ flood = { pin = 8 }
             "{}",
             a.status
         );
+        assert_eq!(pill(&a), "");
+        // Forgotten while the link was down: refused at its next try, the
+        // Pi's state known from before. The pill says refused, not that
+        // state (LIO-561).
+        std::fs::rename(&clients, &kept).unwrap();
+        gate.set_cut(false);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        while conn(&a).pi_refused().is_none() {
+            let _ = a.update(Message::Tick);
+            assert!(std::time::Instant::now() < end, "never refused again");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = a.update(Message::Tick);
+        assert!(conn(&a).snapshot.state.is_some());
+        assert_eq!(pill(&a), PILL_REFUSED);
+    }
+
+    /// Renders the Control page while the Pi refuses this computer: first
+    /// refused (the Pi's state never known), and refused again after a live
+    /// link (its state known from before), to `$AXIS_RENDER_DIR` (default
+    /// /tmp/pi-refused), at 1440 × 900 and 1120 × 690 (LIO-561). Not a
+    /// check: run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_the_pi_refusing_this_computer() {
+        use crate::ui::ControlTab as T;
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/pi-refused".into()),
+        );
+        let shot = |a: &mut App, name: &str| {
+            let _ = a.update(Message::Tick);
+            for (w, h) in [(1440., 900.), (1120., 690.)] {
+                let size = iced::Size::new(w, h);
+                let _ = a.update(Message::Resized(size));
+                let dir = out.join(format!("{w}x{h}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                render_png(a, size, &dir.join(format!("{name}.png")));
+            }
+        };
+        let refused = |a: &mut App| {
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(12);
+            while conn(a).pi_refused().is_none() {
+                let _ = a.update(Message::Tick);
+                assert!(std::time::Instant::now() < end, "never refused");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        a.page = Page::Control;
+        let _ = a.update(Message::ControlTab(T::Machine));
+        let gate = Gate::to(server.addr(), false);
+        let _ = a.update(Message::PiAddress(gate.addr.to_string()));
+        let clients = uc100_remote::data::Data {
+            dir: dir.path().join("pi"),
+        }
+        .clients_file();
+        let kept = dir.path().join("clients-kept.toml");
+        std::fs::rename(&clients, &kept).unwrap();
+        let _ = a.update(Message::Connect);
+        refused(&mut a);
+        shot(&mut a, "1-refused");
+        // Let in, live, Idle; then forgotten and the link cut and back.
+        std::fs::rename(&kept, &clients).unwrap();
+        gate.set_open(true);
+        pi_live(&mut a, true, "the link live");
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+            s.state == Some(uc100::controller::State::Idle)
+        });
+        shot(&mut a, "2-connected");
+        gate.set_cut(true);
+        pi_live(&mut a, false, "the link lost");
+        std::fs::rename(&clients, &kept).unwrap();
+        gate.set_cut(false);
+        refused(&mut a);
+        shot(&mut a, "3-refused-after-live");
     }
 
     /// Renders the Control page's Machine tab while connecting to the Pi

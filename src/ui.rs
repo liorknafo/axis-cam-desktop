@@ -9159,13 +9159,22 @@ fn chip<'a>(label: &str, background: Color) -> Element<'a, Message> {
         })
         .into()
 }
+/// What the MACHINE bar's state pill says while the Pi refuses this
+/// computer: the banner over the Control page says why (LIO-561).
+pub(crate) const PILL_REFUSED: &str = "Refused";
+
 /// The machine's state on the MACHINE bar, a fixed width so that nothing
-/// beside it moves as it changes; "Tool change" while one is due.
+/// beside it moves as it changes; "Tool change" while one is due,
+/// "Refused" while the Pi refuses this computer.
 fn state_pill<'a>(c: &crate::control::Connection) -> Element<'a, Message> {
     use uc100::controller::State;
     let state = c.snapshot.state.as_ref();
     let tool_change = phase(Some(c)) == Phase::ToolChange && state == Some(&State::Idle);
     let (label, background) = match state {
+        // Turned away, not connecting: it won't get in until the Pi or this
+        // app is changed. In the banner's colour, which says why; over a
+        // state last known before the refusal (LIO-561).
+        _ if c.pi_refused().is_some() => (PILL_REFUSED, WARN),
         _ if tool_change => ("Tool change", Color::from_rgb8(209, 139, 22)),
         None => ("Connecting…", Color::from_rgb8(106, 118, 134)),
         Some(State::Idle) => ("Idle", Color::from_rgb8(47, 138, 87)),
