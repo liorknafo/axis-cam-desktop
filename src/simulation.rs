@@ -198,6 +198,14 @@ pub struct Plan {
     /// with its moves; the Steps give one page a pass. Empty for every
     /// other plan.
     pub slot_passes: Vec<crate::slot::Pass>,
+    /// A drilling plan's holes as it makes them (`cam::Builder::start_hole`),
+    /// each the index of the move it starts at: the first after the tool
+    /// rose to the clearance out of the hole before. The run's steps are
+    /// these holes, whatever the tool does in one between them: a deep
+    /// drilling's pecks, a helical milling's rings (`run::plan_steps`,
+    /// LIO-555). A hole bored again in a later pass is a hole again. Empty
+    /// for every other plan.
+    pub holes: Vec<usize>,
 }
 /// A stop of the spindle partway through a plan: before move `at` the
 /// spindle and coolant stop and, with a `pause`, the program waits there,
@@ -615,6 +623,7 @@ fn generate_plan(
         keep_air: vec![],
         corner_walks: vec![],
         slot_passes: vec![],
+        holes: vec![],
         display_scale: scale,
         duration: 0.,
         target,

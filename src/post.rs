@@ -4151,6 +4151,7 @@ pub(crate) mod fixture {
             keep_air: vec![],
             corner_walks: vec![],
             slot_passes: vec![],
+            holes: vec![],
             display_scale: 1.,
             duration: 0.,
             target: 9.,

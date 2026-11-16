@@ -1330,6 +1330,8 @@ pub fn generate(
     let mut plan = parts[0].1.clone();
     plan.moves.clear();
     plan.keep_air.clear();
+    // Moves at an A have no steps (`run::plan_steps`): no hole starts either.
+    plan.holes.clear();
     plan.duration = 0.;
     let (mut a_now, mut at): (f32, Option<[f32; 3]>) = (start.a, None);
     for (k, (a, part)) in parts.iter().enumerate() {
@@ -1415,6 +1417,14 @@ pub fn enter_held(
     entered.keep_air.clear();
     entered.duration = 0.;
     entry.push(&mut entered, None, None);
+    // A hole starts where its move is now, the first where the entry does
+    // (`Plan::holes`).
+    let entered_at = entered.moves.len();
+    let shift = |h: usize| match h.checked_sub(entry.first) {
+        Some(k) if k > 0 => entered_at + k,
+        _ => 0,
+    };
+    entered.holes = plan.holes.iter().map(|&h| shift(h)).collect();
     for (i, m) in plan.moves[entry.first..].iter().enumerate() {
         push(&mut entered, m.clone());
         *entered.keep_air.last_mut().unwrap() =

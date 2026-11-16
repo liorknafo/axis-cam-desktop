@@ -661,6 +661,7 @@ pub fn nominal(
         keep_air: vec![],
         corner_walks: vec![],
         slot_passes: vec![],
+        holes: vec![],
     };
     let mut sim = Simulation::new(plan);
     (sim.initial_volume, sim.frame) = (Some(volume), Some(frame));
@@ -894,6 +895,10 @@ pub fn hold(
             .get(stop.at)
             .copied()
             .unwrap_or(refed.moves.len());
+    }
+    // So does a hole's start (`Plan::holes`).
+    for h in &mut sim.plan.holes {
+        *h = refed.starts.get(*h).copied().unwrap_or(refed.moves.len());
     }
     sim.plan.moves = refed.moves;
     sim.plan.keep_air = refed.keep_air;

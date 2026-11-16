@@ -357,6 +357,7 @@ pub(crate) fn outline(f: Outline) -> Result<Plan, String> {
         keep_air: vec![],
         corner_walks: vec![],
         slot_passes: vec![],
+        holes: vec![],
         display_scale: f.scale,
         duration: 0.,
         target: f.target,
