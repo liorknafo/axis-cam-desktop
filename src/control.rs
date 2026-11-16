@@ -2365,6 +2365,21 @@ pub struct PiRun {
 const JOB_REACH: Duration = Duration::from_secs(3);
 
 /// A running driver controller for one machine.
+/// A machine position declaration sent and not yet in the driver's log
+/// (`Connection::declaring`).
+#[derive(Clone, Copy)]
+struct Declaring {
+    axis: usize,
+    value: f64,
+    /// The driver's log count when it was sent.
+    log_seq: u64,
+    sent: Instant,
+    /// It was sent again.
+    again: bool,
+    /// The machine position when it was first sent.
+    from: [f64; 6],
+}
+
 pub struct Connection {
     driver: Driver,
     pub machine_id: String,
@@ -2421,13 +2436,12 @@ pub struct Connection {
     /// (`declaring`): the driver drops a second `SetMachine` until it has
     /// re-read the position.
     declare: VecDeque<(usize, f64)>,
-    /// The declaration sent and not yet in the driver's log: the axis, its
-    /// value, the log count and time it was sent, and whether it was sent
-    /// again. Two that reach the driver in one of its loops would see it
-    /// drop the second, so the next waits: on the Pi the network bunches
-    /// them, and here a driver thread that runs late on a busy computer
-    /// takes two ticks' worth at once (LIO-554).
-    declaring: Option<(usize, f64, u64, Instant, bool)>,
+    /// The declaration sent and not yet in the driver's log. Two that reach
+    /// the driver in one of its loops would see it drop the second, so the
+    /// next waits: on the Pi the network bunches them, and here a driver
+    /// thread that runs late on a busy computer takes two ticks' worth at
+    /// once (LIO-554).
+    declaring: Option<Declaring>,
     held: Option<Held>,
     pub jog_step: Option<f64>,
     /// A's step in degrees (`Action::JogAngle`).
@@ -3253,10 +3267,17 @@ impl Connection {
         // Any state but Idle (E-stop, a move) drops what is left, so nothing
         // is declared later by surprise.
         if self.idle() {
-            if !self.declaring()
-                && let Some((axis, value)) = self.declare.pop_front()
-            {
-                self.declaring = Some((axis, value, self.snapshot.log_seq, Instant::now(), false));
+            if self.declaring() {
+                // Held until the driver logs the one sent.
+            } else if let Some((axis, value)) = self.declare.pop_front() {
+                self.declaring = Some(Declaring {
+                    axis,
+                    value,
+                    log_seq: self.snapshot.log_seq,
+                    sent: Instant::now(),
+                    again: false,
+                    from: self.snapshot.machine_pos,
+                });
                 self.send(Command::SetMachine { axis, value });
                 // The pins stay put on the table: in the new machine
                 // coordinates they are where the axis moved from.
@@ -3265,12 +3286,10 @@ impl Connection {
                     self.sim_pins = Some(at);
                     self.fit_sim_block();
                 }
-                if self.declare.is_empty()
-                    && let Some(said) = self.referencing.take()
-                {
-                    self.pin_referenced = true;
-                    self.pin_said = Some((true, said));
-                }
+            } else if let Some(said) = self.referencing.take() {
+                // Every pin 1 declaration is in the driver's log.
+                self.pin_referenced = true;
+                self.pin_said = Some((true, said));
             }
         } else {
             self.declare.clear();
@@ -3284,7 +3303,7 @@ impl Connection {
         }
         // Reference X Y from pin 1 probes once X and Y have a position: the
         // driver reports it a loop or two after the declarations.
-        if self.pin_start && self.declare.is_empty() {
+        if self.pin_start && self.declare.is_empty() && self.declaring.is_none() {
             if !self.idle() {
                 self.pin_start = false;
                 self.pin_said = Some((
@@ -5461,36 +5480,50 @@ impl Connection {
     }
 
     /// Whether a declaration sent is still awaited: until the driver logs
-    /// it, the next is held; one not logged within a second is sent once
-    /// more, then given up, the axis left without a machine position (on
-    /// the Pi with a note).
+    /// it, the next is held. One not logged within a second is sent once
+    /// more, but only while the machine is where it was when it was sent,
+    /// so that it never undoes a move made since; then it is given up with
+    /// those after it, and a Reference X Y from pin 1 they were for fails.
     fn declaring(&mut self) -> bool {
-        let Some((axis, value, seq, at, again)) = self.declaring else {
+        let Some(d) = self.declaring else {
             return false;
         };
         let s = &self.snapshot;
-        let said = format!("{} declared at machine", AXIS_NAMES[axis]);
-        let fresh = s.log_seq.saturating_sub(seq) as usize;
+        let said = format!("{} declared at machine", AXIS_NAMES[d.axis]);
+        let fresh = s.log_seq.saturating_sub(d.log_seq) as usize;
         if s.log.iter().rev().take(fresh).any(|l| l.starts_with(&said)) {
             self.declaring = None;
             return false;
         }
-        if at.elapsed() < Duration::from_secs(1) {
+        if d.sent.elapsed() < Duration::from_secs(1) {
             return true;
         }
-        if again {
+        if d.again || s.machine_pos != d.from {
             self.declaring = None;
             self.declare.clear();
+            let name = AXIS_NAMES[d.axis];
             if self.pi.is_some() {
                 self.pi_note = Some(format!(
-                    "{} was not declared on the Pi: set machine zero again.",
-                    AXIS_NAMES[axis]
+                    "{name} was not declared on the Pi: set machine zero again."
+                ));
+            }
+            if self.referencing.take().is_some() || std::mem::take(&mut self.pin_start) {
+                self.pin_said = Some((
+                    false,
+                    format!("{name} was not declared: reference X and Y from pin 1 again."),
                 ));
             }
             return true;
         }
-        self.send(Command::SetMachine { axis, value });
-        self.declaring = Some((axis, value, seq, Instant::now(), true));
+        self.send(Command::SetMachine {
+            axis: d.axis,
+            value: d.value,
+        });
+        self.declaring = Some(Declaring {
+            sent: Instant::now(),
+            again: true,
+            ..d
+        });
         true
     }
 
@@ -6067,20 +6100,7 @@ soft_max = 0.0
     #[test]
     fn a_declaration_waits_until_the_driver_has_logged_the_one_before() {
         let dir = tempfile::tempdir().unwrap();
-        let profile = dir.path().join("limited.toml");
-        std::fs::write(&profile, LIMITED).unwrap();
-        let mut m = Machine::new(3);
-        m.p.insert("controller".into(), "UC100".into());
-        m.p.insert("uc100_profile".into(), profile.display().to_string());
-        m.p.insert("uc100_connection".into(), "Simulated".into());
-        let mut c = Connection::open(&m, dir.path()).unwrap();
-        until(&mut c, 3.0, "E-stop after connecting", |s| {
-            s.state == Some(State::EStop)
-        });
-        c.send(Command::Reset);
-        until(&mut c, 3.0, "Idle after Reset", |s| {
-            s.state == Some(State::Idle)
-        });
+        let mut c = limited_idle(dir.path());
         c.act(Action::MachineZero(None));
         // Three ticks on the snapshot from before X was sent, as when the
         // driver's loop is late: X only.
@@ -6095,6 +6115,143 @@ soft_max = 0.0
             let said = format!("{axis} declared at machine 0.000");
             assert!(c.snapshot.log.contains(&said), "{:?}", c.snapshot.log);
         }
+    }
+
+    /// A connection to a simulated LIMITED machine, Idle after Reset.
+    fn limited_idle(dir: &Path) -> Connection {
+        let profile = dir.join("limited.toml");
+        std::fs::write(&profile, LIMITED).unwrap();
+        let mut m = Machine::new(3);
+        m.p.insert("controller".into(), "UC100".into());
+        m.p.insert("uc100_profile".into(), profile.display().to_string());
+        m.p.insert("uc100_connection".into(), "Simulated".into());
+        let mut c = Connection::open(&m, dir).unwrap();
+        until(&mut c, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        c.send(Command::Reset);
+        until(&mut c, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        c
+    }
+
+    /// The declaration of `axis` at `value`, sent two seconds ago from
+    /// machine position `from` and not logged since (the driver dropped
+    /// it); `again`: sent a second time already.
+    fn unlogged(c: &Connection, axis: usize, value: f64, from: [f64; 6], again: bool) -> Declaring {
+        Declaring {
+            axis,
+            value,
+            log_seq: c.snapshot.log_seq,
+            sent: Instant::now() - Duration::from_secs(2),
+            again,
+            from,
+        }
+    }
+
+    /// The driver's log lines since `seq`.
+    fn logged_since(c: &Connection, seq: u64) -> Vec<String> {
+        let new = c.snapshot.log_seq.saturating_sub(seq) as usize;
+        let log = &c.snapshot.log;
+        log[log.len().saturating_sub(new)..].to_vec()
+    }
+
+    /// A declaration not logged within a second is sent once more only
+    /// while the machine is where it was when it was sent: X 0 asked for
+    /// before an MDI move to X 3 is never declared at X 3, and those after
+    /// it are given up too (LIO-554). Not moved since, it is sent again.
+    #[test]
+    fn a_declaration_is_sent_again_only_where_it_was_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = limited_idle(dir.path());
+        c.act(Action::MachineZero(None));
+        until(&mut c, 3.0, "X, Y and Z set", |s| {
+            s.referenced[..3].iter().all(|r| *r)
+        });
+        let before = c.snapshot.machine_pos;
+        c.send(Command::Mdi("G0 X3".into()));
+        until(&mut c, 5.0, "X at 3", |s| {
+            s.state == Some(State::Idle) && (s.machine_pos[0] - 3.).abs() < 1e-3
+        });
+        let seq = c.snapshot.log_seq;
+        c.declaring = Some(unlogged(&c, 0, 0., before, false));
+        c.declare.push_back((1, 5.));
+        c.observe();
+        assert!(c.declaring.is_none() && c.declare.is_empty());
+        std::thread::sleep(Duration::from_millis(100));
+        c.refresh();
+        assert!((c.snapshot.machine_pos[0] - 3.).abs() < 1e-3);
+        assert!(c.snapshot.machine_pos[1].abs() < 1e-3);
+        assert!(
+            !logged_since(&c, seq).iter().any(|l| l.contains("declared")),
+            "{:?}",
+            logged_since(&c, seq)
+        );
+        // Where it was sent from: sent again, and logged.
+        c.declaring = Some(unlogged(&c, 0, 0., c.snapshot.machine_pos, false));
+        c.observe();
+        assert!(c.declaring.is_some_and(|d| d.again));
+        until(&mut c, 3.0, "X declared again", |s| {
+            s.machine_pos[0].abs() < 1e-3
+        });
+        c.refresh();
+        assert!(c.declaring.is_none());
+        assert!(logged_since(&c, seq).contains(&"X declared at machine 0.000".to_string()));
+    }
+
+    /// Reference X Y from pin 1 holds once the driver has logged both of
+    /// its declarations, not when the last is sent. One given up fails it,
+    /// and a declaration after does not finish it; nor does Reference X Y
+    /// wait on to probe (LIO-554).
+    #[test]
+    fn reference_x_y_from_pin_1_holds_only_once_both_declarations_are_logged() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = limited_idle(dir.path());
+        c.declare.extend([(0, 1.), (1, 2.)]);
+        c.referencing = Some("Referenced.".into());
+        for _ in 0..3 {
+            c.observe();
+        }
+        assert_eq!((c.pin_referenced, &c.pin_said), (false, &None));
+        until(&mut c, 3.0, "X and Y declared", |s| {
+            s.referenced[..2].iter().all(|r| *r)
+        });
+        c.refresh();
+        c.refresh();
+        assert!(c.pin_referenced);
+        assert_eq!(c.pin_said, Some((true, "Referenced.".into())));
+        // X given up: the reference fails, and Y declared after does not
+        // finish it.
+        let failed = Some((
+            false,
+            "X was not declared: reference X and Y from pin 1 again.".to_string(),
+        ));
+        (c.pin_referenced, c.pin_said) = (false, None);
+        c.referencing = Some("Referenced.".into());
+        c.declaring = Some(unlogged(&c, 0, 1., c.snapshot.machine_pos, true));
+        c.declare.push_back((1, 2.));
+        c.observe();
+        assert!(c.referencing.is_none() && c.declare.is_empty());
+        assert_eq!(c.pin_said, failed);
+        let seq = c.snapshot.log_seq;
+        c.act(Action::MachineZero(Some(1)));
+        until(&mut c, 3.0, "Y declared", |s| {
+            s.log_seq > seq
+                && s.log
+                    .last()
+                    .is_some_and(|l| l == "Y declared at machine 0.000")
+        });
+        c.refresh();
+        assert!(!c.pin_referenced);
+        assert_eq!(c.pin_said, failed);
+        // Waiting to probe once X and Y are declared where they show.
+        c.pin_said = None;
+        c.pin_start = true;
+        c.declaring = Some(unlogged(&c, 0, 1., c.snapshot.machine_pos, true));
+        c.observe();
+        assert!(!c.pin_start && c.probing.is_none());
+        assert_eq!(c.pin_said, failed);
     }
 
     /// The driver ends a jog itself at a soft limit and goes Idle a few of
