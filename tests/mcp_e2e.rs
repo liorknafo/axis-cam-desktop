@@ -966,10 +966,14 @@ fn an_agent_builds_a_manual_mill_setup_with_commands_only() {
     assert_eq!(added["outcome"], "done", "{added}");
     let state = s.tool("inspect", json!({}));
     assert_eq!(state["setups"][0]["machine"], "Manual Mill", "{state}");
+    // 4 mm of stock under the part, which a flip faces off later: the
+    // drill's point and 1 mm of breakthrough under the through holes
+    // (2.98 mm for Ø6.6) end inside it, not in the vise below. Without
+    // parallels (LIO-537), 2 mm would leave the drill 1 mm past it.
     s.batch(
         [
             ("stock_top", "2"),
-            ("stock_bottom", "2"),
+            ("stock_bottom", "4"),
             ("stock_left", "3"),
             ("stock_right", "3"),
             ("stock_front", "3"),
