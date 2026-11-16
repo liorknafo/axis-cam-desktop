@@ -6020,6 +6020,43 @@ soft_max = 0.0
         }
     }
 
+    /// On macOS the driver's controller thread is a real-time thread (a Mach
+    /// time-constraint thread, driver PR #13), so a busy Mac doesn't wake it
+    /// too late to keep the 40 ms motion buffer from running dry (LIO-527).
+    /// The log says so, for the simulated UC100 too.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_motion_thread_is_real_time_on_macos() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("limited.toml");
+        std::fs::write(&profile, LIMITED).unwrap();
+        let mut m = Machine::new(3);
+        m.p.insert("controller".into(), "UC100".into());
+        m.p.insert("uc100_profile".into(), profile.display().to_string());
+        m.p.insert("uc100_connection".into(), "Simulated".into());
+        let mut c = Connection::open(&m, dir.path()).unwrap();
+        until(
+            &mut c,
+            3.0,
+            "the motion thread's priority in the log",
+            |s| {
+                s.log
+                    .iter()
+                    .any(|l| l.starts_with("Motion thread priority"))
+            },
+        );
+        let said: Vec<_> = c
+            .snapshot
+            .log
+            .iter()
+            .filter(|l| l.starts_with("Motion thread priority"))
+            .collect();
+        assert_eq!(
+            said,
+            ["Motion thread priority: real-time (Mach time-constraint, 2 ms of CPU every 4 ms)"]
+        );
+    }
+
     /// The driver ends a jog itself at a soft limit and goes Idle a few of
     /// its loops later; until then its snapshot still says Jog, with the
     /// limit logged. A tick that read such a snapshot and acts on it once

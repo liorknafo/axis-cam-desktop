@@ -1084,8 +1084,8 @@ fn holding_fingerprint(doc: &Document, left: u64) -> Option<u64> {
     Some(hasher.finish())
 }
 /// Gives the calling thread the ordinary priority, below the driver's
-/// motion thread, which raises its own (user-interactive on macOS,
-/// real-time on Linux, time-critical on Windows), whatever the thread that
+/// motion thread, which raises its own (real-time on macOS and Linux,
+/// time-critical on Windows), whatever the thread that
 /// started it had: a background job's (`App::refresh_run_mesh`). Lower ones
 /// get nothing while the window's drawing keeps every core busy.
 fn below_the_driver() {
