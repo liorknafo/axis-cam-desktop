@@ -5452,10 +5452,11 @@ flood = { pin = 8 }
         assert_eq!(a.picture_job, None);
     }
 
-    /// FAST with Z at the JY5800's 1000 mm/min: Stop after step stops on
-    /// the rapids between two steps, which a tick must see. On FAST those
-    /// last about 150 ms, less than one tick of a busy computer (up to
-    /// 600 ms at a load of 250); at this Z speed about a second (LIO-554).
+    /// FAST with Z at 1000 mm/min, still twice the JY5800's 500
+    /// (`assets/jy5800.toml`): Stop after step stops on the rapids between
+    /// two steps, which a tick must see. On FAST those last about 150 ms,
+    /// less than one tick of a busy computer (up to 600 ms at a load of
+    /// 250); at this Z speed about a second (LIO-554).
     fn fast_z_slow() -> String {
         let z = "max_velocity = 30000.0";
         assert_eq!(FAST.matches(z).count(), 1);
@@ -5480,7 +5481,7 @@ flood = { pin = 8 }
         // The driver's line runs ahead of the tool: while the tool comes
         // down into the step, the line can still be on the rapids that end
         // the step before, where Stop after step would stop that one. At
-        // the JY5800's Z speed it is (LIO-554); armed once past them.
+        // this Z speed it is (LIO-554); armed once past them.
         let ranges = run_of(a).stop_ranges();
         let line = conn(a).snapshot.current_line;
         if let Some(end) = line.and_then(|l| ranges.iter().find(|r| r.contains(&l))) {
