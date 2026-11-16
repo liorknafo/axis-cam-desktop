@@ -1040,6 +1040,20 @@ fn an_agent_builds_a_manual_mill_setup_with_commands_only() {
     assert_eq!(ops.len(), 3, "{names:?}");
     assert_eq!(ops[1]["tool"], "Centre drill A2.5x6.3", "{names:?}");
     assert_eq!(ops[2]["name"], "Drill Ø6.6 · 4 holes", "{names:?}");
+    // The holes go through, so the drill does: its 1.98 mm point and 1 mm,
+    // inside the 4 mm of stock under the part (LIO-553, LIO-560).
+    let listed = s.tool(
+        "list_fields",
+        json!({"target": "operation", "operation": drill_op}),
+    );
+    let drill_value = |key: &str| {
+        (listed["fields"].as_array().unwrap().iter())
+            .find(|f| f["key"] == key)
+            .unwrap_or_else(|| panic!("no {key}: {listed}"))["value"]
+            .clone()
+    };
+    assert_eq!(drill_value("through"), "Yes");
+    assert_eq!(drill_value("breakthrough"), "3");
     // add_centring is for a drill that has none: refused, nothing done.
     let again = s.tool(
         "execute",
