@@ -240,19 +240,14 @@ fn sides(a: [f64; 2], b: [f64; 2], axis: usize, offset: f64, clockwise: bool) ->
     vec![at(b, first), at(a, first), at(a, -first), at(b, -first)]
 }
 /// Whether the Slot only joins its round ends (LIO-550): the user says
-/// they are bored, or, as the stock shows, earlier cuts emptied the round
-/// `half` about each end's centre from `top` down to `target`. A hundredth
-/// is spared on the radius and the depth: a boring head set to the slot's
-/// width leaves its wall there exactly.
-fn joins(
-    setup: &Setup,
-    op: &Operation,
-    b: &Builder,
-    slot: &Slot,
-    half: f32,
-    top: f32,
-    target: f32,
-) -> bool {
+/// they are bored, or, as the stock shows, at each end's centre one earlier
+/// cut alone holds the whole round `half` about it from `top` down to
+/// `target` (`RestStock::entry_cleared`): a boring head's or a drill's
+/// last pass, or a flat sweep. Points round the circle are not enough: ends
+/// roughed with overlapping plunges leave scallops between them (LIO-550
+/// review). A hundredth is spared on the radius and the depth: a boring
+/// head set to the slot's width leaves its wall there exactly.
+fn joins(setup: &Setup, op: &Operation, slot: &Slot, half: f32, top: f32, target: f32) -> bool {
     match get(&op.p, "slot_ends") {
         e if e == ENDS[1] => false,
         e if e == ENDS[2] => true,
@@ -260,10 +255,11 @@ fn joins(
             let spare = crate::corner::READ as f32;
             let r = half - spare;
             let bottom = (target + spare).min(top);
-            setup.preview_remaining.is_some()
-                && [slot.a, slot.b]
+            setup.preview_remaining.as_ref().is_some_and(|rest| {
+                [slot.a, slot.b]
                     .iter()
-                    .all(|c| cam::bored(setup, b, *c, r, top, bottom))
+                    .all(|c| rest.entry_cleared(*c, r, bottom, top))
+            })
         }
     }
 }
@@ -382,7 +378,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     let coarse = (0.1 * f64::from(rc)).min(0.1);
     // Both ends already bored to the width (LIO-550): the walks only join
     // them, straight, and nothing is stepped round an end.
-    let joined = !matching && joins(setup, op, &b, &slot, half, top, target);
+    let joined = !matching && joins(setup, op, &slot, half, top, target);
     let walk = |left: f32, scallop: f64| {
         if joined {
             Ok((sides(aw, bw, axis, f64::from(reach - left), clockwise), 0.))

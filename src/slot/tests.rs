@@ -1790,6 +1790,38 @@ fn a_slot_joins_only_ends_bored_to_its_width_and_depth_or_as_told() {
     // Bored deeper and wider: still open.
     let (deeper, _) = bored_first(&doc, &mesh, 8.3, 9.5);
     assert!(joined(&deeper, auto));
+    // Roughed by eight Ø12 plunges round each end, their edges on R8.25:
+    // each point of the circle a plunge reaches is open, but between two
+    // plunges a scallop stands 0.1 mm proud of the wall (LIO-550 review).
+    // No one cut holds the end: it is cut.
+    {
+        let mut plunged = doc.setups[0].clone();
+        let stock = crate::stock::resolve(&plunged, Some(&mesh)).unwrap().stock;
+        let zero = crate::post::datum(&plunged, stock, &mesh).unwrap();
+        let slot = Slot::read(&plunged.operations[0], zero).unwrap();
+        let f = Frame::new(&plunged, &mesh);
+        let mut v = Volume::stock(stock, f, false);
+        for c in [slot.a, slot.b] {
+            for k in 0..8 {
+                let t = k as f32 * std::f32::consts::FRAC_PI_4;
+                let at = [c[0] + 2.25 * t.cos(), c[1] + 2.25 * t.sin()];
+                v.cut(
+                    [at[0], at[1], zero[2] + 5.],
+                    [at[0], at[1], zero[2] - 8.9],
+                    6.,
+                    40.,
+                    CutterShape::Flat,
+                    f,
+                    (0, 5),
+                );
+            }
+        }
+        let rest = crate::rest::RestStock::new(&v, f);
+        // The circle's eight points are open, yet the ends are not.
+        assert!(rest.bored(slot.a, 8.24, zero[2], zero[2] - 8.89));
+        plunged.preview_remaining = Some(std::sync::Arc::new(rest));
+        assert!(!joined(&plunged, auto));
+    }
     // Undersized, too shallow, or nothing before: the ends are cut.
     for (r, depth) in [(8.0, 8.9), (8.25, 7.)] {
         let (short, _) = bored_first(&doc, &mesh, r, depth);
