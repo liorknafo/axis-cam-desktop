@@ -2,7 +2,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::Path,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -90,6 +90,9 @@ pub struct Mesh {
     pub origin: [f32; 3],
     rotated_bounds: Kept,
     threads: KeptThreads,
+    /// Every surface's place (`picks::places`), once worked out: see
+    /// `Mesh::places`.
+    places: OnceLock<Arc<Vec<crate::picks::Place>>>,
 }
 impl Mesh {
     /// The preview normalization is uniform; use the same factor for mm stock.
@@ -153,6 +156,20 @@ impl Mesh {
         kept.push((angles, found.clone()));
         found
     }
+    /// Every surface of the part in the model file's units
+    /// (`picks::places`), which the save of the workspace keeps with each
+    /// operation's picks: worked out the first time it is asked, and kept,
+    /// the mesh being the same once built. `load_with` asks, so that a
+    /// loaded part has them before the window's thread does (LIO-559).
+    pub fn places(&self) -> Arc<Vec<crate::picks::Place>> {
+        let find = || Arc::new(crate::picks::places(self));
+        self.places.get_or_init(find).clone()
+    }
+    /// Whether `places` has been worked out.
+    #[cfg(test)]
+    pub(crate) fn places_known(&self) -> bool {
+        self.places.get().is_some()
+    }
 }
 /// The thickness a DXF flat profile is extruded to when its project does
 /// not say (`ModelFile::thickness`), mm.
@@ -200,6 +217,11 @@ pub fn load_with(path: &Path, thickness: Option<f32>) -> Result<Mesh, String> {
     };
     let mut mesh = normalize_faces(triangles, cad.as_deref())?;
     mesh.units = units;
+    // On the loader's thread, never the window's: worked out on the window's
+    // thread by the first save of the workspace after an edit's pause, they
+    // held it half a second on a busy computer, and a held jog stopped
+    // (LIO-559).
+    mesh.places();
     Ok(mesh)
 }
 /// The CAD face of each triangle of a binary STL, as the STEP reader
@@ -387,6 +409,7 @@ pub(crate) fn normalize_faces(
         origin,
         rotated_bounds: Kept::default(),
         threads: KeptThreads::default(),
+        places: OnceLock::new(),
     })
 }
 pub fn sample() -> Mesh {
@@ -423,6 +446,7 @@ pub fn sample() -> Mesh {
         origin: [0., 0., 0.],
         rotated_bounds: Kept::default(),
         threads: KeptThreads::default(),
+        places: OnceLock::new(),
     }
 }
 fn box_faces(out: &mut Vec<Face>, a: [f32; 3], b: [f32; 3], feature: Option<usize>, tone: f32) {

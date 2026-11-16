@@ -56,8 +56,9 @@ pub struct Followed {
     pub notes: Vec<String>,
 }
 
-/// Every surface of `mesh` in the model file's units.
-fn places(mesh: &Mesh) -> Vec<Place> {
+/// Every surface of `mesh` in the model file's units. A pass over every
+/// face: asked through `Mesh::places`, which keeps them.
+pub(crate) fn places(mesh: &Mesh) -> Vec<Place> {
     let scale = mesh.display_scale();
     let file =
         |p: [f32; 3]| -> [f32; 3] { std::array::from_fn(|i| (p[i] - mesh.origin[i]) / scale) };
@@ -134,7 +135,7 @@ pub fn record(doc: &mut Document, mesh: &Mesh) {
         if kept.get(&o.id).is_some_and(|p| p.describe(selection)) {
             continue;
         }
-        let all = all.get_or_insert_with(|| places(mesh));
+        let all = all.get_or_insert_with(|| mesh.places());
         let faces: Option<Vec<Place>> = (selection.ids.iter())
             .map(|&id| all.get(id).cloned())
             .collect();
@@ -279,7 +280,7 @@ pub fn follow(doc: &mut Document, mesh: &Mesh, old: Option<&Mesh>) -> Followed {
         return followed;
     }
     let tol = tolerance(mesh);
-    let new = places(mesh);
+    let new = mesh.places();
     let grid = Grid::new(&new, tol);
     // The surfaces of `mesh` that `old` had too, unchanged: worked out only
     // when a surface changed shape.
@@ -326,7 +327,7 @@ pub fn follow(doc: &mut Document, mesh: &Mesh, old: Option<&Mesh>) -> Followed {
                 }
                 let kept = kept.get_or_insert_with(|| {
                     old.filter(|o| !o.fingerprint.is_empty())
-                        .map(|old| places(old).iter().filter_map(|p| grid.same(p)).collect())
+                        .map(|old| old.places().iter().filter_map(|p| grid.same(p)).collect())
                         .unwrap_or_default()
                 });
                 let there: Vec<&Place> = (new.iter())
@@ -444,6 +445,33 @@ pub(crate) mod tests {
             ids,
         });
         doc
+    }
+
+    /// A part loaded has the places of its surfaces worked out on the
+    /// loader's thread, and `record` keeps those: the first save of the
+    /// workspace after an edit's pause, on the window's thread, no longer
+    /// passes over every face of the part, which held the window half a
+    /// second on a busy computer (LIO-559). A copy of the part shares them;
+    /// a mesh built in line works them out when first asked.
+    #[test]
+    fn a_loaded_part_has_its_places_before_the_first_save() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/four-setup-block.3mf");
+        let mesh = crate::mesh::load(&path).unwrap();
+        assert!(mesh.places_known());
+        assert_eq!(*mesh.places(), places(&mesh));
+        let copy = mesh.clone();
+        assert!(std::sync::Arc::ptr_eq(&copy.places(), &mesh.places()));
+        let top = surface(&mesh, [0., 0., 1.]);
+        let mut doc = doc_picking(&mesh, vec![top]);
+        record(&mut doc, &copy);
+        let op = &doc.setup().operations[0];
+        assert_eq!(doc.places[&op.id].faces, vec![mesh.places()[top].clone()]);
+        let built = crate::mesh::normalize(block(40., 8., false)).unwrap();
+        assert!(!built.places_known());
+        let top = surface(&built, [0., 0., 1.]);
+        record(&mut doc_picking(&built, vec![top]), &built);
+        assert!(built.places_known());
     }
 
     /// The same part with its surfaces numbered anew: each pick is found as
