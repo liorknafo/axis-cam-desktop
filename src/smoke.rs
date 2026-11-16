@@ -10938,6 +10938,7 @@ flood = { pin = 8 }
             let _ = a.update(Message::SelectOp(0));
             match action {
                 "delete" => {
+                    let _ = a.update(Message::AskRemoveOp);
                     let _ = a.update(Message::ConfirmDeleteOp(true));
                 }
                 "disable" => {
@@ -16209,8 +16210,27 @@ soft_max = 180.0
         }
     }
 
+    /// A tool switched to Drill takes a drill's two flutes while its count is
+    /// still the old type's usual one; a count the user typed stays.
+    #[test]
+    fn a_tool_switched_to_drill_takes_two_flutes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("w.json"), None);
+        let _ = a.update(Message::NewTool);
+        let flutes = |a: &App| get(&a.tool_draft.p, "flutes").to_string();
+        assert_eq!(flutes(&a), "3");
+        let edit = |k: &'static str, v: &str| Message::Edit(Target::Tool, k, v.into());
+        let _ = a.update(edit("type", "Drill"));
+        assert_eq!(flutes(&a), "2");
+        let _ = a.update(edit("type", "Flat end mill"));
+        assert_eq!(flutes(&a), "3");
+        let _ = a.update(edit("flutes", "4"));
+        let _ = a.update(edit("type", "Drill"));
+        assert_eq!(flutes(&a), "4");
+    }
+
     /// The operation editor's Delete asks first, as a setup's does: Cancel
-    /// keeps the operation, another selection closes the question, and
+    /// keeps the operation, another selection leaves the question, and
     /// Delete operation removes it. The question shows in place of the
     /// editor's commands, and the footer knows the page its status is from.
     #[test]
@@ -16221,21 +16241,45 @@ soft_max = 180.0
         let _ = a.update(Message::SelectOp(0));
         let count = a.doc.setup().operations.len();
         let _ = a.update(Message::AskRemoveOp);
-        assert!(a.confirm_delete_op);
+        assert!(a.asking_delete_op());
         let _ = a.view();
         let _ = a.update(Message::ConfirmDeleteOp(false));
-        assert!(!a.confirm_delete_op);
+        assert!(!a.asking_delete_op());
         assert_eq!(a.doc.setup().operations.len(), count);
         let _ = a.update(Message::AskRemoveOp);
         let _ = a.update(Message::SelectOp(1));
         assert!(
-            !a.confirm_delete_op,
-            "another operation closes the question"
+            !a.asking_delete_op(),
+            "another operation leaves the question"
         );
+        // Confirming a question asked about another operation deletes nothing.
+        let _ = a.update(Message::ConfirmDeleteOp(true));
+        assert_eq!(a.doc.setup().operations.len(), count);
+        // Moved into the asked operation's place, another operation is not
+        // asked about: the question follows the operation, not its row.
+        let first = a.doc.setup().operations[0].id.clone();
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::AskRemoveOp);
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.update(Message::MoveOp(-1));
+        assert_ne!(a.doc.setup().operations[0].id, first);
+        assert_eq!(a.selected, Some(0));
+        assert!(
+            !a.asking_delete_op(),
+            "the moved operation is not asked about"
+        );
+        // The asked one, selected in its new row, still is.
+        let _ = a.update(Message::SelectOp(1));
+        assert_eq!(a.doc.setup().operations[1].id, first);
+        assert!(a.asking_delete_op());
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::ConfirmDeleteOp(true));
+        assert_eq!(a.doc.setup().operations.len(), count);
+        assert!(a.doc.setup().operations.iter().any(|o| o.id == first));
         let _ = a.update(Message::SelectOp(0));
         let _ = a.update(Message::AskRemoveOp);
         let _ = a.update(Message::ConfirmDeleteOp(true));
-        assert!(!a.confirm_delete_op);
+        assert!(!a.asking_delete_op());
         assert_eq!(a.doc.setup().operations.len(), count - 1);
         // A status belongs to the page it was set on: one that a page change
         // leaves as it was is an earlier page's.

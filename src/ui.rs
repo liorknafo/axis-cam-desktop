@@ -1120,12 +1120,31 @@ fn status_line(app: &App) -> Element<'_, Message> {
 const STATUS_CHARS: usize = 120;
 /// The leading whole sentences of `s` within `limit` characters, and at least
 /// the first. A sentence ends at a full stop, question or exclamation mark
-/// followed by a space ("33.4 min" does not end one), so an error's reason
-/// after "Import failed." stays in sight when it is short.
+/// followed by a space and a capital, a digit or a quote, and not after an
+/// abbreviation ("33.4 min", "e.g. a vise" and "e.g. 6061" do not end one),
+/// so an error's reason after "Import failed." stays in sight when it is
+/// short.
 fn leading_sentences(s: &str, limit: usize) -> &str {
+    const ABBREVIATIONS: [&str; 6] = ["e.g", "i.e", "etc", "approx", "vs", "max"];
+    let ends = |i: usize| {
+        // "(e.g." is the word "e.g" too.
+        let word = s[..i]
+            .rsplit(' ')
+            .next()
+            .unwrap_or("")
+            .trim_start_matches(['(', '[', '"', '\'', '“', '‘']);
+        if ABBREVIATIONS.iter().any(|a| word.eq_ignore_ascii_case(a)) {
+            return false;
+        }
+        let mut after = s[i + 1..].chars();
+        after.next() == Some(' ')
+            && after
+                .next()
+                .is_some_and(|c| c.is_uppercase() || c.is_ascii_digit() || "\"'“‘(".contains(c))
+    };
     let mut end = s.len();
     for (i, c) in s.char_indices() {
-        if matches!(c, '.' | '?' | '!') && s[i + 1..].starts_with(' ') {
+        if matches!(c, '.' | '?' | '!') && ends(i) {
             if s[..=i].chars().count() > limit && end < s.len() {
                 break;
             }
@@ -5092,7 +5111,7 @@ fn operation_editor_with<'a>(
         )
         .width(Fill),
     );
-    foot = if app.confirm_delete_op {
+    foot = if app.asking_delete_op() {
         // Asked in the place of the commands, as a setup's Delete is
         // (`setup_editor`).
         // Its centre drillings go with it (`Message::RemoveOp`).
@@ -17123,6 +17142,19 @@ mod tests {
         assert_eq!(
             leading_sentences("No full stop here", 5),
             "No full stop here"
+        );
+        // An abbreviation does not end one.
+        assert_eq!(
+            leading_sentences("Model a holder, e.g. a vise. Then check it.", 30),
+            "Model a holder, e.g. a vise."
+        );
+        assert_eq!(
+            leading_sentences("Pick an alloy, e.g. 6061 or 7075. Then save.", 35),
+            "Pick an alloy, e.g. 6061 or 7075."
+        );
+        assert_eq!(
+            leading_sentences("Pick an alloy (e.g. 6061). Then save it.", 30),
+            "Pick an alloy (e.g. 6061)."
         );
         assert_eq!(
             leading_sentences("Too long a first one. Second.", 5),

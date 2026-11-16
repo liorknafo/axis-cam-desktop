@@ -75,6 +75,7 @@ pub fn load_reporting(path: &Path) -> Result<(Document, Vec<String>), String> {
             }
         }
     }
+    d.fix_starter_drill();
     let mut notes = vec![];
     if d.number_tools() {
         notes.push(NUMBERED_TOOLS.to_string());
@@ -230,6 +231,50 @@ mod tests {
         );
         assert_eq!(doc.materials.len(), 25);
         assert!(doc.selected_material().unwrap().cutting_data().is_some());
+    }
+    /// A project saved before the fix loads its starter drill with a drill's
+    /// two flutes, once: three set after that stay, and a drill of another
+    /// name keeps its own.
+    #[test]
+    fn loading_gives_the_unedited_starter_drill_two_flutes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drill.axis.json");
+        let mut doc = Document::sample();
+        let drill = doc
+            .tools
+            .iter()
+            .position(|t| t.name() == crate::model::STARTER_DRILL)
+            .unwrap();
+        doc.tools[drill].p.insert("flutes".into(), "3".into());
+        // Saved before the fix.
+        doc.starter_drill_fixed = false;
+        let mut own = doc.tools[drill].clone();
+        own.id = "own-drill".into();
+        own.p.insert("name".into(), "My drill".into());
+        doc.tools.push(own);
+        save(&path, &doc).unwrap();
+        let loaded = load(&path).unwrap();
+        let flutes = |name: &str| {
+            let t = loaded.tools.iter().find(|t| t.name() == name).unwrap();
+            get(&t.p, "flutes").to_string()
+        };
+        assert_eq!(flutes(crate::model::STARTER_DRILL), "2");
+        assert_eq!(flutes("My drill"), "3");
+        assert!(loaded.starter_drill_fixed);
+        // Set to three by the user afterwards, it stays three.
+        let mut again = loaded.clone();
+        let drill = again
+            .tools
+            .iter_mut()
+            .find(|t| t.name() == crate::model::STARTER_DRILL)
+            .unwrap();
+        drill.p.insert("flutes".into(), "3".into());
+        save(&path, &again).unwrap();
+        let reloaded = load(&path).unwrap();
+        let t = (reloaded.tools.iter())
+            .find(|t| t.name() == crate::model::STARTER_DRILL)
+            .unwrap();
+        assert_eq!(get(&t.p, "flutes"), "3");
     }
     #[test]
     fn loading_refuses_materials_that_share_an_id_or_have_none() {
