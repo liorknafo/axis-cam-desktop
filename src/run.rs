@@ -5876,12 +5876,13 @@ pub(crate) mod tests {
     }
 
     /// A deep drilling's steps are its holes, each with all its pecks
-    /// (LIO-549): the tablet fixture's Drilling with its clearance at its
-    /// retract height, 5 mm, as axis-shop's copy of it has (its holes go
-    /// 44 mm deep and that profile has 55 mm of Z): 5 holes in 3 mm pecks
-    /// that each rise to the clearance. It has 5 steps, "Hole 1" to
-    /// "Hole 5", not a "Hole" a peck. The running program's marks count them as the plan
-    /// does and call a hole done only once the tool leaves it, so Stop after
+    /// (LIO-549): the tablet fixture's Drilling with its pecks retracting to
+    /// its clearance, both 5 mm above the stock, as axis-shop's copy of it
+    /// had (its holes go 44 mm deep and that profile has 55 mm of Z): 5 holes
+    /// in 3 mm pecks that each rise to the clearance. It has 5 steps,
+    /// "Hole 1" to "Hole 5", not a "Hole" a peck. The running program's marks
+    /// count them as the plan does and call a hole done only once the tool
+    /// leaves it, so Stop after
     /// step stops between holes, never between two pecks; the tablet file
     /// says the same.
     #[test]
@@ -5894,8 +5895,10 @@ pub(crate) mod tests {
             .position(|o| o.strategy == crate::model::Strategy::Drill)
             .unwrap();
         let op = &mut doc.setups[0].operations[oi];
-        assert_eq!(crate::get(&op.p, "retract"), "5");
+        // The fixture's own pecks retract to 2 mm, below its 5 mm clearance
+        // (LIO-540); a project may retract them to the clearance itself.
         op.p.insert("clearance".into(), "5".into());
+        op.p.insert("retract".into(), "5".into());
         let op = &doc.setups[0].operations[oi];
         assert_eq!(crate::get(&op.p, "cycle"), "Deep drilling");
         assert_eq!(crate::num(&op.p, "peck"), Some(3.));
