@@ -1885,7 +1885,7 @@ fn run_help(a: &crate::run::Action) -> (&'static str, &'static str) {
         ),
         CycleStart => (
             "Run the next tool run: its moves at the current work zero, checked against the soft limits first. The tool first rises or drops to the clearance plane where it stands, so leave it where a straight vertical move is safe.",
-            "",
+            "Cycle Start first waits for the machine (on a Pi, the Pi) to apply what was sent just before it, such as a Zero, Set Z or a jog, so the tool run starts from the work zero and position they left. Sending anything else meanwhile cancels the press, and so does a wait of 5 s: press it again.",
         ),
         Hold => (
             "Feed hold: slow to a stop and wait. Resume continues; in a narrow window this button becomes Resume while held. Space holds from any page while no text field is being edited, and resumes on the Control page.",

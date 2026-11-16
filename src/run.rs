@@ -254,6 +254,20 @@ pub const PI_LOST: &str = "The link to the Pi is not answering: wait for it to r
 /// link was never live yet: nothing was lost (LIO-519).
 pub const PI_CONNECTING: &str = "Connecting to the Pi: wait for it.";
 
+/// What the Run panel says while a Cycle Start press waits for the Pi to
+/// apply what this computer sent before it (`Connection::cycle_pending`).
+pub const PI_APPLYING: &str =
+    "Cycle Start waits for the Pi to apply what this computer sent before it…";
+
+/// The same on USB and the simulator: the controller takes a command
+/// within milliseconds.
+pub const CONTROLLER_TAKING: &str =
+    "Cycle Start waits for the controller to take what was sent before it…";
+
+/// Why Cycle Start waits while machine positions are declared axis by axis
+/// (`Connection::declaring_machine`).
+pub const DECLARING: &str = "The machine position is being set, axis by axis: wait for it.";
+
 /// A setup being run on the connected machine, tool run by tool run.
 pub struct Run {
     pub setup: usize,
@@ -1613,6 +1627,15 @@ impl Run {
         self.outcome = Some((false, why));
     }
 
+    /// A Cycle Start press that waited for the machine was dropped, nothing
+    /// sent (`Connection::cycle_pending`): `why` says so where a tool run's
+    /// outcome is said.
+    pub fn press_dropped(&mut self, why: String) {
+        if self.running.is_none() {
+            self.outcome = Some((false, why));
+        }
+    }
+
     /// The step (operation index in the setup, step) Stop after step stops
     /// after when the driver's line is on block `block` of the running tool
     /// run, if it stops there.
@@ -1681,6 +1704,12 @@ impl Run {
         if self.running.is_some() {
             return vec!["A tool run is running.".into()];
         }
+        if c.press_waits() {
+            return vec![match c.pi {
+                Some(_) => PI_APPLYING.into(),
+                None => CONTROLLER_TAKING.into(),
+            }];
+        }
         if c.pi_down() {
             // Never live since it connected: nothing to reconnect yet
             // (LIO-519).
@@ -1748,6 +1777,9 @@ impl Run {
         }
         if !c.idle() {
             e.push("The machine is not Idle.".into());
+        }
+        if c.declaring_machine() {
+            e.push(DECLARING.into());
         }
         // No machine position on X, Y or Z, or no soft limits in the profile,
         // does not stop Cycle Start (`limits_unchecked`). On A it does: the

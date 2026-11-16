@@ -2362,6 +2362,21 @@ flood = { pin = 8 }
         let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(programs)));
     }
 
+    /// Cycle Start, then ticks until the press is over: it waits for the
+    /// machine to show what was sent before it (LIO-562).
+    fn cycle_start(a: &mut App) {
+        let _ = a.update(Message::Run(crate::run::Action::CycleStart));
+        let mut deadline = Deadline::new(2. * crate::control::PRESS_WAIT.as_secs_f64());
+        while conn(a).press_waits() {
+            assert!(
+                deadline.within(&conn(a).snapshot),
+                "Cycle Start still waits"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let _ = a.update(Message::Tick);
+        }
+    }
+
     fn run_of(a: &App) -> &crate::run::Run {
         conn(a).run.as_ref().expect("a setup to run")
     }
@@ -4788,7 +4803,17 @@ flood = { pin = 8 }
                 },
             }]),
         };
-        assert!(other.send_tool_run(99, job, vec![], None));
+        // Made from a snapshot that shows all it sent (LIO-562).
+        let mut deadline = Deadline::new(5.);
+        let made_from = loop {
+            let (snapshot, ack) = other.acked();
+            if let Some(a) = ack.filter(|a| a.applied >= a.sent) {
+                break a.seq;
+            }
+            assert!(deadline.within(&snapshot), "the other's ack");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(other.send_tool_run(99, job, vec![], None, made_from));
         let mut deadline = Deadline::new(10.);
         while !other.link().tool_run_ends.iter().any(|e| e.id == 99) {
             assert!(deadline.within(&other.snapshot()), "the other's end");
@@ -4856,7 +4881,7 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::Setup(0)));
         answer_skips(&mut a, 0);
         a.control.as_mut().unwrap().lose_next_job = true;
-        let _ = a.update(Message::Run(R::CycleStart));
+        cycle_start(&mut a);
         assert!(run_of(&a).running.is_some());
         let started = std::time::Instant::now();
         run_until(&mut a, 10.0, "the lost tool run put back", |r| {
@@ -4885,7 +4910,7 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::Setup(0)));
         answer_skips(&mut a, 0);
         a.control.as_mut().unwrap().lose_next_job = true;
-        let _ = a.update(Message::Run(R::CycleStart));
+        cycle_start(&mut a);
         assert!(run_of(&a).running.is_some());
         let _ = a.update(Message::Disconnect);
         assert!(a.pi_run.is_some());
@@ -4902,6 +4927,419 @@ flood = { pin = 8 }
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
         let _ = a.update(Message::Run(R::CycleStart));
         run_until(&mut a, 60.0, "tool run 1", |r| r.done[0]);
+    }
+
+    /// LIO-562: X set to 7 here (as Zero, Set Z or a probe sets the work
+    /// offset) and Cycle Start pressed at once, before a snapshot shows it.
+    /// The press waits for one that does, saying so, and the tool run is
+    /// made from the new work offset, the one the machine has.
+    fn cycle_start_after_set_work(a: &mut App, waits: &str) {
+        use crate::run::Action as R;
+        use uc100::controller::{Command, State};
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(a, 0);
+        assert!(problems(a).is_empty(), "{:?}", problems(a));
+        let before = conn(a).snapshot.work_offset;
+        conn(a).send(Command::SetWork { axis: 0, value: 7. });
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(conn(a).press_waits() && run_of(a).running.is_none());
+        assert_eq!(problems(a), [waits]);
+        cycle_start(a);
+        let offset = run_of(a).running.as_ref().expect("started").offset;
+        assert!(
+            (offset[0] - (before[0] - 7.)).abs() < 1e-9,
+            "{offset:?} {before:?}"
+        );
+        assert_eq!(offset, conn(a).snapshot.work_offset);
+        tick_until(a, 5.0, "the tool run", |s| s.state == Some(State::Run));
+        let _ = a.update(Message::Run(R::Stop));
+        tick_until(a, 5.0, "Idle", |s| s.state == Some(State::Idle));
+    }
+
+    #[test]
+    fn cycle_start_on_the_pi_waits_for_the_pi_to_apply_a_new_work_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, _server) = pi_app(dir.path());
+        zeroed(&mut a);
+        cycle_start_after_set_work(&mut a, crate::run::PI_APPLYING);
+    }
+
+    #[test]
+    fn cycle_start_here_waits_for_the_controller_to_take_a_new_work_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        cycle_start_after_set_work(&mut a, crate::run::CONTROLLER_TAKING);
+    }
+
+    /// LIO-562: Set machine zero declares the axes one at a time; until the
+    /// last is in, Cycle Start waits, so no tool run is made from a machine
+    /// position about to change (starting one would drop the rest).
+    #[test]
+    fn cycle_start_waits_while_machine_zero_declares_the_axes() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, _server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Machine(crate::control::Action::MachineZero(None)));
+        assert!(conn(&a).declaring_machine());
+        assert!(
+            problems(&a).iter().any(|p| p == crate::run::DECLARING),
+            "{:?}",
+            problems(&a)
+        );
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(!conn(&a).press_waits() && run_of(&a).running.is_none());
+        let mut deadline = Deadline::new(10.);
+        while conn(&a).declaring_machine() {
+            assert!(deadline.within(&conn(&a).snapshot), "still declaring");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let _ = a.update(Message::Tick);
+        }
+        assert!(run_of(&a).running.is_none());
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+    }
+
+    /// LIO-562: a waiting press never starts after something else was sent,
+    /// after `PRESS_WAIT`, or for another run (the setup picked or checked
+    /// again); it says why, nothing moved, and Cycle Start can be pressed
+    /// again.
+    #[test]
+    fn a_waiting_cycle_start_is_dropped_by_a_later_send_or_after_its_wait() {
+        use crate::run::Action as R;
+        use uc100::controller::{Command, State};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let set = |a: &App, value| {
+            conn(a).send(Command::SetWork { axis: 0, value });
+        };
+        let dropped = |a: &mut App, why: &str| {
+            assert!(!conn(a).press_waits() && run_of(a).running.is_none());
+            let (ok, message) = run_of(a).outcome.clone().unwrap();
+            assert!(!ok && message.contains(why), "{message}");
+            assert!(message.contains("The tool run was not sent"), "{message}");
+            let s = server.snapshot().unwrap();
+            assert_eq!((s.state, s.program_name), (Some(State::Idle), None));
+            tick_for(a, 100);
+            assert!(problems(a).is_empty(), "{:?}", problems(a));
+        };
+        // Sent after the press.
+        set(&a, 7.);
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(conn(&a).press_waits());
+        set(&a, 8.);
+        cycle_start(&mut a);
+        dropped(
+            &mut a,
+            "something was sent to the machine after it was pressed",
+        );
+        // Never applied in time: checked with no snapshot since the press.
+        set(&a, 9.);
+        let _ = a.update(Message::Run(R::CycleStart));
+        let c = a.control.as_mut().unwrap();
+        c.age_press(crate::control::PRESS_WAIT + std::time::Duration::from_secs(1));
+        c.cycle_pending(&a.doc);
+        dropped(
+            &mut a,
+            "the Pi had not applied what this computer sent before it within 5 s",
+        );
+        // Expired, though the Pi has applied it by the next tick: still
+        // dropped, never a start late.
+        set(&a, 9.5);
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(conn(&a).press_waits());
+        pi_until(&server, 5.0, "the Set work", |s| {
+            (s.work_pos[0] - 9.5).abs() < 1e-9
+        });
+        let c = a.control.as_mut().unwrap();
+        c.age_press(crate::control::PRESS_WAIT + std::time::Duration::from_secs(1));
+        let _ = a.update(Message::Tick);
+        dropped(&mut a, "within 5 s");
+        // The setup picked again, or checked again, and its check answered
+        // before the next tick: another run, so not started.
+        for again in [R::Setup(0), R::Check] {
+            set(&a, 11.);
+            let _ = a.update(Message::Run(R::CycleStart));
+            assert!(conn(&a).press_waits());
+            let _ = a.update(Message::Run(again));
+            answer_skips(&mut a, 0);
+            cycle_start(&mut a);
+            dropped(
+                &mut a,
+                "the setup was picked or checked again while it waited",
+            );
+        }
+        // Another Run action meanwhile.
+        set(&a, 10.);
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(conn(&a).press_waits());
+        let _ = a.update(Message::Run(R::ClearSteps));
+        dropped(&mut a, "the run was changed while it waited");
+        // And it starts when pressed again.
+        cycle_start(&mut a);
+        let offset = run_of(&a).running.as_ref().expect("started").offset;
+        assert_eq!(offset, conn(&a).snapshot.work_offset);
+        let _ = a.update(Message::Run(R::Stop));
+        tick_until(&mut a, 5.0, "Idle", |s| s.state == Some(State::Idle));
+    }
+
+    /// LIO-562: Stop (the button, enabled while a press waits, or MCP's
+    /// stop), Hold and the Space key cancel a Cycle Start waiting for the
+    /// machine, with the machine Idle: nothing starts after it (sol rounds
+    /// 2 and 3).
+    #[test]
+    fn stop_hold_and_space_cancel_a_waiting_cycle_start() {
+        use crate::run::Action as R;
+        use uc100::controller::{Command, State};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        tick_for(&mut a, 100);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let before = server.snapshot().unwrap().machine_pos;
+        let cases = [
+            (Message::Run(R::Stop), "Stop cancelled"),
+            (Message::Run(R::Hold), "Hold cancelled"),
+            (Message::HoldKey, "Hold (Space) cancelled"),
+        ];
+        for (k, (cancel, said)) in cases.into_iter().enumerate() {
+            conn(&a).send(Command::SetWork {
+                axis: 0,
+                value: 7. + k as f64,
+            });
+            let _ = a.update(Message::Run(R::CycleStart));
+            assert!(conn(&a).press_waits(), "{said}");
+            let _ = a.update(cancel);
+            assert!(
+                !conn(&a).press_waits() && run_of(&a).running.is_none(),
+                "{said}"
+            );
+            let (ok, message) = run_of(&a).outcome.clone().unwrap();
+            assert!(!ok && message.starts_with(said), "{message}");
+            tick_for(&mut a, 300);
+            assert!(run_of(&a).running.is_none(), "{said}");
+            let s = server.snapshot().unwrap();
+            assert_eq!(
+                (s.state, s.program_name),
+                (Some(State::Idle), None),
+                "{said}"
+            );
+            assert_eq!(s.machine_pos, before, "{said}");
+        }
+    }
+
+    /// LIO-562: a jog key cancels a waiting Cycle Start at once, on the Pi
+    /// and here: the key jogs only once the focus check answers, and a tick
+    /// before that answer must not start the tool run (sol round 4).
+    #[test]
+    fn a_jog_key_cancels_a_waiting_cycle_start_before_its_focus_check() {
+        use crate::run::Action as R;
+        use uc100::controller::Command;
+        for pi in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut a, _server) = if pi {
+                let (a, server) = pi_app(dir.path());
+                (a, Some(server))
+            } else {
+                (run_app(dir.path()), None)
+            };
+            zeroed(&mut a);
+            let _ = a.update(Message::Run(R::Setup(0)));
+            answer_skips(&mut a, 0);
+            tick_for(&mut a, 100);
+            assert!(a.jog_pad_shown());
+            conn(&a).send(Command::SetWork { axis: 0, value: 7. });
+            let _ = a.update(Message::Run(R::CycleStart));
+            assert!(conn(&a).press_waits(), "pi {pi}");
+            // The focus check's answer has not come; ticks do.
+            let _ = a.update(Message::JogKey(0, false, false));
+            assert!(!conn(&a).press_waits(), "pi {pi}");
+            let (ok, message) = run_of(&a).outcome.clone().unwrap();
+            assert!(
+                !ok && message.starts_with("A jog key cancelled Cycle Start"),
+                "{message}"
+            );
+            tick_for(&mut a, 300);
+            assert!(run_of(&a).running.is_none(), "pi {pi}");
+            let _ = a.update(Message::JogKeyUp);
+        }
+    }
+
+    /// LIO-562: Stop now, enabled while a Cycle Start waits, also stops a
+    /// jog sent just before it that the snapshot does not show yet (the
+    /// Pi's snapshots held back a moment): the driver takes Stop while
+    /// Idle as nothing, so it goes whatever the snapshot says (astra
+    /// round 1).
+    #[test]
+    fn stop_during_the_wait_stops_a_jog_not_shown_yet() {
+        use crate::control::Action as C;
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        let gate = Gate::to(server.addr(), false);
+        gate.set_open(true);
+        let _ = a.update(Message::PiAddress(gate.addr.to_string()));
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        tick_for(&mut a, 100);
+        let x0 = server.snapshot().unwrap().machine_pos[0];
+        // Snapshots held back, well inside the link's live window.
+        gate.set_open(false);
+        let _ = a.update(Message::Machine(C::JogStep(Some(100.))));
+        let _ = a.update(Message::Machine(C::JogSpeed(1.)));
+        let _ = a.update(Message::Machine(C::JogPress(0, false)));
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(conn(&a).press_waits());
+        pi_until(&server, 1., "the jog on the Pi", |s| {
+            s.state != Some(State::Idle)
+        });
+        assert_eq!(conn(&a).snapshot.state, Some(State::Idle));
+        let clicks = crate::ui::probe::clicks(
+            crate::ui::run_bar(&a, conn(&a)),
+            iced::Size::new(1440., 200.),
+        );
+        let stop = (clicks.into_iter())
+            .find(|m| matches!(m, Message::Run(R::Stop)))
+            .expect("Stop now enabled while Cycle Start waits");
+        let _ = a.update(stop);
+        assert!(!conn(&a).press_waits() && run_of(&a).running.is_none());
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(
+            !ok && message.starts_with("Stop cancelled Cycle Start"),
+            "{message}"
+        );
+        assert!(message.contains("the tool run was not sent"), "{message}");
+        // Stopped at once, far short of the 100 mm step.
+        pi_until(&server, 0.5, "the jog stopped", |s| {
+            s.state == Some(State::Idle)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let s = server.snapshot().unwrap();
+        assert_eq!(s.state, Some(State::Idle));
+        assert!(
+            (s.machine_pos[0] - x0).abs() < 10.,
+            "{} from {x0}",
+            s.machine_pos[0]
+        );
+        gate.set_open(true);
+        tick_for(&mut a, 300);
+        assert!(run_of(&a).running.is_none());
+    }
+
+    /// LIO-562: Space cancels a waiting Cycle Start on USB too.
+    #[test]
+    fn space_cancels_a_waiting_cycle_start_here() {
+        use crate::run::Action as R;
+        use uc100::controller::{Command, State};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        tick_for(&mut a, 100);
+        let before = conn(&a).snapshot.machine_pos;
+        conn(&a).send(Command::SetWork { axis: 0, value: 7. });
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(conn(&a).press_waits());
+        let _ = a.update(Message::HoldKey);
+        assert!(!conn(&a).press_waits());
+        tick_for(&mut a, 300);
+        assert!(run_of(&a).running.is_none());
+        let s = &conn(&a).snapshot;
+        assert_eq!(
+            (s.state.clone(), s.machine_pos),
+            (Some(State::Idle), before)
+        );
+    }
+
+    /// LIO-562: the link's `sent` falls for a message dropped on its way,
+    /// so a Stop that cuts a long queued message leaves it where it was at
+    /// the press. The press still tells the Stop and starts nothing (sol
+    /// round 2).
+    #[test]
+    fn a_waiting_cycle_start_is_dropped_by_a_stop_that_cuts_a_queued_message() {
+        use crate::run::Action as R;
+        use uc100::controller::{Command, State};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        tick_for(&mut a, 100);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let before = server.snapshot().unwrap().machine_pos;
+        // A comment-only MDI line long enough to go in parts, cut by the
+        // Stop before its last part.
+        conn(&a).send(Command::Mdi(format!(
+            "({})",
+            "queued comment ".repeat(1_000_000)
+        )));
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(conn(&a).press_waits());
+        conn(&a).send(Command::Stop);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        cycle_start(&mut a);
+        assert!(run_of(&a).running.is_none());
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(
+            !ok && message.contains("something was sent to the machine after it was pressed"),
+            "{message}"
+        );
+        tick_for(&mut a, 300);
+        let s = server.snapshot().unwrap();
+        assert_eq!((s.state, s.program_name), (Some(State::Idle), None));
+        assert_eq!(s.machine_pos, before);
+    }
+
+    /// LIO-562: a tool run made from a snapshot that does not show a
+    /// command the Pi's controller had taken (here sent as made from the
+    /// snapshot before a Set work) is refused by the Pi. The run says why
+    /// and that nothing moved, and Cycle Start runs it once pressed again.
+    #[test]
+    fn a_tool_run_the_pi_refuses_as_made_from_an_old_snapshot_is_put_back() {
+        use crate::run::Action as R;
+        use uc100::controller::{Command, State};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Tick);
+        let old = conn(&a).ack_seq().expect("a snapshot from the Pi");
+        let before = conn(&a).snapshot.work_offset;
+        conn(&a).send(Command::SetWork { axis: 0, value: 7. });
+        tick_until(&mut a, 1.0, "the Set work", |s| s.work_offset != before);
+        a.control.as_mut().unwrap().made_from = Some(old);
+        cycle_start(&mut a);
+        run_until(&mut a, 5.0, "the refusal", |r| r.running.is_none());
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(!ok, "{message}");
+        assert_eq!(message, crate::control::STALE_TOOL_RUN);
+        let s = server.snapshot().unwrap();
+        assert_eq!((s.state, s.program_name), (Some(State::Idle), None));
+        assert!(!run_of(&a).done[0] && !run_of(&a).started());
+        // Never started: no note that where it stopped is not known (astra
+        // round 1).
+        tick_for(&mut a, 300);
+        assert!(
+            !(conn(&a).pi_note.as_deref()).is_some_and(|n| n.contains("where it stopped")),
+            "{:?}",
+            conn(&a).pi_note
+        );
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        cycle_start(&mut a);
+        tick_until(&mut a, 5.0, "the tool run", |s| s.state == Some(State::Run));
+        let _ = a.update(Message::Run(R::Stop));
+        tick_until(&mut a, 5.0, "Idle", |s| s.state == Some(State::Idle));
     }
 
     /// Machine zero on the Pi declares X, Y and Z one after another, each
@@ -5577,7 +6015,7 @@ flood = { pin = 8 }
         assert!(skip(&mut a, 1, Some(Cut)) && skip(&mut a, 3, Some(Left)));
         assert_eq!(sent(&a), [vec![0, 2]]);
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
-        let _ = a.update(Message::Run(R::CycleStart));
+        cycle_start(&mut a);
         let names: Vec<String> = (run_of(&a).running_blocks().unwrap().iter())
             .filter_map(|b| match b {
                 crate::post::Block::Start { op, .. } => {
@@ -9043,9 +9481,10 @@ flood = { pin = 8 }
         assert!(a.run_stock().is_none() && a.live_stock().is_some());
     }
 
-    /// The driver refuses a job sent while it is not idle for it: for a few
-    /// milliseconds after a work or machine zero it re-anchors its position,
-    /// while the app's snapshot still says Idle. Such a Cycle Start ran
+    /// A Cycle Start pressed while the app's snapshot still says Idle but
+    /// a move was just sent waits for the snapshot that shows the move
+    /// (LIO-562), and then starts nothing: the machine is not Idle. Before,
+    /// the job was sent and the driver refused it. Either way it ran
     /// nothing, so it does not count as the setup's first tool run: the
     /// work-zero steps stay and the X/Y work zero is not held yet (#168).
     #[test]
@@ -9063,14 +9502,17 @@ flood = { pin = 8 }
         assert!(work_zero_steps(&a, conn(&a)).is_some());
         let has = |a: &App, text: &str| problems(a).iter().any(|p| p.contains(text));
         // The machine starts a slow move; the app, with no tick since, still
-        // sees it Idle and sends the job, which the driver refuses.
+        // sees it Idle. The press waits for the snapshot that shows the
+        // move, sends nothing, and says why.
         conn(&a).send(Command::Mdi("G1 X5 F600".into()));
         let _ = a.update(Message::Run(R::CycleStart));
-        assert!(run_of(&a).running.is_some());
-        run_until(&mut a, 5.0, "the refusal", |r| r.running.is_none());
+        assert!(conn(&a).press_waits() && run_of(&a).running.is_none());
+        assert_eq!(problems(&a), [crate::run::CONTROLLER_TAKING]);
+        cycle_start(&mut a);
+        assert!(run_of(&a).running.is_none());
         let (ok, message) = run_of(&a).outcome.clone().unwrap();
         assert!(
-            !ok && message.contains("not started, the machine is not idle"),
+            !ok && message.contains("did not start the tool run: The machine is not Idle."),
             "{message}"
         );
         assert!(!run_of(&a).done[0] && run_of(&a).next == 0);
@@ -9635,7 +10077,7 @@ flood = { pin = 8 }
         let _ = a.update(Message::Machine(Action::Spindle(Spindle::Cw)));
         tick_until(&mut a, 2.0, "CW", |s| s.spindle == Some(Spindle::Cw));
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
-        let _ = a.update(Message::Run(R::CycleStart));
+        cycle_start(&mut a);
         assert!(run_of(&a).running.is_some());
         tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
         let _ = a.update(Message::Run(R::Stop));
