@@ -2417,13 +2417,16 @@ pub struct Connection {
     pub config: MachineConfig,
     /// The driver's state at the last tick.
     pub snapshot: Snapshot,
-    /// Machine positions still to declare (axis, value), sent one per tick:
-    /// the driver drops a second `SetMachine` until it has re-read the position.
+    /// Machine positions still to declare (axis, value), sent one at a time
+    /// (`declaring`): the driver drops a second `SetMachine` until it has
+    /// re-read the position.
     declare: VecDeque<(usize, f64)>,
-    /// On the Pi, the declaration sent and not yet in the driver's log: the
-    /// axis, its value, the log count and time it was sent, and whether it
-    /// was sent again. Two that reach the Pi together (the network bunches
-    /// them) would see the driver drop the second, so the next waits.
+    /// The declaration sent and not yet in the driver's log: the axis, its
+    /// value, the log count and time it was sent, and whether it was sent
+    /// again. Two that reach the driver in one of its loops would see it
+    /// drop the second, so the next waits: on the Pi the network bunches
+    /// them, and here a driver thread that runs late on a busy computer
+    /// takes two ticks' worth at once (LIO-554).
     declaring: Option<(usize, f64, u64, Instant, bool)>,
     held: Option<Held>,
     pub jog_step: Option<f64>,
@@ -3250,13 +3253,10 @@ impl Connection {
         // Any state but Idle (E-stop, a move) drops what is left, so nothing
         // is declared later by surprise.
         if self.idle() {
-            if !self.declaring_on_pi()
+            if !self.declaring()
                 && let Some((axis, value)) = self.declare.pop_front()
             {
-                if self.pi.is_some() {
-                    self.declaring =
-                        Some((axis, value, self.snapshot.log_seq, Instant::now(), false));
-                }
+                self.declaring = Some((axis, value, self.snapshot.log_seq, Instant::now(), false));
                 self.send(Command::SetMachine { axis, value });
                 // The pins stay put on the table: in the new machine
                 // coordinates they are where the axis moved from.
@@ -5460,10 +5460,11 @@ impl Connection {
         }
     }
 
-    /// On the Pi, whether a declaration sent is still awaited: until the
-    /// driver logs it, the next is held; one not logged within a second is
-    /// sent once more, then given up.
-    fn declaring_on_pi(&mut self) -> bool {
+    /// Whether a declaration sent is still awaited: until the driver logs
+    /// it, the next is held; one not logged within a second is sent once
+    /// more, then given up, the axis left without a machine position (on
+    /// the Pi with a note).
+    fn declaring(&mut self) -> bool {
         let Some((axis, value, seq, at, again)) = self.declaring else {
             return false;
         };
@@ -5480,10 +5481,12 @@ impl Connection {
         if again {
             self.declaring = None;
             self.declare.clear();
-            self.pi_note = Some(format!(
-                "{} was not declared on the Pi: set machine zero again.",
-                AXIS_NAMES[axis]
-            ));
+            if self.pi.is_some() {
+                self.pi_note = Some(format!(
+                    "{} was not declared on the Pi: set machine zero again.",
+                    AXIS_NAMES[axis]
+                ));
+            }
             return true;
         }
         self.send(Command::SetMachine { axis, value });
@@ -6055,6 +6058,43 @@ soft_max = 0.0
             said,
             ["Motion thread priority: real-time (Mach time-constraint, 2 ms of CPU every 4 ms)"]
         );
+    }
+
+    /// Set machine zero declares X, Y and Z one at a time, each once the
+    /// driver has logged the one before: a driver that runs late on a busy
+    /// computer would take two in one of its loops and drop the second
+    /// (LIO-554). Ticks that read no new snapshot send nothing more.
+    #[test]
+    fn a_declaration_waits_until_the_driver_has_logged_the_one_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("limited.toml");
+        std::fs::write(&profile, LIMITED).unwrap();
+        let mut m = Machine::new(3);
+        m.p.insert("controller".into(), "UC100".into());
+        m.p.insert("uc100_profile".into(), profile.display().to_string());
+        m.p.insert("uc100_connection".into(), "Simulated".into());
+        let mut c = Connection::open(&m, dir.path()).unwrap();
+        until(&mut c, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        c.send(Command::Reset);
+        until(&mut c, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        c.act(Action::MachineZero(None));
+        // Three ticks on the snapshot from before X was sent, as when the
+        // driver's loop is late: X only.
+        for _ in 0..3 {
+            c.observe();
+        }
+        assert_eq!(Vec::from(c.declare.clone()), [(1, 0.), (2, 0.)]);
+        until(&mut c, 3.0, "X, Y and Z set", |s| {
+            s.referenced[..3].iter().all(|r| *r)
+        });
+        for axis in ["X", "Y", "Z"] {
+            let said = format!("{axis} declared at machine 0.000");
+            assert!(c.snapshot.log.contains(&said), "{:?}", c.snapshot.log);
+        }
     }
 
     /// The driver ends a jog itself at a soft limit and goes Idle a few of

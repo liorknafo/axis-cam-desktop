@@ -2047,8 +2047,24 @@ mist = { pin = 9 }
         cap: std::time::Instant,
     }
 
+    /// Gives the test's thread the app's main thread's place: in the app,
+    /// that thread ticks the machine at the user-interactive QoS a macOS
+    /// app's main thread has. A test thread has the default QoS, which a
+    /// busy computer wakes late: at a load of 250, a 20 ms sleep between
+    /// two ticks of a held jog took up to 173 ms, against 30 ms at the
+    /// app's QoS, and the driver ends a jog not sent again within 400 ms
+    /// (LIO-554).
+    fn as_the_apps_main_thread() {
+        // SAFETY: a plain libc call on the current thread.
+        #[cfg(target_os = "macos")]
+        unsafe {
+            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+        }
+    }
+
     impl Deadline {
         fn new(secs: f64) -> Self {
+            as_the_apps_main_thread();
             let wall = std::time::Duration::from_secs_f64(secs * 10.)
                 .max(std::time::Duration::from_secs(60));
             Self {
@@ -5436,6 +5452,16 @@ flood = { pin = 8 }
         assert_eq!(a.picture_job, None);
     }
 
+    /// FAST with Z at the JY5800's 1000 mm/min: Stop after step stops on
+    /// the rapids between two steps, which a tick must see. On FAST those
+    /// last about 150 ms, less than one tick of a busy computer (up to
+    /// 600 ms at a load of 250); at this Z speed about a second (LIO-554).
+    fn fast_z_slow() -> String {
+        let z = "max_velocity = 30000.0";
+        assert_eq!(FAST.matches(z).count(), 1);
+        FAST.replace(z, "max_velocity = 1000.0")
+    }
+
     /// The Face and the Pocket, one tool run, its Cycle Start sent, and
     /// Stop after step armed once the tool cuts step `s` of operation `oi`:
     /// the stop's journal once the machine is Idle (LIO-311).
@@ -5451,9 +5477,32 @@ flood = { pin = 8 }
             r.step_at(None)
                 .is_some_and(|(o, n, done)| (o, n, done) == (oi, s, false))
         });
+        // The driver's line runs ahead of the tool: while the tool comes
+        // down into the step, the line can still be on the rapids that end
+        // the step before, where Stop after step would stop that one. At
+        // the JY5800's Z speed it is (LIO-554); armed once past them.
+        let ranges = run_of(a).stop_ranges();
+        let line = conn(a).snapshot.current_line;
+        if let Some(end) = line.and_then(|l| ranges.iter().find(|r| r.contains(&l))) {
+            let end = *end.end();
+            tick_until(a, 30.0, "the line past the step before", |s| {
+                s.current_line.is_some_and(|l| l > end)
+            });
+        }
         let _ = a.update(Message::Run(R::StopAfterStep));
         assert!(run_of(a).stop_after);
-        run_until(a, 30.0, "the stop", |r| r.running.is_none());
+        // A tick must see the driver on the rapids after the step: ticked
+        // as the app ticks, without drawing the window between, which on a
+        // busy computer takes longer than they last (LIO-554).
+        let mut deadline = Deadline::new(30.);
+        while run_of(a).running.is_some() {
+            let _ = a.update(Message::Tick);
+            assert!(
+                deadline.within(&conn(a).snapshot),
+                "timed out waiting for the stop"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         tick_until(a, 5.0, "Idle", |s| s.state == Some(State::Idle));
         a.control.as_ref().unwrap().journal().expect("the journal")
     }
@@ -5465,7 +5514,7 @@ flood = { pin = 8 }
     #[test]
     fn stop_after_step_armed_in_the_face_stops_at_its_end() {
         let dir = tempfile::tempdir().unwrap();
-        let mut a = run_app_of(dir.path(), FAST, &[0, 1]);
+        let mut a = run_app_of(dir.path(), &fast_z_slow(), &[0, 1]);
         let left = crate::run::check_steps(&a.doc, a.part_mesh().unwrap(), 0, &[], &[]).1;
         let levels = left.steps.iter().find(|s| s.op == 0).unwrap().steps.len();
         let journal = stop_after(&mut a, 0, levels - 1);
@@ -5492,7 +5541,7 @@ flood = { pin = 8 }
         use crate::run::Action as R;
         use uc100::controller::State;
         let dir = tempfile::tempdir().unwrap();
-        let mut a = run_app_of(dir.path(), FAST, &[0, 1]);
+        let mut a = run_app_of(dir.path(), &fast_z_slow(), &[0, 1]);
         let journal = stop_after(&mut a, 1, 0);
         assert_eq!((journal.op, journal.step), (1, Some(0)));
         assert!(run_of(&a).programs.is_none());
@@ -8848,7 +8897,15 @@ flood = { pin = 8 }
         idle(&mut a);
         check_run(&mut a, 0);
         assert!(run_of(&a).checked().is_some());
+        let epoch_before = run_of(&a).epoch;
         a.last_edit -= crate::EDIT_PAUSE * 2;
+        // The tick that ends the edit pause saves the project and starts
+        // the stock checks: 17 ms, but over 400 ms on a busy computer, so
+        // that taken while jogging it lets the driver's keepalive lapse and
+        // end the jog (LIO-554). Taken first, the machine still Idle and
+        // the setup checked, it starts no check.
+        let _ = a.update(Message::Tick);
+        assert_eq!(run_of(&a).epoch, epoch_before);
         // A held jog: Check again marks the check wanted and starts none.
         let _ = a.update(Message::Machine(Action::JogPress(0, false)));
         tick_until(&mut a, 2.0, "the jog", |s| s.state == Some(State::Jog));
@@ -14293,6 +14350,7 @@ flood = { pin = 8 }
 
     /// Ticks for `ms` milliseconds.
     fn tick_for(a: &mut App, ms: u64) {
+        as_the_apps_main_thread();
         let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
         while std::time::Instant::now() < end {
             let _ = a.update(Message::Tick);
