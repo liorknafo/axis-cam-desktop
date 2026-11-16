@@ -4452,10 +4452,16 @@ fn operation_editor_with<'a>(
             ] {
                 c = c.push(row![checks.field(p, a.0, a.1), checks.field(p, b.0, b.1)].spacing(9));
             }
+            // Made before LIO-550 without it: as the stock shows.
+            let ends = match get(p, "slot_ends") {
+                "" => crate::slot::ENDS[0],
+                e => e,
+            };
             c=c.push(choice(p,"through","Through stock", &["No","Yes"],t))
                 .push(checks.field(p,"breakthrough","Breakthrough beyond stock bottom · mm"))
+                .push(choice_value(p, ends, "slot_ends", "Round ends", &crate::slot::ENDS, t))
                 .push(checks.field(p,"scallop","Scallop left between steps · mm"))
-                .push(note("A cutter narrower than the slot sweeps the centre line, steps out round it and walks the outline each level, the round ends in DRO steps leaving at most the scallop between two; then it finishes the outline at size on the floor."))
+                .push(note("A cutter narrower than the slot sweeps the centre line, steps out round it and walks the outline each level, the round ends in DRO steps leaving at most the scallop between two; then it finishes the outline at size on the floor. When both round ends are already bored to the slot's width and depth, it only joins them: straight passes along each side, then the straight walls at size."))
                 .push(note("Blind: bottom is the floor before floor stock to leave. Through: bottom is the stock's back face; breakthrough extends below it. Check clearance below the part: parallels and table are unmodeled."));
         }
         "Box" => {
@@ -4663,11 +4669,28 @@ fn operation_editor_with<'a>(
                 .push(checks.field(p, "depth", "Depth · mm"));
         }
         // A hand Drill: only what its screens use, the Z it drills to
-        // (LIO-435).
+        // (LIO-435), and whether the drill's tip goes out under a hole that
+        // goes through the part, and how far (LIO-553).
         "Heights" if o.strategy == Strategy::Drill && manual::is_hand(machine) => {
             c = c
-                .push(note("Each hole's depth comes from the part. Bottom offset raises the Z the drill goes down to on the DRO."))
+                .push(note("Each hole's depth comes from the part. Bottom offset raises the Z the drill goes down to on the DRO; Through takes the drill's tip out under a hole that goes through the part, by Breakthrough."))
                 .push(checks.field(p, "bottom", "Bottom offset · mm"));
+            if !o.drills_pin_holes() {
+                c = c.push(choice(
+                    p,
+                    "through",
+                    if o.helical() {
+                        "Cutter through bottom"
+                    } else {
+                        "Drill tip through bottom"
+                    },
+                    &["Yes", "No"],
+                    t,
+                ));
+                if get(p, "through") == "Yes" {
+                    c = c.push(checks.field(p, "breakthrough", "Breakthrough · mm"));
+                }
+            }
         }
         "Heights" => {
             c = c.push(note(if o.strategy == Strategy::Slot {

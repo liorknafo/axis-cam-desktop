@@ -394,9 +394,13 @@ pub(crate) mod tests {
     /// A Ø`outer` ring `height` tall with a Ø`bore` hole straight through
     /// it, 64 sides.
     pub(crate) fn ring(bore: f32, outer: f32, height: f32) -> Mesh {
+        crate::mesh::normalize(ring_triangles(bore, outer, height)).unwrap()
+    }
+    /// `ring`'s triangles.
+    pub(crate) fn ring_triangles(bore: f32, outer: f32, height: f32) -> Vec<[[f32; 3]; 3]> {
         let (r, o) = (bore / 2., outer / 2.);
         let section = [(o, height), (r, height), (r, 0.), (o, 0.), (o, height)];
-        crate::mesh::normalize(crate::cam::tests::revolved(&section)).unwrap()
+        crate::cam::tests::revolved(&section)
     }
     pub(crate) fn drill(d: &str) -> Tool {
         let mut t = Tool::new(&format!("Drill {d}"), "Drill", d);

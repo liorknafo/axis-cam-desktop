@@ -305,6 +305,9 @@ pub enum Step {
         /// The round ends' radius as cut, and the tool's radius.
         radius: f32,
         tool: f32,
+        /// Both round ends were bored to the width before it: the walks
+        /// only join them, straight (LIO-550, `slot::Pass::joined`).
+        joined: bool,
     },
     /// The stock after the operation.
     Check { op: usize },
@@ -2331,6 +2334,7 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                         points: pass.points.clone(),
                         radius,
                         tool: plan.radius,
+                        joined: pass.joined,
                     });
                 }
                 steps.push(Step::Check { op: oi });

@@ -1452,11 +1452,22 @@ pub(crate) fn step_detail(
                 index,
                 of,
                 targets,
+                pass,
+                joined,
                 ..
             } => (
                 "Slot",
                 Some(*op),
-                format!("Slot pass {index} of {of}: move to each DRO number in order."),
+                format!(
+                    "Slot pass {index} of {of}{}: move to each DRO number in order.",
+                    match pass {
+                        crate::slot::Kind::Outline { .. } if *joined =>
+                            ", straight along the sides between the bored ends",
+                        crate::slot::Kind::Finish if *joined =>
+                            ", the straight walls at size between the bored ends",
+                        _ => "",
+                    }
+                ),
                 targets.iter().map(readout).collect(),
                 vec![],
             ),
