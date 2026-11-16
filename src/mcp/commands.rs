@@ -5009,6 +5009,42 @@ pub(crate) mod tests {
             assert_eq!(get(&d, "through"), through, "{}", d.app.status);
         }
     }
+    /// LIO-553 review: a Drill of one Hole diameter judges by the holes it
+    /// drills. A Ø8 drill through the ring, then a blind Ø6 picked beside
+    /// it in a cup it does not drill (its filter is Ø8): it still goes
+    /// through, by the same breakthrough.
+    #[test]
+    fn a_drill_judges_through_by_the_holes_its_diameter_filter_drills() {
+        let mut tris = crate::cam::boring::tests::ring_triangles(8., 40., 10.);
+        // A Ø20 cup 10 high at X40, a Ø6 hole 6 deep in its top.
+        for part in [
+            &[(10., 10.), (3., 10.), (3., 4.), (0., 4.)][..],
+            &[(0., 0.), (10., 0.), (10., 10.)][..],
+        ] {
+            tris.extend(
+                crate::cam::tests::revolved(part)
+                    .into_iter()
+                    .map(|t| t.map(|p| [p[0] + 40., p[1], p[2]])),
+            );
+        }
+        let mut d = hand_drilling(tris, "8");
+        let args = json!({"target": "operation", "key": "hole_diameter", "value": "8"});
+        assert_eq!(outcome(&run(&mut d, "edit_field", args).unwrap()), "done");
+        let op = |d: &Direct, k: &str| {
+            crate::model::get(&d.app.doc.setup().operations[0].p, k).to_string()
+        };
+        // The part's middle is at X15: the ring's bore at −15, the cup's
+        // hole at +25.
+        let _ = d.app.update(Message::Surface(hole_wall(&d, -15., 0., 4.)));
+        assert_eq!(op(&d, "through"), "Yes", "{}", d.app.status);
+        assert_eq!(op(&d, "breakthrough"), "3.5");
+        let _ = d.app.update(Message::Surface(hole_wall(&d, 25., 0., 3.)));
+        let picked = d.app.doc.setup().operations[0].surfaces.clone().unwrap();
+        assert!(picked.ids.len() > 1, "{picked:?}");
+        assert_eq!(op(&d, "through"), "Yes", "{}", d.app.status);
+        assert_eq!(op(&d, "breakthrough"), "3.5");
+        assert!(!d.app.status.contains("blind"), "{}", d.app.status);
+    }
     /// LIO-553: a hand Drill says whether its tip goes out under a hole that
     /// goes through the part, and how far, in its editor and to `edit_field`;
     /// a pick of holes that all go through makes it go through, past by the

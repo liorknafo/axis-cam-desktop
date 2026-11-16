@@ -2881,13 +2881,13 @@ impl App {
             }
         }
     }
-    /// Whether the Drill `o` drills any hole now (LIO-553); false for any
-    /// other operation, and with no part.
+    /// Whether the Drill `o` drills any hole now, after its Hole diameter
+    /// filter (LIO-553); false for any other operation, and with no part.
     fn drills_any(&self, o: &Operation) -> bool {
         o.strategy == Strategy::Drill
-            && self.part_mesh().is_some_and(
-                |mesh| matches!(self.drill_holes(o, mesh).as_ref(), Ok(holes) if !holes.is_empty()),
-            )
+            && self.part_mesh().is_some_and(|mesh| {
+                matches!(self.drill_holes(o, mesh).as_ref(), Ok(holes) if holes.iter().any(|h| cam::drills(o, h)))
+            })
     }
     /// A Drill `id` whose picks changed (LIO-553): its first picks, holes
     /// that all go through the part, drill through, the tip out past the
@@ -2910,10 +2910,13 @@ impl App {
         if tool.is_some_and(|t| get(&t.p, "type") != "Drill") {
             return;
         }
-        let holes = self.drill_holes(o, mesh);
-        let Ok(holes) = holes.as_ref() else {
+        let listed = self.drill_holes(o, mesh);
+        let Ok(listed) = listed.as_ref() else {
             return;
         };
+        // Only the holes it drills: those of its Hole diameter filter (a
+        // blind Ø6 picked beside a Ø8 Drill's through holes is left alone).
+        let holes: Vec<&cam::Hole> = listed.iter().filter(|h| cam::drills(o, h)).collect();
         if holes.is_empty() {
             return;
         }
