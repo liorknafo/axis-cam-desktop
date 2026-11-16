@@ -3676,8 +3676,9 @@ flood = { pin = 8 }
     /// nothing is sent. Paired again, the Pi lets it in at its next try and
     /// the status line says "Connected to <machine>: <state>", the refusal
     /// gone (LIO-519). The MACHINE bar's state pill says "Refused" while
-    /// refused, also over a state known before, never "Connecting…"
-    /// (LIO-561).
+    /// refused, also over a state known before, never "Connecting…"; for
+    /// an E-stop last known, no Reset beside it and the run bar says the
+    /// refusal, not to press Reset (LIO-561).
     #[test]
     fn a_refusing_pi_is_said_on_the_status_line_until_it_lets_this_computer_in() {
         use crate::control::{Action as A, NOT_SENT_PI_REFUSED};
@@ -3780,6 +3781,11 @@ flood = { pin = 8 }
         let p = problems(&a);
         assert!(!p.iter().any(|t| t.contains("refused")), "{p:?}");
         assert_eq!(pill(&a), "");
+        // The simulated UC100 starts in E-stop: the bar offers Reset and
+        // the run bar says to press it.
+        let texts = page_texts(&a);
+        assert!(texts.iter().any(|t| t == "Reset"), "{texts:?}");
+        assert!(texts.iter().any(|t| t.starts_with("E-stop:")), "{texts:?}");
         // Live and then cut: a lost link, as before.
         gate.set_cut(true);
         pi_live(&mut a, false, "the link lost");
@@ -3802,8 +3808,19 @@ flood = { pin = 8 }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let _ = a.update(Message::Tick);
-        assert!(conn(&a).snapshot.state.is_some());
+        assert_eq!(
+            conn(&a).snapshot.state,
+            Some(uc100::controller::State::EStop)
+        );
         assert_eq!(pill(&a), PILL_REFUSED);
+        // Nor the E-stop's Reset beside it: it would not be sent; and the
+        // run bar says the refusal, not "E-stop: press Reset".
+        let texts = page_texts(&a);
+        assert!(!texts.iter().any(|t| t == "Reset"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.starts_with("E-stop:")), "{texts:?}");
+        let (line, _) = crate::ui::run_line(&a, conn(&a));
+        let why = conn(&a).pi_refused().unwrap();
+        assert_eq!(line[0].0, format!("The Pi refused this computer: {why}"));
     }
 
     /// Renders the Control page while the Pi refuses this computer: first
@@ -3851,21 +3868,30 @@ flood = { pin = 8 }
         let _ = a.update(Message::Connect);
         refused(&mut a);
         shot(&mut a, "1-refused");
-        // Let in, live, Idle; then forgotten and the link cut and back.
+        // Let in and live, in E-stop with Reset beside it; then forgotten
+        // and the link cut and back. Then the same in Idle.
+        let again = |a: &mut App, name: &str| {
+            std::fs::rename(&kept, &clients).unwrap();
+            gate.set_open(true);
+            pi_live(a, true, "the link live");
+            shot(a, &format!("{name}-connected"));
+            gate.set_cut(true);
+            pi_live(a, false, "the link lost");
+            std::fs::rename(&clients, &kept).unwrap();
+            gate.set_cut(false);
+            refused(a);
+            shot(a, &format!("{name}-refused-after-live"));
+        };
+        again(&mut a, "2-estop");
+        // Let in at its next try (within 5 s), Idle after a Reset.
         std::fs::rename(&kept, &clients).unwrap();
-        gate.set_open(true);
-        pi_live(&mut a, true, "the link live");
+        pi_live(&mut a, true, "the link live again");
         let _ = a.update(Message::MachineReset);
         tick_until(&mut a, 3.0, "Idle after Reset", |s| {
             s.state == Some(uc100::controller::State::Idle)
         });
-        shot(&mut a, "2-connected");
-        gate.set_cut(true);
-        pi_live(&mut a, false, "the link lost");
         std::fs::rename(&clients, &kept).unwrap();
-        gate.set_cut(false);
-        refused(&mut a);
-        shot(&mut a, "3-refused-after-live");
+        again(&mut a, "3-idle");
     }
 
     /// Renders the Control page's Machine tab while connecting to the Pi

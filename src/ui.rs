@@ -9282,7 +9282,9 @@ fn machine_bar(app: &App) -> Element<'_, Message> {
             bar = bar.push(chip("SIMULATED", Color::from_rgb8(194, 122, 18)));
         }
         bar = bar.push(state_pill(c));
-        if c.snapshot.state == Some(State::EStop) {
+        // Not while the Pi refuses this computer: the E-stop is only the
+        // state last known, and a Reset would not be sent (LIO-561).
+        if c.snapshot.state == Some(State::EStop) && c.pi_refused().is_none() {
             bar = bar.push(primary("Reset", Message::MachineReset));
         }
         bar = bar.push(estop());
@@ -9818,6 +9820,15 @@ pub(crate) fn run_line(
     let s = &c.snapshot;
     let state = s.state.as_ref();
     let plain = |t: &str| vec![(t.to_string(), INK)];
+    // Refused, nothing runs, and a state known from before is not the
+    // machine's now: not "E-stop: press Reset", with no Reset to press
+    // (LIO-561). As the run's problems say it (LIO-519).
+    if let Some(why) = c.pi_refused() {
+        return (
+            vec![(format!("The Pi refused this computer: {why}"), AMBER)],
+            vec![],
+        );
+    }
     if state == Some(&State::EStop) {
         let why = s
             .estop_reason
