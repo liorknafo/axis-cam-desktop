@@ -4736,9 +4736,10 @@ fn lift_z(guide: &Guide, tool: Option<&Tool>, op: usize, boxes: &[Bounds], jaws:
         });
     let before = boxes.get(done).map_or(f32::NEG_INFINITY, |b| b.max[2]);
     let highest = (jaws.iter()).map(|j| j.max[2]).fold(before, f32::max);
-    up(planned
-        .unwrap_or(f32::NEG_INFINITY)
-        .max(highest + SAFE_ABOVE))
+    let z = (planned.unwrap_or(f32::NEG_INFINITY)).max(highest + SAFE_ABOVE);
+    // To the micron first: the heights carry float dust (a clamp's top
+    // 25.000015 over the stock's), which `up` would read as Z 30.01.
+    up((z * 1000.).round() / 1000.)
 }
 /// A tap in a wrench on a centre (LIO-449): Z is the centre's point, which
 /// the DRO follows; the tap is in the hole, not on the quill.

@@ -1022,6 +1022,13 @@ mod tests {
         );
         let gap = crate::holding::gap(&doc.setups[0]).unwrap();
         assert!(crate::holding::hits(&plan, &boxes, gap).is_empty());
+        // Its Holes page says so: up to Z 30.00 over the stock's top, the
+        // work zero, before X and Y move.
+        let guide = crate::guide::build(&doc, &mesh, 0).unwrap();
+        let lifts = crate::steps::Lifts::of(&doc, &mesh, &guide);
+        let z = lifts.z(&doc, &guide, 2) + guide.zero[2] - plan.stock.max[2];
+        assert_eq!(format!("{z:.3}"), "30.000");
+        assert_eq!(lifts.holder(), "the clamps");
         // The operation as saved keeps its own clearance.
         assert_eq!(num(&doc.setups[0].operations[2].p, "clearance"), Some(15.));
         // A clearance of its own above them is kept.
