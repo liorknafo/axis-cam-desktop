@@ -4976,10 +4976,14 @@ pub(crate) mod tests {
             })
             .unwrap()
     }
-    /// LIO-553 review: on the built-in example, a Drill's first hole picked
-    /// from the feature list goes through as a wall picked does.
+    /// LIO-553 review: the built-in example's Ø8 holes are drawn on its
+    /// flange's top, not modelled (`mesh::sample`), and its drill goes down
+    /// to Z8 in the flange (`viewport::paths`): nothing says they go through,
+    /// so a Drill picking one from the feature list keeps No, as it does a
+    /// blind hole; picked by a Feature click as by a wall, the check is the
+    /// same, and finds no hole there.
     #[test]
-    fn a_drill_picking_the_examples_through_hole_from_its_features_goes_through() {
+    fn a_drill_picking_the_examples_drawn_hole_from_its_features_keeps_its_through() {
         use crate::model::{Operation, Strategy, Tool};
         let mut d = direct();
         assert!(d.app.is_sample());
@@ -4996,16 +5000,14 @@ pub(crate) mod tests {
         let get = |d: &Direct, k: &str| {
             crate::model::get(&d.app.doc.setup().operations[0].p, k).to_string()
         };
-        assert_eq!(get(&d, "through"), "No");
-        let _ = d.app.update(Message::Feature(5));
-        assert_eq!(d.app.doc.setup().operations[0].geometry, vec![5]);
-        assert_eq!(get(&d, "through"), "Yes", "{}", d.app.status);
-        assert_eq!(get(&d, "breakthrough"), "3.5");
-        // A second hole is no first pick: a No the user chose stays.
-        let args = json!({"target": "operation", "key": "through", "value": "No"});
-        assert_eq!(outcome(&run(&mut d, "edit_field", args).unwrap()), "done");
-        let _ = d.app.update(Message::Feature(6));
-        assert_eq!(get(&d, "through"), "No");
+        for through in ["No", "Yes"] {
+            let o = &mut d.app.doc.setup_mut().operations[0];
+            o.geometry.clear();
+            o.p.insert("through".into(), through.into());
+            let _ = d.app.update(Message::Feature(5));
+            assert_eq!(d.app.doc.setup().operations[0].geometry, vec![5]);
+            assert_eq!(get(&d, "through"), through, "{}", d.app.status);
+        }
     }
     /// LIO-553: a hand Drill says whether its tip goes out under a hole that
     /// goes through the part, and how far, in its editor and to `edit_field`;
