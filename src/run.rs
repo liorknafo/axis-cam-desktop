@@ -2330,8 +2330,12 @@ impl Run {
             return None;
         }
         let programs = self.checked()?;
-        let before = programs.get(self.next)?.partly.get(self.from)?;
-        if self.at_step().is_none() {
+        let p = programs.get(self.next)?;
+        let before = p.partly.get(self.from)?;
+        // Its operation's first steps taken as cut, by a start at a step or
+        // a skip of them, cut the stock it starts from (LIO-568).
+        let first_cut = (p.indexes.get(self.from)).is_some_and(|&oi| self.cut_of(oi).contains(&0));
+        if self.at_step().is_none() && !first_cut {
             return Some(Cow::Borrowed(before));
         }
         // Inside an operation the check does not follow the stock, but it
@@ -2929,16 +2933,24 @@ pub fn check_steps(
             }
             // Steps taken as cut are in the stock already: the stock before
             // this operation and those before it has them cut, so the live
-            // carve starts from it (LIO-312). ponytail: the top view only;
-            // an indexed setup's moves (at an A) stay out of it.
+            // carve starts from it (LIO-312), in the top view and in the 3D
+            // view's volume (LIO-568). ponytail: the top view leaves out an
+            // indexed setup's moves (at an A).
             let before = Arc::make_mut(&mut left.before);
+            let plan = &sim.plan;
+            let (r, flute) = (plan.cut_radius(), plan.flute_length);
             let moves = (steps.iter().filter_map(|&s| found.steps.get(s)))
-                .flat_map(|s| &sim.plan.moves[s.moves.clone()])
-                .filter(|m| m.a.is_none());
+                .flat_map(|s| &plan.moves[s.moves.clone()]);
             for m in moves {
                 for b in before.iter_mut().filter(|b| b.op <= *oi) {
-                    b.stock
-                        .cut_shape(m.from, m.to, sim.plan.cut_radius(), sim.plan.shape);
+                    if m.a.is_none() {
+                        b.stock.cut_shape(m.from, m.to, r, plan.shape);
+                    }
+                    if m.motion == crate::simulation::Motion::Feed
+                        && let (Some(volume), Some(frame)) = (&mut b.volume, sim.frame_at(m.a))
+                    {
+                        volume.cut(m.from, m.to, r, flute, plan.shape, frame, sim.source);
+                    }
                 }
             }
             sim.plan = cut_plan(&sim.plan, &found.steps, steps);
@@ -7844,7 +7856,9 @@ pub(crate) mod tests {
     /// zero Stock top center: Pass 1, taken as cut, faced the stock top, but
     /// it was cut with the work zero the start keeps, so the start passes,
     /// the zero found and probed as for the whole run. Pass 1 is still in
-    /// the stock the run starts from.
+    /// the stock the run starts from, the top view's and the 3D view's, and
+    /// a work zero set on the stock now finds the top cut, whether the run
+    /// starts at Pass 2 or skips Pass 1.
     #[test]
     fn a_start_at_a_later_pass_of_the_first_operation_keeps_its_work_zero() {
         let dir = tempfile::tempdir().unwrap();
@@ -7874,12 +7888,53 @@ pub(crate) mod tests {
             b.stock.heights.iter().sum()
         };
         assert!(before(&cut_left) < before(&left));
+        // In the 3D view's volume too: the live carve starts with Pass 1 cut.
+        let removed = |l: &Left| -> f32 {
+            let b = l.before.iter().find(|b| b.op == 0).unwrap();
+            b.volume.as_ref().unwrap().removed_volume()
+        };
+        assert!(
+            removed(&cut_left) > removed(&left) + 1000.,
+            "{}",
+            removed(&cut_left)
+        );
         let moves = |c: &Checked| {
             (c.blocks.iter())
                 .filter(|b| matches!(b, Block::Move { op: 0, .. }))
                 .count()
         };
         assert!(moves(p) < moves(w));
+        // A run that keeps the work zero passes; one set on the stock now
+        // finds Pass 1 cut where it is touched off, whether the run starts
+        // at Pass 2 or skips Pass 1: not the stock top it was set on.
+        let partly = |skip: bool| {
+            let mut run = Run::new(&doc, 0, 0);
+            run.checked_as(
+                Arc::new(Ok(whole.clone())),
+                Some(Arc::new(left.clone())),
+                None,
+            );
+            run.pick(0, if skip { 0 } else { 1 }, false);
+            assert!(if skip {
+                run.skip_steps(true)
+            } else {
+                run.start_step()
+            });
+            assert_eq!(run.all_cut(), [(0, vec![0])]);
+            run.checked_as(
+                Arc::new(Ok(cut.clone())),
+                Some(Arc::new(cut_left.clone())),
+                None,
+            );
+            assert!(run.partway());
+            run.partly().unwrap().into_owned()
+        };
+        let (skipped, started) = (partly(true), partly(false));
+        assert_eq!(skipped, started);
+        assert!(skipped.top_cut && !skipped.cut.is_empty(), "{skipped:?}");
+        assert_eq!(skipped.surface, None);
+        let centre = (skipped.probe_from.iter()).find(|(r, _)| *r == p.probe.clone().unwrap());
+        assert!(centre.is_some_and(|(_, ok)| ok.is_err()), "{centre:?}");
     }
 
     /// The journal of where a run stopped (LIO-275) is written and read
