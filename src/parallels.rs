@@ -210,10 +210,6 @@ pub fn boxes(setup: &Setup, stock: Bounds) -> Vec<HoldBox> {
         _ => vec![],
     }
 }
-/// How many parallels `setup` stands on: 0 without or when they do not read.
-pub fn boxes_count(setup: &Setup) -> usize {
-    of(setup).ok().flatten().map_or(0, |p| p.at.len())
-}
 /// `boxes` of `parallels`.
 pub fn boxes_of(parallels: &Parallels, stock: Bounds) -> Vec<HoldBox> {
     let k = parallels.across();

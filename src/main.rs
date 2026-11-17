@@ -3525,7 +3525,15 @@ impl App {
                 post::sync_pin_drilling(&mut self.doc, mesh);
             }
         }
-        // A centre drilling's holes are the drill's it centres.
+        // A centre drilling's holes are the drill's it centres; a drill
+        // turned into a boring head's, a tap's or a reamer's needs none
+        // (LIO-536).
+        let active = self.doc.index();
+        for (si, gone) in centre::drop_needless(&mut self.doc) {
+            if si == active {
+                self.selected = self.selected.map(|oi| oi - usize::from(oi > gone));
+            }
+        }
         centre::sync(&mut self.doc);
         // A Drill's holes, counted for its name when they are picked
         // (LIO-426): only then, so that an edit, an undo or another setup
@@ -4658,6 +4666,57 @@ impl App {
         *kept = Some((key, found.clone()));
         found
     }
+    /// The holes Drill `o` of the current setup drills (`drill_holes`),
+    /// kept for each operation by what `drill_holes` keeps it by
+    /// (`later_drills`), for up to 64 operations.
+    pub(crate) fn kept_drill_holes(
+        &self,
+        o: &Operation,
+        mesh: &mesh::Mesh,
+    ) -> std::sync::Arc<DrillHoles> {
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::hash::DefaultHasher::new();
+            (self.holes_key(o, mesh), get(&o.p, "cycle"), o.helical()).hash(&mut hasher);
+            (o.id.clone(), hasher.finish())
+        };
+        let mut kept = self.later_drills.borrow_mut();
+        if kept.len() > 64 {
+            kept.clear();
+        }
+        (kept.entry(key))
+            .or_insert_with(|| self.drill_holes(o, mesh))
+            .clone()
+    }
+    /// Whether operation `oi` of the current setup has its holes opened
+    /// before it: as the Steps' guide reads the stock (`guide::opened`)
+    /// when it is built for the job as it is, else `centre::centred`, the
+    /// holes kept (`kept_drill_holes`). A spot a facing took away after
+    /// it is then not counted, and a centre drilling can be added again.
+    pub(crate) fn centred(&self, oi: usize) -> bool {
+        let read = (self.current_guide().and_then(|g| g.as_ref().ok())).and_then(|shown| {
+            // Every Holes step of it (one at each A angle, say).
+            (shown.guide.steps.iter())
+                .filter_map(|s| match s {
+                    guide::Step::Holes { op, uncentred, .. } if *op == oi => {
+                        Some(!uncentred.iter().any(|u| *u))
+                    }
+                    _ => None,
+                })
+                .reduce(|a, b| a && b)
+        });
+        if let Some(read) = read {
+            return read;
+        }
+        let mesh = self.part_mesh();
+        centre::centred_by(self.doc.setup(), oi, &mut |o: &Operation| {
+            self.kept_drill_holes(o, mesh?)
+                .as_ref()
+                .as_ref()
+                .ok()
+                .cloned()
+        })
+    }
     /// The holes `op`'s picked surfaces pick (`pocket::picked_holes`), each
     /// at the A angle that turns it up in an indexed setup that cuts holes
     /// at several (`Document::holes_listed`); not kept (`pocket_holes` is).
@@ -4729,27 +4788,8 @@ impl App {
                         // The hole as it drills it: its bore's narrowest
                         // diameter, the largest drill that fits.
                         // Kept for every later Drill (a pilot, then the
-                        // drill), by what `drill_holes` keeps it by.
-                        let key = (
-                            o.id.clone(),
-                            self.holes_key(o, mesh),
-                            get(&o.p, "cycle"),
-                            o.helical(),
-                        );
-                        let key = {
-                            use std::hash::{Hash, Hasher};
-                            let mut hasher = std::hash::DefaultHasher::new();
-                            (key.1, key.2, key.3).hash(&mut hasher);
-                            (key.0, hasher.finish())
-                        };
-                        let mut kept = self.later_drills.borrow_mut();
-                        if kept.len() > 64 {
-                            kept.clear();
-                        }
-                        let listed = (kept.entry(key))
-                            .or_insert_with(|| self.drill_holes(o, mesh))
-                            .clone();
-                        drop(kept);
+                        // drill).
+                        let listed = self.kept_drill_holes(o, mesh);
                         let found = (listed.as_ref().as_ref().ok())?.iter().find(|h| {
                             cam::drills(o, h)
                                 && angle(h.a)
@@ -7754,8 +7794,16 @@ impl App {
                         if let Some(cut) = added.bore_cut {
                             ops[oi + n].p.insert("bore_cut".into(), cut.to_string());
                         }
-                        // On the manual mill the first drill is centre drilled.
-                        let (centrings, said) = centre::needed(&self.doc, si, self.part_mesh());
+                        // On the manual mill the first drill is centre
+                        // drilled: the stages, not the setup's other drills.
+                        let stages: Vec<String> = (self.doc.setups[si].operations[oi..oi + n]
+                            .iter())
+                        .map(|o| o.id.clone())
+                        .collect();
+                        let (centrings, said) =
+                            centre::needed_for(&self.doc, si, self.part_mesh(), |o| {
+                                stages.contains(&o.id)
+                            });
                         centre::insert(&mut self.doc, si, centrings);
                         // The finishing operation stays the one open.
                         self.selected =

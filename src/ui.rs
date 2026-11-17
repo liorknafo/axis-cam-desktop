@@ -3853,9 +3853,7 @@ fn operation_editor_with<'a>(
             c = c.push(secondary("Open tool library", Message::Page(Page::Tools)));
             // A manual-mill drill on a flat face walks: centre drill first.
             if centre::wants_centre(o, &app.doc.tools, machine)
-                && app
-                    .selected
-                    .is_some_and(|oi| !centre::centred(app.doc.setup(), oi))
+                && app.selected.is_some_and(|oi| !app.centred(oi))
             {
                 c = c
                     .push(caution(
@@ -4696,8 +4694,9 @@ fn operation_editor_with<'a>(
                 .push(checks.field(p, "depth", "Depth · mm"));
         }
         // A hand Drill: only what its screens use, the Z it drills to
-        // (LIO-435), and whether the drill's tip goes out under a hole that
-        // goes through the part, and how far (LIO-553).
+        // (LIO-435), whether the drill's tip goes out under a hole that
+        // goes through the part, and how far (LIO-553), and the Z it goes
+        // up to between holes (LIO-538).
         "Heights" if o.strategy == Strategy::Drill && manual::is_hand(machine) => {
             c = c
                 .push(note("Each hole's depth comes from the part. Bottom offset raises the Z the drill goes down to on the DRO; Through takes the drill's tip out under a hole that goes through the part, by Breakthrough."))
@@ -4717,6 +4716,14 @@ fn operation_editor_with<'a>(
                 if get(p, "through") == "Yes" {
                     c = c.push(checks.field(p, "breakthrough", "Breakthrough · mm"));
                 }
+            }
+            if manual::is_manual(machine) {
+                c = c
+                    .push(note(format!(
+                        "Before X and Y move to the next hole, the quill goes up to Clearance over the stock top, and at least {} mm over the tops of the clamps or the vise's jaws.",
+                        manual::SAFE_ABOVE
+                    )))
+                    .push(checks.field(p, "clearance", "Clearance above stock · mm"));
             }
         }
         "Heights" => {

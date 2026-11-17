@@ -71,6 +71,9 @@ pub struct Shown {
     tools: Vec<Option<image::Handle>>,
     /// On the lathe: what its side views draw.
     side: Option<turning::Side>,
+    /// What its hole pages lift over (`Lifts`): the clamps or the jaws,
+    /// not the parallels `jaws` draws too (LIO-537).
+    lifts: Lifts,
 }
 /// A size drawn on a picture: a dimension line from `a` to `b` (picture
 /// pixels), with extension lines to them from the feature's points `ext`,
@@ -84,6 +87,10 @@ struct Dim {
     leader: bool,
 }
 impl Shown {
+    /// What its hole pages' lifts read (`Lifts`).
+    pub fn lifts(&self) -> Lifts {
+        self.lifts.clone()
+    }
     /// The same pictures with the guide worked out again for `doc`
     /// (`guide::again`): after a measurement or the dial check's answer.
     pub fn again(&self, doc: &Document, mesh: &Mesh) -> Result<Shown, String> {
@@ -99,6 +106,7 @@ impl Shown {
             dims: self.dims.clone(),
             tools: self.tools.clone(),
             side: self.side.clone(),
+            lifts: self.lifts.clone(),
         })
     }
 }
@@ -113,10 +121,67 @@ fn normal(p: &[[f32; 3]]) -> [f32; 3] {
     }
     n
 }
+/// What a hole page's lift to a safe Z reads (LIO-449, LIO-538): the
+/// stock box before each operation of the guide, then after the last
+/// (`simulation::leftover_box`), and the vise's jaws or the clamps, each
+/// in work coordinates.
+#[derive(Debug, Clone, Default)]
+pub struct Lifts {
+    boxes: Vec<Bounds>,
+    jaws: Vec<Bounds>,
+    vise: bool,
+}
+impl Lifts {
+    /// Those of `guide`, on the part `mesh`.
+    pub fn of(doc: &Document, mesh: &Mesh, guide: &Guide) -> Lifts {
+        use crate::simulation::leftover_box;
+        let setup = &doc.setups[guide.setup];
+        let zero = guide.zero;
+        let work = |b: Bounds| b.translated(zero.map(|v| -v));
+        let mut boxes = vec![work(leftover_box(&guide.before, setup, mesh))];
+        boxes.extend(
+            guide
+                .done
+                .iter()
+                .map(|d| work(leftover_box(&d.after, setup, mesh))),
+        );
+        let jaws: Vec<Bounds> = match &guide.steps[0] {
+            Step::Hold { holding, .. } if crate::holding::modelled(setup) => {
+                let held = Gripped {
+                    stock: holding.stock.translated(zero),
+                    band: holding.band.translated(zero),
+                    bottom: holding.bottom + zero[2],
+                    girth: holding.girth,
+                };
+                (doc.holding_boxes(setup, held))
+                    .map(|b| crate::holding::shown(&b, held.stock))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|b| b.bounds)
+                    .collect()
+            }
+            _ => vec![],
+        };
+        let jaws: Vec<Bounds> = jaws.into_iter().map(work).collect();
+        let vise = matches!(&guide.steps[0], Step::Hold { vise: Some(_), .. }) && !jaws.is_empty();
+        Lifts { boxes, jaws, vise }
+    }
+    /// The DRO's Z the tool goes up to before X and Y move to a hole of
+    /// operation `op` of `doc`'s setup (`safe_z`).
+    pub fn z(&self, doc: &Document, guide: &Guide, op: usize) -> f32 {
+        let setup = &doc.setups[guide.setup];
+        let tool =
+            (setup.operations.get(op)).and_then(|o| doc.tools.iter().find(|t| t.id == o.tool));
+        lift_z(guide, tool, op, &self.boxes, &self.jaws)
+    }
+    /// What holds the stock, in a hole page's words (`holder`).
+    pub fn holder(&self) -> &'static str {
+        holder_of(self.vise, !self.jaws.is_empty())
+    }
+}
 /// The guide of setup `si` (`guide::build`) with the part's outline, the
 /// stock boxes, the jaws and the 3D pictures of the stock.
 pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
-    use crate::simulation::leftover_box;
     let guide = crate::guide::build(doc, mesh, si)?;
     let setup = &doc.setups[si];
     let zero = guide.zero;
@@ -139,30 +204,10 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
             }
         }
     }
-    let mut boxes = vec![work(leftover_box(&guide.before, setup, mesh))];
-    boxes.extend(
-        guide
-            .done
-            .iter()
-            .map(|d| work(leftover_box(&d.after, setup, mesh))),
-    );
-    let jaws: Vec<Bounds> = match &guide.steps[0] {
-        Step::Hold { holding, .. } if crate::holding::modelled(setup) => {
-            let held = Gripped {
-                stock: holding.stock.translated(zero),
-                band: holding.band.translated(zero),
-                bottom: holding.bottom + zero[2],
-                girth: holding.girth,
-            };
-            (doc.holding_boxes(setup, held))
-                .map(|b| crate::holding::shown(&b, held.stock))
-                .unwrap_or_default()
-                .into_iter()
-                .map(|b| b.bounds)
-                .collect()
-        }
-        _ => vec![],
-    };
+    // The heights a hole page lifts over: the stock and the clamps or
+    // the jaws (`Lifts`), the same the MCP's steps read.
+    let lifts = Lifts::of(doc, mesh, &guide);
+    let (boxes, jaws) = (lifts.boxes.clone(), lifts.jaws.clone());
     // The parallels the setup says the stock stands on (LIO-537), under
     // the box it starts from.
     let modelled: Vec<Bounds> = match &guide.steps[0] {
@@ -174,7 +219,6 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
         }
         _ => vec![],
     };
-    let jaws: Vec<Bounds> = jaws.into_iter().map(work).collect();
     // In a vise: the jaw plates go down from the grip by their height, and
     // parallels fill what is under the stock between them: the setup's own
     // when it says where they are.
@@ -321,6 +365,7 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
         dims,
         tools,
         side,
+        lifts,
     })
 }
 /// Where a new tool touches the top: on the highest flat face of the stock
@@ -4661,15 +4706,22 @@ const LIFT: f32 = crate::cam::LIFT + 0.05;
 /// The heading over a hole's readouts: "Hole 2 of 6", and the DRO's hole
 /// to call up when that is another number (LIO-407).
 /// How far above the stock and its holding, mm, the tool goes at least
-/// before it moves to a hole (LIO-449).
-const SAFE_ABOVE: f32 = 5.;
+/// before it moves to a hole (LIO-449); a manual-mill Drill's plan goes as
+/// high between its holes (`manual::over_holding`).
+const SAFE_ABOVE: f32 = crate::manual::SAFE_ABOVE;
 /// The DRO's Z the tool goes up to before X and Y move to a hole of `op`
 /// (LIO-449): the plan's own clearance over the stock (its highest move,
 /// the operation's "clearance"), and never less than `SAFE_ABOVE` over the
 /// stock left and the tops of the vise's jaws or the clamps.
 fn safe_z(p: &Page<'_>, op: usize) -> f32 {
-    let g = p.guide();
-    let planned = (g.done.get(p.done(op)).filter(|d| d.op == op))
+    p.shown.lifts.z(p.doc, p.guide(), op)
+}
+/// `safe_z` of operation `op` of `guide`, cut with `tool`, the stock boxes
+/// before each operation `boxes` and the jaws or clamps `jaws` in work
+/// coordinates (`Lifts`).
+fn lift_z(guide: &Guide, tool: Option<&Tool>, op: usize, boxes: &[Bounds], jaws: &[Bounds]) -> f32 {
+    let done = (guide.done.iter()).position(|d| d.op == op).unwrap_or(0);
+    let planned = (guide.done.get(done).filter(|d| d.op == op))
         .and_then(|d| {
             (d.plan.moves.iter())
                 .flat_map(|m| [m.from[2], m.to[2]])
@@ -4678,28 +4730,32 @@ fn safe_z(p: &Page<'_>, op: usize) -> f32 {
         // A centre drill's plan is of its pilot's top, the DRO set to its
         // tip (`Step::Holes`): its clearance reads the pilot lower.
         .map(|z| {
-            z - g.zero[2]
-                - p.tool(op)
+            z - guide.zero[2]
+                - tool
                     .and_then(|t| t.centre_drill())
                     .map_or(0., |c| c.pilot_length)
         });
-    let holder = (p.shown.jaws.iter()).map(|j| j.max[2]);
-    let highest = holder.fold(p.before(op).max[2], f32::max);
-    up(planned
-        .unwrap_or(f32::NEG_INFINITY)
-        .max(highest + SAFE_ABOVE))
+    let before = boxes.get(done).map_or(f32::NEG_INFINITY, |b| b.max[2]);
+    let highest = (jaws.iter()).map(|j| j.max[2]).fold(before, f32::max);
+    let z = (planned.unwrap_or(f32::NEG_INFINITY)).max(highest + SAFE_ABOVE);
+    // To the micron first: the heights carry float dust (a clamp's top
+    // 25.000015 over the stock's), which `up` would read as Z 30.01.
+    up((z * 1000.).round() / 1000.)
 }
 /// A tap in a wrench on a centre (LIO-449): Z is the centre's point, which
 /// the DRO follows; the tap is in the hole, not on the quill.
 const WRENCH_LIFT: &str = "In a wrench, Z is the centre's point, not the tap's tip: before each move to a hole, turn the tap out, lift it and the wrench clear of the stock by hand, then raise the centre.";
 /// What holds the stock, in a hole page's words.
 fn holder(p: &Page<'_>) -> &'static str {
-    // The jaws drawn are the clamps' and the parallels' (LIO-537): the
-    // clamps are said only when the setup has them.
-    let clamped = p.shown.jaws.len() > crate::parallels::boxes_count(p.setup);
-    if !p.shown.vise.is_empty() {
+    // The jaws drawn are the clamps' and the parallels' (LIO-537):
+    // the clamps are said only when the setup has them (`Lifts`).
+    p.shown.lifts.holder()
+}
+/// `holder`: a vise holds the stock, or clamps (`jaws`) do, or neither.
+fn holder_of(vise: bool, jaws: bool) -> &'static str {
+    if vise {
         "the vise"
-    } else if clamped {
+    } else if jaws {
         "the clamps"
     } else {
         "what holds it"
@@ -6886,6 +6942,54 @@ pub(crate) mod tests {
             crate::centre::insert(doc, 0, ops);
         })
     }
+    /// The app counts a drill as centred as the Steps read the stock
+    /// when their guide is built (LIO-536): a milling operation between
+    /// the centre drilling and the drill that leaves the spots (the Step
+    /// again) does not undo it. Without the guide it may have taken them
+    /// away: the drill is not counted, so the editor warns and offers a
+    /// centre drilling again (MCP `add_centring` reads the same).
+    #[test]
+    fn the_app_counts_a_centring_the_stock_still_has() {
+        let a = centred_app();
+        assert!(a.centred(3));
+        let mut a = app_with("Yes", |doc| {
+            let mut c =
+                crate::model::Tool::new("Centre drill A2.5×6.3", crate::model::CENTRE_DRILL, "6.3");
+            c.set_type(crate::model::CENTRE_DRILL);
+            c.p.insert("stickout".into(), "40".into());
+            doc.tools.push(c);
+            let (ops, _) = crate::centre::needed(doc, 0, None);
+            crate::centre::insert(doc, 0, ops);
+            let mut again = doc.setups[0].operations[1].clone();
+            again.id = "step-again".into();
+            doc.setups[0].operations.insert(3, again);
+        });
+        if let Some(Err(why)) = a.current_guide() {
+            panic!("{why}");
+        }
+        let uncentred = (guide(&a).steps.iter())
+            .find_map(|s| match s {
+                Step::Holes {
+                    op: 4, uncentred, ..
+                } => Some(uncentred.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(uncentred.iter().all(|u| !*u), "{uncentred:?}");
+        assert!(a.centred(4));
+        assert!(!crate::centre::centred(a.doc.setup(), 4, a.part_mesh()));
+        a.guide = None;
+        assert!(!a.centred(4));
+        a.page = crate::Page::Work;
+        let _ = a.update(Message::SelectOp(4));
+        let _ = a.update(Message::Tab("Tool".into()));
+        let t = texts(&a);
+        assert!(t.iter().any(|s| s == "Centre drill first"), "{t:?}");
+        assert!(
+            t.iter().any(|s| s == "+ Add a centre drilling before it"),
+            "{t:?}"
+        );
+    }
     /// The Holes step of operation `op`.
     fn holes_step(a: &App, op: usize) -> usize {
         (guide(a).steps.iter())
@@ -8849,6 +8953,15 @@ pub(crate) mod tests {
             let jaws = (shown.jaws.iter()).map(|b| b.max[2]).fold(top, f32::max);
             let safe = clear.max(jaws + SAFE_ABOVE);
             assert!(safe >= top + SAFE_ABOVE - 1e-4 && safe >= jaws + SAFE_ABOVE - 1e-4);
+            // The MCP's steps read it the same (`Lifts`), the guide's own
+            // or one worked out for it.
+            let mesh = a.part_mesh().unwrap();
+            let lifts = [shown.lifts(), Lifts::of(&a.doc, mesh, &g)];
+            for l in &lifts {
+                assert_eq!(dro(l.z(&a.doc, &g, *op)), dro(safe));
+                assert_eq!(l.holder(), lifts[0].holder());
+            }
+            let clear_of = format!("clear of the stock and {}", lifts[0].holder());
             for item in 0..holes.len() {
                 a.doc.guide.insert(id.clone(), at);
                 a.guide_item = item;
@@ -8861,6 +8974,10 @@ pub(crate) mod tests {
                 let axes = t.iter().position(|s| s == "X" || s == "Y").unwrap();
                 assert!(lift < axes, "{t:?}");
                 assert!(t.iter().any(|s| s.contains("before X and Y move")), "{t:?}");
+                assert!(
+                    t.iter().any(|s| s.starts_with(&clear_of)),
+                    "{clear_of}: {t:?}"
+                );
                 // The lift is the first readout lit; reached, the axes are.
                 send(&mut a, GuideAction::Reached(0));
                 assert_eq!(a.guide_reached, 1);

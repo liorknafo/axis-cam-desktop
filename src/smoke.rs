@@ -7318,11 +7318,10 @@ flood = { pin = 8 }
         assert!(!ops[tap].tabs(&machine).contains(&"Heights"));
         let _ = a.update(Message::SelectOp(drill));
         let _ = a.update(Message::Tab("Heights".into()));
-        lacks(
-            &a,
-            &["Clearance above stock · mm", "Retract above stock · mm"],
-        );
-        shows(&a, &["Bottom offset · mm"]);
+        // Its Clearance is the Z the quill goes up to between holes, which
+        // the Steps' lift reads (LIO-538); a retract it has none of.
+        lacks(&a, &["Retract above stock · mm"]);
+        shows(&a, &["Bottom offset · mm", "Clearance above stock · mm"]);
         let texts = page_texts(&a);
         let checked = texts.iter().filter(|t| t.contains("Checked:")).count();
         assert!(checked <= 1, "{texts:?}");
