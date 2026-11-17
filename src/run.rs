@@ -6311,8 +6311,16 @@ pub(crate) mod tests {
         assert_eq!(bore.folds(1..=4), [1..=1, 2..=3, 4..=4]);
         assert_eq!(bore.folds(1..=5), [1..=1, 2..=5]);
         assert_eq!(bore.folds(0..=4), [0..=3, 4..=4]);
-        assert_eq!(bore.folds(0..=5), [0..=5]);
-        assert_eq!(bore.folds(2..=3), [2..=3]);
+        assert_eq!(
+            bore.folds(0..=5),
+            vec![0..=5; 1],
+            "whole passes are one line"
+        );
+        assert_eq!(
+            bore.folds(2..=3),
+            vec![2..=3; 1],
+            "one whole pass is one line"
+        );
         // Each step one visit, in to the bore's top and one cut down it;
         // hole 1 and hole 2 are the same two bores in every pass, and each
         // pass is set before its first visit.
