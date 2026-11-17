@@ -212,7 +212,7 @@ pub(super) fn ream(
         } else {
             b.plan.rest_top.zip(lower).map(|(a, b)| a.max(b))
         };
-        b.start_at([h.center[0], h.center[1], cutting_top], Some(cutting_top))?;
+        b.start_hole([h.center[0], h.center[1], cutting_top], Some(cutting_top))?;
         let rate = b.feed;
         b.push([h.center[0], h.center[1], target], Motion::Feed, true, rate)?;
         b.dwell(dwell);
@@ -362,7 +362,7 @@ pub(super) fn bore(
             } else {
                 b.plan.rest_top.zip(lower).map(|(a, b)| a.max(b))
             };
-            b.start_at([c[0], c[1], top], Some(top))?;
+            b.start_hole([c[0], c[1], top], Some(top))?;
             b.push([c[0], c[1], bottom], Motion::Feed, true, rate)?;
             b.dwell(dwell);
             if feed_out {

@@ -269,6 +269,7 @@ impl Builder {
                 keep_air: vec![],
                 corner_walks: vec![],
                 slot_passes: vec![],
+                holes: vec![],
                 display_scale: stock.display_scale,
                 duration: 0.,
                 target: top,
@@ -387,6 +388,14 @@ impl Builder {
         });
         self.push([p[0], p[1], approach], Motion::Rapid, false, self.rapid)?;
         self.push(p, Motion::Feed, false, self.feed * 0.25)
+    }
+    /// `start_at` for a hole of a drilling plan, which starts there
+    /// (`Plan::holes`): from the clearance, the tool risen out of the hole
+    /// before.
+    pub(crate) fn start_hole(&mut self, p: [f32; 3], top: Option<f32>) -> Result<(), String> {
+        self.retract()?;
+        self.plan.holes.push(self.plan.moves.len());
+        self.start_at(p, top)
     }
     pub(crate) fn stroke(&mut self, points: &[[f32; 3]]) -> Result<(), String> {
         if points.len() < 2 {
@@ -2554,7 +2563,7 @@ fn pin_holes(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
         if drill {
             let levels = ((face - target) / peck).ceil().max(1.) as usize;
             b.plan.levels += levels;
-            b.start_at([c[0], c[1], face], Some(face))?;
+            b.start_hole([c[0], c[1], face], Some(face))?;
             for level in 1..=levels {
                 let z = (face - level as f32 * peck).max(target);
                 b.push([c[0], c[1], z], Motion::Feed, true, b.feed)?;
@@ -2589,7 +2598,7 @@ fn pin_holes(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
             .sum();
         let laps = ((face - target) / pitch).ceil().max(1.) as usize;
         b.plan.levels += laps + 1;
-        b.start_at([lap[0][0], lap[0][1], face], Some(face))?;
+        b.start_hole([lap[0][0], lap[0][1], face], Some(face))?;
         for k in 0..=laps {
             let mut gone = 0.;
             for w in lap.windows(2) {
@@ -2935,7 +2944,7 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         }
         b.plan.target = b.plan.target.min(target);
         b.plan.levels += levels;
-        b.start_at([h.center[0], h.center[1], cutting_top], Some(cutting_top))?;
+        b.start_hole([h.center[0], h.center[1], cutting_top], Some(cutting_top))?;
         // By hand, X and Y are set and locked at each hole: the pass time
         // (LIO-377).
         if crate::manual::is_manual(&setup.machine) {
@@ -3154,7 +3163,7 @@ fn helical(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
             };
             let start = at(0, cutting_top);
             if i == 0 {
-                b.start_at(start, Some(cutting_top))?;
+                b.start_hole(start, Some(cutting_top))?;
             } else {
                 // Over the cleared middle to the next ring's start, above the
                 // material, then down to it.
@@ -3448,7 +3457,7 @@ fn thread_mill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resul
         let c = h.center;
         let around =
             |a: f32, radius: f32, z: f32| [c[0] + radius * a.cos(), c[1] + radius * a.sin(), z];
-        b.start_at([c[0], c[1], start], Some(h.top))?;
+        b.start_hole([c[0], c[1], start], Some(h.top))?;
         for &radius in &radii {
             let radius = radius.max(0.001);
             let rate = b.feed * radius / (radius + r);
@@ -3577,7 +3586,7 @@ fn tap(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, 
             number(op, "top")?,
         )
         .max(h.top);
-        b.start_at([h.center[0], h.center[1], mouth], Some(mouth))?;
+        b.start_hole([h.center[0], h.center[1], mouth], Some(mouth))?;
         // In one pitch a turn, then back out.
         let rate = b.feed;
         b.push([h.center[0], h.center[1], depth], Motion::Feed, true, rate)?;
