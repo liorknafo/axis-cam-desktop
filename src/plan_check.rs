@@ -3260,13 +3260,13 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>(),
             vec![
-                "workholding 1/Some(1): Face by planner: the tool hits the clamp on -X (offset 0) at X-67.0 Y-15.7 Z-2.0 (within the 2 mm gap).",
-                "workholding 1/Some(1): Face by planner: the tool hits the clamp on +X (offset 0) at X67.0 Y-15.7 Z-2.0 (within the 2 mm gap).",
-                "workholding 1/Some(3): Contour by planner: the tool hits the clamp on -X (offset 0) at X-45.0 Y-12.9 Z15.0 (within the 2 mm gap).",
-                "workholding 1/Some(3): Contour by planner: the holder hits the clamp on -X (offset 0) at X-65.1 Y-10.0 Z-38.0 (within the 2 mm gap).",
-                "workholding 1/Some(3): Contour by planner: the tool hits the clamp on +X (offset 0) at X65.1 Y10.0 Z-6.0 (within the 2 mm gap).",
-                "workholding 1/Some(3): Contour by planner: the holder hits the clamp on +X (offset 0) at X65.1 Y10.0 Z-38.0 (within the 2 mm gap).",
-                "workholding 1/Some(4): Drill by planner: the tool hits the clamp on +X (offset 0) at X48.0 Y-10.0 Z15.0 (within the 2 mm gap).",
+                "workholding 1/Some(1): Face by planner: the tool hits the clamp on -X (offset 0) at X-67.0 Y-15.7 Z-2.0 (within the 2 mm gap). It needs 7.0 mm more room across to keep the gap.",
+                "workholding 1/Some(1): Face by planner: the tool hits the clamp on +X (offset 0) at X67.0 Y-15.7 Z-2.0 (within the 2 mm gap). It needs 7.0 mm more room across to keep the gap.",
+                "workholding 1/Some(3): Contour by planner: the tool hits the clamp on -X (offset 0) at X-45.0 Y-12.9 Z15.0 (within the 2 mm gap). It needs 7.0 mm more room across to keep the gap.",
+                "workholding 1/Some(3): Contour by planner: the holder hits the clamp on -X (offset 0) at X-65.1 Y-10.0 Z-38.0 (within the 2 mm gap). It needs 18.0 mm more room across to keep the gap.",
+                "workholding 1/Some(3): Contour by planner: the tool hits the clamp on +X (offset 0) at X65.1 Y10.0 Z-6.0 (within the 2 mm gap). It needs 7.0 mm more room across to keep the gap.",
+                "workholding 1/Some(3): Contour by planner: the holder hits the clamp on +X (offset 0) at X65.1 Y10.0 Z-38.0 (within the 2 mm gap). It needs 18.0 mm more room across to keep the gap.",
+                "workholding 1/Some(4): Drill by planner: the tool hits the clamp on +X (offset 0) at X48.0 Y-10.0 Z15.0 (within the 2 mm gap). It needs 2.0 mm more room across to keep the gap.",
                 unheld,
             ]
         );

@@ -76,6 +76,7 @@ pub(crate) fn in_spindle(
         holder_radius: plan.holder_radius,
         holder_length,
         nose_radius: nose / 2.,
+        body: crate::holding::body(plan),
     };
     let note = match assumed.is_empty() {
         true => String::new(),
@@ -1404,7 +1405,7 @@ impl Chuck {
                     at(0),
                     at(1),
                     at(2),
-                    if hit.part == "tool" { "" } else { assumed },
+                    if crate::holding::of_tool(hit.part) { "" } else { assumed },
                 ));
             }
         }
@@ -1434,9 +1435,9 @@ impl Walk<'_> {
     /// What of operation `oi`'s tool is assumed, ending a message about a
     /// hit by `part`: nothing when the cutter itself hits.
     fn assumed(&self, oi: usize, part: &str) -> &str {
-        match part {
-            "tool" => "",
-            _ => &self.tools[&oi].1,
+        match crate::holding::of_tool(part) {
+            true => "",
+            false => &self.tools[&oi].1,
         }
     }
     /// One problem per operation, kind of move, box and part of the tool.
@@ -2151,7 +2152,7 @@ mod tests {
         assert!(
             said.iter().any(|s| s.starts_with(
                 "Flats at A 90°, Contour: the tool hits the chuck jaw 3 at X-92.0 Y20.0 Z54.6"
-            ) && s.ends_with("(within the 2 mm gap).")),
+            ) && s.ends_with("(within the 2 mm gap). It needs 8.0 mm more room across to keep the gap.")),
             "{said:?}"
         );
         // The same cut at A0, where jaw 1 is straight up and jaw 3 below:
@@ -2211,7 +2212,8 @@ mod tests {
             );
             let nose = said.iter().any(|s| {
                 s.starts_with("Contour: the spindle nose hits the chuck jaw 1 at ")
-                    && s.ends_with("(within the 2 mm gap). Assumed: the holder's 10 mm length (the tool gives none: enter it in the Tool library).")
+                    && s.contains("(within the 2 mm gap). It needs ")
+                    && s.ends_with(" mm more room across to keep the gap. Assumed: the holder's 10 mm length (the tool gives none: enter it in the Tool library).")
             });
             assert_eq!(nose, hit, "{said:?}");
         }

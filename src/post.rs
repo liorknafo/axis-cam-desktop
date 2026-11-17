@@ -7631,7 +7631,9 @@ M2
         // it 15 mm above the stock top.
         assert!(
             expected.starts_with("Pocket: the tool hits the clamp on -X (offset 0) at X-22.0 Y")
-                && expected.ends_with(" Z15.0 (within the 2 mm gap)."),
+                && expected.ends_with(
+                    " Z15.0 (within the 2 mm gap). It needs 7.0 mm more room across to keep the gap."
+                ),
             "{expected}"
         );
         // Moved along the side, clear of the pocket, it exports again.
@@ -7693,7 +7695,9 @@ M2
         assert_eq!(refused.len(), 1, "{refused:?}");
         assert!(
             refused[0].starts_with("Pocket: the tool hits the clamp on -X (offset ")
-                && refused[0].ends_with(" (within the 0 mm gap)."),
+                && refused[0].ends_with(
+                    " (within the 0 mm gap). It needs 0.5 mm more room across to keep the gap."
+                ),
             "{refused:?}"
         );
         // A UC100 run checks the same, with the profile's blend.

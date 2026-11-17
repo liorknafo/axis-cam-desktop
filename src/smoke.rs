@@ -20811,7 +20811,12 @@ soft_max = 180.0
         assert_eq!(crate::ui::holding_warning(&a), cached);
         a.doc.setups[0].p.insert("holding_gap".into(), "3".into());
         let (_, lines) = crate::ui::holding_warning(&a).unwrap();
-        assert!(lines[0].ends_with("(within the 3 mm gap)."), "{lines:?}");
+        assert!(
+            lines[0].ends_with(
+                "(within the 3 mm gap). It needs 8.0 mm more room across to keep the gap."
+            ),
+            "{lines:?}"
+        );
         a.doc.setups[0].p.insert("holding_gap".into(), "2".into());
         assert_eq!(crate::ui::holding_warning(&a).unwrap().1, expected);
         let key = a.holding_note.borrow().clone().unwrap().0;
@@ -21202,7 +21207,9 @@ soft_max = 180.0
             "{problems:?}"
         );
         assert!(
-            !hits.is_empty() && hits.iter().all(|p| p.ends_with("(within the 2 mm gap).")),
+            !hits.is_empty()
+                && hits.iter().all(|p| p.contains("(within the 2 mm gap). It needs ")
+                    && p.ends_with(" mm more room across to keep the gap.")),
             "{problems:?}"
         );
         for name in &named {
