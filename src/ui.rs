@@ -9860,27 +9860,35 @@ pub(crate) fn run_line(
             .map_or(String::new(), |(n, os)| {
                 format!(" · {}", os.label_of(n).to_lowercase())
             });
+        // Compact, the line is cut short: the step comes first, "pass 1 of
+        // 3 · hole 2 of 2" whole, then where the job is (LIO-558).
+        let (first, within) = match Fit::of(app).narrow {
+            true => (step, String::new()),
+            false => (String::new(), step),
+        };
         let mut parts = vec![
             ("Cutting ".into(), INK),
             (p.ops[op].name.clone(), INK),
-            (
-                // Where the job is, as the Steps page says it (LIO-431).
-                format!(
-                    " · Setup {} of {} · operation {} of {}{step} · tool run {} of {} · block {} of {blocks}",
-                    run.setup + 1,
-                    app.doc.setups.len(),
-                    op + 1,
-                    p.ops.len(),
-                    i + 1,
-                    programs.len(),
-                    block + 1
-                ),
-                MUTED,
-            ),
+            (first, MUTED),
         ];
         if run.stop_after {
-            parts.insert(2, (" · stops after this step".into(), AMBER));
+            parts.push((" · stops after this step".into(), AMBER));
         }
+        parts.push((
+            // Where the job is, as the Steps page says it (LIO-431).
+            format!(
+                " · Setup {} of {} · operation {} of {}{within} · tool run {} of {} · block {} of {blocks}",
+                run.setup + 1,
+                app.doc.setups.len(),
+                op + 1,
+                p.ops.len(),
+                i + 1,
+                programs.len(),
+                block + 1
+            ),
+            MUTED,
+        ));
+        parts.retain(|(t, _)| !t.is_empty());
         return (parts, vec![]);
     }
     let mut problems = run.problems(c, &app.doc);

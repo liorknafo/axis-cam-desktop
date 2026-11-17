@@ -6463,6 +6463,21 @@ flood = { pin = 8 }
         });
         let _ = a.update(Message::Run(R::StopAfterStep));
         assert!(run_of(&a).stop_after);
+        // The run line says the visit, "pass 1 of 3 · hole 2 of 2": first
+        // when the window is compact and the line is cut short, else where
+        // the Steps page has it, after the operation.
+        for (w, h) in [(1120., 690.), (1440., 900.)] {
+            let _ = a.update(Message::Resized(iced::Size::new(w, h)));
+            let (parts, _) = crate::ui::run_line(&a, conn(&a));
+            let line: String = parts.iter().map(|(t, _)| t.as_str()).collect();
+            let (step, setup) = (
+                line.find(" · pass 1 of 3 · hole 2 of 2").expect(&line),
+                line.find(" · Setup 1 of 1").expect(&line),
+            );
+            let stops = line.find(" · stops after this step").expect(&line);
+            assert_eq!(step < setup, w < 1360., "{w}: {line}");
+            assert!(stops < setup, "{w}: {line}");
+        }
         let mut deadline = Deadline::new(20.);
         let mut set = false;
         while run_of(&a).running.is_some() {
@@ -6475,10 +6490,7 @@ flood = { pin = 8 }
         assert!(set, "it stopped before the pause to set the head");
         let outcome = run_of(&a).outcome.clone().unwrap();
         assert_eq!(outcome.1, "Stopped after pass 1 · hole 2", "{outcome:?}");
-        assert_eq!(
-            conn(&a).snapshot.spindle,
-            Some(uc100::gcode::Spindle::Off)
-        );
+        assert_eq!(conn(&a).snapshot.spindle, Some(uc100::gcode::Spindle::Off));
         tick_until(&mut a, 5., "Idle after the stop", |s| {
             s.state == Some(State::Idle)
         });
