@@ -6036,13 +6036,14 @@ flood = { pin = 8 }
         zeroed(&mut a);
         check_run(&mut a, 0);
         // The app ticks all along: by the time a hand reaches the pad, the
-        // edit pause has ended and its tick saved the project. That tick
-        // takes about 20 ms, but up to half a second on a busy computer, so taken right
-        // after the press it lets the driver's 400 ms keepalive lapse and
-        // end the jog before any tick sees it (LIO-564, LIO-559).
+        // edit pause has ended and its tick has started the save. Until
+        // that save left the window's thread (LIO-559), that tick took up
+        // to half a second on a busy computer: taken right after the press,
+        // it let the driver's 400 ms keepalive end the jog before any tick
+        // saw it (LIO-564).
         a.last_edit -= crate::EDIT_PAUSE * 2;
         let _ = a.update(Message::Tick);
-        assert!(!a.dirty, "the edit pause's tick saved: {}", a.status);
+        assert!(!a.dirty, "the pause's tick started the save: {}", a.status);
         // At 5 % (50 mm/s), Y takes 2.8 s from 140 to its 280 mm soft
         // limit: at the usual 50 % it took 0.28 s, which a busy computer
         // could sleep through between two ticks.
