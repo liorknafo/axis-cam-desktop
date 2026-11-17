@@ -8832,11 +8832,13 @@ pub(crate) fn axis_names(axes: &[usize]) -> String {
 /// end of its travel: the profile sets no soft limits on X, Y and Z, or on
 /// some of them (`unlimited`, #164), or an axis with them has no machine
 /// position yet (`unset`). All are the same prominent box with their own
-/// sentence on what to do (#73). None while the soft limits are on.
+/// sentence on what to do (#73): Home for those of `homes` (the axes with a
+/// home switch), Set machine zero for the others (LIO-573). None while the
+/// soft limits are on.
 pub(crate) fn limits_off_warning(
     unlimited: &[usize],
     unset: &[usize],
-    home_switches: bool,
+    homes: &[usize],
 ) -> Option<(&'static str, Vec<String>)> {
     let mut lines = vec![];
     if unlimited.len() >= 3 {
@@ -8873,14 +8875,11 @@ pub(crate) fn limits_off_warning(
             if one { "it" } else { "them" },
             if one { "its" } else { "their" },
         ));
-        lines.push(
-            if home_switches {
-                "Home below to turn them on."
-            } else {
-                "Set machine zero below to turn them on."
-            }
-            .into(),
-        );
+        let (home, set): (Vec<usize>, Vec<usize>) = unset.iter().partition(|a| homes.contains(a));
+        lines.push(format!(
+            "{} below to turn them on.",
+            crate::control::place_words(&home, &set, false, false)
+        ));
     }
     (!lines.is_empty()).then_some(("Soft limits are OFF", lines))
 }
@@ -11354,10 +11353,16 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
     ]
     .spacing(6);
     if !placed {
+        // Home for those with a home switch, Set machine zero or Keep the
+        // last position for the others, each named when both are wanted
+        // (LIO-573).
+        let unset: Vec<usize> = (0..3).filter(|&a| !s.referenced[a]).collect();
+        let (home, set): (Vec<usize>, Vec<usize>) = unset.iter().partition(|&&a| c.homes(a));
         let mut b = row![].spacing(6);
-        if c.home_switches() {
+        if !home.is_empty() {
             b = b.push(small("Home again", idle(Action::Home), false));
-        } else {
+        }
+        if !set.is_empty() {
             b = b
                 .push(small(
                     "Set machine zero here",
@@ -11369,6 +11374,18 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
                     idle(Action::KeepPosition),
                     false,
                 ));
+        }
+        if !home.is_empty() && !set.is_empty() {
+            one = one.push(
+                text(format!(
+                    "{}.",
+                    crate::control::place_words(&home, &set, true, true)
+                ))
+                .size(12),
+            );
+        }
+        if let Some(w) = (!home.is_empty()).then(|| c.home_warning()).flatten() {
+            one = one.push(text(w).size(12).color(AMBER));
         }
         one = one.push(b);
     }
@@ -11882,7 +11899,7 @@ fn machine_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'
     }
     let (unlimited, unset) = (c.unlimited_axes(), c.unset_limited_axes());
     col = col.push(
-        if let Some((heading, lines)) = limits_off_warning(&unlimited, &unset, c.home_switches()) {
+        if let Some((heading, lines)) = limits_off_warning(&unlimited, &unset, &c.home_axes()) {
             caution(heading, lines)
         } else {
             let range = |a: usize| {
@@ -11927,13 +11944,20 @@ fn machine_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'
             false,
         ));
     }
-    if c.home_switches() {
+    // Home runs the axes with a switch, the others are declared (LIO-573).
+    let homed = c.home_axes();
+    if !homed.is_empty() {
         zero = zero.push(small("Home", idle(Action::Home), false));
+        if let Some(w) = c.home_warning() {
+            zero = zero.push(text(w).size(12).color(AMBER));
+        }
     }
     zero = zero.push(muted(if declared.is_empty() {
         HOME_NOTE.to_string()
-    } else {
+    } else if homed.is_empty() {
         machine_zero_note(c.orient)
+    } else {
+        mixed_zero_note(c.orient, &homed, &declared)
     }));
     if let Some(pins) = pin_block(c) {
         zero = zero.push(pins);
@@ -12937,14 +12961,20 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
             .map(|n| format!(" {n}"))
             .unwrap_or_default()
     )];
-    steps.push(if (0..3).all(|a| s.referenced[a]) {
+    // Home for X, Y and Z with a home switch, Set machine zero for the
+    // others: it declares every axis without one, so all of them are
+    // jogged to their ends first (LIO-573).
+    let unset: Vec<usize> = (0..3).filter(|&a| !s.referenced[a]).collect();
+    let free: Vec<usize> = (0..3).filter(|&a| !c.homes(a)).collect();
+    steps.push(if unset.is_empty() {
         "1. X, Y and Z have a machine position.".into()
-    } else if c.home_switches() {
+    } else if unset.iter().all(|&a| c.homes(a)) {
         "1. Optional: Home in the Machine tab, so that the soft limits are on. Without it Cycle Start runs with them off.".into()
     } else {
         format!(
-            "1. Optional: Set machine zero in the Machine tab, so that the soft limits are on: jog {} first. Without it Cycle Start runs with them off.",
-            zero_ends(c.orient, "to")
+            "1. Optional: {} in the Machine tab, so that the soft limits are on: jog {} first. Without it Cycle Start runs with them off.",
+            c.place(&unset, false, false),
+            zero_places(c.orient, &free, "to")
         )
     });
     steps.push(if p.offset == format!("G{}", 54 + s.active_wcs) {
@@ -13501,16 +13531,43 @@ const HOME_NOTE: &str = "Home references every axis on its switch. Every E-stop 
 /// ("at" or "to"): X and Y at their minimum ends, named where they are on
 /// the table, and Z at the top.
 pub(crate) fn zero_ends(o: crate::orient::Orient, at: &str) -> String {
-    format!(
-        "X {at} its {} end, Y {at} its {} end and Z {at} the top",
-        o.end(0, false),
-        o.end(1, false)
-    )
+    zero_places(o, &[0, 1, 2], at)
+}
+/// Where machine zero is for `axes` on a machine of orientation `o`, after
+/// `at`: X and Y at their minimum ends, Z at the top, a rotary axis at its
+/// zero mark.
+pub(crate) fn zero_places(o: crate::orient::Orient, axes: &[usize], at: &str) -> String {
+    let places: Vec<String> = (axes.iter())
+        .map(|&a| match a {
+            0 | 1 => format!("{} {at} its {} end", AXES[a], o.end(a, false)),
+            2 => format!("Z {at} the top"),
+            _ => format!("{} {at} its zero mark", AXES[a]),
+        })
+        .collect();
+    match places.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => places.concat(),
+    }
 }
 fn move_there_waits(o: crate::orient::Orient) -> String {
     format!(
         "Move there waits for machine zero: it rises to the top of Z first. Set it here, with {} (where the simulator starts), or in the Machine tab.",
         zero_ends(o, "at")
+    )
+}
+/// The Machine tab's note when some axes have a home switch (`homed`) and
+/// others not (`declared`, a rotary A, say): Home gives the first theirs,
+/// Set machine zero or Keep the last position the others (LIO-573).
+fn mixed_zero_note(o: crate::orient::Orient, homed: &[usize], declared: &[usize]) -> String {
+    let one = declared.len() == 1;
+    format!(
+        "Home references {} on {} switch{}, in the homing order. {} {} none: jog {}, then Set machine zero here, or Keep the last position AXIS CAM saved at the last disconnect if nothing moved the machine since. Every E-stop clears the machine position: home and set it again after one.",
+        crate::control::axis_list(homed),
+        if homed.len() == 1 { "its" } else { "their" },
+        if homed.len() == 1 { "" } else { "es" },
+        crate::control::axis_list(declared),
+        if one { "has" } else { "have" },
+        zero_places(o, declared, "to"),
     )
 }
 fn machine_zero_note(o: crate::orient::Orient) -> String {

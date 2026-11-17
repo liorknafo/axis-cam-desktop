@@ -14085,7 +14085,7 @@ flood = { pin = 8 }
         // own sentence (add them to the profile), at any position.
         let none = config(UNLIMITED);
         assert!(!none.soft_limits_configured());
-        let (heading, lines) = limits_off_warning(&[0, 1, 2], &[], false).unwrap();
+        let (heading, lines) = limits_off_warning(&[0, 1, 2], &[], &[]).unwrap();
         assert_eq!(heading, "Soft limits are OFF");
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(
@@ -14096,21 +14096,27 @@ flood = { pin = 8 }
         // Configured but not referenced: the same heading, other sentences.
         let limited = config(LIMITED);
         assert!(limited.soft_limits_configured());
-        let (h, lines) = limits_off_warning(&[], &[0, 1, 2], false).unwrap();
+        let (h, lines) = limits_off_warning(&[], &[0, 1, 2], &[]).unwrap();
         assert_eq!(h, heading);
         assert!(
             lines[0].starts_with("X, Y and Z have no machine position"),
             "{lines:?}"
         );
         assert_eq!(lines[1], "Set machine zero below to turn them on.");
-        let (_, lines) = limits_off_warning(&[], &[2], true).unwrap();
+        let (_, lines) = limits_off_warning(&[], &[2], &[2, 0, 1]).unwrap();
         assert!(
             lines[0].starts_with("Z has no machine position"),
             "{lines:?}"
         );
         assert_eq!(lines[1], "Home below to turn them on.");
+        // X and Y with switches, Z and A without (LIO-573): each named.
+        let (_, lines) = limits_off_warning(&[], &[0, 1, 2, 3], &[0, 1]).unwrap();
+        assert_eq!(
+            lines[1],
+            "Home X and Y, and Set machine zero for Z and A below to turn them on."
+        );
         // Configured and referenced: no warning.
-        assert!(limits_off_warning(&[], &[], true).is_none());
+        assert!(limits_off_warning(&[], &[], &[2, 0, 1]).is_none());
         // Soft limits on X and Y only (#164): the driver counts the profile
         // as limited, the page does not, since Z runs into its ends, and the
         // box names the axis without them and says to add them.
@@ -14132,7 +14138,7 @@ flood = { pin = 8 }
         idle(&mut a);
         assert!(!conn(&a).soft_limits_configured());
         assert_eq!(conn(&a).unlimited_axes(), vec![2]);
-        let (h, lines) = limits_off_warning(&conn(&a).unlimited_axes(), &[], false).unwrap();
+        let (h, lines) = limits_off_warning(&conn(&a).unlimited_axes(), &[], &[]).unwrap();
         assert_eq!(h, heading);
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(
@@ -14147,14 +14153,14 @@ flood = { pin = 8 }
         );
         // With X and Y waiting for a position too, both are said; Z is not
         // waiting for one.
-        let (_, lines) = limits_off_warning(&[2], &[0, 1, 2], false).unwrap();
+        let (_, lines) = limits_off_warning(&[2], &[0, 1, 2], &[]).unwrap();
         assert_eq!(lines.len(), 4, "{lines:?}");
         assert!(
             lines[2].starts_with("X and Y have no machine position"),
             "{lines:?}"
         );
         assert_eq!(lines[3], "Set machine zero below to turn them on.");
-        let (_, lines) = limits_off_warning(&[1, 2], &[], false).unwrap();
+        let (_, lines) = limits_off_warning(&[1, 2], &[], &[]).unwrap();
         assert!(
             lines[0].starts_with(
                 "Y and Z have no soft limits in this profile, so nothing stops them at the end of their travel."
@@ -14332,13 +14338,13 @@ flood = { pin = 8 }
     }
 
     #[test]
-    fn home_needs_home_switches_on_every_axis() {
+    fn home_runs_only_with_home_switches() {
         use crate::control::Action;
         use uc100::controller::State;
         let dir = tempfile::tempdir().unwrap();
         let mut a = profile_app(dir.path(), LIMITED);
         idle(&mut a);
-        assert!(!conn(&a).home_switches());
+        assert!(conn(&a).home_axes().is_empty());
         let _ = a.update(Message::Machine(Action::Home));
         std::thread::sleep(std::time::Duration::from_millis(100));
         let _ = a.update(Message::Tick);
@@ -14353,7 +14359,10 @@ flood = { pin = 8 }
         let dir = tempfile::tempdir().unwrap();
         let mut a = profile_app(dir.path(), SWITCHED);
         idle(&mut a);
-        assert!(conn(&a).home_switches());
+        // The profile's homing order, Z first.
+        assert_eq!(conn(&a).home_axes(), [2, 0, 1]);
+        // Z homes up first: nothing to warn of.
+        assert_eq!(conn(&a).home_warning(), None);
         mdi(&mut a, "G0 X4 Y3 Z-2");
         let _ = a.update(Message::Machine(Action::Home));
         tick_until(&mut a, 3.0, "homing", |s| s.state == Some(State::Homing));
@@ -14361,6 +14370,187 @@ flood = { pin = 8 }
             s.state == Some(State::Idle) && s.referenced[..3].iter().all(|r| *r)
         });
         assert!(at(&a)[..3].iter().all(|v| v.abs() < 1e-2), "{:?}", at(&a));
+    }
+
+    /// FAST with home switches on X and Y, none on Z, and a rotary A
+    /// without one either (LIO-573).
+    fn xy_switched() -> String {
+        let p = FAST
+            .replace(
+                "dir = { pin = 3 }\n",
+                "dir = { pin = 3 }\nhome = { pin = 11 }\n",
+            )
+            .replace(
+                "dir = { pin = 5 }\n",
+                "dir = { pin = 5 }\nhome = { pin = 12 }\n",
+            );
+        format!("{p}{A_AXIS}")
+    }
+
+    /// Renders the Machine tab and the start-at-a-step box of the `xy_switched`
+    /// machine (LIO-573) to PNGs in `$AXIS_RENDER_DIR` (default
+    /// /tmp/home-switches): Home with Set machine zero, before and after
+    /// homing, and the box after an E-stop. Not a check: run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_home_with_switchless_axes() {
+        use crate::control::Action;
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/home-switches".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let size = iced::Size::new(1600., 1000.);
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_on(dir.path(), &xy_switched());
+        a.page = Page::Control;
+        idle(&mut a);
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Machine));
+        render_png(&a, size, &out.join("1-machine-tab-no-position.png"));
+        let _ = a.update(Message::Machine(Action::Home));
+        tick_until(&mut a, 3.0, "homing", |s| s.state == Some(State::Homing));
+        tick_until(&mut a, 10.0, "X and Y homed", |s| {
+            s.state == Some(State::Idle) && s.referenced[0] && s.referenced[1]
+        });
+        let _ = a.update(Message::Machine(Action::MachineZero(None)));
+        tick_until(&mut a, 3.0, "Z and A set", |s| {
+            s.referenced[2] && s.referenced[3]
+        });
+        render_png(&a, size, &out.join("2-machine-tab-placed.png"));
+        mdi(&mut a, "G0 X195 Y140 Z-20");
+        let _ = a.update(Message::Machine(Action::WorkZero(None)));
+        tick_for(&mut a, 100);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::Steps(Some(1))));
+        let _ = a.update(Message::Run(R::PickStep(1, 2)));
+        let _ = a.update(Message::Run(R::StartStep));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| !s.referenced[0]);
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Start));
+        render_png(&a, size, &out.join("3-start-at-a-step-after-e-stop.png"));
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Machine));
+        render_png(&a, size, &out.join("4-machine-tab-after-e-stop.png"));
+    }
+
+    /// LIO-573: X and Y have home switches, Z and a rotary A have none.
+    /// Home is offered and homes X and Y alone, in the homing order (the
+    /// driver refuses a Home that names Z or A); Set machine zero and Keep
+    /// the last position declare Z and A and leave X and Y homed. The soft
+    /// limits warning, the probe, Go and the start-at-a-step checks name
+    /// which does what.
+    #[test]
+    fn home_runs_the_axes_with_switches_and_machine_zero_declares_the_others() {
+        use crate::control::Action;
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_on(dir.path(), &xy_switched());
+        a.page = Page::Control;
+        idle(&mut a);
+        let c = conn(&a);
+        assert_eq!(c.home_axes(), [0, 1], "ZXY, Z without a switch");
+        // X and Y travel at the tool's height: said before Home.
+        assert_eq!(
+            c.home_warning().as_deref(),
+            Some(
+                "Home moves X and Y with the tool at the height it is, as Z has no home switch: jog Z up clear of the work and the clamps before Home."
+            )
+        );
+        assert!(c.homes(0) && c.homes(1) && !c.homes(2) && !c.homes(3));
+        assert_eq!(
+            c.place(&[0, 1, 2], true, true),
+            "Home X and Y again, and Set machine zero again for Z (or Keep the last position)"
+        );
+        assert_eq!(c.place(&[3], true, false), "Set machine zero again");
+        assert_eq!(c.place(&[0, 1], false, true), "Home");
+        assert_eq!(
+            c.go_ready(crate::control::Go::ZTop),
+            Err("Z needs a machine position first: Set machine zero.".into())
+        );
+        let (_, lines) = crate::ui::limits_off_warning(
+            &c.unlimited_axes(),
+            &c.unset_limited_axes(),
+            &c.home_axes(),
+        )
+        .unwrap();
+        assert_eq!(
+            lines[1],
+            "Home X and Y, and Set machine zero for Z and A below to turn them on."
+        );
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Machine));
+        let _ = a.view();
+        // Set machine zero first: Z and A, never X and Y.
+        let _ = a.update(Message::Machine(Action::MachineZero(None)));
+        tick_until(&mut a, 3.0, "Z and A set", |s| {
+            s.referenced[2] && s.referenced[3]
+        });
+        assert!(!conn(&a).snapshot.referenced[0] && !conn(&a).snapshot.referenced[1]);
+        mdi(&mut a, "G0 Z-2");
+        let _ = a.update(Message::Machine(Action::Home));
+        tick_until(&mut a, 3.0, "homing", |s| s.state == Some(State::Homing));
+        tick_until(&mut a, 10.0, "X and Y homed", |s| {
+            s.state == Some(State::Idle) && s.referenced[..4].iter().all(|r| *r)
+        });
+        let s = &conn(&a).snapshot;
+        assert!(
+            !s.log.iter().any(|l| l.contains("no home switch")),
+            "{:?}",
+            s.log
+        );
+        // Homing moved X and Y only: Z stays where it was.
+        assert!((at(&a)[2] + 2.).abs() < 1e-3, "{:?}", at(&a));
+        assert!(conn(&a).unset_limited_axes().is_empty());
+        let _ = a.view();
+        // Keep the last position declares Z and A; X and Y stay homed.
+        let _ = a.update(Message::Machine(Action::KeepPosition));
+        tick_for(&mut a, 200);
+        assert!(conn(&a).snapshot.referenced[..4].iter().all(|r| *r));
+        let _ = a.view();
+        // A start at a step, then an E-stop: what gives X, Y and Z back
+        // theirs is named, and what gives A its.
+        mdi(&mut a, "G0 X195 Y140 Z-20");
+        let _ = a.update(Message::Machine(Action::WorkZero(None)));
+        tick_for(&mut a, 100);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::Steps(Some(1))));
+        let _ = a.update(Message::Run(R::PickStep(1, 2)));
+        let _ = a.update(Message::Run(R::StartStep));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((1, 2)));
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| !s.referenced[0]);
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        let _ = a.view();
+        let p = problems(&a);
+        assert!(
+            p.iter().any(|l| l.ends_with(
+                "Home X and Y again, and Set machine zero again for Z (or Keep the last position) in the Machine tab first."
+            )),
+            "{p:?}"
+        );
+        assert!(
+            p.iter().any(|l| l.starts_with("A has no machine position")
+                && l.ends_with("Set machine zero again in the Machine tab, then Cycle Start.")),
+            "{p:?}"
+        );
+        let line = crate::run::limits_unchecked(conn(&a)).unwrap();
+        assert!(
+            line.ends_with(
+                "Home X and Y, and Set machine zero for Z in the Machine tab to turn them on."
+            ),
+            "{line}"
+        );
     }
 
     /// Ticks for `ms` milliseconds.
