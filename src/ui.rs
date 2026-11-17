@@ -12826,10 +12826,8 @@ pub(crate) fn program<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
                     let steps = run.op_steps(oi).filter(|s| s.steps.len() > 1);
                     let unfolded = steps.is_some() && run.open == Some(oi);
                     let toggle = steps.map(|s| {
-                        let n = s.steps.len();
-                        let what = s.kind().1.to_lowercase();
                         let m = Message::Run(R::Steps((!unfolded).then_some(oi)));
-                        (unfolded, m, format!("{n} {what}"))
+                        (unfolded, m, s.count())
                     });
                     let op_time = times[i].as_ref().and_then(|t| t.get(k).copied());
                     list = list.push(op_row(

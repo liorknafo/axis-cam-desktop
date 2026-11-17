@@ -6324,7 +6324,7 @@ flood = { pin = 8 }
         check_run_pictured(&mut a, dir.path(), 0);
         let notes: Vec<String> = (run_of(&a).steps.iter())
             .filter(|s| s.steps.len() > 1)
-            .map(|s| format!("{} {}", s.steps.len(), s.kind().1.to_lowercase()))
+            .map(|s| s.count())
             .collect();
         assert!(!notes.is_empty());
         // A text cut by its row is laid out narrower than it is alone.
