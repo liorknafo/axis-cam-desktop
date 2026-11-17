@@ -2828,6 +2828,7 @@ pub(crate) fn pictured_holding(
         vec![]
     };
     jaws.extend(pin_boxes(app, setup, stock));
+    jaws.extend(crate::parallels::boxes(setup, stock));
     jaws
 }
 /// The part's holes offered for the fixture pins in the 3D view: shown
@@ -4481,7 +4482,14 @@ fn operation_editor_with<'a>(
                 .push(choice_value(p, ends, "slot_ends", "Round ends", &crate::slot::ENDS, t))
                 .push(checks.field(p,"scallop","Scallop left between steps · mm"))
                 .push(note("A cutter narrower than the slot sweeps the centre line, steps out round it and walks the outline each level, the round ends in DRO steps leaving at most the scallop between two; then it finishes the outline at size on the floor. When both round ends are already bored to the slot's width and depth, it only joins them: straight passes along each side, then the straight walls at size."))
-                .push(note("Blind: bottom is the floor before floor stock to leave. Through: bottom is the stock's back face; breakthrough extends below it. Check clearance below the part: parallels and table are unmodeled."));
+                .push(note(format!(
+                    "Blind: bottom is the floor before floor stock to leave. Through: bottom is the stock's back face; breakthrough extends below it. {}",
+                    // The setup's parallels and the table under them are
+                    // checked when it says them (LIO-537).
+                    crate::parallels::under_the_part(app.doc.setup()).unwrap_or_else(|| {
+                        "Check clearance below the part: parallels and table are unmodeled.".into()
+                    })
+                )));
         }
         "Box" => {
             // The pick first: one click on the face fills the numbers, which
@@ -7208,6 +7216,7 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
             c.push(m.into());
         }
     }
+    c.extend(parallel_controls(app, holding));
     if let Some(note) = stock_note(app) {
         c.push(muted(note).into());
     }
@@ -7216,6 +7225,58 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
             .width(Fill)
             .into(),
     );
+    c
+}
+/// The active setup's parallels under the stock (LIO-537): which way they
+/// run, or none, and when they run, where, how high and how wide. On a mill
+/// in a vise, under clamps or with no workholding modelled
+/// (`parallels::applies`). `holding` is the setup's workholding choice:
+/// without one, the parallels' issues are said here, which the workholding
+/// issues say otherwise.
+fn parallel_controls<'a>(app: &'a App, holding: &str) -> Vec<Element<'a, Message>> {
+    use crate::parallels::{AT, HEIGHT, RUN, RUNS, WIDTH};
+    let s = app.doc.setup();
+    if !crate::parallels::applies(s) && !crate::parallels::chosen(s) {
+        return vec![];
+    }
+    let (p, t) = (&s.p, Target::Setup);
+    let run = match get(p, RUN) {
+        "" => crate::parallels::NONE,
+        value => value,
+    };
+    let mut c: Vec<Element<_>> = vec![
+        muted("What the stock stands on: the table or the vise's floor, or parallels that raise it so that a through hole or slot may break through over the open space between them.")
+            .into(),
+        choice_value(p, run, RUN, "Parallels under the stock", &RUNS, t),
+    ];
+    if !crate::parallels::chosen(s) {
+        return c;
+    }
+    let at = if run == crate::parallels::LEFT_TO_RIGHT {
+        "Where they run · each one's Y from the stock's centre, mm, separated by ;"
+    } else {
+        "Where they run · each one's X from the stock's centre, mm, separated by ;"
+    };
+    c.push(field(p, AT, at, t));
+    c.push(
+        row![
+            container(field(p, HEIGHT, "Height · mm", t)).width(Length::FillPortion(1)),
+            container(hinted_field(p, WIDTH, "Width · mm", "10", t, &[]))
+                .width(Length::FillPortion(1))
+        ]
+        .spacing(10)
+        .into(),
+    );
+    c.push(
+        muted("A cut into a parallel, or past their height into what they stand on, is refused; one over the open space between them may go through the part's underside.")
+            .into(),
+    );
+    if holding == "None" {
+        let lines = editor_holding_lines(app);
+        if !lines.is_empty() {
+            c.push(caution("Parallels", lines));
+        }
+    }
     c
 }
 /// What the button that adds a clamp says.
@@ -7477,6 +7538,7 @@ fn holding_on(
         vec![]
     };
     boxes.extend(pin_boxes(app, setup, stock));
+    boxes.extend(crate::parallels::boxes(setup, stock));
     boxes
 }
 /// The fixture pins `setup` sits on, standing under `stock`, the box it
@@ -7844,7 +7906,11 @@ fn holding_note(
     let on_lathe = lathe::is_lathe(&setup.machine);
     let hand = manual::is_hand(&setup.machine);
     let boxes = match app.doc.holding_boxes(setup, held_of(app, plan.stock)) {
-        Ok(boxes) => boxes,
+        // With the parallels the stock stands on (LIO-537).
+        Ok(mut boxes) => {
+            boxes.extend(crate::parallels::boxes(setup, plan.stock));
+            boxes
+        }
         Err(error) => {
             return Some((
                 if hand {
@@ -14682,7 +14748,7 @@ pub(crate) fn plan_holding_line(job: &crate::model::Document, index: usize) -> O
         ));
     }
     Some(format!(
-        "Modelled workholding{by}: {text} Jaws and clamps are checked as boxes with the gap; parallels, bolts, the table and the machine body are not."
+        "Modelled workholding{by}: {text} Jaws and clamps are checked as boxes with the gap; bolts, the table, the machine body and parallels the setup does not place are not."
     ))
 }
 /// A planned setup's card title. Setup 1 keeps the user's name; a later
@@ -14774,10 +14840,10 @@ pub(crate) fn plan_check_lines(uc100: bool) -> [&'static str; 4] {
 pub(crate) fn plan_not_checked(held: Held, uc100: bool) -> &'static str {
     match held {
         Held::Every if uc100 => {
-            "Not checked: cutting loads, tool deflection, parallels, bolts, the table, the machine body and tool-change motion. Vise jaws and clamps are checked as boxes with a clearance gap in every setup, retracts to the clearance plane included. Speeds and feeds are checked against the material's cutting data, which are starting points."
+            "Not checked: cutting loads, tool deflection, bolts, the table, the machine body, tool-change motion and parallels a setup does not place. Vise jaws and clamps are checked as boxes with a clearance gap in every setup, retracts to the clearance plane included. Speeds and feeds are checked against the material's cutting data, which are starting points."
         }
         Held::Every => {
-            "Not checked: cutting loads, tool deflection, parallels, bolts, the table, the machine body and tool-change motion. Vise jaws and clamps are checked as boxes with a clearance gap in every setup; retracts to machine home are assumed to clear everything. Speeds and feeds are checked against the material's cutting data, which are starting points."
+            "Not checked: cutting loads, tool deflection, bolts, the table, the machine body, tool-change motion and parallels a setup does not place. Vise jaws and clamps are checked as boxes with a clearance gap in every setup; retracts to machine home are assumed to clear everything. Speeds and feeds are checked against the material's cutting data, which are starting points."
         }
         _ => {
             "Not checked: cutting loads, tool deflection, fixtures, clamps and the machine body. Speeds and feeds are checked against the material's cutting data, which are starting points."
@@ -14811,10 +14877,10 @@ pub(crate) fn program_note(held: Held) -> &'static str {
             "LinuxCNC 3-axis or indexed A output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Fixtures, clamps and the machine body are not checked: preview each program in LinuxCNC and air-cut first."
         }
         Held::Every => {
-            "LinuxCNC 3-axis or indexed A output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Every program move, the links between operations, approaches and retracts included, is checked against each setup's vise jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked, and retracts to machine home are assumed to clear everything: preview each program in LinuxCNC and air-cut first."
+            "LinuxCNC 3-axis or indexed A output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Every program move, the links between operations, approaches and retracts included, is checked against each setup's vise jaws or clamps as boxes with a clearance gap; bolts, the table, the machine body, tool-change motion and parallels a setup does not place are not checked, and retracts to machine home are assumed to clear everything: preview each program in LinuxCNC and air-cut first."
         }
         Held::Mixed => {
-            "LinuxCNC 3-axis or indexed A output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Every program move of a setup that models a vise or clamps, the links between operations, approaches and retracts included, is checked against its jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked, and neither are fixtures and clamps in the setups whose workholding is not modelled or cannot be checked; retracts to machine home are assumed to clear everything: preview each program in LinuxCNC and air-cut first."
+            "LinuxCNC 3-axis or indexed A output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Every program move of a setup that models a vise or clamps, the links between operations, approaches and retracts included, is checked against its jaws or clamps as boxes with a clearance gap; bolts, the table, the machine body, tool-change motion and parallels a setup does not place are not checked, and neither are fixtures and clamps in the setups whose workholding is not modelled or cannot be checked; retracts to machine home are assumed to clear everything: preview each program in LinuxCNC and air-cut first."
         }
     }
 }
@@ -14908,13 +14974,13 @@ pub(crate) fn fixtures(note: Note, modelled: bool) -> &'static str {
     match (note, modelled) {
         (Note::Preview, false) => "fixture and machine collisions are not checked.",
         (Note::Preview, true) => {
-            "this operation's own toolpath is checked against the vise jaws or clamps as boxes with a clearance gap (a warning shows if it comes too close); parallels, bolts, the table and the machine body are not."
+            "this operation's own toolpath is checked against the vise jaws or clamps as boxes with a clearance gap (a warning shows if it comes too close); bolts, the table, the machine body and parallels the setup does not place are not."
         }
         (Note::Facing, false) => {
             "Exact CAD faces and fixture or machine collision checks are not implemented; the moves can be exported as LinuxCNC G-code."
         }
         (Note::Facing, true) => {
-            "Exact CAD faces are not implemented. This operation's own toolpath is checked against the vise jaws or clamps as boxes with a clearance gap; parallels, bolts, the table and the machine body are not. The moves can be exported as LinuxCNC G-code."
+            "Exact CAD faces are not implemented. This operation's own toolpath is checked against the vise jaws or clamps as boxes with a clearance gap; bolts, the table, the machine body and parallels the setup does not place are not. The moves can be exported as LinuxCNC G-code."
         }
         (Note::Pocket, false) => "No fixture or holder collision solver is connected.",
         (Note::Pocket, true) => {
@@ -15901,10 +15967,10 @@ pub(crate) fn run_note(held: Held) -> &'static str {
             "A UC100 machine takes no G-code file: each setup is checked as a run checks it before Cycle Start — limits, travel, rapids into material, holder clearance, the profile's spindle and coolant outputs — and runs from MACHINE. The checks that need the connected machine, its work zero and position, are made there. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Fixtures, clamps and the machine body are not checked: air-cut first."
         }
         Held::Every => {
-            "A UC100 machine takes no G-code file: each setup is checked as a run checks it before Cycle Start — limits, travel, rapids into material, holder clearance, the profile's spindle and coolant outputs — and runs from MACHINE. The checks that need the connected machine, its work zero and position, are made there. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Every program move, the links between operations, approaches and retracts included, is checked against each setup's vise jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked: air-cut first."
+            "A UC100 machine takes no G-code file: each setup is checked as a run checks it before Cycle Start — limits, travel, rapids into material, holder clearance, the profile's spindle and coolant outputs — and runs from MACHINE. The checks that need the connected machine, its work zero and position, are made there. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Every program move, the links between operations, approaches and retracts included, is checked against each setup's vise jaws or clamps as boxes with a clearance gap; bolts, the table, the machine body, tool-change motion and parallels a setup does not place are not checked: air-cut first."
         }
         Held::Mixed => {
-            "A UC100 machine takes no G-code file: each setup is checked as a run checks it before Cycle Start — limits, travel, rapids into material, holder clearance, the profile's spindle and coolant outputs — and runs from MACHINE. The checks that need the connected machine, its work zero and position, are made there. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Every program move of a setup that models a vise or clamps, the links between operations, approaches and retracts included, is checked against its jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked, and neither are fixtures and clamps in the setups whose workholding is not modelled or cannot be checked: air-cut first."
+            "A UC100 machine takes no G-code file: each setup is checked as a run checks it before Cycle Start — limits, travel, rapids into material, holder clearance, the profile's spindle and coolant outputs — and runs from MACHINE. The checks that need the connected machine, its work zero and position, are made there. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Every program move of a setup that models a vise or clamps, the links between operations, approaches and retracts included, is checked against its jaws or clamps as boxes with a clearance gap; bolts, the table, the machine body, tool-change motion and parallels a setup does not place are not checked, and neither are fixtures and clamps in the setups whose workholding is not modelled or cannot be checked: air-cut first."
         }
     }
 }
@@ -16392,7 +16458,7 @@ fn operation_audit(app: &App) -> Element<'_, Message> {
     // What each operation supports, under its own heading, in a user's
     // words (LIO-438).
     c = c.push(bold("What each operation supports", 20)).push(note(
-        "An operation marked Available shows its cut on an imported part and can be sent to the machine once its checks pass: limits, rapids into the stock, the holder, and the vise jaws or clamps when the setup has them. Parallels, bolts, the table and the machine body are not checked.",
+        "An operation marked Available shows its cut on an imported part and can be sent to the machine once its checks pass: limits, rapids into the stock, the holder, and the vise jaws or clamps when the setup has them. Bolts, the table, the machine body and parallels a setup does not place are not checked.",
     ));
     for strategy in Strategy::ALL {
         c = c.push(

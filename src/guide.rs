@@ -2028,6 +2028,21 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
     for ((oi, plan), after) in done.into_iter().zip(afters) {
         let last_pattern = next_pattern.take();
         let op = &setup.operations[oi];
+        // No step of any operation cuts into the parallels the stock stands
+        // on, or past their height into the table under them (LIO-537), as
+        // the plan check and the export refuse it.
+        let gap = crate::holding::gap(setup).unwrap_or_default();
+        if let Some(why) = crate::parallels::refusal(
+            setup,
+            held.stock,
+            &plan,
+            gap,
+            crate::post::blend(machine),
+            op.name(),
+            zero,
+        ) {
+            return Err(why);
+        }
         let tool = op.tool.as_str();
         let rpm = num(&op.p, "rpm").unwrap_or(0.);
         let (r, first) = (plan.radius, steps.len());

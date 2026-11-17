@@ -20643,7 +20643,7 @@ soft_max = 180.0
         assert!(a.playback_ready(), "{}", a.status);
         assert!(
             a.status.contains(
-                "Sampled removal; this operation's own toolpath is checked against the vise jaws or clamps as boxes with a clearance gap (a warning shows if it comes too close); parallels, bolts, the table and the machine body are not. Export G-code from the NC review page."
+                "Sampled removal; this operation's own toolpath is checked against the vise jaws or clamps as boxes with a clearance gap (a warning shows if it comes too close); bolts, the table, the machine body and parallels the setup does not place are not. Export G-code from the NC review page."
             ),
             "{}",
             a.status
@@ -20717,10 +20717,9 @@ soft_max = 180.0
                 assert!(!held.contains(claim), "{note:?}: {held}");
             }
         }
-        assert!(
-            fixtures(Note::Facing, true)
-                .contains("parallels, bolts, the table and the machine body are not")
-        );
+        assert!(fixtures(Note::Facing, true).contains(
+            "bolts, the table, the machine body and parallels the setup does not place are not"
+        ));
     }
     #[test]
     fn the_nc_page_note_counts_only_workholding_that_can_be_checked() {
@@ -29697,7 +29696,7 @@ soft_max = 180.0
         );
         assert_eq!(
             plan_not_checked(Held::Every, false),
-            "Not checked: cutting loads, tool deflection, parallels, bolts, the table, the machine body and tool-change motion. Vise jaws and clamps are checked as boxes with a clearance gap in every setup; retracts to machine home are assumed to clear everything. Speeds and feeds are checked against the material's cutting data, which are starting points."
+            "Not checked: cutting loads, tool deflection, bolts, the table, the machine body, tool-change motion and parallels a setup does not place. Vise jaws and clamps are checked as boxes with a clearance gap in every setup; retracts to machine home are assumed to clear everything. Speeds and feeds are checked against the material's cutting data, which are starting points."
         );
         assert_eq!(
             plan_not_checked(Held::Mixed, false),
@@ -29733,13 +29732,13 @@ soft_max = 180.0
         assert_eq!(
             program_note(Held::Every),
             format!(
-                "{base}Every program move, the links between operations, approaches and retracts included, is checked against each setup's vise jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked, and retracts to machine home are assumed to clear everything: preview each program in LinuxCNC and air-cut first."
+                "{base}Every program move, the links between operations, approaches and retracts included, is checked against each setup's vise jaws or clamps as boxes with a clearance gap; bolts, the table, the machine body, tool-change motion and parallels a setup does not place are not checked, and retracts to machine home are assumed to clear everything: preview each program in LinuxCNC and air-cut first."
             )
         );
         assert_eq!(
             program_note(Held::Mixed),
             format!(
-                "{base}Every program move of a setup that models a vise or clamps, the links between operations, approaches and retracts included, is checked against its jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked, and neither are fixtures and clamps in the setups whose workholding is not modelled or cannot be checked; retracts to machine home are assumed to clear everything: preview each program in LinuxCNC and air-cut first."
+                "{base}Every program move of a setup that models a vise or clamps, the links between operations, approaches and retracts included, is checked against its jaws or clamps as boxes with a clearance gap; bolts, the table, the machine body, tool-change motion and parallels a setup does not place are not checked, and neither are fixtures and clamps in the setups whose workholding is not modelled or cannot be checked; retracts to machine home are assumed to clear everything: preview each program in LinuxCNC and air-cut first."
             )
         );
         // The good plan's work-zero lines, with the values its check found:
@@ -29797,7 +29796,7 @@ soft_max = 180.0
             crate::holding::held(&job.setups),
             crate::holding::Held::Every
         );
-        let checked = "Jaws and clamps are checked as boxes with the gap; parallels, bolts, the table and the machine body are not.";
+        let checked = "Jaws and clamps are checked as boxes with the gap; bolts, the table, the machine body and parallels the setup does not place are not.";
         assert_eq!(
             plan_holding_line(job, 0).unwrap(),
             format!(

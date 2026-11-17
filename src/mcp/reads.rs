@@ -1230,6 +1230,12 @@ pub(crate) fn step_detail(
                     ),
                     None => String::new(),
                 };
+                // The parallels it stands on, as the Hold page says them
+                // (LIO-537).
+                let held = match doc.setups.get(si).and_then(crate::parallels::sentence) {
+                    Some(on) => format!("{held}. {}", on.trim_end_matches('.')),
+                    None => held,
+                };
                 // The setup's notes say what holds and supports the part,
                 // as the Hold page shows them (LIO-487).
                 let notes = (doc.setups.get(si)).map_or("", |s| get(&s.p, "notes").trim());

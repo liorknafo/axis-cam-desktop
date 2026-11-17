@@ -1013,7 +1013,7 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
             Some(Kind::Collet) => "The collet nut and block were",
             None => "Vise jaws and clamps were",
         };
-        w.note(&format!("Not checked: parallels, bolts, the table, the machine body and tool-change motion. {checked} checked as boxes with a clearance gap."));
+        w.note(&format!("Not checked: bolts, the table, the machine body, tool-change motion and parallels the setup does not place. {checked} checked as boxes with a clearance gap."));
         w.note(MACHINE_HOME);
         w.note(SOFT_LIMITS);
     } else if crate::sheet::screwed(h.setup) {
@@ -2991,6 +2991,8 @@ fn holding_boxes(
         on_pins(setup, mesh, held.stock, datum).as_ref(),
         held.stock,
     ));
+    // The parallels it stands on (LIO-537).
+    boxes.extend(crate::parallels::boxes(setup, held.stock));
     Ok(boxes)
 }
 /// Why the vise or clamps of setup `si` cannot hold `held` (`gripped`, the
@@ -3713,6 +3715,18 @@ pub(crate) fn checked_held(
         // An indexed setup's jaws were checked at each angle above.
         if !indexed {
             problems.extend(walk.held(setup, g, &blocks, &boxes));
+        }
+        // Nor past the parallels' height into the table or vise under
+        // them (LIO-537): the parallels themselves are among `boxes`.
+        for k in g.clone() {
+            if let Some(past) =
+                crate::parallels::past_the_table(setup, held.stock, &walk.simulations[k].plan)
+            {
+                problems.push(Held {
+                    operation: Some(walk.indexes[k]),
+                    message: format!("{}: {past}", ops[k].name),
+                });
+            }
         }
         if !problems.is_empty() {
             return Err(problems);
@@ -6663,6 +6677,64 @@ M2
         let sample = post_job(&Document::sample(), &crate::mesh::sample());
         assert!(!sample.ready() && sample.errors[0].contains("Import a part"));
     }
+    /// A CNC through drill on parallels (LIO-537): the program is written
+    /// while the drill breaks through over the open space between them,
+    /// and nothing is when a parallel stands under the hole or the
+    /// breakthrough goes past their height into the table.
+    #[test]
+    fn a_through_drill_on_parallels_is_written_only_clear_of_them_and_the_table() {
+        use crate::cam::boring::tests::{drill, drilling, job, ring};
+        use crate::parallels::{AT, FRONT_TO_BACK, HEIGHT, RUN, WIDTH};
+        // Ø6.8 through the 18.5 mm ring at X0, 2.5 mm of breakthrough, the
+        // part's underside the stock's.
+        let mesh = ring(6.8, 30., 18.5);
+        let tool = drill("6.8");
+        let mut op = drilling(&mesh, &tool, "Drilling");
+        op.p.insert("breakthrough".into(), "2.5".into());
+        let (mut doc, _) = job(&mesh, Machine::new(3), vec![(tool, op)]);
+        doc.setups[0].p.insert("stock_bottom".into(), "0".into());
+        // A part of the user's, not the example's.
+        doc.file = Some(crate::model::ModelFile {
+            name: "ring.stl".into(),
+            path: "ring.stl".into(),
+            format: "stl".into(),
+            bytes: 0,
+            thickness: None,
+        });
+        let written = |doc: &Document| {
+            let dir = tempfile::tempdir().unwrap();
+            let out = write_job(&post_job(doc, &mesh), dir.path());
+            let files = std::fs::read_dir(dir.path()).unwrap().count();
+            (out.map(|(_, n)| n), files)
+        };
+        assert_eq!(written(&doc), (Ok(1), 1));
+        let on = |at: &str, height: &str| {
+            let mut doc = doc.clone();
+            for (k, v) in [
+                (RUN, FRONT_TO_BACK),
+                (AT, at),
+                (HEIGHT, height),
+                (WIDTH, "4"),
+            ] {
+                doc.setups[0].p.insert(k.into(), v.into());
+            }
+            written(&doc)
+        };
+        // Parallels X 9..13 and -13..-9: clear of the Ø6.8 and the gap.
+        assert_eq!(on("-11; 11", "10"), (Ok(1), 1));
+        let (refused, files) = on("0; 11", "10");
+        let refused = refused.unwrap_err();
+        assert!(refused.contains("parallel at X0"), "{refused}");
+        assert_eq!(files, 0);
+        // 2 mm parallels: the breakthrough goes 0.5 mm into the table.
+        let (past, files) = on("-11; 11", "2");
+        let past = past.unwrap_err();
+        assert!(
+            past.contains("the tool goes 0.50 mm past the 2 mm parallels the part stands on, into the table or vise under them."),
+            "{past}"
+        );
+        assert_eq!(files, 0);
+    }
     #[test]
     fn write_job_writes_every_program_or_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -8130,7 +8202,7 @@ M2
         let (mut doc, mesh) = pocket_job();
         let header = |doc: &Document| setup_texts(&post_job(doc, &mesh), 0).remove(0);
         let old = "(Not checked: fixtures, clamps and the machine body. LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)\n";
-        let held = "(Not checked: parallels, bolts, the table, the machine body and tool-change motion. Vise jaws and clamps were checked as boxes with a clearance gap.)\n(Retracts to machine home are assumed to clear everything.)\n(LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)\n";
+        let held = "(Not checked: bolts, the table, the machine body, tool-change motion and parallels the setup does not place. Vise jaws and clamps were checked as boxes with a clearance gap.)\n(Retracts to machine home are assumed to clear everything.)\n(LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)\n";
         // Without modelled workholding the old note stands, whatever the
         // setup's fixture description says.
         let text = header(&doc);

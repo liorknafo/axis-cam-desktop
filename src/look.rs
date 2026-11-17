@@ -318,6 +318,7 @@ impl View {
                         .ok()
                         .and_then(|datum| crate::post::on_pins(&setup, mesh, stock, datum));
                     boxes.extend(crate::holding::pin_boxes(on.as_ref(), stock));
+                    boxes.extend(crate::parallels::boxes(&setup, stock));
                     boxes
                 }
                 _ => vec![],
