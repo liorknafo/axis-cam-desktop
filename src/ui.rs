@@ -12334,7 +12334,35 @@ fn step_list<'a>(
     };
     let mut col = column![].spacing(2);
     let lh = step_line(fit) - 2.;
-    for r in step_lines(os.steps.len(), &keep, shown.lines) {
+    // A folded run of a Boring's visits split where its passes start
+    // (`OpSteps::folds`).
+    let lines: Vec<std::ops::RangeInclusive<usize>> =
+        (step_lines(os.steps.len(), &keep, shown.lines).into_iter())
+            .flat_map(|r| {
+                if r.start() == r.end() {
+                    vec![r]
+                } else {
+                    os.folds(r)
+                }
+            })
+            .collect();
+    let label_of = |r: &std::ops::RangeInclusive<usize>| {
+        if r.start() == r.end() {
+            os.label(*r.start())
+        } else {
+            os.labels(r.clone())
+        }
+    };
+    // The labels' column, as wide as the widest of them ("Pass 12 · Holes
+    // 3–9"), estimated from the characters, wide side, up to what leaves
+    // the steps' state beside them room; never less than a level's.
+    let base = if fit.narrow { 74. } else { 84. };
+    let widest = (lines.iter())
+        .map(|r| label_of(r).chars().count())
+        .max()
+        .unwrap_or(0);
+    let label_width = (widest as f32 * 5.4).clamp(base, base + 46.);
+    for r in lines {
         let first = *r.start();
         let one = r.start() == r.end();
         let stage = stages[first];
@@ -12377,11 +12405,7 @@ fn step_list<'a>(
         } else {
             space().width(13).into()
         };
-        let label = if one {
-            os.label(first)
-        } else {
-            os.labels(r.clone())
-        };
+        let label = label_of(&r);
         let font = Font {
             style: if one {
                 iced::font::Style::Normal
@@ -12398,12 +12422,16 @@ fn step_list<'a>(
         let ink = if one { INK } else { MUTED };
         let face = row![
             mark,
-            text(label)
-                .size(11)
-                .font(font)
-                .color(ink)
-                .width(if fit.narrow { 74 } else { 84 })
-                .wrapping(Wrapping::None),
+            // Clipped, never over the state beside it.
+            container(
+                text(label)
+                    .size(11)
+                    .font(font)
+                    .color(ink)
+                    .wrapping(Wrapping::None)
+            )
+            .width(label_width)
+            .clip(true),
             container(
                 text(detail)
                     .size(11)
@@ -12500,26 +12528,41 @@ fn step_list<'a>(
                 .then_some(Message::Run(R::StartStep)),
             false,
         );
+        let (picked_label, time) = (os.labels(p.clone()), format!("· {}", clock(seconds(&p))));
+        // The hint only beside a label it leaves room for, as a Boring's
+        // "Pass 1 · Hole 2 – Pass 3 · Hole 1" may not: the box is the
+        // Operations column less 86 px, widths estimated wide side.
+        let hint = "Shift-click picks a range";
+        let hinted = !fit.narrow
+            && picked_label.chars().count() as f32 * 6.4
+                + time.chars().count() as f32 * 5.6
+                + hint.chars().count() as f32 * 4.8
+                + 8.
+                <= fit.program() - 86.;
         let mut head = row![
-            bold(os.labels(p.clone()), 12),
-            muted(format!("· {}", clock(seconds(&p)))).size(11),
+            bold(picked_label, 12),
+            muted(time).size(11),
             space().width(Fill),
         ]
         .spacing(4)
         .align_y(Alignment::Center);
-        if !fit.narrow {
-            head = head.push(muted("Shift-click picks a range").size(10));
+        if hinted {
+            head = head.push(muted(hint).size(10));
         }
         out = out.push(
             container(
                 column![
                     head,
+                    // On two lines when "Start at pass 12 · hole 10" leaves
+                    // no room for Clear.
                     row![
                         skip,
                         start,
                         small("Clear", Some(Message::Run(R::ClearSteps)), false)
                     ]
                     .spacing(6)
+                    .wrap()
+                    .vertical_spacing(6)
                 ]
                 .spacing(5),
             )

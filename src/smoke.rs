@@ -6379,6 +6379,115 @@ flood = { pin = 8 }
         );
     }
 
+    /// LIO-558: a Boring's steps, its visits of its holes, laid out whole
+    /// in the step list. Two Ø32 bores drilled Ø12 and bored straight from
+    /// there at the default cut, 35 passes of 2 visits, started at "Pass 12
+    /// · Hole 1": at 1440 × 900 and 1120 × 690, and by touch, no folded
+    /// line runs from one pass's holes into another's, each label is laid
+    /// out as wide as it is alone (not cut), and what it says of the step
+    /// ("taken as cut", "starts here") starts right of it, never over it.
+    #[test]
+    fn a_borings_step_lines_are_whole_and_clear_of_their_state() {
+        use crate::cam::boring::tests::{drill, drilling, head, job, on_uc100, ring_triangles};
+        use crate::model::{BORE_RETRACTS, BORING, Machine};
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        let tris: Vec<[[f32; 3]; 3]> = (0..2)
+            .flat_map(|k| {
+                let x = 70. * k as f32;
+                (ring_triangles(32., 60., 28.).into_iter())
+                    .map(move |t| t.map(|p| [p[0] + x, p[1], p[2]]))
+            })
+            .collect();
+        let mesh = crate::mesh::normalize(tris).unwrap();
+        let t = drill("12");
+        let mut d = drilling(&mesh, &t, "Deep drilling");
+        d.p.insert("peck".into(), "12".into());
+        d.p.insert("breakthrough".into(), "4.5".into());
+        let b = head(BORE_RETRACTS[0]);
+        let mut o = drilling(&mesh, &b, BORING);
+        o.p.insert("hole_diameter".into(), "32".into());
+        let (doc, all) = job(&mesh, Machine::new(3), vec![(t, d), (b, o)]);
+        assert!(all.iter().all(|r| r.is_ok()), "{all:?}");
+        let mut doc = on_uc100(doc, dir.path());
+        let machine = a.doc.machines[0].clone();
+        doc.setups[0].machine = machine.clone();
+        doc.machines = vec![machine];
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.page = Page::Control;
+        zeroed(&mut a);
+        check_run_pictured(&mut a, dir.path(), 0);
+        let os = run_of(&a).op_steps(1).expect("the Boring's steps").clone();
+        assert_eq!((os.passes(), os.steps.len()), (35, 70));
+        let _ = a.update(Message::Run(R::Steps(Some(1))));
+        let _ = a.update(Message::Run(R::PickStep(1, 22)));
+        let _ = a.update(Message::Run(R::StartStep));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((1, 22)));
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Job));
+        let alone = |s: &str, italic: bool, window| {
+            let mut t = iced::widget::text(s.to_string()).size(11);
+            if italic {
+                t = t.font(iced::Font {
+                    style: iced::font::Style::Italic,
+                    ..iced::Font::DEFAULT
+                });
+            }
+            crate::ui::probe::placed(t.into(), window)[0].1.width
+        };
+        let states = ["taken as cut", "starts here", "done", "skipped", "cutting"];
+        for (w, h, touch) in [
+            (1440., 900., false),
+            (1120., 690., false),
+            (1120., 690., true),
+        ] {
+            crate::ui::TOUCH.with(|t| t.set(touch));
+            let window = iced::Size::new(w, h);
+            let _ = a.update(Message::Resized(window));
+            // Pictures of it when AXIS_RENDER_DIR says where.
+            if let Ok(out) = std::env::var("AXIS_RENDER_DIR") {
+                let name = format!("boring-steps-{w}{}.png", if touch { "-touch" } else { "" });
+                render_png(&a, window, &std::path::Path::new(&out).join(name));
+            }
+            let placed = crate::ui::probe::placed(a.view(), window);
+            let lines: Vec<&(String, iced::Rectangle)> = (placed.iter())
+                .filter(|(t, _)| t.starts_with("Pass"))
+                .collect();
+            // As many lines as the room takes, at least the folded passes
+            // before and after the start and its pass's two visits.
+            assert!(lines.len() >= 4, "{w} x {h}: {lines:?}");
+            let mut stated = 0;
+            for (t, at) in &lines {
+                assert!(!t.contains(" – "), "{w} x {h}: \"{t}\" runs across passes");
+                let folded = t.starts_with("Passes") || t.contains("Holes");
+                let natural = alone(t, folded, window);
+                assert!(
+                    at.width >= natural - 0.5,
+                    "{w} x {h}: \"{t}\" is cut to {} of {natural}",
+                    at.width
+                );
+                if let Some((s, state)) = (placed.iter()).find(|(s, b)| {
+                    states.contains(&s.as_str()) && (b.center_y() - at.center_y()).abs() < 4.
+                }) {
+                    stated += 1;
+                    assert!(
+                        at.x + at.width <= state.x,
+                        "{w} x {h}: \"{t}\" at {at:?} runs under \"{s}\" at {state:?}"
+                    );
+                }
+            }
+            assert!(stated >= 2, "{w} x {h}: {lines:?}");
+            assert!(
+                lines.iter().any(|(t, _)| t.starts_with("Passes")),
+                "{w} x {h}: {lines:?}"
+            );
+        }
+        crate::ui::TOUCH.with(|t| t.set(false));
+        let _ = a.update(Message::Disconnect);
+    }
+
     /// `shot` of the Control page with Move to open and `targets` typed
     /// (X, Y, Z, A), then Move to closed with the fields emptied.
     fn move_to_shot(a: &mut App, shot: &dyn Fn(&mut App, &str), name: &str, targets: &[&str]) {

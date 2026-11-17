@@ -2969,6 +2969,40 @@ impl OpSteps {
         }
     }
 
+    /// The lines a folded run of steps `range` shows as (`ui::step_list`):
+    /// itself, but a plan cut in passes splits one that starts or ends
+    /// partway through a pass and runs into another into the rest of the
+    /// pass it starts in, the whole passes after it and the start of the
+    /// pass it ends in, so that a line reads "Passes 2–10" or "Pass 11 ·
+    /// Holes 1–3", never "Pass 1 · Hole 2 – Pass 11 · Hole 1" (LIO-558).
+    pub fn folds(
+        &self,
+        range: std::ops::RangeInclusive<usize>,
+    ) -> Vec<std::ops::RangeInclusive<usize>> {
+        let (a, b) = (*range.start(), *range.end());
+        let (Some((pa, ha, na)), Some((pb, hb, nb))) = (self.in_pass(a), self.in_pass(b)) else {
+            return vec![range];
+        };
+        if pa == pb || (ha == 0 && hb + 1 == nb) {
+            return vec![range];
+        }
+        let mut out = vec![];
+        // The rest of the pass it starts in.
+        let mut whole = a;
+        if ha > 0 {
+            whole = a + (na - ha);
+            out.push(a..=whole - 1);
+        }
+        // The whole passes, then the start of the pass it ends in.
+        let tail = (hb + 1 < nb).then_some(b - hb);
+        let last = tail.map_or(b, |t| t - 1);
+        if whole <= last {
+            out.push(whole..=last);
+        }
+        out.extend(tail.map(|t| t..=b));
+        out
+    }
+
     pub fn labels(&self, range: std::ops::RangeInclusive<usize>) -> String {
         let (a, b) = (*range.start(), *range.end());
         if a == b {
@@ -6273,6 +6307,12 @@ pub(crate) mod tests {
         assert_eq!(bore.labels(2..=5), "Passes 2–3");
         assert_eq!(bore.labels(1..=2), "Pass 1 · Hole 2 – Pass 2 · Hole 1");
         assert_eq!(bore.labels(0..=4), "Pass 1 · Hole 1 – Pass 3 · Hole 1");
+        // Folded in the step list, a run is split where passes start.
+        assert_eq!(bore.folds(1..=4), [1..=1, 2..=3, 4..=4]);
+        assert_eq!(bore.folds(1..=5), [1..=1, 2..=5]);
+        assert_eq!(bore.folds(0..=4), [0..=3, 4..=4]);
+        assert_eq!(bore.folds(0..=5), [0..=5]);
+        assert_eq!(bore.folds(2..=3), [2..=3]);
         // Each step one visit, in to the bore's top and one cut down it;
         // hole 1 and hole 2 are the same two bores in every pass, and each
         // pass is set before its first visit.
@@ -6310,6 +6350,8 @@ pub(crate) mod tests {
         assert_eq!(three.labels(4..=5), "Pass 2 · Holes 2–3");
         assert_eq!(three.labels(3..=5), "Pass 2");
         assert_eq!(three.count(), "2 passes · 3 holes");
+        assert_eq!(three.folds(1..=4), [1..=2, 3..=4]);
+        assert_eq!(three.labels(1..=2), "Pass 1 · Holes 2–3");
         // The program: a visit a step, done only once the head leaves it,
         // each pause between the visit before and its pass's first.
         let programs =
