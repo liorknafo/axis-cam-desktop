@@ -818,4 +818,59 @@ pub(crate) mod tests {
         );
         assert!(!text.contains("M0\n"), "{text}");
     }
+    /// LIO-563: the workholding check takes a boring head's body, not only
+    /// the bore it sweeps. The Ø32 bore through the 28 mm ring, drilled
+    /// Ø12 and bored with the Ø50 head (its bar reaching 40 mm under the
+    /// body), by a toe clamp on +Y whose 25 mm tall nose reaches 12 mm onto
+    /// the 64 mm stock, to Y20: the bore's sweep and the bar stay clear of
+    /// it, the body, bored to a millimetre past the exit, comes down to 9
+    /// mm over the stock's top, over the clamp. The clamp on -Y stands at
+    /// X10 to 30, clear of the first rapid from the stock's corner, and the
+    /// body over it too.
+    #[test]
+    fn the_workholding_check_keeps_a_boring_heads_body_off_the_clamps() {
+        let held = |reach: &str| {
+            let mut tool = head(BORE_RETRACTS[0]);
+            tool.p.insert("length".into(), reach.into());
+            tool.p.insert("stickout".into(), "120".into());
+            let (mut doc, mesh, all) = bored(false, tool, |_| {});
+            for r in &all {
+                assert!(r.is_ok(), "{:?}", r.as_ref().err());
+            }
+            doc.workholding = crate::holding::starters();
+            let clamp = (doc.workholding.iter())
+                .find(|h| h.kind() == "Clamp")
+                .unwrap()
+                .id
+                .clone();
+            let p = &mut doc.setups[0].p;
+            p.insert("holding".into(), "Clamps".into());
+            p.insert("holder".into(), clamp);
+            p.insert("clamps".into(), "+Y:0;-Y:20".into());
+            let setups = crate::plan_check::walked_setups(&doc, &mesh, None);
+            let name = doc.setups[0].operations[1].name().to_string();
+            (
+                name,
+                crate::plan_check::setup_holding(&doc, &mesh, 0, &setups[0]),
+            )
+        };
+        let (bore, found) = held("40");
+        assert_eq!(found.len(), 2, "{found:?}");
+        // 25 + 2 - 20 across to the +Y clamp, and the machine's 0.01 mm
+        // blend; to the -Y clamp's corner at X10 Y-20, 27.01 - 22.36.
+        let said = [("+Y (offset 0)", "7.0"), ("-Y (offset 20)", "4.6")];
+        for ((side, room), (oi, line)) in said.iter().zip(&found) {
+            assert_eq!(*oi, Some(1), "{line}");
+            assert!(
+                line.starts_with(&format!(
+                    "{bore}: the tool body hits the clamp on {side} at X0.0 Y0.0 Z"
+                )) && line.ends_with(&format!(
+                    "(within the 2 mm gap). It needs {room} mm more room across to keep the gap."
+                )),
+                "{line}"
+            );
+        }
+        // A bar reaching 60 mm keeps the body over the clamps and the gap.
+        assert_eq!(held("60").1, vec![]);
+    }
 }

@@ -2172,6 +2172,31 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
             }
             Strategy::Drill if op.boring() => {
                 sides([0; 2], &mut steps);
+                // The head's body is far wider than the bore (LIO-563): set
+                // down beside a clamp it hits it, which the pages would not
+                // show. They are refused as a slot's are. Only the head's
+                // ways down and up at each hole count: between holes the
+                // pages have it lifted clear of the stock and the clamps
+                // first, whatever height the plan travels at.
+                let boxes = doc
+                    .holding_boxes(setup, held)
+                    .map_err(|e| format!("{}: workholding cannot be checked: {e}", op.name()))?;
+                let gap = crate::holding::gap(setup).unwrap_or_default();
+                let at_holes: Vec<_> = (plan.moves.iter())
+                    .filter(|m| (m.to[0] - m.from[0]).hypot(m.to[1] - m.from[1]) < 1e-4)
+                    .map(|m| (m.from, m.to))
+                    .collect();
+                let parts = crate::holding::plan_parts(&plan);
+                let reach = gap + crate::post::blend(machine);
+                if let Some(hit) =
+                    crate::holding::hits_parts(&at_holes, &parts, &boxes, reach).first()
+                {
+                    return Err(format!(
+                        "{} Hold the part so that the {} stands clear of the boring head, or bore with a bar that reaches farther below its body.",
+                        crate::holding::message(op.name(), hit, gap, zero),
+                        hit.label
+                    ));
+                }
                 // Each pass's moves: from its stop to the next pass's.
                 let passes: Vec<(usize, f32)> = (plan.stops.iter())
                     .filter_map(|s| Some((s.at, s.size?)))

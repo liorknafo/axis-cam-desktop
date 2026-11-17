@@ -459,7 +459,7 @@ pub fn holding_problems_of(
         let hits = crate::holding::hits_parts(path, parts, boxes, reach);
         for hit in hits {
             let mut message = crate::holding::message(&ops[k].name, &hit, gap, datum);
-            if hit.part != "tool" {
+            if !crate::holding::of_tool(hit.part) {
                 message.push_str(assumed);
             }
             problems.add_about(Some(k), hit.part, &hit.label, message);
@@ -919,7 +919,7 @@ mod tests {
                 &low_clamp()
             ),
             [
-                "Face top: the tool hits the clamp on +X (offset 0) at X30.0 Y0.0 Z10.0 (within the 2 mm gap)."
+                "Face top: the tool hits the clamp on +X (offset 0) at X30.0 Y0.0 Z10.0 (within the 2 mm gap). It needs 17.0 mm more room across to keep the gap."
             ]
         );
         assert!(walk(Machine::new(3), &[fixture::facing_op()], &[&plan], &[]).is_empty());
@@ -958,7 +958,7 @@ mod tests {
                 &boxes
             ),
             [
-                "Second: the tool hits the clamp on +X (offset 0) at X24.0 Y0.0 Z-7.0 (within the 2 mm gap)."
+                "Second: the tool hits the clamp on +X (offset 0) at X24.0 Y0.0 Z-7.0 (within the 2 mm gap). It needs 1.0 mm more room across to keep the gap."
             ]
         );
         // At the clearance plane the retract goes only as high as the highest
@@ -987,7 +987,7 @@ mod tests {
         assert_eq!(
             walk(Machine::new(3), &[fixture::facing_op()], &[&plan], &boxes),
             [
-                "Face top: the tool hits the clamp on +X (offset 0) at X24.0 Y0.0 Z52.0 (within the 2 mm gap)."
+                "Face top: the tool hits the clamp on +X (offset 0) at X24.0 Y0.0 Z52.0 (within the 2 mm gap). It needs 1.0 mm more room across to keep the gap."
             ]
         );
     }
@@ -1007,7 +1007,7 @@ mod tests {
         assert_eq!(
             walk(Machine::new(3), &[named("Cut A"), other], &[&a, &b], &boxes),
             [
-                "Cut A: the tool hits the clamp on +X (offset 0) at X24.0 Y0.0 Z-7.0 (within the 2 mm gap)."
+                "Cut A: the tool hits the clamp on +X (offset 0) at X24.0 Y0.0 Z-7.0 (within the 2 mm gap). It needs 1.0 mm more room across to keep the gap."
             ]
         );
     }
@@ -1029,7 +1029,7 @@ mod tests {
             walk(clearance(), &ops, &[&a, &b], &boxes),
             [
                 "The setup clearance plane (Z10.0) is not above the clamp on +X (offset 0) and its 2 mm gap (Z27.0). Raise the operations' clearance above 27.0 mm over the stock top (Z27.0), or retract to machine home.",
-                "Cut B: the tool hits the clamp on +X (offset 0) at X30.0 Y0.0 Z10.0 (within the 2 mm gap)."
+                "Cut B: the tool hits the clamp on +X (offset 0) at X30.0 Y0.0 Z10.0 (within the 2 mm gap). It needs 17.0 mm more room across to keep the gap."
             ]
         );
         // Retracting to the machine's Z home goes over everything.
@@ -1041,7 +1041,7 @@ mod tests {
         let at_x = |x: f32| fixture::plan([x, 0., 20.], &[(Motion::Feed, [x, 0., 18.], 500.)]);
         let (a, b) = (at_x(0.), at_x(80.));
         let ops = [named("Cut A"), named("Cut B")];
-        let hit = "Cut B: the tool hits the clamp on +X (offset 0) at X30.0 Y0.0 Z10.0 (within the 2 mm gap).";
+        let hit = "Cut B: the tool hits the clamp on +X (offset 0) at X30.0 Y0.0 Z10.0 (within the 2 mm gap). It needs 17.0 mm more room across to keep the gap.";
         assert_eq!(walk(Machine::new(3), &ops, &[&a, &b], &boxes), [hit]);
         // At the clearance plane the plane is refused as well (20, below 37).
         assert_eq!(
@@ -1166,10 +1166,10 @@ mod tests {
         assert_eq!(
             walk(Machine::new(3), &[fixture::facing_op()], &[&plan], &boxes),
             [
-                "Face top: the tool hits the clamp on +X (offset 0) at X24.0 Y0.0 Z10.0 (within the 2 mm gap).",
-                "Face top: the holder hits the clamp on +X (offset 0) at X14.0 Y0.0 Z10.0 (within the 2 mm gap).",
-                "Face top: the tool hits the clamp on -X (offset 0) at X-24.0 Y0.0 Z10.0 (within the 2 mm gap).",
-                "Face top: the holder hits the clamp on -X (offset 0) at X-24.0 Y0.0 Z10.0 (within the 2 mm gap).",
+                "Face top: the tool hits the clamp on +X (offset 0) at X24.0 Y0.0 Z10.0 (within the 2 mm gap). It needs 1.0 mm more room across to keep the gap.",
+                "Face top: the holder hits the clamp on +X (offset 0) at X14.0 Y0.0 Z10.0 (within the 2 mm gap). It needs 12.0 mm more room across to keep the gap.",
+                "Face top: the tool hits the clamp on -X (offset 0) at X-24.0 Y0.0 Z10.0 (within the 2 mm gap). It needs 1.0 mm more room across to keep the gap.",
+                "Face top: the holder hits the clamp on -X (offset 0) at X-24.0 Y0.0 Z10.0 (within the 2 mm gap). It needs 12.0 mm more room across to keep the gap.",
             ]
         );
     }
@@ -1191,7 +1191,7 @@ mod tests {
                 &boxes
             ),
             [
-                "Wide: the tool hits the clamp on +X (offset 0) at X24.0 Y0.0 Z10.0 (within the 2 mm gap)."
+                "Wide: the tool hits the clamp on +X (offset 0) at X24.0 Y0.0 Z10.0 (within the 2 mm gap). It needs 1.0 mm more room across to keep the gap."
             ]
         );
     }
@@ -1240,7 +1240,9 @@ mod tests {
         assert!(
             found[0]
                 .starts_with("Face top: the tool hits the clamp on +X (offset 0) at X24.5 Y0.0")
-                && found[0].ends_with("(within the 0 mm gap)."),
+                && found[0].ends_with(
+                    "(within the 0 mm gap). It needs 0.5 mm more room across to keep the gap."
+                ),
             "{found:?}"
         );
         // At the clearance plane the blend counts too: a plane exactly at

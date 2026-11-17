@@ -944,13 +944,29 @@ pub fn pin_boxes(on: Option<&crate::post::OnPins>, stock: Bounds) -> Vec<HoldBox
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
     pub label: String,
-    /// "tool" (cutter and shank, tip to stickout) or "holder" (above the
+    /// "tool" (cutter and shank, tip to stickout), `BODY` (a body wider
+    /// than the cutter over its neck, `body`) or "holder" (above the
     /// stickout); on the rotary, also "spindle nose" (`chuck::InSpindle`).
     pub part: &'static str,
     /// The tip where the move, clipped to the heights at which the part can
     /// touch the box, first touches the box's footprint (the rectangle itself,
     /// not grown by the reach); when it never does, its closest point to it.
     pub at: [f32; 3],
+    /// How much farther across (XY, mm) the part has to move, in the best
+    /// direction, to keep the reach the hit was found with from the box's
+    /// footprint: for the move that takes it deepest, its radius and the gap
+    /// less how far its axis stays from the footprint, or plus how deep into
+    /// the footprint the axis goes (`xy_deepest`). None where the hit is not
+    /// found across (a lathe's, `lathe_hits`).
+    pub short: Option<f32>,
+}
+/// The name of a tool's body where it is wider than its cutter (`body`).
+pub const BODY: &str = "tool body";
+/// Whether a hit by `part` is a hit by the tool itself, cutter or body, not
+/// by what holds it: the sizes of the holder and the spindle nose may be
+/// assumed, the tool's are its own.
+pub fn of_tool(part: &str) -> bool {
+    part == "tool" || part == BODY
 }
 /// The parameters in 0..=1 at which `a + (b - a) t` lies within `lo..=hi`.
 fn within(a: f64, b: f64, lo: f64, hi: f64) -> Option<(f64, f64)> {
@@ -1018,11 +1034,59 @@ pub fn parts(radius: f32, stickout: f32, holder_radius: f32) -> [Part; 2] {
         ("holder", holder_radius, stickout, f32::INFINITY),
     ]
 }
+/// The body of `plan`'s tool over its neck (`Plan::neck`), where it is
+/// wider than the cutter, as (radius, its height above the tip): from the
+/// neck's reach up to the stickout. A boring head's body over its bar
+/// (LIO-563: a Ø50 head over a bar reaching 30 mm, boring next to a clamp),
+/// a thread mill's or a keyseat cutter's shank wider than its teeth. None
+/// when the tool has no neck, its body is no wider than its cutter, or the
+/// neck reaches the stickout.
+pub fn body(plan: &Plan) -> Option<(f32, f32)> {
+    let [_, reach, radius] = plan.neck?;
+    let from = reach.max(0.);
+    (radius > plan.radius && from < plan.tool_length).then_some((radius, from))
+}
+/// The XY distance from `c` to the rectangle of `b`, less how far inside it
+/// `c` is when it is: how far `c` must move across, in the best direction,
+/// to be out of it, as a negative number (0 on its edge).
+fn signed_xy(b: &Bounds, c: [f64; 2]) -> f64 {
+    let (lo, hi) = (b.min.map(f64::from), b.max.map(f64::from));
+    let (dx, dy) = (
+        (lo[0] - c[0]).max(c[0] - hi[0]),
+        (lo[1] - c[1]).max(c[1] - hi[1]),
+    );
+    match dx <= 0. && dy <= 0. {
+        true => dx.max(dy),
+        false => dx.max(0.).hypot(dy.max(0.)),
+    }
+}
+/// The least `signed_xy` along the segment `p`-`q`: `xy_closest`'s distance
+/// when the segment stays outside the rectangle, else less how deep into it
+/// the segment goes (the signed distance is convex along the segment, so its
+/// least is found by narrowing in on it).
+fn xy_deepest(b: &Bounds, p: [f64; 2], q: [f64; 2], distance: f64) -> f64 {
+    if distance > 0. {
+        return distance;
+    }
+    let at = |t: f64| signed_xy(b, [p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t]);
+    let (mut lo, mut hi) = (0., 1.);
+    for _ in 0..100 {
+        let (a, c) = (lo + (hi - lo) / 3., hi - (hi - lo) / 3.);
+        if at(a) <= at(c) {
+            hi = c;
+        } else {
+            lo = a;
+        }
+    }
+    at((lo + hi) / 2.).min(at(0.)).min(at(1.)).min(0.)
+}
 /// For a tip moving straight from `from` to `to`, a part of a tool occupying
 /// heights `low..=high` above the tip and the box `b` grown by `gap`: the
 /// stretch of the move where the part's heights overlap the box, as the least
-/// XY distance from it to the box's footprint and the tip where that is first
-/// reached. None when the heights never overlap.
+/// XY distance from it to the box's footprint, the tip where that is first
+/// reached, and the least of it signed (`xy_deepest`: less how deep into the
+/// footprint the tip's axis goes, when it does). None when the heights never
+/// overlap.
 fn closest(
     b: &Bounds,
     from: [f64; 3],
@@ -1030,7 +1094,7 @@ fn closest(
     low: f32,
     high: f32,
     gap: f32,
-) -> Option<(f64, [f64; 3])> {
+) -> Option<(f64, [f64; 3], f64)> {
     let z = (
         f64::from(b.min[2] - gap - high),
         f64::from(b.max[2] + gap - low),
@@ -1038,14 +1102,17 @@ fn closest(
     let tip = |t: f64| [0, 1, 2].map(|k| from[k] + (to[k] - from[k]) * t);
     let (t0, t1) = within(from[2], to[2], z.0, z.1)?;
     let (p, q) = (tip(t0), tip(t1));
-    let (distance, s) = xy_closest(b, [p[0], p[1]], [q[0], q[1]]);
-    Some((distance, tip(t0 + (t1 - t0) * s)))
+    let (p, q) = ([p[0], p[1]], [q[0], q[1]]);
+    let (distance, s) = xy_closest(b, p, q);
+    let deepest = xy_deepest(b, p, q, distance);
+    Some((distance, tip(t0 + (t1 - t0) * s), deepest))
 }
 /// Straight `segments` (tip positions, start to end) whose tool or holder
 /// comes within `gap` of a box. Exact: for each segment the stretch where the
 /// part's height overlaps the box (grown by `gap`) is found, and the XY
 /// distance from that stretch to the box's footprint is compared with the
-/// radius plus `gap`. One hit per box and part, the first segment's.
+/// radius plus `gap`. One hit per box and part, the first segment's, with
+/// how far across the deepest of them comes in (`Hit::short`).
 pub fn hits_segments(
     segments: &[([f32; 3], [f32; 3])],
     radius: f32,
@@ -1080,16 +1147,24 @@ pub fn hits_parts(
         }
         for &(part, part_radius, low, high) in tool {
             let reach = f64::from(part_radius) + f64::from(gap);
-            let found = segments.iter().find_map(|&(from, to)| {
+            let (mut first, mut least) = (None, f64::INFINITY);
+            for &(from, to) in segments {
                 let (from, to) = (from.map(f64::from), to.map(f64::from));
-                let (distance, at) = closest(&bounds, from, to, low, high, gap)?;
-                (distance <= reach).then(|| at.map(|v| v as f32))
-            });
-            if let Some(at) = found {
+                let Some((distance, at, deepest)) = closest(&bounds, from, to, low, high, gap)
+                else {
+                    continue;
+                };
+                if distance <= reach {
+                    first.get_or_insert(at.map(|v| v as f32));
+                    least = least.min(deepest);
+                }
+            }
+            if let Some(at) = first {
                 out.push(Hit {
                     label: b.label.clone(),
                     part,
                     at,
+                    short: Some((reach - least) as f32),
                 });
             }
         }
@@ -1132,16 +1207,21 @@ fn lathe_hits(plan: &Plan, boxes: &[HoldBox], gap: f32) -> Vec<Hit> {
                     label: b.label.clone(),
                     part: "tool",
                     at: [0, 1, 2].map(|k| (from[k] + (to[k] - from[k]) * t0) as f32),
+                    short: None,
                 })
             })
         })
         .collect()
 }
-/// The parts of `plan`'s tool (`parts`), and under them the part that
-/// reaches below the point its moves take it to (`Plan::below`): a centre
-/// drill's pilot, as wide as its cone's flat.
+/// The parts of `plan`'s tool (`parts`), its body where that is wider than
+/// the cutter (`body`), and under them the part that reaches below the
+/// point its moves take it to (`Plan::below`): a centre drill's pilot, as
+/// wide as its cone's flat.
 pub fn plan_parts(plan: &Plan) -> Vec<Part> {
     let mut out = parts(plan.radius, plan.tool_length, plan.holder_radius).to_vec();
+    if let Some((radius, from)) = body(plan) {
+        out.push((BODY, radius, from, plan.tool_length));
+    }
     if plan.below > 0. {
         out.push(("tool", plan.shape.flat(), -plan.below, 0.));
     }
@@ -1150,17 +1230,17 @@ pub fn plan_parts(plan: &Plan) -> Vec<Part> {
 /// By how much the moves of `plan` keep clear of the box `b`: for each move
 /// and each part of the tool, the distance `hits_segments` finds (XY, from
 /// the stretch whose heights overlap the box grown by `gap`, to the box's
-/// footprint) less the part's radius and `gap`; the least of them. Positive
-/// exactly when there is no hit; infinite when no move reaches the box's
-/// heights.
+/// footprint, less how deep into it the axis goes: `xy_deepest`) less the
+/// part's radius and `gap`; the least of them. Positive exactly when there
+/// is no hit; infinite when no move reaches the box's heights.
 fn margin(plan: &Plan, b: &Bounds, gap: f32) -> f32 {
     let mut least = f64::INFINITY;
     for (_, radius, low, high) in plan_parts(plan) {
         let reach = f64::from(radius) + f64::from(gap);
         for m in &plan.moves {
             let (from, to) = (m.from.map(f64::from), m.to.map(f64::from));
-            if let Some((distance, _)) = closest(b, from, to, low, high, gap) {
-                least = least.min(distance - reach);
+            if let Some((_, _, deepest)) = closest(b, from, to, low, high, gap) {
+                least = least.min(deepest - reach);
             }
         }
     }
@@ -1175,11 +1255,19 @@ pub fn hits(plan: &Plan, boxes: &[HoldBox], gap: f32) -> Vec<Hit> {
     hits_parts(&moves, &plan_parts(plan), boxes, gap)
 }
 /// A hit as a problem line: the operation, the part of the tool, the box and
-/// where, in work coordinates (`datum` is the work zero in the setup's frame).
+/// where, in work coordinates (`datum` is the work zero in the setup's
+/// frame), and how much more room across it needs (`Hit::short`, to 0.1
+/// mm, at least 0.1).
 pub fn message(operation: &str, hit: &Hit, gap: f32, datum: [f32; 3]) -> String {
     let at = |k: usize| tenth(hit.at[k] - datum[k]);
+    let room = hit.short.map_or(String::new(), |short| {
+        format!(
+            " It needs {} mm more room across to keep the gap.",
+            tenth(short.max(0.1))
+        )
+    });
     format!(
-        "{operation}: the {} hits the {} at X{} Y{} Z{} (within the {} mm gap).",
+        "{operation}: the {} hits the {} at X{} Y{} Z{} (within the {} mm gap).{room}",
         hit.part,
         hit.label,
         at(0),
@@ -4951,11 +5039,130 @@ mod tests {
         fine.p.insert("grip".into(), "3.29".into());
         assert_eq!(vise_for(stock(), &fine, &[]), (true, 3.29));
     }
+    /// LIO-563: the spindle adapter plate's setup 4, its stock top at Z0.
+    /// A Ø50 boring head whose bar reaches 30 mm below its body, stickout
+    /// 90, bores the Ø16.5 counterbores at X±50.35 Y49.9 down to Z-7, by
+    /// two toe clamps on +Y at X±18. The body's underside is at Z23, under
+    /// the clamps' tops at Z25, and the body comes 2.6 mm over each
+    /// clamp's footprint: with the 2 mm gap it needs 4.6 mm more room.
+    #[test]
+    fn a_boring_heads_body_is_checked_against_the_clamps() {
+        let stock = Bounds {
+            min: [-69., -63.5, -20.],
+            max: [69., 63.5, 0.],
+        };
+        let placed = |at: f32| {
+            let layout = clamp_layout(&[(Side::PlusY, -at), (Side::PlusY, at)]);
+            boxes(&layout, &clamp(), stock).unwrap()
+        };
+        let clamps = placed(18.);
+        assert_eq!(clamps.len(), 2);
+        // The clamps as the reviewer measured them.
+        let near = |a: [f32; 3], b: [f32; 3]| (0..3).all(|k| (a[k] - b[k]).abs() < 0.01);
+        assert!(
+            near(clamps[0].bounds.min, [-28., 51.5, 0.])
+                && near(clamps[0].bounds.max, [-8., 111.5, 25.]),
+            "{:?}",
+            clamps[0].bounds
+        );
+        let bore = |x: f32| {
+            vec![
+                ([x, 49.9, 30.], [x, 49.9, -7.]),
+                ([x, 49.9, -7.], [x, 49.9, 30.]),
+            ]
+        };
+        let moves: Vec<_> = bore(-50.35).into_iter().chain(bore(50.35)).collect();
+        let mut head = plan(8.25, &moves);
+        head.flute_length = 30.;
+        head.tool_length = 90.;
+        head.holder_radius = 16.;
+        head.neck = Some([8.25, 30., 25.]);
+        assert_eq!(body(&head), Some((25., 30.)));
+        let found = hits(&head, &clamps, 2.);
+        assert_eq!(
+            found
+                .iter()
+                .map(|h| (h.label.as_str(), h.part))
+                .collect::<Vec<_>>(),
+            [
+                ("clamp on +Y (offset -18)", BODY),
+                ("clamp on +Y (offset 18)", BODY)
+            ],
+            "{found:?}"
+        );
+        for h in &found {
+            let short = h.short.unwrap();
+            assert!((short - 4.593).abs() < 0.01, "{h:?}");
+            // First within the gap on the way down, the underside 2 mm over
+            // the clamp's top.
+            assert!((h.at[2] - -3.).abs() < 0.01, "{h:?}");
+        }
+        assert_eq!(
+            message("Bore counterbore ends 16.5 to Z-7", &found[0], 2., [0.; 3]),
+            "Bore counterbore ends 16.5 to Z-7: the tool body hits the clamp on +Y (offset -18) at X-50.3 Y49.9 Z-3.0 (within the 2 mm gap). It needs 4.6 mm more room across to keep the gap."
+        );
+        for b in &clamps {
+            assert!(margin(&head, &b.bounds, 2.) < 0.);
+        }
+        // Before LIO-563 the tool was the bore's radius up to the stickout:
+        // clear of both clamps.
+        let mut unbodied = head.clone();
+        unbodied.neck = None;
+        assert!(hits(&unbodied, &clamps, 2.).is_empty());
+        // The clamps moved in to X±12 are clear of the body.
+        let moved = placed(12.);
+        assert!(hits(&head, &moved, 2.).is_empty());
+        for b in &moved {
+            assert!(margin(&head, &b.bounds, 2.) > 0.);
+        }
+        // So is a bar long enough for the body to stay above the clamps and
+        // the gap: reaching 34.1 mm, not 33.9.
+        for (reach, clear) in [(34.1, true), (33.9, false)] {
+            let mut long = head.clone();
+            long.neck = Some([8.25, reach, 25.]);
+            assert_eq!(hits(&long, &clamps, 2.).is_empty(), clear, "{reach}");
+        }
+        // A clamp right over a counterbore, its 20 mm nose centred on
+        // X50.35 and its end at Y43.5: the head's axis is 6.4 mm inside the
+        // clamp's footprint, so the body needs its 25 mm, the 2 mm gap and
+        // those 6.4 mm more room across, not 27.
+        let over = [HoldBox {
+            shape: Default::default(),
+            label: "clamp over the hole".into(),
+            bounds: Bounds {
+                min: [40.35, 43.5, 0.],
+                max: [60.35, 103.5, 25.],
+            },
+        }];
+        let found = hits(&head, &over, 2.);
+        let body_hit = found.iter().find(|h| h.part == BODY).unwrap();
+        assert!((body_hit.short.unwrap() - 33.4).abs() < 0.01, "{found:?}");
+        // Straight across its middle the deepest the axis goes is the nose's
+        // half width, 10 mm in.
+        let across = plan(3., &[([0., 73.5, 10.], [100., 73.5, 10.])]);
+        let through = hits(&across, &over, 2.);
+        assert!(
+            (through[0].short.unwrap() - 15.).abs() < 0.01,
+            "{through:?}"
+        );
+        // The margin is as deep: the same figure, negative.
+        assert!((margin(&across, &over[0].bounds, 2.) - -15.).abs() < 0.01);
+        // A body no wider than the cutter adds no part.
+        let mut narrow = head.clone();
+        narrow.neck = Some([6., 30., 8.]);
+        assert_eq!(body(&narrow), None);
+        assert_eq!(plan_parts(&narrow).len(), plan_parts(&unbodied).len());
+    }
     #[test]
     fn a_positive_margin_is_exactly_no_hit() {
         let mut short = plan(3., &[([-60., 20., 60.], [-30., 20., 60.])]);
         short.tool_length = 3.;
+        // A Ø30 body over a neck reaching 10 mm: the cutter passes clear
+        // of the clamp's side, the body not (`body`).
+        let mut bodied = plan(3., &[([-60., 17., 41.], [-30., 17., 41.])]);
+        bodied.neck = Some([3., 10., 15.]);
         let plans = [
+            bodied,
             plan(3., &[([-60., 0., 41.], [-30., 0., 41.])]),
             plan(3., &[([-60., 17., 41.], [-30., 17., 41.])]),
             plan(3., &[([-60., 0., 100.], [-30., 0., 100.])]),
@@ -5046,20 +5253,38 @@ mod tests {
     }
     #[test]
     fn a_hit_reads_as_an_export_problem_in_work_coordinates() {
-        let hit = Hit {
+        let mut hit = Hit {
             label: "vise jaw on +Y".into(),
             part: "tool",
             at: [12.04, 51., 13.],
+            short: None,
         };
         assert_eq!(
             message("Contour", &hit, 2., [0., 10., 10.]),
             "Contour: the tool hits the vise jaw on +Y at X12.0 Y41.0 Z3.0 (within the 2 mm gap)."
         );
+        // How much more room it needs, to the tenth; never none.
+        for (short, said) in [
+            (4.592, "4.6"),
+            (4.6, "4.6"),
+            (7.01, "7.0"),
+            (0., "0.1"),
+            (0.04, "0.1"),
+        ] {
+            hit.short = Some(short);
+            assert_eq!(
+                message("Contour", &hit, 2., [0., 10., 10.]),
+                format!(
+                    "Contour: the tool hits the vise jaw on +Y at X12.0 Y41.0 Z3.0 (within the 2 mm gap). It needs {said} mm more room across to keep the gap."
+                )
+            );
+        }
         // The holder, a gap with decimals, and a hair below zero written as 0.0.
         let hit = Hit {
             label: "clamp on -X (offset 0)".into(),
             part: "holder",
             at: [-5., 0.04, 20.],
+            short: None,
         };
         assert_eq!(
             message("Pocket 2", &hit, 1.5, [-5., 0.06, 20.]),

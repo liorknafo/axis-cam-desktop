@@ -126,6 +126,10 @@ pub struct InSpindle {
     pub holder_radius: f32,
     pub holder_length: f32,
     pub nose_radius: f32,
+    /// The tool's body over its neck where it is wider than the cutter, as
+    /// (radius, its height above the tip), up to the stick-out: a boring
+    /// head's (`holding::body`). None for most tools.
+    pub body: Option<(f32, f32)>,
 }
 impl InSpindle {
     /// How far the spindle nose is over the tip.
@@ -146,7 +150,7 @@ impl ToolParts for (f32, f32, f32) {
 impl ToolParts for InSpindle {
     fn parts(&self) -> Vec<Part> {
         let g = self.gauge();
-        vec![
+        let mut parts = vec![
             ("tool", self.radius, 0., self.stickout),
             ("holder", self.holder_radius, self.stickout, g),
             (
@@ -155,7 +159,11 @@ impl ToolParts for InSpindle {
                 g,
                 f32::INFINITY,
             ),
-        ]
+        ];
+        if let Some((radius, from)) = self.body {
+            parts.push((crate::holding::BODY, radius, from, self.stickout));
+        }
+        parts
     }
 }
 /// Whether the setup holds its stock in the chuck on A: a Chuck on a
@@ -821,6 +829,7 @@ mod tests {
             holder_radius: 10.,
             holder_length: 10.,
             nose_radius: 32.5,
+            body: None,
         };
         let gap = 2.;
         let r = rig_of(&setup(&[("chuck_tailstock", "Retracted")]));

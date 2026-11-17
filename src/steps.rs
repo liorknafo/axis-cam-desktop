@@ -6212,6 +6212,11 @@ pub(crate) mod tests {
     /// drilled Ø12, then bored with the head 1 mm a pass on the radius;
     /// the Steps page open on it.
     fn bored_app() -> App {
+        let (doc, mesh) = bored_job(|_| {});
+        on_page(doc, mesh)
+    }
+    /// `bored_app`'s job, the head edited by `edit`.
+    fn bored_job(edit: impl FnOnce(&mut Tool)) -> (Document, Mesh) {
         use crate::cam::boring::tests::{drill, drilling, head, job, ring};
         let mesh = ring(32., 60., 28.);
         let manual = crate::manual::defaults();
@@ -6219,7 +6224,8 @@ pub(crate) mod tests {
             t.p.insert("machines".into(), manual.id.clone());
             t
         };
-        let (d, h) = (on(drill("12")), on(head(crate::model::BORE_RETRACTS[0])));
+        let (d, mut h) = (on(drill("12")), on(head(crate::model::BORE_RETRACTS[0])));
+        edit(&mut h);
         let mut hole = drilling(&mesh, &d, "Drilling");
         hole.p.insert("breakthrough".into(), "4.5".into());
         let mut bore = drilling(&mesh, &h, crate::model::BORING);
@@ -6231,7 +6237,7 @@ pub(crate) mod tests {
             op.p.insert("feed".into(), "60".into());
         }
         let (doc, _) = job(&mesh, manual, vec![(d, hole), (h, bore)]);
-        on_page(doc, mesh)
+        (doc, mesh)
     }
     /// `doc` and its part `mesh` on the Steps page, its guide built.
     fn on_page(mut doc: Document, mesh: Mesh) -> App {
@@ -6777,6 +6783,58 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+    /// LIO-563: `bored_app`'s Ø50 head, its bar reaching 40 mm below the
+    /// body, bores the Ø32 hole by a toe clamp on +Y whose nose reaches 12
+    /// mm onto the 64 mm stock, to Y20. The body comes down to 12 mm over
+    /// the stock's top, over the clamp: the Steps refuse the setup, naming
+    /// the operation, the clamp and the room it needs, and open the bore.
+    /// With a bar reaching 60 mm the body stays over the clamp and its gap,
+    /// and the pages are back, though the plan travels from the stock's
+    /// corner at Z15, through the clamp on -Y: the pages lift the head
+    /// clear before X and Y move.
+    #[test]
+    fn the_steps_refuse_a_boring_head_whose_body_hits_a_clamp() {
+        let clamped = |reach: &str| {
+            let (mut doc, mesh) = bored_job(|h| {
+                h.p.insert("length".into(), reach.into());
+                h.p.insert("stickout".into(), "120".into());
+            });
+            doc.workholding = crate::holding::starters();
+            let manual = doc.setups[0].machine.id.clone();
+            let clamp = (doc.workholding.iter_mut())
+                .find(|h| h.kind() == "Clamp")
+                .unwrap();
+            clamp.p.insert("machines".into(), manual);
+            let clamp = clamp.id.clone();
+            let p = &mut doc.setups[0].p;
+            p.insert("holding".into(), "Clamps".into());
+            p.insert("holder".into(), clamp);
+            p.insert("clamps".into(), "+Y:0;-Y:20".into());
+            (doc, mesh)
+        };
+        let (doc, mesh) = clamped("40");
+        let bore = doc.setups[0].operations[1].name().to_string();
+        let why = crate::guide::build(&doc, &mesh, 0).unwrap_err();
+        assert!(
+            why.starts_with(&format!(
+                "{bore}: the tool body hits the clamp on +Y (offset 0) at X0.0 Y0.0 Z"
+            )) && why.ends_with(
+                "(within the 2 mm gap). It needs 7.0 mm more room across to keep the gap. Hold the part so that the clamp on +Y (offset 0) stands clear of the boring head, or bore with a bar that reaches farther below its body."
+            ),
+            "{why}"
+        );
+        // The page says it, with the button that opens the bore.
+        let a = on_page(doc, mesh);
+        let t = texts(&a);
+        assert!(t.contains(&why), "{t:?}");
+        assert!(
+            t.iter().any(|s| *s == format!("Open {bore} in planning ▶")),
+            "{t:?}"
+        );
+        let (doc, mesh) = clamped("60");
+        let g = crate::guide::build(&doc, &mesh, 0).unwrap();
+        assert!(g.steps.iter().any(|s| matches!(s, Step::Bore { .. })));
     }
     #[test]
     fn a_bore_pass_shows_what_to_measure_the_head_setting_and_the_hole() {
