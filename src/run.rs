@@ -1511,18 +1511,47 @@ impl Run {
     /// down to the next step, all rapids in the air), so that its planner,
     /// which the stop slows down from, is there; the tool, behind it by the
     /// motion buffer, comes up to it and stops.
+    /// Paused at a program's pause (M0) that comes after a step's end, as a
+    /// Boring's to set the head for the next pass does after the pass's
+    /// last visit, it stops there too, the step done, the pause not yet
+    /// answered (LIO-558).
     pub fn stop_due(&mut self, s: &uc100::controller::Snapshot) -> bool {
-        if !self.stop_after || self.stopping.is_some() || s.state != Some(State::Run) {
+        let paused = matches!(s.state, Some(State::Paused(_)));
+        if !self.stop_after || self.stopping.is_some() || !(paused || s.state == Some(State::Run)) {
             return false;
         }
         let Some((_, _, block)) = self.progress(s.current_line) else {
             return false;
+        };
+        let block = match paused {
+            true => match self.pause_after(block) {
+                Some(b) => b,
+                None => return false,
+            },
+            false => block,
         };
         let Some(step) = self.step_end(block) else {
             return false;
         };
         self.stopping = Some(step);
         true
+    }
+
+    /// The pause (M0) block the machine is paused at, its driver's line on
+    /// block `block`: the line stays the last move's, the rise before the
+    /// pause, so the pause is the first after it, with no feed move between.
+    fn pause_after(&self, block: usize) -> Option<usize> {
+        let blocks = self.running_blocks()?;
+        for (b, at) in blocks.iter().enumerate().skip(block) {
+            match at {
+                Block::Pause { .. } => return Some(b),
+                Block::Move {
+                    kind: Kind::Feed, ..
+                } => return None,
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Stop after step on the Pi (`uc100_remote`): the running tool run's
