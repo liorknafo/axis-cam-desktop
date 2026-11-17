@@ -6035,6 +6035,19 @@ flood = { pin = 8 }
         let mut a = ops_app(dir.path());
         zeroed(&mut a);
         check_run(&mut a, 0);
+        // The app ticks all along: by the time a hand reaches the pad, the
+        // edit pause has ended and its tick has started the save. Until
+        // that save left the window's thread (LIO-559), that tick took up
+        // to half a second on a busy computer: taken right after the press,
+        // it let the driver's 400 ms keepalive end the jog before any tick
+        // saw it (LIO-564).
+        a.last_edit -= crate::EDIT_PAUSE * 2;
+        let _ = a.update(Message::Tick);
+        assert!(!a.dirty, "the pause's tick started the save: {}", a.status);
+        // At 5 % (50 mm/s), Y takes 2.8 s from 140 to its 280 mm soft
+        // limit: at the usual 50 % it took 0.28 s, which a busy computer
+        // could sleep through between two ticks.
+        let _ = a.update(Message::Machine(crate::control::Action::JogSpeed(5.)));
         let still = jog_pad(&a);
         for axis in 0..3 {
             for negative in [false, true] {
@@ -6046,6 +6059,8 @@ flood = { pin = 8 }
         }
         let _ = a.update(Message::Machine(crate::control::Action::JogPress(1, false)));
         tick_until(&mut a, 3.0, "jogging", |s| s.state == Some(State::Jog));
+        // Drawn from the snapshot that says Jog, as the app draws the
+        // page between two ticks of the jog.
         let moving = jog_pad(&a);
         let _ = a.update(Message::Machine(crate::control::Action::JogRelease));
         assert_eq!(still, moving);
