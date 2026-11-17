@@ -6827,7 +6827,7 @@ pub(crate) mod tests {
         // The page says it, with the button that opens the bore.
         let a = on_page(doc, mesh);
         let t = texts(&a);
-        assert!(t.iter().any(|s| *s == why), "{t:?}");
+        assert!(t.contains(&why), "{t:?}");
         assert!(
             t.iter().any(|s| *s == format!("Open {bore} in planning ▶")),
             "{t:?}"

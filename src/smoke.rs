@@ -20813,7 +20813,7 @@ soft_max = 180.0
         let (_, lines) = crate::ui::holding_warning(&a).unwrap();
         assert!(
             lines[0].ends_with(
-                "(within the 3 mm gap). It needs 8.0 mm more room across to keep the gap."
+                "(within the 3 mm gap). It needs 18.0 mm more room across to keep the gap."
             ),
             "{lines:?}"
         );

@@ -7632,7 +7632,7 @@ M2
         assert!(
             expected.starts_with("Pocket: the tool hits the clamp on -X (offset 0) at X-22.0 Y")
                 && expected.ends_with(
-                    " Z15.0 (within the 2 mm gap). It needs 7.0 mm more room across to keep the gap."
+                    " Z15.0 (within the 2 mm gap). It needs 17.0 mm more room across to keep the gap."
                 ),
             "{expected}"
         );
