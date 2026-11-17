@@ -3822,6 +3822,18 @@ pub struct TabletRun {
     /// starts there (`Checked::starts`). A file from before them has none.
     #[serde(default)]
     pub starts: Vec<TabletOpStart>,
+    /// The job line its way out starts on: the spindle and coolant off,
+    /// the retract, the end (`way_out_line`). A tablet job that skips its
+    /// last steps ends with the lines from there (LIO-567).
+    #[serde(default)]
+    pub way_out: Option<u32>,
+    /// Its starts at each step of its operations after the step's first
+    /// (LIO-567), in order: as a start at a step on the Run panel, the
+    /// steps before it taken as cut, each checked so (`check_steps`). The
+    /// tablet starts at a step with one, and joins them to skip steps. A
+    /// file from before them has none.
+    #[serde(default)]
+    pub step_starts: Vec<TabletStepStart>,
 }
 
 /// A tool run started at one of its operations after the first, as Cycle
@@ -3837,6 +3849,51 @@ pub struct TabletOpStart {
     pub lift: Lift,
     pub actions: Vec<TabletLine>,
     pub steps: Vec<TabletStep>,
+    /// The job line of its way down onto its first point (LIO-567): the
+    /// lines before it take the tool across in the air from wherever it
+    /// stands, which is where the tablet's Stop after step stops a job
+    /// that goes on here after a skipped step.
+    #[serde(default)]
+    pub entry: Option<u32>,
+    /// As `TabletRun::way_out`.
+    #[serde(default)]
+    pub way_out: Option<u32>,
+}
+
+/// A tool run started at a step of one of its operations after the step's
+/// first (LIO-567), as Cycle Start sends it from a start at a step: the
+/// setup checked with that operation's steps before it taken as cut
+/// (`check_steps`), its own job (its lines numbered from 1), its steps from
+/// there on, and the lift; or why it cannot start there.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabletStepStart {
+    /// The operation it starts at (its index in the setup) and the step.
+    pub operation: usize,
+    pub step: usize,
+    /// Why it cannot start there, as the Run panel says; its job is empty then.
+    pub problems: Vec<String>,
+    pub lift: Lift,
+    /// Without the wait over the step's entry (`wait`). With `rest`, only
+    /// its lines before the rest.
+    pub actions: Vec<TabletLine>,
+    /// Its job goes on as its tool run's own does (`TabletRun::actions`)
+    /// from line `rest[0]` on, each of those lines its line `rest[0]` is
+    /// `rest[1]` here, after `actions`: the same blocks from the step on,
+    /// carried once, not once per step (`share`). None: `actions` is all.
+    #[serde(default)]
+    pub rest: Option<[u32; 2]>,
+    pub steps: Vec<TabletStep>,
+    /// As `TabletOpStart::entry`.
+    pub entry: Option<u32>,
+    /// Started here by the operator, the job waits over the step's entry
+    /// with the spindle on until Resume feeds in, as `Run::job_actions`
+    /// makes it: a pause with this reason after the last action on or
+    /// before line `entry`. Not when the tablet's job goes on here after a
+    /// skipped step.
+    pub wait: String,
+    /// As `TabletRun::way_out`.
+    pub way_out: Option<u32>,
 }
 
 /// Where a tool run on a setup in the chuck starts from: the tool at the
@@ -4001,15 +4058,19 @@ pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> Tabl
                     Ok((a, s, l)) => (a, s, l, vec![]),
                     Err(why) => (vec![], vec![], lift, why),
                 };
+                let blocks = p.from(k).ok().filter(|_| problems.is_empty());
                 TabletOpStart {
                     operation: p.indexes[k],
                     problems,
                     lift: at_lift,
                     actions,
                     steps,
+                    entry: blocks.and_then(entry_line),
+                    way_out: blocks.and_then(way_out_line),
                 }
             })
             .collect();
+        let step_starts = tablet_step_starts(doc, mesh, si, &run, p, lift, &actions);
         let o = &p.ops[0];
         out.tool_runs.push(TabletRun {
             name: format!("{} · tool run {} of {count}", run.name, i + 1),
@@ -4030,10 +4091,170 @@ pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> Tabl
             actions,
             steps,
             starts,
+            way_out: way_out_line(&p.blocks),
+            step_starts,
         });
     }
     out
 }
+
+/// The job line of the first way down onto a point of `blocks` (its first
+/// `Block::Descend`): the lines before it take the tool across in the air.
+fn entry_line(blocks: &[Block]) -> Option<u32> {
+    (blocks.iter())
+        .position(|b| matches!(b, Block::Descend { .. }))
+        .map(|i| i as u32 + 1)
+}
+
+/// The job line a program's way out starts on: its last `Block::Stop`, the
+/// spindle and coolant off, after which it only retracts, turns A back to
+/// 0 and ends (`post::blocks`).
+fn way_out_line(blocks: &[Block]) -> Option<u32> {
+    (blocks.iter())
+        .rposition(|b| matches!(b, Block::Stop))
+        .map(|i| i as u32 + 1)
+}
+
+/// The tablet's starts of tool run `p` of setup `si` at each step of its
+/// operations after the step's first (LIO-567), as the Run panel's start at
+/// a step: the setup checked again with the operation's steps before it
+/// taken as cut (`check_steps`), the program from that operation lowered
+/// as `tablet_job_from` lowers it, its steps from the start on, and where
+/// it waits (`Run::job_actions`); or why it cannot start there. `base` is
+/// the run of the setup's own check, whose steps they are; `lift` the tool
+/// run's, said with a refused start; `own` its actions, which each start
+/// shares the rest of its job with (`share`).
+fn tablet_step_starts(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    base: &Run,
+    p: &Checked,
+    lift: Lift,
+    own: &[TabletLine],
+) -> Vec<TabletStepStart> {
+    let mut out = vec![];
+    for &oi in &p.indexes {
+        let Some(os) = base.op_steps(oi) else {
+            continue;
+        };
+        for n in 1..os.steps.len() {
+            let mut start = TabletStepStart {
+                operation: oi,
+                step: n,
+                problems: vec![],
+                lift,
+                actions: vec![],
+                rest: None,
+                steps: vec![],
+                entry: None,
+                wait: format!(
+                    "Over the entry of {}: Resume feeds in.",
+                    base.step_label(oi, n)
+                ),
+                way_out: None,
+            };
+            match tablet_step_job(doc, mesh, si, p.chuck.is_some(), oi, n) {
+                Ok((mut actions, steps, lift, entry, way_out)) => {
+                    start.rest = share(&mut actions, own);
+                    (start.actions, start.steps, start.lift) = (actions, steps, lift);
+                    (start.entry, start.way_out) = (entry, way_out);
+                }
+                Err(why) => start.problems = why,
+            }
+            out.push(start);
+        }
+    }
+    out
+}
+
+/// The lines a start's `actions` ends with that its tool run's `own` end
+/// with too, but for a line number shifted by the same for each: cut off
+/// `actions`, and said as `TabletStepStart::rest`. Whole lines only, at
+/// least one; and only when the tool run's lines from there, renumbered,
+/// are exactly the lines cut off (`rest_of`). None: nothing cut.
+fn share(actions: &mut Vec<TabletLine>, own: &[TabletLine]) -> Option<[u32; 2]> {
+    let (mut i, mut j) = (actions.len(), own.len());
+    let mut shift = None;
+    while i > 0 && j > 0 {
+        let (a, b) = (&actions[i - 1], &own[j - 1]);
+        let d = a.line as i64 - b.line as i64;
+        if a.action != b.action || shift.is_some_and(|s| s != d) {
+            break;
+        }
+        (shift, i, j) = (Some(d), i - 1, j - 1);
+    }
+    // From a line's first action in both.
+    let split = |v: &[TabletLine], k: usize| k > 0 && k < v.len() && v[k - 1].line == v[k].line;
+    while i < actions.len() && (split(actions, i) || split(own, j)) {
+        (i, j) = (i + 1, j + 1);
+    }
+    if i >= actions.len() || j >= own.len() || (i > 0 && actions[i - 1].line >= actions[i].line) {
+        return None;
+    }
+    let rest = [own[j].line, actions[i].line];
+    (rest_of(own, rest) == actions[i..]).then(|| {
+        actions.truncate(i);
+        rest
+    })
+}
+
+/// The lines a `TabletStepStart::rest` stands for: its tool run's `own`
+/// from line `rest[0]` on, line `rest[0]` numbered `rest[1]`.
+fn rest_of(own: &[TabletLine], rest: [u32; 2]) -> Vec<TabletLine> {
+    (own.iter())
+        .filter(|l| l.line >= rest[0])
+        .map(|l| TabletLine {
+            line: l.line - rest[0] + rest[1],
+            action: l.action.clone(),
+        })
+        .collect()
+}
+
+/// The job of a start at step `n` of operation `oi` of setup `si` for the
+/// tablet (`tablet_step_starts`): its actions, its steps from there on, its
+/// lift, entry and way out; or why it cannot start there. Not in the chuck
+/// (`chuck`), whose way in is checked only over a tool run's first point.
+#[allow(clippy::type_complexity)]
+fn tablet_step_job(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    chuck: bool,
+    oi: usize,
+    n: usize,
+) -> Result<(Vec<TabletLine>, Vec<TabletStep>, Lift, Option<u32>, Option<u32>), Vec<String>> {
+    if chuck {
+        return Err(vec![CHUCK_STARTS.into()]);
+    }
+    let (programs, left) = check_steps(doc, mesh, si, &[], &[(oi, (0..n).collect())]);
+    let mut run = Run::new(doc, si, 0);
+    // The steps before it taken as cut by the start, as `start_at_step`
+    // makes it: the running program's marks count the steps sent after them.
+    run.start_step = Some((oi, n));
+    run.checked_as(Arc::new(Ok(programs?)), Some(Arc::new(left)), None);
+    if run.start_step != Some((oi, n)) {
+        return Err(vec![format!(
+            "The check did not find {} of this operation again, so the tablet cannot start there. Check the setup again on the computer.",
+            run.step_label(oi, n)
+        )]);
+    }
+    let all = run.programs.clone().expect("checked");
+    let programs = all.as_ref().as_ref().map_err(Clone::clone)?;
+    let Some((i, p, k)) = (programs.iter().enumerate())
+        .find_map(|(i, p)| Some((i, p, p.indexes.iter().position(|&o| o == oi)?)))
+    else {
+        return Err(vec![
+            "The check sends this operation in no tool run, so the tablet cannot start at its steps. Check the setup again on the computer.".into(),
+        ]);
+    };
+    let (actions, mut steps, lift) = tablet_job_from(&mut run, p, i, k)?;
+    // Those before it are the start's, cut already.
+    steps.retain(|t| t.operation != oi || t.step >= n);
+    let blocks = p.from(k)?;
+    Ok((actions, steps, lift, entry_line(blocks), way_out_line(blocks)))
+}
+
 
 /// Why a tablet's tool run on a setup in the chuck does not start at a later
 /// operation.
@@ -5324,6 +5545,137 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    /// The tablet file's starts at steps (LIO-567): one at each step of each
+    /// operation after its first, each the Run panel's start at that step.
+    /// Made into machine coordinates with the wait over the step's entry put
+    /// after the last action on or before its `entry`, as the tablet puts
+    /// it, it is the job Cycle Start sends at that step (`job_actions`),
+    /// from the setup checked with the steps before it taken as cut
+    /// (`check_steps`). Its steps start at that one, numbered as the tool
+    /// run's, and each ends where Stop after step stops; its lines before
+    /// `entry` take the tool across in the air, and from `way_out` on it only
+    /// stops the spindle, retracts and ends, as do the tool run's and each
+    /// start at an operation.
+    #[test]
+    fn a_tablet_start_at_each_step_sends_what_a_start_at_a_step_sends() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (doc, mesh) = tablet_fixture(&profile);
+        let s = tablet_runs(&doc, Ok(&mesh), 0);
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
+        let offset = [120., 90., -35., 0., 0., 0.];
+        // Only stops the spindle (and coolant), lifts and ends from there.
+        let out = |actions: &[TabletLine], from: Option<u32>| {
+            let from = from.expect("a way out");
+            let kinds: Vec<&str> = (actions.iter().filter(|l| l.line >= from))
+                .map(|l| match &l.action {
+                    TabletAction::Spindle { state: Spindle::Off, .. } => "off",
+                    TabletAction::Coolant { flood: false, mist: false } => "off",
+                    TabletAction::Move { lift: true, .. } => "lift",
+                    TabletAction::End => "end",
+                    a => panic!("{a:?} in the way out"),
+                })
+                .filter(|k| *k != "off")
+                .collect();
+            assert_eq!(kinds, ["lift", "end"]);
+        };
+        let mut count = 0;
+        for r in &s.tool_runs {
+            out(&r.actions, r.way_out);
+            for st in &r.starts {
+                out(&st.actions, st.way_out);
+                assert!(st.entry.is_some_and(|e| e > 1), "{:?}", st.entry);
+            }
+            for o in &r.operations {
+                let steps = r.steps.iter().filter(|t| t.operation == o.index).count();
+                let mine: Vec<usize> = (r.step_starts.iter())
+                    .filter(|t| t.operation == o.index)
+                    .map(|t| t.step)
+                    .collect();
+                assert_eq!(mine, (1..steps.max(1)).collect::<Vec<_>>(), "{} {}", r.name, o.name);
+            }
+            for st in &r.step_starts {
+                let (oi, n) = (st.operation, st.step);
+                // The Run panel's start at that step; one its check refuses
+                // is refused on the tablet, saying the same.
+                let mut run = Run::new(&doc, 0, 0);
+                run.start_step = Some((oi, n));
+                let (programs, left) = check_steps(&doc, &mesh, 0, &[], &[(oi, (0..n).collect())]);
+                if let Err(why) = &programs {
+                    assert_eq!(&st.problems, why, "{} {oi} {n}", r.name);
+                    assert!(st.actions.is_empty() && st.entry.is_none());
+                    continue;
+                }
+                assert!(st.problems.is_empty(), "{} {oi} {n}: {:?}", r.name, st.problems);
+                count += 1;
+                run.checked_as(Arc::new(programs), Some(Arc::new(left)), None);
+                assert_eq!(run.start_step, Some((oi, n)));
+                let p = (run.checked().unwrap().iter())
+                    .find(|p| p.indexes.contains(&oi))
+                    .unwrap()
+                    .clone();
+                let k = p.indexes.iter().position(|&o| o == oi).unwrap();
+                let label = run.step_label(oi, n);
+                assert_eq!(st.wait, format!("Over the entry of {label}: Resume feeds in."));
+                let entry = st.entry.unwrap();
+                // Its lines, and the rest its tool run's own from there,
+                // carried once (`share`): all of it from its step's moves on.
+                let rest = st.rest.unwrap_or_else(|| panic!("{} at {label}: nothing shared", r.name));
+                let mut actions = st.actions.clone();
+                actions.extend(rest_of(&r.actions, rest));
+                assert!(st.actions.iter().all(|l| l.line < rest[1]));
+                let at = (actions.iter())
+                    .rposition(|l| l.line <= entry)
+                    .map_or(0, |i| i + 1);
+                let mut waits = actions.clone();
+                waits.insert(
+                    at,
+                    TabletLine {
+                        line: entry,
+                        action: TabletAction::Pause {
+                            reason: st.wait.clone(),
+                        },
+                    },
+                );
+                for start in [[-5., -7., -30., 0., 0., 0.], [3., 4., -1., 0., 0., 0.]] {
+                    assert_eq!(
+                        tablet_job_of(&waits, st.lift, offset, start),
+                        run.job_actions(&p, k, offset, start, Some((oi, n))).unwrap(),
+                        "{} at {label}",
+                        r.name
+                    );
+                }
+                // Across in the air before the entry: no feed.
+                assert!(actions.iter().filter(|l| l.line < entry).all(|l| !matches!(
+                    l.action,
+                    TabletAction::Move { feed: Some(_), .. }
+                )));
+                out(&actions, st.way_out);
+                let first = st.steps.first().unwrap();
+                assert_eq!((first.operation, first.step), (oi, n));
+                // In order, the first's lines from its way in on, as a start
+                // at an operation's.
+                let mut last = 0;
+                for t in &st.steps {
+                    assert_eq!(t.label, run.op_steps(t.operation).unwrap().label(t.step));
+                    let [a, b] = t.lines.unwrap_or_else(|| panic!("{label} {}", t.label));
+                    assert!(a > last && b >= a, "{label} {} {:?}", t.label, t.lines);
+                    last = b;
+                    assert!(!t.end_lines.is_empty(), "{label} {}", t.label);
+                }
+                let want: Vec<(usize, usize)> = (r.steps.iter())
+                    .skip_while(|t| (t.operation, t.step) != (oi, n))
+                    .map(|t| (t.operation, t.step))
+                    .collect();
+                let got: Vec<(usize, usize)> = st.steps.iter().map(|t| (t.operation, t.step)).collect();
+                assert_eq!(got, want);
+            }
+        }
+        // At least holes 2 to 5 and a later level of the pocket start.
+        assert!(count >= 4 + 1, "{count}");
     }
 
     /// A tablet file from before the starts (LIO-476) still reads: its tool
