@@ -1083,6 +1083,8 @@ fn holding_fingerprint(doc: &Document, left: u64) -> Option<u64> {
     serde_json::to_writer(&mut out, &doc.selected_material()).ok()?;
     Some(hasher.finish())
 }
+/// A write of the workspace on a thread of its own (`App::start_persist`).
+type SaveJob = std::thread::JoinHandle<Result<(), String>>;
 /// Gives the calling thread the ordinary priority, below the driver's
 /// motion thread, which raises its own (real-time on macOS and Linux,
 /// time-critical on Windows), whatever the thread that
@@ -1565,6 +1567,10 @@ pub struct App {
     pub dirty: bool,
     /// Why the last automatic save of the workspace failed, until one succeeds.
     pub save_error: Option<String>,
+    /// The workspace being written on a thread of its own by the `Tick`
+    /// after an edit's pause (`start_persist`), until a later `Tick` takes
+    /// its result or a save in line waits for it (`finish_persist`).
+    workspace_save: Option<SaveJob>,
     pub last_edit: Instant,
     pub state_path: PathBuf,
     /// The machine controller, while connected.
@@ -2306,6 +2312,7 @@ impl App {
             last_tick: Instant::now(),
             dirty: migrated,
             save_error: None,
+            workspace_save: None,
             last_edit: Instant::now(),
             state_path,
             project_path,
@@ -3609,7 +3616,7 @@ impl App {
             (now.saturating_duration_since(first), self.sign_out_pending)
         });
         let action = close_action(
-            !self.dirty,
+            !self.unsaved(),
             pending,
             self.blocking_work(),
             self.finishing_work(),
@@ -3913,6 +3920,7 @@ impl App {
     /// still counts as unsettled (`dirty`) until that `Tick`, which starts
     /// the checks that follow it.
     pub(crate) fn persist_now(&mut self) -> bool {
+        self.finish_persist(true);
         if !self.dirty {
             return true;
         }
@@ -3921,16 +3929,83 @@ impl App {
         self.dirty = true;
         saved
     }
+    /// Saves the workspace in line if it has changed, once the write
+    /// `start_persist` started is over: never an older copy over a newer
+    /// one, and nothing left half done when the window closes.
     fn persist(&mut self) {
+        self.finish_persist(true);
         if !self.dirty {
             return;
         }
         self.record_picks();
-        match storage::save(&self.state_path, &self.doc) {
-            Ok(()) => {
+        let saved = storage::save(&self.state_path, &self.doc);
+        if saved.is_ok() {
+            self.dirty = false;
+        }
+        self.saved(saved);
+    }
+    /// The `Tick` after an edit's pause: writes the workspace, if it has
+    /// changed, on a thread of its own. The picks' places are kept on this
+    /// thread (the part keeps them, `Mesh::places`) and the copy written is
+    /// the job as it is now. A write still under way is waited for by the
+    /// new one's thread, never by the window: the newer job is written
+    /// last. Writing it here, a large pick's places (a curved face is many
+    /// surfaces) held the window most of a second on a busy computer, and a
+    /// held jog stopped (LIO-559).
+    fn start_persist(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        self.record_picks();
+        let (path, doc) = (self.state_path.clone(), self.doc.clone());
+        // The write before is handed over once this one's thread is there:
+        // should it not start, the write before is still the window's to
+        // wait for.
+        let (hand, before) = std::sync::mpsc::channel::<Option<SaveJob>>();
+        let spawned = std::thread::Builder::new()
+            .name("workspace save".into())
+            .spawn(move || {
+                // Not at the window's priority, which the driver's motion
+                // thread has too (#167).
+                below_the_driver();
+                if let Ok(Some(before)) = before.recv() {
+                    let _ = before.join();
+                }
+                storage::save(&path, &doc)
+            });
+        match spawned {
+            Ok(save) => {
+                let _ = hand.send(self.workspace_save.take());
+                self.workspace_save = Some(save);
                 self.dirty = false;
-                self.save_error = None;
             }
+            Err(_) => self.persist(),
+        }
+    }
+    /// Takes the result of the writes `start_persist` started, the last of
+    /// which waits for those before it: once it is over, or waiting for it
+    /// when `wait`. A failed write leaves the workspace to save again after
+    /// the next pause.
+    fn finish_persist(&mut self, wait: bool) {
+        let Some(save) = (self.workspace_save).take_if(|s| wait || s.is_finished()) else {
+            return;
+        };
+        let saved = (save.join()).unwrap_or_else(|_| Err("the save stopped".into()));
+        if saved.is_err() {
+            self.dirty = true;
+        }
+        self.saved(saved);
+    }
+    /// Whether the workspace has changes not yet on disk: not saved yet, or
+    /// being written.
+    pub fn unsaved(&self) -> bool {
+        self.dirty || self.workspace_save.is_some()
+    }
+    /// What a save of the workspace says: a failure on the status line,
+    /// once for each error, and the save again after the next pause.
+    fn saved(&mut self, saved: Result<(), String>) {
+        match saved {
+            Ok(()) => self.save_error = None,
             Err(e) => {
                 // The retry after each pause fails the same way; say it once.
                 if self.save_error.as_deref() != Some(e.as_str()) {
@@ -10008,9 +10083,10 @@ impl App {
                     } else {
                         Task::none()
                     };
+                self.finish_persist(false);
                 let paused = now.duration_since(self.last_edit) > EDIT_PAUSE;
-                if self.dirty && paused {
-                    self.persist()
+                if paused {
+                    self.start_persist();
                 }
                 // A close waiting for the sign-in is checked again, so that
                 // it happens when the wait is over.

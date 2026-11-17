@@ -16963,6 +16963,7 @@ soft_max = 180.0
         a.last_edit = std::time::Instant::now() - std::time::Duration::from_secs(1);
         let _ = a.update(Message::Tick);
         assert!(!a.dirty);
+        until_written(&mut a);
         // The next start has nothing to say, keeps the material's id and
         // does not write the workspace again.
         let b = App::from_workspace(path.clone(), None);
@@ -26403,6 +26404,91 @@ soft_max = 180.0
         a.dirty = true;
         assert_eq!(crate::ui::workspace_note(&a), "Saving…");
         let _ = a.view();
+    }
+    /// Ticks until the workspace being written by the `Tick` after an edit's
+    /// pause is written and its result taken.
+    fn until_written(a: &mut App) {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while a.workspace_save.is_some() {
+            assert!(std::time::Instant::now() < end, "the workspace save hangs");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let _ = a.update(Message::Tick);
+        }
+    }
+    /// The `Tick` after an edit's pause writes the workspace on a thread of
+    /// its own (LIO-559): written in that `Tick`, a large pick's places (a
+    /// curved face is many surfaces) held the window most of a second on a
+    /// busy computer, and a held jog stopped. Until it is written the header
+    /// says "Saving…"; a later `Tick` takes the result. Another pause while
+    /// it is written writes the newer job after it. A save in line meanwhile (closing, the shop tablet, the MCP
+    /// session) waits for it and then writes the newer job, never the older
+    /// over it. A write that fails is said and tried again after the next
+    /// pause, as one in line is.
+    #[test]
+    fn the_tick_after_an_edits_pause_writes_the_workspace_off_the_windows_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        let saved = |a: &App| crate::storage::load(&a.state_path).unwrap().title;
+        a.doc.title = "Edited".into();
+        a.dirty = true;
+        a.last_edit -= crate::EDIT_PAUSE * 2;
+        let _ = a.update(Message::Tick);
+        assert!(!a.dirty && a.workspace_save.is_some());
+        assert_eq!(crate::ui::workspace_note(&a), "Saving…");
+        until_written(&mut a);
+        assert_eq!(saved(&a), "Edited");
+        assert_eq!(crate::ui::workspace_note(&a), "Kept on this PC");
+        // An edit's pause while it is written: the newer job is written
+        // after it, the window waiting for neither.
+        a.doc.title = "First".into();
+        a.dirty = true;
+        a.last_edit -= crate::EDIT_PAUSE * 2;
+        let _ = a.update(Message::Tick);
+        a.doc.title = "Second".into();
+        a.dirty = true;
+        a.last_edit -= crate::EDIT_PAUSE * 2;
+        let _ = a.update(Message::Tick);
+        assert!(!a.dirty && a.workspace_save.is_some());
+        until_written(&mut a);
+        assert_eq!(saved(&a), "Second");
+        // A save in line while it is written: after it, with the newer job.
+        a.doc.title = "Older".into();
+        a.dirty = true;
+        a.last_edit -= crate::EDIT_PAUSE * 2;
+        let _ = a.update(Message::Tick);
+        assert!(a.workspace_save.is_some());
+        a.doc.title = "Newer".into();
+        a.dirty = true;
+        a.persist();
+        assert!(!a.dirty && a.workspace_save.is_none() && a.save_error.is_none());
+        assert_eq!(saved(&a), "Newer");
+        // A file where the directory should be: the write fails.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "a file").unwrap();
+        a.state_path = blocker.join("workspace.json");
+        a.doc.title = "Kept late".into();
+        a.dirty = true;
+        a.last_edit -= crate::EDIT_PAUSE * 2;
+        let _ = a.update(Message::Tick);
+        assert!(a.workspace_save.is_some());
+        until_written(&mut a);
+        let error = a.save_error.clone().expect("the failure is kept");
+        assert!(a.dirty);
+        assert_eq!(a.status, format!("Could not save the workspace: {error}"));
+        assert_eq!(
+            crate::ui::workspace_note(&a),
+            format!("Not kept on this PC: {error}")
+        );
+        // Not again at once: after the next pause, here in a working place.
+        let _ = a.update(Message::Tick);
+        assert!(a.workspace_save.is_none() && a.dirty);
+        std::fs::remove_file(&blocker).unwrap();
+        std::fs::create_dir(&blocker).unwrap();
+        a.last_edit -= crate::EDIT_PAUSE * 2;
+        let _ = a.update(Message::Tick);
+        until_written(&mut a);
+        assert!(!a.dirty && a.save_error.is_none());
+        assert_eq!(saved(&a), "Kept late");
     }
     /// Plays a whole sign-in: the browser result, then the save step's result.
     /// The save step writes the session before it reports, and unit tests do

@@ -1162,7 +1162,7 @@ fn leading_sentences(s: &str, limit: usize) -> &str {
 }
 /// The header's line on the automatic save of the workspace.
 pub fn workspace_note(app: &App) -> String {
-    match (&app.save_error, app.dirty) {
+    match (&app.save_error, app.unsaved()) {
         // The project, not a "workspace" (LIO-433).
         (Some(e), _) => format!("Not kept on this PC: {e}"),
         (None, true) => "Saving…".into(),

@@ -241,6 +241,7 @@ pub const NOT_WORK_STATE: &[(&str, &str)] = &[
     ("last_tick", WINDOW),
     ("dirty", FLAG),
     ("save_error", STATUS),
+    ("workspace_save", JOB),
     ("last_edit", FLAG),
     ("state_path", "where the workspace is kept"),
     ("control", CONTROLLER),
