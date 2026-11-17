@@ -3304,6 +3304,14 @@ impl Connection {
                 self.pi_note = link.notes.iter().rev().take(new).next().cloned();
                 self.notes_seen = link.note_seq;
             }
+            // Let in after a refusal: its reason, or a command not sent
+            // for it, is no longer so (LIO-561).
+            if let Some(why) = self.pi_refused()
+                && !matches!(link.state, uc100_remote::LinkState::Refused(_))
+                && (self.pi_note.as_deref()).is_some_and(|n| n == why || n == NOT_SENT_PI_REFUSED)
+            {
+                self.pi_note = None;
+            }
             self.pi_was_live |= link.live;
             self.link = Some(link);
             // The Pi's feed override, whatever this computer asked (none

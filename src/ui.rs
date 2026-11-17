@@ -9820,7 +9820,8 @@ pub(crate) fn run_line(
     let s = &c.snapshot;
     let state = s.state.as_ref();
     let plain = |t: &str| vec![(t.to_string(), INK)];
-    // Refused, nothing runs, and a state known from before is not the
+    // Refused, this computer can start nothing (a tool run the Pi took
+    // before goes on there), and a state known from before is not the
     // machine's now: not "E-stop: press Reset", with no Reset to press
     // (LIO-561). As the run's problems say it (LIO-519).
     if let Some(why) = c.pi_refused() {

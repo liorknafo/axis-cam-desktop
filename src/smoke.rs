@@ -3747,6 +3747,12 @@ flood = { pin = 8 }
             assert_eq!(pill(&a), PILL_REFUSED);
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+        // The Pi's note is the refusal while refused.
+        let note = conn(&a).pi_note.clone();
+        assert!(
+            note.as_deref() == Some(why.as_str()) || note.as_deref() == Some(NOT_SENT_PI_REFUSED),
+            "{note:?}"
+        );
         // Paired again: let in at the next try, within 5 s, the Pi's state
         // not known yet: connecting, the refusal gone.
         std::fs::rename(&kept, &clients).unwrap();
@@ -3760,6 +3766,12 @@ flood = { pin = 8 }
         }
         let _ = a.update(Message::Tick);
         assert!(conn(&a).snapshot.state.is_none() && conn(&a).pi_down());
+        // Nor is the refusal left as the Pi's note (LIO-561).
+        let note = conn(&a).pi_note.clone();
+        assert!(
+            note.as_deref() != Some(why.as_str()) && note.as_deref() != Some(NOT_SENT_PI_REFUSED),
+            "{note:?}"
+        );
         assert_eq!(a.status, format!("Connecting to {name}…"));
         assert_eq!(problems(&a), vec![crate::run::PI_CONNECTING.to_string()]);
         assert_eq!(pill(&a), "Connecting…");
