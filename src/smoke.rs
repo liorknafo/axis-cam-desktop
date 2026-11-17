@@ -6324,7 +6324,7 @@ flood = { pin = 8 }
         check_run_pictured(&mut a, dir.path(), 0);
         let notes: Vec<String> = (run_of(&a).steps.iter())
             .filter(|s| s.steps.len() > 1)
-            .map(|s| format!("{} {}", s.steps.len(), s.kind().1.to_lowercase()))
+            .map(|s| s.count())
             .collect();
         assert!(!notes.is_empty());
         // A text cut by its row is laid out narrower than it is alone.
@@ -6377,6 +6377,210 @@ flood = { pin = 8 }
                 && t.ends_with("and the stock is cut away where it goes.")),
             "{texts:?}"
         );
+    }
+
+    /// Two Ø32 bores 70 mm apart in `a`'s machine, on the Control page and
+    /// checked: drilled Ø12 (operation 0), then, given a cut, milled to
+    /// Ø31.4 (operation 1) and bored in 0.15 mm passes, 3 of them, else
+    /// bored straight from the drilling at the default cut, 35 passes (the
+    /// Boring is operation 1). Returns the Boring's index.
+    fn bored_twice(a: &mut App, dir: &std::path::Path, cut: Option<&str>) -> usize {
+        use crate::cam::boring::tests::{
+            drill, drilling, end_mill, head, job, on_uc100, ring_triangles,
+        };
+        use crate::model::{BORE_RETRACTS, BORING, HELICAL_MILLING, Machine};
+        let tris: Vec<[[f32; 3]; 3]> = (0..2)
+            .flat_map(|k| {
+                let x = 70. * k as f32;
+                (ring_triangles(32., 60., 28.).into_iter())
+                    .map(move |t| t.map(|p| [p[0] + x, p[1], p[2]]))
+            })
+            .collect();
+        let mesh = crate::mesh::normalize(tris).unwrap();
+        let t = drill("12");
+        let mut d = drilling(&mesh, &t, "Deep drilling");
+        d.p.insert("peck".into(), "12".into());
+        d.p.insert("breakthrough".into(), "4.5".into());
+        let mut ops = vec![(t, d)];
+        let b = head(BORE_RETRACTS[0]);
+        let mut o = drilling(&mesh, &b, BORING);
+        o.p.insert("hole_diameter".into(), "32".into());
+        if let Some(cut) = cut {
+            let m = end_mill("10");
+            let mut h = drilling(&mesh, &m, HELICAL_MILLING);
+            for (k, v) in [("bore_allowance", "0.6"), ("rpm", "8000"), ("feed", "800")] {
+                h.p.insert(k.into(), v.into());
+            }
+            ops.push((m, h));
+            o.p.insert("bore_cut".into(), cut.into());
+        }
+        let oi = ops.len();
+        ops.push((b, o));
+        let (doc, all) = job(&mesh, Machine::new(3), ops);
+        assert!(all.iter().all(|r| r.is_ok()), "{all:?}");
+        let mut doc = on_uc100(doc, dir);
+        let machine = a.doc.machines[0].clone();
+        doc.setups[0].machine = machine.clone();
+        doc.machines = vec![machine];
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.page = Page::Control;
+        zeroed(a);
+        check_run_pictured(a, dir, 0);
+        oi
+    }
+
+    /// LIO-558: Stop after step armed in a Boring's last visit of a pass
+    /// stops at the pause to set the head for the next pass, the visit
+    /// done: two bores in 3 passes, started at "Pass 1 · Hole 2", Stop after
+    /// step armed while it bores. The machine pauses at the head-setting
+    /// M0 (the spindle off, the tool at the clearance), and the run stops
+    /// there without the pause being answered: "Stopped after pass 1 ·
+    /// hole 2", Cycle Start then starting at "Pass 2 · Hole 1", whose
+    /// program pauses first to set the head for pass 2.
+    #[test]
+    fn stop_after_step_stops_at_a_borings_pause_between_passes() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        let oi = bored_twice(&mut a, dir.path(), Some("0.15"));
+        assert_eq!(run_of(&a).op_steps(oi).unwrap().steps.len(), 6);
+        let _ = a.update(Message::Run(R::Steps(Some(oi))));
+        let _ = a.update(Message::Run(R::PickStep(oi, 1)));
+        let _ = a.update(Message::Run(R::StartStep));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::KeepZero));
+        let _ = a.update(Message::Run(R::KeepToolZ));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5., "over the entry", |s| {
+            matches!(s.state, Some(State::Paused(_)))
+        });
+        let _ = a.update(Message::Run(R::Resume));
+        tick_until(&mut a, 5., "boring hole 2", |s| {
+            s.state == Some(State::Run) && s.work_pos[2] < -1.
+        });
+        let _ = a.update(Message::Run(R::StopAfterStep));
+        assert!(run_of(&a).stop_after);
+        // The run line says the visit, "pass 1 of 3 · hole 2 of 2": first
+        // when the window is compact and the line is cut short, else where
+        // the Steps page has it, after the operation.
+        for (w, h) in [(1120., 690.), (1440., 900.)] {
+            let _ = a.update(Message::Resized(iced::Size::new(w, h)));
+            let (parts, _) = crate::ui::run_line(&a, conn(&a));
+            let line: String = parts.iter().map(|(t, _)| t.as_str()).collect();
+            let (step, setup) = (
+                line.find(" · pass 1 of 3 · hole 2 of 2").expect(&line),
+                line.find(" · Setup 1 of 1").expect(&line),
+            );
+            let stops = line.find(" · stops after this step").expect(&line);
+            assert_eq!(step < setup, w < 1360., "{w}: {line}");
+            assert!(stops < setup, "{w}: {line}");
+        }
+        let mut deadline = Deadline::new(20.);
+        let mut set = false;
+        while run_of(&a).running.is_some() {
+            let _ = a.update(Message::Tick);
+            set |= matches!(&conn(&a).snapshot.state,
+                Some(State::Paused(why)) if why.contains("pass 2 of 3"));
+            assert!(deadline.within(&conn(&a).snapshot));
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(set, "it stopped before the pause to set the head");
+        let outcome = run_of(&a).outcome.clone().unwrap();
+        assert_eq!(outcome.1, "Stopped after pass 1 · hole 2", "{outcome:?}");
+        assert_eq!(conn(&a).snapshot.spindle, Some(uc100::gcode::Spindle::Off));
+        tick_until(&mut a, 5., "Idle after the stop", |s| {
+            s.state == Some(State::Idle)
+        });
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((oi, 2)));
+        let label = run_of(&a).step_label(oi, 2);
+        assert_eq!(label, "pass 2 · hole 1");
+        let _ = a.update(Message::Disconnect);
+    }
+
+    /// LIO-558: a Boring's steps, its visits of its holes, laid out whole
+    /// in the step list. Two Ø32 bores drilled Ø12 and bored straight from
+    /// there at the default cut, 35 passes of 2 visits, started at "Pass 12
+    /// · Hole 1": at 1440 × 900 and 1120 × 690, and by touch, no folded
+    /// line runs from one pass's holes into another's, each label is laid
+    /// out as wide as it is alone (not cut), and what it says of the step
+    /// ("taken as cut", "starts here") starts right of it, never over it.
+    #[test]
+    fn a_borings_step_lines_are_whole_and_clear_of_their_state() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        bored_twice(&mut a, dir.path(), None);
+        let os = run_of(&a).op_steps(1).expect("the Boring's steps").clone();
+        assert_eq!((os.passes(), os.steps.len()), (35, 70));
+        let _ = a.update(Message::Run(R::Steps(Some(1))));
+        let _ = a.update(Message::Run(R::PickStep(1, 22)));
+        let _ = a.update(Message::Run(R::StartStep));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((1, 22)));
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Job));
+        let alone = |s: &str, italic: bool, window| {
+            let mut t = iced::widget::text(s.to_string()).size(11);
+            if italic {
+                t = t.font(iced::Font {
+                    style: iced::font::Style::Italic,
+                    ..iced::Font::DEFAULT
+                });
+            }
+            crate::ui::probe::placed(t.into(), window)[0].1.width
+        };
+        let states = ["taken as cut", "starts here", "done", "skipped", "cutting"];
+        for (w, h, touch) in [
+            (1440., 900., false),
+            (1120., 690., false),
+            (1120., 690., true),
+        ] {
+            crate::ui::TOUCH.with(|t| t.set(touch));
+            let window = iced::Size::new(w, h);
+            let _ = a.update(Message::Resized(window));
+            // Pictures of it when AXIS_RENDER_DIR says where.
+            if let Ok(out) = std::env::var("AXIS_RENDER_DIR") {
+                let name = format!("boring-steps-{w}{}.png", if touch { "-touch" } else { "" });
+                render_png(&a, window, &std::path::Path::new(&out).join(name));
+            }
+            let placed = crate::ui::probe::placed(a.view(), window);
+            let lines: Vec<&(String, iced::Rectangle)> = (placed.iter())
+                .filter(|(t, _)| t.starts_with("Pass"))
+                .collect();
+            // As many lines as the room takes, at least the folded passes
+            // before and after the start and its pass's two visits.
+            assert!(lines.len() >= 4, "{w} x {h}: {lines:?}");
+            let mut stated = 0;
+            for (t, at) in &lines {
+                assert!(!t.contains(" – "), "{w} x {h}: \"{t}\" runs across passes");
+                let folded = t.starts_with("Passes") || t.contains("Holes");
+                let natural = alone(t, folded, window);
+                assert!(
+                    at.width >= natural - 0.5,
+                    "{w} x {h}: \"{t}\" is cut to {} of {natural}",
+                    at.width
+                );
+                if let Some((s, state)) = (placed.iter()).find(|(s, b)| {
+                    states.contains(&s.as_str()) && (b.center_y() - at.center_y()).abs() < 4.
+                }) {
+                    stated += 1;
+                    assert!(
+                        at.x + at.width <= state.x,
+                        "{w} x {h}: \"{t}\" at {at:?} runs under \"{s}\" at {state:?}"
+                    );
+                }
+            }
+            assert!(stated >= 2, "{w} x {h}: {lines:?}");
+            assert!(
+                lines.iter().any(|(t, _)| t.starts_with("Passes")),
+                "{w} x {h}: {lines:?}"
+            );
+        }
+        crate::ui::TOUCH.with(|t| t.set(false));
+        let _ = a.update(Message::Disconnect);
     }
 
     /// `shot` of the Control page with Move to open and `targets` typed

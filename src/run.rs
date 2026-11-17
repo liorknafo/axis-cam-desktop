@@ -1511,18 +1511,47 @@ impl Run {
     /// down to the next step, all rapids in the air), so that its planner,
     /// which the stop slows down from, is there; the tool, behind it by the
     /// motion buffer, comes up to it and stops.
+    /// Paused at a program's pause (M0) that comes after a step's end, as a
+    /// Boring's to set the head for the next pass does after the pass's
+    /// last visit, it stops there too, the step done, the pause not yet
+    /// answered (LIO-558).
     pub fn stop_due(&mut self, s: &uc100::controller::Snapshot) -> bool {
-        if !self.stop_after || self.stopping.is_some() || s.state != Some(State::Run) {
+        let paused = matches!(s.state, Some(State::Paused(_)));
+        if !self.stop_after || self.stopping.is_some() || !(paused || s.state == Some(State::Run)) {
             return false;
         }
         let Some((_, _, block)) = self.progress(s.current_line) else {
             return false;
+        };
+        let block = match paused {
+            true => match self.pause_after(block) {
+                Some(b) => b,
+                None => return false,
+            },
+            false => block,
         };
         let Some(step) = self.step_end(block) else {
             return false;
         };
         self.stopping = Some(step);
         true
+    }
+
+    /// The pause (M0) block the machine is paused at, its driver's line on
+    /// block `block`: the line stays the last move's, the rise before the
+    /// pause, so the pause is the first after it, with no feed move between.
+    fn pause_after(&self, block: usize) -> Option<usize> {
+        let blocks = self.running_blocks()?;
+        for (b, at) in blocks.iter().enumerate().skip(block) {
+            match at {
+                Block::Pause { .. } => return Some(b),
+                Block::Move {
+                    kind: Kind::Feed, ..
+                } => return None,
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Stop after step on the Pi (`uc100_remote`): the running tool run's
@@ -2846,6 +2875,11 @@ pub struct Step {
     /// How many of its moves feed: the running program's marks count a
     /// drilling operation's holes by them (`step_marks`).
     pub feeds: usize,
+    /// The pass it is in (from 0), of a plan cut in passes with a stop
+    /// before each to set the tool to its size, a Boring's (`Stop::size`):
+    /// each pass goes round every hole, so its steps are its visits of them
+    /// (LIO-558). None for any other plan, or one of a single pass.
+    pub pass: Option<usize>,
 }
 
 /// The steps of one operation of a setup, as the run's check found them
@@ -2866,9 +2900,12 @@ pub struct OpSteps {
 
 impl OpSteps {
     /// What its steps are called: holes, levels when each cuts at one Z,
-    /// else passes.
+    /// else passes. A plan cut in passes (`Step::pass`) is named by them,
+    /// each a visit of its holes (`label`).
     pub fn kind(&self) -> (&'static str, &'static str) {
-        if self.hole {
+        if self.passes() > 0 {
+            ("Pass", "Passes")
+        } else if self.hole {
             ("Hole", "Holes")
         } else if self.steps.iter().all(|s| s.z.is_some()) {
             ("Level", "Levels")
@@ -2891,21 +2928,127 @@ impl OpSteps {
         }
     }
 
-    /// Step `s`'s label: "Level 14", "Hole 3", "Pass 2".
-    pub fn label(&self, s: usize) -> String {
-        format!("{} {}", self.kind().0, s + 1)
+    /// How many passes its plan is cut in (`Step::pass`): 0 for one not
+    /// cut in passes.
+    pub fn passes(&self) -> usize {
+        (self.steps.iter())
+            .filter_map(|s| s.pass)
+            .max()
+            .map_or(0, |p| p + 1)
     }
 
-    /// Steps `range`'s label: "Levels 5–9", or one step's.
-    pub fn labels(&self, range: std::ops::RangeInclusive<usize>) -> String {
-        match range.end() - range.start() {
-            0 => self.label(*range.start()),
-            _ => format!(
-                "{} {}–{}",
-                self.kind().1,
-                range.start() + 1,
-                range.end() + 1
+    /// Step `s` of a plan cut in passes as (its pass, its hole in the pass,
+    /// the pass's holes), from 0: each pass visits the holes in the same
+    /// order, so hole 2 of a pass is hole 2 of every other.
+    fn in_pass(&self, s: usize) -> Option<(usize, usize, usize)> {
+        let pass = self.steps.get(s)?.pass?;
+        let first = (self.steps.iter()).position(|t| t.pass == Some(pass))?;
+        let holes = (self.steps.iter()).filter(|t| t.pass == Some(pass)).count();
+        Some((pass, s - first, holes))
+    }
+
+    /// Whether each of its passes is a single hole's: then a step is a pass.
+    fn one_hole(&self) -> bool {
+        self.steps.len() == self.passes()
+    }
+
+    /// How many steps it has, as its row says: "5 levels", "6 holes"; a
+    /// plan cut in passes counts its passes and holes, "3 passes · 2 holes",
+    /// not its visits (LIO-558), or "3 passes" of one hole.
+    pub fn count(&self) -> String {
+        let (n, kind) = (self.steps.len(), self.kind().1.to_lowercase());
+        match self.passes() {
+            0 => format!("{n} {kind}"),
+            p if self.one_hole() => format!("{p} {kind}"),
+            p => {
+                let holes = self.in_pass(0).map_or(0, |h| h.2);
+                let noun = if holes == 1 { "hole" } else { "holes" };
+                format!("{p} {kind} · {holes} {noun}")
+            }
+        }
+    }
+
+    /// Step `s`'s label: "Level 14", "Hole 3", "Pass 2"; a visit of a hole
+    /// of a plan cut in passes says both, "Pass 2 · Hole 1" (LIO-558).
+    pub fn label(&self, s: usize) -> String {
+        match self.in_pass(s) {
+            Some((p, _, _)) if self.one_hole() => format!("Pass {}", p + 1),
+            Some((p, h, _)) => format!("Pass {} · Hole {}", p + 1, h + 1),
+            None => format!("{} {}", self.kind().0, s + 1),
+        }
+    }
+
+    /// Steps `range`'s label: "Levels 5–9", or one step's. Of a plan cut in
+    /// passes: "Pass 2 · Holes 1–3" within a pass, "Passes 1–2" for whole
+    /// passes, else from the first's label to the last's.
+    /// Step `s`'s label with how many there are, as the run line says
+    /// where the job is: "Level 3 of 9"; a visit of a plan cut in passes
+    /// counts each, "Pass 1 of 3 · Hole 2 of 2", never "of 6" visits
+    /// (LIO-558).
+    pub fn label_of(&self, s: usize) -> String {
+        match self.in_pass(s) {
+            Some((p, _, _)) if self.one_hole() => format!("Pass {} of {}", p + 1, self.passes()),
+            Some((p, h, n)) => format!(
+                "Pass {} of {} · Hole {} of {n}",
+                p + 1,
+                self.passes(),
+                h + 1
             ),
+            None => format!("{} of {}", self.label(s), self.steps.len()),
+        }
+    }
+
+    /// The lines a folded run of steps `range` shows as (`ui::step_list`):
+    /// itself, but a plan cut in passes splits one that starts or ends
+    /// partway through a pass and runs into another into the rest of the
+    /// pass it starts in, the whole passes after it and the start of the
+    /// pass it ends in, so that a line reads "Passes 2–10" or "Pass 11 ·
+    /// Holes 1–3", never "Pass 1 · Hole 2 – Pass 11 · Hole 1" (LIO-558).
+    pub fn folds(
+        &self,
+        range: std::ops::RangeInclusive<usize>,
+    ) -> Vec<std::ops::RangeInclusive<usize>> {
+        let (a, b) = (*range.start(), *range.end());
+        let (Some((pa, ha, na)), Some((pb, hb, nb))) = (self.in_pass(a), self.in_pass(b)) else {
+            return vec![range];
+        };
+        if pa == pb || (ha == 0 && hb + 1 == nb) {
+            return vec![range];
+        }
+        let mut out = vec![];
+        // The rest of the pass it starts in.
+        let mut whole = a;
+        if ha > 0 {
+            whole = a + (na - ha);
+            out.push(a..=whole - 1);
+        }
+        // The whole passes, then the start of the pass it ends in.
+        let tail = (hb + 1 < nb).then_some(b - hb);
+        let last = tail.map_or(b, |t| t - 1);
+        if whole <= last {
+            out.push(whole..=last);
+        }
+        out.extend(tail.map(|t| t..=b));
+        out
+    }
+
+    pub fn labels(&self, range: std::ops::RangeInclusive<usize>) -> String {
+        let (a, b) = (*range.start(), *range.end());
+        if a == b {
+            return self.label(a);
+        }
+        let (Some((pa, ha, _)), Some((pb, hb, nb))) = (self.in_pass(a), self.in_pass(b)) else {
+            return format!("{} {}–{}", self.kind().1, a + 1, b + 1);
+        };
+        let whole = ha == 0 && hb + 1 == nb;
+        if whole && pa == pb {
+            format!("Pass {}", pa + 1)
+        } else if whole {
+            format!("Passes {}–{}", pa + 1, pb + 1)
+        } else if pa == pb {
+            format!("Pass {} · Holes {}–{}", pa + 1, ha + 1, hb + 1)
+        } else {
+            format!("{} – {}", self.label(a), self.label(b))
         }
     }
 }
@@ -2920,7 +3063,9 @@ const AT_CLEARANCE: f32 = 0.01;
 /// A drilling plan's steps are its holes (`Plan::holes`): it splits only
 /// where one starts, so a deep drilling's pecks and a helical milling's
 /// rings, which rise to the clearance too when it is at the retract height,
-/// are in the step of their hole (LIO-549, LIO-555).
+/// are in the step of their hole (LIO-549, LIO-555). A plan cut in passes,
+/// a Boring's, goes round its holes each pass: a step is one visit, and
+/// says its pass (`Step::pass`, LIO-558).
 pub fn plan_steps(plan: &crate::simulation::Plan) -> Vec<Step> {
     use crate::simulation::Motion;
     let moves = &plan.moves;
@@ -2957,9 +3102,22 @@ pub fn plan_steps(plan: &crate::simulation::Plan) -> Vec<Step> {
             fed = Some(i);
         }
     }
+    // Where each pass is set, of a plan cut in more than one (`Step::pass`).
+    let mut sets: Vec<usize> = (plan.stops.iter())
+        .filter(|s| s.size.is_some())
+        .map(|s| s.at)
+        .collect();
+    sets.sort_unstable();
     let ends = starts.iter().skip(1).copied().chain([moves.len()]);
     (starts.iter().zip(ends))
         .map(|(&a, b)| {
+            // Set before its first feed move, the stop after the retract
+            // that starts it.
+            let first_feed = (a..b).find(|&i| feed(i)).unwrap_or(a);
+            let pass = (sets.len() > 1).then(|| {
+                sets.partition_point(|&at| at <= first_feed)
+                    .saturating_sub(1)
+            });
             let level: Vec<f32> = (moves[a..b].iter())
                 .filter(|m| m.motion == Motion::Feed && (m.from[2] - m.to[2]).abs() < 1e-4)
                 .map(|m| m.to[2])
@@ -2976,6 +3134,7 @@ pub fn plan_steps(plan: &crate::simulation::Plan) -> Vec<Step> {
                     .iter()
                     .filter(|m| m.motion == Motion::Feed)
                     .count(),
+                pass,
             }
         })
         .collect()
@@ -3039,7 +3198,8 @@ pub fn fingerprint(plan: &crate::simulation::Plan, tool: &str) -> u64 {
 /// where the one after them starts, as the plan moves between two of its
 /// steps; cut first, the plan starts where the first kept step does, which
 /// a program enters as it enters an operation. Its stops follow their moves,
-/// and a drilling plan's kept steps are its holes (`Plan::holes`).
+/// but for a pass's setting cut after the plan has cut (`Step::pass`), and a
+/// drilling plan's kept steps are its holes (`Plan::holes`).
 pub fn cut_plan(
     plan: &crate::simulation::Plan,
     steps: &[Step],
@@ -3087,14 +3247,30 @@ pub fn cut_plan(
                 .push(plan.keep_air.get(i).copied().unwrap_or(false));
         }
     }
+    let kept = |s: usize| !cut.contains(&s);
+    // A pass's setting of the tool (`Step::pass`) cut with the pass's first
+    // visit goes before its first visit sent, when the plan cut at an
+    // earlier pass's setting before it: the visit skipped alone, the holes
+    // after it are not cut at that pass's size yet (LIO-558). Cut before
+    // anything sent, as a start at a step is, the tool is taken as set for
+    // the pass under way.
+    let moved = |s: &Stop| -> Option<usize> {
+        s.size?;
+        let c = steps.iter().position(|t| t.moves.contains(&s.at))?;
+        let pass = steps[c].pass?;
+        let t = (c + 1..steps.len()).find(|&t| kept(t) && steps[t].pass == Some(pass))?;
+        (0..t).any(kept).then_some(())?;
+        new[steps[t].moves.start]
+    };
     out.stops = (plan.stops.iter())
         .filter_map(|s| {
             Some(Stop {
-                at: new.get(s.at).copied().flatten()?,
+                at: new.get(s.at).copied().flatten().or_else(|| moved(s))?,
                 ..s.clone()
             })
         })
         .collect();
+    out.stops.sort_by_key(|s| s.at);
     out
 }
 
@@ -5996,6 +6172,7 @@ pub(crate) mod tests {
         assert_eq!(labels, ["Hole 1", "Hole 2", "Hole 3", "Hole 4", "Hole 5"]);
         assert_eq!(drill.labels(0..=4), "Holes 1–5");
         assert_eq!(drill.labels(1..=1), "Hole 2");
+        assert_eq!(drill.label_of(1), "Hole 2 of 5");
         // Each step all the pecks of one hole.
         for (s, step) in drill.steps.iter().enumerate() {
             let at: Vec<_> = (feeds.iter())
@@ -6070,6 +6247,275 @@ pub(crate) mod tests {
                 t.end_lines
             );
         }
+    }
+
+    /// A Boring's steps are its visits of its holes, a pass at a time, and
+    /// are called so (LIO-558): two Ø32 bores 70 mm apart, drilled Ø12,
+    /// milled to Ø31.4 and bored to Ø32 in 3 passes (Ø31.65 and Ø31.9 at
+    /// 0.15 a pass on the radius, then the size). The head goes round both
+    /// bores each pass, rising to the clearance between them, so its 6 steps
+    /// are "Pass 1 · Hole 1" to "Pass 3 · Hole 2", not "Hole 1" to "Hole 6",
+    /// hole 2 the same bore in every pass, and its row counts "3 passes · 2
+    /// holes". The running program's marks count a visit a step, each pass's
+    /// pause to set the head between its first visit and the visit before,
+    /// and the tablet file names them the same. A start at "Pass 2 · Hole 2"
+    /// sends the rest with the third pass's pause only: the head is set for
+    /// the second, which took hole 1; "Pass 2 · Hole 1" skipped alone, the
+    /// second pass's pause goes before "Pass 2 · Hole 2" instead, the head
+    /// still set for the first. A Boring of one bore reads "Pass 1" to
+    /// "Pass 3".
+    #[test]
+    fn a_borings_steps_are_named_by_pass_and_hole() {
+        use crate::cam::boring::tests::{
+            drill, drilling, end_mill, head, job, on_uc100, ring_triangles,
+        };
+        use crate::model::{BORE_RETRACTS, BORING, HELICAL_MILLING, Machine};
+        let dir = tempfile::tempdir().unwrap();
+        // `n` bores, each drilled, milled and bored (operation 2).
+        let bored = |n: usize| {
+            let tris: Vec<[[f32; 3]; 3]> = (0..n)
+                .flat_map(|k| {
+                    let x = 70. * k as f32;
+                    (ring_triangles(32., 60., 28.).into_iter())
+                        .map(move |t| t.map(|p| [p[0] + x, p[1], p[2]]))
+                })
+                .collect();
+            let mesh = crate::mesh::normalize(tris).unwrap();
+            let t = drill("12");
+            let mut d = drilling(&mesh, &t, "Deep drilling");
+            d.p.insert("peck".into(), "12".into());
+            d.p.insert("breakthrough".into(), "4.5".into());
+            let m = end_mill("10");
+            let mut h = drilling(&mesh, &m, HELICAL_MILLING);
+            for (k, v) in [("bore_allowance", "0.6"), ("rpm", "8000"), ("feed", "800")] {
+                h.p.insert(k.into(), v.into());
+            }
+            let b = head(BORE_RETRACTS[0]);
+            let mut o = drilling(&mesh, &b, BORING);
+            o.p.insert("hole_diameter".into(), "32".into());
+            o.p.insert("bore_cut".into(), "0.15".into());
+            let (doc, all) = job(&mesh, Machine::new(3), vec![(t, d), (m, h), (b, o)]);
+            for r in &all {
+                assert!(r.is_ok(), "{:?}", r.as_ref().err());
+            }
+            (on_uc100(doc, dir.path()), mesh)
+        };
+        let oi = 2;
+        let (doc, mesh) = bored(2);
+        let sims = simulated(&doc, &mesh, 0);
+        let steps = op_steps(&doc, 0, &sims);
+        let bore = steps.iter().find(|s| s.op == oi).unwrap();
+        let plan = &(sims.iter().find(|s| s.0 == oi).unwrap().1.as_ref())
+            .unwrap()
+            .plan;
+        let sets: Vec<usize> = (plan.stops.iter())
+            .filter(|s| s.size.is_some())
+            .map(|s| s.at)
+            .collect();
+        assert_eq!(sets.len(), 3, "{:?}", plan.stops);
+        assert_eq!(
+            (plan.holes.len(), bore.steps.len(), bore.passes()),
+            (6, 6, 3)
+        );
+        let labels: Vec<String> = (0..6).map(|s| bore.label(s)).collect();
+        let named = [
+            "Pass 1 · Hole 1",
+            "Pass 1 · Hole 2",
+            "Pass 2 · Hole 1",
+            "Pass 2 · Hole 2",
+            "Pass 3 · Hole 1",
+            "Pass 3 · Hole 2",
+        ];
+        assert_eq!(labels, named);
+        assert_eq!(bore.kind(), ("Pass", "Passes"));
+        assert_eq!(bore.count(), "3 passes · 2 holes");
+        // The run line counts passes and holes, not visits.
+        assert_eq!(bore.label_of(3), "Pass 2 of 3 · Hole 2 of 2");
+        assert_eq!(bore.labels(0..=5), "Passes 1–3");
+        assert_eq!(bore.labels(2..=3), "Pass 2");
+        assert_eq!(bore.labels(2..=5), "Passes 2–3");
+        assert_eq!(bore.labels(1..=2), "Pass 1 · Hole 2 – Pass 2 · Hole 1");
+        assert_eq!(bore.labels(0..=4), "Pass 1 · Hole 1 – Pass 3 · Hole 1");
+        // Folded in the step list, a run is split where passes start.
+        assert_eq!(bore.folds(1..=4), [1..=1, 2..=3, 4..=4]);
+        assert_eq!(bore.folds(1..=5), [1..=1, 2..=5]);
+        assert_eq!(bore.folds(0..=4), [0..=3, 4..=4]);
+        assert_eq!(
+            bore.folds(0..=5),
+            vec![0..=5; 1],
+            "whole passes are one line"
+        );
+        assert_eq!(
+            bore.folds(2..=3),
+            vec![2..=3; 1],
+            "one whole pass is one line"
+        );
+        // Each step one visit, in to the bore's top and one cut down it;
+        // hole 1 and hole 2 are the same two bores in every pass, and each
+        // pass is set before its first visit.
+        let xy = |p: [f32; 3]| [0, 1].map(|k| (p[k] * 100.).round() as i64);
+        let per = bore.steps[0].feeds;
+        let at: Vec<[i64; 2]> = (bore.steps.iter())
+            .map(|st| {
+                assert_eq!(st.feeds, per, "{st:?}");
+                let cuts: Vec<usize> = (st.moves.clone())
+                    .filter(|&i| plan.moves[i].motion == Motion::Feed)
+                    .filter(|&i| plan.moves[i].cutting_pass)
+                    .collect();
+                assert_eq!(cuts.len(), 1, "{st:?}");
+                xy(plan.moves[cuts[0]].to)
+            })
+            .collect();
+        assert_ne!(at[0], at[1]);
+        assert_eq!((&at[2..4], &at[4..6]), (&at[0..2], &at[0..2]));
+        for (p, &set) in sets.iter().enumerate() {
+            let first = &bore.steps[2 * p];
+            let feed = (first.moves.clone())
+                .find(|&i| plan.moves[i].motion == Motion::Feed)
+                .unwrap();
+            assert!(first.moves.start <= set && set <= feed, "pass {p}");
+        }
+        // Three passes of three holes: a range within a pass says its holes.
+        let mut three = bore.clone();
+        three.steps = (0..6)
+            .map(|s| Step {
+                pass: Some(s / 3),
+                ..bore.steps[0].clone()
+            })
+            .collect();
+        assert_eq!(three.labels(0..=1), "Pass 1 · Holes 1–2");
+        assert_eq!(three.labels(4..=5), "Pass 2 · Holes 2–3");
+        assert_eq!(three.labels(3..=5), "Pass 2");
+        assert_eq!(three.count(), "2 passes · 3 holes");
+        assert_eq!(three.folds(1..=4), [1..=2, 3..=4]);
+        assert_eq!(three.labels(1..=2), "Pass 1 · Holes 2–3");
+        // The program: a visit a step, done only once the head leaves it,
+        // each pause between the visit before and its pass's first.
+        let programs =
+            crate::post::checked_to_start(&doc, &mesh, 0, &sims, PostSettings::for_uc100, &[])
+                .unwrap();
+        let fed_of = |p: &Checked| -> (usize, Vec<usize>, Vec<usize>) {
+            let k = p.indexes.iter().position(|&o| o == oi).unwrap();
+            let fed = (0..p.blocks.len())
+                .filter(
+                    |&b| matches!(p.blocks[b], Block::Move { op, kind: Kind::Feed, .. } if op == k),
+                )
+                .collect();
+            let pauses = (0..p.blocks.len())
+                .filter(|&b| matches!(p.blocks[b], Block::Pause { op, .. } if op == k))
+                .collect();
+            (k, fed, pauses)
+        };
+        let p = programs.iter().find(|p| p.indexes.contains(&oi)).unwrap();
+        let (k, fed, pauses) = fed_of(p);
+        let mark_ops: Vec<Option<MarkOp>> = (p.indexes.iter())
+            .map(|&o| steps.iter().find(|s| s.op == o).map(|s| s.mark_op(&[])))
+            .collect();
+        let marks = step_marks(&p.blocks, &mark_ops);
+        // A visit's feed moves, their first block and their last.
+        let visits = |fed: &[usize]| -> Vec<(usize, usize)> {
+            assert_eq!(fed.len() % per, 0);
+            (fed.chunks(per)).map(|v| (v[0], v[per - 1])).collect()
+        };
+        let of_feed: Vec<usize> = fed.iter().map(|&b| marks[b].unwrap().1).collect();
+        let by_visit: Vec<usize> = (0..6).flat_map(|s| vec![s; per]).collect();
+        assert_eq!(of_feed, by_visit);
+        let v = visits(&fed);
+        assert_eq!(pauses.len(), 3);
+        assert!(pauses[0] < v[0].0);
+        for q in 1..3 {
+            assert!(
+                v[2 * q - 1].1 < pauses[q] && pauses[q] < v[2 * q].0,
+                "pass {q}"
+            );
+        }
+        for (b, m) in marks.iter().enumerate() {
+            let Some((o, s, true)) = *m else { continue };
+            if o != k {
+                continue;
+            }
+            if let Some(&next) = fed.iter().find(|&&f| f > b) {
+                assert_eq!(
+                    marks[next].unwrap().1,
+                    s + 1,
+                    "block {b} said visit {s} done"
+                );
+            }
+        }
+        // The tablet file names them the same.
+        let tablet = tablet_runs(&doc, Ok(&mesh), 0);
+        assert!(tablet.problems.is_empty(), "{:?}", tablet.problems);
+        let said: Vec<&str> = (tablet.tool_runs.iter())
+            .flat_map(|r| &r.steps)
+            .filter(|t| t.operation == oi)
+            .map(|t| t.label.as_str())
+            .collect();
+        assert_eq!(said, named);
+        // Started at "Pass 2 · Hole 2": that visit and the third pass, set
+        // once, before it.
+        let (started, _) = check_steps(&doc, &mesh, 0, &[], &[(oi, vec![0, 1, 2])]);
+        let started = started.unwrap();
+        let p = started.iter().find(|p| p.indexes.contains(&oi)).unwrap();
+        let (_, fed, pauses) = fed_of(p);
+        let v = visits(&fed);
+        assert_eq!((v.len(), pauses.len()), (3, 1));
+        assert!(v[0].1 < pauses[0] && pauses[0] < v[1].0);
+        let Block::Pause { message, .. } = &p.blocks[pauses[0]] else {
+            unreachable!()
+        };
+        assert!(message.contains("pass 3 of 3"), "{message}");
+        // "Pass 2 · Hole 1" skipped alone: the head is still set for the
+        // first pass after "Pass 1 · Hole 2", so the program still pauses to
+        // set it for the second, before "Pass 2 · Hole 2", the spindle
+        // stopped.
+        let (skipping, _) = check_steps(&doc, &mesh, 0, &[], &[(oi, vec![2])]);
+        let skipping = skipping.unwrap();
+        let p = skipping.iter().find(|p| p.indexes.contains(&oi)).unwrap();
+        let (_, fed, pauses) = fed_of(p);
+        let v = visits(&fed);
+        assert_eq!((v.len(), pauses.len()), (5, 3));
+        assert!(v[1].1 < pauses[1] && pauses[1] < v[2].0);
+        let said = |b: usize| match &p.blocks[b] {
+            Block::Pause { message, .. } => message.clone(),
+            _ => unreachable!(),
+        };
+        assert!(
+            said(pauses[1]).contains("pass 2 of 3"),
+            "{}",
+            said(pauses[1])
+        );
+        assert!(
+            said(pauses[2]).contains("pass 3 of 3"),
+            "{}",
+            said(pauses[2])
+        );
+        let actions = lower(p, 0, [100., 100., -100., 0., 0., 0.], [0.; 6]).unwrap();
+        let mut on = false;
+        let mut paused = 0;
+        for l in &actions {
+            match &l.action {
+                uc100::gcode::Action::Spindle { state, .. } => {
+                    on = *state != uc100::gcode::Spindle::Off
+                }
+                uc100::gcode::Action::Pause { reason } => {
+                    assert!(!on, "paused with the spindle on: {reason}");
+                    paused += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(paused, 3);
+        // One bore: a step is a pass.
+        let (doc, mesh) = bored(1);
+        let sims = simulated(&doc, &mesh, 0);
+        let one = (op_steps(&doc, 0, &sims).into_iter())
+            .find(|s| s.op == oi)
+            .unwrap();
+        let labels: Vec<String> = (0..one.steps.len()).map(|s| one.label(s)).collect();
+        assert_eq!(labels, ["Pass 1", "Pass 2", "Pass 3"]);
+        assert_eq!(one.count(), "3 passes");
+        assert_eq!(one.label_of(1), "Pass 2 of 3");
+        assert_eq!(one.labels(1..=2), "Passes 2–3");
     }
 
     /// A helical-milled bore is one step, all its rings (LIO-555): the
@@ -6587,6 +7033,7 @@ pub(crate) mod tests {
                 z: Some(5.),
                 seconds: 1.,
                 feeds: 1,
+                pass: None,
             };
             Left {
                 steps: vec![OpSteps {

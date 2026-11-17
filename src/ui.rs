@@ -9855,32 +9855,40 @@ pub(crate) fn run_line(
         let blocks = run.running_blocks().map_or(1, <[_]>::len);
         // The step being cut, of how many, when the operation has steps.
         let step = (run.step_at(s.current_line))
-            .and_then(|(oi, n, _)| Some((oi, n, run.op_steps(oi)?.steps.len())))
-            .filter(|t| t.2 > 1)
-            .map_or(String::new(), |(oi, n, count)| {
-                format!(" · {} of {count}", run.step_label(oi, n))
+            .and_then(|(oi, n, _)| Some((n, run.op_steps(oi)?)))
+            .filter(|(_, os)| os.steps.len() > 1)
+            .map_or(String::new(), |(n, os)| {
+                format!(" · {}", os.label_of(n).to_lowercase())
             });
+        // Compact, the line is cut short: the step comes first, "pass 1 of
+        // 3 · hole 2 of 2" whole, then where the job is (LIO-558).
+        let (first, within) = match Fit::of(app).narrow {
+            true => (step, String::new()),
+            false => (String::new(), step),
+        };
         let mut parts = vec![
             ("Cutting ".into(), INK),
             (p.ops[op].name.clone(), INK),
-            (
-                // Where the job is, as the Steps page says it (LIO-431).
-                format!(
-                    " · Setup {} of {} · operation {} of {}{step} · tool run {} of {} · block {} of {blocks}",
-                    run.setup + 1,
-                    app.doc.setups.len(),
-                    op + 1,
-                    p.ops.len(),
-                    i + 1,
-                    programs.len(),
-                    block + 1
-                ),
-                MUTED,
-            ),
+            (first, MUTED),
         ];
         if run.stop_after {
-            parts.insert(2, (" · stops after this step".into(), AMBER));
+            parts.push((" · stops after this step".into(), AMBER));
         }
+        parts.push((
+            // Where the job is, as the Steps page says it (LIO-431).
+            format!(
+                " · Setup {} of {} · operation {} of {}{within} · tool run {} of {} · block {} of {blocks}",
+                run.setup + 1,
+                app.doc.setups.len(),
+                op + 1,
+                p.ops.len(),
+                i + 1,
+                programs.len(),
+                block + 1
+            ),
+            MUTED,
+        ));
+        parts.retain(|(t, _)| !t.is_empty());
         return (parts, vec![]);
     }
     let mut problems = run.problems(c, &app.doc);
@@ -12334,7 +12342,35 @@ fn step_list<'a>(
     };
     let mut col = column![].spacing(2);
     let lh = step_line(fit) - 2.;
-    for r in step_lines(os.steps.len(), &keep, shown.lines) {
+    // A folded run of a Boring's visits split where its passes start
+    // (`OpSteps::folds`).
+    let lines: Vec<std::ops::RangeInclusive<usize>> =
+        (step_lines(os.steps.len(), &keep, shown.lines).into_iter())
+            .flat_map(|r| {
+                if r.start() == r.end() {
+                    vec![r]
+                } else {
+                    os.folds(r)
+                }
+            })
+            .collect();
+    let label_of = |r: &std::ops::RangeInclusive<usize>| {
+        if r.start() == r.end() {
+            os.label(*r.start())
+        } else {
+            os.labels(r.clone())
+        }
+    };
+    // The labels' column, as wide as the widest of them ("Pass 12 · Holes
+    // 3–9"), estimated from the characters, wide side, up to what leaves
+    // the steps' state beside them room; never less than a level's.
+    let base = if fit.narrow { 74. } else { 84. };
+    let widest = (lines.iter())
+        .map(|r| label_of(r).chars().count())
+        .max()
+        .unwrap_or(0);
+    let label_width = (widest as f32 * 5.4).clamp(base, base + 46.);
+    for r in lines {
         let first = *r.start();
         let one = r.start() == r.end();
         let stage = stages[first];
@@ -12377,11 +12413,7 @@ fn step_list<'a>(
         } else {
             space().width(13).into()
         };
-        let label = if one {
-            os.label(first)
-        } else {
-            os.labels(r.clone())
-        };
+        let label = label_of(&r);
         let font = Font {
             style: if one {
                 iced::font::Style::Normal
@@ -12398,12 +12430,16 @@ fn step_list<'a>(
         let ink = if one { INK } else { MUTED };
         let face = row![
             mark,
-            text(label)
-                .size(11)
-                .font(font)
-                .color(ink)
-                .width(if fit.narrow { 74 } else { 84 })
-                .wrapping(Wrapping::None),
+            // Clipped, never over the state beside it.
+            container(
+                text(label)
+                    .size(11)
+                    .font(font)
+                    .color(ink)
+                    .wrapping(Wrapping::None)
+            )
+            .width(label_width)
+            .clip(true),
             container(
                 text(detail)
                     .size(11)
@@ -12500,26 +12536,41 @@ fn step_list<'a>(
                 .then_some(Message::Run(R::StartStep)),
             false,
         );
+        let (picked_label, time) = (os.labels(p.clone()), format!("· {}", clock(seconds(&p))));
+        // The hint only beside a label it leaves room for, as a Boring's
+        // "Pass 1 · Hole 2 – Pass 3 · Hole 1" may not: the box is the
+        // Operations column less 86 px, widths estimated wide side.
+        let hint = "Shift-click picks a range";
+        let hinted = !fit.narrow
+            && picked_label.chars().count() as f32 * 6.4
+                + time.chars().count() as f32 * 5.6
+                + hint.chars().count() as f32 * 4.8
+                + 8.
+                <= fit.program() - 86.;
         let mut head = row![
-            bold(os.labels(p.clone()), 12),
-            muted(format!("· {}", clock(seconds(&p)))).size(11),
+            bold(picked_label, 12),
+            muted(time).size(11),
             space().width(Fill),
         ]
         .spacing(4)
         .align_y(Alignment::Center);
-        if !fit.narrow {
-            head = head.push(muted("Shift-click picks a range").size(10));
+        if hinted {
+            head = head.push(muted(hint).size(10));
         }
         out = out.push(
             container(
                 column![
                     head,
+                    // On two lines when "Start at pass 12 · hole 10" leaves
+                    // no room for Clear.
                     row![
                         skip,
                         start,
                         small("Clear", Some(Message::Run(R::ClearSteps)), false)
                     ]
                     .spacing(6)
+                    .wrap()
+                    .vertical_spacing(6)
                 ]
                 .spacing(5),
             )
@@ -12826,10 +12877,8 @@ pub(crate) fn program<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
                     let steps = run.op_steps(oi).filter(|s| s.steps.len() > 1);
                     let unfolded = steps.is_some() && run.open == Some(oi);
                     let toggle = steps.map(|s| {
-                        let n = s.steps.len();
-                        let what = s.kind().1.to_lowercase();
                         let m = Message::Run(R::Steps((!unfolded).then_some(oi)));
-                        (unfolded, m, format!("{n} {what}"))
+                        (unfolded, m, s.count())
                     });
                     let op_time = times[i].as_ref().and_then(|t| t.get(k).copied());
                     list = list.push(op_row(
