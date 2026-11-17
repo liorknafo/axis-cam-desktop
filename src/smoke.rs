@@ -21208,8 +21208,10 @@ soft_max = 180.0
         );
         assert!(
             !hits.is_empty()
-                && hits.iter().all(|p| p.contains("(within the 2 mm gap). It needs ")
-                    && p.ends_with(" mm more room across to keep the gap.")),
+                && hits
+                    .iter()
+                    .all(|p| p.contains("(within the 2 mm gap). It needs ")
+                        && p.ends_with(" mm more room across to keep the gap.")),
             "{problems:?}"
         );
         for name in &named {

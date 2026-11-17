@@ -5019,7 +5019,8 @@ mod tests {
         // The clamps as the reviewer measured them.
         let near = |a: [f32; 3], b: [f32; 3]| (0..3).all(|k| (a[k] - b[k]).abs() < 0.01);
         assert!(
-            near(clamps[0].bounds.min, [-28., 51.5, 0.]) && near(clamps[0].bounds.max, [-8., 111.5, 25.]),
+            near(clamps[0].bounds.min, [-28., 51.5, 0.])
+                && near(clamps[0].bounds.max, [-8., 111.5, 25.]),
             "{:?}",
             clamps[0].bounds
         );
@@ -5038,7 +5039,10 @@ mod tests {
         assert_eq!(body(&head), Some((25., 30.)));
         let found = hits(&head, &clamps, 2.);
         assert_eq!(
-            found.iter().map(|h| (h.label.as_str(), h.part)).collect::<Vec<_>>(),
+            found
+                .iter()
+                .map(|h| (h.label.as_str(), h.part))
+                .collect::<Vec<_>>(),
             [
                 ("clamp on +Y (offset -18)", BODY),
                 ("clamp on +Y (offset 18)", BODY)
@@ -5194,11 +5198,19 @@ mod tests {
             "Contour: the tool hits the vise jaw on +Y at X12.0 Y41.0 Z3.0 (within the 2 mm gap)."
         );
         // How much more room it needs, to the tenth; never none.
-        for (short, said) in [(4.592, "4.6"), (4.6, "4.6"), (7.01, "7.0"), (0., "0.1"), (0.04, "0.1")] {
+        for (short, said) in [
+            (4.592, "4.6"),
+            (4.6, "4.6"),
+            (7.01, "7.0"),
+            (0., "0.1"),
+            (0.04, "0.1"),
+        ] {
             hit.short = Some(short);
             assert_eq!(
                 message("Contour", &hit, 2., [0., 10., 10.]),
-                format!("Contour: the tool hits the vise jaw on +Y at X12.0 Y41.0 Z3.0 (within the 2 mm gap). It needs {said} mm more room across to keep the gap.")
+                format!(
+                    "Contour: the tool hits the vise jaw on +Y at X12.0 Y41.0 Z3.0 (within the 2 mm gap). It needs {said} mm more room across to keep the gap."
+                )
             );
         }
         // The holder, a gap with decimals, and a hair below zero written as 0.0.

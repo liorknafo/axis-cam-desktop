@@ -2152,7 +2152,9 @@ mod tests {
         assert!(
             said.iter().any(|s| s.starts_with(
                 "Flats at A 90°, Contour: the tool hits the chuck jaw 3 at X-92.0 Y20.0 Z54.6"
-            ) && s.ends_with("(within the 2 mm gap). It needs 8.0 mm more room across to keep the gap.")),
+            ) && s.ends_with(
+                "(within the 2 mm gap). It needs 8.0 mm more room across to keep the gap."
+            )),
             "{said:?}"
         );
         // The same cut at A0, where jaw 1 is straight up and jaw 3 below:

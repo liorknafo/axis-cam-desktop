@@ -1240,7 +1240,9 @@ mod tests {
         assert!(
             found[0]
                 .starts_with("Face top: the tool hits the clamp on +X (offset 0) at X24.5 Y0.0")
-                && found[0].ends_with("(within the 0 mm gap). It needs 0.5 mm more room across to keep the gap."),
+                && found[0].ends_with(
+                    "(within the 0 mm gap). It needs 0.5 mm more room across to keep the gap."
+                ),
             "{found:?}"
         );
         // At the clearance plane the blend counts too: a plane exactly at

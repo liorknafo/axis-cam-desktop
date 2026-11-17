@@ -849,7 +849,10 @@ pub(crate) mod tests {
             p.insert("clamps".into(), "+Y:0;-Y:20".into());
             let setups = crate::plan_check::walked_setups(&doc, &mesh, None);
             let name = doc.setups[0].operations[1].name().to_string();
-            (name, crate::plan_check::setup_holding(&doc, &mesh, 0, &setups[0]))
+            (
+                name,
+                crate::plan_check::setup_holding(&doc, &mesh, 0, &setups[0]),
+            )
         };
         let (bore, found) = held("40");
         assert_eq!(found.len(), 2, "{found:?}");
@@ -859,8 +862,11 @@ pub(crate) mod tests {
         for ((side, room), (oi, line)) in said.iter().zip(&found) {
             assert_eq!(*oi, Some(1), "{line}");
             assert!(
-                line.starts_with(&format!("{bore}: the tool body hits the clamp on {side} at X0.0 Y0.0 Z"))
-                    && line.ends_with(&format!("(within the 2 mm gap). It needs {room} mm more room across to keep the gap.")),
+                line.starts_with(&format!(
+                    "{bore}: the tool body hits the clamp on {side} at X0.0 Y0.0 Z"
+                )) && line.ends_with(&format!(
+                    "(within the 2 mm gap). It needs {room} mm more room across to keep the gap."
+                )),
                 "{line}"
             );
         }
