@@ -4223,7 +4223,16 @@ fn tablet_step_job(
     chuck: bool,
     oi: usize,
     n: usize,
-) -> Result<(Vec<TabletLine>, Vec<TabletStep>, Lift, Option<u32>, Option<u32>), Vec<String>> {
+) -> Result<
+    (
+        Vec<TabletLine>,
+        Vec<TabletStep>,
+        Lift,
+        Option<u32>,
+        Option<u32>,
+    ),
+    Vec<String>,
+> {
     if chuck {
         return Err(vec![CHUCK_STARTS.into()]);
     }
@@ -4252,9 +4261,14 @@ fn tablet_step_job(
     // Those before it are the start's, cut already.
     steps.retain(|t| t.operation != oi || t.step >= n);
     let blocks = p.from(k)?;
-    Ok((actions, steps, lift, entry_line(blocks), way_out_line(blocks)))
+    Ok((
+        actions,
+        steps,
+        lift,
+        entry_line(blocks),
+        way_out_line(blocks),
+    ))
 }
-
 
 /// Why a tablet's tool run on a setup in the chuck does not start at a later
 /// operation.
@@ -5572,8 +5586,14 @@ pub(crate) mod tests {
             let from = from.expect("a way out");
             let kinds: Vec<&str> = (actions.iter().filter(|l| l.line >= from))
                 .map(|l| match &l.action {
-                    TabletAction::Spindle { state: Spindle::Off, .. } => "off",
-                    TabletAction::Coolant { flood: false, mist: false } => "off",
+                    TabletAction::Spindle {
+                        state: Spindle::Off,
+                        ..
+                    } => "off",
+                    TabletAction::Coolant {
+                        flood: false,
+                        mist: false,
+                    } => "off",
                     TabletAction::Move { lift: true, .. } => "lift",
                     TabletAction::End => "end",
                     a => panic!("{a:?} in the way out"),
@@ -5595,7 +5615,13 @@ pub(crate) mod tests {
                     .filter(|t| t.operation == o.index)
                     .map(|t| t.step)
                     .collect();
-                assert_eq!(mine, (1..steps.max(1)).collect::<Vec<_>>(), "{} {}", r.name, o.name);
+                assert_eq!(
+                    mine,
+                    (1..steps.max(1)).collect::<Vec<_>>(),
+                    "{} {}",
+                    r.name,
+                    o.name
+                );
             }
             for st in &r.step_starts {
                 let (oi, n) = (st.operation, st.step);
@@ -5609,7 +5635,12 @@ pub(crate) mod tests {
                     assert!(st.actions.is_empty() && st.entry.is_none());
                     continue;
                 }
-                assert!(st.problems.is_empty(), "{} {oi} {n}: {:?}", r.name, st.problems);
+                assert!(
+                    st.problems.is_empty(),
+                    "{} {oi} {n}: {:?}",
+                    r.name,
+                    st.problems
+                );
                 count += 1;
                 run.checked_as(Arc::new(programs), Some(Arc::new(left)), None);
                 assert_eq!(run.start_step, Some((oi, n)));
@@ -5619,11 +5650,16 @@ pub(crate) mod tests {
                     .clone();
                 let k = p.indexes.iter().position(|&o| o == oi).unwrap();
                 let label = run.step_label(oi, n);
-                assert_eq!(st.wait, format!("Over the entry of {label}: Resume feeds in."));
+                assert_eq!(
+                    st.wait,
+                    format!("Over the entry of {label}: Resume feeds in.")
+                );
                 let entry = st.entry.unwrap();
                 // Its lines, and the rest its tool run's own from there,
                 // carried once (`share`): all of it from its step's moves on.
-                let rest = st.rest.unwrap_or_else(|| panic!("{} at {label}: nothing shared", r.name));
+                let rest = st
+                    .rest
+                    .unwrap_or_else(|| panic!("{} at {label}: nothing shared", r.name));
                 let mut actions = st.actions.clone();
                 actions.extend(rest_of(&r.actions, rest));
                 assert!(st.actions.iter().all(|l| l.line < rest[1]));
@@ -5643,16 +5679,19 @@ pub(crate) mod tests {
                 for start in [[-5., -7., -30., 0., 0., 0.], [3., 4., -1., 0., 0., 0.]] {
                     assert_eq!(
                         tablet_job_of(&waits, st.lift, offset, start),
-                        run.job_actions(&p, k, offset, start, Some((oi, n))).unwrap(),
+                        run.job_actions(&p, k, offset, start, Some((oi, n)))
+                            .unwrap(),
                         "{} at {label}",
                         r.name
                     );
                 }
                 // Across in the air before the entry: no feed.
-                assert!(actions.iter().filter(|l| l.line < entry).all(|l| !matches!(
-                    l.action,
-                    TabletAction::Move { feed: Some(_), .. }
-                )));
+                assert!(
+                    actions
+                        .iter()
+                        .filter(|l| l.line < entry)
+                        .all(|l| !matches!(l.action, TabletAction::Move { feed: Some(_), .. }))
+                );
                 out(&actions, st.way_out);
                 let first = st.steps.first().unwrap();
                 assert_eq!((first.operation, first.step), (oi, n));
@@ -5670,7 +5709,8 @@ pub(crate) mod tests {
                     .skip_while(|t| (t.operation, t.step) != (oi, n))
                     .map(|t| (t.operation, t.step))
                     .collect();
-                let got: Vec<(usize, usize)> = st.steps.iter().map(|t| (t.operation, t.step)).collect();
+                let got: Vec<(usize, usize)> =
+                    st.steps.iter().map(|t| (t.operation, t.step)).collect();
                 assert_eq!(got, want);
             }
         }
