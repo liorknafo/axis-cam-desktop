@@ -3054,6 +3054,15 @@ pub fn check_steps(
                     }
                 }
             }
+            // The tool went down their columns in the run that cut them: a
+            // later step's air link may come down one as far as it went
+            // (`air::relink`), which the export's check proves by that
+            // (LIO-565).
+            sim.went = (steps.iter().filter_map(|&s| found.steps.get(s)))
+                .flat_map(|s| &sim.plan.moves[s.moves.clone()])
+                .filter(|m| m.a.is_none())
+                .flat_map(|m| [m.from, m.to])
+                .collect();
             sim.plan = cut_plan(&sim.plan, &found.steps, steps);
         }
     }
@@ -7826,6 +7835,20 @@ pub(crate) mod tests {
         let mut others = zs.clone();
         others.remove(1);
         assert_eq!(kept, others);
+        // Started at each level, its levels before taken as cut, and with
+        // each level skipped, the program passes the export's check: a
+        // level's air link comes down the column the levels before cleared,
+        // where the tool went in the run that cut them.
+        for s in 0..7 {
+            let start: Vec<usize> = (0..s).collect();
+            for cut in [start, vec![s]] {
+                if cut.is_empty() {
+                    continue;
+                }
+                let (checked, _) = check_steps(&doc, &mesh, 0, &[], &[(0, cut.clone())]);
+                assert!(checked.is_ok(), "{cut:?}: {:?}", checked.err());
+            }
+        }
         // The running program's marks count its levels as the plan does,
         // each done only when the tool has left it for the next.
         let programs =

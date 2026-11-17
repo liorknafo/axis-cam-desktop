@@ -210,17 +210,22 @@ pub fn check_setup_ops(
     // The A the program has turned to (`Block::Index`); None until it turns.
     let mut a_now: Option<f32> = None;
     // Lowest tip Z reached at each XY by the loaded tool since its tool
-    // change, at the A it is at: a turn of A moves the stock under it.
+    // change, at the A it is at: a turn of A moves the stock under it. An
+    // operation started at a later step has been everywhere its steps taken
+    // as cut went, with this tool (`Simulation::went`, LIO-565).
     let mut visited: HashMap<(i64, i64), f32> = HashMap::new();
+    let mut went_in: Vec<usize> = vec![];
     for block in blocks {
         let (op, from, to, rapid) = match block {
             Block::Start { change: true, .. } => {
                 visited.clear();
+                went_in.clear();
                 continue;
             }
             Block::Index { a, .. } => {
                 a_now = Some(*a);
                 visited.clear();
+                went_in.clear();
                 continue;
             }
             Block::Descend { op, xy, z } => {
@@ -268,6 +273,13 @@ pub fn check_setup_ops(
             }
             _ => continue,
         };
+        if !went_in.contains(&op) {
+            went_in.push(op);
+            for p in &sims[op].went {
+                let z = visited.entry(key(p[0], p[1])).or_insert(p[2]);
+                *z = z.min(p[2]);
+            }
+        }
         let (rest, top) = at_angle(op, a_now);
         let o = &ops[op];
         let low = from[2].min(to[2]);
