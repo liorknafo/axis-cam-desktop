@@ -2889,7 +2889,7 @@ pub(crate) mod tests {
     /// `posting_bar_job` with the contour in setup 1 too, then a finishing
     /// contour after it there: setup 1 is a plain setup on the bar in the
     /// chuck.
-    fn chuck_setup_1_job(angles: &str) -> (Document, Mesh) {
+    pub(crate) fn chuck_setup_1_job(angles: &str) -> (Document, Mesh) {
         let (mut doc, mesh) = posting_bar_job(20., "100", angles);
         let mut rough = doc.setups[1].operations[0].clone();
         rough.id = crate::model::id();

@@ -3348,8 +3348,9 @@ pub fn plan_steps(plan: &crate::simulation::Plan) -> Vec<Step> {
 /// a chuck-held plan does from over what its jaws swing
 /// (`indexed::enter_held`), but it never rises there again, so steps by that
 /// height would be one: a bore at a time is the clearance it retracts to
-/// (LIO-555). The highest Z of all for a plan without a feed move.
-fn step_clearance(plan: &crate::simulation::Plan) -> f32 {
+/// (LIO-555). The highest Z of all for a plan without a feed move. Air
+/// trimming's links between levels rise to it too (`air::relink`, LIO-565).
+pub(crate) fn step_clearance(plan: &crate::simulation::Plan) -> f32 {
     use crate::simulation::Motion;
     let moves = &plan.moves;
     let first = (moves.iter())
@@ -7739,6 +7740,131 @@ pub(crate) mod tests {
         let labels: Vec<String> = (0..n).map(|s| steps[0].label(s)).collect();
         assert_eq!(labels, want);
         // The tablet file: a step a bore, each ending somewhere to stop.
+        let tablet = tablet_runs(&doc, Ok(&mesh), 0);
+        assert!(tablet.problems.is_empty(), "{:?}", tablet.problems);
+        let tablet: Vec<_> = tablet.tool_runs.iter().flat_map(|r| &r.steps).collect();
+        let labels: Vec<&str> = tablet.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(labels, want);
+        assert!(tablet.iter().all(|t| !t.end_lines.is_empty()));
+    }
+
+    /// A chuck-held Contour's levels are a step each (LIO-565): the plain
+    /// setup on the bar in the chuck, its roughing Contour alone, comes in
+    /// from over what the jaws swing (`indexed::enter_held`) and retracts to
+    /// its own clearance between levels. Air trimming replaces some of those
+    /// retracts by links of its own, which rose to the swing height, the
+    /// plan's highest rapid: by the highest Z from the first cut on
+    /// (`step_clearance`), only those split it, Z38, Z36 and Z34 in one step
+    /// called "Pass 1". The links go no higher than its own clearance now:
+    /// every level starts at it, "Level 1" to "Level 7" at Z38 to Z27; a
+    /// skipped level leaves the others whole; the running program's marks
+    /// count the levels as the plan does, and the tablet file says them.
+    #[test]
+    fn a_chuck_held_contours_levels_are_a_step_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut doc, mesh) = crate::indexed::tests::chuck_setup_1_job("90, 180");
+        doc.setups.truncate(1);
+        doc.setups[0].operations.truncate(1);
+        let profile = dir.path().join("template.toml");
+        // With an A axis, and as fast as the plans' 6000 mm/min rapids.
+        let fast = (uc100::config::TEMPLATE)
+            .replace("max_velocity = 2000.0", "max_velocity = 12000.0")
+            .replace("max_velocity = 1000.0", "max_velocity = 6000.0");
+        let config = format!(
+            "{fast}\n[axes.a]\nsteps_per_unit = 10.0\nmax_velocity = 360.0\nacceleration = 100.0\nsoft_min = -360.0\nsoft_max = 360.0\nstep = {{ pin = 8 }}\ndir = {{ pin = 9 }}\n"
+        );
+        std::fs::write(&profile, config).unwrap();
+        let machine = &mut doc.setups[0].machine;
+        for (k, v) in [("z", "300"), ("controller", "UC100")] {
+            machine.p.insert(k.into(), v.into());
+        }
+        machine
+            .p
+            .insert("uc100_profile".into(), profile.display().to_string());
+        doc.machines = vec![doc.setups[0].machine.clone()];
+        doc.active = doc.setups[0].id.clone();
+        doc.sync_stock_sources();
+        doc.sync_turns(Some(&mesh));
+        let sims = simulated(&doc, &mesh, 0);
+        let sim = sims[0].1.as_ref().unwrap();
+        let plan = &sim.plan;
+        let first = (plan.moves.iter())
+            .position(|m| m.motion == Motion::Feed)
+            .unwrap();
+        let clear = step_clearance(plan);
+        // It comes in from far above its clearance, and air trimming linked
+        // some of its levels; no move from its first cut on goes back up
+        // there.
+        let entry = plan.moves[0].from[2];
+        assert!(entry > clear + 10., "{entry} {clear}");
+        let air = sim.air.as_ref().unwrap();
+        assert!(air.stretches > 0, "{air:?}");
+        assert!(plan.moves[first..].iter().all(|m| m.to[2] < entry - 10.));
+        // Its levels, from the top, each cut flat.
+        let mut levels: Vec<f32> = (plan.moves.iter())
+            .filter(|m| m.motion == Motion::Feed && (m.from[2] - m.to[2]).abs() < 1e-4)
+            .map(|m| m.to[2])
+            .collect();
+        levels.sort_by(|a, b| b.total_cmp(a));
+        levels.dedup_by(|a, b| (*a - *b).abs() < 0.005);
+        assert_eq!(levels, [38., 36., 34., 32., 30., 28., 27.]);
+        let steps = op_steps(&doc, 0, &sims);
+        let contour = &steps[0];
+        assert_eq!(contour.kind().0, "Level");
+        let zs: Vec<Option<f32>> = contour.steps.iter().map(|s| s.z).collect();
+        assert_eq!(zs, levels.iter().map(|&z| Some(z)).collect::<Vec<_>>());
+        let want: Vec<String> = (1..=7).map(|l| format!("Level {l}")).collect();
+        let labels: Vec<String> = (0..7).map(|s| contour.label(s)).collect();
+        assert_eq!(labels, want);
+        for w in contour.steps.windows(2) {
+            assert!(plan.moves[w[1].moves.start].from[2] >= clear - AT_CLEARANCE);
+        }
+        // Skipped (or before a start at a step), a level goes whole: the
+        // plan without Z36 is the other six, each a step at its own height.
+        let less = cut_plan(plan, &contour.steps, &[1]);
+        let kept: Vec<Option<f32>> = (plan_steps(&less).iter()).map(|s| s.z).collect();
+        let mut others = zs.clone();
+        others.remove(1);
+        assert_eq!(kept, others);
+        // The running program's marks count its levels as the plan does,
+        // each done only when the tool has left it for the next.
+        let programs =
+            crate::post::checked_to_start(&doc, &mesh, 0, &sims, PostSettings::for_uc100, &[])
+                .unwrap();
+        let p = programs.iter().find(|p| p.indexes.contains(&0)).unwrap();
+        let k = p.indexes.iter().position(|&o| o == 0).unwrap();
+        let mark_ops: Vec<Option<MarkOp>> = (p.indexes.iter())
+            .map(|&o| steps.iter().find(|s| s.op == o).map(|s| s.mark_op(&[])))
+            .collect();
+        let marks = step_marks(&p.blocks, &mark_ops);
+        let fed: Vec<usize> = (0..p.blocks.len())
+            .filter(|&b| {
+                matches!(
+                    p.blocks[b],
+                    Block::Move {
+                        op,
+                        kind: Kind::Feed,
+                        ..
+                    } if op == k
+                )
+            })
+            .collect();
+        let of_feed: Vec<usize> = fed.iter().map(|&b| marks[b].unwrap().1).collect();
+        for (s, step) in contour.steps.iter().enumerate() {
+            let sent = of_feed.iter().filter(|&&m| m == s).count();
+            assert_eq!(sent, step.feeds, "level {s}");
+        }
+        assert!(of_feed.windows(2).all(|w| w[1] == w[0] || w[1] == w[0] + 1));
+        for (b, m) in marks.iter().enumerate() {
+            let Some((o, s, true)) = *m else { continue };
+            if o != k {
+                continue;
+            }
+            if let Some(&next) = fed.iter().find(|&&f| f > b) {
+                assert_eq!(marks[next].unwrap().1, s + 1, "block {b} said level {s} done");
+            }
+        }
+        // The tablet file: a step a level, each ending somewhere to stop.
         let tablet = tablet_runs(&doc, Ok(&mesh), 0);
         assert!(tablet.problems.is_empty(), "{:?}", tablet.problems);
         let tablet: Vec<_> = tablet.tool_runs.iter().flat_map(|r| &r.steps).collect();
