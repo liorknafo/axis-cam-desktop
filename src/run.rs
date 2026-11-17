@@ -1779,10 +1779,25 @@ impl Run {
         } else if self.partway() {
             match self.partly() {
                 None => e.push(format!("The check did not work out the stock operation {}, {}, starts from: pick its first operation, or check the setup again.", from + 1, first.name)),
-                Some(_) if !self.zeroed => e.push(format!(
-                    "This run starts at {}, after operations taken as cut: set the work zero on the stock they left in the Work zero tab, or press Keep this work zero there if it is still the one they were cut with.",
-                    first.name
-                )),
+                Some(_) if !self.zeroed => {
+                    let oi = p.indexes.get(from).copied();
+                    let steps: Vec<usize> = oi.map_or_else(Vec::new, |oi| self.cut_of(oi));
+                    e.push(match (oi, &steps[..]) {
+                        (Some(oi), [first_step, ..]) => format!(
+                            "This run starts at {}, with {} of it taken as cut: set the work zero on the stock they left in the Work zero tab, or press Keep this work zero there if it is still the one they were cut with.",
+                            first.name,
+                            if steps.len() == 1 {
+                                self.step_label(oi, *first_step)
+                            } else {
+                                format!("{} of its steps", steps.len())
+                            }
+                        ),
+                        _ => format!(
+                            "This run starts at {}, after operations taken as cut: set the work zero on the stock they left in the Work zero tab, or press Keep this work zero there if it is still the one they were cut with.",
+                            first.name
+                        ),
+                    });
+                }
                 Some(_) => {}
             }
         }
@@ -2108,17 +2123,19 @@ impl Run {
 
     /// The run starts partway through the setup before any of its tool runs
     /// started: at a later tool run or operation than the first, those
-    /// before taken as cut. Its work zero is set on the stock they leave
-    /// (`partly`), and Cycle Start waits for it (`zeroed`).
+    /// before taken as cut, or with steps of its operation taken as cut.
+    /// Its work zero is set on the stock they leave (`partly`), and Cycle
+    /// Start waits for it (`zeroed`).
     pub fn partway(&self) -> bool {
         // An operation taken as cut before the start (`Skip::Cut`) is one.
         let start =
             (self.checked()).and_then(|c| c.get(self.next)?.indexes.get(self.from).copied());
         let cut = |&(oi, how): &(usize, Skip)| how == Skip::Cut && start.is_some_and(|s| oi < s);
-        // So are steps taken as cut before it.
-        let steps = |(oi, cut): &(usize, Vec<usize>)| {
-            !cut.is_empty() && start.is_some_and(|s| *oi < s || *oi == s && cut.contains(&0))
-        };
+        // So are steps taken as cut before it, and any of its own: taken as
+        // cut, their material is gone, wherever the work zero is touched
+        // off (LIO-568).
+        let steps =
+            |(oi, cut): &(usize, Vec<usize>)| !cut.is_empty() && start.is_some_and(|s| *oi <= s);
         let early = (self.next, self.from) != (0, 0)
             || self.skips.iter().any(cut)
             || self.cut_steps.iter().any(steps);
@@ -2332,10 +2349,10 @@ impl Run {
         let programs = self.checked()?;
         let p = programs.get(self.next)?;
         let before = p.partly.get(self.from)?;
-        // Its operation's first steps taken as cut, by a start at a step or
-        // a skip of them, cut the stock it starts from (LIO-568).
-        let first_cut = (p.indexes.get(self.from)).is_some_and(|&oi| self.cut_of(oi).contains(&0));
-        if self.at_step().is_none() && !first_cut {
+        // Steps of its operation taken as cut, before a start at a step or
+        // skipped, have cut the stock it starts from (LIO-568).
+        let steps_cut = (p.indexes.get(self.from)).is_some_and(|&oi| !self.cut_of(oi).is_empty());
+        if self.at_step().is_none() && !steps_cut {
             return Some(Cow::Borrowed(before));
         }
         // Inside an operation the check does not follow the stock, but it
@@ -7905,36 +7922,43 @@ pub(crate) mod tests {
         };
         assert!(moves(p) < moves(w));
         // A run that keeps the work zero passes; one set on the stock now
-        // finds Pass 1 cut where it is touched off, whether the run starts
-        // at Pass 2 or skips Pass 1: not the stock top it was set on.
-        let partly = |skip: bool| {
+        // finds the top cut where it is touched off, whether the run starts
+        // at Pass 2, skips Pass 1, or starts at Pass 1 with Pass 2, already
+        // cut, skipped: not the stock top it was set on.
+        let partly = |s: usize, skip: bool| {
             let mut run = Run::new(&doc, 0, 0);
             run.checked_as(
                 Arc::new(Ok(whole.clone())),
                 Some(Arc::new(left.clone())),
                 None,
             );
-            run.pick(0, if skip { 0 } else { 1 }, false);
+            run.pick(0, s, false);
             assert!(if skip {
                 run.skip_steps(true)
             } else {
                 run.start_step()
             });
-            assert_eq!(run.all_cut(), [(0, vec![0])]);
-            run.checked_as(
-                Arc::new(Ok(cut.clone())),
-                Some(Arc::new(cut_left.clone())),
-                None,
-            );
+            let cut_steps = vec![if skip { s } else { s - 1 }];
+            assert_eq!(run.all_cut(), [(0, cut_steps.clone())]);
+            let (cut, cut_left) = check_steps(&doc, &mesh, 0, &[], &[(0, cut_steps)]);
+            run.checked_as(Arc::new(cut), Some(Arc::new(cut_left)), None);
             assert!(run.partway());
-            run.partly().unwrap().into_owned()
+            let partly = run.partly().unwrap().into_owned();
+            (partly, run)
         };
-        let (skipped, started) = (partly(true), partly(false));
+        let (skipped, _) = partly(0, true);
+        let (started, _) = partly(1, false);
+        let (later, run) = partly(1, true);
         assert_eq!(skipped, started);
+        assert_eq!(later, started);
         assert!(skipped.top_cut && !skipped.cut.is_empty(), "{skipped:?}");
         assert_eq!(skipped.surface, None);
         let centre = (skipped.probe_from.iter()).find(|(r, _)| *r == p.probe.clone().unwrap());
         assert!(centre.is_some_and(|(_, ok)| ok.is_err()), "{centre:?}");
+        // Starting at Pass 1, Cycle Start waits for the work zero, kept or
+        // set again.
+        assert!(!run.zeroed);
+        assert_eq!((run.next, run.from, run.at_step()), (0, 0, None));
     }
 
     /// The journal of where a run stopped (LIO-275) is written and read
