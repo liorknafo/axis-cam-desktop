@@ -8651,11 +8651,11 @@ fn wizard_at(app: &App, at: usize) -> Element<'_, Message> {
                             "Pin 1's machine place: X {:.3} Y {:.3}, recorded on the Control page.",
                             at[0], at[1]
                         )).into(),
-                        Ok(Some(_)) => muted("Pin 1's machine place is not recorded yet: on the Control page, set machine zero, then Record the pins' place.").into(),
+                        Ok(Some(_)) => muted("Pin 1's machine place is not recorded yet: on the Control page, give X, Y and Z a machine position (Home for an axis with a home switch, Set machine zero for one without), then Record the pins' place.").into(),
                         Ok(None) => muted("No fixture pins.").into(),
                         Err(e) => warnings(e),
                     })
-                    .push(note("Dowel pins pressed into a plate on the table, square to X and Y, typed in the plate's own coordinates as drilled. A part drops over them by holes in it, so it sits in the same place and turn every time, also after a flip: a setup that sits on the pins (its Work zero step) gets its X and Y work offset from them without probing; Z is still touched off. Pin 1 is the reference pin: its machine place is recorded once on the Control page, and after every E-stop or power cycle Reference X Y from pin 1 makes machine X and Y, every saved work offset and the soft limits hold again."))
+                    .push(note("Dowel pins pressed into a plate on the table, square to X and Y, typed in the plate's own coordinates as drilled. A part drops over them by holes in it, so it sits in the same place and turn every time, also after a flip: a setup that sits on the pins (its Work zero step) gets its X and Y work offset from them without probing; Z is still touched off. Pin 1 is the reference pin: its machine place is recorded once on the Control page, and after every E-stop or power cycle Reference X Y from pin 1 makes machine X and Y, every saved work offset and the soft limits hold again. An axis with a home switch gets that from Home instead: nothing is referenced from the pin on it."))
                     .push(note("AXIS CAM drives this machine itself from the Control page, one tool run at a time with a manual tool change in between. The profile is the UC100 driver's machine file: I/O pins, steps per mm, speeds, limits and homing. Set this machine's X, Y and Z travel to the profile's soft limits: Cycle Start checks that they agree."));
             }
         }
@@ -13261,18 +13261,12 @@ fn pin_steps(
     on: &crate::post::OnPins,
 ) -> Vec<String> {
     let s = &c.snapshot;
-    let recorded = matches!(&c.pins, Ok(Some(pins)) if pins.reference.is_some());
     let mut steps = vec![format!(
         "The part sits on the fixture pins, pin 1 at X{} Y{} in work coordinates: the pins give X and Y exactly, and Z is touched off on the stock.",
         crate::post::exact_mm(on.pin1[0]),
         crate::post::exact_mm(on.pin1[1])
     )];
-    steps.push(match (recorded, c.pin_referenced, s.referenced[2]) {
-        (_, true, true) => "1. X and Y are referenced from pin 1 since the last E-stop, and Z has a machine position.".into(),
-        (false, ..) => "1. Under Position, set machine zero, then with the part off the pins Record the pins' place (once for the plate).".into(),
-        (true, _, false) => "1. Under Position, set machine zero on Z at the top of its travel, then with the part off the pins Reference X Y from pin 1 (after every E-stop or power cycle).".into(),
-        (true, false, true) => "1. With the part off the pins, jog the probe a few mm above the middle of pin 1 and press Reference X Y from pin 1 in the Machine tab: every E-stop clears it.".into(),
-    });
+    steps.push(pin_ready_step(c));
     steps.push(if p.offset == format!("G{}", 54 + s.active_wcs) {
         format!("2. {} is the active work system.", p.offset)
     } else {
@@ -13306,6 +13300,140 @@ fn pin_steps(
         None => "4. Touch Z off on the part with Set under Work zero: the program header says where Z0 is.".into(),
     });
     steps
+}
+/// How X and Y hold the pins' place once they do (`Connection::pins_hold`):
+/// homed if they have a home switch, the others referenced from pin 1
+/// (LIO-574).
+fn pin_held_words(c: &crate::control::Connection) -> String {
+    match c.pin_axes() {
+        [] => "X and Y are homed".into(),
+        axes @ [_, _] => format!(
+            "{} are referenced from pin 1",
+            crate::control::axis_list(axes)
+        ),
+        axes => format!(
+            "{} is homed and {} referenced from pin 1",
+            crate::control::axis_list(&[1 - axes[0]]),
+            crate::control::axis_list(axes)
+        ),
+    }
+}
+/// The first of a setup on the pins' work zero steps: X and Y where the
+/// pins' place was recorded in, and Z with a machine position. Home gives
+/// that to an axis with a home switch, Set machine zero to Z without one,
+/// and Reference X Y from pin 1 to X and Y without one (LIO-574).
+pub(crate) fn pin_ready_step(c: &crate::control::Connection) -> String {
+    let s = &c.snapshot;
+    let recorded = matches!(&c.pins, Ok(Some(pins)) if pins.reference.is_some());
+    if recorded && c.pins_hold() && s.referenced[2] {
+        return format!(
+            "1. {} since the last E-stop, and Z has a machine position.",
+            pin_held_words(c)
+        );
+    }
+    if !recorded {
+        let unset: Vec<usize> = (0..3).filter(|&a| !s.referenced[a]).collect();
+        return if unset.is_empty() {
+            "1. With the part off the pins, Record the pins' place in the Machine tab (once for the plate).".into()
+        } else {
+            format!(
+                "1. In the Machine tab, {}, then with the part off the pins Record the pins' place (once for the plate).",
+                c.place(&unset, false, false)
+            )
+        };
+    }
+    let axes = c.pin_axes();
+    let unhomed: Vec<usize> = (0..3).filter(|&a| c.homes(a) && !s.referenced[a]).collect();
+    let z_set = !c.homes(2) && !s.referenced[2];
+    let first = match (unhomed.is_empty(), z_set) {
+        (true, true) => Some("set machine zero on Z at the top of its travel".to_string()),
+        (false, false) => Some("Home".to_string()),
+        (false, true) => Some(format!(
+            "Home {}, and set machine zero on Z at the top of its travel",
+            crate::control::axis_list(&unhomed)
+        )),
+        (true, false) => None,
+    };
+    let unpinned = !axes.is_empty() && !(c.pin_referenced && axes.iter().all(|&a| s.referenced[a]));
+    let label = crate::control::pin_label(axes);
+    match (first, unpinned) {
+        (Some(first), true) => format!(
+            "1. In the Machine tab, {first}, then with the part off the pins {label} (after every E-stop or power cycle)."
+        ),
+        (None, _) => format!(
+            "1. With the part off the pins, jog the probe a few mm above the middle of pin 1 and press {label} in the Machine tab: every E-stop clears it."
+        ),
+        (Some(first), false) => format!(
+            "1. In the Machine tab, {first} (after every E-stop or power cycle).{}",
+            if axes.is_empty() {
+                " X and Y have home switches, so the pins' place holds again after a Home: nothing is referenced from pin 1."
+            } else {
+                ""
+            }
+        ),
+    }
+}
+/// What the Fixture pins block says of the pins' place (`pin_block`):
+/// whether X and Y hold it (true), and what gives it back after an E-stop
+/// or records it: Home for X and Y with a home switch, Reference X Y from
+/// pin 1 for those without (LIO-574).
+pub(crate) fn pin_state(c: &crate::control::Connection) -> (bool, String) {
+    let reference = c
+        .pins
+        .as_ref()
+        .ok()
+        .and_then(|p| p.as_ref())
+        .and_then(|p| p.reference);
+    let Some(at) = reference else {
+        return (
+            false,
+            format!(
+                "Not recorded yet. Once X, Y and Z have a machine position ({}): take the part off the pins, jog the probe a few mm above the middle of pin 1 and press Record the pins' place. It finds pin 1, then pin 2, and says how square the plate is.{}",
+                c.place(&[0, 1, 2], false, false),
+                c.record_blocked()
+                    .map_or(String::new(), |why| format!(" {why}"))
+            ),
+        );
+    };
+    if c.pins_hold() {
+        return (
+            true,
+            format!(
+                "{}{} recorded at machine X {:.3} Y {:.3}.",
+                pin_held_words(c),
+                if c.pin_axes().is_empty() {
+                    ", so the pins' place holds: pin 1"
+                } else {
+                    ","
+                },
+                at[0],
+                at[1]
+            ),
+        );
+    }
+    let axes = c.pin_axes();
+    let why = c.reference_blocked().filter(|_| !axes.is_empty());
+    let todo = match axes {
+        [] => "Home. X and Y have home switches, so Home gives them their machine position and the pins' place holds again after it: nothing is referenced from pin 1.".into(),
+        [_, _] => "take the part off the pins, jog the probe a few mm above the middle of pin 1 and press Reference X Y from pin 1: X and Y need no machine position first, Z does.".into(),
+        _ => {
+            let homed = crate::control::axis_list(&[1 - axes[0]]);
+            let pinned = crate::control::axis_list(axes);
+            format!(
+                "Home, then take the part off the pins, jog the probe a few mm above the middle of pin 1 and press {}: {pinned} needs no machine position first, {homed} and Z do. {homed} has a home switch, so Home gives it its position and only {pinned} is declared from the pin.",
+                crate::control::pin_label(axes)
+            )
+        }
+    };
+    (
+        false,
+        format!(
+            "Pin 1 is recorded at machine X {:.3} Y {:.3}. After every E-stop or power cycle, {todo}{}",
+            at[0],
+            at[1],
+            why.map_or(String::new(), |why| format!(" {why}"))
+        ),
+    )
 }
 /// What the checks say once the work zero is on the stock: whether every
 /// tool run fits the soft limits, which needs a machine position.
@@ -13426,47 +13554,35 @@ fn pin_block<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>>
         Ok(Some(pins)) => Some(pins),
         Err(_) => None,
     };
-    let (record, reference) = (c.record_blocked(), c.reference_blocked());
-    let mut col = column![
-        bold("Fixture pins", 12),
-        row![
-            act(
-                "Record the pins' place",
-                record
-                    .is_none()
-                    .then_some(Message::Machine(Action::RecordPins)),
-                c.pinning() == Some(true)
-            ),
-            act(
-                "Reference X Y from pin 1",
-                reference
-                    .is_none()
-                    .then_some(Message::Machine(Action::ReferencePins)),
-                c.pinning() == Some(false)
-            ),
-        ]
-        .spacing(6),
-    ]
+    let axes = c.pin_axes();
+    let mut buttons = row![act(
+        "Record the pins' place",
+        c.record_blocked()
+            .is_none()
+            .then_some(Message::Machine(Action::RecordPins)),
+        c.pinning() == Some(true)
+    )]
     .spacing(6);
+    // With home switches on X and Y, Home gives them their position and
+    // nothing is referenced from the pin (LIO-574).
+    if !axes.is_empty() {
+        buttons = buttons.push(act(
+            crate::control::pin_label(axes),
+            c.reference_blocked()
+                .is_none()
+                .then_some(Message::Machine(Action::ReferencePins)),
+            c.pinning() == Some(false),
+        ));
+    }
+    let mut col = column![bold("Fixture pins", 12), buttons].spacing(6);
     let green = Color::from_rgb8(39, 130, 93);
-    let state = match pins.and_then(|p| p.reference) {
-        _ if c.pinning().is_some() => text("Probing pin 1: E-stop stops it.").size(12),
-        Some(at) if c.pin_referenced => text(format!(
-            "X and Y are referenced from pin 1, recorded at machine X {:.3} Y {:.3}.",
-            at[0], at[1]
-        ))
-        .size(12)
-        .color(green),
-        Some(at) => muted(format!(
-            "Pin 1 is recorded at machine X {:.3} Y {:.3}. After every E-stop or power cycle, take the part off the pins, jog the probe a few mm above the middle of pin 1 and press Reference X Y from pin 1: X and Y need no machine position first, Z does.{}",
-            at[0],
-            at[1],
-            reference.map_or(String::new(), |why| format!(" {why}"))
-        )),
-        None => muted(format!(
-            "Not recorded yet. Once, after setting machine zero: take the part off the pins, jog the probe a few mm above the middle of pin 1 and press Record the pins' place. It finds pin 1, then pin 2, and says how square the plate is.{}",
-            record.map_or(String::new(), |why| format!(" {why}"))
-        )),
+    let state = match (c.pinning(), pins.is_some()) {
+        (Some(_), _) => text("Probing pin 1: E-stop stops it.").size(12),
+        (None, true) => match pin_state(c) {
+            (true, said) => text(said).size(12).color(green),
+            (false, said) => muted(said),
+        },
+        (None, false) => muted(c.record_blocked().unwrap_or_default()),
     };
     col = col.push(state);
     if let Some(top) = c.sim_pin1_top() {

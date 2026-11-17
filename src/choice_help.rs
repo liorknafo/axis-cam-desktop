@@ -159,7 +159,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
         }
         ("on_pins", "Yes") => (
             "The part drops over the machine's fixture pins by holes in it, so its place and turn are known: the pins give this setup's X and Y work offset (Set X Y from the pins on the Control page), with no probing. Z is still touched off on the stock. The pins are kept clear of as workholding; the vise or clamps still hold the part down.",
-            "Cycle Start waits until X and Y are referenced from pin 1 since the last E-stop and the work offset is the one the pins give. The check warns when no earlier setup drills the holes for the pins.",
+            "Cycle Start waits until X and Y are referenced from pin 1 (homed, on an axis with a home switch) since the last E-stop and the work offset is the one the pins give. The check warns when no earlier setup drills the holes for the pins.",
         ),
         ("pin_source", "Part's holes") => (
             "The part drops over the pins by round holes in its own design, opening on the face this setup sits on: choose them from the list, or pick them in the 3D view.",

@@ -1776,11 +1776,11 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
             "",
         ),
         RecordPins => (
-            "Once, after setting machine zero, and again whenever the plate is moved: with the part off the pins and the probe a few mm above the middle of pin 1, find pin 1's centre and keep its machine X Y in the machine's profile. Then it flies over the top of Z to where the plate puts pin 2, finds it, and says how far it is off the line from pin 1: over 0.05 mm, square the plate.",
+            "Once X, Y and Z have a machine position (Home for an axis with a home switch, Set machine zero for one without), and again whenever the plate is moved: with the part off the pins and the probe a few mm above the middle of pin 1, find pin 1's centre and keep its machine X Y in the machine's profile. Then it flies over the top of Z to where the plate puts pin 2, finds it, and says how far it is off the line from pin 1: over 0.05 mm, square the plate.",
             "Pin centre touches the pin's top, then probes its sides from −X, +X, −Y and +Y, min(3 mm, half the pin's height) below the top, starting outside it by the pin's and the tip's diameters and 1 mm. The tip's radius cancels out.",
         ),
         ReferencePins => (
-            "After every E-stop or power cycle, or at the start of a session: with the part off the pins and the probe a few mm above the middle of pin 1, find pin 1's centre and declare machine X and Y so that it is where it was recorded. Pin 1 acts as the machine's home for X and Y: every saved G54–G59 offset, the soft limits and the pins' place hold again. Z still gets its machine zero at the top of travel.",
+            "After every E-stop or power cycle, or at the start of a session: with the part off the pins and the probe a few mm above the middle of pin 1, find pin 1's centre and declare machine X and Y so that it is where it was recorded. Pin 1 acts as the machine's home for X and Y: every saved G54–G59 offset, the soft limits and the pins' place hold again. Z still gets its machine zero at the top of travel. An axis with a home switch is never declared, as that would take its homed reference away: Home gives it its position. With a switch on X or Y the other alone is declared, after Home; with switches on both, this is not offered, as the pins' place recorded after a Home holds again after the next.",
             "X and Y need no machine position first: they are declared where they show, the probe moves only a few mm from where the tip is, and then they are declared again from the pin. Z needs one, as the probe moves it.",
         ),
         PinZero => (

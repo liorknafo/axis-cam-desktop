@@ -5333,8 +5333,8 @@ pub fn busy(state: Option<&State>) -> bool {
 
 /// Why a setup that sits on the pins (`Checked::pins`) cannot start on
 /// `c` yet: the connected machine's pins are not the setup's, their place
-/// is not recorded, X and Y are not referenced from pin 1 since the last
-/// E-stop, or the work offset is not the one the pins give. None for any
+/// is not recorded, X and Y are not referenced from pin 1 (or homed) since
+/// the last E-stop, or the work offset is not the one the pins give. None for any
 /// other setup.
 fn pin_problems(c: &Connection, setup: &crate::model::Setup, p: &Checked) -> Vec<String> {
     let Some(on) = &p.pins else {
@@ -5363,8 +5363,10 @@ fn pin_problems(c: &Connection, setup: &crate::model::Setup, p: &Checked) -> Vec
         );
         return e;
     };
-    if !c.pin_referenced {
-        e.push("X and Y are not referenced from pin 1 since the machine was connected or E-stopped: Reference X Y from pin 1 in the Machine tab first.".into());
+    // Home for X and Y with a home switch, the pin for those without
+    // (LIO-574).
+    if let Some(why) = c.pins_unheld() {
+        e.push(why);
         return e;
     }
     let want = [0, 1].map(|a| at[a] - on.pin1[a] as f64);
