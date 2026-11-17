@@ -2911,6 +2911,9 @@ pub fn check_steps(
             // Taken as cut, they cut the stock the operation starts from:
             // the checks of the steps sent see that material gone (LIO-311).
             if let Some(mut volume) = sim.initial_volume.take() {
+                // The work zero was set on the stock before them: they were
+                // cut with it, and a start keeps it (LIO-568).
+                sim.before_steps.get_or_insert_with(|| volume.clone());
                 let plan = &sim.plan;
                 for m in (steps.iter())
                     .filter_map(|&s| found.steps.get(s))
@@ -7835,6 +7838,48 @@ pub(crate) mod tests {
             assert!(left(&cut, oi) < left(&whole, oi), "before operation {oi}");
         }
         assert_eq!(left(&cut, 3), left(&whole, 3));
+    }
+
+    /// A start at Face's Pass 2 on the tablet's fixture (LIO-568), its work
+    /// zero Stock top center: Pass 1, taken as cut, faced the stock top, but
+    /// it was cut with the work zero the start keeps, so the start passes,
+    /// the zero found and probed as for the whole run. Pass 1 is still in
+    /// the stock the run starts from.
+    #[test]
+    fn a_start_at_a_later_pass_of_the_first_operation_keeps_its_work_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (doc, mesh) = tablet_fixture(&profile);
+        assert_eq!(
+            crate::model::get(&doc.setups[0].p, "origin"),
+            "Stock top center"
+        );
+        let (whole, left) = check_steps(&doc, &mesh, 0, &[], &[]);
+        let whole = whole.unwrap();
+        let face = left.steps.iter().find(|s| s.op == 0).unwrap();
+        assert!(face.steps.len() >= 2, "{:?}", face.steps.len());
+        let (cut, cut_left) = check_steps(&doc, &mesh, 0, &[], &[(0, vec![0])]);
+        let cut = cut.unwrap_or_else(|e| panic!("{e:?}"));
+        let (p, w) = (&cut[0], &whole[0]);
+        assert_eq!(p.indexes.first(), Some(&0));
+        assert!(p.from(0).is_ok());
+        assert_eq!(p.datum, w.datum);
+        assert_eq!(p.probe, w.probe);
+        assert_eq!(p.probe_from, w.probe_from);
+        assert!(p.probe.is_ok(), "{:?}", p.probe);
+        // Pass 1 is cut in the stock before Face, and Face sends less.
+        let before = |l: &Left| -> f32 {
+            let b = l.before.iter().find(|b| b.op == 0).unwrap();
+            b.stock.heights.iter().sum()
+        };
+        assert!(before(&cut_left) < before(&left));
+        let moves = |c: &Checked| {
+            (c.blocks.iter())
+                .filter(|b| matches!(b, Block::Move { op: 0, .. }))
+                .count()
+        };
+        assert!(moves(p) < moves(w));
     }
 
     /// The journal of where a run stopped (LIO-275) is written and read

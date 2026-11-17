@@ -902,6 +902,11 @@ pub struct Simulation {
     pub initial_stock: StockGrid,
     pub volume: Option<crate::volume::Volume>,
     pub initial_volume: Option<crate::volume::Volume>,
+    /// `initial_volume` as it was before a run's check carved the steps it
+    /// takes as cut into it (`run::check_steps`, LIO-568): the stock the
+    /// work zero was set on, before those steps cut it. None when no step
+    /// was carved.
+    pub before_steps: Option<crate::volume::Volume>,
     pub frame: Option<crate::volume::Frame>,
     /// The frame at each A angle of an indexed setup's operation (`indexed`):
     /// a move at A `a` cuts the part posed by the frame listed for `a`.
@@ -947,6 +952,7 @@ impl Simulation {
             stock,
             volume: None,
             initial_volume: None,
+            before_steps: None,
             frame: None,
             turns: vec![],
             preceding: 0,
@@ -999,6 +1005,13 @@ impl Simulation {
             .unwrap_or(to);
         let t = ((self.seconds - m.start) / (m.end - m.start).max(1e-6)).clamp(0., 1.);
         Some(from + (to - from) * t)
+    }
+    /// The stock the setup's work zero was set on, when this is its first
+    /// operation's simulation: the stock it started from, before any of its
+    /// steps a run takes as cut (`before_steps`), which were cut with that
+    /// work zero (LIO-568).
+    pub fn zero_volume(&self) -> Option<&crate::volume::Volume> {
+        self.before_steps.as_ref().or(self.initial_volume.as_ref())
     }
     /// `forces::bites` of this simulation, worked out once.
     pub fn bites(&self) -> &[crate::forces::Bite] {
