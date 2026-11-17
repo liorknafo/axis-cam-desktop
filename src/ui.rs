@@ -10034,7 +10034,9 @@ pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
             widget::tooltip::Position::Bottom,
         )
     };
-    let line: Element<_> = if c.probe_moving() {
+    // Not over a refusal: a probe move known from before is not the
+    // machine's now, and Stop now cannot reach it (LIO-561).
+    let line: Element<_> = if c.probe_moving() && c.pi_refused().is_none() {
         text(PROBE_HOLD)
             .size(13)
             .color(WARN)
