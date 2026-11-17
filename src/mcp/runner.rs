@@ -362,7 +362,7 @@ impl Host {
         }
         let mut file = SessionFile::of(&self.app);
         let key = file.key();
-        if !force && self.kept == Some(key) && !self.app.dirty {
+        if !force && self.kept == Some(key) && !self.app.unsaved() {
             return Ok(());
         }
         if !self.app.persist_now() {
