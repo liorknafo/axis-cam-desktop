@@ -185,6 +185,7 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
     let guide = crate::guide::build(doc, mesh, si)?;
     let setup = &doc.setups[si];
     let zero = guide.zero;
+    let work = |b: Bounds| b.translated(zero.map(|v| -v));
     let placement = crate::stock::Placement::new(mesh, Some(setup));
     let scale = 1. / mesh.display_scale();
     let mut part: [Vec<Vec<[f32; 2]>>; 3] = Default::default();
