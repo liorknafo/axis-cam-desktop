@@ -6035,6 +6035,18 @@ flood = { pin = 8 }
         let mut a = ops_app(dir.path());
         zeroed(&mut a);
         check_run(&mut a, 0);
+        // The app ticks all along: by the time a hand reaches the pad, the
+        // edit pause has ended and its tick saved the project. That tick
+        // takes about 20 ms, but up to half a second on a busy computer, so taken right
+        // after the press it lets the driver's 400 ms keepalive lapse and
+        // end the jog before any tick sees it (LIO-564, LIO-559).
+        a.last_edit -= crate::EDIT_PAUSE * 2;
+        let _ = a.update(Message::Tick);
+        assert!(!a.dirty, "the edit pause's tick saved: {}", a.status);
+        // At 5 % (50 mm/s), Y takes 2.8 s from 140 to its 280 mm soft
+        // limit: at the usual 50 % it took 0.28 s, which a busy computer
+        // could sleep through between two ticks.
+        let _ = a.update(Message::Machine(crate::control::Action::JogSpeed(5.)));
         let still = jog_pad(&a);
         for axis in 0..3 {
             for negative in [false, true] {
@@ -6047,6 +6059,7 @@ flood = { pin = 8 }
         let _ = a.update(Message::Machine(crate::control::Action::JogPress(1, false)));
         tick_until(&mut a, 3.0, "jogging", |s| s.state == Some(State::Jog));
         let moving = jog_pad(&a);
+        assert_eq!(conn(&a).held(), Some((1, false)), "the jog still held");
         let _ = a.update(Message::Machine(crate::control::Action::JogRelease));
         assert_eq!(still, moving);
         // Every scrollable is inside the page under the run bar, none of it
