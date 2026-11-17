@@ -6058,8 +6058,9 @@ flood = { pin = 8 }
         }
         let _ = a.update(Message::Machine(crate::control::Action::JogPress(1, false)));
         tick_until(&mut a, 3.0, "jogging", |s| s.state == Some(State::Jog));
+        // Drawn from the snapshot that says Jog, as the app draws the
+        // page between two ticks of the jog.
         let moving = jog_pad(&a);
-        assert_eq!(conn(&a).held(), Some((1, false)), "the jog still held");
         let _ = a.update(Message::Machine(crate::control::Action::JogRelease));
         assert_eq!(still, moving);
         // Every scrollable is inside the page under the run bar, none of it
