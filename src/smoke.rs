@@ -26418,10 +26418,12 @@ soft_max = 180.0
     /// The `Tick` after an edit's pause writes the workspace on a thread of
     /// its own (LIO-559): written in that `Tick`, a large pick's places (a
     /// curved face is many surfaces) held the window most of a second on a
-    /// busy computer, and a held jog stopped. Until it is written the header
-    /// says "Saving…"; a later `Tick` takes the result. Another pause while
-    /// it is written writes the newer job after it. A save in line meanwhile (closing, the shop tablet, the MCP
-    /// session) waits for it and then writes the newer job, never the older
+    /// busy computer, and a held jog stopped. Until it is written the
+    /// workspace counts as unsaved (`App::unsaved`, the note a failed save
+    /// shows); a later `Tick` takes the result. Another pause while it is
+    /// written writes the newer job after it. A save in line meanwhile
+    /// (closing, the shop tablet, the MCP session) waits for it and then
+    /// writes the newer job, never the older
     /// over it. A write that fails is said and tried again after the next
     /// pause, as one in line is.
     #[test]
