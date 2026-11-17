@@ -5674,8 +5674,10 @@ pub(crate) mod tests {
                 assert_eq!(got, want);
             }
         }
-        // At least holes 2 to 5 and a later level of the pocket start.
-        assert!(count >= 4 + 1, "{count}");
+        // Pocket's later levels and holes 2 to 5 start; Face's pass 2 too,
+        // once the check takes pass 1 as cut without refusing the work zero
+        // (LIO-568).
+        assert!(count >= 9, "{count}");
     }
 
     /// A tablet file from before the starts (LIO-476) still reads: its tool
