@@ -6941,6 +6941,54 @@ pub(crate) mod tests {
             crate::centre::insert(doc, 0, ops);
         })
     }
+    /// The app counts a drill as centred as the Steps read the stock
+    /// when their guide is built (LIO-536): a milling operation between
+    /// the centre drilling and the drill that leaves the spots (the Step
+    /// again) does not undo it. Without the guide it may have taken them
+    /// away: the drill is not counted, so the editor warns and offers a
+    /// centre drilling again (MCP `add_centring` reads the same).
+    #[test]
+    fn the_app_counts_a_centring_the_stock_still_has() {
+        let a = centred_app();
+        assert!(a.centred(3));
+        let mut a = app_with("Yes", |doc| {
+            let mut c =
+                crate::model::Tool::new("Centre drill A2.5×6.3", crate::model::CENTRE_DRILL, "6.3");
+            c.set_type(crate::model::CENTRE_DRILL);
+            c.p.insert("stickout".into(), "40".into());
+            doc.tools.push(c);
+            let (ops, _) = crate::centre::needed(doc, 0, None);
+            crate::centre::insert(doc, 0, ops);
+            let mut again = doc.setups[0].operations[1].clone();
+            again.id = "step-again".into();
+            doc.setups[0].operations.insert(3, again);
+        });
+        if let Some(Err(why)) = a.current_guide() {
+            panic!("{why}");
+        }
+        let uncentred = (guide(&a).steps.iter())
+            .find_map(|s| match s {
+                Step::Holes {
+                    op: 4, uncentred, ..
+                } => Some(uncentred.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(uncentred.iter().all(|u| !*u), "{uncentred:?}");
+        assert!(a.centred(4));
+        assert!(!crate::centre::centred(a.doc.setup(), 4, a.part_mesh()));
+        a.guide = None;
+        assert!(!a.centred(4));
+        a.page = crate::Page::Work;
+        let _ = a.update(Message::SelectOp(4));
+        let _ = a.update(Message::Tab("Tool".into()));
+        let t = texts(&a);
+        assert!(t.iter().any(|s| s == "Centre drill first"), "{t:?}");
+        assert!(
+            t.iter().any(|s| s == "+ Add a centre drilling before it"),
+            "{t:?}"
+        );
+    }
     /// The Holes step of operation `op`.
     fn holes_step(a: &App, op: usize) -> usize {
         (guide(a).steps.iter())

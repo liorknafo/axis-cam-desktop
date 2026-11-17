@@ -77,10 +77,13 @@ pub const SAME_CENTRE: f32 = 0.05;
 pub type HolesOf<'a> = dyn FnMut(&Operation) -> Option<Vec<cam::Hole>> + 'a;
 /// Whether operation `oi` of `setup` has its holes opened before it: an
 /// enabled earlier operation centre drills it (`centres`), or drills the
-/// same holes (a centre drilling, a countersink, a pilot drill), or, with
-/// the part `mesh`, drills from the solid at the centre of every hole it
-/// drills (`at_centres`): a centre drilling picked on a counterbore's
-/// arcs centres the drill picked on the slot's under them (LIO-536).
+/// same holes from the solid (a centre drilling, a countersink, a pilot
+/// drill), or, with the part `mesh`, drills from the solid at the centre
+/// of every hole it drills (`at_centres`): a centre drilling picked on a
+/// counterbore's arcs centres the drill picked on the slot's under them
+/// (LIO-536). Not one a milling operation follows before the drill: a
+/// facing, a pocket or a slot may take away the face it spotted (the
+/// guide's `opened`, which reads the stock, says for sure).
 pub fn centred(setup: &Setup, oi: usize, mesh: Option<&Mesh>) -> bool {
     let mut kept = std::collections::HashMap::new();
     centred_by(setup, oi, &mut |o: &Operation| {
@@ -95,16 +98,25 @@ pub fn centred_by(setup: &Setup, oi: usize, holes: &mut HolesOf<'_>) -> bool {
     let Some(op) = setup.operations.get(oi) else {
         return false;
     };
-    let opens = |o: &Operation| o.strategy == Strategy::Drill && !o.drills_pin_holes();
-    let earlier: Vec<&Operation> = (setup.operations[..oi].iter())
+    // Drills from the solid: not a tap, a reamer or a boring head, which
+    // follow a hole already there.
+    let opens = |o: &Operation| {
+        o.strategy == Strategy::Drill
+            && !o.drills_pin_holes()
+            && FROM_SOLID.contains(&get(&o.p, "cycle"))
+    };
+    // The enabled operations since the last milling one before the drill:
+    // a spot made before that may be gone.
+    let since = (setup.operations[..oi].iter())
+        .rposition(|o| o.enabled && o.strategy != Strategy::Drill)
+        .map_or(0, |k| k + 1);
+    let earlier: Vec<&Operation> = (setup.operations[since..oi].iter())
         .filter(|o| o.enabled)
         .collect();
     if (earlier.iter()).any(|o| get(&o.p, CENTRES) == op.id || (opens(o) && same_holes(o, op))) {
         return true;
     }
-    let candidates: Vec<&&Operation> = (earlier.iter())
-        .filter(|o| opens(o) && FROM_SOLID.contains(&get(&o.p, "cycle")))
-        .collect();
+    let candidates: Vec<&&Operation> = earlier.iter().filter(|o| opens(o)).collect();
     if candidates.is_empty() {
         return false;
     }
@@ -679,7 +691,12 @@ mod tests {
         assert!(!centred(setup, 3, None));
         // A spot that is off, or a tap or a boring head before it, does
         // not open the holes.
-        for (k, v) in [("enabled", ""), ("cycle", "Tapping"), ("cycle", "Boring")] {
+        for (k, v) in [
+            ("enabled", ""),
+            ("cycle", "Tapping"),
+            ("cycle", "Boring"),
+            ("cycle", "Reaming"),
+        ] {
             let mut doc = doc.clone();
             let spot = &mut doc.setups[0].operations[2];
             match k {
@@ -689,6 +706,40 @@ mod tests {
                 }
             }
             assert!(!centred_by(&doc.setups[0], 3, &mut moved(0., 4)), "{k} {v}");
+        }
+        // Picking what the drill picks: so too, only from the solid.
+        let mut same = doc.clone();
+        let drill = same.setups[0].operations[3].clone();
+        follow(&mut same.setups[0].operations[2], &drill);
+        assert!(same_holes(&same.setups[0].operations[2], &drill));
+        assert!(centred(&same.setups[0], 3, None));
+        for cycle in ["Tapping", "Boring", "Reaming"] {
+            let mut doc = same.clone();
+            (doc.setups[0].operations[2].p).insert("cycle".into(), cycle.into());
+            assert!(!centred(&doc.setups[0], 3, None), "{cycle}");
+        }
+        // A milling operation between them may take the spots away (a
+        // facing 12 deeper): not counted, by its picks or its centres. A
+        // drilling between them does not.
+        for (strategy, counted) in [(Strategy::Box, false), (Strategy::Drill, true)] {
+            let mut doc = same.clone();
+            let tool = doc.setups[0].operations[0].tool.clone();
+            let mut between = crate::guide::tests::boxed(
+                "Face again",
+                &tool,
+                [-500., 500., -500., 500., -2., -14.],
+                &[],
+            );
+            between.strategy = strategy;
+            doc.setups[0].operations.insert(3, between);
+            assert_eq!(centred(&doc.setups[0], 4, None), counted, "{strategy:?}");
+            assert_eq!(
+                centred_by(&doc.setups[0], 4, &mut moved(0., 4)),
+                counted,
+                "{strategy:?}"
+            );
+            doc.setups[0].operations[3].enabled = false;
+            assert!(centred(&doc.setups[0], 4, None), "{strategy:?} off");
         }
     }
     #[test]

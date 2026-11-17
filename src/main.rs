@@ -4689,8 +4689,25 @@ impl App {
             .clone()
     }
     /// Whether operation `oi` of the current setup has its holes opened
-    /// before it (`centre::centred`), the holes kept (`kept_drill_holes`).
+    /// before it: as the Steps' guide reads the stock (`guide::opened`)
+    /// when it is built for the job as it is, else `centre::centred`, the
+    /// holes kept (`kept_drill_holes`). A spot a facing took away after
+    /// it is then not counted, and a centre drilling can be added again.
     pub(crate) fn centred(&self, oi: usize) -> bool {
+        let read = (self.current_guide().and_then(|g| g.as_ref().ok())).and_then(|shown| {
+            // Every Holes step of it (one at each A angle, say).
+            (shown.guide.steps.iter())
+                .filter_map(|s| match s {
+                    guide::Step::Holes { op, uncentred, .. } if *op == oi => {
+                        Some(!uncentred.iter().any(|u| *u))
+                    }
+                    _ => None,
+                })
+                .reduce(|a, b| a && b)
+        });
+        if let Some(read) = read {
+            return read;
+        }
         let mesh = self.part_mesh();
         centre::centred_by(self.doc.setup(), oi, &mut |o: &Operation| {
             self.kept_drill_holes(o, mesh?)
