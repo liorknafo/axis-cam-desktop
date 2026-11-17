@@ -2952,6 +2952,23 @@ impl OpSteps {
     /// Steps `range`'s label: "Levels 5–9", or one step's. Of a plan cut in
     /// passes: "Pass 2 · Holes 1–3" within a pass, "Passes 1–2" for whole
     /// passes, else from the first's label to the last's.
+    /// Step `s`'s label with how many there are, as the run line says
+    /// where the job is: "Level 3 of 9"; a visit of a plan cut in passes
+    /// counts each, "Pass 1 of 3 · Hole 2 of 2", never "of 6" visits
+    /// (LIO-558).
+    pub fn label_of(&self, s: usize) -> String {
+        match self.in_pass(s) {
+            Some((p, _, _)) if self.one_hole() => format!("Pass {} of {}", p + 1, self.passes()),
+            Some((p, h, n)) => format!(
+                "Pass {} of {} · Hole {} of {n}",
+                p + 1,
+                self.passes(),
+                h + 1
+            ),
+            None => format!("{} of {}", self.label(s), self.steps.len()),
+        }
+    }
+
     pub fn labels(&self, range: std::ops::RangeInclusive<usize>) -> String {
         let (a, b) = (*range.start(), *range.end());
         if a == b {
@@ -6092,6 +6109,7 @@ pub(crate) mod tests {
         assert_eq!(labels, ["Hole 1", "Hole 2", "Hole 3", "Hole 4", "Hole 5"]);
         assert_eq!(drill.labels(0..=4), "Holes 1–5");
         assert_eq!(drill.labels(1..=1), "Hole 2");
+        assert_eq!(drill.label_of(1), "Hole 2 of 5");
         // Each step all the pecks of one hole.
         for (s, step) in drill.steps.iter().enumerate() {
             let at: Vec<_> = (feeds.iter())
@@ -6248,6 +6266,8 @@ pub(crate) mod tests {
         assert_eq!(labels, named);
         assert_eq!(bore.kind(), ("Pass", "Passes"));
         assert_eq!(bore.count(), "3 passes · 2 holes");
+        // The run line counts passes and holes, not visits.
+        assert_eq!(bore.label_of(3), "Pass 2 of 3 · Hole 2 of 2");
         assert_eq!(bore.labels(0..=5), "Passes 1–3");
         assert_eq!(bore.labels(2..=3), "Pass 2");
         assert_eq!(bore.labels(2..=5), "Passes 2–3");
@@ -6415,6 +6435,7 @@ pub(crate) mod tests {
         let labels: Vec<String> = (0..one.steps.len()).map(|s| one.label(s)).collect();
         assert_eq!(labels, ["Pass 1", "Pass 2", "Pass 3"]);
         assert_eq!(one.count(), "3 passes");
+        assert_eq!(one.label_of(1), "Pass 2 of 3");
         assert_eq!(one.labels(1..=2), "Passes 2–3");
     }
 

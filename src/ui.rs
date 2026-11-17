@@ -9855,10 +9855,10 @@ pub(crate) fn run_line(
         let blocks = run.running_blocks().map_or(1, <[_]>::len);
         // The step being cut, of how many, when the operation has steps.
         let step = (run.step_at(s.current_line))
-            .and_then(|(oi, n, _)| Some((oi, n, run.op_steps(oi)?.steps.len())))
-            .filter(|t| t.2 > 1)
-            .map_or(String::new(), |(oi, n, count)| {
-                format!(" · {} of {count}", run.step_label(oi, n))
+            .and_then(|(oi, n, _)| Some((n, run.op_steps(oi)?)))
+            .filter(|(_, os)| os.steps.len() > 1)
+            .map_or(String::new(), |(n, os)| {
+                format!(" · {}", os.label_of(n).to_lowercase())
             });
         let mut parts = vec![
             ("Cutting ".into(), INK),
