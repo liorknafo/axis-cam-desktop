@@ -228,29 +228,61 @@ pub(super) fn ream(
     }
     b.finish()
 }
+/// How far from a whole number of divisions a step still counts as one, in
+/// divisions: only the rounding of the sizes, far less than anyone reads
+/// off a dial.
+const WHOLE: f32 = 0.01;
+/// The head's dial divisions that set it out `out` mm on the diameter, at
+/// `dial` mm a division (above 0): `Ok` with the whole number, or `Err`
+/// with the count to one decimal when the step falls between divisions
+/// (LIO-585). Only the last pass, to the hole's size, does: `bore_passes`
+/// puts the others on the dial.
+pub fn head_divisions(out: f32, dial: f32) -> Result<f32, f32> {
+    let count = out / dial;
+    if (count - count.round()).abs() <= WHOLE {
+        Ok(count.round())
+    } else {
+        Err((count * 10.).round() / 10.)
+    }
+}
 /// What the operator is told before boring pass `k` of `sizes`: to set the
 /// head to the first size, and before each later one to measure the bore
 /// the last left and set the head out to the next, by how much and how
-/// many of its `dial` divisions.
+/// many of its `dial` divisions. A step that is not a whole number of them
+/// is set from the bore as measured, with the count from the expected bore
+/// beside it; no parentheses, as the message goes into a G-code comment.
 pub fn adjust_message(sizes: &[f32], k: usize, dial: f32) -> String {
     let size = sizes[k];
+    let (index, of) = (k + 1, sizes.len());
     if k == 0 {
-        return format!(
-            "Boring head: set it to Ø{size:.2}, pass 1 of {}, then resume.",
-            sizes.len()
-        );
+        return format!("Boring head: set it to Ø{size:.2}, pass 1 of {of}, then resume.");
     }
     let (before, out) = (sizes[k - 1], size - sizes[k - 1]);
-    let divisions = if dial > 0. {
-        format!(", {} divisions of {dial},", (out / dial).round())
-    } else {
-        String::new()
+    let measure = format!("Boring head: measure the bore, Ø{before:.2} expected.");
+    let divisions = match (dial > 0.).then(|| head_divisions(out, dial)) {
+        Some(Err(count)) => {
+            return format!(
+                "{measure} Set the head out from the measured bore to Ø{size:.2}: {size:.2} − measured on the diameter at {dial} a division, {count:.1} divisions from Ø{before:.2}, pass {index} of {of}, then resume."
+            );
+        }
+        Some(Ok(n)) => format!(", {n} divisions of {dial},"),
+        None => String::new(),
     };
     format!(
-        "Boring head: measure the bore, Ø{before:.2} expected. Set the head out {out:.2} on the diameter{divisions} to Ø{size:.2}, pass {} of {}, then resume.",
-        k + 1,
-        sizes.len()
+        "{measure} Set the head out {out:.2} on the diameter{divisions} to Ø{size:.2}, pass {index} of {of}, then resume."
     )
+}
+/// The Bore step's word for the head's divisions out from `before` to
+/// `size` on a dial of `dial` mm a division: "N divisions", or for a step
+/// between divisions, set from the measured bore with the count from the
+/// expected one (LIO-585).
+pub fn divisions_tag(before: f32, size: f32, dial: f32) -> String {
+    match head_divisions(size - before, dial) {
+        Ok(n) => format!("{n} divisions"),
+        Err(count) => {
+            format!("({size:.2} − measured) ÷ {dial} divisions: {count:.1} from Ø{before:.2}")
+        }
+    }
 }
 /// Boring (`BORING`): the holes of one size (its Hole diameter), each open
 /// at least to the head's smallest bore from an earlier operation, bored
@@ -570,6 +602,83 @@ pub(crate) mod tests {
         }
         // Already at the size: one pass, a spring pass.
         assert_eq!(bore_passes(32., 32., 0.3, 0.1, 0.01), vec![32.]);
+    }
+    /// The rough passes are whole divisions of the head's dial; the last,
+    /// to the hole's size, falls between them on an inch dial, and its
+    /// pause says to set from the measured bore with the count from the
+    /// expected one, never a rounded whole count (LIO-585).
+    #[test]
+    fn the_last_bore_pass_between_divisions_is_set_from_the_measured_bore() {
+        // Ø16.5 counterbores roughed Ø15.9, 0.1 a pass on the radius: on
+        // the 0.0508 dial the last rough pass is Ø16.358, 2.8 divisions
+        // under the size.
+        for (dial, count) in [(0.01, None), (0.0254, Some("4.6")), (0.0508, Some("2.8"))] {
+            let sizes = bore_passes(15.9, 16.5, 0.1, 0.1, dial);
+            let last = sizes.len() - 1;
+            assert_eq!(sizes[last], 16.5, "{sizes:?}");
+            assert!(last >= 2, "{sizes:?}");
+            for k in 1..last {
+                let n = head_divisions(sizes[k] - sizes[k - 1], dial);
+                assert!(n.is_ok(), "{dial}: {sizes:?} {n:?}");
+                let said = adjust_message(&sizes, k, dial);
+                let n = n.unwrap();
+                assert!(
+                    n >= 1. && said.contains(&format!(", {n} divisions of {dial},")),
+                    "{said}"
+                );
+                assert_eq!(
+                    divisions_tag(sizes[k - 1], sizes[k], dial),
+                    format!("{n} divisions")
+                );
+            }
+            let said = adjust_message(&sizes, last, dial);
+            let tag = divisions_tag(sizes[last - 1], 16.5, dial);
+            match count {
+                // 16.40 to 16.50: 10 divisions of 0.01.
+                None => {
+                    assert!(
+                        said.contains("out 0.10 on the diameter, 10 divisions of 0.01, to Ø16.50"),
+                        "{said}"
+                    );
+                    assert_eq!(tag, "10 divisions");
+                }
+                Some(count) => {
+                    let before = sizes[last - 1];
+                    assert!(said.starts_with(&format!(
+                        "Boring head: measure the bore, Ø{before:.2} expected. Set the head out from the measured bore to Ø16.50: 16.50 − measured on the diameter at {dial} a division, {count} divisions from Ø{before:.2}, pass {} of {}, then resume.",
+                        last + 1,
+                        sizes.len()
+                    )), "{said}");
+                    assert_eq!(
+                        tag,
+                        format!("(16.50 − measured) ÷ {dial} divisions: {count} from Ø{before:.2}")
+                    );
+                    // No whole count, as the old rounding gave (5 and 3).
+                    assert!(
+                        !said.contains(" divisions of") && !tag.ends_with(" divisions"),
+                        "{said} {tag}"
+                    );
+                }
+            }
+        }
+        // The issue's case: Ø16.383 (645 divisions of 0.001") to Ø16.5.
+        let sizes = bore_passes(15.9, 16.5, 0.1, 0.1, 0.0254);
+        assert!((sizes[sizes.len() - 2] - 16.383).abs() < 1e-4, "{sizes:?}");
+        assert_eq!(
+            divisions_tag(sizes[sizes.len() - 2], 16.5, 0.0254),
+            "(16.50 − measured) ÷ 0.0254 divisions: 4.6 from Ø16.38"
+        );
+        // Within the sizes' rounding of a whole number: whole.
+        assert_eq!(head_divisions(0.1 + 1e-6, 0.01), Ok(10.));
+        assert_eq!(head_divisions(0.1016, 0.0254), Ok(4.));
+        assert_eq!(head_divisions(0.117, 0.0254), Err(4.6));
+        assert_eq!(head_divisions(0.117, 0.0508), Err(2.3));
+        // In the G-code the pause's minus sign stays a minus.
+        let said = adjust_message(&sizes, sizes.len() - 1, 0.0254);
+        assert!(
+            crate::post::comment(&said).contains("16.50 - measured"),
+            "{said}"
+        );
     }
     #[test]
     fn a_reamer_feeds_in_dwells_and_feeds_back_out() {
