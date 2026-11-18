@@ -811,7 +811,13 @@ when that file is missing, so edits made in Controller configuration are kept. T
    another message takes its place (LIO-150).
 3. While connected, a red **E-STOP** is in the toolbar on every page, and
    **Esc** sends E-stop from anywhere, even while typing. Leaving E-stop
-   always needs Reset.
+   always needs Reset. On a machine run through a Pi, E-STOP reaches the
+   machine only while the link to the Pi answers: while it does not, or
+   while the Pi refuses this computer, E-STOP is a dull red and its hover
+   help says it cannot reach the machine and to use the machine's own
+   E-stop. The amber banner over the Control page says the same when the
+   link was live before, refused or not: whatever ran from here may still
+   be running (LIO-580).
 
 **Simulated** runs the driver's real controller, planner and checks against a
 simulated UC100: no hardware is opened and nothing moves. It keeps its own

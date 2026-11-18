@@ -3694,6 +3694,23 @@ flood = { pin = 8 }
                 _ => panic!("{texts:?}"),
             }
         };
+        // E-STOP's hover help on the page: one card for the MACHINE bar's
+        // E-STOP, the same for each (LIO-580).
+        let estop_help = |a: &App| {
+            let cards = laid(a).run(Helps::default()).expect("the page").1;
+            let bodies: Vec<String> = (cards.into_iter())
+                .filter(|h| h.title == "E-STOP")
+                .map(|h| h.body)
+                .collect();
+            assert!(!bodies.is_empty(), "no E-STOP hover help");
+            assert!(bodies.windows(2).all(|w| w[0] == w[1]), "{bodies:?}");
+            bodies[0].clone()
+        };
+        let reaches = crate::help::command(&Message::MachineEStop, "E-STOP".into()).body;
+        assert_ne!(
+            reaches,
+            crate::help::command(&Message::Noop, "x".into()).body
+        );
         let dir = tempfile::tempdir().unwrap();
         let (mut a, server) = pi_app(dir.path());
         a.page = Page::Control;
@@ -3733,6 +3750,20 @@ flood = { pin = 8 }
             vec![format!("The Pi refused this computer: {why}")]
         );
         assert!(!conn(&a).in_control() && !conn(&a).pi_lost());
+        // Never live from here: the banner is the refusal alone; E-STOP
+        // says it cannot reach the machine (LIO-580).
+        assert_eq!(
+            crate::ui::pi_banner(conn(&a)),
+            Some(format!("The Pi refused this computer: {why}"))
+        );
+        assert_eq!(
+            crate::ui::estop_unreachable(conn(&a)),
+            Some("the Pi refuses this computer")
+        );
+        assert_eq!(
+            estop_help(&a),
+            crate::ui::estop_unreachable_help("the Pi refuses this computer")
+        );
         let _ = a.update(Message::Machine(A::Home));
         assert_eq!(conn(&a).pi_note.as_deref(), Some(NOT_SENT_PI_REFUSED));
         // Still refused at its next tries: the status line keeps it.
@@ -3793,6 +3824,9 @@ flood = { pin = 8 }
         let p = problems(&a);
         assert!(!p.iter().any(|t| t.contains("refused")), "{p:?}");
         assert_eq!(pill(&a), "");
+        assert_eq!(crate::ui::pi_banner(conn(&a)), None);
+        assert_eq!(crate::ui::estop_unreachable(conn(&a)), None);
+        assert_eq!(estop_help(&a), reaches);
         // The simulated UC100 starts in E-stop: the bar offers Reset and
         // the run bar says to press it.
         let texts = page_texts(&a);
@@ -3808,6 +3842,19 @@ flood = { pin = 8 }
             a.status
         );
         assert_eq!(pill(&a), "");
+        assert_eq!(
+            crate::ui::pi_banner(conn(&a)).as_deref(),
+            Some(crate::ui::PI_LOST)
+        );
+        assert_eq!(
+            crate::ui::estop_unreachable(conn(&a)),
+            Some("the link to the Pi is not answering")
+        );
+        assert!(
+            estop_help(&a).contains("use the machine's own E-stop"),
+            "{}",
+            estop_help(&a)
+        );
         // Forgotten while the link was down: refused at its next try, the
         // Pi's state known from before. The pill says refused, not that
         // state (LIO-561).
@@ -3833,6 +3880,32 @@ flood = { pin = 8 }
         let (line, _) = crate::ui::run_line(&a, conn(&a));
         let why = conn(&a).pi_refused().unwrap().to_string();
         assert_eq!(line[0].0, format!("The Pi refused this computer: {why}"));
+        // The banner keeps the warning beside the reason: the machine
+        // carries on, and E-stop from here cannot reach it (LIO-580).
+        assert_eq!(
+            crate::ui::pi_banner(conn(&a)),
+            Some(format!(
+                "The Pi refused this computer: {}. {}",
+                why.trim_end_matches('.'),
+                crate::ui::PI_REFUSED_LOST
+            ))
+        );
+        let texts = page_texts(&a);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.ends_with(crate::ui::PI_REFUSED_LOST)
+                    && t.contains("machine's own E-stop")),
+            "{texts:?}"
+        );
+        assert_eq!(
+            crate::ui::estop_unreachable(conn(&a)),
+            Some("the Pi refuses this computer")
+        );
+        assert_eq!(
+            estop_help(&a),
+            crate::ui::estop_unreachable_help("the Pi refuses this computer")
+        );
         // A probe move known from before: neither the run bar nor Space
         // says "Stop now aborts it", which cannot reach the machine.
         let status = a.status.clone();
@@ -3857,9 +3930,10 @@ flood = { pin = 8 }
     }
 
     /// Renders the Control page while the Pi refuses this computer: first
-    /// refused (the Pi's state never known), and refused again after a live
-    /// link (its state known from before), to `$AXIS_RENDER_DIR` (default
-    /// /tmp/pi-refused), at 1440 × 900 and 1120 × 690 (LIO-561). Not a
+    /// refused (the Pi's state never known), the live link lost, and refused
+    /// again after it (its state known from before), to `$AXIS_RENDER_DIR`
+    /// (default /tmp/pi-refused), at 1440 × 900 and 1120 × 690 (LIO-561,
+    /// LIO-580). Not a
     /// check: run it with --ignored.
     #[test]
     #[ignore]
@@ -3910,6 +3984,7 @@ flood = { pin = 8 }
             shot(a, &format!("{name}-connected"));
             gate.set_cut(true);
             pi_live(a, false, "the link lost");
+            shot(a, &format!("{name}-lost"));
             std::fs::rename(&clients, &kept).unwrap();
             gate.set_cut(false);
             refused(a);

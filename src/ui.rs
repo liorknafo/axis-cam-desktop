@@ -1362,8 +1362,8 @@ pub fn view(app: &App) -> Element<'_, Message> {
         tool_btn(icon, label, Message::Page(page), app.page == page).into()
     }));
     top_row = top_row.push(space().width(Fill));
-    if app.control.is_some() {
-        top_row = top_row.push(estop());
+    if let Some(c) = &app.control {
+        top_row = top_row.push(estop(c));
     }
     let docbar = container(top_row)
         .height(66)
@@ -8722,28 +8722,67 @@ fn wizard_at(app: &App, at: usize) -> Element<'_, Message> {
         .height(Fill)
         .into()
 }
+/// Why E-STOP cannot reach the machine from this computer now, if it
+/// cannot: the link to the Pi is not answering, or the Pi refuses this
+/// computer (LIO-580).
+pub(crate) fn estop_unreachable(c: &crate::control::Connection) -> Option<&'static str> {
+    if c.pi_refused().is_some() {
+        Some("the Pi refuses this computer")
+    } else if c.pi_down() {
+        Some("the link to the Pi is not answering")
+    } else {
+        None
+    }
+}
+
+/// E-STOP's hover help while it cannot reach the machine.
+pub(crate) fn estop_unreachable_help(why: &str) -> String {
+    format!(
+        "E-stop cannot reach the machine from here: {why}. The machine carries on without this computer: use the machine's own E-stop."
+    )
+}
+
 /// The red E-stop: in the top bar on every page while connected, and on the Control page.
-fn estop<'a>() -> Element<'a, Message> {
-    button(bold("E-STOP", 14).color(Color::WHITE))
-        .on_press(Message::MachineEStop)
-        .padding(finger([8, 16], 14, "E-STOP"))
-        .style(|_, status| button::Style {
-            background: Some(
-                if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-                    Color::from_rgb8(160, 20, 20)
-                } else {
-                    Color::from_rgb8(200, 30, 30)
-                }
-                .into(),
-            ),
-            text_color: Color::WHITE,
-            border: Border {
-                radius: 4.into(),
-                ..Default::default()
-            },
+/// While it cannot reach the machine (`estop_unreachable`) it is a dull red,
+/// and its hover help says so and to use the machine's own E-stop
+/// (LIO-580); a press still goes to the link, which drops it.
+fn estop<'a>(c: &crate::control::Connection) -> Element<'a, Message> {
+    let unreachable = estop_unreachable(c);
+    let dull = unreachable.is_some();
+    let b = button(bold("E-STOP", 14).color(if dull {
+        Color::from_rgb8(236, 214, 214)
+    } else {
+        Color::WHITE
+    }))
+    .on_press(Message::MachineEStop)
+    .padding(finger([8, 16], 14, "E-STOP"))
+    .style(move |_, status| button::Style {
+        background: Some(
+            if dull {
+                Color::from_rgb8(146, 104, 104)
+            } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+                Color::from_rgb8(160, 20, 20)
+            } else {
+                Color::from_rgb8(200, 30, 30)
+            }
+            .into(),
+        ),
+        text_color: Color::WHITE,
+        border: Border {
+            radius: 4.into(),
             ..Default::default()
-        })
-        .into()
+        },
+        ..Default::default()
+    });
+    match unreachable {
+        Some(why) => HelpButton::with_help(
+            b,
+            &Message::MachineEStop,
+            crate::help::Help::text("E-STOP", estop_unreachable_help(why)),
+        )
+        .into(),
+        None => HelpButton::new(b, &Message::MachineEStop, "E-STOP").into(),
+    }
 }
 
 /// A Control page button: greyed out without a message, when the machine
@@ -9286,7 +9325,7 @@ fn machine_bar(app: &App) -> Element<'_, Message> {
         if c.snapshot.state == Some(State::EStop) && c.pi_refused().is_none() {
             bar = bar.push(primary("Reset", Message::MachineReset));
         }
-        bar = bar.push(estop());
+        bar = bar.push(estop(c));
     }
     container(bar)
         .height(fit.machine_bar())
@@ -9727,16 +9766,30 @@ fn shop_projects(app: &App) -> Element<'_, Message> {
 /// not answering.
 pub(crate) const PI_LOST: &str = "No link to the Pi. Everything shown is its last known state. The machine carries on without this computer: a jog stops by itself, and a tool run goes on, but if no computer controls the machine again within a minute it stops after the step it is cutting, lifts Z and turns the spindle off. Hold, Stop and E-stop cannot reach it from here until the link is back: use the machine's own E-stop. Reconnecting…";
 
+/// What the banner adds to the Pi's refusal when the link was live before
+/// it: whatever ran from here may still be running (LIO-580).
+pub(crate) const PI_REFUSED_LOST: &str = "The machine carries on without this computer: a tool run goes on, and Hold, Stop and E-stop cannot reach it from here. Use the machine's own E-stop.";
+
 /// The banner over the Control page while the link to the Pi is down after
 /// it was live, or the Pi refuses this computer. Connecting for the first
 /// time, the Machine tab says so and nothing is over the page (LIO-517).
-fn pi_lost(c: &crate::control::Connection) -> Option<Element<'_, Message>> {
+/// Refused after a live link, it also says that the machine carries on
+/// and to use its own E-stop (LIO-580).
+pub(crate) fn pi_banner(c: &crate::control::Connection) -> Option<String> {
     let link = c.link.as_ref()?;
-    let said = match &link.state {
+    Some(match &link.state {
+        uc100_remote::LinkState::Refused(why) if c.pi_lost() => format!(
+            "The Pi refused this computer: {}. {PI_REFUSED_LOST}",
+            why.trim_end_matches('.')
+        ),
         uc100_remote::LinkState::Refused(why) => format!("The Pi refused this computer: {why}"),
         _ if c.pi_lost() => PI_LOST.to_string(),
         _ => return None,
-    };
+    })
+}
+
+fn pi_lost(c: &crate::control::Connection) -> Option<Element<'_, Message>> {
+    let said = pi_banner(c)?;
     Some(
         container(bold(said, 14).color(Color::WHITE))
             .padding([10, 14])

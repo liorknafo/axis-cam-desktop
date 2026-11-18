@@ -99,6 +99,14 @@ impl<'a> HelpButton<'a> {
             press: Some(message.clone()),
         }
     }
+    /// A button whose hover help is `help`, not its message's.
+    pub fn with_help(button: widget::Button<'a, Message>, message: &Message, help: Help) -> Self {
+        Self {
+            button,
+            help,
+            press: Some(message.clone()),
+        }
+    }
     pub fn operation(
         button: widget::Button<'a, Message>,
         strategy: Strategy,
@@ -1583,6 +1591,14 @@ pub fn command(m: &Message, label: String) -> Help {
         ),
         LoadModels => (
             "Ask OpenAI again which models your ChatGPT plan can use in this app.",
+            "",
+        ),
+        MachineEStop => (
+            "Stop the machine at once: every axis, the spindle and the coolant stop, and a tool run or probe ends. Its machine position is no longer trusted: home or set it again after Reset. Esc does the same from any page.",
+            "",
+        ),
+        MachineReset => (
+            "Leave E-stop and enable the machine. Its machine position must be set again (home it, or set machine zero) before a move that needs it.",
             "",
         ),
         Machine(a) => machine_help(a),
