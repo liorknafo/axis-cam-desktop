@@ -4141,7 +4141,10 @@ impl Connection {
         if let Some(run) = self.run.as_ref().filter(|r| r.partway())
             && run.partly().is_some_and(|p| p.top_cut)
         {
-            return Err("The operations before the start cut into the stock top, so a touch plate laid on it may not lie at a height the check knows: Probe Z cannot set Z. Touch the tool tip off at the touch-off spot instead.".into());
+            return Err(format!(
+                "{} cut into the stock top, so a touch plate laid on it may not lie at a height the check knows: Probe Z cannot set Z. Touch the tool tip off at the touch-off spot instead.",
+                capital(run.cut_by())
+            ));
         }
         self.touch_off()
             .map(|(_, work)| work[2])
@@ -4421,11 +4424,18 @@ impl Connection {
             .run
             .as_ref()
             .filter(|r| r.partway())
-            .map(|r| r.partly())
+            .map(|r| (r.partly(), r.cut_by()))
         {
-            Some(None) => Err(crate::run::PARTWAY_UNKNOWN.to_string()),
-            Some(Some(partly)) if p.probe.is_ok() && !partly.cut.is_empty() => Err(format!(
-                "The operations before the start cut the stock's {}, where a probe finds this work zero.",
+            Some((None, _)) => Err(crate::run::PARTWAY_UNKNOWN.to_string()),
+            // Not a part of the stock: the reason the check cannot tell it.
+            Some((Some(partly), _))
+                if p.probe.is_ok() && partly.cut == [crate::run::STEPS_UNFOLLOWED] =>
+            {
+                Err("The check does not follow the stock cut by the steps taken as cut where a probe finds this work zero.".into())
+            }
+            Some((Some(partly), by)) if p.probe.is_ok() && !partly.cut.is_empty() => Err(format!(
+                "{} cut the stock's {}, where a probe finds this work zero.",
+                capital(by),
                 partly.cut.join(", ")
             )),
             _ => p.probe.clone(),
@@ -6378,6 +6388,14 @@ pub fn focus_first() -> impl iced::advanced::widget::Operation {
         }
     }
     operation::then(Scan::default(), |target| FocusAt(target, 0))
+}
+
+/// `s` with its first letter a capital.
+fn capital(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map_or(String::new(), |f| {
+        f.to_uppercase().collect::<String>() + c.as_str()
+    })
 }
 
 #[cfg(test)]

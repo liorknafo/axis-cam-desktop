@@ -273,11 +273,15 @@ pub const DECLARING: &str = "The machine position is being set, axis by axis: wa
 pub const PARTWAY_UNKNOWN: &str =
     "The check did not work out the stock the start leaves: check the setup again.";
 
-/// What a start at a step of a setup's last operation sent cut, said as
-/// `Partly::cut`: the check knows its stock only before that operation,
-/// none after it (`Run::partly`).
-const STEPS_UNFOLLOWED: &str =
-    "stock the steps before the start cut, which the check does not follow";
+/// What cut the stock a run started partway starts from, when operations
+/// before its start did (`Run::cut_by`).
+const CUT_BY_OPERATIONS: &str = "the operations before the start";
+
+/// What steps taken as cut in the start's operation, the setup's last
+/// operation sent, cut, said as `Partly::cut`: the check knows its stock
+/// only before that operation, none after it (`Run::partly`).
+pub(crate) const STEPS_UNFOLLOWED: &str =
+    "stock cut by the steps taken as cut, which the check does not follow";
 
 /// A setup being run on the connected machine, tool run by tool run.
 pub struct Run {
@@ -1779,10 +1783,25 @@ impl Run {
         } else if self.partway() {
             match self.partly() {
                 None => e.push(format!("The check did not work out the stock operation {}, {}, starts from: pick its first operation, or check the setup again.", from + 1, first.name)),
-                Some(_) if !self.zeroed => e.push(format!(
-                    "This run starts at {}, after operations taken as cut: set the work zero on the stock they left in the Work zero tab, or press Keep this work zero there if it is still the one they were cut with.",
-                    first.name
-                )),
+                Some(_) if !self.zeroed => {
+                    let oi = p.indexes.get(from).copied();
+                    let steps: Vec<usize> = oi.map_or_else(Vec::new, |oi| self.cut_of(oi));
+                    e.push(match (oi, &steps[..]) {
+                        (Some(oi), [first_step, ..]) => format!(
+                            "This run starts at {}, with {} of it taken as cut: set the work zero on the stock they left in the Work zero tab, or press Keep this work zero there if it is still the one they were cut with.",
+                            first.name,
+                            if steps.len() == 1 {
+                                self.step_label(oi, *first_step)
+                            } else {
+                                format!("{} of its steps", steps.len())
+                            }
+                        ),
+                        _ => format!(
+                            "This run starts at {}, after operations taken as cut: set the work zero on the stock they left in the Work zero tab, or press Keep this work zero there if it is still the one they were cut with.",
+                            first.name
+                        ),
+                    });
+                }
                 Some(_) => {}
             }
         }
@@ -2108,17 +2127,19 @@ impl Run {
 
     /// The run starts partway through the setup before any of its tool runs
     /// started: at a later tool run or operation than the first, those
-    /// before taken as cut. Its work zero is set on the stock they leave
-    /// (`partly`), and Cycle Start waits for it (`zeroed`).
+    /// before taken as cut, or with steps of its operation taken as cut.
+    /// Its work zero is set on the stock they leave (`partly`), and Cycle
+    /// Start waits for it (`zeroed`).
     pub fn partway(&self) -> bool {
         // An operation taken as cut before the start (`Skip::Cut`) is one.
         let start =
             (self.checked()).and_then(|c| c.get(self.next)?.indexes.get(self.from).copied());
         let cut = |&(oi, how): &(usize, Skip)| how == Skip::Cut && start.is_some_and(|s| oi < s);
-        // So are steps taken as cut before it.
-        let steps = |(oi, cut): &(usize, Vec<usize>)| {
-            !cut.is_empty() && start.is_some_and(|s| *oi < s || *oi == s && cut.contains(&0))
-        };
+        // So are steps taken as cut before it, and any of its own: taken as
+        // cut, their material is gone, wherever the work zero is touched
+        // off (LIO-568).
+        let steps =
+            |(oi, cut): &(usize, Vec<usize>)| !cut.is_empty() && start.is_some_and(|s| *oi <= s);
         let early = (self.next, self.from) != (0, 0)
             || self.skips.iter().any(cut)
             || self.cut_steps.iter().any(steps);
@@ -2158,17 +2179,89 @@ impl Run {
         if partly.surface.is_some() {
             return None;
         }
+        let by = self.cut_by();
         Some(if partly.cut.is_empty() {
-            "The check cannot tell the surface the operations before the start leave where the stock top is touched off.".into()
+            format!(
+                "The check cannot tell the surface {by} leave where the stock top is touched off."
+            )
         } else if partly.cut == [STEPS_UNFOLLOWED] {
             // Not a part of the stock: said as the reason it is (LIO-579).
-            "The check does not follow the stock the steps before the start cut, so it cannot tell the surface they left where the stock top is touched off.".into()
+            "The check does not follow the stock cut by the steps taken as cut, so it cannot tell the surface they left where the stock top is touched off.".into()
         } else {
             format!(
-                "The operations before the start cut the stock's {}, and the check cannot tell the surface they left where the stock top is touched off.",
+                "{}{} cut the stock's {}, and the check cannot tell the surface they left where the stock top is touched off.",
+                by[..1].to_uppercase(),
+                &by[1..],
                 partly.cut.join(", ")
             )
         })
+    }
+
+    /// What cut the stock a run that starts partway (`partway`) starts
+    /// from, as its messages say it: "the operations before the start", or
+    /// "the steps taken as cut" when it is partway by steps of its own
+    /// operation alone (LIO-568).
+    pub fn cut_by(&self) -> &'static str {
+        let start =
+            (self.checked()).and_then(|c| c.get(self.next)?.indexes.get(self.from).copied());
+        let ops_before = (self.next, self.from) != (0, 0)
+            || (self.skips.iter()).any(|s| s.1 == Skip::Cut && start.is_some_and(|o| s.0 < o))
+            || (self.cut_steps.iter()).any(|c| start.is_some_and(|o| c.0 < o));
+        if ops_before {
+            CUT_BY_OPERATIONS
+        } else {
+            "the steps taken as cut"
+        }
+    }
+
+    /// What a run that starts partway (`partway`) takes as cut before its
+    /// start, in the setup's order: each operation by name ("Face"), sent
+    /// before it or skipped (`Skip::Cut`), and the steps of the start's own
+    /// operation ("Face pass 2", "Face passes 1–2", "Face, 3 of its
+    /// passes").
+    pub fn taken_as_cut(&self) -> Vec<String> {
+        let Some(programs) = self.checked() else {
+            return vec![];
+        };
+        let Some(p) = programs.get(self.next) else {
+            return vec![];
+        };
+        let start = p.indexes.get(self.from).copied();
+        // The names of operations not sent are the layout's (`layout`).
+        let name = |oi: usize| -> String {
+            let all = (self.layout.as_deref()).and_then(|l| l.as_deref().ok());
+            (all.into_iter().chain([programs]).flatten())
+                .find_map(|p| Some(p.ops[p.indexes.iter().position(|&o| o == oi)?].name.clone()))
+                .unwrap_or_else(|| format!("operation {}", oi + 1))
+        };
+        let mut ops: Vec<usize> = (programs[..self.next].iter())
+            .flat_map(|p| p.indexes.iter().copied())
+            .chain(p.indexes[..self.from.min(p.indexes.len())].iter().copied())
+            .chain(
+                (self.skips.iter())
+                    .filter(|s| s.1 == Skip::Cut && start.is_some_and(|o| s.0 < o))
+                    .map(|s| s.0),
+            )
+            .collect();
+        ops.sort_unstable();
+        ops.dedup();
+        let mut said: Vec<String> = ops.into_iter().map(name).collect();
+        if let Some(oi) = start {
+            let cut = self.cut_of(oi);
+            if let (Some(&first), Some(&last)) = (cut.first(), cut.last()) {
+                let (op, steps) = (name(oi), self.op_steps(oi));
+                said.push(match steps {
+                    Some(s) if last - first + 1 == cut.len() => {
+                        format!("{op} {}", s.labels(first..=last).to_lowercase())
+                    }
+                    _ => {
+                        let kind = steps.map_or("steps", |s| s.kind().1).to_lowercase();
+                        format!("{op}, {} of its {kind}", cut.len())
+                    }
+                });
+            }
+        }
+        said
     }
 
     /// The start at a step Cycle Start starts at (`start_step`), while its
@@ -2330,8 +2423,12 @@ impl Run {
             return None;
         }
         let programs = self.checked()?;
-        let before = programs.get(self.next)?.partly.get(self.from)?;
-        if self.at_step().is_none() {
+        let p = programs.get(self.next)?;
+        let before = p.partly.get(self.from)?;
+        // Steps of its operation taken as cut, before a start at a step or
+        // skipped, have cut the stock it starts from (LIO-568).
+        let steps_cut = (p.indexes.get(self.from)).is_some_and(|&oi| !self.cut_of(oi).is_empty());
+        if self.at_step().is_none() && !steps_cut {
             return Some(Cow::Borrowed(before));
         }
         // Inside an operation the check does not follow the stock, but it
@@ -2342,6 +2439,14 @@ impl Run {
             .skip_while(|p| !std::ptr::eq(*p, before))
             .nth(1);
         let unknown = STEPS_UNFOLLOWED;
+        // The stock after the operation says what the operations before
+        // the next one cut; partway by steps of its own alone, they are
+        // the steps taken as cut (LIO-568).
+        let by_steps = self.cut_by() != CUT_BY_OPERATIONS;
+        let said = |e: &String| match e.strip_prefix("The operations before it ") {
+            Some(rest) if by_steps => format!("The steps taken as cut {rest}"),
+            _ => e.clone(),
+        };
         Some(Cow::Owned(match after {
             Some(after) => Partly {
                 cut: after.cut.clone(),
@@ -2352,7 +2457,7 @@ impl Run {
                         let was = before.probe_from.iter().find(|(b, _)| b == r);
                         let ok = match (ok, was) {
                             (Ok(()), Some((_, Ok(())))) => Ok(()),
-                            (Err(e), _) => Err(e.clone()),
+                            (Err(e), _) => Err(said(e)),
                             (_, Some((_, Err(e)))) => Err(e.clone()),
                             _ => Err(format!("The check cannot follow the {unknown}.")),
                         };
@@ -2911,6 +3016,9 @@ pub fn check_steps(
             // Taken as cut, they cut the stock the operation starts from:
             // the checks of the steps sent see that material gone (LIO-311).
             if let Some(mut volume) = sim.initial_volume.take() {
+                // The work zero was set on the stock before them: they were
+                // cut with it, and a start keeps it (LIO-568).
+                sim.before_steps.get_or_insert_with(|| volume.clone());
                 let plan = &sim.plan;
                 for m in (steps.iter())
                     .filter_map(|&s| found.steps.get(s))
@@ -2926,16 +3034,24 @@ pub fn check_steps(
             }
             // Steps taken as cut are in the stock already: the stock before
             // this operation and those before it has them cut, so the live
-            // carve starts from it (LIO-312). ponytail: the top view only;
-            // an indexed setup's moves (at an A) stay out of it.
+            // carve starts from it (LIO-312), in the top view and in the 3D
+            // view's volume (LIO-568). ponytail: the top view leaves out an
+            // indexed setup's moves (at an A).
             let before = Arc::make_mut(&mut left.before);
+            let plan = &sim.plan;
+            let (r, flute) = (plan.cut_radius(), plan.flute_length);
             let moves = (steps.iter().filter_map(|&s| found.steps.get(s)))
-                .flat_map(|s| &sim.plan.moves[s.moves.clone()])
-                .filter(|m| m.a.is_none());
+                .flat_map(|s| &plan.moves[s.moves.clone()]);
             for m in moves {
                 for b in before.iter_mut().filter(|b| b.op <= *oi) {
-                    b.stock
-                        .cut_shape(m.from, m.to, sim.plan.cut_radius(), sim.plan.shape);
+                    if m.a.is_none() {
+                        b.stock.cut_shape(m.from, m.to, r, plan.shape);
+                    }
+                    if m.motion == crate::simulation::Motion::Feed
+                        && let (Some(volume), Some(frame)) = (&mut b.volume, sim.frame_at(m.a))
+                    {
+                        volume.cut(m.from, m.to, r, flute, plan.shape, frame, sim.source);
+                    }
                 }
             }
             sim.plan = cut_plan(&sim.plan, &found.steps, steps);
@@ -5928,10 +6044,20 @@ pub(crate) mod tests {
                 assert_eq!(got, want);
             }
         }
-        // Pocket's later levels and holes 2 to 5 start; Face's pass 2 too,
-        // once the check takes pass 1 as cut without refusing the work zero
-        // (LIO-568).
+        // Pocket's later levels and holes 2 to 5 start, and Face's pass 2:
+        // the check takes pass 1 as cut without refusing the work zero it
+        // was cut with (LIO-568). None is refused.
         assert!(count >= 9, "{count}");
+        let refused: Vec<_> = (s.tool_runs.iter().flat_map(|r| &r.step_starts))
+            .filter(|st| !st.problems.is_empty())
+            .map(|st| (st.operation, st.step, &st.problems))
+            .collect();
+        assert!(refused.is_empty(), "{refused:?}");
+        assert!((s.tool_runs.iter().flat_map(|r| &r.step_starts)).any(|st| (
+            st.operation,
+            st.step
+        ) == (0, 1)
+            && st.entry.is_some()));
     }
 
     /// Each start partway through the setup carries its work zero on the
@@ -6072,7 +6198,7 @@ pub(crate) mod tests {
                 assert_eq!(
                     z.blocked.as_deref(),
                     Some(
-                        "The check does not follow the stock the steps before the start cut, so it cannot tell the surface they left where the stock top is touched off."
+                        "The check does not follow the stock cut by the steps taken as cut, so it cannot tell the surface they left where the stock top is touched off."
                     ),
                     "{n}"
                 );
@@ -7835,6 +7961,119 @@ pub(crate) mod tests {
             assert!(left(&cut, oi) < left(&whole, oi), "before operation {oi}");
         }
         assert_eq!(left(&cut, 3), left(&whole, 3));
+    }
+
+    /// A start at Face's Pass 2 on the tablet's fixture (LIO-568), its work
+    /// zero Stock top center: Pass 1, taken as cut, faced the stock top, but
+    /// it was cut with the work zero the start keeps, so the start passes,
+    /// the zero found and probed as for the whole run. Pass 1 is still in
+    /// the stock the run starts from, the top view's and the 3D view's, and
+    /// a work zero set on the stock now finds the top cut, whether the run
+    /// starts at Pass 2 or skips Pass 1.
+    #[test]
+    fn a_start_at_a_later_pass_of_the_first_operation_keeps_its_work_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (doc, mesh) = tablet_fixture(&profile);
+        assert_eq!(
+            crate::model::get(&doc.setups[0].p, "origin"),
+            "Stock top center"
+        );
+        let (whole, left) = check_steps(&doc, &mesh, 0, &[], &[]);
+        let whole = whole.unwrap();
+        let face_steps = left.steps.iter().find(|s| s.op == 0).unwrap().clone();
+        assert!(face_steps.steps.len() >= 2, "{:?}", face_steps.steps.len());
+        let (cut, cut_left) = check_steps(&doc, &mesh, 0, &[], &[(0, vec![0])]);
+        let cut = cut.unwrap_or_else(|e| panic!("{e:?}"));
+        let (p, w) = (&cut[0], &whole[0]);
+        assert_eq!(p.indexes.first(), Some(&0));
+        assert!(p.from(0).is_ok());
+        assert_eq!(p.datum, w.datum);
+        assert_eq!(p.probe, w.probe);
+        assert_eq!(p.probe_from, w.probe_from);
+        assert!(p.probe.is_ok(), "{:?}", p.probe);
+        // Pass 1 is cut in the stock before Face, and Face sends less.
+        let before = |l: &Left| -> f32 {
+            let b = l.before.iter().find(|b| b.op == 0).unwrap();
+            b.stock.heights.iter().sum()
+        };
+        assert!(before(&cut_left) < before(&left));
+        // In the 3D view's volume too: the live carve starts with Pass 1 cut.
+        let removed = |l: &Left| -> f32 {
+            let b = l.before.iter().find(|b| b.op == 0).unwrap();
+            b.volume.as_ref().unwrap().removed_volume()
+        };
+        assert!(
+            removed(&cut_left) > removed(&left) + 1000.,
+            "{}",
+            removed(&cut_left)
+        );
+        let moves = |c: &Checked| {
+            (c.blocks.iter())
+                .filter(|b| matches!(b, Block::Move { op: 0, .. }))
+                .count()
+        };
+        assert!(moves(p) < moves(w));
+        // A run that keeps the work zero passes; one set on the stock now
+        // finds the top cut where it is touched off, whether the run starts
+        // at Pass 2, skips Pass 1, or starts at Pass 1 with Pass 2, already
+        // cut, skipped: not the stock top it was set on.
+        let partly = |s: usize, skip: bool| {
+            let mut run = Run::new(&doc, 0, 0);
+            run.checked_as(
+                Arc::new(Ok(whole.clone())),
+                Some(Arc::new(left.clone())),
+                None,
+            );
+            run.pick(0, s, false);
+            assert!(if skip {
+                run.skip_steps(true)
+            } else {
+                run.start_step()
+            });
+            let cut_steps = vec![if skip { s } else { s - 1 }];
+            assert_eq!(run.all_cut(), [(0, cut_steps.clone())]);
+            let (cut, cut_left) = check_steps(&doc, &mesh, 0, &[], &[(0, cut_steps)]);
+            run.checked_as(Arc::new(cut), Some(Arc::new(cut_left)), None);
+            assert!(run.partway());
+            let partly = run.partly().unwrap().into_owned();
+            (partly, run)
+        };
+        let (skipped, first) = partly(0, true);
+        let (started, second) = partly(1, false);
+        let (later, run) = partly(1, true);
+        // The Work zero tab says what each takes as cut.
+        let face = doc.setups[0].operations[0].name();
+        let pass = |n: usize| vec![format!("{face} {}", face_steps.label(n).to_lowercase())];
+        assert_eq!(first.taken_as_cut(), pass(0));
+        assert_eq!(second.taken_as_cut(), pass(0));
+        assert_eq!(run.taken_as_cut(), pass(1));
+        assert_eq!(skipped, started);
+        assert_eq!(later, started);
+        assert!(skipped.top_cut && !skipped.cut.is_empty(), "{skipped:?}");
+        assert_eq!(skipped.surface, None);
+        let centre = (skipped.probe_from.iter()).find(|(r, _)| *r == p.probe.clone().unwrap());
+        assert!(centre.is_some_and(|(_, ok)| ok.is_err()), "{centre:?}");
+        // Zero Z and Probe Z say why they cannot set Z, naming the steps.
+        for r in [&first, &second, &run] {
+            let why = r.partway_blocked().unwrap();
+            assert!(
+                why.starts_with("The steps taken as cut cut the stock's "),
+                "{why}"
+            );
+            assert_eq!(r.touch_off(), None);
+            assert_eq!(r.cut_by(), "the steps taken as cut");
+            // Nor do the probe spots' reasons speak of operations.
+            for (_, ok) in &r.partly().unwrap().probe_from {
+                let why = ok.as_ref().unwrap_err();
+                assert!(!why.contains("operations"), "{why}");
+            }
+        }
+        // Starting at Pass 1, Cycle Start waits for the work zero, kept or
+        // set again.
+        assert!(!run.zeroed);
+        assert_eq!((run.next, run.from, run.at_step()), (0, 0, None));
     }
 
     /// The journal of where a run stopped (LIO-275) is written and read

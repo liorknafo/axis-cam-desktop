@@ -375,7 +375,8 @@ pub const STOCK_TOP_CUT: &str =
 /// A Model-origin setup's work zero located for the operator, from the
 /// setup's first simulation: the part's box in work coordinates (mm) and the
 /// stock top's Z, or None for the stock top when an earlier setup has cut it
-/// (`stock_top_cut`). None for other work zeros.
+/// (`stock_top_cut`, on the stock the work zero was set on:
+/// `Simulation::zero_volume`). None for other work zeros.
 pub(crate) fn model_zero(
     setup: &Setup,
     mesh: &Mesh,
@@ -387,7 +388,7 @@ pub(crate) fn model_zero(
     let stock = sim.plan.stock;
     let zero = datum(setup, stock, mesh).ok()?;
     let (part, top) = zero_place(part_box(setup, mesh), stock, zero);
-    let cut = match (&sim.initial_volume, sim.frame) {
+    let cut = match (sim.zero_volume(), sim.frame) {
         (Some(volume), Some(frame)) => stock_top_cut(stock, volume, frame),
         _ => false,
     };
@@ -2548,7 +2549,7 @@ pub(crate) fn zero_check(
             return found;
         }
     };
-    let missing = match (&first.initial_volume, first.frame) {
+    let missing = match (first.zero_volume(), first.frame) {
         (Some(volume), Some(frame)) => undrilled_pins(&on, volume, frame, stock.min[2]),
         _ => (0..on.places.len())
             .map(|i| (i, format!("pin {}", i + 1)))
@@ -2568,7 +2569,9 @@ pub(crate) fn zero_check(
     found
 }
 /// `zero_check` for the stock alone: where the work zero is on it and how
-/// a probe finds it.
+/// a probe finds it. The stock is the one it was set on
+/// (`Simulation::zero_volume`): the steps of the first operation a run
+/// takes as cut were cut with it, and are no earlier setup's (LIO-568).
 fn stock_zero_check(
     setup: &Setup,
     stock: Bounds,
@@ -2592,7 +2595,7 @@ fn stock_zero_check(
     // stock-based zeros that are.
     let mut off: Option<(String, &str, Vec<&str>)> = None;
     let mut skewed = false;
-    if let (Some(volume), Some(frame)) = (&first.initial_volume, first.frame) {
+    if let (Some(volume), Some(frame)) = (first.zero_volume(), first.frame) {
         if !volume.frame.square_to(frame) {
             off = Some((
                 "the stock was defined in an orientation that is not square to this setup".into(),
@@ -2667,7 +2670,8 @@ fn stock_zero_check(
 /// The stock-top spots a probe can find a setup's work zero from
 /// (`SPOTS`: the corners, the middles of the edges and the centre), each
 /// with why it cannot: a jaw or clamp in its way (`in_the_way`), or a face
-/// it is touched on that earlier setups cut (`stock_zero_cut`). The zero
+/// it is touched on that earlier setups cut (`stock_zero_cut`, on the stock
+/// the work zero was set on: `Simulation::zero_volume`). The zero
 /// stays where the program has it: one probed from another spot is placed
 /// from there by the stock's size. Empty for a zero no probe finds.
 pub(crate) fn probe_from(
@@ -2683,7 +2687,7 @@ pub(crate) fn probe_from(
     SPOTS
         .iter()
         .map(|&(_, refs)| {
-            let why = match (&first.initial_volume, first.frame) {
+            let why = match (first.zero_volume(), first.frame) {
                 (Some(volume), Some(frame)) if !volume.frame.square_to(frame) => Some(
                     "the stock was defined in an orientation that is not square to this setup"
                         .to_string(),
