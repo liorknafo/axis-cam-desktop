@@ -11692,7 +11692,7 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
         let blocked = c.partway_blocked();
         buttons = buttons.push(match c.touch_off() {
             _ if blocked.is_some() => small("Zero Z on the stock top", None, false),
-            Some((_, work)) if pins || run.partway() => small(
+            Some((_, work)) if pins || run.on_cut_stock() => small(
                 format!("Set Z{}", crate::post::exact_mm(work[2] as f32)),
                 manual.then_some(Message::Machine(Action::TouchOff)),
                 false,
