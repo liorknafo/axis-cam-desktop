@@ -14387,6 +14387,51 @@ flood = { pin = 8 }
         format!("{p}{A_AXIS}")
     }
 
+    /// LIO-573 review: a switchless B has no jog buttons, so the Machine
+    /// tab says to set it where it stands, turn it to its mark by MDI and
+    /// set it again, and that works.
+    #[test]
+    fn a_switchless_b_is_turned_to_its_mark_by_mdi() {
+        use crate::control::Action;
+        let b = "\n[axes.b]\nsteps_per_unit = 40.0\nmax_velocity = 3600.0\nacceleration = 360.0\nstep = { pin = 1 }\ndir = { pin = 17 }\nsoft_min = -180.0\nsoft_max = 180.0\n";
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_on(dir.path(), &format!("{}{b}", xy_switched()));
+        a.page = Page::Control;
+        idle(&mut a);
+        assert!(conn(&a).axis(4) && !conn(&a).homes(4));
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Machine));
+        let texts = page_texts(&a);
+        let says = "B has no jog buttons and turns only once it has a machine position: if it is not at its zero mark, press B beside Set machine zero here, turn B to the mark with MDI lines such as G91 G0 B5, then G90 (A needs its position first: MDI runs only once every rotary axis has one), then press B again.";
+        assert!(
+            texts.iter().any(
+                |t| t.starts_with("Home references X and Y on their switches") && t.contains(says)
+            ),
+            "{texts:?}"
+        );
+        let area = iced::Rectangle::new(iced::Point::ORIGIN, WINDOW);
+        let press_b = (crate::ui::probe::clicks_in(a.view(), WINDOW, area, 5.).into_iter())
+            .find(|m| matches!(m, Message::Machine(Action::MachineZero(Some(4)))))
+            .expect("B beside Set machine zero here");
+        let _ = a.update(press_b.clone());
+        tick_until(&mut a, 3.0, "B set where it stands", |s| s.referenced[4]);
+        // A's position first, as the note says: the driver runs no MDI
+        // line while a rotary axis has none.
+        let _ = a.update(Message::Machine(Action::MachineZero(Some(3))));
+        tick_until(&mut a, 3.0, "A set", |s| s.referenced[3]);
+        mdi(&mut a, "G91 G0 B5");
+        mdi(&mut a, "G90");
+        assert!(
+            (at(&a)[4] - 5.).abs() < 1e-3,
+            "{:?} {:?}",
+            at(&a),
+            conn(&a).snapshot.log
+        );
+        let _ = a.update(press_b);
+        tick_until(&mut a, 3.0, "B set at its mark", |s| {
+            s.referenced[4] && s.machine_pos[4].abs() < 1e-3
+        });
+    }
+
     /// Renders the Machine tab and the start-at-a-step box of the `xy_switched`
     /// machine (LIO-573) to PNGs in `$AXIS_RENDER_DIR` (default
     /// /tmp/home-switches): Home with Set machine zero, before and after

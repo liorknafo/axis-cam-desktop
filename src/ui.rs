@@ -13609,22 +13609,33 @@ fn mixed_zero_note(o: crate::orient::Orient, homed: &[usize], declared: &[usize]
     )
 }
 /// How a rotary axis of `axes` without a switch gets to its zero mark,
-/// after a space: it jogs only once it has a machine position, so it is set
-/// where it stands first (its button beside Set machine zero here), jogged
-/// to the mark, and set again. Empty without one.
+/// after a space: it turns only once it has a machine position, so it is
+/// set where it stands first (its button beside Set machine zero here),
+/// turned to the mark and set again. A by its jog buttons; B and C, which
+/// have none, by MDI lines. Empty without one.
 fn rotary_zero_note(axes: &[usize]) -> String {
-    let rot: Vec<usize> = axes.iter().copied().filter(|&a| a >= 3).collect();
-    match rot.as_slice() {
-        [] => String::new(),
-        [a] => format!(
-            " {n} jogs only once it has a machine position: if it is not at its zero mark, press {n} beside Set machine zero here, jog {n} to the mark, then press {n} again.",
-            n = AXES[*a]
-        ),
-        _ => format!(
-            " {} jog only once they have a machine position: one not at its zero mark, press its button beside Set machine zero here, jog it to the mark, then press its button again.",
-            crate::control::axis_list(&rot)
-        ),
+    let mut out = String::new();
+    if axes.contains(&3) {
+        out.push_str(" A jogs only once it has a machine position: if it is not at its zero mark, press A beside Set machine zero here, jog A to the mark, then press A again.");
     }
+    let bc: Vec<usize> = axes.iter().copied().filter(|&a| a >= 4).collect();
+    // The driver runs no MDI line while a rotary axis has none.
+    let first = if axes.contains(&3) {
+        " (A needs its position first: MDI runs only once every rotary axis has one)"
+    } else if bc.len() > 1 {
+        " (MDI runs only once both have theirs)"
+    } else {
+        ""
+    };
+    match bc.as_slice() {
+        [] => {}
+        [a] => out.push_str(&format!(
+            " {n} has no jog buttons and turns only once it has a machine position: if it is not at its zero mark, press {n} beside Set machine zero here, turn {n} to the mark with MDI lines such as G91 G0 {n}5, then G90{first}, then press {n} again.",
+            n = AXES[*a]
+        )),
+        _ => out.push_str(&format!(" B and C have no jog buttons and turn only once they have a machine position: for one not at its zero mark, press its button beside Set machine zero here, turn it to the mark with MDI lines such as G91 G0 B5, then G90{first}, then press its button again.")),
+    }
+    out
 }
 fn machine_zero_note(o: crate::orient::Orient) -> String {
     format!(
