@@ -6010,10 +6010,20 @@ pub(crate) mod tests {
                 assert_eq!(got, want);
             }
         }
-        // Pocket's later levels and holes 2 to 5 start; Face's pass 2 too,
-        // once the check takes pass 1 as cut without refusing the work zero
-        // (LIO-568).
+        // Pocket's later levels and holes 2 to 5 start, and Face's pass 2:
+        // the check takes pass 1 as cut without refusing the work zero it
+        // was cut with (LIO-568). None is refused.
         assert!(count >= 9, "{count}");
+        let refused: Vec<_> = (s.tool_runs.iter().flat_map(|r| &r.step_starts))
+            .filter(|st| !st.problems.is_empty())
+            .map(|st| (st.operation, st.step, &st.problems))
+            .collect();
+        assert!(refused.is_empty(), "{refused:?}");
+        assert!((s.tool_runs.iter().flat_map(|r| &r.step_starts)).any(|st| (
+            st.operation,
+            st.step
+        ) == (0, 1)
+            && st.entry.is_some()));
     }
 
     /// Each start partway through the setup carries its work zero on the
