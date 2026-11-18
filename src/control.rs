@@ -4427,6 +4427,15 @@ impl Connection {
             .map(|r| (r.partly(), r.cut_by()))
         {
             Some((None, _)) => Err(crate::run::PARTWAY_UNKNOWN.to_string()),
+            // Not a part of the stock: the reason the check cannot tell it.
+            Some((Some(partly), _))
+                if p.probe.is_ok() && partly.cut == [crate::run::STEPS_UNFOLLOWED] =>
+            {
+                Err(format!(
+                    "The check does not follow the {}, where a probe finds this work zero.",
+                    crate::run::STEPS_UNFOLLOWED
+                ))
+            }
             Some((Some(partly), by)) if p.probe.is_ok() && !partly.cut.is_empty() => Err(format!(
                 "{} cut the stock's {}, where a probe finds this work zero.",
                 capital(by),

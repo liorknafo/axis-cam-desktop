@@ -273,10 +273,14 @@ pub const DECLARING: &str = "The machine position is being set, axis by axis: wa
 pub const PARTWAY_UNKNOWN: &str =
     "The check did not work out the stock the start leaves: check the setup again.";
 
+/// What cut the stock a run started partway starts from, when operations
+/// before its start did (`Run::cut_by`).
+const CUT_BY_OPERATIONS: &str = "the operations before the start";
+
 /// What steps taken as cut in the start's operation, the setup's last
 /// operation sent, cut, said as `Partly::cut`: the check knows its stock
 /// only before that operation, none after it (`Run::partly`).
-const STEPS_UNFOLLOWED: &str =
+pub(crate) const STEPS_UNFOLLOWED: &str =
     "stock cut by the steps taken as cut, which the check does not follow";
 
 /// A setup being run on the connected machine, tool run by tool run.
@@ -2204,7 +2208,7 @@ impl Run {
             || (self.skips.iter()).any(|s| s.1 == Skip::Cut && start.is_some_and(|o| s.0 < o))
             || (self.cut_steps.iter()).any(|c| start.is_some_and(|o| c.0 < o));
         if ops_before {
-            "the operations before the start"
+            CUT_BY_OPERATIONS
         } else {
             "the steps taken as cut"
         }
@@ -2435,6 +2439,14 @@ impl Run {
             .skip_while(|p| !std::ptr::eq(*p, before))
             .nth(1);
         let unknown = STEPS_UNFOLLOWED;
+        // The stock after the operation says what the operations before
+        // the next one cut; partway by steps of its own alone, they are
+        // the steps taken as cut (LIO-568).
+        let by_steps = self.cut_by() != CUT_BY_OPERATIONS;
+        let said = |e: &String| match e.strip_prefix("The operations before it ") {
+            Some(rest) if by_steps => format!("The steps taken as cut {rest}"),
+            _ => e.clone(),
+        };
         Some(Cow::Owned(match after {
             Some(after) => Partly {
                 cut: after.cut.clone(),
@@ -2445,7 +2457,7 @@ impl Run {
                         let was = before.probe_from.iter().find(|(b, _)| b == r);
                         let ok = match (ok, was) {
                             (Ok(()), Some((_, Ok(())))) => Ok(()),
-                            (Err(e), _) => Err(e.clone()),
+                            (Err(e), _) => Err(said(e)),
                             (_, Some((_, Err(e)))) => Err(e.clone()),
                             _ => Err(format!("The check cannot follow the {unknown}.")),
                         };
@@ -8052,6 +8064,11 @@ pub(crate) mod tests {
             );
             assert_eq!(r.touch_off(), None);
             assert_eq!(r.cut_by(), "the steps taken as cut");
+            // Nor do the probe spots' reasons speak of operations.
+            for (_, ok) in &r.partly().unwrap().probe_from {
+                let why = ok.as_ref().unwrap_err();
+                assert!(!why.contains("operations"), "{why}");
+            }
         }
         // Starting at Pass 1, Cycle Start waits for the work zero, kept or
         // set again.
