@@ -8716,6 +8716,10 @@ impl App {
                         return Task::none();
                     }
                     match c.snapshot.state {
+                        // Refused, the state is from before and nothing
+                        // reaches the machine: the status line keeps the
+                        // refusal (LIO-561).
+                        _ if c.pi_refused().is_some() => {}
                         Some(State::Run) if c.probe_moving() => self.status = ui::PROBE_HOLD.into(),
                         Some(State::Run) => c.send(Command::FeedHold),
                         Some(State::Hold) if jog_pad_shown => c.send(Command::Resume),

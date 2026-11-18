@@ -3831,8 +3831,29 @@ flood = { pin = 8 }
         assert!(!texts.iter().any(|t| t == "Reset"), "{texts:?}");
         assert!(!texts.iter().any(|t| t.starts_with("E-stop:")), "{texts:?}");
         let (line, _) = crate::ui::run_line(&a, conn(&a));
-        let why = conn(&a).pi_refused().unwrap();
+        let why = conn(&a).pi_refused().unwrap().to_string();
         assert_eq!(line[0].0, format!("The Pi refused this computer: {why}"));
+        // A probe move known from before: neither the run bar nor Space
+        // says "Stop now aborts it", which cannot reach the machine.
+        let status = a.status.clone();
+        if let Some(c) = a.control.as_mut() {
+            c.snapshot.state = Some(uc100::controller::State::Run);
+            c.snapshot.program_name = Some("Probe".into());
+        }
+        assert!(conn(&a).probe_moving() && conn(&a).pi_refused().is_some());
+        let texts = page_texts(&a);
+        assert!(
+            !texts.iter().any(|t| t == crate::ui::PROBE_HOLD),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("The Pi refused this computer: ")),
+            "{texts:?}"
+        );
+        let _ = a.update(Message::HoldKey);
+        assert_eq!(a.status, status);
     }
 
     /// Renders the Control page while the Pi refuses this computer: first
