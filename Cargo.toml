@@ -58,6 +58,11 @@ opt-level = 2
 [profile.dev.package.fidget-mesh]
 opt-level = 2
 
+[target.'cfg(unix)'.dev-dependencies]
+# Asks each of the test process's open files what it is (`fstat`), with no
+# duplicate or close (`mcp::runner`'s tests); already in the tree.
+libc = "0.2"
+
 [dev-dependencies]
 # Lay a page out on the software renderer, with no window, to read its widget
 # tree and click it (`ui::probe`); both are already in the tree through iced.

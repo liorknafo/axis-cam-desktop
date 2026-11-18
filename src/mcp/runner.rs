@@ -1084,10 +1084,9 @@ mod tests {
     /// does not meet the copy.
     #[track_caller]
     fn assert_let_go(folder: &Path, why: &str) {
-        let lock = folder.join("lock");
         #[cfg(unix)]
         assert!(
-            !open_here(&lock),
+            !open_here(&folder.join("lock")),
             "{why}: this process still has the lock file open"
         );
         // Windows passes no open file to a program it starts: held is held.
@@ -1117,22 +1116,23 @@ mod tests {
     }
 
     /// Whether one of this process's open files is the file at `path`:
-    /// each in `/dev/fd` asked with `fstat`, never duplicated or closed (a
-    /// duplicate would hold its lock too).
+    /// each number in `/dev/fd` asked with `fstat`, never duplicated or
+    /// closed (a duplicate would hold its lock too). A number closed since
+    /// it was listed (the listing's own, or another thread's) fails
+    /// `fstat`; one opened again since is some other file.
     #[cfg(unix)]
     fn open_here(path: &Path) -> bool {
-        use std::os::fd::FromRawFd;
         use std::os::unix::fs::MetadataExt;
         let want = std::fs::metadata(path).unwrap();
         let fds: Vec<i32> = (std::fs::read_dir("/dev/fd").unwrap().flatten())
             .filter_map(|e| e.file_name().to_str()?.parse().ok())
             .collect();
         fds.into_iter().any(|fd| {
-            // SAFETY: the `File` is never dropped, so the descriptor is
-            // only read with `fstat`, never closed; one another thread
-            // closed meanwhile fails it, or is some other file.
-            let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
-            (file.metadata()).is_ok_and(|m| (m.dev(), m.ino()) == (want.dev(), want.ino()))
+            // SAFETY: `fstat` only writes the `stat` it is given, all
+            // zeroes a valid value; a closed number is EBADF, not UB.
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            let got = unsafe { libc::fstat(fd, &raw mut stat) };
+            got == 0 && (stat.st_dev as u64, stat.st_ino as u64) == (want.dev(), want.ino())
         })
     }
 
