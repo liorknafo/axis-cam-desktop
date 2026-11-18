@@ -7033,35 +7033,90 @@ flood = { pin = 8 }
     /// program pauses first to set the head for pass 2.
     #[test]
     fn stop_after_step_stops_at_a_borings_pause_between_passes() {
-        use crate::run::Action as R;
-        use uc100::controller::State;
         let dir = tempfile::tempdir().unwrap();
         let mut a = run_app(dir.path());
-        let oi = bored_twice(&mut a, dir.path(), Some("0.15"));
-        assert_eq!(run_of(&a).op_steps(oi).unwrap().steps.len(), 6);
+        let seen = stop_at_a_borings_head_pause(&mut a, dir.path());
+        assert!(seen, "it stopped before the pause to set the head");
+        let _ = a.update(Message::Disconnect);
+    }
+
+    /// LIO-577: as above with Network (Pi), the Pi stopping the tool run
+    /// itself (LIO-570). It stops at the head-setting pause's own line,
+    /// the last line the Pi's driver logged pausing at, for pass 2 of 3,
+    /// and the Pi's driver never resumes from that pause: the spindle off
+    /// there, the tool over the stock.
+    #[test]
+    fn stop_after_step_on_the_pi_stops_at_a_borings_pause_between_passes() {
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        stop_at_a_borings_head_pause(&mut a, dir.path());
+        let end = (conn(&a)
+            .link
+            .as_ref()
+            .unwrap()
+            .tool_run_ends
+            .last()
+            .cloned())
+        .expect("the Pi told the tool run's end");
+        let fired = end.stopped_after.expect("stopped by Stop after step");
+        let s = server.snapshot().unwrap();
+        let head = (s.log.iter())
+            .rposition(|l| l.starts_with("Line ") && l.contains("pass 2 of 3"))
+            .unwrap_or_else(|| panic!("never paused to set the head: {:?}", s.log));
+        let paused: u32 = (s.log[head].strip_prefix("Line "))
+            .and_then(|l| l.split_once(':')?.0.parse().ok())
+            .expect(&s.log[head]);
+        assert_eq!(
+            fired,
+            paused,
+            "the Pi stopped elsewhere than the pause: {:?}",
+            &s.log[head..]
+        );
+        assert!(
+            !s.log[head..].iter().any(|l| l.starts_with("Resumed")),
+            "the pause was answered: {:?}",
+            &s.log[head..]
+        );
+        assert_eq!(s.state, Some(State::Idle));
+        assert_eq!(s.spindle, Some(uc100::gcode::Spindle::Off));
+        assert!(s.work_pos[2] > 0.5, "stopped at work Z {}", s.work_pos[2]);
+        let _ = a.update(Message::Disconnect);
+    }
+
+    /// The LIO-558 scenario on `a` (a `run_app`, or on the Pi): Stop after
+    /// step armed in the Boring's last hole of pass 1, the run ends
+    /// "Stopped after pass 1 · hole 2" with the spindle off, Cycle Start
+    /// then starting at "pass 2 · hole 1". Whether this computer saw the
+    /// machine paused to set the head for pass 2.
+    fn stop_at_a_borings_head_pause(a: &mut App, dir: &std::path::Path) -> bool {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let oi = bored_twice(a, dir, Some("0.15"));
+        assert_eq!(run_of(a).op_steps(oi).unwrap().steps.len(), 6);
         let _ = a.update(Message::Run(R::Steps(Some(oi))));
         let _ = a.update(Message::Run(R::PickStep(oi, 1)));
         let _ = a.update(Message::Run(R::StartStep));
-        answer_skips(&mut a, 0);
+        answer_skips(a, 0);
         let _ = a.update(Message::Run(R::KeepZero));
         let _ = a.update(Message::Run(R::KeepToolZ));
-        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        assert!(problems(a).is_empty(), "{:?}", problems(a));
         let _ = a.update(Message::Run(R::CycleStart));
-        tick_until(&mut a, 5., "over the entry", |s| {
+        tick_until(a, 5., "over the entry", |s| {
             matches!(s.state, Some(State::Paused(_)))
         });
         let _ = a.update(Message::Run(R::Resume));
-        tick_until(&mut a, 5., "boring hole 2", |s| {
+        tick_until(a, 5., "boring hole 2", |s| {
             s.state == Some(State::Run) && s.work_pos[2] < -1.
         });
         let _ = a.update(Message::Run(R::StopAfterStep));
-        assert!(run_of(&a).stop_after);
+        assert!(run_of(a).stop_after);
         // The run line says the visit, "pass 1 of 3 · hole 2 of 2": first
         // when the window is compact and the line is cut short, else where
         // the Steps page has it, after the operation.
         for (w, h) in [(1120., 690.), (1440., 900.)] {
             let _ = a.update(Message::Resized(iced::Size::new(w, h)));
-            let (parts, _) = crate::ui::run_line(&a, conn(&a));
+            let (parts, _) = crate::ui::run_line(a, conn(a));
             let line: String = parts.iter().map(|(t, _)| t.as_str()).collect();
             let (step, setup) = (
                 line.find(" · pass 1 of 3 · hole 2 of 2").expect(&line),
@@ -7073,25 +7128,28 @@ flood = { pin = 8 }
         }
         let mut deadline = Deadline::new(20.);
         let mut set = false;
-        while run_of(&a).running.is_some() {
+        while run_of(a).running.is_some() {
             let _ = a.update(Message::Tick);
-            set |= matches!(&conn(&a).snapshot.state,
+            set |= matches!(&conn(a).snapshot.state,
                 Some(State::Paused(why)) if why.contains("pass 2 of 3"));
-            assert!(deadline.within(&conn(&a).snapshot));
+            assert!(
+                deadline.within(&conn(a).snapshot),
+                "the run never ended, the machine {:?}",
+                conn(a).snapshot.state
+            );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        assert!(set, "it stopped before the pause to set the head");
-        let outcome = run_of(&a).outcome.clone().unwrap();
+        let outcome = run_of(a).outcome.clone().unwrap();
         assert_eq!(outcome.1, "Stopped after pass 1 · hole 2", "{outcome:?}");
-        assert_eq!(conn(&a).snapshot.spindle, Some(uc100::gcode::Spindle::Off));
-        tick_until(&mut a, 5., "Idle after the stop", |s| {
+        assert_eq!(conn(a).snapshot.spindle, Some(uc100::gcode::Spindle::Off));
+        tick_until(a, 5., "Idle after the stop", |s| {
             s.state == Some(State::Idle)
         });
-        answer_skips(&mut a, 0);
-        assert_eq!(run_of(&a).at_step(), Some((oi, 2)));
-        let label = run_of(&a).step_label(oi, 2);
+        answer_skips(a, 0);
+        assert_eq!(run_of(a).at_step(), Some((oi, 2)));
+        let label = run_of(a).step_label(oi, 2);
         assert_eq!(label, "pass 2 · hole 1");
-        let _ = a.update(Message::Disconnect);
+        set
     }
 
     /// LIO-558: a Boring's steps, its visits of its holes, laid out whole
